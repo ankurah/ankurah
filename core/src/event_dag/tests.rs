@@ -3904,7 +3904,17 @@ mod gen_corruption_immunity {
                 // Validity: emitted order is a topological order over the
                 // honest edges (generation doctoring preserves structure).
                 assert_topo_order(chain, &corpus.parents_map, context);
+                // The semantic core, presented CANONICALLY over the core set
+                // itself: the emitted order restricted to the core is not
+                // schedule-stable (overshoot extras can delay a core
+                // member's Kahn readiness and reorder ties), so the byte
+                // comparison binds the core SET in its own canonical order,
+                // the sorted-set tier the oracle brief's chain ruling
+                // admits. With the completeness law above, the core set
+                // always equals s_cover minus c_cover, so this is defense
+                // in depth.
                 let core: Vec<EventId> = chain.iter().filter(|id| s_cover.contains(*id) && !c_cover.contains(*id)).cloned().collect();
+                let core = crate::event_dag::ordering::canonicalize_chain(core, &corpus.parents_map);
                 Bound::StrictDescends { chain_core: core }
             }
             AbstractCausalRelation::Disjoint { subject_root, other_root, .. } => {
@@ -4125,6 +4135,585 @@ mod gen_corruption_immunity {
              divergence and every green immunity result is vacuous. Got {:?}",
             corrupted.relation
         );
+    }
+
+    // ---- Corruption shapes (oracle brief section 2, per channel where
+    // meaningful; the fold's two-channel matrix) ----
+
+    /// All randomized sub-arm shapes. Payload shapes corrupt what the lying
+    /// retriever serves; gclock shapes corrupt the operand annotations the
+    /// prechecks and schedule seeds read; cross corrupts both independently
+    /// (the channels then usually DISAGREE, the materialization-drift shape
+    /// amendment K's bookkeeping worries about).
+    pub(super) const SHAPES: &[&str] = &[
+        "gc-rand-payload",
+        "gc-rand-gclock",
+        "gc-rand-cross",
+        "gc-deflate-meet",
+        "gc-inflate-tip",
+        "gc-sat-interior",
+        "gc-sat-tips",
+        "gc-genesis",
+    ];
+
+    /// The biased adversarial value mix (oracle brief GC-RAND).
+    fn corrupt_value(rng: &mut Rng, truth: u32) -> u32 {
+        match rng.below(5) {
+            0 => 0,
+            1 => 1,
+            2 => {
+                let delta = 1 + rng.below(3) as u32;
+                if rng.below(2) == 0 {
+                    truth.saturating_add(delta)
+                } else {
+                    truth.saturating_sub(delta)
+                }
+            }
+            3 => 4_000_000_000u32.saturating_add(rng.below(1000) as u32),
+            _ => u32::MAX,
+        }
+    }
+
+    /// Build one shape's doctoring for a (corpus, pair). Returns None when
+    /// the shape is not meaningful on this pair (e.g. deflate-meet on a
+    /// non-diverged baseline), which the caller skips.
+    fn shape_doctoring(
+        shape: &str,
+        rng: &mut Rng,
+        corpus: &Corpus,
+        subject: &[EventId],
+        comparison: &[EventId],
+        baseline: &Bound,
+    ) -> Option<Doctoring> {
+        let mut d = Doctoring::default();
+        match shape {
+            "gc-rand-payload" => {
+                for id in &corpus.ids {
+                    if rng.below(2) == 0 {
+                        let truth = corpus.gen_of(id);
+                        d.payloads.push((id.clone(), corrupt_value(rng, truth)));
+                    }
+                }
+                if d.payloads.is_empty() {
+                    let id = corpus.ids[rng.below(corpus.ids.len())].clone();
+                    let truth = corpus.gen_of(&id);
+                    d.payloads.push((id, corrupt_value(rng, truth)));
+                }
+            }
+            "gc-rand-gclock" => {
+                for tip in subject.iter() {
+                    if rng.below(2) == 0 {
+                        d.subject_tips.push((tip.clone(), corrupt_value(rng, corpus.gen_of(tip))));
+                    }
+                }
+                for tip in comparison.iter() {
+                    if rng.below(2) == 0 {
+                        d.comparison_tips.push((tip.clone(), corrupt_value(rng, corpus.gen_of(tip))));
+                    }
+                }
+                if d.is_empty() {
+                    let tip = &comparison[rng.below(comparison.len())];
+                    d.comparison_tips.push((tip.clone(), corrupt_value(rng, corpus.gen_of(tip))));
+                }
+            }
+            "gc-rand-cross" => {
+                // Both channels, independent draws: where they hit the same
+                // tip they usually disagree (the drift shape).
+                let id = corpus.ids[rng.below(corpus.ids.len())].clone();
+                let truth = corpus.gen_of(&id);
+                d.payloads.push((id, corrupt_value(rng, truth)));
+                for tip in subject.iter().chain(comparison.iter()) {
+                    if rng.below(2) == 0 {
+                        d.payloads.push((tip.clone(), corrupt_value(rng, corpus.gen_of(tip))));
+                    }
+                    if rng.below(2) == 0 {
+                        let over = corrupt_value(rng, corpus.gen_of(tip));
+                        if subject.contains(tip) {
+                            d.subject_tips.push((tip.clone(), over));
+                        } else {
+                            d.comparison_tips.push((tip.clone(), over));
+                        }
+                    }
+                }
+                if d.subject_tips.is_empty() && d.comparison_tips.is_empty() {
+                    let tip = &subject[rng.below(subject.len())];
+                    d.subject_tips.push((tip.clone(), corrupt_value(rng, corpus.gen_of(tip))));
+                }
+            }
+            "gc-deflate-meet" => {
+                // Meet-boundary deflation (the delta red-team BLOCKER 1
+                // recipe generalized): meet members and their immediate
+                // children doctored below their parents' values.
+                let Bound::DivergedSince { meet, subject_children, other_children, .. } = baseline else {
+                    return None;
+                };
+                for id in meet.iter().chain(subject_children.iter()).chain(other_children.iter()) {
+                    d.payloads.push((id.clone(), if rng.below(2) == 0 { 0 } else { 1 }));
+                }
+                if d.payloads.is_empty() {
+                    return None;
+                }
+            }
+            "gc-inflate-tip" => {
+                // Operand-channel inflation of one comparison tip: the
+                // wrong-suppression direction, materialization channel.
+                let tip = &comparison[rng.below(comparison.len())];
+                d.comparison_tips.push((tip.clone(), 4_000_000_000));
+            }
+            "gc-sat-interior" => {
+                // Interior u32::MAX with tips left honest: a shape honest
+                // stamping cannot produce; tip eligibility stays ENABLED
+                // over a corrupt-saturated interior, so soundness must come
+                // from suppress-only wiring alone.
+                let tips: BTreeSet<&EventId> = subject.iter().chain(comparison.iter()).collect();
+                for id in &corpus.ids {
+                    if !tips.contains(id) {
+                        d.payloads.push((id.clone(), u32::MAX));
+                    }
+                }
+                if d.payloads.is_empty() {
+                    return None; // every event is a tip; no interior exists
+                }
+            }
+            "gc-sat-tips" => {
+                // Tips at MAX through BOTH channels: the disable rule must
+                // fire (prechecks self-disable; never a suppression) and the
+                // run must equal baseline.
+                for tip in subject.iter() {
+                    d.payloads.push((tip.clone(), u32::MAX));
+                    d.subject_tips.push((tip.clone(), u32::MAX));
+                }
+                for tip in comparison.iter() {
+                    d.payloads.push((tip.clone(), u32::MAX));
+                    d.comparison_tips.push((tip.clone(), u32::MAX));
+                }
+            }
+            "gc-genesis" => {
+                // Genesis-not-1: the genesis rule is ADMISSION's law; the
+                // comparison detects roots by empty parent clocks and must
+                // not care what a genesis claims.
+                for id in &corpus.ids {
+                    if corpus.parents_map[id].is_empty() {
+                        let v = match rng.below(3) {
+                            0 => 0,
+                            1 => 7,
+                            _ => u32::MAX,
+                        };
+                        d.payloads.push((id.clone(), v));
+                    }
+                }
+                if d.payloads.is_empty() {
+                    return None;
+                }
+            }
+            other => panic!("unknown corruption shape {other}"),
+        }
+        Some(d)
+    }
+
+    // ---- Randomized corpus generation (shared with the plain property
+    // test's idiom: xorshift, occasional extra roots, antichain clocks) ----
+
+    fn generate_corpus(rng: &mut Rng, n_events: usize) -> Corpus {
+        let mut events: Vec<Event> = Vec::new();
+        let mut ids: Vec<EventId> = Vec::new();
+        let mut parents_map: BTreeMap<EventId, Vec<EventId>> = BTreeMap::new();
+        for i in 0..n_events {
+            let parent_ids: Vec<EventId> = if i == 0 || rng.below(6) == 0 {
+                vec![]
+            } else {
+                let mut chosen = BTreeSet::new();
+                for _ in 0..(1 + rng.below(2)) {
+                    chosen.insert(ids[rng.below(ids.len())].clone());
+                }
+                super::comparison_property::to_antichain(&parents_map, &chosen)
+            };
+            let parent_events: Vec<&Event> =
+                parent_ids.iter().map(|pid| events.iter().find(|e| e.id() == *pid).expect("parent id was minted above")).collect();
+            let ev = make_test_event_u16(i as u16 + 1, &parent_events);
+            parents_map.insert(ev.id(), parent_ids);
+            ids.push(ev.id());
+            events.push(ev);
+        }
+        Corpus::from_events(events)
+    }
+
+    fn pick_clock(rng: &mut Rng, corpus: &Corpus) -> Vec<EventId> {
+        let mut set = BTreeSet::new();
+        for _ in 0..(1 + rng.below(3)) {
+            set.insert(corpus.ids[rng.below(corpus.ids.len())].clone());
+        }
+        super::comparison_property::to_antichain(&corpus.parents_map, &set)
+    }
+
+    // ---- Env knobs (dedicated, oracle brief section 6: the immunity arm
+    // scales independently of the plain oracle) ----
+
+    fn gen_seed_base() -> u32 { std::env::var("GEN_ORACLE_SEED_BASE").ok().and_then(|s| s.parse().ok()).unwrap_or(1) }
+    fn gen_seed_count() -> u32 { std::env::var("GEN_ORACLE_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(300) }
+    fn gen_large_seed_count() -> u32 { std::env::var("GEN_ORACLE_LARGE_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(20) }
+    fn gen_shape_filter() -> Option<String> { std::env::var("GEN_ORACLE_SHAPE").ok() }
+
+    /// Documented corruption-seed mix: one xorshift stream per
+    /// (dag_seed, shape), so shapes are independent and each is
+    /// reproducible from the artifact line alone.
+    fn corruption_seed(dag_seed: u32, shape_index: usize) -> u32 {
+        dag_seed.wrapping_mul(0x9E37_79B9) ^ ((shape_index as u32 + 1).wrapping_mul(0x517C_C1B7)) | 1
+    }
+
+    /// Drive every shape of the two-channel matrix over one generated
+    /// corpus size band. Returns how many corrupted runs showed any FREE
+    /// delta (the GC-RAND aggregate non-vacuity numerator).
+    async fn drive_seed_band(dag_seed: u32, n_min: usize, n_span: usize, shape_filter: &Option<String>) -> usize {
+        let mut rng = Rng(dag_seed.wrapping_mul(0x9E37_79B9) | 1);
+        let n_events = n_min + rng.below(n_span);
+        let corpus = generate_corpus(&mut rng, n_events);
+        let mut free_deltas = 0usize;
+
+        for _pair in 0..4 {
+            let subject = pick_clock(&mut rng, &corpus);
+            let comparison = pick_clock(&mut rng, &corpus);
+
+            // Honest baseline. Its own laws: the builder stamps honestly
+            // (zero edge violations), the verdict matches the brute-force
+            // reachability oracle (arm i for compare_with), and every
+            // payload generation equals its brute-force depth (arm iv).
+            let (sg, cg) = Doctoring::default().operands(&corpus, &subject, &comparison);
+            let baseline =
+                run(corpus.retriever.clone(), &corpus, &subject, &comparison, sg, cg, None, &HashMap::new(), "immunity baseline").await;
+            assert_eq!(
+                baseline.stats.edge_check_violations, 0,
+                "dag_seed={dag_seed}: the corpus builder must stamp honestly (its own correctness check)"
+            );
+            let expected = super::comparison_property::oracle(&corpus.parents_map, &subject, &comparison);
+            assert!(
+                bound_matches_expected(&expected, &baseline.bound),
+                "dag_seed={dag_seed}: arm (i): the accelerated baseline diverged from the brute-force oracle: expected {expected:?}, got {:?}",
+                baseline.bound
+            );
+            assert_depths_equal_generations(&corpus, dag_seed);
+
+            for (shape_index, shape) in SHAPES.iter().enumerate() {
+                if let Some(filter) = shape_filter {
+                    if filter != shape {
+                        continue;
+                    }
+                }
+                let mut shape_rng = Rng(corruption_seed(dag_seed, shape_index));
+                let Some(doctoring) = shape_doctoring(shape, &mut shape_rng, &corpus, &subject, &comparison, &baseline.bound) else {
+                    continue;
+                };
+                let (lying, back) = doctoring.retriever(&corpus);
+                let (sg, cg) = doctoring.operands(&corpus, &subject, &comparison);
+                let corrupted =
+                    run(lying, &corpus, &subject, &comparison, sg, cg, None, &back, &format!("shape {shape} dag_seed {dag_seed}")).await;
+                assert_bound_identical(
+                    dag_seed,
+                    shape,
+                    corruption_seed(dag_seed, shape_index),
+                    &subject,
+                    &comparison,
+                    &doctoring.triples(&corpus),
+                    &baseline,
+                    &corrupted,
+                );
+                if corrupted.stats != baseline.stats || corrupted.fetches != baseline.fetches {
+                    free_deltas += 1;
+                }
+            }
+        }
+        free_deltas
+    }
+
+    fn bound_matches_expected(expected: &super::comparison_property::Expected, bound: &Bound) -> bool {
+        use super::comparison_property::Expected;
+        match (expected, bound) {
+            (Expected::Equal, Bound::Equal) => true,
+            (Expected::StrictDescends, Bound::StrictDescends { .. }) => true,
+            (Expected::StrictAscends, Bound::StrictAscends) => true,
+            (Expected::DivergedMeet(want), Bound::DivergedSince { meet, .. }) => {
+                let mut got = meet.clone();
+                got.sort();
+                let mut want = want.clone();
+                want.sort();
+                got == want
+            }
+            (Expected::Disjoint, Bound::Disjoint) => true,
+            _ => false,
+        }
+    }
+
+    /// Arm (iv): every honest payload generation equals its brute-force
+    /// topological depth over the true parent map (a transient
+    /// assertion-time walk, not a store).
+    fn assert_depths_equal_generations(corpus: &Corpus, dag_seed: u32) {
+        fn depth(id: &EventId, parents: &BTreeMap<EventId, Vec<EventId>>, memo: &mut HashMap<EventId, u32>) -> u32 {
+            if let Some(d) = memo.get(id) {
+                return *d;
+            }
+            let ps = &parents[id];
+            let d = if ps.is_empty() { 1 } else { 1 + ps.iter().map(|p| depth(p, parents, memo)).max().expect("nonempty") };
+            memo.insert(id.clone(), d);
+            d
+        }
+        let mut memo = HashMap::new();
+        for id in &corpus.ids {
+            let expected = depth(id, &corpus.parents_map, &mut memo);
+            assert_eq!(corpus.gen_of(id), expected, "dag_seed={dag_seed}: arm (iv): honest stamp diverged from brute-force depth for {id}");
+        }
+    }
+
+    /// ARM (ii), the randomized two-channel matrix at gate defaults
+    /// (GEN_ORACLE_SEED_BASE / GEN_ORACLE_SEEDS / GEN_ORACLE_SHAPE scale it
+    /// out; the nightly runs 25k seeds). Every corrupted run must be
+    /// BOUND-identical to its honest baseline; across the whole arm at
+    /// least one run must show a FREE delta (aggregate non-vacuity: the
+    /// corruption BITES, the oracle is not comparing a run to itself).
+    #[tokio::test]
+    async fn randomized_corpora_are_immune_to_generation_corruption() {
+        let base = gen_seed_base();
+        let count = gen_seed_count();
+        let filter = gen_shape_filter();
+        let mut free_deltas = 0usize;
+        for dag_seed in base..base.saturating_add(count) {
+            free_deltas += drive_seed_band(dag_seed, 5, 6, &filter).await;
+        }
+        assert!(
+            free_deltas > 0,
+            "aggregate non-vacuity failed: no corrupted run showed even a FREE delta; the doctor map cannot be engaging"
+        );
+    }
+
+    /// The larger-DAG variant (oracle brief section 3.1): 20..=40 events
+    /// exercise frontier ordering far harder than the 5..=10 default. A
+    /// token count rides the gate (GEN_ORACLE_LARGE_SEEDS, default 20);
+    /// the nightly scales it.
+    #[tokio::test]
+    async fn randomized_large_corpora_are_immune_to_generation_corruption() {
+        let base = gen_seed_base();
+        let count = gen_large_seed_count();
+        let filter = gen_shape_filter();
+        for dag_seed in base..base.saturating_add(count) {
+            drive_seed_band(dag_seed.wrapping_add(0x4000_0000), 20, 21, &filter).await;
+        }
+    }
+
+    // ---- Named deterministic sub-arm pins (always-on; never env-scaled) ----
+
+    /// Every shape of the matrix against the 4.1 counterexample DAG, whose
+    /// meet {c1, m} is structurally delicate (the RFC stop rule broke on
+    /// it). All shapes, both channels, BOUND-identical.
+    #[tokio::test]
+    async fn gc_seed_41_is_immune_under_every_shape() {
+        let (corpus, s, c, _c1, _m) = seed_41();
+        assert_seed_immune(&corpus, &[s], &[c], "gc_seed_41").await;
+    }
+
+    /// Every shape against the 4.3 self-refutation DAG (meet {f}, where a
+    /// wrong stop rule kept the evicted m).
+    #[tokio::test]
+    async fn gc_seed_43_is_immune_under_every_shape() {
+        let (corpus, a, b, _f) = seed_43();
+        assert_seed_immune(&corpus, &[a], &[b], "gc_seed_43").await;
+    }
+
+    async fn assert_seed_immune(corpus: &Corpus, subject: &[EventId], comparison: &[EventId], name: &str) {
+        let (sg, cg) = Doctoring::default().operands(corpus, subject, comparison);
+        let baseline =
+            run(corpus.retriever.clone(), corpus, subject, comparison, sg, cg, None, &HashMap::new(), &format!("{name} baseline")).await;
+        for (shape_index, shape) in SHAPES.iter().enumerate() {
+            let mut shape_rng = Rng(corruption_seed(0xD2D2_0041, shape_index));
+            let Some(doctoring) = shape_doctoring(shape, &mut shape_rng, corpus, subject, comparison, &baseline.bound) else {
+                continue;
+            };
+            let (lying, back) = doctoring.retriever(corpus);
+            let (sg, cg) = doctoring.operands(corpus, subject, comparison);
+            let corrupted = run(lying, corpus, subject, comparison, sg, cg, None, &back, &format!("{name} shape {shape}")).await;
+            assert_bound_identical(
+                0xD2D2_0041,
+                shape,
+                corruption_seed(0xD2D2_0041, shape_index),
+                subject,
+                comparison,
+                &doctoring.triples(corpus),
+                &baseline,
+                &corrupted,
+            );
+        }
+    }
+
+    /// GC-SAT shape (a) named pin: interior saturation with honest-low tips
+    /// keeps the prechecks ENABLED (tip eligibility sees non-MAX values)
+    /// while the interior lies; soundness comes from suppress-only wiring
+    /// alone, and the traversed saturated edges are SEEN (violation
+    /// counter: a FREE delta asserted on purpose).
+    #[tokio::test]
+    async fn gc_sat_interior_is_contained_and_detected() {
+        let g = make_test_event(1, &[]);
+        let a = make_test_event(2, &[&g]);
+        let b = make_test_event(3, &[&a]);
+        let c = make_test_event(4, &[&b]);
+        let corpus = Corpus::from_events(vec![g.clone(), a.clone(), b.clone(), c.clone()]);
+        let subject = [c.id()];
+        let comparison = [g.id()];
+
+        let (sg, cg) = Doctoring::default().operands(&corpus, &subject, &comparison);
+        let baseline =
+            run(corpus.retriever.clone(), &corpus, &subject, &comparison, sg, cg, None, &HashMap::new(), "gc-sat-a baseline").await;
+
+        let doctoring = Doctoring { payloads: vec![(a.id(), u32::MAX), (b.id(), u32::MAX)], subject_tips: vec![], comparison_tips: vec![] };
+        let (lying, back) = doctoring.retriever(&corpus);
+        let (sg, cg) = doctoring.operands(&corpus, &subject, &comparison);
+        let corrupted = run(lying, &corpus, &subject, &comparison, sg, cg, None, &back, "gc-sat-a corrupted").await;
+
+        assert_bound_identical(41, "gc-sat-interior", 0, &subject, &comparison, &doctoring.triples(&corpus), &baseline, &corrupted);
+        assert!(
+            corrupted.stats.edge_check_violations >= 1,
+            "the walk traverses the corrupt-saturated interior and must SEE it, got {}",
+            corrupted.stats.edge_check_violations
+        );
+    }
+
+    /// GC-SAT shape (b) named pin: tips at MAX through BOTH channels make
+    /// the prechecks self-DISABLE (disabled is not suppressed: the counter
+    /// stays at baseline zero and the quick check still runs), and the run
+    /// equals baseline byte-for-byte.
+    #[tokio::test]
+    async fn gc_sat_tips_disable_the_prechecks_without_suppressing() {
+        let h = make_test_event(1, &[]);
+        let e = make_test_event(2, &[&h]);
+        let corpus = Corpus::from_events(vec![h.clone(), e.clone()]);
+        let subject = [e.id()];
+        let comparison = [h.id()];
+
+        let (sg, cg) = Doctoring::default().operands(&corpus, &subject, &comparison);
+        let baseline =
+            run(corpus.retriever.clone(), &corpus, &subject, &comparison, sg, cg, None, &HashMap::new(), "gc-sat-b baseline").await;
+        assert_eq!(baseline.stats.precheck_suppressions, 0, "precondition: the honest one-step shape suppresses nothing");
+
+        let doctoring = Doctoring {
+            payloads: vec![(e.id(), u32::MAX), (h.id(), u32::MAX)],
+            subject_tips: vec![(e.id(), u32::MAX)],
+            comparison_tips: vec![(h.id(), u32::MAX)],
+        };
+        let (lying, back) = doctoring.retriever(&corpus);
+        let (sg, cg) = doctoring.operands(&corpus, &subject, &comparison);
+        let corrupted = run(lying, &corpus, &subject, &comparison, sg, cg, None, &back, "gc-sat-b corrupted").await;
+
+        assert_bound_identical(43, "gc-sat-tips", 0, &subject, &comparison, &doctoring.triples(&corpus), &baseline, &corrupted);
+        assert_eq!(
+            corrupted.stats.precheck_suppressions, 0,
+            "saturated operands DISABLE the precheck (266-C.iv); disabling must never read as a suppression"
+        );
+    }
+
+    /// GC-GENESIS named pin: geneses doctored to {0, 7, MAX} through the
+    /// payload channel change nothing BOUND, on a descent shape and on a
+    /// two-root Disjoint shape (roots are detected by empty parent clocks,
+    /// never by gen == 1).
+    #[tokio::test]
+    async fn gc_genesis_claims_do_not_steer_roots_or_verdicts() {
+        // Descent shape.
+        let g = make_test_event(1, &[]);
+        let a = make_test_event(2, &[&g]);
+        let corpus = Corpus::from_events(vec![g.clone(), a.clone()]);
+        let (sg, cg) = Doctoring::default().operands(&corpus, &[a.id()], &[g.id()]);
+        let baseline =
+            run(corpus.retriever.clone(), &corpus, &[a.id()], &[g.id()], sg, cg, None, &HashMap::new(), "gc-genesis descent baseline")
+                .await;
+        for claim in [0u32, 7, u32::MAX] {
+            let doctoring = Doctoring { payloads: vec![(g.id(), claim)], subject_tips: vec![], comparison_tips: vec![] };
+            let (lying, back) = doctoring.retriever(&corpus);
+            let (sg, cg) = doctoring.operands(&corpus, &[a.id()], &[g.id()]);
+            let corrupted =
+                run(lying, &corpus, &[a.id()], &[g.id()], sg, cg, None, &back, &format!("gc-genesis descent claim {claim}")).await;
+            assert_bound_identical(1, "gc-genesis", claim, &[a.id()], &[g.id()], &doctoring.triples(&corpus), &baseline, &corrupted);
+        }
+
+        // Disjoint shape: two independent roots.
+        let r1 = make_test_event(10, &[]);
+        let r2 = make_test_event(11, &[]);
+        let d1 = make_test_event(12, &[&r1]);
+        let d2 = make_test_event(13, &[&r2]);
+        let corpus = Corpus::from_events(vec![r1.clone(), r2.clone(), d1.clone(), d2.clone()]);
+        let (sg, cg) = Doctoring::default().operands(&corpus, &[d1.id()], &[d2.id()]);
+        let baseline =
+            run(corpus.retriever.clone(), &corpus, &[d1.id()], &[d2.id()], sg, cg, None, &HashMap::new(), "gc-genesis disjoint baseline")
+                .await;
+        assert!(matches!(baseline.bound, Bound::Disjoint), "precondition: two roots are Disjoint");
+        let doctoring = Doctoring { payloads: vec![(r1.id(), u32::MAX), (r2.id(), 7)], subject_tips: vec![], comparison_tips: vec![] };
+        let (lying, back) = doctoring.retriever(&corpus);
+        let (sg, cg) = doctoring.operands(&corpus, &[d1.id()], &[d2.id()]);
+        let corrupted = run(lying, &corpus, &[d1.id()], &[d2.id()], sg, cg, None, &back, "gc-genesis disjoint corrupted").await;
+        assert_bound_identical(2, "gc-genesis", 0, &[d1.id()], &[d2.id()], &doctoring.triples(&corpus), &baseline, &corrupted);
+    }
+
+    /// Cross-mismatch named pin (the fold's materialization-drift shape):
+    /// the retriever and the operand GClock DISAGREE about one tip. Both
+    /// lies flow, the channels contradict each other, and nothing BOUND
+    /// moves.
+    #[tokio::test]
+    async fn gc_cross_mismatch_between_channels_is_contained() {
+        let g = make_test_event(1, &[]);
+        let m = make_test_event(2, &[&g]);
+        let w = make_test_event(3, &[&m]);
+        let corpus = Corpus::from_events(vec![g.clone(), m.clone(), w.clone()]);
+        let subject = [w.id()];
+        let comparison = [m.id()];
+
+        let (sg, cg) = Doctoring::default().operands(&corpus, &subject, &comparison);
+        let baseline =
+            run(corpus.retriever.clone(), &corpus, &subject, &comparison, sg, cg, None, &HashMap::new(), "gc-cross baseline").await;
+
+        // The retriever serves m at 9; the comparison operand claims 5;
+        // the subject operand deflates w to 3. Every consumer sees a
+        // different world and none of it may matter.
+        let doctoring = Doctoring { payloads: vec![(m.id(), 9)], subject_tips: vec![(w.id(), 3)], comparison_tips: vec![(m.id(), 5)] };
+        let (lying, back) = doctoring.retriever(&corpus);
+        let (sg, cg) = doctoring.operands(&corpus, &subject, &comparison);
+        let corrupted = run(lying, &corpus, &subject, &comparison, sg, cg, None, &back, "gc-cross corrupted").await;
+
+        assert_bound_identical(3, "gc-cross", 0, &subject, &comparison, &doctoring.triples(&corpus), &baseline, &corrupted);
+        assert!(
+            corrupted.stats.precheck_suppressions >= 1,
+            "the corruption must BITE: the drifted operands (maxg(C)=5 > maxg(S)=3) fire P1, got {}",
+            corrupted.stats.precheck_suppressions
+        );
+    }
+
+    /// ARM (iii), synthetic saturation, expressly distinct from GC-SAT: the
+    /// corpus is HONESTLY saturated (every checkable edge equation-consistent
+    /// under saturating arithmetic; the base is a deep-history stand-in
+    /// genesis at the ceiling), BOTH runs see the same honest values, and
+    /// the disable rule preserves verdicts: the operand-annotated run equals
+    /// the operand-free plain walk byte-for-byte with zero suppressions and
+    /// zero violations.
+    #[tokio::test]
+    async fn synthetic_saturation_disable_path_preserves_verdicts() {
+        let base = Event { generation: u32::MAX - 1, ..make_test_event(1, &[]) };
+        let mid = Event { generation: u32::MAX, ..make_test_event(2, &[&base]) };
+        let tip = Event { generation: u32::MAX, ..make_test_event(3, &[&mid]) };
+        let sibling = Event { generation: u32::MAX, ..make_test_event(4, &[&mid]) };
+        let corpus = Corpus::from_events(vec![base.clone(), mid.clone(), tip.clone(), sibling.clone()]);
+
+        for (subject, comparison, name) in
+            [(vec![tip.id()], vec![base.id()], "descent at the ceiling"), (vec![tip.id()], vec![sibling.id()], "divergence at the ceiling")]
+        {
+            let (sg, cg) = Doctoring::default().operands(&corpus, &subject, &comparison);
+            let annotated = run(corpus.retriever.clone(), &corpus, &subject, &comparison, sg, cg, None, &HashMap::new(), name).await;
+            let plain =
+                compare(corpus.retriever.clone(), &Clock::from(subject.clone()), &Clock::from(comparison.clone()), 4 * corpus.size())
+                    .await
+                    .unwrap();
+            let plain_variant_matches = match (&annotated.bound, &plain.relation) {
+                (Bound::StrictDescends { .. }, AbstractCausalRelation::StrictDescends { .. }) => true,
+                (Bound::DivergedSince { meet, .. }, AbstractCausalRelation::DivergedSince { meet: pm, .. }) => meet == pm,
+                _ => false,
+            };
+            assert!(plain_variant_matches, "{name}: the disable path must preserve the plain walk's verdict");
+            assert_eq!(annotated.stats.precheck_suppressions, 0, "{name}: saturated operands disable, never suppress");
+            assert_eq!(annotated.stats.edge_check_violations, 0, "{name}: an honestly saturated corpus is violation-free");
+        }
     }
 
     /// Format pin for the extended artifact line (mirrors
