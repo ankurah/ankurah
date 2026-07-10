@@ -107,17 +107,23 @@ pub(crate) async fn check_generation<G: SuspenseEvents + Send + Sync>(
 ///    malformed input (an adopted mismatch could never stamp a commit),
 ///    rejected with the typed lineage error like any other malformed
 ///    input.
-/// 2. PAYLOAD CONTRADICTION, durable nodes only (`storage_is_definitive`):
-///    a durable node never adopts a wire-carried generation uninspected.
-///    Each entry whose tip event is locally held (staging, then local
-///    storage) must match that payload's generation; a contradiction
-///    aborts the item typed, nothing adopted. Entries for tips NOT locally
-///    held keep the carried value (nothing provable; the same posture as
-///    unverifiable cargo, and a wrong value self-defeats at the next
-///    admission that can check it). Ephemeral nodes skip this layer: they
-///    adopt inside the same trust envelope as the state itself, and an
-///    inherited lie self-defeats when their next commit relays to a
-///    durable peer holding the real payloads.
+/// 2. PAYLOAD INSPECTION, durable nodes only (`storage_is_definitive`):
+///    a durable node never adopts a wire-carried generation uninspected
+///    (REV 5 section K). Every entry's tip event must be locally
+///    resolvable (staging, then local storage) and match that payload's
+///    generation; a contradiction OR an unresolvable tip aborts the item
+///    typed, nothing adopted (M4 remediation item 4: the earlier
+///    fall-through for unheld tips adopted an uninspectable value that
+///    would then serve as rejection ground truth against honest
+///    descendants and as commit-stamp input). No production lane delivers
+///    a wire state to a durable node today, so this arm is defensive
+///    depth; any future durable wire-state ingress (D5/D6 territory)
+///    inherits the strict posture instead of the hole. Ephemeral nodes
+///    skip this layer: they adopt inside the same trust envelope as the
+///    state itself, and an inherited lie surfaces as a loud typed
+///    rejection when their next commit relays to a durable peer holding
+///    the real payloads (a wedge until a strictly descending re-adoption
+///    heals the annotation, not silent corruption).
 ///
 /// Engine rehydration does NOT pass through here: the persisted entity
 /// record is the node's own prior materialization (that is what makes
@@ -128,14 +134,19 @@ pub(crate) async fn verify_state_head_generations<G: SuspenseEvents + Send + Syn
     }
     if getter.storage_is_definitive() {
         for (claimed, id) in state.head_generations.iter() {
-            if let Some(local) = getter.get_local_event(id).await? {
-                if local.generation != *claimed {
-                    return Err(IngestError::Lineage(LineageRejection::GenerationMismatch {
-                        event: id.clone(),
-                        claimed: *claimed,
-                        expected: local.generation,
-                    })
-                    .into());
+            match getter.get_local_event(id).await? {
+                Some(local) => {
+                    if local.generation != *claimed {
+                        return Err(IngestError::Lineage(LineageRejection::GenerationMismatch {
+                            event: id.clone(),
+                            claimed: *claimed,
+                            expected: local.generation,
+                        })
+                        .into());
+                    }
+                }
+                None => {
+                    return Err(IngestError::Lineage(LineageRejection::UnresolvableHeadGenerationTip { event: id.clone() }).into());
                 }
             }
         }
