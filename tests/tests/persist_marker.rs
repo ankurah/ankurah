@@ -9,12 +9,14 @@
 mod common;
 
 use ankurah::core::property::backend::{lww::LWWBackend, PropertyBackend};
+use ankurah::core::storage::StorageEngine as _;
 use ankurah::policy::DEFAULT_CONTEXT as c;
 use ankurah::{proto, Mutable, Node, PermissiveAgent};
 use anyhow::Result;
 use common::*;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// The LWW OperationSet for a title write (forged events flow through the
 /// real ingest, so the operations must be honest LWW payloads).
@@ -111,27 +113,35 @@ async fn hard_reset_purges_the_entity_map_and_held_views_stay_frozen() -> Result
     Ok(())
 }
 
-/// R-D2-4c (plan REV 4 section 3 M4; REV 5 H erratum: ef68e081 shipped no
-/// deterministic regression test, so this constructs the two-lane
-/// interleaving fresh). Two arms over one gated store:
+/// R-D2-4c AS AMENDED by the M4 post-milestone remediation (the adversarial
+/// review's finding 2): the ef68e081 two-lane hazard is now closed by
+/// ORDERING, not by redundant writing. Two arms over one gated store:
 ///
-/// ELISION CONTROL (the arm that is red before the marker lands): with the
-/// marker CURRENT, a redelivery elides its persist entirely.
+/// ELISION CONTROL (the arm that was red before the marker landed): with
+/// the marker CURRENT, a redelivery elides its persist entirely.
 ///
-/// THE INTERLEAVING (the ef68e081 class the elision must not resurrect):
-/// lane A applies a fresh event and its persist is HELD OPEN at the
-/// storage gate, so A has not stamped a marker; lane B redelivers the same
-/// event, applies as a no-op, and reaches the persist step while A is
-/// still parked. The marker (stamped for the pre-A head) does not match
-/// the advanced head, so B MUST write: head mismatch defeats the marker.
-/// If B elided here, a caller re-reading local storage after B returns
-/// could miss state lane A has not yet persisted, which is exactly the
-/// race ef68e081 fixed by removing the old no-op elision.
+/// THE INTERLEAVING: lane A applies a fresh event and its persist is HELD
+/// OPEN at the storage gate mid-span; lane B redelivers the same event,
+/// applies as a no-op, and reaches the persist funnel while A is parked.
+/// The funnel serializes persists per entity id, so B cannot RESOLVE
+/// (write or elide) while A's span is in flight; once A's completed write
+/// covers their shared head and stamps the marker, B's elision check reads
+/// truthful testimony and elides. When B returns Ok, storage already holds
+/// the head B vouches for (read-your-application preserved with ONE write).
+///
+/// The pre-remediation form of this pin forced B to WRITE while A was in
+/// flight (the marker named the pre-A head), which defended the elision
+/// side but left the engine-side reorder open: A's and B's writes raced at
+/// the blind last-writer engine upsert, and the loser could regress the
+/// stored buffer (see
+/// concurrent_same_entity_persists_leave_storage_at_the_resident_head).
+/// Serialization discharges the same hazard by construction, so the pin
+/// now asserts the serialized world's postconditions.
 #[tokio::test]
-async fn r_d2_4c_two_lane_interleaving_defeats_the_marker_where_current_markers_elide() -> Result<()> {
-    let engine = InstrumentedEngine::new(SledStorageEngine::new_test()?);
+async fn r_d2_4c_two_lane_interleaving_serializes_where_current_markers_elide() -> Result<()> {
+    let engine = Arc::new(InstrumentedEngine::new(SledStorageEngine::new_test()?));
     let instruments = engine.instruments();
-    let node = Node::new_durable(Arc::new(engine), PermissiveAgent::new());
+    let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await;
 
@@ -158,10 +168,12 @@ async fn r_d2_4c_two_lane_interleaving_defeats_the_marker_where_current_markers_
     );
 
     // THE INTERLEAVING. A fresh event over the current head; lane A's
-    // persist parks at the closed gate AFTER the resident advanced.
+    // persist parks at the selective hold AFTER the resident advanced (the
+    // hold takes exactly one call, so lane B's funnel is free to reach the
+    // engine if the serialization ever regressed).
     let e1 = ankurah_tests::forge::event_with_parents(rec_id, Record::collection(), title_ops("t1"), &[&genesis]);
     let baseline = instruments.set_state_attempts();
-    instruments.close_gate();
+    instruments.hold_next(1);
 
     let lane_a = {
         let node = node.clone();
@@ -178,26 +190,169 @@ async fn r_d2_4c_two_lane_interleaving_defeats_the_marker_where_current_markers_
     );
 
     // Lane B: the same event again, while A is parked. B's apply is a
-    // no-op, but the marker still names the PRE-A head: B must persist.
-    let lane_b = {
+    // no-op; its funnel persist must WAIT behind A's in-flight span rather
+    // than resolve early (writing OR eliding).
+    let mut lane_b = {
         let node = node.clone();
         let e1 = e1.clone();
         tokio::spawn(
             async move { node.commit_remote_transaction(&c, proto::TransactionId::new(), vec![proto::Attested::opt(e1, None)]).await },
         )
     };
-    instruments.wait_until_parked(2).await;
+    let b_early = tokio::time::timeout(Duration::from_millis(750), &mut lane_b).await;
+    assert!(
+        b_early.is_err(),
+        "R-D2-4c (amended): a sibling persist of the same entity must not resolve while another lane's \
+         snapshot-write-stamp span is in flight; an early return here means the funnel no longer serializes"
+    );
+    assert_eq!(
+        instruments.set_state_attempts() - baseline,
+        1,
+        "R-D2-4c (amended): only lane A's write may have reached the engine while its span is open"
+    );
 
-    instruments.open_gate();
+    instruments.release_held();
     lane_a.await?.expect("lane A commits cleanly");
     lane_b.await?.expect("lane B commits cleanly");
 
     assert_eq!(
         instruments.set_state_attempts() - baseline,
-        2,
-        "R-D2-4c: lane B's persist must happen while lane A's is in flight (head mismatch defeats the marker); \
-         one write means the elision resurrected the ef68e081 race, three means double-writing"
+        1,
+        "R-D2-4c (amended): exactly ONE write serves both lanes; A's completed persist covers the shared \
+         head and stamps the marker, and B elides on that completed-persist testimony"
     );
+
+    // B returned Ok on elision testimony: storage must already hold the
+    // head B vouched for.
+    let stored = engine.collection(&Record::collection()).await?.get_state(rec_id).await?;
+    assert_eq!(
+        stored.payload.state.head,
+        node.get_resident_entity(rec_id).expect("still resident").head(),
+        "when the eliding lane returns, the stored buffer already covers the head its Ok testified to"
+    );
+    Ok(())
+}
+
+/// THE M4 REMEDIATION RED (adversarial review finding 2, MAJOR): once every
+/// concurrent funnel persist of ONE entity resolves, a fresh read from
+/// storage must yield the RESIDENT head. Every engine's set_state is a
+/// blind last-writer upsert, so without per-entity ordering across the
+/// snapshot-write-stamp span, a lane that snapshotted an OLDER head can
+/// land its write AFTER a sibling's newer one: the stored buffer regresses,
+/// fresh fetchers read the old state, and the marker elision makes the
+/// regression STICKY (a redelivery of the newer head elides on truthful-
+/// looking testimony instead of healing the store) until the head next
+/// advances or the process restarts.
+///
+/// Staging, deterministic in both worlds: lane A applies E1 (a child of
+/// genesis) and its persist (snapshot [E1]) is held open AT THE ENGINE via
+/// the selective hold; lane B applies E2, a CONCURRENT SIBLING of E1 (also
+/// a child of genesis), widening the head to [E1, E2], and drives its own
+/// funnel persist. The sibling shape keeps E1 a head tip throughout, so
+/// both lanes' change notifications stay clean and the pin isolates the
+/// storage boundary. In the unserialized world B's write [E1, E2] commits
+/// and B completes while A is parked (the timed join below observes that),
+/// so releasing A lands the stale [E1] write LAST and storage regresses.
+/// In the serialized world B waits behind A's span (the timed join
+/// elapses, pure pacing), the release lets A finish, and B then snapshots
+/// the newest head and writes [E1, E2] last. Either way every lane
+/// resolves and the pin asserts what production requires of the settled
+/// state: storage head == resident head, marker current for exactly that
+/// head, never leading storage.
+#[tokio::test]
+async fn concurrent_same_entity_persists_leave_storage_at_the_resident_head() -> Result<()> {
+    let engine = Arc::new(InstrumentedEngine::new(SledStorageEngine::new_test()?));
+    let instruments = engine.instruments();
+    let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
+    node.system.create().await?;
+    let ctx = node.context_async(c).await;
+
+    // Resident record with a stamped marker; the held view keeps the
+    // canonical resident, as in the sibling pins.
+    let (rec_id, view, genesis) = {
+        let trx = ctx.begin();
+        let rec = trx.create(&Record { title: "t0".to_owned(), artist: "a0".to_owned() }).await?;
+        let id = rec.id();
+        let view = rec.read();
+        let mut events = trx.commit_and_return_events().await?;
+        (id, view, events.remove(0))
+    };
+
+    let e1 = ankurah_tests::forge::event_with_parents(rec_id, Record::collection(), title_ops("t1"), &[&genesis]);
+    let e2 = ankurah_tests::forge::event_with_parents(rec_id, Record::collection(), title_ops("t2"), &[&genesis]);
+
+    // Lane A: applies E1, snapshots head [E1], parks at the engine. Only
+    // this one call is held; the gate stays open for lane B's write.
+    let baseline = instruments.set_state_attempts();
+    instruments.hold_next(1);
+    let lane_a = {
+        let node = node.clone();
+        let e1 = e1.clone();
+        tokio::spawn(
+            async move { node.commit_remote_transaction(&c, proto::TransactionId::new(), vec![proto::Attested::opt(e1, None)]).await },
+        )
+    };
+    instruments.wait_until_parked(1).await;
+    assert!(
+        node.get_resident_entity(rec_id).expect("still resident").head().contains(&e1.id()),
+        "precondition: lane A advanced the resident to [E1]; its persist of that snapshot is parked at the engine"
+    );
+
+    // Lane B: applies E2 (resident head [E2]) and drives its own persist.
+    let mut lane_b = {
+        let node = node.clone();
+        let e2 = e2.clone();
+        tokio::spawn(
+            async move { node.commit_remote_transaction(&c, proto::TransactionId::new(), vec![proto::Attested::opt(e2, None)]).await },
+        )
+    };
+
+    // Unserialized world: B's write passes the open gate and B completes
+    // while A is parked; join it so B's write AND stamp are fully done
+    // before the release lands A's stale write last. Serialized world: B is
+    // parked behind A's span and cannot resolve until the release below, so
+    // this join must elapse; the timeout is pacing, not an assertion.
+    let b_early = tokio::time::timeout(Duration::from_millis(1500), &mut lane_b).await;
+
+    instruments.release_held();
+    lane_a.await?.expect("lane A commits cleanly");
+    match b_early {
+        Ok(join) => join?.expect("lane B commits cleanly"),
+        Err(_elapsed) => lane_b.await?.expect("lane B commits cleanly"),
+    }
+
+    assert_eq!(instruments.set_state_attempts() - baseline, 2, "sanity: each lane persisted exactly once");
+
+    let resident_head = node.get_resident_entity(rec_id).expect("still resident").head();
+    assert!(resident_head.contains(&e2.id()), "precondition: the resident settled at [E2]");
+
+    // THE PIN: a fresh read from storage yields the resident head.
+    let stored = engine.collection(&Record::collection()).await?.get_state(rec_id).await?;
+    assert_eq!(
+        stored.payload.state.head, resident_head,
+        "M4 remediation (adversarial finding 2): once all persists of an entity resolve, the stored buffer \
+         must hold the resident head; a stale snapshot landing last regresses storage, and the marker \
+         elision then serves every redelivery from testimony instead of healing the store"
+    );
+
+    // And the settled marker never LEADS storage: it is current for exactly
+    // the stored head, observed as a current no-op redelivery eliding with
+    // zero writes while a fresh storage read still answers the same head.
+    let baseline = instruments.set_state_attempts();
+    node.commit_remote_transaction(&c, proto::TransactionId::new(), vec![proto::Attested::opt(e2.clone(), None)])
+        .await
+        .expect("idempotent redelivery is clean");
+    assert_eq!(
+        instruments.set_state_attempts() - baseline,
+        0,
+        "the settled marker elides the current no-op redelivery (it names the resident head)"
+    );
+    let stored = engine.collection(&Record::collection()).await?.get_state(rec_id).await?;
+    assert_eq!(
+        stored.payload.state.head, resident_head,
+        "the elision testified truthfully: storage holds the head the marker names (the marker does not lead storage)"
+    );
+    let _ = &view;
     Ok(())
 }
 
