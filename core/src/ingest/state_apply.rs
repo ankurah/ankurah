@@ -47,7 +47,6 @@ pub(crate) async fn apply_state_feed<S, E>(
     state: State,
     events_to_commit: &[Attested<Event>],
     persist: &dyn PersistState,
-    unverified: &super::UnverifiedEvents,
 ) -> Result<StateApplied, MutationError>
 where
     S: GetState + Send + Sync,
@@ -106,7 +105,7 @@ where
             // unverifiable id becomes acceleration-ineligible once its
             // commit succeeds.
             if unverifiable_cargo.contains(&event.payload.id()) {
-                unverified.insert(event.payload.id());
+                entities.unverified().insert(event.payload.id());
             }
         }
     }
@@ -152,7 +151,7 @@ where
     if advanced {
         match super::plan_entity(&entity.head(), &[], staging, event_getter).await {
             Ok(plan) if !plan.schedule.is_empty() => {
-                let outcome = super::execute_plan(plan, &entity, entities, staging, event_getter, persist, unverified).await;
+                let outcome = super::execute_plan(plan, &entity, entities, staging, event_getter, persist).await;
                 if let Some(failure) = outcome.failure {
                     tracing::warn!(entity_id = %entity.id(), "buffered-event re-drive after state adoption failed: {failure}");
                 }
@@ -172,7 +171,7 @@ mod tests {
     use super::*;
     use crate::error::{IngestError, LineageRejection};
     use crate::ingest::testkit::{event, FailingCommitStore, NoState, NoopPersist};
-    use crate::ingest::{StagingArea, UnverifiedEvents};
+    use crate::ingest::StagingArea;
     use ankurah_proto::EventId;
     use std::collections::BTreeMap;
 
@@ -207,9 +206,8 @@ mod tests {
             head_generations: ankurah_proto::GClock::from((9, e1_id.clone())),
         };
 
-        let unverified = UnverifiedEvents::default();
-        let result =
-            apply_state_feed(&entities, &NoState, &getter, &staging, entity_id, "test".into(), lying, &[], &NoopPersist, &unverified).await;
+        let unverified = entities.unverified();
+        let result = apply_state_feed(&entities, &NoState, &getter, &staging, entity_id, "test".into(), lying, &[], &NoopPersist).await;
 
         match result {
             Err(MutationError::Ingest(IngestError::Lineage(LineageRejection::GenerationMismatch { claimed, expected, .. }))) => {
@@ -247,10 +245,9 @@ mod tests {
             head_generations: ankurah_proto::GClock::from((1, genesis.payload.id())),
         };
 
-        let unverified = UnverifiedEvents::default();
+        let unverified = entities.unverified();
         let result =
-            apply_state_feed(&entities, &NoState, &getter, &staging, entity_id, "test".into(), mismatched, &[], &NoopPersist, &unverified)
-                .await;
+            apply_state_feed(&entities, &NoState, &getter, &staging, entity_id, "test".into(), mismatched, &[], &NoopPersist).await;
 
         match result {
             Err(MutationError::Ingest(IngestError::Lineage(LineageRejection::HeadGenerationsMismatch))) => {}
@@ -283,11 +280,10 @@ mod tests {
             head_generations: carried.clone(),
         };
 
-        let unverified = UnverifiedEvents::default();
-        let applied =
-            apply_state_feed(&entities, &NoState, &getter, &staging, entity_id, "test".into(), state, &[], &NoopPersist, &unverified)
-                .await
-                .expect("a consistent bodiless snapshot adopts cleanly on an ephemeral node");
+        let unverified = entities.unverified();
+        let applied = apply_state_feed(&entities, &NoState, &getter, &staging, entity_id, "test".into(), state, &[], &NoopPersist)
+            .await
+            .expect("a consistent bodiless snapshot adopts cleanly on an ephemeral node");
         assert!(applied.advanced, "fresh adoption advances");
         assert_eq!(
             applied.entity.head_generations(),
@@ -317,7 +313,7 @@ mod tests {
         let staging = std::sync::Arc::new(StagingArea::with_default_cap());
         // Ephemeral store holding NOTHING: the adopted parent stays bodiless.
         let getter = FailingCommitStore::ephemeral(staging.clone(), EventId::from_bytes([0xEE; 32]));
-        let unverified = UnverifiedEvents::default();
+        let unverified = entities.unverified();
 
         // Pre-existing resident: bodiless adoption of head {h2} at
         // generation 2 (the trust envelope). The strong handle keeps it
@@ -327,11 +323,10 @@ mod tests {
             head: ankurah_proto::Clock::from(vec![h2_id.clone()]),
             head_generations: ankurah_proto::GClock::from((2, h2_id.clone())),
         };
-        let resident =
-            apply_state_feed(&entities, &NoState, &getter, &staging, entity_id, "test".into(), adopted, &[], &NoopPersist, &unverified)
-                .await
-                .expect("bodiless adoption succeeds")
-                .entity;
+        let resident = apply_state_feed(&entities, &NoState, &getter, &staging, entity_id, "test".into(), adopted, &[], &NoopPersist)
+            .await
+            .expect("bodiless adoption succeeds")
+            .entity;
         assert!(entities.get(&entity_id).is_some(), "precondition: the resident pre-exists the update feed");
 
         // The mis-stamped twin FIRST, while its parent h2 is the resident's
@@ -364,7 +359,6 @@ mod tests {
             lying_state,
             std::slice::from_ref(&lying),
             &NoopPersist,
-            &unverified,
         )
         .await;
         match result {
@@ -405,7 +399,6 @@ mod tests {
             update,
             std::slice::from_ref(&h3),
             &NoopPersist,
-            &unverified,
         )
         .await
         .expect("the update-shaped item applies");

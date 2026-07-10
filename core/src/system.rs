@@ -188,7 +188,7 @@ where
         event_getter.stage_event(event.clone());
 
         // Apply the creation event so LWW values are tagged with event_id before serialization.
-        system_entity.apply_event(&event_getter, &event).await?;
+        system_entity.apply_event(&event_getter, &event, Some(self.0.entities.unverified())).await?;
         let attested_event: Attested<Event> = event.clone().into();
         event_getter.commit_event(&attested_event).await?;
         // Now get the entity state after the head is updated.

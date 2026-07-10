@@ -195,6 +195,14 @@ pub struct EntityInner {
     /// property-definition id its data is keyed under, for the sync read path.
     /// Absent for bare and temporary entities (they read name-keyed data only).
     resolver: std::sync::RwLock<Option<Weak<dyn CatalogResolver>>>,
+    /// TEST ONLY: the most recent comparison's CompareStats, mirrored after
+    /// each apply_event/apply_state compare so unit tests can pin the
+    /// apply-path precheck wiring (suppression counts are otherwise
+    /// unobservable through the bool/StateApplyResult returns). Written
+    /// strictly AFTER a comparison completes, so the write-only-during-walk
+    /// rule holds; absent from production builds.
+    #[cfg(test)]
+    pub(crate) last_compare_stats: std::sync::Mutex<Option<crate::event_dag::stats::CompareStats>>,
 }
 
 #[derive(Debug)]
@@ -472,6 +480,8 @@ impl Entity {
             kind: EntityKind::Primary,
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
             resolver: std::sync::RwLock::new(None),
+            #[cfg(test)]
+            last_compare_stats: std::sync::Mutex::new(None),
         }))
     }
 
@@ -492,6 +502,8 @@ impl Entity {
             kind: EntityKind::Primary,
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
             resolver: std::sync::RwLock::new(None),
+            #[cfg(test)]
+            last_compare_stats: std::sync::Mutex::new(None),
         }))
     }
 
@@ -521,6 +533,8 @@ impl Entity {
             kind: EntityKind::Primary,
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
             resolver: std::sync::RwLock::new(None),
+            #[cfg(test)]
+            last_compare_stats: std::sync::Mutex::new(None),
         })))
     }
 
@@ -659,6 +673,18 @@ impl Entity {
     #[cfg(test)]
     pub(crate) fn applied_contains(&self, id: &EventId) -> bool { self.state.read().unwrap().applied.contains(id) }
 
+    /// TEST ONLY: mirror one completed comparison's stats (see the field doc).
+    #[cfg(test)]
+    pub(crate) fn record_compare_stats(&self, stats: &crate::event_dag::stats::CompareStats) {
+        *self.last_compare_stats.lock().unwrap() = Some(stats.clone());
+    }
+
+    /// TEST ONLY: the most recent apply-path comparison's stats, if any.
+    #[cfg(test)]
+    pub(crate) fn take_last_compare_stats(&self) -> Option<crate::event_dag::stats::CompareStats> {
+        self.last_compare_stats.lock().unwrap().take()
+    }
+
     /// Attempts to mutate the entity state if the head matches the expected value.
     ///
     /// This provides TOCTOU protection: grabs the write lock, checks that `state.head == expected_head`,
@@ -771,10 +797,25 @@ impl Entity {
         Ok(true)
     }
 
-    /// Attempt to apply an event to the entity
+    /// Attempt to apply an event to the entity.
+    ///
+    /// `unverified` is the node's admitted-unverified id set (D2-4
+    /// eligibility): the comparison's generation prechecks consult it at
+    /// consumption so no unverified value feeds an acceleration. Callers
+    /// without node context (unit tests, bootstrap lanes whose shapes never
+    /// reach the comparison) pass None, which reads as the empty set: the
+    /// documented loss-safe degradation, since every acceleration is wired
+    /// suppress-only and verdicts are generation-independent (5b-ii).
     #[cfg_attr(feature = "instrument", tracing::instrument(level="debug", skip_all, fields(entity = %self, event = %event)))]
-    pub async fn apply_event<E>(&self, getter: &E, event: &Event) -> Result<bool, MutationError>
-    where E: GetEvents + Send + Sync {
+    pub async fn apply_event<E>(
+        &self,
+        getter: &E,
+        event: &Event,
+        unverified: Option<&crate::ingest::UnverifiedEvents>,
+    ) -> Result<bool, MutationError>
+    where
+        E: GetEvents + Send + Sync,
+    {
         debug!("apply_event head: {event} to {self}");
 
         // Idempotency is handled by the comparison algorithm:
@@ -859,15 +900,40 @@ impl Entity {
             // this site instead would need the reset epoch, which the
             // entity deliberately does not hold (M4 report carries the
             // deferral rationale).
-            let already_incorporated = self.state.read().unwrap().applied.contains(&event_id);
-            if already_incorporated {
-                debug!("applied-set hit - already incorporated, skip");
-                return Ok(false);
-            }
+            // One read-lock acquisition per attempt: the applied-set re-read
+            // plus a COHERENT (head, head_generations) snapshot, so the
+            // precheck operands always annotate exactly the head the
+            // comparison runs against (the maintenance invariant pairs them
+            // under this lock). Refreshing the head here rather than only on
+            // a failed try_mutate is the same TOCTOU discipline: the mutate
+            // step still validates against the exact head this attempt
+            // compared.
+            let comparison_gens = {
+                let state = self.state.read().unwrap();
+                if state.applied.contains(&event_id) {
+                    debug!("applied-set hit - already incorporated, skip");
+                    return Ok(false);
+                }
+                head = state.head.clone();
+                state.head_generations.clone()
+            };
+
+            // Precheck operands (D2-4): the subject side is the in-hand
+            // event's own hashed stamp; the comparison side is the
+            // resident's materialized annotation. Suppress-only inside the
+            // comparison; eligibility (unverified set, saturation) is
+            // resolved at consumption.
+            let opts = crate::event_dag::comparison::CompareOptions {
+                subject_gens: Some(GClock::from((event.generation, event_id.clone()))),
+                comparison_gens: Some(comparison_gens),
+                unverified,
+            };
 
             // Stage the event so BFS can discover it, then compare event's clock vs head
             let subject_clock: Clock = event_id.clone().into();
-            let comparison_result = crate::event_dag::compare(getter, &subject_clock, &head, DEFAULT_BUDGET).await?;
+            let comparison_result = crate::event_dag::comparison::compare_with(getter, &subject_clock, &head, DEFAULT_BUDGET, opts).await?;
+            #[cfg(test)]
+            self.record_compare_stats(&comparison_result.stats);
             match comparison_result.relation {
                 AbstractCausalRelation::Equal => {
                     debug!("Equal - skip");
@@ -966,8 +1032,19 @@ impl Entity {
     /// - `AlreadyApplied` — state matches current head (Equal)
     /// - `Older` — incoming state is older than current (StrictAscends), no-op
     /// - `DivergedRequiresEvents` — state diverged, events needed for proper merge
-    pub async fn apply_state<E>(&self, getter: &E, state: &State) -> Result<StateApplyResult, MutationError>
-    where E: GetEvents + Send + Sync {
+    ///
+    /// `unverified` as on [`Entity::apply_event`]: the node's
+    /// admitted-unverified id set for precheck eligibility; None reads as
+    /// empty (loss-safe, suppress-only).
+    pub async fn apply_state<E>(
+        &self,
+        getter: &E,
+        state: &State,
+        unverified: Option<&crate::ingest::UnverifiedEvents>,
+    ) -> Result<StateApplyResult, MutationError>
+    where
+        E: GetEvents + Send + Sync,
+    {
         let mut head = self.head();
         let new_head = state.head.clone();
 
@@ -975,7 +1052,25 @@ impl Entity {
         const MAX_RETRIES: usize = 5;
 
         for attempt in 0..MAX_RETRIES {
-            let comparison_result = crate::event_dag::compare(getter, &new_head, &head, DEFAULT_BUDGET).await?;
+            // Coherent (head, head_generations) snapshot per attempt, as in
+            // apply_event. The subject side carries the incoming state's own
+            // annotation: ingress-validated structurally everywhere and
+            // against held payloads on durable nodes, adopted inside the
+            // state's trust envelope on ephemeral nodes (REV 5 K); the
+            // prechecks it feeds are suppress-only regardless.
+            let comparison_gens = {
+                let es = self.state.read().unwrap();
+                head = es.head.clone();
+                es.head_generations.clone()
+            };
+            let opts = crate::event_dag::comparison::CompareOptions {
+                subject_gens: Some(state.head_generations.clone()),
+                comparison_gens: Some(comparison_gens),
+                unverified,
+            };
+            let comparison_result = crate::event_dag::comparison::compare_with(getter, &new_head, &head, DEFAULT_BUDGET, opts).await?;
+            #[cfg(test)]
+            self.record_compare_stats(&comparison_result.stats);
             match comparison_result.relation {
                 AbstractCausalRelation::Equal => {
                     debug!("{self} apply_state - heads are equal, skipping");
@@ -1072,6 +1167,8 @@ impl Entity {
             // Carry the resolver across the fork so a transaction's read path
             // still resolves names to ids.
             resolver: std::sync::RwLock::new(self.resolver.read().unwrap().clone()),
+            #[cfg(test)]
+            last_compare_stats: std::sync::Mutex::new(None),
         }))
     }
 
@@ -1182,6 +1279,8 @@ impl TemporaryEntity {
             // slightly annoying that we need to populate this, given that it won't be used
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
             resolver: std::sync::RwLock::new(resolver),
+            #[cfg(test)]
+            last_compare_stats: std::sync::Mutex::new(None),
         })))
     }
     pub fn values(&self) -> Vec<(String, Option<Value>)> {
@@ -1477,6 +1576,18 @@ struct WeakEntitySetInner {
     /// fair queue deadlocks a re-acquisition behind a waiting writer);
     /// every holder acquires once at its entry point.
     reset_fence: tokio::sync::RwLock<()>,
+    /// The node's admitted-unverified event id set (D2-3): ids admitted
+    /// WITHOUT the generation equation check (adopted-history backfill,
+    /// unverifiable state cargo, unresolvable commit-lane parents).
+    /// Membership makes an id's generation ineligible for the M5
+    /// acceleration prechecks; loss degrades to default-eligible (see
+    /// unverified.rs for why that is safe). HOMED HERE at M5, mirroring
+    /// the REV 5 section G reachability pattern that placed the reset
+    /// epoch on this struct: the eligibility consumers are the apply-path
+    /// comparisons, reached both from the ingest lanes (which already
+    /// carry a WeakEntitySet) and from this struct's own state-adoption
+    /// methods, where a bare NodeInner field was unreachable.
+    unverified: crate::ingest::UnverifiedEvents,
 }
 
 impl WeakEntitySet {
@@ -1501,6 +1612,11 @@ impl WeakEntitySet {
         }
         entity
     }
+
+    /// The node's admitted-unverified event id set (see the field doc):
+    /// ingest lanes record into it at durable admission; the apply-path
+    /// comparisons consult it for precheck eligibility.
+    pub(crate) fn unverified(&self) -> &crate::ingest::UnverifiedEvents { &self.0.unverified }
 
     /// The current reset epoch (D2-6). The persist funnel captures this
     /// BEFORE a set_state begins and stamps the captured value at
@@ -1580,7 +1696,7 @@ impl WeakEntitySet {
                     }
                 };
                 if needs_apply {
-                    entity.apply_state(event_getter, &state).await?;
+                    entity.apply_state(event_getter, &state, Some(self.unverified())).await?;
                 }
                 self.bind(&entity);
                 Ok(Some(entity))
@@ -1752,7 +1868,7 @@ impl WeakEntitySet {
         }
 
         // if we're here, we've retrieved the entity from the set and need to apply the state
-        let result = entity.apply_state(event_getter, &state).await?;
+        let result = entity.apply_state(event_getter, &state, Some(self.unverified())).await?;
         let changed = matches!(result, StateApplyResult::Applied);
         // Bind AFTER the apply: apply_state may rebuild backends from the
         // incoming raw buffers, which would discard a binding attached

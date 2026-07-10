@@ -89,9 +89,10 @@ impl ExecutionOutcome {
 
 /// Execute a plan against one entity. PerItem containment semantics; the
 /// Atomic (transaction) mode arrives with the commit-lane cutover (M6/M7).
-/// `unverified` is the node's admitted-unverified set (D2-3): every event
-/// this plan admits without the generation equation check records its id
-/// there, which is what makes it ineligible for the M5 accelerations.
+/// Every event this plan admits without the generation equation check
+/// records its id in the node's admitted-unverified set (D2-3), carried by
+/// `entities` (WeakEntitySet::unverified), which is what makes it
+/// ineligible for the M5 accelerations.
 pub(crate) async fn execute_plan<G: SuspenseEvents + Send + Sync>(
     plan: IngestPlan,
     entity: &Entity,
@@ -99,7 +100,6 @@ pub(crate) async fn execute_plan<G: SuspenseEvents + Send + Sync>(
     staging: &StagingArea,
     getter: &G,
     persist: &dyn PersistState,
-    unverified: &super::UnverifiedEvents,
 ) -> ExecutionOutcome {
     // Plan membership, captured for the retention sweep at the end: with
     // node-held staging, whatever this plan resolves must leave the area,
@@ -161,7 +161,7 @@ pub(crate) async fn execute_plan<G: SuspenseEvents + Send + Sync>(
             }
         };
 
-        match entity.apply_event(getter, &attested.payload).await {
+        match entity.apply_event(getter, &attested.payload, Some(entities.unverified())).await {
             Ok(true) => {
                 if let Err(e) = getter.commit_event(&attested).await {
                     // Applied to the resident but not durable: the resident
@@ -176,7 +176,7 @@ pub(crate) async fn execute_plan<G: SuspenseEvents + Send + Sync>(
                     break;
                 }
                 if unverified_admission {
-                    unverified.insert(id.clone());
+                    entities.unverified().insert(id.clone());
                 }
                 outcomes.push((id.clone(), IngestOutcome::Applied));
                 applied.push(attested);
@@ -199,7 +199,7 @@ pub(crate) async fn execute_plan<G: SuspenseEvents + Send + Sync>(
                             break;
                         }
                         if unverified_admission {
-                            unverified.insert(id.clone());
+                            entities.unverified().insert(id.clone());
                         }
                     }
                     Ok(true) => {
@@ -361,7 +361,7 @@ mod tests {
         // The resident holds genesis; the orphan B buffered from an earlier
         // delivery; THIS delivery carries only the parent P.
         let entity = Entity::create(entity_id, "test".into());
-        entity.apply_event(&getter, &genesis.payload).await.expect("genesis applies");
+        entity.apply_event(&getter, &genesis.payload, None).await.expect("genesis applies");
         getter.commit_event(&genesis).await.expect("genesis commits");
         staging.stage(orphan);
         staging.stage(parent);
@@ -369,8 +369,7 @@ mod tests {
         let plan = plan_entity(&entity.head(), &[p.clone()], &staging, &getter).await.expect("plan builds");
         assert_eq!(plan.schedule, vec![p.clone(), b.clone()], "re-drive schedules the buffered orphan behind its parent");
 
-        let outcome =
-            execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist, &crate::ingest::UnverifiedEvents::default()).await;
+        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist).await;
 
         assert!(outcome.failure.is_some(), "the injected commit failure surfaces");
         assert!(staging.contains(&b), "a carryover orphan the plan never resolved must stay buffered; sweeping it loses an acked event");
@@ -399,14 +398,13 @@ mod tests {
         let getter = FailingCommitStore::new(staging.clone(), x_id.clone());
 
         let entity = Entity::create(entity_id, "test".into());
-        entity.apply_event(&getter, &genesis.payload).await.expect("genesis applies");
+        entity.apply_event(&getter, &genesis.payload, None).await.expect("genesis applies");
         getter.commit_event(&genesis).await.expect("genesis commits");
         staging.stage(x);
 
         let plan = plan_entity(&entity.head(), &[x_id.clone()], &staging, &getter).await.expect("plan builds");
         let persist = RecordingPersist::new();
-        let outcome =
-            execute_plan(plan, &entity, &entities, &staging, &getter, &persist, &crate::ingest::UnverifiedEvents::default()).await;
+        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &persist).await;
 
         assert!(outcome.failure.is_some(), "the injected commit failure surfaces");
         assert!(entity.head().contains(&x_id), "the resident advanced in memory (safe: buffer may lag the log)");
@@ -431,12 +429,12 @@ mod tests {
         let failing = FailingCommitStore::new(staging.clone(), x_id.clone());
 
         let entity = Entity::create(entity_id, "test".into());
-        entity.apply_event(&failing, &genesis.payload).await.expect("genesis applies");
+        entity.apply_event(&failing, &genesis.payload, None).await.expect("genesis applies");
         failing.commit_event(&genesis).await.expect("genesis commits");
         staging.stage(x.clone());
 
         let plan = plan_entity(&entity.head(), &[x_id.clone()], &staging, &failing).await.expect("plan builds");
-        let _ = execute_plan(plan, &entity, &entities, &staging, &failing, &NoopPersist, &crate::ingest::UnverifiedEvents::default()).await;
+        let _ = execute_plan(plan, &entity, &entities, &staging, &failing, &NoopPersist).await;
         assert!(staging.contains(&x_id), "precondition: body retained after the failed commit");
 
         // The store heals (a different designated failure id); the sender
@@ -447,8 +445,7 @@ mod tests {
         assert!(plan.schedule.contains(&x_id), "a head-contained member that is staged but unstored must schedule for backfill");
 
         let persist = RecordingPersist::new();
-        let outcome =
-            execute_plan(plan, &entity, &entities, &staging, &healed, &persist, &crate::ingest::UnverifiedEvents::default()).await;
+        let outcome = execute_plan(plan, &entity, &entities, &staging, &healed, &persist).await;
         assert!(outcome.failure.is_none(), "backfill commit succeeds: {:?}", outcome.failure);
         assert!(!staging.contains(&x_id), "promotion removes the backfilled event from staging");
         assert!(persist.called(), "persist resumes once the log caught up");
@@ -504,8 +501,8 @@ mod tests {
         assert_eq!(plan.schedule, vec![h3_id.clone()], "head-contained but unstored member schedules for backfill");
         assert!(plan.backfill.contains(&h3_id), "the planner classifies it as the adopted-history backfill lane");
 
-        let unverified = crate::ingest::UnverifiedEvents::default();
-        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist, &unverified).await;
+        let unverified = entities.unverified();
+        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist).await;
 
         // The lane ADMITS the event (no verification, no rejection)...
         assert!(outcome.failure.is_none(), "the backfill admission must not fail: {:?}", outcome.failure);
@@ -560,9 +557,9 @@ mod tests {
         let ext_id = extension.payload.id();
         let plan = plan_entity(&entity.head(), &[ext_id.clone()], &staging, &getter).await.expect("plan builds");
         assert!(!plan.backfill.contains(&ext_id), "an extension is not the backfill lane; it goes through verification");
-        let unverified = crate::ingest::UnverifiedEvents::default();
+        let unverified = entities.unverified();
         let local_reads_before = getter.get_local_event_calls();
-        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist, &unverified).await;
+        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist).await;
         assert!(outcome.failure.is_none(), "the extension applies: {:?}", outcome.failure);
         assert!(
             !unverified.contains(&ext_id),
@@ -577,7 +574,7 @@ mod tests {
         let child_id = child.payload.id();
         staging.stage(child.clone());
         let plan = plan_entity(&entity.head(), &[child_id.clone()], &staging, &getter).await.expect("plan builds");
-        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist, &unverified).await;
+        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist).await;
         assert!(outcome.failure.is_none(), "the verified child applies: {:?}", outcome.failure);
         assert!(!unverified.contains(&child_id), "a verified admission must NOT be recorded unverified");
     }
@@ -604,7 +601,7 @@ mod tests {
         let staging = std::sync::Arc::new(StagingArea::with_default_cap());
         // No injected failure: the designated fail id matches nothing.
         let getter = FailingCommitStore::new(staging.clone(), EventId::from_bytes([0xEE; 32]));
-        let unverified = crate::ingest::UnverifiedEvents::default();
+        let unverified = entities.unverified();
 
         // Deliver the chain; the persist completes.
         let entity = Entity::create(entity_id, "test".into());
@@ -613,7 +610,7 @@ mod tests {
         staging.stage(e2.clone());
         let plan =
             plan_entity(&entity.head(), &[g_id.clone(), e1_id.clone(), e2_id.clone()], &staging, &getter).await.expect("plan builds");
-        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist, &unverified).await;
+        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist).await;
         assert!(outcome.failure.is_none(), "clean delivery: {:?}", outcome.failure);
         assert!(entity.head().contains(&e2_id), "precondition: the head advanced to the tip");
 
@@ -623,7 +620,7 @@ mod tests {
         let plan = plan_entity(&entity.head(), &[e1_id.clone()], &staging, &getter).await.expect("re-plan builds");
         assert_eq!(plan.schedule, vec![e1_id.clone()], "precondition: a below-head redelivery schedules");
         let fetches_before = getter.get_event_calls();
-        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist, &unverified).await;
+        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist).await;
         assert!(outcome.failure.is_none(), "the redelivery must not fail: {:?}", outcome.failure);
         assert_eq!(
             outcome.outcomes,
@@ -660,13 +657,13 @@ mod tests {
         let staging = std::sync::Arc::new(StagingArea::with_default_cap());
         // e2's commit fails; everything else works.
         let getter = FailingCommitStore::new(staging.clone(), e2_id.clone());
-        let unverified = crate::ingest::UnverifiedEvents::default();
+        let unverified = entities.unverified();
 
         // Control: a clean delivery whose persist completes records its ids.
         let entity = Entity::create(entity_id, "test".into());
         staging.stage(genesis.clone());
         let plan = plan_entity(&entity.head(), &[g_id.clone()], &staging, &getter).await.expect("plan builds");
-        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist, &unverified).await;
+        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist).await;
         assert!(outcome.failure.is_none(), "clean genesis delivery: {:?}", outcome.failure);
         assert!(entity.applied_contains(&g_id), "control: a completed persist must record the applied event (the post-persist hook)");
 
@@ -677,7 +674,7 @@ mod tests {
         staging.stage(e2.clone());
         let plan = plan_entity(&entity.head(), &[e1_id.clone(), e2_id.clone()], &staging, &getter).await.expect("plan builds");
         let persist = RecordingPersist::new();
-        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &persist, &unverified).await;
+        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &persist).await;
         assert!(outcome.failure.is_some(), "the injected commit failure surfaces");
         assert!(!persist.called(), "precondition (e68288df): the plan's persist is suppressed");
         assert!(getter.event_stored(&e1_id).await.unwrap(), "precondition: e1 is durably committed");
@@ -699,7 +696,7 @@ mod tests {
         let plan = plan_entity(&entity.head(), &[e2_id.clone()], &staging, &healed).await.expect("re-plan builds");
         assert!(plan.backfill.contains(&e2_id), "precondition: the redelivery takes the backfill lane");
         let persist = RecordingPersist::new();
-        let outcome = execute_plan(plan, &entity, &entities, &staging, &healed, &persist, &unverified).await;
+        let outcome = execute_plan(plan, &entity, &entities, &staging, &healed, &persist).await;
         assert!(outcome.failure.is_none(), "the backfill commit succeeds: {:?}", outcome.failure);
         assert!(persist.called(), "persist resumes once the log caught up");
         assert!(entity.applied_contains(&e2_id), "after the log caught up and THIS persist completed, the covered id is recorded");
@@ -725,7 +722,7 @@ mod tests {
         let entities = crate::entity::WeakEntitySet::default();
         let staging = std::sync::Arc::new(StagingArea::with_default_cap());
         let getter = FailingCommitStore::new(staging.clone(), EventId::from_bytes([0xEE; 32]));
-        let unverified = crate::ingest::UnverifiedEvents::default();
+        let unverified = entities.unverified();
 
         // Cap 4: the six applied ids overflow it, evicting the two oldest
         // (genesis, e1) FIFO.
@@ -734,7 +731,7 @@ mod tests {
             staging.stage(ev.clone());
         }
         let plan = plan_entity(&entity.head(), &ids, &staging, &getter).await.expect("plan builds");
-        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist, &unverified).await;
+        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist).await;
         assert!(outcome.failure.is_none(), "clean delivery: {:?}", outcome.failure);
         assert!(
             entity.applied_contains(&ids[3]) && entity.applied_contains(&ids[4]),
@@ -751,14 +748,14 @@ mod tests {
         staging.stage(e3.clone());
         let plan = plan_entity(&entity.head(), &[ids[3].clone()], &staging, &getter).await.expect("plan builds");
         let before = getter.get_event_calls();
-        let retained = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist, &unverified).await;
+        let retained = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist).await;
         let retained_fetches = getter.get_event_calls() - before;
 
         // Evicted id (e1): walks to the same conclusion.
         staging.stage(e1.clone());
         let plan = plan_entity(&entity.head(), &[ids[1].clone()], &staging, &getter).await.expect("plan builds");
         let before = getter.get_event_calls();
-        let evicted = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist, &unverified).await;
+        let evicted = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist).await;
         let evicted_fetches = getter.get_event_calls() - before;
 
         assert!(retained.failure.is_none() && evicted.failure.is_none(), "neither redelivery fails");
@@ -791,7 +788,7 @@ mod tests {
         let entities = crate::entity::WeakEntitySet::default();
         let staging = std::sync::Arc::new(StagingArea::with_default_cap());
         let getter = FailingCommitStore::new(staging.clone(), EventId::from_bytes([0xEE; 32]));
-        let unverified = crate::ingest::UnverifiedEvents::default();
+        let unverified = entities.unverified();
 
         // Establish the resident at head {e1} through the pipeline: both
         // admissions verify, so the materialized entries are
@@ -800,7 +797,7 @@ mod tests {
         staging.stage(genesis.clone());
         staging.stage(e1.clone());
         let plan = plan_entity(&entity.head(), &[genesis.payload.id(), e1_id.clone()], &staging, &getter).await.expect("plan builds");
-        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist, &unverified).await;
+        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist).await;
         assert!(outcome.failure.is_none(), "clean delivery: {:?}", outcome.failure);
         assert!(entity.head().contains(&e1_id), "precondition: resident head at e1");
 
@@ -820,7 +817,7 @@ mod tests {
         let plan = plan_entity(&entity.head(), &[forged_id.clone()], &staging, &getter).await.expect("plan builds");
         let local_reads_before = getter.get_local_event_calls();
         let walk_reads_before = getter.get_event_calls();
-        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist, &unverified).await;
+        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist).await;
 
         match outcome.failure {
             Some(MutationError::Ingest(crate::error::IngestError::Lineage(crate::error::LineageRejection::GenerationMismatch {
@@ -862,7 +859,7 @@ mod tests {
         let entities = crate::entity::WeakEntitySet::default();
         let staging = std::sync::Arc::new(StagingArea::with_default_cap());
         let getter = FailingCommitStore::new(staging.clone(), EventId::from_bytes([0xEE; 32]));
-        let unverified = crate::ingest::UnverifiedEvents::default();
+        let unverified = entities.unverified();
 
         // Head {e2}: e1 is committed BELOW the head, locally held, NOT a
         // materialized tip.
@@ -873,7 +870,7 @@ mod tests {
         let plan = plan_entity(&entity.head(), &[genesis.payload.id(), e1_id.clone(), e2.payload.id()], &staging, &getter)
             .await
             .expect("plan builds");
-        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist, &unverified).await;
+        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist).await;
         assert!(outcome.failure.is_none(), "clean delivery: {:?}", outcome.failure);
         assert!(entity.head().contains(&e2.payload.id()) && !entity.head().contains(&e1_id), "precondition: e1 sits below the head");
 
@@ -891,7 +888,7 @@ mod tests {
 
         let plan = plan_entity(&entity.head(), &[forged_id.clone()], &staging, &getter).await.expect("plan builds");
         let local_reads_before = getter.get_local_event_calls();
-        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist, &unverified).await;
+        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist).await;
 
         match outcome.failure {
             Some(MutationError::Ingest(crate::error::IngestError::Lineage(crate::error::LineageRejection::GenerationMismatch {
@@ -916,7 +913,7 @@ mod tests {
         let honest_id = honest.payload.id();
         staging.stage(honest.clone());
         let plan = plan_entity(&entity.head(), &[honest_id.clone()], &staging, &getter).await.expect("plan builds");
-        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist, &unverified).await;
+        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist).await;
         assert!(outcome.failure.is_none(), "the honest concurrent twin applies: {:?}", outcome.failure);
         assert!(entity.head().contains(&honest_id), "the honest twin joined the head");
         assert!(
@@ -947,7 +944,7 @@ mod tests {
         let entities = crate::entity::WeakEntitySet::default();
         let staging = std::sync::Arc::new(StagingArea::with_default_cap());
         let getter = FailingCommitStore::new(staging.clone(), EventId::from_bytes([0xEE; 32]));
-        let unverified = crate::ingest::UnverifiedEvents::default();
+        let unverified = entities.unverified();
         let entity = Entity::create(entity_id, "test".into());
 
         // Two deliveries: [genesis, a] lands head {a}; [b, c] widens through
@@ -958,7 +955,7 @@ mod tests {
                 staging.stage(e);
             }
             let plan = plan_entity(&entity.head(), &ids, &staging, &getter).await.expect("plan builds");
-            let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist, &unverified).await;
+            let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist).await;
             assert!(outcome.failure.is_none(), "honest batch applies: {:?}", outcome.failure);
         }
         let head = entity.head();
@@ -990,7 +987,7 @@ mod tests {
         staging.stage(Attested::opt(forged, None));
         let plan = plan_entity(&entity.head(), &[forged_id.clone()], &staging, &getter).await.expect("plan builds");
         let local_reads_before = getter.get_local_event_calls();
-        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist, &unverified).await;
+        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist).await;
         match outcome.failure {
             Some(MutationError::Ingest(crate::error::IngestError::Lineage(crate::error::LineageRejection::GenerationMismatch {
                 claimed,
@@ -1019,7 +1016,7 @@ mod tests {
         staging.stage(honest.clone());
         let plan = plan_entity(&entity.head(), &[honest_id.clone()], &staging, &getter).await.expect("plan builds");
         let local_reads_before = getter.get_local_event_calls();
-        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist, &unverified).await;
+        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist).await;
         assert!(outcome.failure.is_none(), "the honest subset-parented arrival applies: {:?}", outcome.failure);
         assert_eq!(
             getter.get_local_event_calls() - local_reads_before,

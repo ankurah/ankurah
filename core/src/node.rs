@@ -186,13 +186,6 @@ where PA: PolicyAgent
     /// lifecycle territory.
     pub(crate) staging: SafeMap<CollectionId, Arc<crate::ingest::StagingArea>>,
 
-    /// Events admitted WITHOUT generation verification (the adopted-history
-    /// lanes, D2-3): bounded, in-memory, ids only. Consumed by the M5
-    /// eligibility rule (an unverified generation never feeds an
-    /// acceleration); loss on restart or eviction degrades to
-    /// default-eligible, which the suppress-only discipline keeps safe.
-    pub(crate) unverified_events: crate::ingest::UnverifiedEvents,
-
     /// Type resolver for AST preparation (temporary heuristic until Phase 3 schema)
     pub(crate) type_resolver: crate::TypeResolver,
 }
@@ -276,7 +269,6 @@ where
             predicate_context: SafeMap::new(),
             subscription_relay,
             staging: SafeMap::new(),
-            unverified_events: crate::ingest::UnverifiedEvents::default(),
             type_resolver: crate::TypeResolver::new(),
         }));
 
@@ -977,7 +969,7 @@ where
                 crate::ingest::GenerationCheck::Verified => {}
                 crate::ingest::GenerationCheck::Unverifiable => {
                     tracing::warn!(event = %event_id, "commit-lane phase one could not resolve parents for generation verification; admitting unverified");
-                    self.unverified_events.insert(event_id.clone());
+                    self.entities.unverified().insert(event_id.clone());
                 }
             }
         }
@@ -995,7 +987,9 @@ where
         for event_id in &plan.schedule {
             let Some(attested) = staging.get_attested(event_id) else { continue };
             let fork_before = fork.snapshot(Arc::new(AtomicBool::new(true)));
-            fork.apply_event(&getter, &attested.payload).await.map_err(crate::ingest::type_comparison_error)?;
+            fork.apply_event(&getter, &attested.payload, Some(self.entities.unverified()))
+                .await
+                .map_err(crate::ingest::type_comparison_error)?;
             match self.policy_agent.check_event(self, cdata, &fork_before, &fork, &attested.payload) {
                 Ok(Some(attestation)) => {
                     let mut updated = attested.clone();
@@ -1077,8 +1071,7 @@ where
         let mut failure: Option<MutationError> = None;
         for PlannedEntityGroup { entity, staging, getter, collection, plan } in ready {
             let persist = crate::node_applier::NodePersist { node: self, collection: &collection };
-            let outcome =
-                crate::ingest::execute_plan(plan, &entity, &self.entities, &staging, &getter, &persist, &self.unverified_events).await;
+            let outcome = crate::ingest::execute_plan(plan, &entity, &self.entities, &staging, &getter, &persist).await;
             // One change per entity carrying its applied events in
             // application order. The old per-event shape was an artifact of
             // building each change mid-loop while the head sat at that
@@ -1360,7 +1353,6 @@ where
                             state.payload.state.clone(),
                             &[],
                             &persist,
-                            &self.unverified_events,
                         )
                         .await
                     }
