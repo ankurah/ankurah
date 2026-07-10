@@ -430,6 +430,12 @@ Identifier Selections, RegisterSchema). Durable nodes upgrade first
 (receiver-side protection makes this a deployment order, not a
 simultaneous upgrade). No interim name-keyed-with-catalog state ships.
 
+AMENDED (#289, 2026-07-09): PR #307 bumps again, to PROTOCOL_VERSION = 3:
+the data-plane envelope carries model definition entity ids instead of
+collection names, and updates/responses ship once-per-connection schema
+descriptors (decision 29). Same deployment order; still one branch, so 2
+and 3 land as one released epoch.
+
 ## Phase C outline (engine-local; detailed after A)
 
 - sled: property_config keyed by property entity id bytes instead of
@@ -451,6 +457,12 @@ simultaneous upgrade). No interim name-keyed-with-catalog state ships.
   per RFC 4a; #304 consumes that cleanliness.
 - IndexedDB: name-bound via catalog, lazy re-materialization on rename
   (storage/indexeddb-wasm/src/collection.rs:73-81).
+
+AMENDED (#289, 2026-07-09): the durable column maps, collision suffixes,
+and the sled/IndexedDB keying above landed early on PR #307 (decision 28).
+What remains in Phase C: rename DDL (ALTER TABLE RENAME COLUMN driven by
+catalog changes), rename-driven IndexedDB re-materialization, and the
+model <-> table map half deferred with #304.
 
 ## Landing strategy
 
@@ -503,6 +515,14 @@ simultaneous upgrade). No interim name-keyed-with-catalog state ships.
     so the catalog warm never materializes empty `_ankurah_*` trees;
     sled overrides it, the other engines' overrides are follow-up work
     (tracked in tasks.md group 4).
+    AMENDED (review correction, #289, 2026-07-10): the pg/sqlite/idb overrides
+    became load-bearing under the model-id envelope swap -- a durable restart on
+    those engines warmed an EMPTY catalog and lost model routing -- so they are
+    now implemented: non-creating discovery via the state / `{name}_event` table
+    pairing (SQL) and the distinct `__collection` values over the compound index
+    (idb). The warm now propagates a listing error instead of treating it as
+    "no collections exist" (start still latches readiness on failure, so a warm
+    error rejects loudly rather than hanging).
 12. **Reactor event-batching fix folded in**: ReactorUpdateItem now
     appends events across same-entity changes within one notify batch
     instead of keeping only the first change's events. A multi-event
@@ -520,6 +540,11 @@ simultaneous upgrade). No interim name-keyed-with-catalog state ships.
     dependence. Rejected: an engine trait-seam change (Phase C
     territory) and 0xA1-emit from id-keyed memory (cannot encode
     unknown-id entries: data loss).
+    AMENDED (PropertyKey amendment, #289, 2026-07-07): the display-name hint is
+    WITHDRAWN from the property backend entirely. The committed entry drops its
+    `name` field; the backend stores `{value, event_id}` only. Schema-blind
+    engine materialization (the A-to-C window the hint served) becomes a
+    catalog-side concern tracked with the engine work on #312. See decision 27.
 14. **Predicate-level required-defaults are out of Phase A** (RFC 5.4
     scoping): resolved-identifier predicate evaluation treats an absent
     property as NULL uniformly (IsNull matches, comparisons false),
@@ -544,6 +569,12 @@ simultaneous upgrade). No interim name-keyed-with-catalog state ships.
     already-bound collection, a denied or unreachable re-assert stays a
     warning and the write proceeds (unregistered fields land as
     residue). ctx.register::<M>() remains the eager strict form.
+    EXTENDED (PropertyKey amendment, #289, 2026-07-07): commit_local_trx now
+    also RESOLVES each entity's transient uncommitted `Name` keys to their `Id`
+    at this same point, after ensure-registration and before the commit event.
+    The sync accessor stages a name-keyed value (it has only the field name), so
+    the committed and wire forms are always id-keyed for a registered user
+    collection. See decision 27.
 17. **The schema-blind projection regime of the checked read** (pre-PR
     review finding, 2026-07-05): a backend parsed with NO binding --
     the engines' post-filter TemporaryEntity and policy-agent state
@@ -692,3 +723,146 @@ simultaneous upgrade). No interim name-keyed-with-catalog state ships.
     an existence oracle). Sync, matching check_event.
     Registration-scoped: the broader per-property policy surface stays
     deferred to the #264/#274 consolidated design.
+27. **The PropertyKey backend contract** (the PropertyKey amendment, #289,
+    2026-07-07; supersedes the rev-4 SchemaBinding / WireMode data-plane
+    machinery and RFC 5.5). Every property backend keys by a uniform
+    `enum PropertyKey { Id(EntityId), Name(String) }`
+    (core/src/property/mod.rs). The backend is a dumb identity-keyed store: no
+    binding, no per-instance wire mode, no display-name hint. Name-to-id
+    resolution moves to the catalog-aware write path -- `commit_local_trx`
+    re-keys an LWW entity's transient `Name` keys to `Id` after
+    ensure-registration and before the commit event (LWW resolves at commit);
+    the yrs write accessor resolves at write time because yrs cannot re-key CRDT
+    history at commit. Reads use MAP-LEVEL presence: an `Id` entry present, even
+    a cleared `None` tombstone, is authoritative and never falls back to a stale
+    `Name` value; only an absent id consults the RFC 5.4 sibling gate (now fed a
+    caller-supplied sibling-id set) and then the bare `Name` residue. The
+    catalog-blind `Entity` carries a stamped `Weak<dyn PropertyResolver>` (the
+    live catalog) for the sync read path, replacing the old `Node::bind_entity`
+    backend flip. INVARIANT: writes are always id-keyed for a registered user
+    collection; a `Name` key is emitted only for system and catalog collections
+    and for legacy decode. yrs is uniform (id-named roots), overriding the RFC
+    5.5 Phase C "yrs roots stay name-keyed" decision. The wire is one tagged map
+    (the leading version byte still decodes legacy 0xA1 and pre-0.9 buffers, but
+    only the id-keyed form is emitted). ERRATA: LWW leaves a stale `Name` entry
+    in place, safely shadowed by its `Id` entry (cleanup in an event-sourced
+    backend is a convergence-sensitive tombstone event, not a local delete); yrs
+    cannot tombstone (empty Y.Text equals None, erratum 1), so a cleared
+    pre-epoch yrs field may resurrect a stale name value on a migrated old
+    database (accepted, pre-1.0 development data only). Layering: the schema
+    layer no longer imports a binding from a property backend, and node.rs no
+    longer references any concrete backend type. Amends decisions 13 and 16;
+    full rationale on #289.
+    AMENDED (read-dispatch amendment, #289, 2026-07-09; implemented on PR
+    #307): the backend read surface shrinks further. get_checked and
+    get_resolved are DELETED; `LWWBackend::entry(&PropertyKey) ->
+    Option<Option<Value>>` (absent vs cleared-tombstone vs value) is the only
+    read primitive, and the RFC 5.4 rule ladder is dispatched outside the
+    backend by lww_read_checked / lww_read_lenient in
+    core/src/property/mod.rs. A present Id entry, even a tombstone, never
+    falls back to Name residue; Name-keyed user-collection entries are
+    legacy data, read only by that outside fallback.
+    The ladder ends with a FOREIGN-DATA gate, reformulating decision 15
+    for the hint-less regime (FLAGGED as a semantics widening: decision 15
+    said "same-display-name value under an unresolvable id" fails visible,
+    but without display-name hints the read cannot know a foreign id's
+    name). On the BOUND getter path only: resolved id absent, sibling gate
+    passed, Name residue absent, and DATA present under ids the catalog
+    cannot name at all (another system's allocations, e.g. the cross-root
+    raw-state copy the 2026-07-05 ruling covers) -> TypeSkew, never a
+    fabricated default, because absence-of-the-property cannot be proven
+    over un-nameable data. Predicate evaluation does NOT arm the gate
+    (absent evaluates as NULL, decision 14, fabricating nothing); unbound
+    reads have no catalog to be foreign to. Foreign TOMBSTONES (cleared,
+    no data to lose) do not trip it. Post descriptor shipping (decision
+    29) legitimately-replicated data always follows its definitions, so
+    the gate does not re-open the RFC 5.6 catalog-lag window on wire
+    paths.
+28. **Engine-owned durable property-id -> column maps, landed with Phase A**
+    (engine column-map amendment, #289, 2026-07-09; implemented on PR #307,
+    accelerating the Phase C column-binding bullet). Root cause: with
+    display-name hints withdrawn (decision 13 amendment) the engines
+    materialized columns named by the only stable thing they had, the
+    property id, while queries addressed human names -- a systemic read
+    regression. Resolution, per the ratified engine-ownership principle
+    (each storage engine alone owns and remembers its internal id <-> name
+    mappings; neither Node, System, nor CatalogManager bears it): every
+    engine persists a property-id -> column map, seeded from an injected
+    resolver (StorageEngine::set_property_resolver, wired at Node::build)
+    at set_state and consulted on every read. Postgres/sqlite:
+    ankurah_property_columns table, UNIQUE(collection, column_name),
+    insert-if-absent plus winner read-back so concurrent claimants
+    converge. Sled: property_columns tree under an assignment lock.
+    IndexedDB: property_columns object store, assigned in a pre-pass
+    before the entities transaction (IndexedDB auto-commits across foreign
+    awaits). Naming rules (core/src/storage.rs naming module): sanitized
+    display name; collisions append the property id's TRAILING 4+ base64
+    characters, widening until unique (trailing because ULIDs share
+    leading timestamp characters); unresolvable names fall back to p_ plus
+    trailing id characters, loudly (never expected to fire). Bare property
+    ids never appear as column names; collisions DEDUPE rather than
+    hard-error (hard-error is unmergeable: retype is a supported flow).
+    Reads: fetch_states translates the resolved Selection into engine
+    column space once at its top (selection_to_column_space; order-by
+    names go through the resolver); residual bare Paths reject at the
+    resolution pass (AC5), deliberately not at the engine seam
+    (system-collection storage queries legitimately run name-addressed).
+    Table creation and column creation timing are UNCHANGED (tables on
+    first need, columns on first write). Envelope stamping is LAZY: model
+    id resolution is checked on the first hydrated row, never up front, so
+    an empty scan on a cold catalog returns empty instead of erroring (the
+    ephemeral known_matches pre-fetch against a never-stored collection),
+    and an absent-entity get_state surfaces EntityNotFound, never a
+    model-resolution error (get_retrieve_or_create relies on that
+    fallthrough). Rename DDL stays Phase C. The
+    model <-> table half of the bidirectional-map mandate is DEFERRED with
+    #304 (buckets stay collection-string-keyed until storage APIs are
+    keyed by model) -- flagged for maintainer veto.
+29. **The model-id wire envelope, well-known model ids, and descriptor
+    shipping** (model-id envelope amendment, #289, 2026-07-09; implemented
+    on PR #307; PROTOCOL_VERSION = 3). Event, EntityState, EntityDelta,
+    and SubscriptionUpdateItem carry `model: EntityId` in place of
+    `collection: CollectionId`; EventId already excluded collection from
+    identity, so event ids are unchanged. Collection strings survive only
+    in query/API surfaces and registration payloads (collection is the
+    data there, #305). System and catalog collections use well-known model
+    ids ([0u8; 15] plus ordinal: 1 = _ankurah_system, 2 = _ankurah_model,
+    3 = _ankurah_property, 4 = _ankurah_model_property; unmintable ULID
+    range; core/src/schema/mod.rs); the receiver-side protection guard
+    (A6) keys on them. Ingress: Node::resolve_model maps model id ->
+    collection via well-knowns then the catalog; unknown model ids REJECT
+    loud and retryable, never synthesize a collection. Cold-catalog
+    policy is maintainer-ruled c + e + d: (c) NodeUpdate and NodeResponse
+    carry `#[serde(default)] schema: Vec<Attested<EntityState>>` -- the
+    real attested catalog entity states for any non-well-known model the
+    payload references, shipped once per connection per model
+    (PeerState.announced_models), policy-validated and ingested by the
+    receiver BEFORE body processing; definitions never ride inside events
+    or state buffers. (e) Catalog warmth participates in readiness via
+    the existing ensure_subscribed / context_async gates, and on the
+    INGRESS side via resolve_model_wait: a durable node whose startup
+    storage warm has not finished awaits catalog readiness once and
+    retries before rejecting (a restarted node receiving traffic
+    immediately must not reject models it allocated pre-restart; the warm
+    task latches readiness even on a failed scan so the wait is bounded).
+    Ephemeral ingress never waits -- definitions arrive inline, so a miss
+    is final. (d) The
+    decision-28 fallback naming stays as the loud never-fired net.
+    Storage engines stamp reconstructed envelopes via a shared
+    bucket_model_id helper (well-knowns -> resolver -> loud retrieval
+    error). Two policy-surface changes, both forced by the same fact (raw
+    state is now id-keyed, so hooks must receive what they need to
+    resolve): check_read_event gains a collection parameter (core
+    resolves, agents keep authorizing by collection), and check_read gains
+    the node's catalog resolver (Option<Weak<dyn PropertyResolver>>) --
+    an agent that evaluates NAME-addressed policy predicates against
+    entity state (scope filters) must bind its inspection view through it
+    (TemporaryEntity::new_bound; the unbound TemporaryEntity remains the
+    schema-blind engine post-filter tier), or every display name resolves
+    to nothing on a post-epoch buffer and scope enforcement denies
+    everything. This is the policy-inspection half of what decision 17's
+    display-name-hint projection used to provide; the engine-projection
+    half stays with #312. Entity unification (1-M
+    entity <-> model, membership vec, single entity store) is the
+    direction this preserves but is expressly DEFERRED: #330, with #305
+    and #312 comments recording the boundary.

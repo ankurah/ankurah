@@ -455,6 +455,13 @@ exemption exists to forbid. If we later
 want the meta-schema itself introspectable, we mint well-known property
 entities for it; nothing is load-bearing on that.
 
+AMENDED (PropertyKey amendment, #289, 2026-07-07): system and catalog
+collections stay name-keyed through the `PropertyKey::Name` variant -- a data
+fact about those collections' keys, not a per-instance wire mode. The deferred
+upgrade path to hardcoded well-known constant ids for the meta-schema stays open
+and non-load-bearing (this paragraph already records that nothing depends on
+materializing it). See plan.md decision 27.
+
 **Protection (rev 3: structural and receiver-side).** `PROTECTED_COLLECTIONS`
 is currently dead code: no reader exists (core/src/system.rs:21, exhaustive
 grep). This RFC makes it real and structural: the catalog collections
@@ -479,6 +486,22 @@ reserved and rejected for user-model collection ids at derive time and at
 CollectionSet::get. Because enforcement sits on the receiving durable node,
 mixed-fleet safety is a deployment ORDER (upgrade durable nodes first), not
 a simultaneous-upgrade requirement.
+AMENDED (model-id envelope amendment, #289, 2026-07-09): with collection
+names gone from the event envelope (5.5), the receiver guard keys on the
+well-known model ids (core/src/schema/mod.rs, well_known_collection) instead
+of collection strings; the protected set is unchanged.
+AMENDED (review correction, #289, 2026-07-10): keying on the wire model id's
+STATIC well-known-ness was found to be bypassable, because the actual write
+target is the collection that id RESOLVES to through the (mutable) catalog map;
+a poisoned map entry -- a non-reserved model id routed to a catalog collection
+-- walked past the static check. The guard now resolves every CommitTransaction
+event's model up front and rejects the transaction if any resolves into
+PROTECTED_COLLECTIONS, before any event is written (registration writes the
+catalog through a direct commit path that bypasses this ingress guard). The
+descriptor-ingest path was hardened to match: shipped catalog defs are ingested
+only after the recipient/connection checks, a wire model def naming a reserved
+collection is rejected, and a wire def cannot rebind a collection already mapped
+to a different model id.
 
 ## 5. Design by axis
 
@@ -813,6 +836,33 @@ in why it is semantically correct rather than a workaround:
    a default. Without this gate, a String-to-i64 retype would read every
    pre-retype entity's real "30" as a phantom 0; with it, mid-migration
    reads are fail-visible, matching this RFC's rename philosophy (5.8).
+   AMENDED (PropertyKey amendment, #289, 2026-07-07): the gate is reshaped to a
+   caller-supplied sibling-id set. `LWWBackend::get_checked(resolved_id, name,
+   sibling_ids)` does pure map-level presence plus the gate; the catalog-aware
+   caller (the compiled View getter through the entity's stamped resolver, or a
+   resolved-identifier predicate) supplies the same-display-name sibling ids.
+   Name-collision detection is a catalog concern, not a backend one. See
+   plan.md decision 27.
+   AMENDED again (read-dispatch amendment, #289, 2026-07-09; implemented on
+   PR #307): get_checked leaves the backend too. The backend's read surface
+   is one presence primitive, `LWWBackend::entry(&PropertyKey) ->
+   Option<Option<Value>>` -- absent vs cleared-tombstone vs value
+   (core/src/property/backend/lww.rs) -- and the rule ladder itself is
+   dispatched OUTSIDE the backend by `lww_read_checked` / `lww_read_lenient`
+   in core/src/property/mod.rs: a present Id entry, even a tombstone, is
+   authoritative and never falls back to Name residue (anti-resurrection);
+   only an absent id consults the sibling gate and then the legacy Name
+   entry. Name-keyed entries in user-collection buffers are LEGACY DATA,
+   read only by that outside fallback; the backend never interprets keys.
+   The ladder ends with a FOREIGN-DATA gate (reformulating plan decision
+   15 for the hint-less regime): on the BOUND getter path only, an absent
+   resolved id over a buffer holding data under ids the catalog cannot
+   name at all (another system's allocations, e.g. a cross-root raw-state
+   copy) fails visible as TypeSkew rather than fabricating a default --
+   without display-name hints the read cannot prove the absent property
+   is not among the foreign data. Predicate evaluation does NOT arm this
+   gate (absent evaluates as NULL by design, plan decision 14, so nothing
+   is fabricated), and unbound reads have no catalog to be foreign to.
 5. Property not registered and not in the local schema:
    PropertyError::UnknownProperty (a new variant; today's Missing keeps its
    meaning for pre-Phase-A code paths).
@@ -851,6 +901,51 @@ whose every field is default" means under rule 3. This piece is independent
 of the catalog and could land with Phase A.
 
 ### 5.5 Wire and state impact (phased identity keying)
+
+AMENDED (PropertyKey amendment, #289, 2026-07-07): the LWW `SchemaBinding` plus
+`WireMode` plus bind-at-assembly machinery described in this section is REPLACED
+by the uniform `PropertyKey` contract (plan.md decision 27). The backend holds
+no binding and no wire mode; identity is carried by the key, resolution moves to
+the catalog-aware write path, and the wire is a single id-keyed tagged map (the
+leading version byte still decodes legacy 0xA1 and pre-0.9 buffers, but only the
+id-keyed form is emitted). The Phase C "defer yrs rekeying; roots stay
+name-keyed" decision below is OVERRIDDEN: yrs is uniform `PropertyKey` (id-named
+roots) like every other backend.
+
+AMENDED (model-id envelope amendment, #289, 2026-07-09; implemented on PR
+#307 together with the engine column maps under Phase C below): the
+data-plane envelope drops collection names entirely. `Event`, `EntityState`,
+`EntityDelta`, and `SubscriptionUpdateItem` carry `model: EntityId` -- the
+model definition entity's id -- where they carried `collection: CollectionId`
+(proto/src/data.rs, proto/src/request.rs, proto/src/update.rs). EventId
+already excluded the collection from identity (proto/src/data.rs), so event
+ids are unchanged. Collection strings survive only in query/API surfaces and
+registration payloads, where the collection is the data (#305). The system
+and catalog collections, which have no allocated model entities, use
+WELL-KNOWN model ids -- [0u8; 15] plus an ordinal (1 = _ankurah_system,
+2 = _ankurah_model, 3 = _ankurah_property, 4 = _ankurah_model_property), a
+range no ULID mint can produce (core/src/schema/mod.rs) -- and the section-4
+protection guard keys on them. Ingress resolution (Node::resolve_model) maps
+a wire model id to its collection via well-knowns then the catalog map; an
+unknown model id is REJECTED loud (retryable), never synthesized into a
+collection. On a DURABLE node whose startup catalog warm (a storage scan)
+has not finished, ingress resolution awaits catalog readiness once and
+retries before rejecting (resolve_model_wait) -- a restarted node
+receiving traffic immediately must not reject models it allocated before
+the restart; this is policy (e)'s readiness participation on the ingress
+side. Ephemeral nodes never wait: their definitions arrive inline with
+the message, so a miss is already final. Cold-catalog policy, maintainer-ruled as options c + e + d:
+(c) once per connection per model, NodeUpdate and NodeResponse attach the
+attested catalog entity states (model, memberships, properties) for any
+non-well-known model the payload references (`#[serde(default)] schema:
+Vec<Attested<EntityState>>`; core/src/node.rs schema_states_for_models /
+ingest_schema, tracked per peer in PeerState.announced_models); receivers
+policy-validate each definition and ingest them BEFORE processing the body;
+definitions never ride inside events or state buffers. (e) Catalog warmth
+participates in readiness through the existing ensure_subscribed /
+context_async gates. (d) The engines' truncated-id fallback naming (Phase C
+amendment below) stays as a loud belt-and-suspenders net that should never
+fire. Ships as PROTOCOL_VERSION = 3 (proto/src/peering.rs).
 
 The load-bearing observation: property names appear on the wire in exactly
 two places, inside opaque backend payloads (LWW diff/state maps, yrs update
@@ -924,6 +1019,38 @@ gated changes into one protocol epoch behind #294:
     aaaa..., `name_bb` for bbbb...). Ratified as the mental model
     2026-07-06; implementation stays in Phase C. This finally gives the
     postgres TODO its property ids (storage/postgres/src/lib.rs:368-373).
+    AMENDED (engine column-map amendment, #289, 2026-07-09; implemented on
+    PR #307, accelerating this bullet and the sled rekey out of Phase C):
+    every engine now keeps a DURABLE property-id -> column map, seeded from
+    the injected catalog resolver (StorageEngine::set_property_resolver) at
+    set_state and consulted on every read. Postgres and sqlite persist it in
+    an ankurah_property_columns table (UNIQUE(collection, column_name);
+    insert-if-absent with winner read-back so concurrent claimants
+    converge); sled in a property_columns tree; IndexedDB in a
+    property_columns object store (assignment runs as a pre-pass before the
+    entities transaction because IndexedDB auto-commits across foreign
+    awaits). Naming (core/src/storage.rs, naming module): the sanitized
+    display name; a collision appends the property id's TRAILING four or
+    more base64 characters ({name}_{suffix}, widening until unique;
+    trailing, because ULIDs share leading timestamp characters); an
+    unresolvable name falls back to p_ plus trailing id characters, loudly
+    (the policy-d net above; expected never to fire). Bare property ids
+    NEVER appear as column names. Reads: fetch_states translates the
+    resolved Selection into engine column space ONCE at its top
+    (selection_to_column_space: Identifier by property id through the map,
+    order-by names through the resolver), so retype lineages and renamed
+    properties address distinct columns correctly; residual bare Paths are
+    rejected earlier, at the resolution pass (AC5), deliberately NOT at the
+    engine seam, because system-collection storage queries legitimately run
+    name-addressed. Envelope stamping is LAZY: a scan that matches nothing
+    never demands a model id (resolution is checked on the first hydrated
+    row), so a cold catalog cannot fail an empty fetch (e.g. the ephemeral
+    known_matches pre-fetch against a never-stored collection), and an
+    absent-entity get_state surfaces EntityNotFound, never a
+    model-resolution error. Rename DDL (ALTER TABLE RENAME COLUMN on catalog
+    change) remains Phase C. The durable MODEL <-> TABLE map half remains
+    deferred with #304: buckets stay collection-string-keyed until storage
+    APIs are keyed by model.
   - IndexedDB: entity objects hold property-name fields
     (storage/indexeddb-wasm/src/collection.rs:73-81); same treatment as
     SQL: names bound via catalog, lazily re-materialized on rename.
@@ -1316,7 +1443,10 @@ shaped so the differ has nothing special to do.
   postgres/sqlite catalog-bound columns with rename DDL and collision
   suffixes; IndexedDB re-materialization on rename; all while keeping the
   canonical-vs-materialization write seams clean per 4a (#304's
-  consumer).
+  consumer). (AMENDED 2026-07-09: the durable column maps, collision
+  suffixes, and sled/IndexedDB keying landed early on PR #307 with the
+  engine column-map amendment, 5.5; rename DDL and rename-driven
+  re-materialization remain here.)
 - **Phase D:** the declarative schema document and differ (#301),
   catalog-to-binding codegen (#302), rename-hint tooling (orphan
   detection, divergence warnings), per-property policy keys when the
