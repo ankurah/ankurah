@@ -21,7 +21,9 @@ use std::sync::Mutex;
 
 /// Default bound: sized like the applied-set default (plan D2-5), generously
 /// above the largest expected bridge batch (the lane benches exercise
-/// 5000-event bridges); about 2 MB per node at 32 bytes an id.
+/// 5000-event bridges). The container holds each id twice (the FIFO order
+/// plus the membership set), so a full set is roughly 4 MiB of ids per node
+/// at 32 bytes an id, plus set overhead.
 pub(crate) const DEFAULT_UNVERIFIED_CAP: usize = 65536;
 
 /// Bounded FIFO set of event ids admitted without generation verification.

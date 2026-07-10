@@ -25,10 +25,15 @@ use ankurah_storage_common::{filtering::ValueSetStream, OrderByComponents, Plan}
 use futures::StreamExt;
 use tracing::{debug, warn};
 
-/// Read the mandatory u32 generation off a stored event object. Numbers round-trip
-/// through JS as f64 and a u32 is exactly representable, so this is lossless. There
-/// is no numeric `TryFrom<JsValue>` to route through `Object::get`, hence the direct
-/// reflect-and-`as_f64` read.
+/// Read the mandatory u32 generation off a stored EVENT object. Numbers
+/// round-trip through JS as f64 and a u32 is exactly representable, so the
+/// read is lossless FOR VALUES THE PAIRED WRITE PATH PRODUCED; a corrupted
+/// stored number still coerces silently through the `as u32` cast (the same
+/// class the entity-record GClock decode rejects typed since the M4
+/// remediation; tightening this event-column read is tracked with the other
+/// indexeddb read-path follow-ups). There is no numeric `TryFrom<JsValue>`
+/// to route through `Object::get`, hence the direct reflect-and-`as_f64`
+/// read.
 fn read_generation(event_obj: &Object) -> Result<u32, RetrievalError> {
     let raw = js_sys::Reflect::get(event_obj, &GENERATION_KEY)
         .map_err(|_| RetrievalError::StorageError(anyhow::anyhow!("Failed to get generation").into()))?;

@@ -14,7 +14,8 @@ use proto::Attested;
 
 /// PersistState adapter for the ingest pipeline: attestation needs the
 /// node's PolicyAgent, so the feeder supplies persistence. Shared by the
-/// applier arms, the node's Get response lane, and the local commit lane:
+/// applier arms, the node's Get response lane, the remote commit lane
+/// (commit_remote_transaction phase two), and the local commit lane:
 /// every resident persist funnels through here, which is what makes this
 /// the ONE home for the persist-currency discipline (D2-6).
 pub(crate) struct NodePersist<'a, SE, PA>
