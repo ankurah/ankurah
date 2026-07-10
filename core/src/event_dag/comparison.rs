@@ -35,6 +35,7 @@
 use super::{
     accumulator::{compute_ancestry_from_dag, ComparisonResult, EventAccumulator},
     frontier::Frontier,
+    ordering::canonicalize_chain,
     relation::AbstractCausalRelation,
 };
 use crate::error::RetrievalError;
@@ -119,8 +120,12 @@ pub async fn compare<E: GetEvents>(
         }
 
         if applicable && comparison_set.is_subset(&all_parents) {
-            // Subject's parents cover all comparison heads -> StrictDescends
-            let chain: Vec<EventId> = subject.as_slice().to_vec();
+            // Subject's parents cover all comparison heads -> StrictDescends.
+            // Canonical emission (Q2): a sorted clock over an antichain is
+            // already the canonical order, but routing it through the same
+            // canonicalizer as the BFS keeps the two emission paths
+            // byte-identical by construction rather than by coincidence.
+            let chain = canonicalize_chain(subject.as_slice().to_vec(), accumulator.dag());
             return Ok(ComparisonResult::new(AbstractCausalRelation::StrictDescends { chain }, accumulator));
         }
     }
@@ -446,9 +451,11 @@ impl<'a, E: GetEvents> Comparison<'a, E> {
             let frontier_grounded = self.subject.frontier.ids.iter().all(|id| comparison_ancestry.contains(id));
             if roots_grounded && frontier_grounded {
                 // Forward chain (older to newer), excluding the comparison
-                // heads themselves.
+                // heads themselves; emitted canonical (Q2) so the chain is a
+                // function of its SET, not of the schedule that visited it.
                 let chain: Vec<_> =
                     self.subject.visited.iter().rev().filter(|id| !self.comparison.original.contains(id)).cloned().collect();
+                let chain = canonicalize_chain(chain, dag);
                 return Some(AbstractCausalRelation::StrictDescends { chain });
             }
         }
@@ -514,10 +521,18 @@ impl<'a, E: GetEvents> Comparison<'a, E> {
             let meet: Vec<_> =
                 self.meet_candidates.iter().filter(|id| self.states.get(*id).map_or(0, |s| s.common_child_count) == 0).cloned().collect();
 
-            // Build forward chains from meet to tips
+            // Build forward chains from meet to tips, emitted canonical (Q2).
+            // NOTE (recorded defect, red-team fold item 2): build_forward_chain
+            // trims at the LAST-ENCOUNTERED meet member in visit order and can
+            // drop genuine divergent-region events on uneven shapes, despite
+            // relation.rs documenting these chains as full; no production
+            // consumer reads them today, the immunity oracle binds only their
+            // semantic validity (FREE-but-valid), and the defect is with the
+            // maintainer. Canonicalization orders whatever the trim retained;
+            // it cannot restore what the trim discarded.
             let meet_set: BTreeSet<_> = meet.iter().cloned().collect();
-            let subject_chain = Self::build_forward_chain(&self.subject.visited, &meet_set);
-            let other_chain = Self::build_forward_chain(&self.comparison.visited, &meet_set);
+            let subject_chain = canonicalize_chain(Self::build_forward_chain(&self.subject.visited, &meet_set), dag);
+            let other_chain = canonicalize_chain(Self::build_forward_chain(&self.comparison.visited, &meet_set), dag);
 
             // Collect immediate children of meet toward each side
             let (subject_immediate, other_immediate) = self.collect_immediate_children(&meet);
