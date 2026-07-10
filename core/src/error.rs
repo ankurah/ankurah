@@ -240,6 +240,11 @@ pub enum LineageRejection {
     /// buggy or malicious writer; contained like any malformed event
     /// (plan REV 4, D2-3).
     GenerationMismatch { event: EventId, claimed: u32, expected: u32 },
+    /// A state's head-generation annotation does not cover exactly its
+    /// head's tips (same ids, each exactly once). Structurally malformed
+    /// input, rejected before adoption on every node flavor: an adopted
+    /// mismatch could never stamp a commit (D2 M4, plan REV 5 section K).
+    HeadGenerationsMismatch,
 }
 
 impl std::fmt::Display for LineageRejection {
@@ -251,6 +256,9 @@ impl std::fmt::Display for LineageRejection {
             LineageRejection::BatchCycle => write!(f, "event batch contains a parent cycle"),
             LineageRejection::GenerationMismatch { event, claimed, expected } => {
                 write!(f, "generation mismatch for event {event}: claimed {claimed}, expected {expected} from its parents")
+            }
+            LineageRejection::HeadGenerationsMismatch => {
+                write!(f, "state head_generations does not annotate exactly the state head")
             }
         }
     }

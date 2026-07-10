@@ -500,7 +500,8 @@ async fn test_backend_error_handling() -> Result<()> {
     // Create a state with an unknown backend name
     let mut state_buffers = BTreeMap::new();
     state_buffers.insert("unknown_backend".to_string(), vec![0u8; 10]);
-    let invalid_state = State { state_buffers: StateBuffers(state_buffers), head: Default::default(), head_generations: Default::default() };
+    let invalid_state =
+        State { state_buffers: StateBuffers(state_buffers), head: Default::default(), head_generations: Default::default() };
 
     // Attempting to use this state should return an error, not panic
     let node = durable_sled_setup().await?;

@@ -126,7 +126,11 @@ impl StorageCollection for IndexedDBBucket {
                 payload: EntityState {
                     entity_id: id,
                     collection: self.collection_id.clone(),
-                    state: State { state_buffers: entity.get(&STATE_BUFFER_KEY)?, head: entity.get(&HEAD_KEY)?, head_generations: Default::default() },
+                    state: State {
+                        state_buffers: entity.get(&STATE_BUFFER_KEY)?,
+                        head: entity.get(&HEAD_KEY)?,
+                        head_generations: Default::default(),
+                    },
                 },
                 attestations: entity.get(&ATTESTATIONS_KEY)?,
             })
@@ -527,7 +531,11 @@ fn js_object_to_entity_state(
     let entity_state = EntityState {
         collection: collection_id.clone(),
         entity_id: id,
-        state: State { state_buffers: entity_obj.get(&STATE_BUFFER_KEY)?, head: entity_obj.get(&HEAD_KEY)?, head_generations: Default::default() },
+        state: State {
+            state_buffers: entity_obj.get(&STATE_BUFFER_KEY)?,
+            head: entity_obj.get(&HEAD_KEY)?,
+            head_generations: Default::default(),
+        },
     };
 
     let attestations = entity_obj.get(&ATTESTATIONS_KEY)?;
