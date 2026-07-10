@@ -245,6 +245,15 @@ pub enum LineageRejection {
     /// input, rejected before adoption on every node flavor: an adopted
     /// mismatch could never stamp a commit (D2 M4, plan REV 5 section K).
     HeadGenerationsMismatch,
+    /// A wire state carries a head-generation annotation for a tip whose
+    /// event is not locally resolvable on this DEFINITIVE-storage node, so
+    /// the carried value cannot be inspected against a payload. Amendment
+    /// K's durable rule: a durable node never adopts a wire-carried
+    /// generation uninspected; adopted, the unvalidated value would become
+    /// rejection ground truth against honest descendants and commit-stamp
+    /// input (M4 remediation item 4). Ephemeral nodes adopt inside the
+    /// state's trust envelope and never produce this.
+    UnresolvableHeadGenerationTip { event: EventId },
 }
 
 impl std::fmt::Display for LineageRejection {
@@ -259,6 +268,9 @@ impl std::fmt::Display for LineageRejection {
             }
             LineageRejection::HeadGenerationsMismatch => {
                 write!(f, "state head_generations does not annotate exactly the state head")
+            }
+            LineageRejection::UnresolvableHeadGenerationTip { event } => {
+                write!(f, "carried head generation for tip {event} cannot be inspected: the tip's event is not locally resolvable on this definitive-storage node")
             }
         }
     }
