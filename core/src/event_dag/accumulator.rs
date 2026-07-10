@@ -39,13 +39,38 @@ pub(crate) struct EventAccumulator<E: GetEvents> {
     /// retries; ComparisonResult snapshots them at construction. WRITE-ONLY
     /// during the walk (see the `stats` module doc).
     pub(crate) stats: CompareStats,
+
+    // ---- Walk-time edge-check state (D2 M5, plan D2-4) ----
+    // Transient per-comparison locals (the registry-ban exemption): ids
+    // only, dropped with the accumulator, surviving budget retries so no
+    // edge is double-counted across them.
+    //
+    /// Children whose equation was evaluated (pass or fail); one check per
+    /// child, ever.
+    edge_checked: BTreeSet<EventId>,
+    /// Parent id -> children whose check is blocked on that parent's
+    /// payload arriving; drained when it does (backward BFS fetches parents
+    /// after children, so this is the productive direction).
+    edge_waiting: BTreeMap<EventId, Vec<EventId>>,
+    /// Children demoted to per-comparison ineligibility by a failed check
+    /// (D2-4: demotion, never retroactive rejection). Consumed by the
+    /// eligibility-keyed frontier ordering; never by a verdict path.
+    demoted: BTreeSet<EventId>,
 }
 
 impl<E: GetEvents> EventAccumulator<E> {
     /// Create a new accumulator with the given retriever.
     /// LRU cache defaults to 1000 entries.
     pub(crate) fn new(event_getter: E) -> Self {
-        Self { dag: BTreeMap::new(), cache: LruCache::new(NonZeroUsize::new(1000).unwrap()), event_getter, stats: CompareStats::default() }
+        Self {
+            dag: BTreeMap::new(),
+            cache: LruCache::new(NonZeroUsize::new(1000).unwrap()),
+            event_getter,
+            stats: CompareStats::default(),
+            edge_checked: BTreeSet::new(),
+            edge_waiting: BTreeMap::new(),
+            demoted: BTreeSet::new(),
+        }
     }
 
     /// Called during BFS traversal -- records DAG structure and caches the
@@ -56,10 +81,80 @@ impl<E: GetEvents> EventAccumulator<E> {
     /// payload id at write); under lying or corrupt storage this keying
     /// yields a coherent walk over the served structure, where recomputed-id
     /// keying stalled the walk into BudgetExceeded with poisoned grounding.
+    ///
+    /// Each accumulation also drives the walk-time edge checks: the arrival
+    /// may complete the in-hand parent set of the event itself (multi-parent
+    /// re-encounters) or of children registered as waiting on it.
     pub(crate) fn accumulate(&mut self, id: &EventId, event: &Event) {
         let parents: Vec<EventId> = event.parent.as_slice().to_vec();
         self.dag.insert(id.clone(), parents);
         self.cache.put(id.clone(), event.clone());
+
+        // The edge check is free where the walk already holds the payloads
+        // (plan D2-4): check the arrival as a child, then any children whose
+        // last missing parent this arrival was.
+        self.edge_check(id);
+        if let Some(waiters) = self.edge_waiting.remove(id) {
+            for child in waiters {
+                self.edge_check(&child);
+            }
+        }
+    }
+
+    /// Evaluate gen(child) == 1 + max(gen(parents)) (saturating, the same
+    /// arithmetic as the stamp) when child and all parents are in hand; on
+    /// violation WARN with a counter and demote the child to per-comparison
+    /// ineligibility, then continue (D2-4: a walk never retroactively
+    /// rejects committed history; admission is the rejection boundary).
+    /// Genesis events carry no edge, so nothing in-walk checks their
+    /// absolute claim (that is admission's genesis law; the comparison must
+    /// not treat gen 1 as a root signal, GC-GENESIS).
+    ///
+    /// Opportunistic by design: a payload evicted from the bounded cache
+    /// before its family completes simply misses its check. Checks are
+    /// keyed to run at most once per child, across budget retries too.
+    fn edge_check(&mut self, child_id: &EventId) {
+        if self.edge_checked.contains(child_id) {
+            return;
+        }
+        let Some(parents) = self.dag.get(child_id) else {
+            return;
+        };
+        if parents.is_empty() {
+            self.edge_checked.insert(child_id.clone());
+            return;
+        }
+        let mut parent_gens = Vec::with_capacity(parents.len());
+        let mut missing: Vec<EventId> = Vec::new();
+        for parent in parents {
+            match self.cache.peek(parent) {
+                Some(event) => parent_gens.push(event.generation),
+                None => missing.push(parent.clone()),
+            }
+        }
+        if !missing.is_empty() {
+            for parent in missing {
+                self.edge_waiting.entry(parent).or_default().push(child_id.clone());
+            }
+            return;
+        }
+        let Some(child_gen) = self.cache.peek(child_id).map(|e| e.generation) else {
+            return; // evicted between accumulation and drain; opportunistic
+        };
+        let expected = Event::generation_from_parents(parent_gens.into_iter());
+        if child_gen != expected {
+            tracing::warn!(
+                child = %child_id,
+                claimed = child_gen,
+                expected,
+                "walk-time edge check: child generation contradicts its in-hand parents; demoting to ineligible for this comparison"
+            );
+            self.stats.edge_check_violations += 1;
+            if self.demoted.insert(child_id.clone()) {
+                self.stats.demotions += 1;
+            }
+        }
+        self.edge_checked.insert(child_id.clone());
     }
 
     /// Get event by id: cache -> retriever (storage).
@@ -103,7 +198,9 @@ pub struct ComparisonResult<E: GetEvents> {
     /// The walk's counters, snapshotted at verdict time (dispositions Q4):
     /// post-verdict layer iteration through the accumulator does not bleed
     /// into them. Crate-visible; readers are tests, the immunity oracle,
-    /// and bench evidence, never the walk itself (write-only rule).
+    /// and bench evidence, never the walk itself (write-only rule), hence
+    /// the not(test) dead-code allowance.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) stats: CompareStats,
 }
 
