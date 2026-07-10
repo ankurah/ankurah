@@ -103,7 +103,7 @@ pub async fn compare<E: GetEvents>(
         for id in subject.as_slice() {
             match accumulator.get_event(id).await {
                 Ok(event) => {
-                    accumulator.accumulate(&event);
+                    accumulator.accumulate(id, &event);
                     let parents = event.parent.as_slice();
                     if parents.is_empty() || !parents.iter().all(|p| comparison_set.contains(p)) {
                         applicable = false;
@@ -317,10 +317,16 @@ impl<'a, E: GetEvents> Comparison<'a, E> {
                 }
                 Err(e) => return Err(e),
             };
-            self.accumulator.accumulate(&event);
+            // R1 (dispositions Q1): bookkeeping keys on the REQUESTED id,
+            // never the served payload's recomputed id. The frontiers hold
+            // requested ids, so recomputed-id keying stalls the walk the
+            // moment storage lies; requested-id keying keeps the walk
+            // coherent over the served structure, and the D2-4 edge checks
+            // are the sanctioned detector for serve-time corruption.
+            self.accumulator.accumulate(id, &event);
             self.remaining_budget = self.remaining_budget.saturating_sub(1);
             self.accumulator.stats.budget_decrements += 1;
-            self.process_event(event.id(), event.parent.as_slice());
+            self.process_event(id.clone(), event.parent.as_slice());
         }
 
         // Check if we have a result

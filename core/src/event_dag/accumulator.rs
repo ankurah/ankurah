@@ -48,22 +48,38 @@ impl<E: GetEvents> EventAccumulator<E> {
         Self { dag: BTreeMap::new(), cache: LruCache::new(NonZeroUsize::new(1000).unwrap()), event_getter, stats: CompareStats::default() }
     }
 
-    /// Called during BFS traversal -- records DAG structure and caches the event.
-    pub(crate) fn accumulate(&mut self, event: &Event) {
-        let id = event.id();
+    /// Called during BFS traversal -- records DAG structure and caches the
+    /// event UNDER THE REQUESTED ID (R1, dispositions Q1): mid-walk identity
+    /// is the requested-id space, and content addressing remains the
+    /// integrity mechanism at admission and at rest. In every honest run the
+    /// requested id equals the payload's recomputed id (engines key rows by
+    /// payload id at write); under lying or corrupt storage this keying
+    /// yields a coherent walk over the served structure, where recomputed-id
+    /// keying stalled the walk into BudgetExceeded with poisoned grounding.
+    pub(crate) fn accumulate(&mut self, id: &EventId, event: &Event) {
         let parents: Vec<EventId> = event.parent.as_slice().to_vec();
-        self.dag.insert(id, parents);
-        self.cache.put(event.id(), event.clone());
+        self.dag.insert(id.clone(), parents);
+        self.cache.put(id.clone(), event.clone());
     }
 
     /// Get event by id: cache -> retriever (storage).
     /// All events are already in storage (eager storage model).
+    ///
+    /// A served payload whose recomputed id differs from the requested id is
+    /// COUNTED (write-only observability, R1: a counter is permitted, a
+    /// verify-and-error is not; a hard error here would both add a per-fetch
+    /// hash cost on honest lanes and make the immunity oracle's seam
+    /// unimplementable). The recompute rides underlying fetches only; LRU
+    /// hits skip it.
     pub(crate) async fn get_event(&mut self, id: &EventId) -> Result<Event, RetrievalError> {
         if let Some(event) = self.cache.get(id) {
             return Ok(event.clone());
         }
         let event = self.event_getter.get_event(id).await?;
         self.stats.events_fetched += 1;
+        if event.id() != *id {
+            self.stats.id_mismatches += 1;
+        }
         self.cache.put(id.clone(), event.clone());
         Ok(event)
     }

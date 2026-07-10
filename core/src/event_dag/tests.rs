@@ -2037,7 +2037,7 @@ mod phase4_mixed_parent_merge {
         let mut accumulator = EventAccumulator::new(retriever.clone());
         for id in [&id_b, &id_g, &id_c, &id_e] {
             let event = retriever.get_event(id).await.unwrap();
-            accumulator.accumulate(&event);
+            accumulator.accumulate(id, &event);
         }
 
         // Meet = [A], current head = [B]
@@ -2744,6 +2744,26 @@ mod requested_id_keying {
              change the outcome, got {:?}",
             result.relation
         );
+        assert_eq!(result.stats.id_mismatches, 1, "the doctored fetch is observed exactly once (underlying fetches only)");
+        assert_eq!(result.stats.events_fetched, 3, "the stall is gone: b, g, and the doctored a fetch once each");
+    }
+
+    /// The honest path is unchanged by R1: requested and recomputed ids are
+    /// equal on every honest fetch, so the mismatch counter stays zero and
+    /// the verdict is identical with or without the wrapper.
+    #[tokio::test]
+    async fn honest_retriever_observes_no_mismatches() {
+        let mut retriever = MockRetriever::new();
+        let g = make_test_event(1, &[]);
+        let a = make_test_event(2, &[&g]);
+        let b = make_test_event(3, &[&a]);
+        for e in [&g, &a, &b] {
+            retriever.add_event(e);
+        }
+        let wrapped = GenCorruptedRetriever::new(retriever); // no overrides
+        let result = compare(wrapped, &clock!(b.id()), &clock!(g.id()), 100).await.unwrap();
+        assert!(matches!(result.relation, AbstractCausalRelation::StrictDescends { .. }));
+        assert_eq!(result.stats.id_mismatches, 0);
     }
 }
 
