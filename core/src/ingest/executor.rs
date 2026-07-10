@@ -133,10 +133,14 @@ pub(crate) async fn execute_plan<G: SuspenseEvents + Send + Sync>(
         //   and record unverified below.
         // - preverified plans (commit-lane phase one already ran the check
         //   over this schedule) do not re-verify.
-        // - everything else checks the equation against LOCALLY resolvable
-        //   parents (staging, then local storage; never a peer fetch): a
-        //   mismatch is a typed hard failure with the same containment as
-        //   any malformed event, and unresolvable parents admit unverified
+        // - everything else checks the equation, resolving parents from the
+        //   resident's materialized head generations first (REV 5 K: read
+        //   FRESH each iteration, so an in-order bridge step verifies
+        //   against the entries the previous apply just pinned; no read at
+        //   all for covered parents) and locally held payloads otherwise
+        //   (staging, then local storage; never a peer fetch): a mismatch
+        //   is a typed hard failure with the same containment as any
+        //   malformed event, and unresolvable parents admit unverified
         //   (the adopted-horizon extension shape on ephemeral nodes).
         // Recording happens only at durable admission (a successful
         // commit_event below): an event that fails to commit is not yet
@@ -146,7 +150,8 @@ pub(crate) async fn execute_plan<G: SuspenseEvents + Send + Sync>(
         } else if preverified {
             false
         } else {
-            match super::check_generation(getter, &attested.payload).await {
+            let materialized = entity.head_generations();
+            match super::check_generation(getter, Some(&materialized), &attested.payload).await {
                 Ok(super::GenerationCheck::Verified) => false,
                 Ok(super::GenerationCheck::Unverifiable) => true,
                 Err(e) => {
@@ -506,15 +511,21 @@ mod tests {
     }
 
     /// The other adopted-horizon shape: a FRESH event EXTENDING an adopted
-    /// head whose body is not locally in hand. It applies through the normal
-    /// lane (StrictDescends via the quick check, which deliberately avoids
-    /// fetching the comparison events), so its parents are never locally
-    /// resolvable at admission: it must admit AND record as unverified
-    /// (the eligibility rule of D2-4 needs every unchecked admission in the
-    /// set), while a subsequent child whose parent IS local verifies and
-    /// stays out of the set.
+    /// head whose body is not locally in hand. UPDATED AT M4 (plan REV 5
+    /// sections B and K): head-parented arrivals are COVERED by the
+    /// resident's materialized head generations, so the extension now
+    /// VERIFIES against the materialization (whose adopted entries carry
+    /// the state's trust envelope) instead of admitting unverified as M2
+    /// built it, and it costs ZERO payload reads. Its own child then
+    /// extends the induction the same way. Eligibility consequence (the K
+    /// bookkeeping default): neither id lands in the unverified set, so
+    /// both stay acceleration-eligible; an inherited wrong value could only
+    /// cost performance (5b-ii: verdicts are immune to any generation
+    /// assignment) and self-defeats at the next durable admission. The
+    /// UNVERIFIABLE admission class still exists and is pinned by
+    /// R-D2-2c (the backfill lane, whose members are never checked).
     #[tokio::test]
-    async fn extending_an_adopted_head_admits_unverified_but_verified_children_stay_eligible() {
+    async fn extending_an_adopted_head_verifies_against_the_materialization() {
         let entity_id = EntityId::new();
         let h1 = event(entity_id, &[]);
         let h2 = event(entity_id, &[&h1]);
@@ -535,18 +546,26 @@ mod tests {
             .await
             .expect("fresh snapshot adoption materializes the resident");
 
-        // Deliver the extension: parents unresolvable, admits unverified.
+        // Deliver the extension: its parent is the materialized head tip,
+        // so it verifies against the materialization, read-free, and stays
+        // OUT of the unverified set.
         staging.stage(extension.clone());
         let ext_id = extension.payload.id();
         let plan = plan_entity(&entity.head(), &[ext_id.clone()], &staging, &getter).await.expect("plan builds");
         assert!(!plan.backfill.contains(&ext_id), "an extension is not the backfill lane; it goes through verification");
         let unverified = crate::ingest::UnverifiedEvents::default();
+        let local_reads_before = getter.get_local_event_calls();
         let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist, &unverified).await;
         assert!(outcome.failure.is_none(), "the extension applies: {:?}", outcome.failure);
-        assert!(unverified.contains(&ext_id), "an admission whose parents were not locally resolvable must record unverified");
+        assert!(
+            !unverified.contains(&ext_id),
+            "a head-parented extension verifies against the materialization (REV 5 B); it must NOT record unverified"
+        );
+        assert_eq!(getter.get_local_event_calls() - local_reads_before, 0, "the covered verification reads no payloads");
 
-        // A child of the (now locally committed) extension verifies at
-        // admission and stays eligible.
+        // A child of the extension is covered by the ADVANCED
+        // materialization (the extension's own admission-verified entry):
+        // the induction extends.
         let child = event(entity_id, &[&extension]);
         let child_id = child.payload.id();
         staging.stage(child.clone());

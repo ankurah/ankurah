@@ -125,25 +125,16 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         }
 
         // Generate events from the transaction entities. The commit-lane
-        // stamp (D2-2) reads each parent's generation from its event
-        // payload, resolved staging-then-local-then-peer: on an ephemeral
-        // node a snapshot-adopted head's events are not in local storage,
-        // and the CachedEventGetter fetches (and caches) them from a
-        // durable peer, the pre-accepted per-commit cost. The node-held
-        // staging area is shared so a commit over a head whose event a
-        // prior commit failure left staged-but-unstored still resolves.
+        // stamp (D2-2, rewired at M4 per plan REV 5 section K) reads the
+        // transaction fork's MATERIALIZED head generations: a commit's
+        // parents are exactly the fork's head tips, always covered, so
+        // stamping retrieves no events and fetches from no peer on any
+        // node. The bodiless-adoption case (an ephemeral get() followed by
+        // an edit) stamps from the annotation the adopted state carried.
         let trx_id = trx.id.clone();
         let mut entity_events = Vec::new();
         for entity in trx.entities.iter() {
-            let stamp_collection = self.node.collections.get(entity.collection()).await?;
-            let stamp_getter = crate::retrieval::CachedEventGetter::with_staging(
-                entity.collection().clone(),
-                stamp_collection,
-                &self.node,
-                &self.cdata,
-                self.node.staging_for(entity.collection()),
-            );
-            if let Some(event) = entity.generate_commit_event(&stamp_getter).await? {
+            if let Some(event) = entity.generate_commit_event()? {
                 // Protected collections (system + metadata catalog) are not
                 // mutable through ordinary transactions; the catalog's only
                 // mutation path is the registration operation (RFC 4).

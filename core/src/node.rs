@@ -951,8 +951,11 @@ where
 
         // Admission verification, phase one (D2-3): every scheduled event's
         // claimed generation checks against the equation
-        // gen == 1 + max(parent generations) over the group's staged events
-        // plus local storage (genesis events must claim exactly 1). A
+        // gen == 1 + max(parent generations), resolving parents from the
+        // canonical resident's materialized head generations first (REV 5
+        // section K: a head-parented commit, the common case, verifies with
+        // NO reads at all) and the group's staged events plus local storage
+        // otherwise (genesis events must claim exactly 1). A
         // mismatch denies the whole transaction HERE, before the fork
         // preview and before anything durable, with the same containment as
         // a policy denial. Verification runs ONCE per admission: setting
@@ -960,16 +963,17 @@ where
         // re-check, and the fork previews below never verify. Backfill
         // members (head-contained but unstored redeliveries) skip the check
         // by design and record at execution. On these lanes parents are
-        // local by construction (the local lane just stamped from them; the
-        // remote lane plans against its own durable lineage), so
-        // Unverifiable is a should-not-happen degradation: warned and
-        // recorded, never guessed at.
+        // resolvable by construction (the local lane just stamped from the
+        // resident's materialization; the remote lane plans against its own
+        // durable lineage), so Unverifiable is a should-not-happen
+        // degradation: warned and recorded, never guessed at.
+        let materialized = entity.head_generations();
         for event_id in &plan.schedule {
             if plan.backfill.contains(event_id) {
                 continue;
             }
             let Some(attested) = staging.get_attested(event_id) else { continue };
-            match crate::ingest::check_generation(&getter, &attested.payload).await? {
+            match crate::ingest::check_generation(&getter, Some(&materialized), &attested.payload).await? {
                 crate::ingest::GenerationCheck::Verified => {}
                 crate::ingest::GenerationCheck::Unverifiable => {
                     tracing::warn!(event = %event_id, "commit-lane phase one could not resolve parents for generation verification; admitting unverified");
@@ -1477,6 +1481,12 @@ where
     pub fn staging_contains_for_test(&self, collection: &CollectionId, id: &proto::EventId) -> bool {
         self.staging_for(collection).contains(id)
     }
+
+    /// Number of entries in the resident entity map, dead weak entries
+    /// included. The M4 purge pin asserts EMPTY after a hard_reset (no
+    /// tombstones), which upgrade-based probes cannot distinguish.
+    #[cfg(feature = "test-helpers")]
+    pub fn resident_count_for_test(&self) -> usize { self.entities.resident_count() }
 }
 
 impl<SE, PA> NodeInner<SE, PA>

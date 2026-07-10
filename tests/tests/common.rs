@@ -750,3 +750,129 @@ impl<G: ankurah::core::retrieval::SuspenseEvents + Send + Sync> ankurah::core::r
         self.inner.get_local_event(event_id).await
     }
 }
+
+// ---------------------------------------------------------------------------
+// Storage instrumentation for the D2 M4 persist-marker pins (R-D2-4a/4c and
+// the marker-race end-to-end variant): a StorageEngine wrapper that counts
+// set_state calls at the STORAGE boundary (the honest observable for persist
+// elision) and can hold them open behind an async gate (the #299 MessageGate
+// technique applied to storage), so a test can deterministically interleave
+// a hard_reset or a sibling lane with an in-flight persist.
+// ---------------------------------------------------------------------------
+
+/// Shared instrumentation handle: clone freely; all collections of one
+/// [`InstrumentedEngine`] report here.
+#[derive(Clone)]
+pub struct StorageInstruments {
+    set_state_attempts: Arc<std::sync::atomic::AtomicUsize>,
+    gate_open: Arc<tokio::sync::watch::Sender<bool>>,
+    gate_rx: tokio::sync::watch::Receiver<bool>,
+    parked: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl StorageInstruments {
+    fn new() -> Self {
+        let (tx, rx) = tokio::sync::watch::channel(true);
+        Self {
+            set_state_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            gate_open: Arc::new(tx),
+            gate_rx: rx,
+            parked: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    /// Number of set_state calls OBSERVED AT ENTRY since construction
+    /// (parked calls count; they were attempted).
+    pub fn set_state_attempts(&self) -> usize { self.set_state_attempts.load(std::sync::atomic::Ordering::SeqCst) }
+
+    /// Close the gate: subsequent set_state calls park until reopened.
+    pub fn close_gate(&self) { let _ = self.gate_open.send(false); }
+
+    /// Reopen the gate, releasing every parked set_state in arrival order.
+    pub fn open_gate(&self) { let _ = self.gate_open.send(true); }
+
+    /// Wait until at least `n` set_state calls are parked at the gate.
+    pub async fn wait_until_parked(&self, n: usize) {
+        while self.parked.load(std::sync::atomic::Ordering::SeqCst) < n {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+}
+
+/// StorageEngine wrapper: every collection's set_state is counted and gated;
+/// everything else delegates untouched (hard_reset's delete_all_collections
+/// included, so a reset can complete while a persist is parked).
+pub struct InstrumentedEngine<E> {
+    inner: E,
+    instruments: StorageInstruments,
+}
+
+impl<E> InstrumentedEngine<E> {
+    pub fn new(inner: E) -> Self { Self { inner, instruments: StorageInstruments::new() } }
+    pub fn instruments(&self) -> StorageInstruments { self.instruments.clone() }
+}
+
+#[async_trait::async_trait]
+impl<E> ankurah::core::storage::StorageEngine for InstrumentedEngine<E>
+where E: ankurah::core::storage::StorageEngine + Send + Sync
+{
+    type Value = E::Value;
+
+    async fn collection(
+        &self,
+        id: &proto::CollectionId,
+    ) -> Result<Arc<dyn ankurah::core::storage::StorageCollection>, ankurah::core::error::RetrievalError> {
+        let inner = self.inner.collection(id).await?;
+        Ok(Arc::new(InstrumentedCollection { inner, instruments: self.instruments.clone() }))
+    }
+
+    async fn delete_all_collections(&self) -> Result<bool, MutationError> { self.inner.delete_all_collections().await }
+}
+
+pub struct InstrumentedCollection {
+    inner: Arc<dyn ankurah::core::storage::StorageCollection>,
+    instruments: StorageInstruments,
+}
+
+#[async_trait::async_trait]
+impl ankurah::core::storage::StorageCollection for InstrumentedCollection {
+    async fn set_state(&self, state: proto::Attested<proto::EntityState>) -> Result<bool, MutationError> {
+        self.instruments.set_state_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if !*self.instruments.gate_rx.borrow() {
+            self.instruments.parked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut rx = self.instruments.gate_rx.clone();
+            while !*rx.borrow() {
+                rx.changed().await.expect("the gate sender lives in StorageInstruments");
+            }
+            self.instruments.parked.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.inner.set_state(state).await
+    }
+    async fn get_state(&self, id: proto::EntityId) -> Result<proto::Attested<proto::EntityState>, ankurah::core::error::RetrievalError> {
+        self.inner.get_state(id).await
+    }
+    async fn fetch_states(
+        &self,
+        selection: &ankurah::ankql::ast::Selection,
+    ) -> Result<Vec<proto::Attested<proto::EntityState>>, ankurah::core::error::RetrievalError> {
+        self.inner.fetch_states(selection).await
+    }
+    async fn add_event(&self, entity_event: &proto::Attested<proto::Event>) -> Result<bool, MutationError> {
+        self.inner.add_event(entity_event).await
+    }
+    async fn get_events(
+        &self,
+        event_ids: Vec<proto::EventId>,
+    ) -> Result<Vec<proto::Attested<proto::Event>>, ankurah::core::error::RetrievalError> {
+        self.inner.get_events(event_ids).await
+    }
+    async fn has_event(&self, event_id: &proto::EventId) -> Result<bool, ankurah::core::error::RetrievalError> {
+        self.inner.has_event(event_id).await
+    }
+    async fn dump_entity_events(
+        &self,
+        entity_id: proto::EntityId,
+    ) -> Result<Vec<proto::Attested<proto::Event>>, ankurah::core::error::RetrievalError> {
+        self.inner.dump_entity_events(entity_id).await
+    }
+}

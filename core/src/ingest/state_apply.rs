@@ -53,26 +53,41 @@ where
     S: GetState + Send + Sync,
     E: SuspenseEvents + Send + Sync,
 {
+    // The incoming state's OWN head-generation annotation is validated
+    // first, BEFORE anything adopts (plan REV 5 section K, the validation
+    // invariant): structurally on every node flavor (the annotation must
+    // cover exactly the head's tips), and against locally held event
+    // payloads on durable nodes (a durable node never adopts a
+    // wire-carried value that contradicts an event it holds). Either
+    // failure aborts the ENTIRE item typed, same containment as the cargo
+    // check below. Ephemeral nodes adopt the values inside the state's own
+    // trust envelope, so only the structural layer runs there.
+    super::verify_state_head_generations(event_getter, &state).await?;
+
     // Cargo generations are checked BEFORE the state applies (plan REV 5
     // section L, reversing the M2 warn-and-store arm): a claim that
-    // PROVABLY contradicts locally held parents aborts the ENTIRE item
+    // PROVABLY contradicts resolvable parents aborts the ENTIRE item
     // with the typed lineage error, so nothing from the item is adopted
     // or stored (the feeders unstage on error). The grievance is with the
     // state that vouched for the malformed history: valid non-advancing
     // input drops silently, verifiably INVALID input errors loudly,
     // uniform with the streaming lane's typed rejection. This is
     // admission rejection of malformed input, not a generation routing a
-    // verdict (the suppress-only discipline is untouched). UNVERIFIABLE
-    // cargo (parents not locally held) keeps the adopted-history
+    // verdict (the suppress-only discipline is untouched). Parents resolve
+    // from the EXISTING resident's materialized head generations first
+    // (REV 5 K: update-shaped cargo parented on the current head verifies
+    // read-free) and local payloads otherwise. UNVERIFIABLE
+    // cargo (parents not resolvable) keeps the adopted-history
     // admission: the SNAPSHOT, not the equation, vouches for it, so it
     // stores and records acceleration-ineligible below; fresh adoption
     // therefore never trips the abort (no local parents, nothing
     // provable). A storage failure from the local parent read aborts the
     // item just as loudly (it would have failed the commit right below
     // anyway).
+    let resident_materialization = entities.get(&entity_id).map(|resident| resident.head_generations());
     let mut unverifiable_cargo: Vec<EventId> = Vec::new();
     for event in events_to_commit {
-        match super::check_generation(event_getter, &event.payload).await {
+        match super::check_generation(event_getter, resident_materialization.as_ref(), &event.payload).await {
             Ok(super::GenerationCheck::Verified) => {}
             Ok(super::GenerationCheck::Unverifiable) => unverifiable_cargo.push(event.payload.id()),
             Err(e) => return Err(e),
@@ -240,5 +255,42 @@ mod tests {
             other => panic!("a structurally mismatched head annotation must be rejected as malformed, got {other:?}"),
         }
         assert!(entities.get(&entity_id).is_none(), "nothing from the malformed item may be adopted");
+    }
+
+    /// The trust-envelope arm (REV 5 section K): an EPHEMERAL node adopts a
+    /// consistent wire annotation as carried, no payload inspection (it
+    /// holds no payloads to inspect; the state itself is the trust
+    /// envelope), and the resident materializes carrying exactly those
+    /// values, ready to stamp a commit read-free.
+    #[tokio::test]
+    async fn ephemeral_node_adopts_carried_annotation_inside_the_trust_envelope() {
+        let entity_id = ankurah_proto::EntityId::new();
+        let genesis = event(entity_id, &[]);
+        let e1 = event(entity_id, &[&genesis]);
+        let e1_id = e1.payload.id();
+
+        let entities = crate::entity::WeakEntitySet::default();
+        let staging = std::sync::Arc::new(StagingArea::with_default_cap());
+        // Ephemeral store holding NOTHING: bodiless adoption.
+        let getter = FailingCommitStore::ephemeral(staging.clone(), EventId::from_bytes([0xEE; 32]));
+
+        let carried = ankurah_proto::GClock::from((2, e1_id.clone()));
+        let state = ankurah_proto::State {
+            state_buffers: ankurah_proto::StateBuffers(BTreeMap::new()),
+            head: ankurah_proto::Clock::from(vec![e1_id.clone()]),
+            head_generations: carried.clone(),
+        };
+
+        let unverified = UnverifiedEvents::default();
+        let applied =
+            apply_state_feed(&entities, &NoState, &getter, &staging, entity_id, "test".into(), state, &[], &NoopPersist, &unverified)
+                .await
+                .expect("a consistent bodiless snapshot adopts cleanly on an ephemeral node");
+        assert!(applied.advanced, "fresh adoption advances");
+        assert_eq!(
+            applied.entity.head_generations(),
+            carried,
+            "the resident materializes the carried annotation (the stamp operand for its next commit)"
+        );
     }
 }

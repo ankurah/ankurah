@@ -27,7 +27,7 @@ pub(crate) use plan::{plan_entity, IngestPlan};
 pub(crate) use staging::StagingArea;
 pub(crate) use state_apply::apply_state_feed;
 pub(crate) use unverified::UnverifiedEvents;
-pub(crate) use verify::{check_generation, GenerationCheck};
+pub(crate) use verify::{check_generation, verify_state_head_generations, GenerationCheck};
 
 use crate::error::{IngestError, LineageError, LineageRejection, MutationError, RetrievalError};
 

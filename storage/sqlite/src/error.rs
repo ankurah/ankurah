@@ -22,6 +22,12 @@ pub enum SqliteError {
     #[error("SQL generation error: {0}")]
     SqlGeneration(String),
 
+    /// A stored row violates a cross-column invariant (for example the
+    /// generations array not matching the head array length). Fails the
+    /// read loudly instead of reconstituting a wrong value.
+    #[error("row integrity error: {0}")]
+    Integrity(String),
+
     #[error("Task join error: {0}")]
     TaskJoin(String),
 }
