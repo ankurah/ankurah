@@ -3450,10 +3450,10 @@ mod comparison_property {
 
     /// Deterministic xorshift32: no external dependency, and every failure is
     /// reproducible from the printed dag_seed.
-    struct Rng(u32);
+    pub(super) struct Rng(pub(super) u32);
 
     impl Rng {
-        fn next(&mut self) -> u32 {
+        pub(super) fn next(&mut self) -> u32 {
             let mut x = self.0;
             x ^= x << 13;
             x ^= x >> 17;
@@ -3462,11 +3462,11 @@ mod comparison_property {
             x
         }
 
-        fn below(&mut self, n: usize) -> usize { (self.next() as usize) % n }
+        pub(super) fn below(&mut self, n: usize) -> usize { (self.next() as usize) % n }
     }
 
     /// Inclusive ancestry over the true parent map (the oracle's reachability).
-    fn ancestry(parents: &BTreeMap<EventId, Vec<EventId>>, heads: &[EventId]) -> BTreeSet<EventId> {
+    pub(super) fn ancestry(parents: &BTreeMap<EventId, Vec<EventId>>, heads: &[EventId]) -> BTreeSet<EventId> {
         let mut out = BTreeSet::new();
         let mut stack: Vec<EventId> = heads.to_vec();
         while let Some(id) = stack.pop() {
@@ -3482,7 +3482,7 @@ mod comparison_property {
 
     /// Reduce a set of events to its maximal antichain: drop members that are
     /// proper ancestors of other members.
-    fn to_antichain(parents: &BTreeMap<EventId, Vec<EventId>>, ids: &BTreeSet<EventId>) -> Vec<EventId> {
+    pub(super) fn to_antichain(parents: &BTreeMap<EventId, Vec<EventId>>, ids: &BTreeSet<EventId>) -> Vec<EventId> {
         ids.iter()
             .filter(|id| !ids.iter().any(|other| other != *id && ancestry(parents, std::slice::from_ref(other)).contains(*id)))
             .cloned()
@@ -3490,7 +3490,7 @@ mod comparison_property {
     }
 
     #[derive(Debug)]
-    enum Expected {
+    pub(super) enum Expected {
         Equal,
         StrictDescends,
         StrictAscends,
@@ -3501,7 +3501,7 @@ mod comparison_property {
     /// Brute-force specification of the comparison verdict. Precedence mirrors
     /// the machine: Equal, then the strict completions (which fire during
     /// traversal), then the exhaustion verdicts.
-    fn oracle(parents: &BTreeMap<EventId, Vec<EventId>>, subject: &[EventId], comparison: &[EventId]) -> Expected {
+    pub(super) fn oracle(parents: &BTreeMap<EventId, Vec<EventId>>, subject: &[EventId], comparison: &[EventId]) -> Expected {
         let s_set: BTreeSet<EventId> = subject.iter().cloned().collect();
         let c_set: BTreeSet<EventId> = comparison.iter().cloned().collect();
         if s_set == c_set {
@@ -3545,7 +3545,7 @@ mod comparison_property {
         Expected::DivergedMeet(to_antichain(parents, &common))
     }
 
-    fn verdict_matches(expected: &Expected, actual: &AbstractCausalRelation<EventId>) -> bool {
+    pub(super) fn verdict_matches(expected: &Expected, actual: &AbstractCausalRelation<EventId>) -> bool {
         match (expected, actual) {
             (Expected::Equal, AbstractCausalRelation::Equal) => true,
             (Expected::StrictDescends, AbstractCausalRelation::StrictDescends { .. }) => true,
@@ -3703,6 +3703,457 @@ mod comparison_property {
             "artifact line must carry a copy-pasteable single-seed repro command: {line}"
         );
         assert!(!line.contains('\n'), "artifact line must be a single line: {line}");
+    }
+}
+
+// ============================================================================
+// THE GEN-CORRUPTION IMMUNITY ORACLE (D2 M5 arm ii; oracle brief +
+// red-team fold). Executable form of the 5b-ii theorem's quantifier: for
+// fixed ids and fixed parent edges, ANY assignment of generation values
+// observed by the comparison leaves verdicts, meets, and the layer
+// partition identical. Corruption is injected through BOTH channels the
+// consuming code reads (the fold's two-channel matrix): the PAYLOAD
+// channel (a lying retriever serving doctored payloads under original
+// ids) and the MATERIALIZATION channel (doctored operand GClocks feeding
+// the prechecks and schedule seeds), plus cross-mismatch shapes where the
+// channels disagree.
+//
+// BOUND observables (byte-identical or STOP-AND-REPORT): relation
+// variant; the StrictDescends chain semantic core plus its completeness
+// law; the DivergedSince meet, immediate-children sets, and full layer
+// partition; the Disjoint variant. FREE-but-valid (may differ; targeted
+// arms assert deltas on purpose): suppression, violation, demotion,
+// fetch and decrement counters, fetch order, Disjoint root identities
+// (first-reached, fold item 2), and DivergedSince chain content (the
+// recorded build_forward_chain trim defect; canonical order and validity
+// still hold per run). BudgetExceeded in ANY run is a harness bug, never
+// tolerated: the budget is 4x corpus and the walk decrements at most
+// twice per event.
+// ============================================================================
+
+#[cfg(test)]
+mod gen_corruption_immunity {
+    use super::comparison_property::{ancestry, Rng};
+    use super::*;
+    use crate::event_dag::stats::CompareStats;
+    use std::collections::BTreeSet;
+
+    // ---- Corpus ----
+
+    pub(super) struct Corpus {
+        pub retriever: MockRetriever,
+        pub events: Vec<Event>,
+        pub ids: Vec<EventId>,
+        pub parents_map: BTreeMap<EventId, Vec<EventId>>,
+    }
+
+    impl Corpus {
+        pub fn from_events(events: Vec<Event>) -> Self {
+            let mut retriever = MockRetriever::new();
+            let mut ids = Vec::new();
+            let mut parents_map = BTreeMap::new();
+            for e in &events {
+                retriever.add_event(e);
+                ids.push(e.id());
+                parents_map.insert(e.id(), e.parent.as_slice().to_vec());
+            }
+            Self { retriever, events, ids, parents_map }
+        }
+
+        pub fn event(&self, id: &EventId) -> &Event { self.events.iter().find(|e| e.id() == *id).expect("id minted from this corpus") }
+
+        pub fn gen_of(&self, id: &EventId) -> u32 { self.event(id).generation }
+
+        /// Honest operand annotation for a clock's tips (the materialized
+        /// GClock a resident or wire state would carry).
+        pub fn operand(&self, tips: &[EventId]) -> GClock {
+            GClock::new(tips.iter().map(|t| (self.gen_of(t), t.clone())).collect::<Vec<_>>())
+        }
+
+        pub fn size(&self) -> usize { self.events.len() }
+    }
+
+    // ---- Doctoring (one corrupted run's worth of lies) ----
+
+    #[derive(Default, Clone)]
+    pub(super) struct Doctoring {
+        /// Payload channel: original id -> corrupt generation.
+        pub payloads: Vec<(EventId, u32)>,
+        /// Materialization channel: per-tip operand overrides.
+        pub subject_tips: Vec<(EventId, u32)>,
+        pub comparison_tips: Vec<(EventId, u32)>,
+    }
+
+    impl Doctoring {
+        pub fn is_empty(&self) -> bool { self.payloads.is_empty() && self.subject_tips.is_empty() && self.comparison_tips.is_empty() }
+
+        /// The (id, original, corrupted) triples for the artifact line.
+        pub fn triples(&self, corpus: &Corpus) -> String {
+            let mut parts = Vec::new();
+            for (id, corrupt) in &self.payloads {
+                parts.push(format!("payload({id},{},{corrupt})", corpus.gen_of(id)));
+            }
+            for (id, corrupt) in &self.subject_tips {
+                parts.push(format!("subject_tip({id},{},{corrupt})", corpus.gen_of(id)));
+            }
+            for (id, corrupt) in &self.comparison_tips {
+                parts.push(format!("comparison_tip({id},{},{corrupt})", corpus.gen_of(id)));
+            }
+            format!("[{}]", parts.join(","))
+        }
+
+        /// The lying retriever plus the doctored-payload-id -> original-id
+        /// map (layer events recompute doctored ids; captures map back).
+        pub fn retriever(&self, corpus: &Corpus) -> (GenCorruptedRetriever, HashMap<EventId, EventId>) {
+            let mut lying = GenCorruptedRetriever::new(corpus.retriever.clone());
+            let mut back = HashMap::new();
+            for (id, corrupt) in &self.payloads {
+                let doctored = Event { generation: *corrupt, ..corpus.event(id).clone() };
+                back.insert(doctored.id(), id.clone());
+                lying.doctor(id.clone(), doctored);
+            }
+            (lying, back)
+        }
+
+        /// Operand GClocks with this doctoring's tip overrides applied.
+        pub fn operands(&self, corpus: &Corpus, subject: &[EventId], comparison: &[EventId]) -> (GClock, GClock) {
+            let apply = |tips: &[EventId], overrides: &[(EventId, u32)]| {
+                GClock::new(
+                    tips.iter()
+                        .map(|t| {
+                            let g = overrides.iter().find(|(id, _)| id == t).map(|(_, g)| *g).unwrap_or_else(|| corpus.gen_of(t));
+                            (g, t.clone())
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            };
+            (apply(subject, &self.subject_tips), apply(comparison, &self.comparison_tips))
+        }
+    }
+
+    // ---- Captured observables ----
+
+    /// The BOUND set (byte-comparable between runs).
+    #[derive(Debug, Clone, PartialEq)]
+    pub(super) enum Bound {
+        Equal,
+        StrictAscends,
+        StrictDescends {
+            /// chain intersected with s_cover \ c_cover, in emitted
+            /// (canonical) order.
+            chain_core: Vec<EventId>,
+        },
+        DivergedSince {
+            meet: Vec<EventId>,
+            subject_children: Vec<EventId>,
+            other_children: Vec<EventId>,
+            /// Per layer: (sorted to_apply, sorted already_applied), ids
+            /// mapped back to originals.
+            layers: Vec<(Vec<EventId>, Vec<EventId>)>,
+        },
+        Disjoint,
+    }
+
+    pub(super) struct Capture {
+        pub bound: Bound,
+        pub stats: CompareStats,
+        pub fetches: Vec<EventId>,
+    }
+
+    /// Drive one comparison and capture its observables, asserting the
+    /// per-run validity laws (which hold for corrupted runs too: validity
+    /// is about structure, which generation doctoring never touches).
+    /// Panics with `context` on any harness-guarantee violation
+    /// (BudgetExceeded, broken validity), which is a STOP-AND-REPORT
+    /// artifact, not an acceptable outcome.
+    pub(super) async fn run<G: GetEvents + Send + Sync>(
+        getter: G,
+        corpus: &Corpus,
+        subject_ids: &[EventId],
+        comparison_ids: &[EventId],
+        subject_gens: GClock,
+        comparison_gens: GClock,
+        unverified: Option<&crate::ingest::UnverifiedEvents>,
+        back_map: &HashMap<EventId, EventId>,
+        context: &str,
+    ) -> Capture {
+        let subject = Clock::from(subject_ids.to_vec());
+        let comparison = Clock::from(comparison_ids.to_vec());
+        let budget = 4 * corpus.size();
+
+        let logging = LoggingRetriever::new(getter);
+        let log = logging.log_handle();
+        let opts = CompareOptions { subject_gens: Some(subject_gens), comparison_gens: Some(comparison_gens), unverified };
+        let result = compare_with(logging, &subject, &comparison, budget, opts).await.expect("oracle corpora are fully fetchable");
+
+        let stats = result.stats.clone();
+        assert!(
+            stats.budget_decrements <= 2 * corpus.size(),
+            "{context}: the <=2-decrements-per-event law broke (got {} over {} events); the oracle budget math is void",
+            stats.budget_decrements,
+            corpus.size()
+        );
+
+        let s_cover = ancestry(&corpus.parents_map, subject_ids);
+        let c_cover = ancestry(&corpus.parents_map, comparison_ids);
+
+        let bound = match &result.relation {
+            AbstractCausalRelation::Equal => Bound::Equal,
+            AbstractCausalRelation::StrictAscends => Bound::StrictAscends,
+            AbstractCausalRelation::BudgetExceeded { .. } => {
+                panic!(
+                    "{context}: BudgetExceeded with budget 4x corpus is a HARNESS BUG (stop and report); never raise the budget in place"
+                )
+            }
+            AbstractCausalRelation::StrictDescends { chain } => {
+                let chain_set: BTreeSet<EventId> = chain.iter().cloned().collect();
+                // The arm (i) completeness law, NOT weakened (fold item 2):
+                // every event strictly between the covers is in the chain.
+                for id in s_cover.difference(&c_cover) {
+                    assert!(chain_set.contains(id), "{context}: StrictDescends chain completeness law broke: missing {id}");
+                }
+                // Validity: emitted order is a topological order over the
+                // honest edges (generation doctoring preserves structure).
+                assert_topo_order(chain, &corpus.parents_map, context);
+                let core: Vec<EventId> = chain.iter().filter(|id| s_cover.contains(*id) && !c_cover.contains(*id)).cloned().collect();
+                Bound::StrictDescends { chain_core: core }
+            }
+            AbstractCausalRelation::Disjoint { subject_root, other_root, .. } => {
+                // Roots are FREE-but-valid (first-reached, fold item 2):
+                // each reported root is genuinely parentless and reachable
+                // from its side, and the two differ.
+                for (root, cover, side) in [(subject_root, &s_cover, "subject"), (other_root, &c_cover, "comparison")] {
+                    assert!(
+                        corpus.parents_map.get(root).is_some_and(|p| p.is_empty()),
+                        "{context}: Disjoint {side} root {root} is not parentless"
+                    );
+                    assert!(cover.contains(root), "{context}: Disjoint {side} root {root} is outside its side's cover");
+                }
+                assert_ne!(subject_root, other_root, "{context}: Disjoint roots must differ");
+                Bound::Disjoint
+            }
+            AbstractCausalRelation::DivergedSince { meet, subject: s_children, other: o_children, subject_chain, other_chain } => {
+                // Chains are FREE-but-valid: canonical order over honest
+                // edges, members within their side's cover.
+                for (chain, cover, side) in [(subject_chain, &s_cover, "subject"), (other_chain, &c_cover, "comparison")] {
+                    assert_topo_order(chain, &corpus.parents_map, context);
+                    for id in chain {
+                        assert!(cover.contains(id), "{context}: DivergedSince {side} chain member {id} outside its cover");
+                    }
+                }
+                let meet_bound = meet.clone();
+                let s_children_bound = s_children.clone();
+                let o_children_bound = o_children.clone();
+                // The layer partition downstream of the meet is BOUND:
+                // byte-identical sequence, ids mapped back to originals.
+                let mut layers_bound = Vec::new();
+                let mut layers = result.into_layers(comparison_ids.to_vec()).expect("DivergedSince always yields layers");
+                while let Some(layer) = layers.next().await.expect("layer iteration fetches from the same corpus") {
+                    let map_back = |events: &[Event]| {
+                        let mut mapped: Vec<EventId> =
+                            events.iter().map(|e| back_map.get(&e.id()).cloned().unwrap_or_else(|| e.id())).collect();
+                        mapped.sort();
+                        mapped
+                    };
+                    layers_bound.push((map_back(&layer.to_apply), map_back(&layer.already_applied)));
+                }
+                Bound::DivergedSince {
+                    meet: meet_bound,
+                    subject_children: s_children_bound,
+                    other_children: o_children_bound,
+                    layers: layers_bound,
+                }
+            }
+        };
+
+        let fetches = log.lock().unwrap().clone();
+        Capture { bound, stats, fetches }
+    }
+
+    fn assert_topo_order(chain: &[EventId], parents_map: &BTreeMap<EventId, Vec<EventId>>, context: &str) {
+        let mut seen: BTreeSet<EventId> = BTreeSet::new();
+        let in_chain: BTreeSet<EventId> = chain.iter().cloned().collect();
+        for id in chain {
+            if let Some(parents) = parents_map.get(id) {
+                for p in parents {
+                    if in_chain.contains(p) {
+                        assert!(seen.contains(p), "{context}: chain is not a topological order: {id} precedes its parent {p}");
+                    }
+                }
+            }
+            seen.insert(id.clone());
+        }
+    }
+
+    /// The extended ORACLEFAIL artifact line (oracle brief 3.4): one line,
+    /// self-contained, carrying the shape, the corruption seed, the
+    /// doctored triples, and the exact single-seed repro command.
+    pub(super) fn gen_artifact_line(
+        dag_seed: u32,
+        shape: &str,
+        corruption_seed: u32,
+        subject: &[EventId],
+        comparison: &[EventId],
+        triples: &str,
+        baseline: &Bound,
+        corrupted: &Bound,
+    ) -> String {
+        format!(
+            "ORACLEFAIL kind=gen_corruption dag_seed={dag_seed} shape={shape} corruption_seed={corruption_seed} subject={subject:?} comparison={comparison:?} doctored={triples} baseline={baseline:?} corrupted={corrupted:?} reproduce=\"GEN_ORACLE_SEED_BASE={dag_seed} GEN_ORACLE_SEEDS=1 GEN_ORACLE_SHAPE={shape} cargo test -p ankurah-core --lib event_dag::tests::gen_corruption_immunity::randomized_corpora_are_immune_to_generation_corruption -- --exact --nocapture\""
+        )
+    }
+
+    /// Assert the corrupted run's BOUND observables equal the baseline's,
+    /// panicking with the full artifact line on ANY divergence
+    /// (STOP-AND-REPORT; there is no acceptable divergence and no
+    /// fix-forward).
+    pub(super) fn assert_bound_identical(
+        dag_seed: u32,
+        shape: &str,
+        corruption_seed: u32,
+        subject: &[EventId],
+        comparison: &[EventId],
+        triples: &str,
+        baseline: &Capture,
+        corrupted: &Capture,
+    ) {
+        if baseline.bound != corrupted.bound {
+            panic!(
+                "{}",
+                gen_artifact_line(dag_seed, shape, corruption_seed, subject, comparison, triples, &baseline.bound, &corrupted.bound)
+            );
+        }
+    }
+
+    // ---- Named seed corpora (derivations sections 4.1 and 4.3) ----
+
+    /// GC-SEED-41: the derivations 4.1 counterexample DAG. Returns the
+    /// corpus plus (subject tip s, comparison tip c, c1, m) for meet pins.
+    pub(super) fn seed_41() -> (Corpus, EventId, EventId, EventId, EventId) {
+        let g = make_test_event(1, &[]);
+        let x = make_test_event(2, &[&g]);
+        let y = make_test_event(3, &[&x]);
+        let z = make_test_event(4, &[&y]);
+        let c1 = make_test_event(5, &[&z]);
+        let m = make_test_event(6, &[&g]);
+        let u = make_test_event(7, &[&m]);
+        let v = make_test_event(8, &[&m]);
+        let s = make_test_event(9, &[&c1, &u]);
+        let c = make_test_event(10, &[&c1, &v]);
+        let (s_id, c_id, c1_id, m_id) = (s.id(), c.id(), c1.id(), m.id());
+        (Corpus::from_events(vec![g, x, y, z, c1, m, u, v, s, c]), s_id, c_id, c1_id, m_id)
+    }
+
+    /// GC-SEED-43: the derivations 4.3 self-refutation DAG. Returns the
+    /// corpus plus (A, B, f) for the meet pin.
+    pub(super) fn seed_43() -> (Corpus, EventId, EventId, EventId) {
+        let g = make_test_event(1, &[]);
+        let m = make_test_event(2, &[&g]);
+        let c = make_test_event(3, &[&m]);
+        let f = make_test_event(4, &[&c]);
+        let a = make_test_event(5, &[&f, &m]);
+        let b = make_test_event(6, &[&f, &m]);
+        let (a_id, b_id, f_id) = (a.id(), b.id(), f.id());
+        (Corpus::from_events(vec![g, m, c, f, a, b]), a_id, b_id, f_id)
+    }
+
+    /// The 4.1 baseline meet is EXACTLY {c1, m}: the DAG on which the RFC's
+    /// generation-threshold stop rule would have wrongly concluded {c1},
+    /// missing the low-generation common branch head m (derivations 4.1).
+    /// Pinned BEFORE any corruption runs against this corpus.
+    #[tokio::test]
+    async fn gc_seed_41_baseline_meet_is_c1_and_m() {
+        let (corpus, s, c, c1, m) = seed_41();
+        let (sg, cg) = Doctoring::default().operands(&corpus, std::slice::from_ref(&s), std::slice::from_ref(&c));
+        let capture = run(corpus.retriever.clone(), &corpus, &[s], &[c], sg, cg, None, &HashMap::new(), "gc_seed_41 baseline").await;
+        match &capture.bound {
+            Bound::DivergedSince { meet, .. } => {
+                let mut expected = vec![c1, m];
+                expected.sort();
+                assert_eq!(meet, &expected, "the 4.1 ground truth: meet EXACTLY {{c1, m}}");
+            }
+            other => panic!("gc_seed_41 baseline must be DivergedSince, got {other:?}"),
+        }
+        assert_eq!(capture.stats.edge_check_violations, 0, "the honest build stamps cleanly");
+    }
+
+    /// The 4.3 baseline meet is EXACTLY {f}: m is evicted by its common
+    /// child c, which the all-frontier-common stop rule could not see
+    /// (derivations 4.3). Pinned BEFORE any corruption runs.
+    #[tokio::test]
+    async fn gc_seed_43_baseline_meet_is_f() {
+        let (corpus, a, b, f) = seed_43();
+        let (sg, cg) = Doctoring::default().operands(&corpus, std::slice::from_ref(&a), std::slice::from_ref(&b));
+        let capture = run(corpus.retriever.clone(), &corpus, &[a], &[b], sg, cg, None, &HashMap::new(), "gc_seed_43 baseline").await;
+        match &capture.bound {
+            Bound::DivergedSince { meet, .. } => {
+                assert_eq!(meet, &vec![f], "the 4.3 ground truth: meet EXACTLY {{f}} (m evicted by its common child)");
+            }
+            other => panic!("gc_seed_43 baseline must be DivergedSince, got {other:?}"),
+        }
+        assert_eq!(capture.stats.edge_check_violations, 0, "the honest build stamps cleanly");
+    }
+
+    /// GC-CONTROL, the alarm-rings canary (harness self-test): STRUCTURAL
+    /// corruption (a served payload with a dropped parent) genuinely
+    /// changes the outcome, and the harness must DETECT the divergence.
+    /// Guards against a vacuously green oracle (a doctor map that never
+    /// engages, or a comparison of a run against itself). The detected
+    /// divergence is asserted, then swallowed.
+    #[tokio::test]
+    async fn gc_control_canary_detects_structural_divergence() {
+        let g = make_test_event(1, &[]);
+        let a = make_test_event(2, &[&g]);
+        let b = make_test_event(3, &[&a]);
+        let corpus = Corpus::from_events(vec![g.clone(), a.clone(), b.clone()]);
+        let (sg, cg) = Doctoring::default().operands(&corpus, &[b.id()], &[g.id()]);
+        let baseline =
+            run(corpus.retriever.clone(), &corpus, &[b.id()], &[g.id()], sg.clone(), cg.clone(), None, &HashMap::new(), "canary baseline")
+                .await;
+        assert!(matches!(baseline.bound, Bound::StrictDescends { .. }), "precondition: honest verdict is StrictDescends");
+
+        // Structural lie: a served with an EMPTY parent clock (g dropped).
+        // Post-R1 the walk adopts the served structure, so b's ancestry
+        // bottoms out at a and the sides are disjoint. NOTE: the doctored
+        // event changes STRUCTURE, so the corpus validity laws do not
+        // apply; drive compare_with directly rather than through run().
+        let mut lying = GenCorruptedRetriever::new(corpus.retriever.clone());
+        lying.doctor(a.id(), Event { parent: Clock::default(), ..a.clone() });
+        let corrupted = compare_with(
+            lying,
+            &clock!(b.id()),
+            &clock!(g.id()),
+            4 * corpus.size(),
+            CompareOptions { subject_gens: Some(sg), comparison_gens: Some(cg), unverified: None },
+        )
+        .await
+        .unwrap();
+
+        let diverged = !matches!(corrupted.relation, AbstractCausalRelation::StrictDescends { .. });
+        assert!(
+            diverged,
+            "THE CANARY IS DEAD: structural corruption produced the baseline verdict; the harness cannot detect \
+             divergence and every green immunity result is vacuous. Got {:?}",
+            corrupted.relation
+        );
+    }
+
+    /// Format pin for the extended artifact line (mirrors
+    /// artifact_line_format_is_self_contained).
+    #[test]
+    fn gen_artifact_line_format_is_self_contained() {
+        let line = gen_artifact_line(41, "gc-deflate", 7, &[], &[], "[payload(x,2,9)]", &Bound::Equal, &Bound::StrictAscends);
+        assert!(line.starts_with("ORACLEFAIL "), "must carry the ORACLEFAIL marker: {line}");
+        assert!(line.contains("kind=gen_corruption"), "must self-identify the oracle: {line}");
+        assert!(line.contains("dag_seed=41"), "must carry the dag seed: {line}");
+        assert!(line.contains("shape=gc-deflate"), "must carry the corruption shape: {line}");
+        assert!(line.contains("corruption_seed=7"), "must carry the corruption seed: {line}");
+        assert!(line.contains("doctored=[payload(x,2,9)]"), "must carry the doctored triples: {line}");
+        assert!(
+            line.contains("reproduce=\"GEN_ORACLE_SEED_BASE=41 GEN_ORACLE_SEEDS=1 GEN_ORACLE_SHAPE=gc-deflate cargo test"),
+            "must carry a copy-pasteable single-seed repro: {line}"
+        );
+        assert!(!line.contains('\n'), "must be a single line: {line}");
     }
 }
 
