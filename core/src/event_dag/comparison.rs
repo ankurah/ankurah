@@ -197,7 +197,7 @@ pub(crate) async fn compare_with<E: GetEvents>(
     let mut current_budget = initial_budget;
 
     loop {
-        let mut comp = Comparison::new(&mut accumulator, subject, comparison, current_budget);
+        let mut comp = Comparison::new(&mut accumulator, subject, comparison, current_budget, &opts);
         let relation = loop {
             if let Some(relation) = comp.step().await? {
                 break relation;
@@ -220,6 +220,12 @@ pub(crate) async fn compare_with<E: GetEvents>(
 /// Internal state machine for the comparison algorithm.
 struct Comparison<'a, E: GetEvents> {
     accumulator: &'a mut EventAccumulator<E>,
+
+    /// The comparison's generation operands (D2-4): schedule keys for the
+    /// level drain (initial tips read their seeds from here; interior
+    /// entries read in-hand payloads) and the eligibility context. Never a
+    /// verdict input.
+    opts: &'a CompareOptions<'a>,
 
     /// The subject clock's backward traversal.
     subject: Side,
@@ -339,11 +345,18 @@ impl NodeState {
 }
 
 impl<'a, E: GetEvents> Comparison<'a, E> {
-    fn new(accumulator: &'a mut EventAccumulator<E>, subject: &Clock, comparison: &Clock, budget: usize) -> Self {
+    fn new(
+        accumulator: &'a mut EventAccumulator<E>,
+        subject: &Clock,
+        comparison: &Clock,
+        budget: usize,
+        opts: &'a CompareOptions<'a>,
+    ) -> Self {
         Self {
             accumulator,
             subject: Side::new(subject.as_slice().iter().cloned().collect()),
             comparison: Side::new(comparison.as_slice().iter().cloned().collect()),
+            opts,
             states: HashMap::new(),
             meet_candidates: BTreeSet::new(),
             any_common: false,
@@ -351,11 +364,52 @@ impl<'a, E: GetEvents> Comparison<'a, E> {
         }
     }
 
+    /// The schedule key for one frontier entry (D2-4 eligibility at
+    /// consumption): the in-hand payload's generation where the walk holds
+    /// it, else the caller's materialized tip seed (initial tips only:
+    /// interior events have no materialization); filtered by walk-time
+    /// demotion, the admitted-unverified set, and the saturation sentinel.
+    /// None means "unknown", scheduled last.
+    fn eligible_gen(&self, id: &EventId) -> Option<u32> {
+        if self.accumulator.is_demoted(id) {
+            return None;
+        }
+        if self.opts.unverified.is_some_and(|set| set.contains(id)) {
+            return None;
+        }
+        let g = self
+            .accumulator
+            .peek_generation(id)
+            .or_else(|| self.opts.subject_gens.as_ref().and_then(|sg| sg.generation_of(id)))
+            .or_else(|| self.opts.comparison_gens.as_ref().and_then(|cg| cg.generation_of(id)))?;
+        (g != u32::MAX).then_some(g)
+    }
+
     async fn step(&mut self) -> Result<Option<AbstractCausalRelation<EventId>>, RetrievalError> {
-        // Collect frontier IDs from both frontiers
-        let mut all_frontier_ids = Vec::new();
+        // Collect the level: both frontiers' entries, deduplicated (an id on
+        // both frontiers processes once; process_event handles both flags).
+        let mut all_frontier_ids: Vec<EventId> = Vec::new();
         all_frontier_ids.extend(self.subject.frontier.ids.iter().cloned());
         all_frontier_ids.extend(self.comparison.frontier.ids.iter().cloned());
+        all_frontier_ids.sort();
+        all_frontier_ids.dedup();
+
+        // In-level schedule (plan D2-4; derivations section 3): maximum
+        // eligible generation first, unknowns last, EventId ascending
+        // tiebreak (the pre-sort above plus a stable sort). A PURE schedule
+        // choice: the level's membership, every per-level set, and the
+        // check_result verdicts at level end are order-independent, so a
+        // generation value can steer only WHEN work happens, never what is
+        // concluded (5b-ii). The one order-sensitive corner is the
+        // unfetchable-both-frontiers fallback below, whose success was
+        // ALWAYS schedule luck (BTree id order before this change): with
+        // honest operands, deeper entries drain first, which can only form
+        // both-frontier co-membership for an unfetchable meet EARLIER, so
+        // the fallback fires at least as often as under id order.
+        all_frontier_ids.sort_by_key(|id| match self.eligible_gen(id) {
+            Some(g) => (0u8, std::cmp::Reverse(g)),
+            None => (1u8, std::cmp::Reverse(0)),
+        });
 
         for id in &all_frontier_ids {
             // Skip events already processed (e.g. an ID that appeared in both
