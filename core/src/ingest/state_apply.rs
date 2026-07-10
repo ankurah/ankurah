@@ -115,9 +115,11 @@ where
     // resident an instant ago with its own persist still in flight, and the
     // delta lanes re-read local storage to build result sets when they
     // return (read-your-application). Persisting the resident's current
-    // state is always monotone-safe; eliding it raced exactly that window.
-    // The sound elision is M4's persist-currency marker, not the
-    // applied-set. Notification stays advance-only. Empty-head guard for
+    // state is always monotone-safe; eliding it on the APPLY VERDICT raced
+    // exactly that window. The sound elision lives inside the persist
+    // funnel (D2-6): the persist-currency marker elides only on
+    // completed-persist testimony for exactly the current head in the
+    // current epoch. Notification stays advance-only. Empty-head guard for
     // symmetry with the executor: a phantom's empty state must not land in
     // storage.
     let covered_head = entity.head();

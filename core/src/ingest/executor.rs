@@ -233,9 +233,10 @@ pub(crate) async fn execute_plan<G: SuspenseEvents + Send + Sync>(
     // sibling lane may have integrated these events with its own persist
     // still in flight, and the delta lanes re-read local storage to build
     // result sets when they return (read-your-application). Persisting the
-    // resident's current state is always monotone-safe; the M2 no-op
-    // elision raced exactly that window. A storage-backed currency check
-    // (D2's applied-set) is the sound way to skip this write later. Two
+    // resident's current state is always monotone-safe; the old no-op
+    // elision raced exactly that window. The sound skip lives inside the
+    // persist funnel (D2-6): the persist-currency marker elides only on
+    // completed-persist testimony for the current head and epoch. Two
     // exceptions: an empty-head entity has nothing true to persist (a
     // phantom's empty state must not land in storage), and a resident
     // whose head names an event a commit failure kept out of the log must
@@ -247,17 +248,23 @@ pub(crate) async fn execute_plan<G: SuspenseEvents + Send + Sync>(
         match persist.persist(entity).await {
             Ok(()) => {
                 // The post-persist hook, insertion half (derivations
-                // section 5; REV 5 section F): the completed set_state
-                // proves coverage for exactly this plan's applied events
-                // and its already-integrated skips (AlreadyCommitted
+                // section 5; REV 5 section F): Ok from the funnel means a
+                // set_state covering the entity's current head COMPLETED,
+                // either just now or previously (the M4 marker elision:
+                // elision fires only on marker currency, which is exactly
+                // the completed-persist testimony these rows need). That
+                // proves coverage for this plan's applied events and its
+                // already-integrated skips (AlreadyCommitted
                 // preresolutions are plan-time head members and
                 // AlreadyIntegrated events are in the head's ancestry;
                 // both stay covered by every later persisted head, since
-                // heads never regress). The suppress-persist path above
+                // heads never regress). Inserting the no-op skip outcomes
+                // under an ELIDED persist is derivations 5's D2-3.d
+                // enablement at this hook: the insert is gated on the
+                // marker being current. The suppress-persist path above
                 // inserts NOTHING (R-D2-3b), and neither does a failed
                 // persist: a row must never testify to coverage the
-                // persisted buffer lacks. M4 extends this same hook with
-                // the persist-currency marker stamp.
+                // persisted buffer lacks.
                 entity.mark_applied(outcomes.iter().filter_map(|(id, o)| match o {
                     IngestOutcome::Applied
                     | IngestOutcome::Skipped(SkipReason::AlreadyIntegrated)

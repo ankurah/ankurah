@@ -14,7 +14,9 @@ use proto::Attested;
 
 /// PersistState adapter for the ingest pipeline: attestation needs the
 /// node's PolicyAgent, so the feeder supplies persistence. Shared by the
-/// applier arms and the node's Get response lane.
+/// applier arms, the node's Get response lane, and the local commit lane:
+/// every resident persist funnels through here, which is what makes this
+/// the ONE home for the persist-currency discipline (D2-6).
 pub(crate) struct NodePersist<'a, SE, PA>
 where
     SE: StorageEngine + Send + Sync + 'static,
@@ -30,8 +32,28 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
+    /// Persist the resident's current state, ELIDING the write when the
+    /// persist-currency marker proves a completed set_state already covers
+    /// exactly the current head in the current reset epoch (D2-6,
+    /// obligations (b) and (c); the sanctioned re-introduction of the
+    /// elision ef68e081 removed, now keyed on completed-persist testimony
+    /// instead of no-op applies, so the two-lane interleaving R-D2-4c pins
+    /// cannot re-open: a sibling lane's in-flight persist has not stamped
+    /// yet, and its head advance defeats the head conjunct anyway).
+    ///
+    /// The reset epoch is captured BEFORE the persist begins and the
+    /// captured value is stamped at completion, so a persist straddling a
+    /// hard_reset stamps the pre-reset epoch and its marker is never
+    /// trusted. The marker stamps the exact head save_state serialized
+    /// (returned by it), never a re-read.
     async fn persist(&self, entity: &crate::entity::Entity) -> Result<(), MutationError> {
-        NodeApplier::save_state(self.node, entity, self.collection).await
+        let epoch = self.node.entities.reset_epoch();
+        if entity.persist_marker_current(epoch) {
+            return Ok(());
+        }
+        let persisted_head = NodeApplier::save_state(self.node, entity, self.collection).await?;
+        entity.stamp_persist_marker(epoch, persisted_head);
+        Ok(())
     }
 }
 
@@ -313,21 +335,27 @@ impl NodeApplier {
         Ok(())
     }
 
+    /// Serialize, attest, and persist the resident's current state.
+    /// Returns the HEAD the completed set_state wrote (the snapshot
+    /// to_state read under the entity lock, which may lag a concurrent
+    /// advance): the persist-currency marker must stamp exactly what was
+    /// persisted, never a re-read.
     async fn save_state<SE, PA>(
         node: &Node<SE, PA>,
         entity: &crate::entity::Entity,
         collection_wrapper: &crate::storage::StorageCollectionWrapper,
-    ) -> Result<(), MutationError>
+    ) -> Result<proto::Clock, MutationError>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
         let state = entity.to_state()?;
+        let persisted_head = state.head.clone();
         let entity_state = proto::EntityState { entity_id: entity.id(), model: entity.model_id()?, state };
         let attestation = node.policy_agent.attest_state(node, &entity_state);
         let attested = Attested::opt(entity_state, attestation);
         collection_wrapper.set_state(attested).await?;
-        Ok(())
+        Ok(persisted_head)
     }
 
     /// Apply multiple EntityDeltas in parallel with batched reactor notification

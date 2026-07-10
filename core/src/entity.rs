@@ -600,8 +600,8 @@ impl Entity {
 
     /// The insertion half of the shared post-persist hook (derivations
     /// section 5; plan REV 5 sections E and F): record event ids a
-    /// JUST-COMPLETED set_state of this resident proves covered. Callers
-    /// invoke this immediately after their persist call returns Ok, with
+    /// COMPLETED set_state of this resident proves covered. Callers invoke
+    /// this immediately after the persist funnel returns Ok, with
     /// exactly the lane's proven-covered ids (the executor's applied and
     /// already-integrated outcomes; the adopted head's own ids after a
     /// state-adoption persist; the local commit lane's committed event). A
@@ -610,11 +610,11 @@ impl Entity {
     /// head when the persist began is covered by every later persisted head
     /// (heads never regress).
     ///
-    /// M4 extends this same post-persist boundary with the persist-currency
-    /// marker stamp; proven-no-op VERDICT inserts (derivations 5's
-    /// consequence for D2-3.d: recording a walk's Equal/StrictAscends
-    /// conclusion without a fresh persist) stay out until that marker
-    /// exists, because only marker currency makes them sound.
+    /// The funnel's Ok includes the M4 marker ELISION (a completed persist
+    /// already covers the current head in the current epoch), which is what
+    /// makes recording proven-no-op outcomes behind it sound: derivations
+    /// 5's D2-3.d rule, enabled at this hook (the insert happens only when
+    /// a persist completed or the marker is current).
     pub(crate) fn mark_applied<I: IntoIterator<Item = EventId>>(&self, ids: I) {
         let mut state = self.state.write().unwrap();
         for id in ids {
@@ -819,9 +819,14 @@ impl Entity {
             // callers (the planner's backfill escape and the executor's
             // Ok(false) arm re-check event_stored), so a member whose log
             // row is missing still gets its backfill. The walk's own
-            // Equal/StrictAscends conclusions below are NOT recorded here:
-            // proven-no-op verdict inserts need the M4 persist-currency
-            // marker (derivations 5's consequence for D2-3.d).
+            // Equal/StrictAscends conclusions below are still NOT recorded
+            // HERE: derivations 5's D2-3.d (proven-no-op verdict inserts
+            // gated on marker currency) is enabled at the POST-PERSIST
+            // hook, where the executor records no-op skip outcomes behind
+            // the funnel's marker-checked persist-or-elide; recording at
+            // this site instead would need the reset epoch, which the
+            // entity deliberately does not hold (M4 report carries the
+            // deferral rationale).
             let already_incorporated = self.state.read().unwrap().applied.contains(&event_id);
             if already_incorporated {
                 debug!("applied-set hit - already incorporated, skip");
@@ -1228,6 +1233,95 @@ mod applied_set_tests {
         assert!(entity.applied_contains(&id(7)));
         let fork = entity.snapshot(Arc::new(AtomicBool::new(true)));
         assert!(!fork.applied_contains(&id(7)), "the applied-set never forks (D2-5)");
+    }
+}
+
+#[cfg(test)]
+mod persist_marker_tests {
+    use super::*;
+
+    fn id(b: u8) -> EventId { EventId::from_bytes([b; 32]) }
+
+    /// THE MARKER-RACE PIN, mechanism seam (maintainer ruling 2026-07-09,
+    /// replacing half of R-D2-4b): a persist that captures epoch N,
+    /// straddles a hard_reset (bump to N+1), and completes, stamps a marker
+    /// that is NEVER trusted; the next apply persists for real. Exercised
+    /// against the primitives the funnel composes: WeakEntitySet's epoch
+    /// cell (capture-before, bump = the reset instant) and the entity's
+    /// stamp/currency pair. The end-to-end variant (a real hard_reset
+    /// across a gated set_state) lives in the integration suite.
+    #[test]
+    fn marker_race_a_straddling_persist_is_never_trusted() {
+        let set = WeakEntitySet::default();
+        let entity = set.create("test".into());
+        let head: Clock = id(1).into();
+
+        // The persist begins: the epoch is captured BEFORE set_state.
+        let captured = set.reset_epoch();
+        // hard_reset lands mid-flight.
+        set.bump_reset_epoch();
+        // The persist completes and stamps the CAPTURED epoch (D2-6: never
+        // the current one; stamping the current epoch here is exactly the
+        // bug this pin exists to catch).
+        entity.stamp_persist_marker(captured, head);
+
+        assert!(
+            !entity.persist_marker_current(set.reset_epoch()),
+            "a marker stamped by a persist that straddled a reset must never be trusted: the next apply persists for real"
+        );
+
+        // Control: a persist fully inside one epoch is trusted...
+        let current = set.reset_epoch();
+        entity.stamp_persist_marker(current, entity.head());
+        assert!(entity.persist_marker_current(current), "a completed same-epoch persist of the current head elides");
+        // ...until the NEXT reset distrusts it too.
+        set.bump_reset_epoch();
+        assert!(!entity.persist_marker_current(set.reset_epoch()), "every earlier epoch's markers die at a reset");
+    }
+
+    /// The head conjunct (the other half of the elision predicate; the
+    /// R-D2-4c mechanism): a marker stamped for an older head is defeated
+    /// the moment the head advances, epoch match notwithstanding.
+    #[test]
+    fn marker_for_an_older_head_is_defeated_by_the_head_conjunct() {
+        let set = WeakEntitySet::default();
+        let entity = set.create("test".into());
+        let epoch = set.reset_epoch();
+
+        entity.stamp_persist_marker(epoch, Clock::default());
+        assert!(entity.persist_marker_current(epoch), "marker for the current (empty) head is trusted in its epoch");
+
+        // The head advances (a sibling lane's apply); the old marker lies
+        // about coverage and must not elide.
+        entity.commit_head(&Event {
+            entity_id: entity.id(),
+            collection: "test".into(),
+            operations: OperationSet(BTreeMap::new()),
+            parent: Clock::default(),
+            generation: 1,
+        });
+        assert!(!entity.persist_marker_current(epoch), "a marker naming an older head must never elide the newer head's persist");
+    }
+
+    /// The purge (REV 5 section D.1) at the mechanism seam: the map goes
+    /// EMPTY (dead weak entries included), held strong references keep
+    /// working, and the purged id resolves to None.
+    #[test]
+    fn purge_empties_the_map_without_touching_held_entities() {
+        let set = WeakEntitySet::default();
+        let held = set.create("test".into());
+        let held_id = held.id();
+        // A dead weak entry: the strong reference from create drops at the
+        // end of the statement, leaving a tombstone in the map.
+        let dropped_id = set.create("test".into()).id();
+        assert!(set.get(&dropped_id).is_none(), "precondition: the entry is a dead weak (upgrade fails)");
+        assert_eq!(set.resident_count(), 2, "precondition: live and dead entries populate the map");
+
+        set.purge();
+
+        assert_eq!(set.resident_count(), 0, "the purge clears the map, tombstones included");
+        assert!(set.get(&held_id).is_none(), "a purged id is unreachable even while strongly held elsewhere");
+        assert_eq!(held.id(), held_id, "the held reference itself stays alive and readable");
     }
 }
 
