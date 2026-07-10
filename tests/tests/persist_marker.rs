@@ -586,3 +586,88 @@ async fn hard_reset_is_not_porous_to_inflight_materialization() -> Result<()> {
     assert_eq!(node.resident_count_for_test(), 0, "the map holds nothing after the reset");
     Ok(())
 }
+
+/// THE EPOCH-CONJUNCT PIN (M4 remediation item 2, adversarial finding 4,
+/// reshaped by the reset fence): a marker stamped BEFORE a hard_reset, on
+/// a resident that survives the purge only through held strong
+/// references, must never be trusted afterward, even though its HEAD
+/// still matches (the one corner where the epoch conjunct is the sole
+/// standing defense: the purge covers every map-resolved lane, and any
+/// head advance would defeat the marker anyway).
+///
+/// GREEN FROM BIRTH, per the M4 red-first convention's exception clause:
+/// the epoch conjunct has existed since the marker landed (8a718607), so
+/// no red is constructible without first breaking production code. Teeth
+/// were verified by hostile edit instead (dropping the epoch comparison
+/// from persist_marker_current turns exactly this pin red; evidence in
+/// the commit body). Note on the finding's original shape: it asked to
+/// pin the funnel's capture-epoch-BEFORE-the-await ordering, but the
+/// reset fence (item 5) made that ordering unobservable, in the good
+/// way: no reset step can interleave a fenced persist span, so capture
+/// placement within the span cannot matter. What remains load-bearing,
+/// and is pinned here through the REAL funnel at an unchanged head, is
+/// the conjunct itself.
+#[tokio::test]
+async fn a_pre_reset_marker_at_an_unchanged_head_is_never_trusted() -> Result<()> {
+    let engine = Arc::new(InstrumentedEngine::new(SledStorageEngine::new_test()?));
+    let instruments = engine.instruments();
+    let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
+    node.system.create().await?;
+    let ctx = node.context_async(c).await;
+
+    let (rec_id, _view, genesis) = {
+        let trx = ctx.begin();
+        let rec = trx.create(&Record { title: "t0".to_owned(), artist: "a0".to_owned() }).await?;
+        let id = rec.id();
+        let view = rec.read();
+        let mut events = trx.commit_and_return_events().await?;
+        (id, view, events.remove(0))
+    };
+    // The held STRONG entity is the post-purge survivor this pin drives.
+    let held = node.get_resident_entity(rec_id).expect("resident");
+
+    // Lane A: E1 applies (head [E1]); its persist parks at the engine with
+    // the pre-reset epoch captured inside its fenced span.
+    let e1 = ankurah_tests::forge::event_with_parents(rec_id, Record::collection(), title_ops("t1"), &[&genesis]);
+    instruments.close_gate();
+    let lane_a = {
+        let node = node.clone();
+        let e1 = e1.clone();
+        tokio::spawn(
+            async move { node.commit_remote_transaction(&c, proto::TransactionId::new(), vec![proto::Attested::opt(e1, None)]).await },
+        )
+    };
+    instruments.wait_until_parked(1).await;
+
+    // The reset queues behind the fence; the release drains lane A first
+    // (write into pre-wipe storage, stamp of the PRE-reset epoch), then
+    // the reset bumps, purges, and wipes.
+    let reset = {
+        let node = node.clone();
+        tokio::spawn(async move { node.system.hard_reset().await })
+    };
+    instruments.open_gate();
+    lane_a.await?.expect("the drained persist completes cleanly before the wipe");
+    reset.await??;
+
+    // The held resident still heads [E1], exactly what the marker names;
+    // only the epoch distinguishes the dead testimony from a live one.
+    assert!(held.head().contains(&e1.id()), "precondition: the held resident's head is unchanged since the stamp");
+    assert!(
+        !held.persist_marker_current_for_test(node.reset_epoch_for_test()),
+        "the epoch conjunct: a marker stamped before the reset must not be current under the successor epoch, \
+         even at an unchanged head"
+    );
+
+    // And the funnel itself refuses the dead testimony: a driven persist
+    // of the held resident WRITES (the epoch conjunct is the only defense
+    // standing; an elision here would trust a dead epoch's marker).
+    let baseline = instruments.set_state_attempts();
+    node.funnel_persist_for_test(&held).await?;
+    assert_eq!(
+        instruments.set_state_attempts() - baseline,
+        1,
+        "a funnel persist of the held resident after the reset must WRITE, never elide on the dead epoch's marker"
+    );
+    Ok(())
+}

@@ -608,14 +608,23 @@ impl Entity {
     /// Whether the marker proves a persist of the CURRENT head in the
     /// CURRENT reset epoch already completed (D2-6 elision predicate):
     /// `marker.epoch == epoch AND marker.head == current head`. A marker
-    /// stamped by a persist that straddled a hard_reset carries the
-    /// pre-reset epoch and never satisfies this; a marker stamped for an
-    /// older head is defeated by the head comparison (the ef68e081 two-lane
+    /// stamped before a hard_reset carries a dead epoch and never
+    /// satisfies this (the fence orders every stamp against the reset, so
+    /// "stamped before" is well defined); a marker stamped for an older
+    /// head is defeated by the head comparison (the ef68e081 two-lane
     /// interleaving, R-D2-4c).
     pub(crate) fn persist_marker_current(&self, epoch: u64) -> bool {
         let state = self.state.read().unwrap();
         matches!(&state.marker, Some(marker) if marker.epoch == epoch && marker.head == state.head)
     }
+
+    /// TEST ONLY: the D2-6 elision predicate against an explicit epoch.
+    /// The epoch-conjunct pin asserts a pre-reset marker is not current
+    /// under the successor epoch even though its head still matches.
+    ///
+    /// Requires the `test-helpers` feature to be enabled.
+    #[cfg(feature = "test-helpers")]
+    pub fn persist_marker_current_for_test(&self, epoch: u64) -> bool { self.persist_marker_current(epoch) }
 
     /// The insertion half of the shared post-persist hook (derivations
     /// section 5; plan REV 5 sections E and F): record event ids a
