@@ -139,12 +139,14 @@ where
         let attested_event: Attested<Event> = event.clone().into();
         event_getter.commit_event(&attested_event).await?;
         // Now get the entity state after the head is updated.
-        // DOCUMENTED SAFE BYPASS (D2, REV 5 section G, alongside
+        // DOCUMENTED SAFE BYPASS (D2-6, REV 5 section G, alongside
         // join_system's below): this raw set_state skips the shared
-        // post-persist hook, so the root's applied-set (and, at M4, its
-        // persist marker) simply lag: a later redelivery of the genesis
-        // walks to its no-op instead of skipping O(1). Safe direction,
-        // runs once at system creation.
+        // persist funnel, so the root's applied-set and persist marker
+        // simply LAG: a later redelivery of the genesis walks to its
+        // no-op instead of skipping O(1), and its first funnel persist
+        // writes redundantly instead of eliding. Lagging is the safe
+        // direction (a marker may never LEAD storage); runs once at
+        // system creation.
         let attested_state: Attested<EntityState> = system_entity.to_entity_state()?.into();
         storage.set_state(attested_state.clone()).await?;
 
@@ -224,10 +226,12 @@ where
 
         // Set the state.
         // DOCUMENTED SAFE BYPASS (D2-6; REV 5 section G): the verbatim
-        // persist of the peer's attested bytes skips the shared
-        // post-persist hook, so the adopted root's applied-set (and, at
-        // M4, its persist marker) lag: redeliveries walk instead of
-        // skipping O(1). Safe direction, preserves attestation provenance.
+        // persist of the peer's attested bytes skips the shared persist
+        // funnel, so the adopted root's applied-set and persist marker
+        // LAG: redeliveries walk instead of skipping O(1) and the first
+        // funnel persist writes redundantly instead of eliding. Lagging
+        // is the safe direction (a marker may never LEAD storage);
+        // preserves attestation provenance.
         storage.set_state(state.clone()).await?;
 
         // Set root and mark system as ready
@@ -250,6 +254,23 @@ where
     /// This is used when an ephemeral node needs to join a system with a different root.
     /// **This is a destructive operation and should be used with extreme caution.**
     pub async fn hard_reset(&self) -> Result<()> {
+        // The reset epoch bump comes FIRST (D2-6): from this instant, every
+        // persist that captured the previous epoch stamps a marker that is
+        // never trusted, so no persist the successor system needs can be
+        // elided on the dead system's testimony. Memory-only; nothing
+        // persisted.
+        self.0.entities.bump_reset_epoch();
+
+        // The purge (REV 5 section D.1, the one-id-one-system invariant):
+        // every entry in the resident map at reset time belongs to the dead
+        // system by definition, so clear the map, taking only the map's own
+        // lock (no entity locks, no lock-order hazard, no sweep). Stale
+        // residents become unreachable from ingest immediately, before the
+        // storage wipe below; holders of strong references keep their
+        // frozen snapshots. This also drops the accumulated dead weak
+        // entries.
+        self.0.entities.purge();
+
         // Delete all collections from storage
         self.0.collectionset.delete_all_collections().await?;
 

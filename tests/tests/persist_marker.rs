@@ -10,7 +10,7 @@ mod common;
 
 use ankurah::core::property::backend::{lww::LWWBackend, PropertyBackend};
 use ankurah::policy::DEFAULT_CONTEXT as c;
-use ankurah::{proto, Node, PermissiveAgent};
+use ankurah::{proto, Mutable, Node, PermissiveAgent};
 use anyhow::Result;
 use common::*;
 use std::collections::BTreeMap;
@@ -43,16 +43,22 @@ async fn r_d2_4a_current_noop_redelivery_produces_zero_set_state_calls() -> Resu
     let ctx = node.context_async(c).await;
 
     // Create the record; the commit's own persist completes and (with M4)
-    // stamps the marker for the current head.
-    let (rec_id, genesis) = {
+    // stamps the marker for the current head. The fork's view is held
+    // across the commit so the canonical resident (whose marker the commit
+    // stamped) STAYS resident: markers live on the resident instance and
+    // are stamped only by completed set_states, so a dropped-and-rehydrated
+    // resident legitimately starts unmarked and pays one redundant write
+    // before its own marker takes over.
+    let (rec_id, view, genesis) = {
         let trx = ctx.begin();
         let rec = trx.create(&Record { title: "t0".to_owned(), artist: "a0".to_owned() }).await?;
         let id = rec.id();
+        let view = rec.read();
         let mut events = trx.commit_and_return_events().await?;
-        (id, events.remove(0))
+        (id, view, events.remove(0))
     };
-    let view = ctx.get::<RecordView>(rec_id).await?;
     assert_eq!(view.title().unwrap(), "t0", "precondition: the record is resident and current");
+    assert!(node.get_resident_entity(rec_id).is_some(), "precondition: the canonical stayed resident across the commit");
 
     // Redeliver the same event: a current no-op.
     let baseline = instruments.set_state_attempts();
@@ -129,14 +135,16 @@ async fn r_d2_4c_two_lane_interleaving_defeats_the_marker_where_current_markers_
     node.system.create().await?;
     let ctx = node.context_async(c).await;
 
-    let (rec_id, genesis) = {
+    // Held view keeps the canonical (and its stamped marker) resident, as
+    // in R-D2-4a above.
+    let (rec_id, view, genesis) = {
         let trx = ctx.begin();
         let rec = trx.create(&Record { title: "t0".to_owned(), artist: "a0".to_owned() }).await?;
         let id = rec.id();
+        let view = rec.read();
         let mut events = trx.commit_and_return_events().await?;
-        (id, events.remove(0))
+        (id, view, events.remove(0))
     };
-    let view = ctx.get::<RecordView>(rec_id).await?;
 
     // ELISION CONTROL: marker current, redelivery writes nothing.
     let baseline = instruments.set_state_attempts();
@@ -163,7 +171,11 @@ async fn r_d2_4c_two_lane_interleaving_defeats_the_marker_where_current_markers_
         )
     };
     instruments.wait_until_parked(1).await;
-    assert!(view.entity().head().contains(&e1.id()), "precondition: lane A advanced the resident in memory; its persist is in flight");
+    let _ = &view; // the held view keeps the canonical resident throughout
+    assert!(
+        node.get_resident_entity(rec_id).expect("still resident").head().contains(&e1.id()),
+        "precondition: lane A advanced the resident in memory; its persist is in flight"
+    );
 
     // Lane B: the same event again, while A is parked. B's apply is a
     // no-op, but the marker still names the PRE-A head: B must persist.
@@ -185,6 +197,81 @@ async fn r_d2_4c_two_lane_interleaving_defeats_the_marker_where_current_markers_
         2,
         "R-D2-4c: lane B's persist must happen while lane A's is in flight (head mismatch defeats the marker); \
          one write means the elision resurrected the ef68e081 race, three means double-writing"
+    );
+    Ok(())
+}
+
+/// THE MARKER-RACE PIN, end-to-end variant (maintainer ruling 2026-07-09;
+/// the mechanism-seam pin lives in core's entity persist_marker_tests): a
+/// persist holds open at the storage gate ACROSS a real hard_reset and
+/// completes after it. Its marker carries the pre-reset epoch and is never
+/// trusted, and the purge already made the stale resident unreachable, so
+/// the next delivery of the same event materializes fresh from whatever
+/// the straddling persist left behind and PERSISTS FOR REAL (observed at
+/// the storage boundary), rather than being elided on dead-system
+/// testimony.
+#[tokio::test]
+async fn straddling_persist_is_never_trusted_end_to_end() -> Result<()> {
+    let engine = InstrumentedEngine::new(SledStorageEngine::new_test()?);
+    let instruments = engine.instruments();
+    let node = Node::new_durable(Arc::new(engine), PermissiveAgent::new());
+    node.system.create().await?;
+    let ctx = node.context_async(c).await;
+
+    // The held view keeps the canonical resident so lane A's straddling
+    // persist targets the SAME instance the marker semantics protect.
+    let (rec_id, _view, genesis) = {
+        let trx = ctx.begin();
+        let rec = trx.create(&Record { title: "t0".to_owned(), artist: "a0".to_owned() }).await?;
+        let id = rec.id();
+        let view = rec.read();
+        let mut events = trx.commit_and_return_events().await?;
+        (id, view, events.remove(0))
+    };
+
+    // Lane A: a fresh edit whose persist parks at the closed gate AFTER the
+    // apply and the event commit (the epoch was captured before set_state).
+    let e1 = ankurah_tests::forge::event_with_parents(rec_id, Record::collection(), title_ops("t1"), &[&genesis]);
+    instruments.close_gate();
+    let lane_a = {
+        let node = node.clone();
+        let e1 = e1.clone();
+        tokio::spawn(
+            async move { node.commit_remote_transaction(&c, proto::TransactionId::new(), vec![proto::Attested::opt(e1, None)]).await },
+        )
+    };
+    instruments.wait_until_parked(1).await;
+
+    // The reset lands mid-flight: epoch bump, purge, storage wipe. The
+    // parked set_state is untouched (only set_state is gated; the wipe
+    // goes through delete_all_collections).
+    node.system.hard_reset().await?;
+    assert_eq!(node.resident_count_for_test(), 0, "precondition: the purge emptied the map while the persist is parked");
+
+    // Release: the straddling persist resumes into post-reset storage.
+    // EITHER outcome is legitimate for a dev-only reset racing a persist:
+    // it may complete (stamping the pre-reset epoch, which the epoch
+    // conjunct then distrusts forever, the mechanism pin) or fail loudly
+    // against the wiped engine (sled drops its trees; the open handle
+    // errors). What may NEVER happen is the successor system trusting
+    // anything the straddler left behind.
+    instruments.open_gate();
+    let straddle_outcome = lane_a.await?;
+
+    // The successor system starts over: the record's GENESIS delivers into
+    // the wiped system (the one-id-one-system invariant makes redelivering
+    // descendants of the dead system illegitimate; this pin only needs A
+    // delivery on this id to persist for real). The purge made the stale
+    // marker unreachable, and even a reachable one would fail the epoch
+    // conjunct.
+    let baseline = instruments.set_state_attempts();
+    node.commit_remote_transaction(&c, proto::TransactionId::new(), vec![proto::Attested::opt(genesis.clone(), None)])
+        .await
+        .expect("the post-reset delivery is clean");
+    assert!(
+        instruments.set_state_attempts() - baseline >= 1,
+        "the marker-race pin: after a straddling persist (outcome: {straddle_outcome:?}), the next apply must persist for real \
+         (no elision on dead-system testimony)"
     );
     Ok(())
 }
