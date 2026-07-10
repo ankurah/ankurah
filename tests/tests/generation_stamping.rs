@@ -1,38 +1,9 @@
 mod common;
 
 use ankurah::proto;
+use ankurah_tests::common::brute_force_depths;
 use anyhow::Result;
 use common::*;
-use std::collections::HashMap;
-
-/// Recompute every event's topological level by walking parent edges over the
-/// dumped event set: depth(genesis) = 1, depth(e) = 1 + max(depth(parents)).
-/// This is the brute-force oracle R-D2-2a compares stamped generations
-/// against (plan REV 4 section 3 M2; 266-A defines the level). The recursion
-/// is a transient assertion-time walk over event payloads, not a store.
-fn brute_force_depths(events: &[proto::Attested<proto::Event>]) -> HashMap<proto::EventId, u32> {
-    let by_id: HashMap<proto::EventId, &proto::Event> = events.iter().map(|e| (e.payload.id(), &e.payload)).collect();
-
-    fn depth(id: &proto::EventId, by_id: &HashMap<proto::EventId, &proto::Event>, memo: &mut HashMap<proto::EventId, u32>) -> u32 {
-        if let Some(d) = memo.get(id) {
-            return *d;
-        }
-        let event = by_id.get(id).unwrap_or_else(|| panic!("parent event {id} missing from the dumped set; the oracle needs full lineage"));
-        let d = if event.parent.is_empty() {
-            1
-        } else {
-            1 + event.parent.iter().map(|p| depth(p, by_id, memo)).max().expect("nonempty parent clock")
-        };
-        memo.insert(id.clone(), d);
-        d
-    }
-
-    let mut memo = HashMap::new();
-    for e in events {
-        depth(&e.payload.id(), &by_id, &mut memo);
-    }
-    memo
-}
 
 /// Assert every stored event's carried generation equals its brute-force
 /// topological depth, and return (event count, max depth) for shape checks.

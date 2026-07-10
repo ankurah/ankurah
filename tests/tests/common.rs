@@ -765,6 +765,13 @@ impl<G: ankurah::core::retrieval::SuspenseEvents + Send + Sync> ankurah::core::r
 #[derive(Clone)]
 pub struct StorageInstruments {
     set_state_attempts: Arc<std::sync::atomic::AtomicUsize>,
+    /// Event reads at the STORAGE boundary (get_events calls; each call may
+    /// carry several ids). The honest observable for "this flow read no
+    /// event payloads" claims: the D2 M5 rehydration pin asserts the GClock
+    /// reconstitutes with ZERO event reads (REV 5 K), and walk-count
+    /// characterizations read it as their denominator. Flagged as an M5
+    /// fixture debt by the M4 test-adequacy panel.
+    get_events_calls: Arc<std::sync::atomic::AtomicUsize>,
     gate_open: Arc<tokio::sync::watch::Sender<bool>>,
     gate_rx: tokio::sync::watch::Receiver<bool>,
     parked: Arc<std::sync::atomic::AtomicUsize>,
@@ -797,6 +804,7 @@ impl StorageInstruments {
         let (get_tx, get_rx) = tokio::sync::watch::channel(0u64);
         Self {
             set_state_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            get_events_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             gate_open: Arc::new(tx),
             gate_rx: rx,
             parked: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -814,6 +822,9 @@ impl StorageInstruments {
     /// Number of set_state calls OBSERVED AT ENTRY since construction
     /// (parked calls count; they were attempted).
     pub fn set_state_attempts(&self) -> usize { self.set_state_attempts.load(std::sync::atomic::Ordering::SeqCst) }
+
+    /// Number of get_events calls at the storage boundary since construction.
+    pub fn get_events_calls(&self) -> usize { self.get_events_calls.load(std::sync::atomic::Ordering::SeqCst) }
 
     /// Close the gate: subsequent set_state calls park until reopened.
     pub fn close_gate(&self) { let _ = self.gate_open.send(false); }
@@ -993,6 +1004,7 @@ impl ankurah::core::storage::StorageCollection for InstrumentedCollection {
         &self,
         event_ids: Vec<proto::EventId>,
     ) -> Result<Vec<proto::Attested<proto::Event>>, ankurah::core::error::RetrievalError> {
+        self.instruments.get_events_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.inner.get_events(event_ids).await
     }
     async fn has_event(&self, event_id: &proto::EventId) -> Result<bool, ankurah::core::error::RetrievalError> {
