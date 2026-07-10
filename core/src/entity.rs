@@ -140,18 +140,6 @@ impl EntityInner {
     /// (read / write / subscribe). Same resolution as the internal read path.
     pub(crate) fn property_key(&self, name: &str) -> PropertyKey { self.resolve_key(name) }
 
-    /// The cross-contract same-display-name id set for the RFC 5.4 sibling gate
-    /// (empty when no resolver is stamped).
-    pub(crate) fn siblings(&self, name: &str) -> Vec<EntityId> { self.resolver().map(|r| r.siblings(name)).unwrap_or_default() }
-
-    /// Whether the stamped catalog can name this property-definition id at
-    /// all -- the foreign-data gate input for the bound checked read (plan
-    /// decision 15: data under an id the catalog cannot resolve is another
-    /// system's allocation). An UNBOUND entity (no resolver) answers `true`
-    /// for everything: with no catalog there is no notion of foreign, and the
-    /// gate stays off.
-    pub(crate) fn catalog_knows_id(&self, id: &EntityId) -> bool { self.resolver().map_or(true, |r| r.name_for(id).is_some()) }
-
     /// Defensive canonicalization at the read/evaluation boundary (rfc.md 5.6
     /// as amended 2026-07-10): commits canonicalize writes, but ingest is
     /// deliberately schema-blind (catalog lag), so a legacy or ill-typed
@@ -184,36 +172,42 @@ impl EntityInner {
         }
     }
 
-    /// Lenient read of `name`: resolve to the id, then the Id-then-legacy-Name
-    /// presence dispatch ([`crate::property::lww_read_lenient`]) -- an id key
-    /// present (even cleared) is authoritative and never resurrects a stale
-    /// legacy name value (the PropertyKey amendment, #289).
+    /// Read `name` for evaluation and lenient consumers: resolve to the id,
+    /// then run the generic Id-then-legacy-Name presence dispatch
+    /// ([`crate::property::read_resolved`]) uniformly over every backend --
+    /// an id key present (even cleared) is authoritative and never resurrects
+    /// a stale legacy name value (the PropertyKey amendment, #289). A field
+    /// belongs to exactly one backend per schema, so the first backend
+    /// holding an entry wins; there is no per-backend special-casing here
+    /// (backends are addressed only through the [`PropertyBackend`] trait).
     fn read_lenient(&self, name: &str) -> Option<Value> {
         let state = self.state.read().expect("other thread panicked, panic here too");
         match self.resolve_key(name) {
-            PropertyKey::Id(id) => {
-                let lww_name = crate::property::backend::LWWBackend::property_backend_name();
-                if let Some(backend) = state.backends.get(lww_name) {
-                    if let Ok(lww) = backend.clone().as_arc_dyn_any().downcast::<crate::property::backend::LWWBackend>() {
-                        if let Some(value) = crate::property::lww_read_lenient(&lww, id, name) {
-                            return self.canonicalize_lenient(&id, value);
-                        }
-                    }
-                }
-                // Non-LWW backends (yrs): id key, then bare name residue.
-                state
-                    .backends
-                    .iter()
-                    .filter(|(backend_name, _)| backend_name.as_str() != lww_name)
-                    .find_map(|(_, backend)| {
-                        backend
-                            .property_value(&PropertyKey::Id(id))
-                            .or_else(|| backend.property_value(&PropertyKey::Name(name.to_string())))
-                    })
-                    .and_then(|value| self.canonicalize_lenient(&id, value))
-            }
+            PropertyKey::Id(id) => state
+                .backends
+                .values()
+                .find_map(|backend| crate::property::read_resolved(backend.as_ref(), id, name))
+                .and_then(|value| self.canonicalize_lenient(&id, value)),
             key @ PropertyKey::Name(_) => state.backends.values().find_map(|backend| backend.property_value(&key)),
         }
+    }
+
+    /// Read for RESOLVED-identifier predicate evaluation: the same generic
+    /// dispatch with the caller-supplied property id (no name re-resolution),
+    /// canonicalized at the evaluation boundary. Absent evaluates NULL (plan
+    /// decision 14). Evaluation has no error surface: type admission is
+    /// registration's job (the canonical value_type ruling, 2026-07-10), and
+    /// an ill-typed stored value reads as NULL with a warning.
+    pub(crate) fn read_resolved_eval(&self, property_id: EntityId, name: &str) -> Option<Value> {
+        if name == "id" {
+            return Some(Value::EntityId(self.id));
+        }
+        let state = self.state.read().expect("other thread panicked, panic here too");
+        state
+            .backends
+            .values()
+            .find_map(|backend| crate::property::read_resolved(backend.as_ref(), property_id, name))
+            .and_then(|value| self.canonicalize_lenient(&property_id, value))
     }
 }
 
@@ -241,31 +235,28 @@ impl Entity {
             return Ok(());
         };
         let collection = self.collection.as_str();
-        let lww_name = crate::property::backend::LWWBackend::property_backend_name();
         let state = self.state.read().expect("other thread panicked, panic here too");
-        for (backend_name, backend) in state.backends.iter() {
+        for backend in state.backends.values() {
             for key in backend.uncommitted_keys() {
                 if let PropertyKey::Name(name) = &key {
                     if let Some(id) = resolver.resolve(collection, name) {
                         backend.rekey(&key, PropertyKey::Id(id));
-                        // Canonicalize the staged value. LWW only: it is the
-                        // Value-typed backend; yrs is string-only and its
-                        // canonical type is pinned by backend equality at
-                        // registration. A staged clear (tombstone) has no
-                        // value to cast. An unknown canonical string (a newer
-                        // fleet's type) writes as compiled: registration
-                        // admitted this binary, so the types were equal.
-                        if backend_name.as_str() == lww_name {
-                            if let Some(target) =
-                                resolver.canonical_value_type(&id).and_then(|c| crate::value::ValueType::from_property_str(&c))
-                            {
-                                if let Ok(lww) = backend.clone().as_arc_dyn_any().downcast::<crate::property::backend::LWWBackend>() {
-                                    if let Some(Some(value)) = lww.entry(&PropertyKey::Id(id)) {
-                                        if crate::value::ValueType::of(&value) != target {
-                                            let cast = value.cast_to(target)?;
-                                            lww.set(PropertyKey::Id(id), Some(cast));
-                                        }
-                                    }
+                        // Canonicalize the staged value through the generic
+                        // trait primitives (`entry` / `restage`): a backend
+                        // whose edits are not value-shaped (a text CRDT)
+                        // stages nothing and restages nothing. A staged clear
+                        // (tombstone) has no value to cast. An unknown
+                        // canonical string (a newer fleet's type) writes as
+                        // compiled: registration admitted this binary, so
+                        // the types were equal.
+                        if let Some(target) =
+                            resolver.canonical_value_type(&id).and_then(|c| crate::value::ValueType::from_property_str(&c))
+                        {
+                            let staged = PropertyKey::Id(id);
+                            if let Some(Some(value)) = backend.entry(&staged) {
+                                if crate::value::ValueType::of(&value) != target {
+                                    let cast = value.cast_to(target)?;
+                                    backend.restage(&staged, Some(cast));
                                 }
                             }
                         }
@@ -727,54 +718,9 @@ impl Filterable for Entity {
         }
     }
 
-    /// Checked read for RESOLVED-identifier predicate evaluation (RFC 5.4),
-    /// via the catalog-side dispatch [`crate::property::lww_read_checked`] --
-    /// so a same-display-name retype lineage sitting on this entity fails
-    /// visible (`TypeSkew`) instead of evaluating as a silent NULL -- then
-    /// falls back to the other backends (yrs etc.) via the lenient
-    /// `property_value`. The sibling gate is LWW-vs-LWW only; yrs-vs-LWW
-    /// same-name conflicts are pre-existing pathology out of scope for the
-    /// Phase A gate (A10 spec scope note).
-    fn value_checked(&self, property_id: EntityId, name: &str) -> Result<Option<Value>, crate::property::PropertyError> {
-        if name == "id" {
-            return Ok(Some(Value::EntityId(self.id)));
-        }
-        let state = self.state.read().expect("other thread panicked, panic here too");
-        let lww_name = crate::property::backend::LWWBackend::property_backend_name();
-        // The sibling gate (RFC 5.4 rule 4) needs the cross-contract same-name
-        // id set; supply it from the stamped catalog resolver (absent -> no
-        // gate, e.g. a bare entity). A `TypeSkew` here is a real cross-lineage
-        // collision and must propagate, not be masked by a later backend's
-        // lenient read. Absent and not skewed: fall through to the other
-        // backends before concluding NULL.
-        let siblings = self.resolver().map(|r| r.siblings(name)).unwrap_or_default();
-        if let Some(backend) = state.backends.get(lww_name) {
-            if let Ok(lww) = backend.clone().as_arc_dyn_any().downcast::<crate::property::backend::LWWBackend>() {
-                // `|_| true` disables the foreign-data gate: predicate
-                // evaluation treats absent as NULL by design (plan decision
-                // 14), so it fabricates nothing a foreign value could be
-                // shadowed by; the gate is the bound GETTER's concern
-                // (property/value/lww.rs).
-                if let Some(value) = crate::property::lww_read_checked(&lww, property_id, name, &siblings, |_| true)? {
-                    // Canonical-type normalization for the evaluation
-                    // boundary; junk reads as NULL (decision 14), it does not
-                    // fall through to another backend.
-                    return Ok(self.canonicalize_lenient(&property_id, value));
-                }
-            }
-        }
-        // Non-LWW backends (yrs): lenient id-then-name read, no gate.
-        Ok(state
-            .backends
-            .iter()
-            .filter(|(backend_name, _)| backend_name.as_str() != lww_name)
-            .find_map(|(_, backend)| {
-                backend
-                    .property_value(&PropertyKey::Id(property_id))
-                    .or_else(|| backend.property_value(&PropertyKey::Name(name.to_string())))
-            })
-            .and_then(|value| self.canonicalize_lenient(&property_id, value)))
-    }
+    /// Read for RESOLVED-identifier predicate evaluation, via the shared
+    /// [`EntityInner::read_resolved_eval`] dispatch.
+    fn value_resolved(&self, property_id: EntityId, name: &str) -> Option<Value> { self.0.read_resolved_eval(property_id, name) }
 }
 
 impl TemporaryEntity {
@@ -839,43 +785,11 @@ impl Filterable for TemporaryEntity {
         }
     }
 
-    /// Checked read for RESOLVED-identifier predicate evaluation (RFC 5.4),
-    /// mirroring [`Entity::value_checked`] via the same catalog-side dispatch
-    /// ([`crate::property::lww_read_checked`]): a present id entry is
-    /// authoritative, then the legacy Name residue, then the other backends
-    /// via the lenient `property_value`. A `TemporaryEntity` has no resolver,
-    /// so its sibling set is empty (no gate): the caller-supplied resolved id
-    /// is the only schema knowledge in play.
-    fn value_checked(&self, property_id: EntityId, name: &str) -> Result<Option<Value>, crate::property::PropertyError> {
-        if name == "id" {
-            return Ok(Some(Value::EntityId(self.0.id)));
-        }
-        let state = self.0.state.read().expect("other thread panicked, panic here too");
-        let lww_name = crate::property::backend::LWWBackend::property_backend_name();
-        if let Some(backend) = state.backends.get(lww_name) {
-            if let Ok(lww) = backend.clone().as_arc_dyn_any().downcast::<crate::property::backend::LWWBackend>() {
-                // Unbound (no resolver): no sibling set and no foreign-data
-                // gate -- the caller-supplied resolved id is the only schema
-                // knowledge in play.
-                if let Some(value) = crate::property::lww_read_checked(&lww, property_id, name, &[], |_| true)? {
-                    // Canonical-type normalization when a resolver is bound
-                    // (new_bound); an unbound temporary passes through.
-                    return Ok(self.0.canonicalize_lenient(&property_id, value));
-                }
-            }
-        }
-        // Non-LWW backends (yrs): lenient id-then-name read, no gate.
-        Ok(state
-            .backends
-            .iter()
-            .filter(|(backend_name, _)| backend_name.as_str() != lww_name)
-            .find_map(|(_, backend)| {
-                backend
-                    .property_value(&PropertyKey::Id(property_id))
-                    .or_else(|| backend.property_value(&PropertyKey::Name(name.to_string())))
-            })
-            .and_then(|value| self.0.canonicalize_lenient(&property_id, value)))
-    }
+    /// Read for RESOLVED-identifier predicate evaluation, via the shared
+    /// [`EntityInner::read_resolved_eval`] dispatch. An unbound temporary (no
+    /// resolver) skips canonicalization: the caller-supplied resolved id is
+    /// the only schema knowledge in play.
+    fn value_resolved(&self, property_id: EntityId, name: &str) -> Option<Value> { self.0.read_resolved_eval(property_id, name) }
 }
 
 impl std::fmt::Display for TemporaryEntity {

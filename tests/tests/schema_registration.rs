@@ -300,7 +300,7 @@ async fn non_castable_retype_refuses_registration() -> anyhow::Result<()> {
         properties: vec![property("name", None, "lww", "binary")],
         memberships: vec![],
     };
-    expect_error(client.request(server.id, &DEFAULT_CONTEXT, retype).await?, "not compatible");
+    expect_error(client.request(server.id, &DEFAULT_CONTEXT, retype).await?, "not castable");
 
     let values = catalog_values(&server, PROPERTY, string_id).await?;
     assert_eq!(values.get("value_type"), Some(&Some(Value::String("string".into()))), "the refusal changes nothing");
@@ -322,7 +322,7 @@ async fn backend_change_refuses_registration() -> anyhow::Result<()> {
         properties: vec![property("name", None, "lww", "string")],
         memberships: vec![],
     };
-    expect_error(client.request(server.id, &DEFAULT_CONTEXT, rebackend).await?, "not compatible");
+    expect_error(client.request(server.id, &DEFAULT_CONTEXT, rebackend).await?, "not castable");
 
     let values = catalog_values(&server, PROPERTY, yrs_id).await?;
     assert_eq!(values.get("backend"), Some(&Some(Value::String("yrs".into()))), "the refusal changes nothing");

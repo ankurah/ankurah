@@ -1,14 +1,16 @@
-//! RFC 5.4 (specs/model-property-metadata/rfc.md) read-path rules with the sibling gate (work package A10).
+//! RFC 5.4 (specs/model-property-metadata/rfc.md, as amended 2026-07-10)
+//! read-path rules (work package A10).
 //!
-//! Four behaviors, pinned end to end:
-//!  1. Retype lineage (the crown): a same-display-name property from a
-//!     different property id holds data on an entity; reading the field through
-//!     the new contract is fail-visible `TypeSkew` -- from the compiled View
-//!     getter AND from a resolved-identifier predicate comparison -- never a
-//!     fabricated default over the sibling's real value (rule 4).
-//!  2. A required LWW `i64` that is absent, with NO sibling, reads the type
-//!     default `0` (rule 3, the #175 fix generalized to LWW). A required
-//!     `String` reads "", a required `bool` reads `false`.
+//! Behaviors pinned end to end:
+//!  1. Data under a DIFFERENT property id is simply not this field: the
+//!     resolved read consults exactly its own id (then legacy name residue)
+//!     and never substitutes another id's value. Type admission is
+//!     REGISTRATION's job (the canonical value_type ruling), so there is no
+//!     read-time gate and no read-time type error beyond a per-value
+//!     `NonCastable` projection failure.
+//!  2. A required LWW `i64` that is absent reads the type default `0`
+//!     (rule 3, the #175 fix generalized to LWW). A required `String` reads
+//!     "", a required `bool` reads `false`.
 //!  3. An absent OPTIONAL field reads `None`, `IS NULL` matches it, and a
 //!     comparison against it is false (rule 2 + the absent-as-NULL predicate
 //!     unification).
@@ -16,11 +18,6 @@
 //!     optional at the catalog level (`MembershipDef.optional == None`);
 //!     predicate-level required-defaults are deliberately OUT OF SCOPE for
 //!     Phase A (documented below).
-//!
-//! The cross-root transplant ruling (2026-07-05) applies throughout: the
-//! sibling gate makes a foreign value fail visible rather than silently
-//! substituting it; there is no lenient foreign-id fallback under the checked
-//! read. See `core/src/property/backend/lww.rs::get_checked`.
 
 mod common;
 
@@ -28,7 +25,7 @@ use ankurah::core::entity::Entity;
 use ankurah::core::property::backend::lww::LWWBackend;
 use ankurah::core::property::backend::PropertyBackend;
 use ankurah::core::property::value::LWW;
-use ankurah::core::property::{lww_read_checked, FromEntity, PropertyError, PropertyKey};
+use ankurah::core::property::{read_resolved, FromEntity, PropertyKey};
 use ankurah::core::selection::filter::evaluate_predicate;
 use ankurah::model::View;
 use ankurah::proto::{self, EntityId};
@@ -51,64 +48,34 @@ fn foreign_id_state_buffer(foreign_id: EntityId, value: Value, event_id: proto::
 }
 
 // ---------------------------------------------------------------------------
-// (1) Retype lineage: the sibling gate fails visible (TypeSkew) over a
-//     same-display-name sibling holding data.
+// (1) Data under a different property id is not this field: the resolved
+//     read never substitutes it (the canonical value_type ruling,
+//     2026-07-10, superseded the read-time sibling/foreign gates -- type
+//     admission is registration's job, and one live property per (model,
+//     name) is an allocator invariant).
 // ---------------------------------------------------------------------------
-//
-// POST-#289 SHAPE: the sibling gate moved off the backend's display-name scan
-// and onto the catalog-supplied `sibling_ids` set (amendment #289 point 6;
-// `ankurah_core::property::lww_read_checked(backend, resolved_id, name, sibling_ids)`,
-// dispatched OUTSIDE the backend). The backend is a
-// dumb identity store now, so name-collision detection is a catalog concern and
-// the backend does pure presence + the supplied gate. This test pins the gate
-// at that home: the compiled View getter and resolved-identifier predicate both
-// funnel through `lww_read_checked`, so exercising it directly with the two id
-// entries a retype lineage produces is the faithful expression of the intent.
-//
-// (The prior end-to-end form seeded a value under a SYNTHETIC foreign id and
-// leaned on a display-name hint + on-backend scan to make the getter skew. Both
-// the hint and the on-backend name scan were withdrawn by #289, and a synthetic
-// id is never in the catalog's `names_global`, so the resolver cannot surface it
-// as a sibling -- an end-to-end retype now requires two real same-name property
-// registrations, out of scope for this unit. The gate logic itself is unchanged
-// and is what this pins.)
 
 #[tokio::test]
-async fn retype_lineage_type_skews_through_checked_dispatch() -> anyhow::Result<()> {
-    // Two property-definition ids sharing the display name "title": A is the
-    // locally-resolved (string) lineage, B a sibling (older i64) lineage whose
-    // data is what sits on the entity -- the mid-retype / cross-root on-disk
-    // state. The backend holds the value ONLY under B (id-keyed 0xA2), nothing
-    // under A.
-    let a_string = EntityId::new();
-    let b_i64 = EntityId::new();
-    assert_ne!(a_string, b_i64, "the sibling is a distinct property id");
+async fn foreign_id_data_is_not_this_field() -> anyhow::Result<()> {
+    // Two distinct property ids: A is the locally-resolved property; B is
+    // some other id whose data sits on the entity (an out-of-band copied
+    // buffer, or another model's allocation). The backend holds the value
+    // ONLY under B (id-keyed 0xA2), nothing under A.
+    let a = EntityId::new();
+    let b = EntityId::new();
+    assert_ne!(a, b);
 
     let event_id = proto::EventId::from_bytes([9u8; 32]);
-    let buffer = foreign_id_state_buffer(b_i64, Value::I64(30), event_id.clone());
-    assert_eq!(buffer[0], 0xA2, "seeded sibling state is 0xA2 (id-keyed)");
+    let buffer = foreign_id_state_buffer(b, Value::I64(30), event_id.clone());
+    assert_eq!(buffer[0], 0xA2, "seeded state is 0xA2 (id-keyed)");
     let backend = LWWBackend::from_state_buffer(&buffer).unwrap();
 
-    // Reading `title` as A, with B supplied as a same-name sibling, fails
-    // visible (TypeSkew over B's real value) instead of fabricating a default:
-    // A is absent, and the gate finds B holding data under the shared name.
-    let err =
-        lww_read_checked(&backend, a_string, "title", &[b_i64], |_| true).expect_err("read must fail visible over the retype sibling");
-    match err {
-        PropertyError::TypeSkew { name, a, b } => {
-            assert_eq!(name, "title");
-            assert_eq!(a, a_string.to_base64(), "a names the resolved (string) lineage");
-            assert_eq!(b, b_i64.to_base64(), "b names the sibling (i64) lineage");
-        }
-        other => panic!("expected TypeSkew, got {other:?}"),
-    }
-
-    // Without the sibling in the supplied set (no catalog gate), the same absent
-    // read is a clean `Ok(None)` -- the gate is exactly the supplied-siblings
-    // input, not a property of the stored bytes. (`|_| true` also keeps the
-    // foreign-data gate off; with `|_| false` B's un-nameable data would skew
-    // via THAT gate instead, which is the bound-getter regime.)
-    assert_eq!(lww_read_checked(&backend, a_string, "title", &[], |_| true).unwrap(), None, "absent id with no gate reads None, not skew");
+    // Reading as A finds nothing: B's value is never substituted, and the
+    // read is absent (the caller then applies its absent policy). No gate,
+    // no error: registration is where type/identity admission happens.
+    assert_eq!(read_resolved(&backend, a, "title"), None, "another id's data must not substitute for this field");
+    // Reading as B finds B's value, exactly as stored.
+    assert_eq!(read_resolved(&backend, b, "title"), Some(Value::I64(30)));
 
     Ok(())
 }

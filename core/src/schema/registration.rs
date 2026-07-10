@@ -72,20 +72,13 @@ pub enum RegistrationError {
     #[error("explicit model id {model} is bound to collection '{found_collection}'; binder declares '{collection}'")]
     ExplicitModelIdMismatch { model: EntityId, found_collection: String, collection: String },
     #[error(
-        "explicit property id {property} is canonically ({found_backend}, {found_value_type}); binder declares ({backend}, {value_type}), which is not compatible (backend must match; value types must be mutually castable)"
+        "explicit property id {property} is canonically ({found_backend}, {found_value_type}); binder declares ({backend}, {value_type}), which is not castable to/from the canonical type (backend must match; value types must be mutually castable)"
     )]
     ExplicitIdMismatch { property: EntityId, found_backend: String, found_value_type: String, backend: String, value_type: String },
     #[error(
-        "property '{name}' in '{collection}' is canonically ({found_backend}, {found_value_type}); this binary declares ({backend}, {value_type}), which is not compatible (backend must match; value types must be mutually castable per Value::cast_to). The canonical type is fixed at allocation; changing it is a deliberate migration (#303), never a model-struct edit"
+        "property '{name}' in '{collection}' is canonically ({found_backend}, {found_value_type}); this binary declares ({backend}, {value_type}), which is not castable to/from the canonical type (backend must match; value types must be mutually castable per Value::cast_to). The canonical type is fixed at allocation; changing it is a deliberate migration (#303), never a model-struct edit"
     )]
-    PropertyIncompatible {
-        collection: String,
-        name: String,
-        found_backend: String,
-        found_value_type: String,
-        backend: String,
-        value_type: String,
-    },
+    NonCastable { collection: String, name: String, found_backend: String, found_value_type: String, backend: String, value_type: String },
     #[error("registration refused by policy: {0}")]
     PolicyDenied(#[from] AccessDenied),
     #[error(transparent)]
@@ -720,7 +713,7 @@ fn value_types_compatible(canonical: &str, declared: &str) -> bool {
 /// for a name-keyed upsert hit. Never mutates the found definition.
 fn check_property_compat(def: &super::catalog::PropertyDef, p: &PropertyDescriptor) -> Result<(), RegistrationError> {
     if def.backend != p.backend || !value_types_compatible(&def.value_type, &p.value_type) {
-        return Err(RegistrationError::PropertyIncompatible {
+        return Err(RegistrationError::NonCastable {
             collection: p.minting_collection.clone(),
             name: p.name.clone(),
             found_backend: def.backend.clone(),

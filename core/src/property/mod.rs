@@ -68,9 +68,6 @@ pub trait PropertyResolver: Send + Sync {
     /// collection field, or a user field not yet registered), which the caller
     /// keeps as a [`PropertyKey::Name`].
     fn resolve(&self, collection: &str, name: &str) -> Option<EntityId>;
-    /// Every live property-definition id sharing display `name` across all
-    /// contracts -- the RFC 5.4 sibling-gate input the checked read needs.
-    fn siblings(&self, name: &str) -> Vec<EntityId>;
     /// The display name of a property-definition id, if the catalog knows it:
     /// the reverse of [`resolve`](Self::resolve). Storage engines seed their
     /// durable id-to-column-name maps from this at materialization time.
@@ -97,71 +94,31 @@ pub trait PropertyResolver: Send + Sync {
     }
 }
 
-/// Checked read of a resolved property over an LWW backend: the RFC 5.4 read
-/// dispatch, on the catalog-aware side of the backend boundary (the backend
-/// itself holds no name-to-id knowledge; it only answers per-key
-/// [`backend::LWWBackend::entry`] presence).
+/// Read a resolved property from ONE backend: the read dispatch (rfc.md 5.4
+/// as amended 2026-07-10), on the catalog-aware side of the backend boundary.
+/// Generic over [`backend::PropertyBackend::entry`] -- no caller may downcast
+/// to a concrete backend for a read.
 ///
 /// Order: a PRESENT `Id(resolved_id)` entry -- even a cleared `None` tombstone
-/// -- is authoritative and never falls back (so an id-keyed clear cannot
-/// resurrect a stale legacy name value). Only a truly ABSENT id consults the
-/// sibling gate (rule 4: a same-display-name retype lineage holding data fails
-/// visible as `TypeSkew` rather than defaulting over it), then the legacy
-/// `Name` residue (pre-epoch data not yet re-keyed onto the id), then the
-/// FOREIGN-DATA gate: data present under an id `catalog_knows` cannot name at
-/// all means this buffer holds another system's allocations (a cross-root
-/// raw-state copy, plan decision 15: "different roots means different
-/// systems"), and the read cannot prove the absent property is not among that
-/// foreign data -- fail visible as `TypeSkew`, never fabricate a default over
-/// it. Callers without catalog knowledge (unbound reads) or whose consumer
-/// treats absent as NULL by design (resolved-predicate evaluation, plan
-/// decision 14) pass `|_| true`, which disables the foreign gate.
-pub fn lww_read_checked(
-    lww: &backend::LWWBackend,
-    resolved_id: EntityId,
-    name: &str,
-    sibling_ids: &[EntityId],
-    catalog_knows: impl Fn(&EntityId) -> bool,
-) -> Result<Option<Value>, traits::PropertyError> {
-    if let Some(value) = lww.entry(&PropertyKey::Id(resolved_id)) {
-        return Ok(value);
-    }
-    for sibling in sibling_ids {
-        if *sibling == resolved_id {
-            continue;
-        }
-        if lww.entry(&PropertyKey::Id(*sibling)).flatten().is_some() {
-            return Err(traits::PropertyError::TypeSkew { name: name.to_string(), a: resolved_id.to_base64(), b: sibling.to_base64() });
-        }
-    }
-    if let Some(value) = lww.entry(&PropertyKey::Name(name.to_string())).flatten() {
-        return Ok(Some(value));
-    }
-    for (key, value) in backend::PropertyBackend::property_values(lww) {
-        if let PropertyKey::Id(other) = key {
-            if other != resolved_id && value.is_some() && !catalog_knows(&other) {
-                return Err(traits::PropertyError::TypeSkew { name: name.to_string(), a: resolved_id.to_base64(), b: other.to_base64() });
-            }
-        }
-    }
-    Ok(None)
-}
-
-/// Lenient counterpart of [`lww_read_checked`]: the same Id-then-legacy-Name
-/// presence dispatch, without the sibling gate. Same anti-resurrection rule: a
-/// present-but-cleared id entry reads `None` and never falls back to the name.
-pub fn lww_read_lenient(lww: &backend::LWWBackend, resolved_id: EntityId, name: &str) -> Option<Value> {
-    match lww.entry(&PropertyKey::Id(resolved_id)) {
+/// -- is authoritative and never falls back (an id-keyed clear cannot
+/// resurrect a stale legacy name value); then legacy pre-epoch `Name` residue;
+/// then absent. Absent-handling policy (required defaults, `Option` `None`,
+/// predicate NULL) belongs to the caller. TYPE policy does not live here at
+/// all: the compiled/canonical type pair is admitted at REGISTRATION (the
+/// canonical value_type ruling), and a per-value cast failure surfaces where
+/// a value is staged or projected (`PropertyError::NonCastable`), never as a
+/// read-dispatch concern.
+pub fn read_resolved(backend: &dyn backend::PropertyBackend, resolved_id: EntityId, name: &str) -> Option<Value> {
+    match backend.entry(&PropertyKey::Id(resolved_id)) {
         Some(value) => value,
-        None => lww.entry(&PropertyKey::Name(name.to_string())).flatten(),
+        None => backend.entry(&PropertyKey::Name(name.to_string())).flatten(),
     }
 }
 
 #[cfg(test)]
 mod read_dispatch_tests {
-    use super::backend::LWWBackend;
-    use super::traits::PropertyError;
-    use super::{lww_read_checked, lww_read_lenient, PropertyKey, Value};
+    use super::backend::{LWWBackend, PropertyBackend};
+    use super::{read_resolved, PropertyKey, Value};
     use ankurah_proto::EntityId;
 
     fn id(byte: u8) -> EntityId {
@@ -170,37 +127,27 @@ mod read_dispatch_tests {
         EntityId::from_bytes(bytes)
     }
 
+    fn lww() -> LWWBackend { LWWBackend::new() }
+
     #[test]
-    fn checked_returns_present_id_value() {
-        let backend = LWWBackend::new();
+    fn returns_present_id_value() {
+        let backend = lww();
         backend.set(PropertyKey::Id(id(0x11)), Some(Value::String("alpha".into())));
-        assert_eq!(lww_read_checked(&backend, id(0x11), "title", &[], |_| true).unwrap(), Some(Value::String("alpha".into())));
-        // An unwritten registered id with no sibling reads absent (the caller
-        // then fabricates the required default). `|_| true` keeps the
-        // foreign-data gate off; the 0x11 data would otherwise trip it.
-        assert_eq!(lww_read_checked(&backend, id(0x22), "author", &[], |_| true).unwrap(), None);
+        assert_eq!(read_resolved(&backend, id(0x11), "title"), Some(Value::String("alpha".into())));
+        // An unwritten registered id reads absent (the caller then applies
+        // its absent policy). Data under OTHER ids is simply not this field:
+        // the type question was settled at registration, and there is no
+        // read-time gate (the canonical value_type ruling, 2026-07-10).
+        assert_eq!(read_resolved(&backend, id(0x22), "author"), None);
     }
 
     #[test]
-    fn checked_sibling_gate_fails_visible() {
-        // A same-display-name sibling (retype lineage) holds data under a
-        // different id; the resolved id is absent -> TypeSkew, not a default.
-        let backend = LWWBackend::new();
-        backend.set(PropertyKey::Id(id(0x33)), Some(Value::I64(7)));
-        let err = lww_read_checked(&backend, id(0x11), "title", &[id(0x33)], |_| true);
-        assert!(matches!(err, Err(PropertyError::TypeSkew { .. })), "sibling with data must skew: {err:?}");
-        // A sibling that holds NO data does not skew.
-        let empty = LWWBackend::new();
-        assert_eq!(lww_read_checked(&empty, id(0x11), "title", &[id(0x33)], |_| true).unwrap(), None);
-    }
-
-    #[test]
-    fn checked_falls_back_to_name_residue_only_when_id_absent() {
-        // Legacy Name residue with no id entry: the id is absent, no sibling ->
-        // the bare Name value is read (the legacy fallback).
-        let backend = LWWBackend::new();
+    fn falls_back_to_name_residue_only_when_id_absent() {
+        // Legacy Name residue with no id entry: the id is absent -> the bare
+        // Name value is read (the legacy fallback).
+        let backend = lww();
         backend.set(PropertyKey::name("title"), Some(Value::String("alpha".into())));
-        assert_eq!(lww_read_checked(&backend, id(0x11), "title", &[], |_| true).unwrap(), Some(Value::String("alpha".into())));
+        assert_eq!(read_resolved(&backend, id(0x11), "title"), Some(Value::String("alpha".into())));
     }
 
     #[test]
@@ -208,49 +155,26 @@ mod read_dispatch_tests {
         // THE map-level-presence invariant: an id-keyed CLEAR (present None
         // tombstone) must shadow a stale legacy Name value, never resurrect
         // it. An `Option`-chained `get(Id).or_else(get(Name))` would return
-        // the stale name value here; presence dispatch returns None.
-        let backend = LWWBackend::new();
+        // the stale name value here; presence dispatch returns None. This is
+        // exactly why `PropertyBackend::entry` is three-way.
+        let backend = lww();
         backend.set(PropertyKey::name("title"), Some(Value::String("stale".into())));
         backend.set(PropertyKey::Id(id(0x11)), None);
-        assert_eq!(
-            lww_read_checked(&backend, id(0x11), "title", &[], |_| true).unwrap(),
-            None,
-            "cleared id must not resurrect the stale name"
-        );
-        assert_eq!(lww_read_lenient(&backend, id(0x11), "title"), None, "lenient read honors the same rule");
+        assert_eq!(read_resolved(&backend, id(0x11), "title"), None, "cleared id must not resurrect the stale name");
     }
 
     #[test]
-    fn checked_foreign_data_gate_fails_visible() {
-        // Plan decision 15 under the hint-less regime: the resolved id is
-        // absent and the buffer holds DATA under an id the catalog cannot
-        // name (another system's allocation, e.g. a cross-root raw-state
-        // copy). The bound read cannot prove the absent property is not among
-        // that foreign data -> TypeSkew, never a fabricated default.
-        let backend = LWWBackend::new();
-        backend.set(PropertyKey::Id(id(0x99)), Some(Value::String("foreign".into())));
-        let known = [id(0x11), id(0x22)];
-        let err = lww_read_checked(&backend, id(0x11), "title", &[], |other| known.contains(other));
-        assert!(matches!(err, Err(PropertyError::TypeSkew { .. })), "foreign data must skew: {err:?}");
-
-        // A KNOWN other id (a different property of this entity) does not
-        // trip the gate: absent reads absent.
-        let mut known_all = known.to_vec();
-        known_all.push(id(0x99));
-        assert_eq!(lww_read_checked(&backend, id(0x11), "title", &[], |other| known_all.contains(other)).unwrap(), None);
-
-        // A foreign TOMBSTONE (cleared, no data to lose) does not trip it.
-        let cleared = LWWBackend::new();
-        cleared.set(PropertyKey::Id(id(0x99)), None);
-        assert_eq!(lww_read_checked(&cleared, id(0x11), "title", &[], |other| known.contains(other)).unwrap(), None);
-
-        // Name residue still wins over the gate: a real legacy value for THIS
-        // name is data, not a fabrication.
-        backend.set(PropertyKey::name("title"), Some(Value::String("legacy".into())));
-        assert_eq!(
-            lww_read_checked(&backend, id(0x11), "title", &[], |other| known.contains(other)).unwrap(),
-            Some(Value::String("legacy".into()))
-        );
+    fn trait_entry_is_three_way_for_lww() {
+        // The generic `entry` contract the dispatch runs on: absent /
+        // present-but-cleared / value must stay distinguishable through
+        // `&dyn PropertyBackend`.
+        let backend = lww();
+        backend.set(PropertyKey::Id(id(0x11)), Some(Value::I64(7)));
+        backend.set(PropertyKey::Id(id(0x22)), None);
+        let dyn_backend: &dyn PropertyBackend = &backend;
+        assert_eq!(dyn_backend.entry(&PropertyKey::Id(id(0x11))), Some(Some(Value::I64(7))));
+        assert_eq!(dyn_backend.entry(&PropertyKey::Id(id(0x22))), Some(None), "tombstone must read present-but-cleared");
+        assert_eq!(dyn_backend.entry(&PropertyKey::Id(id(0x33))), None, "absent must read absent");
     }
 }
 
@@ -296,8 +220,8 @@ pub trait Property: Sized {
     /// The value an ABSENT REQUIRED property of this type reads back as under
     /// RFC 5.4 rule 3 (the #175 fix): the value type's default, fed to
     /// [`from_value`] by the compiled projection when the backend holds no
-    /// entry AND the sibling gate is clear (see
-    /// [`lww_read_checked`](crate::property::lww_read_checked) and `property/value/lww.rs`).
+    /// entry (see [`read_resolved`](crate::property::read_resolved) and
+    /// `property/value/lww.rs`).
     ///
     /// `None` means "no fabricable default" (`from_value(None)` then decides:
     /// a required scalar would error `Missing`, an `Option<T>` swallows it to

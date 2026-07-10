@@ -31,7 +31,7 @@ impl std::fmt::Display for CastError {
 }
 
 impl From<CastError> for PropertyError {
-    fn from(err: CastError) -> Self { PropertyError::CastError(err) }
+    fn from(err: CastError) -> Self { PropertyError::NonCastable(err) }
 }
 
 impl std::error::Error for CastError {}

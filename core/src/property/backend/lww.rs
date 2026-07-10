@@ -131,19 +131,20 @@ impl LWWBackend {
     }
 
     /// Read a key's stored value (present, whatever its commit state). This is
-    /// a raw single-key read; the Id-then-Name legacy fallback and the sibling
-    /// gate live on the catalog-aware caller (see [`entry`]).
+    /// a raw single-key read; the Id-then-Name legacy fallback lives on the
+    /// catalog-aware caller (see [`entry`]).
     pub fn get(&self, key: &PropertyKey) -> Option<Value> { self.values.read().unwrap().get(key).and_then(|e| e.value()) }
 
     /// Presence-distinguishing read of a single key: `None` = key absent,
     /// `Some(None)` = key present but cleared (a tombstone), `Some(Some(v))` =
-    /// a live value. This is the primitive the catalog-aware read paths in
-    /// `core/src/entity.rs` build the legacy Id-then-Name fallback and the RFC
-    /// 5.4 sibling gate on: there, a PRESENT id entry (even a tombstone) is
-    /// authoritative and never falls back to a stale legacy `Name` residue --
-    /// a distinction the `Option`-valued [`get`] cannot express. The backend
-    /// itself holds no name-to-id knowledge (the PropertyKey amendment, #289);
-    /// the dispatch lives entirely on the caller.
+    /// a live value. This is the primitive the generic read dispatch
+    /// (`crate::property::read_resolved`, via `PropertyBackend::entry`) builds
+    /// the legacy Id-then-Name fallback on: a PRESENT id entry (even a
+    /// tombstone) is authoritative and never falls back to a stale legacy
+    /// `Name` residue -- a distinction the `Option`-valued [`get`] cannot
+    /// express. The backend itself holds no name-to-id knowledge (the
+    /// PropertyKey amendment, #289); the dispatch lives entirely on the
+    /// caller.
     pub fn entry(&self, key: &PropertyKey) -> Option<Option<Value>> { self.values.read().unwrap().get(key).map(|e| e.value()) }
 
     /// The event_id that last wrote a key's value (if tracked). Raw single-key
@@ -222,6 +223,10 @@ impl PropertyBackend for LWWBackend {
     fn property_values(&self) -> BTreeMap<PropertyKey, Option<Value>> {
         self.values.read().unwrap().iter().map(|(k, v)| (k.clone(), v.value())).collect()
     }
+
+    fn entry(&self, key: &PropertyKey) -> Option<Option<Value>> { LWWBackend::entry(self, key) }
+
+    fn restage(&self, key: &PropertyKey, value: Option<Value>) { self.set(key.clone(), value); }
 
     fn property_backend_name() -> &'static str { "lww" }
 

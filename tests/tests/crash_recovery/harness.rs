@@ -436,7 +436,6 @@ struct HandoffModelResolver {
 
 impl ankurah::core::property::PropertyResolver for HandoffModelResolver {
     fn resolve(&self, _collection: &str, _name: &str) -> Option<EntityId> { None }
-    fn siblings(&self, _name: &str) -> Vec<EntityId> { Vec::new() }
     fn name_for(&self, _id: &EntityId) -> Option<String> { None }
     fn model_id_for(&self, collection: &str) -> Option<EntityId> { (collection == self.collection).then_some(self.model) }
 }

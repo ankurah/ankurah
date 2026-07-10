@@ -173,7 +173,6 @@ mod column_space_tests {
     }
     impl PropertyResolver for OneField {
         fn resolve(&self, _collection: &str, name: &str) -> Option<EntityId> { (name == self.name).then_some(self.id) }
-        fn siblings(&self, _name: &str) -> Vec<EntityId> { Vec::new() }
         fn name_for(&self, id: &EntityId) -> Option<String> { (*id == self.id).then(|| self.name.to_string()) }
     }
 

@@ -50,18 +50,16 @@ impl<T: Property> LWW<T> {
     ///     default never fires;
     ///   - absent + no fabricable default (`EntityId`/`Ref<T>`, derived enums)
     ///     -> `PropertyError::Missing` (or `None` under an `Option`).
-    /// The read is gated: data under a sibling id the catalog cannot reconcile
-    /// surfaces `PropertyError::TypeSkew` instead of any of the above
-    /// (the catalog-side dispatch, `crate::property::lww_read_checked`).
     ///
     /// A present value is stored CANONICALLY typed (rfc.md 5.6 as amended
     /// 2026-07-10); a compiled type drifted from the canonical one reads
     /// through `Value::cast_to` (canonical -> compiled), and a per-value cast
-    /// failure surfaces as the fail-visible `CastError`, never a fabricated
+    /// failure surfaces as the fail-visible `NonCastable`, never a fabricated
     /// default. The same hop covers a legacy or ill-typed payload
-    /// defensively.
+    /// defensively. Type-pair admission is REGISTRATION's job (the canonical
+    /// value_type ruling): reads carry no gate.
     pub fn get(&self) -> Result<T, PropertyError> {
-        match self.get_checked_value()? {
+        match self.stored_value() {
             Some(value) => {
                 let value = match crate::value::ValueType::from_property_str(T::VALUE_TYPE) {
                     Some(target) if crate::value::ValueType::of(&value) != target => value.cast_to(target)?,
@@ -69,32 +67,20 @@ impl<T: Property> LWW<T> {
                 };
                 T::from_value(Some(value))
             }
-            // Absent (and no skew): feed the type's required-absent default to
+            // Absent: feed the type's required-absent default to
             // `from_value`. `None` -> `from_value(None)` keeps today's meaning
             // (Missing for a required scalar, None for an Option).
             None => T::from_value(T::absent_default()),
         }
     }
 
-    /// The stored value under the RFC 5.4 sibling gate: `Ok(Some)` present,
-    /// `Ok(None)` absent, `Err(TypeSkew)` when a retype lineage holds data
-    /// here (delegates to the catalog-side dispatch,
-    /// [`crate::property::lww_read_checked`]).
-    pub fn get_checked_value(&self) -> Result<Option<Value>, PropertyError> {
+    /// The stored value: `Some` present, `None` absent, via the generic
+    /// resolved-property dispatch ([`crate::property::read_resolved`]).
+    pub fn stored_value(&self) -> Option<Value> {
         match self.entity.property_key(&self.property_name) {
-            crate::property::PropertyKey::Id(id) => crate::property::lww_read_checked(
-                &self.backend,
-                id,
-                &self.property_name,
-                &self.entity.siblings(&self.property_name),
-                // The BOUND getter arms the foreign-data gate (plan decision
-                // 15): absent under our id with data sitting under ids the
-                // catalog cannot name (a cross-root raw-state copy) must fail
-                // visible, never read a fabricated default over it.
-                |other| self.entity.catalog_knows_id(other),
-            ),
-            // Unregistered or system field: read the bare name, no sibling gate.
-            key @ crate::property::PropertyKey::Name(_) => Ok(self.backend.get(&key)),
+            crate::property::PropertyKey::Id(id) => crate::property::read_resolved(self.backend.as_ref(), id, &self.property_name),
+            // Unregistered or system field: read the bare name.
+            key @ crate::property::PropertyKey::Name(_) => self.backend.get(&key),
         }
     }
 }
@@ -110,10 +96,9 @@ impl<T: Property> FromEntity for LWW<T> {
 // projected type is OPEN (any `Property`: scalars, `Option<_>`, `Json`,
 // `Ref<T>`, derived enums), so it cannot enumerate concrete impls the way
 // `YrsString`'s closed set does. The RFC 5.4 read rules are threaded through
-// `LWW::get` -> `lww_read_checked` -> `Property::absent_default` instead: the
-// required-vs-optional-vs-default decision is keyed on the projected type, and
-// the sibling gate rides along uniformly (so `TypeSkew` propagates for every
-// projection, per the A10 spec).
+// `LWW::get` -> `read_resolved` -> `Property::absent_default` instead: the
+// required-vs-optional-vs-default decision is keyed on the projected type
+// (the A10 spec, as amended by the canonical value_type ruling 2026-07-10).
 impl<T: Property> FromActiveType<LWW<T>> for T {
     fn from_active(active: LWW<T>) -> Result<Self, PropertyError>
     where Self: Sized {

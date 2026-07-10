@@ -100,8 +100,8 @@ struct CatalogMapInner {
     by_collection: BTreeMap<String, EntityId>,
     /// model id -> its membership ids (the contract edge set).
     model_memberships: BTreeMap<EntityId, BTreeSet<EntityId>>,
-    /// property display name -> property ids, across ALL contracts. The
-    /// cross-contract sibling gate (RFC 5.4 rule 4) scans this.
+    /// property display name -> property ids, across ALL contracts. Backs
+    /// the by-name allocator lookup and the name index queries.
     names_global: BTreeMap<String, BTreeSet<EntityId>>,
 }
 
@@ -257,10 +257,6 @@ impl CatalogMapInner {
             let m = self.memberships.get(id)?;
             (m.property == *property).then(|| m.clone())
         })
-    }
-
-    fn siblings_by_name(&self, name: &str) -> Vec<EntityId> {
-        self.names_global.get(name).into_iter().flat_map(|s| s.iter().copied()).collect()
     }
 }
 
@@ -468,7 +464,6 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     fn resolve(&self, collection: &str, name: &str) -> Option<EntityId> { self.map.read().unwrap().resolve(collection, name) }
-    fn siblings(&self, name: &str) -> Vec<EntityId> { self.map.read().unwrap().siblings_by_name(name) }
     fn name_for(&self, id: &EntityId) -> Option<String> { self.map.read().unwrap().properties.get(id).map(|def| def.name.clone()) }
     fn model_id_for(&self, collection: &str) -> Option<EntityId> { self.map.read().unwrap().by_collection.get(collection).copied() }
     fn canonical_value_type(&self, id: &EntityId) -> Option<String> {
@@ -888,8 +883,10 @@ where
     pub fn memberships_of(&self, model: &EntityId) -> Vec<MembershipDef> { self.0.map.read().unwrap().memberships_of(model) }
 
     /// Property ids sharing display name `name` across ALL contracts (the
-    /// cross-contract sibling gate, RFC 5.4 rule 4).
-    pub fn siblings_by_name(&self, name: &str) -> Vec<EntityId> { self.0.map.read().unwrap().siblings_by_name(name) }
+    /// map's global name index, which also backs [`Self::property_by_name`]).
+    pub fn siblings_by_name(&self, name: &str) -> Vec<EntityId> {
+        self.0.map.read().unwrap().names_global.get(name).into_iter().flat_map(|s| s.iter().copied()).collect()
+    }
 
     // -- registration lifecycle (RFC 5.2, work package A11b; rev 4) ---------
 

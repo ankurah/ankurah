@@ -16,12 +16,10 @@ pub enum Error {
     UnsupportedExpression(&'static str),
     #[error("Unsupported operator: {0}")]
     UnsupportedOperator(&'static str),
-    /// A checked property read hit the RFC 5.4 (specs/model-property-metadata/rfc.md) sibling gate: a same-display-
-    /// name retype lineage holds data on this item, so the read is fail-visible
-    /// (a `TypeSkew` from `Filterable::value_checked`) rather than a silent
-    /// NULL. Predicate evaluation surfaces it as an error, so the offending
-    /// item is reported (`FilterResult::Error`) instead of silently
-    /// matching/not-matching.
+    /// A property read failed during evaluation. Post the canonical
+    /// value_type ruling (2026-07-10) the resolved-read dispatch itself is
+    /// infallible (absent and ill-typed both evaluate NULL); this remains
+    /// for non-dispatch read failures.
     #[error("property read error: {0}")]
     PropertyRead(String),
 }
@@ -64,11 +62,12 @@ pub trait Filterable {
     fn collection(&self) -> &str;
     fn value(&self, name: &str) -> Option<Value>;
 
-    /// Read a property under the RFC 5.4 sibling gate for RESOLVED-identifier
-    /// evaluation. `Ok(Some)` = present, `Ok(None)` = absent (evaluated as NULL
-    /// by the caller), `Err` = a checked-read failure such as `TypeSkew` (a
-    /// same-display-name retype lineage holds data), surfaced as an evaluation
-    /// error rather than a silent NULL.
+    /// Read a property for RESOLVED-identifier evaluation. `Some` = present,
+    /// `None` = absent (evaluated as NULL by the caller). Evaluation has no
+    /// type-error surface: the compiled/canonical type pair is admitted at
+    /// REGISTRATION (the canonical value_type ruling, 2026-07-10), and an
+    /// ill-typed stored value reads as NULL with a warning at the entity's
+    /// evaluation boundary.
     ///
     /// `property_id` is the resolved property-definition id the identifier
     /// carries (RFC 5.5); it addresses id-keyed data directly, so this works on
@@ -76,11 +75,11 @@ pub trait Filterable {
     ///
     /// The default delegates to the lenient [`value`], so mock/test items and
     /// non-entity `Filterable`s are unaffected. `Entity` overrides it to route
-    /// the checked lookup through the catalog-side dispatch
-    /// (`crate::property::lww_read_checked`).
-    fn value_checked(&self, property_id: ankurah_proto::EntityId, name: &str) -> Result<Option<Value>, PropertyError> {
+    /// the lookup through the generic dispatch
+    /// (`crate::property::read_resolved`).
+    fn value_resolved(&self, property_id: ankurah_proto::EntityId, name: &str) -> Option<Value> {
         let _ = property_id;
-        Ok(self.value(name))
+        self.value(name)
     }
 }
 
@@ -124,18 +123,16 @@ fn evaluate_identifier<I: Filterable>(item: &I, identifier: &Identifier) -> Resu
         // does not hold evaluates as NULL (IsNull matches, comparisons are
         // false) instead of erroring PropertyNotFound -- this unifies the three
         // historical missing-property behaviors (filter hard-error, reactor
-        // unwrap_or(false), SQL assume_null). The read is CHECKED, so a
-        // same-display-name retype sibling holding data surfaces as an
-        // evaluation error (`TypeSkew`) rather than a silent NULL.
-        return Ok(match item.value_checked(property_id, name)? {
+        // unwrap_or(false), SQL assume_null).
+        return Ok(match item.value_resolved(property_id, name) {
             Some(value) => ExprOutput::Value(value),
             None => ExprOutput::None,
         });
     }
-    // A JSON sub-path on a resolved identifier: fetch the base property
-    // (checked, so TypeSkew propagates), then traverse into it. An absent base
-    // is NULL (consistent with the bare case), never PropertyNotFound.
-    let Some(base) = item.value_checked(property_id, name)? else {
+    // A JSON sub-path on a resolved identifier: fetch the base property, then
+    // traverse into it. An absent base is NULL (consistent with the bare
+    // case), never PropertyNotFound.
+    let Some(base) = item.value_resolved(property_id, name) else {
         return Ok(ExprOutput::None);
     };
     match base.extract_at_path(&identifier.subpath) {

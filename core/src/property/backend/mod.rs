@@ -107,6 +107,24 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
     /// resolution). A pure key operation -- the catalog-aware caller decides
     /// the mapping, so the backend never sees the catalog. Default no-op.
     fn rekey(&self, from: &PropertyKey, to: PropertyKey) { let _ = (from, to); }
+
+    /// Three-way presence for `key`: `None` = no entry at all; `Some(None)` =
+    /// an entry holding no value (a cleared tombstone: authoritative absence
+    /// that must never fall back to legacy name residue); `Some(Some)` = a
+    /// value. This is the primitive the resolved-property read dispatch
+    /// ([`crate::property::read_resolved`]) runs on, generically -- no caller
+    /// may downcast to a concrete backend for it. The default two-way
+    /// projection (via [`Self::property_value`]) suits backends without
+    /// tombstone semantics (e.g. text CRDTs).
+    fn entry(&self, key: &PropertyKey) -> Option<Option<Value>> { self.property_value(key).map(Some) }
+
+    /// Replace the STAGED (uncommitted) value under `key` -- the commit-time
+    /// canonicalization hook (rfc.md 5.6 as amended 2026-07-10): the
+    /// catalog-aware caller casts a staged value to the property's canonical
+    /// value_type and restages it here. Default no-op: a backend whose edits
+    /// are not value-shaped (a text CRDT) has its canonical type pinned by
+    /// backend equality at registration, so there is nothing to cast.
+    fn restage(&self, key: &PropertyKey, value: Option<Value>) { let _ = (key, value); }
 }
 
 // This is where this gets a bit tough.

@@ -71,34 +71,23 @@ async fn test_two_event_determinism_same_property() -> Result<()> {
         assert_eq!(title_order1, "Title from C", "C has higher EventId, should win");
     }
 
-    // Cross-root raw-state copy is FAIL-VISIBLE on a BOUND read (maintainer
-    // ruling, 2026-07-05: "copying raw state buffers between systems with
-    // different roots should yield an error -- different roots means
-    // different systems. Assimilate or GTFO"). node2 is its OWN system (its
-    // own `system.create`), and under rev 4 it ASSIMILATES by registering
-    // `record` with its own allocator, which allocates a DIFFERENT property
-    // id for `title` than node1's. Copying node1's id-keyed 0xA2 state into
-    // node2 lands node1's value under a foreign id whose display-name hint
-    // still reads "title"; node2's binding refuses to substitute it for its
-    // own absent `title`, surfacing `TypeSkew` (RFC 5.4 rule 4) rather than
-    // silently reading node1's value. The read fails visible; the copy
-    // itself does not error. (A node that never registered `record` at all
-    // would be schema-blind here and read through the lenient decision-17
-    // projection instead; that regime is engine/policy territory, not this
-    // test's subject.)
+    // Cross-root raw-state copy: the foreign value is NEVER SUBSTITUTED
+    // (canonical value_type ruling, 2026-07-10, superseding the 2026-07-05
+    // fail-visible gate: read-time gates died with it; the wire-ingress
+    // model-id guard is where cross-system data is refused, and an
+    // out-of-band copy reads as absent). node2 is its OWN system (its own
+    // `system.create`) and registers `record` with its own allocator, which
+    // allocates a DIFFERENT property id for `title` than node1's. Copying
+    // node1's id-keyed 0xA2 state into node2 lands node1's value under an id
+    // node2's catalog does not resolve for `title`: the resolved read
+    // consults exactly its own id, finds nothing, and the required String
+    // reads its absent default -- node1's value must not leak through.
     ctx2.register::<Record>().await?;
     let state1 = collection1.get_state(record_id).await?;
     let collection2 = ctx2.collection(&Record::collection()).await?;
     collection2.set_state(state1.clone()).await?;
-    let err = ctx2
-        .get::<RecordView>(record_id)
-        .await?
-        .title()
-        .expect_err("cross-root raw-state copy must fail visible, not silently read the foreign value");
-    assert!(
-        matches!(err, ankurah::core::property::PropertyError::TypeSkew { .. }),
-        "cross-root state copy read must surface TypeSkew (RFC 5.4 gate / ruling 2026-07-05), got: {err:?}"
-    );
+    let title2 = ctx2.get::<RecordView>(record_id).await?.title()?;
+    assert_eq!(title2, "", "the foreign id's value must read absent (the required-String default), never substitute");
 
     Ok(())
 }

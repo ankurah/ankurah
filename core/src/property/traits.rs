@@ -32,8 +32,14 @@ pub enum PropertyError {
     #[error("transaction is no longer alive")]
     TransactionClosed,
 
-    #[error("cast error: {0}")]
-    CastError(CastError),
+    /// A per-value cast failure against the property's canonical value_type
+    /// (rfc.md 5.6, the canonical value_type ruling): the type PAIR was
+    /// admitted at registration, but this particular value does not fit
+    /// (numeric overflow, unparseable string). Surfaces at the write that
+    /// staged the value or the read that projects it -- never at policy or
+    /// query evaluation, which read leniently.
+    #[error("not castable: {0}")]
+    NonCastable(CastError),
 
     /// A property reference that neither the local compiled schema nor the
     /// catalog defines: predicate building fails closed (RFC 5.3 in specs/model-property-metadata/rfc.md, AC5).
@@ -50,12 +56,6 @@ pub enum PropertyError {
     /// returns.
     #[error("collection '{collection}' is not registered and could not be registered from this node")]
     UnregisteredCollection { collection: String },
-
-    /// A same-display-name sibling property (a retype lineage from any
-    /// contract) holds data on this entity: reads fail visible instead of
-    /// fabricating a default (RFC 5.4 rule 4).
-    #[error("type skew on '{name}': sibling property lineages {a} and {b} both hold data here")]
-    TypeSkew { name: String, a: String, b: String },
 }
 
 impl PartialEq for PropertyError {
