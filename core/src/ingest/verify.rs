@@ -142,3 +142,98 @@ pub(crate) async fn verify_state_head_generations<G: SuspenseEvents + Send + Syn
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::{IngestError, LineageRejection, MutationError};
+    use crate::ingest::testkit;
+    use crate::ingest::StagingArea;
+    use ankurah_proto::{Clock, EntityId, EventId, GClock, State, StateBuffers};
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    fn state_with(head: Vec<EventId>, annotation: Vec<(u32, EventId)>) -> State {
+        State { state_buffers: StateBuffers(BTreeMap::new()), head: Clock::from(head), head_generations: GClock::new(annotation) }
+    }
+
+    /// M4 remediation item 4 (cross-model review, verified by the
+    /// coordinator): on a DEFINITIVE-storage node, a carried annotation
+    /// entry for a tip whose event is NOT locally resolvable must be
+    /// rejected typed, never adopted uninspected. Amendment K's durable
+    /// rule says a durable node never adopts a wire-carried generation
+    /// uninspected; the silent fall-through adopts exactly such a value,
+    /// which then serves as rejection ground truth against honest
+    /// descendants (wrongful GenerationMismatch at the covered-parent
+    /// check) and as commit-stamp input. Unreachable from production wire
+    /// lanes today (durable nodes ingest no wire states at this commit),
+    /// which is why this red is unit-level, driving the boundary directly.
+    #[tokio::test]
+    async fn definitive_storage_rejects_a_carried_generation_for_an_unheld_tip() {
+        let staging = Arc::new(StagingArea::default());
+        let getter = testkit::FailingCommitStore::new(staging, EventId::from_bytes([0xFF; 32]));
+
+        let unheld_tip = EventId::from_bytes([7; 32]);
+        let state = state_with(vec![unheld_tip.clone()], vec![(3, unheld_tip.clone())]);
+
+        let result = verify_state_head_generations(&getter, &state).await;
+        assert!(
+            matches!(
+                &result,
+                Err(MutationError::Ingest(IngestError::Lineage(LineageRejection::UnresolvableHeadGenerationTip { event })))
+                    if *event == unheld_tip
+            ),
+            "a definitive-storage node must reject a carried head generation it cannot inspect (unheld tip), got {result:?}"
+        );
+    }
+
+    /// Control: a locally held tip whose carried value matches its payload
+    /// passes on a definitive-storage node (the inspection succeeds).
+    #[tokio::test]
+    async fn definitive_storage_accepts_a_carried_generation_matching_the_held_payload() {
+        let staging = Arc::new(StagingArea::default());
+        let getter = testkit::FailingCommitStore::new(staging, EventId::from_bytes([0xFF; 32]));
+
+        let entity_id = EntityId::new();
+        let genesis = testkit::event(entity_id, &[]);
+        getter.commit_event(&genesis).await.expect("commit succeeds");
+
+        let state = state_with(vec![genesis.payload.id()], vec![(1, genesis.payload.id())]);
+        verify_state_head_generations(&getter, &state).await.expect("a held, payload-matching annotation validates");
+    }
+
+    /// Control: the payload-contradiction arm still fires for a HELD tip
+    /// with a lying carried value (pre-existing behavior, unchanged).
+    #[tokio::test]
+    async fn definitive_storage_rejects_a_carried_generation_contradicting_the_held_payload() {
+        let staging = Arc::new(StagingArea::default());
+        let getter = testkit::FailingCommitStore::new(staging, EventId::from_bytes([0xFF; 32]));
+
+        let entity_id = EntityId::new();
+        let genesis = testkit::event(entity_id, &[]);
+        getter.commit_event(&genesis).await.expect("commit succeeds");
+
+        let state = state_with(vec![genesis.payload.id()], vec![(2, genesis.payload.id())]);
+        let result = verify_state_head_generations(&getter, &state).await;
+        assert!(
+            matches!(
+                &result,
+                Err(MutationError::Ingest(IngestError::Lineage(LineageRejection::GenerationMismatch { claimed: 2, expected: 1, .. })))
+            ),
+            "a held tip with a contradicting carried value stays a typed GenerationMismatch, got {result:?}"
+        );
+    }
+
+    /// Control: an ephemeral (non-definitive) node adopts an unheld tip's
+    /// carried value inside the state's trust envelope (REV 5 section K),
+    /// unchanged by the durable-side tightening.
+    #[tokio::test]
+    async fn ephemeral_adopts_a_carried_generation_for_an_unheld_tip() {
+        let staging = Arc::new(StagingArea::default());
+        let getter = testkit::FailingCommitStore::ephemeral(staging, EventId::from_bytes([0xFF; 32]));
+
+        let unheld_tip = EventId::from_bytes([7; 32]);
+        let state = state_with(vec![unheld_tip.clone()], vec![(3, unheld_tip.clone())]);
+        verify_state_head_generations(&getter, &state).await.expect("the trust envelope adopts on ephemeral nodes");
+    }
+}
