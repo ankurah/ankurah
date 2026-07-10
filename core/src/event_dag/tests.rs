@@ -3284,6 +3284,99 @@ mod chain_canonicalization {
 }
 
 // ============================================================================
+// APPLIED-SET CAP-THRASH CHARACTERIZATION (plan D2-5: M5 characterizes the
+// cliff empirically). The applied-set's FIFO eviction turns an O(1) skip
+// back into a comparison walk for redeliveries older than the cap window;
+// the cliff is the fetch-count jump at the eviction boundary. Cost changes,
+// outcome never does (R-D2-3c's law, re-asserted here at every sample).
+// ============================================================================
+
+#[cfg(test)]
+mod applied_set_cap_thrash {
+    use super::*;
+    use crate::entity::Entity;
+
+    fn lww_event_for(entity_id: EntityId, title: &str, parents: &[&Event]) -> Event {
+        let backend = LWWBackend::new();
+        backend.set("title".into(), Some(Value::String(title.into())));
+        let ops = backend.to_operations().unwrap().unwrap();
+        Event {
+            entity_id,
+            collection: "test".into(),
+            operations: OperationSet(BTreeMap::from([("lww".to_string(), ops)])),
+            parent: Clock::from(parents.iter().map(|p| p.id()).collect::<Vec<_>>()),
+            generation: Event::generation_from_parents(parents.iter().map(|p| p.generation)),
+        }
+    }
+
+    /// Build a CHAIN entity with cap-bounded applied rows, then redeliver at
+    /// sample positions across the eviction boundary and measure walk
+    /// fetches. Inside the window: zero fetches (the O(1) skip). Outside:
+    /// the comparison walk, whose fetch count grows with the redelivered
+    /// event's depth below the head (the thrash cost is a FULL backward
+    /// walk per evicted redelivery, not a constant). The printed table is
+    /// the D2-5 empirical characterization for the PR evidence; run with
+    /// --nocapture to see it.
+    #[tokio::test]
+    async fn redelivery_cost_cliff_at_the_cap_boundary() {
+        const N: usize = 256;
+        const CAP: usize = 64;
+        let entity_id = {
+            let mut b = [0u8; 16];
+            b[0] = 99;
+            EntityId::from_bytes(b)
+        };
+        let entity = Entity::create_with_applied_cap(entity_id, "test".into(), CAP);
+
+        let mut retriever = MockRetriever::new();
+        let mut chain: Vec<Event> = Vec::with_capacity(N);
+        for i in 0..N {
+            let ev = match chain.last() {
+                None => lww_event_for(entity_id, &format!("t{i}"), &[]),
+                Some(prev) => lww_event_for(entity_id, &format!("t{i}"), &[prev]),
+            };
+            retriever.add_event(&ev);
+            chain.push(ev);
+        }
+        for ev in &chain {
+            assert!(entity.apply_event(&retriever, ev, None).await.unwrap(), "the chain applies in order");
+            // The post-persist hook's insertion half, simulated: each apply
+            // is followed by a completed persist covering the event.
+            entity.mark_applied([ev.id()]);
+        }
+
+        // FIFO eviction: only the last CAP ids remain members.
+        assert!(!entity.applied_contains(&chain[N - CAP - 1].id()), "precondition: the id just below the window was evicted");
+        assert!(entity.applied_contains(&chain[N - CAP].id()), "precondition: the oldest window member is retained");
+
+        println!("D2-5 cap-thrash characterization: N={N} chain events, cap={CAP}");
+        println!("position-from-head | member | walk fetches (per redelivery)");
+        let samples = [1usize, CAP / 2, CAP - 1, CAP, CAP + 1, 2 * CAP, N / 2, N - 1];
+        for depth_from_head in samples {
+            let idx = N - 1 - depth_from_head;
+            let ev = &chain[idx];
+            let member = entity.applied_contains(&ev.id());
+            let logging = LoggingRetriever::new(retriever.clone());
+            let log = logging.log_handle();
+            let applied = entity.apply_event(&logging, ev, None).await.unwrap();
+            let fetches = log.lock().unwrap().len();
+            assert!(!applied, "outcome invariance: a redelivery is a no-op regardless of membership (R-D2-3c)");
+            if member {
+                assert_eq!(fetches, 0, "an applied-set member redelivery is the O(1) skip: zero fetches");
+            } else {
+                assert!(fetches > 0, "an evicted redelivery walks (cost, never outcome)");
+                assert!(
+                    fetches >= depth_from_head.min(N),
+                    "the walk grounds the redelivered event against the head: fetch count scales with its depth \
+                     ({depth_from_head} below head), got {fetches}"
+                );
+            }
+            println!("{depth_from_head:>18} | {member:>6} | {fetches}");
+        }
+    }
+}
+
+// ============================================================================
 // THE BUDGET INVARIANT (red-team fold item 7): the walk decrements budget at
 // most TWICE per distinct event under ANY schedule (once per side;
 // Side::processed makes per-side expansion idempotent and the level snapshot
