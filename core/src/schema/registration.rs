@@ -2,8 +2,8 @@
 //! (specs/model-property-metadata/rfc.md section 5.2, rev 4).
 //!
 //! Registration is an UPSERT: the executor looks each definition up by its
-//! lookup key (model by collection; property by (model, name, backend,
-//! value_type); membership by (model, property)), ALLOCATES a fresh
+//! lookup key (model by collection; property by (model, name); membership by
+//! (model, property)), ALLOCATES a fresh
 //! `EntityId::new()` -- a true ULID -- on miss, and emits ordinary events
 //! through the policy-checked commit pipeline. The whole execution
 //! serializes on a process-local mutex, and the executor upserts the
@@ -21,6 +21,14 @@
 //! registration: the request carries language-agnostic descriptors.
 //! Idempotence is the upsert's: a repeat registration finds every key,
 //! emits zero events, and returns the same ids.
+//!
+//! A property's (backend, value_type) is CANONICAL: fixed at allocation and
+//! never changed by registration (rfc.md 5.6 as amended 2026-07-10). A hit
+//! whose descriptor declares a different value_type is admitted only when the
+//! two types are mutually castable per `Value::cast_to` (the binary writes
+//! and reads through the cast); a different backend, or a non-castable type
+//! pair, refuses the registration loudly. Changing a canonical type is a
+//! deliberate migration (#303), never a model-struct edit.
 
 use std::collections::BTreeMap;
 
@@ -34,7 +42,7 @@ use crate::node::Node;
 use crate::policy::{AccessDenied, PlannedMembership, PlannedUpdate, PolicyAgent, RegistrationPlan};
 use crate::property::backend::{LWWBackend, PropertyBackend};
 use crate::storage::StorageEngine;
-use crate::value::Value;
+use crate::value::{Value, ValueType};
 
 use super::{model_collection, model_property_collection, property_collection};
 
@@ -63,8 +71,21 @@ pub enum RegistrationError {
     ExplicitModelIdNotFound { model: EntityId },
     #[error("explicit model id {model} is bound to collection '{found_collection}'; binder declares '{collection}'")]
     ExplicitModelIdMismatch { model: EntityId, found_collection: String, collection: String },
-    #[error("explicit property id {property} is ({found_backend}, {found_value_type}); binder declares ({backend}, {value_type})")]
+    #[error(
+        "explicit property id {property} is canonically ({found_backend}, {found_value_type}); binder declares ({backend}, {value_type}), which is not compatible (backend must match; value types must be mutually castable)"
+    )]
     ExplicitIdMismatch { property: EntityId, found_backend: String, found_value_type: String, backend: String, value_type: String },
+    #[error(
+        "property '{name}' in '{collection}' is canonically ({found_backend}, {found_value_type}); this binary declares ({backend}, {value_type}), which is not compatible (backend must match; value types must be mutually castable per Value::cast_to). The canonical type is fixed at allocation; changing it is a deliberate migration (#303), never a model-struct edit"
+    )]
+    PropertyIncompatible {
+        collection: String,
+        name: String,
+        found_backend: String,
+        found_value_type: String,
+        backend: String,
+        value_type: String,
+    },
     #[error("registration refused by policy: {0}")]
     PolicyDenied(#[from] AccessDenied),
     #[error(transparent)]
@@ -248,12 +269,14 @@ where
                     let values = self.verify_explicit_binding(id, p).await?;
                     plan.existing.push(id);
                     let scope = resolve_model!(&p.minting_collection);
+                    // The response carries the bound entity's CANONICAL
+                    // (backend, value_type), not the binder's declaration.
                     out_properties.push(RegisteredProperty {
                         id,
                         model: entity_id_field(&values, "minted_for").unwrap_or(scope),
                         name: string_field(&values, "name").unwrap_or_else(|| p.name.clone()),
-                        backend: p.backend.clone(),
-                        value_type: p.value_type.clone(),
+                        backend: string_field(&values, "backend").unwrap_or_else(|| p.backend.clone()),
+                        value_type: string_field(&values, "value_type").unwrap_or_else(|| p.value_type.clone()),
                         target_model: entity_id_field(&values, "target_model"),
                     });
                     property_ids.insert((p.minting_collection.clone(), p.name.clone()), id);
@@ -270,15 +293,27 @@ where
                 None => None,
             };
 
-            let current = self.property_lookup_checked(&scope, &p.name, &p.backend, &p.value_type).await?;
+            let current = self.property_lookup_checked(&scope, &p.name).await?;
 
             // RFC 5.8 rename-hint pre-pass, GUARDED: only when the
             // current-name lookup misses and the hinted lookup hits. The
             // hint is an ordinary name follow-up; the property keeps its id.
             let renamed = match (&current, &p.renamed_from) {
-                (None, Some(old)) => self.property_lookup_checked(&scope, old, &p.backend, &p.value_type).await?,
+                (None, Some(old)) => self.property_lookup_checked(&scope, old).await?,
                 _ => None,
             };
+
+            // The canonical-type compatibility gate (rfc.md 5.6 as amended
+            // 2026-07-10): a hit never mutates (backend, value_type) and
+            // never forks a second identity. Refuses loudly on a different
+            // backend or a non-castable type pair; a castable drift is
+            // admitted (the binary writes and reads through the cast) and
+            // logged, and the response below carries the CANONICAL types so
+            // the requester's catalog map holds its cast target.
+            let canonical = current.as_ref().or(renamed.as_ref()).map(|def| (def.backend.clone(), def.value_type.clone()));
+            if let Some(def) = current.as_ref().or(renamed.as_ref()) {
+                check_property_compat(def, p)?;
+            }
 
             let property_id = match (&current, &renamed) {
                 (Some(def), _) => {
@@ -358,12 +393,13 @@ where
             };
 
             property_ids.insert((p.minting_collection.clone(), p.name.clone()), property_id);
+            let (backend, value_type) = canonical.unwrap_or_else(|| (p.backend.clone(), p.value_type.clone()));
             out_properties.push(RegisteredProperty {
                 id: property_id,
                 model: scope,
                 name: p.name.clone(),
-                backend: p.backend.clone(),
-                value_type: p.value_type.clone(),
+                backend,
+                value_type,
                 target_model: target.or_else(|| current.as_ref().and_then(|d| d.target_model)),
             });
         }
@@ -492,29 +528,23 @@ where
     /// Allocator lookup for a property by its full key (model, name,
     /// backend, value_type): map first, storage on a miss (see
     /// [`Self::model_lookup_checked`]).
-    async fn property_lookup_checked(
-        &self,
-        model: &EntityId,
-        name: &str,
-        backend: &str,
-        value_type: &str,
-    ) -> Result<Option<super::catalog::PropertyDef>, RetrievalError> {
-        if let Some(def) = self.catalog.property_by_key(model, name, backend, value_type) {
+    async fn property_lookup_checked(&self, model: &EntityId, name: &str) -> Result<Option<super::catalog::PropertyDef>, RetrievalError> {
+        if let Some(def) = self.catalog.property_by_name(model, name) {
             return Ok(Some(def));
         }
-        let predicate = and(
-            and(field_eq_id("minted_for", *model), field_eq_str("name", name)),
-            and(field_eq_str("backend", backend), field_eq_str("value_type", value_type)),
-        );
+        let predicate = and(field_eq_id("minted_for", *model), field_eq_str("name", name));
         let Some((id, values)) = self.catalog_row_by_key(property_collection(), predicate).await? else {
             return Ok(None);
         };
+        // The stored row is authoritative for the canonical (backend,
+        // value_type); the requester's declaration is compatibility-checked
+        // against it by the caller, never written over it.
         let def = super::catalog::PropertyDef {
             id,
             minted_for: Some(*model),
             name: name.to_string(),
-            backend: backend.to_string(),
-            value_type: value_type.to_string(),
+            backend: string_field(&values, "backend").unwrap_or_default(),
+            value_type: string_field(&values, "value_type").unwrap_or_default(),
             target_model: entity_id_field(&values, "target_model"),
         };
         self.catalog.upsert_registered(
@@ -600,7 +630,11 @@ where
             _ => String::new(),
         };
         let (found_backend, found_value_type) = (get_string("backend"), get_string("value_type"));
-        if found_backend != p.backend || found_value_type != p.value_type {
+        // Same compatibility bar as the name-keyed upsert (rfc.md 5.6 as
+        // amended 2026-07-10): the backend must match, and a drifted
+        // value_type is admitted only when mutually castable with the
+        // canonical one. The binding never mutates the bound definition.
+        if found_backend != p.backend || !value_types_compatible(&found_value_type, &p.value_type) {
             return Err(RegistrationError::ExplicitIdMismatch {
                 property: id,
                 found_backend,
@@ -668,6 +702,44 @@ fn string_field(values: &BTreeMap<String, Option<Value>>, field: &str) -> Option
         Some(Some(Value::String(s))) => Some(s.clone()),
         _ => None,
     }
+}
+
+/// Whether a declared value_type is admissible against a canonical one:
+/// equal, or mutually castable per the `Value::cast_to` relation. A type
+/// string this build cannot parse (a newer fleet's type) is compatible only
+/// when equal.
+fn value_types_compatible(canonical: &str, declared: &str) -> bool {
+    canonical == declared
+        || match (ValueType::from_property_str(canonical), ValueType::from_property_str(declared)) {
+            (Some(a), Some(b)) => ValueType::mutually_castable(a, b),
+            _ => false,
+        }
+}
+
+/// The canonical-type compatibility gate (rfc.md 5.6 as amended 2026-07-10)
+/// for a name-keyed upsert hit. Never mutates the found definition.
+fn check_property_compat(def: &super::catalog::PropertyDef, p: &PropertyDescriptor) -> Result<(), RegistrationError> {
+    if def.backend != p.backend || !value_types_compatible(&def.value_type, &p.value_type) {
+        return Err(RegistrationError::PropertyIncompatible {
+            collection: p.minting_collection.clone(),
+            name: p.name.clone(),
+            found_backend: def.backend.clone(),
+            found_value_type: def.value_type.clone(),
+            backend: p.backend.clone(),
+            value_type: p.value_type.clone(),
+        });
+    }
+    if def.value_type != p.value_type {
+        tracing::warn!(
+            "property '{}' in '{}' is canonically '{}'; this binary declares '{}' and will write and read through casts. \
+             The canonical type is fixed at allocation (rfc.md 5.6); changing it is a deliberate migration (#303)",
+            p.name,
+            p.minting_collection,
+            def.value_type,
+            p.value_type
+        );
+    }
+    Ok(())
 }
 
 fn bool_field(values: &BTreeMap<String, Option<Value>>, field: &str) -> Option<bool> {

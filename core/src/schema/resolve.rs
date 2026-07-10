@@ -24,12 +24,13 @@
 //!   first (a property may legitimately share its collection's name).
 
 use ankql::ast::{Expr, Identifier, OrderByItem, PathExpr, Predicate, Selection};
-use ankurah_proto::CollectionId;
+use ankurah_proto::{CollectionId, EntityId};
 
 use crate::policy::PolicyAgent;
 use crate::property::PropertyError;
 use crate::schema::catalog::CatalogManager;
 use crate::storage::StorageEngine;
+use crate::value::{Value, ValueType};
 
 impl<SE, PA> CatalogManager<SE, PA>
 where
@@ -214,11 +215,23 @@ where
 
     fn resolve_predicate(&self, collection: &CollectionId, predicate: &Predicate) -> Result<Predicate, PropertyError> {
         Ok(match predicate {
-            Predicate::Comparison { left, operator, right } => Predicate::Comparison {
-                left: Box::new(self.resolve_expr(collection, left)?),
-                operator: operator.clone(),
-                right: Box::new(self.resolve_expr(collection, right)?),
-            },
+            Predicate::Comparison { left, operator, right } => {
+                let left = self.resolve_expr(collection, left)?;
+                let right = self.resolve_expr(collection, right)?;
+                // Canonicalize literal operands to the compared property's
+                // canonical value_type (rfc.md 5.6 as amended 2026-07-10):
+                // stored values are canonically typed, and the reactor's
+                // watcher index matches on collated bytes, so the literal
+                // side must collate in the same type. Whole-property
+                // comparisons only: a subpath addresses a JSON subfield,
+                // whose inner type the catalog does not describe (the
+                // TypeResolver Json heuristic keeps covering those). A
+                // literal the canonical type cannot represent fails the
+                // query loud at its origin, consistent with fail-closed
+                // resolution.
+                let (left, right) = self.canonicalize_comparison(left, right)?;
+                Predicate::Comparison { left: Box::new(left), operator: operator.clone(), right: Box::new(right) }
+            }
             Predicate::And(a, b) => {
                 Predicate::And(Box::new(self.resolve_predicate(collection, a)?), Box::new(self.resolve_predicate(collection, b)?))
             }
@@ -228,6 +241,53 @@ where
             Predicate::Not(inner) => Predicate::Not(Box::new(self.resolve_predicate(collection, inner)?)),
             Predicate::IsNull(expr) => Predicate::IsNull(Box::new(self.resolve_expr(collection, expr)?)),
             Predicate::True | Predicate::False | Predicate::Placeholder => predicate.clone(),
+        })
+    }
+
+    /// The canonical cast target of a comparison side: a resolved
+    /// whole-property `Identifier` (an empty subpath) whose canonical
+    /// value_type the catalog knows and this build can parse. Subfield
+    /// references and unresolved forms have no target.
+    fn canonical_target(&self, expr: &Expr) -> Option<ValueType> {
+        if let Expr::Identifier(ident) = expr {
+            if ident.subpath.is_empty() {
+                return self.canonical_value_type_of(&EntityId::from_ulid(ident.property)).and_then(|s| ValueType::from_property_str(&s));
+            }
+        }
+        None
+    }
+
+    /// Cast the literal operands opposite a resolved whole-property reference
+    /// to that property's canonical value_type (see [`Self::resolve_predicate`]).
+    /// Identifier-vs-identifier and literal-vs-literal comparisons pass
+    /// through unchanged.
+    fn canonicalize_comparison(&self, left: Expr, right: Expr) -> Result<(Expr, Expr), PropertyError> {
+        fn cast_literals(expr: Expr, target: ValueType) -> Result<Expr, PropertyError> {
+            Ok(match expr {
+                Expr::Literal(lit) => {
+                    let value: Value = (&lit).into();
+                    if ValueType::of(&value) == target {
+                        Expr::Literal(lit)
+                    } else {
+                        Expr::Literal(value.cast_to(target)?.into())
+                    }
+                }
+                Expr::ExprList(items) => {
+                    Expr::ExprList(items.into_iter().map(|e| cast_literals(e, target)).collect::<Result<Vec<_>, _>>()?)
+                }
+                other => other,
+            })
+        }
+        Ok(match (self.canonical_target(&left), self.canonical_target(&right)) {
+            (Some(target), None) => {
+                let right = cast_literals(right, target)?;
+                (left, right)
+            }
+            (None, Some(target)) => {
+                let left = cast_literals(left, target)?;
+                (left, right)
+            }
+            _ => (left, right),
         })
     }
 

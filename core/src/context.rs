@@ -115,9 +115,12 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         // Resolve each entity's transient uncommitted Name keys to their
         // property id now the catalog is warm (the PropertyKey amendment, #289):
         // the sync accessor stages Name keys, and the committed/wire form must
-        // be id-keyed for a registered user collection.
+        // be id-keyed for a registered user collection. Values canonicalize to
+        // the property's catalog value_type here (rfc.md 5.6 as amended
+        // 2026-07-10); a value the canonical type cannot represent fails the
+        // commit at this writer.
         for entity in trx.entities.iter() {
-            entity.resolve_pending_keys();
+            entity.resolve_pending_keys()?;
         }
 
         // Generate events from the transaction entities

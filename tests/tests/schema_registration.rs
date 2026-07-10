@@ -4,8 +4,10 @@
 //! the way a schema-less durable node serves ephemeral clients, and pin
 //! the allocation semantics: ids come from the SchemaRegistered response,
 //! repeats are pure no-ops, rename hints move lineages without re-keying,
-//! retypes mint fresh identities, and the exists-aware policy verb gates
-//! actual creations.
+//! retypes never fork (a castable declaration reuses the identity against
+//! the CANONICAL value_type, a non-castable one refuses; rfc.md 5.6 as
+//! amended 2026-07-10), and the exists-aware policy verb gates actual
+//! creations.
 
 mod common;
 use ankurah::core::property::backend::{LWWBackend, PropertyBackend};
@@ -245,15 +247,23 @@ async fn chained_renames_win_by_recency_not_tiebreak() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// RFC 5.1: the type pair is in the lookup key, so a retype mints a NEW
-/// property identity; both live under one display name (sibling-gate
-/// territory on the read side).
+/// rfc.md 5.6 as amended 2026-07-10: the property lookup key is (model,
+/// name) and the value_type is CANONICAL -- fixed at allocation, never
+/// changed by registration. A same-name registration declaring a mutually
+/// castable type REUSES the identity, and the response carries the CANONICAL
+/// type (the requester's cast target), not the declaration.
 #[tokio::test]
-async fn retype_mints_a_distinct_identity() -> anyhow::Result<()> {
+async fn castable_retype_reuses_the_identity_and_keeps_the_canonical_type() -> anyhow::Result<()> {
     let (server, client, _conn) = connected_pair().await?;
 
-    let first = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+    let first = proto::NodeRequestBody::RegisterSchema {
+        models: vec![proto::ModelDescriptor { collection: "album".into(), name: "Album".into(), explicit_id: None }],
+        properties: vec![property("name", None, "lww", "string")],
+        memberships: vec![],
+    };
+    let first = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, first).await?);
     let string_id = first.1[0].id;
+    assert_eq!(first.1[0].value_type, "string");
 
     let retype = proto::NodeRequestBody::RegisterSchema {
         models: vec![],
@@ -261,13 +271,61 @@ async fn retype_mints_a_distinct_identity() -> anyhow::Result<()> {
         memberships: vec![],
     };
     let retyped = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, retype).await?);
-    let i64_id = retyped.1[0].id;
-    assert_ne!(i64_id, string_id, "a retype is a new identity, never a merge");
+    assert_eq!(retyped.1[0].id, string_id, "a castable retype reuses the identity, never a fork");
+    assert_eq!(retyped.1[0].value_type, "string", "the response carries the CANONICAL type, the requester's cast target");
 
-    let values = catalog_values(&server, PROPERTY, i64_id).await?;
-    assert_eq!(values.get("value_type"), Some(&Some(Value::String("i64".into()))));
-    let old = catalog_values(&server, PROPERTY, string_id).await?;
-    assert_eq!(old.get("value_type"), Some(&Some(Value::String("string".into()))), "the original lineage is untouched");
+    let values = catalog_values(&server, PROPERTY, string_id).await?;
+    assert_eq!(values.get("value_type"), Some(&Some(Value::String("string".into()))), "the canonical type never changes");
+
+    Ok(())
+}
+
+/// A non-castable type pair refuses the registration loudly, and the
+/// canonical definition is untouched. Changing a canonical type is a
+/// deliberate migration (#303), never a model-struct edit.
+#[tokio::test]
+async fn non_castable_retype_refuses_registration() -> anyhow::Result<()> {
+    let (server, client, _conn) = connected_pair().await?;
+
+    let first = proto::NodeRequestBody::RegisterSchema {
+        models: vec![proto::ModelDescriptor { collection: "album".into(), name: "Album".into(), explicit_id: None }],
+        properties: vec![property("name", None, "lww", "string")],
+        memberships: vec![],
+    };
+    let first = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, first).await?);
+    let string_id = first.1[0].id;
+
+    let retype = proto::NodeRequestBody::RegisterSchema {
+        models: vec![],
+        properties: vec![property("name", None, "lww", "binary")],
+        memberships: vec![],
+    };
+    expect_error(client.request(server.id, &DEFAULT_CONTEXT, retype).await?, "not compatible");
+
+    let values = catalog_values(&server, PROPERTY, string_id).await?;
+    assert_eq!(values.get("value_type"), Some(&Some(Value::String("string".into()))), "the refusal changes nothing");
+
+    Ok(())
+}
+
+/// A backend change is never castable (a different CRDT algebra, not a
+/// cast): refuse, regardless of the value types.
+#[tokio::test]
+async fn backend_change_refuses_registration() -> anyhow::Result<()> {
+    let (server, client, _conn) = connected_pair().await?;
+
+    let first = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+    let yrs_id = first.1[0].id;
+
+    let rebackend = proto::NodeRequestBody::RegisterSchema {
+        models: vec![],
+        properties: vec![property("name", None, "lww", "string")],
+        memberships: vec![],
+    };
+    expect_error(client.request(server.id, &DEFAULT_CONTEXT, rebackend).await?, "not compatible");
+
+    let values = catalog_values(&server, PROPERTY, yrs_id).await?;
+    assert_eq!(values.get("backend"), Some(&Some(Value::String("yrs".into()))), "the refusal changes nothing");
 
     Ok(())
 }

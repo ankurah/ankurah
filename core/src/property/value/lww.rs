@@ -50,12 +50,25 @@ impl<T: Property> LWW<T> {
     ///     default never fires;
     ///   - absent + no fabricable default (`EntityId`/`Ref<T>`, derived enums)
     ///     -> `PropertyError::Missing` (or `None` under an `Option`).
-    /// The read is gated: a same-display-name retype sibling holding data
+    /// The read is gated: data under a sibling id the catalog cannot reconcile
     /// surfaces `PropertyError::TypeSkew` instead of any of the above
     /// (the catalog-side dispatch, `crate::property::lww_read_checked`).
+    ///
+    /// A present value is stored CANONICALLY typed (rfc.md 5.6 as amended
+    /// 2026-07-10); a compiled type drifted from the canonical one reads
+    /// through `Value::cast_to` (canonical -> compiled), and a per-value cast
+    /// failure surfaces as the fail-visible `CastError`, never a fabricated
+    /// default. The same hop covers a legacy or ill-typed payload
+    /// defensively.
     pub fn get(&self) -> Result<T, PropertyError> {
         match self.get_checked_value()? {
-            Some(value) => T::from_value(Some(value)),
+            Some(value) => {
+                let value = match crate::value::ValueType::from_property_str(T::VALUE_TYPE) {
+                    Some(target) if crate::value::ValueType::of(&value) != target => value.cast_to(target)?,
+                    _ => value,
+                };
+                T::from_value(Some(value))
+            }
             // Absent (and no skew): feed the type's required-absent default to
             // `from_value`. `None` -> `from_value(None)` keeps today's meaning
             // (Missing for a required scalar, None for an Option).

@@ -209,19 +209,38 @@ impl CatalogMapInner {
 
     /// The property named `name` in `collection`, resolved through the
     /// collection's model and its memberships (RFC 5.2). Authoritative.
+    ///
+    /// One live membership per (model, name) is an allocator invariant under
+    /// the canonical value_type ruling (registration compat-checks, never
+    /// forks), so multi-candidate election cannot arise from a well-formed
+    /// catalog; a second match here means a corrupted or pre-ruling map and
+    /// is worth a loud trace.
     fn resolve(&self, collection: &str, name: &str) -> Option<EntityId> {
         let model_id = self.by_collection.get(collection)?;
         let membership_ids = self.model_memberships.get(model_id)?;
+        let mut found: Option<EntityId> = None;
         for mid in membership_ids {
             if let Some(membership) = self.memberships.get(mid) {
                 if let Some(prop) = self.properties.get(&membership.property) {
                     if prop.name == name {
-                        return Some(prop.id);
+                        match found {
+                            None => found = Some(prop.id),
+                            Some(first) => {
+                                tracing::warn!(
+                                    "catalog map holds multiple live properties named '{}' in '{}' ({} and {}); resolving to the first",
+                                    name,
+                                    collection,
+                                    first,
+                                    prop.id
+                                );
+                                break;
+                            }
+                        }
                     }
                 }
             }
         }
-        None
+        found
     }
 
     fn memberships_of(&self, model: &EntityId) -> Vec<MembershipDef> {
@@ -452,6 +471,9 @@ where
     fn siblings(&self, name: &str) -> Vec<EntityId> { self.map.read().unwrap().siblings_by_name(name) }
     fn name_for(&self, id: &EntityId) -> Option<String> { self.map.read().unwrap().properties.get(id).map(|def| def.name.clone()) }
     fn model_id_for(&self, collection: &str) -> Option<EntityId> { self.map.read().unwrap().by_collection.get(collection).copied() }
+    fn canonical_value_type(&self, id: &EntityId) -> Option<String> {
+        self.map.read().unwrap().properties.get(id).map(|def| def.value_type.clone())
+    }
 }
 
 impl<SE, PA> CatalogManager<SE, PA>
@@ -892,15 +914,28 @@ where
     /// its whole lookup/allocate/commit/upsert sequence.
     pub(crate) async fn lock_allocator(&self) -> tokio::sync::MutexGuard<'_, ()> { self.0.allocator.lock().await }
 
-    /// The property lookup key (RFC 5.1): (minting model, current name,
-    /// backend, value_type). Used by the executor's upsert and the rename
-    /// hint pre-pass.
-    pub fn property_by_key(&self, model: &EntityId, name: &str, backend: &str, value_type: &str) -> Option<PropertyDef> {
+    /// The property lookup key (RFC 5.1 as amended 2026-07-10): (minting
+    /// model, current name). Backend and value_type left the key with the
+    /// canonical value_type ruling: a same-name registration with a different
+    /// type is a COMPATIBILITY question against the found definition, never a
+    /// second identity. Used by the executor's upsert and the rename hint
+    /// pre-pass.
+    pub fn property_by_name(&self, model: &EntityId, name: &str) -> Option<PropertyDef> {
         let map = self.0.map.read().unwrap();
         map.names_global.get(name)?.iter().find_map(|id| {
             let p = map.properties.get(id)?;
-            (p.minted_for == Some(*model) && p.backend == backend && p.value_type == value_type).then(|| p.clone())
+            (p.minted_for == Some(*model) && p.name == name).then(|| p.clone())
         })
+    }
+
+    /// The canonical value_type of a property-definition id, if the map knows
+    /// it (the CatalogManager-side twin of
+    /// [`crate::property::PropertyResolver::canonical_value_type`]; rfc.md
+    /// 5.6 as amended 2026-07-10). The resolution pass casts comparison
+    /// literals to this type so predicate evaluation and the reactor's
+    /// watcher index collate in the type the backends store.
+    pub(crate) fn canonical_value_type_of(&self, id: &EntityId) -> Option<String> {
+        self.0.map.read().unwrap().properties.get(id).map(|def| def.value_type.clone())
     }
 
     /// Fold resolved definitions into the map: the executor calls this

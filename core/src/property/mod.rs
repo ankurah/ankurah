@@ -85,6 +85,16 @@ pub trait PropertyResolver: Send + Sync {
         let _ = collection;
         None
     }
+    /// The property's canonical value_type (the catalog string form, e.g.
+    /// "string" / "i64"), fixed at allocation and never changed by
+    /// registration (rfc.md 5.6 as amended 2026-07-10). Writers cast to it
+    /// before values reach the backends. Defaults to `None` (unknown id, or a
+    /// resolver without catalog access), which callers treat as "write the
+    /// value as compiled".
+    fn canonical_value_type(&self, id: &EntityId) -> Option<String> {
+        let _ = id;
+        None
+    }
 }
 
 /// Checked read of a resolved property over an LWW backend: the RFC 5.4 read
@@ -266,15 +276,18 @@ pub trait Property: Sized {
     /// "entityid", ...) that MUST equal the `Value` variant [`into_value`]
     /// actually produces (RFC 4 in specs/model-property-metadata/rfc.md mapping table).
     ///
-    /// IDENTITY-CRITICAL: `#[derive(Model)]` reads this const (at compile
+    /// CONTRACT-CRITICAL: `#[derive(Model)]` reads this const (at compile
     /// time, via the associated const) for field types outside the built-in
-    /// table, and the value feeds the property-id derivation (RFC 5.1) --
-    /// two nodes disagreeing on it mint different ids for the same field,
-    /// and CHANGING it for a shipped type is a retype (mints a new property
-    /// identity, RFC 5.8). Defaults to "string" because the JSON-in-a-string
-    /// register is the catch-all serialization (`#[derive(Property)]` pins
-    /// it explicitly); a hand-written impl producing any other variant must
-    /// override this to match.
+    /// table, and the value is what registration declares against the
+    /// property's CANONICAL value_type (rfc.md 5.6 as amended 2026-07-10):
+    /// the canonical type is fixed at first allocation and never changed by
+    /// registration; a binary declaring a different but mutually castable
+    /// type writes and reads through `Value::cast_to`, and a non-castable
+    /// declaration refuses registration loudly. Changing a canonical type is
+    /// a deliberate migration (#303), never a code edit. Defaults to "string"
+    /// because the JSON-in-a-string register is the catch-all serialization
+    /// (`#[derive(Property)]` pins it explicitly); a hand-written impl
+    /// producing any other variant must override this to match.
     const VALUE_TYPE: &'static str = "string";
 
     fn into_value(&self) -> Result<Option<Value>, PropertyError>;
