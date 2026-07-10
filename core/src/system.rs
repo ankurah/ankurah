@@ -127,10 +127,9 @@ where
         lww_backend.set("item".into(), proto::sys::Item::SysRoot.into_value()?);
 
         // The system root is a fresh entity: its commit event is a genesis
-        // (empty head), so the D2-2 stamp is exactly 1 and the getter
-        // resolves nothing.
+        // (empty head), so the D2-2 stamp is exactly 1 and nothing resolves.
         let event_getter = LocalEventGetter::new(storage.clone(), true);
-        let event = system_entity.generate_commit_event(&event_getter).await?.ok_or(anyhow!("Expected event"))?;
+        let event = system_entity.generate_commit_event()?.ok_or(anyhow!("Expected event"))?;
 
         // Stage the event, apply, then commit
         event_getter.stage_event(event.clone());
@@ -196,6 +195,17 @@ where
 
         let collection_id = CollectionId::fixed_name(SYSTEM_COLLECTION_ID);
         let storage = self.0.collectionset.get(&collection_id).await?;
+
+        // Structural sanity on the trust anchor (M4, REV 5 section K): the
+        // root state's head-generation annotation must cover exactly its
+        // head, or the adopted root could never stamp a commit. This is the
+        // one wire-state ingress that does not route through the shared
+        // state-apply, so the check is inlined; the VALUES are adopted
+        // inside the same trust envelope as the root itself (this path only
+        // runs on ephemeral nodes).
+        if !state.payload.state.head_generations.matches_head(&state.payload.state.head) {
+            return Err(MutationError::Ingest(crate::error::IngestError::Lineage(crate::error::LineageRejection::HeadGenerationsMismatch)));
+        }
 
         // Entity-mediated adoption (D1 M4): the root state materializes
         // through with_state like every other state feed, so the resident

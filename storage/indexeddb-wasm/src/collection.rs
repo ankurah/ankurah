@@ -87,6 +87,12 @@ impl StorageCollection for IndexedDBBucket {
             entity.set(&*COLLECTION_KEY, self.collection_id.as_str())?;
             entity.set(&*STATE_BUFFER_KEY, &state.payload.state.state_buffers)?;
             entity.set(&*HEAD_KEY, &state.payload.state.head)?;
+            // Per-tip head generations (D2 M4, REV 5 section K home 3):
+            // self-contained [generation, eventIdBase64] pairs under one
+            // key, so rehydration reconstitutes the materialization without
+            // reading events. A pre-M4 record lacks the key and state reads
+            // fail loudly (fresh-database ruling).
+            entity.set(&*GENERATIONS_KEY, &state.payload.state.head_generations)?;
             entity.set(&*ATTESTATIONS_KEY, &state.attestations)?;
 
             // Extract all fields for indexing
@@ -129,7 +135,7 @@ impl StorageCollection for IndexedDBBucket {
                     state: State {
                         state_buffers: entity.get(&STATE_BUFFER_KEY)?,
                         head: entity.get(&HEAD_KEY)?,
-                        head_generations: Default::default(),
+                        head_generations: entity.get(&GENERATIONS_KEY)?,
                     },
                 },
                 attestations: entity.get(&ATTESTATIONS_KEY)?,
@@ -522,7 +528,7 @@ fn js_object_to_entity_state(
     entity_obj: &Object,
     collection_id: &ankurah_proto::CollectionId,
 ) -> Result<Attested<EntityState>, RetrievalError> {
-    use crate::statics::{ATTESTATIONS_KEY, HEAD_KEY, ID_KEY, STATE_BUFFER_KEY};
+    use crate::statics::{ATTESTATIONS_KEY, GENERATIONS_KEY, HEAD_KEY, ID_KEY, STATE_BUFFER_KEY};
     use ankurah_proto::{Attested, EntityId, EntityState, State};
 
     // Extract the specific fields that are stored in IndexedDB using Object::get
@@ -534,7 +540,7 @@ fn js_object_to_entity_state(
         state: State {
             state_buffers: entity_obj.get(&STATE_BUFFER_KEY)?,
             head: entity_obj.get(&HEAD_KEY)?,
-            head_generations: Default::default(),
+            head_generations: entity_obj.get(&GENERATIONS_KEY)?,
         },
     };
 

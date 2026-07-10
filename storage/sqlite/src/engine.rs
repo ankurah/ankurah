@@ -117,11 +117,20 @@ impl StorageEngine for SqliteStorageEngine {
 
 fn create_state_table(conn: &Connection, collection_id: &CollectionId) -> Result<(), SqliteError> {
     let table_name = collection_id.as_str();
+    // generations is the per-tip head-generation column (D2 M4, plan REV 5
+    // section K home 3): a JSON array of u32 PARALLEL to the head array
+    // (generations[i] annotates head[i]). NOT NULL because the annotation
+    // is mandatory (fresh-database ruling); a pre-M4 table lacks the column
+    // and state reads fail loudly. Reads are STRICTLY TYPED: sqlite treats
+    // an unknown double-quoted identifier as a string literal (the F2
+    // trap), so the reader parses the value as JSON and the literal string
+    // "generations" fails the parse instead of decoding silently.
     let query = format!(
         r#"CREATE TABLE IF NOT EXISTS "{}"(
             "id" TEXT PRIMARY KEY,
             "state_buffer" BLOB NOT NULL,
             "head" TEXT NOT NULL,
+            "generations" TEXT NOT NULL,
             "attestations" BLOB
         )"#,
         table_name
@@ -258,6 +267,23 @@ impl SqliteBucket {
     }
 }
 
+/// Reconstitute the per-tip head generations from the parallel columns (D2
+/// M4, plan REV 5 section K): the generations JSON array annotates the head
+/// array position-wise, both in Clock's sorted canonical order. Strictly
+/// typed and length-checked; a pre-M4 row yields the F2 string literal
+/// "generations" here, which fails the JSON parse loudly.
+fn gclock_from_parallel(head: &Clock, generations_json: &str) -> Result<GClock, SqliteError> {
+    let generations: Vec<u32> = serde_json::from_str(generations_json).map_err(SqliteError::Json)?;
+    if generations.len() != head.len() {
+        return Err(SqliteError::Integrity(format!(
+            "generations column has {} entries for a head of {} tips",
+            generations.len(),
+            head.len()
+        )));
+    }
+    Ok(GClock::new(head.iter().zip(generations).map(|(tip, generation)| (generation, tip.clone())).collect::<Vec<_>>()))
+}
+
 #[async_trait]
 impl StorageCollection for SqliteBucket {
     async fn set_state(&self, state: Attested<EntityState>) -> Result<bool, MutationError> {
@@ -270,6 +296,25 @@ impl StorageCollection for SqliteBucket {
 
         let state_buffers = bincode::serialize(&state.payload.state.state_buffers)?;
         let head_json = serde_json::to_string(&state.payload.state.head).map_err(|e| MutationError::General(Box::new(e)))?;
+        // Parallel to the head array (entry i annotates head[i]; the head
+        // serializes in Clock's sorted canonical order). A head tip without
+        // a materialized entry is malformed input and fails the write
+        // loudly rather than persisting a hole.
+        let generations: Vec<u32> = state
+            .payload
+            .state
+            .head
+            .iter()
+            .map(|tip| {
+                state
+                    .payload
+                    .state
+                    .head_generations
+                    .generation_of(tip)
+                    .ok_or_else(|| MutationError::General(format!("state head tip {tip} lacks a head-generation entry").into()))
+            })
+            .collect::<Result<_, _>>()?;
+        let generations_json = serde_json::to_string(&generations).map_err(|e| MutationError::General(Box::new(e)))?;
         let attestations_blob = bincode::serialize(&state.attestations)?;
         let id = state.payload.entity_id.to_base64();
         let id_clone = id.clone(); // Clone for use in closure
@@ -301,7 +346,7 @@ impl StorageCollection for SqliteBucket {
         }
 
         // Build the UPSERT query
-        const BASE_COLUMNS: &[&str] = &["id", "state_buffer", "head", "attestations"];
+        const BASE_COLUMNS: &[&str] = &["id", "state_buffer", "head", "generations", "attestations"];
 
         let table_name = self.state_table();
         let num_columns = BASE_COLUMNS.len() + materialized.len();
@@ -312,6 +357,7 @@ impl StorageCollection for SqliteBucket {
         values.push(rusqlite::types::Value::Text(id));
         values.push(rusqlite::types::Value::Blob(state_buffers));
         values.push(rusqlite::types::Value::Text(head_json));
+        values.push(rusqlite::types::Value::Text(generations_json));
         values.push(rusqlite::types::Value::Blob(attestations_blob));
 
         // Track which placeholders need jsonb() wrapper (base columns don't)
@@ -392,21 +438,24 @@ impl StorageCollection for SqliteBucket {
 
         let result = conn
             .with_connection(move |c| {
-                let query = format!(r#"SELECT "id", "state_buffer", "head", "attestations" FROM "{}" WHERE "id" = ?"#, table_name);
+                let query =
+                    format!(r#"SELECT "id", "state_buffer", "head", "generations", "attestations" FROM "{}" WHERE "id" = ?"#, table_name);
 
                 let result = c.query_row(&query, [&id_str], |row| {
                     let _row_id: String = row.get(0)?;
                     let state_buffer: Vec<u8> = row.get(1)?;
                     let head_json: String = row.get(2)?;
-                    let attestations_blob: Vec<u8> = row.get(3)?;
-                    Ok((state_buffer, head_json, attestations_blob))
+                    let generations_json: String = row.get(3)?;
+                    let attestations_blob: Vec<u8> = row.get(4)?;
+                    Ok((state_buffer, head_json, generations_json, attestations_blob))
                 });
 
                 match result {
-                    Ok((state_buffer, head_json, attestations_blob)) => {
+                    Ok((state_buffer, head_json, generations_json, attestations_blob)) => {
                         let state_buffers: BTreeMap<String, Vec<u8>> =
                             bincode::deserialize(&state_buffer).map_err(|e| SqliteError::Serialization(e))?;
                         let head: Clock = serde_json::from_str(&head_json).map_err(|e| SqliteError::Json(e))?;
+                        let head_generations = gclock_from_parallel(&head, &generations_json)?;
                         let attestations: AttestationSet =
                             bincode::deserialize(&attestations_blob).map_err(|e| SqliteError::Serialization(e))?;
 
@@ -414,7 +463,7 @@ impl StorageCollection for SqliteBucket {
                             payload: EntityState {
                                 entity_id: id,
                                 collection: collection_id,
-                                state: State { state_buffers: StateBuffers(state_buffers), head, head_generations: GClock::default() },
+                                state: State { state_buffers: StateBuffers(state_buffers), head, head_generations },
                             },
                             attestations,
                         })
@@ -484,7 +533,7 @@ impl StorageCollection for SqliteBucket {
             limit: if needs_post_filter { None } else { effective_selection.limit },
         };
 
-        let mut builder = SqlBuilder::with_fields(vec!["id", "state_buffer", "head", "attestations"]);
+        let mut builder = SqlBuilder::with_fields(vec!["id", "state_buffer", "head", "generations", "attestations"]);
         builder.table_name(self.state_table());
         builder.selection(&sql_selection).map_err(|e| SqliteError::SqlGeneration(e.to_string()))?;
 
@@ -500,13 +549,14 @@ impl StorageCollection for SqliteBucket {
                     let id_str: String = row.get(0)?;
                     let state_buffer: Vec<u8> = row.get(1)?;
                     let head_json: String = row.get(2)?;
-                    let attestations_blob: Vec<u8> = row.get(3)?;
-                    Ok((id_str, state_buffer, head_json, attestations_blob))
+                    let generations_json: String = row.get(3)?;
+                    let attestations_blob: Vec<u8> = row.get(4)?;
+                    Ok((id_str, state_buffer, head_json, generations_json, attestations_blob))
                 })?;
 
                 let mut results = Vec::new();
                 for row in rows {
-                    let (id_str, state_buffer, head_json, attestations_blob) = row?;
+                    let (id_str, state_buffer, head_json, generations_json, attestations_blob) = row?;
 
                     let id = EntityId::from_base64(&id_str).map_err(|e| {
                         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(std::io::Error::other(e)))
@@ -517,15 +567,18 @@ impl StorageCollection for SqliteBucket {
                     let head: Clock = serde_json::from_str(&head_json).map_err(|e| {
                         rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(std::io::Error::other(e)))
                     })?;
+                    let head_generations = gclock_from_parallel(&head, &generations_json).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(std::io::Error::other(e)))
+                    })?;
                     let attestations: AttestationSet = bincode::deserialize(&attestations_blob).map_err(|e| {
-                        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Blob, Box::new(std::io::Error::other(e)))
+                        rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Blob, Box::new(std::io::Error::other(e)))
                     })?;
 
                     results.push(Attested {
                         payload: EntityState {
                             entity_id: id,
                             collection: collection_id.clone(),
-                            state: State { state_buffers: StateBuffers(state_buffers), head, head_generations: GClock::default() },
+                            state: State { state_buffers: StateBuffers(state_buffers), head, head_generations },
                         },
                         attestations,
                     });

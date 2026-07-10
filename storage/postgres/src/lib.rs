@@ -263,11 +263,18 @@ impl PostgresBucket {
     }
 
     pub async fn create_state_table(&self, client: &mut tokio_postgres::Client) -> Result<(), StateError> {
+        // generations is the per-tip head-generation column (D2 M4, plan
+        // REV 5 section K home 3): a bigint array PARALLEL to the head
+        // array (generations[i] annotates head[i]; u32 stored as bigint for
+        // the same unsigned-range reason as the event table). NOT NULL
+        // because the annotation is mandatory (fresh-database ruling); a
+        // pre-M4 table lacks the column and state reads fail loudly.
         let create_query = format!(
             r#"CREATE TABLE IF NOT EXISTS "{}"(
                 "id" character(22) PRIMARY KEY,
                 "state_buffer" BYTEA,
                 "head" character(43)[],
+                "generations" bigint[] NOT NULL,
                 "attestations" BYTEA[]
             )"#,
             self.state_table()
@@ -342,6 +349,24 @@ impl PostgresBucket {
     }
 }
 
+/// Reconstitute the per-tip head generations from the parallel arrays (D2
+/// M4, plan REV 5 section K): generations[i] annotates head[i], where the
+/// head array is stored (and re-read) in Clock's sorted canonical order.
+/// Strictly typed and length-checked: a pre-M4 row (no column, caught by
+/// the SELECT), a length mismatch, or an out-of-range value all fail
+/// loudly rather than reconstituting a wrong materialization.
+fn gclock_from_parallel(head: &Clock, generations: &[i64]) -> Result<GClock, String> {
+    if generations.len() != head.len() {
+        return Err(format!("generations column has {} entries for a head of {} tips", generations.len(), head.len()));
+    }
+    let mut entries = Vec::with_capacity(generations.len());
+    for (tip, raw) in head.iter().zip(generations) {
+        let generation: u32 = (*raw).try_into().map_err(|_| format!("generation {raw} for head tip {tip} is outside u32 range"))?;
+        entries.push((generation, tip.clone()));
+    }
+    Ok(GClock::new(entries))
+}
+
 #[async_trait]
 impl StorageCollection for PostgresBucket {
     async fn set_state(&self, state: Attested<EntityState>) -> Result<bool, MutationError> {
@@ -354,13 +379,37 @@ impl StorageCollection for PostgresBucket {
             warn!("Warning: Empty head detected for entity {}", id);
         }
 
+        // The generations column is PARALLEL to the head array: entry i
+        // annotates head[i]. Clock's ToSql writes the head in its sorted
+        // canonical order, so aligning by that same iteration is exact. A
+        // head tip without a materialized entry is malformed input (the
+        // resident maintains the annotation with every head mutation) and
+        // fails the write loudly rather than persisting a hole.
+        let generations: Vec<i64> = state
+            .payload
+            .state
+            .head
+            .iter()
+            .map(|tip| {
+                state
+                    .payload
+                    .state
+                    .head_generations
+                    .generation_of(tip)
+                    .map(|g| g as i64)
+                    .ok_or_else(|| MutationError::General(format!("state head tip {tip} lacks a head-generation entry").into()))
+            })
+            .collect::<Result<_, _>>()?;
+
         let mut client = self.pool.get().await.map_err(|err| MutationError::General(err.into()))?;
 
-        let mut columns: Vec<String> = vec!["id".to_owned(), "state_buffer".to_owned(), "head".to_owned(), "attestations".to_owned()];
+        let mut columns: Vec<String> =
+            vec!["id".to_owned(), "state_buffer".to_owned(), "head".to_owned(), "generations".to_owned(), "attestations".to_owned()];
         let mut params: Vec<&(dyn ToSql + Sync)> = Vec::new();
         params.push(&id);
         params.push(&state_buffers);
         params.push(&state.payload.state.head);
+        params.push(&generations);
         params.push(&attestations);
 
         let mut materialized: Vec<(String, Option<PGValue>)> = Vec::new();
@@ -468,7 +517,8 @@ impl StorageCollection for PostgresBucket {
 
     async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError> {
         // be careful with sql injection via bucket name
-        let query = format!(r#"SELECT "id", "state_buffer", "head", "attestations" FROM "{}" WHERE "id" = $1"#, self.state_table());
+        let query =
+            format!(r#"SELECT "id", "state_buffer", "head", "generations", "attestations" FROM "{}" WHERE "id" = $1"#, self.state_table());
 
         let mut client = match self.pool.get().await {
             Ok(client) => client,
@@ -504,6 +554,8 @@ impl StorageCollection for PostgresBucket {
         let serialized_buffers: Vec<u8> = row.try_get("state_buffer").map_err(RetrievalError::storage)?;
         let state_buffers: BTreeMap<String, Vec<u8>> = bincode::deserialize(&serialized_buffers).map_err(RetrievalError::storage)?;
         let head: Clock = row.try_get("head").map_err(RetrievalError::storage)?;
+        let generations: Vec<i64> = row.try_get("generations").map_err(RetrievalError::storage)?;
+        let head_generations = gclock_from_parallel(&head, &generations).map_err(|e| RetrievalError::StorageError(e.into()))?;
         let attestation_bytes: Vec<Vec<u8>> = row.try_get("attestations").map_err(RetrievalError::storage)?;
         let attestations = attestation_bytes
             .into_iter()
@@ -515,7 +567,7 @@ impl StorageCollection for PostgresBucket {
             payload: EntityState {
                 entity_id: id,
                 collection: self.collection_id.clone(),
-                state: State { state_buffers: StateBuffers(state_buffers), head, head_generations: GClock::default() },
+                state: State { state_buffers: StateBuffers(state_buffers), head, head_generations },
             },
             attestations: AttestationSet(attestations),
         })
@@ -585,7 +637,7 @@ impl StorageCollection for PostgresBucket {
         };
 
         let mut results = Vec::new();
-        let mut builder = SqlBuilder::with_fields(vec!["id", "state_buffer", "head", "attestations"]);
+        let mut builder = SqlBuilder::with_fields(vec!["id", "state_buffer", "head", "generations", "attestations"]);
         builder.table_name(self.state_table());
         builder.selection(&sql_selection)?;
 
@@ -612,6 +664,8 @@ impl StorageCollection for PostgresBucket {
             let state_buffer: Vec<u8> = row.try_get(1).map_err(RetrievalError::storage)?;
             let state_buffers: BTreeMap<String, Vec<u8>> = bincode::deserialize(&state_buffer).map_err(RetrievalError::storage)?;
             let head: Clock = row.try_get("head").map_err(RetrievalError::storage)?;
+            let generations: Vec<i64> = row.try_get("generations").map_err(RetrievalError::storage)?;
+            let head_generations = gclock_from_parallel(&head, &generations).map_err(|e| RetrievalError::StorageError(e.into()))?;
             let attestation_bytes: Vec<Vec<u8>> = row.try_get("attestations").map_err(RetrievalError::storage)?;
             let attestations = attestation_bytes
                 .into_iter()
@@ -623,7 +677,7 @@ impl StorageCollection for PostgresBucket {
                 payload: EntityState {
                     entity_id: id,
                     collection: self.collection_id.clone(),
-                    state: State { state_buffers: StateBuffers(state_buffers), head, head_generations: GClock::default() },
+                    state: State { state_buffers: StateBuffers(state_buffers), head, head_generations },
                 },
                 attestations: AttestationSet(attestations),
             });
