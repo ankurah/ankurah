@@ -1120,6 +1120,60 @@ mod persist_marker_tests {
     }
 }
 
+#[cfg(test)]
+mod saturation_stamp_tests {
+    use super::*;
+    use crate::ingest::testkit::{FailingCommitStore, NoState};
+    use crate::ingest::{check_generation, GenerationCheck, StagingArea};
+    use ankurah_proto::StateBuffers;
+
+    /// Stamping FROM a saturated adopted tip (M4 remediation item 9,
+    /// test-adequacy panel MAJOR 3's entity-level arm): the trust envelope
+    /// makes a u32::MAX materialized entry reachable today (an ephemeral
+    /// adopting a GClock entry of u32::MAX then committing evaluates
+    /// 1 + u32::MAX in production code). The commit stamp must stay AT the
+    /// sentinel (never wrap; a wrap-to-0 stamp makes a maximal-depth tip
+    /// look below-genesis to any M5 precheck, inverting the conservative
+    /// direction 266-C.iv guarantees), and admission verification of that
+    /// commit against the same materialization must agree (stamp and
+    /// verify share one helper; this pins that they stay shared, so no
+    /// honest self-rejection wedge opens at the ceiling).
+    #[tokio::test]
+    async fn commit_from_a_saturated_adopted_tip_stamps_the_sentinel_and_verifies() {
+        let set = WeakEntitySet::default();
+        let entity_id = EntityId::new();
+        let tip = EventId::from_bytes([9; 32]);
+
+        // Bodiless adoption of a saturated tip (the trust envelope).
+        let adopted = State {
+            state_buffers: StateBuffers(BTreeMap::new()),
+            head: Clock::from(vec![tip.clone()]),
+            head_generations: GClock::from((u32::MAX, tip.clone())),
+        };
+        let staging = std::sync::Arc::new(StagingArea::with_default_cap());
+        let getter = FailingCommitStore::ephemeral(staging, EventId::from_bytes([0xEE; 32]));
+        let (_, entity) = set.with_state(&NoState, &getter, entity_id, "test".into(), adopted).await.expect("bodiless adoption");
+
+        // A local write so the commit has operations to carry.
+        let lww = entity.get_backend::<crate::property::backend::lww::LWWBackend>().expect("backend");
+        use crate::property::backend::PropertyBackend;
+        lww.set("title".into(), Some(Value::String("at-the-ceiling".to_owned())));
+
+        let event = entity.generate_commit_event().expect("the stamp reads the materialization").expect("a write produces an event");
+        assert_eq!(event.generation, u32::MAX, "stamping from a saturated tip stays AT the sentinel (no wrap, no panic)");
+        assert_eq!(event.parent, Clock::from(vec![tip]), "the commit parents on the adopted head");
+
+        // Verification agrees via the SAME shared helper: no honest
+        // self-rejection wedge at the ceiling.
+        let materialized = entity.head_generations();
+        let check = check_generation(&getter, Some(&materialized), &event).await.expect("the check runs");
+        assert!(
+            matches!(check, GenerationCheck::Verified),
+            "admission verification of a sentinel-stamped commit against the same materialization must agree"
+        );
+    }
+}
+
 // TODO - Implement TOCTOU Race condition tests. Require real backend state mutations to be meaningful. punting that for now
 
 /// Shared interior of [`WeakEntitySet`]: the resident map plus the node's
