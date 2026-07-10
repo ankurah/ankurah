@@ -355,4 +355,20 @@ mod tests {
         );
         assert_eq!(id, bincode::deserialize(&bytes).unwrap());
     }
+
+    /// The 266-C.iv saturation contract as ARITHMETIC (M4 remediation item
+    /// 9, test-adequacy panel MAJOR 3): the sentinel was pinned only as a
+    /// STORED value (the four engine round-trips), so replacing
+    /// saturating_add(1) with a plain + 1 passed the entire suite (no test
+    /// fed a maximal parent through the helper; release builds would wrap
+    /// to 0, inverting exactly the conservative direction the sentinel
+    /// guarantees for the M5 prechecks).
+    #[test]
+    fn generation_from_parents_saturates_at_the_sentinel() {
+        assert_eq!(Event::generation_from_parents([u32::MAX]), u32::MAX, "a saturated parent stays at the sentinel, never wraps");
+        assert_eq!(Event::generation_from_parents([u32::MAX - 1]), u32::MAX, "the last honest depth lands exactly on the sentinel");
+        assert_eq!(Event::generation_from_parents([u32::MAX, 3]), u32::MAX, "max() then saturate, order-independent");
+        assert_eq!(Event::generation_from_parents([3, u32::MAX]), u32::MAX, "max() then saturate, order-independent");
+        assert_eq!(Event::generation_from_parents([]), 1, "genesis stamps exactly 1 (266-A)");
+    }
 }
