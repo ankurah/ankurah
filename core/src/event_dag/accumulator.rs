@@ -13,6 +13,7 @@ use lru::LruCache;
 use crate::error::RetrievalError;
 use crate::event_dag::layers::EventLayers;
 use crate::event_dag::relation::AbstractCausalRelation;
+use crate::event_dag::stats::CompareStats;
 use crate::retrieval::GetEvents;
 use ankurah_proto::{Event, EventId};
 
@@ -32,13 +33,19 @@ pub(crate) struct EventAccumulator<E: GetEvents> {
 
     /// Event getter with storage access
     event_getter: E,
+
+    /// Per-comparison counters (D2 M5, dispositions Q4). They live on the
+    /// accumulator because it sees every fetch and survives budget-escalation
+    /// retries; ComparisonResult snapshots them at construction. WRITE-ONLY
+    /// during the walk (see the `stats` module doc).
+    pub(crate) stats: CompareStats,
 }
 
 impl<E: GetEvents> EventAccumulator<E> {
     /// Create a new accumulator with the given retriever.
     /// LRU cache defaults to 1000 entries.
     pub(crate) fn new(event_getter: E) -> Self {
-        Self { dag: BTreeMap::new(), cache: LruCache::new(NonZeroUsize::new(1000).unwrap()), event_getter }
+        Self { dag: BTreeMap::new(), cache: LruCache::new(NonZeroUsize::new(1000).unwrap()), event_getter, stats: CompareStats::default() }
     }
 
     /// Called during BFS traversal -- records DAG structure and caches the event.
@@ -56,6 +63,7 @@ impl<E: GetEvents> EventAccumulator<E> {
             return Ok(event.clone());
         }
         let event = self.event_getter.get_event(id).await?;
+        self.stats.events_fetched += 1;
         self.cache.put(id.clone(), event.clone());
         Ok(event)
     }
@@ -76,12 +84,19 @@ pub struct ComparisonResult<E: GetEvents> {
     pub(crate) relation: AbstractCausalRelation<EventId>,
     /// The event accumulator with DAG structure (private -- access via into_layers).
     accumulator: EventAccumulator<E>,
+    /// The walk's counters, snapshotted at verdict time (dispositions Q4):
+    /// post-verdict layer iteration through the accumulator does not bleed
+    /// into them. Crate-visible; readers are tests, the immunity oracle,
+    /// and bench evidence, never the walk itself (write-only rule).
+    pub(crate) stats: CompareStats,
 }
 
 impl<E: GetEvents> ComparisonResult<E> {
-    /// Create a new ComparisonResult.
+    /// Create a new ComparisonResult, snapshotting the accumulator's
+    /// counters as of the verdict.
     pub(crate) fn new(relation: AbstractCausalRelation<EventId>, accumulator: EventAccumulator<E>) -> Self {
-        Self { relation, accumulator }
+        let stats = accumulator.stats.clone();
+        Self { relation, accumulator, stats }
     }
 
     /// For DivergedSince results, consume self to get a layer iterator.

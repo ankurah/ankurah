@@ -2662,6 +2662,63 @@ mod strict_descends_gap_jump {
 }
 
 // ============================================================================
+// COMPARESTATS MECHANICS (D2 M5, dispositions Q4)
+// ============================================================================
+
+#[cfg(test)]
+mod compare_stats_mechanics {
+    use super::*;
+
+    /// events_fetched counts UNDERLYING retriever fetches only; LRU hits are
+    /// not fetches. budget_decrements counts processed frontier occupants,
+    /// which exceeds distinct events exactly when the two sides reach an
+    /// event at different steps (here: the comparison side processes g at
+    /// level 1 and the subject's traversal re-processes it at level 3).
+    ///
+    /// Trace for chain g <- a <- b, subject {b}, comparison {g}:
+    /// quick check fetches b (1; parents not within comparison, BFS runs);
+    /// level 1 processes b (LRU hit) and g (fetch 2); level 2 processes a
+    /// (fetch 3); level 3 processes g on the subject side (LRU hit). Totals:
+    /// 3 fetches, 4 decrements, verdict StrictDescends.
+    #[tokio::test]
+    async fn stats_count_underlying_fetches_and_budget_decrements() {
+        let mut retriever = MockRetriever::new();
+        let g = make_test_event(1, &[]);
+        let a = make_test_event(2, &[&g]);
+        let b = make_test_event(3, &[&a]);
+        for e in [&g, &a, &b] {
+            retriever.add_event(e);
+        }
+
+        let result = compare(retriever, &clock!(b.id()), &clock!(g.id()), 100).await.unwrap();
+        assert!(matches!(result.relation, AbstractCausalRelation::StrictDescends { .. }));
+        assert_eq!(result.stats.events_fetched, 3, "b, g, a fetched once each; the level-3 re-encounter of g is an LRU hit");
+        assert_eq!(result.stats.budget_decrements, 4, "b, g, a, plus g re-processed from the subject side");
+        assert_eq!(result.stats.id_mismatches, 0, "honest retriever: every payload recomputes to its requested id");
+        assert_eq!(result.stats.precheck_suppressions, 0, "no prechecks ran (no generation operands supplied)");
+        assert_eq!(result.stats.edge_check_violations, 0);
+        assert_eq!(result.stats.demotions, 0);
+    }
+
+    /// The Equal and empty-clock early returns complete without touching the
+    /// retriever: their stats are all zero.
+    #[tokio::test]
+    async fn early_returns_carry_zero_stats() {
+        let mut retriever = MockRetriever::new();
+        let g = make_test_event(4, &[]);
+        retriever.add_event(&g);
+
+        let equal = compare(retriever.clone(), &clock!(g.id()), &clock!(g.id()), 100).await.unwrap();
+        assert!(matches!(equal.relation, AbstractCausalRelation::Equal));
+        assert_eq!(equal.stats, Default::default());
+
+        let empty = compare(retriever, &clock!(g.id()), &Clock::default(), 100).await.unwrap();
+        assert!(matches!(empty.relation, AbstractCausalRelation::DivergedSince { .. }));
+        assert_eq!(empty.stats, Default::default());
+    }
+}
+
+// ============================================================================
 // PROPERTY TEST: state machine verdict vs brute-force reachability oracle
 // ============================================================================
 
