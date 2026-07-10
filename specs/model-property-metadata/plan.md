@@ -559,6 +559,13 @@ model <-> table map half deferred with #304.
     under an unresolvable id fails visible as TypeSkew. Display-name
     hints are engine-projection only and never route writes or bound
     reads (the schema-blind projection regime is decision 17).
+    AMENDED (canonical value_type ruling, #289, 2026-07-10): the READ-SIDE
+    half of this decision (the foreign-data gate on bound getters) is
+    VETOED and removed with the other read-time gates (decision 31). The
+    transplant stance itself stands: cross-system data is refused at the
+    wire ingress by the unknown-model-id rejection, and an out-of-band
+    copied buffer now reads as ABSENT (never substituted) rather than
+    erroring per-read.
 16. **Commit-time registration closes the edit-only gap**: the sync
     edit path cannot await a durable registration, so commit_local_trx
     ensure-registers any touched collection whose compiled schema is
@@ -899,3 +906,27 @@ model <-> table map half deferred with #304.
     name) becomes an allocator invariant (CatalogMapInner::resolve warns
     if a map ever holds two). Supersedes the fork-identity semantics of
     rev 4's 5.6 and decision 19's "changing VALUE_TYPE is a retype" note.
+31. **Read-time gates removed; backends addressed only through the
+    PropertyBackend trait** (maintainer ruling in session, 2026-07-10,
+    same thread as decision 30; rfc.md 5.4 rule-4 amendment). The sibling
+    gate and the foreign-data gate are deleted from every read path:
+    registration is the sole type/identity admission point, so by the
+    time a read or query runs the gates' question is already answered,
+    and TypeSkew is deleted with them (the surviving read-time failure is
+    the per-value PropertyError::NonCastable projection error, renamed
+    from CastError; the registration refusal is
+    RegistrationError::NonCastable). Cross-system data is refused at wire
+    ingress by the unknown-model-id rejection; an out-of-band copied
+    buffer reads as absent, never substituted (decision 15's read-side
+    half vetoed). Mechanically: PropertyBackend gains `entry` (three-way
+    presence: absent / cleared tombstone / value, the primitive the
+    anti-resurrection rule needs) and `restage` (commit-time
+    canonicalization hook), both with defaults suiting tombstone-less
+    backends; the dispatch collapses to the generic
+    `property::read_resolved`; every by-name backend touch and downcast
+    in generic core (entity.rs read paths, resolve_pending_keys) is
+    removed -- LWW is an ordinary registered backend with no special
+    status in core, and `backend_from_string` is the one sanctioned
+    by-name seam (the registry constructor). PropertyResolver::siblings
+    and the entity's catalog_knows_id helper die with the gates;
+    Filterable::value_checked becomes the infallible value_resolved.

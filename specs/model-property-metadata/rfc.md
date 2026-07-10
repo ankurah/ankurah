@@ -875,6 +875,23 @@ in why it is semantically correct rather than a workaround:
    is not among the foreign data. Predicate evaluation does NOT arm this
    gate (absent evaluates as NULL by design, plan decision 14, so nothing
    is fabricated), and unbound reads have no catalog to be foreign to.
+   AMENDED (canonical value_type ruling, #289, 2026-07-10): the sibling gate
+   and the foreign-data gate are REMOVED (plan decision 31; decision 15's
+   read-side half is vetoed by the maintainer). Type and identity admission
+   happen at REGISTRATION -- a non-castable declared type refuses there, and
+   one live property per (model, name) is an allocator invariant -- so by the
+   time any read or query runs, the question the gates asked has already been
+   answered. The dispatch collapses to `read_resolved` in
+   core/src/property/mod.rs, generic over `PropertyBackend::entry`: a present
+   id entry (even a tombstone) is authoritative and never falls back
+   (anti-resurrection unchanged), then legacy Name residue, then absent. Data
+   under a DIFFERENT property id is simply not this field and never
+   substitutes; an out-of-band copied buffer reads as absent (the
+   wire-ingress unknown-model-id rejection is where cross-system data is
+   refused). The only read-time failure is the per-value
+   `PropertyError::NonCastable` projection error (renamed from CastError;
+   TypeSkew is deleted). Policy inspection and predicate evaluation read
+   leniently and have no type-error surface at all.
 5. Property not registered and not in the local schema:
    PropertyError::UnknownProperty (a new variant; today's Missing keeps its
    meaning for pre-Phase-A code paths).
@@ -1113,9 +1130,9 @@ Phase C is engine-local and carries no wire dependency of its own.
   struct-level retype is therefore durably INERT: the canonical type does
   not follow the code, and registration logs the drift. Changing a canonical
   type is a deliberate migration operation (#303), never a model-struct
-  edit. One live property per (model, name) becomes an allocator invariant;
-  the 5.4 sibling gate remains for cross-contract same-name ids and legacy
-  data. The SchemaRegistered response carries the CANONICAL (backend,
+  edit. One live property per (model, name) becomes an allocator invariant,
+  and the 5.4 read-time gates are removed outright (see the 5.4 rule-4
+  amendment of the same date): registration is the sole admission point. The SchemaRegistered response carries the CANONICAL (backend,
   value_type) so a drifted requester's catalog map holds its cast target;
   explicit-id binding verification (5.9) admits the same castable drift.
 - **Old node missing a property (fleet-version skew):** backend payloads are
