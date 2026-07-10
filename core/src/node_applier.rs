@@ -37,9 +37,25 @@ where
     /// exactly the current head in the current reset epoch (D2-6,
     /// obligations (b) and (c); the sanctioned re-introduction of the
     /// elision ef68e081 removed, now keyed on completed-persist testimony
-    /// instead of no-op applies, so the two-lane interleaving R-D2-4c pins
-    /// cannot re-open: a sibling lane's in-flight persist has not stamped
-    /// yet, and its head advance defeats the head conjunct anyway).
+    /// instead of no-op applies).
+    ///
+    /// The WHOLE span (elision check, snapshot, engine write, stamp) runs
+    /// under the node's per-entity-id persist lock (the M4 post-review
+    /// remediation of the adversarial finding 2): engines are blind
+    /// last-writer upserts, so unserialized sibling lanes could land their
+    /// writes in the opposite order of their snapshots, regressing the
+    /// stored buffer while the marker elision made the regression sticky.
+    /// Serialized, persists of one entity are totally ordered, the write
+    /// that lands last carries the snapshot taken last (heads never
+    /// regress, so storage never regresses), a sibling waiting its turn
+    /// elides truthfully on the completed persist's stamp, and the marker
+    /// can never lead storage. The elision check sits INSIDE the lock so
+    /// it always reads the newest sibling stamp; keyed by id rather than
+    /// by instance so the transient two-residents-for-one-id window
+    /// (concurrency panel NOTE 4) cannot bypass the ordering. The two
+    /// documented raw set_state bypasses in system.rs stay outside the
+    /// lock: they never stamp, so there the marker only lags (the safe
+    /// direction).
     ///
     /// The reset epoch is captured BEFORE the persist begins and the
     /// captured value is stamped at completion, so a persist straddling a
@@ -47,6 +63,8 @@ where
     /// trusted. The marker stamps the exact head save_state serialized
     /// (returned by it), never a re-read.
     async fn persist(&self, entity: &crate::entity::Entity) -> Result<(), MutationError> {
+        let span = self.node.entities.persist_span(entity.id());
+        let _guard = span.lock().await;
         let epoch = self.node.entities.reset_epoch();
         if entity.persist_marker_current(epoch) {
             return Ok(());

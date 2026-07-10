@@ -104,10 +104,14 @@ impl AppliedSet {
 /// only when `epoch` equals the current reset epoch AND `head` equals the
 /// resident's current head; a persist that straddled a hard_reset stamped
 /// the pre-reset epoch and is therefore never trusted. The marker may LAG
-/// storage (the raw set_state bypasses in system.rs never stamp it; a
-/// sibling lane's completed persist may not have stamped yet), which only
-/// costs a redundant monotone-safe write; it may never LEAD storage, which
-/// is why only a completed set_state stamps it.
+/// storage (the raw set_state bypasses in system.rs never stamp it), which
+/// only costs a redundant monotone-safe write; it may never LEAD storage,
+/// which is why only a completed set_state stamps it AND why the funnel
+/// serializes each entity's whole snapshot-write-stamp span on the node's
+/// per-id persist lock (WeakEntitySet::persist_span): unserialized lanes
+/// could land engine writes in the opposite order of their snapshots,
+/// leaving the store regressed behind the head the marker testifies to
+/// (the M4 post-review remediation of the adversarial finding 2).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PersistMarker {
     pub(crate) epoch: u64,
@@ -373,8 +377,11 @@ impl Entity {
     /// persist funnel immediately after a set_state of this resident
     /// COMPLETED, with `epoch` captured BEFORE that persist began and `head`
     /// the exact head the completed persist wrote. Overwriting an existing
-    /// marker is safe in every interleaving: a marker can only lag storage
-    /// (costing a redundant monotone-safe write), never lead it.
+    /// marker is safe because the funnel serializes each entity's persists
+    /// on the node's per-id span lock (WeakEntitySet::persist_span): stamps
+    /// land in write order, so every stamp names exactly the newest
+    /// completed write and the marker can only lag storage (costing a
+    /// redundant monotone-safe write), never lead it.
     pub(crate) fn stamp_persist_marker(&self, epoch: u64, head: Clock) {
         self.state.write().unwrap().marker = Some(PersistMarker { epoch, head });
     }
@@ -1109,6 +1116,27 @@ struct WeakEntitySetInner {
     /// resetting it to zero is safe because markers restart empty too (a
     /// marker can only lag storage).
     reset_epoch: AtomicU64,
+    /// Per-entity persist serialization (D2-6, the M4 post-review
+    /// remediation of the cross-lane stamp reorder): the shared persist
+    /// funnel (NodePersist::persist) holds this lock for the entity's id
+    /// across its full elision-check, snapshot, set_state, stamp span.
+    /// Every engine's set_state is a blind last-writer upsert, so without
+    /// the span lock two funnel lanes persisting one entity can commit
+    /// their writes in the opposite order of their snapshots, regressing
+    /// the stored buffer to an older head while the marker elision keeps
+    /// the regression sticky. Serialized, writes of one entity are totally
+    /// ordered, the last write carries the newest snapshot (heads never
+    /// regress), and the marker can never LEAD storage.
+    ///
+    /// Keyed by EntityId at the NODE level, not by Entity instance: the
+    /// pre-existing remove_if_phantom/with_state interplay can transiently
+    /// yield two live instances for one id (concurrency panel NOTE 4), and
+    /// instance-keyed locks would silently stop serializing exactly then.
+    /// Entries are never removed: they are tiny (an id, an Arc, an idle
+    /// mutex), growth is bounded by distinct entities persisted over one
+    /// process lifetime, and eager cleanup would reintroduce the
+    /// two-locks-for-one-id hazard this map exists to close.
+    persist_locks: crate::util::safemap::SafeMap<EntityId, Arc<tokio::sync::Mutex<()>>>,
 }
 
 /// A set of entities held weakly
@@ -1134,6 +1162,11 @@ impl WeakEntitySet {
     /// Bump the reset epoch (hard_reset only). Every marker stamped under
     /// an earlier epoch becomes permanently untrusted.
     pub(crate) fn bump_reset_epoch(&self) -> u64 { self.0.reset_epoch.fetch_add(1, Ordering::AcqRel) + 1 }
+
+    /// The persist-serialization lock for one entity id (see the
+    /// `persist_locks` field doc). Funnel use only: hold it across the full
+    /// elision-check, snapshot, set_state, stamp span.
+    pub(crate) fn persist_span(&self, id: EntityId) -> Arc<tokio::sync::Mutex<()>> { self.0.persist_locks.get_or_default(id) }
 
     /// The hard_reset purge (REV 5 D.1): clear the resident map, taking only
     /// the map's own lock (no entity locks, so no lock-order hazard). Every
