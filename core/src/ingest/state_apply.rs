@@ -280,7 +280,6 @@ mod tests {
             head_generations: carried.clone(),
         };
 
-        let unverified = entities.unverified();
         let applied = apply_state_feed(&entities, &NoState, &getter, &staging, entity_id, "test".into(), state, &[], &NoopPersist)
             .await
             .expect("a consistent bodiless snapshot adopts cleanly on an ephemeral node");
