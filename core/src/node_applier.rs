@@ -57,12 +57,27 @@ where
     /// lock: they never stamp, so there the marker only lags (the safe
     /// direction).
     ///
-    /// The reset epoch is captured BEFORE the persist begins and the
-    /// captured value is stamped at completion, so a persist straddling a
-    /// hard_reset stamps the pre-reset epoch and its marker is never
-    /// trusted. The marker stamps the exact head save_state serialized
-    /// (returned by it), never a re-read.
+    /// The whole span also holds the RESET FENCE in read mode (M4
+    /// remediation, item 5): hard_reset takes the write half across its
+    /// epoch bump, map purge, and storage wipe, so in-flight persists
+    /// drain before the wipe and no persist span can interleave any reset
+    /// step. A funnel persist therefore cannot land dead-system bytes in
+    /// post-wipe storage, cannot stamp a current-epoch marker over storage
+    /// the wipe then erases, and cannot elide on a marker a reset just
+    /// killed. The reset epoch is captured inside the fenced span, before
+    /// the engine write, and the captured value is stamped at completion:
+    /// with the fence, every funnel persist runs strictly before or
+    /// strictly after a reset, and the epoch conjunct's remaining live job
+    /// is distrusting markers stamped BEFORE a reset on residents that
+    /// survive it through held strong references. The marker stamps the
+    /// exact head save_state serialized (returned by it), never a re-read.
+    ///
+    /// Acquisition order: fence read (node-wide, coarse) first, then the
+    /// per-entity span lock (fine); no path acquires them in the other
+    /// order or nested, and hard_reset takes no entity locks, so there is
+    /// no cycle.
     async fn persist(&self, entity: &crate::entity::Entity) -> Result<(), MutationError> {
+        let _fence = self.node.entities.reset_fence_read().await;
         let span = self.node.entities.persist_span(entity.id());
         let _guard = span.lock().await;
         let epoch = self.node.entities.reset_epoch();
