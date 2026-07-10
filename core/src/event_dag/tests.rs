@@ -7,9 +7,9 @@ use crate::property::backend::PropertyBackend;
 use crate::retrieval::GetEvents;
 use crate::value::Value;
 
-use super::comparison::compare;
+use super::comparison::{compare, compare_with, CompareOptions};
 use super::relation::AbstractCausalRelation;
-use ankurah_proto::{Clock, EntityId, Event, EventId, OperationSet};
+use ankurah_proto::{Clock, EntityId, Event, EventId, GClock, OperationSet};
 use async_trait::async_trait;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -84,6 +84,34 @@ impl GetEvents for GenCorruptedRetriever {
         if let Some(doctored) = self.overrides.get(event_id) {
             return Ok(doctored.clone());
         }
+        self.inner.get_event(event_id).await
+    }
+
+    async fn event_stored(&self, event_id: &EventId) -> Result<bool, RetrievalError> { self.inner.event_stored(event_id).await }
+}
+
+/// A retriever wrapper that RECORDS the sequence of requested ids (oracle
+/// brief section 4.1: the fetch-order log is the test-side observable for
+/// schedule changes, quick-check suppression and frontier reordering both).
+/// Zero production surface; interior mutability so the log survives the
+/// comparison taking ownership.
+#[derive(Clone)]
+struct LoggingRetriever<G> {
+    inner: G,
+    log: Arc<std::sync::Mutex<Vec<EventId>>>,
+}
+
+impl<G> LoggingRetriever<G> {
+    fn new(inner: G) -> Self { Self { inner, log: Arc::new(std::sync::Mutex::new(Vec::new())) } }
+
+    /// Handle to the fetch log; reads the ids requested so far, in order.
+    fn log_handle(&self) -> Arc<std::sync::Mutex<Vec<EventId>>> { self.log.clone() }
+}
+
+#[async_trait]
+impl<G: GetEvents + Send + Sync> GetEvents for LoggingRetriever<G> {
+    async fn get_event(&self, event_id: &EventId) -> Result<Event, RetrievalError> {
+        self.log.lock().unwrap().push(event_id.clone());
         self.inner.get_event(event_id).await
     }
 
@@ -2775,6 +2803,230 @@ mod requested_id_keying {
         let result = compare(wrapped, &clock!(b.id()), &clock!(g.id()), 100).await.unwrap();
         assert!(matches!(result.relation, AbstractCausalRelation::StrictDescends { .. }));
         assert_eq!(result.stats.id_mismatches, 0);
+    }
+}
+
+// ============================================================================
+// P1/P2 PRECHECKS, SUPPRESS-ONLY (D2 M5, plan D2-4, derivations section 2).
+// A precheck rejection may only SUPPRESS the positive fast-path attempt (the
+// StrictDescends quick check); it never selects, skips, or concludes a
+// verdict path. These pins drive compare_with with adversarial operand
+// values and assert the counter moved AND every BOUND observable stayed
+// byte-identical to the honest baseline.
+// ============================================================================
+
+#[cfg(test)]
+mod prechecks_suppress_only {
+    use super::*;
+
+    /// The B1 deflate seed (delta red-team BLOCKER 1, instantiated per the
+    /// oracle brief GC-DEFLATE): honest chain g(1) <- m(2) <- u(3) <- w(4),
+    /// subject {w}, comparison {m}; truth is StrictDescends. Doctored values
+    /// m -> 5, u -> 2, w -> 3 arrive through BOTH channels (payloads via the
+    /// lying retriever, tips via the operand GClocks, mutually consistent).
+    /// On the lies P1 computes maxg(C) = 5 > maxg(S) = 3 and wrongly rejects
+    /// a TRUE StrictDescends; the rejection may only suppress the attempt,
+    /// and the walk must return the byte-identical verdict.
+    #[tokio::test]
+    async fn b1_deflate_wrong_rejection_fires_and_is_contained() {
+        let mut retriever = MockRetriever::new();
+        let g = make_test_event(1, &[]);
+        let m = make_test_event(2, &[&g]);
+        let u = make_test_event(3, &[&m]);
+        let w = make_test_event(4, &[&u]);
+        for e in [&g, &m, &u, &w] {
+            retriever.add_event(e);
+        }
+        let subject = clock!(w.id());
+        let comparison = clock!(m.id());
+
+        // Honest baseline: honest payloads, honest operands.
+        let baseline = compare_with(
+            retriever.clone(),
+            &subject,
+            &comparison,
+            100,
+            CompareOptions {
+                subject_gens: Some(GClock::from((4, w.id()))),
+                comparison_gens: Some(GClock::from((2, m.id()))),
+                unverified: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(baseline.relation, AbstractCausalRelation::StrictDescends { .. }), "precondition: truth is StrictDescends");
+        assert_eq!(baseline.stats.precheck_suppressions, 0, "honest values reject nothing on this shape");
+
+        // Corrupted run: deflation through both channels, consistently.
+        let mut lying = GenCorruptedRetriever::new(retriever);
+        lying.doctor(m.id(), Event { generation: 5, ..m.clone() });
+        lying.doctor(u.id(), Event { generation: 2, ..u.clone() });
+        lying.doctor(w.id(), Event { generation: 3, ..w.clone() });
+        let corrupted = compare_with(
+            lying,
+            &subject,
+            &comparison,
+            100,
+            CompareOptions {
+                subject_gens: Some(GClock::from((3, w.id()))),
+                comparison_gens: Some(GClock::from((5, m.id()))),
+                unverified: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            corrupted.stats.precheck_suppressions >= 1,
+            "the corruption must BITE: P1 sees maxg(C)=5 > maxg(S)=3 and fires (suppression delta >= 1 vs baseline), got {}",
+            corrupted.stats.precheck_suppressions
+        );
+        assert_eq!(corrupted.relation, baseline.relation, "BOUND: the wrong rejection may only suppress; verdict and chain byte-equal");
+    }
+
+    /// GC-INFLATE, one-step shape: subject {e} sits exactly one step above
+    /// comparison {h} and the baseline quick check fires. Inflating the
+    /// COMPARISON operand makes P1 suppress the attempt; the BFS must return
+    /// the byte-identical verdict, and the fetch-order log shows the route
+    /// change (the suppressed quick check never fetched the comparison
+    /// head; the BFS does): a FREE delta asserted on purpose.
+    #[tokio::test]
+    async fn inflate_one_step_suppresses_quick_check_and_bfs_agrees() {
+        let mut retriever = MockRetriever::new();
+        let h = make_test_event(1, &[]);
+        let e = make_test_event(2, &[&h]);
+        retriever.add_event(&h);
+        retriever.add_event(&e);
+        let subject = clock!(e.id());
+        let comparison = clock!(h.id());
+
+        let honest_ops = || CompareOptions {
+            subject_gens: Some(GClock::from((2, e.id()))),
+            comparison_gens: Some(GClock::from((1, h.id()))),
+            unverified: None,
+        };
+
+        let base_log_retriever = LoggingRetriever::new(retriever.clone());
+        let base_log = base_log_retriever.log_handle();
+        let baseline = compare_with(base_log_retriever, &subject, &comparison, 100, honest_ops()).await.unwrap();
+        assert!(matches!(baseline.relation, AbstractCausalRelation::StrictDescends { .. }));
+        assert_eq!(baseline.stats.precheck_suppressions, 0, "honest values suppress nothing (the quick check fires)");
+        let base_fetches = base_log.lock().unwrap().clone();
+        assert_eq!(base_fetches, vec![e.id()], "precondition: the quick check fetches only the subject tip");
+
+        // Operand-channel inflation only: the retriever stays honest.
+        let corr_log_retriever = LoggingRetriever::new(retriever);
+        let corr_log = corr_log_retriever.log_handle();
+        let corrupted = compare_with(
+            corr_log_retriever,
+            &subject,
+            &comparison,
+            100,
+            CompareOptions {
+                subject_gens: Some(GClock::from((2, e.id()))),
+                comparison_gens: Some(GClock::from((4_000_000_000, h.id()))),
+                unverified: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            corrupted.stats.precheck_suppressions >= 1,
+            "the inflated comparison tip must suppress the quick-check attempt, got {}",
+            corrupted.stats.precheck_suppressions
+        );
+        assert_eq!(corrupted.relation, baseline.relation, "BOUND: byte-identical verdict and chain through the BFS route");
+        let corr_fetches = corr_log.lock().unwrap().clone();
+        assert_ne!(corr_fetches, base_fetches, "FREE, asserted on purpose: the route change is visible in the fetch order");
+    }
+
+    /// The no-op flank (oracle brief GC-INFLATE): inflating a SUBJECT tip
+    /// must not newly fire anything. Prechecks can only REJECT
+    /// StrictDescends hypotheses; a wiring inversion that concluded
+    /// positively from a huge subject value would show up here.
+    #[tokio::test]
+    async fn inflated_subject_tip_is_a_no_op_flank() {
+        let mut retriever = MockRetriever::new();
+        let h = make_test_event(1, &[]);
+        let e = make_test_event(2, &[&h]);
+        retriever.add_event(&h);
+        retriever.add_event(&e);
+
+        let result = compare_with(
+            retriever,
+            &clock!(e.id()),
+            &clock!(h.id()),
+            100,
+            CompareOptions {
+                subject_gens: Some(GClock::from((4_000_000_000, e.id()))),
+                comparison_gens: Some(GClock::from((1, h.id()))),
+                unverified: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.stats.precheck_suppressions, 0, "an inflated subject rejects nothing (P1 compares maxg(C) > maxg(S))");
+        assert!(matches!(result.relation, AbstractCausalRelation::StrictDescends { .. }));
+    }
+
+    /// The apply-path wiring: a redelivered OLD event (true StrictAscends)
+    /// walks with the resident's materialized annotation as the comparison
+    /// operand and its own stamp as the subject operand; P1 fires (the old
+    /// event provably cannot descend the newer head) and only suppresses.
+    /// Pinned through the cfg(test) stats mirror, the only observable the
+    /// bool return leaves.
+    #[tokio::test]
+    async fn apply_event_wires_operands_and_p1_fires_on_redelivered_ancestor() {
+        use crate::entity::Entity;
+        let entity_id = {
+            let mut b = [0u8; 16];
+            b[0] = 42;
+            EntityId::from_bytes(b)
+        };
+        let entity = Entity::create(entity_id, "test".into());
+
+        let mut retriever = MockRetriever::new();
+        let g = make_lww_event_for_entity(entity_id, vec![("p", "g")], &[]);
+        let a = make_lww_event_for_entity(entity_id, vec![("p", "a")], &[&g]);
+        let b = make_lww_event_for_entity(entity_id, vec![("p", "b")], &[&a]);
+        for e in [&g, &a, &b] {
+            retriever.add_event(e);
+        }
+
+        assert!(entity.apply_event(&retriever, &g, None).await.unwrap());
+        assert!(entity.apply_event(&retriever, &a, None).await.unwrap());
+        assert!(entity.apply_event(&retriever, &b, None).await.unwrap());
+        let _ = entity.take_last_compare_stats();
+
+        // Redeliver a: gen 2 against the materialized head {b} at gen 3.
+        // P1 rejects the (impossible) StrictDescends hypothesis, suppressing
+        // the quick-check attempt; the walk returns StrictAscends (no-op).
+        assert!(!entity.apply_event(&retriever, &a, None).await.unwrap(), "redelivered ancestor is a no-op");
+        let stats = entity.take_last_compare_stats().expect("apply_event mirrored its comparison stats");
+        assert!(
+            stats.precheck_suppressions >= 1,
+            "apply_event must feed the resident GClock and the event stamp into the prechecks; P1 fires here, got {}",
+            stats.precheck_suppressions
+        );
+    }
+
+    /// Helper for the apply-path pin: LWW events on a FIXED entity id (the
+    /// shared helpers derive entity ids from their seed, but apply_event
+    /// validates event ownership against the entity).
+    fn make_lww_event_for_entity(entity_id: EntityId, properties: Vec<(&str, &str)>, parents: &[&Event]) -> Event {
+        let backend = LWWBackend::new();
+        for (name, value) in properties {
+            backend.set(name.into(), Some(Value::String(value.into())));
+        }
+        let ops = backend.to_operations().unwrap().unwrap();
+        Event {
+            entity_id,
+            collection: "test".into(),
+            operations: OperationSet(BTreeMap::from([("lww".to_string(), ops)])),
+            parent: Clock::from(parents.iter().map(|p| p.id()).collect::<Vec<_>>()),
+            generation: Event::generation_from_parents(parents.iter().map(|p| p.generation)),
+        }
     }
 }
 
