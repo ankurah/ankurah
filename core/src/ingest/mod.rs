@@ -16,6 +16,8 @@ pub(crate) mod outcome;
 pub(crate) mod plan;
 pub(crate) mod staging;
 pub(crate) mod state_apply;
+#[cfg(test)]
+pub(crate) mod testkit;
 pub(crate) mod unverified;
 pub(crate) mod verify;
 

@@ -322,130 +322,11 @@ pub(crate) async fn execute_plan<G: SuspenseEvents + Send + Sync>(
 mod tests {
     use super::*;
     use crate::entity::Entity;
-    use crate::error::RetrievalError;
     use crate::ingest::plan_entity;
+    use crate::ingest::testkit::{event, FailingCommitStore, NoState, NoopPersist, RecordingPersist};
     use crate::retrieval::GetEvents;
-    use ankurah_proto::{EntityId, OperationSet};
-    use async_trait::async_trait;
+    use ankurah_proto::EntityId;
     use std::collections::BTreeMap;
-
-    fn event(entity_id: EntityId, parents: &[&Attested<Event>]) -> Attested<Event> {
-        Attested::opt(
-            Event {
-                entity_id,
-                collection: "test".into(),
-                operations: OperationSet(BTreeMap::new()),
-                parent: ankurah_proto::Clock::from(parents.iter().map(|p| p.payload.id()).collect::<Vec<_>>()),
-                generation: Event::generation_from_parents(parents.iter().map(|p| p.payload.generation)),
-            },
-            None,
-        )
-    }
-
-    /// Getter whose `commit_event` fails for one designated event id (the
-    /// deterministic stand-in for a transient storage fault) and retains
-    /// successful commits (bodies included) so `event_stored` and
-    /// `get_local_event` answer like real storage.
-    ///
-    /// Counts `get_event` calls: the honest zero-fetch instrument for the
-    /// O(1)-skip pins (R-D2-3a/3c), unit-level equivalent of the tests
-    /// crate's CountingGetEvents. `event_stored` and `get_local_event` are
-    /// cheap point reads and deliberately NOT folded into this counter (the
-    /// storedness conjunct of obligation (d) and the admission verifier's
-    /// parent read legitimately remain on a served fast path).
-    struct FailingCommitStore {
-        staging: std::sync::Arc<StagingArea>,
-        committed: std::sync::RwLock<std::collections::BTreeMap<EventId, Attested<Event>>>,
-        fail_commit_of: EventId,
-        definitive: bool,
-        get_event_calls: std::sync::atomic::AtomicUsize,
-    }
-
-    impl FailingCommitStore {
-        fn new(staging: std::sync::Arc<StagingArea>, fail_commit_of: EventId) -> Self {
-            Self {
-                staging,
-                committed: std::sync::RwLock::new(std::collections::BTreeMap::new()),
-                fail_commit_of,
-                definitive: true,
-                get_event_calls: std::sync::atomic::AtomicUsize::new(0),
-            }
-        }
-
-        /// Non-definitive (ephemeral) flavor: absence of an event is not
-        /// proof of nonexistence, so the planner schedules speculatively.
-        /// The adopted-history shapes live on ephemeral nodes.
-        fn ephemeral(staging: std::sync::Arc<StagingArea>, fail_commit_of: EventId) -> Self {
-            Self {
-                staging,
-                committed: std::sync::RwLock::new(std::collections::BTreeMap::new()),
-                fail_commit_of,
-                definitive: false,
-                get_event_calls: std::sync::atomic::AtomicUsize::new(0),
-            }
-        }
-
-        /// Number of `get_event` calls (walk fetches) since construction.
-        fn get_event_calls(&self) -> usize { self.get_event_calls.load(std::sync::atomic::Ordering::Relaxed) }
-    }
-
-    #[async_trait]
-    impl crate::retrieval::GetEvents for FailingCommitStore {
-        async fn get_event(&self, event_id: &EventId) -> Result<Event, RetrievalError> {
-            self.get_event_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if let Some(event) = self.staging.get(event_id) {
-                return Ok(event);
-            }
-            self.committed
-                .read()
-                .unwrap()
-                .get(event_id)
-                .map(|e| e.payload.clone())
-                .ok_or_else(|| RetrievalError::EventNotFound(event_id.clone()))
-        }
-        async fn event_stored(&self, event_id: &EventId) -> Result<bool, RetrievalError> {
-            Ok(self.committed.read().unwrap().contains_key(event_id))
-        }
-        fn storage_is_definitive(&self) -> bool { self.definitive }
-    }
-
-    #[async_trait]
-    impl SuspenseEvents for FailingCommitStore {
-        fn stage_event(&self, event: Event) { self.staging.stage(Attested::opt(event, None)); }
-        async fn commit_event(&self, attested: &Attested<Event>) -> Result<(), MutationError> {
-            if attested.payload.id() == self.fail_commit_of {
-                return Err(MutationError::General("injected transient commit failure".into()));
-            }
-            self.committed.write().unwrap().insert(attested.payload.id(), attested.clone());
-            self.staging.remove(&attested.payload.id());
-            Ok(())
-        }
-        async fn get_local_event(&self, event_id: &EventId) -> Result<Option<Event>, RetrievalError> {
-            if let Some(event) = self.staging.get(event_id) {
-                return Ok(Some(event));
-            }
-            Ok(self.committed.read().unwrap().get(event_id).map(|e| e.payload.clone()))
-        }
-    }
-
-    struct NoopPersist;
-    #[async_trait]
-    impl PersistState for NoopPersist {
-        async fn persist(&self, _entity: &Entity) -> Result<(), MutationError> { Ok(()) }
-    }
-
-    struct RecordingPersist(std::sync::atomic::AtomicBool);
-    impl RecordingPersist {
-        fn new() -> Self { Self(std::sync::atomic::AtomicBool::new(false)) }
-        fn called(&self) -> bool { self.0.load(std::sync::atomic::Ordering::SeqCst) }
-    }
-    #[async_trait]
-    impl PersistState for RecordingPersist {
-        async fn persist(&self, _entity: &Entity) -> Result<(), MutationError> {
-            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
-        }
-    }
 
     /// The retention sweep must not delete a carryover orphan (buffered by an
     /// EARLIER delivery, acked as success then) when a transient hard failure
@@ -559,18 +440,6 @@ mod tests {
         assert!(outcome.failure.is_none(), "backfill commit succeeds: {:?}", outcome.failure);
         assert!(!staging.contains(&x_id), "promotion removes the backfilled event from staging");
         assert!(persist.called(), "persist resumes once the log caught up");
-    }
-
-    /// GetState stub for adopted-state shapes: no stored state anywhere.
-    struct NoState;
-    #[async_trait]
-    impl crate::retrieval::GetState for NoState {
-        async fn get_state(
-            &self,
-            _entity_id: EntityId,
-        ) -> Result<Option<ankurah_proto::Attested<ankurah_proto::EntityState>>, RetrievalError> {
-            Ok(None)
-        }
     }
 
     /// R-D2-2c (plan REV 4 section 3 M2): the adopted-history backfill lane
@@ -875,5 +744,74 @@ mod tests {
         assert_eq!(entity.head(), head_before, "neither redelivery moves the head");
         assert_eq!(retained_fetches, 0, "R-D2-3c: the retained member is served O(1), zero event fetches");
         assert!(evicted_fetches > 0, "R-D2-3c: the evicted id pays the comparison walk (cost, not outcome)");
+    }
+
+    /// GClock pin (ii) (plan REV 5 section K, the inductive verification
+    /// rule): an arrival whose parents are ALL covered by the resident's
+    /// materialized head tips verifies against the MATERIALIZATION, so a
+    /// covered-parent mis-stamp is REJECTED with ZERO payload reads: no
+    /// `get_local_event` (the M2 verifier's parent read) and no `get_event`
+    /// (a walk never starts; the rejection precedes the apply). Every
+    /// materialized entry originates from an admission-verified stamp, so
+    /// the covered check extends the induction; payload reads remain the
+    /// fallback for arrivals whose parents the tips do not cover.
+    #[tokio::test]
+    async fn covered_parent_mis_stamp_rejected_against_materialization_without_payload_reads() {
+        let entity_id = EntityId::new();
+        let genesis = event(entity_id, &[]);
+        let e1 = event(entity_id, &[&genesis]);
+        let e1_id = e1.payload.id();
+
+        let entities = crate::entity::WeakEntitySet::default();
+        let staging = std::sync::Arc::new(StagingArea::with_default_cap());
+        let getter = FailingCommitStore::new(staging.clone(), EventId::from_bytes([0xEE; 32]));
+        let unverified = crate::ingest::UnverifiedEvents::default();
+
+        // Establish the resident at head {e1} through the pipeline: both
+        // admissions verify, so the materialized entries are
+        // admission-verified by construction (the induction's base).
+        let entity = Entity::create(entity_id, "test".into());
+        staging.stage(genesis.clone());
+        staging.stage(e1.clone());
+        let plan = plan_entity(&entity.head(), &[genesis.payload.id(), e1_id.clone()], &staging, &getter).await.expect("plan builds");
+        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist, &unverified).await;
+        assert!(outcome.failure.is_none(), "clean delivery: {:?}", outcome.failure);
+        assert!(entity.head().contains(&e1_id), "precondition: resident head at e1");
+
+        // The forgery: a child of e1 (a head tip, so its parent is covered
+        // by the materialization) claiming 4 where the one correct stamp is
+        // 3 (e1 carries generation 2).
+        let forged = Event {
+            entity_id,
+            collection: "test".into(),
+            operations: ankurah_proto::OperationSet(BTreeMap::new()),
+            parent: ankurah_proto::Clock::from(vec![e1_id.clone()]),
+            generation: 4,
+        };
+        let forged_id = forged.id();
+        staging.stage(Attested::opt(forged, None));
+
+        let plan = plan_entity(&entity.head(), &[forged_id.clone()], &staging, &getter).await.expect("plan builds");
+        let local_reads_before = getter.get_local_event_calls();
+        let walk_reads_before = getter.get_event_calls();
+        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist, &unverified).await;
+
+        match outcome.failure {
+            Some(MutationError::Ingest(crate::error::IngestError::Lineage(crate::error::LineageRejection::GenerationMismatch {
+                claimed,
+                expected,
+                ..
+            }))) => {
+                assert_eq!((claimed, expected), (4, 3), "the typed rejection carries the claim and the one correct value");
+            }
+            other => panic!("expected a typed GenerationMismatch rejection, got {other:?}"),
+        }
+        assert!(!entity.head().contains(&forged_id), "a rejected event never advances the resident");
+        assert_eq!(
+            getter.get_local_event_calls() - local_reads_before,
+            0,
+            "GClock pin (ii): a covered-parent mis-stamp must be rejected against the materialization, not against payload reads"
+        );
+        assert_eq!(getter.get_event_calls() - walk_reads_before, 0, "no walk starts for an admission-rejected arrival");
     }
 }

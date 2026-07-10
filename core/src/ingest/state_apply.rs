@@ -27,6 +27,7 @@ use crate::error::MutationError;
 use crate::retrieval::{GetState, SuspenseEvents};
 
 /// What a state feed did to one entity.
+#[derive(Debug)]
 pub(crate) struct StateApplied {
     pub entity: Entity,
     /// True when the entity advanced (fresh adoption or strict descent);
@@ -147,4 +148,97 @@ where
     }
 
     Ok(StateApplied { entity, advanced })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::{IngestError, LineageRejection};
+    use crate::ingest::testkit::{event, FailingCommitStore, NoState, NoopPersist};
+    use crate::ingest::{StagingArea, UnverifiedEvents};
+    use ankurah_proto::EventId;
+    use std::collections::BTreeMap;
+
+    /// GClock pin (v) (plan REV 5 section K, the validation invariant): a
+    /// DURABLE node never adopts a wire-carried head generation that
+    /// contradicts an event payload it holds. The store holds the honest
+    /// chain g (generation 1) then e1 (generation 2); the incoming state
+    /// heads at e1 but annotates it with generation 9. Validation at
+    /// application rejects the item with the typed lineage error and
+    /// nothing is adopted: no resident materializes carrying the lie.
+    /// (Payloads are the sole authoritative source; a lie adopted here
+    /// would poison every commit stamped from this resident.)
+    #[tokio::test]
+    async fn durable_node_rejects_wire_head_generation_contradicting_held_events() {
+        let entity_id = ankurah_proto::EntityId::new();
+        let genesis = event(entity_id, &[]);
+        let e1 = event(entity_id, &[&genesis]);
+        let e1_id = e1.payload.id();
+
+        let entities = crate::entity::WeakEntitySet::default();
+        let staging = std::sync::Arc::new(StagingArea::with_default_cap());
+        // DEFINITIVE store (durable node) holding the honest payloads.
+        let getter = FailingCommitStore::new(staging.clone(), EventId::from_bytes([0xEE; 32]));
+        getter.commit_event(&genesis).await.expect("genesis commits");
+        getter.commit_event(&e1).await.expect("e1 commits");
+
+        // The wire state heads at e1 with a lying annotation (claims 9; the
+        // held payload carries 2).
+        let lying = ankurah_proto::State {
+            state_buffers: ankurah_proto::StateBuffers(BTreeMap::new()),
+            head: ankurah_proto::Clock::from(vec![e1_id.clone()]),
+            head_generations: ankurah_proto::GClock::from((9, e1_id.clone())),
+        };
+
+        let unverified = UnverifiedEvents::default();
+        let result =
+            apply_state_feed(&entities, &NoState, &getter, &staging, entity_id, "test".into(), lying, &[], &NoopPersist, &unverified).await;
+
+        match result {
+            Err(MutationError::Ingest(IngestError::Lineage(LineageRejection::GenerationMismatch { claimed, expected, .. }))) => {
+                assert_eq!((claimed, expected), (9, 2), "the typed rejection carries the wire claim and the held payload's generation");
+            }
+            other => panic!("GClock pin (v): a durable node must reject a wire annotation contradicting held events, got {other:?}"),
+        }
+        assert!(
+            entities.get(&entity_id).is_none(),
+            "GClock pin (v): nothing from the rejected item may be adopted; no resident carries the lie"
+        );
+    }
+
+    /// The companion structural rule: an annotation that does not cover
+    /// exactly the state's head tips is malformed input, rejected at the
+    /// ingress boundary on EVERY node flavor (an adopted mismatch could
+    /// never stamp a commit). Fresh adoption of a CONSISTENT pair on an
+    /// ephemeral node stays untouched (the trust envelope; pinned by the
+    /// adoption arm of the M4 integration tests).
+    #[tokio::test]
+    async fn structurally_mismatched_head_annotation_is_rejected_as_malformed() {
+        let entity_id = ankurah_proto::EntityId::new();
+        let genesis = event(entity_id, &[]);
+        let e1 = event(entity_id, &[&genesis]);
+
+        let entities = crate::entity::WeakEntitySet::default();
+        let staging = std::sync::Arc::new(StagingArea::with_default_cap());
+        // Ephemeral flavor: the structural check is not a trust question.
+        let getter = FailingCommitStore::ephemeral(staging.clone(), EventId::from_bytes([0xEE; 32]));
+
+        // Head names e1; the annotation names genesis. Malformed.
+        let mismatched = ankurah_proto::State {
+            state_buffers: ankurah_proto::StateBuffers(BTreeMap::new()),
+            head: ankurah_proto::Clock::from(vec![e1.payload.id()]),
+            head_generations: ankurah_proto::GClock::from((1, genesis.payload.id())),
+        };
+
+        let unverified = UnverifiedEvents::default();
+        let result =
+            apply_state_feed(&entities, &NoState, &getter, &staging, entity_id, "test".into(), mismatched, &[], &NoopPersist, &unverified)
+                .await;
+
+        match result {
+            Err(MutationError::Ingest(IngestError::Lineage(LineageRejection::HeadGenerationsMismatch))) => {}
+            other => panic!("a structurally mismatched head annotation must be rejected as malformed, got {other:?}"),
+        }
+        assert!(entities.get(&entity_id).is_none(), "nothing from the malformed item may be adopted");
+    }
 }
