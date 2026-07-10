@@ -335,7 +335,7 @@ mod tests {
     use super::*;
     use crate::entity::Entity;
     use crate::ingest::plan_entity;
-    use crate::ingest::testkit::{event, FailingCommitStore, NoState, NoopPersist, RecordingPersist};
+    use crate::ingest::testkit::{event, event_with_title, FailingCommitStore, NoState, NoopPersist, RecordingPersist};
     use crate::retrieval::GetEvents;
     use ankurah_proto::EntityId;
     use std::collections::BTreeMap;
@@ -839,5 +839,193 @@ mod tests {
             "GClock pin (ii): a covered-parent mis-stamp must be rejected against the materialization, not against payload reads"
         );
         assert_eq!(getter.get_event_calls() - walk_reads_before, 0, "no walk starts for an admission-rejected arrival");
+    }
+
+    /// The UNCOVERED-parent fallback (M4 remediation item 7, test-adequacy
+    /// panel MAJOR 1): a parent that is locally HELD but BELOW the head
+    /// (the concurrent-edit shape, the most common real divergence) is not
+    /// covered by the materialized tips, so verification must fall back to
+    /// LOCAL PAYLOAD READS, reject a mis-stamp typed, and classify the
+    /// honest twin Verified. Before this pin, deleting the whole fallback
+    /// arm (verify.rs, the get_local_event loop) passed every suite: all
+    /// existing mis-stamp rejections travel the covered path. The payload
+    /// read itself is bound by the counter, so an always-Unverifiable stub
+    /// cannot pass.
+    #[tokio::test]
+    async fn uncovered_parent_mis_stamp_rejected_via_local_payload_reads() {
+        let entity_id = EntityId::new();
+        let genesis = event(entity_id, &[]);
+        let e1 = event(entity_id, &[&genesis]); // generation 2
+        let e2 = event(entity_id, &[&e1]); // generation 3
+        let e1_id = e1.payload.id();
+
+        let entities = crate::entity::WeakEntitySet::default();
+        let staging = std::sync::Arc::new(StagingArea::with_default_cap());
+        let getter = FailingCommitStore::new(staging.clone(), EventId::from_bytes([0xEE; 32]));
+        let unverified = crate::ingest::UnverifiedEvents::default();
+
+        // Head {e2}: e1 is committed BELOW the head, locally held, NOT a
+        // materialized tip.
+        let entity = Entity::create(entity_id, "test".into());
+        staging.stage(genesis.clone());
+        staging.stage(e1.clone());
+        staging.stage(e2.clone());
+        let plan = plan_entity(&entity.head(), &[genesis.payload.id(), e1_id.clone(), e2.payload.id()], &staging, &getter)
+            .await
+            .expect("plan builds");
+        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist, &unverified).await;
+        assert!(outcome.failure.is_none(), "clean delivery: {:?}", outcome.failure);
+        assert!(entity.head().contains(&e2.payload.id()) && !entity.head().contains(&e1_id), "precondition: e1 sits below the head");
+
+        // The forgery: a concurrent child of e1 claiming 4 (e1's payload
+        // carries 2, so the one correct stamp is 3).
+        let forged = Event {
+            entity_id,
+            collection: "test".into(),
+            operations: ankurah_proto::OperationSet(BTreeMap::new()),
+            parent: ankurah_proto::Clock::from(vec![e1_id.clone()]),
+            generation: 4,
+        };
+        let forged_id = forged.id();
+        staging.stage(Attested::opt(forged, None));
+
+        let plan = plan_entity(&entity.head(), &[forged_id.clone()], &staging, &getter).await.expect("plan builds");
+        let local_reads_before = getter.get_local_event_calls();
+        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist, &unverified).await;
+
+        match outcome.failure {
+            Some(MutationError::Ingest(crate::error::IngestError::Lineage(crate::error::LineageRejection::GenerationMismatch {
+                claimed,
+                expected,
+                ..
+            }))) => {
+                assert_eq!((claimed, expected), (4, 3), "the typed rejection carries the claim and the payload-derived value");
+            }
+            other => panic!("an uncovered-parent mis-stamp must be rejected via local payload reads, got {other:?}"),
+        }
+        assert!(
+            getter.get_local_event_calls() > local_reads_before,
+            "the rejection must come from a LOCAL PAYLOAD READ of the below-head parent (binding the fallback arm itself)"
+        );
+
+        // The honest twin (claiming 3) travels the same fallback, applies,
+        // and is classified VERIFIED: it must stay OUT of the unverified
+        // set (an always-Unverifiable stub admits it but records it
+        // acceleration-ineligible, which this half catches).
+        let honest = event_with_title(entity_id, "honest-concurrent-twin", &[&e1]);
+        let honest_id = honest.payload.id();
+        staging.stage(honest.clone());
+        let plan = plan_entity(&entity.head(), &[honest_id.clone()], &staging, &getter).await.expect("plan builds");
+        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist, &unverified).await;
+        assert!(outcome.failure.is_none(), "the honest concurrent twin applies: {:?}", outcome.failure);
+        assert!(entity.head().contains(&honest_id), "the honest twin joined the head");
+        assert!(
+            !unverified.contains(&honest_id),
+            "an honest below-head-parented event verified via payload reads is NOT recorded unverified (eligibility preserved)"
+        );
+    }
+
+    /// Amendment K's THIRD covered class plus per-tip attribution under
+    /// widening (M4 remediation item 8, test-adequacy panel MAJOR 2): a
+    /// multi-tip head whose tips carry UNEQUAL generations must materialize
+    /// each tip's OWN stamp (the layer path's widening attribution), and a
+    /// SUBSET-parented arrival on that head must verify against the
+    /// materialization read-free, with the max-confusion forgery (claiming
+    /// 1 + the OTHER tip's generation) rejected typed. These are exactly
+    /// the properties that distinguish the per-tip GClock from a scalar
+    /// max; every pre-existing multi-tip test carried EQUAL tips, so a
+    /// value misattribution at the widening site passed the whole suite
+    /// (the debug_assert there checks id sets, not values).
+    #[tokio::test]
+    async fn subset_parented_arrival_on_an_unequal_multi_tip_head() {
+        let entity_id = EntityId::new();
+        let genesis = event(entity_id, &[]); // generation 1
+        let a = event(entity_id, &[&genesis]); // generation 2
+        let b = event_with_title(entity_id, "b", &[&genesis]); // generation 2, a DISTINCT concurrent sibling of a
+        let c = event(entity_id, &[&b]); // generation 3
+
+        let entities = crate::entity::WeakEntitySet::default();
+        let staging = std::sync::Arc::new(StagingArea::with_default_cap());
+        let getter = FailingCommitStore::new(staging.clone(), EventId::from_bytes([0xEE; 32]));
+        let unverified = crate::ingest::UnverifiedEvents::default();
+        let entity = Entity::create(entity_id, "test".into());
+
+        // Two deliveries: [genesis, a] lands head {a}; [b, c] widens through
+        // the layer path to the unequal antichain {a, c}.
+        for batch in [vec![genesis.clone(), a.clone()], vec![b.clone(), c.clone()]] {
+            let ids: Vec<EventId> = batch.iter().map(|e| e.payload.id()).collect();
+            for e in batch {
+                staging.stage(e);
+            }
+            let plan = plan_entity(&entity.head(), &ids, &staging, &getter).await.expect("plan builds");
+            let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist, &unverified).await;
+            assert!(outcome.failure.is_none(), "honest batch applies: {:?}", outcome.failure);
+        }
+        let head = entity.head();
+        assert!(
+            head.contains(&a.payload.id()) && head.contains(&c.payload.id()) && head.as_slice().len() == 2,
+            "precondition: the head is the two-tip antichain {{a, c}}, got {head:?}"
+        );
+
+        // Per-tip attribution: each tip carries ITS OWN stamp, not a shared
+        // max or a swap.
+        let materialized = entity.head_generations();
+        assert_eq!(materialized.generation_of(&a.payload.id()), Some(2), "tip a keeps its own stamp across the widening");
+        assert_eq!(materialized.generation_of(&c.payload.id()), Some(3), "tip c pins its own stamp at the widening");
+
+        // The max-confusion forgery FIRST, while tip a is still a
+        // materialized head tip: claiming 1 + the OTHER tip's generation
+        // (1 + 3 = 4) over parent {a}. The per-tip consult must reject
+        // with a's OWN value (expected 3), READ-FREE (the covered path;
+        // an honest subset child would supersede a and reroute this
+        // through the payload fallback, which is a different pin).
+        let forged = Event {
+            entity_id,
+            collection: "test".into(),
+            operations: ankurah_proto::OperationSet(BTreeMap::new()),
+            parent: ankurah_proto::Clock::from(vec![a.payload.id()]),
+            generation: 4,
+        };
+        let forged_id = forged.id();
+        staging.stage(Attested::opt(forged, None));
+        let plan = plan_entity(&entity.head(), &[forged_id.clone()], &staging, &getter).await.expect("plan builds");
+        let local_reads_before = getter.get_local_event_calls();
+        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist, &unverified).await;
+        match outcome.failure {
+            Some(MutationError::Ingest(crate::error::IngestError::Lineage(crate::error::LineageRejection::GenerationMismatch {
+                claimed,
+                expected,
+                ..
+            }))) => {
+                assert_eq!(
+                    (claimed, expected),
+                    (4, 3),
+                    "the rejection reads the PARENT TIP's own materialized value, never the head-wide max"
+                );
+            }
+            other => panic!("the max-confusion forgery over a subset parent must be rejected typed, got {other:?}"),
+        }
+        assert_eq!(
+            getter.get_local_event_calls() - local_reads_before,
+            0,
+            "the subset-parented rejection is served by the per-tip consult, zero payload reads"
+        );
+
+        // The third covered class, honest arm: an arrival parenting a
+        // STRICT SUBSET of the multi-tip head ({a} alone) verifies against
+        // the materialization, read-free, applies, and stays eligible.
+        let honest = event_with_title(entity_id, "honest-subset-child", &[&a]); // generation 3
+        let honest_id = honest.payload.id();
+        staging.stage(honest.clone());
+        let plan = plan_entity(&entity.head(), &[honest_id.clone()], &staging, &getter).await.expect("plan builds");
+        let local_reads_before = getter.get_local_event_calls();
+        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist, &unverified).await;
+        assert!(outcome.failure.is_none(), "the honest subset-parented arrival applies: {:?}", outcome.failure);
+        assert_eq!(
+            getter.get_local_event_calls() - local_reads_before,
+            0,
+            "a subset-parented arrival on a multi-tip head verifies from the materialization: zero payload reads"
+        );
+        assert!(!unverified.contains(&honest_id), "verified subset-parented arrivals stay acceleration-eligible");
     }
 }
