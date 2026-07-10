@@ -866,3 +866,36 @@ model <-> table map half deferred with #304.
     entity <-> model, membership vec, single entity store) is the
     direction this preserves but is expressly DEFERRED: #330, with #305
     and #312 comments recording the boundary.
+30. **Canonical value_type; registration is a compatibility check, never a
+    mutation** (maintainer ruling in session, 2026-07-10; recorded on #289
+    and #303; rfc.md 5.1/5.6 amendments). Backend and value_type leave the
+    property lookup key -- the executor looks up by (model, name) in both
+    the catalog map and the storage double-check -- and a property's
+    (backend, value_type) is CANONICAL, fixed at first allocation. A hit
+    declaring a different value_type never forks a second identity and
+    never updates the definition: a mutually castable pair (per
+    Value::cast_to; type-level twin ValueType::castable_to, kept in
+    lockstep by test) admits the binary with a drift warning, anything
+    else refuses loudly (RegistrationError::PropertyIncompatible), and a
+    backend change always refuses. The SchemaRegistered response carries
+    the CANONICAL (backend, value_type) -- the requester's cast target --
+    on hits and explicit-id bindings alike, and explicit-id verification
+    admits the same castable drift. The cast discipline: commit-time
+    canonicalization at the Name->Id rekey choke point (a value the
+    canonical type cannot represent fails that writer's commit); the bound
+    getter casts canonical->compiled (per-value failure = fail-visible
+    CastError); the resolution pass casts comparison literals opposite a
+    resolved whole-property reference (subpaths keep the TypeResolver Json
+    heuristic; a literal the canonical type cannot represent fails the
+    query loud at origin); the entity read/evaluation boundary
+    (read_lenient / value_checked) defensively canonicalizes, reading
+    junk as NULL with a warning (decision 14's absent-as-NULL precedent),
+    which keeps the reactor's byte-collated watcher index and predicate
+    evaluation in one type. Motivation: exactly one stored type per
+    property makes engine columns and index collation consistent (the
+    lesson behind the old hardcoded-string collation). A struct-level
+    retype is durably INERT; changing a canonical type is a deliberate
+    migration operation, spilled to #303. One live property per (model,
+    name) becomes an allocator invariant (CatalogMapInner::resolve warns
+    if a map ever holds two). Supersedes the fork-identity semantics of
+    rev 4's 5.6 and decision 19's "changing VALUE_TYPE is a retype" note.

@@ -525,6 +525,18 @@ collection + name + type identifier verbatim):
   Flipping `optional` or retargeting a reference does NOT re-key.
 - membership: by (model id, property id)
 
+AMENDED (canonical value_type ruling, #289, 2026-07-10): backend and
+value_type LEAVE the property lookup key -- the lookup is (model id,
+current `name`) -- because keeping the type pair in the key made a
+struct-level retype fork a second same-name identity (see the 5.6
+amendment, which supersedes that design). Collision safety now comes from
+the compatibility gate at the hit: a registration declaring a different
+(backend, value_type) never mutates the found definition and never mints;
+it is admitted when the backend matches and the value types are mutually
+castable per the Value::cast_to relation (core/src/value/cast.rs), and
+refused loudly otherwise. Flipping `optional` or retargeting a reference
+still does not re-key.
+
 A miss creates the entity via ORDINARY events through the normal commit
 machinery (no frozen encoder, no special genesis; with nothing
 byte-frozen, the creation event simply carries the full definition
@@ -1079,6 +1091,33 @@ Phase C is engine-local and carries no wire dependency of its own.
   through that window. A declared-coercion migration ("retyped_from", where
   new code reads the old property id through a cast) is future
   schema-evolution work this design leaves room for but does not include.
+  AMENDED (canonical value_type ruling, #289, 2026-07-10): SUPERSEDED before
+  first release -- the fork-identity design above never shipped. A property's
+  (backend, value_type) is CANONICAL: fixed at first allocation and never
+  changed by registration (the lookup key drops the type pair, 5.1
+  amendment). A same-name registration is a COMPATIBILITY check, not a fork
+  and not an update: the backend must match, and a drifted value_type is
+  admitted only when mutually castable with the canonical one per the
+  Value::cast_to relation, else the registration refuses loudly. An admitted
+  drifted binary operates entirely through casts: its commits canonicalize
+  staged values INTO the backends (writer-side, so engines and indexes
+  collate exactly one type per property -- the motivating requirement, since
+  cast-at-comparison alone cannot cure a mixed-type stored population; a
+  value the canonical type cannot represent fails that writer's commit), its
+  getters cast canonical values back to the compiled type (per-value
+  failures surface as the fail-visible CastError), comparison literals
+  canonicalize in the resolution pass, and readers defensively canonicalize
+  at the read/evaluation boundary (ingest stays schema-blind per the
+  catalog-lag rule below, so a legacy or ill-typed payload under a known id
+  evaluates as NULL with a warning rather than poisoning the read). A
+  struct-level retype is therefore durably INERT: the canonical type does
+  not follow the code, and registration logs the drift. Changing a canonical
+  type is a deliberate migration operation (#303), never a model-struct
+  edit. One live property per (model, name) becomes an allocator invariant;
+  the 5.4 sibling gate remains for cross-contract same-name ids and legacy
+  data. The SchemaRegistered response carries the CANONICAL (backend,
+  value_type) so a drifted requester's catalog map holds its cast target;
+  explicit-id binding verification (5.9) admits the same castable drift.
 - **Old node missing a property (fleet-version skew):** backend payloads are
   opaque; the old node applies and persists operations for ids it has no
   model field for, exactly as it does today for names it does not know
