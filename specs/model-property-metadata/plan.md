@@ -117,6 +117,9 @@ live with the executor rather than in proto:
 - property: by (model id, current name, backend, value_type) -- the type
   pair stays in the key so a retype mints a new identity and the RFC 5.4
   sibling gate keeps firing
+  (SUPERSEDED 2026-07-10: the type pair left the key and the gates are
+  removed; lookup is (model id, current name) with the canonical-type
+  compatibility gate. Decisions 30 and 31; rfc.md 5.1/5.4/5.6 amendments.)
 - membership: by (model id, property id)
 
 There is nothing to golden-vector: no byte surface participates in
@@ -235,7 +238,9 @@ normalize/migrate-on-bind).
 
 Tests: upsert idempotency (register twice -> same ids, zero events);
 rename-hint application and its no-op guard; retype mints a distinct id
-(lookup key includes the type pair); policy denial refuses cleanly; the
+(lookup key includes the type pair) (SUPERSEDED 2026-07-10, decision 30:
+the test now pins castable-retype-reuses-identity and the non-castable
+refusal); policy denial refuses cleanly; the
 strict never-registered-offline error at create/commit.
 
 ### A6. Receiver-side structural protection (RFC 4; rev 4 trims it)
@@ -409,7 +414,8 @@ read back "".
   compile (trybuild or equivalent); shared property by explicit id
   readable from two contracts with differing optional; retype mints a
   distinct property id (and the sibling gate fires on mixed data, A10
-  test).
+  test) (SUPERSEDED 2026-07-10, decisions 30/31: retype reuses the
+  identity through the compatibility gate, and the gates are removed).
 
 ### A12. Errors, guards, audits (cross-cutting)
 
@@ -621,7 +627,10 @@ model <-> table map half deferred with #304.
     "string" to match its JSON-string serialization; hand-written
     impls declare the `Value` variant their `into_value` actually
     produces. Every existing type keeps its current string (no
-    re-keying); shipped-type changes are retypes by definition.
+    re-keying); shipped-type changes are retypes by definition
+    (AMENDED 2026-07-10, decision 30: a changed VALUE_TYPE no longer
+    forks an identity -- it is admitted through the canonical-type
+    compatibility gate when mutually castable, refused otherwise).
     Rejected: keeping the always-string assumption (misdeclares
     hand impls, and retro-fitting the const post-release would re-key
     every custom property that then declared a non-string type);

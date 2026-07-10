@@ -98,7 +98,9 @@ DONE: PR #306; decision record posted on #294.
 
 - [x] CatalogMap: id -> definition maps for all three kinds; collection
       -> model; model -> membership set; per-collection display-name
-      index + global name index (sibling gate feed); resolve/lookup API.
+      index + global name index (was the sibling-gate feed; the gate is
+      removed, decision 31 -- the index now backs the by-name allocator
+      lookup); resolve/lookup API.
 - [x] Warm + incremental updates: durable nodes subscribe FIRST
       (fetch-free reactor queries) then merge the storage scan, so a
       mid-warm registration is never missed; ephemeral nodes stand up
@@ -191,7 +193,8 @@ DONE: PR #306; decision record posted on #294.
       required-defaults are deliberately OUT of Phase A (plan decision
       15).
 - [x] Cross-contract sibling gate (LWWBackend::get_checked) ->
-      PropertyError::TypeSkew naming both ids, from the View getter AND
+      PropertyError::TypeSkew naming both ids (since removed with the
+      gates, decision 31), from the View getter AND
       filter evaluation; the lenient foreign-id-by-hint fallback is
       REMOVED per the cross-root ruling (2026-07-05: different roots
       are different systems; transplants fail visible); hints are
@@ -237,7 +240,9 @@ DONE: PR #306; decision record posted on #294.
 
 ## 9. Cross-cutting and pre-PR
 
-- [x] Error variants: UnknownProperty, TypeSkew, registration refusals
+- [x] Error variants: UnknownProperty, TypeSkew (since deleted; the
+      surviving read-time failure is NonCastable, decision 31),
+      registration refusals
       (explicit-id absence/mismatch, PolicyDenied, NoDurablePeer).
       CatalogGenesisError and AnchorReuse died with rev 4.
 - [ ] Nomenclature pass over new code/docs (#305: Model = contract
@@ -332,7 +337,11 @@ DONE in one train on this branch (ratification trail on #289):
   the old value_type be castable to the new one; reads that miss the
   new id follow the edge and CAST the old backend value at query time
   (the RFC 5.4 sibling gate, but with recorded permission: today's
-  TypeSkew is exactly this situation without the edge). Optional lazy
+  TypeSkew is exactly this situation without the edge).
+  (SUPERSEDED 2026-07-10, decisions 30/31 and the #303 reframe: identity
+  never forks on retype and TypeSkew is deleted; the future migration
+  operates on the single property's CANONICAL value_type as a deliberate
+  catalog operation, never a code-driven fork-with-edge.) Optional lazy
   rewrite-on-save migrates values opportunistically, like the v1->v2
   key migration. Design needs: normative cast rules (cross-node
   determinism; value/cast.rs is the seed), fallible-cast policy
