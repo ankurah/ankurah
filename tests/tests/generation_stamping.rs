@@ -161,6 +161,89 @@ async fn r_d2_2a_crossed_stamps_equal_brute_force_depth() -> Result<()> {
     Ok(())
 }
 
+/// R-D2-2a, unequal-depth merge (M4 remediation item 8, test-adequacy
+/// panel MAJOR 2's integration half): every other multi-tip head in the
+/// suite carries EQUAL tip generations, so nothing bound commit-lane
+/// stamping over a head whose per-tip values DIFFER. Shape: local edit A
+/// (generation 2) over genesis; a remotely delivered honest chain B, C
+/// (generations 2 and 3) widens the resident to the unequal antichain
+/// {A, C}; a local merge edit then parents on both tips and must stamp
+/// 1 + max(2, 3) = 4, which the brute-force depth oracle verifies over
+/// the full dumped log (a per-tip misattribution at the widening site,
+/// or a min/first-tip confusion in the stamp, lands on 3 instead).
+#[tokio::test]
+async fn r_d2_2a_unequal_depth_merge_stamps_equal_brute_force_depth() -> Result<()> {
+    use ankurah::core::property::backend::{lww::LWWBackend, PropertyBackend};
+    use ankurah::core::value::Value;
+    use ankurah::Mutable;
+    use std::collections::BTreeMap;
+
+    let node = durable_sled_setup().await?;
+    let ctx = node.context_async(DEFAULT_CONTEXT).await;
+
+    let (rec_id, view, genesis) = {
+        let trx = ctx.begin();
+        let rec = trx.create(&Record { title: "t0".to_owned(), artist: "a0".to_owned() }).await?;
+        let id = rec.id();
+        let view = rec.read();
+        let mut events = trx.commit_and_return_events().await?;
+        (id, view, events.remove(0))
+    };
+
+    // Local edit A: generation 2, head {A}.
+    {
+        let trx = ctx.begin();
+        view.edit(&trx)?.title().set(&"a".to_owned())?;
+        trx.commit().await?;
+    }
+
+    // The honest remote chain B (child of genesis, generation 2, concurrent
+    // with A) and C (child of B, generation 3): the delivery widens the
+    // resident head to the UNEQUAL antichain {A, C}.
+    let title_ops = |title: &str| {
+        let backend = LWWBackend::new();
+        backend.set("title".into(), Some(Value::String(title.to_owned())));
+        proto::OperationSet(BTreeMap::from([("lww".to_owned(), backend.to_operations().unwrap().expect("ops"))]))
+    };
+    let b = ankurah_tests::forge::event_with_parents(rec_id, Record::collection(), title_ops("b"), &[&genesis]);
+    let c = ankurah_tests::forge::event_with_parents(rec_id, Record::collection(), title_ops("c"), &[&b]);
+    let c_id = c.id();
+    node.commit_remote_transaction(
+        &DEFAULT_CONTEXT,
+        proto::TransactionId::new(),
+        vec![proto::Attested::opt(b, None), proto::Attested::opt(c, None)],
+    )
+    .await?;
+    let head = view.entity().head();
+    assert_eq!(head.as_slice().len(), 2, "precondition: two-tip antichain, got {head:?}");
+    assert!(head.contains(&c_id), "precondition: the deeper branch's tip C is a head tip");
+
+    // The merge edit parents on {A, C} and must stamp 1 + max(2, 3) = 4.
+    let merge_id = {
+        let trx = ctx.begin();
+        view.edit(&trx)?.title().set(&"merged".to_owned())?;
+        let mut events = trx.commit_and_return_events().await?;
+        events.remove(0).id()
+    };
+
+    let (count, max_depth) = assert_stamps_equal_depth(&ctx, rec_id, "unequal-depth merge").await?;
+    assert_eq!(count, 5, "genesis, local A, remote B and C, one merge");
+    assert_eq!(max_depth, 4, "the merge sits one level above the DEEPER branch");
+
+    // Sharp value check on the merge itself: max over UNEQUAL parents, not
+    // min, not the first tip's value.
+    let collection = ctx.collection(&Record::collection()).await?;
+    let merge = collection
+        .dump_entity_events(rec_id)
+        .await?
+        .into_iter()
+        .find(|e| e.payload.id() == merge_id)
+        .expect("the merge event is in the log");
+    assert_eq!(merge.payload.generation, 4, "the merge stamps 1 + max over unequal per-tip generations");
+    assert_eq!(merge.payload.parent.as_slice().len(), 2, "the merge parents on both tips");
+    Ok(())
+}
+
 /// GClock pin (iv), THE ORIGINAL MOTIVATING CASE (plan REV 5 section K,
 /// "what it buys"): an ephemeral node that adopted a BODILESS state (the
 /// get() path ships a StateSnapshot with no event bodies) commits over the
