@@ -121,8 +121,9 @@ impl Event {
 
     /// The generation an event must carry given the generations of its parents:
     /// `1 + max(parent generations)`, or `1` for a genesis event (no parents).
-    /// Saturates at `u32::MAX` (266-C.iv); a comparison touching a saturated value
-    /// disables the generation accelerations and falls back to the plain walk.
+    /// Saturates at `u32::MAX` (266-C.iv); the plan has the M5 accelerations
+    /// treat any saturated value as ineligible and fall back to the plain walk
+    /// (no comparison consults generations before M5).
     pub fn generation_from_parents(parent_generations: impl IntoIterator<Item = u32>) -> u32 {
         parent_generations.into_iter().max().map_or(1, |m| m.saturating_add(1))
     }

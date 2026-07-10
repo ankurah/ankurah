@@ -124,17 +124,20 @@ impl std::fmt::Display for Clock {
 /// CANONICAL ENTRY ORDER (pinned by the M4 brief; serde stability and
 /// set-comparison against plain `Clock` heads require one): entries are
 /// sorted ascending by the `(u32, EventId)` tuple's DERIVED order, i.e.
-/// generation-major with EventId tiebreak, matching the comparison
-/// frontier's deterministic ordering (max-generation-first, EventId
-/// tiebreak), and deduplicated by id (a head is a set of tips; on
+/// generation-major with EventId tiebreak, the same ordering the plan
+/// assigns the M5 comparison frontier (max-generation-first, EventId
+/// tiebreak; no frontier consults generations today), and deduplicated by
+/// id (a head is a set of tips; on
 /// duplicate-id input the smallest tuple deterministically wins). The
 /// canonical order makes `max_generation` the last entry. Every construction
 /// path, deserialization of peer-supplied values included, normalizes rather
 /// than trusting input order.
 ///
 /// TRUST: entries carry their values unconditionally (stamping needs the max
-/// over all tips regardless, and a wrong inherited value self-defeats at the
-/// next durable admission); acceleration ELIGIBILITY is answered at
+/// over all tips regardless; a wrong inherited value is rejected LOUDLY at
+/// the next durable admission that can check it, which wedges the poisoned
+/// node on that entity until a strictly descending re-adoption or resync
+/// heals the annotation); acceleration ELIGIBILITY is answered at
 /// consumption time by the node's unverified-events id set, so no per-entry
 /// flag exists here. A durable node never adopts a wire-carried entry that
 /// contradicts an event payload it holds (validated at application); an
@@ -162,9 +165,11 @@ impl GClock {
 
     pub fn iter(&self) -> impl Iterator<Item = &(u32, EventId)> { self.0.iter() }
 
-    /// The maximum generation over all entries: the stamping operand
-    /// (`1 + max`) and the P1 precheck operand. O(1) by the canonical
-    /// generation-major order (the last entry carries the max).
+    /// The maximum generation over all entries, O(1) by the canonical
+    /// generation-major order (the last entry carries the max). Currently
+    /// UNUSED in production: reserved as the M5 P1 precheck operand.
+    /// Stamping computes the same max itself via
+    /// `Event::generation_from_parents` over the entries.
     pub fn max_generation(&self) -> Option<u32> { self.0.last().map(|(g, _)| *g) }
 
     /// The materialized generation for one tip id, if present. Heads are

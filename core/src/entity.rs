@@ -38,7 +38,9 @@ pub struct TemporaryEntity(Arc<EntityInner>);
 
 /// Default bound for the applied-set (plan D2-5): generously above the
 /// largest expected bridge batch (the lane benches exercise 5000-event
-/// bridges), about 2 MB per hot resident at 32 bytes an id when full.
+/// bridges). The container holds each id twice (the FIFO order plus the
+/// membership set), so a full set is roughly 4 MiB of ids per hot resident
+/// at 32 bytes an id, plus set overhead.
 pub(crate) const DEFAULT_APPLIED_CAP: usize = 65536;
 
 /// The applied-set (plan D2-5 as amended by REV 5 sections C and F): a
@@ -331,8 +333,10 @@ impl Entity {
     /// MATERIALIZED head generations, read under the same lock as the head
     /// and operations: NO event retrieval and NO peer fetch, on any node
     /// (this is what makes the bodiless-adoption commit work offline-clean;
-    /// the M2 fetch machinery remains in the codebase as admission
-    /// verification's fallback for uncovered parents, not for stamping).
+    /// admission verification's fallback for uncovered parents is the M2
+    /// LOCAL payload read, get_local_event over staging and local storage,
+    /// which NEVER fetches from a peer; the per-commit peer-fetch machinery
+    /// was removed with this rewire).
     /// Every materialized entry originates from an admission-verified stamp
     /// or the state's own trust envelope; a head tip without an entry is a
     /// broken invariant and fails the commit loudly, because every

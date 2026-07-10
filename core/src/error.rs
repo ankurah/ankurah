@@ -233,12 +233,19 @@ pub enum LineageRejection {
     /// The batch's parent edges form a cycle (malformed or malicious input;
     /// impossible for honest content-addressed ids).
     BatchCycle,
-    /// The event's claimed generation fails the admission equation
-    /// `generation == 1 + max(parent generations)` against locally resolved
-    /// parent payloads (genesis events must claim exactly 1). The stamp is
-    /// deterministic given the parents, so this is only ever reachable by a
-    /// buggy or malicious writer; contained like any malformed event
-    /// (plan REV 4, D2-3).
+    /// A claimed generation contradicts what this node can resolve. Two
+    /// emitters (D2 M4): admission verification, where an event's claim
+    /// fails the equation `generation == 1 + max(parent generations)`
+    /// against parents resolved from the resident's MATERIALIZED head
+    /// generations first (which on ephemeral nodes may be
+    /// trust-envelope-carried rather than payload-verified) and local
+    /// payload reads otherwise (genesis events must claim exactly 1); and
+    /// state-adoption validation on definitive-storage nodes, where a wire
+    /// annotation's per-tip value contradicts the locally held tip payload
+    /// (a direct value comparison). The honest value is deterministic
+    /// given the parents, so this is only ever reachable by a buggy or
+    /// malicious writer; contained like any malformed input (plan REV 4
+    /// D2-3, REV 5 section K).
     GenerationMismatch { event: EventId, claimed: u32, expected: u32 },
     /// A state's head-generation annotation does not cover exactly its
     /// head's tips (same ids, each exactly once). Structurally malformed
