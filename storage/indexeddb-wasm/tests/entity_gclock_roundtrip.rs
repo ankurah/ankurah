@@ -45,3 +45,43 @@ pub async fn entity_head_generations_survive_indexeddb_roundtrip() -> Result<(),
     IndexedDBStorageEngine::cleanup(&db_name).await?;
     Ok(())
 }
+
+/// M4 remediation item 3 (adversarial review finding 6a): the indexeddb
+/// generation decode (TryFrom<JsValue> for GClock, proto/src/wasm.rs, the
+/// read path for the entity record's __generations pairs) must fail LOUDLY
+/// on any stored number that is not exactly a u32, matching the
+/// range-checked discipline of the other engine homes (postgres try_into
+/// with typed errors, sqlite strict typing). The saturating cast it
+/// replaces coerced NaN and negatives to 0, truncated fractions, and
+/// clamped overflow to u32::MAX, all silently.
+#[wasm_bindgen_test]
+pub fn generation_decode_rejects_numbers_that_are_not_exactly_u32() {
+    use js_sys::Array;
+    use wasm_bindgen::JsValue;
+
+    let id = proto::EventId::from_bytes([1; 32]);
+    let encode = |generation: JsValue| -> JsValue {
+        let pair = Array::new();
+        pair.push(&generation);
+        pair.push(&JsValue::from_str(&id.to_base64()));
+        let entries = Array::new();
+        entries.push(&pair);
+        entries.into()
+    };
+
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 1.5, u32::MAX as f64 + 1.0] {
+        let result = proto::GClock::try_from(encode(JsValue::from_f64(bad)));
+        assert!(
+            matches!(result, Err(proto::DecodeError::InvalidGeneration(_))),
+            "a stored generation of {bad} must fail the decode with the typed error, got {result:?}"
+        );
+    }
+
+    // The exact u32 boundaries still decode (a u32 is exactly representable
+    // as an f64, so the happy path is lossless).
+    for good in [0u32, 1, u32::MAX] {
+        let decoded = proto::GClock::try_from(encode(JsValue::from_f64(good as f64)))
+            .unwrap_or_else(|e| panic!("an exact u32 ({good}) must decode, got {e}"));
+        assert_eq!(decoded, proto::GClock::new(vec![(good, id.clone())]), "the decoded entry carries the exact stored value");
+    }
+}
