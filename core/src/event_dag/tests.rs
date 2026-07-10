@@ -3020,6 +3020,86 @@ mod prechecks_suppress_only {
 }
 
 // ============================================================================
+// WALK-TIME EDGE CHECKS (D2 M5, plan D2-4): when the walk holds child and
+// parents, assert gen(child) == 1 + max(gen(parents)) (saturating); on
+// violation WARN with a counter, demote the child to per-comparison
+// ineligibility, continue. Never a retroactive rejection, never a verdict
+// input.
+// ============================================================================
+
+#[cfg(test)]
+mod walk_time_edge_checks {
+    use super::*;
+
+    /// A traversed doctored edge must be SEEN: the lying retriever serves
+    /// interior event a with generation 7 (honest: 2), so both in-hand
+    /// edges around it violate the equation (a against its parent g, child
+    /// b against a). The walk warns and demotes, and the verdict is
+    /// byte-identical to the honest baseline (containment).
+    #[tokio::test]
+    async fn traversed_doctored_edge_warns_demotes_and_is_contained() {
+        let mut retriever = MockRetriever::new();
+        let g = make_test_event(1, &[]);
+        let a = make_test_event(2, &[&g]);
+        let b = make_test_event(3, &[&a]);
+        for e in [&g, &a, &b] {
+            retriever.add_event(e);
+        }
+        let subject = clock!(b.id());
+        let comparison = clock!(g.id());
+
+        let baseline = compare(retriever.clone(), &subject, &comparison, 100).await.unwrap();
+        assert!(matches!(baseline.relation, AbstractCausalRelation::StrictDescends { .. }));
+        assert_eq!(baseline.stats.edge_check_violations, 0, "an honest corpus must produce zero violations");
+        assert_eq!(baseline.stats.demotions, 0);
+
+        let mut lying = GenCorruptedRetriever::new(retriever);
+        lying.doctor(a.id(), Event { generation: 7, ..a.clone() });
+        let corrupted = compare(lying, &subject, &comparison, 100).await.unwrap();
+
+        assert!(
+            corrupted.stats.edge_check_violations >= 1,
+            "the walk traversed the doctored edge and must have SEEN the lie (violation counter), got {}",
+            corrupted.stats.edge_check_violations
+        );
+        assert!(
+            corrupted.stats.demotions >= 1,
+            "a violating child is demoted to per-comparison ineligibility, got {}",
+            corrupted.stats.demotions
+        );
+        assert_eq!(corrupted.relation, baseline.relation, "BOUND: warn and demote, verdict unchanged");
+    }
+
+    /// Edge-honest SATURATED chains pass the check: the expected value uses
+    /// the same saturating arithmetic as the stamp, so a parent at u32::MAX
+    /// with a child at u32::MAX is equation-consistent, not a violation.
+    /// The base is a deep-history stand-in genesis carrying an explicit
+    /// near-ceiling claim (a genesis has no edges, so nothing in-walk can or
+    /// should check its absolute claim; that is admission's law): every
+    /// CHECKABLE edge here is equation-consistent under saturation.
+    #[tokio::test]
+    async fn honest_saturated_edges_do_not_warn() {
+        let mut retriever = MockRetriever::new();
+        // Explicit claims, equation-consistent per edge: the sanctioned
+        // adversarial-construction form (registry-ban ruling).
+        let near = Event { generation: u32::MAX - 1, ..make_test_event(2, &[]) };
+        let at = Event { generation: u32::MAX, ..make_test_event(3, &[&near]) };
+        let still = Event { generation: u32::MAX, ..make_test_event(4, &[&at]) };
+        let mut add = |e: &Event| retriever.add_event(e);
+        add(&near);
+        add(&at);
+        add(&still);
+
+        let result = compare(retriever, &clock!(still.id()), &clock!(near.id()), 100).await.unwrap();
+        assert!(matches!(result.relation, AbstractCausalRelation::StrictDescends { .. }));
+        assert_eq!(
+            result.stats.edge_check_violations, 0,
+            "saturating expected values keep honest ceiling chains violation-free (266-C.iv direction)"
+        );
+    }
+}
+
+// ============================================================================
 // CHAIN CANONICALIZATION AT EMISSION (D2 M5, dispositions Q2 as corrected by
 // the red-team fold item 3: the topo sorter is FIFO Kahn whose tie order
 // derives from input order, so canonical output requires sorted-by-id input)
