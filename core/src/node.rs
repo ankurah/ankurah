@@ -1141,6 +1141,29 @@ where
     /// tombstones), which upgrade-based probes cannot distinguish.
     #[cfg(feature = "test-helpers")]
     pub fn resident_count_for_test(&self) -> usize { self.entities.resident_count() }
+
+    /// TEST ONLY: the node's current reset epoch (D2-6). The epoch-conjunct
+    /// pin compares a pre-reset marker's stamp against this.
+    ///
+    /// Requires the `test-helpers` feature to be enabled.
+    #[cfg(feature = "test-helpers")]
+    pub fn reset_epoch_for_test(&self) -> u64 { self.entities.reset_epoch() }
+
+    /// TEST ONLY: drive the SHARED persist funnel (NodePersist::persist,
+    /// the one home of the persist-currency discipline, D2-6) against a
+    /// specific resident, exactly as every production lane does. The
+    /// epoch-conjunct pin needs a funnel persist at an UNCHANGED head:
+    /// every public lane advances the head before persisting, which would
+    /// let the head conjunct mask the epoch conjunct under test.
+    ///
+    /// Requires the `test-helpers` feature to be enabled.
+    #[cfg(feature = "test-helpers")]
+    pub async fn funnel_persist_for_test(&self, entity: &crate::entity::Entity) -> Result<(), crate::error::MutationError> {
+        use crate::ingest::PersistState;
+        let collection = self.collections.get(entity.collection()).await?;
+        let persist = crate::node_applier::NodePersist { node: self, collection: &collection };
+        persist.persist(entity).await
+    }
 }
 
 impl<SE, PA> NodeInner<SE, PA>
