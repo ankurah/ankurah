@@ -357,14 +357,16 @@ async fn concurrent_same_entity_persists_leave_storage_at_the_resident_head() ->
 }
 
 /// THE MARKER-RACE PIN, end-to-end variant (maintainer ruling 2026-07-09;
-/// the mechanism-seam pin lives in core's entity persist_marker_tests): a
-/// persist holds open at the storage gate ACROSS a real hard_reset and
-/// completes after it. Its marker carries the pre-reset epoch and is never
-/// trusted, and the purge already made the stale resident unreachable, so
-/// the next delivery of the same event materializes fresh from whatever
-/// the straddling persist left behind and PERSISTS FOR REAL (observed at
-/// the storage boundary), rather than being elided on dead-system
-/// testimony.
+/// the mechanism-seam pin lives in core's entity persist_marker_tests),
+/// RESTAGED for the reset/persist fence (M4 remediation): a persist parked
+/// at the storage gate when a hard_reset arrives is DRAINED first (the
+/// fence write guard waits for it), so the old foreground-await staging
+/// would deadlock; the reset now runs as a task and completes after the
+/// release. The pin's property is unchanged: whatever a persist
+/// overlapping a reset leaves behind, the successor system trusts NONE of
+/// it, so the next delivery on that id materializes fresh and PERSISTS
+/// FOR REAL (observed at the storage boundary), never eliding on
+/// dead-system testimony.
 #[tokio::test]
 async fn straddling_persist_is_never_trusted_end_to_end() -> Result<()> {
     let engine = InstrumentedEngine::new(SledStorageEngine::new_test()?);
@@ -373,7 +375,7 @@ async fn straddling_persist_is_never_trusted_end_to_end() -> Result<()> {
     node.system.create().await?;
     let ctx = node.context_async(c).await;
 
-    // The held view keeps the canonical resident so lane A's straddling
+    // The held view keeps the canonical resident so lane A's overlapping
     // persist targets the SAME instance the marker semantics protect.
     let (rec_id, _view, genesis) = {
         let trx = ctx.begin();
@@ -397,21 +399,24 @@ async fn straddling_persist_is_never_trusted_end_to_end() -> Result<()> {
     };
     instruments.wait_until_parked(1).await;
 
-    // The reset lands mid-flight: epoch bump, purge, storage wipe. The
-    // parked set_state is untouched (only set_state is gated; the wipe
-    // goes through delete_all_collections).
-    node.system.hard_reset().await?;
-    assert_eq!(node.resident_count_for_test(), 0, "precondition: the purge emptied the map while the persist is parked");
+    // The reset runs as a task: with the fence it drains lane A before the
+    // bump, purge, and wipe; without it (the pre-remediation world) it
+    // completed while A was parked. The pin tolerates either interleaving;
+    // hard_reset_drains_inflight_persists_before_wiping pins the ordering.
+    let reset = {
+        let node = node.clone();
+        tokio::spawn(async move { node.system.hard_reset().await })
+    };
 
-    // Release: the straddling persist resumes into post-reset storage.
-    // EITHER outcome is legitimate for a dev-only reset racing a persist:
-    // it may complete (stamping the pre-reset epoch, which the epoch
-    // conjunct then distrusts forever, the mechanism pin) or fail loudly
-    // against the wiped engine (sled drops its trees; the open handle
-    // errors). What may NEVER happen is the successor system trusting
-    // anything the straddler left behind.
+    // Release lane A, then let the reset finish. Lane A's own outcome is
+    // deliberately tolerated either way: under the fence it completes
+    // cleanly before the wipe; in the unfenced world it raced the wipe and
+    // could fail loudly. What may NEVER happen is the successor system
+    // trusting anything it left behind.
     instruments.open_gate();
     let straddle_outcome = lane_a.await?;
+    reset.await??;
+    assert_eq!(node.resident_count_for_test(), 0, "precondition: the reset purged the map");
 
     // The successor system starts over: the record's GENESIS delivers into
     // the wiped system (the one-id-one-system invariant makes redelivering
@@ -425,8 +430,80 @@ async fn straddling_persist_is_never_trusted_end_to_end() -> Result<()> {
         .expect("the post-reset delivery is clean");
     assert!(
         instruments.set_state_attempts() - baseline >= 1,
-        "the marker-race pin: after a straddling persist (outcome: {straddle_outcome:?}), the next apply must persist for real \
-         (no elision on dead-system testimony)"
+        "the marker-race pin: after a persist overlapped a reset (outcome: {straddle_outcome:?}), the next apply must persist \
+         for real (no elision on dead-system testimony)"
     );
+    Ok(())
+}
+
+/// THE RESET/PERSIST FENCE PIN (M4 remediation, cross-model review item 5):
+/// hard_reset must DRAIN in-flight funnel persists before its epoch bump,
+/// purge, and wipe, and must hold new ones out until the wipe completes.
+/// Without the fence, a persist parked at the engine when the reset runs
+/// lands its write AFTER the wipe: on postgres, set_state's UndefinedTable
+/// recovery recreates the state table and the dead system's row survives
+/// DURABLY in the successor system's storage (storage/postgres/src/lib.rs),
+/// violating the one-id-one-system reset invariant (plan REV 5 section D);
+/// sled merely swallows the write into dropped tree handles, which is why
+/// the sled-staged discriminator here is the DRAIN ORDERING itself, with
+/// the storage-cleanliness invariant asserted alongside.
+#[tokio::test]
+async fn hard_reset_drains_inflight_persists_before_wiping() -> Result<()> {
+    let engine = Arc::new(InstrumentedEngine::new(SledStorageEngine::new_test()?));
+    let instruments = engine.instruments();
+    let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
+    node.system.create().await?;
+    let ctx = node.context_async(c).await;
+
+    let (rec_id, _view, genesis) = {
+        let trx = ctx.begin();
+        let rec = trx.create(&Record { title: "t0".to_owned(), artist: "a0".to_owned() }).await?;
+        let id = rec.id();
+        let view = rec.read();
+        let mut events = trx.commit_and_return_events().await?;
+        (id, view, events.remove(0))
+    };
+
+    // Lane A: a persist in flight, parked at the engine.
+    let e1 = ankurah_tests::forge::event_with_parents(rec_id, Record::collection(), title_ops("t1"), &[&genesis]);
+    instruments.close_gate();
+    let lane_a = {
+        let node = node.clone();
+        let e1 = e1.clone();
+        tokio::spawn(
+            async move { node.commit_remote_transaction(&c, proto::TransactionId::new(), vec![proto::Attested::opt(e1, None)]).await },
+        )
+    };
+    instruments.wait_until_parked(1).await;
+
+    // THE PIN: the reset must NOT resolve while that persist is in flight.
+    // (In the fenced world this join elapses deterministically: the write
+    // guard cannot be granted while lane A holds the fence in read mode.)
+    let mut reset = {
+        let node = node.clone();
+        tokio::spawn(async move { node.system.hard_reset().await })
+    };
+    let reset_early = tokio::time::timeout(Duration::from_millis(750), &mut reset).await;
+    assert!(
+        reset_early.is_err(),
+        "the fence pin: hard_reset resolved while a funnel persist was parked at the engine; it must drain \
+         in-flight persists before bumping the epoch, purging the map, and wiping storage"
+    );
+    assert!(node.get_resident_entity(rec_id).is_some(), "while the reset is fenced out, the purge has not run");
+
+    // Release: the drained persist completes FIRST (write and stamp, into
+    // intact pre-wipe storage), then the reset proceeds through bump,
+    // purge, and wipe.
+    instruments.open_gate();
+    lane_a.await?.expect("the drained persist completes cleanly, before the wipe");
+    reset.await??;
+
+    // The one-id-one-system invariant: the successor system's storage does
+    // not contain the dead entity (the drained write preceded the wipe).
+    assert!(
+        engine.collection(&Record::collection()).await?.get_state(rec_id).await.is_err(),
+        "post-reset storage must not contain the dead system's entity"
+    );
+    assert_eq!(node.resident_count_for_test(), 0, "and the purge ran");
     Ok(())
 }
