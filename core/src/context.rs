@@ -11,7 +11,7 @@ use crate::{
     storage::{StorageCollectionWrapper, StorageEngine},
     transaction::Transaction,
 };
-use ankurah_proto::{self as proto, Attested, Clock, CollectionId, Event};
+use ankurah_proto::{self as proto, Attested, CollectionId, Event};
 use async_trait::async_trait;
 use std::sync::{atomic::AtomicBool, Arc};
 use tracing::debug;
@@ -154,8 +154,8 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         }
 
         // Update heads BEFORE relaying (makes entities visible to server echo)
-        for (entity, _, event_id, _) in &planned {
-            entity.commit_head(Clock::new([event_id.clone()]));
+        for ((entity, _, _, _), attested) in planned.iter().zip(&attested_events) {
+            entity.commit_head(&attested.payload);
         }
         // Relay to peers and wait for confirmation
         self.node.relay_to_required_peers(&self.cdata, trx_id, &attested_events).await?;

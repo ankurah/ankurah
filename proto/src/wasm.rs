@@ -5,7 +5,7 @@ use wasm_bindgen::JsValue;
 use crate::AttestationSet;
 use crate::CollectionId;
 use crate::StateBuffers;
-use crate::{Clock, DecodeError, EntityId, EventId, OperationSet};
+use crate::{Clock, DecodeError, EntityId, EventId, GClock, OperationSet};
 
 impl TryFrom<JsValue> for EntityId {
     type Error = DecodeError;
@@ -67,6 +67,39 @@ impl From<&Clock> for JsValue {
             array.push(&JsValue::from_str(&base64_str));
         }
 
+        array.into()
+    }
+}
+
+/// GClock is stored self-contained as an array of `[generation, eventIdBase64]`
+/// pairs, one per head tip. Numbers round-trip through JS as f64 and a u32 is
+/// exactly representable, so the generation read is lossless; construction
+/// normalizes to the canonical order like every other GClock path.
+impl TryFrom<JsValue> for GClock {
+    type Error = DecodeError;
+
+    fn try_from(value: JsValue) -> Result<Self, Self::Error> {
+        let array: js_sys::Array = value.dyn_into().map_err(|_| DecodeError::InvalidFormat)?;
+        let mut entries = Vec::new();
+        for i in 0..array.length() {
+            let pair: js_sys::Array = array.get(i).dyn_into().map_err(|_| DecodeError::InvalidFormat)?;
+            let generation = pair.get(0).as_f64().ok_or(DecodeError::InvalidFormat)? as u32;
+            let id_str = pair.get(1).as_string().ok_or(DecodeError::NotStringValue)?;
+            entries.push((generation, EventId::from_base64(&id_str)?));
+        }
+        Ok(GClock::new(entries))
+    }
+}
+
+impl From<&GClock> for JsValue {
+    fn from(val: &GClock) -> Self {
+        let array = js_sys::Array::new();
+        for (generation, id) in val.iter() {
+            let pair = js_sys::Array::new();
+            pair.push(&JsValue::from_f64(*generation as f64));
+            pair.push(&JsValue::from_str(&id.to_base64()));
+            array.push(&pair);
+        }
         array.into()
     }
 }

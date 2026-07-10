@@ -9,9 +9,9 @@ use crate::{
     reactor::AbstractEntity,
     value::Value,
 };
-use ankurah_proto::{Clock, CollectionId, EntityId, EntityState, Event, EventId, OperationSet, State};
+use ankurah_proto::{Clock, CollectionId, EntityId, EntityState, Event, EventId, GClock, OperationSet, State};
 use std::collections::{BTreeMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use tracing::{debug, error, warn};
 
@@ -98,15 +98,43 @@ impl AppliedSet {
     pub(crate) fn len(&self) -> usize { self.order.len() }
 }
 
+/// The persist-currency marker (D2-6): testimony that a set_state of THIS
+/// resident COMPLETED for exactly `head`, with the node's reset epoch
+/// captured BEFORE that persist began. A redundant persist may be elided
+/// only when `epoch` equals the current reset epoch AND `head` equals the
+/// resident's current head; a persist that straddled a hard_reset stamped
+/// the pre-reset epoch and is therefore never trusted. The marker may LAG
+/// storage (the raw set_state bypasses in system.rs never stamp it; a
+/// sibling lane's completed persist may not have stamped yet), which only
+/// costs a redundant monotone-safe write; it may never LEAD storage, which
+/// is why only a completed set_state stamps it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PersistMarker {
+    pub(crate) epoch: u64,
+    pub(crate) head: Clock,
+}
+
 /// Combined state for atomic updates of head and backends
 #[derive(Debug)]
 struct EntityInnerState {
     head: Clock,
+    /// Per-tip head generations (D2 REV 5 section K, home 2 of 3): the
+    /// materialized annotation of `head`, maintained exactly and read-free
+    /// alongside every head mutation (an entry is pinned from the applied
+    /// event's stamp when its tip joins the head and dropped when the tip
+    /// is superseded). INVARIANT: `head_generations.matches_head(&head)` on
+    /// every resident; commit stamping and covered-parent admission
+    /// verification read this instead of retrieving event payloads.
+    head_generations: GClock,
     // TODO: remove interior mutability from backends; make mutation methods take &mut self
     backends: BTreeMap<String, Arc<dyn PropertyBackend>>,
     /// The applied-set (D2-5): under the same lock as the head, consumed
     /// only by apply_event's O(1) skip, inserted only post-persist.
     applied: AppliedSet,
+    /// The persist-currency marker (D2-6): stamped only by the shared
+    /// persist funnel (NodePersist) after a completed set_state, consulted
+    /// there to elide redundant persists. Never forks, never persisted.
+    marker: Option<PersistMarker>,
 }
 
 impl EntityInnerState {
@@ -199,8 +227,13 @@ impl Entity {
             state_buffers.insert(name.clone(), state_buffer);
         }
         let state_buffers = ankurah_proto::StateBuffers(state_buffers);
-        Ok(State { state_buffers, head: state.head.clone() })
+        Ok(State { state_buffers, head: state.head.clone(), head_generations: state.head_generations.clone() })
     }
+
+    /// The resident's materialized per-tip head generations (REV 5 K), read
+    /// under the head lock. Cloned out (heads are tiny) so callers never
+    /// hold the lock across an await.
+    pub(crate) fn head_generations(&self) -> GClock { self.state.read().unwrap().head_generations.clone() }
 
     pub fn to_entity_state(&self) -> Result<EntityState, StateError> {
         let state = self.to_state()?;
@@ -214,8 +247,10 @@ impl Entity {
             collection,
             state: std::sync::RwLock::new(EntityInnerState {
                 head: Clock::default(),
+                head_generations: GClock::default(),
                 backends: BTreeMap::default(),
                 applied: AppliedSet::default(),
+                marker: None,
             }),
             kind: EntityKind::Primary,
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
@@ -231,8 +266,10 @@ impl Entity {
             collection,
             state: std::sync::RwLock::new(EntityInnerState {
                 head: Clock::default(),
+                head_generations: GClock::default(),
                 backends: BTreeMap::default(),
                 applied: AppliedSet::with_cap(cap),
+                marker: None,
             }),
             kind: EntityKind::Primary,
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
@@ -250,7 +287,18 @@ impl Entity {
         Ok(Self(Arc::new(EntityInner {
             id,
             collection,
-            state: std::sync::RwLock::new(EntityInnerState { head: state.head.clone(), backends, applied: AppliedSet::default() }),
+            state: std::sync::RwLock::new(EntityInnerState {
+                head: state.head.clone(),
+                // Adopted with the state: engine rehydration reconstitutes the
+                // node's own materialization; wire-carried values pass the
+                // ingress validation (structural always, payload-contradiction
+                // on durable nodes) before reaching here, and ephemeral nodes
+                // adopt inside the state's own trust envelope (REV 5 K).
+                head_generations: state.head_generations.clone(),
+                backends,
+                applied: AppliedSet::default(),
+                marker: None,
+            }),
             kind: EntityKind::Primary,
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
         })))
@@ -318,11 +366,38 @@ impl Entity {
         }
     }
 
-    /// Updates the head of the entity to the given clock, which should come exclusively from generate_commit_event
-    pub(crate) fn commit_head(&self, new_head: Clock) {
+    /// Updates the head of the entity to the just-committed event, which
+    /// should come exclusively from generate_commit_event. Takes the EVENT
+    /// (not a bare clock) so the materialized head generation advances in
+    /// the same write (REV 5 K: maintenance rides every head mutation).
+    pub(crate) fn commit_head(&self, event: &Event) {
         // TODO figure out how to implement CAS with the backend state
         // probably need an increment for local edits
-        self.state.write().unwrap().head = new_head;
+        let mut state = self.state.write().unwrap();
+        state.head = event.id().into();
+        state.head_generations = GClock::from((event.generation, event.id()));
+    }
+
+    /// Stamp the persist-currency marker (D2-6). Called ONLY by the shared
+    /// persist funnel immediately after a set_state of this resident
+    /// COMPLETED, with `epoch` captured BEFORE that persist began and `head`
+    /// the exact head the completed persist wrote. Overwriting an existing
+    /// marker is safe in every interleaving: a marker can only lag storage
+    /// (costing a redundant monotone-safe write), never lead it.
+    pub(crate) fn stamp_persist_marker(&self, epoch: u64, head: Clock) {
+        self.state.write().unwrap().marker = Some(PersistMarker { epoch, head });
+    }
+
+    /// Whether the marker proves a persist of the CURRENT head in the
+    /// CURRENT reset epoch already completed (D2-6 elision predicate):
+    /// `marker.epoch == epoch AND marker.head == current head`. A marker
+    /// stamped by a persist that straddled a hard_reset carries the
+    /// pre-reset epoch and never satisfies this; a marker stamped for an
+    /// older head is defeated by the head comparison (the ef68e081 two-lane
+    /// interleaving, R-D2-4c).
+    pub(crate) fn persist_marker_current(&self, epoch: u64) -> bool {
+        let state = self.state.read().unwrap();
+        matches!(&state.marker, Some(marker) if marker.epoch == epoch && marker.head == state.head)
     }
 
     /// The insertion half of the shared post-persist hook (derivations
@@ -405,6 +480,7 @@ impl Entity {
         meet: &[EventId],
         expected_head: &mut Clock,
         new_tip: EventId,
+        new_tip_generation: u32,
     ) -> Result<bool, MutationError> {
         let mut applied_layers: Vec<crate::event_dag::EventLayer> = Vec::new();
 
@@ -449,11 +525,17 @@ impl Entity {
 
             // Update head: remove superseded tips, add the new event. The
             // new tip extends tips in its parent clock (the meet); any of
-            // those in the current head are now superseded.
+            // those in the current head are now superseded. The materialized
+            // generations mirror the head exactly (REV 5 K): superseded tips
+            // drop their entries, the new tip pins its stamp, surviving
+            // concurrent tips keep theirs.
             for parent_id in meet {
                 state.head.remove(parent_id);
+                state.head_generations.remove(parent_id);
             }
-            state.head.insert(new_tip);
+            state.head.insert(new_tip.clone());
+            state.head_generations.insert(new_tip_generation, new_tip);
+            debug_assert!(state.head_generations.matches_head(&state.head), "head generations must annotate exactly the head");
         }
         self.broadcast.send(());
         Ok(true)
@@ -505,6 +587,7 @@ impl Entity {
                     state.apply_operations_from_event(backend_name.clone(), operations, event.id())?;
                 }
                 state.head = event.id().into();
+                state.head_generations = GClock::from((event.generation, event.id()));
                 drop(state); // Release lock before broadcast
                              // Notify Signal subscribers about the change
                 self.broadcast.send(());
@@ -582,7 +665,7 @@ impl Entity {
                         let meet: Vec<EventId> = head.as_slice().to_vec();
                         let (_relation, accumulator) = comparison_result.into_parts();
                         let layers = accumulator.into_layers(meet.clone(), meet.clone());
-                        if self.apply_accumulated_layers(layers, &meet, &mut head, event_id.clone()).await? {
+                        if self.apply_accumulated_layers(layers, &meet, &mut head, event_id.clone(), event.generation).await? {
                             return Ok(true);
                         }
                         continue;
@@ -593,6 +676,9 @@ impl Entity {
                             state.apply_operations_from_event(backend_name.clone(), operations, event_id.clone())?;
                         }
                         state.head = new_head.clone();
+                        // StrictDescends supersedes the whole head: the new
+                        // tip's stamp is the only surviving entry (REV 5 K).
+                        state.head_generations = GClock::from((event.generation, event_id.clone()));
                         Ok(())
                     })? {
                         self.broadcast.send(());
@@ -615,7 +701,7 @@ impl Entity {
                     let (_relation, accumulator) = comparison_result.into_parts();
                     let layers = accumulator.into_layers(meet.clone(), head.as_slice().to_vec());
 
-                    if self.apply_accumulated_layers(layers, &meet, &mut head, event.id()).await? {
+                    if self.apply_accumulated_layers(layers, &meet, &mut head, event.id(), event.generation).await? {
                         return Ok(true);
                     }
                     continue;
@@ -669,6 +755,12 @@ impl Entity {
                             es.backends.insert(name.to_owned(), backend);
                         }
                         es.head = new_head;
+                        // The carried annotation travels with the head it
+                        // annotates: validated at the ingress boundary
+                        // (structural everywhere, payload-contradiction on
+                        // durable nodes), adopted inside the state's trust
+                        // envelope on ephemeral nodes (REV 5 K).
+                        es.head_generations = state.head_generations.clone();
                         Ok(())
                     })? {
                         self.broadcast.send(());
@@ -729,7 +821,17 @@ impl Entity {
             // The applied-set NEVER FORKS (D2-5): a fork starts empty, so
             // fork previews always take the honest comparison path and a
             // fork's rows can never testify about the canonical resident.
-            state: std::sync::RwLock::new(EntityInnerState { head: state.head.clone(), backends: forked, applied: AppliedSet::default() }),
+            // The head generations DO fork (they annotate the forked head:
+            // a transaction fork's commit stamps from them), while the
+            // persist marker does NOT (it testifies about the canonical
+            // resident's persistence; forks never persist).
+            state: std::sync::RwLock::new(EntityInnerState {
+                head: state.head.clone(),
+                head_generations: state.head_generations.clone(),
+                backends: forked,
+                applied: AppliedSet::default(),
+                marker: None,
+            }),
             kind: EntityKind::Transacted { trx_alive, upstream: self.clone() },
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
         }))
@@ -819,7 +921,13 @@ impl TemporaryEntity {
         Ok(Self(Arc::new(EntityInner {
             id,
             collection,
-            state: std::sync::RwLock::new(EntityInnerState { head: state.head.clone(), backends, applied: AppliedSet::default() }),
+            state: std::sync::RwLock::new(EntityInnerState {
+                head: state.head.clone(),
+                head_generations: state.head_generations.clone(),
+                backends,
+                applied: AppliedSet::default(),
+                marker: None,
+            }),
             kind: EntityKind::Primary,
             // slightly annoying that we need to populate this, given that it won't be used
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
@@ -900,12 +1008,30 @@ mod applied_set_tests {
 }
 
 // TODO - Implement TOCTOU Race condition tests. Require real backend state mutations to be meaningful. punting that for now
+
+/// Shared interior of [`WeakEntitySet`]: the resident map plus the node's
+/// reset epoch. They live together because the SAME Arc is cloned into both
+/// `NodeInner.entities` (the persist path reaches it through the node) and
+/// `SystemManager`'s inner (hard_reset reaches it through the system
+/// manager), which is exactly the shared-reachability the epoch needs; a
+/// bare NodeInner field would be unreachable from hard_reset (REV 5 G).
+#[derive(Default)]
+struct WeakEntitySetInner {
+    entities: std::sync::RwLock<BTreeMap<EntityId, WeakEntity>>,
+    /// The memory-only reset epoch (D2-6): bumped by hard_reset, captured by
+    /// the persist funnel BEFORE each set_state begins, stamped into the
+    /// persist marker at completion. Never persisted; process restart
+    /// resetting it to zero is safe because markers restart empty too (a
+    /// marker can only lag storage).
+    reset_epoch: AtomicU64,
+}
+
 /// A set of entities held weakly
 #[derive(Clone, Default)]
-pub struct WeakEntitySet(Arc<std::sync::RwLock<BTreeMap<EntityId, WeakEntity>>>);
+pub struct WeakEntitySet(Arc<WeakEntitySetInner>);
 impl WeakEntitySet {
     pub fn get(&self, id: &EntityId) -> Option<Entity> {
-        let entities = self.0.read().unwrap();
+        let entities = self.0.entities.read().unwrap();
         // TODO: call policy agent with cdata
         if let Some(entity) = entities.get(id) {
             entity.upgrade()
@@ -913,6 +1039,30 @@ impl WeakEntitySet {
             None
         }
     }
+
+    /// The current reset epoch (D2-6). The persist funnel captures this
+    /// BEFORE a set_state begins and stamps the captured value at
+    /// completion, so a persist straddling a reset stamps the pre-reset
+    /// epoch and its marker is never trusted.
+    pub(crate) fn reset_epoch(&self) -> u64 { self.0.reset_epoch.load(Ordering::Acquire) }
+
+    /// Bump the reset epoch (hard_reset only). Every marker stamped under
+    /// an earlier epoch becomes permanently untrusted.
+    pub(crate) fn bump_reset_epoch(&self) -> u64 { self.0.reset_epoch.fetch_add(1, Ordering::AcqRel) + 1 }
+
+    /// The hard_reset purge (REV 5 D.1): clear the resident map, taking only
+    /// the map's own lock (no entity locks, so no lock-order hazard). Every
+    /// entry in the map at reset time belongs to the dead system by
+    /// definition (one entity id lives in exactly one system, never two);
+    /// clearing makes stale residents unreachable from ingest and also
+    /// drops the accumulated dead weak entries. Holders of strong Entity
+    /// references keep reading their stale snapshots unchanged; the
+    /// successor system simply never hands them out again.
+    pub(crate) fn purge(&self) { self.0.entities.write().unwrap().clear() }
+
+    /// Number of entries in the resident map (live or dead weak). The purge
+    /// pin asserts EMPTY, tombstones included.
+    pub(crate) fn resident_count(&self) -> usize { self.0.entities.read().unwrap().len() }
 
     pub async fn get_or_retrieve<S, E>(
         &self,
@@ -955,7 +1105,7 @@ impl WeakEntitySet {
         match self.get_or_retrieve(state_getter, event_getter, collection_id, id).await? {
             Some(entity) => Ok(entity),
             None => {
-                let mut entities = self.0.write().unwrap();
+                let mut entities = self.0.entities.write().unwrap();
                 // TODO: call policy agent with cdata
                 if let Some(entity) = entities.get(id) {
                     if let Some(entity) = entity.upgrade() {
@@ -970,7 +1120,7 @@ impl WeakEntitySet {
     }
     /// Create a brand new entity, and add it to the set
     pub fn create(&self, collection: CollectionId) -> Entity {
-        let mut entities = self.0.write().unwrap();
+        let mut entities = self.0.entities.write().unwrap();
         let id = EntityId::new();
         let entity = Entity::create(id, collection);
         entities.insert(id, entity.weak());
@@ -983,7 +1133,7 @@ impl WeakEntitySet {
     /// update that then failed to apply; leaving it resident makes the entity
     /// appear to exist with no state. Returns true if an entry was removed.
     pub fn remove_if_phantom(&self, id: &EntityId) -> bool {
-        let mut entities = self.0.write().unwrap();
+        let mut entities = self.0.entities.write().unwrap();
         if let Some(weak) = entities.get(id) {
             if let Some(entity) = weak.upgrade() {
                 if !entity.head().is_empty() {
@@ -1008,7 +1158,7 @@ impl WeakEntitySet {
     /// Requires the `test-helpers` feature to be enabled.
     #[cfg(feature = "test-helpers")]
     pub fn conjure_evil_phantom(&self, id: EntityId, collection: CollectionId) -> Entity {
-        let mut entities = self.0.write().unwrap();
+        let mut entities = self.0.entities.write().unwrap();
         let entity = Entity::create(id, collection);
         entities.insert(id, entity.weak());
         entity
@@ -1017,7 +1167,7 @@ impl WeakEntitySet {
     /// Get or create entity after async operations, checking for race conditions
     /// Returns (existed, entity) where existed is true if the entity was already present
     fn private_get_or_create(&self, id: EntityId, collection_id: &CollectionId, state: &State) -> Result<(bool, Entity), RetrievalError> {
-        let mut entities = self.0.write().unwrap();
+        let mut entities = self.0.entities.write().unwrap();
         if let Some(existing_weak) = entities.get(&id) {
             if let Some(existing_entity) = existing_weak.upgrade() {
                 debug!("Entity {id} was created by another thread during async work, using that one");

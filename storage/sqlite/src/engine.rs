@@ -10,7 +10,7 @@ use ankurah_core::property::backend::backend_from_string;
 use ankurah_core::selection::filter::evaluate_predicate;
 use ankurah_core::storage::{StorageCollection, StorageEngine};
 use ankurah_proto::{
-    AttestationSet, Attested, Clock, CollectionId, EntityId, EntityState, Event, EventId, OperationSet, State, StateBuffers,
+    AttestationSet, Attested, Clock, CollectionId, EntityId, EntityState, Event, EventId, GClock, OperationSet, State, StateBuffers,
 };
 use async_trait::async_trait;
 use rusqlite::{params_from_iter, Connection};
@@ -414,7 +414,7 @@ impl StorageCollection for SqliteBucket {
                             payload: EntityState {
                                 entity_id: id,
                                 collection: collection_id,
-                                state: State { state_buffers: StateBuffers(state_buffers), head },
+                                state: State { state_buffers: StateBuffers(state_buffers), head, head_generations: GClock::default() },
                             },
                             attestations,
                         })
@@ -525,7 +525,7 @@ impl StorageCollection for SqliteBucket {
                         payload: EntityState {
                             entity_id: id,
                             collection: collection_id.clone(),
-                            state: State { state_buffers: StateBuffers(state_buffers), head },
+                            state: State { state_buffers: StateBuffers(state_buffers), head, head_generations: GClock::default() },
                         },
                         attestations,
                     });

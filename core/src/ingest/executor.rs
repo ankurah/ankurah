@@ -604,10 +604,12 @@ mod tests {
         let getter = FailingCommitStore::ephemeral(staging.clone(), EventId::from_bytes([0xEE; 32]));
 
         // Adopt the state snapshot: resident materializes at head {h3} with
-        // no event bodies anywhere local.
+        // no event bodies anywhere local. The snapshot carries the honest
+        // per-tip generation annotation, as any real sender would.
         let adopted = ankurah_proto::State {
             state_buffers: ankurah_proto::StateBuffers(BTreeMap::new()),
             head: ankurah_proto::Clock::from(vec![h3_id.clone()]),
+            head_generations: ankurah_proto::GClock::from((h3.payload.generation, h3_id.clone())),
         };
         let (_, entity) = entities
             .with_state(&NoState, &getter, entity_id, "test".into(), adopted)
@@ -657,6 +659,7 @@ mod tests {
         let adopted = ankurah_proto::State {
             state_buffers: ankurah_proto::StateBuffers(BTreeMap::new()),
             head: ankurah_proto::Clock::from(vec![h2.payload.id()]),
+            head_generations: ankurah_proto::GClock::from((h2.payload.generation, h2.payload.id())),
         };
         let (_, entity) = entities
             .with_state(&NoState, &getter, entity_id, "test".into(), adopted)

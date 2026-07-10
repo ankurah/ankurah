@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{auth::Attested, clock::Clock, collection::CollectionId, id::EntityId, AttestationSet, DecodeError};
+use crate::{auth::Attested, clock::Clock, clock::GClock, collection::CollectionId, id::EntityId, AttestationSet, DecodeError};
 
 #[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 pub struct EventId([u8; 32]);
@@ -221,6 +221,14 @@ pub struct State {
     pub state_buffers: StateBuffers,
     /// The set of concurrent events (usually only one) which have been applied to the entity state above
     pub head: Clock,
+    /// Per-tip generations for `head` (D2, plan REV 5 section K): one entry
+    /// per head tip, carrying the generation the tip's event payload claims,
+    /// pinned at admission. Must annotate exactly `head`'s tips
+    /// ([`GClock::matches_head`]); a state whose annotation does not is
+    /// malformed and is rejected at the ingress boundary. This is what lets
+    /// a receiving node stamp commits and admission-verify head-parented
+    /// arrivals without retrieving any event payloads.
+    pub head_generations: GClock,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
