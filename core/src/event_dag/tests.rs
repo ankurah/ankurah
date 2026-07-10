@@ -3273,6 +3273,105 @@ mod chain_canonicalization {
 }
 
 // ============================================================================
+// THE BUDGET INVARIANT (red-team fold item 7): the walk decrements budget at
+// most TWICE per distinct event under ANY schedule (once per side;
+// Side::processed makes per-side expansion idempotent and the level snapshot
+// deduplicates). The immunity oracle's non-binding-budget guarantee (budget
+// = 4x corpus, neither run may BudgetExceed) rests on this bound; a frontier
+// rewrite that breaks per-side once-only processing would turn
+// BudgetExceeded into a schedule-dependent oracle artifact.
+// ============================================================================
+
+#[cfg(test)]
+mod budget_invariant {
+    use super::*;
+
+    /// Staggered divergence maximizes dual-side re-encounters: subject
+    /// {u} over m over g; comparison {v} over g. The two traversals reach g
+    /// at DIFFERENT levels (comparison at level 2, subject at level 3), so
+    /// g is decremented once per side; everything else once. Exact totals
+    /// pin the accounting; the bound pins the law.
+    #[tokio::test]
+    async fn decrements_are_at_most_two_per_event_and_exact_on_the_staggered_seed() {
+        let mut retriever = MockRetriever::new();
+        let g = make_test_event(1, &[]);
+        let m = make_test_event(2, &[&g]);
+        let u = make_test_event(3, &[&m]);
+        let v = make_test_event(4, &[&g]);
+        for e in [&g, &m, &u, &v] {
+            retriever.add_event(e);
+        }
+        let n_events = 4;
+
+        let result = compare(retriever, &clock!(u.id()), &clock!(v.id()), 2 * n_events).await.unwrap();
+        match &result.relation {
+            AbstractCausalRelation::DivergedSince { meet, .. } => assert_eq!(meet, &vec![g.id()]),
+            other => panic!("expected DivergedSince at meet {{g}}, got {other:?}"),
+        }
+        assert_eq!(result.stats.budget_decrements, 5, "u, v, m once each; g once per side (the staggered dual re-encounter); nothing else");
+        assert!(result.stats.budget_decrements <= 2 * n_events, "the <= 2 per event law");
+        assert_eq!(result.stats.events_fetched, 4, "the re-encounter is an LRU hit, not a fetch");
+    }
+
+    /// PER-SIDE once-only processing is what carries the bound: a node
+    /// reachable by two paths of DIFFERENT lengths within ONE side is
+    /// decremented once for that side, because the longer path's late
+    /// arrival finds it in the processed set and must not re-queue it.
+    /// Shape: s parents {p, w}; p child of z; w child of x; x child of z;
+    /// z child of g. The subject walk reaches z at level 3 via p and again
+    /// at level 4 via x (the seed search fixes the in-level order so x is
+    /// processed after z, the arrival order that would re-queue). Exact
+    /// decrement count pins it: 6 events, one dual-side re-encounter (g),
+    /// total exactly 7.
+    #[tokio::test]
+    async fn longer_path_re_arrival_does_not_requeue_a_processed_node() {
+        let g = make_test_event(1, &[]);
+        let z = make_test_event(2, &[&g]);
+        let p = make_test_event(3, &[&z]);
+        for seed in 0..u16::MAX {
+            let x = make_test_event_u16(seed, &[&z]);
+            if x.id() > z.id() {
+                let w = make_test_event_u16(seed.wrapping_add(1), &[&x]);
+                let s = make_test_event(4, &[&p, &w]);
+                let mut retriever = MockRetriever::new();
+                for e in [&g, &z, &p, &x, &w, &s] {
+                    retriever.add_event(e);
+                }
+                let result = compare(retriever, &clock!(s.id()), &clock!(g.id()), 24).await.unwrap();
+                assert!(matches!(result.relation, AbstractCausalRelation::StrictDescends { .. }));
+                assert_eq!(
+                    result.stats.budget_decrements, 7,
+                    "s, p, w, z, x once each on the subject side; g once per side; the level-4 \
+                     re-arrival at z via x must not re-queue it"
+                );
+                assert!(result.stats.budget_decrements <= 2 * 6, "the <= 2 per event law");
+                return;
+            }
+        }
+        unreachable!("half of all seeds order x above z");
+    }
+
+    /// The same-level dual encounter costs ONE decrement: with equal-depth
+    /// divergence (subject {x}, comparison {y}, both children of g) the two
+    /// frontiers hold g in the same level and the deduplicated snapshot
+    /// processes it once with both flags.
+    #[tokio::test]
+    async fn same_level_dual_encounter_decrements_once() {
+        let mut retriever = MockRetriever::new();
+        let g = make_test_event(1, &[]);
+        let x = make_test_event(2, &[&g]);
+        let y = make_test_event(3, &[&g]);
+        for e in [&g, &x, &y] {
+            retriever.add_event(e);
+        }
+
+        let result = compare(retriever, &clock!(x.id()), &clock!(y.id()), 6).await.unwrap();
+        assert!(matches!(&result.relation, AbstractCausalRelation::DivergedSince { meet, .. } if meet == &vec![g.id()]));
+        assert_eq!(result.stats.budget_decrements, 3, "x, y, and ONE dual-flag processing of g");
+    }
+}
+
+// ============================================================================
 // COMPARESTATS MECHANICS (D2 M5, dispositions Q4)
 // ============================================================================
 
