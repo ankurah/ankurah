@@ -53,6 +53,43 @@ fn test_model_id() -> EntityId {
     EntityId::from_bytes(bytes)
 }
 
+/// A retriever that LIES about generations (D2 M5, oracle brief section
+/// 1.2): serves a doctored payload under the ORIGINAL requested id. The
+/// honest corpus stays untouched in `inner`; `overrides` maps original id
+/// to a doctored event that is byte-identical except for the corrupted
+/// field(s). This models a wrong value reaching the comparison WITHOUT
+/// admission having vetted it: storage corruption in place, a hostile
+/// backend, a plumbing bug, or an adopted-history value the admission
+/// equation never saw; exactly the domain of the 5b-ii immunity theorem.
+///
+/// Doctored events are NEVER inserted through MockRetriever::add_event
+/// (which keys by the payload's recomputed id, so the lie would mint a
+/// fresh id instead of wearing the original one; red-team fold F4 trap).
+#[derive(Clone)]
+struct GenCorruptedRetriever {
+    inner: MockRetriever,
+    overrides: HashMap<EventId, Event>,
+}
+
+impl GenCorruptedRetriever {
+    fn new(inner: MockRetriever) -> Self { Self { inner, overrides: HashMap::new() } }
+
+    /// Serve `doctored` whenever `original_id` is requested.
+    fn doctor(&mut self, original_id: EventId, doctored: Event) { self.overrides.insert(original_id, doctored); }
+}
+
+#[async_trait]
+impl GetEvents for GenCorruptedRetriever {
+    async fn get_event(&self, event_id: &EventId) -> Result<Event, RetrievalError> {
+        if let Some(doctored) = self.overrides.get(event_id) {
+            return Ok(doctored.clone());
+        }
+        self.inner.get_event(event_id).await
+    }
+
+    async fn event_stored(&self, event_id: &EventId) -> Result<bool, RetrievalError> { self.inner.event_stored(event_id).await }
+}
+
 /// Create a test event with deterministic content-hashed IDs.
 /// The seed differentiates events; the parent EVENTS determine the parent
 /// clock, and the generation is stamped `1 + max` of their payload
@@ -2668,6 +2705,55 @@ mod strict_descends_gap_jump {
             p1,
             Some(Value::String("written_by_X".into())),
             "CONSISTENCY VIOLATION: head descends X but X's write (p1) is missing. p1={p1:?}"
+        );
+    }
+}
+
+// ============================================================================
+// R1: REQUESTED-ID KEYING (D2 M5 pre-task, dispositions Q1, maintainer
+// approved). The comparison keys its bookkeeping on the id it REQUESTED,
+// not the id recomputed from the served payload, so a lying retriever
+// yields a coherent walk over the served structure instead of a budget
+// stall. In every honest run the two ids are equal (engines key rows by
+// payload id at write); the behavior differs only under lying or corrupt
+// storage, where a coherent walk plus the D2-4 edge checks strictly beats
+// silent mis-keying, budget spin, and poisoned grounding. On the ephemeral
+// CachedEventGetter lane a mid-walk peer fetch is inside amendment K's
+// trust envelope (a durable node lying to an ephemeral is out of threat
+// model), which is what makes trading the pre-R1 fail-stop for a coherent
+// walk sound there (red-team fold item 6).
+// ============================================================================
+
+#[cfg(test)]
+mod requested_id_keying {
+    use super::*;
+
+    /// R1 red (oracle brief section 1.4): one doctored payload served under
+    /// the original id must complete with the TRUE verdict. Pre-R1 the
+    /// mis-keyed row never leaves the frontier (frontier.remove sees the
+    /// recomputed id), the walk refetches the requested id from the LRU
+    /// forever, and the comparison burns to BudgetExceeded through every
+    /// escalation.
+    #[tokio::test]
+    async fn doctored_payload_under_original_id_completes_with_true_verdict() {
+        let mut retriever = MockRetriever::new();
+        let g = make_test_event(1, &[]);
+        let a = make_test_event(2, &[&g]);
+        let b = make_test_event(3, &[&a]);
+        for e in [&g, &a, &b] {
+            retriever.add_event(e);
+        }
+
+        // Interior corruption: the walk must traverse a to ground b in g.
+        let mut lying = GenCorruptedRetriever::new(retriever);
+        lying.doctor(a.id(), Event { generation: 999, ..a.clone() });
+
+        let result = compare(lying, &clock!(b.id()), &clock!(g.id()), 100).await.unwrap();
+        assert!(
+            matches!(result.relation, AbstractCausalRelation::StrictDescends { .. }),
+            "the true verdict is StrictDescends (b descends g through a); a generation-only lie may never \
+             change the outcome, got {:?}",
+            result.relation
         );
     }
 }
