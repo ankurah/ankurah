@@ -103,8 +103,7 @@ pub(crate) async fn compare_with<E: GetEvents>(
     budget: usize,
     opts: CompareOptions<'_>,
 ) -> Result<ComparisonResult<E>, RetrievalError> {
-    let _ = &opts; // Inert until the precheck and ordering commits land (red-first).
-                   // Identical clocks (including two empty ones) are equal.
+    // Identical clocks (including two empty ones) are equal.
     if subject.as_slice() == comparison.as_slice() {
         let accumulator = EventAccumulator::new(event_getter);
         return Ok(ComparisonResult::new(AbstractCausalRelation::Equal, accumulator));
@@ -128,6 +127,24 @@ pub(crate) async fn compare_with<E: GetEvents>(
 
     let mut accumulator = EventAccumulator::new(event_getter);
 
+    // P1/P2 prechecks (D2-4, derivations section 2), wired SUPPRESS-ONLY:
+    // when the eligible operands prove StrictDescends(subject over
+    // comparison) impossible, the positive fast-path attempt below is
+    // skipped and the walk decides everything. The rejection can never
+    // conclude or route a verdict: on honest operands the suppressed quick
+    // check would have found nothing (the rejection is sound), and on lying
+    // operands the walk still returns the true verdict, so a wrong value
+    // costs time, never an outcome (5b-ii; pinned by the immunity oracle).
+    // The counter is bumped per suppressed ATTEMPT, whether or not the
+    // attempt would have succeeded (write-only observability).
+    let suppress_quick_check = match (&opts.subject_gens, &opts.comparison_gens) {
+        (Some(sg), Some(cg)) => super::prechecks::rejects_strict_descends(subject, sg, comparison, cg, opts.unverified),
+        _ => false,
+    };
+    if suppress_quick_check {
+        accumulator.stats.precheck_suppressions += 1;
+    }
+
     // Quick check: if every subject event sits exactly one step above the
     // comparison heads (nonempty parent set, all parents within the comparison
     // set) and every comparison head is covered by some subject event's
@@ -141,7 +158,7 @@ pub(crate) async fn compare_with<E: GetEvents>(
     // relevant to the parent union (a disjoint genesis root, or an event on a
     // foreign lineage) is silently vouched for by its siblings, and the BFS
     // that would detect the disjoint lineage never runs.
-    {
+    if !suppress_quick_check {
         let comparison_set: BTreeSet<EventId> = comparison.as_slice().iter().cloned().collect();
         let mut all_parents: BTreeSet<EventId> = BTreeSet::new();
         let mut applicable = true;
