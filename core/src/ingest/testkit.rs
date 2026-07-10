@@ -27,6 +27,28 @@ pub(crate) fn event(entity_id: EntityId, parents: &[&Attested<Event>]) -> Attest
     )
 }
 
+/// Forge an honestly stamped event carrying a real LWW write. Ids are
+/// content-addressed, so shapes that need DISTINCT SIBLINGS over one parent
+/// (concurrent-edit shapes) must differ in operations; two empty-ops
+/// children of the same parent are one event.
+pub(crate) fn event_with_title(entity_id: EntityId, title: &str, parents: &[&Attested<Event>]) -> Attested<Event> {
+    use crate::property::backend::{lww::LWWBackend, PropertyBackend};
+    use crate::value::Value;
+    let backend = LWWBackend::new();
+    backend.set("title".into(), Some(Value::String(title.to_owned())));
+    let ops = backend.to_operations().expect("LWW serializes").expect("a write produces operations");
+    Attested::opt(
+        Event {
+            entity_id,
+            collection: "test".into(),
+            operations: OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
+            parent: ankurah_proto::Clock::from(parents.iter().map(|p| p.payload.id()).collect::<Vec<_>>()),
+            generation: Event::generation_from_parents(parents.iter().map(|p| p.payload.generation)),
+        },
+        None,
+    )
+}
+
 /// Getter whose `commit_event` fails for one designated event id (the
 /// deterministic stand-in for a transient storage fault) and retains
 /// successful commits (bodies included) so `event_stored` and

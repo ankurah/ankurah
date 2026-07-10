@@ -295,4 +295,127 @@ mod tests {
             "the resident materializes the carried annotation (the stamp operand for its next commit)"
         );
     }
+
+    /// The materialization consult on a PRE-EXISTING resident (M4
+    /// remediation item 7's sibling, test-adequacy panel MINOR 4): every
+    /// earlier test in this module runs against a fresh WeakEntitySet, so
+    /// resident_materialization was None in all of them and the consult
+    /// could be deleted unnoticed. This pin adopts head {h2} bodiless
+    /// first, then feeds the standard update shape (state heading {h3},
+    /// cargo h3 parented on the current head {h2}): the cargo must verify
+    /// READ-FREE from the resident's materialization (the K claim for the
+    /// highest-traffic lane), stay OUT of the unverified set (M5
+    /// eligibility), and a mis-stamped twin must be rejected typed with
+    /// the expected value read from the materialization (h2 is BODILESS
+    /// here, so no payload fallback could ever supply it).
+    #[tokio::test]
+    async fn update_shaped_cargo_on_a_pre_existing_resident_verifies_from_the_materialization() {
+        let entity_id = ankurah_proto::EntityId::new();
+        let h2_id = EventId::from_bytes([2; 32]);
+
+        let entities = crate::entity::WeakEntitySet::default();
+        let staging = std::sync::Arc::new(StagingArea::with_default_cap());
+        // Ephemeral store holding NOTHING: the adopted parent stays bodiless.
+        let getter = FailingCommitStore::ephemeral(staging.clone(), EventId::from_bytes([0xEE; 32]));
+        let unverified = UnverifiedEvents::default();
+
+        // Pre-existing resident: bodiless adoption of head {h2} at
+        // generation 2 (the trust envelope). The strong handle keeps it
+        // resident across the feeds below.
+        let adopted = ankurah_proto::State {
+            state_buffers: ankurah_proto::StateBuffers(BTreeMap::new()),
+            head: ankurah_proto::Clock::from(vec![h2_id.clone()]),
+            head_generations: ankurah_proto::GClock::from((2, h2_id.clone())),
+        };
+        let resident =
+            apply_state_feed(&entities, &NoState, &getter, &staging, entity_id, "test".into(), adopted, &[], &NoopPersist, &unverified)
+                .await
+                .expect("bodiless adoption succeeds")
+                .entity;
+        assert!(entities.get(&entity_id).is_some(), "precondition: the resident pre-exists the update feed");
+
+        // The mis-stamped twin FIRST, while its parent h2 is the resident's
+        // materialized head: cargo parented {h2} claiming 4 where the
+        // materialization says the one correct stamp is 3. The expected
+        // value can only come from the MATERIALIZATION (h2 is bodiless on
+        // this node), so the typed rejection binds the consult itself.
+        let lying = ankurah_proto::Event {
+            entity_id,
+            collection: "test".into(),
+            operations: ankurah_proto::OperationSet(BTreeMap::new()),
+            parent: ankurah_proto::Clock::from(vec![h2_id.clone()]),
+            generation: 4,
+        };
+        let lying_id = lying.id();
+        let lying = Attested::opt(lying, None);
+        staging.stage(lying.clone());
+        let lying_state = ankurah_proto::State {
+            state_buffers: ankurah_proto::StateBuffers(BTreeMap::new()),
+            head: ankurah_proto::Clock::from(vec![lying_id.clone()]),
+            head_generations: ankurah_proto::GClock::from((4, lying_id.clone())),
+        };
+        let result = apply_state_feed(
+            &entities,
+            &NoState,
+            &getter,
+            &staging,
+            entity_id,
+            "test".into(),
+            lying_state,
+            std::slice::from_ref(&lying),
+            &NoopPersist,
+            &unverified,
+        )
+        .await;
+        match result {
+            Err(MutationError::Ingest(IngestError::Lineage(LineageRejection::GenerationMismatch { claimed, expected, .. }))) => {
+                assert_eq!((claimed, expected), (4, 3), "the expected value is read from the resident's materialization");
+            }
+            other => panic!("mis-stamped cargo over a materialized parent must be rejected typed, got {other:?}"),
+        }
+        staging.remove(&lying_id);
+        assert!(resident.head().contains(&h2_id), "the rejected item adopted nothing; the resident still heads {{h2}}");
+
+        // The honest update shape: cargo h3 parented on the current head,
+        // state heading {h3} annotated with h3's stamp.
+        let h3 = ankurah_proto::Event {
+            entity_id,
+            collection: "test".into(),
+            operations: ankurah_proto::OperationSet(BTreeMap::new()),
+            parent: ankurah_proto::Clock::from(vec![h2_id.clone()]),
+            generation: 3,
+        };
+        let h3_id = h3.id();
+        let h3 = Attested::opt(h3, None);
+        staging.stage(h3.clone());
+        let update = ankurah_proto::State {
+            state_buffers: ankurah_proto::StateBuffers(BTreeMap::new()),
+            head: ankurah_proto::Clock::from(vec![h3_id.clone()]),
+            head_generations: ankurah_proto::GClock::from((3, h3_id.clone())),
+        };
+
+        let reads_before = getter.get_local_event_calls();
+        let applied = apply_state_feed(
+            &entities,
+            &NoState,
+            &getter,
+            &staging,
+            entity_id,
+            "test".into(),
+            update,
+            std::slice::from_ref(&h3),
+            &NoopPersist,
+            &unverified,
+        )
+        .await
+        .expect("the update-shaped item applies");
+        assert!(applied.advanced, "strict descent advances");
+        assert_eq!(
+            getter.get_local_event_calls() - reads_before,
+            0,
+            "update-shaped cargo parented on the current head verifies READ-FREE from the resident's materialization"
+        );
+        assert!(!unverified.contains(&h3_id), "verified cargo stays acceleration-eligible (not recorded unverified)");
+        assert_eq!(resident.head_generations().generation_of(&h3_id), Some(3), "the resident heads {{h3}} at its own stamp");
+    }
 }
