@@ -327,11 +327,39 @@ where
     /// Reset while the caller owns `lifecycle`. Kept separate so a mismatched
     /// `join_system` can reset atomically without recursively locking.
     async fn hard_reset_locked(&self) -> Result<()> {
-        // The reset epoch bump comes FIRST (D2-6): from this instant, every
-        // persist that captured the previous epoch stamps a marker that is
-        // never trusted, so no persist the successor system needs can be
-        // elided on the dead system's testimony. Memory-only; nothing
-        // persisted.
+        // The reset fence, write half (M4 remediation, item 5): held across
+        // the bump, the purge, AND the wipe. In-flight funnel persists hold
+        // the read half across their whole spans, so they DRAIN here before
+        // anything destructive runs (their writes land in pre-wipe storage
+        // and are wiped with it), and no new persist can start until the
+        // wipe completes; a persist can therefore never resurrect
+        // dead-system bytes in the successor system's storage (postgres
+        // would otherwise recreate the state table under an in-flight
+        // set_state and retry the dead row into it). This also closes the
+        // epoch's bump-instant blind spots (concurrency panel finding 2):
+        // no persist span can interleave between bump and wipe, so a
+        // second post-wipe epoch bump would distinguish nothing and is
+        // deliberately not taken. The residue that remains, a funnel
+        // persist STARTING after this guard drops on a resident kept alive
+        // only by strong references, writes the dead system's bytes with a
+        // truthfully current marker; that is the held-reference
+        // illegitimate-delivery class whose enforcement is D3/D6 scope
+        // (plan REV 5 section D), recorded on the PersistMarker doc.
+        //
+        // The two documented raw set_state bypasses in this file need no
+        // fence: create() bootstraps a brand-new system's root before any
+        // funnel persist exists for it, and join_system's verbatim root
+        // persist runs strictly AFTER its own hard_reset returned, on the
+        // same task, writing the successor system's root. Neither ever
+        // stamps a marker.
+        let _fence = self.0.entities.reset_fence_write().await;
+
+        // The reset epoch bump comes FIRST among the destructive steps
+        // (D2-6): from this instant, every marker stamped under the
+        // previous epoch is never trusted again, so no persist the
+        // successor system needs can be elided on the dead system's
+        // testimony (reachable post-purge only through held strong
+        // references). Memory-only; nothing persisted.
         self.0.entities.bump_reset_epoch();
 
         // The purge (REV 5 section D.1, the one-id-one-system invariant):

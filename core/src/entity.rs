@@ -104,16 +104,28 @@ impl AppliedSet {
 /// resident COMPLETED for exactly `head`, with the node's reset epoch
 /// captured BEFORE that persist began. A redundant persist may be elided
 /// only when `epoch` equals the current reset epoch AND `head` equals the
-/// resident's current head; a persist that straddled a hard_reset stamped
-/// the pre-reset epoch and is therefore never trusted. The marker may LAG
-/// storage (the raw set_state bypasses in system.rs never stamp it), which
-/// only costs a redundant monotone-safe write; it may never LEAD storage,
+/// resident's current head. The reset fence (WeakEntitySet::reset_fence,
+/// M4 remediation item 5) keeps any funnel persist from interleaving a
+/// hard_reset's bump, purge, or wipe, so every marker is stamped strictly
+/// before or strictly after a reset; the epoch conjunct's live job is
+/// distrusting markers stamped BEFORE a reset on residents that survive
+/// the purge through held strong references. The marker may LAG storage
+/// (the raw set_state bypasses in system.rs never stamp it), which only
+/// costs a redundant monotone-safe write; it may never LEAD storage,
 /// which is why only a completed set_state stamps it AND why the funnel
 /// serializes each entity's whole snapshot-write-stamp span on the node's
 /// per-id persist lock (WeakEntitySet::persist_span): unserialized lanes
 /// could land engine writes in the opposite order of their snapshots,
 /// leaving the store regressed behind the head the marker testifies to
 /// (the M4 post-review remediation of the adversarial finding 2).
+///
+/// KNOWN RESIDUE (dev-only reset surface): a funnel persist STARTING
+/// after a reset completes, on a dead-system resident kept alive only by
+/// held strong references, writes that resident's bytes into the
+/// successor system's storage and stamps a truthfully current marker over
+/// its own write. The marker never lies there (storage really holds what
+/// it names); the illegitimacy is the cross-system delivery itself, whose
+/// enforcement is D3/D6 scope (plan REV 5 section D).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PersistMarker {
     pub(crate) epoch: u64,
@@ -1380,6 +1392,24 @@ struct WeakEntitySetInner {
     /// process lifetime, and eager cleanup would reintroduce the
     /// two-locks-for-one-id hazard this map exists to close.
     persist_locks: crate::util::safemap::SafeMap<EntityId, Arc<tokio::sync::Mutex<()>>>,
+    /// The reset fence (M4 remediation, item 5): hard_reset holds the WRITE
+    /// half across its epoch bump, purge, and storage wipe; the persist
+    /// funnel holds the READ half across each full persist span. In-flight
+    /// persists therefore DRAIN before the wipe and no new one can start
+    /// until it completes (tokio's fair RwLock queues later readers behind
+    /// a waiting writer), so a persist can never land dead-system bytes in
+    /// the successor system's storage (postgres would otherwise recreate
+    /// the state table under an in-flight set_state and durably resurrect
+    /// the dead row). The fence also closes the epoch's bump-instant
+    /// blind spots (concurrency panel finding 2): a persist span can no
+    /// longer interleave any reset step, so it cannot stamp a
+    /// current-epoch marker over storage the wipe then erases (W2) nor
+    /// elide on a pre-reset marker after the wipe (W3).
+    ///
+    /// ACQUISITION RULE: never nest fence read guards on one task (the
+    /// fair queue deadlocks a re-acquisition behind a waiting writer);
+    /// every holder acquires once at its entry point.
+    reset_fence: tokio::sync::RwLock<()>,
 }
 
 impl WeakEntitySet {
@@ -1419,6 +1449,16 @@ impl WeakEntitySet {
     /// `persist_locks` field doc). Funnel use only: hold it across the full
     /// elision-check, snapshot, set_state, stamp span.
     pub(crate) fn persist_span(&self, id: EntityId) -> Arc<tokio::sync::Mutex<()>> { self.0.persist_locks.get_or_default(id) }
+
+    /// The reset fence, read half (see the `reset_fence` field doc): held
+    /// across a whole persist span. Acquire ONCE per task entry point,
+    /// never nested.
+    pub(crate) async fn reset_fence_read(&self) -> tokio::sync::RwLockReadGuard<'_, ()> { self.0.reset_fence.read().await }
+
+    /// The reset fence, write half: hard_reset only, held across bump,
+    /// purge, and wipe. Drains in-flight fence readers first and holds new
+    /// ones out until it drops.
+    pub(crate) async fn reset_fence_write(&self) -> tokio::sync::RwLockWriteGuard<'_, ()> { self.0.reset_fence.write().await }
 
     /// The hard_reset purge (REV 5 D.1): clear the resident map, taking only
     /// the map's own lock (no entity locks, so no lock-order hazard). Every
