@@ -34,7 +34,10 @@ impl<T: Property> LWW<T> {
             return Err(PropertyError::TransactionClosed);
         }
         let value = value.into_value()?;
-        self.backend.set(self.property_name.clone(), value);
+        // The sync accessor has only the field name: stage a transient Name
+        // key. commit_local_trx resolves it to the property id before the event
+        // is generated (the PropertyKey amendment, #289).
+        self.backend.set(crate::property::PropertyKey::Name(self.property_name.clone()), value);
         Ok(())
     }
 
@@ -49,7 +52,7 @@ impl<T: Property> LWW<T> {
     ///     -> `PropertyError::Missing` (or `None` under an `Option`).
     /// The read is gated: a same-display-name retype sibling holding data
     /// surfaces `PropertyError::TypeSkew` instead of any of the above
-    /// (`LWWBackend::get_checked`).
+    /// (the catalog-side dispatch, `crate::property::lww_read_checked`).
     pub fn get(&self) -> Result<T, PropertyError> {
         match self.get_checked_value()? {
             Some(value) => T::from_value(Some(value)),
@@ -62,8 +65,25 @@ impl<T: Property> LWW<T> {
 
     /// The stored value under the RFC 5.4 sibling gate: `Ok(Some)` present,
     /// `Ok(None)` absent, `Err(TypeSkew)` when a retype lineage holds data
-    /// here (delegates to [`LWWBackend::get_checked`]).
-    pub fn get_checked_value(&self) -> Result<Option<Value>, PropertyError> { self.backend.get_checked(&self.property_name) }
+    /// here (delegates to the catalog-side dispatch,
+    /// [`crate::property::lww_read_checked`]).
+    pub fn get_checked_value(&self) -> Result<Option<Value>, PropertyError> {
+        match self.entity.property_key(&self.property_name) {
+            crate::property::PropertyKey::Id(id) => crate::property::lww_read_checked(
+                &self.backend,
+                id,
+                &self.property_name,
+                &self.entity.siblings(&self.property_name),
+                // The BOUND getter arms the foreign-data gate (plan decision
+                // 15): absent under our id with data sitting under ids the
+                // catalog cannot name (a cross-root raw-state copy) must fail
+                // visible, never read a fabricated default over it.
+                |other| self.entity.catalog_knows_id(other),
+            ),
+            // Unregistered or system field: read the bare name, no sibling gate.
+            key @ crate::property::PropertyKey::Name(_) => Ok(self.backend.get(&key)),
+        }
+    }
 }
 
 impl<T: Property> FromEntity for LWW<T> {
@@ -77,7 +97,7 @@ impl<T: Property> FromEntity for LWW<T> {
 // projected type is OPEN (any `Property`: scalars, `Option<_>`, `Json`,
 // `Ref<T>`, derived enums), so it cannot enumerate concrete impls the way
 // `YrsString`'s closed set does. The RFC 5.4 read rules are threaded through
-// `LWW::get` -> `get_checked` -> `Property::absent_default` instead: the
+// `LWW::get` -> `lww_read_checked` -> `Property::absent_default` instead: the
 // required-vs-optional-vs-default decision is keyed on the projected type, and
 // the sibling gate rides along uniformly (so `TypeSkew` propagates for every
 // projection, per the A10 spec).
@@ -97,9 +117,13 @@ impl<T: Property> InitializeWith<T> for LWW<T> {
 }
 
 impl<T: Property> ankurah_signals::Signal for LWW<T> {
-    fn listen(&self, listener: Listener) -> ListenerGuard { self.backend.listen_field(&self.property_name, listener) }
+    fn listen(&self, listener: Listener) -> ListenerGuard {
+        self.backend.listen_field(&self.entity.property_key(&self.property_name), listener)
+    }
 
-    fn broadcast_id(&self) -> ankurah_signals::broadcast::BroadcastId { self.backend.field_broadcast_id(&self.property_name) }
+    fn broadcast_id(&self) -> ankurah_signals::broadcast::BroadcastId {
+        self.backend.field_broadcast_id(&self.entity.property_key(&self.property_name))
+    }
 }
 
 impl<T: Property> ankurah_signals::Subscribe<T> for LWW<T>

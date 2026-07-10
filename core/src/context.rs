@@ -112,6 +112,14 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
             }
         }
 
+        // Resolve each entity's transient uncommitted Name keys to their
+        // property id now the catalog is warm (the PropertyKey amendment, #289):
+        // the sync accessor stages Name keys, and the committed/wire form must
+        // be id-keyed for a registered user collection.
+        for entity in trx.entities.iter() {
+            entity.resolve_pending_keys();
+        }
+
         // Generate events from the transaction entities
         let trx_id = trx.id.clone();
         let mut entity_events = Vec::new();
@@ -120,9 +128,9 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
                 // Protected collections (system + metadata catalog) are not
                 // mutable through ordinary transactions; the catalog's only
                 // mutation path is the registration operation (RFC 4).
-                if crate::system::PROTECTED_COLLECTIONS.contains(&event.collection.as_str()) {
+                if let Some(protected) = crate::schema::well_known_collection(&event.model) {
                     return Err(MutationError::General(
-                        format!("collection '{}' is protected and not writable by transactions", event.collection).into(),
+                        format!("collection '{}' is protected and not writable by transactions", protected).into(),
                     ));
                 }
                 // Validate creation events: if parent is empty, this is a creation event
@@ -164,8 +172,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
             };
 
             // Stage event and apply to fork for after state (no commit_event call here)
-            let collection_id = &event.collection;
-            let collection = self.node.collections.get(collection_id).await?;
+            let collection = self.node.collections.get(entity.collection()).await?;
             let event_getter = crate::retrieval::LocalEventGetter::new(collection, self.node.durable);
             event_getter.stage_event(event.clone());
             forked.apply_event(&event_getter, &event).await?;
@@ -178,8 +185,8 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         }
 
         // Phase 2: all events attested; persist them.
-        for (_, attested) in &entity_attested_events {
-            let collection = self.node.collections.get(&attested.payload.collection).await?;
+        for (entity, attested) in &entity_attested_events {
+            let collection = self.node.collections.get(entity.collection()).await?;
             let event_getter = crate::retrieval::LocalEventGetter::new(collection, self.node.durable);
             event_getter.commit_event(attested).await?;
         }
@@ -194,8 +201,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         // All peers confirmed, persist state to storage
         let mut changes: Vec<EntityChange> = Vec::new();
         for (entity, attested_event) in entity_attested_events {
-            let collection_id = &attested_event.payload.collection;
-            let collection = self.node.collections.get(collection_id).await?;
+            let collection = self.node.collections.get(entity.collection()).await?;
 
             // Persist canonical entity (upstream for transactional forks, entity itself for primary)
             let canonical_entity = match &entity.kind {
@@ -210,7 +216,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
 
             let state = canonical_entity.to_state()?;
 
-            let entity_state = EntityState { entity_id: canonical_entity.id(), collection: canonical_entity.collection().clone(), state };
+            let entity_state = EntityState { entity_id: canonical_entity.id(), model: canonical_entity.model_id()?, state };
             let attestation = self.node.policy_agent.attest_state(&self.node, &entity_state);
             let attested = Attested::opt(entity_state, attestation);
             collection.set_state(attested).await?;
@@ -399,7 +405,7 @@ where
             debug!("Node({}).get_entity found local entity - returning", self.node.id);
             let state = local.to_state()?;
             let entity_id = local.id();
-            self.node.policy_agent.check_read(&self.cdata, &entity_id, collection_id, &state)?;
+            self.node.policy_agent.check_read(&self.cdata, &entity_id, collection_id, &state, Some(self.node.catalog.resolver_weak()))?;
             return Ok(local);
         }
         debug!("{}.get_entity fetching from storage", self.node);
@@ -412,6 +418,7 @@ where
                     &entity_state.payload.entity_id,
                     collection_id,
                     &entity_state.payload.state,
+                    Some(self.node.catalog.resolver_weak()),
                 )?;
                 let state_getter = crate::retrieval::LocalStateGetter::new(collection.clone());
                 let event_getter = crate::retrieval::CachedEventGetter::new(collection_id.clone(), collection, &self.node, &self.cdata);

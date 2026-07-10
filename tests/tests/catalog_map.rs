@@ -296,9 +296,10 @@ async fn ephemeral_resolves_known_collection_offline_from_cache() -> anyhow::Res
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    // Resolution and binding still answer from the cached map.
+    // Resolution still answers from the cached map (the binding surface was
+    // replaced by name->id resolution in the PropertyKey refactor).
     assert_eq!(client.catalog.resolve("album", "name"), Some(name_id), "cache survives disconnect");
-    assert!(client.catalog.binding_for(&"album".into()).is_some(), "binding built from the cache offline");
+    assert!(client.catalog.resolve("album", "name").is_some(), "resolution answers from the cache offline");
 
     // A cached live query initializes offline: resolution runs against the
     // cached catalog, activation reads local storage (empty), and the relay

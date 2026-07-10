@@ -70,10 +70,18 @@ pub trait Filterable {
     /// same-display-name retype lineage holds data), surfaced as an evaluation
     /// error rather than a silent NULL.
     ///
+    /// `property_id` is the resolved property-definition id the identifier
+    /// carries (RFC 5.5); it addresses id-keyed data directly, so this works on
+    /// a schema-blind `TemporaryEntity` that has no name-to-id resolver.
+    ///
     /// The default delegates to the lenient [`value`], so mock/test items and
     /// non-entity `Filterable`s are unaffected. `Entity` overrides it to route
-    /// the checked lookup through the LWW backend's `get_checked`.
-    fn value_checked(&self, name: &str) -> Result<Option<Value>, PropertyError> { Ok(self.value(name)) }
+    /// the checked lookup through the catalog-side dispatch
+    /// (`crate::property::lww_read_checked`).
+    fn value_checked(&self, property_id: ankurah_proto::EntityId, name: &str) -> Result<Option<Value>, PropertyError> {
+        let _ = property_id;
+        Ok(self.value(name))
+    }
 }
 
 fn evaluate_expr<I: Filterable>(item: &I, expr: &Expr) -> Result<ExprOutput<Value>, Error> {
@@ -108,6 +116,9 @@ fn evaluate_expr<I: Filterable>(item: &I, expr: &Expr) -> Result<ExprOutput<Valu
 /// even when it equals the collection name (Phase A: name-based lookup).
 fn evaluate_identifier<I: Filterable>(item: &I, identifier: &Identifier) -> Result<ExprOutput<Value>, Error> {
     let name = identifier.property_name();
+    // The resolved identifier carries the property-definition id (RFC 5.5);
+    // thread it so the checked read addresses id-keyed data directly.
+    let property_id = ankurah_proto::EntityId::from_ulid(identifier.property);
     if identifier.is_simple() {
         // Bare column reference. RFC 5.4: a RESOLVED identifier that the item
         // does not hold evaluates as NULL (IsNull matches, comparisons are
@@ -116,7 +127,7 @@ fn evaluate_identifier<I: Filterable>(item: &I, identifier: &Identifier) -> Resu
         // unwrap_or(false), SQL assume_null). The read is CHECKED, so a
         // same-display-name retype sibling holding data surfaces as an
         // evaluation error (`TypeSkew`) rather than a silent NULL.
-        return Ok(match item.value_checked(name)? {
+        return Ok(match item.value_checked(property_id, name)? {
             Some(value) => ExprOutput::Value(value),
             None => ExprOutput::None,
         });
@@ -124,7 +135,7 @@ fn evaluate_identifier<I: Filterable>(item: &I, identifier: &Identifier) -> Resu
     // A JSON sub-path on a resolved identifier: fetch the base property
     // (checked, so TypeSkew propagates), then traverse into it. An absent base
     // is NULL (consistent with the bare case), never PropertyNotFound.
-    let Some(base) = item.value_checked(name)? else {
+    let Some(base) = item.value_checked(property_id, name)? else {
         return Ok(ExprOutput::None);
     };
     match base.extract_at_path(&identifier.subpath) {
@@ -395,29 +406,25 @@ mod tests {
     /// Identifier predicate evaluated via a schema-blind [`TemporaryEntity`]
     /// over an id-keyed (0xA2) state buffer, exactly as
     /// `post_filter_states` does in the sqlite/postgres engines (and as a
-    /// policy agent inspecting a raw state does). Regression: before the
-    /// hint-projection regime of `get_checked`, every id-keyed property
-    /// evaluated as absent (NULL) here, silently dropping matching rows.
+    /// policy agent inspecting a raw state does). Regression guard: a
+    /// resolved-identifier predicate must read the id-keyed value here; before
+    /// threading the identifier's property id through the checked read it
+    /// evaluated as absent (NULL), silently dropping matching rows.
     #[test]
     fn temporary_entity_post_filter_reads_id_keyed_state() {
         use crate::entity::TemporaryEntity;
         use crate::property::backend::{LWWBackend, PropertyBackend};
-        use ankql::ast::{ComparisonOperator, Expr, Identifier, Literal, PathExpr, Predicate};
+        use ankql::ast::{ComparisonOperator, Expr, Identifier, Literal, Predicate};
         use ankurah_proto as proto;
         use std::collections::BTreeMap;
-        use std::sync::Arc;
         use ulid::Ulid;
 
         // A bound id-keyed writer, as any post-epoch user entity is.
         let title_id = proto::EntityId::from_bytes([0x11; 16]);
-        let binding = Arc::new(crate::property::backend::lww::SchemaBinding {
-            to_id: BTreeMap::from([("title".to_string(), title_id)]),
-            to_name: BTreeMap::from([(title_id, "title".to_string())]),
-        });
         let writer = LWWBackend::new();
-        writer.bind_schema(binding);
-        writer.set_wire_mode(crate::property::backend::lww::WireMode::IdKeyedV2);
-        writer.set("title".to_string(), Some(crate::value::Value::String("alpha".to_string())));
+        // Build an id-keyed buffer directly: the commit path resolves user
+        // writes to id keys, so any post-epoch buffer is id-keyed (no binding).
+        writer.set(crate::property::PropertyKey::Id(title_id), Some(crate::value::Value::String("alpha".to_string())));
         let ops = writer.to_operations().unwrap().unwrap();
         writer.apply_operations_with_event(&ops, proto::EventId::from_bytes([3; 32])).unwrap();
         let buffer = writer.to_state_buffer().unwrap();
@@ -436,15 +443,12 @@ mod tests {
             operator: ComparisonOperator::Equal,
             right: Box::new(Expr::Literal(Literal::String("alpha".to_string()))),
         };
-        assert!(evaluate_predicate(&entity, &id_pred).unwrap(), "id-keyed value must be readable through its hint");
+        assert!(evaluate_predicate(&entity, &id_pred).unwrap(), "id-keyed value must be readable through its resolved id");
 
-        // Path predicate (the lenient read path used for unresolved refs).
-        let path_pred = Predicate::Comparison {
-            left: Box::new(Expr::Path(PathExpr::simple("title"))),
-            operator: ComparisonOperator::Equal,
-            right: Box::new(Expr::Literal(Literal::String("alpha".to_string()))),
-        };
-        assert!(evaluate_predicate(&entity, &path_pred).unwrap(), "lenient projection must also read the hint");
+        // (The old lenient hint-projection sub-case is gone: an UNRESOLVED path
+        // over a schema-blind TemporaryEntity cannot resolve "title" to its id,
+        // so id-keyed data is not readable by bare name -- deferred to the
+        // catalog-bound engines, #312, plan.md decision 27.)
 
         // A property nothing claims evaluates as NULL: comparison false, no error.
         let absent_pred = Predicate::Comparison {

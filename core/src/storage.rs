@@ -10,6 +10,368 @@ pub fn state_name(name: &str) -> String { format!("{}_state", name) }
 
 pub fn event_name(name: &str) -> String { format!("{}_event", name) }
 
+/// The model-definition id a storage bucket stamps on wire envelopes it
+/// reconstructs from stored fragments (#330): well-known system/catalog ids
+/// first (answerable stone-cold, which is how the catalog itself warms from
+/// storage), then the injected catalog resolver. An error means a
+/// user-collection envelope is being reconstructed before the catalog warmed;
+/// readiness gating makes that unreachable in steady state, and failing loud
+/// beats stamping a wrong id.
+pub fn bucket_model_id(
+    collection: &CollectionId,
+    resolver: Option<&dyn crate::property::PropertyResolver>,
+) -> Result<EntityId, RetrievalError> {
+    crate::schema::well_known_model_id(collection.as_str())
+        .or_else(|| resolver.and_then(|r| r.model_id_for(collection.as_str())))
+        .ok_or_else(|| RetrievalError::Other(format!("no model id known for collection '{collection}' (catalog cold?)")))
+}
+
+/// Rewrite a resolved selection into an engine's COLUMN SPACE: every property
+/// reference (a resolved `Identifier` in the predicate, a name-based order-by
+/// path) is translated to the column name the engine's durable id-to-column
+/// map assigned, so everything downstream of `fetch_states` -- SQL builders,
+/// the index planner, in-memory sort comparators, projected-row lookups --
+/// addresses columns by one consistent string.
+///
+/// This is what makes reads id-addressed (the ratified design): a renamed
+/// property still reads its original (sticky) column, a collision-deduped
+/// property reads `{name}_{suffix}` rather than silently reading the other
+/// lineage's column, and a fallback-named `p_{suffix}` column is fully
+/// queryable.
+///
+/// Translation rules, per reference:
+/// - Predicate `Identifier`: `column_of(property_id)`, else keep its display
+///   name (a map miss means this engine never materialized that property, so
+///   the name matches the column it WOULD create -- and the missing-column
+///   handling downstream answers NULL exactly as today). The identifier keeps
+///   its property id: the post-filter tier still evaluates by id.
+/// - Order-by path (name-only): resolve the name through the injected catalog
+///   resolver, then the map, with the same miss rule. The `id`
+///   pseudo-property and engine-internal `__`-prefixed fields pass through
+///   untouched, as does everything when no resolver is available (a bare
+///   engine, or the catalog is gone).
+/// - Bare predicate `Path`s get the same order-by treatment: system/catalog
+///   collection queries (which never resolve) and engine-internal fields pass
+///   through name-addressed, exactly as before.
+pub fn selection_to_column_space(
+    collection: &str,
+    selection: &ankql::ast::Selection,
+    resolver: Option<&dyn crate::property::PropertyResolver>,
+    column_of: &dyn Fn(&EntityId) -> Option<String>,
+) -> ankql::ast::Selection {
+    use ankql::ast::{Expr, OrderByItem, Predicate};
+
+    let translate_name = |name: &str| -> Option<String> {
+        if name == "id" || name.starts_with("__") {
+            return None;
+        }
+        let id = resolver?.resolve(collection, name)?;
+        column_of(&id)
+    };
+
+    fn walk_expr(expr: &Expr, translate_id: &dyn Fn(&EntityId, &str) -> String, translate_name: &dyn Fn(&str) -> Option<String>) -> Expr {
+        match expr {
+            Expr::Identifier(identifier) => {
+                let column = translate_id(&EntityId::from_ulid(identifier.property), &identifier.name);
+                Expr::Identifier(ankql::ast::Identifier {
+                    property: identifier.property,
+                    name: column,
+                    subpath: identifier.subpath.clone(),
+                })
+            }
+            Expr::Path(path) => match path.steps.split_first() {
+                Some((first, rest)) => match translate_name(first) {
+                    Some(column) => {
+                        let mut steps = Vec::with_capacity(path.steps.len());
+                        steps.push(column);
+                        steps.extend(rest.iter().cloned());
+                        Expr::Path(ankql::ast::PathExpr { steps })
+                    }
+                    None => expr.clone(),
+                },
+                None => expr.clone(),
+            },
+            Expr::ExprList(exprs) => Expr::ExprList(exprs.iter().map(|e| walk_expr(e, translate_id, translate_name)).collect()),
+            Expr::Predicate(p) => Expr::Predicate(walk_predicate(p, translate_id, translate_name)),
+            Expr::InfixExpr { left, operator, right } => Expr::InfixExpr {
+                left: Box::new(walk_expr(left, translate_id, translate_name)),
+                operator: operator.clone(),
+                right: Box::new(walk_expr(right, translate_id, translate_name)),
+            },
+            Expr::Literal(_) | Expr::Placeholder => expr.clone(),
+        }
+    }
+
+    fn walk_predicate(
+        predicate: &Predicate,
+        translate_id: &dyn Fn(&EntityId, &str) -> String,
+        translate_name: &dyn Fn(&str) -> Option<String>,
+    ) -> Predicate {
+        match predicate {
+            Predicate::Comparison { left, operator, right } => Predicate::Comparison {
+                left: Box::new(walk_expr(left, translate_id, translate_name)),
+                operator: operator.clone(),
+                right: Box::new(walk_expr(right, translate_id, translate_name)),
+            },
+            Predicate::And(a, b) => Predicate::And(
+                Box::new(walk_predicate(a, translate_id, translate_name)),
+                Box::new(walk_predicate(b, translate_id, translate_name)),
+            ),
+            Predicate::Or(a, b) => Predicate::Or(
+                Box::new(walk_predicate(a, translate_id, translate_name)),
+                Box::new(walk_predicate(b, translate_id, translate_name)),
+            ),
+            Predicate::Not(inner) => Predicate::Not(Box::new(walk_predicate(inner, translate_id, translate_name))),
+            Predicate::IsNull(expr) => Predicate::IsNull(Box::new(walk_expr(expr, translate_id, translate_name))),
+            Predicate::True | Predicate::False | Predicate::Placeholder => predicate.clone(),
+        }
+    }
+
+    let translate_id = |id: &EntityId, display: &str| -> String { column_of(id).unwrap_or_else(|| display.to_string()) };
+
+    let order_by = selection.order_by.as_ref().map(|items| {
+        items
+            .iter()
+            .map(|item| match item.path.steps.split_first() {
+                Some((first, rest)) => match translate_name(first) {
+                    Some(column) => {
+                        let mut steps = Vec::with_capacity(item.path.steps.len());
+                        steps.push(column);
+                        steps.extend(rest.iter().cloned());
+                        OrderByItem { path: ankql::ast::PathExpr { steps }, direction: item.direction.clone() }
+                    }
+                    None => item.clone(),
+                },
+                None => item.clone(),
+            })
+            .collect()
+    });
+
+    ankql::ast::Selection {
+        predicate: walk_predicate(&selection.predicate, &translate_id, &translate_name),
+        order_by,
+        limit: selection.limit,
+    }
+}
+
+#[cfg(test)]
+mod column_space_tests {
+    use super::selection_to_column_space;
+    use crate::property::PropertyResolver;
+    use ankql::ast::{ComparisonOperator, Expr, Identifier, Literal, OrderByItem, OrderDirection, PathExpr, Predicate, Selection};
+    use ankurah_proto::EntityId;
+
+    fn id(byte: u8) -> EntityId {
+        let mut bytes = [0u8; 16];
+        bytes[0] = byte;
+        EntityId::from_bytes(bytes)
+    }
+
+    struct OneField {
+        name: &'static str,
+        id: EntityId,
+    }
+    impl PropertyResolver for OneField {
+        fn resolve(&self, _collection: &str, name: &str) -> Option<EntityId> { (name == self.name).then_some(self.id) }
+        fn siblings(&self, _name: &str) -> Vec<EntityId> { Vec::new() }
+        fn name_for(&self, id: &EntityId) -> Option<String> { (*id == self.id).then(|| self.name.to_string()) }
+    }
+
+    fn title_selection(property: EntityId, order_step: &str) -> Selection {
+        Selection {
+            predicate: Predicate::Comparison {
+                left: Box::new(Expr::Identifier(Identifier { property: property.to_ulid(), name: "title".into(), subpath: vec![] })),
+                operator: ComparisonOperator::Equal,
+                right: Box::new(Expr::Literal(Literal::String("x".into()))),
+            },
+            order_by: Some(vec![OrderByItem { path: PathExpr::simple(order_step.to_string()), direction: OrderDirection::Asc }]),
+            limit: None,
+        }
+    }
+
+    fn predicate_column(selection: &Selection) -> String {
+        match &selection.predicate {
+            Predicate::Comparison { left, .. } => match left.as_ref() {
+                Expr::Identifier(identifier) => identifier.name.clone(),
+                other => panic!("unexpected left expr {other:?}"),
+            },
+            other => panic!("unexpected predicate {other:?}"),
+        }
+    }
+
+    #[test]
+    fn identifier_and_order_by_translate_through_the_map() {
+        // The collision/rename shape: the map assigned a deduped column.
+        let property = id(0x11);
+        let resolver = OneField { name: "title", id: property };
+        let out = selection_to_column_space("record", &title_selection(property, "title"), Some(&resolver), &|queried| {
+            (*queried == property).then(|| "title_IpDQ".to_string())
+        });
+        assert_eq!(predicate_column(&out), "title_IpDQ", "identifier addresses the assigned column");
+        assert_eq!(out.order_by.unwrap()[0].path.first(), "title_IpDQ", "order-by resolves name->id->column");
+    }
+
+    #[test]
+    fn map_miss_keeps_the_display_name() {
+        // Never-materialized property: the name matches the column a write
+        // WOULD create, and missing-column handling answers NULL as today.
+        let property = id(0x11);
+        let resolver = OneField { name: "title", id: property };
+        let out = selection_to_column_space("record", &title_selection(property, "title"), Some(&resolver), &|_| None);
+        assert_eq!(predicate_column(&out), "title");
+        assert_eq!(out.order_by.unwrap()[0].path.first(), "title");
+    }
+
+    #[test]
+    fn pseudo_and_internal_fields_pass_through() {
+        let property = id(0x11);
+        let resolver = OneField { name: "title", id: property };
+        // `id` pseudo-property and engine-internal `__collection` are never
+        // translated, resolver or not.
+        let out = selection_to_column_space("record", &title_selection(property, "id"), Some(&resolver), &|_| Some("never".to_string()));
+        assert_eq!(out.order_by.unwrap()[0].path.first(), "id");
+        let out = selection_to_column_space("record", &title_selection(property, "__collection"), Some(&resolver), &|_| {
+            Some("never".to_string())
+        });
+        assert_eq!(out.order_by.unwrap()[0].path.first(), "__collection");
+    }
+
+    #[test]
+    fn no_resolver_leaves_names_untouched() {
+        // A bare engine (no injected catalog): order-by/path names pass
+        // through; identifiers still translate by id (the map needs no names).
+        let property = id(0x11);
+        let out = selection_to_column_space("record", &title_selection(property, "title"), None, &|queried| {
+            (*queried == property).then(|| "title_IpDQ".to_string())
+        });
+        assert_eq!(predicate_column(&out), "title_IpDQ");
+        assert_eq!(out.order_by.unwrap()[0].path.first(), "title");
+    }
+}
+
+/// Storage-identifier naming policy for the engine-owned durable id-to-name
+/// maps (tables from model-definition ids, columns from property-definition
+/// ids). Pure string policy: the engine owns the map and its persistence;
+/// these helpers only pick names. The invariants they encode (ratified on
+/// #289/#305):
+///
+/// - Names are SEEDS, ids are identity: a friendly name comes from the catalog
+///   resolver at materialization time, correctness never depends on it (reads
+///   translate ids through the engine's map).
+/// - Collisions dedupe as `{name}_{suffix}` where the suffix is the TRAILING
+///   4+ characters of the definition id's base64 (trailing, because ULIDs
+///   share their leading timestamp characters), widening until unique.
+/// - An id whose name the resolver cannot supply falls back to a synthetic
+///   `{prefix}_{suffix}` name from the id alone -- the belt-and-suspenders
+///   net for the intra-node descriptor race. Callers log loudly when it
+///   fires; with descriptor shipping it should effectively never fire.
+pub mod naming {
+    use ankurah_proto::EntityId;
+
+    /// Sanitize a display name into a storage identifier seed: every char
+    /// outside `[A-Za-z0-9_]` becomes `_`, and a leading digit is prefixed
+    /// with `_`. Engines still quote identifiers; this exists so the same
+    /// display name yields the same column name on every engine (and so the
+    /// postgres/sqlite `sane_name` whitelist accepts it).
+    pub fn sanitize(name: &str) -> String {
+        let mut out: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' }).collect();
+        if out.is_empty() || out.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+            out.insert(0, '_');
+        }
+        out
+    }
+
+    /// The dedup/fallback suffix: the trailing `len` base64 characters of the
+    /// id, filtered to `[A-Za-z0-9]` (drops the url-safe `-`/`_` so the suffix
+    /// survives [`sanitize`] unchanged; the widening loop absorbs the rare
+    /// ambiguity this creates).
+    fn id_suffix(id: &EntityId, len: usize) -> String {
+        let base64 = id.to_base64();
+        let clean: Vec<char> = base64.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+        let start = clean.len().saturating_sub(len);
+        clean[start..].iter().collect()
+    }
+
+    /// Pick the storage name for `desired` (an already-[`sanitize`]d seed):
+    /// `desired` itself when free, else `{desired}_{trailing 4+ of id}`,
+    /// widening the suffix until `is_taken` clears. `is_taken` closes over the
+    /// engine's map and reserved names (fixed columns like `id`,
+    /// `state_buffer`, `head`, `attestations` count as taken).
+    pub fn dedupe(desired: &str, id: &EntityId, is_taken: impl Fn(&str) -> bool) -> String {
+        if !is_taken(desired) {
+            return desired.to_string();
+        }
+        for len in 4..=22 {
+            let candidate = format!("{}_{}", desired, id_suffix(id, len));
+            if !is_taken(&candidate) {
+                return candidate;
+            }
+        }
+        // 22 base64 chars = the full id: collision here means the same id was
+        // already mapped, which callers check before naming. Unreachable, but
+        // return the fully-qualified form rather than panic.
+        format!("{}_{}", desired, id_suffix(id, 22))
+    }
+
+    /// Synthetic name for an id the resolver cannot name: `{prefix}_{suffix}`
+    /// through the same widening dedup. `prefix` is `p` for properties, `m`
+    /// for models, keeping the fallback visibly synthetic in raw data.
+    pub fn fallback(prefix: &str, id: &EntityId, is_taken: impl Fn(&str) -> bool) -> String {
+        for len in 4..=22 {
+            let candidate = format!("{}_{}", prefix, id_suffix(id, len));
+            if !is_taken(&candidate) {
+                return candidate;
+            }
+        }
+        format!("{}_{}", prefix, id_suffix(id, 22))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn id(byte: u8) -> EntityId {
+            let mut bytes = [0u8; 16];
+            bytes[0] = byte;
+            bytes[15] = byte.wrapping_add(1);
+            EntityId::from_bytes(bytes)
+        }
+
+        #[test]
+        fn sanitize_maps_invalid_chars_and_leading_digit() {
+            assert_eq!(sanitize("title"), "title");
+            assert_eq!(sanitize("my-field.x"), "my_field_x");
+            assert_eq!(sanitize("9lives"), "_9lives");
+            assert_eq!(sanitize(""), "_");
+        }
+
+        #[test]
+        fn dedupe_returns_desired_when_free() {
+            assert_eq!(dedupe("title", &id(1), |_| false), "title");
+        }
+
+        #[test]
+        fn dedupe_suffixes_with_trailing_id_chars_and_widens() {
+            let property = id(1);
+            let suffix4 = {
+                let clean: String = property.to_base64().chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+                clean[clean.len() - 4..].to_string()
+            };
+            // Plain name taken -> first widening step.
+            assert_eq!(dedupe("title", &property, |n| n == "title"), format!("title_{suffix4}"));
+            // That taken too -> widens to 5.
+            let five = dedupe("title", &property, |n| n == "title" || n.ends_with(&suffix4));
+            assert!(five.starts_with("title_") && five.len() > format!("title_{suffix4}").len());
+        }
+
+        #[test]
+        fn fallback_is_visibly_synthetic() {
+            let name = fallback("p", &id(7), |_| false);
+            assert!(name.starts_with("p_") && name.len() >= 6, "got {name}");
+        }
+    }
+}
+
 #[async_trait]
 pub trait StorageEngine: Send + Sync {
     type Value;
@@ -26,6 +388,17 @@ pub trait StorageEngine: Send + Sync {
     /// warm (falling back to live subscription updates) rather than
     /// misbehaving. Engines override this with their real list.
     async fn list_collections(&self) -> Result<Vec<CollectionId>, RetrievalError> { Ok(Vec::new()) }
+
+    /// Inject the catalog's property resolver. Engines that maintain
+    /// human-named materialized structures (postgres/sqlite/indexeddb columns,
+    /// sled property slots) seed their DURABLE id-to-name maps from it at
+    /// materialization time; the maps stay engine-owned, the resolver is only
+    /// the name source. Called once from `Node` construction, after the
+    /// catalog exists -- the engine object is constructed before the node, so
+    /// this cannot be a constructor argument. Weak: the engine must not keep
+    /// the catalog (and thus the node) alive. Default no-op for engines with
+    /// no human-named structures (memory/test engines).
+    fn set_property_resolver(&self, resolver: std::sync::Weak<dyn crate::property::PropertyResolver>) { let _ = resolver; }
 }
 
 #[async_trait]

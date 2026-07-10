@@ -65,10 +65,12 @@ impl PolicyAgent for DenySecondAlbumEventAgent {
         _node: &NodeInnerAlias<SE, Self>,
         _cdata: &Self::ContextData,
         _entity_before: &Entity,
-        _entity_after: &Entity,
-        event: &proto::Event,
+        entity_after: &Entity,
+        _event: &proto::Event,
     ) -> Result<Option<proto::Attestation>, AccessDenied> {
-        if event.collection.as_str() == "album" && self.album_checks.fetch_add(1, Ordering::SeqCst) >= 1 {
+        // #330: proto::Event carries a model id, not a collection name; read the
+        // collection from the entity instead (identical for this event).
+        if entity_after.collection().as_str() == "album" && self.album_checks.fetch_add(1, Ordering::SeqCst) >= 1 {
             return Err(AccessDenied::ByPolicy("test agent denies the second album event"));
         }
         Ok(None)
@@ -112,6 +114,7 @@ impl PolicyAgent for DenySecondAlbumEventAgent {
         _id: &proto::EntityId,
         _collection: &proto::CollectionId,
         _state: &proto::State,
+        _resolver: Option<std::sync::Weak<dyn ankurah::core::property::PropertyResolver>>,
     ) -> Result<(), AccessDenied>
     where
         C: Iterable<Self::ContextData>,
@@ -119,8 +122,15 @@ impl PolicyAgent for DenySecondAlbumEventAgent {
         Ok(())
     }
 
-    fn check_read_event<C>(&self, _data: &C, _event: &Attested<proto::Event>) -> Result<(), AccessDenied>
-    where C: Iterable<Self::ContextData> {
+    fn check_read_event<C>(
+        &self,
+        _data: &C,
+        _collection: &proto::CollectionId,
+        _event: &Attested<proto::Event>,
+    ) -> Result<(), AccessDenied>
+    where
+        C: Iterable<Self::ContextData>,
+    {
         Ok(())
     }
 

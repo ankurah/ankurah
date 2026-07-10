@@ -20,8 +20,8 @@ use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
 
 use crate::harness::{
-    assert_state_heads_resolvable, child_crash_point, child_sled_dir, event_present, fresh_sled_dir, handoff_write, handoff_write_event,
-    has_persisted_state, persisted_head, reopen_sled, spawn_crash_child, CrashPoint, CrashStorageEngine,
+    assert_state_heads_resolvable, child_crash_point, child_sled_dir, event_present, fresh_sled_dir, handoff_model_resolver, handoff_write,
+    handoff_write_event, has_persisted_state, persisted_head, reopen_sled, spawn_crash_child, CrashPoint, CrashStorageEngine,
 };
 use crate::models::{Album, AlbumView};
 
@@ -52,7 +52,7 @@ async fn armed_child_node(crash: CrashPoint) -> Result<(CrashNode, Arc<CrashStor
 /// durable node. Each album is a distinct entity, so each event is a creation
 /// event (empty parent). Returned in commit order as attested events, ready to
 /// feed to `commit_remote_transaction` on the node under test.
-async fn generate_creation_batch(n: usize) -> Result<Vec<Attested<proto::Event>>> {
+async fn generate_creation_batch(n: usize, model: proto::EntityId) -> Result<Vec<Attested<proto::Event>>> {
     let helper = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
     helper.system.create().await?;
     let ctx = helper.context(c)?;
@@ -61,7 +61,18 @@ async fn generate_creation_batch(n: usize) -> Result<Vec<Attested<proto::Event>>
         trx.create(&Album { name: format!("Batch {i}"), year: format!("20{i:02}") }).await?;
     }
     let events = trx.commit_and_return_events().await?;
-    Ok(events.into_iter().map(Attested::from).collect())
+    // Restamp with the TARGET node's model id (#330): in production a sender's
+    // binding comes from the target-system allocator (registration), so its
+    // events carry an id the target resolves; the throwaway helper node
+    // allocates independently. EventId excludes the model, so event ids and
+    // parent clocks are unchanged by the restamp.
+    Ok(events
+        .into_iter()
+        .map(|mut event| {
+            event.model = model;
+            Attested::from(event)
+        })
+        .collect())
 }
 
 /// Re-deliver a set of attested events to a node through the real ingest path
@@ -157,7 +168,9 @@ async fn child_mid_batch() -> Result<()> {
     };
     let (node, _engine) = armed_child_node(crash).await?;
 
-    let events = generate_creation_batch(S2_BATCH).await?;
+    let model = node.catalog.model_id_for(Album::collection().as_str()).expect("Album registered in armed_child_node");
+    handoff_write("model", &model.to_base64())?;
+    let events = generate_creation_batch(S2_BATCH, model).await?;
     // Record every entity id (in batch order) and the full events for re-delivery.
     for e in &events {
         handoff_write("entity", &e.payload.entity_id.to_base64())?;
@@ -187,8 +200,12 @@ async fn scenario_2_mid_batch() -> Result<()> {
     let events = outcome.events("event");
     assert_eq!(events.len(), S2_BATCH, "expected all batch events recorded");
 
-    // Reopen and verify partial-batch durability against the invariant.
+    // Reopen and verify partial-batch durability against the invariant. The
+    // bare engine (no node) needs a model id to stamp reconstructed state
+    // envelopes (#330); wire the one the child allocated.
     let engine = reopen_sled(&dir)?;
+    let _resolver =
+        handoff_model_resolver(&engine, Album::collection().as_str(), outcome.entity_id("model").expect("child must record the model id"));
     let collection = engine.collection(&Album::collection()).await?;
 
     // Global invariant: nothing persisted references a missing event.
@@ -270,6 +287,10 @@ async fn child_mid_merge() -> Result<()> {
         id
     };
     handoff_write("entity", &album.to_base64())?;
+    // Parent-side bare-engine probes need Album's model id to reconstruct
+    // state envelopes (#330); the create above registered it.
+    let model = node.catalog.model_id_for(Album::collection().as_str()).expect("Album registered by the create");
+    handoff_write("model", &model.to_base64())?;
 
     // B: first edit (parent A). Head becomes {B}.
     let a_view = ctx.get::<AlbumView>(album).await?;
@@ -311,6 +332,10 @@ async fn scenario_3_mid_merge() -> Result<()> {
     assert!(!pre_head.is_empty(), "child must record the pre-merge head");
 
     let engine = reopen_sled(&dir)?;
+    // Bare-engine probes need the child's model id for envelope
+    // reconstruction (#330).
+    let _resolver =
+        handoff_model_resolver(&engine, Album::collection().as_str(), outcome.entity_id("model").expect("child must record the model id"));
     let collection = engine.collection(&Album::collection()).await?;
 
     // Invariant 1: no persisted state references a missing event.
@@ -346,7 +371,9 @@ async fn child_entity_creation() -> Result<()> {
     };
     let (node, _engine) = armed_child_node(crash).await?;
 
-    let events = generate_creation_batch(1).await?;
+    let model = node.catalog.model_id_for(Album::collection().as_str()).expect("Album registered in armed_child_node");
+    handoff_write("model", &model.to_base64())?;
+    let events = generate_creation_batch(1, model).await?;
     handoff_write("entity", &events[0].payload.entity_id.to_base64())?;
     handoff_write_event("event", &events[0])?;
 

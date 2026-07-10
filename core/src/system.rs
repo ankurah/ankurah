@@ -148,7 +148,7 @@ where
         let system_entity = self.0.entities.create(collection_id.clone());
 
         let lww_backend = system_entity.get_backend::<LWWBackend>().expect("LWW Backend should exist");
-        lww_backend.set("item".into(), proto::sys::Item::SysRoot.into_value()?);
+        lww_backend.set(crate::property::PropertyKey::name("item"), proto::sys::Item::SysRoot.into_value()?);
 
         let event = system_entity.generate_commit_event()?.ok_or(anyhow!("Expected event"))?;
 
@@ -304,7 +304,7 @@ where
                 .with_state(&state_getter, &event_getter, state.payload.entity_id, collection_id.clone(), state.payload.state.clone())
                 .await?;
             let lww_backend = entity.get_backend::<LWWBackend>().expect("LWW Backend should exist");
-            if let Some(value) = lww_backend.get(&"item".to_string()) {
+            if let Some(value) = lww_backend.get(&crate::property::PropertyKey::name("item")) {
                 let item = proto::sys::Item::from_value(Some(value)).expect("Invalid sys item");
 
                 if let proto::sys::Item::SysRoot = &item {

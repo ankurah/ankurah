@@ -119,7 +119,11 @@ impl SubscriptionHandler {
             // are evaluated against entity state, not just the predicate. Skip
             // unreadable entities silently (mirroring the Fetch/Get handlers) so one
             // out-of-scope entity doesn't fail the whole subscription.
-            if node.policy_agent.check_read(cdata, &state.payload.entity_id, &collection_id, &state.payload.state).is_err() {
+            if node
+                .policy_agent
+                .check_read(cdata, &state.payload.entity_id, &collection_id, &state.payload.state, Some(node.catalog.resolver_weak()))
+                .is_err()
+            {
                 continue;
             }
 
@@ -176,10 +180,5 @@ where
         .collect();
 
     // Create subscription update item
-    Some(proto::SubscriptionUpdateItem {
-        entity_id: item.entity.id(),
-        collection: item.entity.collection().clone(),
-        content,
-        predicate_relevance,
-    })
+    Some(proto::SubscriptionUpdateItem { entity_id: item.entity.id(), model: item.entity.model_id().ok()?, content, predicate_relevance })
 }

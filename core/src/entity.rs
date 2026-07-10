@@ -6,6 +6,7 @@ use crate::{
     event_dag::AbstractCausalRelation,
     model::View,
     property::backend::{backend_from_string, PropertyBackend},
+    property::{PropertyKey, PropertyResolver},
     reactor::AbstractEntity,
     value::Value,
 };
@@ -77,6 +78,11 @@ pub struct EntityInner {
     pub(crate) kind: EntityKind,
     /// Broadcast for notifying Signal subscribers about entity changes
     pub(crate) broadcast: ankurah_signals::broadcast::Broadcast,
+    /// Catalog resolver stamped at assembly (the PropertyKey amendment, #289):
+    /// lets this catalog-blind entity resolve a display name to the
+    /// property-definition id its data is keyed under, for the sync read path.
+    /// Absent for bare and temporary entities (they read name-keyed data only).
+    resolver: std::sync::RwLock<Option<Weak<dyn PropertyResolver>>>,
 }
 
 #[derive(Debug)]
@@ -108,6 +114,70 @@ impl WeakEntity {
     pub fn upgrade(&self) -> Option<Entity> { self.0.upgrade().map(Entity) }
 }
 
+/// Resolver-aware read helpers shared by every EntityInner view: the resident
+/// [`Entity`] and the [`TemporaryEntity`] (which is bound only when
+/// constructed via [`TemporaryEntity::new_bound`]). Both deref here.
+impl EntityInner {
+    /// The catalog resolver stamped at assembly, if still live.
+    fn resolver(&self) -> Option<Arc<dyn PropertyResolver>> { self.resolver.read().unwrap().as_ref().and_then(|w| w.upgrade()) }
+
+    /// Stamp the catalog resolver (assembly-time). Replaces the old
+    /// backend-binding push (`Node::bind_entity`): the backend stays dumb and
+    /// the entity resolves names to ids for the sync read path.
+    pub(crate) fn set_resolver(&self, resolver: Weak<dyn PropertyResolver>) { *self.resolver.write().unwrap() = Some(resolver); }
+
+    /// Resolve a display name to the key its data is stored under: the
+    /// property-definition id when the catalog knows the field, else the bare
+    /// name (system/catalog collections, or an unregistered field).
+    fn resolve_key(&self, name: &str) -> PropertyKey {
+        match self.resolver().and_then(|r| r.resolve(self.collection.as_str(), name)) {
+            Some(id) => PropertyKey::Id(id),
+            None => PropertyKey::Name(name.to_string()),
+        }
+    }
+
+    /// Resolve a display name to its property key for the value accessors
+    /// (read / write / subscribe). Same resolution as the internal read path.
+    pub(crate) fn property_key(&self, name: &str) -> PropertyKey { self.resolve_key(name) }
+
+    /// The cross-contract same-display-name id set for the RFC 5.4 sibling gate
+    /// (empty when no resolver is stamped).
+    pub(crate) fn siblings(&self, name: &str) -> Vec<EntityId> { self.resolver().map(|r| r.siblings(name)).unwrap_or_default() }
+
+    /// Whether the stamped catalog can name this property-definition id at
+    /// all -- the foreign-data gate input for the bound checked read (plan
+    /// decision 15: data under an id the catalog cannot resolve is another
+    /// system's allocation). An UNBOUND entity (no resolver) answers `true`
+    /// for everything: with no catalog there is no notion of foreign, and the
+    /// gate stays off.
+    pub(crate) fn catalog_knows_id(&self, id: &EntityId) -> bool { self.resolver().map_or(true, |r| r.name_for(id).is_some()) }
+
+    /// Lenient read of `name`: resolve to the id, then the Id-then-legacy-Name
+    /// presence dispatch ([`crate::property::lww_read_lenient`]) -- an id key
+    /// present (even cleared) is authoritative and never resurrects a stale
+    /// legacy name value (the PropertyKey amendment, #289).
+    fn read_lenient(&self, name: &str) -> Option<Value> {
+        let state = self.state.read().expect("other thread panicked, panic here too");
+        match self.resolve_key(name) {
+            PropertyKey::Id(id) => {
+                let lww_name = crate::property::backend::LWWBackend::property_backend_name();
+                if let Some(backend) = state.backends.get(lww_name) {
+                    if let Ok(lww) = backend.clone().as_arc_dyn_any().downcast::<crate::property::backend::LWWBackend>() {
+                        if let Some(value) = crate::property::lww_read_lenient(&lww, id, name) {
+                            return Some(value);
+                        }
+                    }
+                }
+                // Non-LWW backends (yrs): id key, then bare name residue.
+                state.backends.iter().filter(|(backend_name, _)| backend_name.as_str() != lww_name).find_map(|(_, backend)| {
+                    backend.property_value(&PropertyKey::Id(id)).or_else(|| backend.property_value(&PropertyKey::Name(name.to_string())))
+                })
+            }
+            key @ PropertyKey::Name(_) => state.backends.values().find_map(|backend| backend.property_value(&key)),
+        }
+    }
+}
+
 impl Entity {
     pub fn id(&self) -> EntityId { self.id }
 
@@ -117,6 +187,28 @@ impl Entity {
     pub fn collection(&self) -> &CollectionId { &self.collection }
 
     pub fn head(&self) -> Clock { self.state.read().unwrap().head.clone() }
+
+    /// Resolve transient uncommitted `Name` keys to their `Id` at commit, using
+    /// the catalog-aware resolver (the PropertyKey amendment, #289). Pure key
+    /// operations on the backends; the catalog never enters them.
+    pub(crate) fn resolve_pending_keys(&self) {
+        let Some(resolver) = self.resolver() else {
+            // No resolver (a bare entity, or a system/catalog collection):
+            // nothing to resolve, keys stay name-keyed as staged.
+            return;
+        };
+        let collection = self.collection.as_str();
+        let state = self.state.read().expect("other thread panicked, panic here too");
+        for backend in state.backends.values() {
+            for key in backend.uncommitted_keys() {
+                if let PropertyKey::Name(name) = &key {
+                    if let Some(id) = resolver.resolve(collection, name) {
+                        backend.rekey(&key, PropertyKey::Id(id));
+                    }
+                }
+            }
+        }
+    }
 
     /// Check if this entity is writable (i.e., it's a transaction fork that's still alive)
     pub fn is_writable(&self) -> bool {
@@ -139,7 +231,17 @@ impl Entity {
 
     pub fn to_entity_state(&self) -> Result<EntityState, StateError> {
         let state = self.to_state()?;
-        Ok(EntityState { entity_id: self.id(), collection: self.collection.clone(), state })
+        Ok(EntityState { entity_id: self.id(), model: self.model_id()?, state })
+    }
+
+    /// The model-definition id stamped on this entity's wire envelopes
+    /// (#330): the well-known id for system/catalog collections, else the
+    /// stamped catalog resolver's mapping for the collection. Fails
+    /// `UnknownModel` when neither answers.
+    pub(crate) fn model_id(&self) -> Result<EntityId, StateError> {
+        crate::schema::well_known_model_id(self.collection.as_str())
+            .or_else(|| self.resolver().and_then(|r| r.model_id_for(self.collection.as_str())))
+            .ok_or_else(|| StateError::UnknownModel(self.collection.to_string()))
     }
 
     // used by the Model macro
@@ -150,6 +252,7 @@ impl Entity {
             state: std::sync::RwLock::new(EntityInnerState { head: Clock::default(), backends: BTreeMap::default() }),
             kind: EntityKind::Primary,
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
+            resolver: std::sync::RwLock::new(None),
         }))
     }
 
@@ -167,6 +270,7 @@ impl Entity {
             state: std::sync::RwLock::new(EntityInnerState { head: state.head.clone(), backends }),
             kind: EntityKind::Primary,
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
+            resolver: std::sync::RwLock::new(None),
         })))
     }
 
@@ -192,7 +296,7 @@ impl Entity {
             Ok(None)
         } else {
             let operations = OperationSet(operations);
-            let event = Event { entity_id: self.id, collection: self.collection.clone(), operations, parent: state.head.clone() };
+            let event = Event { entity_id: self.id, model: self.model_id()?, operations, parent: state.head.clone() };
             Ok(Some(event))
         }
     }
@@ -494,6 +598,9 @@ impl Entity {
             state: std::sync::RwLock::new(EntityInnerState { head: state.head.clone(), backends: forked }),
             kind: EntityKind::Transacted { trx_alive, upstream: self.clone() },
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
+            // Carry the resolver across the fork so a transaction's read path
+            // still resolves names to ids.
+            resolver: std::sync::RwLock::new(self.resolver.read().unwrap().clone()),
         }))
     }
 
@@ -518,17 +625,7 @@ impl Entity {
 
     pub fn values(&self) -> Vec<(String, Option<Value>)> {
         let state = self.state.read().expect("other thread panicked, panic here too");
-        state
-            .backends
-            .values()
-            .flat_map(|backend| {
-                backend
-                    .property_values()
-                    .iter()
-                    .map(|(name, value)| (name.to_string(), value.clone()))
-                    .collect::<Vec<(String, Option<Value>)>>()
-            })
-            .collect()
+        state.backends.values().flat_map(|backend| backend.property_values().into_iter().map(|(k, v)| (k.display_name(), v))).collect()
     }
 }
 
@@ -542,9 +639,7 @@ impl AbstractEntity for Entity {
         if field == "id" {
             Some(crate::value::Value::EntityId(self.id))
         } else {
-            // Iterate through backends to find one that has this property
-            let state = self.state.read().expect("other thread panicked, panic here too");
-            state.backends.values().find_map(|backend| backend.property_value(&field.into()))
+            self.read_lenient(field)
         }
     }
 }
@@ -562,47 +657,70 @@ impl Filterable for Entity {
         if name == "id" {
             Some(Value::EntityId(self.id))
         } else {
-            // Iterate through backends to find one that has this property
-            let state = self.state.read().expect("other thread panicked, panic here too");
-            state.backends.values().find_map(|backend| backend.property_value(&name.to_owned()))
+            self.read_lenient(name)
         }
     }
 
-    /// Checked read for RESOLVED-identifier predicate evaluation (RFC 5.4).
-    /// Consults the LWW backend's `get_checked` FIRST -- so a same-display-name
-    /// retype lineage sitting on this entity fails visible (`TypeSkew`) instead
-    /// of evaluating as a silent NULL -- then falls back to the other backends
-    /// (yrs etc.) via the lenient `property_value`. The sibling gate is
-    /// LWW-vs-LWW only; yrs-vs-LWW same-name conflicts are pre-existing
-    /// pathology out of scope for the Phase A gate (A10 spec scope note).
-    fn value_checked(&self, name: &str) -> Result<Option<Value>, crate::property::PropertyError> {
+    /// Checked read for RESOLVED-identifier predicate evaluation (RFC 5.4),
+    /// via the catalog-side dispatch [`crate::property::lww_read_checked`] --
+    /// so a same-display-name retype lineage sitting on this entity fails
+    /// visible (`TypeSkew`) instead of evaluating as a silent NULL -- then
+    /// falls back to the other backends (yrs etc.) via the lenient
+    /// `property_value`. The sibling gate is LWW-vs-LWW only; yrs-vs-LWW
+    /// same-name conflicts are pre-existing pathology out of scope for the
+    /// Phase A gate (A10 spec scope note).
+    fn value_checked(&self, property_id: EntityId, name: &str) -> Result<Option<Value>, crate::property::PropertyError> {
         if name == "id" {
             return Ok(Some(Value::EntityId(self.id)));
         }
         let state = self.state.read().expect("other thread panicked, panic here too");
         let lww_name = crate::property::backend::LWWBackend::property_backend_name();
-        // LWW backend first, through the gate. A `TypeSkew` here is a real
-        // cross-lineage collision and must propagate, not be masked by a later
-        // backend's lenient read. Absent (and not skewed): fall through to the
-        // other backends before concluding NULL.
+        // The sibling gate (RFC 5.4 rule 4) needs the cross-contract same-name
+        // id set; supply it from the stamped catalog resolver (absent -> no
+        // gate, e.g. a bare entity). A `TypeSkew` here is a real cross-lineage
+        // collision and must propagate, not be masked by a later backend's
+        // lenient read. Absent and not skewed: fall through to the other
+        // backends before concluding NULL.
+        let siblings = self.resolver().map(|r| r.siblings(name)).unwrap_or_default();
         if let Some(backend) = state.backends.get(lww_name) {
             if let Ok(lww) = backend.clone().as_arc_dyn_any().downcast::<crate::property::backend::LWWBackend>() {
-                if let Some(value) = lww.get_checked(&name.to_owned())? {
+                // `|_| true` disables the foreign-data gate: predicate
+                // evaluation treats absent as NULL by design (plan decision
+                // 14), so it fabricates nothing a foreign value could be
+                // shadowed by; the gate is the bound GETTER's concern
+                // (property/value/lww.rs).
+                if let Some(value) = crate::property::lww_read_checked(&lww, property_id, name, &siblings, |_| true)? {
                     return Ok(Some(value));
                 }
             }
         }
-        // Non-LWW backends (yrs, pn_counter): lenient read, no gate.
-        Ok(state
-            .backends
-            .iter()
-            .filter(|(backend_name, _)| backend_name.as_str() != lww_name)
-            .find_map(|(_, backend)| backend.property_value(&name.to_owned())))
+        // Non-LWW backends (yrs): lenient id-then-name read, no gate.
+        Ok(state.backends.iter().filter(|(backend_name, _)| backend_name.as_str() != lww_name).find_map(|(_, backend)| {
+            backend.property_value(&PropertyKey::Id(property_id)).or_else(|| backend.property_value(&PropertyKey::Name(name.to_string())))
+        }))
     }
 }
 
 impl TemporaryEntity {
     pub fn new(id: EntityId, collection: CollectionId, state: &State) -> Result<Self, RetrievalError> {
+        // Temporary entities parse UNBOUND by default (engine post-filter
+        // tier): no resolver, so lenient name reads see only name-keyed data,
+        // while resolved-identifier predicate reads carry their own id.
+        Self::new_bound(id, collection, state, None)
+    }
+
+    /// [`Self::new`] with a catalog resolver stamped, for consumers that
+    /// evaluate NAME-addressed predicates against id-keyed state -- policy
+    /// agents inspecting entity state for scope enforcement (the
+    /// `PolicyAgent::check_read` resolver parameter). Without the binding, a
+    /// display name resolves to nothing on a post-epoch buffer and every
+    /// scope predicate evaluates false.
+    pub fn new_bound(
+        id: EntityId,
+        collection: CollectionId,
+        state: &State,
+        resolver: Option<std::sync::Weak<dyn PropertyResolver>>,
+    ) -> Result<Self, RetrievalError> {
         // Inline from_state_buffers logic
         let mut backends = BTreeMap::new();
         for (name, state_buffer) in state.state_buffers.iter() {
@@ -617,11 +735,12 @@ impl TemporaryEntity {
             kind: EntityKind::Primary,
             // slightly annoying that we need to populate this, given that it won't be used
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
+            resolver: std::sync::RwLock::new(resolver),
         })))
     }
     pub fn values(&self) -> Vec<(String, Option<Value>)> {
         let state = self.0.state.read().expect("other thread panicked, panic here too");
-        state.backends.values().flat_map(|backend| backend.property_values()).collect()
+        state.backends.values().flat_map(|backend| backend.property_values().into_iter().map(|(k, v)| (k.display_name(), v))).collect()
     }
 }
 
@@ -633,57 +752,44 @@ impl Filterable for TemporaryEntity {
         if name == "id" {
             Some(Value::EntityId(self.0.id))
         } else {
-            let state = self.0.state.read().expect("other thread panicked, panic here too");
-            let lww_name = crate::property::backend::LWWBackend::property_backend_name();
-            // LWW reads through the schema-blind PROJECTION (bare name, then a
-            // unique decode-time hint): a TemporaryEntity parses its backends
-            // UNBOUND, so a plain name read would miss every id-keyed entry in
-            // a 0xA2 buffer. This is the engines' post-filter/policy
-            // inspection tier and sees the same fields materialization does.
-            if let Some(backend) = state.backends.get(lww_name) {
-                if let Ok(lww) = backend.clone().as_arc_dyn_any().downcast::<crate::property::backend::LWWBackend>() {
-                    if let Some(value) = lww.get_projected(&name.to_owned()) {
-                        return Some(value);
-                    }
-                }
-            }
-            state
-                .backends
-                .iter()
-                .filter(|(backend_name, _)| backend_name.as_str() != lww_name)
-                .find_map(|(_, backend)| backend.property_value(&name.to_owned()))
+            // The shared lenient dispatch: with a stamped resolver
+            // (new_bound, e.g. policy scope inspection) the name resolves to
+            // its id and reads id-keyed data; unbound (the engine
+            // post-filter tier) it degenerates to the bare name-keyed scan,
+            // exactly the pre-binding behavior. Schema-blind name projection
+            // of id-keyed entries remains #312 territory (plan decision 13
+            // withdrawn).
+            self.0.read_lenient(name)
         }
     }
 
     /// Checked read for RESOLVED-identifier predicate evaluation (RFC 5.4),
-    /// mirroring [`Entity::value_checked`]: the LWW backend's `get_checked`
-    /// first (so a same-display-name retype lineage fails visible `TypeSkew`
-    /// rather than evaluating as a silent NULL), then the other backends via
-    /// the lenient `property_value`. A materialized `TemporaryEntity` parses
-    /// its backends UNBOUND, so `get_checked` runs in its schema-blind
-    /// projection regime: bare Name residue, then the decode-time hints
-    /// (unique claimant reads, ambiguous claimants skew) -- exactly the
-    /// fields the storage-engine materialization path projects.
-    fn value_checked(&self, name: &str) -> Result<Option<Value>, crate::property::PropertyError> {
+    /// mirroring [`Entity::value_checked`] via the same catalog-side dispatch
+    /// ([`crate::property::lww_read_checked`]): a present id entry is
+    /// authoritative, then the legacy Name residue, then the other backends
+    /// via the lenient `property_value`. A `TemporaryEntity` has no resolver,
+    /// so its sibling set is empty (no gate): the caller-supplied resolved id
+    /// is the only schema knowledge in play.
+    fn value_checked(&self, property_id: EntityId, name: &str) -> Result<Option<Value>, crate::property::PropertyError> {
         if name == "id" {
             return Ok(Some(Value::EntityId(self.0.id)));
         }
         let state = self.0.state.read().expect("other thread panicked, panic here too");
         let lww_name = crate::property::backend::LWWBackend::property_backend_name();
-        // LWW backend first, through the gate; a `TypeSkew` here propagates.
         if let Some(backend) = state.backends.get(lww_name) {
             if let Ok(lww) = backend.clone().as_arc_dyn_any().downcast::<crate::property::backend::LWWBackend>() {
-                if let Some(value) = lww.get_checked(&name.to_owned())? {
+                // Unbound (no resolver): no sibling set and no foreign-data
+                // gate -- the caller-supplied resolved id is the only schema
+                // knowledge in play.
+                if let Some(value) = crate::property::lww_read_checked(&lww, property_id, name, &[], |_| true)? {
                     return Ok(Some(value));
                 }
             }
         }
-        // Non-LWW backends (yrs, pn_counter): lenient read, no gate.
-        Ok(state
-            .backends
-            .iter()
-            .filter(|(backend_name, _)| backend_name.as_str() != lww_name)
-            .find_map(|(_, backend)| backend.property_value(&name.to_owned())))
+        // Non-LWW backends (yrs): lenient id-then-name read, no gate.
+        Ok(state.backends.iter().filter(|(backend_name, _)| backend_name.as_str() != lww_name).find_map(|(_, backend)| {
+            backend.property_value(&PropertyKey::Id(property_id)).or_else(|| backend.property_value(&PropertyKey::Name(name.to_string())))
+        }))
     }
 }
 

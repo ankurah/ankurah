@@ -16,6 +16,7 @@
 mod common;
 
 use ankurah::core::property::backend::{lww::LWWBackend, PropertyBackend};
+use ankurah::core::property::PropertyKey;
 use ankurah::core::value::Value;
 use ankurah::proto::{self, Attested};
 use ankurah::{policy::DEFAULT_CONTEXT as c, Model, Node, PermissiveAgent, View};
@@ -36,22 +37,29 @@ use common::{Record, RecordView};
 /// The event id is a content hash over (entity_id, operations, parent), so the
 /// forger cannot choose it (C4-01): whatever id the DAG keys on is recomputed
 /// from these contents, never read from any declared field.
-fn forge_title_event(entity_id: proto::EntityId, parent: proto::Clock, title: &str) -> proto::Event {
+///
+/// `title_prop` is the registered property-definition id for `title`: a
+/// post-epoch peer writes id-keyed operations (the PropertyKey contract), and
+/// a name-keyed forgery would be shadowed on read by the seeded id-keyed
+/// value (the anti-resurrection rule) -- these tests pin containment and
+/// idempotency, so the forgeries must be well-formed current-epoch events.
+fn forge_title_event(
+    entity_id: proto::EntityId,
+    model: proto::EntityId,
+    title_prop: proto::EntityId,
+    parent: proto::Clock,
+    title: &str,
+) -> proto::Event {
     let backend = LWWBackend::new();
-    backend.set("title".into(), Some(Value::String(title.to_owned())));
+    backend.set(PropertyKey::Id(title_prop), Some(Value::String(title.to_owned())));
     let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
-    proto::Event {
-        entity_id,
-        collection: Record::collection(),
-        operations: proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
-        parent,
-    }
+    proto::Event { entity_id, model, operations: proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])), parent }
 }
 
 fn event_only_item(event: proto::Event) -> proto::SubscriptionUpdateItem {
     proto::SubscriptionUpdateItem {
         entity_id: event.entity_id,
-        collection: event.collection.clone(),
+        model: event.model,
         content: proto::UpdateContent::EventOnly(vec![Attested::opt(event, None).into()]),
         predicate_relevance: vec![],
     }
@@ -59,10 +67,10 @@ fn event_only_item(event: proto::Event) -> proto::SubscriptionUpdateItem {
 
 /// A single EventOnly item carrying several events (delivered in the given
 /// wire order, which the receiver must not trust).
-fn event_only_multi(entity_id: proto::EntityId, events: Vec<proto::Event>) -> proto::SubscriptionUpdateItem {
+fn event_only_multi(entity_id: proto::EntityId, model: proto::EntityId, events: Vec<proto::Event>) -> proto::SubscriptionUpdateItem {
     proto::SubscriptionUpdateItem {
         entity_id,
-        collection: Record::collection(),
+        model,
         content: proto::UpdateContent::EventOnly(events.into_iter().map(|e| Attested::opt(e, None).into()).collect()),
         predicate_relevance: vec![],
     }
@@ -74,6 +82,7 @@ fn deliver(from: proto::EntityId, to: proto::EntityId, items: Vec<proto::Subscri
         from,
         to,
         body: proto::NodeUpdateBody::SubscriptionUpdate { items },
+        schema: vec![],
     })
 }
 
@@ -89,6 +98,13 @@ struct Fixture {
     ctx_c: ankurah::Context,
     _conn: LocalProcessConnection<SledStorageEngine, PermissiveAgent, SledStorageEngine, PermissiveAgent>,
     _relay: ankurah::LiveQuery<RecordView>,
+    /// #330: Record's allocated model id, stamped on every forged event/item so
+    /// the receiver's ingress `resolve_model` routes it to the record collection.
+    record_model: proto::EntityId,
+    /// Registered property-definition ids for Record's fields: post-epoch
+    /// forgeries write id-keyed operations (see `forge_title_event`).
+    record_title: proto::EntityId,
+    record_artist: proto::EntityId,
 }
 
 async fn fixture() -> Result<Fixture> {
@@ -102,7 +118,12 @@ async fn fixture() -> Result<Fixture> {
     // A live subscription establishes the relay context apply_updates requires
     // for this peer; held for the test's duration.
     let _relay = ctx_c.query_wait::<RecordView>("title = 'no-such-title'").await?;
-    Ok(Fixture { server, client, ctx_s, ctx_c, _conn, _relay })
+    // The relay query resolves the Record predicate, which first-use-registers
+    // the model (REN 2), so the durable server now holds its allocated id.
+    let record_model = server.catalog.model_id_for(Record::collection().as_str()).expect("Record registered by the relay query");
+    let record_title = server.catalog.resolve(Record::collection().as_str(), "title").expect("title registered with Record");
+    let record_artist = server.catalog.resolve(Record::collection().as_str(), "artist").expect("artist registered with Record");
+    Ok(Fixture { server, client, ctx_s, ctx_c, _conn, _relay, record_model, record_title, record_artist })
 }
 
 /// Create a Record on the server and materialize it on the client, returning
@@ -197,28 +218,30 @@ async fn malformed_clock_identity_is_order_independent_end_to_end() -> Result<()
     // Two concurrent children of the same head, committed so the head becomes
     // a two-id antichain we can then feed back in scrambled order.
     let head0 = view.entity().head().clone();
-    let ev_b = forge_title_event(rec_id, head0.clone(), "b");
+    let ev_b = forge_title_event(rec_id, f.record_model, f.record_title, head0.clone(), "b");
     let ev_c = {
         // Distinct ops so ev_c is a sibling, not a duplicate of ev_b.
         let backend = LWWBackend::new();
-        backend.set("artist".into(), Some(Value::String("c-artist".to_owned())));
+        backend.set(PropertyKey::Id(f.record_artist), Some(Value::String("c-artist".to_owned())));
         let ops = backend.to_operations().unwrap().expect("ops");
         proto::Event {
             entity_id: rec_id,
-            collection: Record::collection(),
+            model: f.record_model,
             operations: proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
             parent: head0.clone(),
         }
     };
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, vec![ev_b.clone(), ev_c.clone()])])).await?;
+    f.client
+        .handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, f.record_model, vec![ev_b.clone(), ev_c.clone()])]))
+        .await?;
 
     // The head is now the antichain {ev_b, ev_c}. Build a merge event whose
     // parent lists those two ids in two different orders; both must hash equal.
     let two_ids = vec![ev_b.id(), ev_c.id()];
     let mut reversed = two_ids.clone();
     reversed.reverse();
-    let ev_merge_a = forge_title_event(rec_id, proto::Clock::from(two_ids.clone()), "merged");
-    let ev_merge_b = forge_title_event(rec_id, proto::Clock::from(reversed), "merged");
+    let ev_merge_a = forge_title_event(rec_id, f.record_model, f.record_title, proto::Clock::from(two_ids.clone()), "merged");
+    let ev_merge_b = forge_title_event(rec_id, f.record_model, f.record_title, proto::Clock::from(reversed), "merged");
     assert_eq!(ev_merge_a.id(), ev_merge_b.id(), "parent-clock input order must not change event identity");
 
     // Deliver the merge event; the resulting head is a single valid tip.
@@ -249,10 +272,10 @@ async fn forged_dangling_parent_is_contained() -> Result<()> {
 
     // Valid event for A; forged event for B parented on an id that was never
     // created (a fabricated 32-byte hash below any real history).
-    let ev_a = forge_title_event(a_id, view_a.entity().head().clone(), "a1");
+    let ev_a = forge_title_event(a_id, f.record_model, f.record_title, view_a.entity().head().clone(), "a1");
     let id_ev_a = ev_a.id();
     let dangling = proto::Clock::from(vec![proto::EventId::from_bytes([0xAB; 32])]);
-    let ev_b_forged = forge_title_event(b_id, dangling, "forged");
+    let ev_b_forged = forge_title_event(b_id, f.record_model, f.record_title, dangling, "forged");
     let id_forged = ev_b_forged.id();
 
     // handle_message returns Ok; the per-item failure rides the ack path.
@@ -284,14 +307,14 @@ async fn forged_extra_genesis_head_does_not_trigger_wholesale_adoption() -> Resu
 
     // A legitimate child B of the current head, and an independent genesis X
     // (empty parent) for the same entity id: X shares no lineage with the head.
-    let ev_b = forge_title_event(rec_id, head0.clone(), "child-b");
+    let ev_b = forge_title_event(rec_id, f.record_model, f.record_title, head0.clone(), "child-b");
     let ev_x = {
         let backend = LWWBackend::new();
-        backend.set("artist".into(), Some(Value::String("foreign-x".to_owned())));
+        backend.set(PropertyKey::Id(f.record_artist), Some(Value::String("foreign-x".to_owned())));
         let ops = backend.to_operations().unwrap().expect("ops");
         proto::Event {
             entity_id: rec_id,
-            collection: Record::collection(),
+            model: f.record_model,
             operations: proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
             parent: proto::Clock::default(),
         }
@@ -303,7 +326,7 @@ async fn forged_extra_genesis_head_does_not_trigger_wholesale_adoption() -> Resu
     // security property is: the legitimate child's write is not lost, and the
     // foreign root does not get adopted as the sole head (which would discard
     // the real genesis lineage).
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, vec![ev_b, ev_x])])).await?;
+    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, f.record_model, vec![ev_b, ev_x])])).await?;
 
     let head = view.entity().head();
     // The original genesis lineage must not have been wholesale-replaced by the
@@ -336,7 +359,11 @@ async fn forged_extra_genesis_head_does_not_trigger_wholesale_adoption() -> Resu
 #[test]
 fn declared_cycle_is_unconstructible_content_addressing() {
     let entity = proto::EntityId::new();
-    let mk = |title: &str, parent: proto::Clock| forge_title_event(entity, parent, title);
+    // #330: this pure content-addressing check never routes these events to a
+    // node, so any model id works; use a fixed fabricated one.
+    let model = proto::EntityId::from_bytes([0xEE; 16]);
+    let title_prop = proto::EntityId::from_bytes([0xEF; 16]);
+    let mk = |title: &str, parent: proto::Clock| forge_title_event(entity, model, title_prop, parent, title);
 
     // Start from two independent events and try to wire A.parent := [B.id()]
     // and B.parent := [A.id()]. Compute B first, then A referencing B; now A
@@ -376,12 +403,12 @@ async fn fabricated_cycle_batch_is_contained() -> Result<()> {
     // recomputed content id, so the batch graph has no edges between them.
     let fake1 = proto::EventId::from_bytes([0x11; 32]);
     let fake2 = proto::EventId::from_bytes([0x22; 32]);
-    let ev1 = forge_title_event(rec_id, proto::Clock::from(vec![fake2]), "cycle-1");
-    let ev2 = forge_title_event(rec_id, proto::Clock::from(vec![fake1]), "cycle-2");
+    let ev1 = forge_title_event(rec_id, f.record_model, f.record_title, proto::Clock::from(vec![fake2]), "cycle-1");
+    let ev2 = forge_title_event(rec_id, f.record_model, f.record_title, proto::Clock::from(vec![fake1]), "cycle-2");
     let id1 = ev1.id();
     let id2 = ev2.id();
 
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, vec![ev1, ev2])])).await?;
+    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, f.record_model, vec![ev1, ev2])])).await?;
 
     // Neither fabricated-parent event grounds (their parents do not exist), so
     // the entity is unchanged and no fabricated event enters the head.
@@ -411,7 +438,7 @@ async fn replay_flood_is_idempotent() -> Result<()> {
     let query = f.ctx_c.query_wait::<RecordView>(nocache(format!("id = '{}'", rec_id).as_str())?).await?;
     let _guard = query.subscribe(&watcher);
 
-    let ev = forge_title_event(rec_id, view.entity().head().clone(), "t1");
+    let ev = forge_title_event(rec_id, f.record_model, f.record_title, view.entity().head().clone(), "t1");
     let id_ev = ev.id();
 
     // Flood: 10 identical single-event deliveries, none may error.
@@ -420,7 +447,9 @@ async fn replay_flood_is_idempotent() -> Result<()> {
     }
     // And the same event redelivered inside a multi-event batch alongside
     // itself (duplicate within one item), out of order.
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, vec![ev.clone(), ev.clone()])])).await?;
+    f.client
+        .handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, f.record_model, vec![ev.clone(), ev.clone()])]))
+        .await?;
 
     assert_eq!(view.title().unwrap(), "t1", "state reflects exactly one application");
     let head = view.entity().head();
@@ -452,7 +481,7 @@ async fn forged_second_genesis_rejected_on_durable_node() -> Result<()> {
 
     // Forge a DISTINCT second genesis (empty parent, different ops => different
     // id) and deliver it to the SERVER attributed to the client peer.
-    let alt = forge_title_event(rec_id, proto::Clock::default(), "ALT-GENESIS");
+    let alt = forge_title_event(rec_id, f.record_model, f.record_title, proto::Clock::default(), "ALT-GENESIS");
     assert!(alt.is_entity_create(), "alt is a creation event");
     let alt_id = alt.id();
     f.server.handle_message(deliver(f.client.id, f.server.id, vec![event_only_item(alt)])).await?;
@@ -480,7 +509,7 @@ async fn forged_second_genesis_rejected_on_ephemeral_node() -> Result<()> {
     let (rec_id, view) = seed_record(&f, "t0", "a0").await?;
     let head_before = view.entity().head().clone();
 
-    let alt = forge_title_event(rec_id, proto::Clock::default(), "ALT-EPH");
+    let alt = forge_title_event(rec_id, f.record_model, f.record_title, proto::Clock::default(), "ALT-EPH");
     let alt_id = alt.id();
     f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(alt)])).await?;
 
@@ -501,10 +530,16 @@ async fn phantom_entity_is_evicted_on_failed_apply() -> Result<()> {
     let f = fixture().await?;
     let (a_id, view_a) = seed_record(&f, "a0", "artist-a").await?;
 
-    let ev_a = forge_title_event(a_id, view_a.entity().head().clone(), "a1");
+    let ev_a = forge_title_event(a_id, f.record_model, f.record_title, view_a.entity().head().clone(), "a1");
     let unknown_id = proto::EntityId::new();
     // Non-creation event (non-empty parent) for an entity the client never saw.
-    let ev_unknown = forge_title_event(unknown_id, proto::Clock::from(vec![proto::EventId::from_bytes([7u8; 32])]), "ghost");
+    let ev_unknown = forge_title_event(
+        unknown_id,
+        f.record_model,
+        f.record_title,
+        proto::Clock::from(vec![proto::EventId::from_bytes([7u8; 32])]),
+        "ghost",
+    );
 
     f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(ev_a), event_only_item(ev_unknown)])).await?;
 
@@ -546,7 +581,7 @@ async fn oversized_event_batch_is_rejected() -> Result<()> {
     let mut parent = view.entity().head().clone();
     let mut events: Vec<proto::Event> = Vec::with_capacity(OVERSIZED);
     for i in 0..OVERSIZED {
-        let ev = forge_title_event(rec_id, parent.clone(), &format!("flood-{i}"));
+        let ev = forge_title_event(rec_id, f.record_model, f.record_title, parent.clone(), &format!("flood-{i}"));
         parent = proto::Clock::from(vec![ev.id()]);
         events.push(ev);
     }
@@ -555,7 +590,7 @@ async fn oversized_event_batch_is_rejected() -> Result<()> {
     // handle_message returns Ok regardless (error rides the ack path); the
     // observable expectation once #246 lands is that NOTHING from an oversized
     // batch is committed. Today many events commit, so this assertion fails.
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, events)])).await?;
+    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, f.record_model, events)])).await?;
     let after = committed_event_ids(&f.ctx_c, rec_id).await?.len();
 
     assert_eq!(after, before, "an oversized batch must be rejected wholesale, committing nothing (G-3, #246)");
@@ -615,7 +650,8 @@ async fn equivocation_flood_antichain_is_bounded() -> Result<()> {
     // Many distinct siblings of the same head: each is a genuine, distinct
     // content hash (different title), so de-dup does not collapse them.
     const FLOOD: usize = 256;
-    let siblings: Vec<proto::Event> = (0..FLOOD).map(|i| forge_title_event(rec_id, head0.clone(), &format!("equiv-{i}"))).collect();
+    let siblings: Vec<proto::Event> =
+        (0..FLOOD).map(|i| forge_title_event(rec_id, f.record_model, f.record_title, head0.clone(), &format!("equiv-{i}"))).collect();
     for ev in siblings {
         f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(ev)])).await?;
     }

@@ -37,33 +37,50 @@ impl<Projected> YrsString<Projected> {
     pub fn new(property_name: PropertyName, backend: Arc<YrsBackend>, entity: Entity) -> Self {
         Self { property_name, backend, entity, phantom: PhantomData }
     }
-    pub fn value(&self) -> Option<String> { self.backend.get_string(&self.property_name) }
+    pub fn value(&self) -> Option<String> {
+        // Map-level presence: the resolved id root wins; only an absent id root
+        // falls back to a legacy name root (yrs cannot tombstone, so a cleared
+        // id field may still resurrect a stale name value -- the accepted
+        // migration erratum, the PropertyKey amendment #289).
+        match self.entity.property_key(&self.property_name) {
+            key @ crate::property::PropertyKey::Id(_) => self
+                .backend
+                .get_string(&key)
+                .or_else(|| self.backend.get_string(&crate::property::PropertyKey::Name(self.property_name.clone()))),
+            key @ crate::property::PropertyKey::Name(_) => self.backend.get_string(&key),
+        }
+    }
     pub fn insert(&self, index: u32, value: &str) -> Result<(), MutationError> {
         if !self.entity.is_writable() {
             return Err(PropertyError::TransactionClosed.into());
         }
-        self.backend.insert(&self.property_name, index, value)
+        // yrs cannot re-key CRDT history at commit, so it resolves at write
+        // time (the catalog is warm by edit; an unresolved field writes a name
+        // root as residue). The PropertyKey amendment, #289.
+        self.backend.insert(&self.entity.property_key(&self.property_name), index, value)
     }
     pub fn delete(&self, index: u32, length: u32) -> Result<(), MutationError> {
         if !self.entity.is_writable() {
             return Err(PropertyError::TransactionClosed.into());
         }
-        self.backend.delete(&self.property_name, index, length)
+        self.backend.delete(&self.entity.property_key(&self.property_name), index, length)
     }
     pub fn overwrite(&self, start: u32, length: u32, value: &str) -> Result<(), MutationError> {
         if !self.entity.is_writable() {
             return Err(PropertyError::TransactionClosed.into());
         }
-        self.backend.delete(&self.property_name, start, length)?;
-        self.backend.insert(&self.property_name, start, value)?;
+        let key = self.entity.property_key(&self.property_name);
+        self.backend.delete(&key, start, length)?;
+        self.backend.insert(&key, start, value)?;
         Ok(())
     }
     pub fn replace(&self, value: &str) -> Result<(), MutationError> {
         if !self.entity.is_writable() {
             return Err(PropertyError::TransactionClosed.into());
         }
-        self.backend.delete(&self.property_name, 0, self.value().unwrap_or_default().len() as u32)?;
-        self.backend.insert(&self.property_name, 0, value)?;
+        let key = self.entity.property_key(&self.property_name);
+        self.backend.delete(&key, 0, self.value().unwrap_or_default().len() as u32)?;
+        self.backend.insert(&key, 0, value)?;
         Ok(())
     }
 }
@@ -124,10 +141,14 @@ impl<Projected> InitializeWith<Option<String>> for YrsString<Projected> {
 }
 
 impl<Projected> ankurah_signals::Signal for YrsString<Projected> {
-    fn listen(&self, listener: Listener) -> ListenerGuard { self.backend.listen_field(&self.property_name, listener) }
+    fn listen(&self, listener: Listener) -> ListenerGuard {
+        self.backend.listen_field(&self.entity.property_key(&self.property_name), listener)
+    }
 
     // TODO: determine if we should cache this or not.
-    fn broadcast_id(&self) -> ankurah_signals::broadcast::BroadcastId { self.backend.field_broadcast_id(&self.property_name) }
+    fn broadcast_id(&self) -> ankurah_signals::broadcast::BroadcastId {
+        self.backend.field_broadcast_id(&self.entity.property_key(&self.property_name))
+    }
 }
 
 impl<Projected> ankurah_signals::Subscribe<String> for YrsString<Projected>

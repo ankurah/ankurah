@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use ankurah_core::{
     error::{MutationError, RetrievalError},
+    property::PropertyResolver,
     storage::{StorageCollection, StorageEngine},
 };
 use ankurah_proto::CollectionId;
@@ -16,6 +17,11 @@ use crate::{collection::SledStorageCollection, database::Database, error::SledRe
 
 pub struct SledStorageEngine {
     pub database: Mutex<Arc<Database>>,
+    /// The catalog resolver, injected post-construction by `Node` (see
+    /// `StorageEngine::set_property_resolver`). Lives on the engine -- not on
+    /// [`Database`] -- so a hard reset (which recreates the `Database`) keeps
+    /// it; buckets get a clone at creation.
+    pub(crate) resolver: Arc<std::sync::RwLock<Option<std::sync::Weak<dyn PropertyResolver>>>>,
     #[cfg(debug_assertions)]
     pub prefix_guard_disabled: Arc<AtomicBool>,
 }
@@ -41,6 +47,7 @@ impl SledStorageEngine {
         let db = sled::open(&dbpath)?;
         Ok(Self {
             database: Mutex::new(Arc::new(Database::open(db)?)),
+            resolver: Arc::new(std::sync::RwLock::new(None)),
             #[cfg(debug_assertions)]
             prefix_guard_disabled: Arc::new(AtomicBool::new(false)),
         })
@@ -54,6 +61,7 @@ impl SledStorageEngine {
 
         Ok(Self {
             database: Mutex::new(Arc::new(Database::open(db)?)),
+            resolver: Arc::new(std::sync::RwLock::new(None)),
             #[cfg(debug_assertions)]
             prefix_guard_disabled: Arc::new(AtomicBool::new(false)),
         })
@@ -101,10 +109,13 @@ impl StorageEngine for SledStorageEngine {
             id.to_owned(),
             database,
             tree,
+            self.resolver.clone(),
             #[cfg(debug_assertions)]
             self.prefix_guard_disabled.clone(),
         )))
     }
+
+    fn set_property_resolver(&self, resolver: std::sync::Weak<dyn PropertyResolver>) { *self.resolver.write().unwrap() = Some(resolver); }
 
     async fn delete_all_collections(&self) -> Result<bool, MutationError> {
         let mut any_deleted = false;

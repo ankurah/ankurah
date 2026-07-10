@@ -142,5 +142,22 @@ pub async fn build_nodes(n: usize, captured: Captured) -> anyhow::Result<Vec<Sim
         nodes.push(SimNode { index, durable: false, node, captured: captured.clone() });
     }
 
+    // #330: forged wire envelopes carry a model-definition id, and ingress
+    // `resolve_model` rejects any id its catalog cannot route. The harness
+    // forges events/states directly (bypassing schema registration and the
+    // catalog relay), so seed every node's catalog with the `SimRecord` model
+    // at the fixed `sim_model_id()`. A direct upsert (not the durable
+    // allocator) keeps the id byte-identical across nodes and across runs; the
+    // map is only ever cleared by hard_reset, which the clean system-join here
+    // never triggers, so the seed persists for the run.
+    let sim_model = proto::RegisteredModel {
+        id: super::model::sim_model_id(),
+        collection: SimRecord::collection().as_str().to_string(),
+        name: "SimRecord".to_string(),
+    };
+    for node in &nodes {
+        node.node.catalog.upsert_registered(std::slice::from_ref(&sim_model), &[], &[]);
+    }
+
     Ok(nodes)
 }

@@ -42,6 +42,17 @@ impl GetEvents for MockRetriever {
     async fn event_stored(&self, _event_id: &EventId) -> Result<bool, RetrievalError> { Ok(false) }
 }
 
+/// A single deterministic fake model-definition id for these pure-wire DAG
+/// fixtures (#330). These tests build events by hand and never route them
+/// through a node's catalog, so any stable id works; the model field is also
+/// excluded from `EventId` hashing, so it never perturbs the content-hashed
+/// event ids these tests order and compare on.
+fn test_model_id() -> EntityId {
+    let mut bytes = [0u8; 16];
+    bytes[0] = 0xEE;
+    EntityId::from_bytes(bytes)
+}
+
 /// Create a test event with deterministic content-hashed IDs.
 /// The seed differentiates events; parent_ids determine the parent clock.
 /// Returns the event (call `.id()` on it to get the computed EventId).
@@ -50,7 +61,7 @@ fn make_test_event(seed: u8, parent_ids: &[EventId]) -> Event {
     entity_id_bytes[0] = seed;
     let entity_id = EntityId::from_bytes(entity_id_bytes);
 
-    Event { entity_id, collection: "test".into(), parent: Clock::from(parent_ids.to_vec()), operations: OperationSet(BTreeMap::new()) }
+    Event { entity_id, model: test_model_id(), parent: Clock::from(parent_ids.to_vec()), operations: OperationSet(BTreeMap::new()) }
 }
 
 /// Like make_test_event but with a two-byte seed, for tests that need a wide
@@ -59,7 +70,7 @@ fn make_test_event_u16(seed: u16, parent_ids: &[EventId]) -> Event {
     let mut entity_id_bytes = [0u8; 16];
     entity_id_bytes[0..2].copy_from_slice(&seed.to_be_bytes());
     let entity_id = EntityId::from_bytes(entity_id_bytes);
-    Event { entity_id, collection: "test".into(), parent: Clock::from(parent_ids.to_vec()), operations: OperationSet(BTreeMap::new()) }
+    Event { entity_id, model: test_model_id(), parent: Clock::from(parent_ids.to_vec()), operations: OperationSet(BTreeMap::new()) }
 }
 
 /// Create a Clock from EventIds without consuming them.
@@ -84,7 +95,7 @@ fn make_lww_event(seed: u8, properties: Vec<(&str, &str)>) -> Event {
     let ops = backend.to_operations().unwrap().unwrap();
     Event {
         entity_id,
-        collection: "test".into(),
+        model: test_model_id(),
         parent: Clock::default(),
         operations: OperationSet(BTreeMap::from([("lww".to_string(), ops)])),
     }
@@ -1338,12 +1349,12 @@ mod yrs_layer_tests {
         let entity_id = EntityId::from_bytes(entity_id_bytes);
 
         let backend = YrsBackend::new();
-        backend.insert(text_field, 0, insert_text).unwrap();
+        backend.insert(&crate::property::PropertyKey::name(text_field), 0, insert_text).unwrap();
         let ops = backend.to_operations().unwrap().unwrap();
 
         Event {
             entity_id,
-            collection: "test".into(),
+            model: test_model_id(),
             parent: Clock::default(),
             operations: OperationSet(BTreeMap::from([("yrs".to_string(), ops)])),
         }
@@ -1363,7 +1374,7 @@ mod yrs_layer_tests {
         backend.apply_layer(&layer_from_refs(&already_applied, &to_apply)).unwrap();
 
         // Both inserts should be applied (Yrs CRDT merges them)
-        let result = backend.get_string("text").unwrap();
+        let result = backend.get_string(&crate::property::PropertyKey::name("text")).unwrap();
         // Order depends on Yrs internal logic, but both should be present
         assert!(result.contains("hello") || result.contains("world"), "Expected at least one insert to be present, got: {}", result);
     }
@@ -1378,7 +1389,7 @@ mod yrs_layer_tests {
         let to_apply: Vec<&Event> = vec![&event_a];
         backend.apply_layer(&layer_from_refs(&already_applied, &to_apply)).unwrap();
 
-        let initial_text = backend.get_string("text").unwrap();
+        let initial_text = backend.get_string(&crate::property::PropertyKey::name("text")).unwrap();
         assert_eq!(initial_text, "hello");
 
         // Now apply with event_a in already_applied and event_b in to_apply
@@ -1389,7 +1400,7 @@ mod yrs_layer_tests {
 
         // Only event_b should be applied again (if it wasn't already)
         // The text should contain "world" from event_b
-        let final_text = backend.get_string("text").unwrap();
+        let final_text = backend.get_string(&crate::property::PropertyKey::name("text")).unwrap();
         assert!(final_text.contains("world"), "Expected 'world' to be in text, got: {}", final_text);
     }
 
@@ -1405,21 +1416,21 @@ mod yrs_layer_tests {
         backend1.apply_layer(&layer_from_refs(&[], &[&event_a])).unwrap();
         backend1.apply_layer(&layer_from_refs(&[], &[&event_b])).unwrap();
         backend1.apply_layer(&layer_from_refs(&[], &[&event_c])).unwrap();
-        let result1 = backend1.get_string("text").unwrap();
+        let result1 = backend1.get_string(&crate::property::PropertyKey::name("text")).unwrap();
 
         // Order 2: C, A, B
         let backend2 = YrsBackend::new();
         backend2.apply_layer(&layer_from_refs(&[], &[&event_c])).unwrap();
         backend2.apply_layer(&layer_from_refs(&[], &[&event_a])).unwrap();
         backend2.apply_layer(&layer_from_refs(&[], &[&event_b])).unwrap();
-        let result2 = backend2.get_string("text").unwrap();
+        let result2 = backend2.get_string(&crate::property::PropertyKey::name("text")).unwrap();
 
         // Order 3: B, C, A
         let backend3 = YrsBackend::new();
         backend3.apply_layer(&layer_from_refs(&[], &[&event_b])).unwrap();
         backend3.apply_layer(&layer_from_refs(&[], &[&event_c])).unwrap();
         backend3.apply_layer(&layer_from_refs(&[], &[&event_a])).unwrap();
-        let result3 = backend3.get_string("text").unwrap();
+        let result3 = backend3.get_string(&crate::property::PropertyKey::name("text")).unwrap();
 
         // All results should be identical (CRDT convergence)
         assert_eq!(result1, result2, "Order 1 vs Order 2 should produce same result");
@@ -1429,7 +1440,7 @@ mod yrs_layer_tests {
     #[test]
     fn test_yrs_apply_layer_empty_to_apply() {
         let backend = YrsBackend::new();
-        backend.insert("text", 0, "initial").unwrap();
+        backend.insert(&crate::property::PropertyKey::name("text"), 0, "initial").unwrap();
 
         let event_a = make_yrs_event(1, "text", "hello");
 
@@ -1440,7 +1451,7 @@ mod yrs_layer_tests {
         backend.apply_layer(&layer_from_refs(&already_applied, &to_apply)).unwrap();
 
         // Text should be unchanged (only "initial")
-        let result = backend.get_string("text").unwrap();
+        let result = backend.get_string(&crate::property::PropertyKey::name("text")).unwrap();
         assert_eq!(result, "initial");
     }
 }
@@ -1579,7 +1590,7 @@ mod edge_case_tests {
         let entity_id = EntityId::from_bytes([99u8; 16]);
         let empty_event = Event {
             entity_id,
-            collection: "test".into(),
+            model: test_model_id(),
             parent: Clock::default(),
             operations: OperationSet(BTreeMap::new()), // No operations
         };
@@ -1645,7 +1656,7 @@ mod edge_case_tests {
         let ops = delete_backend.to_operations().unwrap().unwrap();
         let delete_event = Event {
             entity_id,
-            collection: "test".into(),
+            model: test_model_id(),
             parent: Clock::default(),
             operations: OperationSet(BTreeMap::from([("lww".to_string(), ops)])),
         };
@@ -1818,7 +1829,7 @@ mod phase4_duplicate_creation {
 
         Event {
             entity_id,
-            collection: "test".into(),
+            model: test_model_id(),
             parent: Clock::default(), // empty parent = creation event
             operations: OperationSet(BTreeMap::from([("lww".to_string(), ops)])),
         }
@@ -2958,7 +2969,7 @@ mod entity_change_batches {
         let ops = backend.to_operations().unwrap().unwrap();
         Event {
             entity_id,
-            collection: "test".into(),
+            model: test_model_id(),
             operations: OperationSet(BTreeMap::from([("lww".to_string(), ops)])),
             parent: Clock::from(parent_ids.to_vec()),
         }

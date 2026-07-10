@@ -25,125 +25,90 @@
 mod common;
 
 use ankurah::core::entity::Entity;
-use ankurah::core::property::backend::lww::{LWWBackend, SchemaBinding, WireMode};
+use ankurah::core::property::backend::lww::LWWBackend;
 use ankurah::core::property::backend::PropertyBackend;
 use ankurah::core::property::value::LWW;
-use ankurah::core::property::{FromEntity, PropertyError};
-use ankurah::core::selection::filter::{evaluate_predicate, Error as FilterError};
+use ankurah::core::property::{lww_read_checked, FromEntity, PropertyError, PropertyKey};
+use ankurah::core::selection::filter::evaluate_predicate;
 use ankurah::model::View;
 use ankurah::proto::{self, EntityId};
 use ankurah::value::Value;
 use common::*;
 use std::collections::BTreeMap;
 
-/// Register the Record schema on a durable node (via the durable execution
-/// path: a durable node registers itself) so the node's binding resolves
-/// "record"/"title" to the allocator-assigned STRING-lineage id, and return
-/// that id. Blocks until the catalog reflects it.
-async fn register_record_and_title_id(node: &Node<SledStorageEngine, PermissiveAgent>) -> anyhow::Result<EntityId> {
-    node.execute_schema_registration(
-        &DEFAULT_CONTEXT,
-        vec![proto::ModelDescriptor { collection: "record".into(), name: "Record".into(), explicit_id: None }],
-        vec![proto::PropertyDescriptor {
-            minting_collection: "record".into(),
-            name: "title".into(),
-            renamed_from: None,
-            backend: "lww".into(),
-            value_type: "string".into(),
-            target_collection: None,
-            explicit_id: None,
-        }],
-        vec![proto::MembershipDescriptor {
-            collection: "record".into(),
-            property: proto::PropertyRef::Name("title".into()),
-            optional: false,
-        }],
-    )
-    .await?;
-    node.catalog.wait_catalog_ready().await;
-    for _ in 0..100 {
-        if let Some(id) = node.catalog.resolve("record", "title") {
-            return Ok(id);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    panic!("catalog never reflected the record `title` property");
-}
-
-/// Build a 0xA2 LWW state buffer holding `value` under `foreign_id`, carrying
-/// the display-name HINT `name` -- exactly what a prior contract's data looks
-/// like on disk. Produced by binding a throwaway backend so `name` keys onto
-/// `foreign_id` and the reverse map stamps the hint, then serializing.
-fn foreign_id_state_buffer(foreign_id: EntityId, name: &str, value: Value, event_id: proto::EventId) -> Vec<u8> {
+/// Build a 0xA2 LWW state buffer holding `value` under `foreign_id` -- exactly
+/// what a prior contract's data looks like on disk: a value keyed by a property
+/// id the local catalog does not resolve. The backend is now a dumb identity
+/// store, so we key the value directly under `PropertyKey::Id(foreign_id)` (no
+/// binding, no display-name hint -- both were withdrawn by the PropertyKey
+/// amendment, #289) and serialize; the sole entry is keyed by `foreign_id`.
+fn foreign_id_state_buffer(foreign_id: EntityId, value: Value, event_id: proto::EventId) -> Vec<u8> {
     let backend = LWWBackend::new();
-    let mut to_id = BTreeMap::new();
-    let mut to_name = BTreeMap::new();
-    to_id.insert(name.to_string(), foreign_id);
-    to_name.insert(foreign_id, name.to_string());
-    backend.bind_schema(std::sync::Arc::new(SchemaBinding { to_id, to_name }));
-    backend.set_wire_mode(WireMode::IdKeyedV2);
-    backend.set(name.into(), Some(value));
+    backend.set(PropertyKey::Id(foreign_id), Some(value));
     let ops = backend.to_operations().unwrap().unwrap();
     backend.apply_operations_with_event(&ops, event_id).unwrap();
     backend.to_state_buffer().unwrap()
 }
 
 // ---------------------------------------------------------------------------
-// (1) Retype lineage: TypeSkew from the View getter AND from a filter compare.
+// (1) Retype lineage: the sibling gate fails visible (TypeSkew) over a
+//     same-display-name sibling holding data.
 // ---------------------------------------------------------------------------
+//
+// POST-#289 SHAPE: the sibling gate moved off the backend's display-name scan
+// and onto the catalog-supplied `sibling_ids` set (amendment #289 point 6;
+// `ankurah_core::property::lww_read_checked(backend, resolved_id, name, sibling_ids)`,
+// dispatched OUTSIDE the backend). The backend is a
+// dumb identity store now, so name-collision detection is a catalog concern and
+// the backend does pure presence + the supplied gate. This test pins the gate
+// at that home: the compiled View getter and resolved-identifier predicate both
+// funnel through `lww_read_checked`, so exercising it directly with the two id
+// entries a retype lineage produces is the faithful expression of the intent.
+//
+// (The prior end-to-end form seeded a value under a SYNTHETIC foreign id and
+// leaned on a display-name hint + on-backend scan to make the getter skew. Both
+// the hint and the on-backend name scan were withdrawn by #289, and a synthetic
+// id is never in the catalog's `names_global`, so the resolver cannot surface it
+// as a sibling -- an end-to-end retype now requires two real same-name property
+// registrations, out of scope for this unit. The gate logic itself is unchanged
+// and is what this pins.)
 
 #[tokio::test]
-async fn retype_lineage_type_skews_getter_and_filter() -> anyhow::Result<()> {
-    let node = durable_sled_setup().await?;
-    let ctx = node.context_async(DEFAULT_CONTEXT).await;
-
-    // Register the Record schema so the node's binding resolves "record"/
-    // "title" to the allocated STRING-lineage id A.
-    let a_string = register_record_and_title_id(&node).await?; // the binding resolves title -> A
-                                                               // A DIFFERENT id: a sibling lineage the local binding does not resolve,
-                                                               // standing in for an older i64 lineage of the same display name (a value
-                                                               // under a foreign id, exactly what a cross-root state copy looks like).
+async fn retype_lineage_type_skews_through_checked_dispatch() -> anyhow::Result<()> {
+    // Two property-definition ids sharing the display name "title": A is the
+    // locally-resolved (string) lineage, B a sibling (older i64) lineage whose
+    // data is what sits on the entity -- the mid-retype / cross-root on-disk
+    // state. The backend holds the value ONLY under B (id-keyed 0xA2), nothing
+    // under A.
+    let a_string = EntityId::new();
     let b_i64 = EntityId::new();
     assert_ne!(a_string, b_i64, "the sibling is a distinct property id");
 
-    // Seed a NEW record entity whose stored LWW data lives ONLY under the
-    // sibling id B (the old i64 lineage), with the display-name hint "title".
-    // No value exists under A. This is the mid-retype on-disk state, and also
-    // exactly what a cross-root state copy looks like: a value under an id the
-    // local binding does not resolve, hinted with the same display name.
-    let skewed_id = EntityId::new();
     let event_id = proto::EventId::from_bytes([9u8; 32]);
-    let buffer = foreign_id_state_buffer(b_i64, "title", Value::I64(30), event_id.clone());
-    assert_eq!(buffer[0], 0xA2, "seeded sibling state is 0xA2");
-    let mut state_buffers = BTreeMap::new();
-    state_buffers.insert("lww".to_owned(), buffer);
-    let state = proto::State { state_buffers: proto::StateBuffers(state_buffers), head: proto::Clock::from(vec![event_id]) };
-    let storage = node.collections.get(&"record".into()).await?;
-    storage.set_state(proto::Attested::opt(proto::EntityState { entity_id: skewed_id, collection: "record".into(), state }, None)).await?;
+    let buffer = foreign_id_state_buffer(b_i64, Value::I64(30), event_id.clone());
+    assert_eq!(buffer[0], 0xA2, "seeded sibling state is 0xA2 (id-keyed)");
+    let backend = LWWBackend::from_state_buffer(&buffer).unwrap();
 
-    // The View getter for `title` resolves A (absent) but sees B holding data
-    // under the same display name -> TypeSkew, not a fabricated "".
-    let view = ctx.get::<RecordView>(skewed_id).await?;
-    let err = view.title().expect_err("title read must fail visible over the retype sibling");
+    // Reading `title` as A, with B supplied as a same-name sibling, fails
+    // visible (TypeSkew over B's real value) instead of fabricating a default:
+    // A is absent, and the gate finds B holding data under the shared name.
+    let err =
+        lww_read_checked(&backend, a_string, "title", &[b_i64], |_| true).expect_err("read must fail visible over the retype sibling");
     match err {
         PropertyError::TypeSkew { name, a, b } => {
             assert_eq!(name, "title");
-            assert_eq!(a, a_string.to_base64(), "a names the binding-resolved (string) lineage");
+            assert_eq!(a, a_string.to_base64(), "a names the resolved (string) lineage");
             assert_eq!(b, b_i64.to_base64(), "b names the sibling (i64) lineage");
         }
         other => panic!("expected TypeSkew, got {other:?}"),
     }
 
-    // The same skew surfaces from predicate evaluation: a resolved-identifier
-    // comparison on `title` errors (FilterResult::Error upstream) instead of
-    // silently evaluating NULL.
-    let resolved = node.catalog.resolve_selection(&"record".into(), &ankql::parser::parse_selection("title = '30'")?).unwrap();
-    match evaluate_predicate(view.entity(), &resolved.predicate) {
-        Err(FilterError::PropertyRead(msg)) => {
-            assert!(msg.contains("type skew"), "filter error should be the type-skew read error, got: {msg}")
-        }
-        other => panic!("expected a PropertyRead(type skew) filter error, got {other:?}"),
-    }
+    // Without the sibling in the supplied set (no catalog gate), the same absent
+    // read is a clean `Ok(None)` -- the gate is exactly the supplied-siblings
+    // input, not a property of the stored bytes. (`|_| true` also keeps the
+    // foreign-data gate off; with `|_| false` B's un-nameable data would skew
+    // via THAT gate instead, which is the bound-getter regime.)
+    assert_eq!(lww_read_checked(&backend, a_string, "title", &[], |_| true).unwrap(), None, "absent id with no gate reads None, not skew");
 
     Ok(())
 }
@@ -336,11 +301,14 @@ async fn membership_without_optional_follow_up_is_treated_optional() -> anyhow::
 /// derivation (rev 4), so tests build this event directly.
 fn membership_genesis(model: &EntityId, property: &EntityId) -> proto::Event {
     let backend = LWWBackend::new();
-    backend.set("model".into(), Some(Value::EntityId(*model)));
-    backend.set("property".into(), Some(Value::EntityId(*property)));
+    backend.set(PropertyKey::name("model"), Some(Value::EntityId(*model)));
+    backend.set(PropertyKey::name("property"), Some(Value::EntityId(*property)));
     let operations = backend.to_operations().unwrap().unwrap();
     proto::Event {
-        collection: ankurah::core::schema::model_property_collection(),
+        // #330: events carry a model id; the _ankurah_model_property catalog
+        // collection has a well-known one.
+        model: ankurah::core::schema::well_known_model_id(ankurah::core::schema::MODEL_PROPERTY_COLLECTION_ID)
+            .expect("_ankurah_model_property has a well-known model id"),
         entity_id: EntityId::new(),
         operations: proto::OperationSet(BTreeMap::from([("lww".to_string(), operations)])),
         parent: proto::Clock::default(),

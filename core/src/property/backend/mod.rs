@@ -21,7 +21,7 @@ use crate::event_dag::EventLayer;
 pub use lww::LWWBackend;
 pub use yrs::YrsBackend;
 
-use super::{PropertyName, Value};
+use super::{PropertyKey, Value};
 
 // TODO - implement a property backend value iterator so we don't have to alloc a HashMap for every call to values()
 
@@ -30,12 +30,12 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
     fn as_debug(&self) -> &dyn Debug;
     fn fork(&self) -> Arc<dyn PropertyBackend>;
 
-    fn properties(&self) -> Vec<PropertyName>;
-    fn property_value(&self, property_name: &PropertyName) -> Option<Value> {
+    fn properties(&self) -> Vec<PropertyKey>;
+    fn property_value(&self, key: &PropertyKey) -> Option<Value> {
         let mut map = self.property_values();
-        map.remove(property_name).flatten()
+        map.remove(key).flatten()
     }
-    fn property_values(&self) -> BTreeMap<PropertyName, Option<Value>>;
+    fn property_values(&self) -> BTreeMap<PropertyKey, Option<Value>>;
 
     /// Unique property backend identifier.
     fn property_backend_name() -> &'static str
@@ -94,11 +94,19 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
     /// Listen to changes for a specific field managed by this backend.
     /// Auto-creates the broadcast if it doesn't exist yet.
     /// Returns a subscription guard that will unsubscribe when dropped.
-    fn listen_field(
-        &self,
-        field_name: &PropertyName,
-        listener: ankurah_signals::signal::Listener,
-    ) -> ankurah_signals::signal::ListenerGuard;
+    fn listen_field(&self, key: &PropertyKey, listener: ankurah_signals::signal::Listener) -> ankurah_signals::signal::ListenerGuard;
+
+    /// The keys currently staged (uncommitted) in this backend, so the commit
+    /// path can resolve a transient [`PropertyKey::Name`] to its
+    /// [`PropertyKey::Id`] before the event is generated (the PropertyKey
+    /// amendment, #289). Default empty: backends that resolve keys at write
+    /// time (yrs) stage nothing to re-key.
+    fn uncommitted_keys(&self) -> Vec<PropertyKey> { Vec::new() }
+
+    /// Move a staged value from `from` to `to` at commit (Name -> Id
+    /// resolution). A pure key operation -- the catalog-aware caller decides
+    /// the mapping, so the backend never sees the catalog. Default no-op.
+    fn rekey(&self, from: &PropertyKey, to: PropertyKey) { let _ = (from, to); }
 }
 
 // This is where this gets a bit tough.
@@ -108,12 +116,12 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
 // TODO: Implement a property backend type registry rather than this hardcoded nonsense.
 /// Fire the change broadcast for each named field that has subscribers.
 pub(crate) fn notify_changed_fields<'a>(
-    field_broadcasts: &std::sync::Mutex<std::collections::BTreeMap<crate::property::PropertyName, ankurah_signals::broadcast::Broadcast>>,
-    changed: impl IntoIterator<Item = &'a crate::property::PropertyName>,
+    field_broadcasts: &std::sync::Mutex<std::collections::BTreeMap<crate::property::PropertyKey, ankurah_signals::broadcast::Broadcast>>,
+    changed: impl IntoIterator<Item = &'a crate::property::PropertyKey>,
 ) {
     let broadcasts = field_broadcasts.lock().expect("field_broadcasts lock is poisoned");
-    for field_name in changed {
-        if let Some(broadcast) = broadcasts.get(field_name) {
+    for key in changed {
+        if let Some(broadcast) = broadcasts.get(key) {
             broadcast.send(());
         }
     }

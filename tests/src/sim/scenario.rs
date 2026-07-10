@@ -178,7 +178,7 @@ impl<'a> Workload<'a> {
         let fragments: Vec<proto::EventFragment> = events.into_iter().map(|e| e.into()).collect();
         proto::SubscriptionUpdateItem {
             entity_id: entity,
-            collection: super::model::sim_collection(),
+            model: super::model::sim_model_id(),
             content: proto::UpdateContent::EventOnly(fragments),
             predicate_relevance: vec![],
         }
@@ -193,7 +193,7 @@ impl<'a> Workload<'a> {
         let event_fragments: Vec<proto::EventFragment> = events.into_iter().map(|e| e.into()).collect();
         proto::SubscriptionUpdateItem {
             entity_id: entity,
-            collection: super::model::sim_collection(),
+            model: super::model::sim_model_id(),
             content: proto::UpdateContent::StateAndEvent(state_fragment, event_fragments),
             predicate_relevance: vec![],
         }
@@ -206,6 +206,7 @@ impl<'a> Workload<'a> {
             from: self.nodes[origin].id(),
             to: self.nodes[dst].id(),
             body: proto::NodeUpdateBody::SubscriptionUpdate { items },
+            schema: vec![],
         })
     }
 

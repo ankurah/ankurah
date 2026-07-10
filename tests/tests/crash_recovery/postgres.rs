@@ -72,6 +72,11 @@ async fn armed_child_pg_node(crash: CrashPoint) -> Result<(Node<PgCrashEngine, P
     let engine = Arc::new(CrashStorageEngine::new(pg, Some(crash)));
     let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
     node.system.create().await?;
+    // Register the scenario model as setup (mirrors scenarios.rs): the
+    // registration executor's writes stay out of the armed crash-point
+    // counts, and the child's catalog can resolve the batch's model id
+    // (#330).
+    node.context(c)?.register::<Album>().await?;
     engine.arm();
     Ok((node, engine))
 }
@@ -88,7 +93,7 @@ async fn reopen_pg_node(uri: &str) -> Result<Node<Postgres, PermissiveAgent>> {
 
 /// Generate `n` independent album creation events on a throwaway in-memory sled
 /// node (event generation is engine-independent).
-async fn generate_creation_batch(n: usize) -> Result<Vec<Attested<proto::Event>>> {
+async fn generate_creation_batch(n: usize, model: proto::EntityId) -> Result<Vec<Attested<proto::Event>>> {
     use ankurah_storage_sled::SledStorageEngine;
     let helper = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
     helper.system.create().await?;
@@ -98,7 +103,14 @@ async fn generate_creation_batch(n: usize) -> Result<Vec<Attested<proto::Event>>
         trx.create(&Album { name: format!("PgBatch {i}"), year: format!("20{i:02}") }).await?;
     }
     let events = trx.commit_and_return_events().await?;
-    Ok(events.into_iter().map(Attested::from).collect())
+    // Restamp with the target node's model id (#330); see scenarios.rs.
+    Ok(events
+        .into_iter()
+        .map(|mut event| {
+            event.model = model;
+            Attested::from(event)
+        })
+        .collect())
 }
 
 // ============================================================================
@@ -111,7 +123,8 @@ async fn child_pg_commit_event_before_set_state() -> Result<()> {
         return Ok(());
     };
     let (node, _engine) = armed_child_pg_node(crash).await?;
-    let events = generate_creation_batch(1).await?;
+    let model = node.catalog.model_id_for(Album::collection().as_str()).expect("Album registered in armed_child_pg_node");
+    let events = generate_creation_batch(1, model).await?;
     handoff_write("entity", &events[0].payload.entity_id.to_base64())?;
     node.commit_remote_transaction(&c, proto::TransactionId::new(), events).await?;
     panic!("pg scenario 1 child did not crash");
@@ -156,7 +169,8 @@ async fn child_pg_mid_batch() -> Result<()> {
         return Ok(());
     };
     let (node, _engine) = armed_child_pg_node(crash).await?;
-    let events = generate_creation_batch(PG_S2_BATCH).await?;
+    let model = node.catalog.model_id_for(Album::collection().as_str()).expect("Album registered in armed_child_pg_node");
+    let events = generate_creation_batch(PG_S2_BATCH, model).await?;
     for e in &events {
         handoff_write("entity", &e.payload.entity_id.to_base64())?;
         handoff_write_event("event", e)?;
@@ -219,7 +233,8 @@ async fn child_pg_entity_creation() -> Result<()> {
         return Ok(());
     };
     let (node, _engine) = armed_child_pg_node(crash).await?;
-    let events = generate_creation_batch(1).await?;
+    let model = node.catalog.model_id_for(Album::collection().as_str()).expect("Album registered in armed_child_pg_node");
+    let events = generate_creation_batch(1, model).await?;
     handoff_write("entity", &events[0].payload.entity_id.to_base64())?;
     handoff_write_event("event", &events[0])?;
     node.commit_remote_transaction(&c, proto::TransactionId::new(), events).await?;

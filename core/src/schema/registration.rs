@@ -577,7 +577,7 @@ where
             let Some(buffer) = state.payload.state.state_buffers.0.get("lww") else {
                 continue;
             };
-            best = Some((id, LWWBackend::from_state_buffer(buffer)?.property_values()));
+            best = Some((id, crate::property::name_keyed(LWWBackend::from_state_buffer(buffer)?.property_values())));
         }
         Ok(best)
     }
@@ -650,7 +650,7 @@ where
             return Ok(None);
         };
         let backend = LWWBackend::from_state_buffer(buffer)?;
-        Ok(Some((backend.property_values(), head)))
+        Ok(Some((crate::property::name_keyed(backend.property_values()), head)))
     }
 
     /// Values-only convenience over [`Self::catalog_entity_snapshot`].
@@ -718,8 +718,12 @@ fn creation(collection: CollectionId, entity_id: EntityId, fields: Vec<(&str, Va
 fn follow_up(collection: CollectionId, entity_id: EntityId, parent: proto::Clock, fields: Vec<(&str, Value)>) -> proto::Event {
     let backend = LWWBackend::new();
     for (name, value) in fields {
-        backend.set(name.to_string(), Some(value));
+        backend.set(crate::property::PropertyKey::Name(name.to_string()), Some(value));
     }
     let operations = backend.to_operations().expect("LWW encoding of scalar values is infallible").expect("fields are non-empty");
-    proto::Event { collection, entity_id, operations: proto::OperationSet(BTreeMap::from([("lww".to_string(), operations)])), parent }
+    // Catalog collections have well-known model ids by construction (#330);
+    // this helper is only ever called for them.
+    let model = crate::schema::well_known_model_id(collection.as_str())
+        .expect("registration events target the catalog collections, which have well-known model ids");
+    proto::Event { model, entity_id, operations: proto::OperationSet(BTreeMap::from([("lww".to_string(), operations)])), parent }
 }

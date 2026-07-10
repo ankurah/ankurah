@@ -203,7 +203,10 @@ async fn catalog_values(
     let storage = node.collections.get(&collection.into()).await?;
     let state = storage.get_state(id).await?;
     let buffer = state.payload.state.state_buffers.0.get("lww").expect("catalog entities are LWW").clone();
-    Ok(LWWBackend::from_state_buffer(&buffer)?.property_values())
+    // Catalog collections stay name-keyed (RFC 4 bootstrap exemption), so the
+    // PropertyKey-keyed backend values are all `Name`; project to their display
+    // names for the by-string lookups the assertions use.
+    Ok(LWWBackend::from_state_buffer(&buffer)?.property_values().into_iter().map(|(k, v)| (k.display_name(), v)).collect())
 }
 
 /// Build a RegisterSchema request from `Model::schema()` via

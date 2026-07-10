@@ -1,12 +1,15 @@
-use std::sync::atomic::AtomicUsize;
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 
 use ankurah_core::{
     action_debug,
     error::{MutationError, RetrievalError},
+    property::{PropertyKey, PropertyResolver},
     selection::filter::{evaluate_predicate, Filterable},
-    storage::StorageCollection,
+    storage::{naming, StorageCollection},
 };
-use ankurah_proto::{self as proto, Attested, EntityState, EventId, State};
+use ankurah_proto::{self as proto, Attested, EntityId, EntityState, EventId, State};
 use async_trait::async_trait;
 use send_wrapper::SendWrapper;
 use wasm_bindgen::{JsCast, JsValue};
@@ -19,7 +22,7 @@ use crate::{
 use ankurah_storage_common::{filtering::ValueSetStream, OrderByComponents, Plan};
 // Import tracing for debug macro and futures for StreamExt
 use futures::StreamExt;
-use tracing::debug;
+use tracing::{debug, warn};
 
 #[derive(Debug)]
 pub struct IndexedDBBucket {
@@ -27,9 +30,30 @@ pub struct IndexedDBBucket {
     pub(crate) collection_id: proto::CollectionId,
     pub(crate) mutex: tokio::sync::Mutex<()>, // should probably be implemented by Database, but not certain
     pub(crate) invocation_count: AtomicUsize,
+    /// The injected catalog resolver (shared with the engine): the NAME SOURCE
+    /// for [`Self::field_for_key`]. Weak so storage never keeps the node alive.
+    pub(crate) resolver: Arc<RwLock<Option<std::sync::Weak<dyn PropertyResolver>>>>,
+    /// This collection's slice of the engine-owned durable id-to-field map (the
+    /// `property_columns` object store), cached in memory. The map -- not the
+    /// display name -- is what addresses a property's field once assigned:
+    /// renames never move fields, collisions were deduped at assignment.
+    pub(crate) property_columns: Arc<RwLock<BTreeMap<EntityId, String>>>,
+    /// Whether [`Self::ensure_property_columns_loaded`] has hydrated
+    /// `property_columns` from the store yet (lazy, once per bucket).
+    pub(crate) property_columns_loaded: AtomicBool,
     #[cfg(debug_assertions)]
     pub(crate) prefix_guard_disabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
+
+/// Reserved entity-object fields a property field must never shadow: the
+/// primary `id` plus the double-underscore system columns that `set_state`
+/// writes on every entity object.
+const RESERVED_FIELDS: [&str; 5] = ["id", "__collection", "__state_buffer", "__head", "__attestations"];
+
+/// Store key for a property id's field-name assignment in `collection`:
+/// `{collection}\0{id base64}`. A concatenated string key (matching the store's
+/// other string keys) so a collection's whole slice is one prefix range.
+fn property_columns_key(collection: &str, id: &EntityId) -> String { format!("{}\0{}", collection, id.to_base64()) }
 
 impl std::fmt::Display for IndexedDBBucket {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "IndexedDBBucket({})", self.collection_id) }
@@ -41,6 +65,14 @@ impl StorageCollection for IndexedDBBucket {
         self.invocation_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Lock the mutex to prevent concurrent updates
         let _lock = self.mutex.lock().await;
+
+        // Assign + persist durable field names for this state's property keys
+        // BEFORE opening the entities transaction below. This does every
+        // `property_columns` write up front on its own transaction, so the
+        // entities transaction never awaits a foreign transaction (IndexedDB
+        // auto-commits a transaction the moment an await doesn't belong to it),
+        // and it warms the cache so `extract_all_fields` only ever hits it.
+        self.assign_property_fields(&state.payload).await?;
 
         let db_connection = self.db.get_connection().await;
         SendWrapper::new(async move {
@@ -77,8 +109,10 @@ impl StorageCollection for IndexedDBBucket {
             entity.set(&*HEAD_KEY, &state.payload.state.head)?;
             entity.set(&*ATTESTATIONS_KEY, &state.attestations)?;
 
-            // Extract all fields for indexing
-            extract_all_fields(&entity, &state.payload)?;
+            // Extract all fields for indexing (durable field names resolved via
+            // the engine-owned map; the cache was warmed above so every lookup
+            // here is a pure hit that never touches this transaction).
+            self.extract_all_fields(&entity, &state.payload).await?;
 
             // Put the entity in the store
             let request = store.put_with_key(&entity, &state.payload.entity_id.to_string().into()).require("put entity in store")?;
@@ -113,7 +147,7 @@ impl StorageCollection for IndexedDBBucket {
             Ok(Attested {
                 payload: EntityState {
                     entity_id: id,
-                    collection: self.collection_id.clone(),
+                    model: self.model_id()?,
                     state: State { state_buffers: entity.get(&STATE_BUFFER_KEY)?, head: entity.get(&HEAD_KEY)? },
                 },
                 attestations: entity.get(&ATTESTATIONS_KEY)?,
@@ -125,6 +159,22 @@ impl StorageCollection for IndexedDBBucket {
     async fn fetch_states(&self, selection: &ankql::ast::Selection) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         let _invocation = self.invocation_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let _lock = self.mutex.lock().await; // TODO why are we locking here?
+
+        // Translate into this engine's column space FIRST (ids -> assigned
+        // field names via the durable map, order-by names via the catalog
+        // resolver), so the planner's index columns, the record field reads,
+        // and the sort comparators all address the fields writes actually
+        // created (sticky under rename, deduped under collision, synthetic
+        // under fallback).
+        self.ensure_property_columns_loaded().await.map_err(|e| RetrievalError::StorageError(format!("{e:?}").into()))?;
+        let selection = {
+            let resolver = self.resolver.read().expect("RwLock poisoned").as_ref().and_then(|weak| weak.upgrade());
+            let assigned = self.property_columns.read().expect("RwLock poisoned").clone();
+            ankurah_core::storage::selection_to_column_space(self.collection_id.as_str(), selection, resolver.as_deref(), &|id| {
+                assigned.get(id).cloned()
+            })
+        };
+        let selection = &selection;
 
         // Step 1: Amend predicate with __collection comparison
         let amended_selection = add_collection(selection, &self.collection_id);
@@ -254,7 +304,7 @@ impl StorageCollection for IndexedDBBucket {
 
                 let event = Attested {
                     payload: ankurah_proto::Event {
-                        collection: self.collection_id.clone(),
+                        model: self.model_id()?,
                         entity_id: event_obj.get(&ENTITY_ID_KEY)?,
                         operations: event_obj.get(&OPERATIONS_KEY)?,
                         parent: event_obj.get(&PARENT_KEY)?,
@@ -294,7 +344,7 @@ impl StorageCollection for IndexedDBBucket {
 
                 let event = Attested {
                     payload: ankurah_proto::Event {
-                        collection: self.collection_id.clone(),
+                        model: self.model_id()?,
                         // id: event_obj.get(&ID_KEY)?.try_into()?,
                         entity_id: event_obj.get(&ENTITY_ID_KEY)?,
                         operations: event_obj.get(&OPERATIONS_KEY)?,
@@ -326,6 +376,209 @@ impl StorageCollection for IndexedDBBucket {
 // }
 
 impl IndexedDBBucket {
+    /// The model id stamped on envelopes this bucket reconstructs (#330):
+    /// well-knowns, then the injected catalog resolver.
+    fn model_id(&self) -> Result<ankurah_proto::EntityId, RetrievalError> {
+        let resolver = self.resolver.read().expect("RwLock poisoned").as_ref().and_then(|weak| weak.upgrade());
+        ankurah_core::storage::bucket_model_id(&self.collection_id, resolver.as_deref())
+    }
+
+    /// Hydrate `property_columns` with this collection's durable id-to-field
+    /// assignments, once per bucket. Runs BEFORE any write transaction so the
+    /// loaded cache is the authoritative taken-set for [`Self::field_for_key`]
+    /// (and so a field lookup never has to read the store while the entities
+    /// transaction is open -- IndexedDB auto-commits a transaction the moment an
+    /// await doesn't belong to it).
+    async fn ensure_property_columns_loaded(&self) -> Result<(), MutationError> {
+        if self.property_columns_loaded.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let db_connection = self.db.get_connection().await;
+        SendWrapper::new(async move {
+            let transaction = db_connection.transaction_with_str("property_columns").require("create property_columns transaction")?;
+            let store = transaction.object_store("property_columns").require("get property_columns store")?;
+
+            // This collection's rows are exactly the keys under the
+            // `{collection}\0` prefix; base64 chars all sort below U+FFFF, so
+            // this bound captures the slice and nothing else.
+            let prefix = format!("{}\0", self.collection_id.as_str());
+            let upper = format!("{}{}", prefix, '\u{ffff}');
+            let range = web_sys::IdbKeyRange::bound(&JsValue::from_str(&prefix), &JsValue::from_str(&upper))
+                .require("create property_columns key range")?;
+            let request = store.open_cursor_with_range(&range).require("open property_columns cursor")?;
+
+            let mut map = BTreeMap::new();
+            let mut stream = cb_stream(&request, "success", "error");
+            while let Some(result) = stream.next().await {
+                let cursor_result = result.require("property_columns cursor error")?;
+                if cursor_result.is_null() || cursor_result.is_undefined() {
+                    break;
+                }
+                let cursor = cursor_result.dyn_into::<web_sys::IdbCursorWithValue>().require("cast property_columns cursor")?;
+                let key = cursor.key().require("get property_columns cursor key")?;
+                let value = cursor.value().require("get property_columns cursor value")?;
+                // key = "{collection}\0{id base64}", value = the field name.
+                if let (Some(key_str), Some(name)) = (key.as_string(), value.as_string()) {
+                    if let Some(base64) = key_str.strip_prefix(&prefix) {
+                        if let Ok(id) = EntityId::from_base64(base64) {
+                            map.insert(id, name);
+                        }
+                    }
+                }
+                cursor.continue_().require("advance property_columns cursor")?;
+            }
+
+            *self.property_columns.write().unwrap() = map;
+            self.property_columns_loaded.store(true, Ordering::Relaxed);
+            Ok(())
+        })
+        .await
+    }
+
+    /// Assign + persist a durable field name for every property key in a state's
+    /// buffers, hydrating the cache first. Runs BEFORE the entities transaction
+    /// in `set_state`: all of the assignment path's `property_columns` writes
+    /// happen here, on their own transaction, so the entities transaction never
+    /// awaits a foreign transaction (which would silently auto-commit it). After
+    /// this, every [`Self::field_for_key`] call inside `extract_all_fields` is a
+    /// pure cache hit.
+    async fn assign_property_fields(&self, entity_state: &EntityState) -> Result<(), MutationError> {
+        use ankurah_core::property::backend::backend_from_string;
+        self.ensure_property_columns_loaded().await?;
+        for (backend_name, state_buffer) in entity_state.state.state_buffers.iter() {
+            let backend = backend_from_string(backend_name, Some(state_buffer)).map_err(|e| MutationError::General(Box::new(e)))?;
+            for (key, _value) in backend.property_values() {
+                self.field_for_key(&key).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The durable field name for a property key in this collection.
+    ///
+    /// `Name` keys (system/catalog collections, legacy residue) use the name
+    /// directly. `Id` keys resolve through the durable map
+    /// ([`Self::property_columns`]); a miss assigns a field NOW: seed from the
+    /// catalog resolver's display name (sanitized), dedupe against the reserved
+    /// fields and this collection's other assignments (`{name}_{trailing id
+    /// chars}`, the ratified collision rule), or -- when the resolver cannot
+    /// name the id (the intra-node descriptor race; should effectively never
+    /// fire) -- a synthetic `p_{trailing id chars}` name, logged loudly.
+    ///
+    /// PRECONDITION: the cache is already loaded (via
+    /// [`Self::ensure_property_columns_loaded`]). A cache HIT returns WITHOUT
+    /// awaiting, so it is safe to call while the entities transaction is open;
+    /// the miss/assignment path opens the `property_columns` transaction and so
+    /// must only be reached before that (see [`Self::assign_property_fields`]).
+    async fn field_for_key(&self, key: &PropertyKey) -> Result<String, MutationError> {
+        let id = match key {
+            PropertyKey::Name(name) => return Ok(name.clone()),
+            PropertyKey::Id(id) => *id,
+        };
+        if let Some(name) = self.property_columns.read().unwrap().get(&id) {
+            return Ok(name.clone());
+        }
+
+        // Assignment path. The loaded cache is the complete taken-set: wasm is
+        // single-threaded, so no other writer is assigning concurrently.
+        let seed = {
+            let resolver = self.resolver.read().unwrap().as_ref().and_then(|weak| weak.upgrade());
+            resolver.and_then(|r| r.name_for(&id)).map(|name| naming::sanitize(&name))
+        };
+        let field = {
+            let assigned = self.property_columns.read().unwrap();
+            let is_taken = |candidate: &str| {
+                RESERVED_FIELDS.contains(&candidate) || assigned.iter().any(|(other, name)| *other != id && name == candidate)
+            };
+            match &seed {
+                Some(seed) => naming::dedupe(seed, &id, is_taken),
+                None => {
+                    warn!(
+                        "IndexedDBBucket({}): catalog cannot name property {}; assigning fallback field (descriptor race?)",
+                        self.collection_id,
+                        id.to_base64()
+                    );
+                    naming::fallback("p", &id, is_taken)
+                }
+            }
+        };
+        let stored = self.persist_property_column(&id, &field).await?;
+        self.property_columns.write().unwrap().insert(id, stored.clone());
+        Ok(stored)
+    }
+
+    /// Persist an id-to-field assignment to the `property_columns` store,
+    /// returning the durable name. Get-then-put rather than a CAS loop: wasm is
+    /// single-threaded, so between the get and the put no other writer can
+    /// intervene. The get still runs -- belt and suspenders -- and yields to any
+    /// assignment a prior session already durably made for this id.
+    async fn persist_property_column(&self, id: &EntityId, proposed: &str) -> Result<String, MutationError> {
+        let map_key = property_columns_key(self.collection_id.as_str(), id);
+        let proposed = proposed.to_string();
+        let db_connection = self.db.get_connection().await;
+        SendWrapper::new(async move {
+            let transaction = db_connection
+                .transaction_with_str_and_mode("property_columns", web_sys::IdbTransactionMode::Readwrite)
+                .require("create property_columns transaction")?;
+            let store = transaction.object_store("property_columns").require("get property_columns store")?;
+
+            let get_request = store.get(&JsValue::from_str(&map_key)).require("get property_columns entry")?;
+            cb_future(&get_request, "success", "error").await.require("await property_columns get")?;
+            let existing = get_request.result().require("get property_columns result")?;
+            if let Some(name) = existing.as_string() {
+                // Already assigned durably (e.g. by a prior session this bucket
+                // never loaded); keep the durable name.
+                return Ok(name);
+            }
+
+            let put_request =
+                store.put_with_key(&JsValue::from_str(&proposed), &JsValue::from_str(&map_key)).require("put property_columns entry")?;
+            cb_future(&put_request, "success", "error").await.require("await property_columns put")?;
+            cb_future(&transaction, "complete", "error").await.require("complete property_columns transaction")?;
+            Ok(proposed)
+        })
+        .await
+    }
+
+    /// Extract all fields from entity state and set them directly on the
+    /// IndexedDB entity object, keyed by their durable field names.
+    async fn extract_all_fields(&self, entity_obj: &Object, entity_state: &EntityState) -> Result<(), MutationError> {
+        use ankurah_core::property::backend::backend_from_string;
+        use std::collections::HashSet;
+
+        let mut seen_fields = HashSet::new();
+
+        // Process all property values from state buffers
+        for (backend_name, state_buffer) in entity_state.state.state_buffers.iter() {
+            let backend = backend_from_string(backend_name, Some(state_buffer)).map_err(|e| MutationError::General(Box::new(e)))?;
+
+            for (key, value) in backend.property_values() {
+                // Resolve the durable field name through the engine-owned map.
+                // The cache was warmed by `assign_property_fields` before the
+                // entities transaction opened, so this is always a hit here and
+                // never opens a transaction that would evict the entities one.
+                let field_name = self.field_for_key(&key).await?;
+                // First occurrence wins on same-NAME collisions (cross-backend
+                // Name residue, or a Name and an Id that resolve to the same
+                // string). Same-collection id collisions can't reach here: they
+                // were deduped to distinct names at assignment.
+                if !seen_fields.insert(field_name.clone()) {
+                    continue;
+                }
+
+                // Set field directly on entity object (no prefix - they become the primary fields)
+                // Use IdbValue encoding to ensure fields are IndexedDB-key-compatible (bool as 0/1, etc.)
+                let js_value = match value {
+                    Some(ref prop_value) => crate::idb_value::IdbValue::from(prop_value).into(),
+                    None => JsValue::NULL,
+                };
+                entity_obj.set(&field_name, js_value)?;
+            }
+        }
+
+        Ok(())
+    }
+
     async fn execute_plan_query(
         &self,
         index: &web_sys::IdbIndex,
@@ -339,6 +592,9 @@ impl IndexedDBBucket {
         eq_prefix_values: Vec<ankurah_core::value::Value>,
         order_by_spill: &OrderByComponents,
     ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+        // Resolved on the first row that needs stamping: an empty scan on a
+        // cold catalog must return empty, not a model-resolution error.
+        let mut model_memo: Option<ankurah_proto::EntityId> = None;
         let needs_spill_sort = !order_by_spill.spill.is_empty();
 
         // Determine effective prefix guard config (can be disabled in debug builds for testing)
@@ -364,8 +620,17 @@ impl IndexedDBBucket {
         while let Some(result) = stream.next().await {
             let entity_obj = result?;
 
+            let model = match model_memo {
+                Some(model) => model,
+                None => {
+                    let model = self.model_id()?;
+                    model_memo = Some(model);
+                    model
+                }
+            };
+
             // Create IdbRecord - wraps JS object with lazy value extraction
-            let record = match IdbRecord::new(entity_obj, collection_id.clone()) {
+            let record = match IdbRecord::new(entity_obj, collection_id.clone(), model) {
                 Ok(r) => r,
                 Err(_) => continue,
             };
@@ -429,17 +694,20 @@ struct IdbRecord {
     id: ankurah_proto::EntityId,
     object: Object,
     collection_id: ankurah_proto::CollectionId,
+    /// The model id stamped on reconstructed envelopes (#330), resolved once
+    /// by the bucket at record construction.
+    model: ankurah_proto::EntityId,
 }
 
 impl IdbRecord {
     /// Create a new IdbRecord from a JS object
-    fn new(object: Object, collection_id: ankurah_proto::CollectionId) -> Result<Self, RetrievalError> {
+    fn new(object: Object, collection_id: ankurah_proto::CollectionId, model: ankurah_proto::EntityId) -> Result<Self, RetrievalError> {
         let id: ankurah_proto::EntityId = object.get(&ID_KEY)?;
-        Ok(Self { id, object, collection_id })
+        Ok(Self { id, object, collection_id, model })
     }
 
     /// Get the entity state (converts from JS object on demand)
-    fn entity_state(&self) -> Result<Attested<EntityState>, RetrievalError> { js_object_to_entity_state(&self.object, &self.collection_id) }
+    fn entity_state(&self) -> Result<Attested<EntityState>, RetrievalError> { js_object_to_entity_state(&self.object, self.model) }
 
     /// Extract property values needed for sorting
     fn extract_sort_properties(&self, order_by: &OrderByComponents) -> std::collections::BTreeMap<String, ankurah_core::value::Value> {
@@ -483,11 +751,9 @@ fn extract_sort_properties(
     map
 }
 
-/// Convert JS object to EntityState using the correct field extraction
-fn js_object_to_entity_state(
-    entity_obj: &Object,
-    collection_id: &ankurah_proto::CollectionId,
-) -> Result<Attested<EntityState>, RetrievalError> {
+/// Convert JS object to EntityState using the correct field extraction.
+/// `model` is the model id stamped on the reconstructed envelope (#330).
+fn js_object_to_entity_state(entity_obj: &Object, model: ankurah_proto::EntityId) -> Result<Attested<EntityState>, RetrievalError> {
     use crate::statics::{ATTESTATIONS_KEY, HEAD_KEY, ID_KEY, STATE_BUFFER_KEY};
     use ankurah_proto::{Attested, EntityId, EntityState, State};
 
@@ -495,7 +761,7 @@ fn js_object_to_entity_state(
     let id: EntityId = entity_obj.get(&ID_KEY)?;
 
     let entity_state = EntityState {
-        collection: collection_id.clone(),
+        model,
         entity_id: id,
         state: State { state_buffers: entity_obj.get(&STATE_BUFFER_KEY)?, head: entity_obj.get(&HEAD_KEY)? },
     };
@@ -504,36 +770,6 @@ fn js_object_to_entity_state(
     let attested_state = Attested { payload: entity_state, attestations };
 
     Ok(attested_state)
-}
-
-/// Extract all fields from entity state and set them directly on the IndexedDB entity object
-fn extract_all_fields(entity_obj: &Object, entity_state: &EntityState) -> Result<(), MutationError> {
-    use ankurah_core::property::backend::backend_from_string;
-    use std::collections::HashSet;
-
-    let mut seen_fields = HashSet::new();
-
-    // Process all property values from state buffers
-    for (backend_name, state_buffer) in entity_state.state.state_buffers.iter() {
-        let backend = backend_from_string(backend_name, Some(state_buffer)).map_err(|e| MutationError::General(Box::new(e)))?;
-
-        for (field_name, value) in backend.property_values() {
-            // Use first occurrence (like Postgres) to handle field name collisions
-            if !seen_fields.insert(field_name.clone()) {
-                continue;
-            }
-
-            // Set field directly on entity object (no prefix - they become the primary fields)
-            // Use IdbValue encoding to ensure fields are IndexedDB-key-compatible (bool as 0/1, etc.)
-            let js_value = match value {
-                Some(ref prop_value) => crate::idb_value::IdbValue::from(prop_value).into(),
-                None => JsValue::NULL,
-            };
-            entity_obj.set(&field_name, js_value)?;
-        }
-    }
-
-    Ok(())
 }
 
 /// Amend a selection with __collection = 'value' comparison

@@ -1,15 +1,23 @@
-//! Phase A "epoch flip" integration tests (RFC 5.5 in specs/model-property-metadata/rfc.md): after the wire switch,
-//! USER-collection entities emit the id-keyed (v2) LWW encoding -- state
-//! buffer header 0xA2, diff version byte 2, resolved Identifier selections --
-//! while the catalog and system collections stay name-keyed (0xA1/v1, the RFC
-//! 4 bootstrap exemption). These tests pin the observable consequences of the
-//! flip end to end: on-disk bytes, a two-node round trip, the legacy
-//! read-fallback with lazy rewrite-on-save, sled materialization through the
-//! hint projection, and fail-closed resolution.
+//! Phase A wire-encoding integration tests (RFC 5.5 in specs/model-property-metadata/rfc.md).
+//!
+//! POST-#289: the two-mode wire flip was collapsed to a SINGLE id-keyed
+//! encoding. Every LWW state buffer this build emits is 0xA2 (payload
+//! `BTreeMap<PropertyKey, CommittedEntry>`) and every diff is version 2,
+//! whatever the collection -- user, catalog, or system -- because the wire mode,
+//! the schema binding, and the display-name hint were all withdrawn (amendment
+//! #289). Name-keyed system/catalog data is simply carried under
+//! `PropertyKey::Name` inside the same 0xA2 container. The legacy name-keyed
+//! 0xA1 payload (and pre-0.9 unversioned buffers) still DECODE for backward
+//! compatibility but are never emitted.
+//!
+//! These tests pin the observable consequences: every emitted buffer is 0xA2
+//! and every diff v2; a two-node round trip over 0xA2 payloads; a legacy 0xA1
+//! buffer still loads, reads, and lazily rewrites to 0xA2 on edit; sled
+//! materialization of a 0xA2 buffer answers a field predicate; and fail-closed
+//! resolution.
 
 mod common;
 
-use ankurah::core::property::backend::{lww::LWWBackend, PropertyBackend};
 use ankurah::core::value::Value;
 use ankurah::proto;
 use ankurah::{policy::DEFAULT_CONTEXT as c, Node, PermissiveAgent};
@@ -24,10 +32,38 @@ use common::{Record, RecordView};
 // -- helpers ----------------------------------------------------------------
 
 /// The LWW state-buffer version header (first byte). Kept in sync with
-/// `core/src/property/backend/lww.rs` (0xA1 = name-keyed v1, 0xA2 = id-keyed
-/// v2). Hard-coded here because the constants are private to core.
+/// `core/src/property/backend/lww.rs` (0xA1 = legacy name-keyed v1, 0xA2 =
+/// current PropertyKey-keyed v2). Hard-coded here because the constants are
+/// private to core.
 const LWW_STATE_V1: u8 = 0xA1;
 const LWW_STATE_V2: u8 = 0xA2;
+
+/// Mirror of core's private `CommittedEntry` (value + provenance event id).
+/// Bincode serializes a struct field-by-field in declaration order, so this
+/// encodes byte-for-byte identically to core's type -- letting a test forge a
+/// genuine legacy 0xA1 buffer (whose EMISSION path core no longer has, only its
+/// DECODE path) to prove backward-compatible loading + rewrite-on-save.
+#[derive(serde::Serialize)]
+struct LegacyCommittedEntry {
+    value: Option<Value>,
+    event_id: proto::EventId,
+}
+
+/// Forge a legacy name-keyed 0xA1 LWW state buffer: the [`LWW_STATE_V1`] header
+/// byte followed by bincode of `BTreeMap<String, CommittedEntry>`, exactly the
+/// layout core's `from_state_buffer` decodes for version 0xA1. Every field
+/// shares one provenance `event_id`.
+fn build_legacy_v1_buffer(fields: &[(&str, &str)], event_id: proto::EventId) -> Vec<u8> {
+    let map: BTreeMap<String, LegacyCommittedEntry> = fields
+        .iter()
+        .map(|(name, value)| {
+            (name.to_string(), LegacyCommittedEntry { value: Some(Value::String((*value).to_owned())), event_id: event_id.clone() })
+        })
+        .collect();
+    let mut buffer = vec![LWW_STATE_V1];
+    bincode::serialize_into(&mut buffer, &map).expect("legacy v1 buffer serializes");
+    buffer
+}
 
 /// Mirror of the private `LWWDiff` header so a test can read a commit event's
 /// LWW operation version. Bincode serializes a struct as its fields in order,
@@ -61,10 +97,10 @@ fn record_property_id(node: &Node<SledStorageEngine, PermissiveAgent>, name: &st
     node.catalog.resolve("record", name).expect("record property resolves in the catalog after registration")
 }
 
-// -- (a) create + commit emits 0xA2 state and a v2 diff; catalog/system stay v1
+// -- (a) create + commit emits 0xA2 state and a v2 diff; catalog + system too
 
 #[tokio::test]
-async fn user_entity_state_is_0xa2_and_diff_is_v2_catalog_and_system_stay_v1() -> Result<()> {
+async fn every_emitted_state_is_0xa2_and_diff_is_v2() -> Result<()> {
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await;
@@ -78,25 +114,25 @@ async fn user_entity_state_is_0xa2_and_diff_is_v2_catalog_and_system_stay_v1() -
         (id, events)
     };
 
-    // The stored user-entity state buffer is 0xA2 (id-keyed v2).
-    assert_eq!(lww_state_version(&node, "record", rec_id).await?, LWW_STATE_V2, "user entity state buffer must be 0xA2 after the flip");
+    // The stored user-entity state buffer is 0xA2 (the sole encoding).
+    assert_eq!(lww_state_version(&node, "record", rec_id).await?, LWW_STATE_V2, "user entity state buffer must be 0xA2");
 
     // Its commit event's LWW diff version byte is 2.
     let record_event = events.iter().find(|e| e.entity_id == rec_id).expect("a commit event for the record");
     assert_eq!(lww_diff_version(record_event), 2, "user entity commit diff must be LWW v2");
 
-    // A catalog entity (the `title` property definition) stays 0xA1: the
-    // registration triggered by create wrote it name-keyed (bootstrap exemption).
+    // POST-#289: there is ONE encoding. A catalog entity (the `title` property
+    // definition) and the system root are ALSO 0xA2 -- their name-keyed data
+    // rides under `PropertyKey::Name` inside the same 0xA2 container, not a
+    // separate 0xA1 mode (the wire flip / bootstrap-exemption split is gone).
     let title_property_id = record_property_id(&node, "title");
     assert_eq!(
         lww_state_version(&node, "_ankurah_property", title_property_id).await?,
-        LWW_STATE_V1,
-        "catalog property entity must remain 0xA1 (name-keyed)"
+        LWW_STATE_V2,
+        "catalog property entity is also 0xA2 (name data carried inside the single encoding)"
     );
-
-    // The system root stays 0xA1 as well.
     let root_id = node.system.root().unwrap().payload.entity_id;
-    assert_eq!(lww_state_version(&node, "_ankurah_system", root_id).await?, LWW_STATE_V1, "system root must remain 0xA1 (name-keyed)");
+    assert_eq!(lww_state_version(&node, "_ankurah_system", root_id).await?, LWW_STATE_V2, "system root is also 0xA2");
 
     Ok(())
 }
@@ -164,24 +200,24 @@ async fn legacy_v1_state_reads_then_rewrites_to_0xa2_on_edit() -> Result<()> {
         trx.commit().await?;
     }
 
-    // Build a LEGACY name-keyed (0xA1) state for a NEW record id, exactly as a
-    // pre-flip node would have written it, and set it directly into storage.
+    // Build a genuine LEGACY name-keyed (0xA1) state for a NEW record id,
+    // exactly as a pre-flip node would have written it, and set it directly into
+    // storage. This build no longer EMITS 0xA1 (single encoding), so the buffer
+    // is forged from the on-disk layout core still DECODES.
     let legacy_id = proto::EntityId::new();
     let legacy_event_id = proto::EventId::from_bytes([5u8; 32]);
     let legacy_state = {
-        let backend = LWWBackend::new(); // default NameKeyedV1 -> 0xA1
-        backend.set("title".into(), Some(Value::String("legacy-title".to_owned())));
-        backend.set("artist".into(), Some(Value::String("legacy-artist".to_owned())));
-        let ops = backend.to_operations().unwrap().unwrap();
-        backend.apply_operations_with_event(&ops, legacy_event_id.clone()).unwrap();
-        let buffer = backend.to_state_buffer().unwrap();
+        let buffer = build_legacy_v1_buffer(&[("title", "legacy-title"), ("artist", "legacy-artist")], legacy_event_id.clone());
         assert_eq!(buffer[0], LWW_STATE_V1, "seeded legacy buffer must be 0xA1");
         let mut state_buffers = BTreeMap::new();
         state_buffers.insert("lww".to_owned(), buffer);
         proto::State { state_buffers: proto::StateBuffers(state_buffers), head: proto::Clock::from(vec![legacy_event_id]) }
     };
     let storage = node.collections.get(&"record".into()).await?;
-    let entity_state = proto::EntityState { entity_id: legacy_id, collection: "record".into(), state: legacy_state };
+    // #330: EntityState carries a model id; Record was registered by the warming
+    // create above, so resolve it from the catalog.
+    let record_model = node.catalog.model_id_for("record").expect("record registered by the warming create above");
+    let entity_state = proto::EntityState { entity_id: legacy_id, model: record_model, state: legacy_state };
     storage.set_state(proto::Attested::opt(entity_state, None)).await?;
 
     // Read it back through the node: values readable despite the 0xA1 encoding.
@@ -206,7 +242,7 @@ async fn legacy_v1_state_reads_then_rewrites_to_0xa2_on_edit() -> Result<()> {
     Ok(())
 }
 
-// -- (d) sled materialization of a v2 buffer via the hint projection ---------
+// -- (d) sled materialization of a 0xA2 buffer answers a field predicate -----
 
 #[tokio::test]
 async fn sled_materialization_of_v2_entity_matches_field_predicate() -> Result<()> {
@@ -224,9 +260,10 @@ async fn sled_materialization_of_v2_entity_matches_field_predicate() -> Result<(
     };
     assert_eq!(lww_state_version(&node, "record", rec_id).await?, LWW_STATE_V2, "entity stored as 0xA2");
 
-    // A predicate fetch on a field must return the entity: sled materializes
-    // rows by parsing state buffers UNBOUND, so this proves the display-name
-    // HINT in the 0xA2 buffer projects the id-keyed value for materialization.
+    // A predicate fetch on a field must return the entity: this proves sled
+    // materializes the id-keyed 0xA2 buffer into queryable rows (the storage
+    // engine resolves fields for materialization; the withdrawn display-name
+    // hint is no longer involved).
     let results = ctx.fetch::<RecordView>("title = 'findme'").await?;
     let ids: Vec<_> = results.iter().map(|v| v.id()).collect();
     assert!(ids.contains(&rec_id), "predicate fetch on a v2-materialized field must return the entity");

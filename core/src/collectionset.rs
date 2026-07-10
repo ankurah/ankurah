@@ -46,13 +46,17 @@ impl<SE: StorageEngine> CollectionSet<SE> {
 
         let mut collections = self.0.collections.write().await;
 
-        // We might have raced with another node to create this collection
-        if let Entry::Vacant(entry) = collections.entry(id.clone()) {
-            entry.insert(collection.clone());
-        }
+        // We might have raced with another caller to create this collection.
+        // Whoever wins the map slot owns the canonical bucket and its durable
+        // column-map cache; every caller must return that shared bucket, not
+        // its own just-built duplicate, or the two buckets' caches diverge.
+        let canonical = match collections.entry(id.clone()) {
+            Entry::Vacant(entry) => entry.insert(collection).clone(),
+            Entry::Occupied(entry) => entry.get().clone(),
+        };
         drop(collections);
 
-        Ok(collection)
+        Ok(canonical)
     }
 
     pub async fn list_collections(&self) -> Result<Vec<CollectionId>, RetrievalError> {
@@ -66,6 +70,13 @@ impl<SE: StorageEngine> CollectionSet<SE> {
     /// only the catalog collections that exist, so a schema-less node never
     /// materializes empty `_ankurah_*` trees.
     pub async fn engine_collections(&self) -> Result<Vec<CollectionId>, RetrievalError> { self.0.storage_engine.list_collections().await }
+
+    /// Forward the catalog resolver to the engine (see
+    /// [`StorageEngine::set_property_resolver`]). Called once from `Node`
+    /// construction.
+    pub(crate) fn set_property_resolver(&self, resolver: std::sync::Weak<dyn crate::property::PropertyResolver>) {
+        self.0.storage_engine.set_property_resolver(resolver);
+    }
 
     pub async fn delete_all_collections(&self) -> Result<bool, MutationError> {
         // Clear in-memory collections first

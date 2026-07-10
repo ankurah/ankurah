@@ -115,6 +115,7 @@ impl PolicyAgent for RejectingAgent {
         _id: &proto::EntityId,
         _collection: &proto::CollectionId,
         _state: &proto::State,
+        _resolver: Option<std::sync::Weak<dyn ankurah::core::property::PropertyResolver>>,
     ) -> std::result::Result<(), AccessDenied>
     where
         C: Iterable<Self::ContextData>,
@@ -122,8 +123,15 @@ impl PolicyAgent for RejectingAgent {
         Ok(())
     }
 
-    fn check_read_event<C>(&self, _data: &C, _event: &proto::Attested<proto::Event>) -> std::result::Result<(), AccessDenied>
-    where C: Iterable<Self::ContextData> {
+    fn check_read_event<C>(
+        &self,
+        _data: &C,
+        _collection: &proto::CollectionId,
+        _event: &proto::Attested<proto::Event>,
+    ) -> std::result::Result<(), AccessDenied>
+    where
+        C: Iterable<Self::ContextData>,
+    {
         Ok(())
     }
 

@@ -40,7 +40,7 @@ use std::{
 use ankurah_proto::{self as proto, CollectionId, EntityId, QueryId};
 use ankurah_signals::{porcelain::subscribe::SubscriptionGuard, Subscribe};
 use tokio::sync::Notify;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::{
     collectionset::CollectionSet,
@@ -48,7 +48,7 @@ use crate::{
     livequery::EntityLiveQuery,
     node::{Node, WeakNode},
     policy::PolicyAgent,
-    property::backend::{lww::SchemaBinding, LWWBackend, PropertyBackend},
+    property::backend::{LWWBackend, PropertyBackend},
     reactor::{AbstractEntity, GapFetcher, MembershipChange, Reactor, ReactorSubscription, ReactorUpdate},
     resultset::EntityResultSet,
     storage::StorageEngine,
@@ -243,33 +243,6 @@ impl CatalogMapInner {
     fn siblings_by_name(&self, name: &str) -> Vec<EntityId> {
         self.names_global.get(name).into_iter().flat_map(|s| s.iter().copied()).collect()
     }
-
-    /// Build a name<->id translation table for every property reachable via
-    /// `collection`'s model and its memberships (RFC 5.5 v2 binding). Returns
-    /// `None` when the collection has no model in the map yet (nothing to
-    /// bind). On a display-name collision (two ids share a name in one
-    /// contract, i.e. a retype lineage: no tombstones until #303) the FIRST
-    /// membership in id order wins the forward entry -- the SAME pick
-    /// [`Self::resolve`] makes, so query resolution and backend write/read
-    /// routing agree on which lineage a display name addresses -- while both
-    /// id->name entries are kept for projection and the RFC 5.4 sibling
-    /// gate. The loser is only reachable by id. Never fabricates an id the
-    /// contract does not contain.
-    fn binding_for(&self, collection: &str) -> Option<SchemaBinding> {
-        let model_id = self.by_collection.get(collection)?;
-        let membership_ids = self.model_memberships.get(model_id)?;
-        let mut to_id: BTreeMap<String, EntityId> = BTreeMap::new();
-        let mut to_name: BTreeMap<EntityId, String> = BTreeMap::new();
-        for mid in membership_ids {
-            if let Some(membership) = self.memberships.get(mid) {
-                if let Some(prop) = self.properties.get(&membership.property) {
-                    to_id.entry(prop.name.clone()).or_insert(prop.id);
-                    to_name.insert(prop.id, prop.name.clone());
-                }
-            }
-        }
-        Some(SchemaBinding { to_id, to_name })
-    }
 }
 
 // -- entity parsing ---------------------------------------------------------
@@ -335,7 +308,8 @@ fn parse_membership(entity: &Entity, id: EntityId) -> Option<MembershipDef> {
 fn parse_state(collection: &CollectionId, id: EntityId, state: &proto::EntityState) -> Option<Entry> {
     let buffer = state.state.state_buffers.0.get("lww")?;
     let backend = LWWBackend::from_state_buffer(buffer).ok()?;
-    let values = backend.property_values();
+    // Catalog entities are name-keyed (RFC section 4 bootstrap exemption).
+    let values = crate::property::name_keyed(backend.property_values());
     let get_string = |field: &str| match values.get(field) {
         Some(Some(Value::String(s))) => Some(s.clone()),
         _ => None,
@@ -469,6 +443,17 @@ where PA: PolicyAgent
     _pa: std::marker::PhantomData<PA>,
 }
 
+impl<SE, PA> crate::property::PropertyResolver for CatalogInner<SE, PA>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    fn resolve(&self, collection: &str, name: &str) -> Option<EntityId> { self.map.read().unwrap().resolve(collection, name) }
+    fn siblings(&self, name: &str) -> Vec<EntityId> { self.map.read().unwrap().siblings_by_name(name) }
+    fn name_for(&self, id: &EntityId) -> Option<String> { self.map.read().unwrap().properties.get(id).map(|def| def.name.clone()) }
+    fn model_id_for(&self, collection: &str) -> Option<EntityId> { self.map.read().unwrap().by_collection.get(collection).copied() }
+}
+
 impl<SE, PA> CatalogManager<SE, PA>
 where
     SE: StorageEngine + Send + Sync + 'static,
@@ -525,6 +510,12 @@ where
             system.wait_system_ready().await;
             if let Err(e) = me.warm_and_subscribe_durable().await {
                 error!("CatalogManager durable warm failed: {}", e);
+                // Readiness must still latch: ingress resolution
+                // (Node::resolve_model_wait) parks on it, and a permanently
+                // un-ready catalog would turn one failed warm into a hang.
+                // With a partial map, later resolutions reject loudly
+                // instead, which is the retryable failure mode we want.
+                me.mark_ready();
             }
         });
     }
@@ -581,7 +572,11 @@ where
         // were scanning). Only the catalog collections that already exist are
         // read; `get` (and thus fetch_states) would otherwise materialize
         // empty `_ankurah_*` trees on every schema-less durable node.
-        let existing = self.0.collectionset.engine_collections().await.unwrap_or_default();
+        // Propagate a listing failure rather than silently treating it as "no
+        // collections exist" (which would warm nothing and come up empty even
+        // though data is present). `start` catches this, logs it, and still
+        // latches readiness, so resolution rejects loudly instead of hanging.
+        let existing = self.0.collectionset.engine_collections().await?;
         for collection in &catalog {
             if !existing.contains(collection) {
                 continue;
@@ -693,6 +688,54 @@ where
         self.mark_ready();
     }
 
+    /// Ingest catalog definition states shipped on a wire envelope (#330
+    /// once-per-connection descriptor shipping): parse each into its def and
+    /// upsert the in-memory map, exactly like the storage warm. Map-only -- a
+    /// cache warm; the durable catalog entities still replicate through the
+    /// ordinary subscription paths. States whose model id is not a well-known
+    /// catalog collection are ignored (defense in depth; the sender only
+    /// ships catalog entities).
+    pub(crate) fn ingest_wire_states(&self, states: &[proto::Attested<proto::EntityState>]) {
+        if states.is_empty() {
+            return;
+        }
+        let mut map = self.0.map.write().unwrap();
+        for state in states {
+            let Some(collection) = crate::schema::well_known_collection(&state.payload.model) else { continue };
+            if !crate::schema::is_catalog_collection(&collection) {
+                continue;
+            }
+            match parse_state(&collection, state.payload.entity_id, &state.payload) {
+                Some(Entry::Model(def)) => {
+                    // The `schema` envelope field is untrusted and a wider
+                    // ingress than the durable subscription it shortcuts, so a
+                    // wire model def gets two guards beyond parse_state's shape
+                    // check:
+                    //  - it must not name a reserved collection. No legitimate
+                    //    catalog entity describes an `_ankurah_*` collection
+                    //    (the well-known ids have no catalog entity), so such a
+                    //    def could only be an attempt to route ordinary traffic
+                    //    into a protected collection.
+                    //  - it must not REBIND a collection already mapped to a
+                    //    different model id: that would hijack the egress
+                    //    stamping of an existing collection. The authoritative
+                    //    binding arrives through the durable subscription/warm
+                    //    path, which does not pass through this guard.
+                    if def.collection.starts_with(crate::schema::RESERVED_COLLECTION_PREFIX) {
+                        warn!("ignoring shipped model def {} naming reserved collection '{}'", def.id, def.collection);
+                    } else if map.by_collection.get(&def.collection).map_or(false, |existing| *existing != def.id) {
+                        warn!("ignoring shipped model def {} rebinding collection '{}'", def.id, def.collection);
+                    } else {
+                        map.upsert_model(def);
+                    }
+                }
+                Some(Entry::Property(def)) => map.upsert_property(def),
+                Some(Entry::Membership(def)) => map.upsert_membership(def),
+                None => {}
+            }
+        }
+    }
+
     /// Apply one reactor update to the map: Remove drops, everything else
     /// upserts. Idempotent (keyed by entity id).
     fn apply_reactor_update(&self, update: ReactorUpdate) {
@@ -773,14 +816,17 @@ where
     /// The property named `name` in `collection` (RFC 5.2 name lookup).
     pub fn resolve(&self, collection: &str, name: &str) -> Option<EntityId> { self.0.map.read().unwrap().resolve(collection, name) }
 
-    /// A `SchemaBinding` (name<->id for every property reachable via the
-    /// collection's model and memberships) for attaching to a user-collection
-    /// LWW backend so it emits the id-keyed (v2) encoding (RFC 5.5). Returns
-    /// `None` when the collection has no model in the catalog yet. Built fresh
-    /// from the current map on each call (RFC 5.5 Phase A: construct at attach
-    /// time; a cached Arc updated on catalog change is a later optimization).
-    pub fn binding_for(&self, collection: &CollectionId) -> Option<Arc<SchemaBinding>> {
-        self.0.map.read().unwrap().binding_for(collection.as_str()).map(Arc::new)
+    /// A weak handle to this catalog as a name-to-id resolver, stamped onto
+    /// entities at assembly for the sync read path (the PropertyKey amendment,
+    /// #289). Replaces the old per-collection `SchemaBinding` push: identity is
+    /// carried by the [`crate::property::PropertyKey`], not by a binding
+    /// injected into a property backend.
+    pub(crate) fn resolver_weak(&self) -> std::sync::Weak<dyn crate::property::PropertyResolver> {
+        // Downgrade to the concrete Weak first, then let the return type coerce
+        // it to the trait object (CoerceUnsized on Weak); annotating the local
+        // as the dyn type instead would wrongly force `downgrade`'s parameter.
+        let weak = Arc::downgrade(&self.0);
+        weak
     }
 
     pub fn property_by_id(&self, id: &EntityId) -> Option<PropertyDef> { self.0.map.read().unwrap().properties.get(id).cloned() }
@@ -789,6 +835,28 @@ where
         let map = self.0.map.read().unwrap();
         let id = map.by_collection.get(collection)?;
         map.models.get(id).cloned()
+    }
+
+    /// INGRESS resolution for the wire envelope (#330): the collection a
+    /// model-definition id routes to. Well-known (system/catalog) ids first
+    /// -- the bootstrap base case, answerable on a stone-cold node -- then
+    /// the catalog map. `None` means the model is unknown here, which after
+    /// descriptor shipping is a protocol violation the caller rejects loudly.
+    pub fn collection_for_model(&self, model: &EntityId) -> Option<CollectionId> {
+        if let Some(collection) = crate::schema::well_known_collection(model) {
+            return Some(collection);
+        }
+        let map = self.0.map.read().unwrap();
+        map.models.get(model).map(|def| CollectionId::fixed_name(&def.collection))
+    }
+
+    /// EGRESS resolution for the wire envelope (#330): the model-definition
+    /// id stamped on events/states for `collection`. Well-knowns first, then
+    /// the catalog map. `None` for an unregistered user collection -- the
+    /// commit path runs registration before event generation, so a miss
+    /// there is a bug, not a race.
+    pub fn model_id_for(&self, collection: &str) -> Option<EntityId> {
+        crate::schema::well_known_model_id(collection).or_else(|| self.0.map.read().unwrap().by_collection.get(collection).copied())
     }
 
     pub fn membership(&self, model: &EntityId, property: &EntityId) -> Option<MembershipDef> {

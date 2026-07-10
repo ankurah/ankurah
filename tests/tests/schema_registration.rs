@@ -47,7 +47,10 @@ async fn catalog_values(node: &TestNode, collection: &str, id: EntityId) -> anyh
     let storage = node.collections.get(&collection.into()).await?;
     let state = storage.get_state(id).await?;
     let buffer = state.payload.state.state_buffers.0.get("lww").expect("catalog entities are LWW").clone();
-    Ok(LWWBackend::from_state_buffer(&buffer)?.property_values())
+    // Catalog collections stay name-keyed (RFC 4 bootstrap exemption), so the
+    // PropertyKey-keyed backend values are all `Name`; project to their display
+    // names for the by-string lookups the assertions use.
+    Ok(LWWBackend::from_state_buffer(&buffer)?.property_values().into_iter().map(|(k, v)| (k.display_name(), v)).collect())
 }
 
 async fn catalog_head(node: &TestNode, collection: &str, id: EntityId) -> anyhow::Result<proto::Clock> {
@@ -605,6 +608,7 @@ impl ankurah::policy::PolicyAgent for ProbeAgent {
         _id: &proto::EntityId,
         _collection: &proto::CollectionId,
         _state: &proto::State,
+        _resolver: Option<std::sync::Weak<dyn ankurah::core::property::PropertyResolver>>,
     ) -> Result<(), ankurah::policy::AccessDenied>
     where
         C: ankurah::core::util::Iterable<Self::ContextData>,
@@ -612,8 +616,15 @@ impl ankurah::policy::PolicyAgent for ProbeAgent {
         Ok(())
     }
 
-    fn check_read_event<C>(&self, _data: &C, _event: &proto::Attested<proto::Event>) -> Result<(), ankurah::policy::AccessDenied>
-    where C: ankurah::core::util::Iterable<Self::ContextData> {
+    fn check_read_event<C>(
+        &self,
+        _data: &C,
+        _collection: &proto::CollectionId,
+        _event: &proto::Attested<proto::Event>,
+    ) -> Result<(), ankurah::policy::AccessDenied>
+    where
+        C: ankurah::core::util::Iterable<Self::ContextData>,
+    {
         Ok(())
     }
 
@@ -765,7 +776,11 @@ async fn partial_registration_retry_does_not_double_allocate() -> anyhow::Result
         let armed = armed.clone();
         ProbeAgent {
             on_event: Some(std::sync::Arc::new(move |event: &proto::Event| {
-                if event.collection.as_str() == PROPERTY && armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                // #330: events carry a model id, not a collection name; the
+                // _ankurah_property catalog collection has a well-known one.
+                let property_model =
+                    ankurah::core::schema::well_known_model_id(PROPERTY).expect("_ankurah_property has a well-known model id");
+                if event.model == property_model && armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
                     return Err(ankurah::policy::AccessDenied::ByPolicy("property event denied once"));
                 }
                 Ok(())

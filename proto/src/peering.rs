@@ -16,7 +16,11 @@ use crate::{id::EntityId, Attested, EntityState};
 /// - 1: the 0.9 wire shapes plus the versioned Presence handshake (#294).
 /// - 2: the Phase A id-keyed epoch: LWW diff v2 / state 0xA2, resolved
 ///   Identifier selections, RegisterSchema.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// - 3: the model-id wire envelope (#330): Event/EntityState/EntityDelta/
+///   SubscriptionUpdateItem carry the model-definition entity id instead of a
+///   collection name, and NodeUpdate/NodeResponse carry once-per-connection
+///   catalog schema defs.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Whether a peer advertising `remote` can interoperate with this binary.
 ///

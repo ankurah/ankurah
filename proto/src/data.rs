@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{auth::Attested, clock::Clock, collection::CollectionId, id::EntityId, AttestationSet, DecodeError};
+use crate::{auth::Attested, clock::Clock, id::EntityId, AttestationSet, DecodeError};
 
 #[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 pub struct EventId([u8; 32]);
@@ -101,7 +101,12 @@ impl<'de> Deserialize<'de> for EventId {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Event {
-    pub collection: CollectionId,
+    /// The model-definition entity id this event's entity is read/mutated
+    /// under (#330). The wire carries the model ID, never a collection name:
+    /// receivers resolve it to local storage through well-known ids, the
+    /// catalog, and engine-owned mappings. Deliberately EXCLUDED from
+    /// [`EventId`] hashing, like the collection string before it.
+    pub model: EntityId,
     pub entity_id: EntityId,
     pub operations: OperationSet,
     /// The set of concurrent events (usually only one) which is the precursor of this event
@@ -126,9 +131,9 @@ impl From<Attested<Event>> for EventFragment {
     }
 }
 
-impl From<(EntityId, CollectionId, EventFragment)> for Attested<Event> {
-    fn from(value: (EntityId, CollectionId, EventFragment)) -> Self {
-        let event = Event { entity_id: value.0, collection: value.1, operations: value.2.operations, parent: value.2.parent };
+impl From<(EntityId, EntityId, EventFragment)> for Attested<Event> {
+    fn from(value: (EntityId, EntityId, EventFragment)) -> Self {
+        let event = Event { entity_id: value.0, model: value.1, operations: value.2.operations, parent: value.2.parent };
         Attested { payload: event, attestations: value.2.attestations }
     }
 }
@@ -142,9 +147,9 @@ pub struct StateFragment {
 impl From<Attested<EntityState>> for StateFragment {
     fn from(attested: Attested<EntityState>) -> Self { Self { state: attested.payload.state, attestations: attested.attestations } }
 }
-impl From<(EntityId, CollectionId, StateFragment)> for Attested<EntityState> {
-    fn from(value: (EntityId, CollectionId, StateFragment)) -> Self {
-        let entity_state = EntityState { entity_id: value.0, collection: value.1, state: value.2.state };
+impl From<(EntityId, EntityId, StateFragment)> for Attested<EntityState> {
+    fn from(value: (EntityId, EntityId, StateFragment)) -> Self {
+        let entity_state = EntityState { entity_id: value.0, model: value.1, state: value.2.state };
         Attested { payload: entity_state, attestations: value.2.attestations }
     }
 }
@@ -183,7 +188,8 @@ pub struct Operation {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct EntityState {
     pub entity_id: EntityId,
-    pub collection: CollectionId,
+    /// The model-definition entity id (#330); see [`Event::model`].
+    pub model: EntityId,
     pub state: State,
 }
 
@@ -209,7 +215,7 @@ impl std::fmt::Display for Event {
             f,
             "Event({} {}/{} {}{} {})",
             self.id().to_base64_short(),
-            self.collection,
+            self.model.to_base64_short(),
             self.entity_id.to_base64_short(),
             if self.is_entity_create() { "(create) " } else { "" },
             self.parent.to_base64_short(),
@@ -252,7 +258,7 @@ impl std::fmt::Display for EntityState {
 }
 
 impl Attested<Event> {
-    pub fn collection(&self) -> &CollectionId { &self.payload.collection }
+    pub fn model(&self) -> EntityId { self.payload.model }
 }
 
 impl From<Event> for Attested<Event> {
@@ -264,17 +270,17 @@ impl From<EntityState> for Attested<EntityState> {
 }
 
 impl Attested<EntityState> {
-    pub fn to_parts(self) -> (EntityId, CollectionId, StateFragment) {
-        (self.payload.entity_id, self.payload.collection, StateFragment { state: self.payload.state, attestations: self.attestations })
+    pub fn to_parts(self) -> (EntityId, EntityId, StateFragment) {
+        (self.payload.entity_id, self.payload.model, StateFragment { state: self.payload.state, attestations: self.attestations })
     }
-    pub fn from_parts(entity_id: EntityId, collection: CollectionId, fragment: StateFragment) -> Self {
-        Self { payload: EntityState { entity_id, collection, state: fragment.state }, attestations: fragment.attestations }
+    pub fn from_parts(entity_id: EntityId, model: EntityId, fragment: StateFragment) -> Self {
+        Self { payload: EntityState { entity_id, model, state: fragment.state }, attestations: fragment.attestations }
     }
 }
 
 impl Attested<Event> {
-    pub fn from_parts(entity_id: EntityId, collection: CollectionId, frag: EventFragment) -> Self {
-        Self { payload: Event { entity_id, collection, operations: frag.operations, parent: frag.parent }, attestations: frag.attestations }
+    pub fn from_parts(entity_id: EntityId, model: EntityId, frag: EventFragment) -> Self {
+        Self { payload: Event { entity_id, model, operations: frag.operations, parent: frag.parent }, attestations: frag.attestations }
     }
 }
 

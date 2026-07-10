@@ -112,6 +112,7 @@ impl PolicyAgent for BridgePolicyAgent {
         _id: &proto::EntityId,
         _collection: &proto::CollectionId,
         _state: &proto::State,
+        _resolver: Option<std::sync::Weak<dyn ankurah::core::property::PropertyResolver>>,
     ) -> Result<(), AccessDenied>
     where
         C: Iterable<Self::ContextData>,
@@ -119,8 +120,15 @@ impl PolicyAgent for BridgePolicyAgent {
         Ok(())
     }
 
-    fn check_read_event<C>(&self, _data: &C, event: &Attested<proto::Event>) -> Result<(), AccessDenied>
-    where C: Iterable<Self::ContextData> {
+    fn check_read_event<C>(
+        &self,
+        _data: &C,
+        _collection: &proto::CollectionId,
+        event: &Attested<proto::Event>,
+    ) -> Result<(), AccessDenied>
+    where
+        C: Iterable<Self::ContextData>,
+    {
         if self.deny_read_events.lock().unwrap().contains(&event.payload.id()) {
             return Err(AccessDenied::ByPolicy("event read denied by test agent"));
         }
