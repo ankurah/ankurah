@@ -15,6 +15,7 @@ pub(crate) mod frontier;
 pub(crate) mod layers;
 pub mod ordering;
 pub mod relation;
+pub mod stats;
 #[cfg(test)]
 mod tests;
 

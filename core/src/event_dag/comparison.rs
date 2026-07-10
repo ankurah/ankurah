@@ -319,6 +319,7 @@ impl<'a, E: GetEvents> Comparison<'a, E> {
             };
             self.accumulator.accumulate(&event);
             self.remaining_budget = self.remaining_budget.saturating_sub(1);
+            self.accumulator.stats.budget_decrements += 1;
             self.process_event(event.id(), event.parent.as_slice());
         }
 
