@@ -1233,19 +1233,38 @@ impl WeakEntitySet {
         S: GetState + Send + Sync,
         E: GetEvents + Send + Sync,
     {
-        // do it in two phases to avoid holding the lock while waiting for the collection
+        // do it in two phases to avoid holding the map lock while waiting for storage
         match self.get(id) {
             Some(entity) => Ok(Some(entity)),
-            None => match state_getter.get_state(*id).await? {
-                None => Ok(None),
-                Some(state) => {
-                    // technically someone could have added the entity since we last checked, so it's better to use the
-                    // with_state method to re-check
-                    let (_, entity) =
-                        self.with_state(state_getter, event_getter, *id, collection_id.to_owned(), state.payload.state).await?;
-                    Ok(Some(entity))
+            None => {
+                // M4 remediation item 6 (the materialization-porosity pin):
+                // the WHOLE read-then-insert span holds the reset fence in
+                // read mode, so it cannot straddle a hard_reset. A
+                // materialization either completes before the reset (its
+                // insert is then purged with everything else) or starts
+                // after the wipe (post-wipe storage yields nothing and the
+                // id resolves clean). Without the fence, a read completing
+                // before the wipe could insert a dead-system resident into
+                // the PURGED map. apply_state runs after the guard drops
+                // (it can await event retrieval, including peer fetches,
+                // and must not hold the fence). Acquired once here, never
+                // nested (see the reset_fence field doc).
+                let (needs_apply, entity, state) = {
+                    let _fence = self.reset_fence_read().await;
+                    match state_getter.get_state(*id).await? {
+                        None => return Ok(None),
+                        Some(state) => {
+                            let (needs_apply, entity) =
+                                self.materialize_not_resident(state_getter, *id, collection_id, &state.payload.state).await?;
+                            (needs_apply, entity, state.payload.state)
+                        }
+                    }
+                };
+                if needs_apply {
+                    entity.apply_state(event_getter, &state).await?;
                 }
-            },
+                Ok(Some(entity))
+            }
         }
     }
     /// Returns a resident entity, or fetches it from storage, or finally creates if neither of the two are found
@@ -1337,6 +1356,38 @@ impl WeakEntitySet {
         Ok((false, entity))
     }
 
+    /// The not-resident half of a two-phase materialization: read the
+    /// stored baseline, then insert (M4 remediation item 6). CALLER HOLDS
+    /// THE RESET FENCE in read mode across this whole call, so the read
+    /// and the insert land on the same side of any hard_reset. Returns
+    /// (needs_apply, entity): the caller applies its in-hand state after
+    /// dropping the fence, except when the entity was created FROM that
+    /// state (nothing to apply).
+    async fn materialize_not_resident<S>(
+        &self,
+        state_getter: &S,
+        id: EntityId,
+        collection_id: &CollectionId,
+        fallback: &State,
+    ) -> Result<(bool, Entity), RetrievalError>
+    where
+        S: GetState + Send + Sync,
+    {
+        if let Some(stored_state) = state_getter.get_state(id).await? {
+            // A stored baseline exists: seed the resident from it; the
+            // caller's state applies on top (it may equal, descend from, or
+            // diverge against the baseline; apply_state compares).
+            Ok((true, self.private_get_or_create(id, collection_id, &stored_state.payload.state)?.1))
+        } else {
+            match self.private_get_or_create(id, collection_id, fallback)? {
+                // Somebody frontran us to create it: apply the caller's state.
+                (true, entity) => Ok((true, entity)),
+                // Freshly created from the caller's state: nothing to apply.
+                (false, entity) => Ok((false, entity)),
+            }
+        }
+    }
+
     /// Returns a tuple of (changed, entity)
     /// changed is Some(true) if the entity was changed, Some(false) if it already exists and the state was not applied
     /// None if the entity was not previously on the local node (either in the WeakEntitySet or in storage)
@@ -1352,26 +1403,24 @@ impl WeakEntitySet {
         S: GetState + Send + Sync,
         E: GetEvents + Send + Sync,
     {
-        let entity = match self.get(&id) {
-            Some(entity) => entity, // already resident
+        let (needs_apply, entity) = match self.get(&id) {
+            Some(entity) => (true, entity), // already resident
             None => {
-                // not yet resident. We have to retrieve our baseline state before applying the new state
-                if let Some(stored_state) = state_getter.get_state(id).await? {
-                    // get a resident entity for this retrieved state. It's possible somebody frontran us to create it
-                    // but we don't actually care, so we ignore the created flag
-                    self.private_get_or_create(id, &collection_id, &stored_state.payload.state)?.1
-                } else {
-                    // no stored state, so we can use the given state directly
-                    match self.private_get_or_create(id, &collection_id, &state)? {
-                        (true, entity) => entity, // some body frontran us to create it, so we have to apply the new state
-                        (false, entity) => {
-                            // we just created it with the given state, so there's nothing to apply. early return
-                            return Ok((None, entity));
-                        }
-                    }
-                }
+                // Not yet resident: the baseline read and the map insert
+                // run under the reset fence (read mode) so the two-phase
+                // materialization cannot straddle a hard_reset (M4
+                // remediation item 6; see get_or_retrieve). The guard drops
+                // at the end of this arm, BEFORE apply_state (which may
+                // await event retrieval). Acquired once here, never nested.
+                let _fence = self.reset_fence_read().await;
+                self.materialize_not_resident(state_getter, id, &collection_id, &state).await?
             }
         };
+
+        if !needs_apply {
+            // we just created it with the given state, so there's nothing to apply. early return
+            return Ok((None, entity));
+        }
 
         // if we're here, we've retrieved the entity from the set and need to apply the state
         let result = entity.apply_state(event_getter, &state).await?;
