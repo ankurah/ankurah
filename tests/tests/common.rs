@@ -662,16 +662,28 @@ pub struct StorageInstruments {
     gate_open: Arc<tokio::sync::watch::Sender<bool>>,
     gate_rx: tokio::sync::watch::Receiver<bool>,
     parked: Arc<std::sync::atomic::AtomicUsize>,
+    /// Selective hold (the M4 remediation staging): while positive, each
+    /// arriving set_state claims one slot and parks; later arrivals pass
+    /// straight through the open gate. This is what lets a test hold ONE
+    /// lane's write open while a sibling lane's write proceeds, which the
+    /// all-or-nothing global gate cannot stage.
+    hold_next: Arc<std::sync::atomic::AtomicUsize>,
+    held_release: Arc<tokio::sync::watch::Sender<u64>>,
+    held_release_rx: tokio::sync::watch::Receiver<u64>,
 }
 
 impl StorageInstruments {
     fn new() -> Self {
         let (tx, rx) = tokio::sync::watch::channel(true);
+        let (held_tx, held_rx) = tokio::sync::watch::channel(0u64);
         Self {
             set_state_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             gate_open: Arc::new(tx),
             gate_rx: rx,
             parked: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            hold_next: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            held_release: Arc::new(held_tx),
+            held_release_rx: held_rx,
         }
     }
 
@@ -685,7 +697,17 @@ impl StorageInstruments {
     /// Reopen the gate, releasing every parked set_state in arrival order.
     pub fn open_gate(&self) { let _ = self.gate_open.send(true); }
 
-    /// Wait until at least `n` set_state calls are parked at the gate.
+    /// Arm the selective hold: the next `n` set_state arrivals park (they
+    /// count toward [`wait_until_parked`]) while every later arrival passes
+    /// straight through. Released by [`release_held`]; independent of the
+    /// global gate.
+    pub fn hold_next(&self, n: usize) { self.hold_next.fetch_add(n, std::sync::atomic::Ordering::SeqCst); }
+
+    /// Release every set_state parked by [`hold_next`]. The global gate is
+    /// untouched.
+    pub fn release_held(&self) { self.held_release.send_modify(|s| *s += 1); }
+
+    /// Wait until at least `n` set_state calls are parked (gate or hold).
     pub async fn wait_until_parked(&self, n: usize) {
         while self.parked.load(std::sync::atomic::Ordering::SeqCst) < n {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -732,7 +754,31 @@ pub struct InstrumentedCollection {
 impl ankurah::core::storage::StorageCollection for InstrumentedCollection {
     async fn set_state(&self, state: proto::Attested<proto::EntityState>) -> Result<bool, MutationError> {
         self.instruments.set_state_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if !*self.instruments.gate_rx.borrow() {
+        // Selective hold first: claim one slot if armed (compare-exchange so
+        // concurrent arrivals cannot double-claim a single slot).
+        let held = loop {
+            let cur = self.instruments.hold_next.load(std::sync::atomic::Ordering::SeqCst);
+            if cur == 0 {
+                break false;
+            }
+            if self
+                .instruments
+                .hold_next
+                .compare_exchange(cur, cur - 1, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
+                .is_ok()
+            {
+                break true;
+            }
+        };
+        if held {
+            self.instruments.parked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut rx = self.instruments.held_release_rx.clone();
+            let seq = *rx.borrow_and_update();
+            while *rx.borrow_and_update() <= seq {
+                rx.changed().await.expect("the release sender lives in StorageInstruments");
+            }
+            self.instruments.parked.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        } else if !*self.instruments.gate_rx.borrow() {
             self.instruments.parked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let mut rx = self.instruments.gate_rx.clone();
             while !*rx.borrow() {
