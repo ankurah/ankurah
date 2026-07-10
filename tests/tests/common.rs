@@ -670,12 +670,25 @@ pub struct StorageInstruments {
     hold_next: Arc<std::sync::atomic::AtomicUsize>,
     held_release: Arc<tokio::sync::watch::Sender<u64>>,
     held_release_rx: tokio::sync::watch::Receiver<u64>,
+    /// get_state EGRESS hold (the M4 materialization-porosity staging): a
+    /// held get_state parks AFTER its inner read completed, result in
+    /// hand, so a test can run something destructive between a storage
+    /// read finishing and its caller's continuation (e.g. the map insert
+    /// of a two-phase materialization). `get_skip` passes that many
+    /// completions untouched first, selecting WHICH read of a multi-read
+    /// flow is held.
+    get_skip: Arc<std::sync::atomic::AtomicUsize>,
+    get_hold: Arc<std::sync::atomic::AtomicUsize>,
+    get_parked: Arc<std::sync::atomic::AtomicUsize>,
+    get_release: Arc<tokio::sync::watch::Sender<u64>>,
+    get_release_rx: tokio::sync::watch::Receiver<u64>,
 }
 
 impl StorageInstruments {
     fn new() -> Self {
         let (tx, rx) = tokio::sync::watch::channel(true);
         let (held_tx, held_rx) = tokio::sync::watch::channel(0u64);
+        let (get_tx, get_rx) = tokio::sync::watch::channel(0u64);
         Self {
             set_state_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             gate_open: Arc::new(tx),
@@ -684,6 +697,11 @@ impl StorageInstruments {
             hold_next: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             held_release: Arc::new(held_tx),
             held_release_rx: held_rx,
+            get_skip: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            get_hold: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            get_parked: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            get_release: Arc::new(get_tx),
+            get_release_rx: get_rx,
         }
     }
 
@@ -710,6 +728,24 @@ impl StorageInstruments {
     /// Wait until at least `n` set_state calls are parked (gate or hold).
     pub async fn wait_until_parked(&self, n: usize) {
         while self.parked.load(std::sync::atomic::Ordering::SeqCst) < n {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Arm the get_state egress hold: the next `skip` completions pass
+    /// untouched, then the following `hold` park with their result in hand
+    /// until [`release_held_gets`].
+    pub fn hold_gets(&self, skip: usize, hold: usize) {
+        self.get_skip.fetch_add(skip, std::sync::atomic::Ordering::SeqCst);
+        self.get_hold.fetch_add(hold, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Release every get_state parked at the egress hold.
+    pub fn release_held_gets(&self) { self.get_release.send_modify(|s| *s += 1); }
+
+    /// Wait until at least `n` get_state calls are parked at the egress hold.
+    pub async fn wait_until_get_parked(&self, n: usize) {
+        while self.get_parked.load(std::sync::atomic::Ordering::SeqCst) < n {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
@@ -789,7 +825,54 @@ impl ankurah::core::storage::StorageCollection for InstrumentedCollection {
         self.inner.set_state(state).await
     }
     async fn get_state(&self, id: proto::EntityId) -> Result<proto::Attested<proto::EntityState>, ankurah::core::error::RetrievalError> {
-        self.inner.get_state(id).await
+        let result = self.inner.get_state(id).await;
+        // Egress hold: the read is already DONE (result in hand); a held
+        // call parks here so the caller's continuation runs after whatever
+        // the test interleaves. Skip slots resolve first.
+        let mut skipped = false;
+        loop {
+            let cur = self.instruments.get_skip.load(std::sync::atomic::Ordering::SeqCst);
+            if cur == 0 {
+                break;
+            }
+            if self
+                .instruments
+                .get_skip
+                .compare_exchange(cur, cur - 1, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
+                .is_ok()
+            {
+                skipped = true;
+                break;
+            }
+        }
+        if !skipped {
+            let mut held = false;
+            loop {
+                let cur = self.instruments.get_hold.load(std::sync::atomic::Ordering::SeqCst);
+                if cur == 0 {
+                    break;
+                }
+                if self
+                    .instruments
+                    .get_hold
+                    .compare_exchange(cur, cur - 1, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
+                    .is_ok()
+                {
+                    held = true;
+                    break;
+                }
+            }
+            if held {
+                self.instruments.get_parked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut rx = self.instruments.get_release_rx.clone();
+                let seq = *rx.borrow_and_update();
+                while *rx.borrow_and_update() <= seq {
+                    rx.changed().await.expect("the release sender lives in StorageInstruments");
+                }
+                self.instruments.get_parked.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        result
     }
     async fn fetch_states(
         &self,

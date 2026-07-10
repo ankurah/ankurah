@@ -507,3 +507,82 @@ async fn hard_reset_drains_inflight_persists_before_wiping() -> Result<()> {
     assert_eq!(node.resident_count_for_test(), 0, "and the purge ran");
     Ok(())
 }
+
+/// THE MATERIALIZATION-POROSITY PIN (M4 remediation item 6, concurrency
+/// panel finding 1, MAJOR): the purge's one-id-one-system guarantee (plan
+/// REV 5 section D.1) must hold against IN-FLIGHT two-phase
+/// materialization, not only against entities already in the map. Every
+/// materialization path awaits a storage read and then inserts into the
+/// map with no re-check: a read that completed BEFORE a hard_reset can
+/// insert a dead-system resident AFTER the purge, leaving the successor
+/// system with a dead resident every ingest lane and context read can
+/// reach (and a state-feed lane can then persist into successor storage).
+///
+/// Staging: the record exists in storage but is NOT resident; a context
+/// get's baseline read (the with_state not-resident arm) is held at the
+/// get_state EGRESS, its pre-reset result in hand; a hard_reset runs; the
+/// release lets the materialization continue into its map insert. The pin
+/// asserts the dead id does NOT end up resident and successor storage does
+/// not contain it. Under the reset fence the interleaving is ordered
+/// instead: the reset drains the in-flight materialization (whose insert
+/// then lands pre-purge and is purged), so the assertions hold on either
+/// side of the race.
+#[tokio::test]
+async fn hard_reset_is_not_porous_to_inflight_materialization() -> Result<()> {
+    let engine = Arc::new(InstrumentedEngine::new(SledStorageEngine::new_test()?));
+    let instruments = engine.instruments();
+    let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
+    node.system.create().await?;
+    let ctx = node.context_async(c).await;
+
+    // Create the record and drop every strong reference: it lives in
+    // storage only.
+    let rec_id = {
+        let trx = ctx.begin();
+        let rec = trx.create(&Record { title: "stale".to_owned(), artist: "a0".to_owned() }).await?;
+        let id = rec.id();
+        trx.commit().await?;
+        id
+    };
+    assert!(node.get_resident_entity(rec_id).is_none(), "precondition: the record is not resident, storage only");
+
+    // A context get materializes in two phases: the direct storage read
+    // (passes, skip slot) and the with_state baseline read (held at the
+    // egress with the PRE-RESET state in hand).
+    instruments.hold_gets(1, 1);
+    let getter = {
+        let ctx = ctx.clone();
+        tokio::spawn(async move { ctx.get::<RecordView>(rec_id).await })
+    };
+    instruments.wait_until_get_parked(1).await;
+
+    // The reset: with the fence it drains the in-flight materialization
+    // first (this task blocks until the release below); without it (the
+    // pre-remediation world) it completes here and the release then
+    // inserts a dead-system resident into the purged map.
+    let reset = {
+        let node = node.clone();
+        tokio::spawn(async move { node.system.hard_reset().await })
+    };
+
+    instruments.release_held_gets();
+    let got = getter.await?;
+    reset.await??;
+
+    // THE PIN: the dead system's id must not be resident in the successor
+    // system (however the get itself resolved: fenced, its insert landed
+    // pre-purge and was purged; a held result is a frozen strong reference,
+    // not map residency).
+    assert!(
+        node.get_resident_entity(rec_id).is_none(),
+        "M4 remediation item 6: a storage read that began before a hard_reset must not insert a dead-system \
+         resident after the purge (the get resolved as {:?})",
+        got.as_ref().map(|view| view.id())
+    );
+    assert!(
+        engine.collection(&Record::collection()).await?.get_state(rec_id).await.is_err(),
+        "and successor storage does not contain the dead system's entity"
+    );
+    assert_eq!(node.resident_count_for_test(), 0, "the map holds nothing after the reset");
+    Ok(())
+}
