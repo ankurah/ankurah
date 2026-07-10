@@ -681,6 +681,7 @@ pub async fn start_test_server() -> anyhow::Result<(Node<SledStorageEngine, Perm
     }
 
     Err(anyhow::anyhow!("Failed to start test server after {} attempts. Last error: {:?}", MAX_PORT_RETRIES, last_error))
+}
 
 // ---------------------------------------------------------------------------
 // CountingGetEvents: a `GetEvents` wrapper that counts fetch calls, so a test

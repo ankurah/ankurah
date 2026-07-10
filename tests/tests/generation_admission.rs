@@ -271,6 +271,8 @@ async fn r_l_provably_mis_stamped_state_and_event_cargo_aborts_the_item() -> Res
     let forged_id = forged.id();
     let mut crafted_state = collection.get_state(rec_id).await?.payload.state.clone();
     crafted_state.head = proto::Clock::from(vec![forged_id.clone()]);
+    // The forger annotates its head consistently with its own lie.
+    crafted_state.head_generations = proto::GClock::from((forged.generation, forged_id.clone()));
 
     let err = NodeApplier::apply_updates_for_test(
         &client,
@@ -300,6 +302,7 @@ async fn r_l_provably_mis_stamped_state_and_event_cargo_aborts_the_item() -> Res
     let honest_id = honest.id();
     let mut honest_state = collection.get_state(rec_id).await?.payload.state.clone();
     honest_state.head = proto::Clock::from(vec![honest_id.clone()]);
+    honest_state.head_generations = proto::GClock::from((honest.generation, honest_id.clone()));
     NodeApplier::apply_updates_for_test(
         &client,
         &server.id,
@@ -319,7 +322,11 @@ async fn r_l_provably_mis_stamped_state_and_event_cargo_aborts_the_item() -> Res
     let h2_id = h2.id();
     // Only h2 travels; its parent h1 is never given to the client, so the
     // check is UNVERIFIABLE, not provably wrong.
-    let fresh_state = proto::State { state_buffers: proto::StateBuffers(BTreeMap::new()), head: proto::Clock::from(vec![h2_id.clone()]) };
+    let fresh_state = proto::State {
+        state_buffers: proto::StateBuffers(BTreeMap::new()),
+        head: proto::Clock::from(vec![h2_id.clone()]),
+        head_generations: proto::GClock::from((h2.generation, h2_id.clone())),
+    };
     NodeApplier::apply_updates_for_test(
         &client,
         &server.id,

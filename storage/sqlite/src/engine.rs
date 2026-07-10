@@ -11,7 +11,7 @@ use ankurah_core::selection::filter::evaluate_predicate;
 use ankurah_core::storage::{naming, StorageCollection, StorageEngine};
 use ankurah_core::{property::PropertyKey, schema::CatalogResolver};
 use ankurah_proto::{
-    AttestationSet, Attested, Clock, CollectionId, EntityId, EntityState, Event, EventId, OperationSet, State, StateBuffers,
+    AttestationSet, Attested, Clock, CollectionId, EntityId, EntityState, Event, EventId, GClock, OperationSet, State, StateBuffers,
 };
 use async_trait::async_trait;
 use rusqlite::{params_from_iter, Connection};
@@ -658,7 +658,7 @@ impl StorageCollection for SqliteBucket {
             payload: EntityState {
                 entity_id: id,
                 model: self.model_id()?,
-                state: State { state_buffers: StateBuffers(state_buffers), head },
+                state: State { state_buffers: StateBuffers(state_buffers), head, head_generations: GClock::default() },
             },
             attestations,
         })
@@ -759,7 +759,11 @@ impl StorageCollection for SqliteBucket {
                 let attestations: AttestationSet = bincode::deserialize(&attestations_blob).map_err(RetrievalError::storage)?;
 
                 results.push(Attested {
-                    payload: EntityState { entity_id: id, model, state: State { state_buffers: StateBuffers(state_buffers), head } },
+                    payload: EntityState {
+                        entity_id: id,
+                        model,
+                        state: State { state_buffers: StateBuffers(state_buffers), head, head_generations: GClock::default() },
+                    },
                     attestations,
                 });
             }
@@ -879,8 +883,10 @@ impl StorageCollection for SqliteBucket {
 
         let raw_rows = conn
             .with_connection(move |c| {
-                let query =
-                    format!(r#"SELECT "id", "operations", "parent", "generation", "attestations" FROM "{}" WHERE "entity_id" = ?"#, table_name);
+                let query = format!(
+                    r#"SELECT "id", "operations", "parent", "generation", "attestations" FROM "{}" WHERE "entity_id" = ?"#,
+                    table_name
+                );
 
                 let mut stmt = c.prepare(&query)?;
                 let rows = stmt.query_map([&entity_id_str], |row| {

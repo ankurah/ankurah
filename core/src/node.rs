@@ -892,6 +892,7 @@ where
                 }
             }
         }
+    }
 
     /// Phase one of the Atomic commit lanes (M6 remote, M7 local): stage one
     /// entity's events into per-call staging, plan them, typed-fail anything

@@ -190,7 +190,11 @@ impl StorageCollection for IndexedDBBucket {
                 payload: EntityState {
                     entity_id: id,
                     model: self.model_id()?,
-                    state: State { state_buffers: entity.get(&STATE_BUFFER_KEY)?, head: entity.get(&HEAD_KEY)? },
+                    state: State {
+                        state_buffers: entity.get(&STATE_BUFFER_KEY)?,
+                        head: entity.get(&HEAD_KEY)?,
+                        head_generations: Default::default(),
+                    },
                 },
                 attestations: entity.get(&ATTESTATIONS_KEY)?,
             })
@@ -833,7 +837,11 @@ fn js_object_to_entity_state(entity_obj: &Object, model: ankurah_proto::EntityId
     let entity_state = EntityState {
         model,
         entity_id: id,
-        state: State { state_buffers: entity_obj.get(&STATE_BUFFER_KEY)?, head: entity_obj.get(&HEAD_KEY)? },
+        state: State {
+            state_buffers: entity_obj.get(&STATE_BUFFER_KEY)?,
+            head: entity_obj.get(&HEAD_KEY)?,
+            head_generations: Default::default(),
+        },
     };
 
     let attestations = entity_obj.get(&ATTESTATIONS_KEY)?;

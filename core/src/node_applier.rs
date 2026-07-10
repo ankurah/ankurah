@@ -81,8 +81,7 @@ impl NodeApplier {
                 // re-drive integrates from. The getter shares the same area
                 // so BFS discovery and pipeline scheduling see one buffer.
                 let staging = node.staging_for(&collection_id);
-                let event_getter =
-                    CachedEventGetter::with_staging(collection_id, collection.clone(), node, &cdata, staging.clone());
+                let event_getter = CachedEventGetter::with_staging(collection_id, collection.clone(), node, &cdata, staging.clone());
                 let state_getter = LocalStateGetter::new(collection);
                 Self::apply_update(node, from_peer_id, update, &staging, &event_getter, &state_getter, &mut changes, &mut ()).await
             }
@@ -475,8 +474,7 @@ impl NodeApplier {
                 // back-fill of integrated-but-unstored events, advance-gated
                 // state persistence, and phantom eviction on failure.
                 let planned = async {
-                    let entity =
-                        node.entities.get_retrieve_or_create(state_getter, event_getter, &collection_id, &delta.entity_id).await?;
+                    let entity = node.entities.get_retrieve_or_create(state_getter, event_getter, &collection_id, &delta.entity_id).await?;
                     let plan = ingest::plan_entity(&entity.head(), &batch, staging, event_getter).await?;
                     Ok::<_, MutationError>((entity, plan))
                 }

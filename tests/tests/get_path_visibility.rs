@@ -43,7 +43,11 @@ fn forge_state(title: &str, artist: &str, head_event: proto::EventId) -> proto::
     let buf = backend.to_state_buffer().expect("LWW state buffer serializes");
     proto::State {
         state_buffers: proto::StateBuffers(BTreeMap::from([("lww".to_owned(), buf)])),
-        head: proto::Clock::from(vec![head_event]),
+        head: proto::Clock::from(vec![head_event.clone()]),
+        // The head event is fabricated (no payload exists anywhere), so the
+        // forged annotation claims genesis depth; the receiving ephemeral
+        // adopts it inside the state's trust envelope.
+        head_generations: proto::GClock::from((1, head_event)),
     }
 }
 

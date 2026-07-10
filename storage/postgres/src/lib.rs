@@ -11,7 +11,7 @@ use ankurah_core::{
     schema::CatalogResolver,
     storage::{naming, StorageCollection, StorageEngine},
 };
-use ankurah_proto::{Attestation, AttestationSet, Attested, EntityState, EventId, OperationSet, State, StateBuffers};
+use ankurah_proto::{Attestation, AttestationSet, Attested, EntityState, EventId, GClock, OperationSet, State, StateBuffers};
 
 use futures_util::{pin_mut, TryStreamExt};
 
@@ -692,7 +692,7 @@ impl StorageCollection for PostgresBucket {
             payload: EntityState {
                 entity_id: id,
                 model: self.model_id()?,
-                state: State { state_buffers: StateBuffers(state_buffers), head },
+                state: State { state_buffers: StateBuffers(state_buffers), head, head_generations: GClock::default() },
             },
             attestations: AttestationSet(attestations),
         })
@@ -814,7 +814,7 @@ impl StorageCollection for PostgresBucket {
                 payload: EntityState {
                     entity_id: id,
                     model: self.model_id()?,
-                    state: State { state_buffers: StateBuffers(state_buffers), head },
+                    state: State { state_buffers: StateBuffers(state_buffers), head, head_generations: GClock::default() },
                 },
                 attestations: AttestationSet(attestations),
             });
