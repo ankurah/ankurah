@@ -39,9 +39,36 @@ use super::{
     relation::AbstractCausalRelation,
 };
 use crate::error::RetrievalError;
+use crate::ingest::UnverifiedEvents;
 use crate::retrieval::GetEvents;
-use ankurah_proto::{Clock, EventId};
+use ankurah_proto::{Clock, EventId, GClock};
 use std::collections::{BTreeSet, HashMap};
+
+/// Generation operands and eligibility context for one comparison (D2 M5,
+/// plan D2-4). Everything here is ADVISORY acceleration input: per the
+/// 5b-ii usage discipline the values may only suppress a positive fast-path
+/// attempt or order the walk's schedule; the verdict and meet are identical
+/// for any assignment whatsoever (the gen-corruption immunity oracle pins
+/// exactly that at this seam, which is the outermost seam carrying the
+/// prechecks per dispositions Q5).
+#[derive(Default)]
+pub(crate) struct CompareOptions<'a> {
+    /// Per-tip generations of the SUBJECT clock, where materialized: the
+    /// in-hand event's own stamp on the apply_event lane, the incoming
+    /// state's carried annotation on the apply_state lane. None disables
+    /// the prechecks (never the walk).
+    pub(crate) subject_gens: Option<GClock>,
+    /// Per-tip generations of the COMPARISON clock, where materialized: the
+    /// resident's head annotation, snapshotted under the head lock together
+    /// with the head it annotates.
+    pub(crate) comparison_gens: Option<GClock>,
+    /// The node's admitted-unverified id set, consulted AT CONSUMPTION for
+    /// per-tip eligibility (D2-4: an unverified generation never feeds an
+    /// acceleration). None means no set is available and reads as empty,
+    /// the documented loss-safe degradation (unverified.rs: loss degrades
+    /// to default-eligible; suppress-only wiring caps the damage).
+    pub(crate) unverified: Option<&'a UnverifiedEvents>,
+}
 
 /// Compare two clocks to determine their causal relationship.
 ///
@@ -53,13 +80,31 @@ use std::collections::{BTreeSet, HashMap};
 ///
 /// Budget escalation: if the initial budget is exhausted, retries internally
 /// with up to 4x the initial budget before returning `BudgetExceeded`.
+///
+/// This form runs with no generation operands (prechecks disabled, schedule
+/// unkeyed); production callers holding materialized operands use
+/// `compare_with`.
 pub async fn compare<E: GetEvents>(
     event_getter: E,
     subject: &Clock,
     comparison: &Clock,
     budget: usize,
 ) -> Result<ComparisonResult<E>, RetrievalError> {
-    // Identical clocks (including two empty ones) are equal.
+    compare_with(event_getter, subject, comparison, budget, CompareOptions::default()).await
+}
+
+/// `compare` with generation operands (D2 M5): identical verdict semantics,
+/// plus the suppress-only P1/P2 prechecks and eligibility-keyed scheduling
+/// where the operands allow. See `CompareOptions`.
+pub(crate) async fn compare_with<E: GetEvents>(
+    event_getter: E,
+    subject: &Clock,
+    comparison: &Clock,
+    budget: usize,
+    opts: CompareOptions<'_>,
+) -> Result<ComparisonResult<E>, RetrievalError> {
+    let _ = &opts; // Inert until the precheck and ordering commits land (red-first).
+                   // Identical clocks (including two empty ones) are equal.
     if subject.as_slice() == comparison.as_slice() {
         let accumulator = EventAccumulator::new(event_getter);
         return Ok(ComparisonResult::new(AbstractCausalRelation::Equal, accumulator));

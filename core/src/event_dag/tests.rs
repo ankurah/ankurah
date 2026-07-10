@@ -1864,7 +1864,7 @@ mod phase4_duplicate_creation {
         let creation_event_1 = make_creation_event(1);
         retriever.add_event(&creation_event_1);
 
-        let result = entity.apply_event(&retriever, &creation_event_1).await;
+        let result = entity.apply_event(&retriever, &creation_event_1, None).await;
         assert!(result.is_ok(), "First creation event should succeed");
         assert!(result.unwrap(), "First creation event should return true (applied)");
 
@@ -1875,7 +1875,7 @@ mod phase4_duplicate_creation {
         // BFS detects two different roots -> Disjoint -> LineageError::Disjoint
         let creation_event_2 = make_creation_event(2);
         retriever.add_event(&creation_event_2);
-        let result = entity.apply_event(&retriever, &creation_event_2).await;
+        let result = entity.apply_event(&retriever, &creation_event_2, None).await;
 
         assert!(result.is_err(), "Second creation event should fail");
         let err = result.unwrap_err();
@@ -1895,12 +1895,12 @@ mod phase4_duplicate_creation {
         let creation_event = make_creation_event(1);
         retriever.add_event(&creation_event);
 
-        let result = entity.apply_event(&retriever, &creation_event).await;
+        let result = entity.apply_event(&retriever, &creation_event, None).await;
         assert!(result.is_ok() && result.unwrap(), "First apply should succeed");
 
         // Re-deliver the SAME creation event (same content, same id)
         // Since event_stored returns false but event is at head, comparison returns Equal -> no-op
-        let result = entity.apply_event(&retriever, &creation_event).await;
+        let result = entity.apply_event(&retriever, &creation_event, None).await;
         assert!(result.is_ok(), "Re-delivery of same creation event should not error");
         assert!(!result.unwrap(), "Re-delivery should return false (no-op)");
     }
@@ -2670,7 +2670,7 @@ mod strict_descends_gap_jump {
         retriever.add_event(&ev_b);
 
         // Establish local head = {A}.
-        assert!(entity.apply_event(&retriever, &ev_a).await.unwrap(), "A should apply");
+        assert!(entity.apply_event(&retriever, &ev_a, None).await.unwrap(), "A should apply");
         assert_eq!(entity.head(), Clock::from(vec![id_a.clone()]));
         assert_eq!(read_lww(&entity, "p0"), Some(Value::String("genesis".into())));
 
@@ -2681,7 +2681,7 @@ mod strict_descends_gap_jump {
         assert_eq!(sorted_ids, vec![id_x.clone(), id_b.clone()], "sort must place parent X before child B");
 
         for event in &sorted {
-            assert!(entity.apply_event(&retriever, &event.payload).await.unwrap(), "each event applies in causal order");
+            assert!(entity.apply_event(&retriever, &event.payload, None).await.unwrap(), "each event applies in causal order");
         }
 
         assert_eq!(entity.head(), Clock::from(vec![id_b.clone()]), "head advanced to B");
@@ -3219,9 +3219,9 @@ mod entity_change_batches {
         let ev_b = lww_event_for(entity_id, vec![("p2", "from_b")], &[&ev_x]);
         retriever.add_event(&ev_b);
 
-        assert!(entity.apply_event(&retriever, &ev_a).await.unwrap());
-        assert!(entity.apply_event(&retriever, &ev_x).await.unwrap());
-        assert!(entity.apply_event(&retriever, &ev_b).await.unwrap());
+        assert!(entity.apply_event(&retriever, &ev_a, None).await.unwrap());
+        assert!(entity.apply_event(&retriever, &ev_x, None).await.unwrap());
+        assert!(entity.apply_event(&retriever, &ev_b, None).await.unwrap());
         assert_eq!(entity.head(), Clock::from(vec![ev_b.id()]));
 
         let batch = vec![Attested::opt(ev_x.clone(), None), Attested::opt(ev_b.clone(), None)];

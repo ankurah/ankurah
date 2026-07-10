@@ -161,7 +161,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
             // primary entity already carries the operations; only upstream
             // residents of transaction forks apply here.
             if matches!(&entity.kind, crate::entity::EntityKind::Transacted { .. }) {
-                canonical.apply_event(&group.getter, &attested_event.payload).await?;
+                canonical.apply_event(&group.getter, &attested_event.payload, Some(self.node.entities.unverified())).await?;
             }
 
             // The local commit lane persists through the SAME machinery as
