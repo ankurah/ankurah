@@ -3031,6 +3031,84 @@ mod prechecks_suppress_only {
 }
 
 // ============================================================================
+// FRONTIER ORDERING (D2 M5, plan D2-4; derivations section 3): the level
+// drain processes entries max-eligible-generation-first, unknowns last,
+// EventId ascending tiebreak. A pure schedule choice: level membership and
+// every verdict are order-independent (dispositions Q3: level-drain with
+// in-level ordering is the shipped granularity).
+// ============================================================================
+
+#[cfg(test)]
+mod frontier_ordering {
+    use super::*;
+
+    /// Build the ordering shape: comparison {x, y} is an honest antichain
+    /// with DIFFERENT tip generations (x at 2, y at 3 via an extra step),
+    /// subject {s} two steps above (so the quick check is inapplicable and
+    /// the BFS runs). The seed search picks content whose hash order OPPOSES
+    /// the generation order (id(y) > id(x)), so id-ascending and
+    /// generation-descending schedules are observably different.
+    fn ordering_shape() -> (MockRetriever, Event, Event, Event) {
+        let g = make_test_event(1, &[]);
+        let x = make_test_event(2, &[&g]); // gen 2
+        for seed in 0..u16::MAX {
+            let w = make_test_event_u16(seed, &[&g]); // gen 2
+            let y = make_test_event_u16(seed.wrapping_add(1), &[&w]); // gen 3
+            if y.id() > x.id() {
+                let m = make_test_event(3, &[&x, &y]);
+                let s = make_test_event(4, &[&m]);
+                let mut retriever = MockRetriever::new();
+                for e in [&g, &x, &w, &y, &m, &s] {
+                    retriever.add_event(e);
+                }
+                return (retriever, s, x, y);
+            }
+        }
+        unreachable!("half of all seeds order y above x");
+    }
+
+    /// With materialized tip operands, the first drained level fetches the
+    /// higher-generation comparison tip FIRST even though its id sorts
+    /// later: eligible generations key the schedule, ids only break ties.
+    /// (Level membership is schedule-independent, so this is fetch-order
+    /// observable only; the verdict is pinned identical either way.)
+    #[tokio::test]
+    async fn level_drain_fetches_max_eligible_generation_first() {
+        let (retriever, s, x, y) = ordering_shape();
+        let subject = clock!(s.id());
+        let comparison = clock!(x.id(), y.id());
+
+        let logging = LoggingRetriever::new(retriever.clone());
+        let log = logging.log_handle();
+        let with_operands = compare_with(
+            logging,
+            &subject,
+            &comparison,
+            100,
+            CompareOptions {
+                subject_gens: Some(GClock::from((4, s.id()))),
+                comparison_gens: Some(GClock::new(vec![(2, x.id()), (3, y.id())])),
+                unverified: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let fetches = log.lock().unwrap().clone();
+        assert_eq!(
+            &fetches[..3],
+            &[s.id(), y.id(), x.id()],
+            "the level drain must schedule the generation-3 tip y before the generation-2 tip x \
+             (operand-seeded keys, unknowns last, id tiebreak); got {fetches:?}"
+        );
+
+        // BOUND unchanged: the schedule is free, the verdict is not.
+        let plain = compare(retriever, &subject, &comparison, 100).await.unwrap();
+        assert_eq!(with_operands.relation, plain.relation, "ordering is a pure schedule choice; verdicts byte-equal");
+    }
+}
+
+// ============================================================================
 // WALK-TIME EDGE CHECKS (D2 M5, plan D2-4): when the walk holds child and
 // parents, assert gen(child) == 1 + max(gen(parents)) (saturating); on
 // violation WARN with a counter, demote the child to per-comparison
