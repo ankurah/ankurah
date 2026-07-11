@@ -20,7 +20,6 @@ pub mod stats;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use comparison::compare;
 pub(crate) use layers::{CausalRelation, EventLayer};
 pub(crate) use relation::AbstractCausalRelation;
 

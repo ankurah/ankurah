@@ -82,8 +82,12 @@ pub(crate) struct CompareOptions<'a> {
 /// with up to 4x the initial budget before returning `BudgetExceeded`.
 ///
 /// This form runs with no generation operands (prechecks disabled, schedule
-/// unkeyed); production callers holding materialized operands use
-/// `compare_with`.
+/// unkeyed); production callers use `compare_with` (the operand lanes in
+/// entity.rs, and the bridge walk threading the node's eligibility context
+/// since M6), so in a default build this wrapper's consumers are the unit
+/// tests and the bench harness (`bench_support`), hence the cfg'd dead-code
+/// allowance.
+#[cfg_attr(not(any(test, feature = "bench-internals")), allow(dead_code))]
 pub async fn compare<E: GetEvents>(
     event_getter: E,
     subject: &Clock,

@@ -11,7 +11,7 @@
 
 use crate::error::{MutationError, RetrievalError};
 use crate::event_dag::accumulator::ComparisonResult;
-use crate::event_dag::compare as compare_internal;
+use crate::event_dag::comparison::compare as compare_internal;
 use crate::event_dag::layers::EventLayers;
 use crate::event_dag::ordering::topo_sort_events as topo_sort_internal;
 use crate::retrieval::GetEvents;
