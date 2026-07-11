@@ -114,12 +114,17 @@ impl AppliedSet {
 /// the purge through held strong references. The marker may LAG storage
 /// (the raw set_state bypasses in system.rs never stamp it), which only
 /// costs a redundant monotone-safe write; it may never LEAD storage,
-/// which is why only a completed set_state stamps it AND why the funnel
+/// which is why only a completed set_state stamps it, why the funnel
 /// serializes each entity's whole snapshot-write-stamp span on the node's
 /// per-id persist lock (WeakEntitySet::persist_span): unserialized lanes
 /// could land engine writes in the opposite order of their snapshots,
 /// leaving the store regressed behind the head the marker testifies to
-/// (the M4 post-review remediation of the adversarial finding 2).
+/// (the M4 post-review remediation of the adversarial finding 2), and why
+/// the funnel refuses to persist any instance that is not the node's
+/// canonical resident (the codex follow-up remediation): markers are
+/// instance-local, so across duplicate live instances for one id the
+/// id-keyed ordering alone could not keep a stale last write from
+/// regressing storage the canonical's own marker then elides over.
 ///
 /// KNOWN RESIDUE (dev-only reset surface): a funnel persist STARTING
 /// after a reset completes, on a dead-system resident kept alive only by
@@ -615,10 +620,15 @@ impl Entity {
     /// COMPLETED, with `epoch` captured BEFORE that persist began and `head`
     /// the exact head the completed persist wrote. Overwriting an existing
     /// marker is safe because the funnel serializes each entity's persists
-    /// on the node's per-id span lock (WeakEntitySet::persist_span): stamps
-    /// land in write order, so every stamp names exactly the newest
-    /// completed write and the marker can only lag storage (costing a
-    /// redundant monotone-safe write), never lead it.
+    /// on the node's per-id span lock (WeakEntitySet::persist_span) AND
+    /// refuses every instance but the node's canonical resident (the codex
+    /// follow-up remediation): stamps land in write order and only the
+    /// canonical instance may stamp, so every stamp names exactly the
+    /// newest completed write and the marker can only lag storage (costing
+    /// a redundant monotone-safe write), never lead it. Write order alone
+    /// could not say that across the duplicate-instance window, because a
+    /// marker is instance-local testimony (each instance stamps only
+    /// itself).
     pub(crate) fn stamp_persist_marker(&self, epoch: u64, head: Clock) {
         self.state.write().unwrap().marker = Some(PersistMarker { epoch, head });
     }
@@ -1549,18 +1559,24 @@ struct WeakEntitySetInner {
     /// the span lock two funnel lanes persisting one entity can commit
     /// their writes in the opposite order of their snapshots, regressing
     /// the stored buffer to an older head while the marker elision keeps
-    /// the regression sticky. Serialized, writes of one entity are totally
-    /// ordered, the last write carries the newest snapshot (heads never
-    /// regress), and the marker can never LEAD storage.
+    /// the regression sticky. Serialized, writes of one INSTANCE are
+    /// totally ordered, the last write carries the newest snapshot (heads
+    /// never regress), and that instance's marker can never LEAD storage.
     ///
     /// Keyed by EntityId at the NODE level, not by Entity instance: the
     /// pre-existing remove_if_phantom/with_state interplay can transiently
     /// yield two live instances for one id (concurrency panel NOTE 4), and
     /// instance-keyed locks would silently stop serializing exactly then.
-    /// Entries are never removed: they are tiny (an id, an Arc, an idle
-    /// mutex), growth is bounded by distinct entities persisted over one
-    /// process lifetime, and eager cleanup would reintroduce the
-    /// two-locks-for-one-id hazard this map exists to close.
+    /// Ordering across duplicates is not sufficient on its own, though:
+    /// markers are instance-local, so a stale duplicate's last write could
+    /// still regress storage behind the canonical head (the codex
+    /// follow-up finding). The funnel therefore also REFUSES any instance
+    /// that is not the node's canonical resident, checked under this same
+    /// lock (NodePersist::persist). Entries are never removed: they are
+    /// tiny (an id, an Arc, an idle mutex), growth is bounded by distinct
+    /// entities persisted over one process lifetime, and eager cleanup
+    /// would reintroduce the two-locks-for-one-id hazard this map exists
+    /// to close.
     persist_locks: crate::util::safemap::SafeMap<EntityId, Arc<tokio::sync::Mutex<()>>>,
     /// The reset fence (M4 remediation, item 5): hard_reset holds the WRITE
     /// half across its epoch bump, purge, and storage wipe; the persist

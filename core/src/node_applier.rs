@@ -40,21 +40,27 @@ where
     /// elision ef68e081 removed, now keyed on completed-persist testimony
     /// instead of no-op applies).
     ///
-    /// The WHOLE span (elision check, snapshot, engine write, stamp) runs
-    /// under the node's per-entity-id persist lock (the M4 post-review
-    /// remediation of the adversarial finding 2): engines are blind
-    /// last-writer upserts, so unserialized sibling lanes could land their
-    /// writes in the opposite order of their snapshots, regressing the
-    /// stored buffer while the marker elision made the regression sticky.
-    /// Serialized, persists of one entity are totally ordered, the write
-    /// that lands last carries the snapshot taken last (heads never
-    /// regress, so storage never regresses), a sibling waiting its turn
-    /// elides truthfully on the completed persist's stamp, and the marker
-    /// can never lead storage. The elision check sits INSIDE the lock so
-    /// it always reads the newest sibling stamp; keyed by id rather than
-    /// by instance so the transient two-residents-for-one-id window
-    /// (concurrency panel NOTE 4) cannot bypass the ordering. The two
-    /// documented raw set_state bypasses in system.rs stay outside the
+    /// The WHOLE span (canonical check, elision check, snapshot, engine
+    /// write, stamp) runs under the node's per-entity-id persist lock (the
+    /// M4 post-review remediation of the adversarial finding 2): engines
+    /// are blind last-writer upserts, so unserialized sibling lanes could
+    /// land their writes in the opposite order of their snapshots,
+    /// regressing the stored buffer while the marker elision made the
+    /// regression sticky. Serialized, persists of one INSTANCE are totally
+    /// ordered, the write that lands last carries the snapshot taken last
+    /// (heads never regress, so storage never regresses), a sibling
+    /// waiting its turn elides truthfully on the completed persist's
+    /// stamp, and the marker can never lead storage. The elision check
+    /// sits INSIDE the lock so it always reads the newest sibling stamp.
+    /// The lock is keyed by id rather than by instance, but id-keyed
+    /// ORDERING alone did not cover the transient two-residents-for-one-id
+    /// window (concurrency panel NOTE 4): markers are instance-local, so a
+    /// stale duplicate persisting last could still regress storage behind
+    /// the canonical head while the canonical's own marker elided the
+    /// healing write (the codex follow-up finding). The funnel therefore
+    /// also REFUSES any instance that is not the node's canonical
+    /// resident, under the same lock (the first check in the body). The
+    /// two documented raw set_state bypasses in system.rs stay outside the
     /// lock: they never stamp, so there the marker only lags (the safe
     /// direction).
     ///
