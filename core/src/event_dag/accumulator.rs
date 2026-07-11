@@ -48,6 +48,17 @@ pub(crate) struct EventAccumulator<E: GetEvents> {
     /// Children whose equation was evaluated (pass or fail); one check per
     /// child, ever.
     edge_checked: BTreeSet<EventId>,
+    /// Children whose first incomplete check already registered them in
+    /// `edge_waiting` under every then-missing parent. A re-check that is
+    /// still incomplete must NOT re-register: the original registrations
+    /// stand and drain as those parents arrive. Without this guard a wide
+    /// antichain multiplies registrations combinatorially (every drain
+    /// re-checks once per accumulated copy, every incomplete re-check
+    /// re-registers under every still-missing parent: 2^width entries),
+    /// which is a memory explosion, not a slowdown. With it, total
+    /// `edge_waiting` entries are bounded by the DAG's edge count. Cleared
+    /// when the check completes (`edge_checked` then short-circuits).
+    edge_pending: BTreeSet<EventId>,
     /// Parent id -> children whose check is blocked on that parent's
     /// payload arriving; drained when it does (backward BFS fetches parents
     /// after children, so this is the productive direction).
@@ -68,6 +79,7 @@ impl<E: GetEvents> EventAccumulator<E> {
             event_getter,
             stats: CompareStats::default(),
             edge_checked: BTreeSet::new(),
+            edge_pending: BTreeSet::new(),
             edge_waiting: BTreeMap::new(),
             demoted: BTreeSet::new(),
         }
@@ -112,7 +124,11 @@ impl<E: GetEvents> EventAccumulator<E> {
     ///
     /// Opportunistic by design: a payload evicted from the bounded cache
     /// before its family completes simply misses its check. Checks are
-    /// keyed to run at most once per child, across budget retries too.
+    /// keyed to run at most once per child, across budget retries too, and
+    /// a blocked child REGISTERS at most once (`edge_pending`): only its
+    /// first incomplete check writes `edge_waiting`, under every parent
+    /// missing at that moment. A parent in hand then but evicted before the
+    /// last registered one arrives is another opportunistic miss.
     fn edge_check(&mut self, child_id: &EventId) {
         if self.edge_checked.contains(child_id) {
             return;
@@ -122,6 +138,7 @@ impl<E: GetEvents> EventAccumulator<E> {
         };
         if parents.is_empty() {
             self.edge_checked.insert(child_id.clone());
+            self.edge_pending.remove(child_id);
             return;
         }
         let mut parent_gens = Vec::with_capacity(parents.len());
@@ -133,8 +150,10 @@ impl<E: GetEvents> EventAccumulator<E> {
             }
         }
         if !missing.is_empty() {
-            for parent in missing {
-                self.edge_waiting.entry(parent).or_default().push(child_id.clone());
+            if self.edge_pending.insert(child_id.clone()) {
+                for parent in missing {
+                    self.edge_waiting.entry(parent).or_default().push(child_id.clone());
+                }
             }
             return;
         }
@@ -155,6 +174,7 @@ impl<E: GetEvents> EventAccumulator<E> {
             }
         }
         self.edge_checked.insert(child_id.clone());
+        self.edge_pending.remove(child_id);
     }
 
     /// Get event by id: cache -> retriever (storage).
