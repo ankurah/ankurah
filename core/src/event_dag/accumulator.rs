@@ -285,9 +285,86 @@ pub(crate) fn is_descendant_dag(dag: &BTreeMap<EventId, Vec<EventId>>, descendan
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ankurah_proto::{Clock, EntityId, OperationSet};
 
-    // We can't easily test EventAccumulator with a real GetEvents impl in unit tests,
-    // but we can test the helper functions. EventLayer::compare is tested in `layers`.
+    // The helper functions are tested directly below; the accumulator itself
+    // is driven through `accumulate` (which never fetches), so the edge-check
+    // bookkeeping tests need no real `GetEvents`. EventLayer::compare is
+    // tested in `layers`; the fetch paths in `tests`.
+
+    /// `accumulate`-driven tests never fetch; a getter that proves it.
+    struct NoFetch;
+
+    #[async_trait::async_trait]
+    impl GetEvents for NoFetch {
+        async fn get_event(&self, event_id: &EventId) -> Result<Event, RetrievalError> {
+            unreachable!("accumulate-driven edge-check tests never fetch (asked for {event_id})")
+        }
+        async fn event_stored(&self, _event_id: &EventId) -> Result<bool, RetrievalError> { Ok(false) }
+    }
+
+    /// Honestly stamped test event (the tests.rs idiom, duplicated locally
+    /// because sibling test modules cannot share private helpers).
+    fn stamped(seed: u16, parents: &[&Event]) -> Event {
+        let mut entity_id_bytes = [0u8; 16];
+        entity_id_bytes[0..2].copy_from_slice(&seed.to_be_bytes());
+        Event {
+            entity_id: EntityId::from_bytes(entity_id_bytes),
+            collection: "test".into(),
+            operations: OperationSet(BTreeMap::new()),
+            parent: Clock::from(parents.iter().map(|p| p.id()).collect::<Vec<_>>()),
+            generation: Event::generation_from_parents(parents.iter().map(|p| p.generation)),
+        }
+    }
+
+    /// The walk-time edge checks' blocked-registration bookkeeping must be
+    /// bounded by the DAG's EDGE COUNT: a child registers under a missing
+    /// parent AT MOST ONCE per comparison, so the total entries across
+    /// `edge_waiting` can never exceed the number of parent edges (here 128:
+    /// 64 child-of-root edges plus the join's 64 parent edges).
+    ///
+    /// The arrival order is the backward-BFS order of the production
+    /// wide-antichain shape (compare join vs root, e.g. a stale head syncing
+    /// across a burst of concurrent writes): the join arrives FIRST, its 64
+    /// parents trickle in afterwards, the root last. That order is what makes
+    /// duplicate registrations multiply: every arrival that drains a
+    /// duplicated waiter list re-checks the join once PER COPY, and every
+    /// still-incomplete re-check that re-registers doubles the copies under
+    /// every still-missing parent -- 2^width growth, the compare() memory
+    /// explosion observed at the event_dag bench's wide_antichain/64 (one
+    /// call on this 66-event DAG exceeded 11 GB RSS).
+    #[test]
+    fn wide_antichain_edge_registrations_are_bounded_by_edge_count() {
+        const WIDTH: usize = 64;
+        let root = stamped(0, &[]);
+        let children: Vec<Event> = (0..WIDTH).map(|i| stamped(i as u16 + 1, &[&root])).collect();
+        let join = stamped(WIDTH as u16 + 1, &children.iter().collect::<Vec<_>>());
+
+        // Total parent edges in the DAG: the registration bound.
+        let edge_count: usize =
+            std::iter::once(&root).chain(children.iter()).chain(std::iter::once(&join)).map(|e| e.parent.as_slice().len()).sum();
+        assert_eq!(edge_count, 2 * WIDTH, "shape check: WIDTH child-of-root edges plus WIDTH join-parent edges");
+
+        let mut acc = EventAccumulator::new(NoFetch);
+        let arrivals: Vec<&Event> = std::iter::once(&join).chain(children.iter()).chain(std::iter::once(&root)).collect();
+        for (arrived, event) in arrivals.iter().enumerate() {
+            acc.accumulate(&event.id(), event);
+            let total: usize = acc.edge_waiting.values().map(Vec::len).sum();
+            assert!(
+                total <= edge_count,
+                "edge_waiting holds {total} registrations after arrival {} of {} -- the DAG has only {edge_count} edges, \
+                 so blocked-check registrations are multiplying instead of registering at most once per child",
+                arrived + 1,
+                arrivals.len(),
+            );
+        }
+
+        // Everything arrived and the cache (capacity 1000) evicted nothing:
+        // every registration drained and every event completed its check.
+        assert!(acc.edge_waiting.is_empty(), "all registered parents arrived; nothing may remain blocked");
+        assert_eq!(acc.edge_checked.len(), WIDTH + 2, "root, children, and join all completed their one check");
+        assert_eq!(acc.stats.edge_check_violations, 0, "the corpus is honestly stamped");
+    }
 
     #[test]
     fn test_compute_ancestry_from_dag() {
