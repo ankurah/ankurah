@@ -81,6 +81,33 @@ where
         let _fence = self.node.entities.reset_fence_read().await;
         let span = self.node.entities.persist_span(entity.id());
         let _guard = span.lock().await;
+        // Only the node's CANONICAL resident may persist (the M4 codex
+        // follow-up remediation): the marker and the snapshot are per
+        // Entity INSTANCE, so the id-keyed ordering above cannot keep
+        // storage coherent across duplicate live instances for one id
+        // (the remove_if_phantom eviction race, concurrency panel NOTE 4).
+        // A stale instance persisting last would blindly regress storage
+        // behind the canonical head, and the canonical's instance-local
+        // marker would then elide the write that could heal it. The
+        // refusal PRECEDES the elision check so a stale instance cannot
+        // even elide truthfully on its own dead marker (an Ok here would
+        // let its caller record applied-set rows against testimony the
+        // canonical world never gave). An absent or dead map entry ALLOWS:
+        // a sole live instance persisting is coherent (a later
+        // rematerialization reads its write and heals forward; the
+        // dead-system residue on the PersistMarker doc stays a documented
+        // D3/D6 deferral). Entity equality is Arc pointer identity, and
+        // the check sits INSIDE the span lock: serialized against every
+        // sibling persist of this id, a canonical resolved here cannot
+        // have its stamp invalidated by this lane afterward (any later
+        // canonical persist queues behind this span and writes after it).
+        // The refusal is an innocent-race item failure, not a lineage
+        // rejection: the sender's redelivery lands on the canonical.
+        if let Some(canonical) = self.node.entities.get(&entity.id()) {
+            if canonical != *entity {
+                return Err(MutationError::StaleInstancePersistRefused(entity.id()));
+            }
+        }
         let epoch = self.node.entities.reset_epoch();
         if entity.persist_marker_current(epoch) {
             return Ok(());
