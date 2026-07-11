@@ -308,6 +308,36 @@ async fn non_castable_retype_refuses_registration() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Conflicting same-name descriptors in ONE request meet the same
+/// compatibility bar as a catalog hit: a castable duplicate coalesces onto
+/// the first occurrence's resolution, a non-castable one refuses the whole
+/// request instead of being silently absorbed.
+#[tokio::test]
+async fn in_flight_duplicate_descriptors_meet_the_compatibility_bar() -> anyhow::Result<()> {
+    let (server, client, _conn) = connected_pair().await?;
+
+    // Castable duplicate (string then i64): coalesces, one property, the
+    // first declaration fixes the canonical type.
+    let castable = proto::NodeRequestBody::RegisterSchema {
+        models: vec![proto::ModelDescriptor { collection: "album".into(), name: "Album".into(), explicit_id: None }],
+        properties: vec![property("year", None, "lww", "string"), property("year", None, "lww", "i64")],
+        memberships: vec![],
+    };
+    let registered = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, castable).await?);
+    assert_eq!(registered.1.len(), 1, "duplicates coalesce onto one property");
+    assert_eq!(registered.1[0].value_type, "string", "the first occurrence fixes the canonical type");
+
+    // Non-castable duplicate (string then binary): the request refuses.
+    let conflicting = proto::NodeRequestBody::RegisterSchema {
+        models: vec![],
+        properties: vec![property("length", None, "lww", "string"), property("length", None, "lww", "binary")],
+        memberships: vec![],
+    };
+    expect_error(client.request(server.id, &DEFAULT_CONTEXT, conflicting).await?, "not castable");
+
+    Ok(())
+}
+
 /// A backend change is never castable (a different CRDT algebra, not a
 /// cast): refuse, regardless of the value types.
 #[tokio::test]

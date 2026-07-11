@@ -246,13 +246,29 @@ where
             }};
         }
 
-        // -- properties: looked up by (model, name, backend, value_type) ----
-        let mut property_ids: BTreeMap<(String, String), EntityId> = BTreeMap::new();
+        // -- properties: looked up by (model, name); the canonical (backend,
+        //    value_type) recorded per name so in-flight duplicates
+        //    compat-check against it -----------------------------------------
+        let mut property_ids: BTreeMap<(String, String), (EntityId, String, String)> = BTreeMap::new();
         let mut out_properties: Vec<RegisteredProperty> = Vec::new();
         for p in &properties {
-            // Duplicate descriptor in one request: first occurrence wins
-            // (same in-flight rule as models).
-            if property_ids.contains_key(&(p.minting_collection.clone(), p.name.clone())) {
+            // Duplicate descriptor in one request: the first occurrence fixes
+            // the resolution (same in-flight rule as models), and a later
+            // duplicate coalesces onto it under the SAME compatibility bar as
+            // a catalog hit (decision 30): a different backend or a
+            // non-castable value_type refuses the request rather than being
+            // silently absorbed.
+            if let Some((_, canon_backend, canon_vt)) = property_ids.get(&(p.minting_collection.clone(), p.name.clone())) {
+                if p.backend != *canon_backend || !value_types_compatible(canon_vt, &p.value_type) {
+                    return Err(RegistrationError::NonCastable {
+                        collection: p.minting_collection.clone(),
+                        name: p.name.clone(),
+                        found_backend: canon_backend.clone(),
+                        found_value_type: canon_vt.clone(),
+                        backend: p.backend.clone(),
+                        value_type: p.value_type.clone(),
+                    });
+                }
                 continue;
             }
             match p.explicit_id {
@@ -264,15 +280,17 @@ where
                     let scope = resolve_model!(&p.minting_collection);
                     // The response carries the bound entity's CANONICAL
                     // (backend, value_type), not the binder's declaration.
+                    let backend = string_field(&values, "backend").unwrap_or_else(|| p.backend.clone());
+                    let value_type = string_field(&values, "value_type").unwrap_or_else(|| p.value_type.clone());
                     out_properties.push(RegisteredProperty {
                         id,
                         model: entity_id_field(&values, "minted_for").unwrap_or(scope),
                         name: string_field(&values, "name").unwrap_or_else(|| p.name.clone()),
-                        backend: string_field(&values, "backend").unwrap_or_else(|| p.backend.clone()),
-                        value_type: string_field(&values, "value_type").unwrap_or_else(|| p.value_type.clone()),
+                        backend: backend.clone(),
+                        value_type: value_type.clone(),
                         target_model: entity_id_field(&values, "target_model"),
                     });
-                    property_ids.insert((p.minting_collection.clone(), p.name.clone()), id);
+                    property_ids.insert((p.minting_collection.clone(), p.name.clone()), (id, backend, value_type));
                     continue;
                 }
                 None => {}
@@ -385,8 +403,8 @@ where
                 }
             };
 
-            property_ids.insert((p.minting_collection.clone(), p.name.clone()), property_id);
             let (backend, value_type) = canonical.unwrap_or_else(|| (p.backend.clone(), p.value_type.clone()));
+            property_ids.insert((p.minting_collection.clone(), p.name.clone()), (property_id, backend.clone(), value_type.clone()));
             out_properties.push(RegisteredProperty {
                 id: property_id,
                 model: scope,
@@ -411,9 +429,12 @@ where
             };
             let property_id = match &ms.property {
                 PropertyRef::Id(id) => *id,
-                PropertyRef::Name(name) => *property_ids
-                    .get(&(ms.collection.clone(), name.clone()))
-                    .ok_or_else(|| RegistrationError::UnresolvedPropertyRef(name.clone(), ms.collection.clone()))?,
+                PropertyRef::Name(name) => {
+                    property_ids
+                        .get(&(ms.collection.clone(), name.clone()))
+                        .ok_or_else(|| RegistrationError::UnresolvedPropertyRef(name.clone(), ms.collection.clone()))?
+                        .0
+                }
             };
             // Duplicate descriptor in one request: first occurrence wins.
             if membership_seen.contains(&(model_id, property_id)) {
