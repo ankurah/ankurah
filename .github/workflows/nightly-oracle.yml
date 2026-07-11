@@ -45,6 +45,10 @@ on:
         description: "Gen-corruption immunity arm: larger-DAG (20..=40 events) seed count (GEN_ORACLE_LARGE_SEEDS)"
         required: false
         default: "2000"
+      gen_oracle_wide_seeds:
+        description: "Gen-corruption immunity arm: wide-frontier (full-current-tip joins, 24..=48 events) seed count (GEN_ORACLE_WIDE_SEEDS)"
+        required: false
+        default: "1000"
       shape_entities:
         description: "Event-DAG-shape tier: entities in the N-entity churn shape (SHAPE_ENTITIES)"
         required: false
@@ -103,7 +107,9 @@ jobs:
   # The D2 M5 gen-corruption immunity arm at nightly scale: the same
   # two-channel corruption matrix the normal test job runs at 300 seeds
   # (core/src/event_dag/tests.rs, gen_corruption_immunity), driven to 25k
-  # seeds of randomized corpora plus 2k larger-DAG (20..=40 event) seeds.
+  # seeds of randomized corpora plus 2k larger-DAG (20..=40 event) seeds
+  # plus 1k wide-frontier seeds (full-current-tip joins, 24..=48 events;
+  # the corpus class the M5 edge-check memory defect hid in).
   # Every corrupted run must be BOUND-identical to its honest baseline
   # (verdict, meet, immediate children, chain core, layer partition); ANY
   # divergence is a suppress-only discipline breach and the uploaded
@@ -129,6 +135,7 @@ jobs:
           set -o pipefail
           GEN_ORACLE_SEEDS="${{ github.event.inputs.gen_oracle_seeds || '25000' }}" \
           GEN_ORACLE_LARGE_SEEDS="${{ github.event.inputs.gen_oracle_large_seeds || '2000' }}" \
+          GEN_ORACLE_WIDE_SEEDS="${{ github.event.inputs.gen_oracle_wide_seeds || '1000' }}" \
           GEN_ORACLE_SEED_BASE="${{ github.event.inputs.oracle_seed_base || '1' }}" \
             cargo test -p ankurah-core --lib \
               event_dag::tests::gen_corruption_immunity \
