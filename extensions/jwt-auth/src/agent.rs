@@ -36,8 +36,8 @@ impl JwtAgent {
         let path = policy_path.as_ref();
         let json_str =
             std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("Failed to read policy file {}: {}", path.display(), e))?;
-        let config: PolicyConfig =
-            serde_json::from_str(&json_str).map_err(|e| anyhow::anyhow!("Failed to parse policy config from {}: {}", path.display(), e))?;
+        let config = PolicyConfig::from_json(&json_str)
+            .map_err(|e| anyhow::anyhow!("Failed to load policy config from {}: {}", path.display(), e))?;
         Ok(Self {
             state: Arc::new(RwLock::new(AgentState { config, keys: Some(JwtKeys::Signing(keys)) })),
             policy_path: Some(path.to_path_buf()),
