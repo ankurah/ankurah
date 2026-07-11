@@ -96,3 +96,127 @@ async fn castable_drift_writes_and_reads_through_the_canonical_type() -> Result<
 
     Ok(())
 }
+
+/// The reactor's byte-collated watcher index matches through the canonical
+/// type: the drifted (i64) subscriber's literal canonicalizes at resolution,
+/// the drifted writer's value canonicalizes at commit, and the entity-side
+/// extraction reads canonical bytes -- so a live query notifies across the
+/// drift in both directions (match arrives, match leaves).
+#[tokio::test]
+async fn live_query_watcher_matches_through_canonical_types() -> Result<()> {
+    let node = durable_sled_setup().await?;
+    let ctx = node.context_async(DEFAULT_CONTEXT).await;
+
+    // v1 (i32) registers first and fixes the canonical type.
+    let trx = ctx.begin();
+    trx.create(&v1::Film { year: 1980 }).await?;
+    trx.commit().await?;
+
+    // Subscribe through the drifted v2 model with an i64 literal.
+    let watcher = TestWatcher::changeset();
+    let predicate = ankql::parser::parse_selection("year = 2020")?;
+    use ankurah::signals::{Peek, Subscribe};
+    let query = ctx.query_wait::<v2::FilmView>(predicate).await?;
+    let _handle = query.subscribe(&watcher);
+    assert_eq!(watcher.quiesce().await, 0, "no initial matches");
+
+    // A v2 write (staged I64, canonicalized to I32 at commit) must reach the
+    // watcher through the canonical index bytes.
+    let trx = ctx.begin();
+    let film = trx.create(&v2::Film { year: 2020 }).await?;
+    let film_id = film.id();
+    trx.commit().await?;
+    assert!(watcher.wait().await, "the watcher must fire for the canonicalized match");
+    assert_eq!(query.peek().iter().map(|f| f.id()).collect::<Vec<_>>(), vec![film_id]);
+
+    // Move it out of the match window through the drifted setter: removal
+    // notifies too.
+    let trx = ctx.begin();
+    let views: Vec<v2::FilmView> = ctx.fetch("year = 2020").await?;
+    views[0].edit(&trx)?.year().set(&1999i64)?;
+    trx.commit().await?;
+    assert!(watcher.wait_for_count(2, Some(std::time::Duration::from_secs(10))).await, "the removal must notify");
+    assert!(query.peek().is_empty(), "the entity left the live query");
+
+    Ok(())
+}
+
+/// An ill-typed payload under a KNOWN property id (what a misbehaving
+/// peer's schema-blind-applied event could leave behind) is contained at
+/// every read boundary, each with its own posture: storage ACCEPTS it
+/// schema-blind (ingest never blocks on the catalog); a direct get loads
+/// it, and the typed getter fails loudly (`NonCastable`) instead of
+/// fabricating a default; predicate evaluation reads it as NULL (no error,
+/// no phantom match); and a predicate FETCH through sled errors loudly at
+/// scan materialization (the engine tier's coarse pre-#312 posture: a junk
+/// entity fails the query rather than silently vanishing from it).
+#[tokio::test]
+async fn ill_typed_payload_is_contained_at_every_read_boundary() -> Result<()> {
+    let node = durable_sled_setup().await?;
+    let ctx = node.context_async(DEFAULT_CONTEXT).await;
+
+    let trx = ctx.begin();
+    let film = trx.create(&v1::Film { year: 2001 }).await?;
+    let film_id = film.id();
+    drop(film);
+    trx.commit().await?;
+
+    // Forge year = String("abc") under the REAL property id: the
+    // String<->I32 pair is castable (so nothing refuses the pair), but this
+    // value is not.
+    let year_id = node.catalog.siblings_by_name("year")[0];
+    let storage = node.collections.get(&"film".into()).await?;
+    let mut state = storage.get_state(film_id).await?;
+    let forged = {
+        let b = ankurah::core::property::backend::LWWBackend::new();
+        b.set(ankurah::core::property::PropertyKey::Id(year_id), Some(Value::String("abc".into())));
+        let ops = b.to_operations().unwrap().unwrap();
+        b.apply_operations_with_event(&ops, proto::EventId::from_bytes([7u8; 32])).unwrap();
+        b.to_state_buffer().unwrap()
+    };
+    state.payload.state.state_buffers.0.insert("lww".into(), forged);
+
+    // Storage accepts schema-blind.
+    storage.set_state(state).await?;
+
+    // A direct get loads the entity; the typed getter fails visible.
+    let view = ctx.get::<v1::FilmView>(film_id).await?;
+    let err = view.year().expect_err("an uncastable stored value must fail the getter");
+    assert!(err.to_string().contains("not castable"), "expected NonCastable, got: {err}");
+
+    // Predicate evaluation reads junk as NULL: no match, and no error.
+    use ankurah::core::selection::filter::evaluate_predicate;
+    use ankurah::model::View;
+    let resolved = node.catalog.resolve_selection(&"film".into(), &ankql::parser::parse_selection("year = 2001")?)?;
+    assert!(!evaluate_predicate(view.entity(), &resolved.predicate)?, "junk must not match its pre-forge value");
+    let resolved = node.catalog.resolve_selection(&"film".into(), &ankql::parser::parse_selection("year = 5")?)?;
+    assert!(!evaluate_predicate(view.entity(), &resolved.predicate)?, "junk must not match anything");
+
+    // A predicate fetch through sled refuses loudly at scan materialization.
+    let err = ctx.fetch::<v1::FilmView>("year = 2001").await.expect_err("sled scan materialization must refuse the junk");
+    assert!(err.to_string().contains("Type mismatch"), "expected the engine's type mismatch, got: {err}");
+
+    Ok(())
+}
+
+/// ORDER BY collates in the canonical type across drifted writers: numeric
+/// order, never the lexicographic order a string collation would produce
+/// ("10" < "2" < "3").
+#[tokio::test]
+#[ignore = "FOUND DEFECT (pre-existing, exposed by canonical types): the storage-common planner hardcodes ValueType::String for ORDER BY key parts (storage/common/src/planner.rs) and the reactor's build_key_spec_from_selection samples-else-defaults-to-String, so numeric sorts collate lexicographically. Fix: type sort keys from the catalog's canonical value_type. Un-ignore when that lands."]
+async fn order_by_collates_numerically_through_canonical_types() -> Result<()> {
+    let node = durable_sled_setup().await?;
+    let ctx = node.context_async(DEFAULT_CONTEXT).await;
+
+    let trx = ctx.begin();
+    trx.create(&v1::Film { year: 3 }).await?;
+    trx.create(&v2::Film { year: 10 }).await?;
+    trx.create(&v2::Film { year: 2 }).await?;
+    trx.commit().await?;
+
+    let films: Vec<v2::FilmView> = ctx.fetch("year > 0 ORDER BY year ASC").await?;
+    let years: Vec<i64> = films.iter().map(|f| f.year().unwrap()).collect();
+    assert_eq!(years, vec![2, 3, 10], "canonical numeric collation, not lexicographic");
+
+    Ok(())
+}
