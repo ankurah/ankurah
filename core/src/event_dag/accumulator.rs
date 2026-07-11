@@ -161,6 +161,7 @@ impl<E: GetEvents> EventAccumulator<E> {
             return; // evicted between accumulation and drain; opportunistic
         };
         let expected = Event::generation_from_parents(parent_gens.into_iter());
+        self.stats.edge_checks_evaluated += 1;
         if child_gen != expected {
             tracing::warn!(
                 child = %child_id,

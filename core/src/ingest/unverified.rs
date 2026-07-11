@@ -14,9 +14,20 @@
 //! wasted or missed shortcut and walk-time edge checks later demote (plan
 //! section 4). That is why this is memory-only and FIFO-bounded, never
 //! persisted.
+//!
+//! This struct is the node's ACCELERATION-ELIGIBILITY CONTEXT: the one
+//! node-level object every comparison site already receives (apply_event,
+//! apply_state, and the bridge walk all take it), which is why it also
+//! carries the M6 KILL-SWITCH (plan M6): a runtime flag that makes every
+//! generation CONSUMER in the comparison dormant (P1/P2 prechecks,
+//! generation-first level scheduling, walk-time edge checks) while stamping
+//! and admission verification stay on. Same reachability argument that
+//! homed this set on WeakEntitySet (REV 5 section G): the consumers are the
+//! apply-path comparisons, and this is the object that reaches them.
 
 use ankurah_proto::EventId;
 use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 /// Default bound: sized like the applied-set default (plan D2-5), generously
@@ -26,11 +37,17 @@ use std::sync::Mutex;
 /// at 32 bytes an id, plus set overhead.
 pub(crate) const DEFAULT_UNVERIFIED_CAP: usize = 65536;
 
-/// Bounded FIFO set of event ids admitted without generation verification.
+/// Bounded FIFO set of event ids admitted without generation verification,
+/// plus the node-wide generation-acceleration kill-switch (see the module
+/// doc for why the switch lives here).
 #[derive(Debug)]
 pub struct UnverifiedEvents {
     inner: Mutex<Inner>,
     cap: usize,
+    /// The M6 kill-switch (plan M6): when set, every generation consumer in
+    /// the comparison is bypassed (prechecks, schedule keying, edge checks);
+    /// stamping and admission verification are expressly NOT gated on this.
+    accel_disabled: AtomicBool,
 }
 
 #[derive(Debug, Default)]
@@ -44,7 +61,24 @@ impl Default for UnverifiedEvents {
 }
 
 impl UnverifiedEvents {
-    pub fn with_cap(cap: usize) -> Self { Self { inner: Mutex::new(Inner::default()), cap: cap.max(1) } }
+    pub fn with_cap(cap: usize) -> Self {
+        Self { inner: Mutex::new(Inner::default()), cap: cap.max(1), accel_disabled: AtomicBool::new(false) }
+    }
+
+    /// Throw (or clear) the generation-acceleration kill-switch (plan M6).
+    /// With the switch thrown, comparisons run exactly as they would with no
+    /// generation machinery: no precheck consults an operand, the level
+    /// drain schedules in plain id order, and no walk-time edge check is
+    /// evaluated. Verdicts are identical either way (the suppress-only
+    /// discipline; the kill-switch equivalence pins assert it), so throwing
+    /// the switch can only cost the accelerations. Stamping and admission
+    /// verification are NOT affected: events keep their hashed generations
+    /// and forged stamps keep rejecting typed.
+    pub fn set_accelerations_disabled(&self, disabled: bool) { self.accel_disabled.store(disabled, Ordering::Release); }
+
+    /// Whether the kill-switch is thrown (consumed by the comparison at its
+    /// entry point, once per comparison).
+    pub fn accelerations_disabled(&self) -> bool { self.accel_disabled.load(Ordering::Acquire) }
 
     /// Record an admitted-unverified event id. Oldest-first eviction at the
     /// cap: an evicted id becomes default-eligible again, the documented safe
