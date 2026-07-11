@@ -169,6 +169,14 @@ pub enum MutationError {
     TOCTOUAttemptsExhausted,
     #[error("ingest: {0}")]
     Ingest(IngestError),
+    /// The persist funnel refused a non-canonical Entity instance: the id
+    /// resolves to a DIFFERENT live resident in the node's map (D2-6, the
+    /// M4 codex follow-up remediation). An innocent duplicate-instance
+    /// race, not a lineage rejection: the caller's item failure is the
+    /// heal path (the sender redelivers and the redelivery lands on the
+    /// canonical instance). Core-local; never wire-serialized.
+    #[error("persist refused: {0} resolves to a different canonical resident instance")]
+    StaleInstancePersistRefused(EntityId),
 }
 
 impl From<tokio::task::JoinError> for MutationError {
