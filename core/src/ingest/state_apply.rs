@@ -1,5 +1,9 @@
 //! The shared state-apply: one function for every state-bearing feed
-//! (StateSnapshot deltas, the StateAndEvent fast path, Get responses).
+//! (StateSnapshot deltas, the StateAndEvent fast path, Get responses),
+//! with ONE deliberate exception: join_system's system-root adoption is a
+//! wire-state ingress that does not route through here (documented at its
+//! site in system.rs: annotation check inlined, the peer's attested bytes
+//! persisted verbatim through the funnel-bypassing safe direction).
 //!
 //! with_state mediates through the resident entity, so the comparison
 //! machinery decides what the incoming snapshot may do: fresh adoption and

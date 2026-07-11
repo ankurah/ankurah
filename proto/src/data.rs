@@ -120,8 +120,10 @@ pub struct Event {
     pub parent: Clock,
     /// The git-v1 topological level of this event: `1 + max(parent generations)`,
     /// or `1` for a genesis event (266-A, 266-E). Stamped by the committer, carried
-    /// inside the hashed content, and verified per edge at admission. A mandatory
-    /// field: there is no way to represent an event without one.
+    /// inside the hashed content, and verified at admission where parents are
+    /// resolvable (the equation over the whole parent set, all or nothing;
+    /// walk-time edge checks own the opportunistic per-edge detection later). A
+    /// mandatory field: there is no way to represent an event without one.
     pub generation: u32,
 }
 
@@ -131,9 +133,9 @@ impl Event {
 
     /// The generation an event must carry given the generations of its parents:
     /// `1 + max(parent generations)`, or `1` for a genesis event (no parents).
-    /// Saturates at `u32::MAX` (266-C.iv); the plan has the M5 accelerations
-    /// treat any saturated value as ineligible and fall back to the plain walk
-    /// (no comparison consults generations before M5).
+    /// Saturates at `u32::MAX` (266-C.iv); the comparison accelerations treat a
+    /// saturated value as ineligible and fall back to the plain walk (the
+    /// precheck disable path, pinned by the saturation oracle arms).
     pub fn generation_from_parents(parent_generations: impl IntoIterator<Item = u32>) -> u32 {
         parent_generations.into_iter().max().map_or(1, |m| m.saturating_add(1))
     }

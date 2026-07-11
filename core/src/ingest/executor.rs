@@ -1,8 +1,10 @@
 //! The executor: the application sequence for every pipeline feed. The
 //! PerItem arms and the remote commit lane execute through here; the LOCAL
-//! commit lane shares only the planned, policy-checked phase one and keeps
-//! its own phase-two macro-order (commit, advance the transaction forks,
-//! relay to required peers, only then materialize and persist), because an
+//! commit lane shares the planned, policy-checked phase one and the shared
+//! NodePersist persist funnel (the D2-6 one-home rule; context.rs routes
+//! its materialize-and-persist step through it) while keeping its own
+//! phase-two macro-order (commit, advance the transaction forks, relay to
+//! required peers, only then materialize and persist), because an
 //! ephemeral node must not expose state its durable peer has not accepted.
 //! That lane's ordering lives in context.rs; D4 (transactional visibility)
 //! inherits both seams.
@@ -18,7 +20,11 @@
 //!
 //! Containment: a hard failure stops the remaining schedule (later events
 //! likely descend from the failed one), but the applied prefix is real
-//! progress: it is persisted, reported, and notified. That is the C4-11
+//! progress: it is reported and notified, and it is persisted EXCEPT when
+//! the failure was a commit failure that left an applied event out of the
+//! log (uncommitted_in_head suppresses that persist so the buffer never
+//! durably references an uncommitted event; the buffer lags the log's
+//! coverage instead, the direction gap replay repairs). That is the C4-11
 //! semantic the EventOnly arm had and the EventBridge arm lacked; the
 //! executor gives it to every feed. Phantom eviction is likewise uniform
 //! here (C4-12): a speculatively materialized empty-head resident never
@@ -64,8 +70,11 @@ pub(crate) struct ExecutionOutcome {
     /// each arm.
     pub applied: Vec<Attested<Event>>,
     /// The first hard failure, after which the schedule stopped. The applied
-    /// prefix above was still persisted; the feeder decides how the failure
-    /// maps onto its error surface.
+    /// prefix above was still persisted, UNLESS the failure was a commit
+    /// failure that left an applied event out of the log (the
+    /// uncommitted_in_head persist suppression: the buffer must never
+    /// durably reference an uncommitted event). The feeder decides how the
+    /// failure maps onto its error surface.
     pub failure: Option<MutationError>,
 }
 

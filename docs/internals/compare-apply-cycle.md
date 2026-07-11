@@ -64,7 +64,11 @@ batch of events. Three things happen before any comparison:
 
 Only after `apply_event` succeeds is the event
 [committed to permanent storage, then entity state persisted](event-dag.md#the-staging-pattern)
--- stage before head update, commit before state persist.
+-- stage before head update, commit before state persist. The persist itself
+may be **elided** when the resident's persist-currency marker testifies that
+a completed `set_state` already covers exactly this head (see
+[Persistence Ordering](entity-lifecycle.md#persistence-ordering)); in this
+trace the head is new, so the persist is real.
 
 
 ## Stage 1: Compare
@@ -206,9 +210,13 @@ parents.
 
 For completeness, the same machinery handles every other arrival shape:
 
-- **Re-delivery of Y** (head `[X, Y]`): the BFS's comparison side reaches Y --
-  a subject head -- in one step. Verdict `StrictAscends`, no-op. Idempotency
-  falls out of the comparison; there is no separate dedup table.
+- **Re-delivery of Y** (head `[X, Y]`): if Y's id is in the resident's
+  bounded **applied-set** (a memory-only set inserted after Y's persist
+  completed), the retry loop answers the no-op in O(1) with no comparison at
+  all. On a miss (restart, eviction), the BFS's comparison side reaches Y --
+  a subject head -- in one step: verdict `StrictAscends`, no-op. Idempotency
+  still falls out of the comparison; the applied-set is a short-circuit,
+  never a persistent dedup table, and losing it changes cost, never outcome.
 - **Equal** -- the incoming clock *is* the head: no-op before any traversal.
 - **Disjoint** -- traversal bottoms out at two different genesis events:
   rejected. See the

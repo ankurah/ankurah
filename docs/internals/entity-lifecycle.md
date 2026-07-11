@@ -136,8 +136,14 @@ events and empty heads:
 ### The Retry Loop
 
 After guards pass, `apply_event` enters a bounded retry loop (up to 5
-attempts). Each attempt reads the current head, runs
-[`compare()`](event-dag.md#comparing-two-clocks) against the event DAG,
+attempts). Each attempt takes one read-lock acquisition that does three
+things: consult the **applied-set** (a bounded in-memory set of event ids
+this resident has applied or proved covered, inserted only after a completed
+persist) -- a hit is the O(1) already-incorporated no-op, no comparison at
+all -- and snapshot the head together with its per-tip generation annotation,
+so the comparison's precheck operands always annotate exactly the head it
+runs against. On a miss, the attempt runs
+[`compare()`](event-dag.md#comparing-two-clocks) against the event DAG
 and acts on the [`causal relation`](event-dag.md#key-concepts):
 
 | Relation | Action |
@@ -223,6 +229,17 @@ This gives clean crash recovery semantics:
   state and the event is re-applied on next delivery.
 - Crash before `commit_event`: neither event nor updated state is persisted --
   a clean rollback.
+
+Every resident persist funnels through one shared path (`NodePersist`),
+which adds two D2 behaviors. Each resident carries a **persist-currency
+marker**, the pair of the node's reset epoch and the exact head a completed
+`set_state` wrote: when the marker matches the current epoch and head, a
+redundant persist is **elided** entirely (the no-op redelivery case costs
+zero storage writes). The funnel also serializes each entity's whole
+snapshot-write-stamp span on a per-id lock, so concurrent persists of one
+entity cannot land in storage in the opposite order of their snapshots --
+the marker may lag storage (a documented safe direction used by the system
+genesis writes) but never lead it.
 
 
 ## Key Invariants
