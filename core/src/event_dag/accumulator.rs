@@ -67,6 +67,11 @@ pub(crate) struct EventAccumulator<E: GetEvents> {
     /// (D2-4: demotion, never retroactive rejection). Consumed by the
     /// eligibility-keyed frontier ordering; never by a verdict path.
     demoted: BTreeSet<EventId>,
+    /// The M6 kill-switch, set by `compare_with` before any accumulation:
+    /// when true, `accumulate` drives NO edge checks (nothing evaluated,
+    /// nothing registered, nothing demoted). Detection-only machinery, so
+    /// dormancy costs observability, never a verdict.
+    edge_checks_disabled: bool,
 }
 
 impl<E: GetEvents> EventAccumulator<E> {
@@ -82,8 +87,13 @@ impl<E: GetEvents> EventAccumulator<E> {
             edge_pending: BTreeSet::new(),
             edge_waiting: BTreeMap::new(),
             demoted: BTreeSet::new(),
+            edge_checks_disabled: false,
         }
     }
+
+    /// Throw the M6 kill-switch for this comparison's edge checks (called
+    /// once by `compare_with` before any accumulation; see the field doc).
+    pub(crate) fn disable_edge_checks(&mut self) { self.edge_checks_disabled = true; }
 
     /// Called during BFS traversal -- records DAG structure and caches the
     /// event UNDER THE REQUESTED ID (R1, dispositions Q1): mid-walk identity
@@ -104,11 +114,14 @@ impl<E: GetEvents> EventAccumulator<E> {
 
         // The edge check is free where the walk already holds the payloads
         // (plan D2-4): check the arrival as a child, then any children whose
-        // last missing parent this arrival was.
-        self.edge_check(id);
-        if let Some(waiters) = self.edge_waiting.remove(id) {
-            for child in waiters {
-                self.edge_check(&child);
+        // last missing parent this arrival was. Dormant with the M6
+        // kill-switch thrown: no evaluation, no registration bookkeeping.
+        if !self.edge_checks_disabled {
+            self.edge_check(id);
+            if let Some(waiters) = self.edge_waiting.remove(id) {
+                for child in waiters {
+                    self.edge_check(&child);
+                }
             }
         }
     }

@@ -3288,6 +3288,117 @@ mod generation_kill_switch {
         assert_eq!(stats.edge_checks_evaluated, 0, "DORMANT through the apply_event operand path (no edge evaluated)");
     }
 
+    /// EQUIVALENCE on a corpus sample (plan M6), reusing the immunity
+    /// harness machinery: across a fixed randomized band (forty narrow
+    /// corpora and five wide-join corpora, two clock pairs each) plus the
+    /// named seeds (GC-SEED-41, GC-SEED-43, GC-WIDE-ANTICHAIN), the
+    /// switch-thrown run's BOUND observables (verdict, chain core, meet,
+    /// immediate children, layer partition) are byte-identical to the
+    /// ENABLED honest baseline's, both (a) on honest inputs and (b) under
+    /// two-channel gc-rand-cross corruption, where the thrown run must
+    /// also be TOTALLY dormant (zero suppressions, zero edge evaluations,
+    /// zero violations, zero demotions: nothing consumed the lies). Fully
+    /// deterministic, no env knobs: a failure reproduces by rerunning.
+    /// The harness's power to DETECT a bound divergence is proven by the
+    /// immunity module's GC-CONTROL canary; this pin inherits it.
+    #[tokio::test]
+    async fn thrown_switch_preserves_bound_observables_across_corpus_sample() {
+        use super::comparison_property::Rng;
+        use super::gen_corruption_immunity::{generate_corpus, pick_clock, seed_41, seed_43, seed_wide_antichain};
+
+        for seed in 1u32..=40 {
+            let mut rng = Rng(seed.wrapping_add(0x6000_0000).wrapping_mul(0x9E37_79B9) | 1);
+            let n = 5 + rng.below(6);
+            let corpus = generate_corpus(&mut rng, n, false);
+            for pair in 0..2 {
+                let subject = pick_clock(&mut rng, &corpus);
+                let comparison = pick_clock(&mut rng, &corpus);
+                assert_switch_equivalent(&corpus, &subject, &comparison, seed, &format!("narrow seed {seed} pair {pair}")).await;
+            }
+        }
+        for seed in 1u32..=5 {
+            let mut rng = Rng(seed.wrapping_add(0x7000_0000).wrapping_mul(0x9E37_79B9) | 1);
+            let n = 24 + rng.below(25);
+            let corpus = generate_corpus(&mut rng, n, true);
+            for pair in 0..2 {
+                let subject = pick_clock(&mut rng, &corpus);
+                let comparison = pick_clock(&mut rng, &corpus);
+                assert_switch_equivalent(&corpus, &subject, &comparison, seed, &format!("wide seed {seed} pair {pair}")).await;
+            }
+        }
+
+        let (corpus, s, c, _c1, _m) = seed_41();
+        assert_switch_equivalent(&corpus, &[s], &[c], 41, "GC-SEED-41").await;
+        let (corpus, a, b, _f) = seed_43();
+        assert_switch_equivalent(&corpus, &[a], &[b], 43, "GC-SEED-43").await;
+        let (corpus, join, root, ca, cb) = seed_wide_antichain();
+        assert_switch_equivalent(&corpus, std::slice::from_ref(&join), std::slice::from_ref(&root), 64, "GC-WIDE descent").await;
+        assert_switch_equivalent(&corpus, &[ca], &[cb], 65, "GC-WIDE siblings").await;
+    }
+
+    /// One (corpus, pair) through the kill-switch equivalence protocol:
+    /// enabled honest baseline, thrown honest run, thrown gc-rand-cross
+    /// corrupted run; bound equality against the baseline for both thrown
+    /// runs, total dormancy for both.
+    async fn assert_switch_equivalent(
+        corpus: &super::gen_corruption_immunity::Corpus,
+        subject: &[EventId],
+        comparison: &[EventId],
+        corruption_seed: u32,
+        name: &str,
+    ) {
+        use super::comparison_property::Rng;
+        use super::gen_corruption_immunity::{run, shape_doctoring, Doctoring};
+
+        let dormant = |stats: &crate::event_dag::stats::CompareStats, leg: &str| {
+            assert_eq!(stats.precheck_suppressions, 0, "kill-switch {name} ({leg}): a precheck fired with the switch thrown");
+            assert_eq!(stats.edge_checks_evaluated, 0, "kill-switch {name} ({leg}): an edge check evaluated with the switch thrown");
+            assert_eq!(stats.edge_check_violations, 0, "kill-switch {name} ({leg}): an edge violation counted with the switch thrown");
+            assert_eq!(stats.demotions, 0, "kill-switch {name} ({leg}): a demotion happened with the switch thrown");
+        };
+        let ctx = thrown();
+
+        let (sg, cg) = Doctoring::default().operands(corpus, subject, comparison);
+        let baseline =
+            run(corpus.retriever.clone(), corpus, subject, comparison, sg, cg, None, &HashMap::new(), &format!("{name} baseline")).await;
+
+        let (sg, cg) = Doctoring::default().operands(corpus, subject, comparison);
+        let honest_thrown = run(
+            corpus.retriever.clone(),
+            corpus,
+            subject,
+            comparison,
+            sg,
+            cg,
+            Some(&ctx),
+            &HashMap::new(),
+            &format!("{name} thrown honest"),
+        )
+        .await;
+        assert_eq!(
+            honest_thrown.bound, baseline.bound,
+            "kill-switch {name}: the thrown switch changed a BOUND observable on honest inputs"
+        );
+        dormant(&honest_thrown.stats, "honest");
+
+        // gc-rand-cross always yields a doctoring (it seeds at least one
+        // payload lie and falls back to a subject-tip lie).
+        let mut rng = Rng(corruption_seed.wrapping_mul(0x9E37_79B9) ^ 0x00D2_0666 | 1);
+        let doctoring = shape_doctoring("gc-rand-cross", &mut rng, corpus, subject, comparison, &baseline.bound)
+            .expect("gc-rand-cross is meaningful on every pair");
+        let (lying, back) = doctoring.retriever(corpus);
+        let (sg, cg) = doctoring.operands(corpus, subject, comparison);
+        let corrupted_thrown =
+            run(lying, corpus, subject, comparison, sg, cg, Some(&ctx), &back, &format!("{name} thrown corrupted")).await;
+        assert_eq!(
+            corrupted_thrown.bound,
+            baseline.bound,
+            "kill-switch {name}: a corrupted thrown run diverged from the enabled honest baseline (doctored: {})",
+            doctoring.triples(corpus)
+        );
+        dormant(&corrupted_thrown.stats, "corrupted");
+    }
+
     /// LWW events on a FIXED entity id (the tests.rs idiom, duplicated
     /// locally because sibling test modules cannot share private helpers;
     /// apply_event validates event ownership against the entity).
@@ -4511,7 +4622,7 @@ mod gen_corruption_immunity {
     /// Build one shape's doctoring for a (corpus, pair). Returns None when
     /// the shape is not meaningful on this pair (e.g. deflate-meet on a
     /// non-diverged baseline), which the caller skips.
-    fn shape_doctoring(
+    pub(super) fn shape_doctoring(
         shape: &str,
         rng: &mut Rng,
         corpus: &Corpus,
@@ -4656,7 +4767,7 @@ mod gen_corruption_immunity {
     /// how many tips the band accrued; routinely 8..=20 at the wide
     /// tier's sizes). Tips of a DAG are pairwise incomparable, so the
     /// full-tip parent set is already an antichain.
-    fn generate_corpus(rng: &mut Rng, n_events: usize, wide_joins: bool) -> Corpus {
+    pub(super) fn generate_corpus(rng: &mut Rng, n_events: usize, wide_joins: bool) -> Corpus {
         let mut events: Vec<Event> = Vec::new();
         let mut ids: Vec<EventId> = Vec::new();
         let mut parents_map: BTreeMap<EventId, Vec<EventId>> = BTreeMap::new();
@@ -4688,7 +4799,7 @@ mod gen_corruption_immunity {
         Corpus::from_events(events)
     }
 
-    fn pick_clock(rng: &mut Rng, corpus: &Corpus) -> Vec<EventId> {
+    pub(super) fn pick_clock(rng: &mut Rng, corpus: &Corpus) -> Vec<EventId> {
         let mut set = BTreeSet::new();
         for _ in 0..(1 + rng.below(3)) {
             set.insert(corpus.ids[rng.below(corpus.ids.len())].clone());

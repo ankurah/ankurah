@@ -127,6 +127,19 @@ pub(crate) async fn compare_with<E: GetEvents>(
 
     let mut accumulator = EventAccumulator::new(event_getter);
 
+    // The M6 kill-switch (plan M6), read ONCE per comparison from the
+    // caller's eligibility context: with the switch thrown, every
+    // generation consumer below is DORMANT (the prechecks here, the
+    // schedule keying in step(), the edge checks in the accumulator) and
+    // the comparison runs exactly as it would with no generation machinery.
+    // Verdicts are identical either way: the suppress-only discipline
+    // already makes them independent of any operand ASSIGNMENT, and the
+    // kill-switch equivalence pins extend that to operand ABSENCE.
+    let accel_disabled = opts.unverified.is_some_and(|ctx| ctx.accelerations_disabled());
+    if accel_disabled {
+        accumulator.disable_edge_checks();
+    }
+
     // P1/P2 prechecks (D2-4, derivations section 2), wired SUPPRESS-ONLY:
     // when the eligible operands prove StrictDescends(subject over
     // comparison) impossible, the positive fast-path attempt below is
@@ -138,6 +151,7 @@ pub(crate) async fn compare_with<E: GetEvents>(
     // The counter is bumped per suppressed ATTEMPT, whether or not the
     // attempt would have succeeded (write-only observability).
     let suppress_quick_check = match (&opts.subject_gens, &opts.comparison_gens) {
+        _ if accel_disabled => false,
         (Some(sg), Some(cg)) => super::prechecks::rejects_strict_descends(subject, sg, comparison, cg, opts.unverified),
         _ => false,
     };
@@ -197,7 +211,7 @@ pub(crate) async fn compare_with<E: GetEvents>(
     let mut current_budget = initial_budget;
 
     loop {
-        let mut comp = Comparison::new(&mut accumulator, subject, comparison, current_budget, &opts);
+        let mut comp = Comparison::new(&mut accumulator, subject, comparison, current_budget, &opts, accel_disabled);
         let relation = loop {
             if let Some(relation) = comp.step().await? {
                 break relation;
@@ -226,6 +240,11 @@ struct Comparison<'a, E: GetEvents> {
     /// entries read in-hand payloads) and the eligibility context. Never a
     /// verdict input.
     opts: &'a CompareOptions<'a>,
+
+    /// The M6 kill-switch, resolved once by `compare_with`: when set, the
+    /// level drain skips the generation schedule keying entirely and runs
+    /// in plain id order (a pure schedule choice either way).
+    accel_disabled: bool,
 
     /// The subject clock's backward traversal.
     subject: Side,
@@ -351,12 +370,14 @@ impl<'a, E: GetEvents> Comparison<'a, E> {
         comparison: &Clock,
         budget: usize,
         opts: &'a CompareOptions<'a>,
+        accel_disabled: bool,
     ) -> Self {
         Self {
             accumulator,
             subject: Side::new(subject.as_slice().iter().cloned().collect()),
             comparison: Side::new(comparison.as_slice().iter().cloned().collect()),
             opts,
+            accel_disabled,
             states: HashMap::new(),
             meet_candidates: BTreeSet::new(),
             any_common: false,
@@ -406,10 +427,15 @@ impl<'a, E: GetEvents> Comparison<'a, E> {
         // honest operands, deeper entries drain first, which can only form
         // both-frontier co-membership for an unfetchable meet EARLIER, so
         // the fallback fires at least as often as under id order.
-        all_frontier_ids.sort_by_key(|id| match self.eligible_gen(id) {
-            Some(g) => (0u8, std::cmp::Reverse(g)),
-            None => (1u8, std::cmp::Reverse(0)),
-        });
+        // Kill-switch thrown (plan M6): skip the keying entirely; the
+        // pre-sort above already left the level in plain ascending id
+        // order, the exact all-unknowns schedule.
+        if !self.accel_disabled {
+            all_frontier_ids.sort_by_key(|id| match self.eligible_gen(id) {
+                Some(g) => (0u8, std::cmp::Reverse(g)),
+                None => (1u8, std::cmp::Reverse(0)),
+            });
+        }
 
         for id in &all_frontier_ids {
             // Skip events already processed (e.g. an ID that appeared in both
