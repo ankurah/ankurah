@@ -33,13 +33,27 @@ The implementation lives in `core/src/event_dag/` and is consumed primarily by
 ## Key Concepts
 
 **Event** -- A single mutation to an entity. Carries a parent clock (the
-entity's head when the event was created) and a set of backend-specific
-operations. An event with an empty parent clock is a **creation event**
-(genesis).
+entity's head when the event was created), a set of backend-specific
+operations, and a mandatory **generation**: its topological depth,
+`1 + max(parent generations)`, exactly `1` for a creation event. The event id
+is a content hash over `(entity_id, operations, parent, generation)`, so the
+generation is sealed inside the event's identity: storage or wire corruption
+cannot change it without changing the id. An event with an empty parent clock
+is a **creation event** (genesis).
 
 **Clock** -- An ordered set of event IDs representing a frontier in the DAG. An
 entity's **head** is a clock: usually a single event ID (linear history), but
 multiple IDs when concurrent branches coexist.
+
+**Generation** -- The depth number above, stamped by the committer and
+verified at admission wherever the parents are locally resolvable (a mismatch
+is a typed rejection; a genesis must claim exactly 1). Being hash-sealed makes
+a generation *authentic*, not automatically *correct* -- a buggy or hostile
+writer seals its wrong value just as faithfully -- so the comparison consumes
+generations only as accelerations that can never affect an outcome (see
+[Generation accelerations](#generation-accelerations)). Heads are materialized
+with one generation per tip (`GClock`), which is how commit stamping and most
+admission verification run without reading event payloads.
 
 **Meet point** -- The greatest common ancestor(s) of two diverged clocks. The
 meet is itself a frontier: no member is an ancestor of another. Everything
@@ -78,9 +92,11 @@ six possible outcomes:
 | BudgetExceeded | Traversal budget exhausted before a conclusion | Error (see [Budget escalation](#budget-escalation)) |
 
 `StrictDescends` carries a `chain` of the events the subject traversal
-visited. Its contents are duplicate-free, but its order is traversal order,
-not guaranteed topological -- consumers must not use it as an application
-order. Batch application paths sort independently (see
+visited. Its contents are duplicate-free and emitted in **canonical
+topological order** (the chain set re-sorted through the shared topological
+sorter with sorted input, so the emitted order is a function of the set, not
+of the schedule that visited it; pinned by permutation tests). Batch
+application paths still sort independently (see
 [batch ordering](retrieval.md#the-event-lifecycle-stage-apply-commit-persist)).
 
 ### Quick-check: the linear-extension fast path
@@ -94,6 +110,11 @@ subject event's parent set. If so, it returns `StrictDescends` immediately
 This matters for [ephemeral nodes](node-architecture.md#durable-vs-ephemeral-nodes),
 where the comparison head events may not exist in local storage -- the
 quick-check never needs them.
+
+When the caller supplies per-tip generation operands, two rejection
+prechecks (P1/P2) may prove `StrictDescends` impossible before any fetch and
+**suppress** this quick-check attempt -- suppress only, never conclude; see
+[Generation accelerations](#generation-accelerations).
 
 ### BFS traversal
 
@@ -149,6 +170,42 @@ traversal itself restarts from the original clocks -- only the accumulator
 (recorded DAG structure and LRU event cache) survives the retry, so re-walked
 steps avoid storage round-trips but still spend budget. The internal retry
 keeps the public API simple -- callers do not need to manage retry logic.
+
+### Generation accelerations
+
+Since D2 (#266), the comparison consumes event generations in exactly three
+places, all governed by one discipline: a generation may order work and gate
+optional shortcuts, but it can never select, route, or conclude a verdict.
+Verdicts, meets, and layer partitions are byte-identical under arbitrary
+corruption of the values (pinned at scale by the generation-corruption
+immunity oracle in `core/src/event_dag/tests.rs`).
+
+1. **Rejection prechecks (P1/P2)** (`prechecks.rs`) -- given eligible per-tip
+   operands for both clocks, sound rules can prove the `StrictDescends`
+   hypothesis false before any fetch. A rejection only *suppresses* the
+   quick-check attempt; the BFS still decides everything, so a wrong operand
+   costs time, never an outcome.
+2. **Schedule keying** (`comparison.rs`) -- each BFS level drains in
+   max-eligible-generation-first order (EventId tiebreak, unknowns last).
+   A pure schedule choice: level membership and every conclusion are
+   order-independent.
+3. **Walk-time edge checks** (`accumulator.rs`) -- wherever the walk already
+   holds a child and all its parents, it re-checks the stamp equation for
+   free. A violation warns, increments a counter, and demotes that event's
+   value to per-comparison ineligibility; it never rejects committed history
+   (that escalation question is recorded as issue #335). The warning cannot
+   fire under honest, correctly implemented operation -- an honest stamp
+   satisfies the equation by construction and admission rejects mismatches
+   wherever parents are resolvable -- so a production occurrence is a
+   high-signal incident (defective client build, hostile writer, or storage
+   serving doctored payloads).
+
+Eligibility is resolved at consumption: a value is consulted only if it is
+not the `u32::MAX` saturation sentinel, not admitted-unverified (events
+adopted below a state snapshot's horizon), and not demoted by an edge check.
+A node-level kill-switch (`Node::set_generation_accelerations_disabled`)
+makes all three consumers dormant at runtime -- comparisons then run exactly
+as pre-D2 -- while commit stamping and admission verification stay on.
 
 
 ## Event Layers
