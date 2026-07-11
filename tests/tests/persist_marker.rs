@@ -671,3 +671,111 @@ async fn a_pre_reset_marker_at_an_unchanged_head_is_never_trusted() -> Result<()
     );
     Ok(())
 }
+
+/// THE DUPLICATE-INSTANCE REFUSAL PIN (the codex follow-up review's
+/// blocker, coordinator-verified at 92317f65): the per-id span lock orders
+/// persists, but the marker and the snapshot are per Entity INSTANCE, so
+/// with TWO live instances for one id the ordering alone cannot keep
+/// storage coherent. A stale instance persisting LAST blindly upserts its
+/// older head (storage REGRESSES behind the canonical), and the
+/// canonical's next persist then elides on its own instance-local marker,
+/// so the regression is STICKY until the canonical head advances or the
+/// process restarts. The remediation makes the funnel refuse any instance
+/// that is not the node's canonical resident, under the span lock and
+/// BEFORE the elision check; the refusal is an innocent-race item failure,
+/// and the sender's redelivery landing on the canonical is the heal path.
+///
+/// The duplication lever here is conjure_evil_phantom replacing the map
+/// entry while the old instance is strongly held: it stands in for the
+/// remove_if_phantom eviction race (concurrency panel NOTE 4: a sibling
+/// lane's failure evicts the shared entry by id at the executor's
+/// failure-eviction site or commit_remote_transaction's phase-one
+/// eviction, while another lane still holds the instance, and a later
+/// delivery rematerializes a fresh canonical), because no public seam
+/// parks a lane between its apply and its funnel entry. The fix closes
+/// EVERY ordering of that window, which is what this pin binds:
+/// 1. the stale instance's funnel persist returns the typed refusal and
+///    never reaches the engine,
+/// 2. once every persist resolves, storage covers the CANONICAL head,
+/// 3. the canonical's own elision stays truthful (its marker matches both
+///    its head and what storage holds).
+#[tokio::test]
+async fn funnel_refuses_a_stale_duplicate_instance_and_storage_follows_the_canonical() -> Result<()> {
+    let engine = Arc::new(InstrumentedEngine::new(SledStorageEngine::new_test()?));
+    let instruments = engine.instruments();
+    let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
+    node.system.create().await?;
+    let ctx = node.context_async(c).await;
+
+    // Create the record, dropping every strong handle so the creating
+    // resident dies with the transaction.
+    let (rec_id, genesis) = {
+        let trx = ctx.begin();
+        let rec = trx.create(&Record { title: "t0".to_owned(), artist: "a0".to_owned() }).await?;
+        let id = rec.id();
+        let mut events = trx.commit_and_return_events().await?;
+        (id, events.remove(0))
+    };
+    assert!(node.get_resident_entity(rec_id).is_none(), "precondition: no strong holder, the creating resident died");
+
+    // Rehydrate: the soon-to-be-stale instance S at H1 = {genesis}. Its
+    // marker is EMPTY (markers are stamped only by a completed persist of
+    // that same instance), so nothing elides S's persist below.
+    let stale_view = ctx.get::<RecordView>(rec_id).await?;
+    let stale = node.get_resident_entity(rec_id).expect("rehydrated resident");
+    let h1 = stale.head();
+    assert!(h1.contains(&genesis.id()), "precondition: S sits at the genesis head");
+
+    // The duplicate window: the map entry is replaced under S's feet (the
+    // test-only lever standing in for the eviction race described above).
+    let _replacement = node.conjure_evil_phantom(rec_id, Record::collection());
+
+    // A delivery rebuilds the canonical at H2 = {e2} through the real
+    // remote-commit lane, persisting H2 and stamping the NEW instance's
+    // marker.
+    let e2 = ankurah_tests::forge::event_with_parents(rec_id, Record::collection(), title_ops("t1"), &[&genesis]);
+    node.commit_remote_transaction(
+        &c,
+        proto::TransactionId::new(),
+        vec![proto::Attested::opt(genesis.clone(), None), proto::Attested::opt(e2.clone(), None)],
+    )
+    .await
+    .expect("the delivery rebuilds the canonical");
+    let canonical = node.get_resident_entity(rec_id).expect("canonical rebuilt");
+    let h2 = canonical.head();
+    assert!(h2.contains(&e2.id()), "precondition: the canonical advanced to H2");
+    assert_ne!(stale.head(), canonical.head(), "precondition: two live instances at different heads");
+    let stored = engine.collection(&Record::collection()).await?.get_state(rec_id).await?;
+    assert_eq!(stored.payload.state.head, h2, "precondition: storage covers the canonical head");
+
+    // THE REFUSAL: the stale instance drives the real funnel LAST, fully
+    // serialized on the id lock. The funnel must refuse it with the typed
+    // error BEFORE the elision check, and nothing may reach the engine.
+    let baseline = instruments.set_state_attempts();
+    let refusal = node.funnel_persist_for_test(&stale).await;
+    assert!(
+        matches!(&refusal, Err(MutationError::StaleInstancePersistRefused(id)) if *id == rec_id),
+        "the funnel must refuse a non-canonical instance's persist with the typed refusal, got {refusal:?}"
+    );
+    assert_eq!(instruments.set_state_attempts() - baseline, 0, "a refused persist never reaches the engine (no write, no stamp)");
+
+    // THE PROPERTY the refusal protects: after every persist resolved,
+    // storage covers the canonical head (no blind last-writer regression
+    // to H1).
+    let stored = engine.collection(&Record::collection()).await?.get_state(rec_id).await?;
+    assert_eq!(
+        stored.payload.state.head, h2,
+        "marker coherence across duplicate instances: storage must cover the canonical head once all persists resolve"
+    );
+
+    // And the canonical's own elision stays TRUTHFUL: its instance-local
+    // marker names its head, and storage really holds that head.
+    let baseline = instruments.set_state_attempts();
+    node.funnel_persist_for_test(&canonical).await?;
+    assert_eq!(instruments.set_state_attempts() - baseline, 0, "the canonical elides on its own completed-persist testimony");
+    let stored = engine.collection(&Record::collection()).await?.get_state(rec_id).await?;
+    assert_eq!(stored.payload.state.head, h2, "the elision testified truthfully: storage holds the head the canonical's marker names");
+
+    drop(stale_view);
+    Ok(())
+}
