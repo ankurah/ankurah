@@ -71,15 +71,34 @@ impl From<&Clock> for JsValue {
     }
 }
 
+/// Decode one stored generation number from a JsValue, checked and
+/// fail-loud: the ONE conversion rule for every IndexedDB generation read
+/// (the entity record's GClock pairs below and the event column's
+/// read_generation in the indexeddb engine). Numbers round-trip through JS
+/// as f64 and a u32 is exactly representable, so the happy path is
+/// lossless; anything else refuses typed rather than coercing (M4
+/// remediation item 3 set the standard for the GClock decode; the M6
+/// close-out extends it to the event column). NaN and the infinities fail
+/// the fract() test (their fract is NaN), fractions fail it directly, and
+/// the range test rejects negatives and values beyond u32::MAX; only an
+/// exact u32 passes, so the `as` cast is lossless by construction. A
+/// non-number decodes as InvalidFormat.
+pub fn decode_generation(value: &JsValue) -> Result<u32, DecodeError> {
+    let raw = value.as_f64().ok_or(DecodeError::InvalidFormat)?;
+    if raw.fract() != 0.0 || !(0.0..=u32::MAX as f64).contains(&raw) {
+        return Err(DecodeError::InvalidGeneration(raw));
+    }
+    Ok(raw as u32)
+}
+
 /// GClock is stored self-contained as an array of `[generation, eventIdBase64]`
-/// pairs, one per head tip. Numbers round-trip through JS as f64 and a u32 is
-/// exactly representable, so the happy-path generation read is lossless; the
-/// read REFUSES any stored number that is not exactly a u32 with a typed
-/// DecodeError rather than coercing (M4 remediation item 3: the saturating
-/// cast it replaces silently mapped NaN and negatives to 0, truncated
-/// fractions, and clamped overflow, contradicting the loud-failure
-/// discipline of the other engine homes). Construction normalizes to the
-/// canonical order like every other GClock path.
+/// pairs, one per head tip. The generation read routes through
+/// [`decode_generation`], the shared checked conversion (M4 remediation
+/// item 3: the saturating cast it replaced silently mapped NaN and
+/// negatives to 0, truncated fractions, and clamped overflow,
+/// contradicting the loud-failure discipline of the other engine homes).
+/// Construction normalizes to the canonical order like every other GClock
+/// path.
 impl TryFrom<JsValue> for GClock {
     type Error = DecodeError;
 
@@ -88,16 +107,7 @@ impl TryFrom<JsValue> for GClock {
         let mut entries = Vec::new();
         for i in 0..array.length() {
             let pair: js_sys::Array = array.get(i).dyn_into().map_err(|_| DecodeError::InvalidFormat)?;
-            let raw = pair.get(0).as_f64().ok_or(DecodeError::InvalidFormat)?;
-            // Checked, fail-loud conversion: NaN and the infinities fail the
-            // fract() test (their fract is NaN), fractions fail it directly,
-            // and the range test rejects negatives and values beyond
-            // u32::MAX. Only an exact u32 passes, so the `as` cast below is
-            // lossless by construction.
-            if raw.fract() != 0.0 || !(0.0..=u32::MAX as f64).contains(&raw) {
-                return Err(DecodeError::InvalidGeneration(raw));
-            }
-            let generation = raw as u32;
+            let generation = decode_generation(&pair.get(0))?;
             let id_str = pair.get(1).as_string().ok_or(DecodeError::NotStringValue)?;
             entries.push((generation, EventId::from_base64(&id_str)?));
         }

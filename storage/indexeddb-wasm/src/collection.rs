@@ -25,21 +25,19 @@ use ankurah_storage_common::{filtering::ValueSetStream, OrderByComponents, Plan}
 use futures::StreamExt;
 use tracing::{debug, warn};
 
-/// Read the mandatory u32 generation off a stored EVENT object. Numbers
-/// round-trip through JS as f64 and a u32 is exactly representable, so the
-/// read is lossless FOR VALUES THE PAIRED WRITE PATH PRODUCED; a corrupted
-/// stored number still coerces silently through the `as u32` cast (the same
-/// class the entity-record GClock decode rejects typed since the M4
-/// remediation; tightening this event-column read is tracked with the other
-/// indexeddb read-path follow-ups). There is no numeric `TryFrom<JsValue>`
-/// to route through `Object::get`, hence the direct reflect-and-`as_f64`
-/// read.
+/// Read the mandatory u32 generation off a stored EVENT object, through the
+/// shared checked conversion (proto::wasm::decode_generation, the same rule
+/// as the entity-record GClock decode): a stored number that is not exactly
+/// a u32 fails LOUDLY with the typed DecodeError::InvalidGeneration instead
+/// of coercing, and a missing or non-number value fails as InvalidFormat
+/// (M6 close-out; the M4 remediation set this standard and expressly left
+/// this event-column sibling for M6). There is no numeric
+/// `TryFrom<JsValue>` to route through `Object::get`, hence the direct
+/// reflect-and-decode read.
 fn read_generation(event_obj: &Object) -> Result<u32, RetrievalError> {
     let raw = js_sys::Reflect::get(event_obj, &GENERATION_KEY)
         .map_err(|_| RetrievalError::StorageError(anyhow::anyhow!("Failed to get generation").into()))?;
-    raw.as_f64()
-        .map(|n| n as u32)
-        .ok_or_else(|| RetrievalError::StorageError(anyhow::anyhow!("event generation missing or not a number").into()))
+    Ok(proto::wasm::decode_generation(&raw)?)
 }
 
 #[derive(Debug)]
@@ -409,7 +407,12 @@ impl StorageCollection for IndexedDBBucket {
             let transaction = db_connection.transaction_with_str("events").require("create transaction")?;
             let store = transaction.object_store("events").require("get object store")?;
             let index = store.index("by_entity_id").require("get entity_id index")?;
-            let key_range = web_sys::IdbKeyRange::only(&id.into()).require("create key range")?;
+            // The index field is the base64 STRING add_event stores under
+            // __entity_id. The previous `&id.into()` went through the
+            // wasm_bindgen class handle (an object, never a valid IDB key),
+            // so every call failed with a DataError before reading anything;
+            // found by the M6 doctored-generation pin's dump arm.
+            let key_range = web_sys::IdbKeyRange::only(&id.to_base64().into()).require("create key range")?;
             let request = index.open_cursor_with_range(&key_range).require("open cursor")?;
 
             let mut events = Vec::new();
