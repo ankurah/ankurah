@@ -85,6 +85,14 @@ deliberately schema-blind -- applying remote events never blocks on the
 catalog -- so a misbehaving peer can land an ill-typed payload; this
 boundary is what contains it.)
 
+**Sort keys type themselves from the canonical type.** ORDER BY key
+parts -- in the storage planner's index scans and in the reactor's ordered
+live queries alike -- resolve their column through the catalog to the
+canonical value type, so numerics sort numerically. (Before canonical
+types existed, sort collation was hardcoded to strings, which orders
+`10` before `2`.) A column the catalog cannot name falls back to string
+collation.
+
 **Indexes collate in exactly one domain.** The reactor's comparison index
 converts predicate literals to `Value` at insertion so both sides of every
 lookup collate under the same byte encoding. Storage-engine index encoding
