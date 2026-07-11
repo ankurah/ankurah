@@ -241,6 +241,21 @@ where
         Self::build(engine, policy_agent, true, SmallRng::seed_from_u64(rng_seed))
     }
 
+    /// The generation-acceleration kill-switch (D2 plan M6), a node-wide
+    /// runtime flag. Thrown (`true`), every generation CONSUMER in the
+    /// comparison goes dormant: the P1/P2 rejection prechecks, the
+    /// generation-first frontier scheduling, and the walk-time edge checks
+    /// all stand down, and comparisons run exactly as they would with no
+    /// generation machinery. STAMPING AND ADMISSION VERIFICATION STAY ON:
+    /// events keep their hashed generation stamps and a mis-stamped event
+    /// keeps rejecting with the typed lineage error. Verdicts and meets are
+    /// identical in both worlds (the suppress-only discipline; pinned by
+    /// the kill-switch equivalence tests), so throwing the switch can only
+    /// cost acceleration, never an outcome. Operational escape hatch: flip
+    /// it if the accelerator ever misbehaves in production; clear it to
+    /// re-enable.
+    pub fn set_generation_accelerations_disabled(&self, disabled: bool) { self.entities.unverified().set_accelerations_disabled(disabled); }
+
     fn build(engine: Arc<SE>, policy_agent: PA, durable: bool, rng: SmallRng) -> Self {
         let collections = CollectionSet::new(engine);
         let entityset: WeakEntitySet = Default::default();
@@ -1171,14 +1186,20 @@ where
         PA: PolicyAgent + Send + Sync + 'static,
         C: crate::util::Iterable<PA::ContextData>,
     {
-        use crate::event_dag::{compare, AbstractCausalRelation};
+        use crate::event_dag::comparison::{compare_with, CompareOptions};
+        use crate::event_dag::AbstractCausalRelation;
         use crate::retrieval::LocalEventGetter;
         use std::collections::HashSet;
 
         let event_getter = LocalEventGetter::new(storage_collection.clone(), self.durable);
 
-        // First check the causal relationship
-        let comparison_result = compare(&event_getter, current_head, known_head, 100000).await?;
+        // First check the causal relationship. No operand annotations here
+        // (neither head is a resident's), but the node's eligibility
+        // context rides along so the walk-time edge checks and schedule
+        // keying honor D2-4 eligibility and the M6 kill-switch on this
+        // walk too.
+        let opts = CompareOptions { unverified: Some(self.entities.unverified()), ..Default::default() };
+        let comparison_result = compare_with(&event_getter, current_head, known_head, 100000, opts).await?;
 
         match comparison_result.relation {
             AbstractCausalRelation::Equal => {

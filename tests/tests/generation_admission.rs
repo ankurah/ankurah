@@ -221,6 +221,94 @@ async fn r_d2_2b_genesis_must_claim_exactly_one() -> Result<()> {
     Ok(())
 }
 
+/// Plan M6, the kill-switch stay-on pin: with the generation-acceleration
+/// kill-switch thrown on BOTH nodes
+/// (Node::set_generation_accelerations_disabled), STAMPING AND ADMISSION
+/// VERIFICATION STAY ON. An honest commit chain still stamps
+/// 1 + max(parent generations) into the hashed payload (genesis exactly 1);
+/// a forged mis-stamp still rejects with the typed lineage error and its
+/// honestly stamped twin still applies, through real comparisons that run
+/// with every generation consumer dormant.
+///
+/// Green from birth, per the established convention: the switch is wired
+/// exclusively into the comparison's consumers, so no red is constructible
+/// without first mis-wiring it into the stamp or verify paths, which is
+/// exactly the mistake this pin exists to catch. Teeth demonstrated by
+/// hostile edit (output in the commit body): gating check_generation on
+/// the switch turns exactly this pin red.
+#[tokio::test]
+async fn kill_switch_leaves_stamping_and_admission_verification_on() -> Result<()> {
+    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    server.system.create().await?;
+    server.set_generation_accelerations_disabled(true);
+    let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    client.set_generation_accelerations_disabled(true);
+    let _conn = LocalProcessConnection::new(&client, &server).await?;
+    client.system.wait_system_ready().await;
+
+    let ctx_s = server.context(c)?;
+    let ctx_c = client.context(c)?;
+    let _relay_context = ctx_c.query_wait::<RecordView>("title = 'no-such-title'").await?;
+
+    // STAMPING with the switch thrown: genesis stamps exactly 1, its child
+    // stamps 1 + max(parent generations) = 2, sealed inside the hashed
+    // payload as always.
+    let (rec_id, genesis) = {
+        let trx = ctx_s.begin();
+        let rec = trx.create(&Record { title: "t0".to_owned(), artist: "a0".to_owned() }).await?;
+        let id = rec.id();
+        let mut events = trx.commit_and_return_events().await?;
+        (id, events.remove(0))
+    };
+    assert_eq!(genesis.generation, 1, "stamping stays on: genesis claims exactly 1 with the switch thrown");
+    let view_s = ctx_s.get::<RecordView>(rec_id).await?;
+    let edit_event = {
+        let trx = ctx_s.begin();
+        view_s.edit(&trx)?.title().set(&"t1".to_owned())?;
+        let mut events = trx.commit_and_return_events().await?;
+        events.remove(0)
+    };
+    assert_eq!(edit_event.generation, 2, "stamping stays on: the child stamps 1 + max(parent generations)");
+
+    // The client adopted the entity through subscription relay; make the
+    // parents locally resolvable (the backfill lane), then forge.
+    let view = ctx_c.get::<RecordView>(rec_id).await?;
+    assert_eq!(view.title().unwrap(), "t1", "comparisons still work end to end with the switch thrown");
+    NodeApplier::apply_updates_for_test(&client, &server.id, vec![event_only_item(genesis.clone()), event_only_item(edit_event.clone())])
+        .await
+        .expect("backfilling the adopted head's own events is clean");
+    let collection = ctx_c.collection(&Record::collection()).await?;
+    assert!(collection.has_event(&edit_event.id()).await?, "precondition: the parent body is in the client's local log");
+
+    // ADMISSION VERIFICATION with the switch thrown: a child of the
+    // (generation 2) edit claiming 5 is rejected typed; the one correct
+    // claim is 3.
+    let parent = proto::Clock::from(vec![edit_event.id()]);
+    let forged = forge_claiming(rec_id, parent.clone(), "forged-title", 5);
+    let forged_id = forged.id();
+    let err = NodeApplier::apply_updates_for_test(&client, &server.id, vec![event_only_item(forged)])
+        .await
+        .expect_err("verification stays on: a mis-stamped event must still be rejected with the switch thrown");
+    let ApplyError::Items(items) = err else {
+        panic!("expected per-item aggregation, got {err:?}");
+    };
+    assert_generation_mismatch(&items[0].cause, 5, 3, "kill-switch stay-on");
+    assert_eq!(view.title().unwrap(), "t1", "the forgery must not perturb the entity");
+    assert!(!collection.has_event(&forged_id).await?, "the forgery must not be committed");
+
+    // The honestly stamped twin still applies (both directions, as in
+    // R-D2-2b), through a comparison whose consumers are all dormant.
+    let honest = forge_claiming(rec_id, parent, "forged-title", 3);
+    let honest_id = honest.id();
+    NodeApplier::apply_updates_for_test(&client, &server.id, vec![event_only_item(honest)])
+        .await
+        .expect("the correctly stamped twin must apply cleanly with the switch thrown");
+    assert_eq!(view.title().unwrap(), "forged-title");
+    assert!(view.entity().head().contains(&honest_id), "the honest twin advances the head");
+
+    Ok(())
+}
+
 /// Plan REV 5 section L (the StateAndEvent cargo ruling, reversing M2's
 /// warn-and-store arm): an event traveling as StateAndEvent cargo whose
 /// claimed generation PROVABLY contradicts locally held parents aborts the
