@@ -187,13 +187,8 @@ impl WatcherSet {
                     // accumulate_interested_watchers will extract the value at this path.
                     let index = self.index_watchers.entry((collection_id.clone(), property_path)).or_default();
 
-                    // Index the literal in VALUE collation: the lookup side
-                    // (accumulate_interested_watchers) collates entity VALUES,
-                    // and the two Collatable impls are not byte-identical for
-                    // every variant (ast::Literal::I32 encodes 4 raw bytes;
-                    // Value::I32 widens to 8 to preserve numeric order across
-                    // widths). One collation domain -- the value's -- for both
-                    // sides of the index.
+                    // Convert the literal before indexing so thresholds and
+                    // entity values share Value's single collation domain.
                     let value: crate::value::Value = literal.into();
                     match op {
                         WatcherOp::Add => {
