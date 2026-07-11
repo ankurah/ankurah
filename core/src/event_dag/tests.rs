@@ -3822,6 +3822,14 @@ mod comparison_property {
 // still hold per run). BudgetExceeded in ANY run is a harness bug, never
 // tolerated: the budget is 4x corpus and the walk decrements at most
 // twice per event.
+//
+// Corpus WIDTH: the randomized default and large tiers draw at most two
+// parents per event and at most three clock tips, so they never build a
+// wide frontier. The GC-WIDE-ANTICHAIN named seed (width 64, the
+// event_dag bench's detonation shape) and the wide randomized tier
+// (full-current-tip joins) close that class: the M5 edge-check
+// registration explosion (fixed in ba1e5e52) hid exactly there, through
+// nineteen commits of narrow-corpus soundness testing.
 // ============================================================================
 
 #[cfg(test)]
@@ -4160,6 +4168,38 @@ mod gen_corruption_immunity {
         (Corpus::from_events(vec![g, m, c, f, a, b]), a_id, b_id, f_id)
     }
 
+    /// GC-WIDE-ANTICHAIN width: the event_dag bench's detonation width
+    /// (compare/wide_antichain/64), where the pre-ba1e5e52 edge-check
+    /// registration explosion took one comparison past 11 GB RSS.
+    pub(super) const WIDE_ANTICHAIN_WIDTH: usize = 64;
+
+    /// GC-WIDE-ANTICHAIN: one root, WIDE_ANTICHAIN_WIDTH concurrent
+    /// children, one join naming all of them as parents. The mandatory
+    /// wide-frontier seed (blind-spot closure): no other corpus in this
+    /// module walks a frontier wider than three, so nothing here ever
+    /// saturated the blocked-edge-check bookkeeping until this seed.
+    /// Returns the corpus plus (join, root, child_a, child_b) for the
+    /// three pinned pairs: join vs root (the walk holds every join edge
+    /// blocked at once), sibling vs sibling (wide divergence meeting at
+    /// the root), and the full child antichain as a width-64 CLOCK vs
+    /// root (wide operand GClocks and frontier initialization).
+    pub(super) fn seed_wide_antichain() -> (Corpus, EventId, EventId, EventId, EventId) {
+        let root = make_test_event_u16(1, &[]);
+        let children: Vec<Event> = (0..WIDE_ANTICHAIN_WIDTH).map(|i| make_test_event_u16(i as u16 + 2, &[&root])).collect();
+        let join = make_test_event_u16(WIDE_ANTICHAIN_WIDTH as u16 + 2, &children.iter().collect::<Vec<_>>());
+        let (join_id, root_id, ca_id, cb_id) = (join.id(), root.id(), children[0].id(), children[1].id());
+        let mut events = vec![root];
+        events.extend(children);
+        events.push(join);
+        (Corpus::from_events(events), join_id, root_id, ca_id, cb_id)
+    }
+
+    /// Every child of the wide-antichain corpus's root, as a width-64
+    /// antichain clock (the merged-head shape a resident would carry).
+    pub(super) fn wide_antichain_children(corpus: &Corpus, root: &EventId) -> Vec<EventId> {
+        corpus.ids.iter().filter(|id| corpus.parents_map[*id].as_slice() == std::slice::from_ref(root)).cloned().collect()
+    }
+
     /// The 4.1 baseline meet is EXACTLY {c1, m}: the DAG on which the RFC's
     /// generation-threshold stop rule would have wrongly concluded {c1},
     /// missing the low-generation common branch head m (derivations 4.1).
@@ -4194,6 +4234,77 @@ mod gen_corruption_immunity {
             }
             other => panic!("gc_seed_43 baseline must be DivergedSince, got {other:?}"),
         }
+        assert_eq!(capture.stats.edge_check_violations, 0, "the honest build stamps cleanly");
+    }
+
+    /// The wide-antichain baselines, pinned BEFORE any corruption runs:
+    /// join vs root is a StrictDescends whose backward walk fetches the
+    /// join first and holds all 64 of its edges blocked at once (one such
+    /// comparison exceeded 11 GB RSS before ba1e5e52; run()'s budget and
+    /// validity laws now bound it), sibling vs sibling diverges with meet
+    /// EXACTLY {root}, and the full 64-tip child antichain as a CLOCK
+    /// strictly descends the root.
+    #[tokio::test]
+    async fn gc_wide_antichain_baselines_descend_and_meet_at_root() {
+        let (corpus, join, root, ca, cb) = seed_wide_antichain();
+
+        let (sg, cg) = Doctoring::default().operands(&corpus, std::slice::from_ref(&join), std::slice::from_ref(&root));
+        let capture = run(
+            corpus.retriever.clone(),
+            &corpus,
+            &[join.clone()],
+            &[root.clone()],
+            sg,
+            cg,
+            None,
+            &HashMap::new(),
+            "gc_wide_antichain descent baseline",
+        )
+        .await;
+        assert!(matches!(capture.bound, Bound::StrictDescends { .. }), "join vs root must be StrictDescends, got {:?}", capture.bound);
+        assert_eq!(capture.stats.edge_check_violations, 0, "the honest build stamps cleanly");
+
+        let (sg, cg) = Doctoring::default().operands(&corpus, std::slice::from_ref(&ca), std::slice::from_ref(&cb));
+        let capture = run(
+            corpus.retriever.clone(),
+            &corpus,
+            &[ca.clone()],
+            &[cb.clone()],
+            sg,
+            cg,
+            None,
+            &HashMap::new(),
+            "gc_wide_antichain sibling baseline",
+        )
+        .await;
+        match &capture.bound {
+            Bound::DivergedSince { meet, .. } => {
+                assert_eq!(meet, &vec![root.clone()], "wide siblings meet EXACTLY at the root");
+            }
+            other => panic!("gc_wide_antichain sibling baseline must be DivergedSince, got {other:?}"),
+        }
+        assert_eq!(capture.stats.edge_check_violations, 0, "the honest build stamps cleanly");
+
+        let antichain = wide_antichain_children(&corpus, &root);
+        assert_eq!(antichain.len(), WIDE_ANTICHAIN_WIDTH, "shape check: the full child antichain");
+        let (sg, cg) = Doctoring::default().operands(&corpus, &antichain, std::slice::from_ref(&root));
+        let capture = run(
+            corpus.retriever.clone(),
+            &corpus,
+            &antichain,
+            &[root.clone()],
+            sg,
+            cg,
+            None,
+            &HashMap::new(),
+            "gc_wide_antichain clock baseline",
+        )
+        .await;
+        assert!(
+            matches!(capture.bound, Bound::StrictDescends { .. }),
+            "the width-64 clock must strictly descend the root, got {:?}",
+            capture.bound
+        );
         assert_eq!(capture.stats.edge_check_violations, 0, "the honest build stamps cleanly");
     }
 
@@ -4418,16 +4529,28 @@ mod gen_corruption_immunity {
     // ---- Randomized corpus generation (shared with the plain property
     // test's idiom: xorshift, occasional extra roots, antichain clocks) ----
 
-    fn generate_corpus(rng: &mut Rng, n_events: usize) -> Corpus {
+    /// `wide_joins: false` is the original tier: one or two parents per
+    /// event, so no wide frontier ever forms (the blind spot the M5
+    /// edge-check defect hid in). `wide_joins: true` is the wide tier:
+    /// single-parent draws let tips accumulate, and an occasional event
+    /// joins ALL current tips (a full-frontier join, width bounded only by
+    /// how many tips the band accrued; routinely 8..=20 at the wide
+    /// tier's sizes). Tips of a DAG are pairwise incomparable, so the
+    /// full-tip parent set is already an antichain.
+    fn generate_corpus(rng: &mut Rng, n_events: usize, wide_joins: bool) -> Corpus {
         let mut events: Vec<Event> = Vec::new();
         let mut ids: Vec<EventId> = Vec::new();
         let mut parents_map: BTreeMap<EventId, Vec<EventId>> = BTreeMap::new();
+        let mut tips: BTreeSet<EventId> = BTreeSet::new();
         for i in 0..n_events {
             let parent_ids: Vec<EventId> = if i == 0 || rng.below(6) == 0 {
                 vec![]
+            } else if wide_joins && tips.len() >= 2 && rng.below(12) == 0 {
+                tips.iter().cloned().collect()
             } else {
                 let mut chosen = BTreeSet::new();
-                for _ in 0..(1 + rng.below(2)) {
+                let draws = if wide_joins { 1 } else { 1 + rng.below(2) };
+                for _ in 0..draws {
                     chosen.insert(ids[rng.below(ids.len())].clone());
                 }
                 super::comparison_property::to_antichain(&parents_map, &chosen)
@@ -4435,6 +4558,10 @@ mod gen_corruption_immunity {
             let parent_events: Vec<&Event> =
                 parent_ids.iter().map(|pid| events.iter().find(|e| e.id() == *pid).expect("parent id was minted above")).collect();
             let ev = make_test_event_u16(i as u16 + 1, &parent_events);
+            for p in &parent_ids {
+                tips.remove(p);
+            }
+            tips.insert(ev.id());
             parents_map.insert(ev.id(), parent_ids);
             ids.push(ev.id());
             events.push(ev);
@@ -4456,6 +4583,7 @@ mod gen_corruption_immunity {
     fn gen_seed_base() -> u32 { std::env::var("GEN_ORACLE_SEED_BASE").ok().and_then(|s| s.parse().ok()).unwrap_or(1) }
     fn gen_seed_count() -> u32 { std::env::var("GEN_ORACLE_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(300) }
     fn gen_large_seed_count() -> u32 { std::env::var("GEN_ORACLE_LARGE_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(20) }
+    fn gen_wide_seed_count() -> u32 { std::env::var("GEN_ORACLE_WIDE_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(10) }
     fn gen_shape_filter() -> Option<String> { std::env::var("GEN_ORACLE_SHAPE").ok() }
 
     /// Documented corruption-seed mix: one xorshift stream per
@@ -4467,11 +4595,20 @@ mod gen_corruption_immunity {
 
     /// Drive every shape of the two-channel matrix over one generated
     /// corpus size band. Returns how many corrupted runs showed any FREE
-    /// delta (the GC-RAND aggregate non-vacuity numerator).
-    async fn drive_seed_band(dag_seed: u32, n_min: usize, n_span: usize, shape_filter: &Option<String>) -> usize {
+    /// delta (the GC-RAND aggregate non-vacuity numerator) and the
+    /// corpus's maximum parent degree (the wide tier's own non-vacuity
+    /// observable: proof its bands actually contain wide joins).
+    async fn drive_seed_band(
+        dag_seed: u32,
+        n_min: usize,
+        n_span: usize,
+        shape_filter: &Option<String>,
+        wide_joins: bool,
+    ) -> (usize, usize) {
         let mut rng = Rng(dag_seed.wrapping_mul(0x9E37_79B9) | 1);
         let n_events = n_min + rng.below(n_span);
-        let corpus = generate_corpus(&mut rng, n_events);
+        let corpus = generate_corpus(&mut rng, n_events, wide_joins);
+        let max_parent_degree = corpus.parents_map.values().map(Vec::len).max().unwrap_or(0);
         let mut free_deltas = 0usize;
 
         for _pair in 0..4 {
@@ -4526,7 +4663,7 @@ mod gen_corruption_immunity {
                 }
             }
         }
-        free_deltas
+        (free_deltas, max_parent_degree)
     }
 
     fn bound_matches_expected(expected: &super::comparison_property::Expected, bound: &Bound) -> bool {
@@ -4580,7 +4717,7 @@ mod gen_corruption_immunity {
         let filter = gen_shape_filter();
         let mut free_deltas = 0usize;
         for dag_seed in base..base.saturating_add(count) {
-            free_deltas += drive_seed_band(dag_seed, 5, 6, &filter).await;
+            free_deltas += drive_seed_band(dag_seed, 5, 6, &filter, false).await.0;
         }
         assert!(
             free_deltas > 0,
@@ -4598,8 +4735,29 @@ mod gen_corruption_immunity {
         let count = gen_large_seed_count();
         let filter = gen_shape_filter();
         for dag_seed in base..base.saturating_add(count) {
-            drive_seed_band(dag_seed.wrapping_add(0x4000_0000), 20, 21, &filter).await;
+            drive_seed_band(dag_seed.wrapping_add(0x4000_0000), 20, 21, &filter, false).await;
         }
+    }
+
+    /// The WIDE-frontier variant (blind-spot closure, with ba1e5e52):
+    /// corpora whose generator emits full-current-tip joins over 24..=48
+    /// events, so the walk's blocked-edge bookkeeping and the frontier
+    /// ordering see wide parent sets nobody hand-picked. A token count
+    /// rides the gate (GEN_ORACLE_WIDE_SEEDS, default 10: ten bands of
+    /// four pairs each, roughly a second; the deterministic width-64 pin
+    /// is gc_wide_antichain_is_immune_under_every_shape); the nightly
+    /// scales it. The band-wide max parent degree is asserted so the tier
+    /// can never silently degenerate back to narrow corpora.
+    #[tokio::test]
+    async fn randomized_wide_corpora_are_immune_to_generation_corruption() {
+        let base = gen_seed_base();
+        let count = gen_wide_seed_count();
+        let filter = gen_shape_filter();
+        let mut widest = 0usize;
+        for dag_seed in base..base.saturating_add(count) {
+            widest = widest.max(drive_seed_band(dag_seed.wrapping_add(0x2000_0000), 24, 25, &filter, true).await.1);
+        }
+        assert!(widest >= 8, "the wide tier must actually generate wide joins (widest parent set seen: {widest}); the generator's full-tip join path cannot be engaging");
     }
 
     // ---- Named deterministic sub-arm pins (always-on; never env-scaled) ----
@@ -4619,6 +4777,21 @@ mod gen_corruption_immunity {
     async fn gc_seed_43_is_immune_under_every_shape() {
         let (corpus, a, b, _f) = seed_43();
         assert_seed_immune(&corpus, &[a], &[b], "gc_seed_43").await;
+    }
+
+    /// Every shape against the width-64 antichain, on all three pinned
+    /// pairs (descent across the join, wide-sibling divergence, and the
+    /// width-64 clock). The arm-ii closure of the wide-frontier blind
+    /// spot: corruption on a shape whose walk saturates the blocked-edge
+    /// bookkeeping (and whose operand GClocks carry 64 tips) must still
+    /// move nothing BOUND.
+    #[tokio::test]
+    async fn gc_wide_antichain_is_immune_under_every_shape() {
+        let (corpus, join, root, ca, cb) = seed_wide_antichain();
+        assert_seed_immune(&corpus, std::slice::from_ref(&join), std::slice::from_ref(&root), "gc_wide_antichain descent").await;
+        assert_seed_immune(&corpus, &[ca], &[cb], "gc_wide_antichain siblings").await;
+        let antichain = wide_antichain_children(&corpus, &root);
+        assert_seed_immune(&corpus, &antichain, &[root], "gc_wide_antichain clock").await;
     }
 
     async fn assert_seed_immune(corpus: &Corpus, subject: &[EventId], comparison: &[EventId], name: &str) {
