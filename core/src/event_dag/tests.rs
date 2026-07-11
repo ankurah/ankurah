@@ -3178,6 +3178,136 @@ mod walk_time_edge_checks {
 }
 
 // ============================================================================
+// GENERATION KILL-SWITCH (D2 M6, plan M6): a node-level runtime switch on the
+// acceleration-eligibility context (UnverifiedEvents) bypasses every
+// generation CONSUMER in the comparison: the P1/P2 prechecks, the
+// generation-first level scheduling, and the walk-time edge checks all go
+// DORMANT, while stamping and admission verification stay on (pinned in
+// tests/tests/generation_admission.rs). Verdicts and meets are identical in
+// both worlds; the suppress-only discipline already guarantees that for any
+// operand ASSIGNMENT, and these pins extend it to operand ABSENCE.
+// ============================================================================
+
+#[cfg(test)]
+mod generation_kill_switch {
+    use super::*;
+    use crate::ingest::UnverifiedEvents;
+
+    /// A switch-thrown eligibility context: the same node-level object the
+    /// production lanes hand to every comparison (apply_event, apply_state,
+    /// the bridge walk).
+    fn thrown() -> UnverifiedEvents {
+        let ctx = UnverifiedEvents::default();
+        ctx.set_accelerations_disabled(true);
+        ctx
+    }
+
+    /// DORMANCY (plan M6): with the switch thrown, zero precheck
+    /// suppressions and zero edge-check equation evaluations occur, on a
+    /// shape where the enabled world provably shows both, and the verdict
+    /// is byte-identical. The shape is the GC-INFLATE one-step recipe: an
+    /// inflated comparison operand makes P1 suppress the quick check
+    /// (enabled world), which routes through the BFS, whose arrival order
+    /// (e then h) completes e's parent edge in hand and evaluates it.
+    #[tokio::test]
+    async fn thrown_switch_suppresses_no_prechecks_and_evaluates_no_edge_checks() {
+        let mut retriever = MockRetriever::new();
+        let h = make_test_event(1, &[]);
+        let e = make_test_event(2, &[&h]);
+        retriever.add_event(&h);
+        retriever.add_event(&e);
+        let subject = clock!(e.id());
+        let comparison = clock!(h.id());
+        let opts = |unverified| CompareOptions {
+            subject_gens: Some(GClock::from((2, e.id()))),
+            comparison_gens: Some(GClock::from((4_000_000_000, h.id()))),
+            unverified,
+        };
+
+        // Enabled twin, harness honesty: both consumer classes are LIVE on
+        // this shape, so the zeros below cannot be vacuous.
+        let enabled = compare_with(retriever.clone(), &subject, &comparison, 100, opts(None)).await.unwrap();
+        assert!(matches!(enabled.relation, AbstractCausalRelation::StrictDescends { .. }), "precondition: truth is StrictDescends");
+        assert!(
+            enabled.stats.precheck_suppressions >= 1,
+            "harness honesty: the inflated comparison operand must suppress in the ENABLED world, got {}",
+            enabled.stats.precheck_suppressions
+        );
+        assert!(
+            enabled.stats.edge_checks_evaluated >= 1,
+            "harness honesty: the enabled BFS must evaluate e's in-hand parent edge, got {}",
+            enabled.stats.edge_checks_evaluated
+        );
+
+        // Thrown switch: every consumer dormant, verdict untouched.
+        let ctx = thrown();
+        let disabled = compare_with(retriever, &subject, &comparison, 100, opts(Some(&ctx))).await.unwrap();
+        assert_eq!(disabled.relation, enabled.relation, "the kill-switch may not change any verdict");
+        assert_eq!(disabled.stats.precheck_suppressions, 0, "DORMANT: no precheck may consult an operand with the switch thrown");
+        assert_eq!(disabled.stats.edge_checks_evaluated, 0, "DORMANT: no walk-time edge check may be evaluated with the switch thrown");
+    }
+
+    /// THREADING (plan M6): the switch travels the PRODUCTION operand path.
+    /// apply_event hands its comparisons the same eligibility context
+    /// object the node holds, so throwing that object's switch reaches
+    /// them: the redelivered-ancestor shape whose enabled twin provably
+    /// suppresses (the apply_event operand-wiring pin above) must show
+    /// zero suppressions and zero edge-check evaluations when the context
+    /// it was CALLED WITH has the switch thrown.
+    #[tokio::test]
+    async fn thrown_switch_reaches_apply_event_comparisons() {
+        use crate::entity::Entity;
+        let entity_id = {
+            let mut b = [0u8; 16];
+            b[0] = 43;
+            EntityId::from_bytes(b)
+        };
+        let entity = Entity::create(entity_id, "test".into());
+
+        let mut retriever = MockRetriever::new();
+        let g = lww_event_for_entity(entity_id, vec![("p", "g")], &[]);
+        let a = lww_event_for_entity(entity_id, vec![("p", "a")], &[&g]);
+        let b = lww_event_for_entity(entity_id, vec![("p", "b")], &[&a]);
+        for e in [&g, &a, &b] {
+            retriever.add_event(e);
+        }
+
+        let ctx = thrown();
+        assert!(entity.apply_event(&retriever, &g, Some(&ctx)).await.unwrap());
+        assert!(entity.apply_event(&retriever, &a, Some(&ctx)).await.unwrap());
+        assert!(entity.apply_event(&retriever, &b, Some(&ctx)).await.unwrap());
+        let _ = entity.take_last_compare_stats();
+
+        // Redeliver a: the enabled twin of this shape fires P1 (see
+        // apply_event_wires_operands_and_p1_fires_on_redelivered_ancestor)
+        // and evaluates b's in-hand edge during the walk. Thrown, both stay
+        // dormant and the no-op outcome is unchanged.
+        assert!(!entity.apply_event(&retriever, &a, Some(&ctx)).await.unwrap(), "redelivered ancestor stays a no-op");
+        let stats = entity.take_last_compare_stats().expect("apply_event mirrored its comparison stats");
+        assert_eq!(stats.precheck_suppressions, 0, "DORMANT through the apply_event operand path (P1 must not fire)");
+        assert_eq!(stats.edge_checks_evaluated, 0, "DORMANT through the apply_event operand path (no edge evaluated)");
+    }
+
+    /// LWW events on a FIXED entity id (the tests.rs idiom, duplicated
+    /// locally because sibling test modules cannot share private helpers;
+    /// apply_event validates event ownership against the entity).
+    fn lww_event_for_entity(entity_id: EntityId, properties: Vec<(&str, &str)>, parents: &[&Event]) -> Event {
+        let backend = LWWBackend::new();
+        for (name, value) in properties {
+            backend.set(name.into(), Some(Value::String(value.into())));
+        }
+        let ops = backend.to_operations().unwrap().unwrap();
+        Event {
+            entity_id,
+            collection: "test".into(),
+            operations: OperationSet(BTreeMap::from([("lww".to_string(), ops)])),
+            parent: Clock::from(parents.iter().map(|p| p.id()).collect::<Vec<_>>()),
+            generation: Event::generation_from_parents(parents.iter().map(|p| p.generation)),
+        }
+    }
+}
+
+// ============================================================================
 // CHAIN CANONICALIZATION AT EMISSION (D2 M5, dispositions Q2 as corrected by
 // the red-team fold item 3: the topo sorter is FIFO Kahn whose tie order
 // derives from input order, so canonical output requires sorted-by-id input)

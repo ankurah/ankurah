@@ -28,6 +28,13 @@ pub(crate) struct CompareStats {
     /// red-team fold's counter semantics; the B1 seed's suppressed attempt
     /// was inapplicable in baseline, and the delta must still be visible).
     pub(crate) precheck_suppressions: usize,
+    /// Walk-time edge-check EQUATIONS actually evaluated: child and all
+    /// parents in hand, the `1 + max` comparison ran (pass or fail).
+    /// Genesis completions carry no edge and are not counted. The M6
+    /// kill-switch dormancy pin asserts this is ZERO with the switch
+    /// thrown; the enabled world shows it positive on any corpus with a
+    /// fully in-hand parent edge.
+    pub(crate) edge_checks_evaluated: usize,
     /// Walk-time edge-check violations (D2-4): children whose in-hand
     /// payload generation contradicts `1 + max(parent generations)` over
     /// their in-hand parents, saturating arithmetic. One count per failed
