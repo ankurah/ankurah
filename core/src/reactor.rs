@@ -72,6 +72,12 @@ struct ReactorInner<E: AbstractEntity + Filterable, Ev> {
     watcher_set: Arc<std::sync::Mutex<WatcherSet>>,
     /// Serializes notify_change invocations to ensure consistent watcher state
     notify_lock: tokio::sync::Mutex<()>,
+    /// The catalog resolver, injected post-construction by `Node` (the same
+    /// pattern as `StorageEngine::set_property_resolver`): ORDER BY sort keys
+    /// collate in each property's CANONICAL value_type (the canonical
+    /// value_type ruling). `None` (standalone reactors, tests) falls back to
+    /// sample-based inference.
+    property_resolver: std::sync::RwLock<Option<std::sync::Weak<dyn crate::property::PropertyResolver>>>,
 }
 // don't require Clone SE or PA, because we have an Arc
 impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static> Clone for Reactor<E, Ev> {
@@ -88,13 +94,22 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
             subscriptions: Mutex::new(HashMap::new()),
             watcher_set: Arc::new(Mutex::new(WatcherSet::new())),
             notify_lock: tokio::sync::Mutex::new(()),
+            property_resolver: std::sync::RwLock::new(None),
         }))
+    }
+
+    /// Inject the catalog resolver (called once at Node construction, after
+    /// the catalog exists). Subscriptions created afterward type their ORDER
+    /// BY sort keys from the catalog's canonical value_type.
+    pub fn set_property_resolver(&self, resolver: std::sync::Weak<dyn crate::property::PropertyResolver>) {
+        *self.0.property_resolver.write().unwrap() = Some(resolver);
     }
 
     /// Create a new subscription container
     pub fn subscribe(&self) -> ReactorSubscription<E, Ev> {
         let broadcast = ankurah_signals::broadcast::Broadcast::new();
-        let subscription = Subscription::new(broadcast.clone(), self.0.watcher_set.clone());
+        let resolver = self.0.property_resolver.read().unwrap().clone();
+        let subscription = Subscription::new(broadcast.clone(), self.0.watcher_set.clone(), resolver);
         let subscription_id = subscription.id();
         self.0.subscriptions.lock().unwrap().insert(subscription_id, subscription);
         ReactorSubscription(Arc::new(ReactorSubInner { subscription_id, reactor: self.clone(), broadcast }))
@@ -192,10 +207,16 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
     }
 }
 
-/// Build KeySpec from Selection's ORDER BY clause with type inference from sample entities
+/// Build KeySpec from Selection's ORDER BY clause. Sort keys collate in each
+/// property's CANONICAL value_type from the catalog (the canonical value_type
+/// ruling); without a resolver (standalone reactors, tests) or for a column
+/// the catalog cannot name, fall back to sampling a resultset value, then to
+/// String.
 pub(crate) fn build_key_spec_from_selection<E: AbstractEntity>(
     order_by: &[ankql::ast::OrderByItem],
     resultset: &EntityResultSet<E>,
+    resolver: Option<&dyn crate::property::PropertyResolver>,
+    collection: &str,
 ) -> anyhow::Result<KeySpec> {
     let mut keyparts = Vec::new();
 
@@ -204,8 +225,12 @@ pub(crate) fn build_key_spec_from_selection<E: AbstractEntity>(
         // Use the property name from the path (currently only simple paths are supported in ORDER BY)
         let column = item.path.property().to_string();
 
-        // Infer type from first non-null value in resultset entities
-        let value_type = read.iter_entities().find_map(|(_, e)| e.value(&column).map(|v| ValueType::of(&v))).unwrap_or(ValueType::String); // TODO: Get type from system catalog instead of defaulting to String
+        let value_type = resolver
+            .and_then(|r| r.resolve(collection, &column))
+            .and_then(|id| resolver.and_then(|r| r.canonical_value_type(&id)))
+            .and_then(|s| ValueType::from_property_str(&s))
+            .or_else(|| read.iter_entities().find_map(|(_, e)| e.value(&column).map(|v| ValueType::of(&v))))
+            .unwrap_or(ValueType::String);
 
         let direction: IndexDirection = match item.direction {
             ankql::ast::OrderDirection::Asc => IndexDirection::Asc,

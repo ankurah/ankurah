@@ -193,17 +193,27 @@ impl SledStorageCollectionInner {
         // and the sort comparators all address the columns writes actually
         // created (sticky under rename, deduped under collision, synthetic
         // under fallback).
+        let resolver = self.resolver.read().unwrap().as_ref().and_then(|weak| weak.upgrade());
+        let collection = self.collection_id.as_str();
         let selection = {
-            let resolver = self.resolver.read().unwrap().as_ref().and_then(|weak| weak.upgrade());
             let manager = &self.database.property_manager;
-            let collection = self.collection_id.as_str();
             ankurah_core::storage::selection_to_column_space(collection, &selection, resolver.as_deref(), &|id| {
                 manager.column_of(collection, id)
             })
         };
 
+        // ORDER BY key parts collate in each property's CANONICAL value_type
+        // (the canonical value_type ruling): resolve the column name through
+        // the catalog. An unresolvable column (system collections, legacy
+        // names) keeps the historical String collation.
+        let order_type_of = |name: &str| -> Option<ankurah_core::value::ValueType> {
+            let resolver = resolver.as_deref()?;
+            let id = resolver.resolve(collection, name)?;
+            ankurah_core::value::ValueType::from_property_str(&resolver.canonical_value_type(&id)?)
+        };
+
         // Generate query plans and choose the first non-empty one
-        let plans = Planner::new(PlannerConfig::full_support()).plan(&selection, "id");
+        let plans = Planner::new(PlannerConfig::full_support()).plan_with_types(&selection, "id", &order_type_of);
 
         let plan = plans.into_iter().next().ok_or_else(|| RetrievalError::StorageError("No plan generated".into()))?;
 

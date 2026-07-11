@@ -203,7 +203,6 @@ async fn ill_typed_payload_is_contained_at_every_read_boundary() -> Result<()> {
 /// order, never the lexicographic order a string collation would produce
 /// ("10" < "2" < "3").
 #[tokio::test]
-#[ignore = "FOUND DEFECT (pre-existing, exposed by canonical types): the storage-common planner hardcodes ValueType::String for ORDER BY key parts (storage/common/src/planner.rs) and the reactor's build_key_spec_from_selection samples-else-defaults-to-String, so numeric sorts collate lexicographically. Fix: type sort keys from the catalog's canonical value_type. Un-ignore when that lands."]
 async fn order_by_collates_numerically_through_canonical_types() -> Result<()> {
     let node = durable_sled_setup().await?;
     let ctx = node.context_async(DEFAULT_CONTEXT).await;

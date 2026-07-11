@@ -167,8 +167,8 @@ impl StorageCollection for IndexedDBBucket {
         // created (sticky under rename, deduped under collision, synthetic
         // under fallback).
         self.ensure_property_columns_loaded().await.map_err(|e| RetrievalError::StorageError(format!("{e:?}").into()))?;
+        let resolver = self.resolver.read().expect("RwLock poisoned").as_ref().and_then(|weak| weak.upgrade());
         let selection = {
-            let resolver = self.resolver.read().expect("RwLock poisoned").as_ref().and_then(|weak| weak.upgrade());
             let assigned = self.property_columns.read().expect("RwLock poisoned").clone();
             ankurah_core::storage::selection_to_column_space(self.collection_id.as_str(), selection, resolver.as_deref(), &|id| {
                 assigned.get(id).cloned()
@@ -180,8 +180,16 @@ impl StorageCollection for IndexedDBBucket {
         let amended_selection = add_collection(selection, &self.collection_id);
 
         // Step 2: Use planner to generate query plans
+        // ORDER BY key parts collate in each property's CANONICAL value_type
+        // (the canonical value_type ruling); unresolvable columns keep the
+        // historical String collation.
+        let order_type_of = |name: &str| -> Option<ankurah_core::value::ValueType> {
+            let resolver = resolver.as_deref()?;
+            let id = resolver.resolve(self.collection_id.as_str(), name)?;
+            ankurah_core::value::ValueType::from_property_str(&resolver.canonical_value_type(&id)?)
+        };
         let planner = ankurah_storage_common::planner::Planner::new(ankurah_storage_common::planner::PlannerConfig::indexeddb());
-        let plans = planner.plan(&amended_selection, "id");
+        let plans = planner.plan_with_types(&amended_selection, "id", &order_type_of);
 
         // Step 3: Pick the first plan (always)
         let plan = plans.first().ok_or_else(|| RetrievalError::StorageError("No plan generated".into()))?;

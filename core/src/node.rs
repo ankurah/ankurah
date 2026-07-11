@@ -256,6 +256,9 @@ where
         // here, not at engine construction, because the engine is built before
         // the node/catalog exist.
         node.collections.set_property_resolver(node.catalog.resolver_weak());
+        // The reactor types ORDER BY sort keys from the same catalog resolver
+        // (canonical value_type collation).
+        node.reactor.set_property_resolver(node.catalog.resolver_weak());
         // Assembly-time choke point (the PropertyKey amendment, #289): every
         // entity handed out by the entity set gets the catalog resolver
         // stamped, so no assembly path can forget it and the sync read path can

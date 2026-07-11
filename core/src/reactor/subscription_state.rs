@@ -89,6 +89,10 @@ pub(super) struct Inner<E: AbstractEntity + Filterable, Ev> {
     pub(super) id: ReactorSubscriptionId,
     state: std::sync::Mutex<State<E, Ev>>,
     watcher_set: Arc<std::sync::Mutex<crate::reactor::watcherset::WatcherSet>>,
+    /// The catalog resolver captured at subscribe time (see
+    /// `Reactor::set_property_resolver`): types ORDER BY sort keys from the
+    /// canonical value_type.
+    resolver: Option<std::sync::Weak<dyn crate::property::PropertyResolver>>,
 }
 struct State<E: AbstractEntity + Filterable, Ev> {
     pub(crate) queries: HashMap<proto::QueryId, QueryState<E>>,
@@ -103,6 +107,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
     pub fn new(
         broadcast: ankurah_signals::broadcast::Broadcast<ReactorUpdate<E, Ev>>,
         watcher_set: Arc<std::sync::Mutex<crate::reactor::watcherset::WatcherSet>>,
+        resolver: Option<std::sync::Weak<dyn crate::property::PropertyResolver>>,
     ) -> Self {
         Self(Arc::new(Inner {
             id: ReactorSubscriptionId::new(),
@@ -113,6 +118,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
                 broadcast,
             }),
             watcher_set,
+            resolver,
         }))
     }
 
@@ -248,10 +254,18 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         let old_selection = query_state.selection.replace(selection.clone());
 
         // Update resultset configuration
+        let resolver = self.resolver.as_ref().and_then(|w| w.upgrade());
         query_state.resultset.order_by(
             selection
                 .order_by
-                .map(|ob| crate::reactor::build_key_spec_from_selection(ob.as_slice(), &query_state.resultset))
+                .map(|ob| {
+                    crate::reactor::build_key_spec_from_selection(
+                        ob.as_slice(),
+                        &query_state.resultset,
+                        resolver.as_deref(),
+                        collection_id.as_str(),
+                    )
+                })
                 .transpose()?,
         );
 
