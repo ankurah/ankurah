@@ -58,7 +58,12 @@ fn forge_state(
     }
 }
 
-fn event_only_update(server: &proto::EntityId, client: &proto::EntityId, ev: proto::Event) -> proto::NodeUpdate {
+fn event_only_update(
+    server: &proto::EntityId,
+    client: &proto::EntityId,
+    source_query: proto::QueryId,
+    ev: proto::Event,
+) -> proto::NodeUpdate {
     proto::NodeUpdate {
         id: proto::UpdateId::new(),
         from: *server,
@@ -69,6 +74,7 @@ fn event_only_update(server: &proto::EntityId, client: &proto::EntityId, ev: pro
                 model: ev.model,
                 content: proto::UpdateContent::EventOnly(vec![Attested::opt(ev, None).into()]),
                 predicate_relevance: vec![],
+                source_queries: vec![source_query],
             }],
         },
         schema: vec![],
@@ -170,7 +176,7 @@ async fn test_stale_fetch_cannot_regress_newer_state() -> Result<()> {
     let title_property = server.catalog.resolve(Record::collection().as_str(), "title").expect("Record.title registered by create");
     let ev = forge_title_event(title_property, rec_id, &[&genesis], "t1-client-ahead");
     let forged_head = proto::Clock::from(vec![ev.id()]);
-    client.handle_message(proto::NodeMessage::Update(event_only_update(&server.id, &client.id, ev))).await?;
+    client.handle_message(proto::NodeMessage::Update(event_only_update(&server.id, &client.id, _relay_context.query_id(), ev))).await?;
     assert_eq!(view.title().unwrap(), "t1-client-ahead");
     assert_eq!(view.entity().head().clone(), forged_head);
 
@@ -238,7 +244,7 @@ async fn test_get_racing_notify_storm_does_not_deadlock() -> Result<()> {
     let mut parent = genesis;
     for i in 0..20 {
         let ev = forge_title_event(title_property, rec_id, &[&parent], &format!("t{}", i + 1));
-        client.handle_message(proto::NodeMessage::Update(event_only_update(&server.id, &client.id, ev.clone()))).await?;
+        client.handle_message(proto::NodeMessage::Update(event_only_update(&server.id, &client.id, _query.query_id(), ev.clone()))).await?;
         parent = ev;
     }
 

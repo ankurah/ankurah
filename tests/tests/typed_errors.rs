@@ -45,6 +45,7 @@ fn event_only_item(event: proto::Event) -> proto::SubscriptionUpdateItem {
         model: event.model,
         content: proto::UpdateContent::EventOnly(vec![Attested::opt(event, None).into()]),
         predicate_relevance: vec![],
+        source_queries: vec![],
     }
 }
 

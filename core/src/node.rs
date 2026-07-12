@@ -2321,6 +2321,7 @@ mod tests {
         storage::{StorageCollection, StorageEngine},
         value::Value,
     };
+    use ankurah_proto::EntityState;
     use std::{
         collections::BTreeMap,
         sync::atomic::{AtomicBool, Ordering},
@@ -2391,7 +2392,8 @@ mod tests {
                 model: crate::schema::well_known_model_id(crate::schema::MODEL_COLLECTION_ID).unwrap(),
                 state: proto::State {
                     state_buffers: proto::StateBuffers(BTreeMap::from([("lww".to_owned(), backend.to_state_buffer().unwrap())])),
-                    head: proto::Clock::from(vec![event_id]),
+                    head: proto::Clock::from(vec![event_id.clone()]),
+                    head_generations: proto::GClock::from((1, event_id)),
                 },
             },
             None,

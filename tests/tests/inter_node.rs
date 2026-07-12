@@ -216,6 +216,7 @@ async fn duplicated_fragment_in_one_item_yields_a_single_event_change() -> Resul
         model: event.model,
         content: proto::UpdateContent::StateAndEvent(state_fragment, vec![event_fragment.clone(), event_fragment]),
         predicate_relevance: vec![],
+        source_queries: vec![],
     };
 
     NodeApplier::apply_updates_for_test(&client, &server.id, vec![item]).await.expect("the duplicated item applies cleanly");

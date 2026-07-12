@@ -145,7 +145,8 @@ fn forge_catalog_state(collection: &str, entity_id: proto::EntityId, fields: Vec
             model,
             state: proto::State {
                 state_buffers: proto::StateBuffers(BTreeMap::from([("lww".to_owned(), backend.to_state_buffer().unwrap())])),
-                head: proto::Clock::from(vec![event_id]),
+                head: proto::Clock::from(vec![event_id.clone()]),
+                head_generations: proto::GClock::from((1, event_id)),
             },
         },
         None,
@@ -229,8 +230,8 @@ async fn committed_event_ids(ctx: &ankurah::Context, id: proto::EntityId) -> Res
 #[tokio::test]
 async fn stale_stream_is_rejected_before_schema_and_body() -> Result<()> {
     let f = fixture().await?;
-    let (rec_id, view) = seed_record(&f, "before", "artist").await?;
-    let forged = forge_title_event(rec_id, f.record_model, f.record_title, view.entity().head().clone(), "after");
+    let (rec_id, view, genesis) = seed_record(&f, "before", "artist").await?;
+    let forged = forge_title_event(f.record_model, f.record_title, rec_id, &[&genesis], "after");
     let forged_id = forged.id();
     let mut item = event_only_item(forged);
     item.source_queries.push(proto::QueryId::new());
@@ -263,7 +264,7 @@ async fn stale_stream_is_rejected_before_schema_and_body() -> Result<()> {
 #[tokio::test]
 async fn schema_envelope_preserves_immutable_catalog_identity() -> Result<()> {
     let f = fixture().await?;
-    let (probe_id, _) = seed_record(&f, "schema-probe", "schema-probe").await?;
+    let (probe_id, _, _) = seed_record(&f, "schema-probe", "schema-probe").await?;
     let probe_event = f
         .ctx_s
         .collection(&Record::collection())

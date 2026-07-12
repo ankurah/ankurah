@@ -1458,7 +1458,8 @@ mod saturation_stamp_tests {
     use super::*;
     use crate::ingest::testkit::{FailingCommitStore, NoState};
     use crate::ingest::{check_generation, GenerationCheck, StagingArea};
-    use crate::property::{PropertyKey, PropertyResolver};
+    use crate::property::PropertyKey;
+    use crate::schema::CatalogResolver;
     use ankurah_proto::StateBuffers;
 
     struct TestResolver {
@@ -1466,7 +1467,7 @@ mod saturation_stamp_tests {
         title: EntityId,
     }
 
-    impl PropertyResolver for TestResolver {
+    impl CatalogResolver for TestResolver {
         fn resolve(&self, collection: &str, name: &str) -> Option<EntityId> {
             (collection == "test" && name == "title").then_some(self.title)
         }
@@ -1502,7 +1503,7 @@ mod saturation_stamp_tests {
         let staging = std::sync::Arc::new(StagingArea::with_default_cap());
         let getter = FailingCommitStore::ephemeral(staging, EventId::from_bytes([0xEE; 32]));
         let (_, entity) = set.with_state(&NoState, &getter, entity_id, "test".into(), adopted).await.expect("bodiless adoption");
-        let resolver: Arc<dyn PropertyResolver> =
+        let resolver: Arc<dyn CatalogResolver> =
             Arc::new(TestResolver { model: EntityId::from_bytes([0xEE; 16]), title: EntityId::from_bytes([0xEF; 16]) });
         entity.set_resolver(Arc::downgrade(&resolver));
 

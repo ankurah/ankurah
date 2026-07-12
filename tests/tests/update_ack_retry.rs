@@ -73,6 +73,7 @@ fn model_update(model: proto::EntityId) -> proto::NodeUpdateBody {
             model,
             content: proto::UpdateContent::EventOnly(Vec::new()),
             predicate_relevance: Vec::new(),
+            source_queries: vec![],
         }],
     }
 }

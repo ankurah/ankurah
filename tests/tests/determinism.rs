@@ -86,14 +86,14 @@ async fn test_two_event_determinism_same_property() -> Result<()> {
     // arrival orders. Comparing the complete materialized state proves the
     // application-order invariant instead of merely checking one commit order.
     let order_bc = Entity::create(record_id, Record::collection());
-    order_bc.apply_event(&getter, &event_a).await?;
-    order_bc.apply_event(&getter, &event_b).await?;
-    order_bc.apply_event(&getter, &event_c).await?;
+    order_bc.apply_event(&getter, &event_a, None).await?;
+    order_bc.apply_event(&getter, &event_b, None).await?;
+    order_bc.apply_event(&getter, &event_c, None).await?;
 
     let order_cb = Entity::create(record_id, Record::collection());
-    order_cb.apply_event(&getter, &event_a).await?;
-    order_cb.apply_event(&getter, &event_c).await?;
-    order_cb.apply_event(&getter, &event_b).await?;
+    order_cb.apply_event(&getter, &event_a, None).await?;
+    order_cb.apply_event(&getter, &event_c, None).await?;
+    order_cb.apply_event(&getter, &event_b, None).await?;
 
     assert_eq!(order_bc.to_state()?, order_cb.to_state()?, "A,B,C and A,C,B must materialize identical state");
 

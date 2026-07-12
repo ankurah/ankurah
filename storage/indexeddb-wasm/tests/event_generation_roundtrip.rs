@@ -9,7 +9,7 @@
 mod common;
 
 use ankurah::proto::{self, Attested};
-use ankurah::{core::property::PropertyResolver, core::storage::StorageEngine};
+use ankurah::{core::schema::CatalogResolver, core::storage::StorageEngine};
 use ankurah_storage_indexeddb_wasm::IndexedDBStorageEngine;
 use common::*;
 use std::collections::BTreeMap;
@@ -24,7 +24,7 @@ struct TestModelResolver {
     model: proto::EntityId,
 }
 
-impl PropertyResolver for TestModelResolver {
+impl CatalogResolver for TestModelResolver {
     fn resolve(&self, _collection: &str, _name: &str) -> Option<proto::EntityId> { None }
     fn name_for(&self, _id: &proto::EntityId) -> Option<String> { None }
     fn model_id_for(&self, collection: &str) -> Option<proto::EntityId> { (collection == self.collection).then_some(self.model) }
@@ -78,8 +78,8 @@ pub async fn event_generation_survives_indexeddb_roundtrip() -> Result<(), anyho
     let db_name = format!("test_db_{}", ulid::Ulid::new());
     let engine = IndexedDBStorageEngine::open(&db_name).await?;
     let model = proto::EntityId::from_bytes([0xE1; 16]);
-    let resolver: Arc<dyn PropertyResolver> = Arc::new(TestModelResolver { collection: "gen_roundtrip", model });
-    engine.set_property_resolver(Arc::downgrade(&resolver));
+    let resolver: Arc<dyn CatalogResolver> = Arc::new(TestModelResolver { collection: "gen_roundtrip", model });
+    engine.set_catalog_resolver(Arc::downgrade(&resolver));
     let collection = engine.collection(&"gen_roundtrip".into()).await?;
 
     let entity_id = proto::EntityId::new();
@@ -143,8 +143,8 @@ pub async fn doctored_stored_event_generation_fails_loudly_on_read() -> Result<(
     let db_name = format!("test_db_{}", ulid::Ulid::new());
     let engine = IndexedDBStorageEngine::open(&db_name).await?;
     let model = proto::EntityId::from_bytes([0xE2; 16]);
-    let resolver: Arc<dyn PropertyResolver> = Arc::new(TestModelResolver { collection: "gen_doctor", model });
-    engine.set_property_resolver(Arc::downgrade(&resolver));
+    let resolver: Arc<dyn CatalogResolver> = Arc::new(TestModelResolver { collection: "gen_doctor", model });
+    engine.set_catalog_resolver(Arc::downgrade(&resolver));
     let collection = engine.collection(&"gen_doctor".into()).await?;
 
     let entity_id = proto::EntityId::new();

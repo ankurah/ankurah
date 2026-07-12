@@ -335,6 +335,25 @@ where
     /// Reset while the caller owns `lifecycle`. Kept separate so a mismatched
     /// `join_system` can reset atomically without recursively locking.
     async fn hard_reset_locked(&self) -> Result<()> {
+        self.0.reset_incomplete.store(true, Ordering::Release);
+        // Close readiness before the catalog barrier so no concurrent caller
+        // can treat the system as usable while its prior epoch is draining.
+        *self.0.system_ready.write().unwrap() = false;
+
+        // Invalidate the old catalog generation, tear down its live queries,
+        // and wait for responses already admitted at schema ingress to finish
+        // applying. The hook is cloned out of the lock before await. The
+        // drain runs BEFORE the reset fence below is taken: draining
+        // responses acquire fence reads to deliver, so holding the write
+        // half across this wait would deadlock the reset behind its own
+        // drain. Old-system responses completing here is the intended
+        // semantics; whatever they materialize or persist belongs to the
+        // pre-wipe world, which the purge and wipe below clear.
+        let catalog_reset_hook = self.0.catalog_reset_hook.read().unwrap().clone();
+        if let Some(hook) = &catalog_reset_hook {
+            (hook.begin)().await;
+        }
+
         // The reset fence, write half (M4 remediation, item 5): held across
         // the bump, the purge, AND the wipe. In-flight funnel persists hold
         // the read half across their whole spans, so they DRAIN here before
@@ -372,26 +391,13 @@ where
 
         // The purge (REV 5 section D.1, the one-id-one-system invariant):
         // every entry in the resident map at reset time belongs to the dead
-        // system by definition, so clear the map, taking only the map's own
-        // lock (no entity locks, no lock-order hazard, no sweep). Stale
-        // residents become unreachable from ingest immediately, before the
-        // storage wipe below; holders of strong references keep their
-        // frozen snapshots. This also drops the accumulated dead weak
-        // entries.
+        // system by definition, drained applies included, so clear the map,
+        // taking only the map's own lock (no entity locks, no lock-order
+        // hazard, no sweep). Stale residents become unreachable from ingest
+        // immediately, before the storage wipe below; holders of strong
+        // references keep their frozen snapshots. This also drops the
+        // accumulated dead weak entries.
         self.0.entities.purge();
-
-        self.0.reset_incomplete.store(true, Ordering::Release);
-        // Close readiness before the catalog barrier so no concurrent caller
-        // can treat the system as usable while its prior epoch is draining.
-        *self.0.system_ready.write().unwrap() = false;
-
-        // Invalidate the old catalog generation, tear down its live queries,
-        // and wait for responses already admitted at schema ingress to finish
-        // applying. The hook is cloned out of the lock before await.
-        let catalog_reset_hook = self.0.catalog_reset_hook.read().unwrap().clone();
-        if let Some(hook) = &catalog_reset_hook {
-            (hook.begin)().await;
-        }
 
         // Flush node-owned volatile state that belongs to the dead system
         // (staging, descriptor announcement caches, pending update waiters).

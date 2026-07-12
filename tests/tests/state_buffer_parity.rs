@@ -72,6 +72,7 @@ async fn test_event_only_state_buffer_parity_and_cold_rehydration() -> Result<()
         model: ev.model,
         content: proto::UpdateContent::EventOnly(vec![Attested::opt(ev, None).into()]),
         predicate_relevance: vec![],
+        source_queries: vec![_relay_context.query_id()],
     };
     let update = proto::NodeUpdate {
         id: proto::UpdateId::new(),

@@ -299,7 +299,13 @@ async fn catalog_values(
     Ok(LWWBackend::from_state_buffer(&buffer)?.property_values().into_iter().map(|(k, v)| (k.display_name(), v)).collect())
 }
 
-fn catalog_lww_event(collection: &str, id: EntityId, parent: proto::Clock, fields: Vec<(&str, Value)>) -> proto::Event {
+fn catalog_lww_event(
+    collection: &str,
+    id: EntityId,
+    parent: proto::Clock,
+    parent_generations: proto::GClock,
+    fields: Vec<(&str, Value)>,
+) -> proto::Event {
     use ankurah::core::property::{backend::PropertyBackend, PropertyKey};
     let backend = ankurah::core::property::backend::LWWBackend::new();
     for (name, value) in fields {
@@ -310,6 +316,7 @@ fn catalog_lww_event(collection: &str, id: EntityId, parent: proto::Clock, field
         model: ankurah::core::schema::well_known_model_id(collection).expect("catalog collection has a well-known model"),
         entity_id: id,
         operations: proto::OperationSet(BTreeMap::from([("lww".to_string(), operations)])),
+        generation: proto::Event::generation_from_parents(parent_generations.iter().map(|(generation, _)| *generation)),
         parent,
     }
 }
@@ -438,6 +445,7 @@ async fn explicit_id_drives_derived_access_and_query_aliases() -> anyhow::Result
         "_ankurah_property",
         property_id,
         proto::Clock::default(),
+        proto::GClock::default(),
         vec![
             ("minted_for", Value::EntityId(EntityId::new())),
             ("name", Value::String("catalog_score".into())),
@@ -449,6 +457,7 @@ async fn explicit_id_drives_derived_access_and_query_aliases() -> anyhow::Result
         "_ankurah_property",
         text_property_id,
         proto::Clock::default(),
+        proto::GClock::default(),
         vec![
             ("minted_for", Value::EntityId(EntityId::new())),
             ("name", Value::String("catalog_text".into())),
@@ -513,8 +522,14 @@ async fn explicit_id_drives_derived_access_and_query_aliases() -> anyhow::Result
     // Rename only the catalog display name. The compiled explicit alias and
     // every generated accessor keep addressing the same property id.
     let property_storage = server.collections.get(&"_ankurah_property".into()).await?;
-    let property_head = property_storage.get_state(property_id).await?.payload.state.head;
-    let rename = catalog_lww_event("_ankurah_property", property_id, property_head, vec![("name", Value::String("renamed_score".into()))]);
+    let property_state = property_storage.get_state(property_id).await?.payload.state;
+    let rename = catalog_lww_event(
+        "_ankurah_property",
+        property_id,
+        property_state.head.clone(),
+        property_state.head_generations.clone(),
+        vec![("name", Value::String("renamed_score".into()))],
+    );
     server.commit_remote_transaction(&DEFAULT_CONTEXT, proto::TransactionId::new(), vec![proto::Attested::opt(rename, None)]).await?;
     wait_property_name(&server, property_id, "renamed_score").await?;
     wait_property_name(&client, property_id, "renamed_score").await?;
@@ -594,6 +609,7 @@ async fn offline_ordinary_field_does_not_capture_explicitly_shared_same_name() -
         "_ankurah_property",
         property_id,
         proto::Clock::default(),
+        proto::GClock::default(),
         vec![
             ("minted_for", Value::EntityId(foreign_minting_model)),
             ("name", Value::String("name".into())),
@@ -659,6 +675,7 @@ async fn yrs_ordinary_alias_ambiguity_never_uses_a_name_root() -> anyhow::Result
         "_ankurah_property",
         explicit_id,
         proto::Clock::default(),
+        proto::GClock::default(),
         vec![
             ("minted_for", Value::EntityId(EntityId::new())),
             ("name", Value::String("catalog_clash_text".into())),

@@ -13,7 +13,8 @@ use ankurah::proto::{self, Attested};
 use ankurah::{
     core::storage::StorageEngine,
     core::{
-        property::{backend::lww::LWWBackend, backend::PropertyBackend, PropertyKey, PropertyResolver},
+        property::{backend::lww::LWWBackend, backend::PropertyBackend, PropertyKey},
+        schema::CatalogResolver,
         value::Value,
     },
 };
@@ -29,7 +30,7 @@ struct GClockModelResolver {
     model: proto::EntityId,
 }
 
-impl PropertyResolver for GClockModelResolver {
+impl CatalogResolver for GClockModelResolver {
     fn resolve(&self, _collection: &str, _name: &str) -> Option<proto::EntityId> { None }
     fn name_for(&self, _id: &proto::EntityId) -> Option<String> { None }
     fn model_id_for(&self, collection: &str) -> Option<proto::EntityId> { (collection == "gclock_roundtrip").then_some(self.model) }
@@ -40,7 +41,7 @@ struct ReservedFieldResolver {
     property: proto::EntityId,
 }
 
-impl PropertyResolver for ReservedFieldResolver {
+impl CatalogResolver for ReservedFieldResolver {
     fn resolve(&self, collection: &str, name: &str) -> Option<proto::EntityId> {
         (collection == "reserved_gclock" && name == "__generations").then_some(self.property)
     }
@@ -54,8 +55,8 @@ pub async fn entity_head_generations_survive_indexeddb_roundtrip() -> Result<(),
     let db_name = format!("test_db_{}", ulid::Ulid::new());
     let engine = IndexedDBStorageEngine::open(&db_name).await?;
     let model = proto::EntityId::from_bytes([0xEE; 16]);
-    let resolver: Arc<dyn PropertyResolver> = Arc::new(GClockModelResolver { model });
-    engine.set_property_resolver(Arc::downgrade(&resolver));
+    let resolver: Arc<dyn CatalogResolver> = Arc::new(GClockModelResolver { model });
+    engine.set_catalog_resolver(Arc::downgrade(&resolver));
     let collection = engine.collection(&"gclock_roundtrip".into()).await?;
 
     let entity_id = proto::EntityId::new();
@@ -90,8 +91,8 @@ pub async fn property_named_generations_cannot_shadow_the_entity_gclock() -> Res
     let engine = IndexedDBStorageEngine::open(&db_name).await?;
     let model = proto::EntityId::from_bytes([0xD1; 16]);
     let property = proto::EntityId::from_bytes([0xD2; 16]);
-    let resolver: Arc<dyn PropertyResolver> = Arc::new(ReservedFieldResolver { model, property });
-    engine.set_property_resolver(Arc::downgrade(&resolver));
+    let resolver: Arc<dyn CatalogResolver> = Arc::new(ReservedFieldResolver { model, property });
+    engine.set_catalog_resolver(Arc::downgrade(&resolver));
     let collection = engine.collection(&"reserved_gclock".into()).await?;
 
     let tip = proto::EventId::from_bytes([0xD3; 32]);

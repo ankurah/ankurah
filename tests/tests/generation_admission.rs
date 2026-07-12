@@ -43,6 +43,7 @@ fn event_only_item(event: proto::Event) -> proto::SubscriptionUpdateItem {
         model: event.model,
         content: proto::UpdateContent::EventOnly(vec![Attested::opt(event, None).into()]),
         predicate_relevance: vec![],
+        source_queries: vec![],
     }
 }
 
@@ -62,6 +63,7 @@ fn state_and_event_item(
             events.into_iter().map(|e| Attested::opt(e, None).into()).collect(),
         ),
         predicate_relevance: vec![],
+        source_queries: vec![],
     }
 }
 

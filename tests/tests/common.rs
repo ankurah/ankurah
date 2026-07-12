@@ -931,8 +931,8 @@ where E: ankurah::core::storage::StorageEngine + Send + Sync
         self.inner.list_collections().await
     }
 
-    fn set_property_resolver(&self, resolver: std::sync::Weak<dyn ankurah::core::property::PropertyResolver>) {
-        self.inner.set_property_resolver(resolver);
+    fn set_catalog_resolver(&self, resolver: std::sync::Weak<dyn ankurah::core::schema::CatalogResolver>) {
+        self.inner.set_catalog_resolver(resolver);
     }
 }
 

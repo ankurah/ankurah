@@ -79,6 +79,7 @@ async fn legacy_name_root_can_be_replaced_after_property_id_resolution() -> Resu
     let state = proto::State {
         state_buffers: proto::StateBuffers(state_buffers),
         head: proto::Clock::from(vec![proto::EventId::from_bytes([7; 32])]),
+        head_generations: proto::GClock::from((1, proto::EventId::from_bytes([7; 32]))),
     };
     let storage = node.collections.get(&Document::collection()).await?;
     storage.set_state(proto::Attested::opt(proto::EntityState { entity_id: legacy_id, model, state }, None)).await?;

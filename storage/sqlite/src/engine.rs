@@ -1009,7 +1009,7 @@ mod tests {
         model: EntityId,
     }
 
-    impl PropertyResolver for IdentityTestResolver {
+    impl CatalogResolver for IdentityTestResolver {
         fn resolve(&self, _collection: &str, _name: &str) -> Option<EntityId> { None }
         fn name_for(&self, _id: &EntityId) -> Option<String> { None }
         fn model_id_for(&self, collection: &str) -> Option<EntityId> { (collection == "identity_check").then_some(self.model) }
@@ -1036,8 +1036,8 @@ mod tests {
     async fn event_getters_reject_a_payload_stored_under_the_wrong_key() {
         let engine = SqliteStorageEngine::open_in_memory().await.unwrap();
         let model = EntityId::from_bytes([0x11; 16]);
-        let resolver: Arc<dyn PropertyResolver> = Arc::new(IdentityTestResolver { model });
-        engine.set_property_resolver(Arc::downgrade(&resolver));
+        let resolver: Arc<dyn CatalogResolver> = Arc::new(IdentityTestResolver { model });
+        engine.set_catalog_resolver(Arc::downgrade(&resolver));
         let collection = engine.collection(&"identity_check".into()).await.unwrap();
 
         let honest = Event {

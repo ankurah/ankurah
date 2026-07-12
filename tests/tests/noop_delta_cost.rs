@@ -51,6 +51,7 @@ async fn measure_noop_state_delivery_cost() -> Result<()> {
         model: stored.payload.model,
         content: proto::UpdateContent::StateAndEvent(fragment, vec![]),
         predicate_relevance: vec![],
+        source_queries: vec![],
     };
 
     const WARMUP: usize = 200;

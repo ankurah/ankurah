@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use ankurah::ankql;
-use ankurah::core::property::PropertyResolver;
+use ankurah::core::schema::CatalogResolver;
 use ankurah::proto;
 use ankurah_storage_sqlite::SqliteStorageEngine;
 use anyhow::Result;
@@ -22,7 +22,7 @@ struct AlbumModelResolver {
     model: proto::EntityId,
 }
 
-impl PropertyResolver for AlbumModelResolver {
+impl CatalogResolver for AlbumModelResolver {
     fn resolve(&self, _collection: &str, _name: &str) -> Option<proto::EntityId> { None }
     fn name_for(&self, _id: &proto::EntityId) -> Option<String> { None }
     fn model_id_for(&self, collection: &str) -> Option<proto::EntityId> { (collection == "album").then_some(self.model) }
@@ -32,8 +32,8 @@ impl PropertyResolver for AlbumModelResolver {
 async fn gclock_survives_set_state_and_rehydration() -> Result<()> {
     let engine = SqliteStorageEngine::open_in_memory().await?;
     let model = proto::EntityId::from_bytes([0xEE; 16]);
-    let resolver: Arc<dyn PropertyResolver> = Arc::new(AlbumModelResolver { model });
-    engine.set_property_resolver(Arc::downgrade(&resolver));
+    let resolver: Arc<dyn CatalogResolver> = Arc::new(AlbumModelResolver { model });
+    engine.set_catalog_resolver(Arc::downgrade(&resolver));
     let collection = engine.collection(&"album".into()).await?;
 
     let entity_id = proto::EntityId::new();
