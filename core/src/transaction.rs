@@ -31,6 +31,11 @@ pub struct Transaction {
     /// Used to validate that creation events (empty parent) are only for entities
     /// that were actually created in this transaction, not phantom entities.
     pub(crate) created_entity_ids: std::sync::RwLock<std::collections::HashSet<EntityId>>,
+    /// Exact compiled schema shapes used to create, fetch, or edit entities
+    /// in this transaction. Commit reasserts only these shapes: replaying a
+    /// process-global cache would let one failed, incompatible declaration
+    /// poison unrelated later transactions for the same collection.
+    pub(crate) schemas: std::sync::RwLock<Vec<&'static crate::schema::ModelSchema>>,
 }
 
 #[cfg(feature = "wasm")]
@@ -51,6 +56,14 @@ impl Transaction {
             entities: AppendOnlyVec::new(),
             alive: Arc::new(AtomicBool::new(true)),
             created_entity_ids: std::sync::RwLock::new(std::collections::HashSet::new()),
+            schemas: std::sync::RwLock::new(Vec::new()),
+        }
+    }
+
+    fn record_schema(&self, schema: &'static crate::schema::ModelSchema) {
+        let mut schemas = self.schemas.write().unwrap();
+        if !schemas.iter().any(|known| **known == *schema) {
+            schemas.push(schema);
         }
     }
 
@@ -61,13 +74,14 @@ impl Transaction {
 
     pub async fn create<'rec, 'trx: 'rec, M: Model>(&'trx self, model: &M) -> Result<MutableBorrow<'rec, M::Mutable>, MutationError> {
         // RFC 5.2 (specs/model-property-metadata/rfc.md) model first-use: ensure M is registered BEFORE creating
-        // the entity. Bound collections proceed on a failed re-assert; a
-        // NEVER-registered collection fails here (the rev 4 strict offline
-        // surface: identity does not exist until the allocator mints it).
+        // the entity. A failed reassertion proceeds only when this exact shape
+        // is already fully and compatibly bound; a never-registered, missing,
+        // or incompatible field fails here.
         self.dyncontext.ensure_registered(M::schema()).await?;
         let entity = self.dyncontext.create_entity(M::collection(), self.alive.clone());
-        model.initialize_new_entity(&entity);
+        model.initialize_new_entity(&entity)?;
         self.dyncontext.check_write(&entity)?;
+        self.record_schema(M::schema());
 
         // Track that this entity was created in this transaction
         self.created_entity_ids.write().unwrap().insert(entity.id);
@@ -85,7 +99,10 @@ impl Transaction {
             tracing::warn!("registration unavailable on fetch-to-edit for '{}'; commit will enforce: {}", M::collection(), e);
         }
         match self.get_trx_entity(id) {
-            Some(entity) => Ok(MutableBorrow::new(entity)),
+            Some(entity) => {
+                self.record_schema(M::schema());
+                Ok(MutableBorrow::new(entity))
+            }
             None => {
                 // go fetch the entity from the context
                 let retrieved_entity = self.dyncontext.get_entity(*id, &M::collection(), false).await?;
@@ -94,9 +111,12 @@ impl Transaction {
                 if let Some(entity) = self.get_trx_entity(&retrieved_entity.id) {
                     // if this happens, I don't think we want to refresh the entity, because it's already snapshotted in the trx
                     // and we should leave it that way to honor the consistency model
+                    self.record_schema(M::schema());
                     Ok(MutableBorrow::new(entity))
                 } else {
-                    Ok(MutableBorrow::new(self.add_entity(retrieved_entity.snapshot(self.alive.clone()))))
+                    let entity = self.add_entity(retrieved_entity.snapshot(self.alive.clone()));
+                    self.record_schema(M::schema());
+                    Ok(MutableBorrow::new(entity))
                 }
             }
         }
@@ -114,9 +134,11 @@ impl Transaction {
         // now.
         self.dyncontext.cache_compiled(M::schema());
         if let Some(entity) = self.get_trx_entity(&entity.id) {
+            self.record_schema(M::schema());
             return Ok(MutableBorrow::new(entity));
         }
         self.dyncontext.check_write(entity)?;
+        self.record_schema(M::schema());
 
         Ok(MutableBorrow::new(self.add_entity(entity.snapshot(self.alive.clone()))))
     }

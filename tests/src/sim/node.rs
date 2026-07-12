@@ -38,15 +38,17 @@ impl SimNode {
     /// would, including the durable-peer bookkeeping that drives system join.
     pub fn connect_to(&self, peer: &SimNode) {
         let sender = SimSender::new(self.index, peer.id(), self.captured.clone());
-        self.node.register_peer(
-            proto::Presence {
-                node_id: peer.id(),
-                durable: peer.durable,
-                system_root: peer.node.system.root(),
-                protocol_version: proto::PROTOCOL_VERSION,
-            },
-            Box::new(sender),
-        );
+        self.node
+            .register_peer(
+                proto::Presence {
+                    node_id: peer.id(),
+                    durable: peer.durable,
+                    system_root: peer.node.system.root(),
+                    protocol_version: proto::PROTOCOL_VERSION,
+                },
+                Box::new(sender),
+            )
+            .expect("simulation peers use the current protocol version");
     }
 
     /// Ingest a forged batch of events directly through the production remote

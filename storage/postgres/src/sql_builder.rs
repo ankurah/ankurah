@@ -644,7 +644,7 @@ mod tests {
         let base_selection = ankql::parser::parse_selection("name = 'Alice'").unwrap();
         let selection = Selection {
             predicate: base_selection.predicate,
-            order_by: Some(vec![OrderByItem { path: PathExpr::simple("created_at"), direction: OrderDirection::Desc }]),
+            order_by: Some(vec![OrderByItem { path: PathExpr::simple("created_at"), property: None, direction: OrderDirection::Desc }]),
             limit: None,
         };
 
@@ -683,8 +683,8 @@ mod tests {
         let selection = Selection {
             predicate: base_selection.predicate,
             order_by: Some(vec![
-                OrderByItem { path: PathExpr::simple("priority"), direction: OrderDirection::Desc },
-                OrderByItem { path: PathExpr::simple("created_at"), direction: OrderDirection::Asc },
+                OrderByItem { path: PathExpr::simple("priority"), property: None, direction: OrderDirection::Desc },
+                OrderByItem { path: PathExpr::simple("created_at"), property: None, direction: OrderDirection::Asc },
             ]),
             limit: Some(5),
         };

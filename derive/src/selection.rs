@@ -313,6 +313,7 @@ fn generate_selection_code_with_replacements(
                 quote! {
                     ::ankql::ast::OrderByItem {
                         path: ::ankql::ast::PathExpr { steps: vec![#(#steps),*] },
+                        property: None,
                         direction: #direction_code,
                     }
                 }

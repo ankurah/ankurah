@@ -1000,12 +1000,20 @@ mod tests {
     }
     macro_rules! oby_asc {
         ($name:expr) => {
-            ankql::ast::OrderByItem { path: ankql::ast::PathExpr::simple($name), direction: ankql::ast::OrderDirection::Asc }
+            ankql::ast::OrderByItem {
+                path: ankql::ast::PathExpr::simple($name),
+                property: None,
+                direction: ankql::ast::OrderDirection::Asc,
+            }
         };
     }
     macro_rules! oby_desc {
         ($name:expr) => {
-            ankql::ast::OrderByItem { path: ankql::ast::PathExpr::simple($name), direction: ankql::ast::OrderDirection::Desc }
+            ankql::ast::OrderByItem {
+                path: ankql::ast::PathExpr::simple($name),
+                property: None,
+                direction: ankql::ast::OrderDirection::Desc,
+            }
         };
     }
 

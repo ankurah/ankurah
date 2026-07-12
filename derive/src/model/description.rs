@@ -71,9 +71,6 @@ impl ModelDescription {
     pub fn active_fields(&self) -> &[syn::Field] { &self.active_fields }
     pub fn active_field_visibility(&self) -> Vec<&Visibility> { self.active_fields.iter().map(|f| &f.vis).collect() }
     pub fn active_field_names(&self) -> Vec<&Option<Ident>> { self.active_fields.iter().map(|f| &f.ident).collect() }
-    pub fn active_field_name_strs(&self) -> Vec<String> {
-        self.active_fields.iter().map(|f| f.ident.as_ref().unwrap().to_string().to_lowercase()).collect()
-    }
     pub fn projected_field_types(&self) -> Vec<&Type> { self.active_fields.iter().map(|f| &f.ty).collect() }
     /// Get ActiveTypeDesc for each active field
     pub fn active_field_descs(&self) -> syn::Result<Vec<crate::model::backend::ActiveTypeDesc>> {

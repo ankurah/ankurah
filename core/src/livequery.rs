@@ -75,11 +75,15 @@ struct Inner {
     pub(crate) error: Mut<Option<RetrievalError>>,
     pub(crate) initialized: tokio::sync::Notify,
     pub(crate) initialized_version: std::sync::atomic::AtomicU32,
+    // Selection updates wait for the async initial resolver. On ephemeral
+    // nodes, "ready" also means the SubscriptionRelay entry exists. State:
+    // 0 pending, 1 ready, 2 terminal initial-resolution failure.
+    pub(crate) initial_query_state: tokio::sync::watch::Sender<u8>,
     // Version tracking for predicate updates
     pub(crate) current_version: std::sync::atomic::AtomicU32,
-    // Store selection with its version (starts with version 1, updated on selection changes)
-    // This represents user intent (client-side state), separate from reactor's QueryState.selection (reactor-side state)
-    // Using Mut for reactive updates that can be observed in WASM
+    // Catalog-resolved selection with its version. Async updates keep the
+    // previous resolved value here until the next version resolves.
+    // Using Mut for reactive updates that can be observed in WASM.
     pub(crate) selection: Mut<(ankql::ast::Selection, u32)>,
     // Store collection_id for selection updates
     pub(crate) collection_id: CollectionId,
@@ -110,7 +114,6 @@ impl Inner {
     fn node(&self) -> Option<Box<dyn TNodeErased>> { self.node.upgrade() }
 
     async fn wait_initialized(&self) {
-        // If already initialized, return immediately
         if self.initialized_version.load(std::sync::atomic::Ordering::Relaxed)
             >= self.current_version.load(std::sync::atomic::Ordering::Relaxed)
         {
@@ -118,7 +121,6 @@ impl Inner {
         }
 
         // FIXME - this should be waiting for the correct version, not any version
-        // Otherwise wait for the notification
         self.initialized.notified().await;
     }
 
@@ -130,11 +132,16 @@ impl Inner {
     async fn activate(&self, version: u32) -> Result<(), RetrievalError> {
         // Get the current selection and its version
         let (selection, stored_version) = self.selection.value();
+        let current_version = self.current_version.load(std::sync::atomic::Ordering::Acquire);
 
-        // Reject activation if this is an older version than what's currently stored
-        // This prevents out-of-order activations from regressing the state
-        if version < stored_version {
-            warn!("LiveQuery - Dropped stale activation request for version {} (current version is {})", version, stored_version);
+        // Reject activation unless the resolved selection and the requested
+        // activation are the current version. Resolution is asynchronous, so
+        // an older task may finish after a newer update has begun.
+        if version != stored_version || version != current_version {
+            warn!(
+                "LiveQuery - Dropped stale activation request for version {} (stored version {}, current version {})",
+                version, stored_version, current_version
+            );
             return Ok(());
         }
 
@@ -221,7 +228,8 @@ where
     //     task below, which writes the resolved selection back into `inner`
     //     before the reactor sees it.
     //   - EPHEMERAL node: resolved on the forward path in
-    //     `Node::subscribe_remote_query` (see new_with_node_ref).
+    //     `Node::subscribe_remote_query`, then stored back into `inner`
+    //     before relay registration (see new_with_node_ref).
     // Resolution is idempotent and precedes type_resolver at each site.
 
     // Resolve types in the AST (converts literals for JSON path comparisons)
@@ -233,6 +241,7 @@ where
     let query_id = proto::QueryId::new();
     let gap_fetcher: std::sync::Arc<dyn GapFetcher<Entity>> = std::sync::Arc::new(QueryGapFetcher::new(&node, cdata.clone()));
 
+    let has_relay = node.subscription_relay.is_some();
     let inner = Arc::new(Inner {
         query_id,
         node: node_ref,
@@ -241,15 +250,14 @@ where
         error: Mut::new(None),
         initialized: tokio::sync::Notify::new(),
         initialized_version: std::sync::atomic::AtomicU32::new(0), // 0 means uninitialized
-        current_version: std::sync::atomic::AtomicU32::new(1),     // Start at version 1
-        selection: Mut::new((args.selection.clone(), 1)),          // Start with version 1
+        initial_query_state: tokio::sync::watch::channel(0).0,
+        current_version: std::sync::atomic::AtomicU32::new(1), // Start at version 1
+        selection: Mut::new((args.selection.clone(), 1)),      // Start with version 1
         collection_id: collection_id.clone(),
         gap_fetcher,
     });
 
     // Check if this is a durable node (no relay) or ephemeral node (has relay)
-    let has_relay = node.subscription_relay.is_some();
-
     if args.cached || !has_relay {
         // Durable node: spawn initialization task directly (no remote subscription needed)
         let inner2 = inner.clone();
@@ -287,15 +295,28 @@ where
                 Some(node) => catalog.resolve_selection_deferred(&node, Some(&resolve_cdata), &resolve_collection, &current).await,
                 None => {
                     inner2.error.set(Some(RetrievalError::Other("Node has been dropped".into())));
+                    if !has_relay {
+                        inner2.initial_query_state.send_replace(2);
+                    }
                     inner2.mark_initialized(current_version.max(1));
                     return;
                 }
             };
             match resolved {
-                Ok(resolved) => inner2.selection.set((resolved, current_version)),
+                Ok(resolved) => {
+                    if inner2.current_version.load(std::sync::atomic::Ordering::Acquire) == current_version {
+                        inner2.selection.set((resolved, current_version));
+                    }
+                    if !has_relay {
+                        inner2.initial_query_state.send_replace(1);
+                    }
+                }
                 Err(e) => {
                     debug!("LiveQuery resolution failed for predicate {}: {}", query_id, e);
                     inner2.error.set(Some(e.into()));
+                    if !has_relay {
+                        inner2.initial_query_state.send_replace(2);
+                    }
                     // Still mark initialized so waiters do not hang on a query
                     // that fails closed; the error is surfaced via `error`.
                     inner2.mark_initialized(current_version.max(1));
@@ -391,27 +412,11 @@ impl EntityLiveQuery {
         // Mark resultset as not loaded since we're changing the selection
         self.0.resultset.set_loaded(false);
 
-        // Store new selection and version
-        self.0.selection.set((new_selection.clone(), new_version));
-
-        // Check if this node has a relay (ephemeral) or not (durable)
-        let has_relay = node.has_subscription_relay();
-
-        if has_relay {
-            // Ephemeral node: delegate to relay, which will call update_selection_init after applying deltas
-            node.update_remote_query(self.0.query_id, new_selection.clone(), new_version)?;
-        } else {
-            // Durable node: spawn task to call update_selection_init directly
-            let inner = self.0.clone();
-            let query_id = self.0.query_id;
-
-            crate::task::spawn(async move {
-                if let Err(e) = inner.activate(new_version).await {
-                    tracing::error!("LiveQuery update failed for predicate {}: {}", query_id, e);
-                    inner.error.set(Some(e));
-                }
-            });
-        }
+        // Keep the previously RESOLVED selection while this version resolves.
+        // The node stores the resolved form before either forwarding it to a
+        // relay or activating it locally. This prevents the local reactor and
+        // the durable peer from observing different AST/value types.
+        node.update_query_selection(self.0.query_id, self.0.collection_id.clone(), new_selection, new_version, self.weak())?;
 
         Ok(())
     }
@@ -427,12 +432,48 @@ impl EntityLiveQuery {
 
     pub fn error(&self) -> Read<Option<RetrievalError>> { self.0.error.read() }
 
-    /// Record a terminal error for this query (e.g. a fail-closed resolution
-    /// failure raised on the async forward path). Also releases
-    /// `wait_initialized` waiters so they observe the error rather than hang.
-    pub(crate) fn set_error(&self, error: RetrievalError) {
-        self.0.error.set(Some(error));
-        self.0.mark_initialized(self.0.current_version.load(std::sync::atomic::Ordering::Relaxed).max(1));
+    /// Store the catalog-resolved selection only if `version` is still the
+    /// current user intent. Async resolution tasks may complete out of order.
+    pub(crate) fn set_resolved_selection(&self, selection: ankql::ast::Selection, version: u32) -> bool {
+        if self.0.current_version.load(std::sync::atomic::Ordering::Acquire) != version {
+            return false;
+        }
+        self.0.selection.set((selection, version));
+        self.0.current_version.load(std::sync::atomic::Ordering::Acquire) == version
+    }
+
+    /// Activate a selection after the node has resolved and stored it.
+    pub(crate) async fn activate(&self, version: u32) -> Result<(), RetrievalError> { self.0.activate(version).await }
+
+    /// Fail a selection update closed without letting a stale resolver poison
+    /// the current query's error/initialization state.
+    pub(crate) fn set_error_for_version(&self, version: u32, error: RetrievalError) {
+        if self.0.current_version.load(std::sync::atomic::Ordering::Acquire) == version {
+            self.0.error.set(Some(error));
+            self.0.mark_initialized(version);
+        }
+    }
+
+    pub(crate) fn mark_initial_query_ready(&self) { self.0.initial_query_state.send_replace(1); }
+
+    pub(crate) fn mark_initial_query_failed(&self) { self.0.initial_query_state.send_replace(2); }
+
+    /// Wait until the initial selection has resolved. For an ephemeral query,
+    /// the initial SubscriptionRelay entry is also present before readiness.
+    pub(crate) async fn wait_initial_query_ready(&self) -> bool {
+        let mut state = self.0.initial_query_state.subscribe();
+        loop {
+            let current = *state.borrow_and_update();
+            match current {
+                1 => return true,
+                2 => return false,
+                _ => {
+                    if state.changed().await.is_err() {
+                        return false;
+                    }
+                }
+            }
+        }
     }
     pub fn query_id(&self) -> proto::QueryId { self.0.query_id }
     pub fn selection(&self) -> Read<(ankql::ast::Selection, u32)> { self.0.selection.read() }

@@ -2,7 +2,7 @@
 //! (specs/model-property-metadata/rfc.md section 5.2, rev 4).
 //!
 //! These tests drive registration through the ORDINARY client surface --
-//! `trx.create`, `ctx.register::<M>()`, and the read paths -- rather than
+//! `trx.create`, `ctx.register::<M>()`, and predicate-query paths -- rather than
 //! hand-built RegisterSchema requests (that lower layer is covered by
 //! schema_registration.rs / catalog_map.rs). They assert the lifecycle
 //! behaviors the RFC pins:
@@ -10,13 +10,13 @@
 //!   a. auto-assert: `trx.create` on an ephemeral registers durably, and
 //!      the ids everywhere are the durable's allocations;
 //!   b. strict offline: creating into a NEVER-registered collection with
-//!      no durable peer fails at create ("connect once first"), while a
-//!      collection the catalog already knows keeps writing offline;
+//!      no durable peer fails at create ("connect once first"), while an
+//!      exact schema whose every field is already bound compatibly keeps
+//!      writing offline;
 //!   c. explicit `register::<M>()` on a durable: catalog entries appear
 //!      locally, and a second call is a no-op (heads unchanged);
-//!   d. reads register at first use (REN 2 revised, plan decision 25b): a
-//!      compiled model's first query triggers the idempotent registration
-//!      upsert and answers from the authoritative rows;
+//!   d. predicate queries register at first use (REN 2 revised, plan decision
+//!      25b), while direct entity-id gets only cache and load;
 //!   e. hard_reset flushes the map and the ensured latch (allocations
 //!      belong to one system);
 //!   f. fail-loud offline read (RFC 5.3 addendum): with no durable peer, a
@@ -55,6 +55,25 @@ pub struct Doohickey {
 #[derive(Model, Debug, Serialize, Deserialize)]
 pub struct Contraption {
     pub state: String,
+}
+
+mod offline_v1 {
+    use super::*;
+
+    #[derive(Model, Debug, Serialize, Deserialize)]
+    pub struct Evolving {
+        pub label: String,
+    }
+}
+
+mod offline_v2 {
+    use super::*;
+
+    #[derive(Model, Debug, Serialize, Deserialize)]
+    pub struct Evolving {
+        pub label: String,
+        pub added: i64,
+    }
 }
 
 async fn connected_pair(
@@ -122,8 +141,8 @@ async fn auto_assert_create_registers_on_durable() -> anyhow::Result<()> {
 // (b) Strict offline (rev 4, plan decisions 16/22): a create into a
 // NEVER-registered collection with no durable peer fails at create with an
 // actionable error; after reconnecting, the same create succeeds. A
-// collection the catalog already KNOWS (bound) keeps working offline: the
-// re-assert is deferrable and only warns.
+// fully and compatibly bound schema keeps working offline: the reassertion is
+// deferrable and only warns.
 #[tokio::test]
 async fn offline_create_unregistered_is_strict_registered_proceeds() -> anyhow::Result<()> {
     let server = durable_sled_setup().await?;
@@ -161,9 +180,9 @@ async fn offline_create_unregistered_is_strict_registered_proceeds() -> anyhow::
     assert!(server.catalog.resolve("gadget", "name").is_none(), "nothing reached the durable");
     assert!(!client.catalog.is_ensured("gadget"), "a strict failure must not latch");
 
-    // The BOUND collection keeps writing offline (no commit attempted: an
-    // ephemeral cannot relay a commit without a peer; create alone
-    // exercises the trigger).
+    // The fully and compatibly bound Widget shape keeps writing offline (no
+    // commit attempted: an ephemeral cannot relay a commit without a peer;
+    // create alone exercises the registration trigger).
     {
         let trx = ctx.begin();
         let _w = trx.create(&Widget { label: "offline-ok".into(), size: 1 }).await?;
@@ -184,6 +203,34 @@ async fn offline_create_unregistered_is_strict_registered_proceeds() -> anyhow::
     }
     let name_id = wait_resolve(&server, "gadget", "name").await.expect("durable allocates gadget.name after reconnect");
     assert_eq!(client.catalog.resolve("gadget", "name"), Some(name_id), "client map seeded from the response");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn offline_reassert_requires_every_compiled_field_to_be_bound() -> anyhow::Result<()> {
+    let server = durable_sled_setup().await?;
+    let client = ephemeral_sled_setup().await?;
+    let conn = LocalProcessConnection::new(&server, &client).await?;
+    client.system.wait_system_ready().await;
+    let ctx = client.context_async(DEFAULT_CONTEXT).await;
+    ctx.register::<offline_v1::Evolving>().await?;
+
+    drop(conn);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !client.get_durable_peers().is_empty() {
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("client still has a durable peer after disconnect");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let trx = ctx.begin();
+    let error = trx
+        .create(&offline_v2::Evolving { label: "known".into(), added: 1 })
+        .await
+        .expect_err("an unavailable reassertion must not emit an unregistered field as Name residue");
+    assert!(error.to_string().contains("unconfirmed schema"), "expected a schema confirmation failure, got: {error}");
 
     Ok(())
 }
@@ -222,14 +269,14 @@ async fn explicit_register_is_strict_and_idempotent() -> anyhow::Result<()> {
     Ok(())
 }
 
-// (d) Reads register at first use (REN 2 revised, plan decision 25b): a
-// compiled model's first query triggers the idempotent registration
+// (d) Predicate-query paths register at first use (REN 2 revised, plan
+// decision 25b): a compiled model's first query triggers the idempotent registration
 // upsert, so resolution runs against authoritative rows instead of
 // failing loud as unregistered. The fetch still answers EMPTY -- the
 // freshly registered collection holds no entities -- and a second,
 // explicit register is a no-op against the same rows.
 #[tokio::test]
-async fn read_path_registers_at_first_use() -> anyhow::Result<()> {
+async fn predicate_read_path_registers_at_first_use() -> anyhow::Result<()> {
     let server = durable_sled_setup().await?;
     server.catalog.wait_catalog_ready().await;
     let ctx = server.context(DEFAULT_CONTEXT)?;
@@ -239,7 +286,7 @@ async fn read_path_registers_at_first_use() -> anyhow::Result<()> {
     let results = ctx.fetch::<DoohickeyView>("tag = 'x'").await?;
     assert!(results.is_empty(), "a just-registered collection holds no entities");
 
-    // The read path durably registered and latched the collection.
+    // The predicate read durably registered and latched the collection.
     let tag_id = server.catalog.resolve("doohickey", "tag");
     assert!(tag_id.is_some(), "first-use registration fed the catalog");
     assert!(server.catalog.is_ensured("doohickey"), "first-use registration latches");
@@ -320,11 +367,10 @@ async fn catalog_head(node: &TestNode, collection: &str, id: EntityId) -> anyhow
     Ok(storage.get_state(id).await?.payload.state.head)
 }
 
-// (f) The edit-only gap: `Transaction::edit` is sync (cache-only), so the
-// COMMIT closes the gap by ensure-registering any touched collection whose
-// compiled schema is known but not ensured (RFC 5.2 "durable write on first
-// mutating use"). A node that only ever fetch-edits a model still latches
-// its registration at its first commit.
+// (f) The edit-only gap: `Transaction::edit` is sync, so the transaction
+// records the exact schema shape and COMMIT ensure-registers that shape (RFC
+// 5.2 "durable write on first mutating use"). A node that only ever
+// fetch-edits a model still latches its registration at its first commit.
 #[tokio::test]
 async fn edit_only_commit_registers() -> anyhow::Result<()> {
     let (server, client_a, _conn_a) = connected_pair().await?;
@@ -346,7 +392,7 @@ async fn edit_only_commit_registers() -> anyhow::Result<()> {
     let ctx_b = client_b.context_async(DEFAULT_CONTEXT).await;
 
     let view = ctx_b.get::<ContraptionView>(id).await?;
-    assert!(!client_b.catalog.is_ensured("contraption"), "read paths must not latch registration");
+    assert!(!client_b.catalog.is_ensured("contraption"), "a direct id get must not latch registration");
 
     let trx = ctx_b.begin();
     view.edit(&trx)?.state().replace("polished")?;
@@ -359,8 +405,8 @@ async fn edit_only_commit_registers() -> anyhow::Result<()> {
 // RFC 4 erratum 2 resolution: a custom Property type DECLARES its own
 // normative value_type through the trait's associated const, and the derive
 // carries it into the compiled schema, the registration request, the
-// catalog, and the property LOOKUP KEY (rev 4: it feeds the upsert key
-// instead of a hash). `Stars` is a HAND-WRITTEN impl producing
+// catalog, and the canonical compatibility check on a lookup hit. `Stars` is
+// a HAND-WRITTEN impl producing
 // `Value::I64`, so it declares "i64" (the derive(Property) macro pins
 // "string" for its JSON-string serialization).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -401,7 +447,7 @@ async fn custom_property_type_declares_its_value_type() -> anyhow::Result<()> {
 
     let rating_id = wait_resolve(&node, "review", "rating").await.expect("review.rating resolves after register");
     let def = node.catalog.property_by_id(&rating_id).expect("catalog property def");
-    assert_eq!(def.value_type, "i64", "the catalog carries the declared value_type into the lookup key");
+    assert_eq!(def.value_type, "i64", "the catalog stores the declared value_type as the canonical type");
     assert_eq!(def.backend, "lww");
     Ok(())
 }

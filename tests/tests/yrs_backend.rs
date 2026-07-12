@@ -1,5 +1,9 @@
 mod common;
-use ankurah::{policy::DEFAULT_CONTEXT, Model, Node, PermissiveAgent};
+use ankurah::core::property::backend::{PropertyBackend, YrsBackend};
+use ankurah::core::property::{FromEntity, PropertyKey, YrsString};
+use ankurah::model::View;
+use ankurah::signals::Subscribe;
+use ankurah::{policy::DEFAULT_CONTEXT, proto, Model, Node, PermissiveAgent};
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
 use common::TestDag;
@@ -46,6 +50,58 @@ async fn test_all_empty_create_persists_and_reads_back() -> Result<()> {
     let doc = ctx.get::<DocumentView>(doc_id).await?;
     assert_eq!(doc.content()?, "");
 
+    Ok(())
+}
+
+/// A pre-epoch Yrs entity stores its text under the field name. Once the
+/// catalog resolves that field to an id, edits must continue against the
+/// root containing the CRDT history rather than deleting from a fresh,
+/// empty id root (which panics for a nonempty replacement range).
+#[tokio::test]
+async fn legacy_name_root_can_be_replaced_after_property_id_resolution() -> Result<()> {
+    let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    node.system.create().await?;
+    let ctx = node.context_async(DEFAULT_CONTEXT).await;
+
+    // Warm the catalog so `content` resolves to its property id.
+    {
+        let trx = ctx.begin();
+        trx.create(&Document { content: "seed".into() }).await?;
+        trx.commit().await?;
+    }
+
+    let legacy = YrsBackend::new();
+    legacy.insert(&PropertyKey::Name("content".into()), 0, "legacy text")?;
+    let mut state_buffers = std::collections::BTreeMap::new();
+    state_buffers.insert("yrs".to_owned(), legacy.to_state_buffer()?);
+    let legacy_id = proto::EntityId::new();
+    let model = node.catalog.model_id_for("document").expect("Document registered by the warming create");
+    let state = proto::State {
+        state_buffers: proto::StateBuffers(state_buffers),
+        head: proto::Clock::from(vec![proto::EventId::from_bytes([7; 32])]),
+    };
+    let storage = node.collections.get(&Document::collection()).await?;
+    storage.set_state(proto::Attested::opt(proto::EntityState { entity_id: legacy_id, model, state }, None)).await?;
+
+    let view = ctx.get::<DocumentView>(legacy_id).await?;
+    assert_eq!(view.content()?, "legacy text");
+    // Listen on the loaded primary. The transaction edits a fork; commit
+    // applies its operation back to this backend and must publish under the
+    // same legacy root that owns the CRDT history.
+    let primary_content = YrsString::<String>::from_entity("content".into(), view.entity());
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed_from_listener = observed.clone();
+    let _guard = primary_content.subscribe(move |value: String| observed_from_listener.lock().unwrap().push(value));
+
+    let trx = ctx.begin();
+    view.edit(&trx)?.content().replace("migrated edit")?;
+    trx.commit().await?;
+    assert!(
+        observed.lock().unwrap().iter().any(|value| value == "migrated edit"),
+        "a subscriber must observe edits to the legacy history root"
+    );
+
+    assert_eq!(ctx.get::<DocumentView>(legacy_id).await?.content()?, "migrated edit");
     Ok(())
 }
 

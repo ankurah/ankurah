@@ -6,13 +6,13 @@
 //! Rust structs are ONE binding to the catalog, not the definitive schema
 //! (RFC section 3): `#[derive(Model)]` emits a [`ModelSchema`] whose
 //! `(backend, value_type)` pairs come from the NORMATIVE mapping table
-//! (RFC section 4), so that every node maps a given field to the same
-//! descriptor pair byte-for-byte -- the pair is part of the property
-//! LOOKUP KEY at registration (RFC 5.1), so disagreement would register
-//! distinct identities for one field. The catalog entities themselves
-//! remain the definitive schema; ids exist only there and in registration
-//! responses. This type is how a compiled binary names its properties and
-//! how it builds a RegisterSchema request.
+//! (RFC section 4). A property's minting model and name locate its identity;
+//! registration then checks the compiled pair against the immutable canonical
+//! pair (exact backend and a mutually castable value type), refusing an
+//! incompatible binding rather than minting another identity. The catalog
+//! entities themselves remain the definitive schema; ids exist only there and
+//! in registration responses. This type is how a compiled binary names its
+//! properties and how it builds a RegisterSchema request.
 //!
 //! These types are entirely `&'static`: the derive macro emits a `static
 //! ModelSchema` and a `Model::schema()` returning `&'static` to it, so
@@ -37,16 +37,18 @@ pub struct ModelSchema {
     /// RFC 5.2, derive description split).
     pub properties: &'static [FieldSchema],
     /// `#[model(id = "...")]`: bind this model to a KNOWN model entity by
-    /// explicit id (RFC 5.9), bypassing by-collection derivation. `None`
-    /// for the default by-name/by-collection derivation path. The value is
+    /// explicit id (RFC 5.9), bypassing by-collection registration. `None`
+    /// for the default by-name/by-collection registration path. The value is
     /// URL-safe base64 of a 16-byte EntityId, validated at derive time.
     pub explicit_id: Option<&'static str>,
 }
 
 /// The compiled schema for one active field of a model. `(backend,
-/// value_type)` are the NORMATIVE descriptor pair (RFC 4 table) and part
-/// of the property lookup key; `renamed_from` is the transient rename hint
-/// (RFC 5.8); `explicit_id` is a 5.9 shared-property binding.
+/// value_type)` are the NORMATIVE descriptor pair (RFC 4 table) checked
+/// against the property's immutable canonical pair; `target_collection`
+/// identifies the target of a reference-typed property; `renamed_from` is the
+/// transient rename hint (RFC 5.8); `explicit_id` is a 5.9 shared-property
+/// binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FieldSchema {
     /// The Rust field identifier (as declared).
@@ -68,13 +70,17 @@ pub struct FieldSchema {
     /// variant, e.g. "string", "i64", "entityid"), taken from the field's
     /// ORIGINAL Rust type before active-type wrapping (RFC 4 table).
     pub value_type: &'static str,
+    /// The referenced model's collection for `Ref<T>` / `Option<Ref<T>>`.
+    /// Registration resolves this collection to the catalog model id stored
+    /// as `target_model`; non-reference fields carry `None`.
+    pub target_collection: Option<&'static str>,
     /// `true` for `Option<T>` fields. Feeds the MEMBERSHIP record's
     /// `optional`, NOT the property identity (flipping optionality must not
     /// re-key; RFC 4).
     pub optional: bool,
     /// `#[property(id = "...")]`: bind this field to a KNOWN, possibly
     /// shared, property entity by explicit id (RFC 5.9). `None` for the
-    /// default by-name derivation. URL-safe base64 of a 16-byte EntityId,
+    /// default by-name registration. URL-safe base64 of a 16-byte EntityId,
     /// validated at derive time.
     pub explicit_id: Option<&'static str>,
 }
@@ -120,12 +126,7 @@ pub fn registration_request(schema: &ModelSchema) -> (Vec<ModelDescriptor>, Vec<
             renamed_from: field.renamed_from.map(|s| s.to_string()),
             backend: field.backend.to_string(),
             value_type: field.value_type.to_string(),
-            // The local schema does not yet carry the reference target's
-            // collection (a later lifecycle step may populate this from the
-            // referenced Model's schema; the value_type "entityid" already
-            // records reference-ness). Absence is fine: target_model is
-            // mutable metadata, not identity (RFC 4).
-            target_collection: None,
+            target_collection: field.target_collection.map(str::to_string),
             explicit_id,
         });
 
@@ -147,6 +148,6 @@ pub fn registration_request(schema: &ModelSchema) -> (Vec<ModelDescriptor>, Vec<
 /// macro already validated the shape at compile time (URL-safe base64 of 16
 /// bytes), so a malformed value here is a bug in that validation, not user
 /// error; hence the panic carries the offending string.
-fn parse_explicit_id(s: &str) -> ankurah_proto::EntityId {
+pub(crate) fn parse_explicit_id(s: &str) -> ankurah_proto::EntityId {
     ankurah_proto::EntityId::from_base64(s).unwrap_or_else(|e| panic!("derive macro emitted an invalid explicit id {s:?}: {e}"))
 }

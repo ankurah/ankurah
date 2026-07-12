@@ -15,6 +15,35 @@ use crate::value::Value;
 /// to an id).
 pub type PropertyName = String;
 
+/// The address a derive-generated accessor uses for one compiled field.
+///
+/// Most fields are name-addressed at the synchronous API boundary and are
+/// resolved through the live catalog before commit. An explicit
+/// `#[property(id = "...")]` binding is different: the literal id is the
+/// field's identity even when its local Rust name differs from the catalog's
+/// current display name. Keeping both pieces lets reads retain the legacy
+/// name-residue fallback while writes, listeners, and new CRDT roots use the
+/// explicit id directly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PropertyAddress {
+    pub name: PropertyName,
+    pub explicit_id: Option<EntityId>,
+}
+
+impl PropertyAddress {
+    pub fn new(name: impl Into<PropertyName>, explicit_id: Option<EntityId>) -> Self { Self { name: name.into(), explicit_id } }
+
+    pub fn named(name: impl Into<PropertyName>) -> Self { Self::new(name, None) }
+}
+
+impl From<String> for PropertyAddress {
+    fn from(name: String) -> Self { Self::named(name) }
+}
+
+impl From<&str> for PropertyAddress {
+    fn from(name: &str) -> Self { Self::named(name) }
+}
+
 /// How a property is keyed inside a property backend and on the wire.
 ///
 /// A registered user-collection property is keyed by its property-definition
@@ -64,9 +93,10 @@ impl From<String> for PropertyKey {
 /// by the [`PropertyKey`], not by a binding injected into the backend.
 pub trait PropertyResolver: Send + Sync {
     /// The property-definition id for `name` in `collection`, if the catalog
-    /// knows it. `None` for an unregistered name (a system or catalog
-    /// collection field, or a user field not yet registered), which the caller
-    /// keeps as a [`PropertyKey::Name`].
+    /// knows it. `None` for a system/catalog field or a user field not yet
+    /// registered, which a sync accessor may stage transiently as
+    /// [`PropertyKey::Name`]. A registered user commit must resolve that key or
+    /// fail schema confirmation before emitting an event.
     fn resolve(&self, collection: &str, name: &str) -> Option<EntityId>;
     /// The display name of a property-definition id, if the catalog knows it:
     /// the reverse of [`resolve`](Self::resolve). Storage engines seed their

@@ -166,23 +166,11 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    /// Flip a USER-collection entity's LWW backend to the id-keyed (v2) wire
-    /// encoding (RFC 5.5 Phase A). Called at every user-entity assembly path
-    /// (create/load/apply). No-op for the system collection and the metadata
-    /// catalog collections, which stay permanently name-keyed (RFC 4
-    /// bootstrap exemption): those must never carry id keys or emit 0xA2.
-    ///
-    /// Attaches the collection's schema binding when the catalog can produce
-    /// one (name<->id for every membership property), then sets
-    /// [`WireMode::IdKeyedV2`]. If the catalog has no model for this
-    /// collection yet, the wire mode still flips but no binding is attached:
-    /// the backend keys new writes by name (residue) and projects id-keyed
-    /// entries loaded from a 0xA2 buffer via their hints, so it degrades
-    /// exactly like the legacy read-fallback until the binding warms and a
-    /// rewrite-on-save migrates the residue.
-    ///
-    /// The yrs backend is deliberately untouched: yrs roots stay name-keyed
-    /// by decision (RFC 5.5 Phase C).
+    /// Attach the live catalog resolver to a user entity at each assembly
+    /// path (create/load/apply). Property access can then resolve display
+    /// names to stable property ids while backends continue to operate on
+    /// `PropertyKey`. System and metadata-catalog entities are the bootstrap
+    /// exemption and remain name-addressed without a resolver.
     pub(crate) fn stamp_resolver(&self, entity: &Entity) {
         let collection = entity.collection();
         // System + catalog collections are name-keyed (the bootstrap
@@ -1213,16 +1201,26 @@ where
                 Err(e) => {
                     debug!("subscribe_remote_query resolution failed for {query_id}: {e}");
                     if let Some(lq) = livequery.upgrade() {
-                        lq.set_error(e.into());
+                        lq.set_error_for_version(version, e.into());
+                        lq.mark_initial_query_failed();
                     }
                     return;
                 }
             };
             // Resolve types in the AST (converts literals for JSON path comparisons).
             let selection = node.type_resolver.resolve_selection_types(resolved);
+            // The remote peer and the local reactor must consume the SAME
+            // resolved selection. Store it before relay registration, whose
+            // completion callback activates the local reactor.
+            let Some(lq) = livequery.upgrade() else { return };
+            // A newer selection may already be resolving. The initial relay
+            // entry is still required as its serialization point; that newer
+            // task waits for this registration and then updates it.
+            lq.set_resolved_selection(selection.clone(), version);
             node.predicate_context.insert(query_id, cdata.clone());
             if let Some(ref relay) = node.subscription_relay {
                 relay.subscribe_query(query_id, collection_id, selection, cdata, version, livequery);
+                lq.mark_initial_query_ready();
             }
         });
     }
@@ -1250,14 +1248,20 @@ where
 #[async_trait::async_trait]
 pub trait TNodeErased<E: AbstractEntity + Filterable + Send + 'static = Entity>: Send + Sync + 'static {
     fn unsubscribe_remote_predicate(&self, query_id: proto::QueryId);
-    fn update_remote_query(&self, query_id: proto::QueryId, selection: ankql::ast::Selection, version: u32) -> Result<(), anyhow::Error>;
+    fn update_query_selection(
+        &self,
+        query_id: proto::QueryId,
+        collection_id: CollectionId,
+        selection: ankql::ast::Selection,
+        version: u32,
+        livequery: crate::livequery::WeakEntityLiveQuery,
+    ) -> Result<(), anyhow::Error>;
     async fn fetch_entities_from_local(
         &self,
         collection_id: &CollectionId,
         selection: &ankql::ast::Selection,
     ) -> Result<Vec<E>, RetrievalError>;
     fn reactor(&self) -> &Reactor<E>;
-    fn has_subscription_relay(&self) -> bool;
 }
 
 #[async_trait::async_trait]
@@ -1276,34 +1280,49 @@ where
         }
     }
 
-    fn update_remote_query(&self, query_id: proto::QueryId, selection: ankql::ast::Selection, version: u32) -> Result<(), anyhow::Error> {
-        let Some(collection_id) = self.subscription_relay.as_ref().and_then(|relay| relay.collection_for_query(query_id)) else {
-            // No relay, or the query is not (yet) registered: nothing to update.
-            return Ok(());
-        };
-        // As with subscribe_remote_query, the forwarded selection must be
-        // RESOLVED (RFC 5.5), which can await; this trait method is sync, so
-        // resolve + forward in a spawned task. A resolution or forward
-        // failure is logged (the sync caller has already returned); the
-        // selection version guards against regressions.
+    fn update_query_selection(
+        &self,
+        query_id: proto::QueryId,
+        collection_id: CollectionId,
+        selection: ankql::ast::Selection,
+        version: u32,
+        livequery: crate::livequery::WeakEntityLiveQuery,
+    ) -> Result<(), anyhow::Error> {
+        // Both durable and ephemeral updates resolve here. This trait method
+        // is sync, so resolve + store + activate/forward in a spawned task.
+        // Keeping that sequence in one place guarantees that the local
+        // reactor and remote peer see the same resolved AST.
         let node = self.clone();
         crate::task::spawn(async move {
+            let Some(lq) = livequery.upgrade() else { return };
+            if !lq.wait_initial_query_ready().await {
+                lq.set_error_for_version(version, RetrievalError::Other("initial query resolution failed".to_string()));
+                return;
+            }
             // No cdata on this sync trait path: the original subscribe
             // already resolved (registering at first use if needed), so a
             // failure here is a genuinely unresolvable update.
             let selection = match node.catalog.resolve_selection_deferred(&node, None, &collection_id, &selection).await {
                 Ok(resolved) => resolved,
                 Err(e) => {
-                    debug!("update_remote_query resolution failed for {query_id}: {e}");
+                    debug!("update_query_selection resolution failed for {query_id}: {e}");
+                    lq.set_error_for_version(version, e.into());
                     return;
                 }
             };
             // Resolve types in the AST (converts literals for JSON path comparisons).
             let selection = node.type_resolver.resolve_selection_types(selection);
+            if !lq.set_resolved_selection(selection.clone(), version) {
+                return;
+            }
             if let Some(ref relay) = node.subscription_relay {
                 if let Err(e) = relay.update_query(query_id, selection, version) {
-                    debug!("update_remote_query forward failed for {query_id}: {e}");
+                    debug!("update_query_selection forward failed for {query_id}: {e}");
+                    lq.set_error_for_version(version, e.into());
                 }
+            } else if let Err(e) = lq.activate(version).await {
+                tracing::error!("LiveQuery update failed for predicate {query_id}: {e}");
+                lq.set_error_for_version(version, e);
             }
         });
         Ok(())
@@ -1318,8 +1337,6 @@ where
     }
 
     fn reactor(&self) -> &Reactor<Entity> { &self.0.reactor }
-
-    fn has_subscription_relay(&self) -> bool { self.subscription_relay.is_some() }
 }
 
 impl<SE, PA> fmt::Display for Node<SE, PA>

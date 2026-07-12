@@ -1,8 +1,9 @@
 mod common;
 
 use ankurah::{Model, Node, Ref};
+use ankurah_core::error::MutationError;
 use ankurah_core::model::Mutable;
-use ankurah_core::policy::PolicyAgent;
+use ankurah_core::policy::{AccessDenied, PolicyAgent};
 use ankurah_jwt_auth::{JwtAgent, JwtClaims, JwtContext, JwtKeys, PolicyConfig};
 use ankurah_proto::{Clock, Event, OperationSet};
 use ankurah_storage_sled::SledStorageEngine;
@@ -63,14 +64,29 @@ async fn test_jwt_agent_reader_cannot_write_post() -> anyhow::Result<()> {
     let node = Node::new_durable(Arc::new(storage), agent);
     node.system.create().await?;
 
+    // Register through a privileged context first. Otherwise the Reader's
+    // create can fail at the schema-definition gate without ever exercising
+    // the post collection's write policy.
+    node.context(JwtContext::system())?.register::<Post>().await?;
+
     let claims = make_claims("reader-1", &["Reader"], "reader@blog.com");
     let token = sign_token(&keys, &claims);
     let ctx = JwtContext::from_claims(claims, token);
     let context = node.context(ctx)?;
 
     let trx = context.begin();
-    let result = trx.create(&Post { title: "Sneaky Post".into(), body: "Should fail".into() }).await;
-    assert!(result.is_err(), "Reader should not be able to create a post");
+    let error = match trx.create(&Post { title: "Sneaky Post".into(), body: "Should fail".into() }).await {
+        Ok(_) => panic!("Reader should not be able to create a post"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(
+            error,
+            MutationError::AccessDenied(AccessDenied::CollectionDenied(ref collection))
+                if collection.as_str() == "post"
+        ),
+        "expected the post write-policy denial, got: {error:?}"
+    );
 
     Ok(())
 }

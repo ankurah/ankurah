@@ -255,7 +255,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
 
         // Update resultset configuration
         let resolver = self.resolver.as_ref().and_then(|w| w.upgrade());
-        query_state.resultset.order_by(
+        query_state.resultset.order_by_resolved(
             selection
                 .order_by
                 .map(|ob| {

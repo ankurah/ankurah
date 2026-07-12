@@ -128,7 +128,8 @@ impl EntityInner {
 
     /// Resolve a display name to the key its data is stored under: the
     /// property-definition id when the catalog knows the field, else the bare
-    /// name (system/catalog collections, or an unregistered field).
+    /// name (system/catalog collections, legacy residue, or a transient staged
+    /// field whose commit must still confirm registration).
     fn resolve_key(&self, name: &str) -> PropertyKey {
         match self.resolver().and_then(|r| r.resolve(self.collection.as_str(), name)) {
             Some(id) => PropertyKey::Id(id),
@@ -139,6 +140,27 @@ impl EntityInner {
     /// Resolve a display name to its property key for the value accessors
     /// (read / write / subscribe). Same resolution as the internal read path.
     pub(crate) fn property_key(&self, name: &str) -> PropertyKey { self.resolve_key(name) }
+
+    /// Resolve an ordinary user-model field without permitting a fresh Name
+    /// fallback. A missing resolver slot is the intentional name-keyed
+    /// system/bare-entity case; once a resolver has been stamped, failure to
+    /// upgrade or resolve it is a missing/ambiguous catalog binding and must
+    /// surface as an error. Explicit-id accessors bypass this method.
+    pub(crate) fn checked_property_key(&self, name: &str) -> Result<PropertyKey, crate::property::traits::PropertyError> {
+        let resolver = self.resolver.read().expect("other thread panicked, panic here too");
+        let Some(resolver) = resolver.as_ref() else {
+            return Ok(PropertyKey::Name(name.to_string()));
+        };
+        let Some(resolver) = resolver.upgrade() else {
+            return Err(crate::property::traits::PropertyError::UnknownProperty {
+                collection: self.collection.to_string(),
+                name: name.to_string(),
+            });
+        };
+        resolver.resolve(self.collection.as_str(), name).map(PropertyKey::Id).ok_or_else(|| {
+            crate::property::traits::PropertyError::UnknownProperty { collection: self.collection.to_string(), name: name.to_string() }
+        })
+    }
 
     /// Defensive canonicalization at the read/evaluation boundary (rfc.md 5.6
     /// as amended 2026-07-10): commits canonicalize writes, but ingest is
@@ -238,27 +260,44 @@ impl Entity {
         let state = self.state.read().expect("other thread panicked, panic here too");
         for backend in state.backends.values() {
             for key in backend.uncommitted_keys() {
-                if let PropertyKey::Name(name) = &key {
-                    if let Some(id) = resolver.resolve(collection, name) {
+                let id = match &key {
+                    PropertyKey::Name(name) => {
+                        let Some(id) = resolver.resolve(collection, name) else {
+                            // Resolver-bound entities are registered user
+                            // models. An unresolved staged name here means the
+                            // compiled field is missing or ambiguous; emitting
+                            // it would leak fresh Name residue into the
+                            // id-keyed wire epoch. System/catalog entities have
+                            // no resolver, and committed legacy Name entries do
+                            // not appear in `uncommitted_keys`, so both allowed
+                            // name-addressed cases remain untouched.
+                            return Err(crate::property::traits::PropertyError::UnknownProperty {
+                                collection: collection.to_string(),
+                                name: name.clone(),
+                            });
+                        };
                         backend.rekey(&key, PropertyKey::Id(id));
-                        // Canonicalize the staged value through the generic
-                        // trait primitives (`entry` / `restage`): a backend
-                        // whose edits are not value-shaped (a text CRDT)
-                        // stages nothing and restages nothing. A staged clear
-                        // (tombstone) has no value to cast. An unknown
-                        // canonical string (a newer fleet's type) writes as
-                        // compiled: registration admitted this binary, so
-                        // the types were equal.
-                        if let Some(target) =
-                            resolver.canonical_value_type(&id).and_then(|c| crate::value::ValueType::from_property_str(&c))
-                        {
-                            let staged = PropertyKey::Id(id);
-                            if let Some(Some(value)) = backend.entry(&staged) {
-                                if crate::value::ValueType::of(&value) != target {
-                                    let cast = value.cast_to(target)?;
-                                    backend.restage(&staged, Some(cast));
-                                }
-                            }
+                        id
+                    }
+                    // Explicit bindings stage under their literal id from the
+                    // outset. They still require the same writer-side cast to
+                    // the catalog's canonical value_type as a re-keyed field.
+                    PropertyKey::Id(id) => *id,
+                };
+
+                // Canonicalize the staged value through the generic trait
+                // primitives (`entry` / `restage`): a backend whose edits are
+                // not value-shaped (a text CRDT) stages nothing and restages
+                // nothing. A staged clear (tombstone) has no value to cast.
+                // An unknown canonical string (a newer fleet's type) writes
+                // as compiled: registration admitted this binary, so the
+                // types were equal.
+                if let Some(target) = resolver.canonical_value_type(&id).and_then(|c| crate::value::ValueType::from_property_str(&c)) {
+                    let staged = PropertyKey::Id(id);
+                    if let Some(Some(value)) = backend.entry(&staged) {
+                        if crate::value::ValueType::of(&value) != target {
+                            let cast = value.cast_to(target)?;
+                            backend.restage(&staged, Some(cast));
                         }
                     }
                 }
@@ -699,6 +738,10 @@ impl AbstractEntity for Entity {
             self.read_lenient(field)
         }
     }
+
+    fn value_resolved(&self, property_id: ankurah_proto::EntityId, name: &str) -> Option<crate::value::Value> {
+        self.read_resolved_eval(property_id, name)
+    }
 }
 
 impl std::fmt::Display for Entity {
@@ -801,13 +844,11 @@ impl std::fmt::Display for TemporaryEntity {
 // TODO - Implement TOCTOU Race condition tests. Require real backend state mutations to be meaningful. punting that for now
 /// A set of entities held weakly.
 ///
-/// Assembly is the SINGLE choke point for the id-keyed contract flip (RFC
-/// 5.5): every method that hands out an `Entity` runs the `bind_hook`
-/// (installed once by `Node` construction, wrapping `Node::bind_entity`)
-/// before returning, so no caller can forget to bind and silently emit
-/// name-keyed v1 buffers for a user collection. The hook is idempotent and
-/// re-fires on resident hand-outs, so an entity assembled before the
-/// catalog warmed picks its binding up on the next access.
+/// Assembly is the single choke point for catalog-aware property access:
+/// every method that hands out an `Entity` runs the `bind_hook`, installed by
+/// `Node` to stamp its live property resolver. The hook is idempotent and
+/// re-fires on resident hand-outs, so an entity assembled before the catalog
+/// warmed observes the catalog on its next access.
 #[derive(Clone, Default)]
 pub struct WeakEntitySet(Arc<WeakEntitySetInner>);
 

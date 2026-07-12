@@ -45,11 +45,11 @@ pub fn bucket_model_id(
 ///   the name matches the column it WOULD create -- and the missing-column
 ///   handling downstream answers NULL exactly as today). The identifier keeps
 ///   its property id: the post-filter tier still evaluates by id.
-/// - Order-by path (name-only): resolve the name through the injected catalog
-///   resolver, then the map, with the same miss rule. The `id`
-///   pseudo-property and engine-internal `__`-prefixed fields pass through
-///   untouched, as does everything when no resolver is available (a bare
-///   engine, or the catalog is gone).
+/// - Order-by path: a resolved sort key translates its stable property id
+///   directly through the map, so a sticky pre-rename column remains
+///   addressable after the catalog display name changes. Raw/name-only keys
+///   resolve through the injected catalog as a legacy fallback. The `id`
+///   pseudo-property and engine-internal `__`-prefixed fields pass through.
 /// - Bare predicate `Path`s get the same order-by treatment: system/catalog
 ///   collection queries (which never resolve) and engine-internal fields pass
 ///   through name-addressed, exactly as before.
@@ -133,12 +133,16 @@ pub fn selection_to_column_space(
         items
             .iter()
             .map(|item| match item.path.steps.split_first() {
-                Some((first, rest)) => match translate_name(first) {
+                Some((first, rest)) => match item
+                    .property
+                    .map(|property| translate_id(&EntityId::from_ulid(property), first))
+                    .or_else(|| translate_name(first))
+                {
                     Some(column) => {
                         let mut steps = Vec::with_capacity(item.path.steps.len());
                         steps.push(column);
                         steps.extend(rest.iter().cloned());
-                        OrderByItem { path: ankql::ast::PathExpr { steps }, direction: item.direction.clone() }
+                        OrderByItem { path: ankql::ast::PathExpr { steps }, direction: item.direction.clone(), property: item.property }
                     }
                     None => item.clone(),
                 },
@@ -183,7 +187,11 @@ mod column_space_tests {
                 operator: ComparisonOperator::Equal,
                 right: Box::new(Expr::Literal(Literal::String("x".into()))),
             },
-            order_by: Some(vec![OrderByItem { path: PathExpr::simple(order_step.to_string()), direction: OrderDirection::Asc }]),
+            order_by: Some(vec![OrderByItem {
+                path: PathExpr::simple(order_step.to_string()),
+                direction: OrderDirection::Asc,
+                property: None,
+            }]),
             limit: None,
         }
     }
@@ -208,6 +216,23 @@ mod column_space_tests {
         });
         assert_eq!(predicate_column(&out), "title_IpDQ", "identifier addresses the assigned column");
         assert_eq!(out.order_by.unwrap()[0].path.first(), "title_IpDQ", "order-by resolves name->id->column");
+    }
+
+    #[test]
+    fn resolved_order_by_translates_by_id_after_display_rename() {
+        let property = id(0x11);
+        let mut selection = title_selection(property, "old_title");
+        selection.order_by.as_mut().unwrap()[0].property = Some(property.to_ulid());
+
+        // The current resolver no longer knows the old display name. Stable
+        // identity still reaches the sticky physical column directly.
+        let resolver = OneField { name: "title", id: property };
+        let out = selection_to_column_space("record", &selection, Some(&resolver), &|queried| {
+            (*queried == property).then(|| "old_title".to_string())
+        });
+        let order = &out.order_by.unwrap()[0];
+        assert_eq!(order.path.first(), "old_title");
+        assert_eq!(order.property, Some(property.to_ulid()));
     }
 
     #[test]

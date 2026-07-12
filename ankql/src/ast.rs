@@ -132,6 +132,12 @@ pub struct Selection {
 pub struct OrderByItem {
     pub path: PathExpr,
     pub direction: OrderDirection,
+    /// Stable catalog property identity filled by the resolution pass.
+    /// `None` is the parser/raw form and is also used for pseudo-properties
+    /// such as `id`. The display path remains available for SQL generation
+    /// and legacy/name-addressed storage fallbacks.
+    #[serde(default)]
+    pub property: Option<Ulid>,
 }
 
 impl std::fmt::Display for OrderByItem {
@@ -679,6 +685,18 @@ mod tests {
             let decoded: Selection = bincode::deserialize(&bytes).expect("deserialize");
             assert_eq!(decoded, selection);
         }
+    }
+
+    #[test]
+    fn resolved_order_by_bincode_roundtrip() {
+        let property = Ulid::from_bytes([9u8; 16]);
+        let mut selection = identifier_selection("score", vec![]);
+        selection.order_by =
+            Some(vec![OrderByItem { path: PathExpr::simple("score"), direction: OrderDirection::Desc, property: Some(property) }]);
+
+        let bytes = bincode::serialize(&selection).expect("serialize");
+        let decoded: Selection = bincode::deserialize(&bytes).expect("deserialize");
+        assert_eq!(decoded, selection);
     }
 
     #[test]

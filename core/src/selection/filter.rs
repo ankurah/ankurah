@@ -93,9 +93,8 @@ fn evaluate_expr<I: Filterable>(item: &I, expr: &Expr) -> Result<ExprOutput<Valu
         // the Path qualifier logic: the resolution pass already stripped any
         // collection qualifier and fixed the property, so a leading step that
         // happens to equal the collection name is the PROPERTY, never a
-        // qualifier. Evaluate value(name) + subpath extraction only. (Phase A:
-        // name-based lookup through the binding; id-based lookup is a
-        // follow-up, Filterable::value_by_property_id.)
+        // qualifier. Evaluate the stable property id plus subpath; `name`
+        // remains display context and the fallback key for legacy residue.
         Expr::Identifier(identifier) => evaluate_identifier(item, identifier),
         Expr::ExprList(exprs) => {
             let mut result = Vec::new();
@@ -108,11 +107,12 @@ fn evaluate_expr<I: Filterable>(item: &I, expr: &Expr) -> Result<ExprOutput<Valu
     }
 }
 
-/// Evaluate a RESOLVED [`Identifier`]: look up the property by its
-/// resolved-at name, then extract any JSON sub-path. Unlike
+/// Evaluate a RESOLVED [`Identifier`]: look up the property by its stable id,
+/// retaining the resolved-at name for legacy residue, then extract any JSON
+/// sub-path. Unlike
 /// [`evaluate_path_steps`] this does NO collection-qualifier handling -- the
 /// resolution pass already bound the property, so `name` is authoritative
-/// even when it equals the collection name (Phase A: name-based lookup).
+/// display context even when it equals the collection name.
 fn evaluate_identifier<I: Filterable>(item: &I, identifier: &Identifier) -> Result<ExprOutput<Value>, Error> {
     let name = identifier.property_name();
     // The resolved identifier carries the property-definition id (RFC 5.5);

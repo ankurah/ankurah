@@ -52,18 +52,17 @@ pub trait TContext {
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError>;
     /// RFC 5.2 (specs/model-property-metadata/rfc.md) model first-use registration, object-safe so the mutating
     /// transaction paths (`create`/`edit`) can trigger it without the
-    /// concrete `<SE, PA>`. Discriminates per plan decision 16 (rev 4): for
-    /// a collection the catalog already KNOWS (bound), any registration
-    /// failure only warns and the data write proceeds; for a
-    /// NEVER-registered collection, a failed or impossible registration is
-    /// the strict rev 4 surface and returns Err, failing the write
-    /// ("connect once first").
+    /// concrete `<SE, PA>`. Discriminates per plan decision 16 (rev 4): a
+    /// failed reassertion may warn and proceed only when every field in this
+    /// exact compiled shape already has a compatible canonical binding. A
+    /// never-registered collection, missing field, or incompatible field
+    /// fails the write.
     async fn ensure_registered(&self, schema: &'static crate::schema::ModelSchema) -> Result<(), MutationError>;
-    /// Record a compiled model's schema pointer for the commit-time
-    /// registration gap (RFC 5.2, plan decision 16). Object-safe so read
-    /// paths (`get`/`fetch`/`query`) and the sync `edit` path can call it
-    /// without the concrete `<SE, PA>`. Cheap and synchronous. (Rev 4: no
-    /// local id overlay; ids exist only in the catalog.)
+    /// Record a binary-known compiled schema for predicate first-use
+    /// registration and unknown-collection classification. Object-safe so
+    /// read paths (`get`/`fetch`/`query`) and the sync `edit` path can call it
+    /// without the concrete `<SE, PA>`. Commit provenance is recorded on the
+    /// transaction itself, not inferred from this process-global cache.
     fn cache_compiled(&self, schema: &'static crate::schema::ModelSchema);
     /// RFC 5.2 STRICT registration (the eager explicit `ctx.register::<M>()`
     /// form): propagate the error instead of swallowing it. Object-safe.
@@ -77,8 +76,8 @@ pub trait TContext {
 impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> TContext for NodeAndContext<SE, PA> {
     fn node_id(&self) -> proto::EntityId { self.node.id }
     fn create_entity(&self, collection: proto::CollectionId, trx_alive: Arc<AtomicBool>) -> Entity {
-        // Assembly binds the PRIMARY to the id-keyed contract before we
-        // snapshot, so the fork carries binding + wire mode (RFC 5.5).
+        // WeakEntitySet::create stamps the PRIMARY with the live catalog
+        // resolver before this snapshot, so the transaction fork inherits it.
         let primary_entity = self.node.entities.create(collection);
         primary_entity.snapshot(trx_alive)
     }
@@ -101,24 +100,25 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
 
         // Close the edit-only registration gap (RFC 5.2 "durable write on
         // first mutating use"): Transaction::edit is sync and cannot await a
-        // durable registration, so ensure-register here for any touched
-        // collection whose compiled schema is known but not yet ensured.
+        // durable registration, so ensure-register the exact schema shapes
+        // this transaction used. Transaction scope matters: a historically
+        // failed declaration for the same collection must not poison later
+        // transactions using a compatible shape.
         // Same discrimination as the create-path trigger (plan decision 16):
-        // bound collections warn and proceed; a never-registered collection
-        // fails the commit (the rev 4 strict offline surface).
-        for entity in trx.entities.iter() {
-            if let Some(schema) = self.node.catalog.unensured_schema_for(entity.collection().as_str()) {
-                TContext::ensure_registered(self, schema).await?;
-            }
+        // a failed reassertion proceeds only when every compiled field already
+        // has a compatible canonical binding; otherwise the commit fails.
+        let schemas = trx.schemas.read().unwrap().clone();
+        for schema in schemas {
+            TContext::ensure_registered(self, schema).await?;
         }
 
-        // Resolve each entity's transient uncommitted Name keys to their
-        // property id now the catalog is warm (the PropertyKey amendment, #289):
-        // the sync accessor stages Name keys, and the committed/wire form must
-        // be id-keyed for a registered user collection. Values canonicalize to
-        // the property's catalog value_type here (rfc.md 5.6 as amended
-        // 2026-07-10); a value the canonical type cannot represent fails the
-        // commit at this writer.
+        // Resolve ordinary fields' transient uncommitted Name keys to their
+        // property id now the catalog is warm (the PropertyKey amendment,
+        // #289). Explicit-id accessors already stage under their literal Id.
+        // Both forms canonicalize values to the property's catalog value_type
+        // here (rfc.md 5.6 as amended 2026-07-10), and the committed/wire form
+        // is always id-keyed for a registered user collection. A value the
+        // canonical type cannot represent fails this writer's commit.
         for entity in trx.entities.iter() {
             entity.resolve_pending_keys()?;
         }
@@ -240,17 +240,23 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     }
     async fn ensure_registered(&self, schema: &'static crate::schema::ModelSchema) -> Result<(), MutationError> {
         if let Err(e) = self.node.catalog.ensure_registered(&self.node, &self.cdata, schema).await {
-            // Plan decision 16 (rev 4): a collection the catalog already
-            // knows keeps writing against its cached binding; the re-assert
-            // is deferrable and only warns. A NEVER-registered collection
-            // failing registration (offline, or refused) fails the write:
-            // identity does not exist yet and only the allocator can mint it.
-            if self.node.catalog.model_by_collection(schema.collection).is_some() {
-                tracing::warn!("ensure_registered for bound collection '{}' failed (data write proceeds): {}", schema.collection, e);
+            // An unavailable reassertion may proceed only when this exact
+            // compiled shape can already resolve every field to a compatible
+            // canonical definition. Otherwise an unregistered or incompatible
+            // field would escape as Name residue in a registered user model.
+            if self.node.catalog.schema_is_fully_bound_compatible(schema) {
+                tracing::warn!(
+                    "ensure_registered for fully bound collection '{}' failed (data write proceeds with cached canonical bindings): {}",
+                    schema.collection,
+                    e
+                );
             } else {
-                return Err(MutationError::General(
-                    format!("cannot write into unregistered collection '{}': {e}", schema.collection).into(),
-                ));
+                let message = if self.node.catalog.model_by_collection(schema.collection).is_none() {
+                    format!("cannot write into unregistered collection '{}': {e}", schema.collection)
+                } else {
+                    format!("cannot write using an unconfirmed schema for collection '{}': {e}", schema.collection)
+                };
+                return Err(MutationError::General(message.into()));
             }
         }
         Ok(())
@@ -303,18 +309,19 @@ impl Context {
     // }
 
     /// RFC 5.2 eager explicit registration (STRICT form): register `M`'s
-    /// model, properties, and memberships now, propagating any error (unlike
-    /// the auto-assert path on create/edit, which is best-effort). Useful
-    /// before first render so predicate resolution has the ids ready. A
-    /// second call is a no-op (the collection is latched as ensured).
+    /// model, properties, and memberships now, propagating any error. Automatic
+    /// mutating paths also fail a never-registered write; a failed reassertion
+    /// may proceed only when every field is already bound compatibly. Useful
+    /// before first render so predicate resolution has the ids ready. A second
+    /// call for the same compiled shape is a no-op.
     pub async fn register<M: crate::model::Model>(&self) -> Result<(), crate::schema::registration::RegistrationError> {
         self.0.register_strict(M::schema()).await
     }
 
     pub async fn get<R: View>(&self, id: proto::EntityId) -> Result<R, RetrievalError> {
         // Record the compiled schema. Gets (id addressed, no predicate
-        // resolution) do not trigger first-use registration; this feeds the
-        // commit-time registration gap.
+        // resolution) do not trigger first-use registration; a later
+        // predicate use can still identify this as a binary-known schema.
         self.0.cache_compiled(<R::Model as crate::model::Model>::schema());
         let entity = self.0.get_entity(id, &R::collection(), false).await?;
         Ok(R::from_entity(entity))

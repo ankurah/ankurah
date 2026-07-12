@@ -168,9 +168,10 @@ impl WatcherSet {
         use ankql::ast::{Expr, Predicate};
         match predicate {
             Predicate::Comparison { left, operator, right } => {
-                // Extract (property_path, literal) from either a Path or a resolved
-                // Identifier on one side and a Literal on the other. An Identifier
-                // indexes as the equivalent [name, ..subpath] Path (Phase A: name-based).
+                // Extract (property_path, literal) from either a Path or a
+                // resolved Identifier on one side and a Literal on the other.
+                // Identifier paths retain the stable property id so an active
+                // watcher survives a catalog display-name change.
                 let extracted = match (&**left, &**right) {
                     (Expr::Path(path), Expr::Literal(literal)) | (Expr::Literal(literal), Expr::Path(path)) => {
                         Some((PropertyPath::from_path(path), literal))
