@@ -17,6 +17,10 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 mod common;
 use common::{proto, start_test_server};
 
+/// Last protocol epoch before Phase 2 added generation to EventId hashing,
+/// EventFragment, and State head metadata.
+const PRE_D2_PROTOCOL_VERSION: u32 = 3;
+
 #[derive(Clone)]
 struct NullSender(proto::EntityId);
 
@@ -47,6 +51,19 @@ async fn register_peer_refuses_incompatible_version() -> Result<()> {
     let p = presence(proto::PROTOCOL_VERSION);
     let peer_id = p.node_id;
     node.register_peer(p, Box::new(NullSender(peer_id))).expect("current version must be accepted");
+    Ok(())
+}
+
+/// Phase 2 changes both wire and persisted identity. A peer from the prior
+/// epoch must be rejected at the common register_peer enforcement point.
+#[tokio::test]
+async fn register_peer_refuses_pre_d2_protocol_version() -> Result<()> {
+    let node = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    let p = presence(PRE_D2_PROTOCOL_VERSION);
+    let peer_id = p.node_id;
+
+    let err = node.register_peer(p, Box::new(NullSender(peer_id))).expect_err("pre-D2 protocol must be refused");
+    assert_eq!(err, proto::PresenceRejection { expected: proto::PROTOCOL_VERSION, received: PRE_D2_PROTOCOL_VERSION });
     Ok(())
 }
 
