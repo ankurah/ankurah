@@ -1,0 +1,34 @@
+[package]
+name          = "ankurah-connector-iroh"
+version       = "0.9.0"
+edition       = "2021"
+rust-version  = "1.91"
+description   = "Native Ankurah transport over iroh QUIC connections"
+license       = "MIT OR Apache-2.0"
+documentation = "https://docs.rs/ankurah-connector-iroh"
+homepage      = "https://github.com/ankurah/ankurah"
+repository    = "https://github.com/ankurah/ankurah"
+
+[dependencies]
+ankurah-core    = { path = "../../core", version = "=0.9.0" }
+ankurah-proto   = { path = "../../proto", version = "=0.9.0" }
+ankurah-signals = { path = "../../signals", version = "=0.9.0" }
+
+ed25519-dalek = "2"
+iroh           = "1"
+
+tokio      = { version = "1.40", features = ["macros", "rt", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+
+futures-util = "0.3"
+async-trait  = "0.1"
+
+anyhow    = "1.0"
+thiserror = "2.0"
+tracing   = "0.1"
+
+[dev-dependencies]
+ankurah              = { path = "../../ankurah", version = "=0.9.0", features = ["derive"] }
+ankurah-storage-sled = { path = "../../storage/sled", version = "=0.9.0" }
+serde                = { version = "1.0", features = ["derive"] }
+tracing-subscriber   = "0.3"

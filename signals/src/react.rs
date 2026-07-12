@@ -271,10 +271,16 @@ pub fn use_observe() -> Result<ReactObserver, JsValue> {
         // Reuse existing observer
         let ptr = js_sys::Reflect::get(&observer_ref, &JsValue::from_str("__wbg_ptr")).unwrap();
         let react_observer = {
-            // Workaround for lack of downcasting in wasm-bindgen
+            // Workaround for lack of downcasting in wasm-bindgen. The supported downcast
+            // (TryFromJsValue) is unusable here because its JS glue calls __destroy_into_raw,
+            // which would consume the observer stored in the React ref. Borrowing through the
+            // raw __wbg_ptr keeps the stored instance alive across renders. Current
+            // wasm-bindgen (the 0.2.126 floor in Cargo.toml) types the reference ABI as
+            // WasmPtr where older versions used a bare u32, hence the from_usize conversion.
             let ptr_u32: u32 = ptr.as_f64().unwrap() as u32;
             use wasm_bindgen::convert::RefFromWasmAbi;
-            unsafe { ReactObserver::ref_from_abi(ptr_u32) }
+            let abi = <ReactObserver as RefFromWasmAbi>::Abi::from_usize(ptr_u32 as usize);
+            unsafe { ReactObserver::ref_from_abi(abi) }
         };
 
         // Set up React integration
