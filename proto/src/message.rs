@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     auth::AuthData,
     id::EntityId,
-    peering::Presence,
+    peering::{Presence, PresenceRejection},
     request::{NodeRequest, NodeResponse},
     subscription::QueryId,
     update::{NodeUpdate, NodeUpdateAck},
@@ -13,6 +13,9 @@ use crate::{
 pub enum Message {
     Presence(Presence),
     PeerMessage(NodeMessage),
+    /// Best-effort notice that the sender is refusing the connection over
+    /// a protocol version mismatch; the connection closes right after.
+    PresenceRejected(PresenceRejection),
     // TODO RPC messages
 }
 
@@ -30,6 +33,7 @@ impl std::fmt::Display for Message {
         match self {
             Message::Presence(presence) => write!(f, "Presence: {}", presence),
             Message::PeerMessage(node_message) => write!(f, "PeerMessage: {}", node_message),
+            Message::PresenceRejected(rejection) => write!(f, "PresenceRejected: {}", rejection),
         }
     }
 }

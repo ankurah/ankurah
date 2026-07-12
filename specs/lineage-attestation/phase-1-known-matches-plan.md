@@ -166,7 +166,7 @@ EventBridge { events } =>
 **Changes Required**:
 
 - `core/src/context.rs::fetch` - Use `NodeApplier::apply_delta`
-- `core/src/peer_subscription/client_relay.rs::apply_initial_deltas` - Use `NodeApplier::apply_delta`
+- `core/src/peer_subscription/relay.rs::apply_initial_deltas` - Use `NodeApplier::apply_delta`
 - Both should then re-fetch from local storage to populate resultsets
 
 **Critical Design Consideration - Reactor Notification**:

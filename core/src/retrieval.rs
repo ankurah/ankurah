@@ -310,7 +310,14 @@ mod tests {
         entity_id_bytes[0] = seed;
         let entity_id = EntityId::from_bytes(entity_id_bytes);
 
-        Event { entity_id, collection: "test".into(), parent: Clock::from(parent_ids.to_vec()), operations: OperationSet(BTreeMap::new()) }
+        // Deterministic fake model id (#330): these staging-lifecycle fixtures
+        // build events by hand and never route them through a node's catalog,
+        // and the model field is excluded from `EventId` hashing.
+        let mut model_bytes = [0u8; 16];
+        model_bytes[0] = 0xEE;
+        let model = EntityId::from_bytes(model_bytes);
+
+        Event { entity_id, model, parent: Clock::from(parent_ids.to_vec()), operations: OperationSet(BTreeMap::new()) }
     }
 
     // ====================================================================

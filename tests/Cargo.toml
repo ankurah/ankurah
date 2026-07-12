@@ -18,7 +18,7 @@ ankurah-connector-local-process = { path = "../connectors/local-process", versio
 ankurah-websocket-client = { path = "../connectors/websocket-client", version = "=0.9.0" }
 ankurah-websocket-server = { path = "../connectors/websocket-server", version = "=0.9.0" }
 ankurah-storage-common = { path = "../storage/common", version = "=0.9.0" }
-tokio = { version = "1.40", features = ["full"] }
+tokio = { version = "1.40", features = ["full", "test-util"] }
 tracing-subscriber = "0.3"
 ctor = "0.2"
 wasm-bindgen = "0"
@@ -33,9 +33,17 @@ rand        = "0.8"
 rand_chacha = "0.3"
 # C6 crash-recovery: the crash child serializes the committed batch to a
 # handoff file so the parent can re-deliver identical events after reopen.
+# Also used by the raw-socket protocol tests (protocol_version.rs).
 bincode = "1.3.3"
 sha2    = "0.10.8"
 base64  = "0.22"
+
+# raw-socket protocol tests (protocol_version.rs)
+tokio-tungstenite = "0.27"
+futures-util      = "0.3"
+
+# derive-macro compile-fail fixtures (derive_compile_fail.rs)
+trybuild = "1.0"
 
 # C6 postgres crash arm (feature-gated). The node process dies mid-write while
 # the postgres server survives; the parent reopens the same database and checks

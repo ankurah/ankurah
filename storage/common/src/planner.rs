@@ -32,7 +32,26 @@ impl Planner {
     ///
     /// Input: Selection with predicate, primary key field name
     /// Output: Vector of all viable plans (index plans + table scan fallback)
+    ///
+    /// ORDER BY key parts default to String collation; engines that know the
+    /// catalog should call [`Self::plan_with_types`] so sort keys collate in
+    /// each property's CANONICAL value_type.
     pub fn plan(&self, selection: &ankql::ast::Selection, primary_key: &str) -> Vec<Plan> {
+        self.plan_with_types(selection, primary_key, &|_| None)
+    }
+
+    /// [`Self::plan`] with a column-type lookup for ORDER BY key parts: the
+    /// engine resolves a column name through the catalog to the property's
+    /// canonical value_type (the canonical value_type ruling), so ordered
+    /// index scans collate numerics numerically instead of the historical
+    /// hardcoded-String collation. `None` for a column (system collections,
+    /// unresolvable legacy names) keeps the String fallback.
+    pub fn plan_with_types(
+        &self,
+        selection: &ankql::ast::Selection,
+        primary_key: &str,
+        order_type_of: &dyn Fn(&str) -> Option<ValueType>,
+    ) -> Vec<Plan> {
         let conjuncts = ConjunctFinder::find(&selection.predicate);
 
         // Separate conjuncts into equalities and inequalities, filtering out primary key predicates
@@ -56,7 +75,7 @@ impl Planner {
         if let Some(order_by) = &selection.order_by
             && !order_by.is_empty()
         {
-            if let Some(plan) = self.build_order_first_plan(&equalities, &inequalities, order_by, &conjuncts) {
+            if let Some(plan) = self.build_order_first_plan(&equalities, &inequalities, order_by, &conjuncts, order_type_of) {
                 plans.push(plan);
             }
             // If an ORDER BY field has inequalities (covered inequality), do NOT emit INEQ-FIRST
@@ -124,6 +143,7 @@ impl Planner {
         inequalities: &IndexMap<String, Vec<(ComparisonOperator, Value)>>,
         order_by: &[ankql::ast::OrderByItem],
         conjuncts: &[Predicate],
+        order_type_of: &dyn Fn(&str) -> Option<ValueType>,
     ) -> Option<Plan> {
         if order_by.is_empty() {
             return None;
@@ -137,9 +157,10 @@ impl Planner {
             for item in order_by {
                 if item.path.is_simple() {
                     let name = item.path.first();
+                    let vt = order_type_of(name).unwrap_or(ValueType::String);
                     index_keyparts.push(match item.direction {
-                        ankql::ast::OrderDirection::Asc => IndexKeyPart::asc(name.to_string(), ValueType::String),
-                        ankql::ast::OrderDirection::Desc => IndexKeyPart::desc(name.to_string(), ValueType::String),
+                        ankql::ast::OrderDirection::Asc => IndexKeyPart::asc(name.to_string(), vt),
+                        ankql::ast::OrderDirection::Desc => IndexKeyPart::desc(name.to_string(), vt),
                     });
                 }
             }
@@ -151,7 +172,7 @@ impl Planner {
                 if item.path.is_simple() {
                     let name = item.path.first();
                     if !broke && item.direction == first_dir {
-                        index_keyparts.push(IndexKeyPart::asc(name.to_string(), ValueType::String));
+                        index_keyparts.push(IndexKeyPart::asc(name.to_string(), order_type_of(name).unwrap_or(ValueType::String)));
                     } else {
                         broke = true;
                     }
@@ -338,9 +359,11 @@ impl Planner {
     fn extract_comparison(&self, predicate: &Predicate) -> Option<(String, ComparisonOperator, Value)> {
         match predicate {
             Predicate::Comparison { left, operator, right } => {
-                // Extract field path from left side (supports multi-step paths)
+                // Extract field path from left side (supports multi-step paths).
+                // A resolved Identifier behaves as the equivalent [name, ..subpath] Path.
                 let field_path = match left.as_ref() {
                     Expr::Path(path) => path.steps.join("."),
+                    Expr::Identifier(identifier) => identifier.path_steps().join("."),
                     _ => return None,
                 };
 
@@ -781,9 +804,17 @@ impl Planner {
     fn extract_primary_key_bound(&self, predicate: &Predicate, primary_key: &str) -> Option<KeyBoundComponent> {
         if let Predicate::Comparison { left, operator, right } = predicate {
             // Check if this is a primary key comparison
+            // A resolved Identifier addresses the primary key when its subpath is
+            // empty and its resolved name matches, mirroring a simple Path.
             let value = match (left.as_ref(), right.as_ref()) {
                 (Expr::Path(path), Expr::Literal(literal)) if path.is_simple() && path.first() == primary_key => Value::from(literal),
                 (Expr::Literal(literal), Expr::Path(path)) if path.is_simple() && path.first() == primary_key => Value::from(literal),
+                (Expr::Identifier(identifier), Expr::Literal(literal)) if identifier.is_simple() && identifier.name == primary_key => {
+                    Value::from(literal)
+                }
+                (Expr::Literal(literal), Expr::Identifier(identifier)) if identifier.is_simple() && identifier.name == primary_key => {
+                    Value::from(literal)
+                }
                 _ => return None,
             };
 
@@ -883,6 +914,8 @@ impl Planner {
         if let Predicate::Comparison { left, operator: _, right: _ } = predicate {
             match left.as_ref() {
                 Expr::Path(path) if path.is_simple() => path.first() == primary_key,
+                // A resolved Identifier mirrors a simple Path on the primary key.
+                Expr::Identifier(identifier) if identifier.is_simple() => identifier.name == primary_key,
                 _ => false,
             }
         } else {
@@ -908,6 +941,8 @@ impl Planner {
                 // Check if this is a primary key comparison with supported operators
                 let is_primary_key_field = match left.as_ref() {
                     Expr::Path(path) if path.is_simple() => path.first() == primary_key,
+                    // A resolved Identifier mirrors a simple Path on the primary key.
+                    Expr::Identifier(identifier) if identifier.is_simple() => identifier.name == primary_key,
                     _ => false,
                 };
 
@@ -965,12 +1000,20 @@ mod tests {
     }
     macro_rules! oby_asc {
         ($name:expr) => {
-            ankql::ast::OrderByItem { path: ankql::ast::PathExpr::simple($name), direction: ankql::ast::OrderDirection::Asc }
+            ankql::ast::OrderByItem {
+                path: ankql::ast::PathExpr::simple($name),
+                property: None,
+                direction: ankql::ast::OrderDirection::Asc,
+            }
         };
     }
     macro_rules! oby_desc {
         ($name:expr) => {
-            ankql::ast::OrderByItem { path: ankql::ast::PathExpr::simple($name), direction: ankql::ast::OrderDirection::Desc }
+            ankql::ast::OrderByItem {
+                path: ankql::ast::PathExpr::simple($name),
+                property: None,
+                direction: ankql::ast::OrderDirection::Desc,
+            }
         };
     }
 

@@ -7,8 +7,9 @@ use std::{
 
 use ankurah_core::{
     error::{MutationError, RetrievalError, StateError},
-    property::backend::backend_from_string,
-    storage::{StorageCollection, StorageEngine},
+    property::{backend::backend_from_string, PropertyKey},
+    schema::CatalogResolver,
+    storage::{naming, StorageCollection, StorageEngine},
 };
 use ankurah_proto::{Attestation, AttestationSet, Attested, EntityState, EventId, OperationSet, State, StateBuffers};
 
@@ -34,10 +35,16 @@ pub const DEFAULT_CONNECTION_TIMEOUT_SECS: u64 = 30;
 
 pub struct Postgres {
     pool: bb8::Pool<PostgresConnectionManager<NoTls>>,
+    /// The catalog resolver, injected post-construction by `Node` (see
+    /// `StorageEngine::set_catalog_resolver`). Shared with every bucket:
+    /// the name SOURCE for the engine-owned durable id-to-column map.
+    resolver: Arc<RwLock<Option<std::sync::Weak<dyn CatalogResolver>>>>,
 }
 
 impl Postgres {
-    pub fn new(pool: bb8::Pool<PostgresConnectionManager<NoTls>>) -> anyhow::Result<Self> { Ok(Self { pool }) }
+    pub fn new(pool: bb8::Pool<PostgresConnectionManager<NoTls>>) -> anyhow::Result<Self> {
+        Ok(Self { pool, resolver: Arc::new(RwLock::new(None)) })
+    }
 
     pub async fn open(uri: &str) -> anyhow::Result<Self> {
         let manager = PostgresConnectionManager::new_from_stringlike(uri, NoTls)?;
@@ -113,6 +120,8 @@ impl StorageEngine for Postgres {
             schema,
             collection_id: collection_id.clone(),
             columns: Arc::new(RwLock::new(Vec::new())),
+            resolver: self.resolver.clone(),
+            property_columns: Arc::new(RwLock::new(BTreeMap::new())),
             #[cfg(debug_assertions)]
             last_spilled_predicate: Arc::new(RwLock::new(None)),
         };
@@ -124,7 +133,9 @@ impl StorageEngine for Postgres {
         let result = async {
             bucket.create_state_table(&mut client).await?;
             bucket.create_event_table(&mut client).await?;
+            bucket.create_column_map_table(&client).await?;
             bucket.rebuild_columns_cache(&mut client).await?;
+            bucket.load_column_map(&client).await?;
             Ok::<_, StateError>(())
         }
         .await;
@@ -135,6 +146,8 @@ impl StorageEngine for Postgres {
         result?;
         Ok(Arc::new(bucket))
     }
+
+    fn set_catalog_resolver(&self, resolver: std::sync::Weak<dyn CatalogResolver>) { *self.resolver.write().unwrap() = Some(resolver); }
 
     async fn delete_all_collections(&self) -> Result<bool, MutationError> {
         let mut client = self.pool.get().await.map_err(|err| MutationError::General(Box::new(err)))?;
@@ -166,6 +179,29 @@ impl StorageEngine for Postgres {
 
         Ok(true)
     }
+
+    /// Non-creating collection discovery. The
+    /// trait default returns nothing, which would make a durable node warm an
+    /// empty catalog on restart. A collection's state table is named exactly
+    /// its id, paired with an `{id}_event` companion; the engine-wide
+    /// `_ankurah_property_columns` map is the only other table. So a table is a
+    /// collection iff its `{name}_event` companion also exists. Creates nothing.
+    async fn list_collections(&self) -> Result<Vec<CollectionId>, RetrievalError> {
+        let client = self.pool.get().await.map_err(RetrievalError::storage)?;
+        let rows = client
+            .query("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'", &[])
+            .await
+            .map_err(RetrievalError::storage)?;
+        let names: Vec<String> = rows.iter().map(|row| row.get("table_name")).collect();
+        let table_set: std::collections::HashSet<String> = names.iter().cloned().collect();
+        let collections = names
+            .into_iter()
+            .filter(|name| name.as_str() != "_ankurah_property_columns")
+            .filter(|name| table_set.contains(&format!("{name}_event")))
+            .map(CollectionId::from)
+            .collect();
+        Ok(collections)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -180,15 +216,151 @@ pub struct PostgresBucket {
     collection_id: CollectionId,
     schema: String,
     columns: Arc<RwLock<Vec<PostgresColumn>>>,
+    /// The injected catalog resolver (shared with the engine): the NAME SOURCE
+    /// for [`Self::column_for_key`]. Weak so storage never keeps the node alive.
+    resolver: Arc<RwLock<Option<std::sync::Weak<dyn CatalogResolver>>>>,
+    /// This collection's slice of the engine-owned durable id-to-column map
+    /// (the `_ankurah_property_columns` table), cached. The map -- not the
+    /// display name -- is what addresses a property's column once assigned:
+    /// renames never move columns, collisions were deduped at assignment.
+    property_columns: Arc<RwLock<BTreeMap<EntityId, String>>>,
     /// Tracks the last predicate that spilled to post-filtering (debug builds only)
     #[cfg(debug_assertions)]
     last_spilled_predicate: Arc<RwLock<Option<ankql::ast::Predicate>>>,
 }
 
+/// Fixed columns of every state table: reserved, never assignable to a property.
+const BASE_COLUMNS: [&str; 4] = ["id", "state_buffer", "head", "attestations"];
+
 impl PostgresBucket {
     fn state_table(&self) -> String { self.collection_id.as_str().to_string() }
 
     pub fn event_table(&self) -> String { format!("{}_event", self.collection_id.as_str()) }
+
+    /// The model id stamped on envelopes this bucket reconstructs (#330):
+    /// well-knowns, then the injected catalog resolver.
+    fn model_id(&self) -> Result<EntityId, RetrievalError> {
+        let resolver = self.resolver.read().unwrap().as_ref().and_then(|weak| weak.upgrade());
+        ankurah_core::storage::bucket_model_id(&self.collection_id, resolver.as_deref())
+    }
+
+    /// Create the engine-wide durable id-to-column map table. One table for
+    /// the whole database; rows are scoped by collection (dedup scope is
+    /// per-collection, the ratified naming rule).
+    async fn create_column_map_table(&self, client: &tokio_postgres::Client) -> Result<(), StateError> {
+        let query = r#"CREATE TABLE IF NOT EXISTS "_ankurah_property_columns" (
+            "collection" text NOT NULL,
+            "property_id" char(22) NOT NULL,
+            "column_name" text NOT NULL,
+            PRIMARY KEY ("collection", "property_id"),
+            UNIQUE ("collection", "column_name")
+        )"#;
+        client.execute(query, &[]).await.map_err(|err| StateError::DDLError(Box::new(err)))?;
+        Ok(())
+    }
+
+    /// Load this collection's id-to-column assignments into the cache.
+    async fn load_column_map(&self, client: &tokio_postgres::Client) -> Result<(), StateError> {
+        let rows = client
+            .query(
+                r#"SELECT "property_id", "column_name" FROM "_ankurah_property_columns" WHERE "collection" = $1"#,
+                &[&self.collection_id.as_str()],
+            )
+            .await
+            .map_err(|err| StateError::DDLError(Box::new(err)))?;
+        let mut map = BTreeMap::new();
+        for row in rows {
+            let id: EntityId = row.get("property_id");
+            let name: String = row.get("column_name");
+            map.insert(id, name);
+        }
+        *self.property_columns.write().unwrap() = map;
+        Ok(())
+    }
+
+    /// The materialized column for a property key.
+    ///
+    /// `Name` keys (system/catalog collections, legacy residue) use the name
+    /// directly, exactly as before the id-keyed epoch -- which also collapses
+    /// a legacy `Name("title")` residue and its re-registered `Id` successor
+    /// into ONE column, the materialized-layer form of the legacy fallback.
+    ///
+    /// `Id` keys resolve through the durable map; a miss assigns a column NOW:
+    /// seed from the catalog resolver's display name (sanitized), dedupe
+    /// against the base columns and this collection's other assignments
+    /// (`{name}_{trailing id chars}`, the ratified collision rule), or -- when
+    /// the resolver cannot name the id (the intra-node descriptor race; should
+    /// effectively never fire) -- a synthetic `p_{trailing id chars}` name,
+    /// logged loudly. The assignment is CAS'd into the map table so concurrent
+    /// writers converge on one winner.
+    async fn column_for_key(&self, client: &tokio_postgres::Client, key: &PropertyKey) -> Result<String, MutationError> {
+        let id = match key {
+            PropertyKey::Name(name) => return Ok(name.clone()),
+            PropertyKey::Id(id) => *id,
+        };
+        if let Some(column) = self.property_columns.read().unwrap().get(&id) {
+            return Ok(column.clone());
+        }
+
+        // Assignment path. Retry on a column-name uniqueness race: reload the
+        // map (fresh taken-set) and re-dedupe.
+        for _attempt in 0..3 {
+            let seeded = {
+                let resolver = self.resolver.read().unwrap().as_ref().and_then(|weak| weak.upgrade());
+                resolver.and_then(|r| r.name_for(&id)).map(|name| naming::sanitize(&name))
+            };
+            let column = {
+                let assigned = self.property_columns.read().unwrap();
+                let is_taken = |candidate: &str| {
+                    BASE_COLUMNS.contains(&candidate) || assigned.iter().any(|(other, name)| *other != id && name == candidate)
+                };
+                match &seeded {
+                    Some(seed) => naming::dedupe(seed, &id, is_taken),
+                    None => {
+                        warn!(
+                            "PostgresBucket({}): catalog cannot name property {}; assigning fallback column (descriptor race?)",
+                            self.collection_id,
+                            id.to_base64()
+                        );
+                        naming::fallback("p", &id, is_taken)
+                    }
+                }
+            };
+            let inserted = client
+                .execute(
+                    r#"INSERT INTO "_ankurah_property_columns" ("collection", "property_id", "column_name") VALUES ($1, $2, $3)
+                       ON CONFLICT ("collection", "property_id") DO NOTHING"#,
+                    &[&self.collection_id.as_str(), &id, &column],
+                )
+                .await;
+            match inserted {
+                Ok(_) => {
+                    // Read back the winner: covers both "we inserted" and "a
+                    // concurrent writer beat us on the same property id".
+                    let row = client
+                        .query_one(
+                            r#"SELECT "column_name" FROM "_ankurah_property_columns" WHERE "collection" = $1 AND "property_id" = $2"#,
+                            &[&self.collection_id.as_str(), &id],
+                        )
+                        .await
+                        .map_err(|err| MutationError::UpdateFailed(Box::new(err)))?;
+                    let winner: String = row.get(0);
+                    self.property_columns.write().unwrap().insert(id, winner.clone());
+                    return Ok(winner);
+                }
+                Err(err) if error_kind(&err) == ErrorKind::UniqueViolation => {
+                    // A concurrent writer claimed the same COLUMN NAME for a
+                    // different property: refresh the taken-set and re-dedupe.
+                    self.load_column_map(client).await.map_err(|e| MutationError::UpdateFailed(Box::new(e)))?;
+                    continue;
+                }
+                Err(err) => return Err(MutationError::UpdateFailed(Box::new(err))),
+            }
+        }
+        Err(MutationError::UpdateFailed(
+            anyhow::anyhow!("could not assign a column for property {} after repeated collisions", id.to_base64()).into(),
+        ))
+    }
 
     /// Returns the last predicate that spilled to post-filtering (debug builds only).
     ///
@@ -364,12 +536,17 @@ impl StorageCollection for PostgresBucket {
         // Process property values directly from state buffers
         for (name, state_buffer) in state.payload.state.state_buffers.iter() {
             let backend = backend_from_string(name, Some(state_buffer))?;
-            for (column, value) in backend.property_values() {
+            for (key, value) in backend.property_values() {
+                // Id keys address their column through the engine-owned durable
+                // map (assigned on first sight, seeded from the catalog
+                // resolver); Name keys (system/catalog collections, legacy
+                // residue) use the name directly.
+                let column = self.column_for_key(&client, &key).await?;
                 if !seen_properties.insert(column.clone()) {
-                    // Skip if property already seen in another backend
-                    // TODO: this should cause all (or subsequent?) fields with the same name
-                    // to be suffixed with the property id when we have property ids
-                    // requires some thought (and field metadata) on how to do this right
+                    // Same column from another backend of this entity: first
+                    // occurrence wins (cross-backend same-name is pre-existing
+                    // pathology; same-collection id collisions were deduped at
+                    // column assignment and cannot land here).
                     continue;
                 }
 
@@ -509,7 +686,7 @@ impl StorageCollection for PostgresBucket {
         Ok(Attested {
             payload: EntityState {
                 entity_id: id,
-                collection: self.collection_id.clone(),
+                model: self.model_id()?,
                 state: State { state_buffers: StateBuffers(state_buffers), head },
             },
             attestations: AttestationSet(attestations),
@@ -519,6 +696,20 @@ impl StorageCollection for PostgresBucket {
     async fn fetch_states(&self, selection: &ankql::ast::Selection) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         debug!("fetch_states: {:?}", selection);
         let mut client = self.pool.get().await.map_err(|err| RetrievalError::StorageError(Box::new(err)))?;
+
+        // Translate into this engine's column space FIRST (ids -> assigned
+        // column names via the durable map, order-by names via the catalog
+        // resolver), so the schema pre-filter, SQL generation, and post-filter
+        // all address the columns writes actually created (sticky under
+        // rename, deduped under collision, synthetic under fallback).
+        let selection = {
+            let resolver = self.resolver.read().unwrap().as_ref().and_then(|weak| weak.upgrade());
+            let assigned = self.property_columns.read().unwrap().clone();
+            ankurah_core::storage::selection_to_column_space(self.collection_id.as_str(), selection, resolver.as_deref(), &|id| {
+                assigned.get(id).cloned()
+            })
+        };
+        let selection = &selection;
 
         // Pre-filter selection based on cached schema to avoid undefined column errors.
         // If we see columns not in our cache, refresh it first (they might have been added).
@@ -617,7 +808,7 @@ impl StorageCollection for PostgresBucket {
             results.push(Attested {
                 payload: EntityState {
                     entity_id: id,
-                    collection: self.collection_id.clone(),
+                    model: self.model_id()?,
                     state: State { state_buffers: StateBuffers(state_buffers), head },
                 },
                 attestations: AttestationSet(attestations),
@@ -723,7 +914,7 @@ impl StorageCollection for PostgresBucket {
             let attestations: Vec<Attestation> = bincode::deserialize(&attestations_binary).map_err(RetrievalError::storage)?;
 
             let event = Attested {
-                payload: Event { collection: self.collection_id.clone(), entity_id, operations, parent },
+                payload: Event { model: self.model_id()?, entity_id, operations, parent },
                 attestations: AttestationSet(attestations),
             };
             events.push(event);
@@ -761,7 +952,7 @@ impl StorageCollection for PostgresBucket {
             let attestations: Vec<Attestation> = bincode::deserialize(&attestations_binary).map_err(RetrievalError::storage)?;
 
             events.push(Attested {
-                payload: Event { collection: self.collection_id.clone(), entity_id, operations, parent },
+                payload: Event { model: self.model_id()?, entity_id, operations, parent },
                 attestations: AttestationSet(attestations),
             });
         }
@@ -778,6 +969,7 @@ pub enum ErrorKind {
     RowCount,
     UndefinedTable { table: String },
     UndefinedColumn { table: Option<String>, column: String },
+    UniqueViolation,
     Unknown,
     PostgresError(String),
 }
@@ -843,6 +1035,7 @@ pub fn error_kind(err: &tokio_postgres::Error) -> ErrorKind {
                 ErrorKind::PostgresError(string.clone())
             }
         }
+        Some(SqlState::UNIQUE_VIOLATION) => ErrorKind::UniqueViolation,
         _ => ErrorKind::Unknown,
     }
 }

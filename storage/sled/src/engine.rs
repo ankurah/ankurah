@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use ankurah_core::{
     error::{MutationError, RetrievalError},
+    schema::CatalogResolver,
     storage::{StorageCollection, StorageEngine},
 };
 use ankurah_proto::CollectionId;
@@ -16,6 +17,11 @@ use crate::{collection::SledStorageCollection, database::Database, error::SledRe
 
 pub struct SledStorageEngine {
     pub database: Mutex<Arc<Database>>,
+    /// The catalog resolver, injected post-construction by `Node` (see
+    /// `StorageEngine::set_catalog_resolver`). Lives on the engine -- not on
+    /// [`Database`] -- so a hard reset (which recreates the `Database`) keeps
+    /// it; buckets get a clone at creation.
+    pub(crate) resolver: Arc<std::sync::RwLock<Option<std::sync::Weak<dyn CatalogResolver>>>>,
     #[cfg(debug_assertions)]
     pub prefix_guard_disabled: Arc<AtomicBool>,
 }
@@ -41,6 +47,7 @@ impl SledStorageEngine {
         let db = sled::open(&dbpath)?;
         Ok(Self {
             database: Mutex::new(Arc::new(Database::open(db)?)),
+            resolver: Arc::new(std::sync::RwLock::new(None)),
             #[cfg(debug_assertions)]
             prefix_guard_disabled: Arc::new(AtomicBool::new(false)),
         })
@@ -54,6 +61,7 @@ impl SledStorageEngine {
 
         Ok(Self {
             database: Mutex::new(Arc::new(Database::open(db)?)),
+            resolver: Arc::new(std::sync::RwLock::new(None)),
             #[cfg(debug_assertions)]
             prefix_guard_disabled: Arc::new(AtomicBool::new(false)),
         })
@@ -85,6 +93,12 @@ impl SledStorageEngine {
 #[async_trait]
 impl StorageEngine for SledStorageEngine {
     type Value = Vec<u8>;
+
+    /// Trait-level listing (see `StorageEngine::list_collections`); delegates
+    /// to the inherent method, which reads existing sled tree names without
+    /// opening (creating) any.
+    async fn list_collections(&self) -> Result<Vec<CollectionId>, RetrievalError> { SledStorageEngine::list_collections(self) }
+
     async fn collection(&self, id: &CollectionId) -> Result<Arc<dyn StorageCollection>, RetrievalError> {
         // could this block for any meaningful period of time? We might consider spawn_blocking
 
@@ -95,10 +109,13 @@ impl StorageEngine for SledStorageEngine {
             id.to_owned(),
             database,
             tree,
+            self.resolver.clone(),
             #[cfg(debug_assertions)]
             self.prefix_guard_disabled.clone(),
         )))
     }
+
+    fn set_catalog_resolver(&self, resolver: std::sync::Weak<dyn CatalogResolver>) { *self.resolver.write().unwrap() = Some(resolver); }
 
     async fn delete_all_collections(&self) -> Result<bool, MutationError> {
         let mut any_deleted = false;

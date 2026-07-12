@@ -182,7 +182,6 @@ async fn test_secondary_sort_desc_desc() -> Result<(), anyhow::Error> {
 /// Three-column ORDER BY with minimal spill: DESC, DESC, ASC (reverse scan, spill c)
 /// This tests the reverse scan direction with only the last column needing spill
 #[tokio::test]
-#[ignore] // Blocked by #210: i64 values sorted lexicographically instead of numerically
 async fn test_three_column_desc_desc_asc() -> Result<(), anyhow::Error> {
     let ctx = setup_context().await?;
 
@@ -205,10 +204,6 @@ async fn test_three_column_desc_desc_asc() -> Result<(), anyhow::Error> {
     // Name DESC within category: Y before X (for B), Z (for A)
     // Price ASC within (category, name): smallest price first
     let results = fetch_products(&ctx, "stock > 0 ORDER BY category DESC, name DESC, price ASC").await?;
-
-    // Debug: print actual results
-    eprintln!("Results: {:?}", product_tuples(&results));
-    eprintln!("Prices: {:?}", prices(&results));
 
     // B-Y (prices ASC: 50, 100, 200), B-X (150), A-Z (prices ASC: 250, 300)
     assert_eq!(prices(&results), vec![50, 100, 200, 150, 250, 300]);
@@ -272,7 +267,6 @@ async fn test_topk_desc_asc_limit() -> Result<(), anyhow::Error> {
 /// Three-column with LIMIT: ASC, ASC, DESC (forward scan, spill c)
 /// Tests TopKStream with forward scan and tertiary spill
 #[tokio::test]
-#[ignore] // Blocked by #210: i64 values sorted lexicographically instead of numerically
 async fn test_topk_three_column_asc_asc_desc_limit() -> Result<(), anyhow::Error> {
     let ctx = setup_context().await?;
 
@@ -291,7 +285,6 @@ async fn test_topk_three_column_asc_asc_desc_limit() -> Result<(), anyhow::Error
 /// Three-column with LIMIT: DESC, DESC, ASC (reverse scan, spill c)
 /// Tests TopKStream with reverse scan and tertiary spill
 #[tokio::test]
-#[ignore] // Blocked by #210: i64 values sorted lexicographically instead of numerically
 async fn test_topk_three_column_desc_desc_asc_limit() -> Result<(), anyhow::Error> {
     let ctx = setup_context().await?;
 

@@ -8,9 +8,18 @@ pub fn model_impl(model: &crate::model::description::ModelDescription) -> TokenS
     let mutable_name = model.mutable_name();
     let collection_str = model.collection_str();
     let active_field_names = model.active_field_names();
-    let active_field_name_strs = model.active_field_name_strs();
+    let active_field_addresses = match crate::model::schema::active_field_address_tokens(model) {
+        Ok(addresses) => addresses,
+        Err(e) => return e.into_compile_error(),
+    };
     let active_field_types_turbofish = match model.active_field_types_turbofish() {
         Ok(types) => types,
+        Err(e) => return e.into_compile_error(),
+    };
+
+    // The compiled schema: static ModelSchema + fn schema() (RFC 4 in specs/model-property-metadata/rfc.md, 5.8, 5.9).
+    let schema_method = match crate::model::schema::schema_impl(model) {
+        Ok(tokens) => tokens,
         Err(e) => return e.into_compile_error(),
     };
 
@@ -32,11 +41,13 @@ pub fn model_impl(model: &crate::model::description::ModelDescription) -> TokenS
             fn collection() -> ankurah::proto::CollectionId {
                 #collection_str.into()
             }
-            fn initialize_new_entity(&self, entity: &::ankurah::entity::Entity) {
+            #schema_method
+            fn initialize_new_entity(&self, entity: &::ankurah::entity::Entity) -> Result<(), ::ankurah::error::MutationError> {
                 use ::ankurah::property::InitializeWith;
                 #(
-                    #active_field_types_turbofish::initialize_with(&entity, #active_field_name_strs.into(), &self.#active_field_names);
+                    #active_field_types_turbofish::initialize_with(&entity, #active_field_addresses, &self.#active_field_names)?;
                 )*
+                Ok(())
             }
         }
     }

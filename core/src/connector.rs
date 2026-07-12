@@ -33,7 +33,7 @@ pub trait NodeComms: Send + Sync {
     fn id(&self) -> proto::EntityId;
     fn durable(&self) -> bool;
     fn system_root(&self) -> Option<Attested<EntityState>>;
-    fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>);
+    fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) -> Result<(), proto::PresenceRejection>;
     fn deregister_peer(&self, node_id: proto::EntityId);
     async fn handle_message(&self, message: proto::NodeMessage) -> anyhow::Result<()>;
     fn cloned(&self) -> Box<dyn NodeComms>;
@@ -44,9 +44,9 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     fn id(&self) -> proto::EntityId { self.id }
     fn durable(&self) -> bool { self.durable }
     fn system_root(&self) -> Option<Attested<EntityState>> { self.system.root() }
-    fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) {
+    fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) -> Result<(), proto::PresenceRejection> {
         //
-        self.register_peer(presence, sender);
+        self.register_peer(presence, sender)
     }
     fn deregister_peer(&self, node_id: proto::EntityId) {
         //

@@ -48,14 +48,37 @@ pub trait TContext {
     fn get_resident_entity(&self, id: proto::EntityId) -> Option<Entity>;
     async fn fetch_entities(&self, collection: &proto::CollectionId, args: MatchArgs) -> Result<Vec<Entity>, RetrievalError>;
     async fn commit_local_trx(&self, trx: &Transaction) -> Result<Vec<Event>, MutationError>;
-    fn query(&self, collection_id: proto::CollectionId, args: MatchArgs) -> Result<EntityLiveQuery, RetrievalError>;
+    fn query(
+        &self,
+        collection_id: proto::CollectionId,
+        schema: &'static crate::schema::ModelSchema,
+        args: MatchArgs,
+    ) -> Result<EntityLiveQuery, RetrievalError>;
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError>;
+    /// RFC 5.2 (specs/model-property-metadata/rfc.md) model first-use registration, object-safe so the mutating
+    /// transaction paths (`create`/`edit`) can trigger it without the
+    /// concrete `<SE, PA>`. If no durable peer is available, use may proceed
+    /// only when the local catalog proves every model and field identity in
+    /// this exact compiled shape. Policy, executor, missing-field, and
+    /// incompatible-field failures remain strict.
+    async fn ensure_registered(&self, schema: &'static crate::schema::ModelSchema) -> Result<(), MutationError>;
+    /// RFC 5.2 STRICT registration (the eager explicit `ctx.register::<M>()`
+    /// form): propagate the error instead of swallowing it. Object-safe.
+    async fn register_strict(
+        &self,
+        schema: &'static crate::schema::ModelSchema,
+    ) -> Result<(), crate::schema::registration::RegistrationError>;
+    /// Admit the exact compiled schema for a predicate read. Kept separate
+    /// from the mutation helper so read failures do not claim a write failed.
+    async fn ensure_query_schema(&self, schema: &'static crate::schema::ModelSchema) -> Result<(), RetrievalError>;
 }
 
 #[async_trait]
 impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> TContext for NodeAndContext<SE, PA> {
     fn node_id(&self) -> proto::EntityId { self.node.id }
     fn create_entity(&self, collection: proto::CollectionId, trx_alive: Arc<AtomicBool>) -> Entity {
+        // WeakEntitySet::create stamps the PRIMARY with the live catalog
+        // resolver before this snapshot, so the transaction fork inherits it.
         let primary_entity = self.node.entities.create(collection);
         primary_entity.snapshot(trx_alive)
     }
@@ -76,11 +99,43 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
             return Err(MutationError::General("Transaction already committed or rolled back".into()));
         }
 
+        // Close the edit-only registration gap (RFC 5.2 "durable write on
+        // first mutating use"): Transaction::edit is sync and cannot await a
+        // durable registration, so ensure-register the exact schema shapes
+        // this transaction used. Transaction scope matters: a historically
+        // failed declaration for the same collection must not poison later
+        // transactions using a compatible shape.
+        // As on create, the no-peer fallback requires a complete compatible
+        // binding for this exact declaration; every other failure is strict.
+        let schemas = trx.schemas.read().unwrap().clone();
+        for schema in schemas {
+            TContext::ensure_registered(self, schema).await?;
+        }
+
+        // Resolve ordinary fields' transient uncommitted Name keys to their
+        // property id now the catalog is warm (the PropertyKey amendment,
+        // #289). Explicit-id accessors already stage under their literal Id.
+        // Both forms canonicalize values to the property's catalog value_type
+        // here (rfc.md 5.6 as amended 2026-07-10), and the committed/wire form
+        // is always id-keyed for a registered user collection. A value the
+        // canonical type cannot represent fails this writer's commit.
+        for entity in trx.entities.iter() {
+            entity.resolve_pending_keys()?;
+        }
+
         // Generate events from the transaction entities
         let trx_id = trx.id.clone();
         let mut entity_events = Vec::new();
         for entity in trx.entities.iter() {
             if let Some(event) = entity.generate_commit_event()? {
+                // Protected collections (system + metadata catalog) are not
+                // mutable through ordinary transactions; the catalog's only
+                // mutation path is the registration operation (RFC 4).
+                if let Some(protected) = crate::schema::well_known_collection(&event.model) {
+                    return Err(MutationError::General(
+                        format!("collection '{}' is protected and not writable by transactions", protected).into(),
+                    ));
+                }
                 // Validate creation events: if parent is empty, this is a creation event
                 // and the entity must have been created in this transaction via create()
                 if event.is_entity_create() {
@@ -120,8 +175,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
             };
 
             // Stage event and apply to fork for after state (no commit_event call here)
-            let collection_id = &event.collection;
-            let collection = self.node.collections.get(collection_id).await?;
+            let collection = self.node.collections.get(entity.collection()).await?;
             let event_getter = crate::retrieval::LocalEventGetter::new(collection, self.node.durable);
             event_getter.stage_event(event.clone());
             forked.apply_event(&event_getter, &event).await?;
@@ -134,8 +188,8 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         }
 
         // Phase 2: all events attested; persist them.
-        for (_, attested) in &entity_attested_events {
-            let collection = self.node.collections.get(&attested.payload.collection).await?;
+        for (entity, attested) in &entity_attested_events {
+            let collection = self.node.collections.get(entity.collection()).await?;
             let event_getter = crate::retrieval::LocalEventGetter::new(collection, self.node.durable);
             event_getter.commit_event(attested).await?;
         }
@@ -150,8 +204,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         // All peers confirmed, persist state to storage
         let mut changes: Vec<EntityChange> = Vec::new();
         for (entity, attested_event) in entity_attested_events {
-            let collection_id = &attested_event.payload.collection;
-            let collection = self.node.collections.get(collection_id).await?;
+            let collection = self.node.collections.get(entity.collection()).await?;
 
             // Persist canonical entity (upstream for transactional forks, entity itself for primary)
             let canonical_entity = match &entity.kind {
@@ -166,7 +219,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
 
             let state = canonical_entity.to_state()?;
 
-            let entity_state = EntityState { entity_id: canonical_entity.id(), collection: canonical_entity.collection().clone(), state };
+            let entity_state = EntityState { entity_id: canonical_entity.id(), model: canonical_entity.model_id()?, state };
             let attestation = self.node.policy_agent.attest_state(&self.node, &entity_state);
             let attested = Attested::opt(entity_state, attestation);
             collection.set_state(attested).await?;
@@ -179,11 +232,41 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
 
         Ok(attested_events.into_iter().map(|a| a.payload).collect())
     }
-    fn query(&self, collection_id: proto::CollectionId, args: MatchArgs) -> Result<EntityLiveQuery, RetrievalError> {
-        EntityLiveQuery::new(&self.node, collection_id, args, self.cdata.clone())
+    fn query(
+        &self,
+        collection_id: proto::CollectionId,
+        schema: &'static crate::schema::ModelSchema,
+        args: MatchArgs,
+    ) -> Result<EntityLiveQuery, RetrievalError> {
+        EntityLiveQuery::new_for_model(&self.node, collection_id, schema, args, self.cdata.clone())
     }
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
         self.node.system.collection(id).await
+    }
+    async fn ensure_registered(&self, schema: &'static crate::schema::ModelSchema) -> Result<(), MutationError> {
+        self.node.catalog.ensure_schema_for_use(&self.node, &self.cdata, schema).await.map_err(|error| {
+            let message = if self.node.catalog.model_by_collection(schema.collection).is_none() {
+                format!("cannot write into unregistered collection '{}': {error}", schema.collection)
+            } else {
+                format!("cannot write using an unconfirmed schema for collection '{}': {error}", schema.collection)
+            };
+            MutationError::General(message.into())
+        })
+    }
+    async fn register_strict(
+        &self,
+        schema: &'static crate::schema::ModelSchema,
+    ) -> Result<(), crate::schema::registration::RegistrationError> {
+        self.node.catalog.ensure_registered(&self.node, &self.cdata, schema).await
+    }
+    async fn ensure_query_schema(&self, schema: &'static crate::schema::ModelSchema) -> Result<(), RetrievalError> {
+        self.node.catalog.ensure_schema_for_use(&self.node, &self.cdata, schema).await.map_err(|error| {
+            if self.node.catalog.model_by_collection(schema.collection).is_none() {
+                RetrievalError::Other(format!("collection '{}' is not registered: {error}", schema.collection))
+            } else {
+                RetrievalError::Other(error.to_string())
+            }
+        })
     }
 }
 
@@ -225,6 +308,16 @@ impl Context {
     //     Ok(result)
     // }
 
+    /// RFC 5.2 eager explicit registration (STRICT form): register `M`'s
+    /// model, properties, and memberships now, propagating any error. Automatic
+    /// mutating paths also fail a never-registered write; a failed reassertion
+    /// may proceed only when every field is already bound compatibly. Useful
+    /// before first render so predicate resolution has the ids ready. A second
+    /// call for the same compiled shape is a no-op.
+    pub async fn register<M: crate::model::Model>(&self) -> Result<(), crate::schema::registration::RegistrationError> {
+        self.0.register_strict(M::schema()).await
+    }
+
     pub async fn get<R: View>(&self, id: proto::EntityId) -> Result<R, RetrievalError> {
         let entity = self.0.get_entity(id, &R::collection(), false).await?;
         Ok(R::from_entity(entity))
@@ -240,6 +333,11 @@ impl Context {
         let args: MatchArgs = args.try_into().map_err(|e| e.into())?;
         use crate::model::Model;
         let collection_id = R::Model::collection();
+
+        // Predicate reads are schema-dependent and registration is their
+        // admission point. Ensure this exact declaration before any catalog
+        // name can resolve the selection through a different cached shape.
+        self.0.ensure_query_schema(R::Model::schema()).await?;
 
         let entities = self.0.fetch_entities(&collection_id, args).await?;
 
@@ -258,7 +356,7 @@ impl Context {
     where R: View {
         let args: MatchArgs = args.try_into().map_err(|e| e.into())?;
         use crate::model::Model;
-        Ok(self.0.query(R::Model::collection(), args)?.map::<R>())
+        Ok(self.0.query(R::Model::collection(), R::Model::schema(), args)?.map::<R>())
     }
 
     /// Subscribe to changes in entities matching a selection and wait for initialization
@@ -307,7 +405,7 @@ where
             debug!("Node({}).get_entity found local entity - returning", self.node.id);
             let state = local.to_state()?;
             let entity_id = local.id();
-            self.node.policy_agent.check_read(&self.cdata, &entity_id, collection_id, &state)?;
+            self.node.policy_agent.check_read(&self.cdata, &entity_id, collection_id, &state, Some(self.node.catalog.resolver_weak()))?;
             return Ok(local);
         }
         debug!("{}.get_entity fetching from storage", self.node);
@@ -320,6 +418,7 @@ where
                     &entity_state.payload.entity_id,
                     collection_id,
                     &entity_state.payload.state,
+                    Some(self.node.catalog.resolver_weak()),
                 )?;
                 let state_getter = crate::retrieval::LocalStateGetter::new(collection.clone());
                 let event_getter = crate::retrieval::CachedEventGetter::new(collection_id.clone(), collection, &self.node, &self.cdata);
@@ -339,6 +438,21 @@ where
         // Fetch raw states from storage
 
         args.selection.predicate = self.node.policy_agent.filter_predicate(&self.cdata, collection_id, args.selection.predicate)?;
+
+        // Resolve property references against the catalog: PathExpr becomes a
+        // stable Identifier and unknown properties fail closed.
+        // Idempotent, so a selection resolved by an outer caller passes
+        // through unchanged here. A collection that neither the catalog
+        // cache nor first-use registration can resolve fails LOUD
+        // (UnregisteredCollection): a lagging replica cannot prove
+        // emptiness, and a successful registration answers empty truthfully
+        // by querying the real, entity-free collection.
+        args.selection = self
+            .node
+            .catalog
+            .resolve_selection_deferred(&self.node, Some(&self.cdata), collection_id, None, &args.selection)
+            .await
+            .map_err(RetrievalError::from)?;
 
         // Resolve types in the AST (converts literals for JSON path comparisons)
         args.selection = self.node.type_resolver.resolve_selection_types(args.selection);

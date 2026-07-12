@@ -92,12 +92,15 @@ impl IndexManager {
             return Ok((existing, match_type));
         }
 
-        // Create new index
+        // Create a fresh index rather than mutating an incompatible persisted
+        // tree in place. `KeySpec::matches` includes the encoding value type,
+        // so an upgraded database with a legacy String-collated numeric index
+        // reaches this path and is backfilled under a new id. Keeping the old
+        // tree intact is safe for scans that already hold a handle to it.
         let index = {
             let id = self.next_index_id()?;
             let mut w = self.indexes.write().unwrap();
-            let index =
-                Index::new_from_spec(collection, spec.clone(), db, id, self.index_config_tree.clone(), property_manager.clone()).unwrap();
+            let index = Index::new_from_spec(collection, spec.clone(), db, id, self.index_config_tree.clone(), property_manager.clone())?;
             w.insert(id, index.clone());
             index
         };
@@ -292,6 +295,71 @@ impl IndexManager {
                 }
                 (None, None) => {}
             }
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::Database;
+    use ankurah_core::{
+        indexing::{IndexKeyPart, KeySpec},
+        value::{Value, ValueType},
+    };
+
+    fn entity_order(index: &Index) -> anyhow::Result<Vec<EntityId>> {
+        index
+            .tree()
+            .iter()
+            .map(|entry| {
+                let (key, _) = entry?;
+                let id_offset = key.len().checked_sub(16).ok_or_else(|| anyhow::anyhow!("index key is shorter than an entity id"))?;
+                let bytes: [u8; 16] = key[id_offset..].try_into()?;
+                Ok(EntityId::from_bytes(bytes))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reopened_database_rebuilds_legacy_string_collated_numeric_index() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let price_two = EntityId::from_bytes([2; 16]);
+        let price_ten = EntityId::from_bytes([10; 16]);
+        let legacy_index_id;
+
+        {
+            let db = sled::open(directory.path())?;
+            let database = Database::open(db.clone())?;
+            let price_property = database.property_manager.get_property_id("price")?;
+            let products = db.open_tree("collection_product")?;
+            products.insert(price_two.to_bytes(), bincode::serialize(&vec![(price_property, Value::I64(2))])?)?;
+            products.insert(price_ten.to_bytes(), bincode::serialize(&vec![(price_property, Value::I64(10))])?)?;
+
+            // This is the pre-epoch persisted shape: numeric payloads were
+            // indexed using String collation, yielding "10" before "2".
+            let legacy_spec = KeySpec::new(vec![IndexKeyPart::asc("price", ValueType::String)]);
+            let (legacy_index, _) =
+                database.index_manager.assure_index_exists("product", &legacy_spec, &database.db, &database.property_manager)?;
+            legacy_index_id = legacy_index.id();
+            assert_eq!(entity_order(&legacy_index)?, vec![price_ten, price_two]);
+            db.flush()?;
+        }
+
+        {
+            let db = sled::open(directory.path())?;
+            let database = Database::open(db)?;
+            assert!(database.index_manager.indexes.read().unwrap().contains_key(&legacy_index_id));
+
+            let canonical_spec = KeySpec::new(vec![IndexKeyPart::asc("price", ValueType::I64)]);
+            let (canonical_index, _) =
+                database.index_manager.assure_index_exists("product", &canonical_spec, &database.db, &database.property_manager)?;
+
+            assert_ne!(canonical_index.id(), legacy_index_id, "the legacy encoder must not be reused");
+            assert_eq!(canonical_index.spec(), &canonical_spec);
+            assert_eq!(entity_order(&canonical_index)?, vec![price_two, price_ten]);
         }
 
         Ok(())

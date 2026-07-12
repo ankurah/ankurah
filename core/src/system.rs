@@ -1,7 +1,10 @@
 use ankurah_proto::{self as proto, Attested, CollectionId, EntityState, Event};
 use anyhow::{anyhow, Result};
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::marker::PhantomData;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use tokio::sync::Notify;
 use tracing::{error, warn};
@@ -18,7 +21,6 @@ use crate::retrieval::{LocalEventGetter, LocalStateGetter, SuspenseEvents};
 use crate::storage::{StorageCollectionWrapper, StorageEngine};
 use crate::{property::backend::LWWBackend, value::Value};
 pub const SYSTEM_COLLECTION_ID: &str = "_ankurah_system";
-pub const PROTECTED_COLLECTIONS: &[&str] = &[SYSTEM_COLLECTION_ID];
 
 /// System catalog manager for storing various metadata about the system
 /// * root clock
@@ -41,8 +43,32 @@ struct Inner<SE, PA> {
     loading: Notify,
     system_ready: RwLock<bool>,
     system_ready_notify: Notify,
+    /// Serializes system-epoch transitions and initial storage load. Reset's
+    /// catalog drain guarantee is only meaningful when no second reset/join
+    /// can bypass it and delete or republish state concurrently.
+    lifecycle: tokio::sync::Mutex<()>,
+    /// Remains set across cancellation or deletion failure so the next
+    /// lifecycle operation resumes reset before reading or publishing a root.
+    /// Access is serialized by `lifecycle`; atomic storage provides interior
+    /// mutability without a second lock.
+    reset_incomplete: AtomicBool,
     reactor: Reactor,
+    /// Installed by `CatalogManager::start`. Reset has two phases because the
+    /// catalog owns asynchronous relay work while SystemManager owns storage:
+    /// begin invalidates and drains old catalog effects before deletion,
+    /// finish clears catalog state after system/reactor reset, and resume
+    /// re-arms durable catalog maintenance after the replacement root is ready.
+    catalog_reset_hook: RwLock<Option<CatalogResetHook>>,
     _phantom: PhantomData<PA>,
+}
+
+type CatalogResetFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+#[derive(Clone)]
+struct CatalogResetHook {
+    begin: Arc<dyn Fn() -> CatalogResetFuture + Send + Sync>,
+    finish: Arc<dyn Fn() + Send + Sync>,
+    resume: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl<SE, PA> SystemManager<SE, PA>
@@ -62,7 +88,10 @@ where
             collection_map: RwLock::new(BTreeMap::new()),
             system_ready: RwLock::new(false),
             system_ready_notify: Notify::new(),
+            lifecycle: tokio::sync::Mutex::new(()),
+            reset_incomplete: AtomicBool::new(false),
             reactor,
+            catalog_reset_hook: RwLock::new(None),
             _phantom: PhantomData,
         }));
         {
@@ -95,9 +124,29 @@ where
 
     /// Waits until we've successfully initialized or joined a system
     pub async fn wait_system_ready(&self) {
-        if !self.is_system_ready() {
-            self.0.system_ready_notify.notified().await;
+        loop {
+            // notify_waiters stores no permit. Arm the waiter before reading
+            // readiness so a transition between the check and await cannot
+            // strand reconstruction or join callers.
+            let notified = self.0.system_ready_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_system_ready() {
+                return;
+            }
+            notified.await;
         }
+    }
+
+    /// Install the catalog reset barrier (called by `CatalogManager::start`).
+    /// SystemManager remains the sole owner of destructive storage deletion.
+    pub(crate) fn set_catalog_reset_hook(
+        &self,
+        begin: Arc<dyn Fn() -> CatalogResetFuture + Send + Sync>,
+        finish: Arc<dyn Fn() + Send + Sync>,
+        resume: Arc<dyn Fn() + Send + Sync>,
+    ) {
+        *self.0.catalog_reset_hook.write().unwrap() = Some(CatalogResetHook { begin, finish, resume });
     }
 
     /// Creates a new system root. This should only be called once per system by durable nodes
@@ -109,6 +158,10 @@ where
 
         // Wait for local system catalog to be loaded
         self.wait_loaded().await;
+        let _lifecycle = self.0.lifecycle.lock().await;
+        if self.0.reset_incomplete.load(Ordering::Acquire) {
+            self.hard_reset_locked().await?;
+        }
 
         {
             let items = self.0.items.read().unwrap();
@@ -124,7 +177,7 @@ where
         let system_entity = self.0.entities.create(collection_id.clone());
 
         let lww_backend = system_entity.get_backend::<LWWBackend>().expect("LWW Backend should exist");
-        lww_backend.set("item".into(), proto::sys::Item::SysRoot.into_value()?);
+        lww_backend.set(crate::property::PropertyKey::name("item"), proto::sys::Item::SysRoot.into_value()?);
 
         let event = system_entity.generate_commit_event()?.ok_or(anyhow!("Expected event"))?;
 
@@ -148,6 +201,9 @@ where
         // Mark system as ready and notify waiters
         *self.0.system_ready.write().unwrap() = true;
         self.0.system_ready_notify.notify_waiters();
+        if let Some(hook) = self.0.catalog_reset_hook.read().unwrap().clone() {
+            (hook.resume)();
+        }
 
         Ok(())
     }
@@ -156,6 +212,10 @@ where
     pub async fn join_system(&self, state: Attested<EntityState>) -> Result<(), MutationError> {
         // Wait for catalog to be loaded before proceeding
         self.wait_loaded().await;
+        let _lifecycle = self.0.lifecycle.lock().await;
+        if self.0.reset_incomplete.load(Ordering::Acquire) {
+            self.hard_reset_locked().await.map_err(|e| MutationError::General(Box::new(std::io::Error::other(e.to_string()))))?;
+        }
 
         // If node is durable, fail - durable nodes should not join an existing system
         if self.0.durable {
@@ -171,18 +231,20 @@ where
                 notice_info!("Found matching root - Node is part of the same system");
                 *self.0.system_ready.write().unwrap() = true;
                 self.0.system_ready_notify.notify_waiters();
+                if let Some(hook) = self.0.catalog_reset_hook.read().unwrap().clone() {
+                    (hook.resume)();
+                }
                 return Ok(());
             }
             tracing::warn!("Mismatched root state during join: local={:?}, remote={:?}", root, state.payload.state.head);
 
             // Only reset storage if we have a root that needs to be replaced
             tracing::info!("Resetting storage to replace mismatched root");
-            // Drop locks before reset
-            {
-                let mut root = self.0.root.write().expect("Root lock poisoned");
-                *root = None;
-            }
-            self.hard_reset().await.map_err(|e| MutationError::General(Box::new(std::io::Error::other(e.to_string()))))?;
+            // Keep the old root until hard_reset clears it after the drain and
+            // deletion barrier. If this join future is canceled mid-barrier,
+            // a retry must still observe the mismatch and resume the retained
+            // drain rather than installing the new root into a half-reset node.
+            self.hard_reset_locked().await.map_err(|e| MutationError::General(Box::new(std::io::Error::other(e.to_string()))))?;
         }
 
         let collection_id = CollectionId::fixed_name(SYSTEM_COLLECTION_ID);
@@ -198,16 +260,47 @@ where
         }
         *self.0.system_ready.write().unwrap() = true;
         self.0.system_ready_notify.notify_waiters();
+        if let Some(hook) = self.0.catalog_reset_hook.read().unwrap().clone() {
+            (hook.resume)();
+        }
 
         Ok(())
     }
 
     /// Resets all storage by deleting all collections, including the system collection.
-    /// This is used when an ephemeral node needs to join a system with a different root.
+    /// Ephemeral nodes use this when joining a different system; durable nodes
+    /// may use it before creating a replacement root in place.
     /// **This is a destructive operation and should be used with extreme caution.**
     pub async fn hard_reset(&self) -> Result<()> {
-        // Delete all collections from storage
-        self.0.collectionset.delete_all_collections().await?;
+        let _lifecycle = self.0.lifecycle.lock().await;
+        self.hard_reset_locked().await
+    }
+
+    /// Reset while the caller owns `lifecycle`. Kept separate so a mismatched
+    /// `join_system` can reset atomically without recursively locking.
+    async fn hard_reset_locked(&self) -> Result<()> {
+        self.0.reset_incomplete.store(true, Ordering::Release);
+        // Close readiness before the catalog barrier so no concurrent caller
+        // can treat the system as usable while its prior epoch is draining.
+        *self.0.system_ready.write().unwrap() = false;
+
+        // Invalidate the old catalog generation, tear down its live queries,
+        // and wait for responses already admitted at schema ingress to finish
+        // applying. The hook is cloned out of the lock before await.
+        let catalog_reset_hook = self.0.catalog_reset_hook.read().unwrap().clone();
+        if let Some(hook) = &catalog_reset_hook {
+            (hook.begin)().await;
+        }
+
+        // Delete all collections from storage. Even a failed deletion must
+        // release the catalog's resetting latch so callers are not stranded;
+        // system/reactor clearing remains success-only.
+        if let Err(error) = self.0.collectionset.delete_all_collections().await {
+            if let Some(hook) = &catalog_reset_hook {
+                (hook.finish)();
+            }
+            return Err(error.into());
+        }
 
         // Reset our state
         {
@@ -222,13 +315,19 @@ where
             let mut collection_map = self.0.collection_map.write().unwrap();
             collection_map.clear();
         }
-        {
-            let mut system_ready = self.0.system_ready.write().unwrap();
-            *system_ready = false;
-        }
 
         // Reset the reactor state to notify subscriptions
         self.0.reactor.system_reset();
+
+        // Only after storage, system state, and reactor state are clear may
+        // the catalog finish its reset and permit a new warm generation.
+        if let Some(hook) = catalog_reset_hook {
+            (hook.finish)();
+        }
+        // No await exists between successful deletion, system/reactor clear,
+        // catalog finish, and this store. Cancellation therefore leaves the
+        // flag set exactly for incomplete transitions.
+        self.0.reset_incomplete.store(false, Ordering::Release);
 
         Ok(())
     }
@@ -238,12 +337,22 @@ where
 
     /// Waits for the local system catalog to be loaded
     pub async fn wait_loaded(&self) {
-        if !self.is_loaded() {
-            self.0.loading.notified().await;
+        loop {
+            let notified = self.0.loading.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_loaded() {
+                return;
+            }
+            notified.await;
         }
     }
 
     async fn load_system_catalog(&self) -> Result<()> {
+        let _lifecycle = self.0.lifecycle.lock().await;
+        if self.0.reset_incomplete.load(Ordering::Acquire) {
+            self.hard_reset_locked().await?;
+        }
         if self.is_loaded() {
             return Err(anyhow!("System catalog already loaded"));
         }
@@ -266,7 +375,7 @@ where
                 .with_state(&state_getter, &event_getter, state.payload.entity_id, collection_id.clone(), state.payload.state.clone())
                 .await?;
             let lww_backend = entity.get_backend::<LWWBackend>().expect("LWW Backend should exist");
-            if let Some(value) = lww_backend.get(&"item".to_string()) {
+            if let Some(value) = lww_backend.get(&crate::property::PropertyKey::name("item")) {
                 let item = proto::sys::Item::from_value(Some(value)).expect("Invalid sys item");
 
                 if let proto::sys::Item::SysRoot = &item {
@@ -294,6 +403,9 @@ where
         if has_root && self.0.durable {
             *self.0.system_ready.write().unwrap() = true;
             self.0.system_ready_notify.notify_waiters();
+            if let Some(hook) = self.0.catalog_reset_hook.read().unwrap().clone() {
+                (hook.resume)();
+            }
         }
 
         // Set loaded state and notify waiters
@@ -304,6 +416,9 @@ where
 }
 
 impl Property for proto::sys::Item {
+    // JSON in a string register. System entities never enter the catalog
+    // (bootstrap exemption), so this documents the serialization only.
+    const VALUE_TYPE: &'static str = "string";
     fn into_value(&self) -> std::result::Result<Option<Value>, crate::property::PropertyError> {
         Ok(Some(Value::String(
             serde_json::to_string(self).map_err(|_| PropertyError::InvalidValue { value: "".to_string(), ty: "sys::Item".to_string() })?,

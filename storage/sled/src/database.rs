@@ -17,9 +17,10 @@ impl Database {
         let entities_tree = db.open_tree("entities")?; // the actual entities are stored here
         let events_tree = db.open_tree("events")?; // the events are stored here
         let property_config_tree = db.open_tree("property_config")?; // the property config is stored here
+        let property_columns_tree = db.open_tree("property_columns")?; // the durable property-id -> column-name map
         let index_config_tree = db.open_tree("index_config")?; // the index config is stored here
 
-        let property_manager = PropertyManager::open(property_config_tree)?;
+        let property_manager = PropertyManager::open(property_config_tree, property_columns_tree)?;
         let index_manager = IndexManager::open(index_config_tree, &db, property_manager.clone())?;
 
         Ok(Self { db, entities_tree, events_tree, property_manager, index_manager })

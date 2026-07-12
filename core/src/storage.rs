@@ -10,6 +10,26 @@ pub fn state_name(name: &str) -> String { format!("{}_state", name) }
 
 pub fn event_name(name: &str) -> String { format!("{}_event", name) }
 
+/// The model-definition id a storage bucket stamps on wire envelopes it
+/// reconstructs from stored fragments (#330): well-known system/catalog ids
+/// first (answerable stone-cold, which is how the catalog itself warms from
+/// storage), then the injected catalog resolver. An error means a
+/// user-collection envelope is being reconstructed before the catalog warmed;
+/// readiness gating makes that unreachable in steady state, and failing loud
+/// beats stamping a wrong id.
+pub fn bucket_model_id(
+    collection: &CollectionId,
+    resolver: Option<&dyn crate::schema::CatalogResolver>,
+) -> Result<EntityId, RetrievalError> {
+    crate::schema::well_known_model_id(collection.as_str())
+        .or_else(|| resolver.and_then(|r| r.model_id_for(collection.as_str())))
+        .ok_or_else(|| RetrievalError::Other(format!("no model id known for collection '{collection}' (catalog cold?)")))
+}
+
+mod column_space;
+pub mod naming;
+pub use column_space::selection_to_column_space;
+
 #[async_trait]
 pub trait StorageEngine: Send + Sync {
     type Value;
@@ -17,6 +37,26 @@ pub trait StorageEngine: Send + Sync {
     async fn collection(&self, id: &CollectionId) -> Result<Arc<dyn StorageCollection>, RetrievalError>;
     // Delete all collections and their data from the storage engine
     async fn delete_all_collections(&self) -> Result<bool, MutationError>;
+
+    /// List the collections that already have durable storage, WITHOUT
+    /// creating any. Used by the catalog manager to warm only the catalog
+    /// collections that actually exist, so a schema-less node never
+    /// materializes empty `_ankurah_*` trees. The default returns empty,
+    /// which is always safe: a caller then simply skips its existence-gated
+    /// warm (falling back to live subscription updates) rather than
+    /// misbehaving. Engines override this with their real list.
+    async fn list_collections(&self) -> Result<Vec<CollectionId>, RetrievalError> { Ok(Vec::new()) }
+
+    /// Inject the catalog resolver. Engines that maintain
+    /// human-named materialized structures (postgres/sqlite/indexeddb columns,
+    /// sled property slots) seed their DURABLE id-to-name maps from it at
+    /// materialization time; the maps stay engine-owned, the resolver is only
+    /// the name source. Called once from `Node` construction, after the
+    /// catalog exists -- the engine object is constructed before the node, so
+    /// this cannot be a constructor argument. Weak: the engine must not keep
+    /// the catalog (and thus the node) alive. Default no-op for engines with
+    /// no human-named structures (memory/test engines).
+    fn set_catalog_resolver(&self, resolver: std::sync::Weak<dyn crate::schema::CatalogResolver>) { let _ = resolver; }
 }
 
 #[async_trait]

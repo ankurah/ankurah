@@ -1,9 +1,32 @@
 {
   "roles": {
-    "Admin": ["*"],
-    "Editor": ["view_posts", "manage_posts", "view_comments", "manage_comments", "view_users"],
-    "Author": ["view_posts", "create_posts", "view_comments", "create_comments", "view_users"],
-    "Reader": ["view_published_posts", "view_comments", "create_comments"]
+    "Admin": [
+      "*"
+    ],
+    "Editor": [
+      "view_posts",
+      "manage_posts",
+      "view_comments",
+      "manage_comments",
+      "view_users",
+      "read_schema",
+      "define_schema"
+    ],
+    "Author": [
+      "view_posts",
+      "create_posts",
+      "view_comments",
+      "create_comments",
+      "view_users",
+      "read_schema",
+      "define_schema"
+    ],
+    "Reader": [
+      "view_published_posts",
+      "view_comments",
+      "create_comments",
+      "read_schema"
+    ]
   },
   "collections": {
     "post": {
@@ -27,6 +50,18 @@
     "tag": {
       "read": "view_posts",
       "write": "manage_posts"
+    },
+    "_ankurah_model": {
+      "read": "read_schema",
+      "write": "define_schema"
+    },
+    "_ankurah_property": {
+      "read": "read_schema",
+      "write": "define_schema"
+    },
+    "_ankurah_model_property": {
+      "read": "read_schema",
+      "write": "define_schema"
     }
   }
 }

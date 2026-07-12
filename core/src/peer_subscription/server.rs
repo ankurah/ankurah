@@ -34,13 +34,11 @@ impl SubscriptionHandler {
             tracing::info!("SubscriptionHandler[{}] received reactor update with {} items", peer_id, update.items.len());
 
             if let Some(node) = weak_node.upgrade() {
-                tracing::debug!("SubscriptionHandler[{}] sending update to peer {}", peer_id, peer_id);
-                node.send_update(
-                    peer_id,
-                    proto::NodeUpdateBody::SubscriptionUpdate {
-                        items: update.items.into_iter().filter_map(|item| convert_item(&node, peer_id, item)).collect(),
-                    },
-                );
+                let items = update.items.into_iter().filter_map(|item| convert_item(&node, peer_id, item)).collect::<Vec<_>>();
+                if !items.is_empty() {
+                    tracing::debug!("SubscriptionHandler[{}] sending update to peer {}", peer_id, peer_id);
+                    node.send_update(peer_id, proto::NodeUpdateBody::SubscriptionUpdate { items });
+                }
             }
         });
 
@@ -119,7 +117,11 @@ impl SubscriptionHandler {
             // are evaluated against entity state, not just the predicate. Skip
             // unreadable entities silently (mirroring the Fetch/Get handlers) so one
             // out-of-scope entity doesn't fail the whole subscription.
-            if node.policy_agent.check_read(cdata, &state.payload.entity_id, &collection_id, &state.payload.state).is_err() {
+            if node
+                .policy_agent
+                .check_read(cdata, &state.payload.entity_id, &collection_id, &state.payload.state, Some(node.catalog.resolver_weak()))
+                .is_err()
+            {
                 continue;
             }
 
@@ -143,6 +145,14 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
+    let mut source_queries = item.source_queries.clone();
+    source_queries.sort_unstable();
+    source_queries.dedup();
+    if source_queries.is_empty() {
+        tracing::debug!("Dropping reactor update for peer {} because no current query caused it", peer_id);
+        return None;
+    }
+
     // Convert entity to EntityState and attest it
     let entity_state = match item.entity.to_entity_state() {
         Ok(entity_state) => entity_state,
@@ -178,8 +188,9 @@ where
     // Create subscription update item
     Some(proto::SubscriptionUpdateItem {
         entity_id: item.entity.id(),
-        collection: item.entity.collection().clone(),
+        model: item.entity.model_id().ok()?,
         content,
         predicate_relevance,
+        source_queries,
     })
 }

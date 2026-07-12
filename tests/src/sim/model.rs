@@ -12,6 +12,7 @@
 //! production code, not a mock.
 
 use ankurah::core::property::backend::{lww::LWWBackend, PropertyBackend};
+use ankurah::core::property::PropertyKey;
 use ankurah::core::value::Value;
 use ankurah::proto::{self, Attested};
 use ankurah::Model;
@@ -44,6 +45,40 @@ pub fn entity_id(counter: u64) -> proto::EntityId {
 /// The `SimRecord` collection id.
 pub fn sim_collection() -> proto::CollectionId { SimRecord::collection() }
 
+/// The model-definition id the sim stamps on every forged `SimRecord` event,
+/// state, and subscription-update item (#330). The harness forges wire
+/// envelopes that bypass schema registration/relay, so ingress `resolve_model`
+/// would reject an unknown id; [`super::node::build_nodes`] seeds this exact id
+/// into every node's catalog so resolution routes it to the `SimRecord`
+/// collection. Constant and deterministic, so it is identical across every node
+/// in a run and across the two determinism-audit runs. The high bytes are
+/// non-zero, so it can never collide with a well-known model id (all-zero
+/// prefix) nor with a seed-derived entity id ([`entity_id`] fills only the low
+/// eight bytes, leaving the high bytes zero).
+pub fn sim_model_id() -> proto::EntityId { proto::EntityId::from_bytes([0x5B; 16]) }
+
+/// Stable catalog identity for each simulated property. The simulation
+/// bypasses ordinary transactions and forges events directly, so its payloads
+/// must use the same id-keyed address that typed query registration retains.
+pub fn sim_property_id(field: Field) -> proto::EntityId {
+    let mut bytes = [0x5C; 16];
+    bytes[15] = match field {
+        Field::Title => 1,
+        Field::Body => 2,
+    };
+    proto::EntityId::from_bytes(bytes)
+}
+
+/// Stable membership identity for each simulated property.
+pub fn sim_membership_id(field: Field) -> proto::EntityId {
+    let mut bytes = [0x5D; 16];
+    bytes[15] = match field {
+        Field::Title => 1,
+        Field::Body => 2,
+    };
+    proto::EntityId::from_bytes(bytes)
+}
+
 /// Decode the `(title, body)` LWW field values from a materialized `proto::State`
 /// as a subscriber would read them, for the C5 coherence checks that compare a
 /// recorded read against the converged truth. An unset field, or a state with no
@@ -53,11 +88,11 @@ pub fn sim_collection() -> proto::CollectionId { SimRecord::collection() }
 pub fn field_values(state: &proto::State) -> (Option<String>, Option<String>) {
     let Some(buffer) = state.state_buffers.0.get("lww") else { return (None, None) };
     let Ok(backend) = LWWBackend::from_state_buffer(buffer) else { return (None, None) };
-    let read = |name: &str| match backend.get(&name.to_string()) {
+    let read = |field| match backend.get(&PropertyKey::Id(sim_property_id(field))) {
         Some(Value::String(s)) => Some(s),
         _ => None,
     };
-    (read("title"), read("body"))
+    (read(Field::Title), read(Field::Body))
 }
 
 /// Which LWW field a write targets.
@@ -79,7 +114,7 @@ impl Field {
 /// Build the LWW `OperationSet` for setting one field to a value.
 fn lww_ops(field: Field, value: &str) -> proto::OperationSet {
     let backend = LWWBackend::new();
-    backend.set(field.name().into(), Some(Value::String(value.to_owned())));
+    backend.set(PropertyKey::Id(sim_property_id(field)), Some(Value::String(value.to_owned())));
     let ops = backend.to_operations().unwrap().expect("a written LWW backend yields operations");
     proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)]))
 }
@@ -88,17 +123,12 @@ fn lww_ops(field: Field, value: &str) -> proto::OperationSet {
 /// it as a create (`Event::is_entity_create`). `field`/`value` seed the initial
 /// state.
 pub fn genesis_event(entity: proto::EntityId, field: Field, value: &str) -> proto::Event {
-    proto::Event {
-        collection: SimRecord::collection(),
-        entity_id: entity,
-        operations: lww_ops(field, value),
-        parent: proto::Clock::default(),
-    }
+    proto::Event { model: sim_model_id(), entity_id: entity, operations: lww_ops(field, value), parent: proto::Clock::default() }
 }
 
 /// Forge a non-genesis event parented on `parent`, setting `field` to `value`.
 pub fn edit_event(entity: proto::EntityId, parent: proto::Clock, field: Field, value: &str) -> proto::Event {
-    proto::Event { collection: SimRecord::collection(), entity_id: entity, operations: lww_ops(field, value), parent }
+    proto::Event { model: sim_model_id(), entity_id: entity, operations: lww_ops(field, value), parent }
 }
 
 /// Wrap a forged event as an unsigned `Attested<Event>`. Under `PermissiveAgent`

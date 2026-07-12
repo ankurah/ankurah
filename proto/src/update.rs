@@ -1,5 +1,6 @@
-use crate::{auth::Attested, data::EntityState, id::EntityId, subscription::QueryId, CollectionId, EventFragment, StateFragment};
+use crate::{auth::Attested, data::EntityState, id::EntityId, subscription::QueryId, EventFragment, StateFragment};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use ulid::Ulid;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -9,6 +10,16 @@ pub struct UpdateId(Ulid);
 pub enum NodeUpdateBody {
     /// New events for a subscription
     SubscriptionUpdate { items: Vec<SubscriptionUpdateItem> },
+}
+
+impl NodeUpdateBody {
+    /// Model ids carried by entity data in this update. Senders use this to
+    /// attach any catalog definitions the connection has not seen yet.
+    pub fn referenced_models(&self) -> BTreeSet<EntityId> {
+        match self {
+            Self::SubscriptionUpdate { items } => items.iter().map(|item| item.model).collect(),
+        }
+    }
 }
 
 /// Content of an update - either events or state with events
@@ -45,18 +56,23 @@ pub enum MembershipChange {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SubscriptionUpdateItem {
     pub entity_id: EntityId,
-    pub collection: CollectionId,
+    /// The model-definition entity id (#330); see `Event::model` in data.rs.
+    pub model: EntityId,
     pub content: UpdateContent,
     /// Which predicates this update is relevant to and how
     /// Uses PredicateId for remote subscriptions
     pub predicate_relevance: Vec<(QueryId, MembershipChange)>,
+    /// Queries whose subscriptions caused this item to be emitted. Always
+    /// populated for subscription traffic, including ordinary updates whose
+    /// predicate membership did not change.
+    pub source_queries: Vec<QueryId>,
 }
 
 impl TryFrom<SubscriptionUpdateItem> for Attested<EntityState> {
     type Error = anyhow::Error;
     fn try_from(value: SubscriptionUpdateItem) -> Result<Self, Self::Error> {
         match value.content {
-            UpdateContent::StateAndEvent(state, _) => Ok((value.entity_id, value.collection, state).into()),
+            UpdateContent::StateAndEvent(state, _) => Ok((value.entity_id, value.model, state).into()),
             UpdateContent::EventOnly(_) => Err(anyhow::anyhow!("Cannot convert event-only update to entity state")),
         }
     }
@@ -69,6 +85,13 @@ pub struct NodeUpdate {
     pub from: EntityId,
     pub to: EntityId,
     pub body: NodeUpdateBody,
+    /// Catalog definition entities (model/property/membership states) the
+    /// receiver needs to resolve this update's model ids (#330). Shipped once
+    /// per connection per model by the sender; empty when everything was
+    /// already announced. Descriptors ride the message envelope, never inside
+    /// events or state buffers.
+    #[serde(default)]
+    pub schema: Vec<Attested<EntityState>>,
 }
 
 /// An acknowledgement of an update from one node to another
@@ -122,7 +145,7 @@ impl std::fmt::Display for NodeUpdateBody {
 
 impl std::fmt::Display for SubscriptionUpdateItem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}/{}: ", self.collection, self.entity_id)?;
+        write!(f, "{}/{}: ", self.model.to_base64_short(), self.entity_id)?;
 
         match &self.content {
             UpdateContent::EventOnly(events) => write!(f, "Events({})", events.len())?,

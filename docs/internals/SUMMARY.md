@@ -7,5 +7,6 @@
 - [Entity Lifecycle](entity-lifecycle.md)
 - [Node Architecture and Replication](node-architecture.md)
 - [Property Backends](property-backends.md)
+- [Canonical Value Types and Casting](value-casting.md)
 - [LWW Merge Resolution](lww-merge.md)
 - [Testing Strategy](testing.md)

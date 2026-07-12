@@ -537,7 +537,7 @@ mod tests {
         }
     }
 
-    fn oby(col: &str, dir: OrderDirection) -> OrderByItem { OrderByItem { path: PathExpr::simple(col), direction: dir } }
+    fn oby(col: &str, dir: OrderDirection) -> OrderByItem { OrderByItem { path: PathExpr::simple(col), property: None, direction: dir } }
 
     fn oby_asc(col: &str) -> OrderByItem { oby(col, OrderDirection::Asc) }
 

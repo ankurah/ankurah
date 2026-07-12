@@ -9,7 +9,10 @@ pub fn mutable_impl(model: &crate::model::description::ModelDescription) -> Toke
     // TODO - add this to the accessors
     let _active_field_visibility = model.active_field_visibility();
     let active_field_names = model.active_field_names();
-    let active_field_name_strs = model.active_field_name_strs();
+    let active_field_addresses = match crate::model::schema::active_field_address_tokens(model) {
+        Ok(addresses) => addresses,
+        Err(e) => return e.into_compile_error(),
+    };
     let active_field_types = match model.active_field_types() {
         Ok(types) => types,
         Err(_) => return quote! { compile_error!("Failed to generate active field types"); },
@@ -69,7 +72,6 @@ pub fn mutable_impl(model: &crate::model::description::ModelDescription) -> Toke
                 use ankurah::property::FromEntity;
                 assert_eq!(entity.collection(), &Self::collection());
                 Self {
-                    // #( #active_field_names: #active_field_types_turbofish::from_entity(#active_field_name_strs.into(), &entity), )*
                     entity,
                 }
                 }
@@ -83,7 +85,7 @@ pub fn mutable_impl(model: &crate::model::description::ModelDescription) -> Toke
             #(
                 pub fn #active_field_names(&self) -> #active_field_types {
                     use ankurah::property::FromEntity;
-                    #active_field_types_turbofish::from_entity(#active_field_name_strs.into(), &self.entity)
+                    #active_field_types_turbofish::from_entity(#active_field_addresses, &self.entity)
                 }
             )*
         }

@@ -2,7 +2,7 @@ use crate::sender::WebsocketPeerSender;
 use ankurah_core::{connector::PeerSender, policy::PolicyAgent, storage::StorageEngine, Node};
 use ankurah_proto as proto;
 use ankurah_signals::{Mut, Read, Wait};
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use futures_util::{SinkExt, StreamExt};
 use std::{
     sync::{
@@ -277,6 +277,7 @@ where
             node_id: inner.node.id,
             durable: inner.node.durable,
             system_root: inner.node.system.root(),
+            protocol_version: proto::PROTOCOL_VERSION,
         });
 
         sink.send(Message::Binary(bincode::serialize(&presence)?.into())).await?;
@@ -351,14 +352,38 @@ where
         match msg {
             Some(Ok(Message::Binary(data))) => match bincode::deserialize(&data) {
                 Ok(proto::Message::Presence(server_presence)) => {
-                    Self::handle_server_presence(inner, server_presence, peer_sender, outgoing_rx).await;
-                    Ok(MessageResult::Continue)
+                    match Self::handle_server_presence(inner, server_presence, peer_sender, outgoing_rx).await {
+                        Ok(()) => Ok(MessageResult::Continue),
+                        Err(rejection) => {
+                            // register_peer is the enforcement point. The connector's
+                            // only extra job is to explain the refusal while its raw
+                            // transport sink is still available.
+                            let reason = rejection.to_string();
+                            error!("Refusing server {}: {}", inner.server_url, rejection);
+                            if let Ok(bytes) = bincode::serialize(&proto::Message::PresenceRejected(rejection)) {
+                                let _ = sink.send(Message::Binary(bytes.into())).await;
+                            }
+                            Err(anyhow!("server {} refused connection: {}", inner.server_url, reason))
+                        }
+                    }
+                }
+                Ok(proto::Message::PresenceRejected(rejection)) => {
+                    Err(anyhow!("server {} refused connection: {}", inner.server_url, rejection))
                 }
                 Ok(proto::Message::PeerMessage(node_msg)) => {
                     Self::handle_peer_message(inner, node_msg).await;
                     Ok(MessageResult::Continue)
                 }
                 Err(e) => {
+                    if peer_sender.is_none() {
+                        // A handshake we cannot read will never establish; close
+                        // instead of idling on a dead connection.
+                        if proto::is_version0_presence(&data) {
+                            return Err(anyhow!("server {} speaks a pre-versioning (0.9.x or older) protocol", inner.server_url));
+                        } else {
+                            return Err(anyhow!("failed to deserialize handshake message from {}: {}", inner.server_url, e));
+                        }
+                    }
                     warn!("Failed to deserialize message: {}", e);
                     Ok(MessageResult::Continue)
                 }
@@ -403,11 +428,11 @@ where
         server_presence: proto::Presence,
         peer_sender: &mut Option<WebsocketPeerSender>,
         outgoing_rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<proto::NodeMessage>>,
-    ) {
+    ) -> std::result::Result<(), proto::PresenceRejection> {
         info!("Received server presence: {}", server_presence.node_id);
 
         let (sender, rx) = WebsocketPeerSender::new(server_presence.node_id);
-        inner.node.register_peer(server_presence.clone(), Box::new(sender.clone()));
+        inner.node.register_peer(server_presence.clone(), Box::new(sender.clone()))?;
 
         *outgoing_rx = Some(rx);
         *peer_sender = Some(sender);
@@ -415,6 +440,7 @@ where
         inner.connection_state.set(ConnectionState::Connected { url: inner.server_url.to_string(), server_presence });
         inner.connected.store(true, Ordering::Release);
         info!("Successfully connected to server {}", inner.server_url);
+        Ok(())
     }
 
     async fn handle_peer_message(inner: &Arc<Inner<SE, PA>>, node_msg: proto::NodeMessage) {
