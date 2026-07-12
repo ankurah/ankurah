@@ -5,14 +5,15 @@
 //! (`PropertyError::UnknownProperty`) for references nothing defines. This
 //! replaces the three inconsistent missing-property behaviors with one
 //! rule: an unresolvable reference fails at build time; a resolvable
-//! reference whose property is absent on a given entity evaluates under
-//! the RFC 5.4 read rules.
+//! reference whose property is absent on a given entity evaluates as NULL in
+//! predicates and policy.
 //!
-//! Wired (since the protocol v2 epoch) at the four query ORIGIN sites --
+//! Wired in the protocol v3 epoch at the four query ORIGIN sites --
 //! context fetch, `EntityLiveQuery`, and the node-level local-fetch and
 //! remote-subscribe paths -- via [`CatalogManager::resolve_selection_deferred`];
 //! receivers pass already-resolved selections through (the pass is
-//! idempotent, and `Identifier` expressions are left untouched).
+//! idempotent: `Identifier` expressions retain their ids, and resolved
+//! `OrderByItem`s retain their ids while refreshing renamed display paths).
 //!
 //! Special cases:
 //! - `id` is the entity-id pseudo-property, not a catalog property: it
@@ -144,7 +145,7 @@ where
     /// nothing and skips the policy verb). Returns true only when a
     /// registration ran and the map was fed, so the caller should
     /// re-resolve. Returns false when no attempt applies (no cdata on this
-    /// path, no compiled schema, or the collection is already ensured this
+    /// path, no compiled schema, or that compiled shape is already ensured this
     /// process) or the attempt failed (policy denial, no durable peer) --
     /// those surface as `UnregisteredCollection` via `classify_unknown`.
     async fn register_first_use(
@@ -154,14 +155,20 @@ where
         collection: &CollectionId,
     ) -> bool {
         let Some(cdata) = cdata else { return false };
-        let Some(schema) = self.unensured_schema_for(collection.as_str()) else { return false };
-        match self.ensure_registered(node, cdata, schema).await {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::debug!("first-use registration of '{}' failed; the miss surfaces loud: {}", collection, e);
-                false
+        let schemas = self.unensured_schemas_for(collection.as_str());
+        if schemas.is_empty() {
+            return false;
+        }
+        let mut registered_any = false;
+        for schema in schemas {
+            match self.ensure_registered(node, cdata, schema).await {
+                Ok(()) => registered_any = true,
+                Err(e) => {
+                    tracing::debug!("first-use registration of '{}' failed; unresolved references still surface loud: {}", collection, e);
+                }
             }
         }
+        registered_any
     }
 
     /// Classify an `UnknownProperty` from a WARM catalog (rev 4, RFC 5.3):
@@ -194,19 +201,47 @@ where
 
     /// Sort keys resolve under the SAME rules as predicate references
     /// (fail-closed UnknownProperty, `id` pseudo-property passthrough,
-    /// collection-qualifier normalization) but KEEP the PathExpr
-    /// representation: sorting addresses the resolved display name (the SQL
-    /// column / materialized key); id-keyed sort addressing rides the
-    /// catalog-bound engine work (#312).
+    /// collection-qualifier normalization). They keep the display path for
+    /// SQL/physical-column addressing and also carry the stable property id.
+    /// Re-resolving an already-resolved selection refreshes its display name
+    /// when the catalog has renamed that property without losing identity.
     fn resolve_order_by(&self, collection: &CollectionId, item: &OrderByItem) -> Result<OrderByItem, PropertyError> {
+        if let Some(property) = item.property {
+            let mut resolved = item.clone();
+            if let Some(definition) = self.property_by_id(&EntityId::from_bytes(property)) {
+                if let Some(first) = resolved.path.steps.first_mut() {
+                    *first = definition.name;
+                }
+            }
+            return Ok(resolved);
+        }
+
         let steps = &item.path.steps;
-        if steps.is_empty() || steps[0] == "id" || self.resolve(collection.as_str(), &steps[0]).is_some() {
+        if steps.is_empty() || steps[0] == "id" {
             return Ok(item.clone());
         }
+
+        if let Some(property) = self.resolve(collection.as_str(), &steps[0]) {
+            let mut resolved = item.clone();
+            resolved.property = Some(property.to_bytes());
+            return Ok(resolved);
+        }
+
         // Legacy collection-qualified form: strip the qualifier.
         if steps.len() > 1 && steps[0] == collection.as_str() {
-            if steps[1] == "id" || self.resolve(collection.as_str(), &steps[1]).is_some() {
-                return Ok(OrderByItem { path: PathExpr { steps: steps[1..].to_vec() }, direction: item.direction.clone() });
+            if steps[1] == "id" {
+                return Ok(OrderByItem {
+                    path: PathExpr { steps: steps[1..].to_vec() },
+                    direction: item.direction.clone(),
+                    property: None,
+                });
+            }
+            if let Some(property) = self.resolve(collection.as_str(), &steps[1]) {
+                return Ok(OrderByItem {
+                    path: PathExpr { steps: steps[1..].to_vec() },
+                    direction: item.direction.clone(),
+                    property: Some(property.to_bytes()),
+                });
             }
             return Err(PropertyError::UnknownProperty { collection: collection.to_string(), name: steps[1].clone() });
         }

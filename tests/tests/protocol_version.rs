@@ -256,7 +256,7 @@ async fn server_refuses_mismatched_version() -> Result<()> {
 /// The client side of the same handshake: a server speaking a different
 /// version is refused, told why, and never treated as connected.
 #[tokio::test]
-async fn client_refuses_mismatched_server() -> Result<()> {
+async fn client_refuses_mismatched_server_without_hot_loop() -> Result<()> {
     let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -266,7 +266,8 @@ async fn client_refuses_mismatched_server() -> Result<()> {
 
     // Fake server: completes the symmetric challenge exchange, sends a
     // correctly challenge-bound but version-mismatched Presence, then records
-    // whether the client explains itself before disconnecting.
+    // whether the client explains itself before disconnecting and keeps
+    // listening long enough to catch an immediate reconnect.
     let fake_server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.expect("accept");
         let ws = tokio_tungstenite::accept_async(stream).await.expect("ws accept");
@@ -297,13 +298,19 @@ async fn client_refuses_mismatched_server() -> Result<()> {
                 WsMessage::Binary(data) => {
                     if let Ok(proto::Message::PresenceRejected(r)) = proto::decode_message(&data) {
                         saw_rejection = Some(r);
+                        break;
                     }
                 }
                 WsMessage::Close(_) => break,
                 _ => {}
             }
         }
-        saw_rejection
+
+        // INITIAL_BACKOFF is one second. A second TCP accept inside this
+        // shorter window, after the rejection has reached us, would mean a
+        // permanent refusal is hot-looping.
+        let retried_immediately = tokio::time::timeout(Duration::from_millis(500), listener.accept()).await.is_ok();
+        (saw_rejection, retried_immediately)
     });
 
     let client = WebsocketClient::new(client_node.clone(), &format!("ws://{}", addr)).await?;
@@ -316,8 +323,10 @@ async fn client_refuses_mismatched_server() -> Result<()> {
         .expect_err("client connected to an incompatible server");
     assert!(refusal.to_string().contains("incompatible protocol version"), "unexpected refusal: {refusal}");
 
-    let rejection = fake_server.await?.expect("client must send PresenceRejected before closing");
+    let (rejection, retried_immediately) = fake_server.await?;
+    let rejection = rejection.expect("client must send PresenceRejected before closing");
     assert_eq!(rejection, proto::PresenceRejection { expected: proto::PROTOCOL_VERSION, received: 999 });
+    assert!(!retried_immediately, "client retried an incompatible server without backoff");
 
     client.shutdown().await?;
     Ok(())

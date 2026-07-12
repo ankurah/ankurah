@@ -5,7 +5,7 @@ use crate::{
     property::{
         backend::{LWWBackend, PropertyBackend},
         traits::{FromActiveType, FromEntity, PropertyError},
-        InitializeWith, Property, PropertyName, Value,
+        InitializeWith, Property, PropertyAddress, PropertyKey, PropertyName, Value,
     },
 };
 
@@ -17,6 +17,9 @@ use ankurah_signals::{
 #[derive(Clone)]
 pub struct LWW<T: Property> {
     pub property_name: PropertyName,
+    /// Literal identity from `#[property(id = "...")]`, when present.
+    /// Ordinary fields remain resolver/name-addressed until commit.
+    pub property_id: Option<ankurah_proto::EntityId>,
     pub backend: Arc<LWWBackend>,
     pub entity: Entity,
     phantom: PhantomData<T>,
@@ -29,15 +32,23 @@ impl<T: Property> std::fmt::Debug for LWW<T> {
 }
 
 impl<T: Property> LWW<T> {
+    fn addressed_key(&self) -> PropertyKey {
+        self.property_id.map(PropertyKey::Id).unwrap_or_else(|| self.entity.property_key(&self.property_name))
+    }
+
+    fn staging_key(&self) -> PropertyKey {
+        self.property_id.map(PropertyKey::Id).unwrap_or_else(|| PropertyKey::Name(self.property_name.clone()))
+    }
+
     pub fn set(&self, value: &T) -> Result<(), PropertyError> {
         if !self.entity.is_writable() {
             return Err(PropertyError::TransactionClosed);
         }
         let value = value.into_value()?;
-        // The sync accessor has only the field name: stage a transient Name
-        // key. commit_local_trx resolves it to the property id before the event
-        // is generated (the PropertyKey amendment, #289).
-        self.backend.set(crate::property::PropertyKey::Name(self.property_name.clone()), value);
+        // Ordinary sync accessors stage a transient Name key and commit
+        // resolves it. An explicit binding already carries its authoritative
+        // id, so it stages by Id even when the local and catalog names differ.
+        self.backend.set(self.staging_key(), value);
         Ok(())
     }
 
@@ -77,18 +88,18 @@ impl<T: Property> LWW<T> {
     /// The stored value: `Some` present, `None` absent, via the generic
     /// resolved-property dispatch ([`crate::property::read_resolved`]).
     pub fn stored_value(&self) -> Option<Value> {
-        match self.entity.property_key(&self.property_name) {
-            crate::property::PropertyKey::Id(id) => crate::property::read_resolved(self.backend.as_ref(), id, &self.property_name),
+        match self.addressed_key() {
+            PropertyKey::Id(id) => crate::property::read_resolved(self.backend.as_ref(), id, &self.property_name),
             // Unregistered or system field: read the bare name.
-            key @ crate::property::PropertyKey::Name(_) => self.backend.get(&key),
+            key @ PropertyKey::Name(_) => self.backend.get(&key),
         }
     }
 }
 
 impl<T: Property> FromEntity for LWW<T> {
-    fn from_entity(property_name: PropertyName, entity: &Entity) -> Self {
+    fn from_entity(property: PropertyAddress, entity: &Entity) -> Self {
         let backend = entity.get_backend::<LWWBackend>().expect("LWW Backend should exist");
-        Self { property_name, backend, entity: entity.clone(), phantom: PhantomData }
+        Self { property_name: property.name, property_id: property.explicit_id, backend, entity: entity.clone(), phantom: PhantomData }
     }
 }
 
@@ -107,21 +118,17 @@ impl<T: Property> FromActiveType<LWW<T>> for T {
 }
 
 impl<T: Property> InitializeWith<T> for LWW<T> {
-    fn initialize_with(entity: &Entity, property_name: PropertyName, value: &T) -> Self {
-        let new = Self::from_entity(property_name, entity);
-        new.set(value).unwrap();
-        new
+    fn initialize_with(entity: &Entity, property: PropertyAddress, value: &T) -> Result<Self, crate::error::MutationError> {
+        let new = Self::from_entity(property, entity);
+        new.set(value)?;
+        Ok(new)
     }
 }
 
 impl<T: Property> ankurah_signals::Signal for LWW<T> {
-    fn listen(&self, listener: Listener) -> ListenerGuard {
-        self.backend.listen_field(&self.entity.property_key(&self.property_name), listener)
-    }
+    fn listen(&self, listener: Listener) -> ListenerGuard { self.backend.listen_field(&self.addressed_key(), listener) }
 
-    fn broadcast_id(&self) -> ankurah_signals::broadcast::BroadcastId {
-        self.backend.field_broadcast_id(&self.entity.property_key(&self.property_name))
-    }
+    fn broadcast_id(&self) -> ankurah_signals::broadcast::BroadcastId { self.backend.field_broadcast_id(&self.addressed_key()) }
 }
 
 impl<T: Property> ankurah_signals::Subscribe<T> for LWW<T>

@@ -78,7 +78,7 @@ impl ValueEntry {
     }
 }
 
-/// A dumb, identity-keyed last-write-wins store. Every value is keyed by a
+/// A dumb, PropertyKey-keyed last-write-wins store. Every value is keyed by a
 /// [`PropertyKey`] that self-identifies as an id (registered user data) or a
 /// name (system/catalog collections, or legacy pre-epoch data). The backend
 /// holds NO schema state: name-to-id resolution happens on the catalog-aware
@@ -120,11 +120,11 @@ impl Default for LWWBackend {
 impl LWWBackend {
     pub fn new() -> LWWBackend { Self { values: RwLock::new(BTreeMap::default()), field_broadcasts: Mutex::new(BTreeMap::new()) } }
 
-    /// Stage an uncommitted write under an already-resolved key. The sync
-    /// accessor passes a [`PropertyKey::Name`] (it has only the field name);
-    /// the async commit path re-keys it to [`PropertyKey::Id`] before the
-    /// event is generated (the PropertyKey amendment, #289). System and
-    /// catalog collections pass `Name` and stay name-keyed.
+    /// Stage an uncommitted write under the accessor's key. Ordinary sync
+    /// accessors pass [`PropertyKey::Name`] and the async commit path re-keys
+    /// it before the event; an explicit-id accessor already passes
+    /// [`PropertyKey::Id`]. System and catalog collections pass `Name` and
+    /// stay name-keyed (the PropertyKey amendment, #289).
     pub fn set(&self, key: PropertyKey, value: Option<Value>) {
         let mut values = self.values.write().unwrap();
         values.insert(key, ValueEntry::Uncommitted { value });

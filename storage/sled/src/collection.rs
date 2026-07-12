@@ -195,8 +195,30 @@ impl SledStorageCollectionInner {
         // under fallback).
         let resolver = self.resolver.read().unwrap().as_ref().and_then(|weak| weak.upgrade());
         let collection = self.collection_id.as_str();
+        let manager = &self.database.property_manager;
+
+        // Bind each ORDER BY key's canonical type while it is still in
+        // catalog/display-name space, then key that type by the physical
+        // column the planner will see. Physical names are sticky across a
+        // catalog rename and cannot themselves be resolved through the
+        // current name index.
+        let order_types: std::collections::HashMap<String, ankurah_core::value::ValueType> = selection
+            .order_by
+            .iter()
+            .flatten()
+            .filter_map(|item| {
+                let name = item.path.first();
+                if name == "id" || name.starts_with("__") {
+                    return None;
+                }
+                let resolver = resolver.as_deref()?;
+                let id = item.property.map(ankurah_proto::EntityId::from_bytes).or_else(|| resolver.resolve(collection, name))?;
+                let value_type = ankurah_core::value::ValueType::from_property_str(&resolver.canonical_value_type(&id)?)?;
+                let column = manager.column_of(collection, &id).unwrap_or_else(|| name.to_string());
+                Some((column, value_type))
+            })
+            .collect();
         let selection = {
-            let manager = &self.database.property_manager;
             ankurah_core::storage::selection_to_column_space(collection, &selection, resolver.as_deref(), &|id| {
                 manager.column_of(collection, id)
             })
@@ -207,6 +229,9 @@ impl SledStorageCollectionInner {
         // the catalog. An unresolvable column (system collections, legacy
         // names) keeps the historical String collation.
         let order_type_of = |name: &str| -> Option<ankurah_core::value::ValueType> {
+            if let Some(value_type) = order_types.get(name) {
+                return Some(*value_type);
+            }
             let resolver = resolver.as_deref()?;
             let id = resolver.resolve(collection, name)?;
             ankurah_core::value::ValueType::from_property_str(&resolver.canonical_value_type(&id)?)

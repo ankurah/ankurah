@@ -72,10 +72,6 @@ pub enum RegistrationError {
     #[error("explicit model id {model} is bound to collection '{found_collection}'; binder declares '{collection}'")]
     ExplicitModelIdMismatch { model: EntityId, found_collection: String, collection: String },
     #[error(
-        "explicit property id {property} is canonically ({found_backend}, {found_value_type}); binder declares ({backend}, {value_type}), which is not castable to/from the canonical type (backend must match; value types must be mutually castable)"
-    )]
-    ExplicitIdMismatch { property: EntityId, found_backend: String, found_value_type: String, backend: String, value_type: String },
-    #[error(
         "property '{name}' in '{collection}' is canonically ({found_backend}, {found_value_type}); this binary declares ({backend}, {value_type}), which is not castable to/from the canonical type (backend must match; value types must be mutually castable per Value::cast_to). The canonical type is fixed at allocation; changing it is a deliberate migration (#303), never a model-struct edit"
     )]
     NonCastable { collection: String, name: String, found_backend: String, found_value_type: String, backend: String, value_type: String },
@@ -412,7 +408,7 @@ where
                 name: p.name.clone(),
                 backend,
                 value_type,
-                target_model: target.or_else(|| current.as_ref().and_then(|d| d.target_model)),
+                target_model: target.or_else(|| current.as_ref().or(renamed.as_ref()).and_then(|d| d.target_model)),
             });
         }
 
@@ -429,7 +425,17 @@ where
                     .ok_or_else(|| RegistrationError::UnknownMintingCollection(ms.collection.clone()))?,
             };
             let property_id = match &ms.property {
-                PropertyRef::Id(id) => *id,
+                PropertyRef::Id(id) => {
+                    // Id references are explicit bindings to an existing,
+                    // shareable property. Validate the referenced entity just
+                    // like a PropertyDescriptor.explicit_id before the plan is
+                    // committed; otherwise a membership could be persisted
+                    // with a dangling property edge.
+                    if self.catalog_entity_values(property_collection(), *id).await?.is_none() {
+                        return Err(RegistrationError::ExplicitIdNotFound { property: *id });
+                    }
+                    *id
+                }
                 PropertyRef::Name(name) => {
                     property_ids
                         .get(&(ms.collection.clone(), name.clone()))
@@ -651,8 +657,9 @@ where
         // value_type is admitted only when mutually castable with the
         // canonical one. The binding never mutates the bound definition.
         if found_backend != p.backend || !value_types_compatible(&found_value_type, &p.value_type) {
-            return Err(RegistrationError::ExplicitIdMismatch {
-                property: id,
+            return Err(RegistrationError::NonCastable {
+                collection: p.minting_collection.clone(),
+                name: p.name.clone(),
                 found_backend,
                 found_value_type,
                 backend: p.backend.clone(),
@@ -724,7 +731,7 @@ fn string_field(values: &BTreeMap<String, Option<Value>>, field: &str) -> Option
 /// equal, or mutually castable per the `Value::cast_to` relation. A type
 /// string this build cannot parse (a newer fleet's type) is compatible only
 /// when equal.
-fn value_types_compatible(canonical: &str, declared: &str) -> bool {
+pub(crate) fn value_types_compatible(canonical: &str, declared: &str) -> bool {
     canonical == declared
         || match (ValueType::from_property_str(canonical), ValueType::from_property_str(declared)) {
             (Some(a), Some(b)) => ValueType::mutually_castable(a, b),

@@ -79,7 +79,7 @@ impl Collatable for Value {
             Value::EntityId(entity_id) => {
                 let mut bytes = entity_id.to_bytes();
                 // Increment the byte array (big-endian arithmetic)
-                for i in (0..16).rev() {
+                for i in (0..32).rev() {
                     if bytes[i] == 0xFF {
                         bytes[i] = 0;
                     } else {
@@ -185,5 +185,27 @@ impl Collatable for Value {
             Value::EntityId(entity_id) => entity_id.to_bytes() == [0xFFu8; 32],
             Value::Object(_) | Value::Binary(_) | Value::Json(_) => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ankurah_proto::EntityId;
+
+    #[test]
+    fn entity_id_successor_carries_across_the_low_128_bits() {
+        let mut input = [0xFF; 32];
+        input[15] = 0x41;
+        let mut expected = [0; 32];
+        expected[..15].fill(0xFF);
+        expected[15] = 0x42;
+
+        assert_eq!(Value::EntityId(EntityId::from_bytes(input)).successor_bytes(), Some(expected.to_vec()));
+    }
+
+    #[test]
+    fn maximum_entity_id_has_no_successor() {
+        assert_eq!(Value::EntityId(EntityId::from_bytes([0xFF; 32])).successor_bytes(), None);
     }
 }

@@ -1,16 +1,37 @@
 mod common;
+use ankurah::core::{entity::Entity, error::RetrievalError, retrieval::GetEvents};
+use ankurah::proto::{Event, EventId};
 use anyhow::Result;
 use common::*;
+use std::collections::HashMap;
+
+#[derive(Clone)]
+struct ReplayEvents {
+    events: HashMap<EventId, Event>,
+}
+
+impl ReplayEvents {
+    fn new(events: impl IntoIterator<Item = Event>) -> Self {
+        Self { events: events.into_iter().map(|event| (event.id(), event)).collect() }
+    }
+}
+
+#[async_trait::async_trait]
+impl GetEvents for ReplayEvents {
+    async fn get_event(&self, event_id: &EventId) -> Result<Event, RetrievalError> {
+        self.events.get(event_id).cloned().ok_or_else(|| RetrievalError::EventNotFound(event_id.clone()))
+    }
+
+    async fn event_stored(&self, _event_id: &EventId) -> Result<bool, RetrievalError> { Ok(false) }
+}
 
 /// Test 5.1: Two-Event Determinism (LWW)
 /// Two concurrent events modifying same property - result must be identical regardless of order
 #[tokio::test]
 async fn test_two_event_determinism_same_property() -> Result<()> {
-    // Create two separate nodes to test different application orders
+    // Create the concurrent events through the ordinary transaction path.
     let node1 = durable_sled_setup().await?;
-    let node2 = durable_sled_setup().await?;
     let ctx1 = node1.context_async(DEFAULT_CONTEXT).await;
-    let ctx2 = node2.context_async(DEFAULT_CONTEXT).await;
 
     let mut dag = TestDag::new();
 
@@ -41,14 +62,7 @@ async fn test_two_event_determinism_same_property() -> Result<()> {
     dag.enumerate(trx_b.commit_and_return_events().await?); // B
     dag.enumerate(trx_c.commit_and_return_events().await?); // C
 
-    // Get final value from node1 (order: A, B, C). This node holds all three
-    // events under ITS OWN root; the layered DAG merge elects the LWW winner
-    // deterministically here regardless of the order the events were applied
-    // (RFC 5.5 in specs/model-property-metadata/rfc.md). Same-root order-independent convergence -- the subject of
-    // this test -- is asserted below via the winner check, and is exercised
-    // across arrival orders by the sibling tests in this file
-    // (test_multi_property_determinism, test_three_way_concurrent_determinism),
-    // which apply concurrent events on a single node.
+    // Get the source node's winner and the exact three-event DAG.
     let final1 = ctx1.get::<RecordView>(record_id).await?;
     let title_order1 = final1.title().unwrap();
 
@@ -62,6 +76,27 @@ async fn test_two_event_determinism_same_property() -> Result<()> {
         C => [A],
     });
 
+    let event = |label| events.iter().find(|event| dag.label(&event.payload.id()) == Some(label)).unwrap().payload.clone();
+    let event_a = event('A');
+    let event_b = event('B');
+    let event_c = event('C');
+    let getter = ReplayEvents::new([event_a.clone(), event_b.clone(), event_c.clone()]);
+
+    // Replay the same same-system, id-keyed events into fresh entities in both
+    // arrival orders. Comparing the complete materialized state proves the
+    // application-order invariant instead of merely checking one commit order.
+    let order_bc = Entity::create(record_id, Record::collection());
+    order_bc.apply_event(&getter, &event_a).await?;
+    order_bc.apply_event(&getter, &event_b).await?;
+    order_bc.apply_event(&getter, &event_c).await?;
+
+    let order_cb = Entity::create(record_id, Record::collection());
+    order_cb.apply_event(&getter, &event_a).await?;
+    order_cb.apply_event(&getter, &event_c).await?;
+    order_cb.apply_event(&getter, &event_b).await?;
+
+    assert_eq!(order_bc.to_state()?, order_cb.to_state()?, "A,B,C and A,C,B must materialize identical state");
+
     // The winner is determined by lexicographic EventId (all same depth).
     let b_id = dag.id('B').unwrap();
     let c_id = dag.id('C').unwrap();
@@ -71,24 +106,34 @@ async fn test_two_event_determinism_same_property() -> Result<()> {
         assert_eq!(title_order1, "Title from C", "C has higher EventId, should win");
     }
 
-    // Cross-root raw-state copy: the foreign value is NEVER SUBSTITUTED
-    // (canonical value_type ruling, 2026-07-10, superseding the 2026-07-05
-    // fail-visible gate: read-time gates died with it; the wire-ingress
-    // model-id guard is where cross-system data is refused, and an
-    // out-of-band copy reads as absent). node2 is its OWN system (its own
-    // `system.create`) and registers `record` with its own allocator, which
-    // allocates a DIFFERENT property id for `title` than node1's. Copying
-    // node1's id-keyed 0xA2 state into node2 lands node1's value under an id
-    // node2's catalog does not resolve for `title`: the resolved read
-    // consults exactly its own id, finds nothing, and the required String
-    // reads its absent default -- node1's value must not leak through.
-    ctx2.register::<Record>().await?;
-    let state1 = collection1.get_state(record_id).await?;
-    let collection2 = ctx2.collection(&Record::collection()).await?;
-    collection2.set_state(state1.clone()).await?;
-    let title2 = ctx2.get::<RecordView>(record_id).await?.title()?;
-    assert_eq!(title2, "", "the foreign id's value must read absent (the required-String default), never substitute");
+    Ok(())
+}
 
+#[tokio::test]
+async fn cross_root_raw_state_does_not_substitute_property_ids() -> Result<()> {
+    let node1 = durable_sled_setup().await?;
+    let node2 = durable_sled_setup().await?;
+    let ctx1 = node1.context_async(DEFAULT_CONTEXT).await;
+    let ctx2 = node2.context_async(DEFAULT_CONTEXT).await;
+
+    let record_id = {
+        let trx = ctx1.begin();
+        let record = trx.create(&Record { title: "Foreign".to_owned(), artist: "Unknown".to_owned() }).await?;
+        let id = record.id();
+        trx.commit().await?;
+        id
+    };
+
+    // Each root allocates its own property ids. An out-of-band state copy can
+    // preserve opaque foreign data, but it must never substitute that data for
+    // the local root's same-named property.
+    ctx2.register::<Record>().await?;
+    let collection1 = ctx1.collection(&Record::collection()).await?;
+    let collection2 = ctx2.collection(&Record::collection()).await?;
+    collection2.set_state(collection1.get_state(record_id).await?).await?;
+
+    let title = ctx2.get::<RecordView>(record_id).await?.title()?;
+    assert_eq!(title, "", "a foreign property id must read as the local property's absence");
     Ok(())
 }
 

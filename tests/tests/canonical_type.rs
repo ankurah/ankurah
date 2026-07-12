@@ -42,6 +42,67 @@ mod v2 {
     }
 }
 
+mod float_model {
+    use super::*;
+
+    #[derive(Model, Debug, Serialize, Deserialize)]
+    pub struct Metric {
+        pub score: f64,
+    }
+}
+
+mod before_rename {
+    use super::*;
+
+    #[derive(Model, Debug, Serialize, Deserialize)]
+    pub struct Ledger {
+        pub release_year: f64,
+    }
+}
+
+mod after_rename {
+    use super::*;
+
+    #[derive(Model, Debug, Serialize, Deserialize)]
+    pub struct Ledger {
+        #[property(renamed_from = "release_year")]
+        pub year: f64,
+    }
+}
+
+mod canonical_backend {
+    use super::*;
+
+    #[derive(Model, Debug, Serialize, Deserialize)]
+    pub struct Profile {
+        pub name: String,
+    }
+}
+
+mod incompatible_backend {
+    use super::*;
+
+    #[derive(Model, Debug, Serialize, Deserialize)]
+    pub struct Profile {
+        #[active_type(LWW)]
+        pub name: String,
+    }
+}
+
+fn assert_resolved_f64_comparison(selection: &ankql::ast::Selection, expected: f64) {
+    use ankql::ast::{Expr, Literal, Predicate};
+    match &selection.predicate {
+        Predicate::Comparison { left, right, .. } => {
+            assert!(matches!(left.as_ref(), Expr::Identifier(_)), "property reference must be catalog-resolved: {left:?}");
+            assert!(
+                matches!(right.as_ref(), Expr::Literal(Literal::F64(value)) if *value == expected),
+                "comparison literal must be canonical f64 {expected}, got {right:?}"
+            );
+        }
+        other => panic!("expected comparison predicate, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn castable_drift_writes_and_reads_through_the_canonical_type() -> Result<()> {
     let node = durable_sled_setup().await?;
@@ -98,6 +159,35 @@ async fn castable_drift_writes_and_reads_through_the_canonical_type() -> Result<
         Err(err) => err,
     };
     assert!(err.to_string().to_lowercase().contains("overflow"), "expected a numeric-overflow cast error, got: {err}");
+
+    Ok(())
+}
+
+/// The first-use latch is schema-shaped, not merely collection-shaped. A
+/// second compiled model for the same collection must still pass canonical
+/// compatibility instead of inheriting the first model's successful latch.
+#[tokio::test]
+async fn distinct_schema_for_ensured_collection_still_runs_compatibility_gate() -> Result<()> {
+    let node = durable_sled_setup().await?;
+    let ctx = node.context_async(DEFAULT_CONTEXT).await;
+
+    let trx = ctx.begin();
+    trx.create(&canonical_backend::Profile { name: "canonical yrs".into() }).await?;
+    trx.commit().await?;
+
+    let trx = ctx.begin();
+    let error = trx
+        .create(&incompatible_backend::Profile { name: "incompatible lww".into() })
+        .await
+        .expect_err("a different schema shape must not reuse the collection-only registration latch");
+    assert!(error.to_string().contains("unconfirmed schema"), "the incompatible backend must fail before writing, got: {error}");
+
+    // The failed declaration remains known to the process for future
+    // first-use resolution, but must not poison a later transaction that uses
+    // the already-confirmed compatible shape for this collection.
+    let trx = ctx.begin();
+    trx.create(&canonical_backend::Profile { name: "still canonical".into() }).await?;
+    trx.commit().await?;
 
     Ok(())
 }
@@ -221,6 +311,181 @@ async fn order_by_collates_numerically_through_canonical_types() -> Result<()> {
     let films: Vec<v2::FilmView> = ctx.fetch("year > 0 ORDER BY year ASC").await?;
     let years: Vec<i64> = films.iter().map(|f| f.year().unwrap()).collect();
     assert_eq!(years, vec![2, 3, 10], "canonical numeric collation, not lexicographic");
+
+    Ok(())
+}
+
+/// The async live-query paths keep one catalog-resolved selection: the exact
+/// form forwarded to the durable peer is also stored for local reactor
+/// activation. Integer syntax against a canonical f64 property is deliberate:
+/// the parser produces I64, so a raw/resolved split is directly observable.
+#[tokio::test]
+async fn live_query_initial_and_updated_selections_stay_resolved() -> Result<()> {
+    use ankurah::signals::With;
+
+    let server = durable_sled_setup().await?;
+    let client = ephemeral_sled_setup().await?;
+    let _connection = LocalProcessConnection::new(&server, &client).await?;
+    client.system.wait_system_ready().await;
+
+    let server_ctx = server.context_async(DEFAULT_CONTEXT).await;
+    let client_ctx = client.context_async(DEFAULT_CONTEXT).await;
+
+    // Register the model/property before the ephemeral query warms its map.
+    let trx = server_ctx.begin();
+    trx.create(&float_model::Metric { score: 0.0 }).await?;
+    trx.commit().await?;
+
+    let query = client_ctx.query_wait::<float_model::MetricView>(nocache("score = 5")?).await?;
+    let (selection, version) = query.selection().peek();
+    assert_eq!(version, 1);
+    assert_resolved_f64_comparison(&selection, 5.0);
+
+    let watcher = TestWatcher::changeset();
+    let _guard = query.subscribe(&watcher);
+    assert_eq!(watcher.quiesce().await, 0);
+
+    let trx = server_ctx.begin();
+    let five_id = trx.create(&float_model::Metric { score: 5.0 }).await?.id();
+    trx.commit().await?;
+    assert!(watcher.wait().await, "canonical f64 update must reach the ephemeral reactor watcher");
+    assert_eq!(query.ids(), vec![five_id]);
+    watcher.drain();
+
+    query.update_selection_wait("score = 6").await?;
+    let (selection, version) = query.selection().peek();
+    assert_eq!(version, 2);
+    assert_resolved_f64_comparison(&selection, 6.0);
+    assert!(watcher.wait().await, "selection update must remove the old result");
+    assert!(query.ids().is_empty(), "score=5 must leave after updating the selection to score=6");
+    watcher.drain();
+
+    let trx = server_ctx.begin();
+    let six_id = trx.create(&float_model::Metric { score: 6.0 }).await?.id();
+    trx.commit().await?;
+    assert!(watcher.wait().await, "newly matching score=6 must enter the updated live query");
+    assert_eq!(query.ids(), vec![six_id]);
+    watcher.drain();
+
+    // The durable update path uses the same resolve/store/activate sequence.
+    let durable_query = server_ctx.query_wait::<float_model::MetricView>("score = 5").await?;
+    durable_query.update_selection_wait("score = 7").await?;
+    let (selection, version) = durable_query.selection().peek();
+    assert_eq!(version, 2);
+    assert_resolved_f64_comparison(&selection, 7.0);
+
+    // An update may be requested immediately after construction, while the
+    // initial ephemeral resolution/registration task is still in flight.
+    let eager = client_ctx.query::<float_model::MetricView>(nocache("score = 8")?)?;
+    eager.update_selection_wait("score = 9").await?;
+    let (selection, version) = eager.selection().peek();
+    assert_eq!(version, 2);
+    assert_resolved_f64_comparison(&selection, 9.0);
+    eager.error().with(|error| assert!(error.is_none(), "eager update must not race initial registration: {error:?}"));
+
+    // Cached ephemeral queries also run an immediate local-cache activation;
+    // that path must not open the update gate before the relay entry exists.
+    let eager_cached = client_ctx.query::<float_model::MetricView>("score = 12")?;
+    eager_cached.update_selection_wait("score = 13").await?;
+    let (selection, version) = eager_cached.selection().peek();
+    assert_eq!(version, 2);
+    assert_resolved_f64_comparison(&selection, 13.0);
+    eager_cached.error().with(|error| assert!(error.is_none(), "cached eager update must wait for relay insertion: {error:?}"));
+
+    let eager_durable = server_ctx.query::<float_model::MetricView>("score = 10")?;
+    eager_durable.update_selection_wait("score = 11").await?;
+    let (selection, version) = eager_durable.selection().peek();
+    assert_eq!(version, 2);
+    assert_resolved_f64_comparison(&selection, 11.0);
+    eager_durable.error().with(|error| assert!(error.is_none(), "eager durable update must wait for initial resolution: {error:?}"));
+
+    // Unknown updates fail closed and leave the last good resolved selection
+    // in place rather than storing an unresolved AST for later activation.
+    let last_good = query.selection().peek();
+    query.update_selection_wait("not_a_property = 1").await?;
+    query.error().with(|error| assert!(error.is_some(), "unknown property update must surface an error"));
+    assert_eq!(query.selection().peek(), last_good);
+
+    Ok(())
+}
+
+/// A catalog rename preserves property identity while Sled preserves the
+/// first physical column name. ORDER BY must carry the canonical type across
+/// that name translation instead of trying to resolve the old column name
+/// back through the current catalog.
+#[tokio::test]
+async fn renamed_numeric_property_keeps_canonical_sled_collation() -> Result<()> {
+    let server = durable_sled_setup().await?;
+    let ctx = server.context_async(DEFAULT_CONTEXT).await;
+
+    let trx = ctx.begin();
+    let ten_id = trx.create(&before_rename::Ledger { release_year: 10.0 }).await?.id();
+    let two_id = trx.create(&before_rename::Ledger { release_year: 2.0 }).await?.id();
+    let three_id = trx.create(&before_rename::Ledger { release_year: 3.0 }).await?.id();
+    trx.commit().await?;
+
+    // Install the query before the rename. Its predicate watcher and sort
+    // extractor must retain the resolved property id after the display name
+    // changes in the catalog.
+    let active = ctx.query_wait::<before_rename::LedgerView>("release_year > 0 ORDER BY release_year ASC").await?;
+    assert_eq!(active.ids(), vec![two_id, three_id, ten_id]);
+    let resolved_property =
+        active.selection().peek().0.order_by.as_ref().unwrap()[0].property.expect("resolved ORDER BY carries the property id");
+    let watcher = TestWatcher::changeset();
+    let _guard = active.subscribe(&watcher);
+    assert_eq!(watcher.quiesce().await, 0);
+
+    let client = ephemeral_sled_setup().await?;
+    let _connection = LocalProcessConnection::new(&server, &client).await?;
+    client.system.wait_system_ready().await;
+    let response = client
+        .request(
+            server.id,
+            &DEFAULT_CONTEXT,
+            proto::NodeRequestBody::RegisterSchema {
+                models: vec![],
+                properties: vec![proto::PropertyDescriptor {
+                    minting_collection: "ledger".into(),
+                    name: "year".into(),
+                    renamed_from: Some("release_year".into()),
+                    backend: "lww".into(),
+                    value_type: "f64".into(),
+                    target_collection: None,
+                    explicit_id: None,
+                }],
+                memberships: vec![],
+            },
+        )
+        .await?;
+    assert!(matches!(response, proto::NodeResponseBody::SchemaRegistered { .. }));
+
+    // Rebuild the installed query from its serialized/stored resolved
+    // selection, the same shape a relay reconnect re-upserts. The display
+    // name refreshes, while the property id remains the pre-rename identity.
+    let stored_selection = active.selection().peek().0;
+    active.update_selection_wait(stored_selection).await?;
+    let rebuilt = active.selection().peek().0;
+    let rebuilt_order = &rebuilt.order_by.as_ref().unwrap()[0];
+    assert_eq!(rebuilt_order.property, Some(resolved_property));
+    assert_eq!(rebuilt_order.path.first(), "year");
+    assert_eq!(active.ids(), vec![two_id, three_id, ten_id]);
+    watcher.quiesce_drain().await;
+
+    let ledgers: Vec<after_rename::LedgerView> = ctx.fetch("year > 0 ORDER BY year ASC").await?;
+    let years: Vec<f64> = ledgers.iter().map(|ledger| ledger.year().unwrap()).collect();
+    assert_eq!(years, vec![2.0, 3.0, 10.0], "renamed physical column must retain canonical numeric collation");
+
+    let trx = ctx.begin();
+    let seven_id = trx.create(&after_rename::Ledger { year: 7.0 }).await?.id();
+    let one_id = trx.create(&after_rename::Ledger { year: 1.0 }).await?.id();
+    trx.commit().await?;
+
+    assert!(watcher.wait().await, "the pre-rename predicate watcher must observe writes under the stable property id");
+    assert_eq!(
+        active.ids(),
+        vec![one_id, two_id, three_id, seven_id, ten_id],
+        "the pre-rename ORDER BY must extract new values through the stable property id"
+    );
 
     Ok(())
 }

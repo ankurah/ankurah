@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::{id::EntityId, node_id::NodeId, node_id::Signature, Attested, EntityState, Event};
 
@@ -15,7 +16,7 @@ use crate::{id::EntityId, node_id::NodeId, node_id::Signature, Attested, EntityS
 ///   are classified as version 0 (see [`is_version0_presence`]) and refused.
 /// - 1: the 0.9 wire shapes plus the versioned Presence handshake (#294).
 /// - 2: the Phase A id-keyed epoch: LWW diff v2 / state 0xA2, resolved
-///   Identifier selections, RegisterSchema.
+///   predicate Identifiers and ORDER BY property identities, RegisterSchema.
 /// - 3: the model-id wire envelope (#330): Event/EntityState/EntityDelta/
 ///   SubscriptionUpdateItem carry the model-definition entity id instead of a
 ///   collection name, and NodeUpdate/NodeResponse carry once-per-connection
@@ -207,18 +208,44 @@ pub enum PresenceRefusal {
     InvalidSystemRoot(NodeId),
 }
 
-/// The Presence shape that pre-#294 binaries (0.9.x and earlier) send,
-/// pinned at the OLD field widths (16-byte ULID node ids), since the live
-/// types have moved on. Used only to classify an undecodable handshake,
-/// never constructed. The root payload is probed by its Option tag alone:
-/// mirroring the whole 0.9 EntityState shape buys nothing for a
-/// classification whose output is a log line.
-#[derive(Deserialize)]
+/// The complete Presence shape that pre-#294 binaries (0.9.x and earlier)
+/// sent: 16-byte ULID node/entity ids, a collection-bearing EntityState, and
+/// the old opaque attestation envelope. These private mirrors deliberately do
+/// not reuse current identity-bearing types, whose wire widths and envelope
+/// shapes have changed since 0.9.
+#[derive(Serialize, Deserialize)]
 #[allow(dead_code)]
 struct LegacyPresenceProbe {
     node_id: [u8; 16],
     durable: bool,
-    system_root: Option<()>,
+    system_root: Option<LegacyAttested<LegacyEntityState>>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[allow(dead_code)]
+struct LegacyAttested<T> {
+    payload: T,
+    // Legacy Attestation was a Vec<u8> newtype and AttestationSet was a Vec
+    // newtype, both transparent in bincode's data model.
+    attestations: Vec<Vec<u8>>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[allow(dead_code)]
+struct LegacyEntityState {
+    entity_id: [u8; 16],
+    // Legacy CollectionId was a String newtype.
+    collection: String,
+    state: LegacyState,
+}
+
+#[derive(Serialize, Deserialize)]
+#[allow(dead_code)]
+struct LegacyState {
+    // Legacy StateBuffers and Clock were transparent newtypes around these
+    // containers. EventId was already a 32-byte content hash in 0.9.
+    state_buffers: BTreeMap<String, Vec<u8>>,
+    head: Vec<[u8; 32]>,
 }
 
 /// True if `data` (an entire [`crate::Message`] frame that failed normal
@@ -270,14 +297,8 @@ mod tests {
     /// The 0.9.x wire shapes, mirrored at their ORIGINAL widths for the
     /// version-0 classification tests (node ids were 16-byte ULIDs).
     #[derive(Serialize)]
-    struct LegacyPresenceOwned {
-        node_id: [u8; 16],
-        durable: bool,
-        system_root: Option<()>,
-    }
-    #[derive(Serialize)]
     enum LegacyMessage {
-        Presence(LegacyPresenceOwned),
+        Presence(LegacyPresenceProbe),
         #[allow(dead_code)]
         PeerMessage(()),
     }
@@ -331,15 +352,43 @@ mod tests {
     #[test]
     fn classifies_version0_presence() {
         let old_bytes =
-            bincode::serialize(&LegacyMessage::Presence(LegacyPresenceOwned { node_id: [7u8; 16], durable: false, system_root: None }))
+            bincode::serialize(&LegacyMessage::Presence(LegacyPresenceProbe { node_id: [7u8; 16], durable: false, system_root: None }))
                 .unwrap();
         // An old presence fails current decoding and classifies as version 0.
         assert!(crate::decode_message(&old_bytes).is_err());
         assert!(is_version0_presence(&old_bytes));
+
+        // The same legacy payload with an advertised protocol version is a
+        // versioned v1/v2 handshake, not pre-versioning v0. Reject trailing
+        // bytes so the classifier reports only the shape it names.
+        let mut versioned_old_bytes = old_bytes.clone();
+        versioned_old_bytes.extend_from_slice(&1u32.to_le_bytes());
+        assert!(!is_version0_presence(&versioned_old_bytes));
+
         // Garbage and non-Presence variants do not.
         assert!(!is_version0_presence(&[]));
         assert!(!is_version0_presence(&[7, 7, 7, 7, 7]));
         assert!(!is_version0_presence(&[1, 0, 0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn classifies_durable_version0_presence_with_legacy_system_root() {
+        let old_bytes = bincode::serialize(&LegacyMessage::Presence(LegacyPresenceProbe {
+            node_id: [8u8; 16],
+            durable: true,
+            system_root: Some(LegacyAttested {
+                payload: LegacyEntityState {
+                    entity_id: [9u8; 16],
+                    collection: "_ankurah_system".to_owned(),
+                    state: LegacyState { state_buffers: BTreeMap::from([("lww".to_owned(), vec![1, 2, 3])]), head: vec![[0x31; 32]] },
+                },
+                attestations: vec![vec![0xA5, 0x5A]],
+            }),
+        }))
+        .unwrap();
+
+        assert!(crate::decode_message(&old_bytes).is_err());
+        assert!(is_version0_presence(&old_bytes));
     }
 
     #[test]

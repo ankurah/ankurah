@@ -9,6 +9,7 @@ mod watcherset;
 
 pub(crate) use self::{
     candidate_changes::CandidateChanges,
+    property_path::PropertyPath,
     subscription::{ReactorSubscription, ReactorSubscriptionId},
     update::{MembershipChange, ReactorUpdate, ReactorUpdateItem},
     watcherset::{WatcherChange, WatcherSet},
@@ -38,6 +39,14 @@ pub trait AbstractEntity: Clone + std::fmt::Debug {
     fn collection(&self) -> proto::CollectionId;
     fn id(&self) -> &proto::EntityId;
     fn value(&self, field: &str) -> Option<Value>;
+
+    /// Read a catalog-resolved property while retaining its stable id.
+    /// Non-catalog test entities can keep using the display-name fallback;
+    /// [`Entity`] overrides this to address id-keyed state directly.
+    fn value_resolved(&self, property_id: proto::EntityId, name: &str) -> Option<Value> {
+        let _ = property_id;
+        self.value(name)
+    }
 }
 
 /// Trait for types that can be used in notify_change
@@ -217,19 +226,28 @@ pub(crate) fn build_key_spec_from_selection<E: AbstractEntity>(
     resultset: &EntityResultSet<E>,
     resolver: Option<&dyn crate::property::PropertyResolver>,
     collection: &str,
-) -> anyhow::Result<KeySpec> {
+) -> anyhow::Result<crate::resultset::ResultKeySpec> {
     let mut keyparts = Vec::new();
+    let mut property_paths = Vec::new();
 
     let read = resultset.read();
     for item in order_by {
-        // Use the property name from the path (currently only simple paths are supported in ORDER BY)
+        // Use the display name from the path (currently only simple paths are
+        // supported in ORDER BY), but retain the stable identity supplied by
+        // selection resolution. Name lookup is only the raw/legacy fallback.
         let column = item.path.property().to_string();
 
-        let value_type = resolver
-            .and_then(|r| r.resolve(collection, &column))
+        let property_id = item.property.map(proto::EntityId::from_bytes).or_else(|| resolver.and_then(|r| r.resolve(collection, &column)));
+        property_paths.push(crate::reactor::PropertyPath::simple(column.clone(), property_id));
+
+        let value_type = property_id
             .and_then(|id| resolver.and_then(|r| r.canonical_value_type(&id)))
             .and_then(|s| ValueType::from_property_str(&s))
-            .or_else(|| read.iter_entities().find_map(|(_, e)| e.value(&column).map(|v| ValueType::of(&v))))
+            .or_else(|| {
+                property_paths
+                    .last()
+                    .and_then(|path| read.iter_entities().find_map(|(_, e)| path.extract_value(e).map(|v| ValueType::of(&v))))
+            })
             .unwrap_or(ValueType::String);
 
         let direction: IndexDirection = match item.direction {
@@ -240,7 +258,7 @@ pub(crate) fn build_key_spec_from_selection<E: AbstractEntity>(
         keyparts.push(IndexKeyPart { column, sub_path: None, direction, value_type, nulls: Some(NullsOrder::Last), collation: None });
     }
 
-    Ok(KeySpec { keyparts })
+    Ok(crate::resultset::ResultKeySpec::new(KeySpec { keyparts }, property_paths))
 }
 
 impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static> Reactor<E, Ev> {
@@ -614,11 +632,13 @@ mod tests {
     #[async_trait::async_trait]
     impl crate::node::TNodeErased<TestEntity> for MockNode {
         fn unsubscribe_remote_predicate(&self, _query_id: proto::QueryId) {}
-        fn update_remote_query(
+        fn update_query_selection(
             &self,
             _query_id: proto::QueryId,
+            _collection_id: proto::CollectionId,
             _selection: ankql::ast::Selection,
             _version: u32,
+            _livequery: crate::livequery::WeakEntityLiveQuery,
         ) -> Result<(), anyhow::Error> {
             Ok(())
         }
@@ -630,7 +650,6 @@ mod tests {
             Ok(self.entities.clone())
         }
         fn reactor(&self) -> &Reactor<TestEntity> { panic!("MockNode::reactor() should not be called in this test") }
-        fn has_subscription_relay(&self) -> bool { false }
     }
 
     /// Test that once a predicate matches an entity, that entity continues to be watched

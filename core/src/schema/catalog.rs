@@ -293,9 +293,8 @@ fn parse_model(entity: &Entity, id: EntityId) -> Option<ModelDef> {
 }
 
 fn parse_property(entity: &Entity, id: EntityId) -> Option<PropertyDef> {
-    // Genesis fields: name (the anchor), backend, value_type are always
-    // present on a materialized property; name may be overwritten by a
-    // rename follow-up.
+    // Creation fields: name, backend, and value_type are always present on a
+    // materialized property; name may be overwritten by a rename follow-up.
     let name = field_string(entity, "name")?;
     let backend = field_string(entity, "backend")?;
     let value_type = field_string(entity, "value_type")?;
@@ -641,18 +640,80 @@ where PA: PolicyAgent
     /// the rev 4 never-registered-offline error) does NOT latch. Cleared by
     /// `reset` (allocated ids belong to one system and must not survive
     /// hard_reset).
-    ensured: RwLock<BTreeSet<String>>,
-    /// collection -> compiled schema pointer, recorded by every
-    /// cache_compiled call. Lets the COMMIT path close the edit-only
-    /// registration gap: `Transaction::edit` is sync and cannot await a
-    /// durable registration, so commit_local_trx ensure-registers any
-    /// touched collection whose schema is known but not yet ensured
-    /// (RFC 5.2 "durable write on first mutating use"). Pointers are
+    /// Compiled schema shapes successfully checked in this process, grouped
+    /// by collection. Collection-only latching is insufficient: two binaries
+    /// (or two model types in one process) can declare different fields or
+    /// types for the same collection, and each distinct declaration must pass
+    /// the canonical compatibility gate at least once.
+    ensured: RwLock<BTreeMap<String, Vec<&'static ModelSchema>>>,
+    /// collection -> distinct compiled schema pointers, recorded by every
+    /// cache_compiled call. This lets predicate resolution identify and
+    /// first-use-register binary-known model declarations. Commit tracks its
+    /// exact schema shapes on the transaction instead; a failed historical
+    /// declaration must not poison unrelated later transactions. Pointers are
     /// 'static and system-free, so this survives reset().
-    compiled_schemas: RwLock<BTreeMap<String, &'static ModelSchema>>,
+    compiled_schemas: RwLock<BTreeMap<String, Vec<&'static ModelSchema>>>,
     /// The manager stays generic over the node's PolicyAgent for its
     /// Node-taking methods (ensure_registered, ensure_subscribed).
     _pa: std::marker::PhantomData<PA>,
+}
+
+impl<SE, PA> CatalogInner<SE, PA>
+where PA: PolicyAgent
+{
+    /// Resolve a compiled explicit-id alias only after that exact schema shape
+    /// has passed registration in this process. Explicit identity bypasses
+    /// by-name lookup, so this takes precedence over a catalog property that
+    /// merely shares the local alias. The live membership is the evidence
+    /// that the registered model actually includes the bound definition.
+    /// Multiple ensured declarations mapping the same local name to different
+    /// ids are ambiguous and fail closed.
+    fn resolve_property(&self, collection: &str, name: &str) -> Option<EntityId> {
+        let ensured = self.ensured.read().unwrap().get(collection).cloned().unwrap_or_default();
+        let matching_fields: Vec<_> =
+            ensured.into_iter().flat_map(|schema| schema.properties.iter()).filter(|field| field.name == name).collect();
+        if matching_fields.is_empty() {
+            return self.map.read().unwrap().resolve(collection, name);
+        }
+
+        let map = self.map.read().unwrap();
+        let mut candidates = BTreeSet::new();
+        for field in matching_fields {
+            match field.explicit_id {
+                Some(id) => {
+                    candidates.insert(super::local::parse_explicit_id(id));
+                }
+                None => {
+                    // Only an ensured ordinary declaration makes the catalog
+                    // name a candidate. An unrelated catalog property with
+                    // this name must not shadow an explicit local alias.
+                    if let Some(id) = map.resolve(collection, name) {
+                        candidates.insert(id);
+                    }
+                }
+            }
+        }
+
+        if candidates.len() != 1 {
+            tracing::warn!(
+                "ensured schemas map compiled property name '{}.{}' to {} ids; refusing ambiguous resolution",
+                collection,
+                name,
+                candidates.len()
+            );
+            return None;
+        }
+
+        let id = *candidates.iter().next().expect("one property id");
+        let Some(model) = map.by_collection.get(collection) else {
+            return None;
+        };
+        if map.membership(model, &id).is_none() || !map.properties.contains_key(&id) {
+            tracing::warn!("ensured explicit property alias '{}.{}' points to {} without a live catalog membership", collection, name, id);
+            return None;
+        }
+        Some(id)
+    }
 }
 
 impl<SE, PA> crate::property::PropertyResolver for CatalogInner<SE, PA>
@@ -660,7 +721,7 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    fn resolve(&self, collection: &str, name: &str) -> Option<EntityId> { self.map.read().unwrap().resolve(collection, name) }
+    fn resolve(&self, collection: &str, name: &str) -> Option<EntityId> { self.resolve_property(collection, name) }
     fn name_for(&self, id: &EntityId) -> Option<String> { self.map.read().unwrap().properties.get(id).map(|def| def.name.clone()) }
     fn model_id_for(&self, collection: &str) -> Option<EntityId> { self.map.read().unwrap().by_collection.get(collection).copied() }
     fn canonical_value_type(&self, id: &EntityId) -> Option<String> {
@@ -686,7 +747,7 @@ where
             durable_sub: RwLock::new(None),
             ephemeral_queries: RwLock::new(Vec::new()),
             subscribed: RwLock::new(false),
-            ensured: RwLock::new(BTreeSet::new()),
+            ensured: RwLock::new(BTreeMap::new()),
             compiled_schemas: RwLock::new(BTreeMap::new()),
             _pa: std::marker::PhantomData,
         }))
@@ -996,8 +1057,9 @@ where
 
     // -- public lookup API (cheap clones) -----------------------------------
 
-    /// The property named `name` in `collection` (RFC 5.2 name lookup).
-    pub fn resolve(&self, collection: &str, name: &str) -> Option<EntityId> { self.0.map.read().unwrap().resolve(collection, name) }
+    /// The property addressed by `name` in `collection`: an ensured compiled
+    /// explicit-id alias first, otherwise ordinary catalog-name lookup.
+    pub fn resolve(&self, collection: &str, name: &str) -> Option<EntityId> { self.0.resolve_property(collection, name) }
 
     /// A weak handle to this catalog as a name-to-id resolver, stamped onto
     /// entities at assembly for the sync read path (the PropertyKey amendment,
@@ -1056,11 +1118,10 @@ where
 
     // -- registration lifecycle (RFC 5.2, work package A11b; rev 4) ---------
 
-    /// Record a compiled model's schema pointer for the commit-time
-    /// registration gap (plan decision 16): `Transaction::edit` is sync and
-    /// cannot await a durable registration, so `commit_local_trx`
-    /// ensure-registers any touched collection whose compiled schema is
-    /// recorded but not yet ensured.
+    /// Record a binary-known compiled schema for predicate first-use
+    /// registration and unknown-collection classification. Transactions keep
+    /// their own exact schema provenance for commit-time enforcement; this
+    /// process-global cache is never replayed wholesale into a commit.
     ///
     /// Rev 4 note: this used to ALSO overlay locally-derived catalog ids
     /// into the map; under allocation (RFC 5.1) ids exist only in the
@@ -1068,7 +1129,11 @@ where
     /// overlay. Resolution before first registration correctly reports the
     /// property as unknown or defers (RFC 5.3).
     pub fn cache_compiled(&self, schema: &'static ModelSchema) {
-        self.0.compiled_schemas.write().unwrap().insert(schema.collection.to_string(), schema);
+        let mut compiled = self.0.compiled_schemas.write().unwrap();
+        let schemas = compiled.entry(schema.collection.to_string()).or_default();
+        if !schemas.iter().any(|known| **known == *schema) {
+            schemas.push(schema);
+        }
     }
 
     // -- allocator support (RFC 5.1 executor discipline) ---------------------
@@ -1088,6 +1153,34 @@ where
         map.names_global.get(name)?.iter().find_map(|id| {
             let p = map.properties.get(id)?;
             (p.minted_for == Some(*model) && p.name == name).then(|| p.clone())
+        })
+    }
+
+    /// Whether every active field in this compiled schema already has a
+    /// catalog membership with a compatible canonical definition. This is the
+    /// only safe fallback after a registration reassertion is unavailable: a
+    /// missing or incompatible field must fail the write rather than escape as
+    /// new Name residue in a registered user collection.
+    pub(crate) fn schema_is_fully_bound_compatible(&self, schema: &ModelSchema) -> bool {
+        let map = self.0.map.read().unwrap();
+        let Some(model) = map.by_collection.get(schema.collection).copied() else { return false };
+        schema.properties.iter().all(|field| {
+            // An explicit binding bypasses display-name lookup by contract:
+            // the bound definition's canonical name may differ from the
+            // local Rust field (and may be renamed later). Ordinary fields
+            // continue to resolve through their current catalog name.
+            let id = match field.explicit_id {
+                Some(id) => super::local::parse_explicit_id(id),
+                None => {
+                    let Some(id) = map.resolve(schema.collection, field.name) else { return false };
+                    id
+                }
+            };
+            if map.membership(&model, &id).is_none() {
+                return false;
+            }
+            let Some(def) = map.properties.get(&id) else { return false };
+            def.backend == field.backend && super::registration::value_types_compatible(&def.value_type, field.value_type)
         })
     }
 
@@ -1137,9 +1230,10 @@ where
     /// RESOLUTION at a read path's first use of a compiled model (REN 2
     /// revised, plan decision 25b) -- an existing schema resolves to a no-op
     /// plan, so the common read-path case emits nothing and skips the policy
-    /// verb while the response feeds the map. Fast-returns if the collection
-    /// is already ensured this process. Records the compiled
-    /// schema first (for the commit-time gap), then durably registers:
+    /// verb while the response feeds the map. Fast-returns only if this exact
+    /// compiled schema shape is already ensured in this process. Records the
+    /// compiled schema first for future predicate first-use resolution and
+    /// diagnostics, then durably registers:
     ///
     /// - DURABLE node: execute the registration locally
     ///   ([`Node::execute_schema_registration`], which updates the map
@@ -1151,10 +1245,9 @@ where
     /// - EPHEMERAL node with NO durable peer: the rev 4 STRICT OFFLINE rule.
     ///   Registration is impossible without the allocator, so this returns
     ///   [`RegistrationError::NoDurablePeer`] WITHOUT latching. The caller
-    ///   discriminates (plan decision 16): a collection the catalog already
-    ///   knows keeps writing offline against its cached binding (the
-    ///   re-assert is deferrable); a NEVER-registered collection fails the
-    ///   write ("connect once first").
+    ///   discriminates (plan decision 16): an unavailable reassertion is
+    ///   deferrable only if every compiled field already has a compatible
+    ///   canonical binding; otherwise the write fails.
     ///
     /// Every error path returns WITHOUT latching, so a later attempt
     /// retries.
@@ -1165,11 +1258,12 @@ where
         schema: &'static ModelSchema,
     ) -> Result<(), RegistrationError> {
         let collection = schema.collection.to_string();
-        if self.0.ensured.read().unwrap().contains(&collection) {
+        if self.is_schema_ensured(schema) {
             return Ok(());
         }
 
-        // Record the compiled schema for the commit-time registration gap.
+        // Retain this binary-known shape for later predicate first-use
+        // resolution and diagnostics.
         self.cache_compiled(schema);
 
         let (models, properties, memberships) = super::registration_request(schema);
@@ -1178,7 +1272,7 @@ where
             // A durable node executes registration itself (no forwarding);
             // the executor upserts the map before returning.
             node.execute_schema_registration(cdata, models, properties, memberships).await?;
-            self.0.ensured.write().unwrap().insert(collection);
+            self.mark_schema_ensured(schema);
             return Ok(());
         }
 
@@ -1192,7 +1286,7 @@ where
                         // The response is the fast path into the map (RFC
                         // 5.2): fold it in on ack so binding proceeds now.
                         self.upsert_registered(&models, &properties, &memberships);
-                        self.0.ensured.write().unwrap().insert(collection);
+                        self.mark_schema_ensured(schema);
                         Ok(())
                     }
                     // A policy/executor refusal is a STRICT error: do not latch.
@@ -1209,15 +1303,36 @@ where
 
     /// Whether this collection's registration is latched (durably executed
     /// or forwarded successfully) this process.
-    pub fn is_ensured(&self, collection: &str) -> bool { self.0.ensured.read().unwrap().contains(collection) }
+    pub fn is_ensured(&self, collection: &str) -> bool {
+        self.0.ensured.read().unwrap().get(collection).is_some_and(|schemas| !schemas.is_empty())
+    }
 
-    /// The compiled schema recorded for `collection`, if any and if NOT yet
-    /// ensured. The commit path uses this to close the edit-only gap.
-    pub(crate) fn unensured_schema_for(&self, collection: &str) -> Option<&'static ModelSchema> {
-        if self.is_ensured(collection) {
-            return None;
+    fn is_schema_ensured(&self, schema: &ModelSchema) -> bool {
+        self.0.ensured.read().unwrap().get(schema.collection).is_some_and(|schemas| schemas.iter().any(|known| **known == *schema))
+    }
+
+    fn mark_schema_ensured(&self, schema: &'static ModelSchema) {
+        let mut ensured = self.0.ensured.write().unwrap();
+        let schemas = ensured.entry(schema.collection.to_string()).or_default();
+        if !schemas.iter().any(|known| **known == *schema) {
+            schemas.push(schema);
         }
-        self.0.compiled_schemas.read().unwrap().get(collection).copied()
+    }
+
+    /// Every distinct compiled schema recorded for `collection` whose exact
+    /// shape is NOT yet ensured. Predicate first-use resolution uses this so
+    /// one declaration cannot inherit another declaration's collection-level
+    /// latch. Commit uses transaction-scoped schema provenance instead.
+    pub(crate) fn unensured_schemas_for(&self, collection: &str) -> Vec<&'static ModelSchema> {
+        self.0
+            .compiled_schemas
+            .read()
+            .unwrap()
+            .get(collection)
+            .into_iter()
+            .flat_map(|schemas| schemas.iter().copied())
+            .filter(|schema| !self.is_schema_ensured(schema))
+            .collect()
     }
 
     /// TEST/INTROSPECTION: number of parsed entities of each kind

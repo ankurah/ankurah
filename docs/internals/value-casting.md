@@ -5,9 +5,10 @@
 Every registered property has a **canonical value type** -- `"string"`,
 `"i32"`, `"i64"`, `"f64"`, `"bool"`, `"entityid"`, `"json"`, and so on --
 fixed when the property is first allocated in the catalog and never changed
-by registration afterward. Every value stored under that property is stored
-*in* that type, regardless of what type the writing binary was compiled
-with.
+by registration afterward. Every value emitted by a compliant commit under
+that property is stored *in* that type, regardless of what type the writing
+binary was compiled with. Schema-blind ingress can preserve legacy or
+malformed off-type residue; the defensive read boundaries below contain it.
 
 The reason is collation. Storage engines materialize property values into
 columns and build ordered indexes over them; the reactor matches live-query
@@ -15,8 +16,8 @@ predicates against entities through a byte-collated index. None of that
 works over a mixed-type population: `"10"` sorts before `"2"` as a string
 and after it as a number, and an equality lookup keyed on one type's bytes
 misses a value stored in another's. Casting values at comparison time cannot
-cure a mixed population that has already been stored. So the system
-guarantees the population is never mixed: one property, one type, enforced
+cure a mixed population that has already been stored. So compliant writers
+guarantee one property, one type, while readers contain any off-type residue
 at the boundaries described below.
 
 ## Registration is the type authority
@@ -41,9 +42,11 @@ not change the stored type.** The canonical type does not follow your code;
 a struct-level retype either operates through casts or is refused at
 registration. Actually changing a canonical type is reserved for a future
 explicit migration mechanism -- a deliberate catalog operation, never a
-side effect of editing a struct. And because `trx.create` and first-use
-reads both register before any data flows, an incompatible binary is
-refused **at registration time, not at write time**.
+side effect of editing a struct. Mutations and predicate-query paths register
+before they write or resolve fields, so an incompatible binary is refused at
+registration. A direct get by entity id is deliberately different: it can
+load existing state without registering, and its typed getter performs only
+the per-value projection described below.
 
 The one type check that necessarily stays at write time is per-value: a
 compatible type *pair* does not guarantee every *value* fits (five billion
@@ -52,8 +55,9 @@ fail the writing transaction's commit with `PropertyError::NonCastable`.
 
 ## Where casts happen
 
-The cast discipline is a small, closed set of boundaries. Everything else
-reads and writes canonically-typed values without checking anything.
+The cast discipline is a small, closed set of boundaries. Typed application
+paths otherwise read and write canonically-typed values without repeated
+checks; schema-blind ingress remains the explicit exception described below.
 
 **Writes canonicalize at commit.** When a transaction commits, each staged
 value is resolved from its field name to its property id and cast to the
@@ -90,8 +94,10 @@ parts -- in the storage planner's index scans and in the reactor's ordered
 live queries alike -- resolve their column through the catalog to the
 canonical value type, so numerics sort numerically. (Before canonical
 types existed, sort collation was hardcoded to strings, which orders
-`10` before `2`.) A column the catalog cannot name falls back to string
-collation.
+`10` before `2`.) A resolved ORDER BY item carries the property's stable id
+beside its display path, so rebuilding a relay subscription after a rename
+keeps the same property and canonical collation. A column the catalog cannot
+name falls back to string collation.
 
 **Indexes collate in exactly one domain.** The reactor's comparison index
 converts predicate literals to `Value` at insertion so both sides of every
@@ -102,12 +108,14 @@ is a type-mismatch error, so an index never contains mixed-type bytes.
 
 ## What deliberately does not happen
 
-There are **no type gates on the read or query path**. By the time a read
-or query runs, registration has already answered the type-pair question,
-so nothing re-checks it -- predicate evaluation and policy inspection have
-no type-error surface at all. Data sitting under a *different* property id
-than the one being read is simply not that field: it never substitutes,
-and reads of the requested property see absence, not an error.
+There are **no type-pair gates on the read or query path**. Operations that
+require catalog resolution register first; a direct get by entity id does
+not. Neither path re-runs registration compatibility during evaluation.
+Predicate evaluation and policy inspection have no type-error surface at
+all, while a typed getter can still return the per-value `NonCastable` error
+below. Data sitting under a *different* property id than the one being read
+is simply not that field: it never substitutes, and reads of the requested
+property see absence, not an error.
 
 The two `NonCastable` errors are the entire failure vocabulary:
 

@@ -2,10 +2,11 @@
 //! specs/model-property-metadata/rfc.md sections 4, 5.8, 5.9).
 //!
 //! This module generates the `static` [`ankurah::core::schema::ModelSchema`]
-//! and the `Model::schema()` method. Two facts per field are NORMATIVE and
-//! must match every node byte-for-byte, because the catalog property LOOKUP
-//! KEY includes them (RFC 5.1): two nodes disagreeing on a mapping row
-//! register distinct property identities for the same field.
+//! and the `Model::schema()` method. Two facts per field are NORMATIVE.
+//! A property's minting model and name locate its identity; registration
+//! checks these compiled facts against the immutable canonical pair (exact
+//! backend and a mutually castable value type) and refuses an incompatible
+//! binding rather than registering another property identity.
 //!
 //! - `backend`: the backend-registry name the active type resolves to
 //!   ("yrs" / "lww"), obtained from the backend registry
@@ -124,6 +125,13 @@ pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
             }
         };
 
+        // Ref<T> names its target model by collection in the registration
+        // descriptor. Model collections are the lowercased model type name
+        // (ModelDescription::collection_str), so derive the same static value
+        // from T here; Option<Ref<T>> unwraps through reference_target.
+        let target_collection = reference_target(&field.ty).and_then(type_head).map(|name| name.to_lowercase());
+        let target_collection_tokens = option_str_tokens(target_collection.as_deref());
+
         let backend = desc.backend_key().map_err(|msg| syn::Error::new(field.ty.span(), msg))?;
 
         // #[property(renamed_from = "...")]: the transient rename hint (RFC
@@ -148,6 +156,7 @@ pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
                 renamed_from: #renamed_from_tokens,
                 backend: #backend,
                 value_type: #value_type,
+                target_collection: #target_collection_tokens,
                 optional: #optional,
                 explicit_id: #explicit_id_tokens,
             }
@@ -177,6 +186,36 @@ pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
             &__ANKURAH_MODEL_SCHEMA
         }
     })
+}
+
+/// Generate the runtime address carried by each derive-generated accessor.
+/// Ordinary fields carry only their display name; an explicit binding embeds
+/// the already-validated 32-byte entity id directly, avoiding both catalog
+/// name lookup and repeated base64 decoding at runtime.
+pub(crate) fn active_field_address_tokens(model: &ModelDescription) -> syn::Result<Vec<TokenStream>> {
+    model
+        .active_fields()
+        .iter()
+        .map(|field| {
+            let field_ident = field.ident.as_ref().expect("named field");
+            let display_name = field_ident.to_string().to_lowercase();
+            let explicit_id = property_str_attr(&field.attrs, "id")?;
+            let explicit_id_tokens = match explicit_id {
+                Some(id) => {
+                    let bytes = decode_base64url_no_pad(&id).map_err(|msg| syn::Error::new(field.ty.span(), msg))?;
+                    let bytes: [u8; 32] = bytes.try_into().map_err(|bytes: Vec<u8>| {
+                        syn::Error::new(
+                            field.ty.span(),
+                            format!("explicit id {id:?} decodes to {} bytes; an EntityId is exactly 32 bytes", bytes.len()),
+                        )
+                    })?;
+                    quote! { ::core::option::Option::Some(::ankurah::proto::EntityId::from_bytes([#(#bytes),*])) }
+                }
+                None => quote! { ::core::option::Option::None },
+            };
+            Ok(quote! { ::ankurah::property::PropertyAddress::new(#display_name, #explicit_id_tokens) })
+        })
+        .collect()
 }
 
 /// Map a field's original Rust type to its `(value_type, optional)` per the
@@ -247,6 +286,21 @@ fn option_inner(ty: &Type) -> Option<&Type> {
     }
     let syn::PathArguments::AngleBracketed(args) = &seg.arguments else { return None };
     args.args.iter().find_map(|a| if let syn::GenericArgument::Type(t) = a { Some(t) } else { None })
+}
+
+/// If `ty` is `Ref<T>` or `Option<Ref<T>>`, return `T`.
+fn reference_target(ty: &Type) -> Option<&Type> {
+    let ty = option_inner(ty).unwrap_or(ty);
+    let Type::Path(path) = ty else { return None };
+    let segment = path.path.segments.last()?;
+    if segment.ident != "Ref" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else { return None };
+    args.args.iter().find_map(|arg| match arg {
+        syn::GenericArgument::Type(target) => Some(target),
+        _ => None,
+    })
 }
 
 /// Parse a `#[property(key = "value")]` string attribute off a field. There
@@ -406,7 +460,7 @@ mod tests {
     #[test]
     fn base64url_rejects_wrong_length() {
         // 22 valid chars is only 16 bytes.
-        assert!(validate_explicit_id("AAAAAAAAAAAAAAAAAAAA").is_err());
+        assert!(validate_explicit_id("AAAAAAAAAAAAAAAAAAAAAA").is_err());
     }
 
     #[test]

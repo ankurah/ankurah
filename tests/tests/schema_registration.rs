@@ -173,6 +173,51 @@ async fn renamed_from_moves_the_lineage() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A rename without a new target declaration preserves the existing
+/// reference target in the response as well as in storage.
+#[tokio::test]
+async fn rename_response_preserves_existing_target_model() -> anyhow::Result<()> {
+    let (server, client, _conn) = connected_pair().await?;
+
+    let initial = proto::NodeRequestBody::RegisterSchema {
+        models: vec![proto::ModelDescriptor { collection: "album".into(), name: "Album".into(), explicit_id: None }],
+        properties: vec![proto::PropertyDescriptor {
+            minting_collection: "album".into(),
+            name: "artist".into(),
+            renamed_from: None,
+            backend: "lww".into(),
+            value_type: "entityid".into(),
+            target_collection: Some("artist".into()),
+            explicit_id: None,
+        }],
+        memberships: vec![],
+    };
+    let first = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, initial).await?);
+    let property_id = first.1[0].id;
+    let target_model = first.1[0].target_model.expect("initial target resolved");
+
+    let rename = proto::NodeRequestBody::RegisterSchema {
+        models: vec![],
+        properties: vec![proto::PropertyDescriptor {
+            minting_collection: "album".into(),
+            name: "performer".into(),
+            renamed_from: Some("artist".into()),
+            backend: "lww".into(),
+            value_type: "entityid".into(),
+            target_collection: None,
+            explicit_id: None,
+        }],
+        memberships: vec![],
+    };
+    let renamed = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, rename).await?);
+    assert_eq!(renamed.1[0].id, property_id);
+    assert_eq!(renamed.1[0].target_model, Some(target_model));
+    let values = catalog_values(&server, PROPERTY, property_id).await?;
+    assert_eq!(values.get("target_model"), Some(&Some(Value::EntityId(target_model))));
+
+    Ok(())
+}
+
 /// The hint's GUARD (RFC 5.8): it applies only when the current-name
 /// lookup misses. A property already live under the current name wins and
 /// the hint never merges identities. Also pins the policy-permitted
@@ -454,8 +499,8 @@ async fn target_collection_resolves_and_allocates_on_miss() -> anyhow::Result<()
     Ok(())
 }
 
-/// RFC 5.9: explicit-id binding references an existing property (sharing);
-/// absence hard-fails, and a (backend, value_type) mismatch hard-fails.
+/// RFC 5.9: explicit-id binding references an existing property (sharing).
+/// Absence and an incompatible canonical declaration hard-fail.
 #[tokio::test]
 async fn explicit_id_binding_and_sharing() -> anyhow::Result<()> {
     let (server, client, _conn) = connected_pair().await?;
@@ -506,7 +551,7 @@ async fn explicit_id_binding_and_sharing() -> anyhow::Result<()> {
     };
     expect_error(client.request(server.id, &DEFAULT_CONTEXT, missing).await?, "does not exist");
 
-    // Retyped binder: declared (backend, value_type) must match.
+    // A backend change is always incompatible, regardless of value_type.
     let mismatch = proto::NodeRequestBody::RegisterSchema {
         models: vec![],
         properties: vec![proto::PropertyDescriptor {
@@ -520,7 +565,65 @@ async fn explicit_id_binding_and_sharing() -> anyhow::Result<()> {
         }],
         memberships: vec![],
     };
-    expect_error(client.request(server.id, &DEFAULT_CONTEXT, mismatch).await?, "binder declares");
+    expect_error(client.request(server.id, &DEFAULT_CONTEXT, mismatch).await?, "not castable to/from");
+
+    Ok(())
+}
+
+/// An explicit property binding follows the same canonical-type rule as a
+/// name-keyed hit: mutually castable drift is admitted and the response
+/// reports the bound property's canonical type.
+#[tokio::test]
+async fn explicit_id_binding_accepts_castable_type_drift() -> anyhow::Result<()> {
+    let (server, client, _conn) = connected_pair().await?;
+
+    let canonical = proto::NodeRequestBody::RegisterSchema {
+        models: vec![proto::ModelDescriptor { collection: "album".into(), name: "Album".into(), explicit_id: None }],
+        properties: vec![property("year", None, "lww", "i32")],
+        memberships: vec![],
+    };
+    let property_id = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, canonical).await?).1[0].id;
+
+    let drifted = proto::NodeRequestBody::RegisterSchema {
+        models: vec![proto::ModelDescriptor { collection: "playlist".into(), name: "Playlist".into(), explicit_id: None }],
+        properties: vec![proto::PropertyDescriptor {
+            minting_collection: "playlist".into(),
+            name: "year".into(),
+            renamed_from: None,
+            backend: "lww".into(),
+            value_type: "i64".into(),
+            target_collection: None,
+            explicit_id: Some(property_id),
+        }],
+        memberships: vec![],
+    };
+    let bound = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, drifted).await?);
+    assert_eq!(bound.1[0].id, property_id);
+    assert_eq!(bound.1[0].value_type, "i32", "response carries the canonical type");
+    let values = catalog_values(&server, PROPERTY, property_id).await?;
+    assert_eq!(values.get("value_type"), Some(&Some(Value::String("i32".into()))));
+
+    Ok(())
+}
+
+/// A membership cannot bind directly to an unknown property id. The
+/// rejection happens before any of the request's planned creations commit.
+#[tokio::test]
+async fn dangling_membership_property_id_refuses_before_writes() -> anyhow::Result<()> {
+    let (server, client, _conn) = connected_pair().await?;
+    let missing = EntityId::from_bytes([0xEE; 32]);
+    let request = proto::NodeRequestBody::RegisterSchema {
+        models: vec![proto::ModelDescriptor { collection: "dangling".into(), name: "Dangling".into(), explicit_id: None }],
+        properties: vec![],
+        memberships: vec![proto::MembershipDescriptor {
+            collection: "dangling".into(),
+            property: proto::PropertyRef::Id(missing),
+            optional: false,
+        }],
+    };
+
+    expect_error(client.request(server.id, &DEFAULT_CONTEXT, request).await?, "does not exist");
+    assert_eq!(server.catalog.model_id_for("dangling"), None, "planned model creation must not commit on refusal");
 
     Ok(())
 }
@@ -771,8 +874,8 @@ async fn check_schema_registration_gates_creates() -> anyhow::Result<()> {
 }
 
 /// The policy verb fires once for a plan with effects and is SKIPPED for a
-/// pure no-op re-registration (REN 2 second ruling: read paths lean on the
-/// upsert's idempotence, so a no-op registration must not consult the
+/// pure no-op re-registration (REN 2 second ruling: predicate-resolution
+/// paths lean on the upsert's idempotence, so a no-op registration must not consult the
 /// agent -- zero events, zero policy calls, full definitions returned).
 #[tokio::test]
 async fn policy_verb_skipped_on_noop_reregistration() -> anyhow::Result<()> {

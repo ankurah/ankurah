@@ -64,6 +64,35 @@ fn event_body_from_object(event_obj: &Object) -> Result<proto::EventBody, Retrie
     bincode::deserialize(&bytes).map_err(RetrievalError::storage)
 }
 
+/// Capture ORDER BY types while the selection still carries catalog identity,
+/// then key them by the physical field name the planner will receive. A
+/// durable field assignment is sticky across catalog renames and may be
+/// collision-suffixed, so resolving that physical name back through the
+/// catalog is not reliable.
+fn order_types_in_column_space(
+    collection: &str,
+    selection: &ankql::ast::Selection,
+    resolver: Option<&dyn PropertyResolver>,
+    column_of: &dyn Fn(&EntityId) -> Option<String>,
+) -> BTreeMap<String, ankurah_core::value::ValueType> {
+    selection
+        .order_by
+        .iter()
+        .flatten()
+        .filter_map(|item| {
+            let name = item.path.first();
+            if name == "id" || name.starts_with("__") {
+                return None;
+            }
+            let resolver = resolver?;
+            let id = item.property.map(EntityId::from_bytes).or_else(|| resolver.resolve(collection, name))?;
+            let value_type = ankurah_core::value::ValueType::from_property_str(&resolver.canonical_value_type(&id)?)?;
+            let column = column_of(&id).unwrap_or_else(|| name.to_string());
+            Some((column, value_type))
+        })
+        .collect()
+}
+
 impl std::fmt::Display for IndexedDBBucket {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "IndexedDBBucket({})", self.collection_id) }
 }
@@ -177,12 +206,11 @@ impl StorageCollection for IndexedDBBucket {
         // under fallback).
         self.ensure_property_columns_loaded().await.map_err(|e| RetrievalError::StorageError(format!("{e:?}").into()))?;
         let resolver = self.resolver.read().expect("RwLock poisoned").as_ref().and_then(|weak| weak.upgrade());
-        let selection = {
-            let assigned = self.property_columns.read().expect("RwLock poisoned").clone();
-            ankurah_core::storage::selection_to_column_space(self.collection_id.as_str(), selection, resolver.as_deref(), &|id| {
-                assigned.get(id).cloned()
-            })
-        };
+        let assigned = self.property_columns.read().expect("RwLock poisoned").clone();
+        let column_of = |id: &EntityId| assigned.get(id).cloned();
+        let order_types = order_types_in_column_space(self.collection_id.as_str(), selection, resolver.as_deref(), &column_of);
+        let selection =
+            ankurah_core::storage::selection_to_column_space(self.collection_id.as_str(), selection, resolver.as_deref(), &column_of);
         let selection = &selection;
 
         // Step 1: Amend predicate with __collection comparison
@@ -193,6 +221,9 @@ impl StorageCollection for IndexedDBBucket {
         // (the canonical value_type ruling); unresolvable columns keep the
         // historical String collation.
         let order_type_of = |name: &str| -> Option<ankurah_core::value::ValueType> {
+            if let Some(value_type) = order_types.get(name) {
+                return Some(*value_type);
+            }
             let resolver = resolver.as_deref()?;
             let id = resolver.resolve(self.collection_id.as_str(), name)?;
             ankurah_core::value::ValueType::from_property_str(&resolver.canonical_value_type(&id)?)
@@ -804,5 +835,68 @@ pub fn add_collection(selection: &ankql::ast::Selection, collection_id: &ankurah
         predicate: Predicate::And(Box::new(collection_comparison), Box::new(selection.predicate.clone())),
         order_by: selection.order_by.clone(),
         limit: selection.limit,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ankql::ast::{OrderByItem, OrderDirection, PathExpr, Predicate, Selection};
+    use ankurah_core::value::ValueType;
+
+    struct RenamedPropertyResolver {
+        property: EntityId,
+    }
+
+    impl PropertyResolver for RenamedPropertyResolver {
+        fn resolve(&self, collection: &str, name: &str) -> Option<EntityId> {
+            (collection == "record" && name == "score").then_some(self.property)
+        }
+
+        fn name_for(&self, id: &EntityId) -> Option<String> { (*id == self.property).then(|| "score".to_string()) }
+
+        fn canonical_value_type(&self, id: &EntityId) -> Option<String> { (*id == self.property).then(|| "i32".to_string()) }
+    }
+
+    #[test]
+    fn resolved_order_type_survives_sticky_physical_name() {
+        let property = EntityId::from_bytes([7; 32]);
+        let resolver = RenamedPropertyResolver { property };
+        let selection = Selection {
+            predicate: Predicate::True,
+            order_by: Some(vec![OrderByItem {
+                path: PathExpr::simple("score"),
+                direction: OrderDirection::Asc,
+                property: Some(property.to_bytes()),
+            }]),
+            limit: None,
+        };
+
+        // Simulate a column assigned before the catalog display name changed,
+        // or a collision-suffixed assignment that was never a catalog name.
+        let assigned = BTreeMap::from([(property, "legacy_score".to_string())]);
+        let column_of = |id: &EntityId| assigned.get(id).cloned();
+        let order_types = order_types_in_column_space("record", &selection, Some(&resolver), &column_of);
+        let translated = ankurah_core::storage::selection_to_column_space("record", &selection, Some(&resolver), &column_of);
+        let physical_name = translated.order_by.as_ref().unwrap()[0].path.first();
+
+        assert_eq!(physical_name, "legacy_score");
+        assert_eq!(resolver.resolve("record", physical_name), None, "the physical name is not catalog-resolvable");
+        assert_eq!(order_types.get(physical_name), Some(&ValueType::I32));
+
+        // Pin the actual planner boundary: the physical field still gets the
+        // canonical numeric collation rather than String fallback.
+        let amended = add_collection(&translated, &proto::CollectionId::fixed_name("record"));
+        let planner = ankurah_storage_common::planner::Planner::new(ankurah_storage_common::planner::PlannerConfig::indexeddb());
+        let plans = planner.plan_with_types(&amended, "id", &|name| order_types.get(name).copied());
+        let index_spec = plans
+            .iter()
+            .find_map(|plan| match plan {
+                Plan::Index { index_spec, .. } => Some(index_spec),
+                _ => None,
+            })
+            .expect("ORDER BY should produce an IndexedDB index plan");
+        let score_key = index_spec.keyparts.iter().find(|part| part.column == "legacy_score").expect("physical ORDER BY key");
+        assert_eq!(score_key.value_type, ValueType::I32);
     }
 }

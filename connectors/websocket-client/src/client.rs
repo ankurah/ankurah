@@ -7,7 +7,7 @@ use ankurah_core::{
 };
 use ankurah_proto as proto;
 use ankurah_signals::{Mut, Read, Wait};
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use futures_util::{SinkExt, StreamExt};
 use std::{
     sync::{
@@ -415,8 +415,7 @@ where
                     }
                 }
                 Ok(proto::Message::PresenceRejected(rejection)) => {
-                    error!("Server {} refused connection: {}", inner.server_url, rejection);
-                    Ok(MessageResult::Break)
+                    Err(anyhow!("server {} refused connection: {}", inner.server_url, rejection))
                 }
                 Ok(proto::Message::PeerMessage(node_msg)) => {
                     if let Some(sender) = peer_sender.as_ref() {
@@ -437,11 +436,10 @@ where
                         // A handshake we cannot read will never establish; close
                         // instead of idling on a dead connection.
                         if proto::is_version0_presence(&data) {
-                            error!("Server {} speaks a pre-versioning (0.9.x or older) protocol; refusing", inner.server_url);
+                            return Err(anyhow!("server {} speaks a pre-versioning (0.9.x or older) protocol", inner.server_url));
                         } else {
-                            error!("Failed to deserialize handshake message from {}: {}; closing", inner.server_url, e);
+                            return Err(anyhow!("failed to deserialize handshake message from {}: {}", inner.server_url, e));
                         }
-                        return Err(anyhow::anyhow!("failed to decode handshake frame from {}: {e}", inner.server_url));
                     }
                     warn!("Failed to deserialize message: {}", e);
                     Ok(MessageResult::Continue)

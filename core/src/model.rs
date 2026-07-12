@@ -5,7 +5,7 @@ use std::sync::Arc;
 use ankurah_proto::{CollectionId, EntityId, State};
 
 use crate::entity::Entity;
-use crate::error::StateError;
+use crate::error::{MutationError, StateError};
 
 use crate::property::PropertyError;
 
@@ -45,7 +45,7 @@ pub trait Model: Sized {
 
     // TODO - this seems to be necessary, but I don't understand why
     // Backend fields should be getting initialized on demand when the values are set
-    fn initialize_new_entity(&self, entity: &Entity);
+    fn initialize_new_entity(&self, entity: &Entity) -> Result<(), MutationError>;
 }
 
 /// A read only view of an Entity which offers typed accessors

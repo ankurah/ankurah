@@ -10,19 +10,22 @@ FIRST landing, which promotes #294 to Phase 0 of the ladder (sections 4,
 5.2, 5.3, 5.5, 9).
 Rev 4 (maintainer ruling 2026-07-06; RATIFIED same day on #289 after the
 full design walkthrough, and IMPLEMENTED on PR #307): the IDENTITY PLANE
-is redesigned. Schema-specific deterministic derivation, the frozen schema
-genesis encoder, and the anchor apparatus are REMOVED; the durable node
-ALLOCATES EntityIds on first sighting, via an upsert-by-current-name
-RegisterSchema whose response returns the allocated definitions (sections
-3, 4, 5.1, 5.2, 5.8). The later identity-attestation RFC changes the
-allocation primitive from a ULID to the full content hash of the ordinary
-genesis event: the executor supplies fresh genesis entropy and takes the
+is redesigned. Deterministic derivation, the frozen genesis encoder,
+genesis self-certification, and the anchor apparatus are REMOVED; the
+durable node ALLOCATES EntityIds on first sighting, via
+an upsert-by-current-name RegisterSchema whose response returns the
+allocated definitions (sections 3, 4, 5.1, 5.2, 5.8). Rev 4 originally
+specified real ULIDs; the later identity-attestation RFC changes the
+allocation primitive to the full 32-byte content hash of the ordinary genesis
+event. The executor supplies fresh nonce/timestamp entropy and takes the
 resulting event id, while the single-allocator/upsert semantics here remain
-unchanged. The data plane (LWW
-v2/0xA2, binding, read rules, resolution, protocol v2, catalog protection)
-is unchanged. Two same-day follow-on rulings are folded into 5.2/5.3/5.7:
-reads register at first use, and unresolvable references FAIL LOUD
-(25b second ruling; the defer-empty draft is superseded).
+unchanged. The delivered data plane uses uniform `PropertyKey`, LWW v2/0xA2,
+model-id envelopes, resolved query identifiers, and the protocol-v3 metadata
+epoch. Schema-dependent predicate paths register at first use; direct
+entity-id gets only cache and load. Unresolvable references FAIL LOUD (25b
+second ruling; the defer-empty draft is superseded). Protocol v6 later
+replaces the handshake and peer framing without changing those metadata
+semantics.
 Originally: DRAFT for review on #289. Scope agreed 2026-07-05: each model
 gets its own defining entity id, and each property gets its own defining
 entity id; model and property metadata become first-class, replicated
@@ -45,11 +48,10 @@ three places, deliberately diverges from; and the in-repo schema-registry
 plan at specs/unified-refs-edges-json/phase-3-schema.md, reconciled in
 section 7. All code citations are against main at 05593d0d (0.9.0). This
 draft has been through an adversarial review pass (three independent
-reviewers: code-reality, distributed-behavior, requirements-coherence);
-their surviving findings are integrated below, most visibly in 5.4's
-sibling gate (two others, the frozen genesis encoder and the anchor-reuse
-guard, died with the derivation design they guarded when rev 4 pivoted the
-identity plane to allocation).
+reviewers: code-reality, distributed-behavior, requirements-coherence).
+Surviving findings are integrated below; the frozen genesis encoder,
+anchor-reuse guard, and later the read-time sibling gate were removed as the
+design moved to allocated identities and canonical value types.
 
 ## 1. Problem statement
 
@@ -205,15 +207,15 @@ From the surrounding system, non-negotiable constraints:
   renegotiates the constraint: FIRST registration of a definition requires
   a round trip to the allocating durable node, and creating entities in a
   never-registered collection while offline is a strict error ("connect
-  once first", 5.2). Data writes to already-registered collections remain
-  fully offline-capable (the binding is cached). Concurrent registration by
-  independent nodes converges because one allocator serializes it, not
-  because the bytes are deterministic.
+  once first", 5.2). Data writes remain offline-capable only when every field
+  in the exact compiled schema already has a compatible canonical binding in
+  the local catalog. Concurrent registration by independent nodes converges
+  because one allocator serializes it, not because the bytes are
+  deterministic.
 - **Mixed fleets are the normal case.** Nodes running different model code
-  versions (properties added, renamed, retyped) must not corrupt each other,
-  and every wire or persisted format change must sequence behind #294
-  (protocol version in the Presence handshake), which does not exist yet:
-  Presence carries no version field (proto/src/peering.rs:5-10).
+  versions (properties added, renamed, retyped) must not corrupt each other.
+  Protocol v3 now enforces the epoch boundary in the Presence handshake:
+  incompatible peers exchange a refusal and do not register a connection.
 - **Bootstrap must not recurse.** Reading metadata entities must not require
   metadata entities.
 - **Respect the #267 boundary.** The PropertyBackend trait, layer-view API,
@@ -230,9 +232,9 @@ genesis with fresh entropy and uses that event's full content hash as the
 EntityId. Registration is a lookup-or-create upsert by current name, and the
 registration response returns the allocated definitions, which the client
 folds into its catalog map immediately. Registration happens automatically
-at model first-use. Resolution of a property reference consults the
-catalog-fed schema binding (the compiled schema supplies names and types;
-ids exist only in the catalog), and fails closed when the property is
+on schema-dependent first use. Resolution of a property reference consults
+the catalog resolver (the compiled schema supplies names and types; ids exist
+only in the catalog), and fails closed when the property is
 undefined. Registration travels as a dedicated protocol operation, not as
 ordinary entity writes; the durable node policy-checks it and executes it
 as the system's single allocator (4, 5.1). The data contract is id-keyed
@@ -313,11 +315,13 @@ and rejected because concurrent adds would collide as a single register and
 drop fields. Retiring a field is a tombstone flag on the membership (future
 schema-evolution work), never deletion of the shared property entity.
 
-**The Rust-type mapping is normative.** Because the property LOOKUP KEY
-includes (backend, value_type) (section 5.1), every node must map a given
-Rust field type to the same descriptor pair, byte for byte. The mapping is
-adopted from PR #236's plan.md table, restated against the actual active
-types:
+**The Rust-type mapping is normative.** The first allocation fixes a
+property's canonical (backend, value_type), and every later registration
+declares the pair that the binary will actually read and write. The executor
+requires an exact backend match and mutually castable value types; it never
+changes the canonical pair or allocates a second identity for type drift.
+The mapping is adopted from PR #236's plan.md table, restated against the
+actual active types:
 
 | Rust field type | backend | value_type | optional |
 |---|---|---|---|
@@ -354,11 +358,11 @@ value_type as an associated const (`Property::VALUE_TYPE`, default
 outside the built-in table. `#[derive(Property)]` pins "string" explicitly
 (matching its JSON-in-a-string serialization); a hand-written impl
 producing another `Value` variant declares it (e.g. "i64"), and the
-compiled schema, the registration request, the catalog, and the
-property lookup key all carry the declared type. The invariant is
-documented on the const: VALUE_TYPE must equal the `Value` variant
-`into_value` produces, and changing it for a shipped type is a retype
-(a new property identity, RFC 5.8).
+compiled schema, the registration request, and the catalog all carry the
+declared type. The invariant is documented on the const: VALUE_TYPE must
+equal the `Value` variant `into_value` produces. Changing it for a shipped
+type is a compatibility-checked struct-level retype; it never changes the
+property's canonical type or identity.
 
 value_type strings are the lowercased core::value::ValueType variant names
 (REN vs #236's plan.md prose, which listed a separate `ref` variant; the
@@ -368,8 +372,8 @@ the prose). The `optional` column feeds the MEMBERSHIP record, not the
 property entity, and deliberately does NOT enter any identity key: making a
 field Option<T> or not must not re-key the property or the membership. Future backends and
 value types extend this table; extending it is a spec change, because two
-nodes disagreeing on a mapping row register distinct property identities
-for the same field.
+nodes disagreeing on a mapping row may either be refused at registration or
+operate through casts against the one canonical stored type.
 
 Rationale for dedicated collections over PR #236's `sys::Item` variants in
 `_ankurah_system`:
@@ -622,31 +626,33 @@ in 5.2 remains hygiene, not a correctness requirement.
 
 ### 5.2 Registration lifecycle
 
-**Trigger: model first-use per process, durable registration at first
-use on ANY path (REN 2 revised 2026-07-06).** When a context first
-touches a model M (create, edit, fetch, query, subscribe), the node
-ensures registration of M, all its declared active fields (ephemeral
-fields are excluded, derive/src/model/description.rs:31-40), and the
-(M, property) membership records: check the local catalog map, and if
-the binding is absent, issue the registration operation and AWAIT its
-response; the returned definitions are upserted into the catalog map
-immediately on ack, so schema binding, id-keyed writes, and predicate
-resolution proceed right behind it. Because the operation is an
-idempotent UPSERT (below), a read path whose schema the catalog already
-carries resolves to a no-op plan: nothing is emitted, the policy verb
-is skipped (5.7), and the response simply feeds the map. That is what
-makes first-use registration safe as the read path's warm-up, and it
-closes the replica-lag window: a warm-but-lagging catalog replica
-would otherwise misclassify a just-registered collection as
-anticipated (5.3) and answer empty where the authority has rows. The catalog
+**Trigger: model first-use per process on schema-dependent paths (REN 2,
+as implemented).** Create, edit/commit, predicate fetch, query, and
+subscribe ensure registration of M, all its declared active fields
+(ephemeral fields are excluded, derive/src/model/description.rs:31-40),
+and the (M, property) membership records. The node checks the local
+catalog map and, if the binding is absent or doubtful, issues the
+registration operation and AWAITS its response; the returned definitions
+are upserted into the catalog map immediately on ack, so id-keyed writes
+and predicate resolution proceed behind the same canonical binding.
+Because the operation is an idempotent UPSERT (below), a path whose schema
+the authority already carries resolves to a no-op plan: nothing is emitted,
+the policy verb is skipped (5.7), and the response simply feeds the map.
+This closes the replica-lag window in which a warm-but-lagging catalog
+replica could otherwise answer against an incomplete binding. The catalog
 subscription is a CACHE -- an accelerator and offline enabler (the
-ephemeral catalog queries run cached) -- never the arbiter: any doubt
-is resolved by the registration upsert itself. When registration
-cannot run on a read path (policy denial, no durable peer), the read
-FAILS LOUD with the unregistered-collection error (5.3); mutating
-paths enforce strictly as before. An explicit
-`ctx.register::<M>().await` issues the same operation eagerly (e.g.
-before first render).
+ephemeral catalog queries run cached) -- never the arbiter: registration is
+the doubt-resolver.
+
+A direct get by entity id is the deliberate exception. It does not need a
+predicate binding to locate the row, so it only caches the compiled schema
+for a possible later edit and loads the entity; it does not mint or await
+schema registration. Typed projection then follows the ordinary property
+rules, including `Missing` or per-value `NonCastable` where applicable.
+When registration cannot run on a schema-dependent path (policy denial, no
+durable peer), that path FAILS LOUD with the registration error; mutating
+paths enforce strictly before a write lands. An explicit
+`ctx.register::<M>().await` issues the same operation eagerly.
 
 **Transport: registration is a protocol operation, not a client
 transaction (rev 3), and the operation is an UPSERT with a response
@@ -682,18 +688,21 @@ registers by executing the same operation locally. OFFLINE ephemeral
 flow (rev 4, maintainer-ruled trade): a collection that has NEVER been
 registered on this node cannot be created into while offline; create or
 commit fails with a strict, actionable error ("connect once first").
-Data writes to already-registered collections keep working offline: the
-binding is cached, ids are known, events queue exactly as today. There
-is no offline registration queue; the rev 3 queue-and-drain machinery is
-deleted with derivation.
+Data writes keep working offline only when every field in the exact compiled
+schema already has a compatible canonical binding: the ids are known and
+events queue exactly as today. A merely known collection, a missing field, or
+an incompatible declaration still fails loud. There is no offline
+registration queue; the rev 3 queue-and-drain machinery is deleted with
+derivation.
 
 Two load-bearing rationales (maintainer, 2026-07-05) that any refinement
 of this lifecycle must preserve: (a) DATA FREEDOM: authorized users define
 whatever models and properties they see fit, subject only to PolicyAgent
 approval; schema definition is an ephemeral-node capability, never a
 durable-node privilege (collisions are handled by the upsert: identical
-definitions resolve to one entity, same-name different-type definitions
-are distinct entities under the lookup key). (b) Durable nodes cannot be
+definitions resolve to one entity; a same-name declaration with a different
+type is checked against that entity's canonical type and admitted only when
+mutually castable). (b) Durable nodes cannot be
 assumed to have model definitions AT ALL: model code lives on clients;
 registration must originate from ephemeral nodes and carry everything the
 durable side needs.
@@ -702,14 +711,12 @@ REN vs #85 AC2, twice, both disclosed (section 10): (a) granularity is per
 MODEL, all properties in one transaction, not per accessor touch; the derive
 macro statically enumerates fields (it already does for
 initialize_new_entity, derive/src/model/model.rs:35-40), and per-accessor
-granularity would leak partial schemas and buys nothing. (b) timing on READ
-paths is cache-only rather than a durable upsert; AC2's "read/write accessor
-usage time" had read usage registering durably, but a read-only node
-performing catalog writes is a policy surprise and buys nothing until data
-exists. Whether a query-only node may ALSO write durably stays open as a
-policy question (section 11). REN vs PR #236's "on first trx.create only":
-query paths must at least resolve through the catalog map, because
-predicate resolution needs ids before any create happens on this node.
+granularity would leak partial schemas and buys nothing. (b) predicate reads
+register at first use because resolution requires canonical property ids;
+direct id gets are cache/load-only because locating a known entity id does
+not require a predicate binding. REN vs PR #236's "on first trx.create
+only": query paths also resolve through registration, because predicates
+need ids before any create happens on this node.
 
 **Ordering within the registration execution:** model entities, then
 property entities, then memberships, extending #236's two-phase plan. The
@@ -722,8 +729,10 @@ integrate in any arrival order on other nodes.
 subscribing to the three catalog collections (predicate True) once
 system-ready, and fed IMMEDIATELY by SchemaRegistered responses (the
 response is the fast path; the subscription converges everyone else): by
-(minting model, name, backend, value_type) to property entity id, by id to
-definition, and by model id to its membership set (the contract).
+(minting model, current name) to property entity id, by id to canonical
+definition, and by model id to its membership set (the contract). Backend
+and value_type are compatibility inputs on a lookup hit, never identity
+inputs.
 Name-based lookup of models and properties, one of the maintainer's
 required paths, is this map; it answers "the property named X in
 collection C" through the model's memberships. This is an ordinary
@@ -765,8 +774,8 @@ Identifier {
 ```
 
 produced by a resolution pass that binds `steps[0]` against the queried
-collection's schema binding (catalog-fed: the compiled schema contributes
-names and types, ids exist only in the catalog and its registration
+collection's catalog definition (the compiled schema contributes names and
+types; ids exist only in the catalog and its registration
 responses, 5.2) and leaves the remaining steps as the JSON sub-path (to be typed against the phase-3 schema plan's StructuredKey model
 when that lands; section 7). Resolution failure IS the AC5 fail-closed
 behavior: predicate building returns an UnknownProperty error naming the
@@ -776,9 +785,9 @@ core/src/selection/filter.rs:59-91; reactor unwrap_or(false),
 core/src/reactor/subscription_state.rs:391; SQL assume_null,
 storage/postgres/src/lib.rs:528-548) with one rule: an UNRESOLVABLE
 reference fails at build time; a resolvable reference whose property is
-absent on a given entity evaluates as the registered default under 5.4's
-rules, which is well-defined because resolution proved the property exists
-in the schema. It also subsumes the known assume_null/referenced_columns
+absent on a given entity evaluates as NULL in predicates and policy. Required
+defaults belong only to typed View getters under 5.4. It also subsumes the
+known assume_null/referenced_columns
 first-vs-last-step inconsistency on JSON paths (ankql/src/ast.rs:241-333
 keying on path.property() vs path.first(); acknowledged in a sqlite comment,
 storage/sqlite/src/engine.rs:462-468), because the resolution pass fixes
@@ -826,129 +835,49 @@ supplies the replicated data any future ingress check would consult.
 
 ### 5.4 Read-path semantics (the #175 fix)
 
-Adopted from #236, generalized, gated after adversarial review, and grounded
-in why it is semantically correct rather than a workaround:
+The current rule is deliberately small; type and identity admission happen
+at registration, not while reading:
 
-1. Property registered, present in backend: return the value.
-2. Property registered, absent from backend, optional: None. (Today
-   Option<T> already swallows Missing, core/src/property/mod.rs:19-35.)
-3. Property registered, absent from backend, required: the value type's
-   default ("" for string, 0 for integers, false for bool), SUBJECT TO the
-   sibling gate below. For an operation-based CRDT, "no operations for this
-   field" is a legitimate encoding OF the default: yrs cannot and should not
-   distinguish an empty Text from an untouched one
-   (core/src/property/backend/yrs.rs:155-168). Declaring the default at the
-   schema layer is the honest fix; it makes the empty-string case (#175)
-   read back "" by definition instead of erroring PropertyError::Missing
-   (core/src/property/value/yrs.rs:88-95). The same rule applies uniformly
-   to LWW-backed required properties (decided, was draft open question):
-   post-Phase-A a missing required LWW value means pre-metadata legacy data
-   or a concurrent schema skew, and both read coherently as the declared
-   default under the gate.
-4. **The sibling gate (new, from adversarial review).** Rule 3's default is
-   returned ONLY if no other live property entity sharing this display name
-   has data present on this entity, scanned ACROSS contracts, not just the
-   reading contract's membership set: if a retype lineage from another
-   overlapping contract holds a real value here, fabricating a default over
-   it is exactly the phantom-default hazard, whether or not the reader's
-   contract knows that sibling. If a same-named
-   sibling id (a retype lineage, 5.1) has data here, the read surfaces
-   `PropertyError::TypeSkew` naming both property ids instead of fabricating
-   a default. Without this gate, a String-to-i64 retype would read every
-   pre-retype entity's real "30" as a phantom 0; with it, mid-migration
-   reads are fail-visible, matching this RFC's rename philosophy (5.8).
-   AMENDED (PropertyKey amendment, #289, 2026-07-07): the gate is reshaped to a
-   caller-supplied sibling-id set. `LWWBackend::get_checked(resolved_id, name,
-   sibling_ids)` does pure map-level presence plus the gate; the catalog-aware
-   caller (the compiled View getter through the entity's stamped resolver, or a
-   resolved-identifier predicate) supplies the same-display-name sibling ids.
-   Name-collision detection is a catalog concern, not a backend one. See
-   plan.md decision 27.
-   AMENDED again (read-dispatch amendment, #289, 2026-07-09; implemented on
-   PR #307): get_checked leaves the backend too. The backend's read surface
-   is one presence primitive, `LWWBackend::entry(&PropertyKey) ->
-   Option<Option<Value>>` -- absent vs cleared-tombstone vs value
-   (core/src/property/backend/lww.rs) -- and the rule ladder itself is
-   dispatched OUTSIDE the backend by `lww_read_checked` / `lww_read_lenient`
-   in core/src/property/mod.rs: a present Id entry, even a tombstone, is
-   authoritative and never falls back to Name residue (anti-resurrection);
-   only an absent id consults the sibling gate and then the legacy Name
-   entry. Name-keyed entries in user-collection buffers are LEGACY DATA,
-   read only by that outside fallback; the backend never interprets keys.
-   The ladder ends with a FOREIGN-DATA gate (reformulating plan decision
-   15 for the hint-less regime): on the BOUND getter path only, an absent
-   resolved id over a buffer holding data under ids the catalog cannot
-   name at all (another system's allocations, e.g. a cross-root raw-state
-   copy) fails visible as TypeSkew rather than fabricating a default --
-   without display-name hints the read cannot prove the absent property
-   is not among the foreign data. Predicate evaluation does NOT arm this
-   gate (absent evaluates as NULL by design, plan decision 14, so nothing
-   is fabricated), and unbound reads have no catalog to be foreign to.
-   AMENDED (canonical value_type ruling, #289, 2026-07-10): the sibling gate
-   and the foreign-data gate are REMOVED (plan decision 31; decision 15's
-   read-side half is vetoed by the maintainer). Type and identity admission
-   happen at REGISTRATION -- a non-castable declared type refuses there, and
-   one live property per (model, name) is an allocator invariant -- so by the
-   time any read or query runs, the question the gates asked has already been
-   answered. The dispatch collapses to `read_resolved` in
-   core/src/property/mod.rs, generic over `PropertyBackend::entry`: a present
-   id entry (even a tombstone) is authoritative and never falls back
-   (anti-resurrection unchanged), then legacy Name residue, then absent. Data
-   under a DIFFERENT property id is simply not this field and never
-   substitutes; an out-of-band copied buffer reads as absent (the
-   wire-ingress unknown-model-id rejection is where cross-system data is
-   refused). The only read-time failure is the per-value
-   `PropertyError::NonCastable` projection error (renamed from CastError;
-   TypeSkew is deleted). Policy inspection and predicate evaluation read
-   leniently and have no type-error surface at all.
-5. Property not registered and not in the local schema:
-   PropertyError::UnknownProperty (a new variant; today's Missing keeps its
-   meaning for pre-Phase-A code paths).
+1. Query and policy property references resolve to a property id before
+   evaluation. An unknown reference fails closed with `UnknownProperty`.
+2. Generic backend dispatch reads the resolved Id entry first. A present Id
+   entry, including a cleared tombstone, is authoritative. Only an absent Id
+   may fall back to legacy Name residue.
+3. A typed View getter casts the canonical stored value to its compiled type.
+   An unrepresentable value returns `PropertyError::NonCastable`. When the
+   property is absent, the getter's compiled optionality and Property
+   implementation decide `None`, a required default, or `Missing` for types
+   such as `entityid` that have no fabricable default.
+4. Predicate evaluation and policy inspection canonicalize defensively. An
+   absent or uncastable value evaluates as NULL with a warning, never as a
+   type error. Data under a different property id is not this field and never
+   substitutes for it.
 
-Optionality sourcing (decided, from adversarial review; adjusted for
-contracts): optionality is a property OF A MEMBERSHIP, so the flag consulted
-is the one on the (model, property) membership for the contract in play:
-the View getter's model, or the model bound to the queried collection for
-predicate evaluation. When that resolution is ambiguous (several models
-bound to the queried collection carry memberships for the property and
-disagree, or none does), the property is treated as OPTIONAL: absent reads
-as None, never a fabricated default, the same safe-direction bias as the
-partial-metadata rule below. The same property shared by two models can be
-required in one and optional in the other, coherently. A membership whose
-`optional` follow-up has not yet arrived is treated as optional (absent
-reads as None), never defaulted, because fabricating a default on partial
-metadata is the one non-recoverable misread. The View getter continues to
-obey its COMPILED optionality (its return type is fixed at compile time);
-engines, predicate evaluation, and dynamic bindings obey the catalog
-membership flag. A node whose compiled flag disagrees with the converged
-membership flag is the mismatched-code case (5.6): each consumer is
-internally coherent, the catalog makes the disagreement observable, and
-`optional` stays out of every identity key because flipping optionality
-must not re-key data.
+There are no sibling, foreign-data, or backend-specific type gates on the read
+path, and `TypeSkew` is deleted. Cross-system data is refused at wire ingress
+by model id; an out-of-band copied foreign property id reads as absence.
 
-Two notes. First, for the View getter specifically, required-ness and type
-are compile-time knowledge, so rule 3 is implementable locally before the
-catalog exists; the catalog extends the same rule to predicate evaluation,
-engines, and non-Rust bindings, which is where schema truth must be data.
-Second, the degenerate #175 case (every field empty, so zero operations, so
+Optionality remains membership metadata because the same shared property can
+be required by one model and optional in another. The Rust View getter obeys
+its compiled return type. Predicate evaluation does not fabricate required
+defaults and therefore does not need membership optionality; absent is NULL.
+Future dynamic typed bindings can consult the membership flag without making
+it part of property or membership identity.
+
+The degenerate #175 case (every field empty, so zero operations, so
 no creation event and no persisted entity, tests/tests/yrs_backend.rs:300-305)
 is fixed by allowing creation events with an empty operation set rather than
 skipping event generation; EventId hashes fine over empty operations
 (proto/src/data.rs:15-24), and a zero-op genesis is exactly what "an entity
-whose every field is default" means under rule 3. This piece is independent
-of the catalog and could land with Phase A.
+whose every field is default" means. This piece is independent of the catalog.
 
 ### 5.5 Wire and state impact (phased identity keying)
 
-AMENDED (PropertyKey amendment, #289, 2026-07-07): the LWW `SchemaBinding` plus
-`WireMode` plus bind-at-assembly machinery described in this section is REPLACED
-by the uniform `PropertyKey` contract (plan.md decision 27). The backend holds
-no binding and no wire mode; identity is carried by the key, resolution moves to
-the catalog-aware write path, and the wire is a single id-keyed tagged map (the
-leading version byte still decodes legacy 0xA1 and pre-0.9 buffers, but only the
-id-keyed form is emitted). The Phase C "defer yrs rekeying; roots stay
-name-keyed" decision below is OVERRIDDEN: yrs is uniform `PropertyKey` (id-named
-roots) like every other backend.
+The PropertyKey amendment (#289, 2026-07-07) is the current contract. It
+replaced the proposal-time `SchemaBinding`, `WireMode`, and bind-at-assembly
+design before release. The backend holds no binding or mode; identity is
+carried by the key and resolution belongs to catalog-aware callers. Yrs uses
+the same PropertyKey contract as every other backend.
 
 AMENDED (model-id envelope amendment, #289, 2026-07-09; implemented on PR
 #307 together with the engine column maps under Phase C below): the
@@ -979,130 +908,74 @@ payload references (`#[serde(default)] schema: Vec<StateWithGenesis>`;
 core/src/node.rs schema_states_for_models /
 ingest_schema, tracked per peer in PeerState.announced_models); receivers
 accept non-empty batches only from the pinned founder, validate each state and
-genesis, and atomically ingest the complete strict batch BEFORE processing the body;
-definitions never ride inside events or state buffers. (e) Catalog warmth
+its exact genesis proof, parse the complete batch strictly, and atomically
+bootstrap only missing catalog entries BEFORE processing the body. A malformed
+or partial batch leaves the catalog unchanged, and shipped snapshots never
+overwrite an existing descriptor or roll mutable fields backward; the ordinary
+catalog stream is the sole update path. Definitions never ride inside events
+or state buffers. (e) Catalog warmth
 participates in readiness through the existing ensure_subscribed /
 context_async gates. (d) The engines' truncated-id fallback naming (Phase C
 amendment below) stays as a loud belt-and-suspenders net that should never
-fire. Ships as PROTOCOL_VERSION = 3 (proto/src/peering.rs).
+fire. This metadata envelope shipped as PROTOCOL_VERSION = 3
+(proto/src/peering.rs); the identity-attestation amendment below advances the
+current protocol to v6 without changing its schema semantics.
 
-The load-bearing observation: property names appear on the wire in exactly
-two places, inside opaque backend payloads (LWW diff/state maps, yrs update
-root names) and inside query ASTs (grep-verified: no property-id or field-id
-concept exists in shipped proto/core/derive code today; the phase-3 schema
-PLAN's u32 PropertyId is unbuilt and reconciled in section 7). The proto
-Event, OperationSet, EntityState, and StateBuffers shapes never change under
-this design; they are keyed by backend name, not property name
-(proto/src/data.rs:102-204). Rev 3 collapses what were three separately
-gated changes into one protocol epoch behind #294:
+The delivered storage contract is uniform across property backends. Backends
+hold no schema binding or wire mode; every entry is addressed by a tagged
+`PropertyKey::{Id, Name}` supplied by the catalog-aware caller.
 
-- **Phase 0: #294.** Protocol version in the Presence handshake with
-  decided refuse-vs-degrade semantics. Hard prerequisite for everything
-  user-visible below; both the event/state encoding bump and the
-  request-message AST change (#294's general "on-disk or wire format"
-  clause covers request framing even though its motivating example is
-  event encoding) ride the version negotiation it introduces.
-- **Phase A: the id-keyed contract, the catalog, and registration, as one
-  epoch.**
-  - The catalog collections and the registration operation (4, 5.2).
-  - LWW: diff version 2 (LWWDiff.version, currently 1,
-    core/src/property/backend/lww.rs:18) and state buffer version 0xA2
-    (currently 0xA1 with a pre-0.9 legacy fallback,
-    core/src/property/backend/lww.rs:30-42, 154-185), maps keyed by
-    EntityId (32 bytes) instead of name, from day one. Old 0.9 nodes
-    REFUSE unknown versions cleanly rather than misreading them
-    (core/src/property/backend/lww.rs:176-180), which is the right failure
-    mode, and #294 turns it from an error into a negotiated capability.
-    Reads of v1/legacy buffers translate name-to-id through the schema
-    binding and catalog, with lazy rewrite-on-save, exactly the 0.9
-    legacy-fallback precedent; that fallback runs from the first release
-    rather than arriving in a later phase. Catalog-collection writes are
-    exempt (section 4): catalog and system collections stay name-keyed
-    v1/0xA1 forever under the bootstrap exemption, so metadata
-    replication is immune to this and every future bump.
-  - Query ASTs carry the resolved Identifier (5.3); Fetch/SubscribeQuery
-    Selections are bincode, not self-describing, so this is a hard wire
-    break for those messages, absorbed by the same epoch.
-  - Rationale for the collapse (maintainer, 2026-07-05): the data contract
-    should pass model and property ids over the wire immediately; shipping
-    an intermediate name-keyed-with-catalog state would mean migrating
-    twice.
-- **Phase C: engine-level identity binding.** (Engine storage is node-local,
-  so this phase is NOT wire-gated; it consumes the catalog.)
-  - Yrs (decided; timeless, not engine-specific): root names are embedded
-    in the yrs update encoding and cannot be
-    rekeyed without rewriting CRDT history. **Decision (was draft open
-    question): defer yrs rekeying entirely.** Roots stay property-name-keyed
-    for all entities; the catalog binds root name to property id at the
-    ankurah boundary; renames keep working because the root name is just a
-    key the binding maps to. Less code, no dual-root lookup, identical
-    rename behavior. Revisit trigger: if per-field wire addressing ever
-    needs the root itself to carry identity, id-named roots for new entities
-    is the fallback design, and nothing here forecloses it.
-  - Sled: swap the property_config key from name bytes to entity id bytes
-    (storage/sled/src/property.rs:32-63); the u32 compaction and
-    materialized row format are untouched.
-  - Postgres/sqlite: columns REMAIN named by property name for human
-    queryability -- a materialization concern per section 3's
-    property-graph framing (indexing strategy plus admin legibility,
-    never the data model). Each engine keeps its OWN persisted column
-    binding: which column materializes which property definition entity
-    id (the sled property_config precedent generalized), because display
-    names are mutable and collisions are resolved engine-locally. A
-    rename becomes ALTER TABLE RENAME COLUMN driven by observing the
-    catalog change; a display-name collision among live property ids
-    (a retype lineage, a policy-permitted stale-writer fork, or
-    same-named properties across overlapping contracts) keeps the first
-    claimant's bare column and disambiguates newcomers with a short
-    suffix drawn from the property id (e.g. `name` for property
-    aaaa..., `name_bb` for bbbb...). Ratified as the mental model
-    2026-07-06; implementation stays in Phase C. This finally gives the
-    postgres TODO its property ids (storage/postgres/src/lib.rs:368-373).
-    AMENDED (engine column-map amendment, #289, 2026-07-09; implemented on
-    PR #307, accelerating this bullet and the sled rekey out of Phase C):
-    every engine now keeps a DURABLE property-id -> column map, seeded from
-    the injected catalog resolver (StorageEngine::set_property_resolver) at
-    set_state and consulted on every read. Postgres and sqlite persist it in
-    an ankurah_property_columns table (UNIQUE(collection, column_name);
-    insert-if-absent with winner read-back so concurrent claimants
-    converge); sled in a property_columns tree; IndexedDB in a
-    property_columns object store (assignment runs as a pre-pass before the
-    entities transaction because IndexedDB auto-commits across foreign
-    awaits). Naming (core/src/storage.rs, naming module): the sanitized
-    display name; a collision appends the trailing four or more characters
-    of an identifier-safe, injective base32 encoding of the property id
-    ({name}_{suffix}, widening through all 256 bits until unique); an
-    unresolvable name uses the same full-id token behind a synthetic prefix, loudly
-    (the policy-d net above; expected never to fire). Bare property ids
-    NEVER appear as column names, and generated names stay within
-    PostgreSQL's 63-byte identifier limit. Reads: fetch_states translates the
-    resolved Selection into engine column space ONCE at its top
-    (selection_to_column_space: Identifier by property id through the map,
-    order-by names through the resolver), so retype lineages and renamed
-    properties address distinct columns correctly; residual bare Paths are
-    rejected earlier, at the resolution pass (AC5), deliberately NOT at the
-    engine seam, because system-collection storage queries legitimately run
-    name-addressed. Envelope stamping is LAZY: a scan that matches nothing
-    never demands a model id (resolution is checked on the first hydrated
-    row), so a cold catalog cannot fail an empty fetch (e.g. the ephemeral
-    known_matches pre-fetch against a never-stored collection), and an
-    absent-entity get_state surfaces EntityNotFound, never a
-    model-resolution error. Rename DDL (ALTER TABLE RENAME COLUMN on catalog
-    change) remains Phase C. The durable MODEL <-> TABLE map half remains
-    deferred with #304: buckets stay collection-string-keyed until storage
-    APIs are keyed by model.
-  - IndexedDB: entity objects hold property-name fields
-    (storage/indexeddb-wasm/src/collection.rs:73-81); same treatment as
-    SQL: names bound via catalog, lazily re-materialized on rename.
-- Size cost, estimated: a 32-byte id key vs a typically shorter name string
-  in LWW maps. Negligible against event framing overhead; sled rows are
-  already u32-compacted.
+- LWW diff version 2 and state version 0xA2 each encode one
+  `BTreeMap<PropertyKey, ...>`. Legacy diff v1, state 0xA1, and pre-0.9
+  buffers still decode, normalizing their string keys to `PropertyKey::Name`.
+  Every save emits the current tagged form. A registered user commit resolves
+  staged names to `Id` before event generation; system/catalog fields and
+  unresolved legacy residue remain `Name`. A present Id entry, including a
+  tombstone, is authoritative; only an absent Id may fall back to Name
+  residue.
+- Yrs names each root from the same `PropertyKey`. New registered fields use
+  id-named roots; system/catalog or unresolved fields use name roots. Existing
+  CRDT history cannot be re-keyed, so a migrated field whose history still
+  exists only under its legacy name continues reading, editing, and observing
+  that root. Once an id root exists, it is authoritative.
+- Query ASTs carry resolved `Identifier` nodes, and each resolved ORDER BY
+  item carries the same stable property id beside its display path. The id
+  keeps a relayed/rebuilt sort stable across a catalog rename; the path remains
+  the SQL/physical-column hint. Fetch and SubscribeQuery are bincode shapes,
+  so this is a hard wire change rather than a local planner detail.
 
-Sequencing note required by #296: Phase A is a wire/format change and MUST
-NOT ship to mixed fleets before Phase 0 (#294) gives the Presence handshake
-a protocol version with decided refuse-vs-degrade semantics. Within a
-fleet, durable nodes upgrade first (receiver-side protection, section 4).
-Phase C is engine-local and carries no wire dependency of its own.
+Materialized storage is a separate concern. Every engine maintains a durable
+property-id to physical-column map, seeded from the injected catalog resolver
+at `set_state` and consulted on reads. PostgreSQL and SQLite persist it in
+`ankurah_property_columns`; sled uses `property_columns`; IndexedDB uses a
+`property_columns` object store. The first claimant receives the sanitized
+display name; a collision appends a widening suffix from an identifier-safe,
+injective base32 encoding of the full 32-byte property id, widening through
+all 256 bits until unique while staying within the physical identifier limit.
+Renames do not change identity, and physical column assignments remain sticky
+until explicit rename/rematerialization work changes them. A selection is
+translated into physical column space once at the engine boundary; ORDER BY
+retains the property's canonical value_type even when its physical name is a
+sticky pre-rename column. Empty scans resolve the model lazily, so an absent
+row reports `EntityNotFound` rather than a cold-catalog error. The durable
+model-to-table map remains deferred with #304.
+
+These changes ship together behind protocol v3. Presence negotiation refuses
+incompatible peers before registering a connection; the same epoch covers
+the model-id data envelopes, registration messages, resolved selections, and
+backend payload changes. Durable nodes upgrade first. Engine column maps are
+node-local, but they consume the catalog contract introduced by that epoch.
+
+AMENDED by the identity-attestation RFC (2026-07-11): protocol v6 retains the
+metadata epoch above but replaces its handshake and peer framing. Both peers
+issue a `HandshakeChallenge` containing a fresh 32-byte nonce and accept only
+a signed `Presence` that answers the receiver-issued challenge. Every later
+`NodeMessage` travels in a signed, sequenced `SignedPeerMessage` bound to that
+session; core verifies the session, signer, declared sender, and bounded replay
+window before dispatch. The first three v5 outer `Message` discriminants stay
+fixed and the challenge appends as the next kind. The shared wire codec encodes
+and decodes exactly one bounded frame and rejects oversize or trailing bytes,
+so an older Presence cannot be reinterpreted as a v6 challenge or frame.
 
 ### 5.6 Mismatched model code across nodes
 
@@ -1133,7 +1006,7 @@ Phase C is engine-local and carries no wire dependency of its own.
   cast-at-comparison alone cannot cure a mixed-type stored population; a
   value the canonical type cannot represent fails that writer's commit), its
   getters cast canonical values back to the compiled type (per-value
-  failures surface as the fail-visible CastError), comparison literals
+  failures surface as `PropertyError::NonCastable`), comparison literals
   canonicalize in the resolution pass, and readers defensively canonicalize
   at the read/evaluation boundary (ingest stays schema-blind per the
   catalog-lag rule below, so a legacy or ill-typed payload under a known id
@@ -1238,8 +1111,7 @@ under the new name. Semantics, normative regardless of the attribute form:
   the hinted lookup HITS. If a property already exists under the current
   name, the hint no-ops and the existing property wins (the old lineage
   stays orphaned and visible); the executor never merges two identities
-  and never creates a second live property under one (model, name,
-  backend, value_type) key.
+  and never creates a second live property under one (model, name) key.
 - Chained renames update the hint in place (a to b to c ships
   renamed-from-b once b has rolled out). A system that skipped the
   intermediate deploy no-ops the hint and allocates fresh: the same
@@ -1249,7 +1121,8 @@ under the new name. Semantics, normative regardless of the attribute form:
 **The attribute form (maintainer ruling, 2026-07-06):
 `#[property(renamed_from = "title")]`, as a convenience, with explicit-id
 binding intact.** The hint matches by OLD NAME (same model, same
-backend/value_type). It is PORTABLE: one binary applies the same rename
+property identity); the ordinary canonical compatibility check then applies
+to the declaring backend/value_type. It is PORTABLE: one binary applies the same rename
 on every system it deploys to (dev, staging, prod, self-hosted), each
 updating its own allocated id; the attribute is removable after rollout.
 Residual risk is name-shaped: if some system carries a semantically
@@ -1280,12 +1153,12 @@ registrations from ever hijacking it. A system that does not want stale
 writers minting refuses it through the ordinary PolicyAgent gate, in
 either style: object-based (no write access to a property definition
 meeting that description) or principal-based (this user may not define
-schema). A denied registration follows the standing denied path (5.2):
-the collection stays bound, the data write proceeds, and the
-unregistered field lands as name-keyed residue, converging whenever a
-later binding or migration resolves the name. No dedicated convergence
-mechanism (a former-names lookup fallback was considered) is added: the
-fork is a policy decision, not a protocol one.
+    schema). A denied registration prevents the stale write when its old field
+    has no compatible canonical binding. An unavailable reassertion may proceed
+    only when every compiled field is already bound compatibly; a registered
+    user collection never emits a newly unregistered field as Name residue.
+    No former-names lookup fallback is added: the fork remains a policy
+    decision, not a protocol one.
 
 SQL columns follow a rename via the catalog-driven RENAME COLUMN (5.5),
 unchanged. Display-name updates are ordinary provenance-ordered follow-ups
@@ -1311,9 +1184,15 @@ pub label: String,                       // possibly shared, property entity
 ```
 
 Semantics: an explicit id bypasses the by-name lookup entirely.
-Registration looks the entity up executor-side; it verifies the field's
-(backend, value_type) against the definition and fails registration on
-mismatch (the same fail-closed posture as AC5); it ensures the (model,
+Registration looks the entity up executor-side and applies the same canonical
+compatibility rule as by-name registration: backend must match exactly and
+value_type must be mutually castable with the stored canonical value_type.
+Derived field access carries that literal id beside the local field name, so
+getters, mutations, listeners, predicates, and ORDER BY remain bound to the
+definition even when the local name differs or the catalog display name is
+later renamed. The local name remains only the legacy-residue fallback.
+An incompatible binding fails registration; a castable declaration is
+admitted and the response returns the canonical pair. Registration ensures the (model,
 property) MEMBERSHIP exists, allocating it on miss (5.1); it never
 mutates the bound property entity's type pair (backend and value_type are
 verify-only; display-name behavior under binding follows the 5.8 ruling).
@@ -1324,11 +1203,27 @@ consequences, stated as design rather than left implicit. Cold start: if
 the authoring producer has never registered in this system, the binder's
 registration HARD-FAILS; deployments using explicit binding must guarantee
 the definition exists first (DDL application or eager registration of the
-authoring model is the intended provisioning step). Drift: if a bound
-definition is later retyped, every binder's verification fails until
-rebuilt; retyping a shared property is a breaking change for its binders BY
-DESIGN (fail-visible, consistent with 5.6; a declared-coercion escape hatch
-is future schema-evolution work, section 6).
+authoring model is the intended provisioning step). Drift in a binder is
+handled by that same compatibility rule: castable drift uses the definition's
+canonical type, while a different backend or non-castable value type fails
+loudly. The definition itself is immutable after allocation.
+
+The literal id is also the compiled field's runtime address, not registration
+metadata that is discarded afterward. Derive-generated Model initialization,
+View getters, Mutable accessors, listeners, predicates, and ORDER BY retain the
+id even when the Rust field name differs from the catalog definition's current
+display name. Reads may fall back to legacy residue under the local name only
+when the id entry/root is absent; LWW writes and new CRDT roots use the id and
+undergo the same canonical value_type conversion as any other id-keyed write.
+A migrated Yrs field whose history already lives under the legacy name keeps
+editing that root because CRDT history cannot be re-keyed. Query alias
+resolution becomes available only after that exact compiled schema shape has
+registered successfully and the catalog holds its live model/property
+membership. If two ensured compiled declarations map one local name to
+different ids, resolution fails closed as ambiguous. Active-type integrations
+receive the complete `(local name, optional explicit id)` address at their
+`FromEntity` / `InitializeWith` boundary so a backend cannot silently erase
+explicit identity.
 
 **Sharing.** This is how properties are shared between models: model B
 binds model A's property id (or a DDL-authored property's id); B's
@@ -1476,9 +1371,9 @@ shaped so the differ has nothing special to do.
 | Case | Mechanism here | Lands |
 |---|---|---|
 | Empty-string family (#175, #236) | Read-path rules keyed by registration; zero-op creation events (5.4) | Phase A |
-| Schema evolution | Stable identity under rename via the transient hint (5.8); retype = new identity, fail-visible reads (5.1, 5.4, 5.6); ids on the wire | Phase A (SQL rename DDL follows in Phase C) |
+| Schema evolution | Stable identity under rename via the transient hint (5.8); struct-level retypes reuse that identity through the canonical-type compatibility check (5.1, 5.6); ids on the wire | Phase A (canonical-type migration and SQL rename DDL follow later) |
 | SQL column identity | Catalog-bound columns, rename DDL, collision suffixes (5.5) | Phase C |
-| Cross-node strategy agreement | (backend, value_type) in the property lookup key; divergence catalog-visible AND data-separated (id-keyed payloads) (5.6) | Phase A |
+| Cross-node strategy agreement | One canonical (backend, value_type) per property; registration admits castable drift and refuses incompatible declarations; payloads are id-keyed (5.6) | Phase A |
 | Per-field addressing | Property entity id as the stable key for signals, policy, indexes (5.7, 7) | Foundation only; consumers later |
 | Introspection | Catalog collections queryable with ordinary predicates (4) | Phase A |
 
@@ -1494,18 +1389,19 @@ shaped so the differ has nothing special to do.
   operation with policy gate and receiver-side catalog protection (4,
   5.2), the strict never-registered-offline error (5.2), catalog
   subscription and map with response-fed upserts, wait_catalog_ready, and
-  hard_reset flushing (5.2), LWW diff v2 and state 0xA2 keyed by property
-  id with the legacy name-keyed fallback and lazy rewrite (5.5), ankql
+  hard_reset flushing (5.2), uniform `PropertyKey::{Id, Name}` backend maps
+  with id-keyed writes for registered user collections and legacy Name
+  fallback on reads (5.5), ankql
   Identifier on the wire with resolution preceding serialization and
-  receiver-side validation pass-through pending #274 (5.3), read-path
-  rules with the sibling gate (closes #175, including zero-op creation
-  events), reserved-prefix enforcement, UnknownProperty and TypeSkew
-  errors, the transient rename hint (5.8, renamed_from per the
+  receiver-side validation pass-through pending #274 (5.3), generic
+  id-then-legacy-name reads, canonical evaluation, and zero-op creation
+  events (5.4), reserved-prefix enforcement, `UnknownProperty` and
+  `NonCastable` errors, the transient rename hint (5.8, renamed_from per the
   2026-07-06 ruling), explicit id-binding attributes for models and properties
   including shared-property membership (5.9; the attribute is parsed and
   enforced here, while portable AUTHORING of id values gets ergonomic
-  with Phase D's codegen/DDL tooling). Yrs stays name-rooted by decision
-  (5.5).
+  with Phase D's codegen/DDL tooling). Yrs uses the same PropertyKey contract
+  and id-named roots for registered properties (5.5).
 - **Phase C (engine-local, no wire gate):** sled property_config rekey;
   postgres/sqlite catalog-bound columns with rename DDL and collision
   suffixes; IndexedDB re-materialization on rename; all while keeping the
@@ -1526,21 +1422,17 @@ Phase A.)
 ## 10. Renegotiations of #85, collected
 
 1. AC2 trigger granularity: per model at first use, not per accessor
-   (5.2). The upsert key itself is exactly AC2's (collection, name, type
-   identifier), concretized as (model entity, current name, backend,
-   value_type) under section 4's normative mapping; rev 4 made the upsert
-   literal (a durable-side lookup-or-create) rather than derivational.
-2. AC2 read-path timing: REVISED 2026-07-06 (second ruling). As first
-   ratified, read-only usage resolved through the catalog map without
-   durably upserting. Rev 4's replica-lag experience (a warm replica
-   misclassifying a just-registered collection as anticipated, answering
-   empty where the authority had rows) restored AC2's original
-   parenthetical: read accessors DO register at first use -- safely,
-   because the rev 4 operation is an idempotent upsert whose no-op plan
-   emits nothing and skips the policy verb (5.7). Denied or offline
-   registration fails loud (5.3, same-day corollary ruling); read-only
-   principals in schema-complete deployments are unaffected because
-   their registrations resolve to no-op plans.
+   (5.2). The allocator lookup key is (model entity, current name). Backend
+   and value_type are checked against the canonical definition on a hit;
+   they do not participate in identity. Rev 4 made the upsert literal (a
+   durable-side lookup-or-create) rather than derivational.
+2. AC2 read-path timing: schema-dependent predicate fetch/query/subscribe
+   paths register at first use through the idempotent upsert. Direct entity-id
+   gets are the implemented exception: they cache the compiled schema and
+   load the entity without minting identity. Denied or offline registration
+   fails loud on paths that require it (5.3); an already-complete schema
+   resolves to a no-op plan that emits nothing and skips the policy verb
+   (5.7).
 3. AC4 vehicle: a new resolved `Identifier` node produced by a resolution
    pass, rather than mutating `PathExpr` in place (5.3); PathExpr remains
    the parse-time form.
@@ -1554,7 +1446,8 @@ Phase A.)
    registration; rev 4 requires the allocating durable node for FIRST
    registration and makes offline creation into a never-registered
    collection a strict error, maintainer-ruled acceptable 2026-07-06.
-   Offline data writes to registered collections are unaffected.
+   Offline data writes are unaffected only for an exact compiled schema whose
+   fields are all already bound compatibly in the local catalog.
 
 Everything else in #85 is adopted as written, including the
 `_ankurah_property` collection name (AC1) that PR #236 had moved away from.
@@ -1562,13 +1455,15 @@ Everything else in #85 is adopted as written, including the
 ## 11. Open questions (for #289 discussion)
 
 1. **ULID timestamp bits in derived ids** (5.1): SUPERSEDED by rev 4 and
-   the later identity-attestation RFC. Allocated ids are full genesis-event
-   hashes; the advisory genesis timestamp is input, not an ordered ID prefix.
-2. **Registration writes from read-only contexts** (5.2): RESOLVED
-   2026-07-05 as strictly cache-only for readers; REVISED 2026-07-06 --
-   reads register at first use through the idempotent upsert (an
-   existing schema is a no-op plan: no events, no policy question),
-   with denial/offline failing loud per 5.3. See renegotiation 2.
+   the later identity-attestation RFC. Rev 4 originally allocated real ULIDs;
+   current EntityIds are full 32-byte genesis-event hashes. The advisory
+   genesis timestamp and fresh nonce are preimage inputs, not an ordered id
+   prefix.
+2. **Registration writes from read-only contexts** (5.2): RESOLVED by the
+   implemented path split. Predicate fetch/query/subscribe registers at first
+   use through the idempotent upsert; direct entity-id get only caches and
+   loads. An existing schema is a no-op plan, while denial/offline fails loud
+   only on paths that require registration. See renegotiation 2.
 3. **sys::Item::Collection disposition** (4): superseded by the
    Collection-vs-Model terminology deconfliction, tracked as #305
    (maintainer direction: Collection becomes a storage-only concern;
@@ -1598,10 +1493,10 @@ Everything else in #85 is adopted as written, including the
     documented constraint (#309); a real allocator protocol (leases or
     consensus) is future work there.
 
-(Resolved during adversarial review, recorded in their home sections: yrs
-root strategy = defer rekeying, 5.5; LWW required-missing = uniform default
-under the sibling gate, 5.4; relay validation = pass-through until #274,
-5.3; optionality-unknown fallback = optional, 5.4.)
+(Resolved during adversarial review and later amendments, recorded in their
+home sections: Yrs uses id-named roots under the uniform PropertyKey contract,
+5.5; required defaults and absent-as-NULL behavior are separated by consumer,
+5.4; relay validation remains pass-through until #274, 5.3.)
 
 ## 12. References
 

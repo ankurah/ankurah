@@ -1,13 +1,23 @@
 use anyhow::Result;
 
-use crate::{entity::Entity, error::RetrievalError, property::PropertyName, value::CastError};
+use crate::{
+    entity::Entity,
+    error::{MutationError, RetrievalError},
+    property::PropertyAddress,
+    value::CastError,
+};
 
 use thiserror::Error;
 
 use super::Value;
 
 pub trait InitializeWith<T> {
-    fn initialize_with(entity: &Entity, property_name: PropertyName, value: &T) -> Self;
+    /// Construct and initialize an active field from its compiled address.
+    /// Implementations must honor `explicit_id` when present; taking the
+    /// address as the required API (rather than a name-only default) keeps
+    /// third-party active types from silently discarding explicit identity.
+    fn initialize_with(entity: &Entity, property: PropertyAddress, value: &T) -> Result<Self, MutationError>
+    where Self: Sized;
 }
 
 #[derive(Error, Debug)]
@@ -80,7 +90,10 @@ impl From<serde_json::Error> for PropertyError {
 }
 
 pub trait FromEntity {
-    fn from_entity(property_name: PropertyName, entity: &Entity) -> Self;
+    /// Bind an active field to an entity using its complete compiled address.
+    /// Implementations must preserve an explicit id for reads, writes, and
+    /// listener identity rather than resolving only by display name.
+    fn from_entity(property: PropertyAddress, entity: &Entity) -> Self;
 }
 
 pub trait FromActiveType<A> {

@@ -12,28 +12,31 @@ pivot (schema_id derivation, the frozen genesis encoder,
 self-certification, the anchor apparatus, the offline queue). Group 12
 records the pivot work itself.
 
-## 1. Phase 0: #294 protocol version (separate PR off main)
+## 1. Phase 0: #294 protocol negotiation (folded into PR #307)
 
-DONE: PR #306; decision record posted on #294.
+DONE in the metadata epoch. The standalone PR #306 did not merge; its
+handshake work was folded into #307 and the final released epoch is protocol
+v3.
 
-- [x] `PROTOCOL_VERSION: u32 = 1` in proto; `protocol_version: u32`
-      appended as the last field of `Presence`; compatibility check
-      isolated in one function (equality for now).
+- [x] `protocol_version: u32` appended as the last field of `Presence`;
+      compatibility isolated in one equality check. The initial handshake
+      step used version 1; the final folded metadata epoch releases as v3.
 - [x] `Message::PresenceRejected { expected: u32, received: u32 }`
       variant.
-- [x] Fallible `register_peer`: version mismatch (including implied
-      version 0) refuses with `PresenceRejected` sent best-effort, then
-      teardown via the existing deregister path; all four connectors
-      (websocket-server, websocket-client, websocket-client-wasm,
-      local-process) propagate the refusal and close instead of
-      dropping the frame.
+- [x] Fallible `register_peer`: a decoded version mismatch refuses with
+      `PresenceRejected` sent best-effort, then teardown via the existing
+      deregister path; all four connectors (websocket-server,
+      websocket-client, websocket-client-wasm, local-process) propagate the
+      refusal and close instead of dropping the frame. An implied version-0
+      handshake cannot decode as the current `Presence`, so it logs actionable
+      guidance and closes without a rejection payload.
 - [x] Presence decode failure before establishment closes the
       connection with an actionable log (version-0 peer guidance)
       instead of leaving it open.
-- [x] Tests: same-version connect; mismatch refused in both directions
-      (rejection observed); hand-crafted version-0 Presence bytes
-      (old-shape mirror enum) refused without panic; existing
-      integration suite green.
+- [x] Tests: same-version connect; decoded mismatch refused in both directions
+      (rejection observed); hand-crafted version-0 Presence bytes (old-shape
+      mirror enum) classified and closed without panic; existing integration
+      suite green.
 - [x] Close out #294: record refuse-semantics decision and the deferred
       policy-hook question on the issue.
 
@@ -62,8 +65,9 @@ DONE: PR #306; decision record posted on #294.
       four system collections.
 - [x] `_ankurah_` prefix reservation in CollectionSet::get (user paths
       refused, system callers allowed); test.
-- [ ] Catalog entity accessors in the SysRoot raw-entity style (system
-      models; never derive(Model)).
+- [x] Catalog entities use raw parsers in `core/src/schema/catalog.rs` and
+      creation/follow-up writers in `core/src/schema/registration.rs` (never
+      derive(Model)).
 - [x] proto descriptors (ModelDescriptor, PropertyDescriptor,
       MembershipDescriptor) + `NodeRequestBody::RegisterSchema`.
 - [x] Durable-side executor (REWORKED by rev 4, group 12): upsert by
@@ -78,20 +82,21 @@ DONE: PR #306; decision record posted on #294.
       tests.
 - [x] Tests (REWORKED by rev 4): registration from descriptors alone on
       a schema-less server; upsert idempotence (same ids, zero events);
-      renamed_from lineage moves + guard + stale-writer fork; retype
-      mints distinct identity; explicit-id sharing with per-contract
-      optionality; not-found and retype-mismatch hard-fails; ephemeral
-      refusal; policy-verb denial.
+      renamed_from lineage moves + guard + stale-writer fork; castable
+      retypes reuse one identity and return the canonical type; incompatible
+      declarations fail with zero writes; explicit-id sharing with
+      per-contract optionality; ephemeral refusal; policy-verb denial.
 - [x] [REMOVED rev 4] Relay-side self-certification in
       NodeApplier::validate_and_stage and its
       tests/tests/catalog_genesis_relay.rs suite. Deleted; relayed
       catalog events are policy-trusted allocator output behind the
       structural write ban.
-- [ ] Multi-durable propagation: CommitTransaction is refused for
-      catalog collections by design, so durable-durable catalog
-      transport is the registration operation re-issued or the
-      subscription relay; decide and implement with group 4.
-- [ ] Policy-denial test (needs a denying PolicyAgent fixture).
+- [x] Multi-durable scope disposition: PR #307 requires registrations in one
+      system to route to a single allocator. Allocator discovery/consensus for
+      multi-durable deployments is explicitly deferred to #309; it is not an
+      unfinished metadata-epoch task.
+- [x] Policy-denial test (`schema_registration.rs`: resolved-plan denial
+      proves zero writes).
 - [x] Client lifecycle: DONE with group 8 (see group 8 trigger entry).
 
 ## 4. Catalog subscription and map
@@ -111,72 +116,65 @@ DONE: PR #306; decision record posted on #294.
       via a reset hook installed on SystemManager; tests for both
       (tests/tests/catalog_map.rs, 6 tests incl. rename re-indexing and
       ephemeral live updates).
-- [ ] StorageEngine::list_collections overrides for postgres, sqlite,
-      and IndexedDB (#310; the default is empty and sled is the only
-      override). Until they land, a RESTARTING durable node on those
-      engines warms the catalog map LAZILY. Identity stays safe
-      regardless: the allocator double-checks durable storage on every
-      map miss (registration.rs *_lookup_checked, added after external
-      review found the restart double-allocation hazard). What the
-      overrides still buy: eager startup warm, and scanning existing
-      catalog trees without materializing empty ones. Small,
-      engine-local; fits Phase C or earlier.
+- [x] `StorageEngine::list_collections` overrides for PostgreSQL, SQLite,
+      IndexedDB, and sled. Restarting durable nodes can eagerly discover
+      catalog collections; allocator storage checks remain the identity
+      backstop on any map miss.
 
 ## 5. LWW v2 / state 0xA2
 
-- [x] Wire shapes: LWW_DIFF_VERSION_2, LWW_STATE_VERSION_2 (0xA2);
-      by_id + residue two-map payloads; round-trip tests.
-- [x] In-memory PropertyKey::{Id, Name} over the ValueEntry lifecycle;
-      SchemaBinding (bind_schema migration) and WireMode per instance;
-      default NameKeyedV1 byte-identical to today, so catalog/system
-      collections are pinned by default. DORMANT until integration.
+- [x] Wire shapes: LWW_DIFF_VERSION_2 and LWW_STATE_VERSION_2 (0xA2)
+      carry one tagged `PropertyKey::{Id, Name}` map; round-trip tests.
+- [x] Every property backend uses the same PropertyKey lifecycle. Backends
+      are PropertyKey-keyed stores with no schema binding, display-name hint,
+      or per-instance wire mode.
 - [x] Read fallback mechanics: 0xA1 and pre-0.9 buffers decode to Name
-      keys, bind_schema migrates known names to ids, rewrite-on-save
-      emits 0xA2 with residue preserved; v1 diffs apply the same way.
-- [x] Integration flip: Node::bind_entity attaches the catalog-built
-      SchemaBinding and IdKeyedV2 mode at every user-entity assembly
-      path (create, get, fetch, remote commit, subscription/delta
-      apply); catalog/system stay NameKeyedV1; 0xA2 state entries carry
-      display-name hints so unbound engine parsers keep materializing
-      through the A-to-C window (plan decision 13); incoming v1
-      name-keyed writes migrate onto id keys at apply so mixed-version
-      writes compete in one LWW election (tests/tests/epoch_flip.rs).
+      keys; an absent resolved Id may read that legacy Name residue; the
+      next save emits the current 0xA2 tagged form.
+- [x] Integration flip: Node assembly stamps a live catalog resolver;
+      commit resolves ordinary staged LWW Name keys to Id and canonicalizes
+      both those and already-Id explicit bindings; Yrs resolves ordinary roots
+      at edit time and uses literal ids for explicit bindings. Registered user
+      writes are id-keyed, while catalog/system fields stay Name-keyed.
 - [x] Unknown-id v2 payloads apply and persist opaquely (catalog lag);
       unprojectable until a binding knows the id.
-- [x] Compatibility tests: 0xA3/v3 refused with the shipped refusal arm
-      (the same arm a 0.9 binary refuses 0xA2 with); default-mode
-      byte-compatibility pinned; residue preserved through rewrite.
-- [x] PROTOCOL_VERSION -> 2 landed (one bump covering LWW v2/0xA2,
-      resolved Identifier selections, RegisterSchema).
+- [x] Compatibility tests: unknown state versions are refused; legacy
+      buffers decode; Name residue is preserved without substituting for an
+      authoritative Id entry.
+- [x] PROTOCOL_VERSION -> 3 landed, covering LWW v2/0xA2, resolved
+      predicate Identifiers and ORDER BY property identities, RegisterSchema,
+      and model-id wire envelopes.
 
 ## 6. ankql Identifier and resolution
 
 - [x] `Identifier { property, name, subpath }` AST node (property is a
       raw 32-byte id; ankql cannot dep on proto); PathExpr stays the parse
       form; every Expr match site across ankql/core/storage handles
-      Identifier with Path-equivalent semantics; assume_null keys on
-      the resolved name for subpaths BY DESIGN (the first-vs-last-step
-      fix). NOTE for the resolution slice: Identifier evaluation
-      currently shares Path's legacy collection-qualifier branch; a
-      post-resolution Identifier should skip it (name == collection
-      edge).
+      Identifier with the dedicated resolved evaluator; assume_null keys on
+      the resolved name for subpaths BY DESIGN (the first-vs-last-step fix).
+      Legacy collection-qualifier normalization applies only before
+      resolution; Identifier evaluation never reinterprets its name.
 - [x] Resolution pass (CatalogManager::resolve_selection): binds
       steps[0] via the catalog, UnknownProperty fail-closed naming
       collection and property, id pseudo-property passthrough, legacy
       collection-qualifier normalization, idempotent on resolved input,
-      rename follows the property id (tests/tests/resolution.rs).
-      DELIBERATELY UNWIRED from the query paths: fail-closed resolution
-      flips on with the client registration lifecycle + protocol v2
-      epoch (no interim state, rev 3). wait_catalog_ready deferral and
-      TypeResolver absorption land with that flip.
+      rename follows the property id (tests/tests/resolution.rs). Wired at
+      every fetch, LiveQuery, and relay origin with catalog-ready deferral;
+      the resolved selection stored locally is the same selection forwarded
+      remotely and later activated by the reactor.
+- [x] ORDER BY items retain the resolved property id beside their display
+      path; re-resolution refreshes a renamed display name without changing
+      identity, so relay re-upsert and result-set rebuild keep the same sort
+      property and canonical collation.
 - [x] Fetch/SubscribeQuery carry resolved Selections (resolution runs
       at the four origin sites with wait_catalog_ready deferral; sync
       sites resolve in their async continuation); receiver-side
       pass-through for unknown ids (until #274).
 - [x] Engines consume Identifier.name for columns; assume_null /
       referenced_columns keyed consistently via Identifier.
-- [ ] Unify missing-property semantics (filter error / reactor
-      unwrap_or(false) / SQL assume_null) under the one rule.
+- [x] Missing-property semantics unified: resolution fails unknown names;
+      resolved absence or uncastable payload is NULL in predicate/policy
+      evaluation; typed View getters apply their own optional/default rules.
 - [x] Tests: resolve via schema, via catalog only, UnknownProperty on
       neither; subpath preservation; rename resolves to one property id
       (resolution.rs); end-to-end fail-closed fetch + overlay
@@ -192,13 +190,11 @@ DONE: PR #306; decision record posted on #294.
       historical behaviors. Predicate-level membership-sourced
       required-defaults are deliberately OUT of Phase A (plan decision
       15).
-- [x] Cross-contract sibling gate (LWWBackend::get_checked) ->
-      PropertyError::TypeSkew naming both ids (since removed with the
-      gates, decision 31), from the View getter AND
-      filter evaluation; the lenient foreign-id-by-hint fallback is
-      REMOVED per the cross-root ruling (2026-07-05: different roots
-      are different systems; transplants fail visible); hints are
-      engine-projection only (tests/tests/read_rules.rs).
+- [x] Read-time sibling and foreign-data gates, backend-specific checked
+      getters, display-name hints, and `TypeSkew` are removed. Generic
+      `property::read_resolved` performs Id-then-legacy-Name dispatch;
+      typed getters report per-value `NonCastable`, while predicates map
+      absent or uncastable values to NULL (tests/tests/read_rules.rs).
 - [x] Type defaults for required-absent scalars ("", 0, 0.0, false,
       empty binary, Json null); entityid/Ref and custom Property types
       keep Missing (no fabricable default).
@@ -219,32 +215,32 @@ DONE: PR #306; decision record posted on #294.
       hint semantics tested in group 3's reworked suite).
 - [x] `#[model(id = "...")]` / `#[property(id = "...")]`: compile-time
       base64/32-byte validation; carried on the schema and into
-      descriptors (registration-time verification already tested in
-      group 3).
+      descriptors; property ids also flow through generated Model/View/Mutable
+      accessors and ensured-schema predicate/ORDER BY aliases, with
+      registration-time verification already tested in group 3.
 - [x] `_ankurah_` collection prefix -> derive-time compile error
       (trybuild fixtures; the runtime commit_local_trx guard stays as
       defense-in-depth).
 - [x] registration_request(): ModelSchema -> RegisterSchema descriptor
       vectors; end-to-end test registers a derived model's schema and
       resolves it through the catalog map.
-- [x] Registration triggers in context paths: trx.create/get::<M>
-      auto-assert (best-effort; policy gates schema definition, not
-      data writes); sync edit caches, and COMMIT closes the edit-only
-      gap by ensure-registering touched unensured collections; read
-      paths record the compiled schema without durable writes and fail
-      closed pre-registration (rev 4: the id overlay is gone); strict
-      ctx.register::<M>(); the rev 4 strict never-registered-offline
-      error at create/commit (the offline queue is deleted); hard_reset
-      clears the latch and map
-      (tests/tests/registration_lifecycle.rs, 7 tests).
+- [x] Registration triggers in context paths: trx.create and mutating get
+      ensure registration; sync edit records the exact schema on its
+      transaction, and COMMIT closes the edit-only gap by ensure-registering
+      only the shapes that transaction used. Predicate reads resolve through
+      registration when necessary; direct id gets cache the binary-known
+      schema and project whatever state already exists. Strict
+      ctx.register::<M>(), the never-registered-offline create/commit error,
+      and hard_reset clearing the latch and map are covered
+      (tests/tests/registration_lifecycle.rs, 9 tests).
 
 ## 9. Cross-cutting and pre-PR
 
-- [x] Error variants: UnknownProperty, TypeSkew (since deleted; the
-      surviving read-time failure is NonCastable, decision 31),
-      registration refusals
-      (explicit-id absence/mismatch, PolicyDenied, NoDurablePeer).
-      CatalogGenesisError and AnchorReuse died with rev 4.
+- [x] Error variants: `UnknownProperty`; per-value
+      `PropertyError::NonCastable`; registration refusals including
+      `RegistrationError::NonCastable` (including an incompatible explicit
+      property binding), explicit-id absence, PolicyDenied, and NoDurablePeer.
+      `TypeSkew`, CatalogGenesisError, and AnchorReuse are deleted.
 - [ ] Nomenclature pass over new code/docs (#305: Model = contract
       definition entity, Collection = storage table).
 - [x] Adversarial review (rev 3 scope: frozen encoder, v2/v1 fallback,
@@ -279,14 +275,15 @@ DONE in one train on this branch (ratification trail on #289):
       resolved plan before any event is emitted.
 - [x] Client lifecycle: ensure_registered consumes SchemaRegistered
       into the map; cache_compiled reduced to schema-pointer recording;
-      strict never-registered-offline error at create/commit (bound
-      collections warn and proceed); TContext::ensure_registered
-      returns Result and commit_local_trx enforces it.
+      strict never-registered-offline error at create/commit (an unavailable
+      reassert proceeds only for an exact, fully compatible bound shape);
+      TContext::ensure_registered returns Result and commit_local_trx enforces
+      transaction-scoped schema provenance.
 - [x] derive: renamed_from attribute replaces anchor; explicit-id
       binding unchanged.
 - [x] Tests reworked: upsert idempotence, rename-hint application +
-      guard + stale-writer fork, retype distinct identity, policy-verb
-      denial, strict offline, response-fed maps, fail-closed
+      guard + stale-writer fork, canonical-type compatibility and refusal,
+      policy-verb denial, strict offline, response-fed maps, fail-closed
       pre-registration reads; golden-vector and self-cert suites
       deleted.
 
