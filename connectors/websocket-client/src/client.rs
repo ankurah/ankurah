@@ -241,8 +241,15 @@ where
                         }
                         Err(e) => {
                             error!("Connection to {} failed: {}", inner.server_url, e);
+                            // An attempt that reached Connected resets the
+                            // backoff ladder: this failure ends a healthy
+                            // session rather than extending a failing dial
+                            // streak, so the reconnect should be prompt.
+                            // Consecutive failed dials keep doubling.
+                            if inner.connected.swap(false, Ordering::AcqRel) {
+                                backoff = INITIAL_BACKOFF;
+                            }
                             inner.connection_state.set(ConnectionState::Error(ConnectionError::General(e.to_string())));
-                            inner.connected.store(false, Ordering::Release);
 
                             info!("Retrying connection in {:?}", backoff);
                             select! {
