@@ -58,6 +58,35 @@ pub enum PeerFrameError {
     PeerNotReady { peer: proto::NodeId },
 }
 
+const PEER_REPLAY_WINDOW: u64 = 4096;
+
+/// Bounded per-session acceptance window for frame sequence numbers: a
+/// sequence inside the window is accepted at most once, and anything below
+/// the window floor is refused outright, so a frame observed twice is never
+/// dispatched twice.
+#[derive(Default)]
+pub(crate) struct ReplayWindow {
+    highest: Option<u64>,
+    seen: std::collections::BTreeSet<u64>,
+}
+
+impl ReplayWindow {
+    pub(crate) fn accept(&mut self, peer: proto::NodeId, sequence: u64) -> Result<(), PeerFrameError> {
+        if self.seen.contains(&sequence) {
+            return Err(PeerFrameError::ReplayedSequence { peer, sequence });
+        }
+        if self.highest.is_some_and(|highest| sequence < highest.saturating_sub(PEER_REPLAY_WINDOW - 1)) {
+            return Err(PeerFrameError::StaleSequence { peer, sequence });
+        }
+
+        self.highest = Some(self.highest.map_or(sequence, |highest| highest.max(sequence)));
+        self.seen.insert(sequence);
+        let floor = self.highest.unwrap().saturating_sub(PEER_REPLAY_WINDOW - 1);
+        self.seen.retain(|seen| *seen >= floor);
+        Ok(())
+    }
+}
+
 /// Opaque token proving a frame passed session, sequence, signature, and
 /// declared-sender checks. Connectors can verify synchronously in wire order,
 /// then dispatch the token asynchronously without exposing an unbound message

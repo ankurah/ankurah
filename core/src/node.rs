@@ -20,7 +20,7 @@ use crate::{
     action_error, action_info,
     changes::EntityChange,
     collectionset::CollectionSet,
-    connector::{PeerFrameError, PeerHandshake, PeerSender, SendError, VerifiedPeerMessage},
+    connector::{PeerFrameError, PeerHandshake, PeerSender, ReplayWindow, SendError, VerifiedPeerMessage},
     context::Context,
     entity::{Entity, WeakEntitySet},
     error::{MutationError, RequestError, RetrievalError},
@@ -65,31 +65,6 @@ pub struct PeerState {
     /// connection (#330 once-per-connection descriptor shipping). A
     /// reconnection builds a fresh `PeerState`, so the peer is re-announced.
     announced_models: std::sync::Mutex<std::collections::BTreeSet<proto::EntityId>>,
-}
-
-const PEER_REPLAY_WINDOW: u64 = 4096;
-
-#[derive(Default)]
-struct ReplayWindow {
-    highest: Option<u64>,
-    seen: std::collections::BTreeSet<u64>,
-}
-
-impl ReplayWindow {
-    fn accept(&mut self, peer: proto::NodeId, sequence: u64) -> Result<(), PeerFrameError> {
-        if self.seen.contains(&sequence) {
-            return Err(PeerFrameError::ReplayedSequence { peer, sequence });
-        }
-        if self.highest.is_some_and(|highest| sequence < highest.saturating_sub(PEER_REPLAY_WINDOW - 1)) {
-            return Err(PeerFrameError::StaleSequence { peer, sequence });
-        }
-
-        self.highest = Some(self.highest.map_or(sequence, |highest| highest.max(sequence)));
-        self.seen.insert(sequence);
-        let floor = self.highest.unwrap().saturating_sub(PEER_REPLAY_WINDOW - 1);
-        self.seen.retain(|seen| *seen >= floor);
-        Ok(())
-    }
 }
 
 struct PendingRequest {
