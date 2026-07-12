@@ -132,7 +132,7 @@ pub trait NodeComms: Send + Sync {
         outgoing_session: proto::HandshakeChallenge,
         sender: Box<dyn PeerSender>,
     ) -> Result<(), proto::PresenceRefusal>;
-    fn deregister_peer(&self, node_id: proto::NodeId, incoming_session: proto::HandshakeChallenge) -> bool;
+    fn deregister_peer_session(&self, node_id: proto::NodeId, incoming_session: proto::HandshakeChallenge) -> bool;
     fn verify_peer_message(
         &self,
         authenticated_peer: proto::NodeId,
@@ -156,10 +156,9 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         outgoing_session: proto::HandshakeChallenge,
         sender: Box<dyn PeerSender>,
     ) -> Result<(), proto::PresenceRefusal> {
-        //
         self.register_peer(presence, handshake, outgoing_session, sender)
     }
-    fn deregister_peer(&self, node_id: proto::NodeId, incoming_session: proto::HandshakeChallenge) -> bool {
+    fn deregister_peer_session(&self, node_id: proto::NodeId, incoming_session: proto::HandshakeChallenge) -> bool {
         self.deregister_peer_session(node_id, incoming_session)
     }
     fn verify_peer_message(
@@ -167,7 +166,6 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         authenticated_peer: proto::NodeId,
         message: proto::SignedPeerMessage,
     ) -> Result<VerifiedPeerMessage, PeerFrameError> {
-        //
         self.verify_peer_message(authenticated_peer, message)
     }
     async fn handle_verified_peer_message(&self, message: VerifiedPeerMessage) -> anyhow::Result<()> {

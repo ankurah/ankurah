@@ -94,6 +94,10 @@ impl PeerState {
         }
     }
 
+    /// Simulator-only seam (see [`Node::sign_peer_message`]): advances the
+    /// sequence unconditionally, which the production path must not do on a
+    /// failed enqueue, so `send_message` signs inline instead of calling this.
+    #[cfg(feature = "test-helpers")]
     fn sign_message_for_delivery(&self, message: proto::NodeMessage) -> proto::SignedPeerMessage {
         let mut next_sequence = self.next_outgoing_sequence.lock().unwrap_or_else(|e| e.into_inner());
         let sequence = *next_sequence;
@@ -635,7 +639,7 @@ where
                             }
                         }
                     } else {
-                        me.promote_peers_for_root(peer_id, root_id);
+                        me.promote_peers_for_root(root_id);
                         action_info!(me, "successfully joined system");
                     }
                 });
@@ -647,13 +651,12 @@ where
         Ok(())
     }
 
-    fn promote_peers_for_root(&self, node_id: proto::NodeId, root_id: proto::EntityId) -> bool {
+    fn promote_peers_for_root(&self, root_id: proto::EntityId) {
         let _registry_guard = self.peer_registry_lock.lock().unwrap_or_else(|e| e.into_inner());
         if self.system.root_id() != Some(root_id) || !self.system.is_system_ready() {
-            return false;
+            return;
         }
 
-        let mut founder_promoted = false;
         for (peer_id, peer_state) in self.peer_connections.to_vec() {
             if peer_state.ready.load(Ordering::Acquire) {
                 continue;
@@ -663,7 +666,6 @@ where
                     *peer_state.system_generation.write().unwrap() = self.entities.system_generation();
                     peer_state.durable.store(true, Ordering::Release);
                     peer_state.ready.store(true, Ordering::Release);
-                    founder_promoted |= peer_id == node_id;
                     if let Some(ref relay) = self.subscription_relay {
                         relay.notify_peer_connected(peer_id);
                     }
@@ -678,7 +680,6 @@ where
                 Some(_) => {}
             }
         }
-        founder_promoted
     }
 
     fn deregister_peer_pending_root(&self, node_id: proto::NodeId, root_id: proto::EntityId) -> bool {
@@ -1612,8 +1613,7 @@ where
                     return Err(error);
                 }
             };
-            let locally_attested = self.attest_event(event.payload.clone(), admission);
-            event.attestations.0.extend(locally_attested.attestations.0);
+            event.attestations.0.extend(self.mint_event_attestation(&event.payload, admission));
 
             // Commit the staged event to permanent storage
             event_getter.commit_event(event).await?;

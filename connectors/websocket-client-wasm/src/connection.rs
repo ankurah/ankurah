@@ -377,7 +377,7 @@ impl ConnectionInner {
         close_wasm_transport(&self.ws, &self.dispatch_abort, &self.transport_closed);
         self._callbacks.lock().unwrap().take();
         if let ConnectionState::Connected { server_presence, .. } = &*self.state.read().unwrap() {
-            self.node.deregister_peer(server_presence.node_id, self.incoming_session);
+            self.node.deregister_peer_session(server_presence.node_id, self.incoming_session);
         }
     }
 }

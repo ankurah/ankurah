@@ -20,8 +20,10 @@ where
         proto::Attestation { attester: self.id, body, signature }
     }
 
-    pub(crate) fn attest_event(&self, event: proto::Event, admission: Admission) -> proto::Attested<proto::Event> {
-        let attestation = match admission {
+    /// Envelope-only variant of [`Self::attest_event`] for callers that keep
+    /// the event elsewhere and must not clone it just to wrap it.
+    pub(crate) fn mint_event_attestation(&self, event: &proto::Event, admission: Admission) -> Option<proto::Attestation> {
+        match admission {
             Admission::Allow => None,
             Admission::Attest { claims } => Some(self.sign_attestation(proto::AttestationBody::EventAdmitted {
                 system_root: self.system.root_id().expect("attestation requires a pinned system root"),
@@ -29,7 +31,11 @@ where
                 model: event.model,
                 claims,
             })),
-        };
+        }
+    }
+
+    pub(crate) fn attest_event(&self, event: proto::Event, admission: Admission) -> proto::Attested<proto::Event> {
+        let attestation = self.mint_event_attestation(&event, admission);
         proto::Attested::opt(event, attestation)
     }
 
