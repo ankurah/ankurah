@@ -1091,11 +1091,19 @@ where
                         None => RequestLease::unguarded(),
                     };
                     if pending.caller_holds_reset_fence {
-                        debug_assert_eq!(
-                            self.entities.reset_epoch(),
-                            pending.admitted_epoch,
-                            "request_fenced caller released its reset guard before response delivery"
-                        );
+                        // The caller acquired the reset fence before issuing
+                        // this request and normally holds it until delivery,
+                        // which is what makes skipping a nested fence read
+                        // safe here. Future cancellation breaks that promise:
+                        // the caller's guard drops with its future while this
+                        // waiter stays in the map, so a reset can complete
+                        // before delivery runs. Refuse the stale epoch rather
+                        // than warming the successor's catalog with an old
+                        // system's schema.
+                        if self.entities.reset_epoch() != pending.admitted_epoch {
+                            let _ = pending.delivery.send(Err(RequestError::ConnectionLost));
+                            return Ok(());
+                        }
                         self.ingest_schema(&response.from, &response.schema);
                         pending
                             .delivery
