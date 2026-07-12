@@ -1,4 +1,6 @@
-use crate::{auth::Attested, data::EntityState, id::EntityId, node_id::NodeId, subscription::QueryId, EventFragment, StateFragment};
+use crate::{
+    auth::Attested, data::EntityState, id::EntityId, node_id::NodeId, subscription::QueryId, EventFragment, StateFragment, StateWithGenesis,
+};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -76,7 +78,7 @@ pub struct NodeUpdate {
     /// already announced. Descriptors ride the message envelope, never inside
     /// events or state buffers.
     #[serde(default)]
-    pub schema: Vec<Attested<EntityState>>,
+    pub schema: Vec<StateWithGenesis>,
 }
 
 /// An acknowledgement of an update from one node to another

@@ -10,11 +10,15 @@ FIRST landing, which promotes #294 to Phase 0 of the ladder (sections 4,
 5.2, 5.3, 5.5, 9).
 Rev 4 (maintainer ruling 2026-07-06; RATIFIED same day on #289 after the
 full design walkthrough, and IMPLEMENTED on PR #307): the IDENTITY PLANE
-is redesigned. Deterministic derivation, the frozen genesis encoder,
-genesis self-certification, and the anchor apparatus are REMOVED; the
-durable node ALLOCATES true EntityIds (real ULIDs) on first sighting, via
-an upsert-by-current-name RegisterSchema whose response returns the
-allocated definitions (sections 3, 4, 5.1, 5.2, 5.8). The data plane (LWW
+is redesigned. Schema-specific deterministic derivation, the frozen schema
+genesis encoder, and the anchor apparatus are REMOVED; the durable node
+ALLOCATES EntityIds on first sighting, via an upsert-by-current-name
+RegisterSchema whose response returns the allocated definitions (sections
+3, 4, 5.1, 5.2, 5.8). The later identity-attestation RFC changes the
+allocation primitive from a ULID to the full content hash of the ordinary
+genesis event: the executor supplies fresh genesis entropy and takes the
+resulting event id, while the single-allocator/upsert semantics here remain
+unchanged. The data plane (LWW
 v2/0xA2, binding, read rules, resolution, protocol v2, catalog protection)
 is unchanged. Two same-day follow-on rulings are folded into 5.2/5.3/5.7:
 reads register at first use, and unresolvable references FAIL LOUD
@@ -221,8 +225,9 @@ From the surrounding system, non-negotiable constraints:
 Three fixed-name catalog collections, `_ankurah_model`, `_ankurah_property`,
 and `_ankurah_model_property` (contract membership), hold ordinary entities
 whose properties are plain LWW values. Their entity ids are ALLOCATED by the
-durable node (true EntityIds, real ULIDs) the first time a definition is
-sighted: registration is a lookup-or-create upsert by current name, and the
+durable node the first time a definition is sighted: it emits an ordinary
+genesis with fresh entropy and uses that event's full content hash as the
+EntityId. Registration is a lookup-or-create upsert by current name, and the
 registration response returns the allocated definitions, which the client
 folds into its catalog map immediately. Registration happens automatically
 at model first-use. Resolution of a property reference consults the
@@ -507,12 +512,14 @@ to a different model id.
 
 ### 5.1 Identity allocation (the crux)
 
-**Decision (rev 4, superseding rev 3's derivation): durable-allocated
-ids, upserted by current name.** The durable node executing RegisterSchema
-is the system's ALLOCATOR: for every definition it has never seen it mints
-a fresh `EntityId::new()` -- a true ULID with real timestamp and
-randomness -- and returns the allocated definitions in the response (5.2).
-Identity is the allocated id, full stop; every name is metadata.
+**Decision (rev 4, superseding rev 3's schema-specific derivation;
+allocation primitive amended by the identity-attestation RFC):
+durable-allocated ids, upserted by current name.** The durable node executing
+RegisterSchema is the system's ALLOCATOR: for every definition it has never
+seen it emits an ordinary genesis with fresh nonce/timestamp entropy, uses
+the genesis event's full content hash as the EntityId, and returns the
+allocated definitions in the response (5.2). Identity is the allocated id,
+full stop; every name is metadata.
 
 The lookup-or-create keys (the upsert keys, matching #85 AC2's
 collection + name + type identifier verbatim):
@@ -573,10 +580,12 @@ allocator serializes them, not because the bytes are deterministic.
 
 **Why allocation over derivation (maintainer ruling, 2026-07-06).**
 
-1. Derived ids were SHA-256 bytes shoehorned into the EntityId Ulid
-   newtype: no timestamp, no randomness, a documented type fib. Allocated
-   ids are honest ULIDs; the old open question about Ulid timestamp
-   semantics (11.1) dies outright.
+1. At the time of the rev-4 ruling, derived ids were SHA-256 bytes
+   shoehorned into the EntityId ULID newtype: no timestamp, no randomness,
+   a documented type fib. The later identity-attestation RFC replaces the
+   type itself with a 32-byte genesis hash. The lasting rev-4 decision here
+   is to remove schema-specific name/anchor derivation: the allocator emits
+   an ordinary genesis with fresh entropy and uses its generic content hash.
 2. Derivation keyed identity on the ANCHOR, a fossil of the first field
    name, which is the sole reason the whole rev 3 5.8 apparatus existed
    (an anchor attribute carried in source forever, the anchor-reuse guard,
@@ -654,9 +663,9 @@ others on the OBJECT, which model/property definitions are writable at
 all, others both) and then EXECUTES the upsert itself under the 5.1
 mutex: look up each definition by its lookup key, submit the resolved
 plan to `check_schema_registration` (5.7: the exists-aware gate, so
-agents judge actual creations without their own lookups), allocate
-`EntityId::new()` on miss, emit
-ordinary creation events and difference-only follow-ups through
+agents judge actual creations without their own lookups), emit an ordinary
+genesis on miss and use its content-hash EntityId, then emit difference-only
+follow-ups through
 check_event like any write (core/src/context.rs:129), persist, relay, and
 respond with NodeResponseBody::SchemaRegistered carrying the FULL
 resolved definitions (models, properties, memberships, each with its
@@ -951,9 +960,8 @@ already excluded the collection from identity (proto/src/data.rs), so event
 ids are unchanged. Collection strings survive only in query/API surfaces and
 registration payloads, where the collection is the data (#305). The system
 and catalog collections, which have no allocated model entities, use
-WELL-KNOWN model ids -- [0u8; 15] plus an ordinal (1 = _ankurah_system,
-2 = _ankurah_model, 3 = _ankurah_property, 4 = _ankurah_model_property), a
-range no ULID mint can produce (core/src/schema/mod.rs) -- and the section-4
+WELL-KNOWN model ids -- domain-hashed virtual identities under
+`ankurah.well-known-model.v0` (core/src/schema/mod.rs) -- and the section-4
 protection guard keys on them. Ingress resolution (Node::resolve_model) maps
 a wire model id to its collection via well-knowns then the catalog map; an
 unknown model id is REJECTED loud (retryable), never synthesized into a
@@ -965,11 +973,13 @@ the restart; this is policy (e)'s readiness participation on the ingress
 side. Ephemeral nodes never wait: their definitions arrive inline with
 the message, so a miss is already final. Cold-catalog policy, maintainer-ruled as options c + e + d:
 (c) once per connection per model, NodeUpdate and NodeResponse attach the
-attested catalog entity states (model, memberships, properties) for any
-non-well-known model the payload references (`#[serde(default)] schema:
-Vec<Attested<EntityState>>`; core/src/node.rs schema_states_for_models /
+attested catalog entity states (model, memberships, properties) plus each
+state's exact self-certifying genesis event for any non-well-known model the
+payload references (`#[serde(default)] schema: Vec<StateWithGenesis>`;
+core/src/node.rs schema_states_for_models /
 ingest_schema, tracked per peer in PeerState.announced_models); receivers
-policy-validate each definition and ingest them BEFORE processing the body;
+accept non-empty batches only from the pinned founder, validate each state and
+genesis, and atomically ingest the complete strict batch BEFORE processing the body;
 definitions never ride inside events or state buffers. (e) Catalog warmth
 participates in readiness through the existing ensure_subscribed /
 context_async gates. (d) The engines' truncated-id fallback naming (Phase C
@@ -999,7 +1009,7 @@ gated changes into one protocol epoch behind #294:
     core/src/property/backend/lww.rs:18) and state buffer version 0xA2
     (currently 0xA1 with a pre-0.9 legacy fallback,
     core/src/property/backend/lww.rs:30-42, 154-185), maps keyed by
-    EntityId (16 bytes) instead of name, from day one. Old 0.9 nodes
+    EntityId (32 bytes) instead of name, from day one. Old 0.9 nodes
     REFUSE unknown versions cleanly rather than misreading them
     (core/src/property/backend/lww.rs:176-180), which is the right failure
     mode, and #294 turns it from an error into a negotiated capability.
@@ -1059,12 +1069,13 @@ gated changes into one protocol epoch behind #294:
     property_columns object store (assignment runs as a pre-pass before the
     entities transaction because IndexedDB auto-commits across foreign
     awaits). Naming (core/src/storage.rs, naming module): the sanitized
-    display name; a collision appends the property id's TRAILING four or
-    more base64 characters ({name}_{suffix}, widening until unique;
-    trailing, because ULIDs share leading timestamp characters); an
-    unresolvable name falls back to p_ plus trailing id characters, loudly
+    display name; a collision appends the trailing four or more characters
+    of an identifier-safe, injective base32 encoding of the property id
+    ({name}_{suffix}, widening through all 256 bits until unique); an
+    unresolvable name uses the same full-id token behind a synthetic prefix, loudly
     (the policy-d net above; expected never to fire). Bare property ids
-    NEVER appear as column names. Reads: fetch_states translates the
+    NEVER appear as column names, and generated names stay within
+    PostgreSQL's 63-byte identifier limit. Reads: fetch_states translates the
     resolved Selection into engine column space ONCE at its top
     (selection_to_column_space: Identifier by property id through the map,
     order-by names through the resolver), so retype lineages and renamed
@@ -1083,7 +1094,7 @@ gated changes into one protocol epoch behind #294:
   - IndexedDB: entity objects hold property-name fields
     (storage/indexeddb-wasm/src/collection.rs:73-81); same treatment as
     SQL: names bound via catalog, lazily re-materialized on rename.
-- Size cost, estimated: a 16-byte id key vs a typically shorter name string
+- Size cost, estimated: a 32-byte id key vs a typically shorter name string
   in LWW maps. Negligible against event framing overhead; sled rows are
   already u32-compacted.
 
@@ -1292,10 +1303,10 @@ By-name registration (the upsert, 5.1) is the DEFAULT, not the only path. The
 macro accepts explicit bindings to known definition entities:
 
 ```rust
-#[model(id = "AZB64ULID...")]           // bind this struct to a known
+#[model(id = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA")] // known model
 struct Signal { ... }                    // model entity
 
-#[property(id = "AZB64ULID...")]        // bind this field to a known,
+#[property(id = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA")] // known,
 pub label: String,                       // possibly shared, property entity
 ```
 
@@ -1550,9 +1561,9 @@ Everything else in #85 is adopted as written, including the
 
 ## 11. Open questions (for #289 discussion)
 
-1. **Ulid timestamp bits in derived ids** (5.1): SUPERSEDED by rev 4.
-   Allocated ids are real ULIDs with genuine timestamp and randomness;
-   the question no longer exists.
+1. **ULID timestamp bits in derived ids** (5.1): SUPERSEDED by rev 4 and
+   the later identity-attestation RFC. Allocated ids are full genesis-event
+   hashes; the advisory genesis timestamp is input, not an ordered ID prefix.
 2. **Registration writes from read-only contexts** (5.2): RESOLVED
    2026-07-05 as strictly cache-only for readers; REVISED 2026-07-06 --
    reads register at first use through the idempotent upsert (an

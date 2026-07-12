@@ -251,7 +251,7 @@ where
     fn canonical_target(&self, expr: &Expr) -> Option<ValueType> {
         if let Expr::Identifier(ident) = expr {
             if ident.subpath.is_empty() {
-                return self.canonical_value_type_of(&EntityId::from_ulid(ident.property)).and_then(|s| ValueType::from_property_str(&s));
+                return self.canonical_value_type_of(&EntityId::from_bytes(ident.property)).and_then(|s| ValueType::from_property_str(&s));
             }
         }
         None
@@ -305,7 +305,7 @@ where
                 // Try the first step as a property of this collection.
                 if let Some(property) = self.resolve(collection.as_str(), &steps[0]) {
                     return Ok(Expr::Identifier(Identifier {
-                        property: property.to_ulid(),
+                        property: property.to_bytes(),
                         name: steps[0].clone(),
                         subpath: steps[1..].to_vec(),
                     }));
@@ -318,7 +318,7 @@ where
                     }
                     if let Some(property) = self.resolve(collection.as_str(), &steps[1]) {
                         return Ok(Expr::Identifier(Identifier {
-                            property: property.to_ulid(),
+                            property: property.to_bytes(),
                             name: steps[1].clone(),
                             subpath: steps[2..].to_vec(),
                         }));

@@ -9,12 +9,12 @@ use ankurah_core::error::{MutationError, RetrievalError};
 use ankurah_core::property::backend::backend_from_string;
 use ankurah_core::property::{PropertyKey, PropertyResolver};
 use ankurah_core::selection::filter::evaluate_predicate;
-use ankurah_core::storage::{naming, StorageCollection, StorageEngine};
+use ankurah_core::storage::{naming, StorageCollection, StorageEngine, SystemRootClaim};
 use ankurah_proto::{
-    AttestationSet, Attested, Clock, CollectionId, EntityId, EntityState, Event, EventId, OperationSet, State, StateBuffers,
+    AttestationSet, Attested, Clock, CollectionId, EntityId, EntityState, Event, EventBody, EventId, State, StateBuffers, SystemRootProof,
 };
 use async_trait::async_trait;
-use rusqlite::{params_from_iter, Connection};
+use rusqlite::{params_from_iter, Connection, OptionalExtension};
 use tracing::{debug, warn};
 
 use crate::connection::{PooledConnection, SqliteConnectionManager};
@@ -24,6 +24,8 @@ use crate::value::SqliteValue;
 
 /// Default connection pool size
 pub const DEFAULT_POOL_SIZE: u32 = 10;
+const ENGINE_METADATA_TABLE: &str = "_ankurah_engine_metadata";
+const SYSTEM_ROOT_CLAIM_KEY: &str = "system_root";
 
 /// SQLite storage engine
 pub struct SqliteStorageEngine {
@@ -88,6 +90,7 @@ impl StorageEngine for SqliteStorageEngine {
             create_state_table(c, &collection_id_clone)?;
             create_event_table(c, &collection_id_clone)?;
             create_column_map_table(c)?;
+            create_engine_metadata_table(c)?;
             Ok(())
         })
         .await?;
@@ -104,6 +107,59 @@ impl StorageEngine for SqliteStorageEngine {
         *self.resolver.write().expect("RwLock poisoned") = Some(resolver);
     }
 
+    async fn claim_system_root(&self, candidate: &SystemRootProof) -> Result<SystemRootClaim, MutationError> {
+        let conn = self.pool.get().await.map_err(|error| MutationError::General(Box::new(SqliteError::Pool(error.to_string()))))?;
+        let candidate = bincode::serialize(candidate)?;
+        conn.with_connection(move |c| {
+            create_engine_metadata_table(c)?;
+            let inserted = c.execute(
+                &format!(r#"INSERT OR IGNORE INTO "{ENGINE_METADATA_TABLE}" ("key", "value") VALUES (?1, ?2)"#),
+                rusqlite::params![SYSTEM_ROOT_CLAIM_KEY, candidate],
+            )?;
+            if inserted == 1 {
+                return Ok(SystemRootClaim::Claimed);
+            }
+            let existing: Vec<u8> = c.query_row(
+                &format!(r#"SELECT "value" FROM "{ENGINE_METADATA_TABLE}" WHERE "key" = ?1"#),
+                [SYSTEM_ROOT_CLAIM_KEY],
+                |row| row.get(0),
+            )?;
+            let existing = bincode::deserialize(&existing)?;
+            Ok(SystemRootClaim::Existing(existing))
+        })
+        .await
+        .map_err(Into::into)
+    }
+
+    async fn system_root_claim(&self) -> Result<Option<SystemRootProof>, RetrievalError> {
+        let conn = self.pool.get().await.map_err(|error| SqliteError::Pool(error.to_string()))?;
+        conn.with_connection(|c| {
+            create_engine_metadata_table(c)?;
+            let value: Option<Vec<u8>> = c
+                .query_row(&format!(r#"SELECT "value" FROM "{ENGINE_METADATA_TABLE}" WHERE "key" = ?1"#), [SYSTEM_ROOT_CLAIM_KEY], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            value.map(|value| bincode::deserialize(&value).map_err(SqliteError::from)).transpose()
+        })
+        .await
+        .map_err(Into::into)
+    }
+
+    async fn release_system_root_claim(&self, expected: &SystemRootProof) -> Result<bool, MutationError> {
+        let conn = self.pool.get().await.map_err(|error| MutationError::General(Box::new(SqliteError::Pool(error.to_string()))))?;
+        let expected = bincode::serialize(expected)?;
+        conn.with_connection(move |c| {
+            create_engine_metadata_table(c)?;
+            Ok(c.execute(
+                &format!(r#"DELETE FROM "{ENGINE_METADATA_TABLE}" WHERE "key" = ?1 AND "value" = ?2"#),
+                rusqlite::params![SYSTEM_ROOT_CLAIM_KEY, expected],
+            )? == 1)
+        })
+        .await
+        .map_err(Into::into)
+    }
+
     async fn delete_all_collections(&self) -> Result<bool, MutationError> {
         let conn = self.pool.get().await.map_err(|e| MutationError::General(Box::new(SqliteError::Pool(e.to_string()))))?;
 
@@ -116,11 +172,16 @@ impl StorageEngine for SqliteStorageEngine {
                 return Ok(false);
             }
 
+            let mut deleted = false;
             for table in tables {
+                if table == ENGINE_METADATA_TABLE {
+                    continue;
+                }
                 c.execute(&format!(r#"DROP TABLE IF EXISTS "{}""#, table), [])?;
+                deleted = true;
             }
 
-            Ok(true)
+            Ok(deleted)
         })
         .await
         .map_err(|e| MutationError::General(Box::new(e)))
@@ -177,7 +238,7 @@ fn create_event_table(conn: &Connection, collection_id: &CollectionId) -> Result
         r#"CREATE TABLE IF NOT EXISTS "{}"(
             "id" TEXT PRIMARY KEY,
             "entity_id" TEXT,
-            "operations" BLOB,
+            "body" BLOB,
             "parent" TEXT,
             "attestations" BLOB
         )"#,
@@ -211,6 +272,19 @@ fn create_column_map_table(conn: &Connection) -> Result<(), SqliteError> {
         )"#;
     debug!("Creating property column map table: {}", query);
     conn.execute(query, [])?;
+    Ok(())
+}
+
+fn create_engine_metadata_table(conn: &Connection) -> Result<(), SqliteError> {
+    conn.execute(
+        &format!(
+            r#"CREATE TABLE IF NOT EXISTS "{ENGINE_METADATA_TABLE}"(
+                "key" TEXT PRIMARY KEY,
+                "value" BLOB NOT NULL
+            )"#
+        ),
+        [],
+    )?;
     Ok(())
 }
 
@@ -778,7 +852,7 @@ impl StorageCollection for SqliteBucket {
     async fn add_event(&self, entity_event: &Attested<Event>) -> Result<bool, MutationError> {
         let conn = self.pool.get().await.map_err(|e| MutationError::General(Box::new(SqliteError::Pool(e.to_string()))))?;
 
-        let operations = bincode::serialize(&entity_event.payload.operations)?;
+        let body = bincode::serialize(&entity_event.payload.body)?;
         let attestations = bincode::serialize(&entity_event.attestations)?;
         let parent_json = serde_json::to_string(&entity_event.payload.parent).map_err(|e| MutationError::General(Box::new(e)))?;
 
@@ -787,13 +861,13 @@ impl StorageCollection for SqliteBucket {
         let entity_id = entity_event.payload.entity_id.to_base64();
 
         let query = format!(
-            r#"INSERT INTO "{}"("id", "entity_id", "operations", "parent", "attestations") VALUES(?, ?, ?, ?, ?)
+            r#"INSERT INTO "{}"("id", "entity_id", "body", "parent", "attestations") VALUES(?, ?, ?, ?, ?)
                ON CONFLICT ("id") DO NOTHING"#,
             table_name
         );
 
         conn.with_connection(move |c| {
-            let affected = c.execute(&query, rusqlite::params![event_id, entity_id, operations, parent_json, attestations])?;
+            let affected = c.execute(&query, rusqlite::params![event_id, entity_id, body, parent_json, attestations])?;
             Ok(affected > 0)
         })
         .await
@@ -815,7 +889,7 @@ impl StorageCollection for SqliteBucket {
             .with_connection(move |c| {
                 let placeholders = (0..num_ids).map(|_| "?").collect::<Vec<_>>().join(", ");
                 let query = format!(
-                    r#"SELECT "id", "entity_id", "operations", "parent", "attestations" FROM "{}" WHERE "id" IN ({})"#,
+                    r#"SELECT "id", "entity_id", "body", "parent", "attestations" FROM "{}" WHERE "id" IN ({})"#,
                     table_name, placeholders
                 );
 
@@ -824,10 +898,10 @@ impl StorageCollection for SqliteBucket {
                 let rows = stmt.query_map(params.as_slice(), |row| {
                     let _event_id: String = row.get(0)?;
                     let entity_id_str: String = row.get(1)?;
-                    let operations: Vec<u8> = row.get(2)?;
+                    let body: Vec<u8> = row.get(2)?;
                     let parent_json: String = row.get(3)?;
                     let attestations_blob: Vec<u8> = row.get(4)?;
-                    Ok((entity_id_str, operations, parent_json, attestations_blob))
+                    Ok((entity_id_str, body, parent_json, attestations_blob))
                 })?;
                 Ok(rows.collect::<Result<Vec<_>, _>>()?)
             })
@@ -840,13 +914,13 @@ impl StorageCollection for SqliteBucket {
         let mut events = Vec::with_capacity(raw_rows.len());
         if !raw_rows.is_empty() {
             let model = self.model_id()?;
-            for (entity_id_str, operations_blob, parent_json, attestations_blob) in raw_rows {
+            for (entity_id_str, body_blob, parent_json, attestations_blob) in raw_rows {
                 let entity_id = EntityId::from_base64(&entity_id_str).map_err(|e| RetrievalError::storage(std::io::Error::other(e)))?;
-                let operations: OperationSet = bincode::deserialize(&operations_blob).map_err(RetrievalError::storage)?;
+                let body: EventBody = bincode::deserialize(&body_blob).map_err(RetrievalError::storage)?;
                 let parent: Clock = serde_json::from_str(&parent_json).map_err(RetrievalError::storage)?;
                 let attestations: AttestationSet = bincode::deserialize(&attestations_blob).map_err(RetrievalError::storage)?;
 
-                events.push(Attested { payload: Event { model, entity_id, operations, parent }, attestations });
+                events.push(Attested { payload: Event { model, entity_id, body, parent }, attestations });
             }
         }
         Ok(events)
@@ -860,15 +934,15 @@ impl StorageCollection for SqliteBucket {
 
         let raw_rows = conn
             .with_connection(move |c| {
-                let query = format!(r#"SELECT "id", "operations", "parent", "attestations" FROM "{}" WHERE "entity_id" = ?"#, table_name);
+                let query = format!(r#"SELECT "id", "body", "parent", "attestations" FROM "{}" WHERE "entity_id" = ?"#, table_name);
 
                 let mut stmt = c.prepare(&query)?;
                 let rows = stmt.query_map([&entity_id_str], |row| {
                     let _event_id: String = row.get(0)?;
-                    let operations: Vec<u8> = row.get(1)?;
+                    let body: Vec<u8> = row.get(1)?;
                     let parent_json: String = row.get(2)?;
                     let attestations_blob: Vec<u8> = row.get(3)?;
-                    Ok((operations, parent_json, attestations_blob))
+                    Ok((body, parent_json, attestations_blob))
                 })?;
                 Ok(rows.collect::<Result<Vec<_>, _>>()?)
             })
@@ -879,12 +953,12 @@ impl StorageCollection for SqliteBucket {
         let mut events = Vec::with_capacity(raw_rows.len());
         if !raw_rows.is_empty() {
             let model = self.model_id()?;
-            for (operations_blob, parent_json, attestations_blob) in raw_rows {
-                let operations: OperationSet = bincode::deserialize(&operations_blob).map_err(RetrievalError::storage)?;
+            for (body_blob, parent_json, attestations_blob) in raw_rows {
+                let body: EventBody = bincode::deserialize(&body_blob).map_err(RetrievalError::storage)?;
                 let parent: Clock = serde_json::from_str(&parent_json).map_err(RetrievalError::storage)?;
                 let attestations: AttestationSet = bincode::deserialize(&attestations_blob).map_err(RetrievalError::storage)?;
 
-                events.push(Attested { payload: Event { model, entity_id, operations, parent }, attestations });
+                events.push(Attested { payload: Event { model, entity_id, body, parent }, attestations });
             }
         }
         Ok(events)

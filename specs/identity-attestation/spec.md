@@ -1,7 +1,8 @@
 # RFC: Identity and Attestation Substrate
 
 Status: ACCEPTED (rulings 2026-07-11; genesis shape refined to eager freeze
-same date), implementation in same PR.
+same date), implementation and adversarial hardening in same PR. The hardening
+bumps the resulting wire protocol to v6.
 Scope: node identity, entity identity, attestation envelope, PolicyAgent
 admission surface. This is RFC-1 of a pair; RFC-2 (multi-durable sync and
 peer-to-peer reads) builds on it and is deliberately excluded here.
@@ -12,7 +13,7 @@ ingress), issue #271 (history lifecycle), specs/concurrency/phase-2.md
 
 ## Motivation
 
-Ankurah's trust today is connection-scoped. A node id is a random ULID, the
+Before this RFC, Ankurah's trust was connection-scoped. A node id was a random ULID, the
 `Presence` handshake is a single unsigned self-assertion including the
 `durable` flag (proto/src/peering.rs), and authorization rides per-request
 bearer tokens validated by `PolicyAgent::check_request`. This is coherent in
@@ -61,8 +62,8 @@ These were decided in design review and are not re-opened by this document:
   forced content-hash event ids), IPFS, Nostr, Scuttlebutt, Hypercore, Tor
   v3 (v2's 80-bit truncated ids deprecated ecosystem-wide) all converged on
   32 bytes.
-- **R4. Genesis preimage contents.** The genesis binds (system id, nonce,
-  timestamp, initial operations) and carries **no creator field and no
+- **R4. Genesis preimage contents.** The genesis binds (system id, a 32-byte
+  creator-random nonce, timestamp, initial operations) and carries **no creator field and no
   collection**. Creator: an
   unauthenticated creator claim is forgeable and a signed one requires the
   parked author-signature machinery; attribution instead lives in the
@@ -129,19 +130,47 @@ plus transport security.
 pub struct Presence {
     pub node_id: NodeId,
     pub durable: bool,
-    pub system_root: Option<Attested<EntityState>>,
-    pub timestamp: u64,          // unix ms, freshness signal
+    pub system_root: Option<SystemRootProof>,
+    pub challenge: HandshakeChallenge,
+    pub timestamp: u64,          // unix ms, advisory
     pub signature: Signature,    // by node_id's key, over PRESENCE_TAG || bincode(claims)
     pub protocol_version: u32,
+}
+
+pub struct HandshakeChallenge {
+    issuer: NodeId,
+    nonce: [u8; 32],
+}
+
+pub struct SystemRootProof {
+    pub genesis: Event,
+    pub state: Attested<EntityState>,
 }
 ```
 
 The signature covers a `PresenceClaims` projection (node_id, durable, the
-system root entity id if present, timestamp, protocol version) under the domain tag
-`b"ankurah.presence.v0"`. `register_peer` (core/src/node.rs) verifies the
-signature before inserting the peer; an invalid signature rejects the
-connection. This makes node identity unforgeable at the handshake
-(closes the identity half of C4-16 / G-8).
+system root entity id if present, the receiver-issued challenge, timestamp,
+and protocol version) under the domain tag `b"ankurah.presence.v1"`. Both
+peers issue a fresh challenge and answer the other's challenge before
+registration. `register_peer` (core/src/node.rs) consumes the core-issued
+single-use verifier capability, checks challenge issuer/value and signature,
+and rejects replayed Presence from another connection as well as reflected
+self-connections.
+
+Every post-handshake `NodeMessage` is carried in a `SignedPeerMessage` whose
+signature covers `ankurah.peer-message.v0`, the receiver-issued session
+challenge, a monotonically allocated sequence, and the complete message.
+Core verifies the session, NodeId signature, declared sender, and a bounded
+4096-frame replay window before producing an opaque dispatch token. Unique
+out-of-order frames inside the window remain valid; duplicates and stale
+frames do not. This prevents an active relay from turning a forwarded
+Presence into authority to inject later frames as that node.
+
+WebSocket deployments still require authenticated TLS for confidentiality
+and endpoint authentication. An active proxy can relay genuine signed frames
+and deny service, but cannot modify or inject accepted frames. Iroh binds the
+same NodeId key into its QUIC endpoint, adding transport-level possession and
+confidentiality without changing this application-layer verification.
 
 The `durable` flag is verified, not trusted: a peer enters `durable_peers`
 only if its NodeId is a recognized durable of the system. In this RFC's
@@ -153,19 +182,44 @@ recognized durable, which matches the current effective topology.
 ### I.3 System root binding and the join boundary (TOFU)
 
 The system root entity gains a property recording the founder's NodeId,
-written at system creation by the founding durable node. Ephemeral nodes
-that have joined a system verify durable claims and attestation attesters
-against it.
+written at system creation by the founding durable node. Presence carries the
+root's content-addressed genesis plus its exact genesis-materialized state.
+Core recomputes the root id, requires the well-known system model and
+`system: None`, decodes the founder from the genesis operations, requires that
+founder to equal the signing Presence key, and rejects state substitution.
+Ephemeral nodes that have joined a system verify durable claims and
+attestation attesters against this proven binding.
+
+First join reserves the verified root synchronously before the peer enters
+durable routing. Competing first roots therefore cannot both win while the
+chosen proof is persisted asynchronously. A persisted root is revalidated
+from its stored genesis on startup, and a durable node becomes ready only when
+its supplied persisted signing key equals the proven founder.
 
 Honest boundary, stated explicitly: an ephemeral node's FIRST join is
 trust-on-first-use. It learns the system root from the presence of the peer
 it first connects to; it has no prior anchor to verify that root against.
-This is exactly today's `join_system` trust posture, now named. After join,
-the root is pinned and all subsequent durable claims and attester
-recognitions verify against it. Out-of-band root pinning (configuring the
-expected system id, which is now a hash and therefore pinnable) is available
-to embedders that want to close the first-contact window; deeper mechanisms
-are out of scope.
+The root proof prevents a contacted peer from fabricating state for a chosen
+root id, but it cannot tell a brand-new node which valid founder/root pair it
+*should* choose. After join, the root is persisted and pinned and all
+subsequent durable claims and attester recognitions verify against it.
+Embedders that already know an expected root can pre-screen the signed
+Presence/root proof before registration; a dedicated expected-root constructor
+is left to the membership/configuration work rather than implied here.
+
+### I.4 Catalog descriptor proofs
+
+Protocol v6 also closes the bootstrap hole in model descriptor shipping.
+Each inline catalog state is a `StateWithGenesis`: the attested state plus
+the exact genesis event whose content hash equals the descriptor EntityId.
+The receiver validates both halves and their model/entity agreement before
+catalog parsing. Non-empty schema batches are accepted only from the pinned
+system founder, parsed strictly as a complete batch, checked for reserved or
+conflicting bindings, and applied to the in-memory catalog atomically. A
+malformed or partial batch leaves the catalog unchanged. Descriptor shipping
+only fills missing cache entries; it never overwrites an existing descriptor,
+so independently scheduled snapshots cannot roll mutable fields backward.
+The ordinary catalog entity stream remains the sole update path.
 
 ## Part II: Self-certifying entity identity
 
@@ -193,7 +247,7 @@ resolves that TODO:
 
 ```rust
 pub struct Event {
-    pub collection: CollectionId,   // envelope attribution, NOT identity (C4-02)
+    pub model: EntityId,             // envelope attribution, NOT identity (C4-02)
     pub entity_id: EntityId,        // for genesis: equals the derived id (verified)
     pub parent: Clock,              // empty iff genesis
     pub body: EventBody,
@@ -202,7 +256,7 @@ pub struct Event {
 pub enum EventBody {
     Genesis {
         system: Option<EntityId>,   // None ONLY for the system root entity itself
-        nonce: [u8; 16],            // creator-random
+        nonce: [u8; 32],            // creator-random
         timestamp: u64,             // unix ms, advisory
         operations: OperationSet,   // the entity's initial property values
     },
@@ -323,8 +377,10 @@ Notes:
   different id, hence a different entity. The C4-06 creation guard in
   core/src/entity.rs stops depending on `storage_is_definitive()` for
   finality; the check becomes: a genesis event is admissible for entity E
-  iff `event.id() == E`. Ephemeral nodes get the same verdict with no
-  durable round trip. C4-06's trust tier upgrades from "Byzantine-safe on
+  iff `event.id() == E`. Event-bearing ingress gets the verdict locally.
+  State-only ingress retrieves and validates the genesis whose EventId bytes
+  equal the claimed EntityId before materializing or storing the state; an
+  ephemeral cache may therefore make one proof fetch. C4-06's trust tier upgrades from "Byzantine-safe on
   durable / trusted-peer-plus-BFS on ephemeral" to Byzantine-safe
   everywhere.
 - **The multi-durable genesis race dissolves.** Two durables can admit the
@@ -385,8 +441,14 @@ pub struct Attestation {
 }
 
 pub enum AttestationBody {
-    EventAdmitted  { event: EventId, model: EntityId, claims: Vec<u8> },
+    EventAdmitted  {
+        system_root: EntityId,
+        event: EventId,
+        model: EntityId,
+        claims: Vec<u8>,
+    },
     StateAttested  {
+        system_root: EntityId,
         entity: EntityId,
         model: EntityId,
         head: Clock,
@@ -397,10 +459,15 @@ pub enum AttestationBody {
 ```
 
 - The signed bytes are `b"ankurah.attestation.v0" || bincode(body)`.
-  Verification is a pure function of (envelope, expected attester set):
-  signature valid under `attester`, and `attester` recognized (I.2/I.3).
+  Verification is a pure function of (envelope, expected system root,
+  expected attester set): signature valid under `attester`, `system_root`
+  equal to the receiver's pinned system, and `attester` recognized (I.2/I.3).
   No connection context involved; this is what makes the artifact portable
   (multi-durable acceptance, peer-served reads, storage and replay).
+- Both variants bind the pinned system-root EntityId. Signer recognition is
+  insufficient on its own because one node key can found more than one
+  system; without this field, a valid verdict from one such system could be
+  replayed into another.
 - `EventAdmitted` binds both the EventId and the model envelope used for
   admission. The EventId pins the identity-bearing content (C4-01); model is
   deliberately excluded from event identity because entities can be modeled
@@ -440,13 +507,17 @@ The mechanical/semantic split (core does crypto, agent does policy):
 2. **Validation (consume side).** Core verifies envelopes BEFORE the agent
    hook runs: for each attestation on an incoming event/state, check the body
    variant and subject match (event id plus model, or complete state digest),
-   signature, and attester recognition. Invalid or transplanted envelopes are
-   stripped (and counted, for observability) rather than passed through. The agent hooks
+   pinned system-root match, signature, and attester recognition. Invalid or
+   transplanted envelopes are stripped (and counted, for observability) rather
+   than passed through. The agent hooks
    (`validate_received_event`, `validate_received_state`) then receive the
    payload with its VERIFIED attestation set and decide sufficiency:
    PermissiveAgent accepts anything (including zero attestations); a strict
    agent can require a recognized-durable admission envelope. The agent
-   never re-implements signature verification.
+   never re-implements signature verification. Verified founder state
+   envelopes are preserved when an ephemeral node stores or replays the exact
+   same state; a merge or local advance strips them naturally as a subject
+   mismatch before any optional local attestation is added.
 
 3. **Unchanged.** `check_request`/`sign_request` (connection-scoped request
    auth, e.g. JWT bearer), the read/write/collection gates, and
@@ -470,7 +541,9 @@ supplying the envelope that #274's seam will verify. Division of labor:
   fetch, C4-15 / G-1 / #244) gains (a) response filtering to the requested
   ids with recomputed content hashes, and (b) the same
   `validate_received_event` gate the application arms already run, before
-  any `add_event`.
+  any `add_event`. State-only snapshots and direct gets use that same getter
+  to retrieve the genesis named by the state EntityId, and refuse
+  materialization when the proof is missing or mismatched.
 - **#274 (unchanged mandate):** the structural refactor making every arm
   feed one seam producing `ValidatedEvent`, size limits (#246/#247, G-3),
   rate limiting (274-C, G-4), and clock-validation-as-ingress-check (V5
@@ -495,17 +568,19 @@ conflicts with the current text, this list governs:
   with #274's ingress checks.
 - **C4-06** (creation uniqueness): trust tier upgraded to Byzantine-safe on
   all node classes; enforcing seam becomes the structural
-  `event.id() == entity_id` genesis check; the definitive-storage dependency
-  and the durable/ephemeral asymmetry text are retired. The
+  `event.id() == entity_id` genesis check, including a named-genesis fetch for
+  state-only ingress; the definitive-storage dependency and the former
+  durable/ephemeral verdict asymmetry are retired. The
   multi-durable genesis race is recorded as dissolved.
 - **C4-15 / G-1** (unvalidated BFS fetch): status moves from open gap to
   PARTIAL: id-filtering and policy validation land at the seam; the
   structural single-ingress conversion remains with #274. The red-ignored
   test arm `bfs_fetched_events_are_policy_validated` un-ignores.
 - **C4-16 / G-8** (self-asserted peer class): status moves to enforced for
-  identity (signed presence) and PARTIAL for the durable flag (verified
-  against the system-root founder; multi-durable membership is RFC-2). The
-  TOFU join boundary is documented as the honest residual.
+  identity (signed presence plus connection-bound frame dispatch) and PARTIAL
+  for the durable flag (verified against a self-certifying, atomically
+  reserved system-root founder; multi-durable membership is RFC-2). The TOFU
+  choice among otherwise valid first roots is documented as the honest residual.
 - **C4-20** (authorship/authorization not structural): updated to
   distinguish the now-structural attestation envelope (verification is core,
   agent-independent) from authorship, which remains parked per R1. The
@@ -531,10 +606,11 @@ conflicts with the current text, this list governs:
   racing policy changes; "revoke now" semantics): RFC-2, flagged there as
   the genuinely hard residual.
 - **Key rotation**: a durable key rotation is a membership change (RFC-2).
-- **Presence channel binding** (replay hardening of signed presence within
-  a MITM'd unauthenticated transport): noted; websocket deployments rely on
-  TLS, iroh deployments get possession proof from the handshake. Revisit if
-  a transport without either appears.
+- **Transport confidentiality, traffic-analysis resistance, and denial of
+  service by an active relay**: WebSocket deployments rely on authenticated
+  TLS; iroh supplies QUIC encryption and endpoint identity. Challenge-bound
+  Presence and signed sequenced frames provide application-layer identity,
+  integrity, and replay resistance, not secrecy or availability.
 - **#274's structural seam, size limits, rate limits**: unchanged mandate,
   not absorbed here.
 
@@ -542,20 +618,24 @@ conflicts with the current text, this list governs:
 
 1. proto: NodeId/Signature/RequestId types, EntityId re-typing, EventBody
    split, domain-tagged derivation, payload-binding Attestation envelope,
-   signed Presence including protocol version.
+   symmetric challenge-bound signed Presence including genesis-backed
+   `SystemRootProof`, signed sequenced peer frames, genesis-backed schema
+   descriptor states, protocol v6.
    ed25519-dalek v2 (pure Rust, wasm-compatible), rand for nonces; sha2
    already in tree.
 2. core: Node keypair custody, presence sign/verify at register_peer,
-   durable recognition against the system-root founder record, Admission
+   session/signature/replay-verified frame dispatch, atomic durable recognition against
+   the proven system-root founder record, Admission
    enum + envelope minting at commit paths, core-side envelope verification
    ahead of the agent hooks, entity-id derivation in the create path
    (eager freeze: extraction at create() return, construction-order
-   inversion), creation-guard simplification, G-1 seam patch.
+   inversion), creation-guard simplification, state-genesis proof, G-1 seam patch.
 3. Sweep: ankql literal, storage engines, wasm/uniffi bindings, examples,
    tests (fixtures move to create-path helpers).
 4. specs/concurrency/threat-model.md re-dispositions per the list above;
    un-ignore the C4-15 arm; adversarial arms for: forged presence signature,
    unrecognized-durable claim, forged attestation envelope, genesis id
-   mismatch, cross-system genesis replay.
+   mismatch, cross-system genesis/attestation replay, substituted root state,
+   concurrent first roots, spoofed post-handshake sender, and state without genesis.
 5. Gates: fmt/taplo/clippy, full workspace tests, then PR (plain language,
    no internal shorthand; scope and migration posture stated).

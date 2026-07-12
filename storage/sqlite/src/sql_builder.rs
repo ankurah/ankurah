@@ -231,7 +231,7 @@ impl SqlBuilder {
             Literal::Bool(b) => self.push_param(rusqlite::types::Value::Integer(if *b { 1 } else { 0 })),
             Literal::I16(i) => self.push_param(rusqlite::types::Value::Integer(*i as i64)),
             Literal::I32(i) => self.push_param(rusqlite::types::Value::Integer(*i as i64)),
-            Literal::EntityId(ulid) => self.push_param(rusqlite::types::Value::Text(EntityId::from_ulid(*ulid).to_base64())),
+            Literal::EntityId(bytes) => self.push_param(rusqlite::types::Value::Text(EntityId::from_bytes(*bytes).to_base64())),
             Literal::Object(bytes) => self.push_param(rusqlite::types::Value::Blob(bytes.clone())),
             Literal::Binary(bytes) => self.push_param(rusqlite::types::Value::Blob(bytes.clone())),
             // For JSON literals, extract the raw SQL value since json_extract() returns SQL types.
@@ -383,6 +383,26 @@ mod tests {
     }
 
     #[test]
+    fn test_entity_id_literal_uses_43_character_base64url_text() {
+        use ankql::ast::{ComparisonOperator, Expr, Literal, PathExpr, Predicate};
+
+        let bytes = [7u8; 32];
+        let predicate = Predicate::Comparison {
+            left: Box::new(Expr::Path(PathExpr::simple("id"))),
+            operator: ComparisonOperator::Equal,
+            right: Box::new(Expr::Literal(Literal::EntityId(bytes))),
+        };
+        let mut sql = SqlBuilder::new();
+        sql.predicate(&predicate).unwrap();
+
+        let (sql_string, params) = sql.build_where_clause();
+        let encoded = EntityId::from_bytes(bytes).to_base64();
+        assert_eq!(encoded.len(), 43);
+        assert_eq!(sql_string, r#""id" = ?"#);
+        assert_eq!(params, vec![rusqlite::types::Value::Text(encoded)]);
+    }
+
+    #[test]
     fn test_and_condition() {
         let selection = parse_selection("name = 'Alice' AND age = 30").unwrap();
         let mut sql = SqlBuilder::with_fields(vec!["id", "name", "age"]);
@@ -443,13 +463,11 @@ mod tests {
     #[test]
     fn test_identifier_renders_like_path_simple() {
         use ankql::ast::{Expr, Identifier, PathExpr};
-        use ulid::Ulid;
 
         // A simple resolved Identifier renders as the column named `name`, exactly
         // like the equivalent single-step Path. (The parser never produces Identifier,
         // so we construct it programmatically.)
-        let id_sql =
-            where_for(Expr::Identifier(Identifier { property: Ulid::from_bytes([5u8; 16]), name: "status".to_string(), subpath: vec![] }));
+        let id_sql = where_for(Expr::Identifier(Identifier { property: [5u8; 32], name: "status".to_string(), subpath: vec![] }));
         let path_sql = where_for(Expr::Path(PathExpr::simple("status")));
 
         assert_eq!(id_sql, r#""status" = ?"#);
@@ -459,12 +477,11 @@ mod tests {
     #[test]
     fn test_identifier_renders_like_path_json_subpath() {
         use ankql::ast::{Expr, Identifier, PathExpr};
-        use ulid::Ulid;
 
         // An Identifier with a JSON subpath renders json_extract() identically to the
         // equivalent multi-step Path.
         let id_sql = where_for(Expr::Identifier(Identifier {
-            property: Ulid::from_bytes([5u8; 16]),
+            property: [5u8; 32],
             name: "data".to_string(),
             subpath: vec!["user".to_string(), "name".to_string()],
         }));

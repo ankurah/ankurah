@@ -26,8 +26,8 @@ use testcontainers::ContainerAsync;
 use testcontainers_modules::{postgres as pg_module, testcontainers::runners::AsyncRunner};
 
 use crate::harness::{
-    assert_state_heads_resolvable, child_crash_point, event_present, handoff_write, handoff_write_event, has_persisted_state,
-    spawn_crash_child_with, CrashPoint, CrashStorageEngine,
+    assert_state_heads_resolvable, child_crash_point, crash_signing_key, event_present, handoff_write, handoff_write_event,
+    has_persisted_state, spawn_crash_child_with, CrashPoint, CrashStorageEngine,
 };
 use crate::models::Album;
 
@@ -70,7 +70,7 @@ async fn armed_child_pg_node(crash: CrashPoint) -> Result<(Node<PgCrashEngine, P
     let uri = std::env::var(ENV_PG_URI).map_err(|_| anyhow::anyhow!("child missing postgres uri"))?;
     let pg = Arc::new(Postgres::open(&uri).await?);
     let engine = Arc::new(CrashStorageEngine::new(pg, Some(crash)));
-    let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
+    let node = Node::new_durable_with_signing_key(engine.clone(), PermissiveAgent::new(), crash_signing_key());
     node.system.create().await?;
     // Register the scenario model as setup (mirrors scenarios.rs): the
     // registration executor's writes stay out of the armed crash-point
@@ -84,7 +84,7 @@ async fn armed_child_pg_node(crash: CrashPoint) -> Result<(Node<PgCrashEngine, P
 /// Reopen a fresh durable node on the same postgres database (parent side).
 async fn reopen_pg_node(uri: &str) -> Result<Node<Postgres, PermissiveAgent>> {
     let pg = Arc::new(Postgres::open(uri).await?);
-    let node = Node::new_durable(pg, PermissiveAgent::new());
+    let node = Node::new_durable_with_signing_key(pg, PermissiveAgent::new(), crash_signing_key());
     // Drive the async catalog load, then wait for the persisted root.
     let _ = node.system.collection(&Album::collection()).await?;
     node.system.wait_system_ready().await;
@@ -93,7 +93,7 @@ async fn reopen_pg_node(uri: &str) -> Result<Node<Postgres, PermissiveAgent>> {
 
 /// Generate `n` independent album creation events on a throwaway in-memory sled
 /// node (event generation is engine-independent).
-async fn generate_creation_batch(n: usize, model: proto::EntityId) -> Result<Vec<Attested<proto::Event>>> {
+async fn generate_creation_batch(n: usize, model: proto::EntityId, target_system: proto::EntityId) -> Result<Vec<Attested<proto::Event>>> {
     use ankurah_storage_sled::SledStorageEngine;
     let helper = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
     helper.system.create().await?;
@@ -108,6 +108,11 @@ async fn generate_creation_batch(n: usize, model: proto::EntityId) -> Result<Vec
         .into_iter()
         .map(|mut event| {
             event.model = model;
+            let proto::EventBody::Genesis { system, .. } = &mut event.body else {
+                unreachable!("a create-only batch contains only genesis events")
+            };
+            *system = Some(target_system);
+            event.entity_id = event.id().into();
             Attested::from(event)
         })
         .collect())
@@ -124,7 +129,7 @@ async fn child_pg_commit_event_before_set_state() -> Result<()> {
     };
     let (node, _engine) = armed_child_pg_node(crash).await?;
     let model = node.catalog.model_id_for(Album::collection().as_str()).expect("Album registered in armed_child_pg_node");
-    let events = generate_creation_batch(1, model).await?;
+    let events = generate_creation_batch(1, model, node.system.root_id().expect("armed node has a system root")).await?;
     handoff_write("entity", &events[0].payload.entity_id.to_base64())?;
     node.commit_remote_transaction(&c, proto::TransactionId::new(), events).await?;
     panic!("pg scenario 1 child did not crash");
@@ -170,7 +175,7 @@ async fn child_pg_mid_batch() -> Result<()> {
     };
     let (node, _engine) = armed_child_pg_node(crash).await?;
     let model = node.catalog.model_id_for(Album::collection().as_str()).expect("Album registered in armed_child_pg_node");
-    let events = generate_creation_batch(PG_S2_BATCH, model).await?;
+    let events = generate_creation_batch(PG_S2_BATCH, model, node.system.root_id().expect("armed node has a system root")).await?;
     for e in &events {
         handoff_write("entity", &e.payload.entity_id.to_base64())?;
         handoff_write_event("event", e)?;
@@ -234,7 +239,7 @@ async fn child_pg_entity_creation() -> Result<()> {
     };
     let (node, _engine) = armed_child_pg_node(crash).await?;
     let model = node.catalog.model_id_for(Album::collection().as_str()).expect("Album registered in armed_child_pg_node");
-    let events = generate_creation_batch(1, model).await?;
+    let events = generate_creation_batch(1, model, node.system.root_id().expect("armed node has a system root")).await?;
     handoff_write("entity", &events[0].payload.entity_id.to_base64())?;
     handoff_write_event("event", &events[0])?;
     node.commit_remote_transaction(&c, proto::TransactionId::new(), events).await?;

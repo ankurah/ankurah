@@ -157,12 +157,9 @@ impl Collatable for f64 {
     fn is_maximum(&self) -> bool { *self == f64::INFINITY }
 }
 
-// Implementation for EntityId (ULIDs have natural lexicographic ordering)
+// EntityId's fixed-width content hash has natural bytewise ordering.
 impl Collatable for EntityId {
-    fn to_bytes(&self) -> Vec<u8> {
-        // EntityId is based on ULID which has lexicographic ordering
-        self.to_bytes().to_vec()
-    }
+    fn to_bytes(&self) -> Vec<u8> { self.to_bytes().to_vec() }
 
     fn successor_bytes(&self) -> Option<Vec<u8>> {
         if self.is_maximum() {

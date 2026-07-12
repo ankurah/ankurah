@@ -59,10 +59,17 @@ impl<'a> Workload<'a> {
     /// it to all other nodes through the scheduler, and return its id. The id
     /// is deterministic (seed-derived counter).
     pub async fn create_at(&mut self, origin: usize, field: Field, value: &str) -> proto::EntityId {
-        let id = model::entity_id(self.next_entity);
+        let seed = model::entity_id(self.next_entity);
         self.next_entity += 1;
 
-        let event = model::genesis_event(id, field, value);
+        let system = self.nodes[origin]
+            .node
+            .system
+            .root()
+            .map(|root| root.payload.entity_id)
+            .expect("simulation node has joined a system before workloads begin");
+        let event = model::genesis_event(seed, Some(system), field, value);
+        let id = event.entity_id;
         let head = proto::Clock::from(vec![event.id()]);
         let attested = model::attest(event);
 
@@ -142,6 +149,7 @@ impl<'a> Workload<'a> {
     pub async fn deliver_state_update(&mut self, origin: usize, dst: usize, entity: proto::EntityId) {
         let item = self.state_and_event_item(origin, entity).await;
         let message = self.subscription_update_message(origin, dst, vec![item]);
+        let message = self.nodes[origin].node.sign_peer_message(self.nodes[dst].id(), message).expect("sim peers are connected");
         self.scheduler.enqueue(origin, dst, message);
     }
 
@@ -153,6 +161,7 @@ impl<'a> Workload<'a> {
     /// of that specific batch.
     pub fn deliver_items(&mut self, origin: usize, dst: usize, items: Vec<proto::SubscriptionUpdateItem>) {
         let message = self.subscription_update_message(origin, dst, items);
+        let message = self.nodes[origin].node.sign_peer_message(self.nodes[dst].id(), message).expect("sim peers are connected");
         self.scheduler.enqueue(origin, dst, message);
     }
 
@@ -248,7 +257,7 @@ impl<'a> Workload<'a> {
 
         let origin_id = self.nodes[origin].id();
         let node_indices: Vec<usize> = self.nodes.iter().map(|n| n.index).filter(|&i| i != origin).collect();
-        let node_ids: Vec<proto::EntityId> = self.nodes.iter().map(|n| n.id()).collect();
+        let node_ids: Vec<proto::NodeId> = self.nodes.iter().map(|n| n.id()).collect();
 
         for event in &events {
             let event_id = event.payload.id();
@@ -260,6 +269,7 @@ impl<'a> Workload<'a> {
                     body: proto::NodeRequestBody::CommitTransaction { id: proto::TransactionId::new(), events: vec![event.clone()] },
                 };
                 let message = proto::NodeMessage::Request { auth: vec![proto::AuthData(vec![])], request };
+                let message = self.nodes[origin].node.sign_peer_message(self.nodes[dst].id(), message).expect("sim peers are connected");
                 self.scheduler.enqueue_event(origin, dst, entity, event_id.clone(), message);
             }
         }
@@ -374,15 +384,13 @@ where
 
         // Full mesh: every node knows every other. Ephemeral nodes join node 0's
         // system as a side effect of registering it as a durable peer.
-        for a in &nodes {
-            for b in &nodes {
-                if a.index != b.index {
-                    a.connect_to(b);
-                }
+        for a in 0..nodes.len() {
+            for b in (a + 1)..nodes.len() {
+                SimNode::connect_pair(&nodes[a], &nodes[b]);
             }
         }
 
-        let node_ids: Vec<proto::EntityId> = nodes.iter().map(|n| n.id()).collect();
+        let node_ids: Vec<proto::NodeId> = nodes.iter().map(|n| n.id()).collect();
         let mut scheduler = Scheduler::new(captured.clone(), faults, node_ids);
         let mut trace = Trace::new();
 

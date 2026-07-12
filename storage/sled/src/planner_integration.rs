@@ -1,8 +1,8 @@
 // Refactored planner integration - cleaner and more cohesive
 
 use ankurah_core::indexing::KeySpec;
+use ankurah_core::value::Value;
 use ankurah_core::value::ValueType;
-use ankurah_core::{collation::Collatable, value::Value};
 use ankurah_storage_common::{Endpoint, KeyBounds, KeyDatum};
 
 use crate::error::IndexError;

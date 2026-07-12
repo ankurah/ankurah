@@ -1,4 +1,4 @@
-error: explicit id "tooshort" decodes to 6 bytes; an EntityId is exactly 16 bytes (RFC 5.9)
+error: explicit id "tooshort" decodes to 6 bytes; an EntityId is exactly 32 bytes (RFC 5.9)
   --> tests/compile_fail/invalid_explicit_id.rs:10:16
    |
 10 |     pub label: String,

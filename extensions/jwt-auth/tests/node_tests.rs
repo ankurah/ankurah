@@ -239,7 +239,7 @@ async fn test_update_scope_requires_before_and_after_state() -> anyhow::Result<(
         // registered by the creates above. check_event keys on the entity's
         // collection, not this field, but the struct still requires a valid id.
         model: node.catalog.model_id_for(denied_record.collection().as_str()).expect("ScopedRecord registered by the creates above"),
-        operations: OperationSet(BTreeMap::new()),
+        body: ankurah_proto::EventBody::Update { operations: OperationSet(BTreeMap::new()) },
         parent: Clock::new(denied_record.head().to_vec()),
     };
 

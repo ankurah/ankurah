@@ -552,8 +552,13 @@ mod tests {
     }
     impl TestEntity {
         fn new(name: &str, status: &str) -> Self {
+            let mut id = [0u8; 32];
+            for (index, byte) in name.bytes().chain([0xff]).chain(status.bytes()).enumerate() {
+                let slot = index % id.len();
+                id[slot] = id[slot].wrapping_add(byte);
+            }
             Self {
-                id: proto::EntityId::new(),
+                id: proto::EntityId::from_bytes(id),
                 collection: proto::CollectionId::fixed_name("album"),
                 state: Arc::new(Mutex::new(HashMap::from([
                     ("name".to_string(), name.to_string()),

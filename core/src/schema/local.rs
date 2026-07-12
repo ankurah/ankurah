@@ -39,7 +39,7 @@ pub struct ModelSchema {
     /// `#[model(id = "...")]`: bind this model to a KNOWN model entity by
     /// explicit id (RFC 5.9), bypassing by-collection derivation. `None`
     /// for the default by-name/by-collection derivation path. The value is
-    /// URL-safe base64 of a 16-byte EntityId, validated at derive time.
+    /// URL-safe base64 of a 32-byte EntityId, validated at derive time.
     pub explicit_id: Option<&'static str>,
 }
 
@@ -74,7 +74,7 @@ pub struct FieldSchema {
     pub optional: bool,
     /// `#[property(id = "...")]`: bind this field to a KNOWN, possibly
     /// shared, property entity by explicit id (RFC 5.9). `None` for the
-    /// default by-name derivation. URL-safe base64 of a 16-byte EntityId,
+    /// default by-name derivation. URL-safe base64 of a 32-byte EntityId,
     /// validated at derive time.
     pub explicit_id: Option<&'static str>,
 }

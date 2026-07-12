@@ -31,7 +31,7 @@ impl EventId {
     /// shape carries that fact). Binding the system id into every non-root
     /// genesis gives the one-id-one-system invariant a cryptographic
     /// backstop.
-    pub fn from_genesis_parts(system: &Option<EntityId>, nonce: &[u8; 16], timestamp: u64, operations: &OperationSet) -> Self {
+    pub fn from_genesis_parts(system: &Option<EntityId>, nonce: &[u8; 32], timestamp: u64, operations: &OperationSet) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(GENESIS_TAG);
         hasher.update(bincode::serialize(system).unwrap());
@@ -160,7 +160,7 @@ pub enum EventBody {
         /// Creator-random. Distinct create calls draw distinct nonces and
         /// are distinct entities even under identical payloads; a create
         /// retry that reuses the nonce (and payload) is idempotent.
-        nonce: [u8; 16],
+        nonce: [u8; 32],
         /// Unix ms, advisory (creator-supplied; same trust level as ULID
         /// timestamps before it). Adds entropy and preserves a
         /// creation-time signal for storage locality.
@@ -189,7 +189,7 @@ impl Event {
     /// Assemble a genesis event, drawing a fresh nonce and timestamp and
     /// deriving the entity id from the full genesis content (RFC II.2/II.3).
     pub fn genesis(model: EntityId, system: Option<EntityId>, operations: OperationSet) -> Self {
-        let mut nonce = [0u8; 16];
+        let mut nonce = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce);
         let timestamp = crate::time::unix_ms_now();
         let entity_id: EntityId = EventId::from_genesis_parts(&system, &nonce, timestamp, &operations).into();
@@ -310,6 +310,17 @@ pub struct EntityState {
     /// The model-definition entity id (#330); see [`Event::model`].
     pub model: EntityId,
     pub state: State,
+}
+
+/// A state snapshot accompanied by the genesis event that self-certifies the
+/// snapshot's entity identity. The model attribution is carried by both halves
+/// and must be checked separately because model is deliberately outside the
+/// event-id hash. Used where a receiver must consume a state before it has
+/// enough catalog context to fetch that genesis itself.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct StateWithGenesis {
+    pub genesis: Attested<Event>,
+    pub state: Attested<EntityState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -440,7 +451,7 @@ mod tests {
         use sha2::{Digest, Sha256};
 
         let system = Some(EntityId::from_bytes([9u8; 32]));
-        let nonce = [3u8; 16];
+        let nonce = [3u8; 32];
         let timestamp = 1_720_000_000_123u64;
         let operations = OperationSet(BTreeMap::from([("lww".to_string(), vec![Operation { diff: vec![1, 2, 3] }])]));
 
@@ -502,7 +513,7 @@ mod tests {
     /// content under a different system id is a different entity id.
     #[test]
     fn genesis_id_binds_the_system() {
-        let nonce = [1u8; 16];
+        let nonce = [1u8; 32];
         let ts = 42u64;
         let ops = OperationSet(BTreeMap::new());
         let root = EventId::from_genesis_parts(&None, &nonce, ts, &ops);

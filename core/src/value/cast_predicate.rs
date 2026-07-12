@@ -112,7 +112,7 @@ mod tests {
 
     #[test]
     fn test_cast_id_field_string_to_entity_id() {
-        let entity_id = EntityId::new();
+        let entity_id = EntityId::from_bytes([0x11; 32]);
         let base64_str = entity_id.to_base64();
 
         // Create a predicate: id = "base64_string"
@@ -127,8 +127,8 @@ mod tests {
 
         // Verify the string literal was cast to EntityId
         if let Predicate::Comparison { right, .. } = cast_predicate {
-            if let Expr::Literal(Literal::EntityId(ulid)) = *right {
-                assert_eq!(EntityId::from_ulid(ulid), entity_id);
+            if let Expr::Literal(Literal::EntityId(bytes)) = *right {
+                assert_eq!(EntityId::from_bytes(bytes), entity_id);
             } else {
                 panic!("Expected EntityId literal, got {:?}", right);
             }
@@ -139,7 +139,7 @@ mod tests {
 
     #[test]
     fn test_cast_literal_equals_field() {
-        let entity_id = EntityId::new();
+        let entity_id = EntityId::from_bytes([0x22; 32]);
         let base64_str = entity_id.to_base64();
 
         // Create a predicate: "base64_string" = id (literal on left side)
@@ -154,8 +154,8 @@ mod tests {
 
         // Verify the string literal was cast to EntityId
         if let Predicate::Comparison { left, .. } = cast_predicate {
-            if let Expr::Literal(Literal::EntityId(ulid)) = *left {
-                assert_eq!(EntityId::from_ulid(ulid), entity_id);
+            if let Expr::Literal(Literal::EntityId(bytes)) = *left {
+                assert_eq!(EntityId::from_bytes(bytes), entity_id);
             } else {
                 panic!("Expected EntityId literal, got {:?}", left);
             }
@@ -166,7 +166,7 @@ mod tests {
 
     #[test]
     fn test_cast_complex_predicate() {
-        let entity_id = EntityId::new();
+        let entity_id = EntityId::from_bytes([0x33; 32]);
         let base64_str = entity_id.to_base64();
 
         // Create a complex predicate: id = "base64_string" AND name = "test"
@@ -190,8 +190,8 @@ mod tests {
         if let Predicate::And(left_pred, right_pred) = cast_predicate {
             // Check id field was cast to EntityId
             if let Predicate::Comparison { right, .. } = *left_pred {
-                if let Expr::Literal(Literal::EntityId(ulid)) = *right {
-                    assert_eq!(EntityId::from_ulid(ulid), entity_id);
+                if let Expr::Literal(Literal::EntityId(bytes)) = *right {
+                    assert_eq!(EntityId::from_bytes(bytes), entity_id);
                 } else {
                     panic!("Expected EntityId literal for id field");
                 }

@@ -61,7 +61,8 @@ impl From<crate::EventId> for EntityId {
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 impl EntityId {
     #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = toString))]
-    pub fn to_string(&self) -> String { self.to_base64() }
+    #[cfg_attr(feature = "uniffi", uniffi::method(name = "toString"))]
+    pub fn to_string_exported(&self) -> String { self.to_base64() }
 }
 
 // WASM-only methods

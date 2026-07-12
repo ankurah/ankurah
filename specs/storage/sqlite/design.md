@@ -48,10 +48,10 @@ Follow the Postgres pattern with dynamic table creation per collection:
 
 ```sql
 CREATE TABLE IF NOT EXISTS "{collection_id}" (
-    id TEXT PRIMARY KEY,          -- Base64-encoded ULID (matches Postgres)
+    id TEXT PRIMARY KEY,          -- 43-char base64url EntityId (32 bytes)
     state_buffer BLOB NOT NULL,   -- bincode-serialized BTreeMap<String, Vec<u8>>
-    head TEXT NOT NULL,           -- JSON array of ULID strings (Clock)
-    attestations BLOB             -- bincode-serialized Vec<Vec<u8>>
+    head TEXT NOT NULL,           -- JSON array of base64url EventIds (Clock)
+    attestations BLOB             -- bincode-serialized AttestationSet
 );
 ```
 
@@ -61,7 +61,7 @@ CREATE TABLE IF NOT EXISTS "{collection_id}" (
 CREATE TABLE IF NOT EXISTS "{collection_id}_event" (
     id TEXT PRIMARY KEY,          -- Base64-encoded EventId
     entity_id TEXT,               -- Base64-encoded EntityId
-    operations BLOB,              -- bincode-serialized OperationSet
+    body BLOB,                    -- bincode-serialized EventBody
     parent TEXT,                  -- JSON serialized Clock
     attestations BLOB             -- bincode-serialized AttestationSet
 );
@@ -140,7 +140,7 @@ Key implementation details:
 - JSONB path handling: `json_extract("column", '$.path')` for reliable type-aware comparisons
 - Simple paths: Direct column reference `"column"`
 - Multi-step paths: `json_extract("column", '$.step1.step2')`
-- ULID storage: TEXT (base64) matching Postgres
+- EntityId/EventId storage: 43-character base64url TEXT, matching Postgres
 
 ## Connection Manager
 
@@ -189,11 +189,15 @@ storage/sqlite/
 1. **WASM support**: Deferred - not needed for initial implementation
 2. **WAL mode**: Enabled by default with additional performance PRAGMAs
 3. **Connection pooling**: Use `bb8` with custom manager (matches Postgres pattern)
-4. **ULID storage**: TEXT (base64) matching Postgres
+4. **Content-hash ID storage**: 32-byte EntityId/EventId values encoded as
+   43-character base64url TEXT, matching Postgres
 5. **DDL locking**: Use `tokio::sync::Mutex` per collection to serialize ALTER TABLE operations
 6. **JSONB for JSON values**: Use SQLite's JSONB format (stored as BLOB via `jsonb()` function), queried via `json_extract()` for type-aware comparisons
 7. **Event storage**: Separate `{collection}_event` tables with entity_id index for efficient event retrieval
 8. **Table name caching**: Cache state and event table names in `SqliteBucket` to avoid repeated allocations
+9. **Breaking pre-1.0 migration**: Existing databases using 22-character ULID
+   entity ids or an `operations` event column must be reset; this design does not
+   attempt an in-place identity rewrite.
 
 ## References
 

@@ -276,7 +276,7 @@ mod tests {
 
     #[test]
     fn test_string_to_entity_id() {
-        let entity_id = EntityId::new();
+        let entity_id = EntityId::from_bytes([0x11; 32]);
         let base64_str = entity_id.to_base64();
         let value = Value::String(base64_str.clone());
 
@@ -289,7 +289,7 @@ mod tests {
 
     #[test]
     fn test_entity_id_to_string() {
-        let entity_id = EntityId::new();
+        let entity_id = EntityId::from_bytes([0x22; 32]);
         let value = Value::EntityId(entity_id.clone());
 
         let result = value.cast_to(ValueType::String).unwrap();
@@ -379,7 +379,7 @@ mod tests {
             Value::F64(1.0),
             Value::Bool(true),
             Value::String("1".into()),
-            Value::EntityId(ankurah_proto::EntityId::new()),
+            Value::EntityId(ankurah_proto::EntityId::from_bytes([0x33; 32])),
             Value::Object(vec![]),
             Value::Binary(vec![1]),
             Value::Json(serde_json::json!(1)),

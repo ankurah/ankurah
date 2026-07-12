@@ -168,6 +168,7 @@ dependencies = [
  "bincode",
  "chrono",
  "criterion",
+ "ed25519-dalek",
  "futures",
  "futures-signals",
  "futures-timer",
@@ -182,7 +183,9 @@ dependencies = [
  "serde",
  "serde-wasm-bindgen",
  "serde_json",
+ "sha2",
  "smallvec",
+ "tempfile",
  "thiserror 2.0.17",
  "tokio",
  "tracing",
@@ -259,6 +262,7 @@ dependencies = [
  "ankurah-websocket-server",
  "anyhow",
  "chrono",
+ "dirs 5.0.1",
  "example-model",
  "serde_json",
  "tokio",
@@ -410,7 +414,6 @@ dependencies = [
  "tokio-postgres",
  "tracing",
  "tracing-subscriber",
- "ulid",
 ]
 
 [[package]]
@@ -436,7 +439,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "ulid",
 ]
 
 [[package]]
@@ -460,7 +462,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "ulid",
 ]
 
 [[package]]
@@ -483,6 +484,7 @@ dependencies = [
  "bincode",
  "criterion",
  "ctor 0.2.9",
+ "ed25519-dalek",
  "futures-util",
  "itertools 0.14.0",
  "js-sys",
@@ -499,7 +501,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "trybuild",
- "ulid",
  "wasm-bindgen",
 ]
 

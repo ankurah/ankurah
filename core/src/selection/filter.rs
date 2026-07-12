@@ -117,7 +117,7 @@ fn evaluate_identifier<I: Filterable>(item: &I, identifier: &Identifier) -> Resu
     let name = identifier.property_name();
     // The resolved identifier carries the property-definition id (RFC 5.5);
     // thread it so the checked read addresses id-keyed data directly.
-    let property_id = ankurah_proto::EntityId::from_ulid(identifier.property);
+    let property_id = ankurah_proto::EntityId::from_bytes(identifier.property);
     if identifier.is_simple() {
         // Bare column reference. RFC 5.4: a RESOLVED identifier that the item
         // does not hold evaluates as NULL (IsNull matches, comparisons are
@@ -364,17 +364,11 @@ mod tests {
         // A predicate containing Expr::Identifier (constructed programmatically)
         // evaluates identically to the same predicate written with Expr::Path.
         use ankql::ast::{ComparisonOperator, Expr, Identifier, Literal, PathExpr, Predicate};
-        use ulid::Ulid;
-
         let items = vec![TestItem::new("Alice", "30"), TestItem::new("Bob", "25"), TestItem::new("Charlie", "35")];
 
         // Identifier { name: "name", subpath: [] } = 'Alice'
         let id_pred = Predicate::Comparison {
-            left: Box::new(Expr::Identifier(Identifier {
-                property: Ulid::from_bytes([9u8; 16]),
-                name: "name".to_string(),
-                subpath: vec![],
-            })),
+            left: Box::new(Expr::Identifier(Identifier { property: [9u8; 32], name: "name".to_string(), subpath: vec![] })),
             operator: ComparisonOperator::Equal,
             right: Box::new(Expr::Literal(Literal::String("Alice".to_string()))),
         };
@@ -414,10 +408,8 @@ mod tests {
         use ankql::ast::{ComparisonOperator, Expr, Identifier, Literal, Predicate};
         use ankurah_proto as proto;
         use std::collections::BTreeMap;
-        use ulid::Ulid;
-
         // A bound id-keyed writer, as any post-epoch user entity is.
-        let title_id = proto::EntityId::from_bytes([0x11; 16]);
+        let title_id = proto::EntityId::from_bytes([0x11; 32]);
         let writer = LWWBackend::new();
         // Build an id-keyed buffer directly: the commit path resolves user
         // writes to id keys, so any post-epoch buffer is id-keyed (no binding).
@@ -428,15 +420,11 @@ mod tests {
 
         let state =
             proto::State { state_buffers: proto::StateBuffers(BTreeMap::from([("lww".to_string(), buffer)])), head: Default::default() };
-        let entity = TemporaryEntity::new(proto::EntityId::from_bytes([0x77; 16]), "album".into(), &state).unwrap();
+        let entity = TemporaryEntity::new(proto::EntityId::from_bytes([0x77; 32]), "album".into(), &state).unwrap();
 
         // Resolved-Identifier predicate (the checked read path).
         let id_pred = Predicate::Comparison {
-            left: Box::new(Expr::Identifier(Identifier {
-                property: Ulid::from_bytes(title_id.to_bytes()),
-                name: "title".to_string(),
-                subpath: vec![],
-            })),
+            left: Box::new(Expr::Identifier(Identifier { property: title_id.to_bytes(), name: "title".to_string(), subpath: vec![] })),
             operator: ComparisonOperator::Equal,
             right: Box::new(Expr::Literal(Literal::String("alpha".to_string()))),
         };
@@ -449,11 +437,7 @@ mod tests {
 
         // A property nothing claims evaluates as NULL: comparison false, no error.
         let absent_pred = Predicate::Comparison {
-            left: Box::new(Expr::Identifier(Identifier {
-                property: Ulid::from_bytes([8; 16]),
-                name: "ghost".to_string(),
-                subpath: vec![],
-            })),
+            left: Box::new(Expr::Identifier(Identifier { property: [8; 32], name: "ghost".to_string(), subpath: vec![] })),
             operator: ComparisonOperator::Equal,
             right: Box::new(Expr::Literal(Literal::String("alpha".to_string()))),
         };
@@ -619,8 +603,6 @@ mod tests {
             // An Identifier with a JSON subpath evaluates identically to the equivalent
             // multi-step Path (licensing.territory = 'US'), extracting the same nested value.
             use ankql::ast::{ComparisonOperator, Expr, Identifier, Literal, PathExpr, Predicate};
-            use ulid::Ulid;
-
             let items = vec![
                 TrackItem::new("Track A", serde_json::json!({ "territory": "US" })),
                 TrackItem::new("Track B", serde_json::json!({ "territory": "UK" })),
@@ -629,7 +611,7 @@ mod tests {
 
             let id_pred = Predicate::Comparison {
                 left: Box::new(Expr::Identifier(Identifier {
-                    property: Ulid::from_bytes([3u8; 16]),
+                    property: [3u8; 32],
                     name: "licensing".to_string(),
                     subpath: vec!["territory".to_string()],
                 })),

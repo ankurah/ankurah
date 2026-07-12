@@ -122,7 +122,7 @@ mod read_dispatch_tests {
     use ankurah_proto::EntityId;
 
     fn id(byte: u8) -> EntityId {
-        let mut bytes = [0u8; 16];
+        let mut bytes = [0u8; 32];
         bytes[0] = byte;
         EntityId::from_bytes(bytes)
     }

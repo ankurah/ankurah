@@ -18,11 +18,11 @@ pub struct AuthData(pub Vec<u8>);
 
 /// A signed, structured admission attestation (RFC
 /// specs/identity-attestation/spec.md III.1). Verification is a pure
-/// function of (envelope, expected attester set): signature valid under
-/// `attester`, and `attester` recognized against the system-root founder
-/// record. No connection context is involved, which is what makes the
-/// artifact portable (multi-durable acceptance, peer-served reads, storage
-/// and replay).
+/// function of (envelope, expected system root, expected attester set):
+/// signature valid under `attester`, body bound to the expected system root,
+/// and `attester` recognized against that root's founder record. No connection
+/// context is involved, which is what makes the artifact portable
+/// (multi-durable acceptance, peer-served reads, storage and replay).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Attestation {
     pub attester: NodeId,
@@ -36,11 +36,15 @@ pub enum AttestationBody {
     /// Naming an [`EventId`] pins the event's identity-bearing content.
     /// `model` separately pins the deliberately non-identity model envelope,
     /// so an admitted event cannot be relabeled under another model.
+    /// `system_root` prevents a valid envelope from being transplanted into a
+    /// different system founded by the same node key.
     /// `claims` is agent-defined and opaque to core (ruling R5); the
     /// envelope alone ("recognized durable D admitted event E") is the
     /// load-bearing fact.
-    EventAdmitted { event: EventId, model: EntityId, claims: Vec<u8> },
+    EventAdmitted { system_root: EntityId, event: EventId, model: EntityId, claims: Vec<u8> },
     StateAttested {
+        /// The pinned system identity in which this verdict was issued.
+        system_root: EntityId,
         entity: EntityId,
         model: EntityId,
         head: Clock,
@@ -62,6 +66,19 @@ impl Attestation {
     /// Attester RECOGNITION (against the system-root founder record) is the
     /// caller's separate check; this verifies the cryptography only.
     pub fn verify_signature(&self) -> bool { self.attester.verify(&Self::signable_bytes(&self.body), &self.signature) }
+
+    /// Whether this envelope was issued for the expected pinned system.
+    ///
+    /// This check is deliberately separate from signature verification: a
+    /// node key may found more than one system, so signer recognition alone
+    /// cannot prevent cross-system replay.
+    pub fn matches_system_root(&self, expected: EntityId) -> bool {
+        match &self.body {
+            AttestationBody::EventAdmitted { system_root, .. } | AttestationBody::StateAttested { system_root, .. } => {
+                *system_root == expected
+            }
+        }
+    }
 
     /// Digest a state payload exactly as a state attestation does.
     pub fn state_digest(state: &EntityState) -> [u8; 32] {
@@ -167,7 +184,9 @@ mod tests {
     fn attestation_signature_round_trip() {
         let key = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
         let attester = NodeId::from(key.verifying_key());
+        let system_root = EntityId::from_bytes([6u8; 32]);
         let body = AttestationBody::EventAdmitted {
+            system_root,
             event: EventId::from_bytes([1u8; 32]),
             model: EntityId::from_bytes([9u8; 32]),
             claims: vec![1, 2, 3],
@@ -179,10 +198,17 @@ mod tests {
         // Tampering with the body invalidates the signature.
         let mut forged = attestation.clone();
         forged.body = AttestationBody::EventAdmitted {
+            system_root,
             event: EventId::from_bytes([2u8; 32]),
             model: EntityId::from_bytes([9u8; 32]),
             claims: vec![1, 2, 3],
         };
+        assert!(!forged.verify_signature());
+
+        // The system binding is covered by the same signature.
+        let mut forged = attestation.clone();
+        let AttestationBody::EventAdmitted { system_root, .. } = &mut forged.body else { unreachable!() };
+        *system_root = EntityId::from_bytes([7u8; 32]);
         assert!(!forged.verify_signature());
 
         // A different attester cannot claim the same signature.
@@ -194,11 +220,12 @@ mod tests {
 
     #[test]
     fn subject_matching_rejects_transplants_and_state_tampering() {
+        let system_root = EntityId::from_bytes([6u8; 32]);
         let model = EntityId::from_bytes([7u8; 32]);
         let event = Event::genesis(model, None, crate::OperationSet(BTreeMap::new()));
         let event_attestation = Attestation {
             attester: NodeId::from_bytes([3u8; 32]),
-            body: AttestationBody::EventAdmitted { event: event.id(), model, claims: vec![] },
+            body: AttestationBody::EventAdmitted { system_root, event: event.id(), model, claims: vec![] },
             signature: Signature::from_bytes([0u8; 64]),
         };
         assert!(event_attestation.matches_event(&event));
@@ -219,6 +246,7 @@ mod tests {
         let state_attestation = Attestation {
             attester: NodeId::from_bytes([3u8; 32]),
             body: AttestationBody::StateAttested {
+                system_root,
                 entity: state.entity_id,
                 model: state.model,
                 head: state.state.head.clone(),
@@ -233,5 +261,47 @@ mod tests {
         let mut tampered = state.clone();
         tampered.state.state_buffers.0.get_mut("lww").unwrap().push(4);
         assert!(!state_attestation.matches_state(&tampered));
+    }
+
+    #[test]
+    fn valid_attestation_cannot_be_transplanted_between_systems() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[21u8; 32]);
+        let attester = NodeId::from(key.verifying_key());
+        let system_a = EntityId::from_bytes([0xA1; 32]);
+        let system_b = EntityId::from_bytes([0xB2; 32]);
+        let model = EntityId::from_bytes([7u8; 32]);
+        let event = Event::genesis(model, None, crate::OperationSet(BTreeMap::new()));
+        let body = AttestationBody::EventAdmitted { system_root: system_a, event: event.id(), model, claims: b"admitted-in-a".to_vec() };
+        let signature: Signature = key.sign(&Attestation::signable_bytes(&body)).into();
+        let attestation = Attestation { attester, body, signature };
+
+        assert!(attestation.verify_signature(), "the source-system envelope is cryptographically valid");
+        assert!(attestation.matches_event(&event), "the payload binding remains valid after transport");
+        assert!(attestation.matches_system_root(system_a));
+        assert!(!attestation.matches_system_root(system_b), "a valid envelope from system A must not satisfy system B");
+
+        let state = EntityState {
+            entity_id: event.entity_id,
+            model,
+            state: crate::State {
+                state_buffers: crate::StateBuffers(BTreeMap::from([("lww".to_string(), vec![1, 2, 3])])),
+                head: crate::Clock::from(vec![event.id()]),
+            },
+        };
+        let body = AttestationBody::StateAttested {
+            system_root: system_a,
+            entity: state.entity_id,
+            model,
+            head: state.state.head.clone(),
+            state_digest: Attestation::state_digest(&state),
+            claims: b"state-in-a".to_vec(),
+        };
+        let signature: Signature = key.sign(&Attestation::signable_bytes(&body)).into();
+        let attestation = Attestation { attester, body, signature };
+
+        assert!(attestation.verify_signature(), "the source-system state envelope is cryptographically valid");
+        assert!(attestation.matches_state(&state));
+        assert!(attestation.matches_system_root(system_a));
+        assert!(!attestation.matches_system_root(system_b), "system B must also reject a state verdict issued in A");
     }
 }

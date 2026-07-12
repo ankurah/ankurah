@@ -25,6 +25,10 @@ pub enum AccessDenied {
     ParseError(ParseError),
     #[error("Insufficient attestation")]
     InsufficientAttestation,
+    #[error("Structurally invalid event: {0}")]
+    InvalidEventStructure(#[from] proto::EventStructureError),
+    #[error("Genesis belongs to system {actual:?}, expected {expected:?}")]
+    CrossSystemGenesis { expected: Option<proto::EntityId>, actual: Option<proto::EntityId> },
 }
 
 impl From<PropertyError> for AccessDenied {
@@ -40,6 +44,14 @@ impl From<AccessDenied> for wasm_bindgen::JsValue {
 }
 
 impl AccessDenied {}
+
+/// A PolicyAgent's semantic admission result. Core, not the agent, owns the
+/// node key and turns `Attest` into the uniform signed envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Admission {
+    Attest { claims: Vec<u8> },
+    Allow,
+}
 
 /// What a RegisterSchema request will ACTUALLY do, resolved by the
 /// registration executor under the allocation mutex (RFC 5.7 in specs/model-property-metadata/rfc.md; plan
@@ -154,7 +166,7 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
         entity_before: &Entity,
         entity_after: &Entity,
         event: &proto::Event,
-    ) -> Result<Option<proto::Attestation>, AccessDenied>;
+    ) -> Result<Admission, AccessDenied>;
 
     /// Gate a schema registration on its RESOLVED effect (RFC 5.7; plan
     /// decision 26). Called by the registration executor after its lookup
@@ -185,17 +197,18 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     fn validate_received_event<SE: StorageEngine>(
         &self,
         node: &Node<SE, Self>,
-        received_from_node: &proto::EntityId,
+        received_from_node: &proto::NodeId,
         event: &Attested<proto::Event>,
     ) -> Result<(), AccessDenied>;
 
-    /// Attest a state which the caller asserts is valid. Implementation may return None if no attestation is required
-    fn attest_state<SE: StorageEngine>(&self, node: &Node<SE, Self>, state: &proto::EntityState) -> Option<proto::Attestation>;
+    /// Decide whether core should attest a state and which policy claims to
+    /// place inside the signed envelope.
+    fn attest_state<SE: StorageEngine>(&self, node: &Node<SE, Self>, state: &proto::EntityState) -> Admission;
 
     fn validate_received_state<SE: StorageEngine>(
         &self,
         node: &Node<SE, Self>,
-        received_from_node: &proto::EntityId,
+        received_from_node: &proto::NodeId,
         state: &Attested<proto::EntityState>,
     ) -> Result<(), AccessDenied>;
 
@@ -241,7 +254,7 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     fn validate_causal_assertion<SE: StorageEngine>(
         &self,
         node: &Node<SE, Self>,
-        peer_id: &proto::EntityId,
+        peer_id: &proto::NodeId,
         head_relation: &proto::CausalAssertion,
     ) -> Result<(), AccessDenied>;
 
@@ -307,29 +320,25 @@ impl PolicyAgent for PermissiveAgent {
         _entity_before: &Entity,
         _entity_after: &Entity,
         _event: &proto::Event,
-    ) -> Result<Option<proto::Attestation>, AccessDenied> {
-        Ok(None)
+    ) -> Result<Admission, AccessDenied> {
+        Ok(Admission::Allow)
     }
 
     fn validate_received_event<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _from_node: &proto::EntityId,
+        _from_node: &proto::NodeId,
         _event: &proto::Attested<proto::Event>,
     ) -> Result<(), AccessDenied> {
         Ok(())
     }
 
-    fn attest_state<SE: StorageEngine>(&self, _node: &Node<SE, Self>, _state: &proto::EntityState) -> Option<proto::Attestation> {
-        // This PolicyAgent does not require attestation, so we return None
-        // Client/Server policy agents may also return None and defer to the server identity to validate the received state
-        None
-    }
+    fn attest_state<SE: StorageEngine>(&self, _node: &Node<SE, Self>, _state: &proto::EntityState) -> Admission { Admission::Allow }
 
     fn validate_received_state<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _from_node: &proto::EntityId,
+        _from_node: &proto::NodeId,
         _state: &Attested<proto::EntityState>,
     ) -> Result<(), AccessDenied> {
         // This PolicyAgent does not require validation, so we return Ok
@@ -378,7 +387,7 @@ impl PolicyAgent for PermissiveAgent {
     fn validate_causal_assertion<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _peer_id: &proto::EntityId,
+        _peer_id: &proto::NodeId,
         _head_relation: &proto::CausalAssertion,
     ) -> Result<(), AccessDenied> {
         // PermissiveAgent trusts all causal assertions

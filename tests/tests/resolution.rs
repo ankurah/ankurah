@@ -41,7 +41,7 @@ fn register(collection: &str, props: &[(&str, &str, &str)]) -> proto::NodeReques
 /// name (sourced from the SchemaRegistered response).
 async fn register_and_map(
     client: &Node<SledStorageEngine, PermissiveAgent>,
-    server_id: EntityId,
+    server_id: proto::NodeId,
     request: proto::NodeRequestBody,
 ) -> anyhow::Result<BTreeMap<String, EntityId>> {
     match client.request(server_id, &DEFAULT_CONTEXT, request).await? {
@@ -75,7 +75,7 @@ async fn resolution_binds_names_and_fails_closed() -> anyhow::Result<()> {
     let resolved = server.catalog.resolve_selection(&collection, &ankql::parser::parse_selection("name = 'x'")?).unwrap();
     match first_expr(&resolved) {
         Expr::Identifier(ident) => {
-            assert_eq!(ident.property, name_id.to_ulid());
+            assert_eq!(ident.property, name_id.to_bytes());
             assert_eq!(ident.name, "name");
             assert!(ident.subpath.is_empty());
         }
@@ -86,21 +86,23 @@ async fn resolution_binds_names_and_fails_closed() -> anyhow::Result<()> {
     let resolved = server.catalog.resolve_selection(&collection, &ankql::parser::parse_selection("payload.meta.genre = 'jazz'")?).unwrap();
     match first_expr(&resolved) {
         Expr::Identifier(ident) => {
-            assert_eq!(ident.property, payload_id.to_ulid());
+            assert_eq!(ident.property, payload_id.to_bytes());
             assert_eq!(ident.subpath, vec!["meta".to_string(), "genre".to_string()]);
         }
         other => panic!("expected Identifier, got {other:?}"),
     }
 
     // The id pseudo-property stays a Path.
-    let resolved =
-        server.catalog.resolve_selection(&collection, &ankql::parser::parse_selection("id = 'AQIDBAUGBwgJCgsMDQ4PEA'")?).unwrap();
+    let resolved = server
+        .catalog
+        .resolve_selection(&collection, &ankql::parser::parse_selection("id = 'AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA'")?)
+        .unwrap();
     assert!(matches!(first_expr(&resolved), Expr::Path(_)));
 
     // The legacy collection-qualified form normalizes away.
     let resolved = server.catalog.resolve_selection(&collection, &ankql::parser::parse_selection("album.name = 'x'")?).unwrap();
     match first_expr(&resolved) {
-        Expr::Identifier(ident) => assert_eq!((ident.property, ident.name.as_str()), (name_id.to_ulid(), "name")),
+        Expr::Identifier(ident) => assert_eq!((ident.property, ident.name.as_str()), (name_id.to_bytes(), "name")),
         other => panic!("expected Identifier, got {other:?}"),
     }
 

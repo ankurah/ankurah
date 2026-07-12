@@ -10,7 +10,7 @@ use crate::{
     reactor::AbstractEntity,
     value::Value,
 };
-use ankurah_proto::{Clock, CollectionId, EntityId, EntityState, Event, EventId, OperationSet, State};
+use ankurah_proto::{Clock, CollectionId, EntityId, EntityState, Event, EventBody, EventId, OperationSet, State};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
@@ -331,10 +331,13 @@ impl Entity {
         })))
     }
 
-    /// Generate an event which contains all operations for all backends since the last time they were collected
-    /// Used for transaction commit. Notably this does not apply the head to the entity, which must be done
-    /// using commit_head
-    pub(crate) fn generate_commit_event(&self) -> Result<Option<Event>, MutationError> {
+    /// Extract all operations staged since the previous extraction.
+    ///
+    /// Creation uses this once, eagerly, to freeze the genesis payload before
+    /// the entity id exists. Commit uses it again for any edits made after
+    /// `Transaction::create` returned. Backends therefore remain the single
+    /// source of truth for the extraction boundary.
+    pub(crate) fn extract_operations(&self) -> Result<OperationSet, MutationError> {
         let state = self.state.read().expect("other thread panicked, panic here too");
         let mut operations = BTreeMap::<String, Vec<ankurah_proto::Operation>>::new();
         for (name, backend) in &state.backends {
@@ -342,20 +345,25 @@ impl Entity {
                 operations.insert(name.clone(), ops);
             }
         }
+        Ok(OperationSet(operations))
+    }
 
-        // No operations on an EXISTING entity means nothing changed: no event.
-        // On a brand-new entity (empty head) it means every field is its
-        // default, which is still an entity: emit a zero-operation creation
-        // event so the entity exists, replicates, and persists (the #175
-        // degenerate case; RFC 5.4 in specs/model-property-metadata/rfc.md). EventId hashes fine over empty
-        // operations.
-        if operations.is_empty() && !state.head.is_empty() {
-            Ok(None)
-        } else {
-            let operations = OperationSet(operations);
-            let event = Event { entity_id: self.id, model: self.model_id()?, operations, parent: state.head.clone() };
-            Ok(Some(event))
+    /// Generate the single update event for edits accumulated on a transaction
+    /// entity. Genesis is frozen and stored by `Transaction::create`; an
+    /// empty-head entity reaching this path is therefore a phantom, never an
+    /// implicit creation.
+    pub(crate) fn generate_commit_event(&self) -> Result<Option<Event>, MutationError> {
+        let parent = self.head();
+        if parent.is_empty() {
+            return Err(MutationError::InvalidEvent);
         }
+
+        let operations = self.extract_operations()?;
+        if operations.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(Event { entity_id: self.id, model: self.model_id()?, parent, body: EventBody::Update { operations } }))
     }
 
     /// Updates the head of the entity to the given clock, which should come exclusively from generate_commit_event
@@ -398,6 +406,14 @@ impl Entity {
     where E: GetEvents + Send + Sync {
         debug!("apply_event head: {event} to {self}");
 
+        // Structural identity is sufficient on every node class: a genesis
+        // event names exactly the entity id derived from its own content, and
+        // updates must target this entity. No definitive-storage oracle is
+        // needed to decide whether a creation is admissible.
+        if event.entity_id != self.id || event.validate_structure().is_err() {
+            return Err(MutationError::InvalidEvent);
+        }
+
         // Idempotency is handled by the comparison algorithm:
         // - Event already in head -> Equal -> no-op (Ok(false))
         // - Event is ancestor of head -> StrictAscends -> no-op (Ok(false))
@@ -406,32 +422,13 @@ impl Entity {
         // (node_applier, system.rs) store events to storage BEFORE calling
         // apply_event (so BFS can find them), which would cause false positives.
 
-        // Creation event on entity with non-empty head: either re-delivery or attack.
-        // On durable nodes (definitive storage), we can cheaply distinguish:
-        //   event_stored() == true  → re-delivery → no-op
-        //   event_stored() == false → different genesis event → reject
-        // On ephemeral nodes, event_stored() may return false for legitimate
-        // re-deliveries (entity arrived via StateSnapshot without event storage),
-        // so we fall through to BFS which correctly identifies:
-        //   StrictAscends → re-delivery → no-op
-        //   Disjoint → different genesis → reject
-        if event.is_entity_create() && !self.head().is_empty() {
-            if getter.event_stored(&event.id()).await? {
-                return Ok(false);
-            }
-            if getter.storage_is_definitive() {
-                return Err(LineageError::Disjoint.into());
-            }
-            // Ephemeral: fall through to comparison
-        }
-
         // Check for entity creation under the mutex to avoid TOCTOU race
         if event.is_entity_create() {
             let mut state = self.state.write().unwrap();
             // Re-check if head is still empty now that we hold the lock
             if state.head.is_empty() {
                 // this is the creation event for a new entity, so we simply accept it
-                for (backend_name, operations) in event.operations.iter() {
+                for (backend_name, operations) in event.operations().iter() {
                     state.apply_operations_from_event(backend_name.clone(), operations, event.id())?;
                 }
                 state.head = event.id().into();
@@ -468,7 +465,7 @@ impl Entity {
                     let new_head: Clock = event.id().into();
                     let event_id = event.id();
                     if self.try_mutate(&mut head, |state| -> Result<(), MutationError> {
-                        for (backend_name, operations) in event.operations.iter() {
+                        for (backend_name, operations) in event.operations().iter() {
                             state.apply_operations_from_event(backend_name.clone(), operations, event_id.clone())?;
                         }
                         state.head = new_head.clone();
@@ -516,14 +513,14 @@ impl Entity {
                         for layer in all_layers {
                             // Check for backends that first appear in this layer's to_apply events
                             for evt in &layer.to_apply {
-                                for (backend_name, _) in evt.operations.iter() {
+                                for (backend_name, _) in evt.operations().iter() {
                                     if !state.backends.contains_key(backend_name) {
                                         let backend = backend_from_string(backend_name, None)?;
                                         // Replay earlier layers for this newly-created backend
                                         for earlier in &applied_layers {
                                             backend.apply_layer(earlier)?;
                                         }
-                                        state.backends.insert(backend_name.clone(), backend);
+                                        state.backends.insert(backend_name.to_string(), backend);
                                     }
                                 }
                             }
@@ -659,6 +656,41 @@ impl Entity {
             // still resolves names to ids.
             resolver: std::sync::RwLock::new(self.resolver.read().unwrap().clone()),
         }))
+    }
+
+    /// Build the transaction-visible state immediately after a frozen genesis
+    /// while keeping `self` as the empty resident primary until commit.
+    ///
+    /// Re-encoding each applied backend through its state buffer establishes a
+    /// clean extraction baseline for every backend. This is important for Yrs:
+    /// applying the genesis update mutates the document, but only a freshly
+    /// decoded state advances its local `previous_state`, so the initial
+    /// operations cannot leak into the later Update event.
+    fn snapshot_after_genesis(&self, genesis: &Event, trx_alive: Arc<AtomicBool>) -> Result<Self, MutationError> {
+        if !genesis.is_entity_create() || genesis.entity_id != self.id || genesis.validate_structure().is_err() {
+            return Err(MutationError::InvalidEvent);
+        }
+        if genesis.model != self.model_id()? {
+            return Err(MutationError::InvalidEvent);
+        }
+
+        let event_id = genesis.id();
+        let mut backends = BTreeMap::new();
+        for (name, operations) in genesis.operations().iter() {
+            let backend = backend_from_string(name, None)?;
+            backend.apply_operations_with_event(operations, event_id.clone())?;
+            let state = backend.to_state_buffer()?;
+            backends.insert(name.clone(), backend_from_string(name, Some(&state))?);
+        }
+
+        Ok(Self(Arc::new(EntityInner {
+            id: self.id,
+            collection: self.collection.clone(),
+            state: std::sync::RwLock::new(EntityInnerState { head: event_id.into(), backends }),
+            kind: EntityKind::Transacted { trx_alive, upstream: self.clone() },
+            broadcast: ankurah_signals::broadcast::Broadcast::new(),
+            resolver: std::sync::RwLock::new(self.resolver.read().unwrap().clone()),
+        })))
     }
 
     /// Get a reference to the entity's broadcast for Signal implementations
@@ -798,6 +830,58 @@ impl std::fmt::Display for TemporaryEntity {
     }
 }
 
+#[cfg(test)]
+mod eager_genesis_tests {
+    use super::*;
+    use crate::property::backend::{LWWBackend, YrsBackend};
+    use crate::property::PropertyKey;
+
+    #[test]
+    fn genesis_is_the_clean_baseline_for_post_create_updates() {
+        let entities = WeakEntitySet::default();
+        let alive = Arc::new(AtomicBool::new(true));
+        let collection = CollectionId::fixed_name(crate::system::SYSTEM_COLLECTION_ID);
+        let provisional = entities.create_provisional(collection.clone(), alive.clone());
+
+        provisional.get_backend::<LWWBackend>().unwrap().set(PropertyKey::name("title"), Some(Value::String("initial".into())));
+        provisional.get_backend::<YrsBackend>().unwrap().insert(&PropertyKey::name("body"), 0, "initial").unwrap();
+
+        let initial_operations = provisional.extract_operations().unwrap();
+        assert_eq!(initial_operations.keys().map(String::as_str).collect::<Vec<_>>(), vec!["lww", "yrs"]);
+
+        let model = crate::schema::well_known_model_id(crate::system::SYSTEM_COLLECTION_ID).unwrap();
+        let genesis = Event::genesis(model, Some(EntityId::from_bytes([9; 32])), initial_operations);
+        let transaction_entity = entities.create_transaction_entity(collection, &genesis, alive).unwrap();
+
+        assert_eq!(transaction_entity.id(), genesis.entity_id);
+        assert_eq!(transaction_entity.head(), Clock::new([genesis.id()]));
+        assert!(transaction_entity.generate_commit_event().unwrap().is_none());
+
+        // The resident primary is still an empty, removable phantom until the
+        // commit path applies the policy-approved genesis.
+        let resident = entities.get(&genesis.entity_id).unwrap();
+        assert!(resident.head().is_empty());
+        assert!(resident.values().is_empty());
+
+        // Only this post-create write appears in the Update. In particular,
+        // the Yrs genesis update must not be extracted a second time.
+        transaction_entity.get_backend::<LWWBackend>().unwrap().set(PropertyKey::name("title"), Some(Value::String("after".into())));
+        let update = transaction_entity.generate_commit_event().unwrap().unwrap();
+        assert!(!update.is_entity_create());
+        assert_eq!(update.parent, Clock::new([genesis.id()]));
+        assert_eq!(update.operations().keys().map(String::as_str).collect::<Vec<_>>(), vec!["lww"]);
+    }
+
+    #[test]
+    fn empty_head_transaction_entity_is_not_implicitly_created() {
+        let collection = CollectionId::fixed_name(crate::system::SYSTEM_COLLECTION_ID);
+        let primary = Entity::create(EntityId::from_bytes([7; 32]), collection);
+        let phantom = primary.snapshot(Arc::new(AtomicBool::new(true)));
+
+        assert!(matches!(phantom.generate_commit_event(), Err(MutationError::InvalidEvent)));
+    }
+}
+
 // TODO - Implement TOCTOU Race condition tests. Require real backend state mutations to be meaningful. punting that for now
 /// A set of entities held weakly.
 ///
@@ -898,17 +982,38 @@ impl WeakEntitySet {
             }
         }
     }
-    /// Create a brand new entity, and add it to the set
-    pub fn create(&self, collection: CollectionId) -> Entity {
-        let entity = {
-            let mut entities = self.0.entities.write().unwrap();
-            let id = EntityId::new();
-            let entity = Entity::create(id, collection);
-            entities.insert(id, entity.weak());
-            entity
-        };
-        self.bind(&entity);
-        entity
+    /// Create the writable, pre-identity entity used only while a model writes
+    /// its initial values. It is deliberately absent from the resident set:
+    /// the real id does not exist until those values have been frozen into the
+    /// genesis event.
+    pub(crate) fn create_provisional(&self, collection: CollectionId, trx_alive: Arc<AtomicBool>) -> Entity {
+        // The placeholder is never observable outside this create call and is
+        // never inserted into the id-keyed resident set.
+        let primary = Entity::create(EntityId::from_bytes([0; 32]), collection);
+        self.bind(&primary);
+        primary.snapshot(trx_alive)
+    }
+
+    /// Insert the empty resident primary under the id derived by `genesis`,
+    /// then return the transaction snapshot whose baseline is that genesis.
+    /// Subsequent edits on the returned entity therefore extend genesis with
+    /// at most one Update event.
+    pub(crate) fn create_transaction_entity(
+        &self,
+        collection: CollectionId,
+        genesis: &Event,
+        trx_alive: Arc<AtomicBool>,
+    ) -> Result<Entity, MutationError> {
+        let primary = Entity::create(genesis.entity_id, collection);
+        self.bind(&primary);
+        let transaction_entity = primary.snapshot_after_genesis(genesis, trx_alive)?;
+
+        let mut entities = self.0.entities.write().unwrap();
+        if entities.get(&primary.id).and_then(WeakEntity::upgrade).is_some() {
+            return Err(MutationError::AlreadyExists);
+        }
+        entities.insert(primary.id, primary.weak());
+        Ok(transaction_entity)
     }
 
     /// Evict an entity from the set only if it is absent from storage-backed

@@ -20,8 +20,9 @@ use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
 
 use crate::harness::{
-    assert_state_heads_resolvable, child_crash_point, child_sled_dir, event_present, fresh_sled_dir, handoff_model_resolver, handoff_write,
-    handoff_write_event, has_persisted_state, persisted_head, reopen_sled, spawn_crash_child, CrashPoint, CrashStorageEngine,
+    assert_state_heads_resolvable, child_crash_point, child_sled_dir, crash_signing_key, event_present, fresh_sled_dir,
+    handoff_model_resolver, handoff_write, handoff_write_event, has_persisted_state, persisted_head, reopen_sled, spawn_crash_child,
+    CrashPoint, CrashStorageEngine,
 };
 use crate::models::{Album, AlbumView};
 
@@ -35,7 +36,7 @@ async fn armed_child_node(crash: CrashPoint) -> Result<(CrashNode, Arc<CrashStor
     let dir = child_sled_dir().expect("child must have a sled dir");
     let sled = Arc::new(SledStorageEngine::with_path(dir)?);
     let engine = Arc::new(CrashStorageEngine::new(sled, Some(crash)));
-    let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
+    let node = Node::new_durable_with_signing_key(engine.clone(), PermissiveAgent::new(), crash_signing_key());
     node.system.create().await?;
     // Rev 4 (RFC 5.2 in specs/model-property-metadata/rfc.md): a local create auto-registers its model, and the
     // registration executor persists the catalog entities' state first --
@@ -52,7 +53,7 @@ async fn armed_child_node(crash: CrashPoint) -> Result<(CrashNode, Arc<CrashStor
 /// durable node. Each album is a distinct entity, so each event is a creation
 /// event (empty parent). Returned in commit order as attested events, ready to
 /// feed to `commit_remote_transaction` on the node under test.
-async fn generate_creation_batch(n: usize, model: proto::EntityId) -> Result<Vec<Attested<proto::Event>>> {
+async fn generate_creation_batch(n: usize, model: proto::EntityId, target_system: proto::EntityId) -> Result<Vec<Attested<proto::Event>>> {
     let helper = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
     helper.system.create().await?;
     let ctx = helper.context(c)?;
@@ -70,6 +71,11 @@ async fn generate_creation_batch(n: usize, model: proto::EntityId) -> Result<Vec
         .into_iter()
         .map(|mut event| {
             event.model = model;
+            let proto::EventBody::Genesis { system, .. } = &mut event.body else {
+                unreachable!("a create-only batch contains only genesis events")
+            };
+            *system = Some(target_system);
+            event.entity_id = event.id().into();
             Attested::from(event)
         })
         .collect())
@@ -170,7 +176,7 @@ async fn child_mid_batch() -> Result<()> {
 
     let model = node.catalog.model_id_for(Album::collection().as_str()).expect("Album registered in armed_child_node");
     handoff_write("model", &model.to_base64())?;
-    let events = generate_creation_batch(S2_BATCH, model).await?;
+    let events = generate_creation_batch(S2_BATCH, model, node.system.root_id().expect("armed node has a system root")).await?;
     // Record every entity id (in batch order) and the full events for re-delivery.
     for e in &events {
         handoff_write("entity", &e.payload.entity_id.to_base64())?;
@@ -227,7 +233,7 @@ async fn scenario_2_mid_batch() -> Result<()> {
 
     // Reconvergence: reopen the node under test and re-deliver the whole batch,
     // exactly as the sending peer would on retry. Everything must converge.
-    let node = Node::new_durable(Arc::new(engine), PermissiveAgent::new());
+    let node = Node::new_durable_with_signing_key(Arc::new(engine), PermissiveAgent::new(), crash_signing_key());
     // The system root persisted before the workload, so the reopened durable
     // node loads it and becomes ready on its own (no create/join). Awaiting a
     // collection drives the async catalog load first.
@@ -274,7 +280,7 @@ async fn child_mid_merge() -> Result<()> {
     let dir = child_sled_dir().expect("child must have a sled dir");
     let sled = Arc::new(SledStorageEngine::with_path(dir)?);
     let engine = Arc::new(CrashStorageEngine::new(sled, Some(crash)));
-    let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
+    let node = Node::new_durable_with_signing_key(engine.clone(), PermissiveAgent::new(), crash_signing_key());
     node.system.create().await?;
     let ctx = node.context(c)?;
 
@@ -373,7 +379,7 @@ async fn child_entity_creation() -> Result<()> {
 
     let model = node.catalog.model_id_for(Album::collection().as_str()).expect("Album registered in armed_child_node");
     handoff_write("model", &model.to_base64())?;
-    let events = generate_creation_batch(1, model).await?;
+    let events = generate_creation_batch(1, model, node.system.root_id().expect("armed node has a system root")).await?;
     handoff_write("entity", &events[0].payload.entity_id.to_base64())?;
     handoff_write_event("event", &events[0])?;
 
@@ -410,7 +416,7 @@ async fn scenario_4_entity_creation() -> Result<()> {
     );
 
     // Reconvergence via re-delivery of the identical creation event.
-    let node = Node::new_durable(Arc::new(engine), PermissiveAgent::new());
+    let node = Node::new_durable_with_signing_key(Arc::new(engine), PermissiveAgent::new(), crash_signing_key());
     let collection2 = node.system.collection(&Album::collection()).await?;
     node.system.wait_system_ready().await;
     assert!(node.system.is_system_ready(), "reopened durable node must be system-ready");

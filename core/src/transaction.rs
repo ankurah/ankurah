@@ -27,9 +27,12 @@ pub struct Transaction {
     pub(crate) id: proto::TransactionId,
     pub(crate) entities: AppendOnlyVec<Entity>,
     pub(crate) alive: Arc<AtomicBool>,
+    /// Genesis events frozen eagerly by `create`, keyed by their derived
+    /// entity id. Commit emits each before any post-create Update.
+    pub(crate) genesis_events: std::sync::RwLock<std::collections::BTreeMap<EntityId, proto::Event>>,
     /// Entity IDs that were created in this transaction via create().
-    /// Used to validate that creation events (empty parent) are only for entities
-    /// that were actually created in this transaction, not phantom entities.
+    /// Kept as an independent invariant check against `genesis_events` so a
+    /// phantom empty-head entity can never be promoted into a creation.
     pub(crate) created_entity_ids: std::sync::RwLock<std::collections::HashSet<EntityId>>,
 }
 
@@ -50,6 +53,7 @@ impl Transaction {
             id: proto::TransactionId::new(),
             entities: AppendOnlyVec::new(),
             alive: Arc::new(AtomicBool::new(true)),
+            genesis_events: std::sync::RwLock::new(std::collections::BTreeMap::new()),
             created_entity_ids: std::sync::RwLock::new(std::collections::HashSet::new()),
         }
     }
@@ -65,12 +69,34 @@ impl Transaction {
         // NEVER-registered collection fails here (the rev 4 strict offline
         // surface: identity does not exist until the allocator mints it).
         self.dyncontext.ensure_registered(M::schema()).await?;
-        let entity = self.dyncontext.create_entity(M::collection(), self.alive.clone());
-        model.initialize_new_entity(&entity);
+
+        // Initial values are written to a provisional, writable entity which
+        // is deliberately not resident: its id does not exist until these
+        // operations are frozen into the genesis preimage.
+        let provisional = self.dyncontext.create_provisional_entity(M::collection(), self.alive.clone());
+        model.initialize_new_entity(&provisional);
+        provisional.resolve_pending_keys()?;
+
+        let system = self
+            .dyncontext
+            .system_id()
+            .ok_or_else(|| MutationError::General("cannot create an entity before the context has joined or created a system".into()))?;
+        let genesis = proto::Event::genesis(provisional.model_id()?, Some(system), provisional.extract_operations()?);
+
+        // Insert only the derived-id primary. It remains empty until commit;
+        // the returned transaction fork starts at genesis so later edits have
+        // the correct parent and are extracted separately.
+        let entity = self.dyncontext.create_transaction_entity(M::collection(), &genesis, self.alive.clone())?;
         self.dyncontext.check_write(&entity)?;
 
-        // Track that this entity was created in this transaction
-        self.created_entity_ids.write().unwrap().insert(entity.id);
+        // Store the already-extracted genesis exactly once. Commit must never
+        // ask the final transaction entity to reconstruct these operations.
+        if self.genesis_events.write().unwrap().insert(entity.id, genesis).is_some() {
+            return Err(MutationError::AlreadyExists);
+        }
+        if !self.created_entity_ids.write().unwrap().insert(entity.id) {
+            return Err(MutationError::AlreadyExists);
+        }
 
         let entity_ref = self.add_entity(entity);
         Ok(MutableBorrow::new(entity_ref))

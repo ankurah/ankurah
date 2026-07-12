@@ -61,8 +61,8 @@ async fn foreign_id_data_is_not_this_field() -> anyhow::Result<()> {
     // some other id whose data sits on the entity (an out-of-band copied
     // buffer, or another model's allocation). The backend holds the value
     // ONLY under B (id-keyed 0xA2), nothing under A.
-    let a = EntityId::new();
-    let b = EntityId::new();
+    let a = test_entity_id(0xA1);
+    let b = test_entity_id(0xB2);
     assert_ne!(a, b);
 
     let event_id = proto::EventId::from_bytes([9u8; 32]);
@@ -89,7 +89,7 @@ async fn required_absent_i64_reads_type_default_zero() -> anyhow::Result<()> {
     // A bare entity with an empty LWW backend: no data, no binding, no sibling.
     // Reading a REQUIRED i64 projection reads the type default 0 (rule 3),
     // while a REQUIRED String reads "" and a REQUIRED bool reads false.
-    let entity = Entity::create(EntityId::new(), "record".into());
+    let entity = Entity::create(test_entity_id(0x31), "record".into());
     // Touch the LWW backend so it exists on the entity.
     let _ = entity.get_backend::<LWWBackend>().unwrap();
 
@@ -115,7 +115,7 @@ async fn optional_absent_reads_none_and_is_null_matches() -> anyhow::Result<()> 
     // default (rule 2). Optionality short-circuits ahead of the required
     // default because the projected type is Option<i64>: its absent_default is
     // None, so the inner i64 default never fires.
-    let entity = Entity::create(EntityId::new(), "record".into());
+    let entity = Entity::create(test_entity_id(0x32), "record".into());
     let _ = entity.get_backend::<LWWBackend>().unwrap();
     let opt: LWW<Option<i64>> = LWW::from_entity("count".into(), &entity);
     assert_eq!(opt.get()?, None, "absent optional reads None");
@@ -242,7 +242,7 @@ async fn membership_without_optional_follow_up_is_treated_optional() -> anyhow::
     // `optional` field. This is exactly the "follow-up not yet arrived" state.
     // The membership references a distinct (synthetic) property id so it does
     // not collide with the label membership above.
-    let ghost_property = EntityId::new();
+    let ghost_property = test_entity_id(0x47);
 
     // Commit the membership genesis (exactly the identity fields, no
     // `optional`) through commit_remote_transaction: the pipeline every
@@ -250,7 +250,8 @@ async fn membership_without_optional_follow_up_is_treated_optional() -> anyhow::
     // notifies the reactor, which is what feeds the catalog map's fetch-free
     // subscription. (A raw storage set_state would persist silently and the
     // map would never hear about it.)
-    let genesis = membership_genesis(&model_id, &ghost_property);
+    let system = node.system.root().expect("durable node has a system root").payload.entity_id;
+    let genesis = membership_genesis(&model_id, &ghost_property, system);
     node.commit_remote_transaction(&DEFAULT_CONTEXT, proto::TransactionId::new(), vec![proto::Attested::opt(genesis, None)]).await?;
 
     // Once the map applies it, `optional` is None -> treated optional.
@@ -266,18 +267,23 @@ async fn membership_without_optional_follow_up_is_treated_optional() -> anyhow::
 /// executor's creation event: a name-keyed LWW backend (catalog bootstrap
 /// exemption) with an empty parent clock. The genesis module was removed with
 /// derivation (rev 4), so tests build this event directly.
-fn membership_genesis(model: &EntityId, property: &EntityId) -> proto::Event {
+fn membership_genesis(model: &EntityId, property: &EntityId, system_id: EntityId) -> proto::Event {
     let backend = LWWBackend::new();
     backend.set(PropertyKey::name("model"), Some(Value::EntityId(*model)));
     backend.set(PropertyKey::name("property"), Some(Value::EntityId(*property)));
     let operations = backend.to_operations().unwrap().unwrap();
+    let operations = proto::OperationSet(BTreeMap::from([("lww".to_string(), operations)]));
+    let system = Some(system_id);
+    let nonce = [0x4D; 32];
+    let timestamp = 1;
+    let entity_id = EntityId::from(proto::EventId::from_genesis_parts(&system, &nonce, timestamp, &operations));
     proto::Event {
         // #330: events carry a model id; the _ankurah_model_property catalog
         // collection has a well-known one.
         model: ankurah::core::schema::well_known_model_id(ankurah::core::schema::MODEL_PROPERTY_COLLECTION_ID)
             .expect("_ankurah_model_property has a well-known model id"),
-        entity_id: EntityId::new(),
-        operations: proto::OperationSet(BTreeMap::from([("lww".to_string(), operations)])),
+        entity_id,
+        body: proto::EventBody::Genesis { system, nonce, timestamp, operations },
         parent: proto::Clock::default(),
     }
 }

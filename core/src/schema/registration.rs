@@ -3,8 +3,8 @@
 //!
 //! Registration is an UPSERT: the executor looks each definition up by its
 //! lookup key (model by collection; property by (model, name); membership by
-//! (model, property)), ALLOCATES a fresh
-//! `EntityId::new()` -- a true ULID -- on miss, and emits ordinary events
+//! (model, property)), builds a fresh genesis event on miss, derives the
+//! entity id from that event, and emits ordinary events
 //! through the policy-checked commit pipeline. The whole execution
 //! serializes on a process-local mutex, and the executor upserts the
 //! resolved definitions into the catalog map synchronously after commit,
@@ -106,9 +106,7 @@ where
         if !self.durable {
             return Err(RegistrationError::NotDurable);
         }
-        if self.system.root().is_none() {
-            return Err(RegistrationError::SystemNotReady);
-        }
+        let system_id = self.system.root_id().ok_or(RegistrationError::SystemNotReady)?;
         // Schema knowledge follows collection access (RFC 5.7 addendum,
         // maintainer ruling 2026-07-06): every collection this request
         // names must pass can_access_collection for the requesting
@@ -200,13 +198,14 @@ where
                         (def.id, m.name.clone())
                     }
                     None => {
-                        let id = EntityId::new();
-                        plan.creates_models.push((id, m.clone()));
-                        push(creation(
+                        let event = creation(
+                            system_id,
                             model_collection(),
-                            id,
                             vec![("collection", Value::String(m.collection.clone())), ("name", Value::String(m.name.clone()))],
-                        ));
+                        );
+                        let id = event.entity_id;
+                        plan.creates_models.push((id, m.clone()));
+                        push(event);
                         (id, m.name.clone())
                     }
                 },
@@ -229,14 +228,15 @@ where
                             def.id
                         }
                         None => {
-                            let id = EntityId::new();
                             let stub = ModelDescriptor { collection: c.to_string(), name: c.to_string(), explicit_id: None };
-                            plan.creates_models.push((id, stub));
-                            push(creation(
+                            let event = creation(
+                                system_id,
                                 model_collection(),
-                                id,
                                 vec![("collection", Value::String(c.to_string())), ("name", Value::String(c.to_string()))],
-                            ));
+                            );
+                            let id = event.entity_id;
+                            plan.creates_models.push((id, stub));
+                            push(event);
                             model_ids.insert(c.to_string(), id);
                             out_models.push(RegisteredModel { id, collection: c.to_string(), name: c.to_string() });
                             id
@@ -387,8 +387,6 @@ where
                 (None, None) => {
                     // Miss: allocate. The creation event carries the full
                     // definition state.
-                    let id = EntityId::new();
-                    plan.creates_properties.push((id, p.clone()));
                     let mut fields: Vec<(&str, Value)> = vec![
                         ("minted_for", Value::EntityId(scope)),
                         ("name", Value::String(p.name.clone())),
@@ -398,7 +396,10 @@ where
                     if let Some(t) = target {
                         fields.push(("target_model", Value::EntityId(t)));
                     }
-                    push(creation(property_collection(), id, fields));
+                    let event = creation(system_id, property_collection(), fields);
+                    let id = event.entity_id;
+                    plan.creates_properties.push((id, p.clone()));
+                    push(event);
                     id
                 }
             };
@@ -463,17 +464,18 @@ where
                     def.id
                 }
                 None => {
-                    let id = EntityId::new();
-                    plan.creates_memberships.push(PlannedMembership { id, model: model_id, property: property_id, optional: ms.optional });
-                    push(creation(
+                    let event = creation(
+                        system_id,
                         model_property_collection(),
-                        id,
                         vec![
                             ("model", Value::EntityId(model_id)),
                             ("property", Value::EntityId(property_id)),
                             ("optional", Value::Bool(ms.optional)),
                         ],
-                    ));
+                    );
+                    let id = event.entity_id;
+                    plan.creates_memberships.push(PlannedMembership { id, model: model_id, property: property_id, optional: ms.optional });
+                    push(event);
                     id
                 }
             };
@@ -777,7 +779,7 @@ fn field_eq_id(field: &str, id: EntityId) -> ankql::ast::Predicate {
     ankql::ast::Predicate::Comparison {
         left: Box::new(ankql::ast::Expr::Path(ankql::ast::PathExpr { steps: vec![field.to_string()] })),
         operator: ankql::ast::ComparisonOperator::Equal,
-        right: Box::new(ankql::ast::Expr::Literal(ankql::ast::Literal::EntityId(id.to_ulid()))),
+        right: Box::new(ankql::ast::Expr::Literal(ankql::ast::Literal::EntityId(id.to_bytes()))),
     }
 }
 
@@ -793,8 +795,11 @@ fn entity_id_field(values: &BTreeMap<String, Option<Value>>, field: &str) -> Opt
 /// A creation event: full definition state, empty parent clock. Ordinary
 /// in every respect (RFC 5.1: no frozen encoder; catalog collections stay
 /// name-keyed at the backend layer permanently, the bootstrap exemption).
-fn creation(collection: CollectionId, entity_id: EntityId, fields: Vec<(&str, Value)>) -> proto::Event {
-    follow_up(collection, entity_id, proto::Clock::default(), fields)
+fn creation(system_id: EntityId, collection: CollectionId, fields: Vec<(&str, Value)>) -> proto::Event {
+    let operations = encode_fields(fields);
+    let model = crate::schema::well_known_model_id(collection.as_str())
+        .expect("registration events target the catalog collections, which have well-known model ids");
+    proto::Event::genesis(model, Some(system_id), operations)
 }
 
 /// A follow-up event carrying changed metadata, parented at the entity's
@@ -802,14 +807,19 @@ fn creation(collection: CollectionId, entity_id: EntityId, fields: Vec<(&str, Va
 /// metadata it supersedes so LWW recency decides, not the concurrent
 /// tiebreak).
 fn follow_up(collection: CollectionId, entity_id: EntityId, parent: proto::Clock, fields: Vec<(&str, Value)>) -> proto::Event {
+    let operations = encode_fields(fields);
+    // Catalog collections have well-known model ids by construction (#330);
+    // this helper is only ever called for them.
+    let model = crate::schema::well_known_model_id(collection.as_str())
+        .expect("registration events target the catalog collections, which have well-known model ids");
+    proto::Event { model, entity_id, body: proto::EventBody::Update { operations }, parent }
+}
+
+fn encode_fields(fields: Vec<(&str, Value)>) -> proto::OperationSet {
     let backend = LWWBackend::new();
     for (name, value) in fields {
         backend.set(crate::property::PropertyKey::Name(name.to_string()), Some(value));
     }
     let operations = backend.to_operations().expect("LWW encoding of scalar values is infallible").expect("fields are non-empty");
-    // Catalog collections have well-known model ids by construction (#330);
-    // this helper is only ever called for them.
-    let model = crate::schema::well_known_model_id(collection.as_str())
-        .expect("registration events target the catalog collections, which have well-known model ids");
-    proto::Event { model, entity_id, operations: proto::OperationSet(BTreeMap::from([("lww".to_string(), operations)])), parent }
+    proto::OperationSet(BTreeMap::from([("lww".to_string(), operations)]))
 }

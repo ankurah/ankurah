@@ -33,8 +33,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use ankurah::core::error::{MutationError, RetrievalError};
-use ankurah::core::storage::{StorageCollection, StorageEngine};
-use ankurah::proto::{self, Attested, CollectionId, EntityId, EntityState, Event, EventId};
+use ankurah::core::storage::{StorageCollection, StorageEngine, SystemRootClaim};
+use ankurah::proto::{self, Attested, CollectionId, EntityId, EntityState, Event, EventId, SystemRootProof};
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -87,6 +87,11 @@ pub const ENV_SLED_DIR: &str = "ANKURAH_C6_SLED_DIR";
 /// process dies), so the child writes here and fsyncs before the risky
 /// operation.
 pub const ENV_HANDOFF_FILE: &str = "ANKURAH_C6_HANDOFF";
+
+/// Stable durable identity shared by the crash child and its reopened parent.
+/// A real deployment persists this seed; a fresh key on reopen would correctly
+/// fail founder recognition against the stored system root.
+pub fn crash_signing_key() -> ed25519_dalek::SigningKey { ed25519_dalek::SigningKey::from_bytes(&[0xC6; 32]) }
 
 // ============================================================================
 // FLUSH HOOK
@@ -210,6 +215,16 @@ impl<E: StorageEngine + CrashFlushable + 'static> StorageEngine for CrashStorage
     }
 
     async fn delete_all_collections(&self) -> Result<bool, MutationError> { self.inner.delete_all_collections().await }
+
+    async fn claim_system_root(&self, candidate: &SystemRootProof) -> Result<SystemRootClaim, MutationError> {
+        self.inner.claim_system_root(candidate).await
+    }
+
+    async fn system_root_claim(&self) -> Result<Option<SystemRootProof>, RetrievalError> { self.inner.system_root_claim().await }
+
+    async fn release_system_root_claim(&self, expected: &SystemRootProof) -> Result<bool, MutationError> {
+        self.inner.release_system_root_claim(expected).await
+    }
 
     // A wrapper must FORWARD the resolver injection: the trait default is a
     // no-op, and swallowing it leaves the inner engine unable to stamp model

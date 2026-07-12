@@ -126,13 +126,13 @@ fn renamed_from_attribute_carries_the_hint() {
 
 // -- explicit id attributes --------------------------------------------------
 
-// 16 zero bytes as URL-safe base64 (no padding) = 22 'A's; a valid EntityId.
-const ZERO_ID_B64: &str = "AAAAAAAAAAAAAAAAAAAAAA";
+// 32 zero bytes as URL-safe base64 (no padding) = 43 'A's; a valid EntityId.
+const ZERO_ID_B64: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
 #[derive(Model, Debug, Serialize, Deserialize)]
-#[model(id = "AAAAAAAAAAAAAAAAAAAAAA")]
+#[model(id = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")]
 pub struct DescBound {
-    #[property(id = "AAAAAAAAAAAAAAAAAAAAAA")]
+    #[property(id = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")]
     pub label: String,
     pub other: String,
 }

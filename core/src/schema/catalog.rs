@@ -40,7 +40,7 @@ use std::{
 use ankurah_proto::{self as proto, CollectionId, EntityId, QueryId};
 use ankurah_signals::{porcelain::subscribe::SubscriptionGuard, Subscribe};
 use tokio::sync::Notify;
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 
 use crate::{
     collectionset::CollectionSet,
@@ -364,10 +364,207 @@ fn parse_state(collection: &CollectionId, id: EntityId, state: &proto::EntitySta
 }
 
 /// A parsed catalog entry, kind-tagged, from a storage state.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Entry {
     Model(ModelDef),
     Property(PropertyDef),
     Membership(MembershipDef),
+}
+
+impl Entry {
+    fn id(&self) -> EntityId {
+        match self {
+            Self::Model(def) => def.id,
+            Self::Property(def) => def.id,
+            Self::Membership(def) => def.id,
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Model(_) => "model",
+            Self::Property(_) => "property",
+            Self::Membership(_) => "membership",
+        }
+    }
+}
+
+/// Strict failures at the catalog descriptor wire-cache boundary.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub(crate) enum WireCatalogError {
+    #[error("shipped catalog state {entity} uses unknown model {model}")]
+    UnknownModel { entity: EntityId, model: EntityId },
+    #[error("shipped catalog state {entity} uses non-catalog model {model} ({collection})")]
+    NonCatalogModel { entity: EntityId, model: EntityId, collection: String },
+    #[error("shipped catalog state {entity} for {collection} is not parseable")]
+    Unparseable { entity: EntityId, collection: String },
+    #[error("shipped model {model} names reserved collection '{collection}'")]
+    ReservedModel { model: EntityId, collection: String },
+    #[error("shipped batch contains conflicting definitions for entity {entity}")]
+    IntraBatchEntityConflict { entity: EntityId },
+    #[error("shipped batch binds collection '{collection}' to both {first} and {second}")]
+    IntraBatchCollectionConflict { collection: String, first: EntityId, second: EntityId },
+    #[error("shipped batch contains duplicate membership ({model}, {property}) under both {first} and {second}")]
+    IntraBatchMembershipConflict { model: EntityId, property: EntityId, first: EntityId, second: EntityId },
+    #[error("shipped {incoming_kind} {entity} conflicts with existing {existing_kind} of the same id")]
+    ExistingKindConflict { entity: EntityId, incoming_kind: &'static str, existing_kind: &'static str },
+    #[error("shipped model {model} attempts to rebind from '{existing}' to '{incoming}'")]
+    ModelRebinding { model: EntityId, existing: String, incoming: String },
+    #[error("shipped model {incoming} attempts to rebind collection '{collection}' from model {existing}")]
+    CollectionRebinding { collection: String, existing: EntityId, incoming: EntityId },
+    #[error("shipped property {property} changes immutable registration fields")]
+    PropertyRebinding { property: EntityId },
+    #[error("shipped membership {membership} changes its model/property endpoints")]
+    MembershipRebinding { membership: EntityId },
+    #[error("shipped membership {incoming} duplicates existing membership {existing} for ({model}, {property})")]
+    ExistingMembershipConflict { model: EntityId, property: EntityId, existing: EntityId, incoming: EntityId },
+}
+
+/// Parse and validate every descriptor that does not depend on current map
+/// state. Exact duplicates are harmless and collapse to one entry; any
+/// disagreement is a protocol error for the whole batch.
+fn parse_wire_batch(states: &[proto::Attested<proto::EntityState>]) -> Result<Vec<Entry>, WireCatalogError> {
+    let mut entries = BTreeMap::<EntityId, Entry>::new();
+    let mut collections = BTreeMap::<String, EntityId>::new();
+    let mut memberships = BTreeMap::<(EntityId, EntityId), EntityId>::new();
+
+    for state in states {
+        let entity = state.payload.entity_id;
+        let model = state.payload.model;
+        let collection = crate::schema::well_known_collection(&model).ok_or(WireCatalogError::UnknownModel { entity, model })?;
+        if !crate::schema::is_catalog_collection(&collection) {
+            return Err(WireCatalogError::NonCatalogModel { entity, model, collection: collection.as_str().to_owned() });
+        }
+        let entry = parse_state(&collection, entity, &state.payload)
+            .ok_or_else(|| WireCatalogError::Unparseable { entity, collection: collection.as_str().to_owned() })?;
+
+        match &entry {
+            Entry::Model(def) => {
+                if def.collection.starts_with(crate::schema::RESERVED_COLLECTION_PREFIX) {
+                    return Err(WireCatalogError::ReservedModel { model: def.id, collection: def.collection.clone() });
+                }
+                if let Some(first) = collections.insert(def.collection.clone(), def.id) {
+                    if first != def.id {
+                        return Err(WireCatalogError::IntraBatchCollectionConflict {
+                            collection: def.collection.clone(),
+                            first,
+                            second: def.id,
+                        });
+                    }
+                }
+            }
+            Entry::Membership(def) => {
+                if let Some(first) = memberships.insert((def.model, def.property), def.id) {
+                    if first != def.id {
+                        return Err(WireCatalogError::IntraBatchMembershipConflict {
+                            model: def.model,
+                            property: def.property,
+                            first,
+                            second: def.id,
+                        });
+                    }
+                }
+            }
+            Entry::Property(_) => {}
+        }
+
+        if let Some(existing) = entries.get(&entity) {
+            if existing != &entry {
+                return Err(WireCatalogError::IntraBatchEntityConflict { entity });
+            }
+        } else {
+            entries.insert(entity, entry);
+        }
+    }
+
+    Ok(entries.into_values().collect())
+}
+
+fn existing_other_kind(map: &CatalogMapInner, entry: &Entry) -> Option<&'static str> {
+    let id = entry.id();
+    match entry {
+        Entry::Model(_) => {
+            map.properties.contains_key(&id).then_some("property").or_else(|| map.memberships.contains_key(&id).then_some("membership"))
+        }
+        Entry::Property(_) => {
+            map.models.contains_key(&id).then_some("model").or_else(|| map.memberships.contains_key(&id).then_some("membership"))
+        }
+        Entry::Membership(_) => {
+            map.models.contains_key(&id).then_some("model").or_else(|| map.properties.contains_key(&id).then_some("property"))
+        }
+    }
+}
+
+/// Validate against the current map and apply only after the complete entry
+/// set succeeds. The caller holds the map write lock across this function,
+/// closing the validation-to-mutation race.
+fn validate_and_apply_wire_entries(map: &mut CatalogMapInner, entries: Vec<Entry>) -> Result<(), WireCatalogError> {
+    let mut missing = Vec::new();
+    for entry in entries {
+        if let Some(existing_kind) = existing_other_kind(map, &entry) {
+            return Err(WireCatalogError::ExistingKindConflict { entity: entry.id(), incoming_kind: entry.kind(), existing_kind });
+        }
+        match &entry {
+            Entry::Model(def) => {
+                if let Some(existing) = map.models.get(&def.id) {
+                    if existing.collection != def.collection {
+                        return Err(WireCatalogError::ModelRebinding {
+                            model: def.id,
+                            existing: existing.collection.clone(),
+                            incoming: def.collection.clone(),
+                        });
+                    }
+                    // Wire descriptor shipping is a bootstrap cache, not the
+                    // schema update channel. Never let a reordered snapshot
+                    // overwrite mutable fields (for example a newer model
+                    // display name); authoritative reactor/storage ingestion
+                    // advances existing entries with full entity history.
+                    continue;
+                }
+                if let Some(existing) = map.by_collection.get(&def.collection) {
+                    if *existing != def.id {
+                        return Err(WireCatalogError::CollectionRebinding {
+                            collection: def.collection.clone(),
+                            existing: *existing,
+                            incoming: def.id,
+                        });
+                    }
+                }
+            }
+            Entry::Property(def) => {
+                if let Some(existing) = map.properties.get(&def.id) {
+                    if existing.minted_for != def.minted_for || existing.backend != def.backend || existing.value_type != def.value_type {
+                        return Err(WireCatalogError::PropertyRebinding { property: def.id });
+                    }
+                    continue;
+                }
+            }
+            Entry::Membership(def) => {
+                if let Some(existing) = map.memberships.get(&def.id) {
+                    if existing.model != def.model || existing.property != def.property {
+                        return Err(WireCatalogError::MembershipRebinding { membership: def.id });
+                    }
+                    continue;
+                }
+                if let Some(existing) = map.membership(&def.model, &def.property) {
+                    if existing.id != def.id {
+                        return Err(WireCatalogError::ExistingMembershipConflict {
+                            model: def.model,
+                            property: def.property,
+                            existing: existing.id,
+                            incoming: def.id,
+                        });
+                    }
+                }
+            }
+        }
+        missing.push(entry);
+    }
+
+    for entry in missing {
+        apply_entry(map, entry);
+    }
+    Ok(())
 }
 
 // -- gap fetcher ------------------------------------------------------------
@@ -706,51 +903,20 @@ where
     }
 
     /// Ingest catalog definition states shipped on a wire envelope (#330
-    /// once-per-connection descriptor shipping): parse each into its def and
-    /// upsert the in-memory map, exactly like the storage warm. Map-only -- a
-    /// cache warm; the durable catalog entities still replicate through the
-    /// ordinary subscription paths. States whose model id is not a well-known
-    /// catalog collection are ignored (defense in depth; the sender only
-    /// ships catalog entities).
-    pub(crate) fn ingest_wire_states(&self, states: &[proto::Attested<proto::EntityState>]) {
+    /// once-per-connection descriptor shipping). This is an atomic, strict
+    /// cache warm: the complete batch is parsed before locking the map, then
+    /// validated against one map snapshot under a single write lock, and only
+    /// then applied. Any malformed, non-catalog, reserved, or conflicting
+    /// descriptor rejects the entire batch without mutating the map. Durable
+    /// catalog entities still replicate through the ordinary subscription
+    /// paths.
+    pub(crate) fn ingest_wire_states(&self, states: &[proto::Attested<proto::EntityState>]) -> Result<(), WireCatalogError> {
         if states.is_empty() {
-            return;
+            return Ok(());
         }
+        let entries = parse_wire_batch(states)?;
         let mut map = self.0.map.write().unwrap();
-        for state in states {
-            let Some(collection) = crate::schema::well_known_collection(&state.payload.model) else { continue };
-            if !crate::schema::is_catalog_collection(&collection) {
-                continue;
-            }
-            match parse_state(&collection, state.payload.entity_id, &state.payload) {
-                Some(Entry::Model(def)) => {
-                    // The `schema` envelope field is untrusted and a wider
-                    // ingress than the durable subscription it shortcuts, so a
-                    // wire model def gets two guards beyond parse_state's shape
-                    // check:
-                    //  - it must not name a reserved collection. No legitimate
-                    //    catalog entity describes an `_ankurah_*` collection
-                    //    (the well-known ids have no catalog entity), so such a
-                    //    def could only be an attempt to route ordinary traffic
-                    //    into a protected collection.
-                    //  - it must not REBIND a collection already mapped to a
-                    //    different model id: that would hijack the egress
-                    //    stamping of an existing collection. The authoritative
-                    //    binding arrives through the durable subscription/warm
-                    //    path, which does not pass through this guard.
-                    if def.collection.starts_with(crate::schema::RESERVED_COLLECTION_PREFIX) {
-                        warn!("ignoring shipped model def {} naming reserved collection '{}'", def.id, def.collection);
-                    } else if map.by_collection.get(&def.collection).map_or(false, |existing| *existing != def.id) {
-                        warn!("ignoring shipped model def {} rebinding collection '{}'", def.id, def.collection);
-                    } else {
-                        map.upsert_model(def);
-                    }
-                }
-                Some(Entry::Property(def)) => map.upsert_property(def),
-                Some(Entry::Membership(def)) => map.upsert_membership(def),
-                None => {}
-            }
-        }
+        validate_and_apply_wire_entries(&mut map, entries)
     }
 
     /// Apply one reactor update to the map: Remove drops, everything else
@@ -1069,5 +1235,108 @@ fn apply_entry(map: &mut CatalogMapInner, entry: Entry) {
         Entry::Model(def) => map.upsert_model(def),
         Entry::Property(def) => map.upsert_property(def),
         Entry::Membership(def) => map.upsert_membership(def),
+    }
+}
+
+#[cfg(test)]
+mod wire_ingest_tests {
+    use super::*;
+    use crate::property::PropertyKey;
+
+    fn id(byte: u8) -> EntityId { EntityId::from_bytes([byte; 32]) }
+
+    fn model_state(entity_id: EntityId, collection: &str) -> proto::Attested<proto::EntityState> {
+        model_state_named(entity_id, collection, collection, 0xD0)
+    }
+
+    fn model_state_named(entity_id: EntityId, collection: &str, name: &str, event: u8) -> proto::Attested<proto::EntityState> {
+        let source = LWWBackend::new();
+        source.set(PropertyKey::name("collection"), Some(Value::String(collection.to_owned())));
+        source.set(PropertyKey::name("name"), Some(Value::String(name.to_owned())));
+        let operations = source.to_operations().expect("test model operations serialize").expect("test model has writes");
+        let backend = LWWBackend::new();
+        backend.apply_operations_with_event(&operations, proto::EventId::from_bytes([event; 32])).expect("test model operations apply");
+        let buffer = backend.to_state_buffer().expect("test model state serializes");
+        let model = crate::schema::well_known_model_id(crate::schema::MODEL_COLLECTION_ID).expect("model catalog has a well-known id");
+        proto::Attested::opt(
+            proto::EntityState {
+                entity_id,
+                model,
+                state: proto::State {
+                    state_buffers: proto::StateBuffers(BTreeMap::from([("lww".to_owned(), buffer)])),
+                    head: proto::Clock::default(),
+                },
+            },
+            None,
+        )
+    }
+
+    #[test]
+    fn wire_batch_rejects_every_previously_skipped_descriptor_class() {
+        let entity = id(1);
+
+        let mut unknown = model_state(entity, "albums");
+        unknown.payload.model = id(0xE0);
+        assert!(matches!(
+            parse_wire_batch(&[unknown]),
+            Err(WireCatalogError::UnknownModel { entity: found, .. }) if found == entity
+        ));
+
+        let mut non_catalog = model_state(entity, "albums");
+        non_catalog.payload.model =
+            crate::schema::well_known_model_id(crate::system::SYSTEM_COLLECTION_ID).expect("system has a well-known model id");
+        assert!(matches!(parse_wire_batch(&[non_catalog]), Err(WireCatalogError::NonCatalogModel { .. })));
+
+        let mut unparseable = model_state(entity, "albums");
+        unparseable.payload.state.state_buffers.0.clear();
+        assert!(matches!(parse_wire_batch(&[unparseable]), Err(WireCatalogError::Unparseable { .. })));
+
+        let reserved = model_state(entity, "_ankurah_shadow");
+        assert!(matches!(parse_wire_batch(&[reserved]), Err(WireCatalogError::ReservedModel { .. })));
+    }
+
+    #[test]
+    fn intra_batch_collection_conflict_rejects_the_whole_batch() {
+        let result = parse_wire_batch(&[model_state(id(1), "albums"), model_state(id(2), "albums")]);
+        assert!(matches!(result, Err(WireCatalogError::IntraBatchCollectionConflict { .. })));
+    }
+
+    #[test]
+    fn existing_rebinding_does_not_partially_apply_valid_entries() {
+        let existing = id(1);
+        let mut map = CatalogMapInner::default();
+        map.upsert_model(ModelDef { id: existing, collection: "albums".to_owned(), name: "albums".to_owned() });
+
+        let entries = parse_wire_batch(&[model_state(id(2), "artists"), model_state(id(3), "albums")]).unwrap();
+        let result = validate_and_apply_wire_entries(&mut map, entries);
+
+        assert!(matches!(result, Err(WireCatalogError::CollectionRebinding { .. })));
+        assert_eq!(map.by_collection.get("albums"), Some(&existing));
+        assert!(!map.by_collection.contains_key("artists"), "valid earlier entries must not leak from a rejected batch");
+        assert_eq!(map.models.len(), 1);
+    }
+
+    #[test]
+    fn valid_batch_applies_after_complete_validation() {
+        let mut map = CatalogMapInner::default();
+        let entries = parse_wire_batch(&[model_state(id(1), "albums"), model_state(id(2), "artists")]).unwrap();
+        validate_and_apply_wire_entries(&mut map, entries).unwrap();
+
+        assert_eq!(map.by_collection.get("albums"), Some(&id(1)));
+        assert_eq!(map.by_collection.get("artists"), Some(&id(2)));
+        assert_eq!(map.models.len(), 2);
+    }
+
+    #[test]
+    fn reordered_wire_snapshot_cannot_roll_back_mutable_descriptor_fields() {
+        let entity = id(1);
+        let newer = parse_wire_batch(&[model_state_named(entity, "albums", "Albums v2", 0xD2)]).unwrap();
+        let older = parse_wire_batch(&[model_state_named(entity, "albums", "Albums v1", 0xD1)]).unwrap();
+        let mut map = CatalogMapInner::default();
+
+        validate_and_apply_wire_entries(&mut map, newer).unwrap();
+        validate_and_apply_wire_entries(&mut map, older).unwrap();
+
+        assert_eq!(map.models.get(&entity).unwrap().name, "Albums v2");
     }
 }

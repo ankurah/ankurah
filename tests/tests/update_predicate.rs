@@ -26,7 +26,7 @@ async fn test_predicate_update() -> Result<()> {
     let watcher = TestWatcher::changeset();
     let _guard = albums.subscribe(&watcher);
 
-    // Should have Bravo, Charlie (sort for deterministic order - update_selection has to fetch and ulids created in the same ms)
+    // Should have Bravo, Charlie (sort because genesis-hash ids include fresh nonce entropy).
     assert_eq!(albums.ids_sorted(), sorted![b_id, c_id]);
     assert_eq!(watcher.quiesce().await, 0); // no changes yet
 
@@ -82,7 +82,7 @@ async fn test_predicate_update_inter_node() -> Result<()> {
     let watcher = TestWatcher::changeset();
     let _guard = albums.subscribe(&watcher);
 
-    // Should have Bravo, Charlie (sort for deterministic order - update_selection has to fetch and ulids created in the same ms)
+    // Should have Bravo, Charlie (sort because genesis-hash ids include fresh nonce entropy).
     assert_eq!(albums.ids_sorted(), sorted![b_id, c_id]);
     assert_eq!(watcher.quiesce().await, 0); // no changes yet
 
@@ -95,7 +95,7 @@ async fn test_predicate_update_inter_node() -> Result<()> {
     // Update predicate to be less restrictive: year >= "2020"
     albums.update_selection_wait("year >= 2020").await?;
 
-    // Should now have all 3 albums (sort for deterministic order - update_selection has to fetch and ulids created in the same ms)
+    // Should now have all 3 albums (sort because genesis-hash ids include fresh nonce entropy).
     assert_eq!(albums.ids_sorted(), sorted![a_id, b_id, c_id]);
     assert_eq!(watcher.drain_sorted(), vec![sortby_t0![(a_id, ChangeKind::Initial), (b_id, ChangeKind::Initial)]]);
 

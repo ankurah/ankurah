@@ -5,7 +5,7 @@
 //! in-flight messages and, on each step, decides (from the one seeded RNG) which
 //! to deliver, reorder, duplicate, delay, or drop, subject to the current
 //! partition matrix. It delivers by awaiting the recipient's real
-//! `handle_message`, so the production applier runs. Every decision is recorded
+//! connection-bound message ingress, so the production applier runs. Every decision is recorded
 //! in the `Trace`.
 //!
 //! Quiescence is defined by message drain, not by tokio's paused-time
@@ -19,7 +19,7 @@
 //! Load-bearing propagation is delivered under an *acceptance check*: a
 //! `CommitTransaction` for a single event whose parents the receiver has not yet
 //! seen is correctly rejected by the empty-head guard (the V6 semantics), and
-//! `handle_message` still returns `Ok` because the request handler turns the
+//! message ingress still returns `Ok` because the request handler turns the
 //! apply error into an error *response*. So the scheduler cannot read acceptance
 //! from the return value; instead it verifies the event landed in the
 //! receiver's storage and, if not, redelivers it in a later round. This models a
@@ -39,7 +39,7 @@ use super::transport::{message_digest, Captured};
 struct InFlight {
     src: usize,
     dst: usize,
-    message: proto::NodeMessage,
+    message: proto::SignedPeerMessage,
     digest: String,
     /// Advisory messages (acks, responses) may be dropped outright under the
     /// drop fault; load-bearing propagation may only be delayed, never lost, so
@@ -81,7 +81,7 @@ pub struct Scheduler {
     faults: FaultConfig,
     /// Node id per logical index, used to resolve the recipient index of
     /// captured (node-emitted) messages whose routing carries only the id.
-    node_ids: Vec<proto::EntityId>,
+    node_ids: Vec<proto::NodeId>,
     /// Cap on delivery rounds so a harness bug (e.g. an unhealed partition
     /// starving a load-bearing message) surfaces as a loud failure rather than
     /// an infinite loop.
@@ -89,29 +89,36 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
-    pub fn new(captured: Captured, faults: FaultConfig, node_ids: Vec<proto::EntityId>) -> Self {
+    pub fn new(captured: Captured, faults: FaultConfig, node_ids: Vec<proto::NodeId>) -> Self {
         Self { inflight: Vec::new(), partitions: std::collections::BTreeSet::new(), captured, faults, node_ids, max_rounds: 100_000 }
     }
 
     fn node_count(&self) -> usize { self.node_ids.len() }
 
     /// Logical index of the node whose id is `id`, if any.
-    fn index_of(&self, id: &proto::EntityId) -> Option<usize> { self.node_ids.iter().position(|nid| nid == id) }
+    fn index_of(&self, id: &proto::NodeId) -> Option<usize> { self.node_ids.iter().position(|nid| nid == id) }
 
     pub fn faults(&self) -> FaultConfig { self.faults }
 
     /// Enqueue a load-bearing propagation of a single event, redelivered until
     /// the receiver holds `event`. Never dropped outright.
-    pub fn enqueue_event(&mut self, src: usize, dst: usize, entity: proto::EntityId, event: proto::EventId, message: proto::NodeMessage) {
-        let digest = message_digest(&message);
+    pub fn enqueue_event(
+        &mut self,
+        src: usize,
+        dst: usize,
+        entity: proto::EntityId,
+        event: proto::EventId,
+        message: proto::SignedPeerMessage,
+    ) {
+        let digest = message_digest(&message.message);
         self.inflight.push(InFlight { src, dst, message, digest, droppable: false, accept: Some((entity, event)) });
     }
 
     /// Enqueue a load-bearing message with no single acceptance target (e.g. a
     /// harness-built adversarial batch delivered once for its own sake). Not
     /// dropped, not acceptance-retried; may be reordered/delayed/duplicated.
-    pub fn enqueue(&mut self, src: usize, dst: usize, message: proto::NodeMessage) {
-        let digest = message_digest(&message);
+    pub fn enqueue(&mut self, src: usize, dst: usize, message: proto::SignedPeerMessage) {
+        let digest = message_digest(&message.message);
         self.inflight.push(InFlight { src, dst, message, digest, droppable: false, accept: None });
     }
 
@@ -122,8 +129,8 @@ impl Scheduler {
     /// droppable; losing one only costs a retry, never convergence.
     fn absorb_captured(&mut self) {
         for out in self.captured.drain() {
-            let Some(dst) = recipient_id(&out.message).and_then(|id| self.index_of(&id)) else { continue };
-            let digest = message_digest(&out.message);
+            let Some(dst) = recipient_id(&out.message.message).and_then(|id| self.index_of(&id)) else { continue };
+            let digest = message_digest(&out.message.message);
             self.inflight.push(InFlight { src: out.src, dst, message: out.message, digest, droppable: true, accept: None });
         }
     }
@@ -152,14 +159,15 @@ impl Scheduler {
         }
     }
 
-    /// Deliver one message to its recipient's real `handle_message`, recording
-    /// the delivery. `handle_message` errors are swallowed: a node rejecting a
+    /// Deliver one message to its recipient's production, connection-bound
+    /// ingress, recording the delivery. Ingress errors are swallowed: a node rejecting a
     /// message (a dangling parent, a V6 unknown-entity item) is a legitimate
     /// outcome the invariants check for, not a harness error. Returns whether
     /// the message's acceptance target (if any) is now satisfied.
     async fn deliver(&self, item: &InFlight, nodes: &[SimNode], trace: &mut Trace, duplicate: bool) -> bool {
         trace.record(TraceEvent::Deliver { src: item.src, dst: item.dst, digest: item.digest.clone(), duplicate });
-        let _ = nodes[item.dst].node.handle_message(clone_message(&item.message)).await;
+        let authenticated_peer = nodes[item.src].id();
+        let _ = nodes[item.dst].node.handle_peer_message(authenticated_peer, clone_message(&item.message)).await;
         match &item.accept {
             None => true,
             Some((entity, event)) => nodes[item.dst].stored_event_ids(*entity).await.contains(event),
@@ -276,7 +284,7 @@ impl Scheduler {
 
 /// The recipient node id carried by a `NodeMessage`, if it targets a specific
 /// node. Used to route node-emitted (captured) traffic to a logical index.
-fn recipient_id(message: &proto::NodeMessage) -> Option<proto::EntityId> {
+fn recipient_id(message: &proto::NodeMessage) -> Option<proto::NodeId> {
     match message {
         proto::NodeMessage::Request { request, .. } => Some(request.to),
         proto::NodeMessage::Response(response) => Some(response.to),
@@ -290,7 +298,7 @@ fn recipient_id(message: &proto::NodeMessage) -> Option<proto::EntityId> {
 /// is not `Clone`, but duplication and blocked-message requeue need copies. The
 /// round-trip is exact (bincode is canonical here), so a duplicate is
 /// byte-identical to the original.
-fn clone_message(message: &proto::NodeMessage) -> proto::NodeMessage {
-    let bytes = bincode::serialize(message).expect("NodeMessage serializes");
-    bincode::deserialize(&bytes).expect("NodeMessage round-trips")
+fn clone_message(message: &proto::SignedPeerMessage) -> proto::SignedPeerMessage {
+    let bytes = bincode::serialize(message).expect("SignedPeerMessage serializes");
+    bincode::deserialize(&bytes).expect("SignedPeerMessage round-trips")
 }

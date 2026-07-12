@@ -1,9 +1,9 @@
 use ankurah_core::{
     error::{MutationError, RetrievalError},
     property::PropertyResolver,
-    storage::{StorageCollection, StorageEngine},
+    storage::{StorageCollection, StorageEngine, SystemRootClaim},
 };
-use ankurah_proto::{self as proto};
+use ankurah_proto::{self as proto, SystemRootProof};
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -11,6 +11,7 @@ use send_wrapper::SendWrapper;
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsCast;
 
 use crate::{
     collection::IndexedDBBucket,
@@ -19,6 +20,19 @@ use crate::{
 };
 #[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicBool, Ordering};
+
+const ENGINE_METADATA_STORE: &str = "engine_metadata";
+const SYSTEM_ROOT_CLAIM_KEY: &str = "system_root";
+
+fn encode_root_claim(proof: &SystemRootProof) -> Result<JsValue> {
+    let bytes = bincode::serialize(proof)?;
+    Ok(js_sys::Uint8Array::from(bytes.as_slice()).into())
+}
+
+fn decode_root_claim(value: JsValue) -> Result<SystemRootProof> {
+    let bytes = value.dyn_into::<js_sys::Uint8Array>().map_err(|_| anyhow::anyhow!("invalid persisted system-root claim type"))?.to_vec();
+    Ok(bincode::deserialize(&bytes)?)
+}
 
 pub struct IndexedDBStorageEngine {
     // We need SendWrapper because despite the ability to declare an async trait as ?Send,
@@ -78,6 +92,73 @@ impl StorageEngine for IndexedDBStorageEngine {
     }
 
     fn set_property_resolver(&self, resolver: std::sync::Weak<dyn PropertyResolver>) { *self.resolver.write().unwrap() = Some(resolver); }
+
+    async fn claim_system_root(&self, candidate: &SystemRootProof) -> Result<SystemRootClaim, MutationError> {
+        let candidate = candidate.clone();
+        let db_connection = self.db.get_connection().await;
+        SendWrapper::new(async move {
+            let transaction = db_connection
+                .transaction_with_str_and_mode(ENGINE_METADATA_STORE, web_sys::IdbTransactionMode::Readwrite)
+                .require("create engine metadata transaction")?;
+            let complete = cb_future(&transaction, "complete", "error");
+            let store = transaction.object_store(ENGINE_METADATA_STORE).require("get engine metadata store")?;
+            let key = JsValue::from_str(SYSTEM_ROOT_CLAIM_KEY);
+            let get = store.get(&key).require("get system-root claim")?;
+            cb_future(&get, "success", "error").await.require("await system-root claim read")?;
+            let existing = get.result().require("get system-root claim result")?;
+            let result = if existing.is_null() || existing.is_undefined() {
+                let put = store.put_with_key(&encode_root_claim(&candidate)?, &key).require("persist system-root claim")?;
+                cb_future(&put, "success", "error").await.require("await system-root claim write")?;
+                SystemRootClaim::Claimed
+            } else {
+                SystemRootClaim::Existing(decode_root_claim(existing)?)
+            };
+            complete.await.require("complete engine metadata transaction")?;
+            Ok(result)
+        })
+        .await
+    }
+
+    async fn system_root_claim(&self) -> Result<Option<SystemRootProof>, RetrievalError> {
+        let db_connection = self.db.get_connection().await;
+        SendWrapper::new(async move {
+            let transaction = db_connection.transaction_with_str(ENGINE_METADATA_STORE).require("create engine metadata transaction")?;
+            let store = transaction.object_store(ENGINE_METADATA_STORE).require("get engine metadata store")?;
+            let request = store.get(&JsValue::from_str(SYSTEM_ROOT_CLAIM_KEY)).require("get system-root claim")?;
+            cb_future(&request, "success", "error").await.require("await system-root claim read")?;
+            let value = request.result().require("get system-root claim result")?;
+            if value.is_null() || value.is_undefined() {
+                Ok(None)
+            } else {
+                Ok(Some(decode_root_claim(value)?))
+            }
+        })
+        .await
+    }
+
+    async fn release_system_root_claim(&self, expected: &SystemRootProof) -> Result<bool, MutationError> {
+        let expected = expected.clone();
+        let db_connection = self.db.get_connection().await;
+        SendWrapper::new(async move {
+            let transaction = db_connection
+                .transaction_with_str_and_mode(ENGINE_METADATA_STORE, web_sys::IdbTransactionMode::Readwrite)
+                .require("create engine metadata transaction")?;
+            let complete = cb_future(&transaction, "complete", "error");
+            let store = transaction.object_store(ENGINE_METADATA_STORE).require("get engine metadata store")?;
+            let key = JsValue::from_str(SYSTEM_ROOT_CLAIM_KEY);
+            let get = store.get(&key).require("get system-root claim")?;
+            cb_future(&get, "success", "error").await.require("await system-root claim read")?;
+            let existing = get.result().require("get system-root claim result")?;
+            let released = if existing.is_null() || existing.is_undefined() { false } else { decode_root_claim(existing)? == expected };
+            if released {
+                let delete = store.delete(&key).require("release system-root claim")?;
+                cb_future(&delete, "success", "error").await.require("await system-root claim release")?;
+            }
+            complete.await.require("complete engine metadata transaction")?;
+            Ok(released)
+        })
+        .await
+    }
 
     async fn delete_all_collections(&self) -> Result<bool, MutationError> {
         let db_connection = self.db.get_connection().await;

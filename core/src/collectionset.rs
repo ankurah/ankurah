@@ -3,12 +3,12 @@ use std::{
     sync::Arc,
 };
 
-use ankurah_proto::CollectionId;
+use ankurah_proto::{CollectionId, SystemRootProof};
 use tokio::sync::RwLock;
 
 use crate::{
     error::{MutationError, RetrievalError},
-    storage::{StorageCollectionWrapper, StorageEngine},
+    storage::{StorageCollectionWrapper, StorageEngine, SystemRootClaim},
 };
 
 pub struct CollectionSet<SE>(Arc<Inner<SE>>);
@@ -78,7 +78,26 @@ impl<SE: StorageEngine> CollectionSet<SE> {
         self.0.storage_engine.set_property_resolver(resolver);
     }
 
+    pub(crate) async fn claim_system_root(&self, candidate: &SystemRootProof) -> Result<SystemRootClaim, MutationError> {
+        self.0.storage_engine.claim_system_root(candidate).await
+    }
+
+    pub(crate) async fn system_root_claim(&self) -> Result<Option<SystemRootProof>, RetrievalError> {
+        self.0.storage_engine.system_root_claim().await
+    }
+
+    pub(crate) async fn release_system_root_claim(&self, expected: &SystemRootProof) -> Result<bool, MutationError> {
+        self.0.storage_engine.release_system_root_claim(expected).await
+    }
+
     pub async fn delete_all_collections(&self) -> Result<bool, MutationError> {
+        // Keep the complete proposal as a cross-instance fence while data is
+        // deleted. Engines deliberately preserve metadata during their raw
+        // collection wipe; afterward remove only the exact proposal observed
+        // before deletion. An unconditional second clear could erase a new
+        // winner installed between the two operations.
+        let claim = self.0.storage_engine.system_root_claim().await?;
+
         // Clear in-memory collections first
         {
             let mut collections = self.0.collections.write().await;
@@ -86,6 +105,21 @@ impl<SE: StorageEngine> CollectionSet<SE> {
         }
 
         // Then delete all collections from storage
-        self.0.storage_engine.delete_all_collections().await
+        let deleted = self.0.storage_engine.delete_all_collections().await?;
+        match claim {
+            Some(proof) => {
+                if !self.0.storage_engine.release_system_root_claim(&proof).await? {
+                    return Err(MutationError::General(Box::new(std::io::Error::other("system-root claim changed during storage reset"))));
+                }
+            }
+            None => {
+                if self.0.storage_engine.system_root_claim().await?.is_some() {
+                    return Err(MutationError::General(Box::new(std::io::Error::other(
+                        "system-root claim appeared during unfenced storage reset",
+                    ))));
+                }
+            }
+        }
+        Ok(deleted)
     }
 }

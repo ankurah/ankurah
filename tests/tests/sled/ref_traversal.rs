@@ -94,7 +94,7 @@ async fn test_ref_get_traversal() -> Result<()> {
 
 #[tokio::test]
 async fn test_ref_from_entity_id() -> Result<()> {
-    let id = EntityId::new();
+    let id = EntityId::from_bytes([0x61; 32]);
 
     // Test From<EntityId> conversion
     let artist_ref: Ref<RefTestArtist> = id.clone().into();
@@ -109,7 +109,7 @@ async fn test_ref_from_entity_id() -> Result<()> {
 
 #[tokio::test]
 async fn test_ref_serialization() -> Result<()> {
-    let id = EntityId::new();
+    let id = EntityId::from_bytes([0x62; 32]);
     let artist_ref: Ref<RefTestArtist> = Ref::new(id.clone());
 
     // Serialize

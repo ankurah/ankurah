@@ -20,7 +20,7 @@ impl NodeApplier {
     /// we also don't need to fan events out to peers because we're receiving them from a peer
     pub(crate) async fn apply_updates<SE, PA>(
         node: &Node<SE, PA>,
-        from_peer_id: &proto::EntityId,
+        from_peer_id: &proto::NodeId,
         items: Vec<proto::SubscriptionUpdateItem>,
     ) -> Result<(), ApplyError>
     where
@@ -75,7 +75,7 @@ impl NodeApplier {
     /// discovery. Shared by every update arm that carries events.
     fn validate_and_stage<SE, PA, E>(
         node: &Node<SE, PA>,
-        from_peer_id: &proto::EntityId,
+        from_peer_id: &proto::NodeId,
         entity_id: proto::EntityId,
         model: proto::EntityId,
         event_fragments: Vec<proto::EventFragment>,
@@ -98,7 +98,7 @@ impl NodeApplier {
             // allocator-identity enforcement for multi-peer topologies is
             // #309's routing work. validate_received_event is the
             // per-agent hook if a deployment wants to gate this earlier.
-            node.policy_agent.validate_received_event(node, from_peer_id, &attested_event)?;
+            let attested_event = node.validate_incoming_event(from_peer_id, attested_event)?;
             event_getter.stage_event(attested_event.payload.clone());
             attested_events.push(attested_event);
         }
@@ -107,7 +107,7 @@ impl NodeApplier {
 
     async fn apply_update<SE, PA, E, S>(
         node: &Node<SE, PA>,
-        from_peer_id: &proto::EntityId,
+        from_peer_id: &proto::NodeId,
         update: proto::SubscriptionUpdateItem,
         event_getter: &E,
         state_getter: &S,
@@ -184,7 +184,9 @@ impl NodeApplier {
                 let attested_events = crate::event_dag::ordering::topo_sort_events(attested_events)?;
 
                 let state = (entity_id, model, state_fragment.clone()).into();
-                node.policy_agent.validate_received_state(node, from_peer_id, &state)?;
+                let state = node.validate_incoming_state(from_peer_id, state)?;
+                node.validate_state_identity(&state.payload, event_getter).await?;
+                let inherited_attestations = state.attestations;
 
                 // with_state only updates the in-memory entity, it does NOT persist to storage
                 let (changed, entity) =
@@ -197,7 +199,7 @@ impl NodeApplier {
                     for event in &attested_events {
                         event_getter.commit_event(event).await?;
                     }
-                    Self::save_state(node, &entity, &collection).await?;
+                    Self::save_state(node, &entity, &collection, inherited_attestations).await?;
                     changes.push(EntityChange::new(entity, attested_events)?);
                 } else {
                     // State not applied (divergence or older) - fall back to event-by-event application
@@ -210,7 +212,7 @@ impl NodeApplier {
                         }
                     }
                     if !applied_events.is_empty() {
-                        Self::save_state(node, &entity, &collection).await?;
+                        Self::save_state(node, &entity, &collection, inherited_attestations).await?;
                         changes.push(EntityChange::new(entity, applied_events)?);
                     }
                 }
@@ -224,6 +226,7 @@ impl NodeApplier {
         node: &Node<SE, PA>,
         entity: &crate::entity::Entity,
         collection_wrapper: &crate::storage::StorageCollectionWrapper,
+        inherited_attestations: proto::AttestationSet,
     ) -> Result<(), MutationError>
     where
         SE: StorageEngine + Send + Sync + 'static,
@@ -231,8 +234,19 @@ impl NodeApplier {
     {
         let state = entity.to_state()?;
         let entity_state = proto::EntityState { entity_id: entity.id(), model: entity.model_id()?, state };
-        let attestation = node.policy_agent.attest_state(node, &entity_state);
-        let attested = Attested::opt(entity_state, attestation);
+        // A verified founder envelope is a portable artifact. Preserve it
+        // across an ephemeral cache/replay hop when it still names the exact
+        // recomputed state; a merge or local advance naturally strips it as
+        // a subject mismatch.
+        let mut attested = Attested { payload: entity_state, attestations: inherited_attestations };
+        node.verify_state_attestations(&mut attested);
+        let admission = node.policy_agent.attest_state(node, &attested.payload);
+        let locally_attested = node.attest_state(attested.payload.clone(), admission);
+        for envelope in locally_attested.attestations.0 {
+            if !attested.attestations.0.contains(&envelope) {
+                attested.attestations.push(envelope);
+            }
+        }
         collection_wrapper.set_state(attested).await?;
         Ok(())
     }
@@ -242,7 +256,7 @@ impl NodeApplier {
     /// Collects all errors and returns them at the end - caller decides whether to fail or log
     pub(crate) async fn apply_deltas<SE, PA, E, S>(
         node: &Node<SE, PA>,
-        from_peer_id: &proto::EntityId,
+        from_peer_id: &proto::NodeId,
         deltas: Vec<proto::EntityDelta>,
         event_getter: &E,
         state_getter: &S,
@@ -290,7 +304,7 @@ impl NodeApplier {
     /// Returns Some(EntityChange) if the delta resulted in a change, None otherwise
     async fn apply_delta<SE, PA, E, S>(
         node: &Node<SE, PA>,
-        from_peer_id: &proto::EntityId,
+        from_peer_id: &proto::NodeId,
         delta: proto::EntityDelta,
         event_getter: &E,
         state_getter: &S,
@@ -310,7 +324,7 @@ impl NodeApplier {
 
     async fn apply_delta_inner<SE, PA, E, S>(
         node: &Node<SE, PA>,
-        from_peer_id: &proto::EntityId,
+        from_peer_id: &proto::NodeId,
         delta: proto::EntityDelta,
         event_getter: &E,
         state_getter: &S,
@@ -329,7 +343,9 @@ impl NodeApplier {
         match delta.content {
             proto::DeltaContent::StateSnapshot { state } => {
                 let attested_state = (delta.entity_id, delta.model, state).into();
-                node.policy_agent.validate_received_state(node, from_peer_id, &attested_state)?;
+                let attested_state = node.validate_incoming_state(from_peer_id, attested_state)?;
+                node.validate_state_identity(&attested_state.payload, event_getter).await?;
+                let inherited_attestations = attested_state.attestations;
 
                 let (changed, entity) = node
                     .entities
@@ -337,7 +353,7 @@ impl NodeApplier {
                     .await?;
 
                 // Save state to storage
-                Self::save_state(node, &entity, &collection).await?;
+                Self::save_state(node, &entity, &collection, inherited_attestations).await?;
 
                 // Only notify if the snapshot actually advanced the entity. with_state
                 // returns Some(false) when the state did not apply (the entity is
@@ -380,7 +396,7 @@ impl NodeApplier {
                 }
 
                 // Save updated state
-                Self::save_state(node, &entity, &collection).await?;
+                Self::save_state(node, &entity, &collection, proto::AttestationSet::default()).await?;
 
                 // Only notify if the bridge actually advanced the entity. If every
                 // event was already applied (apply_event returned false for all), the

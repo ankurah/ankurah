@@ -55,6 +55,15 @@ const RESERVED_FIELDS: [&str; 5] = ["id", "__collection", "__state_buffer", "__h
 /// other string keys) so a collection's whole slice is one prefix range.
 fn property_columns_key(collection: &str, id: &EntityId) -> String { format!("{}\0{}", collection, id.to_base64()) }
 
+fn event_body_from_object(event_obj: &Object) -> Result<proto::EventBody, RetrievalError> {
+    let value: JsValue = event_obj.get(&BODY_KEY)?;
+    let bytes = value
+        .dyn_into::<js_sys::Uint8Array>()
+        .map_err(|_| RetrievalError::StorageError(anyhow::anyhow!("event body is not binary").into()))?
+        .to_vec();
+    bincode::deserialize(&bytes).map_err(RetrievalError::storage)
+}
+
 impl std::fmt::Display for IndexedDBBucket {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "IndexedDBBucket({})", self.collection_id) }
 }
@@ -272,7 +281,8 @@ impl StorageCollection for IndexedDBBucket {
             let payload = &attested_event.payload;
             event_obj.set(&*ID_KEY, &payload.id())?;
             event_obj.set(&*ENTITY_ID_KEY, payload.entity_id.to_base64())?;
-            event_obj.set(&*OPERATIONS_KEY, &payload.operations)?;
+            let body = bincode::serialize(&payload.body)?;
+            event_obj.set(&*BODY_KEY, JsValue::from(js_sys::Uint8Array::from(body.as_slice())))?;
             event_obj.set(&*ATTESTATIONS_KEY, &attested_event.attestations)?;
             event_obj.set(&*PARENT_KEY, &payload.parent)?;
 
@@ -314,7 +324,7 @@ impl StorageCollection for IndexedDBBucket {
                     payload: ankurah_proto::Event {
                         model: self.model_id()?,
                         entity_id: event_obj.get(&ENTITY_ID_KEY)?,
-                        operations: event_obj.get(&OPERATIONS_KEY)?,
+                        body: event_body_from_object(&event_obj)?,
                         parent: event_obj.get(&PARENT_KEY)?,
                     },
                     attestations: event_obj.get(&ATTESTATIONS_KEY)?,
@@ -355,7 +365,7 @@ impl StorageCollection for IndexedDBBucket {
                         model: self.model_id()?,
                         // id: event_obj.get(&ID_KEY)?.try_into()?,
                         entity_id: event_obj.get(&ENTITY_ID_KEY)?,
-                        operations: event_obj.get(&OPERATIONS_KEY)?,
+                        body: event_body_from_object(&event_obj)?,
                         parent: event_obj.get(&PARENT_KEY)?,
                     },
                     attestations: event_obj.get(&ATTESTATIONS_KEY)?,

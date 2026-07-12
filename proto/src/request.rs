@@ -4,7 +4,7 @@ use ulid::Ulid;
 
 use crate::{
     auth::Attested, clock::Clock, collection::CollectionId, data::Event, id::EntityId, node_id::NodeId, subscription::QueryId,
-    transaction::TransactionId, EntityState, EventFragment, EventId, StateFragment,
+    transaction::TransactionId, EntityState, EventFragment, EventId, StateFragment, StateWithGenesis,
 };
 
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Serialize, Deserialize, Hash, Default)]
@@ -271,7 +271,7 @@ pub struct NodeResponse {
     /// Catalog definition entities the receiver needs to resolve this
     /// response's model ids (#330); see `NodeUpdate::schema` in update.rs.
     #[serde(default)]
-    pub schema: Vec<Attested<EntityState>>,
+    pub schema: Vec<StateWithGenesis>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

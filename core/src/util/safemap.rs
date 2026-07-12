@@ -11,7 +11,21 @@ impl<K: Hash + Eq, V> SafeMap<K, V> {
 
     pub fn insert(&self, key: K, value: V) { self.0.write().expect("Failed to lock the map").insert(key, value); }
 
+    pub fn replace(&self, key: K, value: V) -> Option<V> { self.0.write().expect("Failed to lock the map").insert(key, value) }
+
     pub fn remove(&self, key: &K) -> Option<V> { self.0.write().expect("Failed to lock the map").remove(key) }
+
+    /// Remove `key` only when its current value still matches `predicate`.
+    /// The check and removal share one write lock, so a replacement inserted
+    /// by another connection cannot be deleted by a stale teardown.
+    pub fn remove_if(&self, key: &K, predicate: impl FnOnce(&V) -> bool) -> Option<V> {
+        let mut map = self.0.write().expect("Failed to lock the map");
+        if map.get(key).is_some_and(predicate) {
+            map.remove(key)
+        } else {
+            None
+        }
+    }
 
     pub fn retain(&self, cb: impl Fn(&K, &V) -> bool) { self.0.write().expect("Failed to lock the map").retain(|k, v| cb(k, v)); }
 
@@ -19,6 +33,8 @@ impl<K: Hash + Eq, V> SafeMap<K, V> {
     pub fn len(&self) -> usize { self.0.read().expect("Failed to lock the map").len() }
 
     pub fn clear(&self) { self.0.write().expect("Failed to lock the map").clear(); }
+
+    pub fn drain_values(&self) -> Vec<V> { self.0.write().expect("Failed to lock the map").drain().map(|(_, value)| value).collect() }
 
     pub fn contains_key(&self, key: &K) -> bool { self.0.read().expect("Failed to lock the map").contains_key(key) }
 }

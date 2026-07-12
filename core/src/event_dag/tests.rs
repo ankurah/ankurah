@@ -9,7 +9,7 @@ use crate::value::Value;
 
 use super::comparison::compare;
 use super::relation::AbstractCausalRelation;
-use ankurah_proto::{Clock, EntityId, Event, EventId, OperationSet};
+use ankurah_proto::{Clock, EntityId, Event, EventBody, EventId, OperationSet};
 use async_trait::async_trait;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -48,29 +48,41 @@ impl GetEvents for MockRetriever {
 /// excluded from `EventId` hashing, so it never perturbs the content-hashed
 /// event ids these tests order and compare on.
 fn test_model_id() -> EntityId {
-    let mut bytes = [0u8; 16];
+    let mut bytes = [0u8; 32];
     bytes[0] = 0xEE;
     EntityId::from_bytes(bytes)
+}
+
+/// Construct a deterministic, structurally faithful event fixture. Empty
+/// parents produce a genesis whose entity id is derived from the body;
+/// non-empty parents produce an update for a deterministic synthetic entity.
+fn make_event_with_operations(seed: u16, parent_ids: &[EventId], operations: OperationSet) -> Event {
+    let parent = Clock::from(parent_ids.to_vec());
+    if parent.is_empty() {
+        let system = None;
+        let mut nonce = [0u8; 32];
+        nonce[0..2].copy_from_slice(&seed.to_be_bytes());
+        let timestamp = seed as u64;
+        let entity_id = EntityId::from(EventId::from_genesis_parts(&system, &nonce, timestamp, &operations));
+        Event { entity_id, model: test_model_id(), parent, body: EventBody::Genesis { system, nonce, timestamp, operations } }
+    } else {
+        let mut entity_id_bytes = [0u8; 32];
+        entity_id_bytes[0..2].copy_from_slice(&seed.to_be_bytes());
+        Event { entity_id: EntityId::from_bytes(entity_id_bytes), model: test_model_id(), parent, body: EventBody::Update { operations } }
+    }
 }
 
 /// Create a test event with deterministic content-hashed IDs.
 /// The seed differentiates events; parent_ids determine the parent clock.
 /// Returns the event (call `.id()` on it to get the computed EventId).
 fn make_test_event(seed: u8, parent_ids: &[EventId]) -> Event {
-    let mut entity_id_bytes = [0u8; 16];
-    entity_id_bytes[0] = seed;
-    let entity_id = EntityId::from_bytes(entity_id_bytes);
-
-    Event { entity_id, model: test_model_id(), parent: Clock::from(parent_ids.to_vec()), operations: OperationSet(BTreeMap::new()) }
+    make_event_with_operations(seed as u16, parent_ids, OperationSet(BTreeMap::new()))
 }
 
 /// Like make_test_event but with a two-byte seed, for tests that need a wide
 /// or exhaustive seed space (id-ordering searches, randomized DAG generation).
 fn make_test_event_u16(seed: u16, parent_ids: &[EventId]) -> Event {
-    let mut entity_id_bytes = [0u8; 16];
-    entity_id_bytes[0..2].copy_from_slice(&seed.to_be_bytes());
-    let entity_id = EntityId::from_bytes(entity_id_bytes);
-    Event { entity_id, model: test_model_id(), parent: Clock::from(parent_ids.to_vec()), operations: OperationSet(BTreeMap::new()) }
+    make_event_with_operations(seed, parent_ids, OperationSet(BTreeMap::new()))
 }
 
 /// Create a Clock from EventIds without consuming them.
@@ -83,29 +95,22 @@ macro_rules! clock {
 /// Create a test event with LWW operations.
 /// Uses a seed to create deterministic but different entity IDs for each event.
 fn make_lww_event(seed: u8, properties: Vec<(&str, &str)>) -> Event {
-    // Use seed for entity_id to get different event hashes
-    let mut entity_id_bytes = [0u8; 16];
-    entity_id_bytes[0] = seed;
-    let entity_id = EntityId::from_bytes(entity_id_bytes);
-
     let backend = LWWBackend::new();
     for (name, value) in properties {
         backend.set(name.into(), Some(Value::String(value.into())));
     }
     let ops = backend.to_operations().unwrap().unwrap();
-    Event {
-        entity_id,
-        model: test_model_id(),
-        parent: Clock::default(),
-        operations: OperationSet(BTreeMap::from([("lww".to_string(), ops)])),
-    }
+    make_event_with_operations(seed as u16, &[], OperationSet(BTreeMap::from([("lww".to_string(), ops)])))
 }
 
 /// Like make_lww_event but with an explicit parent clock, for multi-layer DAG scenarios.
 fn make_lww_event_with_parent(seed: u8, properties: Vec<(&str, &str)>, parent_ids: &[EventId]) -> Event {
-    let mut event = make_lww_event(seed, properties);
-    event.parent = Clock::from(parent_ids.to_vec());
-    event
+    let backend = LWWBackend::new();
+    for (name, value) in properties {
+        backend.set(name.into(), Some(Value::String(value.into())));
+    }
+    let ops = backend.to_operations().unwrap().unwrap();
+    make_event_with_operations(seed as u16, parent_ids, OperationSet(BTreeMap::from([("lww".to_string(), ops)])))
 }
 
 fn layer_from_refs_with_context(already_applied: &[&Event], to_apply: &[&Event], context_events: &[&Event]) -> EventLayer {
@@ -1278,8 +1283,8 @@ mod lww_layer_tests {
             .expect("some seed yields A.id > B.id");
 
         let lww_key = "lww".to_string();
-        let a_ops = event_a.operations.get(&lww_key).unwrap();
-        let z_ops = event_z.operations.get(&lww_key).unwrap();
+        let a_ops = event_a.operations().get(&lww_key).unwrap();
+        let z_ops = event_z.operations().get(&lww_key).unwrap();
 
         // All layers share the same accumulated DAG {M, A, X, B}; Z is absent from it.
         let layer1 = || layer_from_refs_with_context(&[&event_a], &[&remote_mid], &[&meet, &event_b]);
@@ -1344,20 +1349,10 @@ mod yrs_layer_tests {
     /// Create a test event with Yrs text operations.
     /// Each text operation inserts the given string at position 0.
     fn make_yrs_event(seed: u8, text_field: &str, insert_text: &str) -> Event {
-        let mut entity_id_bytes = [0u8; 16];
-        entity_id_bytes[0] = seed;
-        let entity_id = EntityId::from_bytes(entity_id_bytes);
-
         let backend = YrsBackend::new();
         backend.insert(&crate::property::PropertyKey::name(text_field), 0, insert_text).unwrap();
         let ops = backend.to_operations().unwrap().unwrap();
-
-        Event {
-            entity_id,
-            model: test_model_id(),
-            parent: Clock::default(),
-            operations: OperationSet(BTreeMap::from([("yrs".to_string(), ops)])),
-        }
+        make_event_with_operations(seed as u16, &[], OperationSet(BTreeMap::from([("yrs".to_string(), ops)])))
     }
 
     #[test]
@@ -1587,13 +1582,7 @@ mod edge_case_tests {
         backend.apply_layer(&layer_from_refs(&[], &[&init_event])).unwrap();
 
         // Create an event with empty operations
-        let entity_id = EntityId::from_bytes([99u8; 16]);
-        let empty_event = Event {
-            entity_id,
-            model: test_model_id(),
-            parent: Clock::default(),
-            operations: OperationSet(BTreeMap::new()), // No operations
-        };
+        let empty_event = make_event_with_operations(99, &[], OperationSet(BTreeMap::new()));
 
         let already_applied: Vec<&Event> = vec![];
         let to_apply: Vec<&Event> = vec![&empty_event];
@@ -1647,19 +1636,10 @@ mod edge_case_tests {
         backend.apply_layer(&layer_from_refs(&[], &[&init_event])).unwrap();
 
         // Create an event that deletes the property (sets to None)
-        let mut entity_id_bytes = [0u8; 16];
-        entity_id_bytes[0] = 1;
-        let entity_id = EntityId::from_bytes(entity_id_bytes);
-
         let delete_backend = LWWBackend::new();
         delete_backend.set("x".into(), None); // Delete
         let ops = delete_backend.to_operations().unwrap().unwrap();
-        let delete_event = Event {
-            entity_id,
-            model: test_model_id(),
-            parent: Clock::default(),
-            operations: OperationSet(BTreeMap::from([("lww".to_string(), ops)])),
-        };
+        let delete_event = make_event_with_operations(1, &[], OperationSet(BTreeMap::from([("lww".to_string(), ops)])));
 
         backend.apply_layer(&layer_from_refs_with_context(&[], &[&delete_event], &[&init_event])).unwrap();
 
@@ -1805,11 +1785,11 @@ mod phase4_idempotency {
     }
 }
 
-/// Phase 4 Test 3: Second creation event for same entity is rejected.
+/// Phase 4 Test 3: A different genesis cannot be rebound to an existing entity.
 ///
-/// An entity may have at most one creation event (empty parent clock). If a second
-/// creation event arrives after the entity already has a non-empty head, it must
-/// be rejected with DuplicateCreation.
+/// Entity identity is the genesis event id, so a distinct genesis necessarily
+/// names a distinct entity. Rebinding its claimed entity id is structurally
+/// invalid and must be rejected before lineage comparison.
 #[cfg(test)]
 mod phase4_duplicate_creation {
     use super::*;
@@ -1817,35 +1797,21 @@ mod phase4_duplicate_creation {
     use crate::error::MutationError;
 
     fn make_creation_event(seed: u8) -> Event {
-        let mut entity_id_bytes = [0u8; 16];
-        entity_id_bytes[0] = 42; // Same entity for both events
-        let entity_id = EntityId::from_bytes(entity_id_bytes);
-
         // Use LWW operations with distinct values to produce different event IDs.
         // Without differing content, identical events would produce the same EventId.
         let backend = LWWBackend::new();
         backend.set("x".into(), Some(Value::String(format!("value_{}", seed))));
         let ops = backend.to_operations().unwrap().unwrap();
-
-        Event {
-            entity_id,
-            model: test_model_id(),
-            parent: Clock::default(), // empty parent = creation event
-            operations: OperationSet(BTreeMap::from([("lww".to_string(), ops)])),
-        }
+        make_event_with_operations(seed as u16, &[], OperationSet(BTreeMap::from([("lww".to_string(), ops)])))
     }
 
     #[tokio::test]
     async fn test_second_creation_event_rejected() {
-        let mut entity_id_bytes = [0u8; 16];
-        entity_id_bytes[0] = 42;
-        let entity_id = EntityId::from_bytes(entity_id_bytes);
-        let entity = Entity::create(entity_id, "test".into());
-
         let mut retriever = MockRetriever::new();
 
         // First creation event should succeed
         let creation_event_1 = make_creation_event(1);
+        let entity = Entity::create(creation_event_1.entity_id, "test".into());
         retriever.add_event(creation_event_1.clone());
 
         let result = entity.apply_event(&retriever, &creation_event_1).await;
@@ -1855,28 +1821,25 @@ mod phase4_duplicate_creation {
         // Entity head should now be non-empty
         assert!(!entity.head().is_empty(), "Entity head should be non-empty after creation");
 
-        // Second creation event (different seed = different event) should be rejected.
-        // BFS detects two different roots -> Disjoint -> LineageError::Disjoint
-        let creation_event_2 = make_creation_event(2);
+        // A different genesis derives a different identity. Pretending that it
+        // belongs to the first entity breaks the genesis-id equality check.
+        let mut creation_event_2 = make_creation_event(2);
+        creation_event_2.entity_id = creation_event_1.entity_id;
         retriever.add_event(creation_event_2.clone());
         let result = entity.apply_event(&retriever, &creation_event_2).await;
 
         assert!(result.is_err(), "Second creation event should fail");
         let err = result.unwrap_err();
-        assert!(matches!(err, MutationError::LineageError(crate::error::LineageError::Disjoint)), "Error should be Disjoint, got: {err:?}");
+        assert!(matches!(err, MutationError::InvalidEvent), "Error should be InvalidEvent, got: {err:?}");
     }
 
     #[tokio::test]
     async fn test_redelivery_of_same_creation_event_is_noop() {
-        let mut entity_id_bytes = [0u8; 16];
-        entity_id_bytes[0] = 42;
-        let entity_id = EntityId::from_bytes(entity_id_bytes);
-        let entity = Entity::create(entity_id, "test".into());
-
         let mut retriever = MockRetriever::new();
 
         // First creation event
         let creation_event = make_creation_event(1);
+        let entity = Entity::create(creation_event.entity_id, "test".into());
         retriever.add_event(creation_event.clone());
 
         let result = entity.apply_event(&retriever, &creation_event).await;
@@ -2650,26 +2613,25 @@ mod strict_descends_gap_jump {
     /// that wrong state is persisted via set_state and served as canonical.
     #[tokio::test]
     async fn test_strict_descends_gap_jump_skips_ancestor_ops() {
-        let mut entity_id_bytes = [0u8; 16];
-        entity_id_bytes[0] = 42;
-        let entity_id = EntityId::from_bytes(entity_id_bytes);
-        let entity = Entity::create(entity_id, "test".into());
-
         let mut retriever = MockRetriever::new();
 
         // A: genesis create event (empty parent). Establishes head {A}.
         let ev_a = make_lww_event_with_parent(1, vec![("p0", "genesis")], &[]);
+        let entity_id = ev_a.entity_id;
+        let entity = Entity::create(entity_id, "test".into());
         let id_a = ev_a.id();
         retriever.add_event(ev_a.clone());
         assert!(ev_a.is_entity_create(), "A must be a creation event");
 
         // X: child of A, writes p1. This is the intermediate ancestor.
-        let ev_x = make_lww_event_with_parent(2, vec![("p1", "written_by_X")], &[id_a.clone()]);
+        let mut ev_x = make_lww_event_with_parent(2, vec![("p1", "written_by_X")], &[id_a.clone()]);
+        ev_x.entity_id = entity_id;
         let id_x = ev_x.id();
         retriever.add_event(ev_x.clone());
 
         // B: child of X, writes p2. B descends A through X.
-        let ev_b = make_lww_event_with_parent(3, vec![("p2", "written_by_B")], &[id_x.clone()]);
+        let mut ev_b = make_lww_event_with_parent(3, vec![("p2", "written_by_B")], &[id_x.clone()]);
+        ev_b.entity_id = entity_id;
         let id_b = ev_b.id();
         retriever.add_event(ev_b.clone());
 
@@ -2899,7 +2861,7 @@ mod comparison_property {
             }
 
             for _pair in 0..4 {
-                let mut pick_clock = |rng: &mut Rng| -> Vec<EventId> {
+                let pick_clock = |rng: &mut Rng| -> Vec<EventId> {
                     let mut set = BTreeSet::new();
                     for _ in 0..(1 + rng.below(3)) {
                         set.insert(ids[rng.below(ids.len())].clone());
@@ -2961,18 +2923,17 @@ mod entity_change_batches {
     /// EntityChange validates event ownership, so the events must genuinely
     /// belong to the entity under test (the shared helper derives entity ids
     /// from its seed).
-    fn lww_event_for(entity_id: EntityId, properties: Vec<(&str, &str)>, parent_ids: &[EventId]) -> Event {
+    fn lww_event_for(seed: u16, entity_id: Option<EntityId>, properties: Vec<(&str, &str)>, parent_ids: &[EventId]) -> Event {
         let backend = LWWBackend::new();
         for (name, value) in properties {
             backend.set(name.into(), Some(Value::String(value.into())));
         }
         let ops = backend.to_operations().unwrap().unwrap();
-        Event {
-            entity_id,
-            model: test_model_id(),
-            operations: OperationSet(BTreeMap::from([("lww".to_string(), ops)])),
-            parent: Clock::from(parent_ids.to_vec()),
+        let mut event = make_event_with_operations(seed, parent_ids, OperationSet(BTreeMap::from([("lww".to_string(), ops)])));
+        if !parent_ids.is_empty() {
+            event.entity_id = entity_id.expect("update fixture requires its genesis-derived entity id");
         }
+        event
     }
 
     /// An ordered parent-then-child batch applies cleanly, leaving only the
@@ -2981,18 +2942,15 @@ mod entity_change_batches {
     /// both events and then fails while constructing the notification.
     #[tokio::test]
     async fn notification_accepts_batch_superseded_ancestors() {
-        let mut entity_id_bytes = [0u8; 16];
-        entity_id_bytes[0] = 77;
-        let entity_id = EntityId::from_bytes(entity_id_bytes);
-        let entity = Entity::create(entity_id, "test".into());
-
         let mut retriever = MockRetriever::new();
 
-        let ev_a = lww_event_for(entity_id, vec![("p0", "genesis")], &[]);
+        let ev_a = lww_event_for(77, None, vec![("p0", "genesis")], &[]);
+        let entity_id = ev_a.entity_id;
+        let entity = Entity::create(entity_id, "test".into());
         retriever.add_event(ev_a.clone());
-        let ev_x = lww_event_for(entity_id, vec![("p1", "from_x")], &[ev_a.id()]);
+        let ev_x = lww_event_for(78, Some(entity_id), vec![("p1", "from_x")], &[ev_a.id()]);
         retriever.add_event(ev_x.clone());
-        let ev_b = lww_event_for(entity_id, vec![("p2", "from_b")], &[ev_x.id()]);
+        let ev_b = lww_event_for(79, Some(entity_id), vec![("p2", "from_b")], &[ev_x.id()]);
         retriever.add_event(ev_b.clone());
 
         assert!(entity.apply_event(&retriever, &ev_a).await.unwrap());
@@ -3006,7 +2964,7 @@ mod entity_change_batches {
 
         // Still rejected: an event that is neither a head tip nor superseded
         // by a later batch member.
-        let stray = lww_event_for(entity_id, vec![("p9", "stray")], &[ev_a.id()]);
+        let stray = lww_event_for(80, Some(entity_id), vec![("p9", "stray")], &[ev_a.id()]);
         let bad = EntityChange::new(entity, vec![Attested::opt(stray, None)]);
         assert!(bad.is_err(), "an event outside the head and unsuperseded in the batch must be rejected");
     }

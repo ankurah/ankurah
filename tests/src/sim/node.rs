@@ -9,17 +9,63 @@
 //!
 //! Nodes are addressed by a stable logical index (0, 1, 2, ...) assigned at
 //! construction. Scheduling, faults, and the trace key on that index and never
-//! on the node's ULID id, which is random and would leak entropy into the
+//! on the node's ed25519 public-key id, which would leak key entropy into the
 //! schedule.
 
 use ankurah::proto::{self, Attested};
 use ankurah::{Node, PermissiveAgent};
 use ankurah_storage_sled::SledStorageEngine;
-use std::sync::Arc;
+use ed25519_dalek::SigningKey;
+use std::{collections::BTreeMap, sync::Arc};
 
 use super::model::SimRecord;
 use super::transport::{Captured, SimSender};
+use ankurah::core::{
+    property::{
+        backend::{lww::LWWBackend, PropertyBackend},
+        PropertyKey,
+    },
+    storage::StorageEngine,
+    value::Value,
+};
 use ankurah::Model;
+
+fn signing_key(index: usize) -> SigningKey {
+    let mut seed = [0xA7; 32];
+    seed[24..].copy_from_slice(&(index as u64).to_be_bytes());
+    SigningKey::from_bytes(&seed)
+}
+
+/// Build the byte-identical system root used by both halves of the simulation
+/// determinism audit. Production correctly draws fresh genesis entropy; this
+/// harness supplies fixed entropy and pre-seeds storage so entity genesis ids
+/// can still bind a real, stable system identity.
+fn deterministic_system_root(founder: proto::NodeId) -> anyhow::Result<(proto::Event, Attested<proto::EntityState>)> {
+    let source = LWWBackend::new();
+    source.set(PropertyKey::name("item"), Some(Value::String(serde_json::to_string(&proto::sys::Item::SysRoot { founder })?)));
+    let lww_ops = source.to_operations()?.expect("a system-root write produces operations");
+    let operations = proto::OperationSet(BTreeMap::from([("lww".to_owned(), lww_ops.clone())]));
+    let model = ankurah::core::schema::well_known_model_id(ankurah::core::system::SYSTEM_COLLECTION_ID)
+        .expect("system collection has a well-known model id");
+    let system = None;
+    let nonce = [0x53; 32];
+    let timestamp = 1_700_000_000_000;
+    let entity_id = proto::EntityId::from(proto::EventId::from_genesis_parts(&system, &nonce, timestamp, &operations));
+    let event = proto::Event {
+        model,
+        entity_id,
+        parent: proto::Clock::default(),
+        body: proto::EventBody::Genesis { system, nonce, timestamp, operations },
+    };
+
+    let materialized = LWWBackend::new();
+    materialized.apply_operations_with_event(&lww_ops, event.id())?;
+    let state = proto::State {
+        state_buffers: proto::StateBuffers(BTreeMap::from([("lww".to_owned(), materialized.to_state_buffer()?)])),
+        head: proto::Clock::from(vec![event.id()]),
+    };
+    Ok((event, Attested::opt(proto::EntityState { entity_id, model, state }, None)))
+}
 
 /// A real Node plus its logical index and the shared capture sink.
 pub struct SimNode {
@@ -30,23 +76,34 @@ pub struct SimNode {
 }
 
 impl SimNode {
-    pub fn id(&self) -> proto::EntityId { self.node.id }
+    pub fn id(&self) -> proto::NodeId { self.node.id }
 
     /// Register `peer` as a connected peer of this node, installing a
     /// `SimSender` so anything this node sends *to* `peer` is captured for the
     /// scheduler. Mirrors `Node::register_peer` as `LocalProcessConnection`
     /// would, including the durable-peer bookkeeping that drives system join.
-    pub fn connect_to(&self, peer: &SimNode) {
-        let sender = SimSender::new(self.index, peer.id(), self.captured.clone());
-        self.node.register_peer(
-            proto::Presence {
-                node_id: peer.id(),
-                durable: peer.durable,
-                system_root: peer.node.system.root(),
-                protocol_version: proto::PROTOCOL_VERSION,
-            },
-            Box::new(sender),
-        );
+    pub fn connect_pair(a: &SimNode, b: &SimNode) {
+        let a_handshake = a.node.begin_peer_handshake();
+        let b_handshake = b.node.begin_peer_handshake();
+        let a_challenge = a_handshake.challenge();
+        let b_challenge = b_handshake.challenge();
+
+        a.node
+            .register_peer(
+                b.node.presence(a_challenge),
+                a_handshake,
+                b_challenge,
+                Box::new(SimSender::new(a.index, b.id(), a.captured.clone())),
+            )
+            .expect("sim peer has a valid challenge-bound presence");
+        b.node
+            .register_peer(
+                a.node.presence(b_challenge),
+                b_handshake,
+                a_challenge,
+                Box::new(SimSender::new(b.index, a.id(), b.captured.clone())),
+            )
+            .expect("sim peer has a valid challenge-bound presence");
     }
 
     /// Ingest a forged batch of events directly through the production remote
@@ -131,14 +188,21 @@ pub async fn build_nodes(n: usize, captured: Captured) -> anyhow::Result<Vec<Sim
     assert!(n >= 1, "need at least one node");
     let mut nodes = Vec::with_capacity(n);
 
-    // Node 0: durable, creates the system.
-    let durable = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
-    durable.system.create().await?;
+    // Node 0: durable, opened over a deterministic pre-seeded system root.
+    // Its signing key matches the founder recorded in that root.
+    let durable_key = signing_key(0);
+    let durable_engine = Arc::new(SledStorageEngine::new_test()?);
+    let system_collection = durable_engine.collection(&ankurah::core::system::SYSTEM_COLLECTION_ID.into()).await?;
+    let (root_genesis, root_state) = deterministic_system_root((&durable_key.verifying_key()).into())?;
+    system_collection.add_event(&Attested::opt(root_genesis, None)).await?;
+    system_collection.set_state(root_state).await?;
+    let durable = Node::new_durable_with_signing_key(durable_engine, PermissiveAgent::new(), durable_key);
+    durable.system.wait_system_ready().await;
     nodes.push(SimNode { index: 0, durable: true, node: durable, captured: captured.clone() });
 
     // Nodes 1..n: ephemeral.
     for index in 1..n {
-        let node = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+        let node = Node::new_with_signing_key(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new(), signing_key(index));
         nodes.push(SimNode { index, durable: false, node, captured: captured.clone() });
     }
 

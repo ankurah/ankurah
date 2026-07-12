@@ -466,8 +466,8 @@ mod tests {
             },
             KeyBoundComponent {
                 column: "user_id".to_string(),
-                low: Endpoint::incl(Value::String("AZoegTHj_4vcBoJ5FfY-Xw".to_string())),
-                high: Endpoint::incl(Value::String("AZoegTHj_4vcBoJ5FfY-Xw".to_string())),
+                low: Endpoint::incl(Value::String("AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA".to_string())),
+                high: Endpoint::incl(Value::String("AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA".to_string())),
             },
             KeyBoundComponent {
                 column: "timestamp".to_string(),
@@ -485,7 +485,7 @@ mod tests {
         // Should generate IDBKeyRange.bound with raw i64 numbers (matches From<&Value>)
         assert!(js_syntax.contains("IDBKeyRange.bound"));
         assert!(js_syntax.contains("\"connectionevent\""));
-        assert!(js_syntax.contains("\"AZoegTHj_4vcBoJ5FfY-Xw\""));
+        assert!(js_syntax.contains("\"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA\""));
         // i64 values as raw numbers (not encoded strings)
         assert!(js_syntax.contains("1761455267792")); // Lower bound as raw number
         assert!(js_syntax.contains("1761456167793")); // Upper bound as raw number

@@ -13,9 +13,11 @@ async fn main() -> Result<()> {
     // initialize tracing
     tracing_subscriber::fmt().with_max_level(Level::INFO).init();
 
-    // Initialize storage engine
-    let storage = SledStorageEngine::with_homedir_folder(".ankurah_example")?;
-    let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
+    // Persistent storage and the durable node key must survive together.
+    let storage_dir = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("home directory unavailable"))?.join(".ankurah_example");
+    let signing_key = ankurah::core::node_key::load_or_create_signing_key(storage_dir.with_extension("node-key"))?;
+    let storage = SledStorageEngine::with_path(storage_dir)?;
+    let node = Node::new_durable_with_signing_key(Arc::new(storage), PermissiveAgent::new(), signing_key);
 
     node.system.wait_loaded().await;
     if node.system.root().is_none() {
