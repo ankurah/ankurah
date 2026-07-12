@@ -22,7 +22,11 @@ use crate::{id::EntityId, Attested, CollectionId, EntityState, State};
 ///   collection name, and NodeUpdate/NodeResponse carry once-per-connection
 ///   catalog schema defs. SubscriptionUpdateItem also carries the source query
 ///   ids used for admission, and ORDER BY items carry stable property identities.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// - 4: the Phase 2 generation epoch (#266). Event and EventFragment carry a
+///   mandatory generation inside the EventId hash, and State carries
+///   head_generations. Wire and on-disk formats are incompatible with version
+///   3, so this epoch requires a fresh database.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Whether a peer advertising `remote` can interoperate with this binary.
 ///
@@ -207,6 +211,7 @@ mod tests {
     fn compatibility_is_exact_match() {
         assert!(protocol_compatible(PROTOCOL_VERSION));
         assert!(!protocol_compatible(0));
+        assert!(!protocol_compatible(PROTOCOL_VERSION - 1));
         assert!(!protocol_compatible(PROTOCOL_VERSION + 1));
     }
 }
