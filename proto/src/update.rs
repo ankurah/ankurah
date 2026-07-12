@@ -73,6 +73,11 @@ pub struct SubscriptionUpdateItem {
     pub source_queries: Vec<QueryId>,
 }
 
+/// Embedder-facing convenience for consuming subscription traffic outside
+/// core: extracts the attested state after the same genesis identity checks
+/// core applies. No core path routes through this impl; the enforcement seam
+/// for received updates is core's node_applier StateAndEvent arm, which
+/// additionally checks the pinned-system scope that proto cannot see.
 impl TryFrom<SubscriptionUpdateItem> for Attested<EntityState> {
     type Error = anyhow::Error;
     fn try_from(value: SubscriptionUpdateItem) -> Result<Self, Self::Error> {

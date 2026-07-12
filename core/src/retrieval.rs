@@ -192,7 +192,14 @@ where
             return Ok(event.payload);
         }
 
-        // Try remote peer
+        // Try a remote peer. Recorded liveness residual: frames dispatch
+        // sequentially (spec I.5), so a fetch reached from inside dispatch
+        // (an EventOnly item with missing parents, or apply_state's
+        // divergence walk) that lands on the blocked session queues its
+        // response behind itself, and requests have no timeout; that
+        // connection wedges. StateAndEvent carries genesis inline so the
+        // common path stays local; the request-timeout decision that closes
+        // the residual lives with the dispatch TODO in dispatch_message.
         let Some(peer_id) = self.node.get_durable_peer_random() else {
             return Err(RetrievalError::EventNotFound(event_id.clone()));
         };
