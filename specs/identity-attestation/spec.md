@@ -253,11 +253,16 @@ that id. Consequences:
    genesis; any creator-controlled field left outside the commitment is a
    free twin channel.
 3. **Commit-time ids**: genesis operations frozen at commit, no id before
-   commit. Breaks the id-at-create API property (the id is allocated as the
-   first act of `create()` today, and the transaction's entity tracking,
-   the returned handle, and intra-transaction references all key on it),
-   and mutually referencing entities created in one transaction would make
-   ids circularly dependent with no resolution order.
+   commit (whether breaking `entity.id()` silently or making it fallible
+   until first commit). Breaks the id-at-create API property (the id is
+   allocated as the first act of `create()` today, and the transaction's
+   entity tracking, the returned handle, and intra-transaction references
+   all key on it), infects the derive-generated model API, bindings, and
+   reactive keying with a fallible id, and forces deferred-reference
+   machinery for same-transaction refs, under which mutually referencing
+   entities created in one transaction make ids circularly dependent with
+   no resolution order; eager freeze resolves the same cycle naturally
+   because the back-reference rides an ordinary Update event.
 4. **Accountable equivocation**: partial binding plus creator signatures,
    with twins detected and punished after the fact. Requires the author
    signature machinery parked by R1, and is reactive where R3's scheme is
