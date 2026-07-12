@@ -30,17 +30,28 @@ pub(crate) struct OutgoingFrame {
 
 pub(crate) struct ConnectionControl {
     stop: CancellationToken,
+    /// Dialers use their client shutdown token here so a core-requested close
+    /// is terminal and cannot reconnect to the old founder. Acceptors leave
+    /// this unset because closing one peer must not stop the whole server.
+    terminal_shutdown: Option<CancellationToken>,
     byte_budget: Arc<Semaphore>,
 }
 
 impl ConnectionControl {
-    fn new() -> Arc<Self> {
-        Arc::new(Self { stop: CancellationToken::new(), byte_budget: Arc::new(Semaphore::new(OUTGOING_BYTE_CAPACITY)) })
+    fn new(terminal_shutdown: Option<CancellationToken>) -> Arc<Self> {
+        Arc::new(Self { stop: CancellationToken::new(), terminal_shutdown, byte_budget: Arc::new(Semaphore::new(OUTGOING_BYTE_CAPACITY)) })
     }
 
     /// Ask the connection pump to stop. Its cleanup guard performs any current
     /// Node deregistration through the connector's registration registry.
     pub(crate) fn stop_connection(&self) { self.stop.cancel() }
+
+    fn close_from_core(&self) {
+        if let Some(shutdown) = &self.terminal_shutdown {
+            shutdown.cancel();
+        }
+        self.stop_connection();
+    }
 
     pub(crate) async fn stopped(&self) { self.stop.cancelled().await }
 
@@ -50,8 +61,15 @@ impl ConnectionControl {
 
 impl IrohPeerSender {
     pub(crate) fn new(recipient_node_id: proto::NodeId) -> (Self, mpsc::Receiver<OutgoingFrame>, Arc<ConnectionControl>) {
+        Self::new_with_terminal_shutdown(recipient_node_id, None)
+    }
+
+    pub(crate) fn new_with_terminal_shutdown(
+        recipient_node_id: proto::NodeId,
+        terminal_shutdown: Option<CancellationToken>,
+    ) -> (Self, mpsc::Receiver<OutgoingFrame>, Arc<ConnectionControl>) {
         let (tx, rx) = mpsc::channel(OUTGOING_QUEUE_CAPACITY);
-        let control = ConnectionControl::new();
+        let control = ConnectionControl::new(terminal_shutdown);
         (Self { tx, recipient_node_id, control: control.clone() }, rx, control)
     }
 }
@@ -95,6 +113,8 @@ impl PeerSender for IrohPeerSender {
     fn recipient_node_id(&self) -> proto::NodeId { self.recipient_node_id }
 
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
+
+    fn close(&self) { self.control.close_from_core() }
 }
 
 #[cfg(test)]
@@ -124,5 +144,16 @@ mod tests {
 
         assert!(matches!(sender.send_message(signed()), Err(SendError::Timeout)));
         assert!(control.stop.is_cancelled());
+    }
+
+    #[test]
+    fn core_close_is_terminal_for_a_dialer() {
+        let shutdown = CancellationToken::new();
+        let (sender, _rx, control) = IrohPeerSender::new_with_terminal_shutdown(proto::NodeId::from_bytes([7; 32]), Some(shutdown.clone()));
+
+        sender.close();
+
+        assert!(control.is_stopped());
+        assert!(shutdown.is_cancelled());
     }
 }

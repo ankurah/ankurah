@@ -225,6 +225,7 @@ where
             send_stream,
             recv_stream,
             Some(&inner.shutdown),
+            Some(inner.shutdown.clone()),
             |server_presence| {
                 info!("Received server presence: {}", server_presence.node_id);
                 inner.connection_state.set(ConnectionState::Connected {

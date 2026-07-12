@@ -151,6 +151,7 @@ pub(crate) async fn run_connection<SE, PA>(
     send_stream: SendStream,
     recv_stream: RecvStream,
     shutdown: Option<&CancellationToken>,
+    terminal_core_close: Option<CancellationToken>,
     mut on_peer_presence: impl FnMut(&proto::Presence),
 ) -> Result<()>
 where
@@ -194,7 +195,8 @@ where
     }
     debug!("Received peer presence: {}", peer_presence);
 
-    let (sender, mut outgoing_rx, connection_control) = IrohPeerSender::new(peer_presence.node_id);
+    let (sender, mut outgoing_rx, connection_control) =
+        IrohPeerSender::new_with_terminal_shutdown(peer_presence.node_id, terminal_core_close);
     let _registration =
         match registrations.register_peer(node, peer_presence.clone(), handshake, outgoing_session, sender, connection_control.clone()) {
             Ok(registration) => registration,
