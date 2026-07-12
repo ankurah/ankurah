@@ -96,7 +96,12 @@ impl Transaction {
         // the entity. A failed reassertion proceeds only when this exact shape
         // is already fully and compatibly bound; a never-registered, missing,
         // or incompatible field fails here.
-        self.dyncontext.ensure_registered(M::schema()).await?;
+        if let Err(error) = self.dyncontext.ensure_registered(M::schema()).await {
+            // Reset tears down pending registration requests; that transport
+            // error must not mask the exact transaction-generation failure.
+            self.ensure_system_generation()?;
+            return Err(error);
+        }
         self.ensure_system_generation()?;
 
         // Initial values are written to a provisional, writable entity which

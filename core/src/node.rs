@@ -598,9 +598,24 @@ where
             // Re-check under the same lock reset uses for draining. A
             // registration that passed the optimistic check just before reset
             // cannot publish itself behind the drain.
-            if self.system.is_destructive_resetting() || !self.entities.is_current_generation(&registration_generation) {
+            if self.system.is_destructive_resetting() {
                 new_state.sender.close();
                 return Err(proto::PresenceRefusal::InvalidSystemRoot(presence.node_id));
+            }
+            if !self.entities.is_current_generation(&registration_generation) {
+                // The shared generation advanced while this handshake was
+                // being verified. For a session that was granted nothing
+                // root-dependent (not durable, no pending reservation) the
+                // swap is benign -- a concurrent first create/join published
+                // a new owner -- so rebind the fresh session to the current
+                // generation instead of refusing a racing loser. Anything
+                // root-dependent was verified against the OLD root state and
+                // must not publish itself behind the transition.
+                if recognized_durable || new_state.pending_root.is_some() {
+                    new_state.sender.close();
+                    return Err(proto::PresenceRefusal::InvalidSystemRoot(presence.node_id));
+                }
+                *new_state.system_generation.write().unwrap() = self.entities.system_generation();
             }
             let old_state = self.peer_connections.replace(presence.node_id, new_state);
             let old_was_durable =

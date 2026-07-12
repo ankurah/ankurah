@@ -262,28 +262,26 @@ async fn server_refuses_mismatched_version() -> Result<()> {
     Ok(())
 }
 
-/// A legacy browser client waits for the server Presence before sending its
-/// own. A durable v3 Presence is undecodable by that client, so it remains
-/// silent; the server must still bound the incomplete handshake.
+/// A legacy client cannot decode the v6 handshake challenge the server now
+/// opens with, so it remains silent and never answers with its own challenge
+/// or Presence; the server must still bound the incomplete handshake.
 #[tokio::test(start_paused = true)]
-async fn server_closes_silent_client_after_durable_presence() -> Result<()> {
+async fn server_closes_silent_client_after_handshake_challenge() -> Result<()> {
     let (_server_node, server_url, server_task) = start_test_server().await?;
     let (ws, _) = tokio_tungstenite::connect_async(format!("{}/ws", server_url)).await?;
     let (_sink, mut stream) = ws.split();
 
-    let server_presence = loop {
-        match stream.next().await {
-            Some(Ok(WsMessage::Binary(data))) => match bincode::deserialize::<proto::Message>(&data)? {
-                proto::Message::Presence(presence) => break presence,
-                other => panic!("server sent {other:?} before its presence"),
-            },
-            Some(Ok(other)) => panic!("server sent {other:?} before its presence"),
-            Some(Err(e)) => return Err(e.into()),
-            None => panic!("server closed before sending its presence"),
-        }
-    };
-    assert!(server_presence.durable, "test server must reproduce the durable Presence shape");
-    assert!(server_presence.system_root.is_some(), "durable Presence must carry the v3 system-root state");
+    // Protocol v6 opens with the server's challenge; the durable Presence is
+    // only sent after this client answers with a challenge of its own.
+    match stream.next().await {
+        Some(Ok(WsMessage::Binary(data))) => match bincode::deserialize::<proto::Message>(&data)? {
+            proto::Message::HandshakeChallenge(_) => {}
+            other => panic!("server sent {other:?} before its handshake challenge"),
+        },
+        Some(Ok(other)) => panic!("server sent {other:?} before its handshake challenge"),
+        Some(Err(e)) => return Err(e.into()),
+        None => panic!("server closed before sending its handshake challenge"),
+    }
 
     // Send nothing. Advancing beyond the production deadline keeps this test
     // deterministic and avoids adding ten seconds to the native test suite.

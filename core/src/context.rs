@@ -143,7 +143,15 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         // binding for this exact declaration; every other failure is strict.
         let schemas = trx.schemas.read().unwrap().clone();
         for schema in schemas {
-            TContext::ensure_registered(self, schema).await?;
+            if let Err(error) = TContext::ensure_registered(self, schema).await {
+                // Reset tears down pending registration requests; that
+                // transport error must not mask the exact
+                // transaction-generation failure.
+                if !trx.system_generation.load(Ordering::Acquire) {
+                    return Err(MutationError::SystemReset);
+                }
+                return Err(error);
+            }
         }
 
         // Registration may await the network, so acquire the reset fence only
