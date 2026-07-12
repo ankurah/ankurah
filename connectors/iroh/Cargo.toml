@@ -2,7 +2,8 @@
 name          = "ankurah-connector-iroh"
 version       = "0.9.0"
 edition       = "2021"
-description   = "Ankurah connector for iroh peer-to-peer QUIC connections"
+rust-version  = "1.91"
+description   = "Native Ankurah transport over iroh QUIC connections"
 license       = "MIT OR Apache-2.0"
 documentation = "https://docs.rs/ankurah-connector-iroh"
 homepage      = "https://github.com/ankurah/ankurah"
@@ -15,7 +16,7 @@ ankurah-signals = { path = "../../signals", version = "=0.9.0" }
 
 iroh = "1"
 
-tokio      = { version = "1.40", features = ["full"] }
+tokio      = { version = "1.40", features = ["macros", "rt", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 
 futures-util = "0.3"

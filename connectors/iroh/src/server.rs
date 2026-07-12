@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 use ankurah_core::{policy::PolicyAgent, storage::StorageEngine, Node};
 use iroh::{
@@ -6,6 +6,8 @@ use iroh::{
     protocol::{AcceptError, ProtocolHandler, Router},
     Endpoint,
 };
+use tokio::{select, time::timeout};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 /// Acceptor side of the iroh connector.
@@ -16,8 +18,8 @@ use tracing::{debug, info};
 /// endpoint; this type only speaks the Ankurah presence/message protocol on top.
 ///
 /// For each accepted connection it runs the same handshake as the websocket
-/// server: it sends its own `Presence` first, registers the remote peer with the
-/// `Node` upon receiving the peer's `Presence`, dispatches subsequent
+/// server: `Presence` is its first outbound frame, it registers the remote peer
+/// with the `Node` upon receiving the peer's `Presence`, dispatches subsequent
 /// `PeerMessage` frames to the node, and deregisters the peer when the
 /// connection closes.
 pub struct IrohServer {
@@ -32,7 +34,16 @@ impl IrohServer {
         PA: PolicyAgent + Send + Sync + 'static,
     {
         info!("Starting iroh server for node {} on endpoint {}", node.id, endpoint.id());
-        let router = Router::builder(endpoint).accept(crate::ALPN, AnkurahProtocol { node }).spawn();
+        let router = Router::builder(endpoint)
+            .accept(
+                crate::ALPN,
+                AnkurahProtocol {
+                    node,
+                    shutdown: CancellationToken::new(),
+                    registrations: Arc::new(crate::connection::RegistrationRegistry::default()),
+                },
+            )
+            .spawn();
         Self { router }
     }
 
@@ -53,6 +64,8 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     node: Node<SE, PA>,
+    shutdown: CancellationToken,
+    registrations: Arc<crate::connection::RegistrationRegistry>,
 }
 
 impl<SE, PA> fmt::Debug for AnkurahProtocol<SE, PA>
@@ -74,11 +87,24 @@ where
 
         // The dialer opens the bidirectional stream and sends its Presence on it;
         // accept_bi resolves once that stream arrives. We then immediately send our
-        // own Presence (inside run_connection), mirroring the websocket server which
-        // sends its Presence first on every new connection.
-        let (send_stream, recv_stream) = connection.accept_bi().await?;
+        // own Presence as our first outbound frame (inside run_connection),
+        // mirroring the websocket server's handshake.
+        let streams = select! {
+            _ = self.shutdown.cancelled() => return Ok(()),
+            streams = timeout(crate::connection::HANDSHAKE_TIMEOUT, connection.accept_bi()) => streams,
+        };
+        let (send_stream, recv_stream) = match streams {
+            Ok(streams) => streams?,
+            Err(_) => {
+                debug!("iroh connection with endpoint {} timed out before opening its Ankurah stream", remote);
+                connection.close(1u32.into(), b"ankurah handshake timeout");
+                return Ok(());
+            }
+        };
 
-        if let Err(e) = crate::connection::run_connection(&self.node, send_stream, recv_stream, None, |_| {}).await {
+        if let Err(e) =
+            crate::connection::run_connection(&self.node, &self.registrations, send_stream, recv_stream, Some(&self.shutdown), |_| {}).await
+        {
             debug!("iroh connection with endpoint {} ended: {}", remote, e);
         }
 
@@ -86,4 +112,6 @@ where
         debug!("iroh connection with endpoint {} closed", remote);
         Ok(())
     }
+
+    async fn shutdown(&self) { self.shutdown.cancel() }
 }

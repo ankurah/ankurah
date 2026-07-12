@@ -11,7 +11,8 @@ use std::{
     time::Duration,
 };
 use thiserror::Error;
-use tokio::{select, sync::Notify, task::JoinHandle, time::sleep};
+use tokio::{select, task::JoinHandle, time::sleep};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
 /// Connection state for the iroh client
@@ -53,8 +54,8 @@ where
     server_addr: EndpointAddr,
     connection_state: Mut<ConnectionState>,
     connected: AtomicBool,
-    shutdown: Notify,
-    shutdown_requested: AtomicBool,
+    shutdown: CancellationToken,
+    registrations: Arc<crate::connection::RegistrationRegistry>,
 }
 
 /// Dialer side of the iroh connector.
@@ -92,8 +93,8 @@ where
             server_addr,
             connection_state: Mut::new(ConnectionState::Disconnected),
             connected: AtomicBool::new(false),
-            shutdown: Notify::new(),
-            shutdown_requested: AtomicBool::new(false),
+            shutdown: CancellationToken::new(),
+            registrations: Arc::new(crate::connection::RegistrationRegistry::default()),
         });
 
         let task = tokio::spawn(Self::run_connection_loop(inner.clone()));
@@ -116,8 +117,7 @@ where
 
         let task = self.task.lock().unwrap().take();
         if let Some(task) = task {
-            self.inner.shutdown_requested.store(true, Ordering::Release);
-            self.inner.shutdown.notify_waiters();
+            self.inner.shutdown.cancel();
 
             match task.await {
                 Ok(()) => info!("iroh client shutdown completed"),
@@ -155,8 +155,12 @@ where
         info!("Starting iroh connection loop to endpoint {}", inner.server_addr.id);
 
         loop {
+            if inner.shutdown.is_cancelled() {
+                break;
+            }
+
             select! {
-                _ = inner.shutdown.notified() => {
+                _ = inner.shutdown.cancelled() => {
                     info!("iroh connection shutting down");
                     break;
                 }
@@ -165,7 +169,7 @@ where
                         Ok(()) => {
                             info!("Connection to endpoint {} completed normally", inner.server_addr.id);
                             backoff = INITIAL_BACKOFF;
-                            if inner.shutdown_requested.load(Ordering::Acquire) {
+                            if inner.shutdown.is_cancelled() {
                                 info!("Shutdown requested, stopping reconnection attempts");
                                 break;
                             }
@@ -177,7 +181,7 @@ where
 
                             info!("Retrying connection in {:?}", backoff);
                             select! {
-                                _ = inner.shutdown.notified() => break,
+                                _ = inner.shutdown.cancelled() => break,
                                 _ = sleep(backoff) => {}
                             }
                             backoff = (backoff * 2).min(MAX_BACKOFF);
@@ -204,13 +208,20 @@ where
         // visible to the acceptor.
         let (send_stream, recv_stream) = connection.open_bi().await?;
 
-        let result = crate::connection::run_connection(&inner.node, send_stream, recv_stream, Some(&inner.shutdown), |server_presence| {
-            info!("Received server presence: {}", server_presence.node_id);
-            inner
-                .connection_state
-                .set(ConnectionState::Connected { endpoint_id: inner.server_addr.id, server_presence: server_presence.clone() });
-            inner.connected.store(true, Ordering::Release);
-        })
+        let result = crate::connection::run_connection(
+            &inner.node,
+            &inner.registrations,
+            send_stream,
+            recv_stream,
+            Some(&inner.shutdown),
+            |server_presence| {
+                info!("Received server presence: {}", server_presence.node_id);
+                inner
+                    .connection_state
+                    .set(ConnectionState::Connected { endpoint_id: inner.server_addr.id, server_presence: server_presence.clone() });
+                inner.connected.store(true, Ordering::Release);
+            },
+        )
         .await;
 
         inner.connected.store(false, Ordering::Release);
@@ -227,8 +238,9 @@ where
     fn drop(&mut self) {
         if let Some(task) = self.task.lock().unwrap().take() {
             debug!("iroh client dropped, requesting shutdown");
-            self.inner.shutdown_requested.store(true, Ordering::Release);
-            self.inner.shutdown.notify_waiters();
+            self.inner.shutdown.cancel();
+            self.inner.connection_state.set(ConnectionState::Disconnected);
+            self.inner.connected.store(false, Ordering::Release);
             task.abort();
         }
     }

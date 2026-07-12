@@ -95,6 +95,159 @@ async fn shutdown_client(client: IrohClient<SledStorageEngine, PermissiveAgent>)
     Ok(())
 }
 
+/// Shutdown is sticky even if requested before the spawned connection loop gets
+/// its first poll. A current-thread runtime makes that ordering deterministic.
+#[tokio::test(flavor = "current_thread")]
+async fn iroh_immediate_client_shutdown_completes() -> Result<()> {
+    let server_node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    server_node.system.create().await?;
+    let server = IrohServer::new(server_node, bind_local_endpoint().await?);
+
+    let client_node = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    let client = IrohClient::new(client_node, bind_local_endpoint().await?, direct_addr(server.endpoint())).await?;
+
+    tokio::time::timeout(Duration::from_secs(2), shutdown_client(client))
+        .await
+        .map_err(|_| anyhow::anyhow!("immediate client shutdown timed out"))??;
+    server.shutdown().await?;
+    Ok(())
+}
+
+/// Explicit client shutdown removes the client's own Node registration before
+/// returning, rather than merely closing the remote transport.
+#[tokio::test]
+async fn iroh_client_shutdown_deregisters_local_peer() -> Result<()> {
+    let server_node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    server_node.system.create().await?;
+    let server = IrohServer::new(server_node.clone(), bind_local_endpoint().await?);
+
+    let client_node = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    let client = IrohClient::new(client_node.clone(), bind_local_endpoint().await?, direct_addr(server.endpoint())).await?;
+    client.wait_connected().await?;
+    assert_eq!(client_node.get_durable_peers(), vec![server_node.id]);
+
+    shutdown_client(client).await?;
+    assert!(client_node.get_durable_peers().is_empty());
+
+    server.shutdown().await?;
+    Ok(())
+}
+
+/// Dropping the client handle aborts its task, so registration cleanup must be
+/// owned by a cancellation-safe guard inside the connection future.
+#[tokio::test]
+async fn iroh_client_drop_deregisters_local_peer() -> Result<()> {
+    let server_node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    server_node.system.create().await?;
+    let server = IrohServer::new(server_node.clone(), bind_local_endpoint().await?);
+
+    let client_node = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    let client = IrohClient::new(client_node.clone(), bind_local_endpoint().await?, direct_addr(server.endpoint())).await?;
+    client.wait_connected().await?;
+    assert_eq!(client_node.get_durable_peers(), vec![server_node.id]);
+
+    let endpoint = client.endpoint().clone();
+    drop(client);
+    let node = client_node.clone();
+    wait_until("dropped client to deregister its local peer", move || node.get_durable_peers().is_empty()).await?;
+    endpoint.close().await;
+
+    server.shutdown().await?;
+    Ok(())
+}
+
+/// Router shutdown cancels protocol-handler futures. The server's Node must be
+/// cleaned up even though normal code after the connection pump is not polled.
+#[tokio::test]
+async fn iroh_server_shutdown_deregisters_local_peer() -> Result<()> {
+    let server_node = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    let server = IrohServer::new(server_node.clone(), bind_local_endpoint().await?);
+
+    let client_node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    client_node.system.create().await?;
+    let client = IrohClient::new(client_node.clone(), bind_local_endpoint().await?, direct_addr(server.endpoint())).await?;
+    client.wait_connected().await?;
+
+    let node = server_node.clone();
+    let client_id = client_node.id;
+    wait_until("server to register durable client", move || node.get_durable_peers() == vec![client_id]).await?;
+
+    server.shutdown().await?;
+    assert!(server_node.get_durable_peers().is_empty());
+    shutdown_client(client).await?;
+    Ok(())
+}
+
+/// Dropping the Router aborts its protocol tasks rather than awaiting their
+/// normal return path. The registration guard must still clean up the Node.
+#[tokio::test]
+async fn iroh_server_drop_deregisters_local_peer() -> Result<()> {
+    let server_node = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    let server = IrohServer::new(server_node.clone(), bind_local_endpoint().await?);
+
+    let client_node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    client_node.system.create().await?;
+    let client = IrohClient::new(client_node.clone(), bind_local_endpoint().await?, direct_addr(server.endpoint())).await?;
+    client.wait_connected().await?;
+
+    let node = server_node.clone();
+    let client_id = client_node.id;
+    wait_until("server to register durable client", move || node.get_durable_peers() == vec![client_id]).await?;
+
+    drop(server);
+    let node = server_node.clone();
+    wait_until("dropped server to deregister its local peer", move || node.get_durable_peers().is_empty()).await?;
+    shutdown_client(client).await?;
+    Ok(())
+}
+
+/// The supported standalone topology is a durable hub with independently
+/// connected ephemeral spokes. A write from one spoke reaches another through
+/// a live query on the hub.
+#[tokio::test]
+async fn iroh_two_spokes_propagate_through_durable_hub() -> Result<()> {
+    let hub_node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    hub_node.system.create().await?;
+    let hub = IrohServer::new(hub_node, bind_local_endpoint().await?);
+    let hub_addr = direct_addr(hub.endpoint());
+
+    let writer_node = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    let writer = IrohClient::new(writer_node.clone(), bind_local_endpoint().await?, hub_addr.clone()).await?;
+    writer.wait_connected().await?;
+    writer_node.system.wait_system_ready().await;
+
+    let reader_node = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    let reader = IrohClient::new(reader_node.clone(), bind_local_endpoint().await?, hub_addr).await?;
+    reader.wait_connected().await?;
+    reader_node.system.wait_system_ready().await;
+
+    use ankurah::signals::Subscribe;
+    let reader_ctx = reader_node.context(c)?;
+    let reader_query = reader_ctx.query_wait::<AlbumView>("year > '2000'").await?;
+    let (reader_tx, mut reader_rx) = tokio::sync::mpsc::unbounded_channel::<ChangeSet<AlbumView>>();
+    let _reader_sub = reader_query.subscribe(reader_tx);
+
+    let writer_ctx = writer_node.context(c)?;
+    let album_id = {
+        let trx = writer_ctx.begin();
+        let album = trx.create(&Album { name: "In Rainbows".into(), year: "2007".into() }).await?;
+        let id = album.id();
+        trx.commit().await?;
+        id
+    };
+
+    let reader_change = tokio::time::timeout(Duration::from_secs(10), reader_rx.recv())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("reader subscription closed"))?;
+    assert_eq!(reader_change.changes.len(), 1);
+    assert_eq!(reader_change.changes[0].entity().id(), album_id);
+
+    shutdown_client(writer).await?;
+    shutdown_client(reader).await?;
+    hub.shutdown().await?;
+    Ok(())
+}
+
 /// Changes propagate through subscriptions in both directions: an entity
 /// committed on either node shows up in the other node's live query.
 #[tokio::test]
