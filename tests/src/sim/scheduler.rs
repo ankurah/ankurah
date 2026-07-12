@@ -22,10 +22,12 @@
 //! message ingress still returns `Ok` because the request handler turns the
 //! apply error into an error *response*. So the scheduler cannot read acceptance
 //! from the return value; instead it verifies the event landed in the
-//! receiver's storage and, if not, redelivers it in a later round. This models a
-//! transport that retries until delivery and lets any causal order converge
-//! (an edit that arrives before its create is retried until the create lands),
-//! without the scheduler ever having to understand causality itself.
+//! receiver's storage and, if not, retries the logical message in a later
+//! round. A retry is freshly signed with the connection's next sequence number:
+//! replaying the original authenticated frame would correctly be rejected by
+//! the v6 replay window. Fault-injected duplicates remain byte-identical frames,
+//! so the scheduler still exercises replay rejection while allowing an edit
+//! that arrives before its create to be retried after the create lands.
 
 use ankurah::proto;
 
@@ -50,6 +52,21 @@ struct InFlight {
     /// absent after delivery, the message is redelivered. `None` for advisory
     /// traffic and for messages with no single acceptance target.
     accept: Option<(proto::EntityId, proto::EventId)>,
+}
+
+impl InFlight {
+    /// Re-enqueue the same logical message as a new authenticated delivery.
+    /// This models an application/transport retry, not a wire replay: the
+    /// latter is injected separately by `duplicate` and must keep the original
+    /// session, sequence, and signature byte-for-byte.
+    fn resign_for_retry(self, nodes: &[SimNode]) -> Self {
+        let Self { src, dst, message, digest, droppable, accept } = self;
+        let message = nodes[src]
+            .node
+            .sign_peer_message(nodes[dst].id(), message.message)
+            .expect("sim peers remain connected while retrying load-bearing traffic");
+        Self { src, dst, message, digest, droppable, accept }
+    }
 }
 
 /// How many times to yield to the executor when the queue looks empty, letting
@@ -262,10 +279,11 @@ impl Scheduler {
                 if dup {
                     let _ = self.deliver(&item, nodes, trace, true).await;
                 }
-                // A load-bearing message not yet accepted (e.g. its parent has
-                // not arrived) is redelivered in a later round.
+                // A load-bearing logical message not yet accepted (e.g. its
+                // parent has not arrived) is retried under a fresh signed
+                // sequence. Replaying this exact frame would be rejected.
                 if !accepted {
-                    requeue.push(item);
+                    requeue.push(item.resign_for_retry(nodes));
                 }
             }
 
