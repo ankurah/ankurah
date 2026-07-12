@@ -227,6 +227,20 @@ that id. Consequences:
 - Create-path surgery: today the id is allocated before the values are
   applied; the order inverts (apply values, extract, derive id, construct
   the entity under the derived id). Localized to the create path.
+- Post-create mutations within a transaction fold into AT MOST ONE Update
+  event per entity per commit, exactly as today: `.set` calls accumulate in
+  the property backends and are extracted once at commit. Eager freeze
+  moves only the CREATION event's extraction point; per-set calls never
+  mint events.
+- Mutual references require the back-reference field to be representable
+  as absent at creation (an Option, a default, or an edge entity): the
+  genesis of the first-created entity truthfully lacks the ref, which
+  arrives in its single update event. A model with two REQUIRED mutual ref
+  fields has a struct-level chicken-and-egg problem under any design (the
+  second id cannot exist when the first struct is built); under eager
+  freeze a placeholder would be enshrined in the genesis forever, so
+  required mutual refs are explicitly discouraged in favor of optional
+  fields or edge entities.
 
 ### II.2.1 Rejected genesis shapes (recorded so they are not re-litigated)
 
