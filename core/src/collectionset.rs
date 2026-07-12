@@ -32,6 +32,10 @@ pub struct Inner<SE> {
 /// otherwise resume after another node reset the engine and recreate old-root
 /// rows. The weak registry preserves backend generality and cannot alias a
 /// reused allocation address while the prior engine/fence is still alive.
+/// A sibling Node's synchronous teardown callback (see
+/// [`CollectionSet::set_epoch_participant`]).
+type EpochParticipant = dyn Fn() + Send + Sync;
+
 struct StorageFence {
     gate: Arc<tokio::sync::RwLock<()>>,
     epoch: AtomicU64,
@@ -41,7 +45,7 @@ struct StorageFence {
     /// identity so an advancing manager can skip its own entry (its own
     /// teardown runs inside its invalidation, with the reservation
     /// exemption). Entries are weak: a dropped Node just disappears.
-    participants: Mutex<Vec<(usize, Weak<dyn Fn() + Send + Sync>)>>,
+    participants: Mutex<Vec<(usize, Weak<EpochParticipant>)>>,
 }
 
 fn shared_storage_fence<SE>(storage_engine: &Arc<SE>) -> Arc<StorageFence> {

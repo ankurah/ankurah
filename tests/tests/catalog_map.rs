@@ -696,8 +696,11 @@ async fn hard_reset_drains_in_flight_durable_catalog_warm() -> anyhow::Result<()
     let inner = Arc::new(SledStorageEngine::new_test()?);
 
     // Seed one complete durable epoch, then drop its owners so the gated node
-    // below reconstructs from real persisted catalog collections.
-    let seed = Node::new_durable(inner.clone(), PermissiveAgent::new());
+    // below reconstructs from real persisted catalog collections. The
+    // reconstruction must present the SAME persisted signing key: a durable
+    // whose key does not match the persisted founder fails closed.
+    let persisted_key = ed25519_dalek::SigningKey::from_bytes(&[0x5C; 32]);
+    let seed = Node::new_durable_with_signing_key(inner.clone(), PermissiveAgent::new(), persisted_key.clone());
     seed.system.create().await?;
     let seed_context = seed.context_async(DEFAULT_CONTEXT).await;
     seed_context.register::<Album>().await?;
@@ -713,7 +716,8 @@ async fn hard_reset_drains_in_flight_durable_catalog_warm() -> anyhow::Result<()
     .expect("the seed node must release the shared engine before reconstruction");
 
     let gate = Arc::new(DurableWarmGate::default());
-    let node = Node::new_durable(Arc::new(GatedListEngine { inner: inner.clone(), gate: gate.clone() }), PermissiveAgent::new());
+    let node =
+        Node::new_durable_with_signing_key(Arc::new(GatedListEngine { inner: inner.clone(), gate: gate.clone() }), PermissiveAgent::new(), persisted_key);
     tokio::time::timeout(Duration::from_secs(2), gate.wait_for_first_list())
         .await
         .expect("reconstructed durable warm must reach the gated collection listing");
