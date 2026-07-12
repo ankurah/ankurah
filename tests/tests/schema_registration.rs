@@ -1020,13 +1020,17 @@ async fn duplicate_descriptors_in_one_request_do_not_double_allocate() -> anyhow
     Ok(())
 }
 
-/// The commit batch is NOT transactional (maintainer ruling 2026-07-06):
-/// a mid-batch check_event denial leaves earlier catalog events durable.
-/// Identity must survive that: the retry's allocator lookup double-checks
-/// STORAGE on its map miss (the aborted commit skipped the map fold) and
-/// converges on the stored model id instead of re-minting.
+/// The commit batch is transactional since the D1 ingest pipeline landed:
+/// commit_remote_transaction is Atomic (M6), so a mid-batch check_event
+/// denial aborts the whole registration with nothing durable. Ratified
+/// 2026-07-07 in #313 comment 4907664087. This test originally pinned the
+/// pre-D1 durable-partial premise; the allocator's storage-backed lookup on
+/// a map miss remains live for crash-window partials and lazily-warming
+/// engines (#310), while #313 still tracks the system-transaction executor.
+/// What must hold here: the denial leaves no catalog rows behind, and the
+/// retry allocates exactly once with response ids matching the stored rows.
 #[tokio::test]
-async fn partial_registration_retry_does_not_double_allocate() -> anyhow::Result<()> {
+async fn denied_registration_is_atomic_and_retry_allocates_once() -> anyhow::Result<()> {
     let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let deny_property_once = {
         let armed = armed.clone();
@@ -1050,22 +1054,26 @@ async fn partial_registration_retry_does_not_double_allocate() -> anyhow::Result
     let _conn = LocalProcessConnection::new(&server, &client).await?;
     client.system.wait_system_ready().await;
 
-    // First attempt: the model creation commits, then the property event is
-    // denied mid-batch -- a durable partial, and no map fold.
+    // First attempt: the property event is denied mid-batch and the Atomic
+    // commit lane aborts the whole registration -- nothing durable, no map
+    // fold.
     expect_error(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?, "denied");
-    assert_eq!(count_rows(&server, MODEL).await?, 1, "partial: the model event preceded the denial and is durable");
+    assert_eq!(count_rows(&server, MODEL).await?, 0, "atomic: the denial leaves no model row behind");
     assert_eq!(count_rows(&server, PROPERTY).await?, 0, "the denied property event must not be durable");
-    let stored = row_ids(&server, MODEL).await?;
+    assert_eq!(count_rows(&server, MEMBERSHIP).await?, 0, "nor any membership row");
 
-    // Retry (agent now allows): the map missed the fold, so the allocator's
-    // storage-backed lookup must find the stored model and reuse its id.
+    // Retry (agent now allows): a clean first registration; exactly one
+    // allocation of each, and the response ids ARE the stored rows.
     let (models, properties, memberships) = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
-    assert_eq!(models[0].id, stored[0], "retry converges on the stored model identity (no re-mint)");
-    assert_eq!(count_rows(&server, MODEL).await?, 1, "still exactly one model row after the retry");
+    assert_eq!(count_rows(&server, MODEL).await?, 1, "exactly one model row after the retry");
     assert_eq!(count_rows(&server, PROPERTY).await?, 1, "the retry completes the property");
     assert_eq!(count_rows(&server, MEMBERSHIP).await?, 1, "and the membership");
+    assert_eq!(models.len(), 1);
     assert_eq!(properties.len(), 1);
     assert_eq!(memberships.len(), 1);
+    assert_eq!(row_ids(&server, MODEL).await?, vec![models[0].id], "the response model id is the stored row");
+    assert_eq!(row_ids(&server, PROPERTY).await?, vec![properties[0].id], "the response property id is the stored row");
+    assert_eq!(row_ids(&server, MEMBERSHIP).await?, vec![memberships[0].id], "the response membership id is the stored row");
 
     Ok(())
 }

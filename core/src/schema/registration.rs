@@ -507,16 +507,15 @@ where
             return Ok((out_models, out_properties, out_memberships));
         }
 
-        // The RFC 5.7 exists-aware policy gate judges the resolved plan before
-        // anything is emitted; refusal fails the
-        // request before any write. Underneath, check_event still gates
-        // each event individually inside the commit pipeline, and the batch
-        // is NOT transactional: a mid-batch event denial leaves the earlier
-        // catalog events durable (maintainer ruling 2026-07-06: registration
-        // does not need to be atomic; #313 tracks the transactional
-        // upgrade). Identity survives such partials because every allocator
-        // lookup double-checks storage on a map miss, so a retry converges
-        // on the stored ids instead of re-minting.
+        // RFC 5.7 / plan decision 26: the exists-aware policy gate judges
+        // the resolved plan before anything is emitted; refusal fails the
+        // request before any write. Underneath, check_event remains defense
+        // in depth, but since D1 its constituent checks run inside the Atomic
+        // commit lane: a denial aborts the whole registration and leaves
+        // nothing durable. Ratified 2026-07-07 in #313 comment 4907664087.
+        // Storage-backed allocator lookups still cover crash-window partials
+        // and lazily-warming engines (#310), while #313 continues to track
+        // the system-transaction executor refactor.
         self.policy_agent.check_schema_registration(self, cdata, &plan)?;
 
         // The ordinary remote-commit pipeline: policy check (check_event),
@@ -532,13 +531,13 @@ where
     }
 
     /// Allocator lookup for a model: the catalog map first, then durable
-    /// storage on a miss. The in-memory map can lag
-    /// durable truth -- a partial-commit abort skips the post-commit fold,
-    /// and non-sled engines warm lazily (#310) -- and minting from a cold
-    /// map would fork identity for a key that already exists. A storage hit
-    /// is folded into the map so the rest of the request (and the next one)
-    /// sees it; ordinary first sightings miss both and pay one bounded
-    /// fetch under the allocator mutex.
+    /// STORAGE on a miss (rev 4 hardening). The in-memory map can lag
+    /// durable truth after a crash-window partial or while non-sled engines
+    /// warm lazily (#310), and minting from a cold map would fork identity
+    /// for a key that already exists. A storage hit is folded into the map so
+    /// the rest of the request (and the next one) sees it; ordinary first
+    /// sightings miss both and pay one bounded fetch under the allocator
+    /// mutex.
     async fn model_lookup_checked(&self, collection: &str) -> Result<Option<super::catalog::ModelDef>, RetrievalError> {
         if let Some(def) = self.catalog.model_by_collection(collection) {
             return Ok(Some(def));

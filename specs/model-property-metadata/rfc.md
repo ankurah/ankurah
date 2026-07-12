@@ -1063,12 +1063,13 @@ know existence, and check_event fires per event mid-commit, where
 creation-ness must be reverse-engineered). Default implementation
 allows, so existing agents are unaffected; refusal fails the whole
 registration before anything is emitted; check_event still gates every
-emitted event underneath, as defense in depth -- individually, not
-transactionally: an agent that allows the plan but denies a constituent
-event aborts the remainder and leaves earlier catalog events durable
-(maintainer ruling 2026-07-06: registration need not be atomic; the
-allocator's storage-checked lookups keep identity convergent across such
-partials, and #313 tracks the transactional upgrade). Schema knowledge
+emitted event underneath as defense in depth, but since D1 those checks run
+inside the Atomic commit lane: an agent that allows the plan but denies a
+constituent aborts the whole registration and leaves nothing durable
+(ratified 2026-07-07 in #313 comment 4907664087). Storage-backed allocator
+lookups still cover crash-window partials and lazily warming engines (#310),
+while #313 continues to track the system-transaction executor refactor.
+Schema knowledge
 follows collection access: the executor requires can_access_collection
 for every collection a request names, before any lookup, so the
 verb-skipped no-op upsert cannot serve as an existence oracle for
