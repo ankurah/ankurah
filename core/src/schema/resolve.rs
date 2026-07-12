@@ -26,6 +26,7 @@
 
 use ankql::ast::{Expr, Identifier, OrderByItem, PathExpr, Predicate, Selection};
 use ankurah_proto::{CollectionId, EntityId};
+use std::sync::{atomic::AtomicBool, Arc};
 
 use crate::policy::PolicyAgent;
 use crate::property::PropertyError;
@@ -76,13 +77,32 @@ where
         collection: &CollectionId,
         selection: &Selection,
     ) -> Result<Selection, PropertyError> {
-        match self.resolve_selection(collection, selection) {
+        let generation = node.entities.system_generation();
+        self.resolve_selection_deferred_in_generation(node, cdata, collection, selection, &generation).await
+    }
+
+    /// Generation-pinned form used when an outer operation (such as
+    /// `Context::fetch_entities`) already captured its exact token before
+    /// entering predicate resolution.
+    pub(crate) async fn resolve_selection_deferred_in_generation(
+        &self,
+        node: &crate::node::Node<SE, PA>,
+        cdata: Option<&PA::ContextData>,
+        collection: &CollectionId,
+        selection: &Selection,
+        generation: &Arc<AtomicBool>,
+    ) -> Result<Selection, PropertyError> {
+        // Predicate first-use is an operation in the same sense as a
+        // transaction: every retry belongs to the system generation in
+        // which resolution began, even if catalog warm-up or registration
+        // awaits a peer and a reset completes meanwhile.
+        match self.resolve_selection_in_generation(node, generation, collection, selection).await {
             Ok(resolved) => Ok(resolved),
             Err(PropertyError::UnknownProperty { collection: c, name }) => {
                 if !self.is_catalog_ready() {
                     if self.is_durable() {
                         // The storage warm is in flight and always completes.
-                        self.wait_catalog_ready().await;
+                        self.wait_catalog_ready_in_generation(node, generation).await.map_err(|_| PropertyError::SystemReset)?;
                     } else if let Some(cdata) = cdata {
                         self.ensure_subscribed(cdata.clone(), node).await;
                         if !self.is_catalog_ready() {
@@ -94,8 +114,8 @@ where
                             // the warm path does: a compiled-but-unregisterable
                             // collection surfaces the loud UnregisteredCollection
                             // error (RFC 5.3), anything else fails closed.
-                            if self.register_first_use(node, Some(cdata), collection).await {
-                                return match self.resolve_selection(collection, selection) {
+                            if self.register_first_use(node, Some(cdata), collection, generation).await? {
+                                return match self.resolve_selection_in_generation(node, generation, collection, selection).await {
                                     Err(PropertyError::UnknownProperty { collection: c, name }) => {
                                         Err(self.classify_unknown(collection, c, name))
                                     }
@@ -105,10 +125,10 @@ where
                             return Err(self.classify_unknown(collection, c, name));
                         }
                     } else {
-                        self.wait_catalog_ready().await;
+                        self.wait_catalog_ready_in_generation(node, generation).await.map_err(|_| PropertyError::SystemReset)?;
                     }
                 }
-                match self.resolve_selection(collection, selection) {
+                match self.resolve_selection_in_generation(node, generation, collection, selection).await {
                     Err(PropertyError::UnknownProperty { collection: c, name }) => {
                         // Warm catalog, still unresolvable. First-use
                         // registration (REN 2 revised, plan decision 25b): a
@@ -122,8 +142,8 @@ where
                         // a real unknown reference fails closed, and a
                         // compiled-but-unregisterable collection surfaces as
                         // the loud UnregisteredCollection error.
-                        if self.register_first_use(node, cdata, collection).await {
-                            return match self.resolve_selection(collection, selection) {
+                        if self.register_first_use(node, cdata, collection, generation).await? {
+                            return match self.resolve_selection_in_generation(node, generation, collection, selection).await {
                                 Err(PropertyError::UnknownProperty { collection: c, name }) => {
                                     Err(self.classify_unknown(collection, c, name))
                                 }
@@ -137,6 +157,21 @@ where
             }
             Err(other) => Err(other),
         }
+    }
+
+    /// Resolve while holding a short exact-generation lease. The lease never
+    /// spans catalog warm-up or peer I/O; each retry reacquires it, turning a
+    /// reset during an await into `SystemReset` rather than an ABA read from
+    /// a newly populated catalog map.
+    async fn resolve_selection_in_generation(
+        &self,
+        node: &crate::node::Node<SE, PA>,
+        generation: &Arc<AtomicBool>,
+        collection: &CollectionId,
+        selection: &Selection,
+    ) -> Result<Selection, PropertyError> {
+        let _generation_guard = node.system.guard_generation(generation).await.map_err(|_| PropertyError::SystemReset)?;
+        self.resolve_selection(collection, selection)
     }
 
     /// Attempt first-use registration of `collection`'s compiled schema
@@ -153,22 +188,31 @@ where
         node: &crate::node::Node<SE, PA>,
         cdata: Option<&PA::ContextData>,
         collection: &CollectionId,
-    ) -> bool {
-        let Some(cdata) = cdata else { return false };
-        let schemas = self.unensured_schemas_for(collection.as_str());
+        generation: &Arc<AtomicBool>,
+    ) -> Result<bool, PropertyError> {
+        let Some(cdata) = cdata else { return Ok(false) };
+        let schemas = {
+            let _generation_guard = node.system.guard_generation(generation).await.map_err(|_| PropertyError::SystemReset)?;
+            self.unensured_schemas_for(collection.as_str())
+        };
         if schemas.is_empty() {
-            return false;
+            let _generation_guard = node.system.guard_generation(generation).await.map_err(|_| PropertyError::SystemReset)?;
+            return Ok(false);
         }
         let mut registered_any = false;
         for schema in schemas {
-            match self.ensure_registered(node, cdata, schema).await {
+            match self.ensure_registered_in_generation(node, cdata, schema, generation).await {
                 Ok(()) => registered_any = true,
+                Err(crate::schema::registration::RegistrationError::Mutation(crate::error::MutationError::SystemReset)) => {
+                    return Err(PropertyError::SystemReset);
+                }
                 Err(e) => {
                     tracing::debug!("first-use registration of '{}' failed; unresolved references still surface loud: {}", collection, e);
                 }
             }
         }
-        registered_any
+        let _generation_guard = node.system.guard_generation(generation).await.map_err(|_| PropertyError::SystemReset)?;
+        Ok(registered_any)
     }
 
     /// Classify an `UnknownProperty` from a WARM catalog (rev 4, RFC 5.3):

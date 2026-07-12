@@ -32,15 +32,9 @@
 //!   random, but they never affect scheduling (the scheduler keys on queue
 //!   position and the seeded RNG) and are excluded from the semantic trace
 //!   digest, so they do not perturb the audit.
-//! - `Node::get_durable_peer_random()` uses `rand::thread_rng()` and is reached
-//!   by the event-gap-fill path in the SubscriptionUpdate applier
-//!   (`CachedEventGetter`) when an event's parents are missing locally. The
-//!   harness avoids triggering it: every event a scenario delivers arrives with
-//!   its parents already present (single-event acceptance-retry on the
-//!   CommitTransaction path; pre-placed lineages on the SubscriptionUpdate
-//!   path). A future scenario that deliberately induces a cross-peer gap would
-//!   reach this `thread_rng` and must expect a determinism-audit failure until
-//!   that production path is made seedable. This boundary is flagged in the PR.
+//! - `Node::get_durable_peer_random()` draws from the node-owned seeded RNG.
+//!   Durable peer candidates are sorted before selection, so event-gap filling
+//!   remains deterministic for a fixed simulation seed.
 //! - Container iteration order: the scheduler holds cut links in a `BTreeSet`
 //!   (not `HashSet`) so heal order is sorted, and all schedule-affecting
 //!   collections are `Vec`/`BTreeSet`/`BTreeMap`. HashMaps in the harness are

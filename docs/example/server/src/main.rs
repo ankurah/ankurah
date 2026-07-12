@@ -46,8 +46,10 @@ async fn postgres_example() -> anyhow::Result<()> {
     let uri = "postgresql://localhost/mydb";
     // liaison id=storage-postgres
     let storage = Postgres::open(uri).await?;
+    let key_path = dirs::home_dir().unwrap().join(".ankurah-postgres-node-key");
+    let signing_key = ankurah::core::node_key::load_or_create_signing_key(key_path)?;
     // liaison end
-    let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
+    let node = Node::new_durable_with_signing_key(Arc::new(storage), PermissiveAgent::new(), signing_key);
 
     let _ = node;
     Ok(())

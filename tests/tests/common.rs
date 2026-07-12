@@ -76,6 +76,7 @@ impl PeerSender for GatedSender {
         self.sender.try_send(message).map_err(|_| SendError::ConnectionClosed)?;
         Ok(())
     }
+    fn close(&self) {}
     fn recipient_node_id(&self) -> proto::NodeId { self.node_id }
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }

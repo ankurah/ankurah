@@ -803,6 +803,13 @@ async fn bfs_fetched_events_are_policy_validated() -> Result<()> {
     let model = server.catalog.model_id_for(Record::collection().as_str()).expect("Record registered");
     let server_collection = ctx_s.collection(&Record::collection()).await?;
     let latest = server_collection.get_state(record_id).await?;
+    let genesis_id = proto::EventId::from_bytes(record_id.to_bytes());
+    let genesis = server_collection
+        .get_events(vec![genesis_id.clone()])
+        .await?
+        .into_iter()
+        .find(|event| event.payload.id() == genesis_id)
+        .expect("server stores the record genesis");
     client
         .handle_message(deliver(
             server.id,
@@ -810,7 +817,7 @@ async fn bfs_fetched_events_are_policy_validated() -> Result<()> {
             vec![proto::SubscriptionUpdateItem {
                 entity_id: record_id,
                 model,
-                content: proto::UpdateContent::StateAndEvent(latest.into(), vec![]),
+                content: proto::UpdateContent::StateAndEvent(proto::StateWithGenesis { genesis, state: latest }, vec![]),
                 predicate_relevance: vec![],
             }],
         ))

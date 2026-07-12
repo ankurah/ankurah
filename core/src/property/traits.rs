@@ -42,6 +42,13 @@ pub enum PropertyError {
     #[error("transaction is no longer alive")]
     TransactionClosed,
 
+    /// The entity/view belongs to storage that was invalidated by a system
+    /// reset.  Keeping this distinct from `Missing` prevents a stale strong
+    /// handle from making deleted old-system state look like an ordinary
+    /// absent/defaulted property.
+    #[error("entity belongs to a system generation that has been reset")]
+    SystemReset,
+
     /// A per-value cast failure against the property's canonical value_type
     /// (rfc.md 5.6, the canonical value_type ruling): the type PAIR was
     /// admitted at registration, but this particular value does not fit

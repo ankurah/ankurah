@@ -83,6 +83,11 @@ pub struct EntityInner {
     /// property-definition id its data is keyed under, for the sync read path.
     /// Absent for bare and temporary entities (they read name-keyed data only).
     resolver: std::sync::RwLock<Option<Weak<dyn PropertyResolver>>>,
+    /// Shared liveness token for the system generation that assembled this
+    /// entity. A hard reset flips the token before deleting storage, so even
+    /// strong Entity/View handles retained by callers immediately become
+    /// unusable and cannot observe or re-persist the old system.
+    system_alive: Arc<AtomicBool>,
 }
 
 #[derive(Debug)]
@@ -118,6 +123,8 @@ impl WeakEntity {
 /// [`Entity`] and the [`TemporaryEntity`] (which is bound only when
 /// constructed via [`TemporaryEntity::new_bound`]). Both deref here.
 impl EntityInner {
+    fn is_system_alive(&self) -> bool { self.system_alive.load(Ordering::Acquire) }
+
     /// The catalog resolver stamped at assembly, if still live.
     fn resolver(&self) -> Option<Arc<dyn PropertyResolver>> { self.resolver.read().unwrap().as_ref().and_then(|w| w.upgrade()) }
 
@@ -203,6 +210,9 @@ impl EntityInner {
     /// holding an entry wins; there is no per-backend special-casing here
     /// (backends are addressed only through the [`PropertyBackend`] trait).
     fn read_lenient(&self, name: &str) -> Option<Value> {
+        if !self.is_system_alive() {
+            return None;
+        }
         let state = self.state.read().expect("other thread panicked, panic here too");
         match self.resolve_key(name) {
             PropertyKey::Id(id) => state
@@ -221,6 +231,9 @@ impl EntityInner {
     /// registration's job (the canonical value_type ruling, 2026-07-10), and
     /// an ill-typed stored value reads as NULL with a warning.
     pub(crate) fn read_resolved_eval(&self, property_id: EntityId, name: &str) -> Option<Value> {
+        if !self.is_system_alive() {
+            return None;
+        }
         if name == "id" {
             return Some(Value::EntityId(self.id));
         }
@@ -241,7 +254,41 @@ impl Entity {
 
     pub fn collection(&self) -> &CollectionId { &self.collection }
 
-    pub fn head(&self) -> Clock { self.state.read().unwrap().head.clone() }
+    pub fn head(&self) -> Clock {
+        if !self.is_system_alive() {
+            return Clock::default();
+        }
+        self.state.read().unwrap().head.clone()
+    }
+
+    /// Whether this handle still belongs to the node's active system
+    /// generation. Primarily exposed for property projections; callers should
+    /// normally observe the typed `SystemReset` errors from reads/writes.
+    pub(crate) fn is_system_alive(&self) -> bool { self.0.is_system_alive() }
+
+    /// Exact generation identity, not merely liveness. Two independently
+    /// assembled resident entities may both carry live tokens, so async
+    /// assembly must compare the token pointer as well as its value before it
+    /// hands an entity back to a generation-bound caller.
+    fn belongs_to_system_generation(&self, generation: &Arc<AtomicBool>) -> bool {
+        self.is_system_alive() && Arc::ptr_eq(&self.system_alive, generation)
+    }
+
+    fn ensure_system_alive_mutation(&self) -> Result<(), MutationError> {
+        if self.is_system_alive() {
+            Ok(())
+        } else {
+            Err(MutationError::SystemReset)
+        }
+    }
+
+    pub(crate) fn ensure_system_alive(&self) -> Result<(), crate::property::PropertyError> {
+        if self.is_system_alive() {
+            Ok(())
+        } else {
+            Err(crate::property::PropertyError::SystemReset)
+        }
+    }
 
     /// Resolve transient uncommitted `Name` keys to their `Id` at commit, using
     /// the catalog-aware resolver (the PropertyKey amendment, #289), and cast
@@ -251,6 +298,7 @@ impl Entity {
     /// canonical type cannot represent fails the commit here, at the writer.
     /// Pure key/value operations on the backends; the catalog never enters them.
     pub(crate) fn resolve_pending_keys(&self) -> Result<(), crate::property::traits::PropertyError> {
+        self.ensure_system_alive()?;
         let Some(resolver) = self.resolver() else {
             // No resolver (a bare entity, or a system/catalog collection):
             // nothing to resolve, keys stay name-keyed as staged.
@@ -308,6 +356,9 @@ impl Entity {
 
     /// Check if this entity is writable (i.e., it's a transaction fork that's still alive)
     pub fn is_writable(&self) -> bool {
+        if !self.is_system_alive() {
+            return false;
+        }
         match &self.kind {
             EntityKind::Primary => false, // Primary entities are read-only
             EntityKind::Transacted { trx_alive, .. } => trx_alive.load(Ordering::Acquire),
@@ -315,6 +366,9 @@ impl Entity {
     }
 
     pub fn to_state(&self) -> Result<State, StateError> {
+        if !self.is_system_alive() {
+            return Err(StateError::SystemReset);
+        }
         let state = self.state.read().expect("other thread panicked, panic here too");
         let mut state_buffers = BTreeMap::default();
         for (name, backend) in &state.backends {
@@ -335,6 +389,9 @@ impl Entity {
     /// stamped catalog resolver's mapping for the collection. Fails
     /// `UnknownModel` when neither answers.
     pub(crate) fn model_id(&self) -> Result<EntityId, StateError> {
+        if !self.is_system_alive() {
+            return Err(StateError::SystemReset);
+        }
         crate::schema::well_known_model_id(self.collection.as_str())
             .or_else(|| self.resolver().and_then(|r| r.model_id_for(self.collection.as_str())))
             .ok_or_else(|| StateError::UnknownModel(self.collection.to_string()))
@@ -342,6 +399,10 @@ impl Entity {
 
     // used by the Model macro
     pub fn create(id: EntityId, collection: CollectionId) -> Self {
+        Self::create_in_system(id, collection, Arc::new(AtomicBool::new(true)))
+    }
+
+    fn create_in_system(id: EntityId, collection: CollectionId, system_alive: Arc<AtomicBool>) -> Self {
         Self(Arc::new(EntityInner {
             id,
             collection,
@@ -349,11 +410,17 @@ impl Entity {
             kind: EntityKind::Primary,
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
             resolver: std::sync::RwLock::new(None),
+            system_alive,
         }))
     }
 
     /// This must remain private - ONLY WeakEntitySet should be constructing Entities
-    fn from_state(id: EntityId, collection: CollectionId, state: &State) -> Result<Self, RetrievalError> {
+    fn from_state_in_system(
+        id: EntityId,
+        collection: CollectionId,
+        state: &State,
+        system_alive: Arc<AtomicBool>,
+    ) -> Result<Self, RetrievalError> {
         let mut backends = BTreeMap::new();
         for (name, state_buffer) in state.state_buffers.iter() {
             let backend = backend_from_string(name, Some(state_buffer))?;
@@ -367,6 +434,7 @@ impl Entity {
             kind: EntityKind::Primary,
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
             resolver: std::sync::RwLock::new(None),
+            system_alive,
         })))
     }
 
@@ -377,6 +445,9 @@ impl Entity {
     /// `Transaction::create` returned. Backends therefore remain the single
     /// source of truth for the extraction boundary.
     pub(crate) fn extract_operations(&self) -> Result<OperationSet, MutationError> {
+        if !self.is_system_alive() {
+            return Err(MutationError::SystemReset);
+        }
         let state = self.state.read().expect("other thread panicked, panic here too");
         let mut operations = BTreeMap::<String, Vec<ankurah_proto::Operation>>::new();
         for (name, backend) in &state.backends {
@@ -392,6 +463,9 @@ impl Entity {
     /// empty-head entity reaching this path is therefore a phantom, never an
     /// implicit creation.
     pub(crate) fn generate_commit_event(&self) -> Result<Option<Event>, MutationError> {
+        if !self.is_system_alive() {
+            return Err(MutationError::SystemReset);
+        }
         let parent = self.head();
         if parent.is_empty() {
             return Err(MutationError::InvalidEvent);
@@ -432,7 +506,7 @@ impl Entity {
     }
 
     pub fn view<V: View>(&self) -> Option<V> {
-        if self.collection() != &V::collection() {
+        if !self.is_system_alive() || self.collection() != &V::collection() {
             None
         } else {
             Some(V::from_entity(self.clone()))
@@ -443,6 +517,7 @@ impl Entity {
     #[cfg_attr(feature = "instrument", tracing::instrument(level="debug", skip_all, fields(entity = %self, event = %event)))]
     pub async fn apply_event<E>(&self, getter: &E, event: &Event) -> Result<bool, MutationError>
     where E: GetEvents + Send + Sync {
+        self.ensure_system_alive_mutation()?;
         debug!("apply_event head: {event} to {self}");
 
         // Structural identity is sufficient on every node class: a genesis
@@ -464,6 +539,7 @@ impl Entity {
         // Check for entity creation under the mutex to avoid TOCTOU race
         if event.is_entity_create() {
             let mut state = self.state.write().unwrap();
+            self.ensure_system_alive_mutation()?;
             // Re-check if head is still empty now that we hold the lock
             if state.head.is_empty() {
                 // this is the creation event for a new entity, so we simply accept it
@@ -472,7 +548,8 @@ impl Entity {
                 }
                 state.head = event.id().into();
                 drop(state); // Release lock before broadcast
-                             // Notify Signal subscribers about the change
+                self.ensure_system_alive_mutation()?;
+                // Notify Signal subscribers about the change
                 self.broadcast.send(());
                 return Ok(true);
             }
@@ -494,6 +571,7 @@ impl Entity {
             // Stage the event so BFS can discover it, then compare event's clock vs head
             let subject_clock: Clock = event.id().into();
             let comparison_result = crate::event_dag::compare(getter, &subject_clock, &head, DEFAULT_BUDGET).await?;
+            self.ensure_system_alive_mutation()?;
             match comparison_result.relation {
                 AbstractCausalRelation::Equal => {
                     debug!("Equal - skip");
@@ -504,12 +582,14 @@ impl Entity {
                     let new_head: Clock = event.id().into();
                     let event_id = event.id();
                     if self.try_mutate(&mut head, |state| -> Result<(), MutationError> {
+                        self.ensure_system_alive_mutation()?;
                         for (backend_name, operations) in event.operations().iter() {
                             state.apply_operations_from_event(backend_name.clone(), operations, event_id.clone())?;
                         }
                         state.head = new_head.clone();
                         Ok(())
                     })? {
+                        self.ensure_system_alive_mutation()?;
                         self.broadcast.send(());
                         return Ok(true);
                     }
@@ -535,12 +615,14 @@ impl Entity {
                     // Collect all layers first, then apply under lock
                     let mut all_layers = Vec::new();
                     while let Some(layer) = layers.next().await? {
+                        self.ensure_system_alive_mutation()?;
                         all_layers.push(layer);
                     }
 
                     // Atomic update: apply layers and augment head under single lock
                     {
                         let mut state = self.state.write().unwrap();
+                        self.ensure_system_alive_mutation()?;
                         // Re-check that head hasn't changed since lineage comparison
                         if state.head != head {
                             warn!("Head changed during lineage comparison, retrying...");
@@ -579,6 +661,7 @@ impl Entity {
                         }
                         state.head.insert(event.id());
                     }
+                    self.ensure_system_alive_mutation()?;
                     self.broadcast.send(());
                     return Ok(true);
                 }
@@ -609,6 +692,7 @@ impl Entity {
     /// - `DivergedRequiresEvents` — state diverged, events needed for proper merge
     pub async fn apply_state<E>(&self, getter: &E, state: &State) -> Result<StateApplyResult, MutationError>
     where E: GetEvents + Send + Sync {
+        self.ensure_system_alive_mutation()?;
         let mut head = self.head();
         let new_head = state.head.clone();
 
@@ -617,6 +701,7 @@ impl Entity {
 
         for attempt in 0..MAX_RETRIES {
             let comparison_result = crate::event_dag::compare(getter, &new_head, &head, DEFAULT_BUDGET).await?;
+            self.ensure_system_alive_mutation()?;
             match comparison_result.relation {
                 AbstractCausalRelation::Equal => {
                     debug!("{self} apply_state - heads are equal, skipping");
@@ -626,6 +711,7 @@ impl Entity {
                     debug!("{self} apply_state - new head descends from current, applying (attempt {})", attempt + 1);
                     let new_head = state.head.clone();
                     if self.try_mutate(&mut head, |es| -> Result<(), MutationError> {
+                        self.ensure_system_alive_mutation()?;
                         for (name, state_buffer) in state.state_buffers.iter() {
                             let backend = backend_from_string(name, Some(state_buffer))?;
                             es.backends.insert(name.to_owned(), backend);
@@ -633,6 +719,7 @@ impl Entity {
                         es.head = new_head;
                         Ok(())
                     })? {
+                        self.ensure_system_alive_mutation()?;
                         self.broadcast.send(());
                         return Ok(StateApplyResult::Applied);
                     }
@@ -694,6 +781,7 @@ impl Entity {
             // Carry the resolver across the fork so a transaction's read path
             // still resolves names to ids.
             resolver: std::sync::RwLock::new(self.resolver.read().unwrap().clone()),
+            system_alive: self.system_alive.clone(),
         }))
     }
 
@@ -729,6 +817,7 @@ impl Entity {
             kind: EntityKind::Transacted { trx_alive, upstream: self.clone() },
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
             resolver: std::sync::RwLock::new(self.resolver.read().unwrap().clone()),
+            system_alive: self.system_alive.clone(),
         })))
     }
 
@@ -752,6 +841,9 @@ impl Entity {
     }
 
     pub fn values(&self) -> Vec<(String, Option<Value>)> {
+        if !self.is_system_alive() {
+            return Vec::new();
+        }
         let state = self.state.read().expect("other thread panicked, panic here too");
         state.backends.values().flat_map(|backend| backend.property_values().into_iter().map(|(k, v)| (k.display_name(), v))).collect()
     }
@@ -833,6 +925,10 @@ impl TemporaryEntity {
             // slightly annoying that we need to populate this, given that it won't be used
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
             resolver: std::sync::RwLock::new(resolver),
+            // Temporary entities are storage-decoding values, not resident
+            // node handles, so they are scoped to the operation that built
+            // them rather than to a resettable resident generation.
+            system_alive: Arc::new(AtomicBool::new(true)),
         })))
     }
     pub fn values(&self) -> Vec<(String, Option<Value>)> {
@@ -878,6 +974,30 @@ mod eager_genesis_tests {
     use super::*;
     use crate::property::backend::{LWWBackend, YrsBackend};
     use crate::property::PropertyKey;
+    use crate::retrieval::GetEvents;
+    use async_trait::async_trait;
+    use std::sync::atomic::AtomicBool;
+    use tokio::sync::Notify;
+
+    struct PausingEvents {
+        events: BTreeMap<EventId, Event>,
+        pause_once: AtomicBool,
+        seen: Notify,
+        release: Notify,
+    }
+
+    #[async_trait]
+    impl GetEvents for PausingEvents {
+        async fn get_event(&self, event_id: &EventId) -> Result<Event, RetrievalError> {
+            if self.pause_once.swap(false, Ordering::AcqRel) {
+                self.seen.notify_one();
+                self.release.notified().await;
+            }
+            self.events.get(event_id).cloned().ok_or_else(|| RetrievalError::EventNotFound(event_id.clone()))
+        }
+
+        async fn event_stored(&self, event_id: &EventId) -> Result<bool, RetrievalError> { Ok(self.events.contains_key(event_id)) }
+    }
 
     #[test]
     fn genesis_is_the_clean_baseline_for_post_create_updates() {
@@ -923,6 +1043,48 @@ mod eager_genesis_tests {
 
         assert!(matches!(phantom.generate_commit_event(), Err(MutationError::InvalidEvent)));
     }
+
+    #[tokio::test]
+    async fn reset_while_lineage_is_awaiting_prevents_apply_and_broadcast() {
+        let entities = WeakEntitySet::default();
+        let generation = entities.system_generation();
+        let collection = CollectionId::fixed_name(crate::system::SYSTEM_COLLECTION_ID);
+        let model = crate::schema::well_known_model_id(crate::system::SYSTEM_COLLECTION_ID).unwrap();
+
+        let provisional =
+            entities.create_provisional_in_generation(collection.clone(), Arc::new(AtomicBool::new(true)), &generation).unwrap();
+        provisional.get_backend::<LWWBackend>().unwrap().set(PropertyKey::name("title"), Some(Value::String("initial".into())));
+        let genesis = Event::genesis(model, None, provisional.extract_operations().unwrap());
+        let primary = Entity::create_in_system(genesis.entity_id, collection, generation.clone());
+
+        // Genesis has no lineage await and establishes the baseline.
+        let immediate =
+            PausingEvents { events: BTreeMap::new(), pause_once: AtomicBool::new(false), seen: Notify::new(), release: Notify::new() };
+        assert!(primary.apply_event(&immediate, &genesis).await.unwrap());
+
+        let fork = primary.snapshot(Arc::new(AtomicBool::new(true)));
+        fork.get_backend::<LWWBackend>().unwrap().set(PropertyKey::name("title"), Some(Value::String("after".into())));
+        let update = fork.generate_commit_event().unwrap().unwrap();
+        let getter = Arc::new(PausingEvents {
+            events: BTreeMap::from([(genesis.id(), genesis), (update.id(), update.clone())]),
+            pause_once: AtomicBool::new(true),
+            seen: Notify::new(),
+            release: Notify::new(),
+        });
+
+        let applying = {
+            let primary = primary.clone();
+            let getter = getter.clone();
+            tokio::spawn(async move { primary.apply_event(getter.as_ref(), &update).await })
+        };
+        getter.seen.notified().await;
+        entities.system_reset();
+        getter.release.notify_one();
+
+        assert!(matches!(applying.await.unwrap(), Err(MutationError::SystemReset)));
+        assert!(!generation.load(Ordering::Acquire));
+        assert!(!primary.is_system_alive());
+    }
 }
 
 // TODO - Implement TOCTOU Race condition tests. Require real backend state mutations to be meaningful. punting that for now
@@ -933,16 +1095,53 @@ mod eager_genesis_tests {
 /// `Node` to stamp its live property resolver. The hook is idempotent and
 /// re-fires on resident hand-outs, so an entity assembled before the catalog
 /// warmed observes the catalog on its next access.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct WeakEntitySet(Arc<WeakEntitySetInner>);
 
-#[derive(Default)]
 struct WeakEntitySetInner {
     entities: std::sync::RwLock<BTreeMap<EntityId, WeakEntity>>,
+    /// Current system generation. Entity construction takes this token while
+    /// holding `entities`; reset takes the same locks in the same order,
+    /// flips the old token, swaps a fresh token, and clears every resident
+    /// lookup atomically with respect to insertion.
+    system_alive: std::sync::RwLock<Arc<AtomicBool>>,
     bind_hook: std::sync::RwLock<Option<Box<dyn Fn(&Entity) + Send + Sync>>>,
 }
 
+impl Default for WeakEntitySet {
+    fn default() -> Self { Self::with_system_generation(Arc::new(AtomicBool::new(true))) }
+}
+
 impl WeakEntitySet {
+    pub(crate) fn with_system_generation(system_generation: Arc<AtomicBool>) -> Self {
+        Self(Arc::new(WeakEntitySetInner {
+            entities: std::sync::RwLock::new(BTreeMap::new()),
+            system_alive: std::sync::RwLock::new(system_generation),
+            bind_hook: std::sync::RwLock::new(None),
+        }))
+    }
+
+    pub(crate) fn system_generation(&self) -> Arc<AtomicBool> { self.0.system_alive.read().unwrap().clone() }
+
+    pub(crate) fn is_current_generation(&self, generation: &Arc<AtomicBool>) -> bool {
+        generation.load(Ordering::Acquire) && Arc::ptr_eq(generation, &self.0.system_alive.read().unwrap())
+    }
+
+    /// Invalidate all strong handles from the previous system and atomically
+    /// evict the resident lookup set. The bind hook survives: it belongs to
+    /// the Node, not to a particular joined system.
+    pub(crate) fn system_reset(&self) { self.system_reset_to(Arc::new(AtomicBool::new(true))); }
+
+    pub(crate) fn system_reset_to(&self, fresh_generation: Arc<AtomicBool>) {
+        let mut entities = self.0.entities.write().unwrap();
+        let mut generation = self.0.system_alive.write().unwrap();
+        generation.store(false, Ordering::Release);
+        *generation = fresh_generation;
+        entities.clear();
+    }
+
+    fn reset_during_retrieval() -> RetrievalError { RetrievalError::Other("system reset while retrieving entity".to_owned()) }
+
     /// Install the assembly-time bind hook. Called once from `Node`
     /// construction; the hook captures a `WeakNode` (no strong cycle).
     pub(crate) fn set_bind_hook(&self, hook: Box<dyn Fn(&Entity) + Send + Sync>) { *self.0.bind_hook.write().unwrap() = Some(hook); }
@@ -976,20 +1175,8 @@ impl WeakEntitySet {
         S: GetState + Send + Sync,
         E: GetEvents + Send + Sync,
     {
-        // do it in two phases to avoid holding the lock while waiting for the collection
-        match self.get(id) {
-            Some(entity) => Ok(Some(entity)),
-            None => match state_getter.get_state(*id).await? {
-                None => Ok(None),
-                Some(state) => {
-                    // technically someone could have added the entity since we last checked, so it's better to use the
-                    // with_state method to re-check
-                    let (_, entity) =
-                        self.with_state(state_getter, event_getter, *id, collection_id.to_owned(), state.payload.state).await?;
-                    Ok(Some(entity))
-                }
-            },
-        }
+        let generation = self.system_generation();
+        self.get_or_retrieve_in_generation(state_getter, event_getter, collection_id, id, generation).await
     }
     /// Returns a resident entity, or fetches it from storage, or finally creates if neither of the two are found
     pub async fn get_retrieve_or_create<S, E>(
@@ -1003,24 +1190,96 @@ impl WeakEntitySet {
         S: GetState + Send + Sync,
         E: GetEvents + Send + Sync,
     {
-        match self.get_or_retrieve(state_getter, event_getter, collection_id, id).await? {
+        let generation = self.system_generation();
+        self.get_retrieve_or_create_in_generation(state_getter, event_getter, collection_id, id, generation).await
+    }
+
+    pub(crate) async fn get_retrieve_or_create_in_generation<S, E>(
+        &self,
+        state_getter: &S,
+        event_getter: &E,
+        collection_id: &CollectionId,
+        id: &EntityId,
+        generation: Arc<AtomicBool>,
+    ) -> Result<Entity, RetrievalError>
+    where
+        S: GetState + Send + Sync,
+        E: GetEvents + Send + Sync,
+    {
+        if !self.is_current_generation(&generation) {
+            return Err(Self::reset_during_retrieval());
+        }
+        match self.get_or_retrieve_in_generation(state_getter, event_getter, collection_id, id, generation.clone()).await? {
             Some(entity) => Ok(entity),
             None => {
                 let entity = {
                     let mut entities = self.0.entities.write().unwrap();
+                    let current = self.0.system_alive.read().unwrap();
+                    if !generation.load(Ordering::Acquire) || !Arc::ptr_eq(&generation, &current) {
+                        return Err(Self::reset_during_retrieval());
+                    }
                     // TODO: call policy agent with cdata
                     match entities.get(id).and_then(|weak| weak.upgrade()) {
-                        Some(entity) => entity,
+                        Some(entity) if entity.belongs_to_system_generation(&generation) => entity,
+                        Some(_) => return Err(Self::reset_during_retrieval()),
                         None => {
-                            let entity = Entity::create(*id, collection_id.to_owned());
+                            let entity = Entity::create_in_system(*id, collection_id.to_owned(), generation.clone());
                             entities.insert(*id, entity.weak());
                             entity
                         }
                     }
                 };
+                if !self.is_current_generation(&generation) || !entity.belongs_to_system_generation(&generation) {
+                    return Err(Self::reset_during_retrieval());
+                }
                 self.bind(&entity);
+                if !self.is_current_generation(&generation) || !entity.belongs_to_system_generation(&generation) {
+                    return Err(Self::reset_during_retrieval());
+                }
                 Ok(entity)
             }
+        }
+    }
+
+    async fn get_or_retrieve_in_generation<S, E>(
+        &self,
+        state_getter: &S,
+        event_getter: &E,
+        collection_id: &CollectionId,
+        id: &EntityId,
+        generation: Arc<AtomicBool>,
+    ) -> Result<Option<Entity>, RetrievalError>
+    where
+        S: GetState + Send + Sync,
+        E: GetEvents + Send + Sync,
+    {
+        match self.get(id) {
+            Some(entity) if self.is_current_generation(&generation) && entity.belongs_to_system_generation(&generation) => Ok(Some(entity)),
+            Some(_) => Err(Self::reset_during_retrieval()),
+            None => match state_getter.get_state(*id).await? {
+                None => {
+                    if !self.is_current_generation(&generation) {
+                        return Err(Self::reset_during_retrieval());
+                    }
+                    Ok(None)
+                }
+                Some(state) => {
+                    if !self.is_current_generation(&generation) {
+                        return Err(Self::reset_during_retrieval());
+                    }
+                    let (_, entity) = self
+                        .with_state_in_generation(
+                            state_getter,
+                            event_getter,
+                            *id,
+                            collection_id.to_owned(),
+                            state.payload.state,
+                            generation,
+                        )
+                        .await?;
+                    Ok(Some(entity))
+                }
+            },
         }
     }
     /// Create the writable, pre-identity entity used only while a model writes
@@ -1028,11 +1287,30 @@ impl WeakEntitySet {
     /// the real id does not exist until those values have been frozen into the
     /// genesis event.
     pub(crate) fn create_provisional(&self, collection: CollectionId, trx_alive: Arc<AtomicBool>) -> Entity {
+        loop {
+            let generation = self.system_generation();
+            match self.create_provisional_in_generation(collection.clone(), trx_alive.clone(), &generation) {
+                Ok(entity) => return entity,
+                Err(MutationError::SystemReset) => continue,
+                Err(error) => panic!("unexpected provisional entity error: {error}"),
+            }
+        }
+    }
+
+    pub(crate) fn create_provisional_in_generation(
+        &self,
+        collection: CollectionId,
+        trx_alive: Arc<AtomicBool>,
+        expected_generation: &Arc<AtomicBool>,
+    ) -> Result<Entity, MutationError> {
+        if !self.is_current_generation(expected_generation) {
+            return Err(MutationError::SystemReset);
+        }
         // The placeholder is never observable outside this create call and is
         // never inserted into the id-keyed resident set.
-        let primary = Entity::create(EntityId::from_bytes([0; 32]), collection);
+        let primary = Entity::create_in_system(EntityId::from_bytes([0; 32]), collection, expected_generation.clone());
         self.bind(&primary);
-        primary.snapshot(trx_alive)
+        Ok(primary.snapshot(trx_alive))
     }
 
     /// Insert the empty resident primary under the id derived by `genesis`,
@@ -1045,11 +1323,43 @@ impl WeakEntitySet {
         genesis: &Event,
         trx_alive: Arc<AtomicBool>,
     ) -> Result<Entity, MutationError> {
-        let primary = Entity::create(genesis.entity_id, collection);
+        let generation = self.system_generation();
+        self.create_transaction_entity_in_generation(collection, genesis, trx_alive, &generation)
+    }
+
+    pub(crate) fn create_transaction_entity_in_generation(
+        &self,
+        collection: CollectionId,
+        genesis: &Event,
+        trx_alive: Arc<AtomicBool>,
+        expected_generation: &Arc<AtomicBool>,
+    ) -> Result<Entity, MutationError> {
+        // Validate the generation and uniqueness before doing the potentially
+        // non-trivial genesis materialization. Binding runs outside the map
+        // lock, per the assembly-boundary lock-order contract.
+        {
+            let entities = self.0.entities.write().unwrap();
+            let generation = self.0.system_alive.read().unwrap();
+            if !expected_generation.load(Ordering::Acquire) || !Arc::ptr_eq(expected_generation, &generation) {
+                return Err(MutationError::SystemReset);
+            }
+            if entities.get(&genesis.entity_id).and_then(WeakEntity::upgrade).is_some() {
+                return Err(MutationError::AlreadyExists);
+            }
+        }
+
+        let primary = Entity::create_in_system(genesis.entity_id, collection, expected_generation.clone());
         self.bind(&primary);
         let transaction_entity = primary.snapshot_after_genesis(genesis, trx_alive)?;
 
+        // Re-check under the same lock order before publication. A reset in
+        // between has flipped `expected_generation`, so an old primary can
+        // never be inserted into the new resident map.
         let mut entities = self.0.entities.write().unwrap();
+        let generation = self.0.system_alive.read().unwrap();
+        if !expected_generation.load(Ordering::Acquire) || !Arc::ptr_eq(expected_generation, &generation) {
+            return Err(MutationError::SystemReset);
+        }
         if entities.get(&primary.id).and_then(WeakEntity::upgrade).is_some() {
             return Err(MutationError::AlreadyExists);
         }
@@ -1063,9 +1373,24 @@ impl WeakEntitySet {
     /// update that then failed to apply; leaving it resident makes the entity
     /// appear to exist with no state. Returns true if an entry was removed.
     pub fn remove_if_phantom(&self, id: &EntityId) -> bool {
+        let generation = self.system_generation();
+        self.remove_if_phantom_in_generation(id, &generation)
+    }
+
+    /// Generation-conditional phantom eviction. A failed old apply may resume
+    /// after reset while a new system has independently materialized the same
+    /// entity id; it must not remove that new resident entry.
+    pub(crate) fn remove_if_phantom_in_generation(&self, id: &EntityId, expected_generation: &Arc<AtomicBool>) -> bool {
         let mut entities = self.0.entities.write().unwrap();
+        let generation = self.0.system_alive.read().unwrap();
+        if !expected_generation.load(Ordering::Acquire) || !Arc::ptr_eq(expected_generation, &generation) {
+            return false;
+        }
         if let Some(weak) = entities.get(id) {
             if let Some(entity) = weak.upgrade() {
+                if !entity.belongs_to_system_generation(expected_generation) {
+                    return false;
+                }
                 if !entity.head().is_empty() {
                     return false;
                 }
@@ -1089,22 +1414,36 @@ impl WeakEntitySet {
     #[cfg(feature = "test-helpers")]
     pub fn conjure_evil_phantom(&self, id: EntityId, collection: CollectionId) -> Entity {
         let mut entities = self.0.entities.write().unwrap();
-        let entity = Entity::create(id, collection);
+        let generation = self.0.system_alive.read().unwrap().clone();
+        let entity = Entity::create_in_system(id, collection, generation);
         entities.insert(id, entity.weak());
         entity
     }
 
     /// Get or create entity after async operations, checking for race conditions
     /// Returns (existed, entity) where existed is true if the entity was already present
-    fn private_get_or_create(&self, id: EntityId, collection_id: &CollectionId, state: &State) -> Result<(bool, Entity), RetrievalError> {
+    fn private_get_or_create(
+        &self,
+        id: EntityId,
+        collection_id: &CollectionId,
+        state: &State,
+        expected_generation: &Arc<AtomicBool>,
+    ) -> Result<(bool, Entity), RetrievalError> {
         let mut entities = self.0.entities.write().unwrap();
+        let generation = self.0.system_alive.read().unwrap();
+        if !expected_generation.load(Ordering::Acquire) || !Arc::ptr_eq(expected_generation, &generation) {
+            return Err(Self::reset_during_retrieval());
+        }
         if let Some(existing_weak) = entities.get(&id) {
             if let Some(existing_entity) = existing_weak.upgrade() {
+                if !existing_entity.belongs_to_system_generation(expected_generation) {
+                    return Err(Self::reset_during_retrieval());
+                }
                 debug!("Entity {id} was created by another thread during async work, using that one");
                 return Ok((true, existing_entity));
             }
         }
-        let entity = Entity::from_state(id, collection_id.to_owned(), state)?;
+        let entity = Entity::from_state_in_system(id, collection_id.to_owned(), state, expected_generation.clone())?;
         entities.insert(id, entity.weak());
         Ok((false, entity))
     }
@@ -1124,21 +1463,48 @@ impl WeakEntitySet {
         S: GetState + Send + Sync,
         E: GetEvents + Send + Sync,
     {
+        let generation = self.system_generation();
+        self.with_state_in_generation(state_getter, event_getter, id, collection_id, state, generation).await
+    }
+
+    pub(crate) async fn with_state_in_generation<S, E>(
+        &self,
+        state_getter: &S,
+        event_getter: &E,
+        id: EntityId,
+        collection_id: CollectionId,
+        state: State,
+        generation: Arc<AtomicBool>,
+    ) -> Result<(Option<bool>, Entity), RetrievalError>
+    where
+        S: GetState + Send + Sync,
+        E: GetEvents + Send + Sync,
+    {
+        if !self.is_current_generation(&generation) {
+            return Err(Self::reset_during_retrieval());
+        }
         let entity = match self.get(&id) {
-            Some(entity) => entity, // already resident
+            Some(entity) if self.is_current_generation(&generation) && entity.belongs_to_system_generation(&generation) => entity,
+            Some(_) => return Err(Self::reset_during_retrieval()),
             None => {
                 // not yet resident. We have to retrieve our baseline state before applying the new state
                 if let Some(stored_state) = state_getter.get_state(id).await? {
                     // get a resident entity for this retrieved state. It's possible somebody frontran us to create it
                     // but we don't actually care, so we ignore the created flag
-                    self.private_get_or_create(id, &collection_id, &stored_state.payload.state)?.1
+                    self.private_get_or_create(id, &collection_id, &stored_state.payload.state, &generation)?.1
                 } else {
                     // no stored state, so we can use the given state directly
-                    match self.private_get_or_create(id, &collection_id, &state)? {
+                    match self.private_get_or_create(id, &collection_id, &state, &generation)? {
                         (true, entity) => entity, // some body frontran us to create it, so we have to apply the new state
                         (false, entity) => {
                             // we just created it with the given state, so there's nothing to apply. early return
+                            if !self.is_current_generation(&generation) || !entity.belongs_to_system_generation(&generation) {
+                                return Err(Self::reset_during_retrieval());
+                            }
                             self.bind(&entity);
+                            if !self.is_current_generation(&generation) || !entity.belongs_to_system_generation(&generation) {
+                                return Err(Self::reset_during_retrieval());
+                            }
                             return Ok((None, entity));
                         }
                     }
@@ -1148,12 +1514,18 @@ impl WeakEntitySet {
 
         // if we're here, we've retrieved the entity from the set and need to apply the state
         let result = entity.apply_state(event_getter, &state).await?;
+        if !self.is_current_generation(&generation) || !entity.belongs_to_system_generation(&generation) {
+            return Err(Self::reset_during_retrieval());
+        }
         let changed = matches!(result, StateApplyResult::Applied);
         // Bind AFTER the apply: apply_state may rebuild backends from the
         // incoming raw buffers, which would discard a binding attached
         // beforehand and leave an unbound (v1-emitting) backend holding
         // id-keyed entries.
         self.bind(&entity);
+        if !self.is_current_generation(&generation) || !entity.belongs_to_system_generation(&generation) {
+            return Err(Self::reset_during_retrieval());
+        }
         Ok((Some(changed), entity))
     }
 }

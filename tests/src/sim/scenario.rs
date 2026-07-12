@@ -197,13 +197,19 @@ impl<'a> Workload<'a> {
     /// state and lineage.
     pub async fn state_and_event_item(&self, origin: usize, entity: proto::EntityId) -> proto::SubscriptionUpdateItem {
         let state = self.nodes[origin].entity_state(entity).await.expect("origin holds entity state");
-        let events = model::causal_sort(self.nodes[origin].stored_events(entity).await);
-        let state_fragment = proto::StateFragment { state, attestations: proto::AttestationSet::default() };
+        let mut events = model::causal_sort(self.nodes[origin].stored_events(entity).await);
+        let genesis_index = events
+            .iter()
+            .position(|event| event.payload.is_entity_create() && event.payload.entity_id == entity)
+            .expect("StateAndEvent origin holds matching genesis");
+        let genesis = events.remove(genesis_index);
+        let model = super::model::sim_model_id();
+        let state = proto::Attested::opt(proto::EntityState { entity_id: entity, model, state }, None);
         let event_fragments: Vec<proto::EventFragment> = events.into_iter().map(|e| e.into()).collect();
         proto::SubscriptionUpdateItem {
             entity_id: entity,
-            model: super::model::sim_model_id(),
-            content: proto::UpdateContent::StateAndEvent(state_fragment, event_fragments),
+            model,
+            content: proto::UpdateContent::StateAndEvent(proto::StateWithGenesis { genesis, state }, event_fragments),
             predicate_relevance: vec![],
         }
     }

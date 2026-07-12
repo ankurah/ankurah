@@ -190,6 +190,8 @@ struct NullSender {
 impl PeerSender for NullSender {
     fn send_message(&self, _message: proto::SignedPeerMessage) -> Result<(), SendError> { Ok(()) }
 
+    fn close(&self) {}
+
     fn recipient_node_id(&self) -> proto::NodeId { self.recipient }
 
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
@@ -829,7 +831,7 @@ async fn denied_remote_genesis_leaves_no_storage_or_resident_phantom() -> Result
 }
 
 #[tokio::test]
-async fn state_snapshot_without_its_named_genesis_cannot_create_an_entity() -> Result<()> {
+async fn state_snapshot_with_mismatched_genesis_cannot_create_an_entity() -> Result<()> {
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
     server.system.create().await?;
     let client = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
@@ -840,7 +842,14 @@ async fn state_snapshot_without_its_named_genesis_cannot_create_an_entity() -> R
 
     let model = server.catalog.model_id_for(IdentityRecord::collection().as_str()).expect("model registered by query");
     let forged_id = proto::EntityId::from_bytes([0xC7; 32]);
-    let state = proto::StateFragment { state: proto::State::default(), attestations: proto::AttestationSet::default() };
+    let wrong_genesis =
+        proto::Event::genesis(model, Some(server.system.root_id().expect("server system root")), proto::OperationSet(BTreeMap::new()));
+    assert_ne!(wrong_genesis.entity_id, forged_id);
+    let wrong_genesis_id = wrong_genesis.id();
+    let proof = proto::StateWithGenesis {
+        genesis: Attested::opt(wrong_genesis, None),
+        state: Attested::opt(proto::EntityState { entity_id: forged_id, model, state: proto::State::default() }, None),
+    };
     client
         .handle_message(proto::NodeMessage::Update(proto::NodeUpdate {
             id: proto::UpdateId::new(),
@@ -850,7 +859,7 @@ async fn state_snapshot_without_its_named_genesis_cannot_create_an_entity() -> R
                 items: vec![proto::SubscriptionUpdateItem {
                     entity_id: forged_id,
                     model,
-                    content: proto::UpdateContent::StateAndEvent(state, vec![]),
+                    content: proto::UpdateContent::StateAndEvent(proof, vec![]),
                     predicate_relevance: vec![],
                 }],
             },
@@ -861,5 +870,9 @@ async fn state_snapshot_without_its_named_genesis_cannot_create_an_entity() -> R
     assert!(client.get_resident_entity(forged_id).is_none());
     let collection = client_context.collection(&IdentityRecord::collection()).await?;
     assert!(collection.get_state(forged_id).await.is_err());
+    assert!(
+        collection.get_events(vec![wrong_genesis_id]).await?.is_empty(),
+        "a mismatched inline identity proof must be rejected before it enters the cache"
+    );
     Ok(())
 }

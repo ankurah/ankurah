@@ -11,6 +11,9 @@ use crate::{policy::PolicyAgent, storage::StorageEngine, Node};
 #[async_trait]
 pub trait PeerSender: Send + Sync {
     fn send_message(&self, message: proto::SignedPeerMessage) -> Result<(), SendError>;
+    /// Terminate the exact registered transport session shared by every clone
+    /// of this sender. Implementations must be idempotent and non-blocking.
+    fn close(&self);
     /// The node ID of the recipient of this message
     fn recipient_node_id(&self) -> proto::NodeId;
     fn cloned(&self) -> Box<dyn PeerSender>;
@@ -60,10 +63,15 @@ pub enum PeerFrameError {
 /// then dispatch the token asynchronously without exposing an unbound message
 /// injection seam.
 #[derive(Debug)]
-pub struct VerifiedPeerMessage(pub(crate) proto::NodeMessage);
+pub struct VerifiedPeerMessage {
+    pub(crate) message: proto::NodeMessage,
+    pub(crate) authenticated_peer: proto::NodeId,
+    pub(crate) incoming_session: proto::HandshakeChallenge,
+    pub(crate) system_generation: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
 
 impl VerifiedPeerMessage {
-    pub fn message(&self) -> &proto::NodeMessage { &self.0 }
+    pub fn message(&self) -> &proto::NodeMessage { &self.message }
 }
 
 /// Core-issued, single-use capability for authenticating one peer connection.

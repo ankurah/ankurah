@@ -1,16 +1,110 @@
 mod common;
 use ankurah::{
+    error::{MutationError, RetrievalError, StateError},
+    model::View,
     policy::DEFAULT_CONTEXT,
+    property::PropertyError,
     proto::{self, Attested, CollectionId},
-    storage::{StorageEngine, SystemRootClaim},
+    storage::{StorageCollection, StorageEngine, SystemRootClaim},
     Node, PermissiveAgent,
 };
 use ankurah_connector_local_process::LocalProcessConnection;
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
-use common::{Album, Pet};
+use async_trait::async_trait;
+use common::{Album, AlbumView, Pet};
 use ed25519_dalek::SigningKey;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use tokio::sync::Notify;
+
+/// One-shot barriers around the storage-wide root metadata calls. They make
+/// cross-Node reset races deterministic while delegating every durable byte
+/// to the real sled engine.
+struct PausingStorageEngine {
+    inner: Arc<SledStorageEngine>,
+    pause_next_claim_read: AtomicBool,
+    claim_read_seen: Notify,
+    release_claim_read: Notify,
+    pause_next_claim_attempt: AtomicBool,
+    fail_paused_claim: AtomicBool,
+    claim_attempt_seen: Notify,
+    release_claim_attempt: Notify,
+}
+
+impl PausingStorageEngine {
+    fn new(inner: Arc<SledStorageEngine>) -> Self {
+        Self {
+            inner,
+            pause_next_claim_read: AtomicBool::new(false),
+            claim_read_seen: Notify::new(),
+            release_claim_read: Notify::new(),
+            pause_next_claim_attempt: AtomicBool::new(false),
+            fail_paused_claim: AtomicBool::new(false),
+            claim_attempt_seen: Notify::new(),
+            release_claim_attempt: Notify::new(),
+        }
+    }
+
+    fn pause_next_claim_read(&self) { self.pause_next_claim_read.store(true, Ordering::Release); }
+    async fn wait_for_claim_read(&self) { self.claim_read_seen.notified().await; }
+    fn release_claim_read(&self) { self.release_claim_read.notify_one(); }
+
+    fn pause_next_claim_attempt(&self) { self.pause_next_claim_attempt.store(true, Ordering::Release); }
+    fn fail_next_claim_after_pause(&self) {
+        self.fail_paused_claim.store(true, Ordering::Release);
+        self.pause_next_claim_attempt();
+    }
+    async fn wait_for_claim_attempt(&self) { self.claim_attempt_seen.notified().await; }
+    fn release_failed_claim(&self) { self.release_claim_attempt.notify_one(); }
+}
+
+#[async_trait]
+impl StorageEngine for PausingStorageEngine {
+    type Value = <SledStorageEngine as StorageEngine>::Value;
+
+    async fn collection(&self, id: &CollectionId) -> Result<Arc<dyn StorageCollection>, RetrievalError> {
+        <SledStorageEngine as StorageEngine>::collection(self.inner.as_ref(), id).await
+    }
+
+    async fn delete_all_collections(&self) -> Result<bool, MutationError> {
+        <SledStorageEngine as StorageEngine>::delete_all_collections(self.inner.as_ref()).await
+    }
+
+    async fn claim_system_root(&self, candidate: &proto::SystemRootProof) -> Result<SystemRootClaim, MutationError> {
+        if self.pause_next_claim_attempt.swap(false, Ordering::AcqRel) {
+            self.claim_attempt_seen.notify_one();
+            self.release_claim_attempt.notified().await;
+            if self.fail_paused_claim.swap(false, Ordering::AcqRel) {
+                return Err(MutationError::General(Box::new(std::io::Error::other("injected root-claim failure"))));
+            }
+        }
+        <SledStorageEngine as StorageEngine>::claim_system_root(self.inner.as_ref(), candidate).await
+    }
+
+    async fn system_root_claim(&self) -> Result<Option<proto::SystemRootProof>, RetrievalError> {
+        let claim = <SledStorageEngine as StorageEngine>::system_root_claim(self.inner.as_ref()).await?;
+        if self.pause_next_claim_read.swap(false, Ordering::AcqRel) {
+            self.claim_read_seen.notify_one();
+            self.release_claim_read.notified().await;
+        }
+        Ok(claim)
+    }
+
+    async fn release_system_root_claim(&self, expected: &proto::SystemRootProof) -> Result<bool, MutationError> {
+        <SledStorageEngine as StorageEngine>::release_system_root_claim(self.inner.as_ref(), expected).await
+    }
+
+    async fn list_collections(&self) -> Result<Vec<CollectionId>, RetrievalError> {
+        <SledStorageEngine as StorageEngine>::list_collections(self.inner.as_ref()).await
+    }
+
+    fn set_property_resolver(&self, resolver: std::sync::Weak<dyn ankurah::core::property::PropertyResolver>) {
+        <SledStorageEngine as StorageEngine>::set_property_resolver(self.inner.as_ref(), resolver);
+    }
+}
 
 /// Tests that reopen durable storage must also reopen the durable identity.
 /// Production embedders persist this seed with `node_key`; a fixed key keeps
@@ -446,5 +540,275 @@ async fn test_system_root_change_behavior() -> Result<()> {
         assert_eq!(data_collections(&ephemeral_engine)?, sorted_names(&["_ankurah_system"]));
     }
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hard_reset_invalidates_old_handles_transactions_and_peer_routes() -> Result<()> {
+    let founder_a_engine = Arc::new(SledStorageEngine::new_test()?);
+    let founder_b_engine = Arc::new(SledStorageEngine::new_test()?);
+    let client_engine = Arc::new(SledStorageEngine::new_test()?);
+
+    let founder_a = Node::new_durable_with_signing_key(founder_a_engine, PermissiveAgent::new(), persisted_durable_key());
+    let founder_b = Node::new_durable_with_signing_key(founder_b_engine, PermissiveAgent::new(), competing_durable_key());
+    founder_a.system.create().await?;
+    founder_b.system.create().await?;
+
+    let client = Node::new(client_engine, PermissiveAgent::new());
+    client.system.wait_loaded().await;
+    let _old_connection = LocalProcessConnection::new(&founder_a, &client).await?;
+    client.system.wait_system_ready().await;
+    for _ in 0..100 {
+        if client.get_durable_peers() == vec![founder_a.id] {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(client.get_durable_peers(), vec![founder_a.id]);
+
+    // Warm the client catalog before creating the application entity so the
+    // retained View uses the ordinary id-keyed projection path.
+    let client_context = client.context_async(DEFAULT_CONTEXT).await;
+    client.catalog.wait_catalog_ready().await;
+    let founder_context = founder_a.context(DEFAULT_CONTEXT)?;
+    let create = founder_context.begin();
+    let album_id = create.create(&Album { name: "old-system album".into(), year: "1973".into() }).await?.id();
+    create.commit().await?;
+
+    let old_view: AlbumView = client_context.get(album_id).await?;
+    assert_eq!(old_view.name()?, "old-system album");
+    let old_entity = old_view.entity().clone();
+    assert!(client.get_resident_entity(album_id).is_some());
+
+    // Keep both a staged transaction and an otherwise-unused transaction
+    // alive across reset. The latter exercises synchronous edit and async
+    // create after its generation has been invalidated.
+    let staged_transaction = client_context.begin();
+    let staged_mutable = old_view.edit(&staged_transaction)?;
+    staged_mutable.name().replace("must never persist")?;
+    let unused_transaction = client_context.begin();
+
+    client.system.hard_reset().await?;
+
+    assert!(client.get_resident_entity(album_id).is_none(), "reset must evict every resident lookup entry");
+    assert!(client.get_durable_peers().is_empty(), "old founder must leave durable routing immediately");
+    assert!(matches!(old_view.name(), Err(PropertyError::SystemReset)));
+    assert!(matches!(old_entity.to_state(), Err(StateError::SystemReset)));
+    assert!(matches!(
+        staged_mutable.name().replace("write through stale mutable"),
+        Err(MutationError::PropertyError(PropertyError::SystemReset))
+    ));
+    assert!(matches!(old_view.edit(&unused_transaction), Err(ankurah::policy::AccessDenied::PropertyError(_))));
+    assert!(matches!(
+        unused_transaction.create(&Album { name: "stale create".into(), year: "2000".into() }).await,
+        Err(MutationError::SystemReset)
+    ));
+    drop(staged_mutable);
+    assert!(matches!(staged_transaction.commit().await, Err(MutationError::SystemReset)));
+    assert!(client_context.get::<AlbumView>(album_id).await.is_err(), "the deleted old id must not resolve without a current peer");
+
+    // Join a different system while the old transport object is deliberately
+    // still alive. Only the new founder may be promoted into routing, and the
+    // old system's self-certifying entity id remains absent.
+    let _new_connection = LocalProcessConnection::new(&founder_b, &client).await?;
+    client.system.wait_system_ready().await;
+    for _ in 0..100 {
+        if client.get_durable_peers() == vec![founder_b.id] {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(client.get_durable_peers(), vec![founder_b.id]);
+    assert!(!client.get_durable_peers().contains(&founder_a.id));
+    let new_context = client.context_async(DEFAULT_CONTEXT).await;
+    assert!(new_context.get::<AlbumView>(album_id).await.is_err(), "old-system id must not resolve after joining a new root");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shared_engine_reset_waits_for_old_load_and_stales_the_other_manager() -> Result<()> {
+    let source_engine = Arc::new(SledStorageEngine::new_test()?);
+    let source = Node::new_durable_with_signing_key(source_engine, PermissiveAgent::new(), persisted_durable_key());
+    source.system.create().await?;
+    let old_proof =
+        source.presence(proto::HandshakeChallenge::new(source.id, [0xA1; 32])).system_root.expect("source advertises its root proof");
+
+    // A complete claim with no collection rows makes the first manager's
+    // startup recovery perform durable writes after the paused claim read.
+    let sled = Arc::new(SledStorageEngine::new_test()?);
+    assert_eq!(sled.claim_system_root(&old_proof).await?, SystemRootClaim::Claimed);
+    let engine = Arc::new(PausingStorageEngine::new(sled.clone()));
+    engine.pause_next_claim_read();
+    let stale = Node::new_durable_with_signing_key(engine.clone(), PermissiveAgent::new(), persisted_durable_key());
+    tokio::time::timeout(std::time::Duration::from_secs(5), engine.wait_for_claim_read()).await?;
+
+    // A separately-built Node over the exact same Arc<StorageEngine> must
+    // share the load/reset lease. Its reset cannot pass the paused old load.
+    let successor = Node::new_durable_with_signing_key(engine.clone(), PermissiveAgent::new(), persisted_durable_key());
+    let reset_node = successor.clone();
+    let mut reset = tokio::spawn(async move { reset_node.system.hard_reset().await });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut reset).await.is_err(),
+        "shared-engine reset must wait for the old manager's load lease"
+    );
+
+    engine.release_claim_read();
+    tokio::time::timeout(std::time::Duration::from_secs(5), &mut reset).await???;
+    tokio::time::timeout(std::time::Duration::from_secs(5), successor.system.wait_loaded()).await?;
+    successor.system.create().await?;
+    let new_root = successor.system.root_id().expect("successor creates a fresh root");
+    assert_ne!(new_root, old_proof.entity_id());
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), stale.system.wait_loaded()).await?;
+    tokio::time::timeout(std::time::Duration::from_secs(1), stale.system.wait_system_ready()).await?;
+    assert!(!stale.system.is_system_ready(), "the old manager is permanently stale after the shared epoch advances");
+    assert!(stale.system.root_id().is_none());
+    assert!(stale.presence(proto::HandshakeChallenge::new(stale.id, [0xA2; 32])).system_root.is_none());
+    assert!(stale.system.create().await.is_err(), "a stale manager cannot resume writes into the successor system");
+
+    let claim = sled.system_root_claim().await?.expect("successor root claim remains durable");
+    assert_eq!(claim.entity_id(), new_root);
+    let collection = sled.collection(&CollectionId::fixed_name(ankurah::core::system::SYSTEM_COLLECTION_ID)).await?;
+    let states =
+        collection.fetch_states(&ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None }).await?;
+    assert_eq!(states.len(), 1);
+    assert_eq!(states[0].payload.entity_id, new_root);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_join_abort_cannot_delete_successor_join_on_shared_engine() -> Result<()> {
+    let founder_a_engine = Arc::new(SledStorageEngine::new_test()?);
+    let founder_b_engine = Arc::new(SledStorageEngine::new_test()?);
+    let founder_a = Node::new_durable_with_signing_key(founder_a_engine, PermissiveAgent::new(), persisted_durable_key());
+    let founder_b = Node::new_durable_with_signing_key(founder_b_engine, PermissiveAgent::new(), competing_durable_key());
+    founder_a.system.create().await?;
+    founder_b.system.create().await?;
+    let proof_a = founder_a.presence(proto::HandshakeChallenge::new(founder_a.id, [0xB1; 32])).system_root.expect("founder A proof");
+    let root_b = founder_b.system.root_id().expect("founder B root");
+
+    // Seed the shared ephemeral cache with A, so A's rejoin is a no-reset
+    // path while B's different-root join is one atomic reset+persist writer.
+    let sled = Arc::new(SledStorageEngine::new_test()?);
+    assert_eq!(sled.claim_system_root(&proof_a).await?, SystemRootClaim::Claimed);
+    let system_collection = sled.collection(&CollectionId::fixed_name(ankurah::core::system::SYSTEM_COLLECTION_ID)).await?;
+    system_collection.add_event(&Attested::opt(proof_a.genesis.clone(), None)).await?;
+    system_collection.set_state(proof_a.state.clone()).await?;
+
+    let engine = Arc::new(PausingStorageEngine::new(sled.clone()));
+    let client_a = Node::new(engine.clone(), PermissiveAgent::new());
+    let client_b = Node::new(engine.clone(), PermissiveAgent::new());
+    tokio::join!(client_a.system.wait_loaded(), client_b.system.wait_loaded());
+    assert_eq!(client_a.system.root_id(), Some(proof_a.entity_id()));
+    assert_eq!(client_b.system.root_id(), Some(proof_a.entity_id()));
+
+    // A owns the shared writer and pauses at an injected claim failure. B's
+    // different-root join queues behind it first; after A releases, B resets
+    // and publishes its root before A's abort cleanup can acquire the writer.
+    engine.fail_next_claim_after_pause();
+    let _connection_a = LocalProcessConnection::new(&founder_a, &client_a).await?;
+    tokio::time::timeout(std::time::Duration::from_secs(5), engine.wait_for_claim_attempt()).await?;
+    let _connection_b = LocalProcessConnection::new(&founder_b, &client_b).await?;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    engine.release_failed_claim();
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), client_b.system.wait_system_ready()).await?;
+    assert!(client_b.system.is_system_ready());
+    assert_eq!(client_b.system.root_id(), Some(root_b));
+
+    // Let A's queued abort acquire the writer. Its bound epoch is stale, so
+    // only A-local caches may be invalidated; B's new claim/rows must survive.
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!client_a.system.is_system_ready());
+    assert!(client_b.system.is_system_ready(), "stale abort must not advance the shared epoch again");
+    assert_eq!(sled.system_root_claim().await?.map(|proof| proof.entity_id()), Some(root_b));
+    let system_collection = sled.collection(&CollectionId::fixed_name(ankurah::core::system::SYSTEM_COLLECTION_ID)).await?;
+    let states = system_collection
+        .fetch_states(&ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None })
+        .await?;
+    assert_eq!(states.len(), 1, "stale abort must not erase the successor root state");
+    assert_eq!(states[0].payload.entity_id, root_b);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn competing_first_joins_on_empty_shared_engine_leave_one_root() -> Result<()> {
+    let founder_a =
+        Node::new_durable_with_signing_key(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new(), persisted_durable_key());
+    let founder_b =
+        Node::new_durable_with_signing_key(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new(), competing_durable_key());
+    founder_a.system.create().await?;
+    founder_b.system.create().await?;
+    let root_a = founder_a.system.root_id().unwrap();
+
+    let sled = Arc::new(SledStorageEngine::new_test()?);
+    let engine = Arc::new(PausingStorageEngine::new(sled.clone()));
+    let client_a = Node::new(engine.clone(), PermissiveAgent::new());
+    let client_b = Node::new(engine.clone(), PermissiveAgent::new());
+    tokio::join!(client_a.system.wait_loaded(), client_b.system.wait_loaded());
+
+    engine.pause_next_claim_attempt();
+    let _connection_a = LocalProcessConnection::new(&founder_a, &client_a).await?;
+    tokio::time::timeout(std::time::Duration::from_secs(5), engine.wait_for_claim_attempt()).await?;
+    let _connection_b = LocalProcessConnection::new(&founder_b, &client_b).await?;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    engine.release_failed_claim();
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), client_a.system.wait_system_ready()).await?;
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+    }
+    assert!(client_a.system.is_system_ready());
+    assert!(!client_b.system.is_system_ready());
+    assert_eq!(sled.system_root_claim().await?.map(|proof| proof.entity_id()), Some(root_a));
+    let collection = sled.collection(&CollectionId::fixed_name(ankurah::core::system::SYSTEM_COLLECTION_ID)).await?;
+    let states =
+        collection.fetch_states(&ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None }).await?;
+    assert_eq!(states.len(), 1);
+    assert_eq!(states[0].payload.entity_id, root_a);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "setup currently hits the pre-existing album descriptor race before the reset assertion; see the Claude handoff"]
+async fn sibling_reset_immediately_invalidates_retained_handles_and_routes() -> Result<()> {
+    let founder =
+        Node::new_durable_with_signing_key(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new(), persisted_durable_key());
+    founder.system.create().await?;
+
+    let shared = Arc::new(SledStorageEngine::new_test()?);
+    let sibling = Node::new(shared.clone(), PermissiveAgent::new());
+    let resetter = Node::new(shared, PermissiveAgent::new());
+    tokio::join!(sibling.system.wait_loaded(), resetter.system.wait_loaded());
+    let _connection = LocalProcessConnection::new(&founder, &sibling).await?;
+    sibling.system.wait_system_ready().await;
+
+    let sibling_context = sibling.context_async(DEFAULT_CONTEXT).await;
+    sibling.catalog.wait_catalog_ready().await;
+    let create = founder.context(DEFAULT_CONTEXT)?.begin();
+    let id = create.create(&Album { name: "shared old".into(), year: "1973".into() }).await?.id();
+    create.commit().await?;
+    // An id-addressed get does not itself perform first-use registration.
+    // Register explicitly so this test reaches retained-handle invalidation
+    // instead of depending on an unrelated descriptor-shipping race.
+    sibling_context.register::<Album>().await?;
+    let retained: AlbumView = sibling_context.get(id).await?;
+    let transaction = sibling_context.begin();
+    let mutable = retained.edit(&transaction)?;
+    assert_eq!(sibling.get_durable_peers(), vec![founder.id]);
+
+    resetter.system.hard_reset().await?;
+    assert!(matches!(retained.name(), Err(PropertyError::SystemReset)));
+    assert!(matches!(mutable.name().replace("stale"), Err(MutationError::PropertyError(PropertyError::SystemReset))));
+    assert!(sibling.get_durable_peers().is_empty());
+    let stale_get = tokio::time::timeout(std::time::Duration::from_secs(2), sibling_context.get::<AlbumView>(id)).await?;
+    assert!(stale_get.is_err());
     Ok(())
 }

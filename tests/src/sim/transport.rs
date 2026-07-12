@@ -16,7 +16,10 @@
 
 use ankurah::core::connector::{PeerSender, SendError};
 use ankurah::proto;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 
 /// A message a node emitted, tagged with the logical index of its sender.
 /// (`NodeMessage` already carries the logical-free routing ids; the harness
@@ -49,18 +52,26 @@ pub struct SimSender {
     /// The recipient's real node id, required by the `PeerSender` contract.
     recipient: proto::NodeId,
     captured: Captured,
+    closed: Arc<AtomicBool>,
 }
 
 impl SimSender {
-    pub fn new(src: usize, recipient: proto::NodeId, captured: Captured) -> Self { Self { src, recipient, captured } }
+    pub fn new(src: usize, recipient: proto::NodeId, captured: Captured) -> Self {
+        Self { src, recipient, captured, closed: Arc::new(AtomicBool::new(false)) }
+    }
 }
 
 #[async_trait::async_trait]
 impl PeerSender for SimSender {
     fn send_message(&self, message: proto::SignedPeerMessage) -> Result<(), SendError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(SendError::ConnectionClosed);
+        }
         self.captured.push(Outbound { src: self.src, message });
         Ok(())
     }
+
+    fn close(&self) { self.closed.store(true, Ordering::Release); }
 
     fn recipient_node_id(&self) -> proto::NodeId { self.recipient }
 
@@ -166,12 +177,12 @@ fn update_item_descriptor(item: &proto::SubscriptionUpdateItem) -> String {
     let entity = item.entity_id;
     let kind = match &item.content {
         proto::UpdateContent::EventOnly(fragments) => format!("eventonly:{}", fragment_ids(entity, fragments)),
-        proto::UpdateContent::StateAndEvent(state, fragments) => {
+        proto::UpdateContent::StateAndEvent(proof, fragments) => {
             // The state fragment's head clock identifies the snapshot content
             // deterministically (state buffers are a BTreeMap, the head is
             // sorted), so hashing the head plus the event ids distinguishes two
             // batches that differ only in payload.
-            format!("stateandevent:head={}:{}", state.state.head.to_base64_short(), fragment_ids(entity, fragments))
+            format!("stateandevent:head={}:{}", proof.state.payload.state.head.to_base64_short(), fragment_ids(entity, fragments))
         }
     };
     format!("{}/{}", entity.to_base64_short(), kind)
