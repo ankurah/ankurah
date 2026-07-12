@@ -616,12 +616,16 @@ async fn hard_reset_invalidates_old_handles_transactions_and_peer_routes() -> Re
     // old system's self-certifying entity id remains absent.
     let _new_connection = LocalProcessConnection::new(&founder_b, &client).await?;
     client.system.wait_system_ready().await;
-    for _ in 0..100 {
-        if client.get_durable_peers() == vec![founder_b.id] {
-            break;
+    // Durable promotion runs in the register task after readiness is
+    // published; readiness does not imply routes yet. Bound the wait by time,
+    // not by scheduler-dependent yield counts.
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while client.get_durable_peers() != vec![founder_b.id] {
+            tokio::task::yield_now().await;
         }
-        tokio::task::yield_now().await;
-    }
+    })
+    .await
+    .expect("the new founder must be promoted into durable routing");
     assert_eq!(client.get_durable_peers(), vec![founder_b.id]);
     assert!(!client.get_durable_peers().contains(&founder_a.id));
     let new_context = client.context_async(DEFAULT_CONTEXT).await;
