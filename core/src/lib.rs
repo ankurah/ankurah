@@ -32,6 +32,7 @@ pub mod resultset;
 pub mod retrieval;
 pub mod selection;
 pub mod storage;
+pub(crate) mod storage_fence;
 pub mod system;
 pub mod task;
 pub mod transaction;

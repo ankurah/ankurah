@@ -1,9 +1,6 @@
 use std::{
     collections::{btree_map::Entry, BTreeMap},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex, OnceLock, Weak,
-    },
+    sync::{atomic::Ordering, Arc},
 };
 
 use ankurah_proto::{CollectionId, SystemRootProof};
@@ -12,6 +9,7 @@ use tokio::sync::RwLock;
 use crate::{
     error::{MutationError, RetrievalError},
     storage::{StorageCollectionWrapper, StorageEngine, SystemRootClaim},
+    storage_fence::{shared_storage_fence, StorageFence},
 };
 
 pub struct CollectionSet<SE>(Arc<Inner<SE>>);
@@ -24,46 +22,6 @@ pub struct Inner<SE> {
     storage_engine: Arc<SE>,
     collections: RwLock<BTreeMap<CollectionId, StorageCollectionWrapper>>,
     storage_fence: Arc<StorageFence>,
-}
-
-/// Process-wide lease shared by every Node constructed from the exact same
-/// `Arc<StorageEngine>`. A SystemManager-local lock cannot protect an engine
-/// shared by two independently-built Nodes: one node's paused load could
-/// otherwise resume after another node reset the engine and recreate old-root
-/// rows. The weak registry preserves backend generality and cannot alias a
-/// reused allocation address while the prior engine/fence is still alive.
-/// A sibling Node's synchronous teardown callback (see
-/// [`CollectionSet::set_epoch_participant`]).
-type EpochParticipant = dyn Fn() + Send + Sync;
-
-struct StorageFence {
-    gate: Arc<tokio::sync::RwLock<()>>,
-    epoch: AtomicU64,
-    generation: std::sync::RwLock<Arc<std::sync::atomic::AtomicBool>>,
-    epoch_changed: Arc<tokio::sync::Notify>,
-    /// Per-Node teardown callbacks, keyed by the registering CollectionSet's
-    /// identity so an advancing manager can skip its own entry (its own
-    /// teardown runs inside its invalidation, with the reservation
-    /// exemption). Entries are weak: a dropped Node just disappears.
-    participants: Mutex<Vec<(usize, Weak<EpochParticipant>)>>,
-}
-
-fn shared_storage_fence<SE>(storage_engine: &Arc<SE>) -> Arc<StorageFence> {
-    static REGISTRY: OnceLock<Mutex<std::collections::HashMap<usize, Weak<StorageFence>>>> = OnceLock::new();
-    let key = Arc::as_ptr(storage_engine).cast::<()>() as usize;
-    let mut registry = REGISTRY.get_or_init(|| Mutex::new(std::collections::HashMap::new())).lock().unwrap();
-    if let Some(fence) = registry.get(&key).and_then(Weak::upgrade) {
-        return fence;
-    }
-    let fence = Arc::new(StorageFence {
-        gate: Arc::new(tokio::sync::RwLock::new(())),
-        epoch: AtomicU64::new(0),
-        generation: std::sync::RwLock::new(Arc::new(std::sync::atomic::AtomicBool::new(true))),
-        epoch_changed: Arc::new(tokio::sync::Notify::new()),
-        participants: Mutex::new(Vec::new()),
-    });
-    registry.insert(key, Arc::downgrade(&fence));
-    fence
 }
 
 impl<SE: StorageEngine> CollectionSet<SE> {
