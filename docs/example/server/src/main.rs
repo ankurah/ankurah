@@ -10,9 +10,13 @@ use std::sync::Arc;
 async fn main() -> Result<()> {
     let storage_dir = dirs::home_dir().unwrap().join(".ankurah");
     // liaison id=server-example
+    let signing_key = ankurah::core::node_key::load_or_create_signing_key(storage_dir.with_extension("node-key"))?;
     let storage = SledStorageEngine::with_path(storage_dir)?;
-    let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
-    node.system.create().await?;
+    let node = Node::new_durable_with_signing_key(Arc::new(storage), PermissiveAgent::new(), signing_key);
+    node.system.wait_loaded().await;
+    if node.system.root().is_none() {
+        node.system.create().await?;
+    }
 
     let mut server = WebsocketServer::new(node);
     println!("Running server...");

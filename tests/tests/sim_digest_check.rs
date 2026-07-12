@@ -13,28 +13,31 @@ use ankurah_tests::sim::transport::message_digest;
 
 fn event_only_message(entity: proto::EntityId, ev: Attested<proto::Event>) -> proto::NodeMessage {
     let frag: proto::EventFragment = ev.into();
+    let node = proto::NodeId::from_bytes([0x42; 32]);
     proto::NodeMessage::Update(proto::NodeUpdate {
         id: proto::UpdateId::new(),
-        from: entity,
-        to: entity,
+        from: node,
+        to: node,
         body: proto::NodeUpdateBody::SubscriptionUpdate {
             items: vec![proto::SubscriptionUpdateItem {
                 entity_id: entity,
-                collection: model::sim_collection(),
+                model: model::sim_model_id(),
                 content: proto::UpdateContent::EventOnly(vec![frag]),
                 predicate_relevance: vec![],
             }],
         },
+        schema: vec![],
     })
 }
 
 #[test]
 fn digest_distinguishes_different_eventonly_batches_same_count() {
     let e = model::entity_id(1);
+    let parent = proto::Clock::from(vec![proto::EventId::from_bytes([0x11; 32])]);
     // Two different single-event EventOnly updates for the same entity: same
     // shape and cardinality, different content.
-    let d1 = message_digest(&event_only_message(e, model::attest(model::genesis_event(e, model::Field::Title, "one"))));
-    let d2 = message_digest(&event_only_message(e, model::attest(model::genesis_event(e, model::Field::Title, "two"))));
+    let d1 = message_digest(&event_only_message(e, model::attest(model::edit_event(e, parent.clone(), model::Field::Title, "one"))));
+    let d2 = message_digest(&event_only_message(e, model::attest(model::edit_event(e, parent, model::Field::Title, "two"))));
     assert_ne!(d1, d2, "different EventOnly batches for one entity must have different digests");
 }
 
@@ -42,7 +45,8 @@ fn digest_distinguishes_different_eventonly_batches_same_count() {
 fn digest_is_stable_for_identical_content() {
     // The other half of the property: equal content must hash equal.
     let e = model::entity_id(2);
-    let d1 = message_digest(&event_only_message(e, model::attest(model::genesis_event(e, model::Field::Title, "same"))));
-    let d2 = message_digest(&event_only_message(e, model::attest(model::genesis_event(e, model::Field::Title, "same"))));
+    let parent = proto::Clock::from(vec![proto::EventId::from_bytes([0x22; 32])]);
+    let d1 = message_digest(&event_only_message(e, model::attest(model::edit_event(e, parent.clone(), model::Field::Title, "same"))));
+    let d2 = message_digest(&event_only_message(e, model::attest(model::edit_event(e, parent, model::Field::Title, "same"))));
     assert_eq!(d1, d2, "identical content must produce identical digests");
 }

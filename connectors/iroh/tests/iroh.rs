@@ -1,9 +1,12 @@
 use ankurah::{changes::ChangeSet, policy::DEFAULT_CONTEXT as c, Model, Node, PermissiveAgent};
-use ankurah_connector_iroh::{IrohClient, IrohServer};
+use ankurah_connector_iroh::{endpoint_secret_key, IrohClient, IrohServer};
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{atomic::AtomicU64, atomic::Ordering, Arc},
+    time::Duration,
+};
 
 #[derive(Model, Debug, Serialize, Deserialize)]
 pub struct Album {
@@ -14,9 +17,30 @@ pub struct Album {
 /// Bind a localhost-only iroh endpoint: no relays, no address lookup services.
 /// `presets::Minimal` sets only the mandatory crypto provider and leaves
 /// relaying disabled, so tests never touch external infrastructure.
-async fn bind_local_endpoint() -> Result<iroh::Endpoint> {
-    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal).clear_ip_transports().bind_addr("127.0.0.1:0")?.bind().await?;
+async fn bind_local_endpoint(key: &ed25519_dalek::SigningKey) -> Result<iroh::Endpoint> {
+    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .secret_key(endpoint_secret_key(key))
+        .clear_ip_transports()
+        .bind_addr("127.0.0.1:0")?
+        .bind()
+        .await?;
     Ok(endpoint)
+}
+
+static NEXT_KEY: AtomicU64 = AtomicU64::new(1);
+
+fn test_node(durable: bool) -> Result<(Node<SledStorageEngine, PermissiveAgent>, ed25519_dalek::SigningKey)> {
+    let counter = NEXT_KEY.fetch_add(1, Ordering::Relaxed);
+    let mut seed = [0u8; 32];
+    seed[..8].copy_from_slice(&counter.to_le_bytes());
+    let key = ed25519_dalek::SigningKey::from_bytes(&seed);
+    let engine = Arc::new(SledStorageEngine::new_test()?);
+    let node = if durable {
+        Node::new_durable_with_signing_key(engine, PermissiveAgent::new(), key.clone())
+    } else {
+        Node::new_with_signing_key(engine, PermissiveAgent::new(), key.clone())
+    };
+    Ok((node, key))
 }
 
 /// EndpointAddr for dialing `endpoint` by its direct socket addresses only.
@@ -40,6 +64,41 @@ async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) -> Result<(
 
 fn names(resultset: Vec<AlbumView>) -> Vec<String> { resultset.iter().map(|r| r.name().unwrap()).collect::<Vec<String>>() }
 
+#[tokio::test]
+async fn endpoint_identity_matches_node_identity() -> Result<()> {
+    let (node, key) = test_node(false)?;
+    let endpoint = bind_local_endpoint(&key).await?;
+    assert_eq!(node.id.as_bytes(), endpoint.id().as_bytes());
+    endpoint.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn constructors_reject_local_endpoint_identity_mismatch() -> Result<()> {
+    let (node, _node_key) = test_node(false)?;
+    let (_other_node, other_key) = test_node(false)?;
+    let endpoint = bind_local_endpoint(&other_key).await?;
+    let rejected_endpoint = endpoint.clone();
+    let server_error = match IrohServer::new(node.clone(), endpoint) {
+        Ok(_) => anyhow::bail!("server accepted a mismatched local endpoint identity"),
+        Err(error) => error,
+    };
+    assert!(server_error.to_string().contains("does not match Ankurah node identity"));
+    rejected_endpoint.close().await;
+
+    let remote_key = ed25519_dalek::SigningKey::from_bytes(&[0xA5; 32]);
+    let remote = bind_local_endpoint(&remote_key).await?;
+    let local = bind_local_endpoint(&other_key).await?;
+    let client_error = match IrohClient::new(node, local.clone(), direct_addr(&remote)).await {
+        Ok(_) => anyhow::bail!("client accepted a mismatched local endpoint identity"),
+        Err(error) => error,
+    };
+    assert!(client_error.to_string().contains("does not match Ankurah node identity"));
+    local.close().await;
+    remote.close().await;
+    Ok(())
+}
+
 /// A durable node accepts, an ephemeral node dials; data created on the durable
 /// node is fetchable from the ephemeral node over the iroh connection.
 #[tokio::test]
@@ -47,9 +106,9 @@ async fn iroh_fetch() -> Result<()> {
     let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
 
     // Durable node with real storage on the accepting side
-    let server_node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    let (server_node, server_key) = test_node(true)?;
     server_node.system.create().await?;
-    let server = IrohServer::new(server_node.clone(), bind_local_endpoint().await?);
+    let server = IrohServer::new(server_node.clone(), bind_local_endpoint(&server_key).await?)?;
 
     // Create some data on the server
     let server_ctx = server_node.context(c)?;
@@ -62,8 +121,8 @@ async fn iroh_fetch() -> Result<()> {
     }
 
     // Ephemeral node dials
-    let client_node = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
-    let client = IrohClient::new(client_node.clone(), bind_local_endpoint().await?, direct_addr(server.endpoint())).await?;
+    let (client_node, client_key) = test_node(false)?;
+    let client = IrohClient::new(client_node.clone(), bind_local_endpoint(&client_key).await?, direct_addr(server.endpoint())).await?;
     client.wait_connected().await?;
     assert_eq!(client.server_node_id(), Some(server_node.id));
 
@@ -99,12 +158,12 @@ async fn shutdown_client(client: IrohClient<SledStorageEngine, PermissiveAgent>)
 /// its first poll. A current-thread runtime makes that ordering deterministic.
 #[tokio::test(flavor = "current_thread")]
 async fn iroh_immediate_client_shutdown_completes() -> Result<()> {
-    let server_node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    let (server_node, server_key) = test_node(true)?;
     server_node.system.create().await?;
-    let server = IrohServer::new(server_node, bind_local_endpoint().await?);
+    let server = IrohServer::new(server_node, bind_local_endpoint(&server_key).await?)?;
 
-    let client_node = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
-    let client = IrohClient::new(client_node, bind_local_endpoint().await?, direct_addr(server.endpoint())).await?;
+    let (client_node, client_key) = test_node(false)?;
+    let client = IrohClient::new(client_node, bind_local_endpoint(&client_key).await?, direct_addr(server.endpoint())).await?;
 
     tokio::time::timeout(Duration::from_secs(2), shutdown_client(client))
         .await
@@ -117,13 +176,14 @@ async fn iroh_immediate_client_shutdown_completes() -> Result<()> {
 /// returning, rather than merely closing the remote transport.
 #[tokio::test]
 async fn iroh_client_shutdown_deregisters_local_peer() -> Result<()> {
-    let server_node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    let (server_node, server_key) = test_node(true)?;
     server_node.system.create().await?;
-    let server = IrohServer::new(server_node.clone(), bind_local_endpoint().await?);
+    let server = IrohServer::new(server_node.clone(), bind_local_endpoint(&server_key).await?)?;
 
-    let client_node = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
-    let client = IrohClient::new(client_node.clone(), bind_local_endpoint().await?, direct_addr(server.endpoint())).await?;
+    let (client_node, client_key) = test_node(false)?;
+    let client = IrohClient::new(client_node.clone(), bind_local_endpoint(&client_key).await?, direct_addr(server.endpoint())).await?;
     client.wait_connected().await?;
+    client_node.system.wait_system_ready().await;
     assert_eq!(client_node.get_durable_peers(), vec![server_node.id]);
 
     shutdown_client(client).await?;
@@ -137,13 +197,14 @@ async fn iroh_client_shutdown_deregisters_local_peer() -> Result<()> {
 /// owned by a cancellation-safe guard inside the connection future.
 #[tokio::test]
 async fn iroh_client_drop_deregisters_local_peer() -> Result<()> {
-    let server_node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    let (server_node, server_key) = test_node(true)?;
     server_node.system.create().await?;
-    let server = IrohServer::new(server_node.clone(), bind_local_endpoint().await?);
+    let server = IrohServer::new(server_node.clone(), bind_local_endpoint(&server_key).await?)?;
 
-    let client_node = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
-    let client = IrohClient::new(client_node.clone(), bind_local_endpoint().await?, direct_addr(server.endpoint())).await?;
+    let (client_node, client_key) = test_node(false)?;
+    let client = IrohClient::new(client_node.clone(), bind_local_endpoint(&client_key).await?, direct_addr(server.endpoint())).await?;
     client.wait_connected().await?;
+    client_node.system.wait_system_ready().await;
     assert_eq!(client_node.get_durable_peers(), vec![server_node.id]);
 
     let endpoint = client.endpoint().clone();
@@ -160,12 +221,12 @@ async fn iroh_client_drop_deregisters_local_peer() -> Result<()> {
 /// cleaned up even though normal code after the connection pump is not polled.
 #[tokio::test]
 async fn iroh_server_shutdown_deregisters_local_peer() -> Result<()> {
-    let server_node = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
-    let server = IrohServer::new(server_node.clone(), bind_local_endpoint().await?);
+    let (server_node, server_key) = test_node(false)?;
+    let server = IrohServer::new(server_node.clone(), bind_local_endpoint(&server_key).await?)?;
 
-    let client_node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    let (client_node, client_key) = test_node(true)?;
     client_node.system.create().await?;
-    let client = IrohClient::new(client_node.clone(), bind_local_endpoint().await?, direct_addr(server.endpoint())).await?;
+    let client = IrohClient::new(client_node.clone(), bind_local_endpoint(&client_key).await?, direct_addr(server.endpoint())).await?;
     client.wait_connected().await?;
 
     let node = server_node.clone();
@@ -182,12 +243,12 @@ async fn iroh_server_shutdown_deregisters_local_peer() -> Result<()> {
 /// normal return path. The registration guard must still clean up the Node.
 #[tokio::test]
 async fn iroh_server_drop_deregisters_local_peer() -> Result<()> {
-    let server_node = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
-    let server = IrohServer::new(server_node.clone(), bind_local_endpoint().await?);
+    let (server_node, server_key) = test_node(false)?;
+    let server = IrohServer::new(server_node.clone(), bind_local_endpoint(&server_key).await?)?;
 
-    let client_node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    let (client_node, client_key) = test_node(true)?;
     client_node.system.create().await?;
-    let client = IrohClient::new(client_node.clone(), bind_local_endpoint().await?, direct_addr(server.endpoint())).await?;
+    let client = IrohClient::new(client_node.clone(), bind_local_endpoint(&client_key).await?, direct_addr(server.endpoint())).await?;
     client.wait_connected().await?;
 
     let node = server_node.clone();
@@ -206,18 +267,18 @@ async fn iroh_server_drop_deregisters_local_peer() -> Result<()> {
 /// a live query on the hub.
 #[tokio::test]
 async fn iroh_two_spokes_propagate_through_durable_hub() -> Result<()> {
-    let hub_node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    let (hub_node, hub_key) = test_node(true)?;
     hub_node.system.create().await?;
-    let hub = IrohServer::new(hub_node, bind_local_endpoint().await?);
+    let hub = IrohServer::new(hub_node, bind_local_endpoint(&hub_key).await?)?;
     let hub_addr = direct_addr(hub.endpoint());
 
-    let writer_node = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
-    let writer = IrohClient::new(writer_node.clone(), bind_local_endpoint().await?, hub_addr.clone()).await?;
+    let (writer_node, writer_key) = test_node(false)?;
+    let writer = IrohClient::new(writer_node.clone(), bind_local_endpoint(&writer_key).await?, hub_addr.clone()).await?;
     writer.wait_connected().await?;
     writer_node.system.wait_system_ready().await;
 
-    let reader_node = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
-    let reader = IrohClient::new(reader_node.clone(), bind_local_endpoint().await?, hub_addr).await?;
+    let (reader_node, reader_key) = test_node(false)?;
+    let reader = IrohClient::new(reader_node.clone(), bind_local_endpoint(&reader_key).await?, hub_addr).await?;
     reader.wait_connected().await?;
     reader_node.system.wait_system_ready().await;
 
@@ -254,12 +315,12 @@ async fn iroh_two_spokes_propagate_through_durable_hub() -> Result<()> {
 async fn iroh_subscription_propagation() -> Result<()> {
     let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
 
-    let server_node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    let (server_node, server_key) = test_node(true)?;
     server_node.system.create().await?;
-    let server = IrohServer::new(server_node.clone(), bind_local_endpoint().await?);
+    let server = IrohServer::new(server_node.clone(), bind_local_endpoint(&server_key).await?)?;
 
-    let client_node = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
-    let client = IrohClient::new(client_node.clone(), bind_local_endpoint().await?, direct_addr(server.endpoint())).await?;
+    let (client_node, client_key) = test_node(false)?;
+    let client = IrohClient::new(client_node.clone(), bind_local_endpoint(&client_key).await?, direct_addr(server.endpoint())).await?;
     client.wait_connected().await?;
     client_node.system.wait_system_ready().await;
 
@@ -315,13 +376,14 @@ async fn iroh_subscription_propagation() -> Result<()> {
 async fn iroh_dialer_deregisters_on_disconnect() -> Result<()> {
     let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
 
-    let server_node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    let (server_node, server_key) = test_node(true)?;
     server_node.system.create().await?;
-    let server = IrohServer::new(server_node.clone(), bind_local_endpoint().await?);
+    let server = IrohServer::new(server_node.clone(), bind_local_endpoint(&server_key).await?)?;
 
-    let client_node = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
-    let client = IrohClient::new(client_node.clone(), bind_local_endpoint().await?, direct_addr(server.endpoint())).await?;
+    let (client_node, client_key) = test_node(false)?;
+    let client = IrohClient::new(client_node.clone(), bind_local_endpoint(&client_key).await?, direct_addr(server.endpoint())).await?;
     client.wait_connected().await?;
+    client_node.system.wait_system_ready().await;
     assert_eq!(client_node.get_durable_peers(), vec![server_node.id]);
 
     // Take the server down; the client's pump exits and deregisters the peer
@@ -342,13 +404,13 @@ async fn iroh_acceptor_deregisters_on_disconnect() -> Result<()> {
     let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
 
     // Ephemeral node accepts
-    let acceptor_node = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
-    let acceptor = IrohServer::new(acceptor_node.clone(), bind_local_endpoint().await?);
+    let (acceptor_node, acceptor_key) = test_node(false)?;
+    let acceptor = IrohServer::new(acceptor_node.clone(), bind_local_endpoint(&acceptor_key).await?)?;
 
     // Durable node dials
-    let dialer_node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    let (dialer_node, dialer_key) = test_node(true)?;
     dialer_node.system.create().await?;
-    let dialer = IrohClient::new(dialer_node.clone(), bind_local_endpoint().await?, direct_addr(acceptor.endpoint())).await?;
+    let dialer = IrohClient::new(dialer_node.clone(), bind_local_endpoint(&dialer_key).await?, direct_addr(acceptor.endpoint())).await?;
     dialer.wait_connected().await?;
 
     // The acceptor registers the durable dialer once it processes the dialer's presence

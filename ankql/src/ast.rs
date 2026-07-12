@@ -1,7 +1,6 @@
 use crate::error::ParseError;
 use crate::selection::sql::generate_selection_sql;
 use serde::{Deserialize, Serialize};
-use ulid::Ulid;
 
 /// Custom serialization for serde_json::Value that stores as bytes.
 /// This is needed because bincode doesn't support deserialize_any.
@@ -25,6 +24,7 @@ mod json_as_bytes {
 pub enum Expr {
     Literal(Literal),
     Path(PathExpr),
+    Identifier(Identifier),
     Predicate(Predicate),
     InfixExpr { left: Box<Expr>, operator: InfixOperator, right: Box<Expr> },
     ExprList(Vec<Expr>), // New variant for handling lists like (1,2,3) in IN clauses
@@ -39,7 +39,9 @@ pub enum Literal {
     F64(f64),
     Bool(bool),
     String(String),
-    EntityId(Ulid),
+    /// A 32-byte entity id (the raw bytes of proto's content-hash
+    /// `EntityId`, which ankql cannot depend on).
+    EntityId([u8; 32]),
     Object(Vec<u8>),
     Binary(Vec<u8>),
     /// JSON value - used for comparisons against JSON property subfields.
@@ -73,6 +75,54 @@ impl std::fmt::Display for PathExpr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.steps.join(".")) }
 }
 
+/// A property reference resolved against the catalog: the property's stable
+/// entity id, its display name, and any JSON sub-path into the property's
+/// value. This is the resolved counterpart of [`PathExpr`], which names a
+/// property by string alone. The parser only ever produces `PathExpr`; an
+/// `Identifier` appears after the resolution pass (in ankurah-core) has
+/// bound that name to an id.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Identifier {
+    /// The property's stable entity id. Held as raw 32-byte content-hash id
+    /// bytes because ankql cannot depend on proto's `EntityId` (same as
+    /// [`Literal::EntityId`]).
+    pub property: [u8; 32],
+    /// The property's display name, used for SQL columns and rendered output.
+    pub name: String,
+    /// JSON sub-path into the property's value; empty for a plain reference.
+    pub subpath: Vec<String>,
+}
+
+impl Identifier {
+    /// The `[name, ..subpath]` steps, the same shape as the [`PathExpr`] this
+    /// was resolved from. Used where an `Identifier` must act like a
+    /// name-addressed path (evaluation and SQL still key on the name).
+    pub fn path_steps(&self) -> Vec<String> {
+        let mut steps = Vec::with_capacity(1 + self.subpath.len());
+        steps.push(self.name.clone());
+        steps.extend(self.subpath.iter().cloned());
+        steps
+    }
+
+    /// The referenced property's name. A sub-path addresses into that
+    /// property's value; it never changes which property is referenced.
+    pub fn property_name(&self) -> &str { &self.name }
+
+    /// True when there is no JSON sub-path: a plain property reference.
+    pub fn is_simple(&self) -> bool { self.subpath.is_empty() }
+}
+
+impl std::fmt::Display for Identifier {
+    /// Renders like [`PathExpr`]: the name, then any sub-path dotted on.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.name)?;
+        for step in &self.subpath {
+            write!(f, ".{}", step)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Selection {
     pub predicate: Predicate,
@@ -84,6 +134,12 @@ pub struct Selection {
 pub struct OrderByItem {
     pub path: PathExpr,
     pub direction: OrderDirection,
+    /// Stable catalog property identity filled by the resolution pass.
+    /// `None` is the parser/raw form and is also used for pseudo-properties
+    /// such as `id`. The display path remains available for SQL generation
+    /// and legacy/name-addressed storage fallbacks.
+    #[serde(default)]
+    pub property: Option<[u8; 32]>,
 }
 
 impl std::fmt::Display for OrderByItem {
@@ -190,6 +246,34 @@ impl Selection {
     }
 }
 
+/// The column an expression addresses, if any. For a `Path` this is the FIRST
+/// step (`licensing` in `licensing.territory` -- the column holding the JSON
+/// value); for an `Identifier`, its `name`. `None` when the expression
+/// addresses no property.
+fn expr_referenced_column(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Path(path) => Some(path.first().to_string()),
+        Expr::Identifier(identifier) => Some(identifier.name.clone()),
+        _ => None,
+    }
+}
+
+/// The property an expression addresses, if any. For a `Path` this is the LAST
+/// step ([`PathExpr::property`]); for an `Identifier`, its `name`. `None` when
+/// the expression addresses no property.
+///
+/// Note the asymmetry on JSON paths: for `licensing.territory`,
+/// [`expr_referenced_column`] returns `licensing` (the column) while this
+/// returns `territory` (the field within it). For an `Identifier` the two
+/// agree, since the property is already resolved to a single `name`.
+fn expr_referenced_property(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Path(path) => Some(path.property()),
+        Expr::Identifier(identifier) => Some(identifier.property_name()),
+        _ => None,
+    }
+}
+
 impl Predicate {
     /// Recursively walk a predicate tree and accumulate results using a closure
     pub fn walk<T, F>(&self, accumulator: T, visitor: &mut F) -> T
@@ -213,10 +297,7 @@ impl Predicate {
             match pred {
                 Predicate::Comparison { left, right, .. } => {
                     for expr in [&**left, &**right] {
-                        if let Expr::Path(path) = expr {
-                            // Use first step for column reference (actual PostgreSQL column name)
-                            // For `licensing.territory`, the column is `licensing`
-                            let col = path.first().to_string();
+                        if let Some(col) = expr_referenced_column(expr) {
                             if !cols.contains(&col) {
                                 cols.push(col);
                             }
@@ -224,8 +305,7 @@ impl Predicate {
                     }
                 }
                 Predicate::IsNull(expr) => {
-                    if let Expr::Path(path) = &**expr {
-                        let col = path.first().to_string();
+                    if let Some(col) = expr_referenced_column(expr) {
                         if !cols.contains(&col) {
                             cols.push(col);
                         }
@@ -241,11 +321,14 @@ impl Predicate {
     pub fn assume_null(&self, columns: &[String]) -> Self {
         match self {
             Predicate::Comparison { left, operator, right } => {
-                // Check if either side is a path whose property is in our null list
-                let has_null_path = match (&**left, &**right) {
-                    (Expr::Path(path), _) | (_, Expr::Path(path)) => columns.contains(&path.property().to_string()),
-                    _ => false,
-                };
+                // Check if either side references a property that is in our null list.
+                // A resolved Identifier references property `name` (the property step
+                // is fixed by the resolution pass; the subpath does NOT change which
+                // property is referenced), mirroring path.property() for a Path.
+                let has_null_path = [&**left, &**right]
+                    .iter()
+                    .filter_map(|expr| expr_referenced_property(expr))
+                    .any(|prop| columns.contains(&prop.to_string()));
 
                 if has_null_path {
                     match operator {
@@ -272,17 +355,11 @@ impl Predicate {
                 }
             }
             Predicate::IsNull(expr) => {
-                // If we're explicitly checking for NULL and the path's property is in our null list,
-                // then this evaluates to true
-                match &**expr {
-                    Expr::Path(path) => {
-                        let is_null = columns.contains(&path.property().to_string());
-                        if is_null {
-                            Predicate::True
-                        } else {
-                            Predicate::IsNull(expr.clone())
-                        }
-                    }
+                // If we're explicitly checking for NULL and the referenced property is in
+                // our null list, then this evaluates to true. Identifier references its
+                // resolved property `name`, mirroring path.property() for a Path.
+                match expr_referenced_property(expr) {
+                    Some(prop) if columns.contains(&prop.to_string()) => Predicate::True,
                     _ => Predicate::IsNull(expr.clone()),
                 }
             }
@@ -392,6 +469,8 @@ impl Expr {
             },
             Expr::Literal(lit) => Ok(Expr::Literal(lit)),
             Expr::Path(path) => Ok(Expr::Path(path)),
+            // A resolved Identifier is a property reference, not a placeholder; pass through.
+            Expr::Identifier(identifier) => Ok(Expr::Identifier(identifier)),
             Expr::Predicate(pred) => Ok(Expr::Predicate(pred.populate_recursive(values)?)),
             Expr::InfixExpr { left, operator, right } => Ok(Expr::InfixExpr {
                 left: Box::new(left.populate_recursive(values)?),
@@ -564,6 +643,128 @@ mod tests {
 
         // Should be unchanged
         assert_eq!(populated, selection.predicate);
+    }
+
+    // -- Identifier (resolved property reference) --
+
+    /// A Selection whose predicate compares a resolved Identifier against a literal.
+    fn identifier_selection(name: &str, subpath: Vec<&str>) -> Selection {
+        Selection {
+            predicate: Predicate::Comparison {
+                left: Box::new(Expr::Identifier(Identifier {
+                    property: [7u8; 32],
+                    name: name.to_string(),
+                    subpath: subpath.into_iter().map(|s| s.to_string()).collect(),
+                })),
+                operator: ComparisonOperator::Equal,
+                right: Box::new(Expr::Literal(Literal::String("US".to_string()))),
+            },
+            order_by: None,
+            limit: None,
+        }
+    }
+
+    /// The equivalent Path-based Selection (steps = [name, ..subpath]) for parity checks.
+    fn path_selection(name: &str, subpath: Vec<&str>) -> Selection {
+        let mut steps = vec![name.to_string()];
+        steps.extend(subpath.into_iter().map(|s| s.to_string()));
+        Selection {
+            predicate: Predicate::Comparison {
+                left: Box::new(Expr::Path(PathExpr { steps })),
+                operator: ComparisonOperator::Equal,
+                right: Box::new(Expr::Literal(Literal::String("US".to_string()))),
+            },
+            order_by: None,
+            limit: None,
+        }
+    }
+
+    #[test]
+    fn identifier_selection_bincode_roundtrip() {
+        // Simple identifier and a JSON-subpath identifier both survive a bincode round-trip.
+        for selection in [identifier_selection("name", vec![]), identifier_selection("licensing", vec!["territory"])] {
+            let bytes = bincode::serialize(&selection).expect("serialize");
+            let decoded: Selection = bincode::deserialize(&bytes).expect("deserialize");
+            assert_eq!(decoded, selection);
+        }
+    }
+
+    #[test]
+    fn resolved_order_by_bincode_roundtrip() {
+        let property = [9u8; 32];
+        let mut selection = identifier_selection("score", vec![]);
+        selection.order_by =
+            Some(vec![OrderByItem { path: PathExpr::simple("score"), direction: OrderDirection::Desc, property: Some(property) }]);
+
+        let bytes = bincode::serialize(&selection).expect("serialize");
+        let decoded: Selection = bincode::deserialize(&bytes).expect("deserialize");
+        assert_eq!(decoded, selection);
+    }
+
+    #[test]
+    fn identifier_selection_json_roundtrip() {
+        for selection in [identifier_selection("name", vec![]), identifier_selection("licensing", vec!["rights", "holder"])] {
+            let json = serde_json::to_string(&selection).expect("to_json");
+            let decoded: Selection = serde_json::from_str(&json).expect("from_json");
+            assert_eq!(decoded, selection);
+        }
+    }
+
+    #[test]
+    fn identifier_assume_null_matches_equivalent_path_simple() {
+        // For a SIMPLE field, assume_null on an Identifier makes the same collapse
+        // decision as the equivalent Path (both key on the single property step).
+        let id_pred = identifier_selection("status", vec![]).predicate;
+        let path_pred = path_selection("status", vec![]).predicate;
+
+        // Nulling the referenced property collapses the comparison to False in both forms.
+        assert_eq!(id_pred.assume_null(&["status".to_string()]), Predicate::False);
+        assert_eq!(path_pred.assume_null(&["status".to_string()]), Predicate::False);
+
+        // Nulling an unrelated property leaves both comparisons intact (unchanged).
+        assert_eq!(id_pred.assume_null(&["unrelated".to_string()]), id_pred);
+        assert_eq!(path_pred.assume_null(&["unrelated".to_string()]), path_pred);
+    }
+
+    #[test]
+    fn identifier_assume_null_keys_on_resolved_property_name() {
+        // An Identifier references property `name`; its subpath does NOT change which
+        // property is referenced. So a JSON-subpath Identifier collapses when `name` is
+        // nulled. This is the whole point of the resolution pass: the property step is
+        // fixed once, resolving the pre-existing Path first-vs-last-step ambiguity
+        // (Path::assume_null keys on the LAST step, so `licensing.territory` there would
+        // instead collapse only when "territory" is nulled).
+        let id_pred = identifier_selection("licensing", vec!["territory"]).predicate;
+
+        // Nulling the resolved property name collapses to False.
+        assert_eq!(id_pred.assume_null(&["licensing".to_string()]), Predicate::False);
+        // Nulling a sub-path step does NOT collapse (the subpath is not the property).
+        assert_eq!(id_pred.assume_null(&["territory".to_string()]), id_pred);
+    }
+
+    #[test]
+    fn identifier_referenced_columns_returns_name() {
+        // referenced_columns keys on the resolved property name, and matches the
+        // column the equivalent Path reports (the first/root step).
+        let id_sel = identifier_selection("licensing", vec!["territory"]);
+        assert_eq!(id_sel.referenced_columns(), vec!["licensing".to_string()]);
+
+        let path_sel = path_selection("licensing", vec!["territory"]);
+        assert_eq!(id_sel.referenced_columns(), path_sel.referenced_columns());
+
+        // A simple identifier reports its name.
+        assert_eq!(identifier_selection("status", vec![]).referenced_columns(), vec!["status".to_string()]);
+    }
+
+    #[test]
+    fn identifier_display_matches_path() {
+        // Display renders name then dotted subpath, consistent with PathExpr.
+        let ident = Identifier { property: [1u8; 32], name: "licensing".to_string(), subpath: vec!["territory".to_string()] };
+        assert_eq!(ident.to_string(), "licensing.territory");
+        assert_eq!(ident.to_string(), PathExpr { steps: vec!["licensing".to_string(), "territory".to_string()] }.to_string());
+
+        let simple = Identifier { property: [1u8; 32], name: "status".to_string(), subpath: vec![] };
+        assert_eq!(simple.to_string(), "status");
     }
 }
 

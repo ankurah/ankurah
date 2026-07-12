@@ -1,8 +1,14 @@
 use crate::error::RetrievalError;
 use crate::schema::CollectionSchema;
 use crate::value::{Value, ValueType};
-use ankql::ast::{Expr, Literal, Predicate};
+use ankql::ast::{Expr, Identifier, Literal, PathExpr, Predicate};
 use anyhow::Result;
+
+/// The parse-time path a resolved Identifier is equivalent to: [name, ..subpath].
+/// Used to look up the field type via `CollectionSchema::field_type`, which is
+/// keyed on `PathExpr`. Phase A: schema lookup remains name-based, so this
+/// mirrors what the equivalent Path would resolve to.
+fn identifier_as_path(identifier: &Identifier) -> PathExpr { PathExpr { steps: identifier.path_steps() } }
 
 /// Cast all literals in a predicate based on field names using a CollectionSchema
 pub fn cast_predicate_types<S: CollectionSchema>(predicate: Predicate, schema: &S) -> Result<Predicate, RetrievalError> {
@@ -10,15 +16,26 @@ pub fn cast_predicate_types<S: CollectionSchema>(predicate: Predicate, schema: &
         Predicate::Comparison { left, operator, right } => {
             // Handle both cases: field = literal AND literal = field
             match (left.as_ref(), right.as_ref()) {
-                // Case 1: field = literal (cast literal to field type)
+                // Case 1: field = literal (cast literal to field type). A resolved
+                // Identifier behaves as the equivalent [name, ..subpath] Path here.
                 (Expr::Path(path), Expr::Literal(literal)) => {
                     let target_type = schema.field_type(path)?;
+                    let cast_literal = cast_literal_to_type(literal.clone(), target_type)?;
+                    Ok(Predicate::Comparison { left, operator, right: Box::new(cast_literal) })
+                }
+                (Expr::Identifier(identifier), Expr::Literal(literal)) => {
+                    let target_type = schema.field_type(&identifier_as_path(identifier))?;
                     let cast_literal = cast_literal_to_type(literal.clone(), target_type)?;
                     Ok(Predicate::Comparison { left, operator, right: Box::new(cast_literal) })
                 }
                 // Case 2: literal = field (cast literal to field type)
                 (Expr::Literal(literal), Expr::Path(path)) => {
                     let target_type = schema.field_type(path)?;
+                    let cast_literal = cast_literal_to_type(literal.clone(), target_type)?;
+                    Ok(Predicate::Comparison { left: Box::new(cast_literal), operator, right })
+                }
+                (Expr::Literal(literal), Expr::Identifier(identifier)) => {
+                    let target_type = schema.field_type(&identifier_as_path(identifier))?;
                     let cast_literal = cast_literal_to_type(literal.clone(), target_type)?;
                     Ok(Predicate::Comparison { left: Box::new(cast_literal), operator, right })
                 }
@@ -47,6 +64,8 @@ fn cast_expr_types<S: CollectionSchema>(expr: Expr, schema: &S) -> Result<Expr, 
     match expr {
         Expr::Literal(literal) => Ok(Expr::Literal(literal)), // Literals are cast in context
         Expr::Path(path) => Ok(Expr::Path(path)),
+        // A resolved Identifier is a property reference; pass through like Path.
+        Expr::Identifier(identifier) => Ok(Expr::Identifier(identifier)),
         Expr::Predicate(predicate) => Ok(Expr::Predicate(cast_predicate_types(predicate, schema)?)),
         Expr::InfixExpr { left, operator, right } => Ok(Expr::InfixExpr {
             left: Box::new(cast_expr_types(*left, schema)?),
@@ -93,7 +112,7 @@ mod tests {
 
     #[test]
     fn test_cast_id_field_string_to_entity_id() {
-        let entity_id = EntityId::new();
+        let entity_id = EntityId::from_bytes([0x11; 32]);
         let base64_str = entity_id.to_base64();
 
         // Create a predicate: id = "base64_string"
@@ -108,8 +127,8 @@ mod tests {
 
         // Verify the string literal was cast to EntityId
         if let Predicate::Comparison { right, .. } = cast_predicate {
-            if let Expr::Literal(Literal::EntityId(ulid)) = *right {
-                assert_eq!(EntityId::from_ulid(ulid), entity_id);
+            if let Expr::Literal(Literal::EntityId(bytes)) = *right {
+                assert_eq!(EntityId::from_bytes(bytes), entity_id);
             } else {
                 panic!("Expected EntityId literal, got {:?}", right);
             }
@@ -120,7 +139,7 @@ mod tests {
 
     #[test]
     fn test_cast_literal_equals_field() {
-        let entity_id = EntityId::new();
+        let entity_id = EntityId::from_bytes([0x22; 32]);
         let base64_str = entity_id.to_base64();
 
         // Create a predicate: "base64_string" = id (literal on left side)
@@ -135,8 +154,8 @@ mod tests {
 
         // Verify the string literal was cast to EntityId
         if let Predicate::Comparison { left, .. } = cast_predicate {
-            if let Expr::Literal(Literal::EntityId(ulid)) = *left {
-                assert_eq!(EntityId::from_ulid(ulid), entity_id);
+            if let Expr::Literal(Literal::EntityId(bytes)) = *left {
+                assert_eq!(EntityId::from_bytes(bytes), entity_id);
             } else {
                 panic!("Expected EntityId literal, got {:?}", left);
             }
@@ -147,7 +166,7 @@ mod tests {
 
     #[test]
     fn test_cast_complex_predicate() {
-        let entity_id = EntityId::new();
+        let entity_id = EntityId::from_bytes([0x33; 32]);
         let base64_str = entity_id.to_base64();
 
         // Create a complex predicate: id = "base64_string" AND name = "test"
@@ -171,8 +190,8 @@ mod tests {
         if let Predicate::And(left_pred, right_pred) = cast_predicate {
             // Check id field was cast to EntityId
             if let Predicate::Comparison { right, .. } = *left_pred {
-                if let Expr::Literal(Literal::EntityId(ulid)) = *right {
-                    assert_eq!(EntityId::from_ulid(ulid), entity_id);
+                if let Expr::Literal(Literal::EntityId(bytes)) = *right {
+                    assert_eq!(EntityId::from_bytes(bytes), entity_id);
                 } else {
                     panic!("Expected EntityId literal for id field");
                 }

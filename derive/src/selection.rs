@@ -313,6 +313,7 @@ fn generate_selection_code_with_replacements(
                 quote! {
                     ::ankql::ast::OrderByItem {
                         path: ::ankql::ast::PathExpr { steps: vec![#(#steps),*] },
+                        property: None,
                         direction: #direction_code,
                     }
                 }
@@ -463,6 +464,13 @@ fn generate_expr_code_with_replacements(
                 ::ankql::ast::Expr::ExprList(vec![#(#expr_codes),*])
             }
         }
+        // The parser never produces a resolved Identifier -- it is the output of a
+        // resolution pass that runs on already-parsed ASTs, not of parse_selection,
+        // which is what feeds this codegen. This arm exists only to keep the match
+        // exhaustive.
+        ankql::ast::Expr::Identifier(_) => {
+            panic!("selection! macro received a resolved Identifier; the parser only produces PathExpr")
+        }
     }
 }
 
@@ -490,9 +498,9 @@ fn generate_literal_code_with_replacements(
         ankql::ast::Literal::I32(i) => {
             quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Literal::I32(#i)) }
         }
-        ankql::ast::Literal::EntityId(ulid) => {
-            let ulid_u128 = ulid.0;
-            quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Literal::EntityId(::ulid::Ulid(#ulid_u128))) }
+        ankql::ast::Literal::EntityId(id) => {
+            let bytes = id.iter();
+            quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Literal::EntityId([#(#bytes),*])) }
         }
         ankql::ast::Literal::Object(_items) => {
             todo!("Object literals");

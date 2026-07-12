@@ -86,6 +86,10 @@ impl fmt::Display for ClientInner {
 }
 
 impl ClientInner {
+    pub(crate) fn is_current_connection(&self, connection: &Connection) -> bool {
+        self.connection.borrow().as_ref().is_some_and(|existing| existing == connection)
+    }
+
     pub(crate) fn handle_state_change(self: &Arc<Self>, connection: &Connection, new_state: ConnectionState) -> bool {
         // we are only interested in state changes for the current connection
         {

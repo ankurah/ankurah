@@ -53,9 +53,9 @@ fn generate_expr_sql(
                 }
                 buffer.push('\'');
             }
-            Literal::EntityId(ulid) => {
+            Literal::EntityId(id) => {
                 buffer.push('\'');
-                buffer.push_str(&general_purpose::URL_SAFE_NO_PAD.encode(ulid.to_bytes()));
+                buffer.push_str(&general_purpose::URL_SAFE_NO_PAD.encode(id));
                 buffer.push('\'');
             }
             Literal::Object(bytes) | Literal::Binary(bytes) => {
@@ -73,6 +73,18 @@ fn generate_expr_sql(
         Expr::Path(path) => {
             // Output each step quoted and dot-separated: "a"."b"."c"
             for (i, step) in path.steps.iter().enumerate() {
+                if i > 0 {
+                    buffer.push('.');
+                }
+                buffer.push('"');
+                buffer.push_str(step);
+                buffer.push('"');
+            }
+        }
+        Expr::Identifier(identifier) => {
+            // Render exactly like the equivalent Path (name, then dotted subpath):
+            // "name"."sub"."path". The resolved name is the SQL column.
+            for (i, step) in identifier.path_steps().iter().enumerate() {
                 if i > 0 {
                     buffer.push('.');
                 }
@@ -135,9 +147,9 @@ fn generate_expr_sql(
                         Literal::Bool(b) => {
                             buffer.push_str(if *b { "true" } else { "false" });
                         }
-                        Literal::EntityId(ulid) => {
+                        Literal::EntityId(id) => {
                             buffer.push('\'');
-                            buffer.push_str(&general_purpose::URL_SAFE_NO_PAD.encode(ulid.to_bytes()));
+                            buffer.push_str(&general_purpose::URL_SAFE_NO_PAD.encode(id));
                             buffer.push('\'');
                         }
                         Literal::Object(_bytes) | Literal::Binary(_bytes) => {

@@ -4,13 +4,13 @@ use ankql::ast::Predicate;
 use ankurah::core::{
     entity::Entity,
     error::ValidationError,
-    node::{Node as NodeInnerAlias, NodeInner, WeakNode},
-    policy::{AccessDenied, DefaultContext, PolicyAgent, DEFAULT_CONTEXT},
+    node::{Node as NodeInnerAlias, NodeInner},
+    policy::{AccessDenied, Admission, DefaultContext, PolicyAgent, DEFAULT_CONTEXT},
     storage::StorageEngine,
     util::Iterable,
 };
 use ankurah::proto::{self, Attested};
-use ankurah::{Model, Mutable, Node};
+use ankurah::{Model, Node};
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -65,32 +65,34 @@ impl PolicyAgent for DenySecondAlbumEventAgent {
         _node: &NodeInnerAlias<SE, Self>,
         _cdata: &Self::ContextData,
         _entity_before: &Entity,
-        _entity_after: &Entity,
-        event: &proto::Event,
-    ) -> Result<Option<proto::Attestation>, AccessDenied> {
-        if event.collection.as_str() == "album" && self.album_checks.fetch_add(1, Ordering::SeqCst) >= 1 {
+        entity_after: &Entity,
+        _event: &proto::Event,
+    ) -> Result<Admission, AccessDenied> {
+        // #330: proto::Event carries a model id, not a collection name; read the
+        // collection from the entity instead (identical for this event).
+        if entity_after.collection().as_str() == "album" && self.album_checks.fetch_add(1, Ordering::SeqCst) >= 1 {
             return Err(AccessDenied::ByPolicy("test agent denies the second album event"));
         }
-        Ok(None)
+        Ok(Admission::Allow)
     }
 
     fn validate_received_event<SE: StorageEngine>(
         &self,
         _node: &NodeInnerAlias<SE, Self>,
-        _from_node: &proto::EntityId,
+        _from_node: &proto::NodeId,
         _event: &proto::Attested<proto::Event>,
     ) -> Result<(), AccessDenied> {
         Ok(())
     }
 
-    fn attest_state<SE: StorageEngine>(&self, _node: &NodeInnerAlias<SE, Self>, _state: &proto::EntityState) -> Option<proto::Attestation> {
-        None
+    fn attest_state<SE: StorageEngine>(&self, _node: &NodeInnerAlias<SE, Self>, _state: &proto::EntityState) -> Admission {
+        Admission::Allow
     }
 
     fn validate_received_state<SE: StorageEngine>(
         &self,
         _node: &NodeInnerAlias<SE, Self>,
-        _from_node: &proto::EntityId,
+        _from_node: &proto::NodeId,
         _state: &Attested<proto::EntityState>,
     ) -> Result<(), AccessDenied> {
         Ok(())
@@ -112,6 +114,7 @@ impl PolicyAgent for DenySecondAlbumEventAgent {
         _id: &proto::EntityId,
         _collection: &proto::CollectionId,
         _state: &proto::State,
+        _resolver: Option<std::sync::Weak<dyn ankurah::core::property::PropertyResolver>>,
     ) -> Result<(), AccessDenied>
     where
         C: Iterable<Self::ContextData>,
@@ -119,8 +122,15 @@ impl PolicyAgent for DenySecondAlbumEventAgent {
         Ok(())
     }
 
-    fn check_read_event<C>(&self, _data: &C, _event: &Attested<proto::Event>) -> Result<(), AccessDenied>
-    where C: Iterable<Self::ContextData> {
+    fn check_read_event<C>(
+        &self,
+        _data: &C,
+        _collection: &proto::CollectionId,
+        _event: &Attested<proto::Event>,
+    ) -> Result<(), AccessDenied>
+    where
+        C: Iterable<Self::ContextData>,
+    {
         Ok(())
     }
 
@@ -129,7 +139,7 @@ impl PolicyAgent for DenySecondAlbumEventAgent {
     fn validate_causal_assertion<SE: StorageEngine>(
         &self,
         _node: &NodeInnerAlias<SE, Self>,
-        _peer_id: &proto::EntityId,
+        _peer_id: &proto::NodeId,
         _assertion: &proto::CausalAssertion,
     ) -> Result<(), AccessDenied> {
         Ok(())

@@ -174,10 +174,24 @@ fn can_pushdown_expr(expr: &Expr) -> bool {
             // Json traversal (pushable) from Ref<T> traversal (not pushable).
             !path.steps.is_empty()
         }
+        // A resolved Identifier is pushdown-capable exactly like the equivalent
+        // Path: it renders as a column (name) with optional JSONB sub-path.
+        Expr::Identifier(_) => true,
         Expr::ExprList(exprs) => exprs.iter().all(can_pushdown_expr),
         Expr::Predicate(_) => false,     // Nested predicates - not supported in SQL expressions
         Expr::InfixExpr { .. } => false, // Not yet supported
         Expr::Placeholder => false,      // Should be replaced before we get here
+    }
+}
+
+/// Whether an expression is a multi-step JSONB traversal (a Path with a sub-path
+/// or a resolved Identifier with a non-empty subpath), which requires ::jsonb
+/// casting of the literal on the other side of a comparison.
+fn expr_is_jsonb_path(expr: &Expr) -> bool {
+    match expr {
+        Expr::Path(p) => !p.is_simple(),
+        Expr::Identifier(identifier) => !identifier.is_simple(),
+        _ => false,
     }
 }
 
@@ -284,30 +298,16 @@ impl SqlBuilder {
                 Literal::Bool(bool) => self.arg(*bool),
                 Literal::I16(i) => self.arg(*i),
                 Literal::I32(i) => self.arg(*i),
-                Literal::EntityId(ulid) => self.arg(EntityId::from_ulid(*ulid).to_base64()),
+                Literal::EntityId(bytes) => self.arg(EntityId::from_bytes(*bytes).to_base64()),
                 Literal::Object(bytes) => self.arg(bytes.clone()),
                 Literal::Binary(bytes) => self.arg(bytes.clone()),
                 Literal::Json(json) => self.arg(json.clone()),
             },
-            Expr::Path(path) => {
-                if path.is_simple() {
-                    // Single-step path: regular column reference "column_name"
-                    let escaped = path.first().replace('"', "\"\"");
-                    self.sql(format!(r#""{}""#, escaped));
-                } else {
-                    // Multi-step path: JSONB traversal "column"->'nested'->'path'
-                    // Use -> for ALL steps to preserve JSONB type for proper comparison semantics.
-                    // The comparison will use ::jsonb cast on literals to ensure type-aware comparison.
-                    let first = path.first().replace('"', "\"\"");
-                    self.sql(format!(r#""{}""#, first));
-
-                    for step in path.steps.iter().skip(1) {
-                        let escaped = step.replace('\'', "''");
-                        // Always use -> to keep as JSONB (not ->> which extracts as text)
-                        self.sql(format!("->'{}'", escaped));
-                    }
-                }
-            }
+            Expr::Path(path) => self.path_steps_sql(&path.steps),
+            // A resolved Identifier renders exactly like the equivalent Path with
+            // steps [name, ..subpath]: a column reference, or a JSONB "column"->'a'->'b'
+            // traversal. Phase A: the resolved name is the postgres column.
+            Expr::Identifier(identifier) => self.path_steps_sql(&identifier.path_steps()),
             Expr::ExprList(exprs) => {
                 self.sql("(");
                 for (i, expr) in exprs.iter().enumerate() {
@@ -323,7 +323,7 @@ impl SqlBuilder {
                             Literal::Bool(bool) => self.arg(*bool),
                             Literal::I16(i) => self.arg(*i),
                             Literal::I32(i) => self.arg(*i),
-                            Literal::EntityId(ulid) => self.arg(EntityId::from_ulid(*ulid).to_base64()),
+                            Literal::EntityId(bytes) => self.arg(EntityId::from_bytes(*bytes).to_base64()),
                             Literal::Object(bytes) => self.arg(bytes.clone()),
                             Literal::Binary(bytes) => self.arg(bytes.clone()),
                             Literal::Json(json) => self.arg(json.clone()),
@@ -340,6 +340,29 @@ impl SqlBuilder {
             _ => return Err(SqlGenerationError::UnsupportedExpression("Only literal, identifier, and list expressions are supported")),
         }
         Ok(())
+    }
+
+    /// Emit a column reference (or JSONB sub-path traversal) for a sequence of path
+    /// steps. Shared by the `Expr::Path` and `Expr::Identifier` arms so both render
+    /// identically.
+    fn path_steps_sql(&mut self, steps: &[String]) {
+        if steps.len() == 1 {
+            // Single-step path: regular column reference "column_name"
+            let escaped = steps[0].replace('"', "\"\"");
+            self.sql(format!(r#""{}""#, escaped));
+        } else {
+            // Multi-step path: JSONB traversal "column"->'nested'->'path'
+            // Use -> for ALL steps to preserve JSONB type for proper comparison semantics.
+            // The comparison will use ::jsonb cast on literals to ensure type-aware comparison.
+            let first = steps[0].replace('"', "\"\"");
+            self.sql(format!(r#""{}""#, first));
+
+            for step in steps.iter().skip(1) {
+                let escaped = step.replace('\'', "''");
+                // Always use -> to keep as JSONB (not ->> which extracts as text)
+                self.sql(format!("->'{}'", escaped));
+            }
+        }
     }
 
     /// Emit a literal expression with ::jsonb cast for proper JSONB comparison semantics.
@@ -390,8 +413,10 @@ impl SqlBuilder {
                 // TODO: Replace path depth heuristic with schema metadata when available.
                 // We infer JSON type from !is_simple(), but with a schema registry we could
                 // look up the actual field type. See phase-3-schema.md for details.
-                let left_is_jsonb = matches!(left.as_ref(), Expr::Path(p) if !p.is_simple());
-                let right_is_jsonb = matches!(right.as_ref(), Expr::Path(p) if !p.is_simple());
+                // A resolved Identifier with a non-empty subpath is a JSONB traversal,
+                // exactly like a multi-step Path.
+                let left_is_jsonb = expr_is_jsonb_path(left.as_ref());
+                let right_is_jsonb = expr_is_jsonb_path(right.as_ref());
 
                 self.expr(left)?;
                 self.sql(" ");
@@ -525,6 +550,28 @@ mod tests {
     }
 
     #[test]
+    fn test_entity_id_literal_uses_43_character_base64url() -> Result<()> {
+        use ankql::ast::{ComparisonOperator, PathExpr};
+
+        let bytes = [7u8; 32];
+        let predicate = Predicate::Comparison {
+            left: Box::new(Expr::Path(PathExpr::simple("id"))),
+            operator: ComparisonOperator::Equal,
+            right: Box::new(Expr::Literal(Literal::EntityId(bytes))),
+        };
+        let mut sql = SqlBuilder::new();
+        sql.predicate(&predicate)?;
+
+        let (sql_string, args) = sql.build_where_clause();
+        let encoded = EntityId::from_bytes(bytes).to_base64();
+        assert_eq!(encoded.len(), 43);
+        assert_eq!(sql_string, r#""id" = $1"#);
+        let expected: Vec<Box<dyn ToSql + Send + Sync>> = vec![Box::new(encoded)];
+        assert_args(&args, &expected);
+        Ok(())
+    }
+
+    #[test]
     fn test_and_condition() -> Result<()> {
         let selection = parse_selection("name = 'Alice' AND age = 30").unwrap();
         let mut sql = SqlBuilder::with_fields(vec!["id", "name", "age"]);
@@ -619,7 +666,7 @@ mod tests {
         let base_selection = ankql::parser::parse_selection("name = 'Alice'").unwrap();
         let selection = Selection {
             predicate: base_selection.predicate,
-            order_by: Some(vec![OrderByItem { path: PathExpr::simple("created_at"), direction: OrderDirection::Desc }]),
+            order_by: Some(vec![OrderByItem { path: PathExpr::simple("created_at"), property: None, direction: OrderDirection::Desc }]),
             limit: None,
         };
 
@@ -658,8 +705,8 @@ mod tests {
         let selection = Selection {
             predicate: base_selection.predicate,
             order_by: Some(vec![
-                OrderByItem { path: PathExpr::simple("priority"), direction: OrderDirection::Desc },
-                OrderByItem { path: PathExpr::simple("created_at"), direction: OrderDirection::Asc },
+                OrderByItem { path: PathExpr::simple("priority"), property: None, direction: OrderDirection::Desc },
+                OrderByItem { path: PathExpr::simple("created_at"), property: None, direction: OrderDirection::Asc },
             ]),
             limit: Some(5),
         };
@@ -791,6 +838,50 @@ mod tests {
 
             assert_eq!(sql_string, r#""data"->'score' >= '95'::jsonb"#);
             Ok(())
+        }
+
+        /// Build the WHERE clause for a single `left = 'US'` comparison predicate.
+        fn where_for(left: Expr) -> String {
+            use ankql::ast::{ComparisonOperator, Literal, Predicate};
+            let predicate = Predicate::Comparison {
+                left: Box::new(left),
+                operator: ComparisonOperator::Equal,
+                right: Box::new(Expr::Literal(Literal::String("US".to_string()))),
+            };
+            let mut sql = SqlBuilder::new();
+            sql.predicate(&predicate).unwrap();
+            sql.build_where_clause().0
+        }
+
+        #[test]
+        fn test_identifier_renders_like_path_simple() {
+            use ankql::ast::Identifier;
+
+            // A simple resolved Identifier renders as the column named `name`, exactly
+            // like the equivalent single-step Path. (The parser never produces Identifier,
+            // so we construct it programmatically.)
+            let id_sql = where_for(Expr::Identifier(Identifier { property: [5u8; 32], name: "status".to_string(), subpath: vec![] }));
+            let path_sql = where_for(Expr::Path(PathExpr::simple("status")));
+
+            assert_eq!(id_sql, r#""status" = $1"#);
+            assert_eq!(id_sql, path_sql);
+        }
+
+        #[test]
+        fn test_identifier_renders_like_path_json_subpath() {
+            use ankql::ast::Identifier;
+
+            // An Identifier with a JSON subpath renders the same "->" traversal and
+            // ::jsonb cast as the equivalent multi-step Path.
+            let id_sql = where_for(Expr::Identifier(Identifier {
+                property: [5u8; 32],
+                name: "licensing".to_string(),
+                subpath: vec!["territory".to_string()],
+            }));
+            let path_sql = where_for(Expr::Path(PathExpr { steps: vec!["licensing".to_string(), "territory".to_string()] }));
+
+            assert_eq!(id_sql, r#""licensing"->'territory' = '"US"'::jsonb"#);
+            assert_eq!(id_sql, path_sql);
         }
     }
 

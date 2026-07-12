@@ -3,7 +3,17 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{auth::Attested, clock::Clock, collection::CollectionId, id::EntityId, AttestationSet, DecodeError};
+use crate::{auth::Attested, clock::Clock, id::EntityId, AttestationSet, DecodeError};
+
+/// Domain tag for genesis event ids (RFC specs/identity-attestation/spec.md
+/// II.3): `genesis id = SHA-256(GENESIS_TAG || bincode(system, nonce,
+/// timestamp, operations))`. The tag separates the two preimage shapes and
+/// versions the scheme.
+pub const GENESIS_TAG: &[u8] = b"ankurah.genesis.v0";
+
+/// Domain tag for update event ids (RFC II.3): `update id =
+/// SHA-256(EVENT_TAG || bincode(entity_id, operations, parent))`.
+pub const EVENT_TAG: &[u8] = b"ankurah.event.v0";
 
 #[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 pub struct EventId([u8; 32]);
@@ -13,13 +23,33 @@ impl std::fmt::Debug for EventId {
 }
 
 impl EventId {
-    /// Generate an EventID from the parts of an Event
-    /// notably, we are not including the collection in the hash because collection is getting excised from identity
-    pub fn from_parts(entity_id: &EntityId, operations: &OperationSet, parent: &Clock) -> Self {
+    /// The id of a genesis event: a domain-tagged hash over the FULL
+    /// distinguishing content of the genesis (RFC II.3). The preimage
+    /// excludes `entity_id` (it is the output: entity id = genesis id),
+    /// excludes the model/collection envelope (attribution, not identity),
+    /// and excludes `parent` (always empty for genesis; the tag plus body
+    /// shape carries that fact). Binding the system id into every non-root
+    /// genesis gives the one-id-one-system invariant a cryptographic
+    /// backstop.
+    pub fn from_genesis_parts(system: &Option<EntityId>, nonce: &[u8; 32], timestamp: u64, operations: &OperationSet) -> Self {
         let mut hasher = Sha256::new();
-        hasher.update(bincode::serialize(&entity_id).unwrap());
-        hasher.update(bincode::serialize(&operations).unwrap());
-        hasher.update(bincode::serialize(&parent).unwrap());
+        hasher.update(GENESIS_TAG);
+        hasher.update(bincode::serialize(system).unwrap());
+        hasher.update(bincode::serialize(nonce).unwrap());
+        hasher.update(bincode::serialize(&timestamp).unwrap());
+        hasher.update(bincode::serialize(operations).unwrap());
+        Self(hasher.finalize().into())
+    }
+
+    /// The id of an update event: a domain-tagged hash over (entity_id,
+    /// operations, parent). The model envelope is excluded from identity,
+    /// like the collection string before it (RFC II.3).
+    pub fn from_update_parts(entity_id: &EntityId, operations: &OperationSet, parent: &Clock) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(EVENT_TAG);
+        hasher.update(bincode::serialize(entity_id).unwrap());
+        hasher.update(bincode::serialize(operations).unwrap());
+        hasher.update(bincode::serialize(parent).unwrap());
         Self(hasher.finalize().into())
     }
     pub fn to_base64(&self) -> String {
@@ -99,36 +129,134 @@ impl<'de> Deserialize<'de> for EventId {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Event {
-    pub collection: CollectionId,
+    /// The model-definition entity id this event's entity is read/mutated
+    /// under (#330). The wire carries the model ID, never a collection name:
+    /// receivers resolve it to local storage through well-known ids, the
+    /// catalog, and engine-owned mappings. Deliberately EXCLUDED from
+    /// [`EventId`] hashing, like the collection string before it.
+    pub model: EntityId,
+    /// For genesis events this EQUALS the derived id (verified by
+    /// [`Event::validate_structure`]); for updates it names the entity the
+    /// event extends.
     pub entity_id: EntityId,
-    pub operations: OperationSet,
-    /// The set of concurrent events (usually only one) which is the precursor of this event
+    /// The set of concurrent events (usually only one) which is the
+    /// precursor of this event. Empty iff the body is a genesis
+    /// (enforced at validation seams).
     pub parent: Clock,
+    pub body: EventBody,
+}
+
+/// The two event shapes (RFC specs/identity-attestation/spec.md II.2). The
+/// genesis is the single creation event and carries the entity's initial
+/// operations, frozen when `create()` returns (eager freeze, ruling R6).
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub enum EventBody {
+    Genesis {
+        /// The system root entity id; `None` ONLY for the system root
+        /// entity itself.
+        system: Option<EntityId>,
+        /// Creator-random. Distinct create calls draw distinct nonces and
+        /// are distinct entities even under identical payloads; a create
+        /// retry that reuses the nonce (and payload) is idempotent.
+        nonce: [u8; 32],
+        /// Unix ms, advisory (creator-supplied; same trust level as ULID
+        /// timestamps before it). Adds entropy and preserves a
+        /// creation-time signal for storage locality.
+        timestamp: u64,
+        /// The entity's initial property values.
+        operations: OperationSet,
+    },
+    Update {
+        operations: OperationSet,
+    },
+}
+
+/// A structurally invalid event: rejected at every ingress seam before any
+/// staging or storage.
+#[derive(Debug, thiserror::Error, PartialEq)]
+pub enum EventStructureError {
+    #[error("genesis event carries a non-empty parent clock")]
+    GenesisWithParent,
+    #[error("update event carries an empty parent clock")]
+    UpdateWithoutParent,
+    #[error("genesis id does not match the claimed entity id (event {event}, claimed {claimed})")]
+    GenesisIdMismatch { event: EventId, claimed: EntityId },
 }
 
 impl Event {
-    // TODO: figure out how we actually want to signify entity creation. This is a hack for now
-    pub fn is_entity_create(&self) -> bool { self.parent.is_empty() }
+    /// Assemble a genesis event, drawing a fresh nonce and timestamp and
+    /// deriving the entity id from the full genesis content (RFC II.2/II.3).
+    pub fn genesis(model: EntityId, system: Option<EntityId>, operations: OperationSet) -> Self {
+        let mut nonce = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce);
+        let timestamp = crate::time::unix_ms_now();
+        let entity_id: EntityId = EventId::from_genesis_parts(&system, &nonce, timestamp, &operations).into();
+        Event { model, entity_id, parent: Clock::default(), body: EventBody::Genesis { system, nonce, timestamp, operations } }
+    }
+
+    pub fn is_entity_create(&self) -> bool { matches!(self.body, EventBody::Genesis { .. }) }
+
+    /// The event's operations, for either body shape.
+    pub fn operations(&self) -> &OperationSet {
+        match &self.body {
+            EventBody::Genesis { operations, .. } => operations,
+            EventBody::Update { operations } => operations,
+        }
+    }
+
+    pub fn id(&self) -> EventId {
+        match &self.body {
+            EventBody::Genesis { system, nonce, timestamp, operations } => {
+                EventId::from_genesis_parts(system, nonce, *timestamp, operations)
+            }
+            EventBody::Update { operations } => EventId::from_update_parts(&self.entity_id, operations, &self.parent),
+        }
+    }
+
+    /// Structural validity, enforced at every ingress seam (RFC II.2/II.4):
+    /// the parent clock is empty iff the body is a genesis, and a genesis is
+    /// admissible for entity E iff its recomputed id IS E (creation
+    /// uniqueness as a structural check on every node class, C4-06).
+    pub fn validate_structure(&self) -> Result<(), EventStructureError> {
+        match &self.body {
+            EventBody::Genesis { .. } => {
+                if !self.parent.is_empty() {
+                    return Err(EventStructureError::GenesisWithParent);
+                }
+                let id = self.id();
+                if EntityId::from(id.clone()) != self.entity_id {
+                    return Err(EventStructureError::GenesisIdMismatch { event: id, claimed: self.entity_id });
+                }
+                Ok(())
+            }
+            EventBody::Update { .. } => {
+                if self.parent.is_empty() {
+                    return Err(EventStructureError::UpdateWithoutParent);
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct EventFragment {
-    pub operations: OperationSet,
+    pub body: EventBody,
     pub parent: Clock,
     pub attestations: AttestationSet,
 }
 
 impl From<Attested<Event>> for EventFragment {
     fn from(attested: Attested<Event>) -> Self {
-        Self { operations: attested.payload.operations, parent: attested.payload.parent, attestations: attested.attestations }
+        Self { body: attested.payload.body, parent: attested.payload.parent, attestations: attested.attestations }
     }
 }
 
-impl From<(EntityId, CollectionId, EventFragment)> for Attested<Event> {
-    fn from(value: (EntityId, CollectionId, EventFragment)) -> Self {
-        let event = Event { entity_id: value.0, collection: value.1, operations: value.2.operations, parent: value.2.parent };
+impl From<(EntityId, EntityId, EventFragment)> for Attested<Event> {
+    fn from(value: (EntityId, EntityId, EventFragment)) -> Self {
+        let event = Event { entity_id: value.0, model: value.1, body: value.2.body, parent: value.2.parent };
         Attested { payload: event, attestations: value.2.attestations }
     }
 }
@@ -142,15 +270,11 @@ pub struct StateFragment {
 impl From<Attested<EntityState>> for StateFragment {
     fn from(attested: Attested<EntityState>) -> Self { Self { state: attested.payload.state, attestations: attested.attestations } }
 }
-impl From<(EntityId, CollectionId, StateFragment)> for Attested<EntityState> {
-    fn from(value: (EntityId, CollectionId, StateFragment)) -> Self {
-        let entity_state = EntityState { entity_id: value.0, collection: value.1, state: value.2.state };
+impl From<(EntityId, EntityId, StateFragment)> for Attested<EntityState> {
+    fn from(value: (EntityId, EntityId, StateFragment)) -> Self {
+        let entity_state = EntityState { entity_id: value.0, model: value.1, state: value.2.state };
         Attested { payload: entity_state, attestations: value.2.attestations }
     }
-}
-
-impl Event {
-    pub fn id(&self) -> EventId { EventId::from_parts(&self.entity_id, &self.operations, &self.parent) }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -183,8 +307,20 @@ pub struct Operation {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct EntityState {
     pub entity_id: EntityId,
-    pub collection: CollectionId,
+    /// The model-definition entity id (#330); see [`Event::model`].
+    pub model: EntityId,
     pub state: State,
+}
+
+/// A state snapshot accompanied by the genesis event that self-certifies the
+/// snapshot's entity identity. The model attribution is carried by both halves
+/// and must be checked separately because model is deliberately outside the
+/// event-id hash. Used where a receiver must consume a state before it has
+/// enough catalog context to fetch that genesis itself.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct StateWithGenesis {
+    pub genesis: Attested<Event>,
+    pub state: Attested<EntityState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -209,11 +345,11 @@ impl std::fmt::Display for Event {
             f,
             "Event({} {}/{} {}{} {})",
             self.id().to_base64_short(),
-            self.collection,
+            self.model.to_base64_short(),
             self.entity_id.to_base64_short(),
-            if self.is_entity_create() { "(create) " } else { "" },
+            if self.is_entity_create() { "(genesis) " } else { "" },
             self.parent.to_base64_short(),
-            self.operations
+            self.operations()
                 .iter()
                 .map(|(backend, ops)| format!("{} => {}b", backend, ops.iter().map(|op| op.diff.len()).sum::<usize>()))
                 .collect::<Vec<_>>()
@@ -224,7 +360,11 @@ impl std::fmt::Display for Event {
 
 impl std::fmt::Display for EventFragment {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "EventFragment(parent {} operations {})", self.parent, self.operations)
+        let operations = match &self.body {
+            EventBody::Genesis { operations, .. } => operations,
+            EventBody::Update { operations } => operations,
+        };
+        write!(f, "EventFragment(parent {} operations {})", self.parent, operations)
     }
 }
 
@@ -252,7 +392,7 @@ impl std::fmt::Display for EntityState {
 }
 
 impl Attested<Event> {
-    pub fn collection(&self) -> &CollectionId { &self.payload.collection }
+    pub fn model(&self) -> EntityId { self.payload.model }
 }
 
 impl From<Event> for Attested<Event> {
@@ -264,17 +404,17 @@ impl From<EntityState> for Attested<EntityState> {
 }
 
 impl Attested<EntityState> {
-    pub fn to_parts(self) -> (EntityId, CollectionId, StateFragment) {
-        (self.payload.entity_id, self.payload.collection, StateFragment { state: self.payload.state, attestations: self.attestations })
+    pub fn to_parts(self) -> (EntityId, EntityId, StateFragment) {
+        (self.payload.entity_id, self.payload.model, StateFragment { state: self.payload.state, attestations: self.attestations })
     }
-    pub fn from_parts(entity_id: EntityId, collection: CollectionId, fragment: StateFragment) -> Self {
-        Self { payload: EntityState { entity_id, collection, state: fragment.state }, attestations: fragment.attestations }
+    pub fn from_parts(entity_id: EntityId, model: EntityId, fragment: StateFragment) -> Self {
+        Self { payload: EntityState { entity_id, model, state: fragment.state }, attestations: fragment.attestations }
     }
 }
 
 impl Attested<Event> {
-    pub fn from_parts(entity_id: EntityId, collection: CollectionId, frag: EventFragment) -> Self {
-        Self { payload: Event { entity_id, collection, operations: frag.operations, parent: frag.parent }, attestations: frag.attestations }
+    pub fn from_parts(entity_id: EntityId, model: EntityId, frag: EventFragment) -> Self {
+        Self { payload: Event { entity_id, model, body: frag.body, parent: frag.parent }, attestations: frag.attestations }
     }
 }
 
@@ -303,5 +443,83 @@ mod tests {
             [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
         );
         assert_eq!(id, bincode::deserialize(&bytes).unwrap());
+    }
+
+    /// The RFC II.3 preimages, computed independently, byte for byte.
+    #[test]
+    fn derivation_preimages_match_the_spec() {
+        use sha2::{Digest, Sha256};
+
+        let system = Some(EntityId::from_bytes([9u8; 32]));
+        let nonce = [3u8; 32];
+        let timestamp = 1_720_000_000_123u64;
+        let operations = OperationSet(BTreeMap::from([("lww".to_string(), vec![Operation { diff: vec![1, 2, 3] }])]));
+
+        let mut preimage = b"ankurah.genesis.v0".to_vec();
+        preimage.extend(bincode::serialize(&(system, nonce, timestamp, operations.clone())).unwrap());
+        let expected: [u8; 32] = Sha256::digest(&preimage).into();
+        assert_eq!(EventId::from_genesis_parts(&system, &nonce, timestamp, &operations), EventId::from_bytes(expected));
+
+        let entity_id = EntityId::from_bytes([7u8; 32]);
+        let parent = Clock::from(vec![EventId::from_bytes([5u8; 32])]);
+        let mut preimage = b"ankurah.event.v0".to_vec();
+        preimage.extend(bincode::serialize(&(entity_id, operations.clone(), parent.clone())).unwrap());
+        let expected: [u8; 32] = Sha256::digest(&preimage).into();
+        assert_eq!(EventId::from_update_parts(&entity_id, &operations, &parent), EventId::from_bytes(expected));
+    }
+
+    #[test]
+    fn genesis_constructor_derives_a_matching_entity_id() {
+        let model = EntityId::from_bytes([0xEEu8; 32]);
+        let event = Event::genesis(model, Some(EntityId::from_bytes([9u8; 32])), OperationSet(BTreeMap::new()));
+        assert!(event.is_entity_create());
+        assert!(event.parent.is_empty());
+        assert_eq!(EntityId::from(event.id()), event.entity_id);
+        event.validate_structure().expect("well-formed genesis validates");
+
+        // Distinct create calls draw distinct nonces: identical payloads are
+        // still distinct entities.
+        let again = Event::genesis(model, Some(EntityId::from_bytes([9u8; 32])), OperationSet(BTreeMap::new()));
+        assert_ne!(event.entity_id, again.entity_id);
+    }
+
+    #[test]
+    fn structural_validation_rejects_malformed_events() {
+        let model = EntityId::from_bytes([0xEEu8; 32]);
+        let mut genesis = Event::genesis(model, None, OperationSet(BTreeMap::new()));
+
+        // A genesis claiming a foreign entity id is unrepresentable-by-construction
+        // and rejected when forged.
+        genesis.entity_id = EntityId::from_bytes([0xABu8; 32]);
+        assert!(matches!(genesis.validate_structure(), Err(EventStructureError::GenesisIdMismatch { .. })));
+
+        // A genesis with a parent clock is malformed.
+        let mut genesis = Event::genesis(model, None, OperationSet(BTreeMap::new()));
+        genesis.parent = Clock::from(vec![EventId::from_bytes([1u8; 32])]);
+        assert_eq!(genesis.validate_structure(), Err(EventStructureError::GenesisWithParent));
+
+        // An update with an empty parent is malformed (parent empty iff genesis).
+        let update = Event {
+            model,
+            entity_id: EntityId::from_bytes([7u8; 32]),
+            parent: Clock::default(),
+            body: EventBody::Update { operations: OperationSet(BTreeMap::new()) },
+        };
+        assert_eq!(update.validate_structure(), Err(EventStructureError::UpdateWithoutParent));
+    }
+
+    /// The system field distinguishes the root genesis (None) from same-content
+    /// non-root geneses, and binds non-root geneses to their system: the same
+    /// content under a different system id is a different entity id.
+    #[test]
+    fn genesis_id_binds_the_system() {
+        let nonce = [1u8; 32];
+        let ts = 42u64;
+        let ops = OperationSet(BTreeMap::new());
+        let root = EventId::from_genesis_parts(&None, &nonce, ts, &ops);
+        let sys_a = EventId::from_genesis_parts(&Some(EntityId::from_bytes([1u8; 32])), &nonce, ts, &ops);
+        let sys_b = EventId::from_genesis_parts(&Some(EntityId::from_bytes([2u8; 32])), &nonce, ts, &ops);
+        assert_ne!(root, sys_a);
+        assert_ne!(sys_a, sys_b);
     }
 }

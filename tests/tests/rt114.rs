@@ -42,9 +42,10 @@ async fn rt114() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use ankurah::signals::Peek;
     assert_eq!(client_query.peek().iter().map(|p| p.year().unwrap_or_default()).collect::<Vec<_>>(), vec!["2020", "2020"]);
 
-    // actually zero events because we receive a state from ItemChange::Initial
-    assert_eq!(0, client_collection.dump_entity_events(album1_id.clone()).await?.len()); // after subscribe
-    assert_eq!(0, client_collection.dump_entity_events(album2_id.clone()).await?.len()); // after subscribe
+    // Snapshots carry the exact genesis proof required to materialize each
+    // content-addressed entity, but not the later event lineage.
+    assert_eq!(1, client_collection.dump_entity_events(album1_id.clone()).await?.len()); // after subscribe
+    assert_eq!(1, client_collection.dump_entity_events(album2_id.clone()).await?.len()); // after subscribe
 
     // Unsubscribe (drop the LiveQuery)
     drop(client_query);
@@ -60,8 +61,8 @@ async fn rt114() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         trx.commit().await?;
     }
 
-    assert_eq!(0, client_collection.dump_entity_events(album1_id.clone()).await?.len()); // after edits
-    assert_eq!(0, client_collection.dump_entity_events(album2_id.clone()).await?.len()); // after edits
+    assert_eq!(1, client_collection.dump_entity_events(album1_id.clone()).await?.len()); // after edits
+    assert_eq!(1, client_collection.dump_entity_events(album2_id.clone()).await?.len()); // after edits
 
     // LiveQuery refactor note: I don't think we really need this sleep, but I guess this helps differentiate between
     // the commit event not arriving (which is expected), vs merely taking some time to arrive unexpectedly
@@ -120,9 +121,10 @@ async fn rt114_b() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let initial_years: Vec<String> = initial_fetch.iter().map(|album| album.year().unwrap_or_default()).collect();
     assert_eq!(vec!["2020", "2020"], initial_years);
 
-    // actually zero events because we receive states directly
-    assert_eq!(0, client_collection.dump_entity_events(album1_id.clone()).await?.len()); // after fetch
-    assert_eq!(0, client_collection.dump_entity_events(album2_id.clone()).await?.len()); // after fetch
+    // Snapshots carry the exact genesis proof required to materialize each
+    // content-addressed entity, but not the later event lineage.
+    assert_eq!(1, client_collection.dump_entity_events(album1_id.clone()).await?.len()); // after fetch
+    assert_eq!(1, client_collection.dump_entity_events(album2_id.clone()).await?.len()); // after fetch
 
     // Make changes on the server while client has cached data
     // Album2: change to 2019 (no longer matches year >= 2020)
@@ -132,8 +134,8 @@ async fn rt114_b() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         trx.commit().await?;
     }
 
-    assert_eq!(0, client_collection.dump_entity_events(album1_id.clone()).await?.len()); // after edits
-    assert_eq!(0, client_collection.dump_entity_events(album2_id.clone()).await?.len()); // after edits
+    assert_eq!(1, client_collection.dump_entity_events(album1_id.clone()).await?.len()); // after edits
+    assert_eq!(1, client_collection.dump_entity_events(album2_id.clone()).await?.len()); // after edits
 
     // Fetch still needs sleeps for now unfortunately. We can probably find a better way to do this though
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;

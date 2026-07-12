@@ -4,8 +4,8 @@ use ankql::ast::Predicate;
 use ankurah::core::{
     entity::Entity,
     error::ValidationError,
-    node::{Node as NodeAlias, NodeInner, WeakNode},
-    policy::{AccessDenied, DefaultContext, PolicyAgent, DEFAULT_CONTEXT},
+    node::{Node as NodeAlias, NodeInner},
+    policy::{AccessDenied, Admission, DefaultContext, PolicyAgent, DEFAULT_CONTEXT},
     storage::StorageEngine,
     util::Iterable,
 };
@@ -69,28 +69,26 @@ impl PolicyAgent for BridgePolicyAgent {
         _entity_before: &Entity,
         _entity_after: &Entity,
         _event: &proto::Event,
-    ) -> Result<Option<proto::Attestation>, AccessDenied> {
-        Ok(None)
+    ) -> Result<Admission, AccessDenied> {
+        Ok(Admission::Allow)
     }
 
     fn validate_received_event<SE: StorageEngine>(
         &self,
         _node: &NodeAlias<SE, Self>,
-        _from_node: &proto::EntityId,
+        _from_node: &proto::NodeId,
         _event: &proto::Attested<proto::Event>,
     ) -> Result<(), AccessDenied> {
         self.validate_calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
-    fn attest_state<SE: StorageEngine>(&self, _node: &NodeAlias<SE, Self>, _state: &proto::EntityState) -> Option<proto::Attestation> {
-        None
-    }
+    fn attest_state<SE: StorageEngine>(&self, _node: &NodeAlias<SE, Self>, _state: &proto::EntityState) -> Admission { Admission::Allow }
 
     fn validate_received_state<SE: StorageEngine>(
         &self,
         _node: &NodeAlias<SE, Self>,
-        _from_node: &proto::EntityId,
+        _from_node: &proto::NodeId,
         _state: &Attested<proto::EntityState>,
     ) -> Result<(), AccessDenied> {
         Ok(())
@@ -112,6 +110,7 @@ impl PolicyAgent for BridgePolicyAgent {
         _id: &proto::EntityId,
         _collection: &proto::CollectionId,
         _state: &proto::State,
+        _resolver: Option<std::sync::Weak<dyn ankurah::core::property::PropertyResolver>>,
     ) -> Result<(), AccessDenied>
     where
         C: Iterable<Self::ContextData>,
@@ -119,8 +118,15 @@ impl PolicyAgent for BridgePolicyAgent {
         Ok(())
     }
 
-    fn check_read_event<C>(&self, _data: &C, event: &Attested<proto::Event>) -> Result<(), AccessDenied>
-    where C: Iterable<Self::ContextData> {
+    fn check_read_event<C>(
+        &self,
+        _data: &C,
+        _collection: &proto::CollectionId,
+        event: &Attested<proto::Event>,
+    ) -> Result<(), AccessDenied>
+    where
+        C: Iterable<Self::ContextData>,
+    {
         if self.deny_read_events.lock().unwrap().contains(&event.payload.id()) {
             return Err(AccessDenied::ByPolicy("event read denied by test agent"));
         }
@@ -132,7 +138,7 @@ impl PolicyAgent for BridgePolicyAgent {
     fn validate_causal_assertion<SE: StorageEngine>(
         &self,
         _node: &NodeAlias<SE, Self>,
-        _peer_id: &proto::EntityId,
+        _peer_id: &proto::NodeId,
         _assertion: &proto::CausalAssertion,
     ) -> Result<(), AccessDenied> {
         Ok(())

@@ -89,6 +89,10 @@ pub(super) struct Inner<E: AbstractEntity + Filterable, Ev> {
     pub(super) id: ReactorSubscriptionId,
     state: std::sync::Mutex<State<E, Ev>>,
     watcher_set: Arc<std::sync::Mutex<crate::reactor::watcherset::WatcherSet>>,
+    /// The catalog resolver captured at subscribe time (see
+    /// `Reactor::set_property_resolver`): types ORDER BY sort keys from the
+    /// canonical value_type.
+    resolver: Option<std::sync::Weak<dyn crate::property::PropertyResolver>>,
 }
 struct State<E: AbstractEntity + Filterable, Ev> {
     pub(crate) queries: HashMap<proto::QueryId, QueryState<E>>,
@@ -103,6 +107,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
     pub fn new(
         broadcast: ankurah_signals::broadcast::Broadcast<ReactorUpdate<E, Ev>>,
         watcher_set: Arc<std::sync::Mutex<crate::reactor::watcherset::WatcherSet>>,
+        resolver: Option<std::sync::Weak<dyn crate::property::PropertyResolver>>,
     ) -> Self {
         Self(Arc::new(Inner {
             id: ReactorSubscriptionId::new(),
@@ -113,6 +118,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
                 broadcast,
             }),
             watcher_set,
+            resolver,
         }))
     }
 
@@ -248,10 +254,18 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         let old_selection = query_state.selection.replace(selection.clone());
 
         // Update resultset configuration
-        query_state.resultset.order_by(
+        let resolver = self.resolver.as_ref().and_then(|w| w.upgrade());
+        query_state.resultset.order_by_resolved(
             selection
                 .order_by
-                .map(|ob| crate::reactor::build_key_spec_from_selection(ob.as_slice(), &query_state.resultset))
+                .map(|ob| {
+                    crate::reactor::build_key_spec_from_selection(
+                        ob.as_slice(),
+                        &query_state.resultset,
+                        resolver.as_deref(),
+                        collection_id.as_str(),
+                    )
+                })
                 .transpose()?,
         );
 
@@ -363,6 +377,12 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
     ) -> Vec<WatcherChange> {
         let mut watcher_changes = Vec::new();
         let mut items: IndexMap<proto::EntityId, ReactorUpdateItem<E, Ev>> = IndexMap::new();
+        // A change folds its events into an entity's item exactly ONCE, even
+        // when several of this subscription's queries surface it (a peer's
+        // handler holds every query that peer registered; two queries over
+        // one predicate are routine). Batch offsets identify changes, since
+        // the generic event type carries no id to dedupe by.
+        let mut folded: std::collections::HashSet<(proto::EntityId, usize)> = std::collections::HashSet::new();
 
         // Take the state lock once for all evaluations
         let mut state_guard = self.state.lock().unwrap();
@@ -382,7 +402,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
             debug!("\tevaluate_changes query: {} {:?}", query_id, selection);
 
             // Process all candidate changes for this query
-            for change in query_candidate.iter() {
+            for (offset, change) in query_candidate.iter_with_offsets() {
                 let entity = change.entity();
                 let entity_id = *AbstractEntity::id(entity);
 
@@ -423,9 +443,23 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
                 if matches || did_match || entity_subscribed {
                     let item = items.entry(entity_id).or_insert_with(|| ReactorUpdateItem {
                         entity: entity.clone(),
-                        events: change.events().to_vec(),
+                        events: Vec::new(),
                         predicate_relevance: Vec::new(),
                     });
+
+                    // Same entity, multiple changes in one batch (e.g. a catalog
+                    // registration's genesis + follow-up): keep the latest entity
+                    // snapshot and APPEND events, so the item's events cover the
+                    // whole head the entity now reflects. Previously the first
+                    // change's events won and the rest were dropped, leaving the
+                    // item's state ahead of its listed events -- which a receiver
+                    // rejects in EntityChange::new. The fold is gated per
+                    // (entity, change): a SECOND QUERY matching the same change
+                    // must not append its events again.
+                    if folded.insert((entity_id, offset)) {
+                        item.entity = entity.clone();
+                        item.events.extend(change.events().iter().cloned());
+                    }
 
                     if let Some(mc) = membership_change {
                         item.predicate_relevance.push((query_id, mc));

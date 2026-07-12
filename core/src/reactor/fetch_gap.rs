@@ -109,7 +109,7 @@ pub fn build_continuation_predicate<E: AbstractEntity>(
     order_by: &[ankql::ast::OrderByItem],
     last_entity: &E,
 ) -> Result<ankql::ast::Predicate, String> {
-    use ankql::ast::{ComparisonOperator, Expr, Literal, OrderDirection, PathExpr, Predicate};
+    use ankql::ast::{ComparisonOperator, Expr, Identifier, Literal, OrderDirection, PathExpr, Predicate};
 
     let mut gap_conditions = Vec::new();
 
@@ -118,10 +118,15 @@ pub fn build_continuation_predicate<E: AbstractEntity>(
 
     // Add ORDER BY continuation conditions
     for order_item in order_by {
-        let field_name = order_item.path.property();
+        let field_name = order_item.path.first();
+        let property_id = order_item.property.map(ankurah_proto::EntityId::from_bytes);
 
         // Get the field value from the last entity
-        if let Some(field_value) = last_entity.value(field_name) {
+        let field_value = match property_id {
+            Some(property) => last_entity.value_resolved(property, field_name),
+            None => last_entity.value(field_name),
+        };
+        if let Some(field_value) = field_value {
             let literal = match field_value {
                 Value::String(s) => Literal::String(s),
                 Value::I16(i) => Literal::I16(i),
@@ -129,7 +134,7 @@ pub fn build_continuation_predicate<E: AbstractEntity>(
                 Value::I64(i) => Literal::I64(i),
                 Value::F64(f) => Literal::F64(f),
                 Value::Bool(b) => Literal::Bool(b),
-                Value::EntityId(id) => Literal::EntityId(id.into()),
+                Value::EntityId(id) => Literal::EntityId(id.to_bytes()),
                 // Skip Object, Binary, and Json for now - they're not commonly used in ORDER BY
                 Value::Object(_) | Value::Binary(_) | Value::Json(_) => continue,
             };
@@ -139,11 +144,13 @@ pub fn build_continuation_predicate<E: AbstractEntity>(
                 OrderDirection::Desc => ComparisonOperator::LessThanOrEqual,
             };
 
-            let condition = Predicate::Comparison {
-                left: Box::new(Expr::Path(order_item.path.clone())),
-                operator,
-                right: Box::new(Expr::Literal(literal)),
+            let property = match order_item.property {
+                Some(property) => {
+                    Expr::Identifier(Identifier { property, name: field_name.to_string(), subpath: order_item.path.steps[1..].to_vec() })
+                }
+                None => Expr::Path(order_item.path.clone()),
             };
+            let condition = Predicate::Comparison { left: Box::new(property), operator, right: Box::new(Expr::Literal(literal)) };
 
             gap_conditions.push(condition);
         }
@@ -153,7 +160,7 @@ pub fn build_continuation_predicate<E: AbstractEntity>(
     let id_exclusion = Predicate::Comparison {
         left: Box::new(Expr::Path(PathExpr::simple("id"))),
         operator: ComparisonOperator::NotEqual,
-        right: Box::new(Expr::Literal(Literal::EntityId((*last_entity.id()).into()))),
+        right: Box::new(Expr::Literal(Literal::EntityId(last_entity.id().to_bytes()))),
     };
     gap_conditions.push(id_exclusion);
 
@@ -196,8 +203,8 @@ mod tests {
 
     impl TestEntity {
         fn new(id: u8, data: HashMap<String, Value>) -> Self {
-            let mut id_bytes = [0u8; 16];
-            id_bytes[15] = id;
+            let mut id_bytes = [0u8; 32];
+            id_bytes[31] = id;
             Self {
                 id: proto::EntityId::from_bytes(id_bytes),
                 collection: proto::CollectionId::fixed_name("test"),
@@ -219,7 +226,7 @@ mod tests {
         let entity = TestEntity::new(1, hashmap!("name".to_string() => Value::String("John".to_string())));
 
         let original_predicate = Predicate::True;
-        let order_by = vec![OrderByItem { path: PathExpr::simple("name"), direction: OrderDirection::Asc }];
+        let order_by = vec![OrderByItem { path: PathExpr::simple("name"), direction: OrderDirection::Asc, property: None }];
 
         let gap_predicate = build_continuation_predicate(&original_predicate, &order_by, &entity).unwrap();
         let expected = ankurah_derive::selection!("true AND name >= 'John' AND id != {}", entity.id()).predicate;
@@ -234,8 +241,8 @@ mod tests {
 
         let original_predicate = Predicate::True;
         let order_by = vec![
-            OrderByItem { path: PathExpr::simple("name"), direction: OrderDirection::Asc },
-            OrderByItem { path: PathExpr::simple("age"), direction: OrderDirection::Desc },
+            OrderByItem { path: PathExpr::simple("name"), direction: OrderDirection::Asc, property: None },
+            OrderByItem { path: PathExpr::simple("age"), direction: OrderDirection::Desc, property: None },
         ];
 
         let gap_predicate = build_continuation_predicate(&original_predicate, &order_by, &entity).unwrap();

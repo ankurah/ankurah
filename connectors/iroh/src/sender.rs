@@ -11,13 +11,13 @@ const OUTGOING_BYTE_CAPACITY: usize = crate::connection::MAX_FRAME_LENGTH;
 
 /// PeerSender implementation for iroh connections.
 ///
-/// Serializes and queues outbound `NodeMessage`s on a bounded channel. The
-/// connection pump drains the channel and writes each message as a
+/// Serializes and queues outbound signed peer frames on a bounded channel. The
+/// connection pump drains the channel and writes each frame as a
 /// length-delimited frame on the connection's bidirectional QUIC stream.
 #[derive(Clone)]
 pub struct IrohPeerSender {
     tx: mpsc::Sender<OutgoingFrame>,
-    recipient_node_id: proto::EntityId,
+    recipient_node_id: proto::NodeId,
     control: Arc<ConnectionControl>,
 }
 
@@ -49,7 +49,7 @@ impl ConnectionControl {
 }
 
 impl IrohPeerSender {
-    pub(crate) fn new(recipient_node_id: proto::EntityId) -> (Self, mpsc::Receiver<OutgoingFrame>, Arc<ConnectionControl>) {
+    pub(crate) fn new(recipient_node_id: proto::NodeId) -> (Self, mpsc::Receiver<OutgoingFrame>, Arc<ConnectionControl>) {
         let (tx, rx) = mpsc::channel(OUTGOING_QUEUE_CAPACITY);
         let control = ConnectionControl::new();
         (Self { tx, recipient_node_id, control: control.clone() }, rx, control)
@@ -58,10 +58,10 @@ impl IrohPeerSender {
 
 #[async_trait]
 impl PeerSender for IrohPeerSender {
-    fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError> {
+    fn send_message(&self, message: proto::SignedPeerMessage) -> Result<(), SendError> {
         debug!("Queuing message for peer {}", self.recipient_node_id);
 
-        let data = bincode::serialize(&proto::Message::PeerMessage(message))
+        let data = proto::encode_message(&proto::Message::PeerMessage(message))
             .map_err(|e| SendError::Other(anyhow::anyhow!("Serialization error: {}", e)))?;
         if data.len() > crate::connection::MAX_FRAME_LENGTH {
             return Err(SendError::Other(anyhow::anyhow!(
@@ -92,7 +92,7 @@ impl PeerSender for IrohPeerSender {
         })
     }
 
-    fn recipient_node_id(&self) -> proto::EntityId { self.recipient_node_id }
+    fn recipient_node_id(&self) -> proto::NodeId { self.recipient_node_id }
 
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
@@ -102,18 +102,27 @@ mod tests {
     use super::*;
 
     fn message() -> proto::NodeMessage {
-        proto::NodeMessage::UnsubscribeQuery { from: proto::EntityId::new(), query_id: proto::QueryId::new() }
+        proto::NodeMessage::UnsubscribeQuery { from: proto::NodeId::from_bytes([7; 32]), query_id: proto::QueryId::new() }
     }
 
     #[test]
     fn outgoing_queue_is_bounded_and_stops_the_connection_on_overflow() {
-        let (sender, _rx, control) = IrohPeerSender::new(proto::EntityId::new());
+        use ed25519_dalek::Signer;
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let node_id = proto::NodeId::from(key.verifying_key());
+        let session = proto::HandshakeChallenge::new(proto::NodeId::from_bytes([8; 32]), [9; 32]);
+        let signed = || {
+            let message = message();
+            let signature = key.sign(&proto::SignedPeerMessage::signable_bytes(session, 0, &message)).into();
+            proto::SignedPeerMessage { session, sequence: 0, message, signature }
+        };
+        let (sender, _rx, control) = IrohPeerSender::new(node_id);
 
         for _ in 0..OUTGOING_QUEUE_CAPACITY {
-            sender.send_message(message()).expect("queue slot should be available");
+            sender.send_message(signed()).expect("queue slot should be available");
         }
 
-        assert!(matches!(sender.send_message(message()), Err(SendError::Timeout)));
+        assert!(matches!(sender.send_message(signed()), Err(SendError::Timeout)));
         assert!(control.stop.is_cancelled());
     }
 }

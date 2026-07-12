@@ -11,7 +11,7 @@ use proc_macro::TokenStream;
 use quote::quote;
 use syn::{parse_macro_input, DeriveInput};
 
-#[proc_macro_derive(Model, attributes(active_type, ephemeral, model))]
+#[proc_macro_derive(Model, attributes(active_type, ephemeral, model, property))]
 pub fn derive_model(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
 
@@ -20,6 +20,14 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
         Ok(model) => model,
         Err(e) => return e.to_compile_error().into(),
     };
+
+    // Validate schema-affecting attributes early (reserved collection
+    // prefix, explicit-id shape; RFC sections 4 and 5.9) so a bad model
+    // yields ONE actionable diagnostic instead of a cascade of downstream
+    // trait-bound errors from the other generated impls.
+    if let Err(e) = model::schema::validate_schema_attrs(&desc) {
+        return e.to_compile_error().into();
+    }
 
     let hygiene_module = quote::format_ident!("__ankurah_derive_impl_{}", to_snake_case(&desc.name().to_string()));
     let wasm_imports = if cfg!(feature = "wasm") {

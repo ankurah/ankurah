@@ -1,9 +1,13 @@
 use serde::{Deserialize, Serialize};
 
+use crate::NodeId;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Item {
     /// The genesis clock for the system - this serves as the root of the clock tree for all entities in the system
-    SysRoot,
+    SysRoot {
+        founder: NodeId,
+    },
     Collection {
         name: String,
     },

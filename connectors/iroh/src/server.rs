@@ -17,22 +17,25 @@ use tracing::{debug, info};
 /// lookup configuration are the embedder's responsibility when building the
 /// endpoint; this type only speaks the Ankurah presence/message protocol on top.
 ///
-/// For each accepted connection it runs the same handshake as the websocket
-/// server: `Presence` is its first outbound frame, it registers the remote peer
-/// with the `Node` upon receiving the peer's `Presence`, dispatches subsequent
-/// `PeerMessage` frames to the node, and deregisters the peer when the
-/// connection closes.
+/// For each accepted connection it runs the same symmetric challenge handshake
+/// as the websocket server, binds the signed Presence to QUIC's authenticated
+/// remote identity, dispatches signed sequenced frames, and conditionally
+/// deregisters that exact session when the connection closes.
 pub struct IrohServer {
     router: Router,
 }
 
 impl IrohServer {
     /// Start accepting Ankurah connections for `node` on `endpoint`.
-    pub fn new<SE, PA>(node: Node<SE, PA>, endpoint: Endpoint) -> Self
+    ///
+    /// Returns an error when the endpoint was not built from the node's
+    /// identity seed.
+    pub fn new<SE, PA>(node: Node<SE, PA>, endpoint: Endpoint) -> anyhow::Result<Self>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
+        crate::validate_local_identity(node.id, endpoint.id())?;
         info!("Starting iroh server for node {} on endpoint {}", node.id, endpoint.id());
         let router = Router::builder(endpoint)
             .accept(
@@ -44,7 +47,7 @@ impl IrohServer {
                 },
             )
             .spawn();
-        Self { router }
+        Ok(Self { router })
     }
 
     /// The underlying iroh endpoint.
@@ -85,10 +88,9 @@ where
         let remote = connection.remote_id();
         debug!("Accepted iroh connection from endpoint {}", remote);
 
-        // The dialer opens the bidirectional stream and sends its Presence on it;
-        // accept_bi resolves once that stream arrives. We then immediately send our
-        // own Presence as our first outbound frame (inside run_connection),
-        // mirroring the websocket server's handshake.
+        // The dialer opens the bidirectional stream and writes its challenge;
+        // accept_bi resolves once that stream arrives. Both roles then run the
+        // same challenge/Presence exchange inside run_connection.
         let streams = select! {
             _ = self.shutdown.cancelled() => return Ok(()),
             streams = timeout(crate::connection::HANDSHAKE_TIMEOUT, connection.accept_bi()) => streams,
@@ -102,8 +104,16 @@ where
             }
         };
 
-        if let Err(e) =
-            crate::connection::run_connection(&self.node, &self.registrations, send_stream, recv_stream, Some(&self.shutdown), |_| {}).await
+        if let Err(e) = crate::connection::run_connection(
+            &self.node,
+            &self.registrations,
+            remote,
+            send_stream,
+            recv_stream,
+            Some(&self.shutdown),
+            |_| {},
+        )
+        .await
         {
             debug!("iroh connection with endpoint {} ended: {}", remote, e);
         }

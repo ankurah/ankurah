@@ -1,3 +1,4 @@
+pub mod attestation;
 pub mod changes;
 pub mod collation;
 pub mod connector;
@@ -21,6 +22,7 @@ pub mod livequery;
 pub mod model;
 pub mod node;
 pub mod node_applier;
+pub mod node_key;
 pub mod peer_subscription;
 pub mod policy;
 pub mod property;

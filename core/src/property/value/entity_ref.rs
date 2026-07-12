@@ -124,6 +124,9 @@ impl<V: View> From<&V> for Ref<V::Model> {
 }
 
 impl<T> Property for Ref<T> {
+    // References carry the target's id on the wire (RFC 4 in specs/model-property-metadata/rfc.md: the reference row
+    // is value_type "entityid" with target_model as mutable metadata).
+    const VALUE_TYPE: &'static str = "entityid";
     fn into_value(&self) -> Result<Option<Value>, PropertyError> { Ok(Some(Value::EntityId(self.id.clone()))) }
 
     fn from_value(value: Option<Value>) -> Result<Self, PropertyError> {
@@ -148,7 +151,7 @@ mod tests {
 
     #[test]
     fn test_ref_roundtrip() {
-        let id = EntityId::new();
+        let id = EntityId::from_bytes([0x11; 32]);
         let r: Ref<TestModel> = Ref::new(id.clone());
 
         let value = r.into_value().unwrap().unwrap();
@@ -160,14 +163,14 @@ mod tests {
 
     #[test]
     fn test_ref_from_entity_id() {
-        let id = EntityId::new();
+        let id = EntityId::from_bytes([0x22; 32]);
         let r: Ref<TestModel> = id.clone().into();
         assert_eq!(r.id(), id);
     }
 
     #[test]
     fn test_ref_into_entity_id() {
-        let id = EntityId::new();
+        let id = EntityId::from_bytes([0x33; 32]);
         let r: Ref<TestModel> = Ref::new(id.clone());
         let recovered: EntityId = r.into();
         assert_eq!(recovered, id);

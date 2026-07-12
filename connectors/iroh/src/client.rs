@@ -20,7 +20,7 @@ use tracing::{debug, error, info};
 pub enum ConnectionState {
     Disconnected,
     Connecting { endpoint_id: EndpointId },
-    Connected { endpoint_id: EndpointId, server_presence: proto::Presence },
+    Connected { endpoint_id: EndpointId, server_presence: Arc<proto::Presence> },
     Error(ConnectionError),
 }
 
@@ -65,10 +65,10 @@ where
 /// using an already-bound [`iroh::Endpoint`]. Relay and address lookup
 /// configuration are the embedder's responsibility when building the endpoint.
 ///
-/// Mirrors the websocket client: it opens a connection, sends its own
-/// `Presence` first, registers the remote peer upon receiving the server's
-/// `Presence`, pumps messages until the connection drops, and then reconnects
-/// with exponential backoff.
+/// Mirrors the websocket client: it opens a connection, exchanges fresh
+/// challenges and signed Presence frames, registers the authenticated remote
+/// peer, pumps signed sequenced messages until the connection drops, and then
+/// reconnects with exponential backoff.
 pub struct IrohClient<SE, PA>
 where
     SE: StorageEngine + Send + Sync + 'static,
@@ -84,7 +84,11 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     /// Create a new iroh client and start connecting to the server address.
+    ///
+    /// Returns an error when the endpoint was not built from the node's
+    /// identity seed.
     pub async fn new(node: Node<SE, PA>, endpoint: Endpoint, server_addr: EndpointAddr) -> Result<Self> {
+        crate::validate_local_identity(node.id, endpoint.id())?;
         info!("Creating iroh client for endpoint {}", server_addr.id);
 
         let inner = Arc::new(Inner {
@@ -141,7 +145,7 @@ where
     }
 
     /// Get the Ankurah node ID of the connected server (if connected)
-    pub fn server_node_id(&self) -> Option<proto::EntityId> {
+    pub fn server_node_id(&self) -> Option<proto::NodeId> {
         use ankurah_signals::Get;
         match self.state().get() {
             ConnectionState::Connected { server_presence, .. } => Some(server_presence.node_id),
@@ -201,24 +205,32 @@ where
         inner.connection_state.set(ConnectionState::Connecting { endpoint_id: inner.server_addr.id });
 
         let connection = inner.endpoint.connect(inner.server_addr.clone(), crate::ALPN).await?;
+        anyhow::ensure!(
+            connection.remote_id() == inner.server_addr.id,
+            "iroh connected remote {} differs from requested endpoint {}",
+            connection.remote_id(),
+            inner.server_addr.id
+        );
         debug!("iroh connection established with endpoint {}", inner.server_addr.id);
 
-        // The dialer opens the bidirectional stream; our Presence is the first frame
-        // on it (sent inside run_connection), which is also what makes the stream
-        // visible to the acceptor.
+        // The dialer opens the bidirectional stream; our challenge is the first
+        // frame on it (sent inside run_connection), which is also what makes the
+        // stream visible to the acceptor.
         let (send_stream, recv_stream) = connection.open_bi().await?;
 
         let result = crate::connection::run_connection(
             &inner.node,
             &inner.registrations,
+            connection.remote_id(),
             send_stream,
             recv_stream,
             Some(&inner.shutdown),
             |server_presence| {
                 info!("Received server presence: {}", server_presence.node_id);
-                inner
-                    .connection_state
-                    .set(ConnectionState::Connected { endpoint_id: inner.server_addr.id, server_presence: server_presence.clone() });
+                inner.connection_state.set(ConnectionState::Connected {
+                    endpoint_id: inner.server_addr.id,
+                    server_presence: Arc::new(server_presence.clone()),
+                });
                 inner.connected.store(true, Ordering::Release);
             },
         )

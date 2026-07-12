@@ -6,16 +6,27 @@ use std::sync::{Arc, Mutex};
 
 use ankurah_core::{
     error::{MutationError, RetrievalError},
-    storage::{StorageCollection, StorageEngine},
+    property::PropertyResolver,
+    storage::{StorageCollection, StorageEngine, SystemRootClaim},
 };
-use ankurah_proto::CollectionId;
+use ankurah_proto::{CollectionId, SystemRootProof};
 use async_trait::async_trait;
 use sled::Config;
 
 use crate::{collection::SledStorageCollection, database::Database, error::SledRetrievalError};
 
+const ENGINE_METADATA_TREE: &str = "ankurah_engine_metadata";
+const SYSTEM_ROOT_CLAIM_KEY: &[u8] = b"system_root";
+
+fn decode_root_claim(bytes: &[u8]) -> Result<SystemRootProof, bincode::Error> { bincode::deserialize(bytes) }
+
 pub struct SledStorageEngine {
     pub database: Mutex<Arc<Database>>,
+    /// The catalog resolver, injected post-construction by `Node` (see
+    /// `StorageEngine::set_property_resolver`). Lives on the engine -- not on
+    /// [`Database`] -- so a hard reset (which recreates the `Database`) keeps
+    /// it; buckets get a clone at creation.
+    pub(crate) resolver: Arc<std::sync::RwLock<Option<std::sync::Weak<dyn PropertyResolver>>>>,
     #[cfg(debug_assertions)]
     pub prefix_guard_disabled: Arc<AtomicBool>,
 }
@@ -41,6 +52,7 @@ impl SledStorageEngine {
         let db = sled::open(&dbpath)?;
         Ok(Self {
             database: Mutex::new(Arc::new(Database::open(db)?)),
+            resolver: Arc::new(std::sync::RwLock::new(None)),
             #[cfg(debug_assertions)]
             prefix_guard_disabled: Arc::new(AtomicBool::new(false)),
         })
@@ -54,6 +66,7 @@ impl SledStorageEngine {
 
         Ok(Self {
             database: Mutex::new(Arc::new(Database::open(db)?)),
+            resolver: Arc::new(std::sync::RwLock::new(None)),
             #[cfg(debug_assertions)]
             prefix_guard_disabled: Arc::new(AtomicBool::new(false)),
         })
@@ -85,6 +98,12 @@ impl SledStorageEngine {
 #[async_trait]
 impl StorageEngine for SledStorageEngine {
     type Value = Vec<u8>;
+
+    /// Trait-level listing (see `StorageEngine::list_collections`); delegates
+    /// to the inherent method, which reads existing sled tree names without
+    /// opening (creating) any.
+    async fn list_collections(&self) -> Result<Vec<CollectionId>, RetrievalError> { SledStorageEngine::list_collections(self) }
+
     async fn collection(&self, id: &CollectionId) -> Result<Arc<dyn StorageCollection>, RetrievalError> {
         // could this block for any meaningful period of time? We might consider spawn_blocking
 
@@ -95,9 +114,57 @@ impl StorageEngine for SledStorageEngine {
             id.to_owned(),
             database,
             tree,
+            self.resolver.clone(),
             #[cfg(debug_assertions)]
             self.prefix_guard_disabled.clone(),
         )))
+    }
+
+    fn set_property_resolver(&self, resolver: std::sync::Weak<dyn PropertyResolver>) { *self.resolver.write().unwrap() = Some(resolver); }
+
+    async fn claim_system_root(&self, candidate: &SystemRootProof) -> Result<SystemRootClaim, MutationError> {
+        let database = self.database.lock().unwrap().clone();
+        let tree = database.db.open_tree(ENGINE_METADATA_TREE).map_err(|error| MutationError::General(Box::new(error)))?;
+        let bytes = bincode::serialize(candidate)?;
+        match tree
+            .compare_and_swap(SYSTEM_ROOT_CLAIM_KEY, None::<&[u8]>, Some(bytes.as_slice()))
+            .map_err(|error| MutationError::General(Box::new(error)))?
+        {
+            Ok(()) => {
+                tree.flush_async().await.map_err(|error| MutationError::General(Box::new(error)))?;
+                Ok(SystemRootClaim::Claimed)
+            }
+            Err(conflict) => {
+                let current = conflict.current.ok_or_else(|| {
+                    MutationError::General(Box::new(std::io::Error::other("system-root claim CAS conflicted without a current value")))
+                })?;
+                let existing = decode_root_claim(current.as_ref())?;
+                Ok(SystemRootClaim::Existing(existing))
+            }
+        }
+    }
+
+    async fn system_root_claim(&self) -> Result<Option<SystemRootProof>, RetrievalError> {
+        let database = self.database.lock().unwrap().clone();
+        let tree = database.db.open_tree(ENGINE_METADATA_TREE).map_err(SledRetrievalError::StorageError)?;
+        tree.get(SYSTEM_ROOT_CLAIM_KEY)
+            .map_err(SledRetrievalError::StorageError)?
+            .map(|bytes| decode_root_claim(bytes.as_ref()).map_err(RetrievalError::from))
+            .transpose()
+    }
+
+    async fn release_system_root_claim(&self, expected: &SystemRootProof) -> Result<bool, MutationError> {
+        let database = self.database.lock().unwrap().clone();
+        let tree = database.db.open_tree(ENGINE_METADATA_TREE).map_err(|error| MutationError::General(Box::new(error)))?;
+        let expected = bincode::serialize(expected)?;
+        let released = tree
+            .compare_and_swap(SYSTEM_ROOT_CLAIM_KEY, Some(expected.as_slice()), None::<&[u8]>)
+            .map_err(|error| MutationError::General(Box::new(error)))?
+            .is_ok();
+        if released {
+            tree.flush_async().await.map_err(|error| MutationError::General(Box::new(error)))?;
+        }
+        Ok(released)
     }
 
     async fn delete_all_collections(&self) -> Result<bool, MutationError> {
@@ -110,7 +177,7 @@ impl StorageEngine for SledStorageEngine {
 
             // Drop each tree
             for name in tree_names {
-                if name == "__sled__default" {
+                if name == "__sled__default" || name == ENGINE_METADATA_TREE.as_bytes() {
                     continue;
                 }
 

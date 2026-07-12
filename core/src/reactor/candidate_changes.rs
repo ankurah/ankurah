@@ -52,6 +52,14 @@ impl<C> CandidateChanges<C> {
 impl<'a, C> QueryCandidate<'a, C> {
     /// Iterate over the candidate changes for this query
     pub fn iter(&self) -> impl Iterator<Item = &C> + '_ { self.offsets.iter().map(move |&offset| &self.changes[offset]) }
+
+    /// Iterate (batch offset, change) pairs for this query. The offset
+    /// identifies the change within the shared batch, so a consumer that
+    /// sees the same change through several queries can fold per-change
+    /// work exactly once.
+    pub fn iter_with_offsets(&self) -> impl Iterator<Item = (usize, &C)> + '_ {
+        self.offsets.iter().map(move |&offset| (offset, &self.changes[offset]))
+    }
 }
 
 impl<C> Clone for CandidateChanges<C> {

@@ -31,7 +31,7 @@ impl std::fmt::Display for CastError {
 }
 
 impl From<CastError> for PropertyError {
-    fn from(err: CastError) -> Self { PropertyError::CastError(err) }
+    fn from(err: CastError) -> Self { PropertyError::NonCastable(err) }
 }
 
 impl std::error::Error for CastError {}
@@ -209,13 +209,74 @@ impl Value {
     pub fn try_cast_to(&self, target_type: ValueType) -> Option<Value> { self.cast_to(target_type).ok() }
 }
 
+impl ValueType {
+    /// The catalog's string form of a value type: the lowercased variant name
+    /// as declared by [`crate::property::Property::VALUE_TYPE`] and stored in
+    /// `_ankurah_property.value_type`. `None` for a string this build does not
+    /// know (a newer fleet's type), which callers must treat as
+    /// incompatible-unless-equal.
+    pub fn from_property_str(s: &str) -> Option<ValueType> {
+        Some(match s {
+            "string" => ValueType::String,
+            "i16" => ValueType::I16,
+            "i32" => ValueType::I32,
+            "i64" => ValueType::I64,
+            "f64" => ValueType::F64,
+            "bool" => ValueType::Bool,
+            "entityid" => ValueType::EntityId,
+            "object" => ValueType::Object,
+            "binary" => ValueType::Binary,
+            "json" => ValueType::Json,
+            _ => return None,
+        })
+    }
+
+    /// The type-level projection of [`Value::cast_to`]: whether a cast arrow
+    /// exists from `self` to `target`. A `true` here still admits per-value
+    /// failure (`InvalidFormat` / `NumericOverflow`); a `false` means every
+    /// value of `self` returns `IncompatibleTypes`. Kept in lockstep with the
+    /// `cast_to` match by the `castable_to_agrees_with_cast_to` test below.
+    pub fn castable_to(self, target: ValueType) -> bool {
+        use ValueType::*;
+        if self == target {
+            return true;
+        }
+        matches!(
+            (self, target),
+            // String <-> EntityId
+            (String, EntityId) | (EntityId, String)
+            // numeric <-> numeric
+            | (I16, I32) | (I16, I64) | (I16, F64)
+            | (I32, I16) | (I32, I64) | (I32, F64)
+            | (I64, I16) | (I64, I32) | (I64, F64)
+            | (F64, I16) | (F64, I32) | (F64, I64)
+            // String <-> numeric / bool
+            | (String, I16) | (String, I32) | (String, I64) | (String, F64) | (String, Bool)
+            | (I16, String) | (I32, String) | (I64, String) | (F64, String) | (Bool, String)
+            // Bool <-> numeric
+            | (Bool, I16) | (Bool, I32) | (Bool, I64) | (Bool, F64)
+            | (I16, Bool) | (I32, Bool) | (I64, Bool) | (F64, Bool)
+            // scalar <-> Json
+            | (String, Json) | (I16, Json) | (I32, Json) | (I64, Json) | (F64, Json) | (Bool, Json)
+            | (Json, String) | (Json, I16) | (Json, I32) | (Json, I64) | (Json, F64) | (Json, Bool)
+        )
+    }
+
+    /// Both cast arrows exist: a binary compiled with one of the pair can
+    /// write through the other (compiled -> canonical) and read back
+    /// (canonical -> compiled). The registration compatibility gate
+    /// (rfc.md 5.6 as amended 2026-07-10) admits a drifted compiled type on
+    /// exactly this condition.
+    pub fn mutually_castable(a: ValueType, b: ValueType) -> bool { a.castable_to(b) && b.castable_to(a) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_string_to_entity_id() {
-        let entity_id = EntityId::new();
+        let entity_id = EntityId::from_bytes([0x11; 32]);
         let base64_str = entity_id.to_base64();
         let value = Value::String(base64_str.clone());
 
@@ -228,7 +289,7 @@ mod tests {
 
     #[test]
     fn test_entity_id_to_string() {
-        let entity_id = EntityId::new();
+        let entity_id = EntityId::from_bytes([0x22; 32]);
         let value = Value::EntityId(entity_id.clone());
 
         let result = value.cast_to(ValueType::String).unwrap();
@@ -299,5 +360,55 @@ mod tests {
         let result = value.cast_to(ValueType::I32).unwrap();
 
         assert_eq!(result, value);
+    }
+
+    /// `ValueType::castable_to` is the type-level projection of the
+    /// `cast_to` match and must stay in lockstep with it: an arrow exists
+    /// for a type pair exactly when SOME value of the source type casts
+    /// without `IncompatibleTypes` (per-value `InvalidFormat` /
+    /// `NumericOverflow` still count as an arrow). Json needs several
+    /// representatives because its `cast_to` arms report a per-value SHAPE
+    /// mismatch as `IncompatibleTypes`.
+    #[test]
+    fn castable_to_agrees_with_cast_to() {
+        use ValueType::*;
+        let representatives: Vec<Value> = vec![
+            Value::I16(1),
+            Value::I32(1),
+            Value::I64(1),
+            Value::F64(1.0),
+            Value::Bool(true),
+            Value::String("1".into()),
+            Value::EntityId(ankurah_proto::EntityId::from_bytes([0x33; 32])),
+            Value::Object(vec![]),
+            Value::Binary(vec![1]),
+            Value::Json(serde_json::json!(1)),
+            Value::Json(serde_json::json!("s")),
+            Value::Json(serde_json::json!(true)),
+        ];
+        let types = [I16, I32, I64, F64, Bool, String, EntityId, Object, Binary, Json];
+        for source in types {
+            let reps: Vec<&Value> = representatives.iter().filter(|v| ValueType::of(v) == source).collect();
+            assert!(!reps.is_empty(), "no representative value for {source:?}");
+            for target in types {
+                let any_arrow = reps.iter().any(|v| !matches!(v.cast_to(target), Err(CastError::IncompatibleTypes { .. })));
+                assert_eq!(source.castable_to(target), any_arrow, "castable_to({source:?}, {target:?}) disagrees with cast_to");
+            }
+        }
+    }
+
+    #[test]
+    fn mutually_castable_pairs() {
+        use ValueType::*;
+        // The registration gate's admissions: both arrows must exist.
+        assert!(ValueType::mutually_castable(String, I64));
+        assert!(ValueType::mutually_castable(I32, I64));
+        assert!(ValueType::mutually_castable(Bool, String));
+        assert!(ValueType::mutually_castable(String, EntityId));
+        // One-way or no-way pairs refuse.
+        assert!(!ValueType::mutually_castable(String, Binary));
+        assert!(!ValueType::mutually_castable(EntityId, I64));
+        assert!(!ValueType::mutually_castable(Object, Json));
+        assert!(!ValueType::mutually_castable(EntityId, Json));
     }
 }

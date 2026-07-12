@@ -7,12 +7,12 @@ use tracing::{debug, warn};
 /// PeerSender implementation for websocket connections
 #[derive(Clone)]
 pub struct WebsocketPeerSender {
-    tx: mpsc::UnboundedSender<proto::NodeMessage>,
-    recipient_node_id: proto::EntityId,
+    tx: mpsc::UnboundedSender<proto::SignedPeerMessage>,
+    recipient_node_id: proto::NodeId,
 }
 
 impl WebsocketPeerSender {
-    pub fn new(recipient_node_id: proto::EntityId) -> (Self, mpsc::UnboundedReceiver<proto::NodeMessage>) {
+    pub fn new(recipient_node_id: proto::NodeId) -> (Self, mpsc::UnboundedReceiver<proto::SignedPeerMessage>) {
         let (tx, rx) = mpsc::unbounded_channel();
         (Self { tx, recipient_node_id }, rx)
     }
@@ -20,7 +20,7 @@ impl WebsocketPeerSender {
 
 #[async_trait]
 impl PeerSender for WebsocketPeerSender {
-    fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError> {
+    fn send_message(&self, message: proto::SignedPeerMessage) -> Result<(), SendError> {
         debug!("Queuing message for peer {}", self.recipient_node_id);
 
         self.tx.send(message).map_err(|_| {
@@ -29,7 +29,7 @@ impl PeerSender for WebsocketPeerSender {
         })
     }
 
-    fn recipient_node_id(&self) -> proto::EntityId { self.recipient_node_id }
+    fn recipient_node_id(&self) -> proto::NodeId { self.recipient_node_id }
 
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }

@@ -1,13 +1,23 @@
 use anyhow::Result;
 
-use crate::{entity::Entity, error::RetrievalError, property::PropertyName, value::CastError};
+use crate::{
+    entity::Entity,
+    error::{MutationError, RetrievalError},
+    property::PropertyAddress,
+    value::CastError,
+};
 
 use thiserror::Error;
 
 use super::Value;
 
 pub trait InitializeWith<T> {
-    fn initialize_with(entity: &Entity, property_name: PropertyName, value: &T) -> Self;
+    /// Construct and initialize an active field from its compiled address.
+    /// Implementations must honor `explicit_id` when present; taking the
+    /// address as the required API (rather than a name-only default) keeps
+    /// third-party active types from silently discarding explicit identity.
+    fn initialize_with(entity: &Entity, property: PropertyAddress, value: &T) -> Result<Self, MutationError>
+    where Self: Sized;
 }
 
 #[derive(Error, Debug)]
@@ -32,8 +42,30 @@ pub enum PropertyError {
     #[error("transaction is no longer alive")]
     TransactionClosed,
 
-    #[error("cast error: {0}")]
-    CastError(CastError),
+    /// A per-value cast failure against the property's canonical value_type
+    /// (rfc.md 5.6, the canonical value_type ruling): the type PAIR was
+    /// admitted at registration, but this particular value does not fit
+    /// (numeric overflow, unparseable string). Surfaces at the write that
+    /// staged the value or the read that projects it -- never at policy or
+    /// query evaluation, which read leniently.
+    #[error("not castable: {0}")]
+    NonCastable(CastError),
+
+    /// A property reference that neither the local compiled schema nor the
+    /// catalog defines: predicate building fails closed (RFC 5.3 in specs/model-property-metadata/rfc.md, AC5).
+    #[error("unknown property '{name}' in collection '{collection}'")]
+    UnknownProperty { collection: String, name: String },
+
+    /// The queried collection has no model in the catalog, this binary
+    /// carries a compiled schema for it, and FIRST-USE REGISTRATION could
+    /// not resolve the doubt (policy denied the definition, or no durable
+    /// peer is reachable). Surfaced as a loud error on query and fetch
+    /// paths (REN 2 second ruling, 2026-07-06): a lagging catalog cache
+    /// cannot prove emptiness, and idling on an unanswerable subscription
+    /// helps no one -- retry once the schema is registered or connectivity
+    /// returns.
+    #[error("collection '{collection}' is not registered and could not be registered from this node")]
+    UnregisteredCollection { collection: String },
 }
 
 impl PartialEq for PropertyError {
@@ -58,7 +90,10 @@ impl From<serde_json::Error> for PropertyError {
 }
 
 pub trait FromEntity {
-    fn from_entity(property_name: PropertyName, entity: &Entity) -> Self;
+    /// Bind an active field to an entity using its complete compiled address.
+    /// Implementations must preserve an explicit id for reads, writes, and
+    /// listener identity rather than resolving only by display name.
+    fn from_entity(property: PropertyAddress, entity: &Entity) -> Self;
 }
 
 pub trait FromActiveType<A> {

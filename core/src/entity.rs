@@ -6,10 +6,11 @@ use crate::{
     event_dag::AbstractCausalRelation,
     model::View,
     property::backend::{backend_from_string, PropertyBackend},
+    property::{PropertyKey, PropertyResolver},
     reactor::AbstractEntity,
     value::Value,
 };
-use ankurah_proto::{Clock, CollectionId, EntityId, EntityState, Event, EventId, OperationSet, State};
+use ankurah_proto::{Clock, CollectionId, EntityId, EntityState, Event, EventBody, EventId, OperationSet, State};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
@@ -77,6 +78,11 @@ pub struct EntityInner {
     pub(crate) kind: EntityKind,
     /// Broadcast for notifying Signal subscribers about entity changes
     pub(crate) broadcast: ankurah_signals::broadcast::Broadcast,
+    /// Catalog resolver stamped at assembly (the PropertyKey amendment, #289):
+    /// lets this catalog-blind entity resolve a display name to the
+    /// property-definition id its data is keyed under, for the sync read path.
+    /// Absent for bare and temporary entities (they read name-keyed data only).
+    resolver: std::sync::RwLock<Option<Weak<dyn PropertyResolver>>>,
 }
 
 #[derive(Debug)]
@@ -108,6 +114,125 @@ impl WeakEntity {
     pub fn upgrade(&self) -> Option<Entity> { self.0.upgrade().map(Entity) }
 }
 
+/// Resolver-aware read helpers shared by every EntityInner view: the resident
+/// [`Entity`] and the [`TemporaryEntity`] (which is bound only when
+/// constructed via [`TemporaryEntity::new_bound`]). Both deref here.
+impl EntityInner {
+    /// The catalog resolver stamped at assembly, if still live.
+    fn resolver(&self) -> Option<Arc<dyn PropertyResolver>> { self.resolver.read().unwrap().as_ref().and_then(|w| w.upgrade()) }
+
+    /// Stamp the catalog resolver (assembly-time). Replaces the old
+    /// backend-binding push (`Node::bind_entity`): the backend stays dumb and
+    /// the entity resolves names to ids for the sync read path.
+    pub(crate) fn set_resolver(&self, resolver: Weak<dyn PropertyResolver>) { *self.resolver.write().unwrap() = Some(resolver); }
+
+    /// Resolve a display name to the key its data is stored under: the
+    /// property-definition id when the catalog knows the field, else the bare
+    /// name (system/catalog collections, legacy residue, or a transient staged
+    /// field whose commit must still confirm registration).
+    fn resolve_key(&self, name: &str) -> PropertyKey {
+        match self.resolver().and_then(|r| r.resolve(self.collection.as_str(), name)) {
+            Some(id) => PropertyKey::Id(id),
+            None => PropertyKey::Name(name.to_string()),
+        }
+    }
+
+    /// Resolve a display name to its property key for the value accessors
+    /// (read / write / subscribe). Same resolution as the internal read path.
+    pub(crate) fn property_key(&self, name: &str) -> PropertyKey { self.resolve_key(name) }
+
+    /// Resolve an ordinary user-model field without permitting a fresh Name
+    /// fallback. A missing resolver slot is the intentional name-keyed
+    /// system/bare-entity case; once a resolver has been stamped, failure to
+    /// upgrade or resolve it is a missing/ambiguous catalog binding and must
+    /// surface as an error. Explicit-id accessors bypass this method.
+    pub(crate) fn checked_property_key(&self, name: &str) -> Result<PropertyKey, crate::property::traits::PropertyError> {
+        let resolver = self.resolver.read().expect("other thread panicked, panic here too");
+        let Some(resolver) = resolver.as_ref() else {
+            return Ok(PropertyKey::Name(name.to_string()));
+        };
+        let Some(resolver) = resolver.upgrade() else {
+            return Err(crate::property::traits::PropertyError::UnknownProperty {
+                collection: self.collection.to_string(),
+                name: name.to_string(),
+            });
+        };
+        resolver.resolve(self.collection.as_str(), name).map(PropertyKey::Id).ok_or_else(|| {
+            crate::property::traits::PropertyError::UnknownProperty { collection: self.collection.to_string(), name: name.to_string() }
+        })
+    }
+
+    /// Defensive canonicalization at the read/evaluation boundary (rfc.md 5.6
+    /// as amended 2026-07-10): commits canonicalize writes, but ingest is
+    /// deliberately schema-blind (catalog lag), so a legacy or ill-typed
+    /// payload can sit under a property id. Comparisons and the reactor's
+    /// watcher index collate canonical bytes, so an off-type value casts to
+    /// the canonical type here; a value the canonical type cannot represent
+    /// reads as NULL (plan decision 14) with a warning, never a poisoned
+    /// evaluation. No resolver, unknown id, or unknown type string: the value
+    /// passes through unchanged.
+    fn canonicalize_lenient(&self, id: &EntityId, value: Value) -> Option<Value> {
+        let Some(target) =
+            self.resolver().and_then(|r| r.canonical_value_type(id)).and_then(|s| crate::value::ValueType::from_property_str(&s))
+        else {
+            return Some(value);
+        };
+        if crate::value::ValueType::of(&value) == target {
+            return Some(value);
+        }
+        match value.cast_to(target) {
+            Ok(cast) => Some(cast),
+            Err(err) => {
+                tracing::warn!(
+                    "entity {}: value under property {} does not fit its canonical type ({}); reading as NULL",
+                    self.id,
+                    id,
+                    err
+                );
+                None
+            }
+        }
+    }
+
+    /// Read `name` for evaluation and lenient consumers: resolve to the id,
+    /// then run the generic Id-then-legacy-Name presence dispatch
+    /// ([`crate::property::read_resolved`]) uniformly over every backend --
+    /// an id key present (even cleared) is authoritative and never resurrects
+    /// a stale legacy name value (the PropertyKey amendment, #289). A field
+    /// belongs to exactly one backend per schema, so the first backend
+    /// holding an entry wins; there is no per-backend special-casing here
+    /// (backends are addressed only through the [`PropertyBackend`] trait).
+    fn read_lenient(&self, name: &str) -> Option<Value> {
+        let state = self.state.read().expect("other thread panicked, panic here too");
+        match self.resolve_key(name) {
+            PropertyKey::Id(id) => state
+                .backends
+                .values()
+                .find_map(|backend| crate::property::read_resolved(backend.as_ref(), id, name))
+                .and_then(|value| self.canonicalize_lenient(&id, value)),
+            key @ PropertyKey::Name(_) => state.backends.values().find_map(|backend| backend.property_value(&key)),
+        }
+    }
+
+    /// Read for RESOLVED-identifier predicate evaluation: the same generic
+    /// dispatch with the caller-supplied property id (no name re-resolution),
+    /// canonicalized at the evaluation boundary. Absent evaluates NULL (plan
+    /// decision 14). Evaluation has no error surface: type admission is
+    /// registration's job (the canonical value_type ruling, 2026-07-10), and
+    /// an ill-typed stored value reads as NULL with a warning.
+    pub(crate) fn read_resolved_eval(&self, property_id: EntityId, name: &str) -> Option<Value> {
+        if name == "id" {
+            return Some(Value::EntityId(self.id));
+        }
+        let state = self.state.read().expect("other thread panicked, panic here too");
+        state
+            .backends
+            .values()
+            .find_map(|backend| crate::property::read_resolved(backend.as_ref(), property_id, name))
+            .and_then(|value| self.canonicalize_lenient(&property_id, value))
+    }
+}
+
 impl Entity {
     pub fn id(&self) -> EntityId { self.id }
 
@@ -117,6 +242,69 @@ impl Entity {
     pub fn collection(&self) -> &CollectionId { &self.collection }
 
     pub fn head(&self) -> Clock { self.state.read().unwrap().head.clone() }
+
+    /// Resolve transient uncommitted `Name` keys to their `Id` at commit, using
+    /// the catalog-aware resolver (the PropertyKey amendment, #289), and cast
+    /// each staged LWW value to the property's CANONICAL value_type (rfc.md
+    /// 5.6 as amended 2026-07-10), so backends, engines, and indexes store one
+    /// consistent type regardless of the writer's compiled type. A value the
+    /// canonical type cannot represent fails the commit here, at the writer.
+    /// Pure key/value operations on the backends; the catalog never enters them.
+    pub(crate) fn resolve_pending_keys(&self) -> Result<(), crate::property::traits::PropertyError> {
+        let Some(resolver) = self.resolver() else {
+            // No resolver (a bare entity, or a system/catalog collection):
+            // nothing to resolve, keys stay name-keyed as staged.
+            return Ok(());
+        };
+        let collection = self.collection.as_str();
+        let state = self.state.read().expect("other thread panicked, panic here too");
+        for backend in state.backends.values() {
+            for key in backend.uncommitted_keys() {
+                let id = match &key {
+                    PropertyKey::Name(name) => {
+                        let Some(id) = resolver.resolve(collection, name) else {
+                            // Resolver-bound entities are registered user
+                            // models. An unresolved staged name here means the
+                            // compiled field is missing or ambiguous; emitting
+                            // it would leak fresh Name residue into the
+                            // id-keyed wire epoch. System/catalog entities have
+                            // no resolver, and committed legacy Name entries do
+                            // not appear in `uncommitted_keys`, so both allowed
+                            // name-addressed cases remain untouched.
+                            return Err(crate::property::traits::PropertyError::UnknownProperty {
+                                collection: collection.to_string(),
+                                name: name.clone(),
+                            });
+                        };
+                        backend.rekey(&key, PropertyKey::Id(id));
+                        id
+                    }
+                    // Explicit bindings stage under their literal id from the
+                    // outset. They still require the same writer-side cast to
+                    // the catalog's canonical value_type as a re-keyed field.
+                    PropertyKey::Id(id) => *id,
+                };
+
+                // Canonicalize the staged value through the generic trait
+                // primitives (`entry` / `restage`): a backend whose edits are
+                // not value-shaped (a text CRDT) stages nothing and restages
+                // nothing. A staged clear (tombstone) has no value to cast.
+                // An unknown canonical string (a newer fleet's type) writes
+                // as compiled: registration admitted this binary, so the
+                // types were equal.
+                if let Some(target) = resolver.canonical_value_type(&id).and_then(|c| crate::value::ValueType::from_property_str(&c)) {
+                    let staged = PropertyKey::Id(id);
+                    if let Some(Some(value)) = backend.entry(&staged) {
+                        if crate::value::ValueType::of(&value) != target {
+                            let cast = value.cast_to(target)?;
+                            backend.restage(&staged, Some(cast));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 
     /// Check if this entity is writable (i.e., it's a transaction fork that's still alive)
     pub fn is_writable(&self) -> bool {
@@ -139,7 +327,17 @@ impl Entity {
 
     pub fn to_entity_state(&self) -> Result<EntityState, StateError> {
         let state = self.to_state()?;
-        Ok(EntityState { entity_id: self.id(), collection: self.collection.clone(), state })
+        Ok(EntityState { entity_id: self.id(), model: self.model_id()?, state })
+    }
+
+    /// The model-definition id stamped on this entity's wire envelopes
+    /// (#330): the well-known id for system/catalog collections, else the
+    /// stamped catalog resolver's mapping for the collection. Fails
+    /// `UnknownModel` when neither answers.
+    pub(crate) fn model_id(&self) -> Result<EntityId, StateError> {
+        crate::schema::well_known_model_id(self.collection.as_str())
+            .or_else(|| self.resolver().and_then(|r| r.model_id_for(self.collection.as_str())))
+            .ok_or_else(|| StateError::UnknownModel(self.collection.to_string()))
     }
 
     // used by the Model macro
@@ -150,6 +348,7 @@ impl Entity {
             state: std::sync::RwLock::new(EntityInnerState { head: Clock::default(), backends: BTreeMap::default() }),
             kind: EntityKind::Primary,
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
+            resolver: std::sync::RwLock::new(None),
         }))
     }
 
@@ -167,13 +366,17 @@ impl Entity {
             state: std::sync::RwLock::new(EntityInnerState { head: state.head.clone(), backends }),
             kind: EntityKind::Primary,
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
+            resolver: std::sync::RwLock::new(None),
         })))
     }
 
-    /// Generate an event which contains all operations for all backends since the last time they were collected
-    /// Used for transaction commit. Notably this does not apply the head to the entity, which must be done
-    /// using commit_head
-    pub(crate) fn generate_commit_event(&self) -> Result<Option<Event>, MutationError> {
+    /// Extract all operations staged since the previous extraction.
+    ///
+    /// Creation uses this once, eagerly, to freeze the genesis payload before
+    /// the entity id exists. Commit uses it again for any edits made after
+    /// `Transaction::create` returned. Backends therefore remain the single
+    /// source of truth for the extraction boundary.
+    pub(crate) fn extract_operations(&self) -> Result<OperationSet, MutationError> {
         let state = self.state.read().expect("other thread panicked, panic here too");
         let mut operations = BTreeMap::<String, Vec<ankurah_proto::Operation>>::new();
         for (name, backend) in &state.backends {
@@ -181,14 +384,25 @@ impl Entity {
                 operations.insert(name.clone(), ops);
             }
         }
+        Ok(OperationSet(operations))
+    }
 
-        if operations.is_empty() {
-            Ok(None)
-        } else {
-            let operations = OperationSet(operations);
-            let event = Event { entity_id: self.id, collection: self.collection.clone(), operations, parent: state.head.clone() };
-            Ok(Some(event))
+    /// Generate the single update event for edits accumulated on a transaction
+    /// entity. Genesis is frozen and stored by `Transaction::create`; an
+    /// empty-head entity reaching this path is therefore a phantom, never an
+    /// implicit creation.
+    pub(crate) fn generate_commit_event(&self) -> Result<Option<Event>, MutationError> {
+        let parent = self.head();
+        if parent.is_empty() {
+            return Err(MutationError::InvalidEvent);
         }
+
+        let operations = self.extract_operations()?;
+        if operations.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(Event { entity_id: self.id, model: self.model_id()?, parent, body: EventBody::Update { operations } }))
     }
 
     /// Updates the head of the entity to the given clock, which should come exclusively from generate_commit_event
@@ -231,6 +445,14 @@ impl Entity {
     where E: GetEvents + Send + Sync {
         debug!("apply_event head: {event} to {self}");
 
+        // Structural identity is sufficient on every node class: a genesis
+        // event names exactly the entity id derived from its own content, and
+        // updates must target this entity. No definitive-storage oracle is
+        // needed to decide whether a creation is admissible.
+        if event.entity_id != self.id || event.validate_structure().is_err() {
+            return Err(MutationError::InvalidEvent);
+        }
+
         // Idempotency is handled by the comparison algorithm:
         // - Event already in head -> Equal -> no-op (Ok(false))
         // - Event is ancestor of head -> StrictAscends -> no-op (Ok(false))
@@ -239,32 +461,13 @@ impl Entity {
         // (node_applier, system.rs) store events to storage BEFORE calling
         // apply_event (so BFS can find them), which would cause false positives.
 
-        // Creation event on entity with non-empty head: either re-delivery or attack.
-        // On durable nodes (definitive storage), we can cheaply distinguish:
-        //   event_stored() == true  → re-delivery → no-op
-        //   event_stored() == false → different genesis event → reject
-        // On ephemeral nodes, event_stored() may return false for legitimate
-        // re-deliveries (entity arrived via StateSnapshot without event storage),
-        // so we fall through to BFS which correctly identifies:
-        //   StrictAscends → re-delivery → no-op
-        //   Disjoint → different genesis → reject
-        if event.is_entity_create() && !self.head().is_empty() {
-            if getter.event_stored(&event.id()).await? {
-                return Ok(false);
-            }
-            if getter.storage_is_definitive() {
-                return Err(LineageError::Disjoint.into());
-            }
-            // Ephemeral: fall through to comparison
-        }
-
         // Check for entity creation under the mutex to avoid TOCTOU race
         if event.is_entity_create() {
             let mut state = self.state.write().unwrap();
             // Re-check if head is still empty now that we hold the lock
             if state.head.is_empty() {
                 // this is the creation event for a new entity, so we simply accept it
-                for (backend_name, operations) in event.operations.iter() {
+                for (backend_name, operations) in event.operations().iter() {
                     state.apply_operations_from_event(backend_name.clone(), operations, event.id())?;
                 }
                 state.head = event.id().into();
@@ -301,7 +504,7 @@ impl Entity {
                     let new_head: Clock = event.id().into();
                     let event_id = event.id();
                     if self.try_mutate(&mut head, |state| -> Result<(), MutationError> {
-                        for (backend_name, operations) in event.operations.iter() {
+                        for (backend_name, operations) in event.operations().iter() {
                             state.apply_operations_from_event(backend_name.clone(), operations, event_id.clone())?;
                         }
                         state.head = new_head.clone();
@@ -349,14 +552,14 @@ impl Entity {
                         for layer in all_layers {
                             // Check for backends that first appear in this layer's to_apply events
                             for evt in &layer.to_apply {
-                                for (backend_name, _) in evt.operations.iter() {
+                                for (backend_name, _) in evt.operations().iter() {
                                     if !state.backends.contains_key(backend_name) {
                                         let backend = backend_from_string(backend_name, None)?;
                                         // Replay earlier layers for this newly-created backend
                                         for earlier in &applied_layers {
                                             backend.apply_layer(earlier)?;
                                         }
-                                        state.backends.insert(backend_name.clone(), backend);
+                                        state.backends.insert(backend_name.to_string(), backend);
                                     }
                                 }
                             }
@@ -488,7 +691,45 @@ impl Entity {
             state: std::sync::RwLock::new(EntityInnerState { head: state.head.clone(), backends: forked }),
             kind: EntityKind::Transacted { trx_alive, upstream: self.clone() },
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
+            // Carry the resolver across the fork so a transaction's read path
+            // still resolves names to ids.
+            resolver: std::sync::RwLock::new(self.resolver.read().unwrap().clone()),
         }))
+    }
+
+    /// Build the transaction-visible state immediately after a frozen genesis
+    /// while keeping `self` as the empty resident primary until commit.
+    ///
+    /// Re-encoding each applied backend through its state buffer establishes a
+    /// clean extraction baseline for every backend. This is important for Yrs:
+    /// applying the genesis update mutates the document, but only a freshly
+    /// decoded state advances its local `previous_state`, so the initial
+    /// operations cannot leak into the later Update event.
+    fn snapshot_after_genesis(&self, genesis: &Event, trx_alive: Arc<AtomicBool>) -> Result<Self, MutationError> {
+        if !genesis.is_entity_create() || genesis.entity_id != self.id || genesis.validate_structure().is_err() {
+            return Err(MutationError::InvalidEvent);
+        }
+        if genesis.model != self.model_id()? {
+            return Err(MutationError::InvalidEvent);
+        }
+
+        let event_id = genesis.id();
+        let mut backends = BTreeMap::new();
+        for (name, operations) in genesis.operations().iter() {
+            let backend = backend_from_string(name, None)?;
+            backend.apply_operations_with_event(operations, event_id.clone())?;
+            let state = backend.to_state_buffer()?;
+            backends.insert(name.clone(), backend_from_string(name, Some(&state))?);
+        }
+
+        Ok(Self(Arc::new(EntityInner {
+            id: self.id,
+            collection: self.collection.clone(),
+            state: std::sync::RwLock::new(EntityInnerState { head: event_id.into(), backends }),
+            kind: EntityKind::Transacted { trx_alive, upstream: self.clone() },
+            broadcast: ankurah_signals::broadcast::Broadcast::new(),
+            resolver: std::sync::RwLock::new(self.resolver.read().unwrap().clone()),
+        })))
     }
 
     /// Get a reference to the entity's broadcast for Signal implementations
@@ -512,17 +753,7 @@ impl Entity {
 
     pub fn values(&self) -> Vec<(String, Option<Value>)> {
         let state = self.state.read().expect("other thread panicked, panic here too");
-        state
-            .backends
-            .values()
-            .flat_map(|backend| {
-                backend
-                    .property_values()
-                    .iter()
-                    .map(|(name, value)| (name.to_string(), value.clone()))
-                    .collect::<Vec<(String, Option<Value>)>>()
-            })
-            .collect()
+        state.backends.values().flat_map(|backend| backend.property_values().into_iter().map(|(k, v)| (k.display_name(), v))).collect()
     }
 }
 
@@ -536,10 +767,12 @@ impl AbstractEntity for Entity {
         if field == "id" {
             Some(crate::value::Value::EntityId(self.id))
         } else {
-            // Iterate through backends to find one that has this property
-            let state = self.state.read().expect("other thread panicked, panic here too");
-            state.backends.values().find_map(|backend| backend.property_value(&field.into()))
+            self.read_lenient(field)
         }
+    }
+
+    fn value_resolved(&self, property_id: ankurah_proto::EntityId, name: &str) -> Option<crate::value::Value> {
+        self.read_resolved_eval(property_id, name)
     }
 }
 
@@ -556,15 +789,35 @@ impl Filterable for Entity {
         if name == "id" {
             Some(Value::EntityId(self.id))
         } else {
-            // Iterate through backends to find one that has this property
-            let state = self.state.read().expect("other thread panicked, panic here too");
-            state.backends.values().find_map(|backend| backend.property_value(&name.to_owned()))
+            self.read_lenient(name)
         }
     }
+
+    /// Read for RESOLVED-identifier predicate evaluation, via the shared
+    /// [`EntityInner::read_resolved_eval`] dispatch.
+    fn value_resolved(&self, property_id: EntityId, name: &str) -> Option<Value> { self.0.read_resolved_eval(property_id, name) }
 }
 
 impl TemporaryEntity {
     pub fn new(id: EntityId, collection: CollectionId, state: &State) -> Result<Self, RetrievalError> {
+        // Temporary entities parse UNBOUND by default (engine post-filter
+        // tier): no resolver, so lenient name reads see only name-keyed data,
+        // while resolved-identifier predicate reads carry their own id.
+        Self::new_bound(id, collection, state, None)
+    }
+
+    /// [`Self::new`] with a catalog resolver stamped, for consumers that
+    /// evaluate NAME-addressed predicates against id-keyed state -- policy
+    /// agents inspecting entity state for scope enforcement (the
+    /// `PolicyAgent::check_read` resolver parameter). Without the binding, a
+    /// display name resolves to nothing on a post-epoch buffer and every
+    /// scope predicate evaluates false.
+    pub fn new_bound(
+        id: EntityId,
+        collection: CollectionId,
+        state: &State,
+        resolver: Option<std::sync::Weak<dyn PropertyResolver>>,
+    ) -> Result<Self, RetrievalError> {
         // Inline from_state_buffers logic
         let mut backends = BTreeMap::new();
         for (name, state_buffer) in state.state_buffers.iter() {
@@ -579,11 +832,12 @@ impl TemporaryEntity {
             kind: EntityKind::Primary,
             // slightly annoying that we need to populate this, given that it won't be used
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
+            resolver: std::sync::RwLock::new(resolver),
         })))
     }
     pub fn values(&self) -> Vec<(String, Option<Value>)> {
         let state = self.0.state.read().expect("other thread panicked, panic here too");
-        state.backends.values().flat_map(|backend| backend.property_values()).collect()
+        state.backends.values().flat_map(|backend| backend.property_values().into_iter().map(|(k, v)| (k.display_name(), v))).collect()
     }
 }
 
@@ -595,11 +849,22 @@ impl Filterable for TemporaryEntity {
         if name == "id" {
             Some(Value::EntityId(self.0.id))
         } else {
-            // Iterate through backends to find one that has this property
-            let state = self.0.state.read().expect("other thread panicked, panic here too");
-            state.backends.values().find_map(|backend| backend.property_value(&name.to_owned()))
+            // The shared lenient dispatch: with a stamped resolver
+            // (new_bound, e.g. policy scope inspection) the name resolves to
+            // its id and reads id-keyed data; unbound (the engine
+            // post-filter tier) it degenerates to the bare name-keyed scan,
+            // exactly the pre-binding behavior. Schema-blind name projection
+            // of id-keyed entries remains #312 territory (plan decision 13
+            // withdrawn).
+            self.0.read_lenient(name)
         }
     }
+
+    /// Read for RESOLVED-identifier predicate evaluation, via the shared
+    /// [`EntityInner::read_resolved_eval`] dispatch. An unbound temporary (no
+    /// resolver) skips canonicalization: the caller-supplied resolved id is
+    /// the only schema knowledge in play.
+    fn value_resolved(&self, property_id: EntityId, name: &str) -> Option<Value> { self.0.read_resolved_eval(property_id, name) }
 }
 
 impl std::fmt::Display for TemporaryEntity {
@@ -608,19 +873,96 @@ impl std::fmt::Display for TemporaryEntity {
     }
 }
 
+#[cfg(test)]
+mod eager_genesis_tests {
+    use super::*;
+    use crate::property::backend::{LWWBackend, YrsBackend};
+    use crate::property::PropertyKey;
+
+    #[test]
+    fn genesis_is_the_clean_baseline_for_post_create_updates() {
+        let entities = WeakEntitySet::default();
+        let alive = Arc::new(AtomicBool::new(true));
+        let collection = CollectionId::fixed_name(crate::system::SYSTEM_COLLECTION_ID);
+        let provisional = entities.create_provisional(collection.clone(), alive.clone());
+
+        provisional.get_backend::<LWWBackend>().unwrap().set(PropertyKey::name("title"), Some(Value::String("initial".into())));
+        provisional.get_backend::<YrsBackend>().unwrap().insert(&PropertyKey::name("body"), 0, "initial").unwrap();
+
+        let initial_operations = provisional.extract_operations().unwrap();
+        assert_eq!(initial_operations.keys().map(String::as_str).collect::<Vec<_>>(), vec!["lww", "yrs"]);
+
+        let model = crate::schema::well_known_model_id(crate::system::SYSTEM_COLLECTION_ID).unwrap();
+        let genesis = Event::genesis(model, Some(EntityId::from_bytes([9; 32])), initial_operations);
+        let transaction_entity = entities.create_transaction_entity(collection, &genesis, alive).unwrap();
+
+        assert_eq!(transaction_entity.id(), genesis.entity_id);
+        assert_eq!(transaction_entity.head(), Clock::new([genesis.id()]));
+        assert!(transaction_entity.generate_commit_event().unwrap().is_none());
+
+        // The resident primary is still an empty, removable phantom until the
+        // commit path applies the policy-approved genesis.
+        let resident = entities.get(&genesis.entity_id).unwrap();
+        assert!(resident.head().is_empty());
+        assert!(resident.values().is_empty());
+
+        // Only this post-create write appears in the Update. In particular,
+        // the Yrs genesis update must not be extracted a second time.
+        transaction_entity.get_backend::<LWWBackend>().unwrap().set(PropertyKey::name("title"), Some(Value::String("after".into())));
+        let update = transaction_entity.generate_commit_event().unwrap().unwrap();
+        assert!(!update.is_entity_create());
+        assert_eq!(update.parent, Clock::new([genesis.id()]));
+        assert_eq!(update.operations().keys().map(String::as_str).collect::<Vec<_>>(), vec!["lww"]);
+    }
+
+    #[test]
+    fn empty_head_transaction_entity_is_not_implicitly_created() {
+        let collection = CollectionId::fixed_name(crate::system::SYSTEM_COLLECTION_ID);
+        let primary = Entity::create(EntityId::from_bytes([7; 32]), collection);
+        let phantom = primary.snapshot(Arc::new(AtomicBool::new(true)));
+
+        assert!(matches!(phantom.generate_commit_event(), Err(MutationError::InvalidEvent)));
+    }
+}
+
 // TODO - Implement TOCTOU Race condition tests. Require real backend state mutations to be meaningful. punting that for now
-/// A set of entities held weakly
+/// A set of entities held weakly.
+///
+/// Assembly is the single choke point for catalog-aware property access:
+/// every method that hands out an `Entity` runs the `bind_hook`, installed by
+/// `Node` to stamp its live property resolver. The hook is idempotent and
+/// re-fires on resident hand-outs, so an entity assembled before the catalog
+/// warmed observes the catalog on its next access.
 #[derive(Clone, Default)]
-pub struct WeakEntitySet(Arc<std::sync::RwLock<BTreeMap<EntityId, WeakEntity>>>);
+pub struct WeakEntitySet(Arc<WeakEntitySetInner>);
+
+#[derive(Default)]
+struct WeakEntitySetInner {
+    entities: std::sync::RwLock<BTreeMap<EntityId, WeakEntity>>,
+    bind_hook: std::sync::RwLock<Option<Box<dyn Fn(&Entity) + Send + Sync>>>,
+}
+
 impl WeakEntitySet {
-    pub fn get(&self, id: &EntityId) -> Option<Entity> {
-        let entities = self.0.read().unwrap();
-        // TODO: call policy agent with cdata
-        if let Some(entity) = entities.get(id) {
-            entity.upgrade()
-        } else {
-            None
+    /// Install the assembly-time bind hook. Called once from `Node`
+    /// construction; the hook captures a `WeakNode` (no strong cycle).
+    pub(crate) fn set_bind_hook(&self, hook: Box<dyn Fn(&Entity) + Send + Sync>) { *self.0.bind_hook.write().unwrap() = Some(hook); }
+
+    /// Run the bind hook on an entity leaving the assembly boundary. Always
+    /// called OUTSIDE the entities lock (the hook takes catalog/backend
+    /// locks of its own).
+    fn bind(&self, entity: &Entity) {
+        if let Some(hook) = self.0.bind_hook.read().unwrap().as_ref() {
+            hook(entity);
         }
+    }
+
+    pub fn get(&self, id: &EntityId) -> Option<Entity> {
+        // TODO: call policy agent with cdata
+        let entity = { self.0.entities.read().unwrap().get(id).and_then(|weak| weak.upgrade()) };
+        if let Some(ref entity) = entity {
+            self.bind(entity);
+        }
+        entity
     }
 
     pub async fn get_or_retrieve<S, E>(
@@ -664,26 +1006,55 @@ impl WeakEntitySet {
         match self.get_or_retrieve(state_getter, event_getter, collection_id, id).await? {
             Some(entity) => Ok(entity),
             None => {
-                let mut entities = self.0.write().unwrap();
-                // TODO: call policy agent with cdata
-                if let Some(entity) = entities.get(id) {
-                    if let Some(entity) = entity.upgrade() {
-                        return Ok(entity);
+                let entity = {
+                    let mut entities = self.0.entities.write().unwrap();
+                    // TODO: call policy agent with cdata
+                    match entities.get(id).and_then(|weak| weak.upgrade()) {
+                        Some(entity) => entity,
+                        None => {
+                            let entity = Entity::create(*id, collection_id.to_owned());
+                            entities.insert(*id, entity.weak());
+                            entity
+                        }
                     }
-                }
-                let entity = Entity::create(*id, collection_id.to_owned());
-                entities.insert(*id, entity.weak());
+                };
+                self.bind(&entity);
                 Ok(entity)
             }
         }
     }
-    /// Create a brand new entity, and add it to the set
-    pub fn create(&self, collection: CollectionId) -> Entity {
-        let mut entities = self.0.write().unwrap();
-        let id = EntityId::new();
-        let entity = Entity::create(id, collection);
-        entities.insert(id, entity.weak());
-        entity
+    /// Create the writable, pre-identity entity used only while a model writes
+    /// its initial values. It is deliberately absent from the resident set:
+    /// the real id does not exist until those values have been frozen into the
+    /// genesis event.
+    pub(crate) fn create_provisional(&self, collection: CollectionId, trx_alive: Arc<AtomicBool>) -> Entity {
+        // The placeholder is never observable outside this create call and is
+        // never inserted into the id-keyed resident set.
+        let primary = Entity::create(EntityId::from_bytes([0; 32]), collection);
+        self.bind(&primary);
+        primary.snapshot(trx_alive)
+    }
+
+    /// Insert the empty resident primary under the id derived by `genesis`,
+    /// then return the transaction snapshot whose baseline is that genesis.
+    /// Subsequent edits on the returned entity therefore extend genesis with
+    /// at most one Update event.
+    pub(crate) fn create_transaction_entity(
+        &self,
+        collection: CollectionId,
+        genesis: &Event,
+        trx_alive: Arc<AtomicBool>,
+    ) -> Result<Entity, MutationError> {
+        let primary = Entity::create(genesis.entity_id, collection);
+        self.bind(&primary);
+        let transaction_entity = primary.snapshot_after_genesis(genesis, trx_alive)?;
+
+        let mut entities = self.0.entities.write().unwrap();
+        if entities.get(&primary.id).and_then(WeakEntity::upgrade).is_some() {
+            return Err(MutationError::AlreadyExists);
+        }
+        entities.insert(primary.id, primary.weak());
+        Ok(transaction_entity)
     }
 
     /// Evict an entity from the set only if it is absent from storage-backed
@@ -692,7 +1063,7 @@ impl WeakEntitySet {
     /// update that then failed to apply; leaving it resident makes the entity
     /// appear to exist with no state. Returns true if an entry was removed.
     pub fn remove_if_phantom(&self, id: &EntityId) -> bool {
-        let mut entities = self.0.write().unwrap();
+        let mut entities = self.0.entities.write().unwrap();
         if let Some(weak) = entities.get(id) {
             if let Some(entity) = weak.upgrade() {
                 if !entity.head().is_empty() {
@@ -717,7 +1088,7 @@ impl WeakEntitySet {
     /// Requires the `test-helpers` feature to be enabled.
     #[cfg(feature = "test-helpers")]
     pub fn conjure_evil_phantom(&self, id: EntityId, collection: CollectionId) -> Entity {
-        let mut entities = self.0.write().unwrap();
+        let mut entities = self.0.entities.write().unwrap();
         let entity = Entity::create(id, collection);
         entities.insert(id, entity.weak());
         entity
@@ -726,7 +1097,7 @@ impl WeakEntitySet {
     /// Get or create entity after async operations, checking for race conditions
     /// Returns (existed, entity) where existed is true if the entity was already present
     fn private_get_or_create(&self, id: EntityId, collection_id: &CollectionId, state: &State) -> Result<(bool, Entity), RetrievalError> {
-        let mut entities = self.0.write().unwrap();
+        let mut entities = self.0.entities.write().unwrap();
         if let Some(existing_weak) = entities.get(&id) {
             if let Some(existing_entity) = existing_weak.upgrade() {
                 debug!("Entity {id} was created by another thread during async work, using that one");
@@ -767,6 +1138,7 @@ impl WeakEntitySet {
                         (true, entity) => entity, // some body frontran us to create it, so we have to apply the new state
                         (false, entity) => {
                             // we just created it with the given state, so there's nothing to apply. early return
+                            self.bind(&entity);
                             return Ok((None, entity));
                         }
                     }
@@ -777,6 +1149,11 @@ impl WeakEntitySet {
         // if we're here, we've retrieved the entity from the set and need to apply the state
         let result = entity.apply_state(event_getter, &state).await?;
         let changed = matches!(result, StateApplyResult::Applied);
+        // Bind AFTER the apply: apply_state may rebuild backends from the
+        // incoming raw buffers, which would discard a binding attached
+        // beforehand and leave an unbound (v1-emitting) backend holding
+        // id-keyed entries.
+        self.bind(&entity);
         Ok((Some(changed), entity))
     }
 }

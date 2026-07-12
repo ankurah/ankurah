@@ -11,6 +11,8 @@ use std::task::{Context, Poll};
 
 use crate::index::Index;
 
+const ENTITY_ID_BYTES: usize = 32;
+
 /// Scanner over a sled index tree yielding EntityId directly
 pub struct SledIndexScanner<'a> {
     pub index: &'a Index,
@@ -120,12 +122,33 @@ impl Stream for SledIndexScanner<'_> {
 
 // TODO: Add extract_ids method for streams that need to convert back to EntityId streams
 
-/// Decode EntityId from index key suffix (last 16 bytes)
+/// Decode EntityId from an index key's final 32-byte suffix.
 pub fn decode_entity_id_from_index_key(key: &[u8]) -> Result<EntityId, RetrievalError> {
-    if key.len() < 1 + 16 {
+    if key.len() < 1 + ENTITY_ID_BYTES {
         return Err(RetrievalError::StorageError("index key too short".into()));
     }
-    let eid_bytes: [u8; 16] =
-        key[key.len() - 16..].try_into().map_err(|_| RetrievalError::StorageError("invalid entity id suffix".into()))?;
+    let eid_bytes: [u8; ENTITY_ID_BYTES] =
+        key[key.len() - ENTITY_ID_BYTES..].try_into().map_err(|_| RetrievalError::StorageError("invalid entity id suffix".into()))?;
     Ok(EntityId::from_bytes(eid_bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_32_byte_entity_id_suffix() {
+        let entity_id = EntityId::from_bytes([0xA5; ENTITY_ID_BYTES]);
+        let mut key = vec![0x10, 0x20, 0x30];
+        key.extend_from_slice(&entity_id.to_bytes());
+
+        assert_eq!(decode_entity_id_from_index_key(&key).unwrap(), entity_id);
+    }
+
+    #[test]
+    fn rejects_key_without_full_32_byte_suffix() {
+        let legacy_sized_key = vec![0; 1 + 16];
+
+        assert!(decode_entity_id_from_index_key(&legacy_sized_key).is_err());
+    }
 }

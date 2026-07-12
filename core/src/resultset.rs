@@ -1,5 +1,9 @@
 use crate::indexing::{encode_tuple_values_with_key_spec, KeySpec};
-use crate::{entity::Entity, model::View, reactor::AbstractEntity};
+use crate::{
+    entity::Entity,
+    model::View,
+    reactor::{AbstractEntity, PropertyPath},
+};
 use ankurah_proto as proto;
 use ankurah_signals::{
     broadcast::{Broadcast, BroadcastId},
@@ -71,9 +75,32 @@ struct State<E: AbstractEntity> {
     order: Vec<EntityEntry<E>>,
     index: HashMap<proto::EntityId, usize>,
     // Ordering configuration
-    key_spec: Option<KeySpec>,
+    key_spec: Option<ResultKeySpec>,
     limit: Option<usize>,
     gap_dirty: bool, // Set when we remove entities and go from =LIMIT to < LIMIT
+}
+
+/// Result-set ordering keeps the ordinary encoding specification together
+/// with the property addresses used to extract each component. Reactor-built
+/// paths retain catalog ids so an active query remains stable across display-
+/// name changes; standalone result sets use name-based paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResultKeySpec {
+    key_spec: KeySpec,
+    property_paths: Vec<PropertyPath>,
+}
+
+impl ResultKeySpec {
+    pub(crate) fn new(key_spec: KeySpec, property_paths: Vec<PropertyPath>) -> Self {
+        assert_eq!(key_spec.keyparts.len(), property_paths.len(), "one extraction path is required per sort key component");
+        Self { key_spec, property_paths }
+    }
+
+    #[cfg(test)]
+    fn from_key_spec(key_spec: KeySpec) -> Self {
+        let property_paths = key_spec.keyparts.iter().map(|keypart| PropertyPath::simple(keypart.column.clone(), None)).collect();
+        Self::new(key_spec, property_paths)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -302,12 +329,12 @@ impl<'a, E: AbstractEntity> ResultSetWrite<'a, E> {
     }
 
     /// Compute sort key for an entity using the current key spec
-    fn compute_sort_key(entity: &E, key_spec: &KeySpec) -> IVec {
+    fn compute_sort_key(entity: &E, key_spec: &ResultKeySpec) -> IVec {
         let mut values = Vec::new();
 
         // Extract values for each key part
-        for keypart in &key_spec.keyparts {
-            let value = AbstractEntity::value(entity, &keypart.column);
+        for property_path in &key_spec.property_paths {
+            let value = property_path.extract_value(entity);
             // TODO: Handle NULLs properly - for now we'll get encoding errors on NULLs
             // which will cause unwrap_or_default() to return empty key (sorts first)
             if let Some(v) = value {
@@ -319,7 +346,7 @@ impl<'a, E: AbstractEntity> ResultSetWrite<'a, E> {
         }
 
         // Encode the tuple - if this fails, return empty key (will sort first)
-        let encoded = encode_tuple_values_with_key_spec(&values, key_spec).unwrap_or_default();
+        let encoded = encode_tuple_values_with_key_spec(&values, &key_spec.key_spec).unwrap_or_default();
         IVec::from(encoded)
     }
 
@@ -468,7 +495,13 @@ impl<E: AbstractEntity> EntityResultSet<E> {
     }
 
     /// Configure ordering for this result set
-    pub(crate) fn order_by(&self, key_spec: Option<KeySpec>) {
+    #[cfg(test)]
+    pub(crate) fn order_by(&self, key_spec: Option<KeySpec>) { self.order_by_resolved(key_spec.map(ResultKeySpec::from_key_spec)); }
+
+    /// Configure ordering with catalog-resolved extraction paths. The
+    /// ordinary KeySpec still owns encoding/collation; these paths only decide
+    /// which stable property supplies each component.
+    pub(crate) fn order_by_resolved(&self, key_spec: Option<ResultKeySpec>) {
         let mut st = self.0.state.lock().unwrap();
 
         // Check if the key spec actually changed
@@ -567,8 +600,8 @@ mod tests {
 
     impl TestEntity {
         fn new(id: u8, properties: HashMap<String, Value>) -> Self {
-            let mut id_bytes = [0u8; 16];
-            id_bytes[15] = id;
+            let mut id_bytes = [0u8; 32];
+            id_bytes[31] = id;
             Self { id: proto::EntityId::from_bytes(id_bytes), collection: proto::CollectionId::fixed_name("test"), properties }
         }
     }

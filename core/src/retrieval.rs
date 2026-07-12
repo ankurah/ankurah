@@ -18,6 +18,13 @@ use crate::{
 use ankurah_proto::{self as proto, Attested, EntityId, Event, EventId};
 use async_trait::async_trait;
 
+/// Select only a response payload whose recomputed content hash is one of
+/// the requested ids. `GetEvents` currently requests a single id at a time,
+/// so this helper deliberately returns at most one envelope.
+fn take_requested_event(peer_events: Vec<Attested<Event>>, requested: &EventId) -> Option<Attested<Event>> {
+    peer_events.into_iter().find(|event| event.payload.id() == *requested)
+}
+
 // ============================================================================
 // TRAITS
 // ============================================================================
@@ -200,11 +207,20 @@ where
             .await?
         {
             proto::NodeResponseBody::GetEvents(peer_events) => {
-                // Store locally for future access
-                for event in peer_events.iter() {
-                    self.collection.add_event(event).await?;
-                }
-                peer_events.into_iter().next().map(|e| e.payload).ok_or_else(|| RetrievalError::EventNotFound(event_id.clone()))
+                // A peer response is untrusted. Recompute each payload's
+                // content hash and ignore everything except the event we
+                // requested; otherwise an unsolicited event could enter the
+                // permanent cache during a mid-BFS fetch.
+                let Some(event) = take_requested_event(peer_events, event_id) else {
+                    return Err(RetrievalError::EventNotFound(event_id.clone()));
+                };
+
+                // Mechanical envelope verification runs before the
+                // deployment policy hook. Persist only the stripped,
+                // policy-accepted envelope.
+                let event = self.node.validate_incoming_event(&peer_id, event)?;
+                self.collection.add_event(&event).await?;
+                Ok(event.payload)
             }
             proto::NodeResponseBody::Error(e) => Err(RetrievalError::StorageError(format!("Error from peer: {}", e).into())),
             _ => Err(RetrievalError::StorageError("Unexpected response type from peer".into())),
@@ -264,7 +280,7 @@ impl GetState for LocalStateGetter {
 mod tests {
     use super::*;
     use crate::storage::{StorageCollection, StorageCollectionWrapper};
-    use ankurah_proto::{AttestationSet, Attested, Clock, EntityId, EntityState, Event, EventId, OperationSet};
+    use ankurah_proto::{AttestationSet, Attested, Clock, EntityId, EntityState, Event, EventBody, EventId, OperationSet};
     use async_trait::async_trait;
     use std::collections::{BTreeMap, HashMap};
     use std::sync::{Arc, Mutex};
@@ -306,11 +322,38 @@ mod tests {
 
     /// Create a test event with a deterministic content-hashed ID.
     fn make_test_event(seed: u8, parent_ids: &[EventId]) -> Event {
-        let mut entity_id_bytes = [0u8; 16];
-        entity_id_bytes[0] = seed;
-        let entity_id = EntityId::from_bytes(entity_id_bytes);
+        // Deterministic fake model id (#330): these staging-lifecycle fixtures
+        // build events by hand and never route them through a node's catalog,
+        // and the model field is excluded from `EventId` hashing.
+        let mut model_bytes = [0u8; 32];
+        model_bytes[0] = 0xEE;
+        let model = EntityId::from_bytes(model_bytes);
 
-        Event { entity_id, collection: "test".into(), parent: Clock::from(parent_ids.to_vec()), operations: OperationSet(BTreeMap::new()) }
+        let operations = OperationSet(BTreeMap::new());
+        if parent_ids.is_empty() {
+            let nonce = [seed; 32];
+            let timestamp = u64::from(seed);
+            let entity_id = EventId::from_genesis_parts(&None, &nonce, timestamp, &operations).into();
+            Event { entity_id, model, parent: Clock::default(), body: EventBody::Genesis { system: None, nonce, timestamp, operations } }
+        } else {
+            let entity_id = EntityId::from_bytes([seed; 32]);
+            Event { entity_id, model, parent: Clock::from(parent_ids.to_vec()), body: EventBody::Update { operations } }
+        }
+    }
+
+    #[test]
+    fn requested_event_filter_ignores_unsolicited_payloads() {
+        let requested = make_test_event(1, &[]);
+        let requested_id = requested.id();
+        let unsolicited = make_test_event(2, &[]);
+
+        let response = vec![
+            Attested { payload: unsolicited, attestations: AttestationSet::default() },
+            Attested { payload: requested, attestations: AttestationSet::default() },
+        ];
+
+        let selected = take_requested_event(response, &requested_id).expect("requested payload should be selected");
+        assert_eq!(selected.payload.id(), requested_id);
     }
 
     // ====================================================================

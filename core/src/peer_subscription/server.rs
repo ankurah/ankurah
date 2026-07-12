@@ -1,4 +1,4 @@
-use ankurah_proto::{self as proto, Attested};
+use ankurah_proto::{self as proto};
 use tracing::warn;
 
 use crate::{
@@ -15,13 +15,13 @@ use ankurah_signals::{Subscribe, SubscriptionGuard};
 /// This handler owns both the ReactorSubscription and the SubscriptionGuard
 /// for listening to changes on that subscription.
 pub struct SubscriptionHandler {
-    _peer_id: proto::EntityId,
+    _peer_id: proto::NodeId,
     subscription: ReactorSubscription,
     _guard: SubscriptionGuard,
 }
 
 impl SubscriptionHandler {
-    pub fn new<SE, PA>(peer_id: proto::EntityId, node: &Node<SE, PA>) -> Self
+    pub fn new<SE, PA>(peer_id: proto::NodeId, node: &Node<SE, PA>) -> Self
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
@@ -95,8 +95,8 @@ impl SubscriptionHandler {
             .into_iter()
             .filter_map(|e| {
                 let entity_state = e.to_entity_state().ok()?;
-                let attestation = node.policy_agent.attest_state(node, &entity_state);
-                Some(Attested::opt(entity_state, attestation))
+                let admission = node.policy_agent.attest_state(node, &entity_state);
+                Some(node.attest_state(entity_state, admission))
             })
             .collect();
 
@@ -119,7 +119,11 @@ impl SubscriptionHandler {
             // are evaluated against entity state, not just the predicate. Skip
             // unreadable entities silently (mirroring the Fetch/Get handlers) so one
             // out-of-scope entity doesn't fail the whole subscription.
-            if node.policy_agent.check_read(cdata, &state.payload.entity_id, &collection_id, &state.payload.state).is_err() {
+            if node
+                .policy_agent
+                .check_read(cdata, &state.payload.entity_id, &collection_id, &state.payload.state, Some(node.catalog.resolver_weak()))
+                .is_err()
+            {
                 continue;
             }
 
@@ -136,7 +140,7 @@ impl SubscriptionHandler {
 /// Convert a single ReactorUpdateItem to a SubscriptionUpdateItem.
 fn convert_item<SE, PA>(
     node: &Node<SE, PA>,
-    peer_id: proto::EntityId,
+    peer_id: proto::NodeId,
     item: crate::reactor::ReactorUpdateItem,
 ) -> Option<proto::SubscriptionUpdateItem>
 where
@@ -152,8 +156,8 @@ where
         }
     };
 
-    let attestation = node.policy_agent.attest_state(node, &entity_state);
-    let attested_state = Attested::opt(entity_state, attestation);
+    let admission = node.policy_agent.attest_state(node, &entity_state);
+    let attested_state = node.attest_state(entity_state, admission);
 
     // Events should already be attested
     let attested_events = item.events;
@@ -176,10 +180,5 @@ where
         .collect();
 
     // Create subscription update item
-    Some(proto::SubscriptionUpdateItem {
-        entity_id: item.entity.id(),
-        collection: item.entity.collection().clone(),
-        content,
-        predicate_relevance,
-    })
+    Some(proto::SubscriptionUpdateItem { entity_id: item.entity.id(), model: item.entity.model_id().ok()?, content, predicate_relevance })
 }

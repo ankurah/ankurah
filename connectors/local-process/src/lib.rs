@@ -10,18 +10,18 @@ use ankurah_core::node::{Node, WeakNode};
 #[derive(Clone)]
 /// Sender for local process connection
 pub struct LocalProcessSender {
-    sender: mpsc::Sender<proto::NodeMessage>,
-    node_id: proto::EntityId,
+    sender: mpsc::Sender<proto::SignedPeerMessage>,
+    node_id: proto::NodeId,
 }
 
 #[async_trait]
 impl PeerSender for LocalProcessSender {
-    fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError> {
+    fn send_message(&self, message: proto::SignedPeerMessage) -> Result<(), SendError> {
         self.sender.try_send(message).map_err(|_| SendError::ConnectionClosed)?;
         Ok(())
     }
 
-    fn recipient_node_id(&self) -> proto::EntityId { self.node_id }
+    fn recipient_node_id(&self) -> proto::NodeId { self.node_id }
 
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
@@ -38,8 +38,10 @@ where
     receiver2_task: tokio::task::JoinHandle<()>,
     node1: WeakNode<SE1, PA1>,
     node2: WeakNode<SE2, PA2>,
-    node1_id: proto::EntityId,
-    node2_id: proto::EntityId,
+    node1_id: proto::NodeId,
+    node2_id: proto::NodeId,
+    node1_incoming_session: proto::HandshakeChallenge,
+    node2_incoming_session: proto::HandshakeChallenge,
 }
 
 impl<SE1, PA1, SE2, PA2> LocalProcessConnection<SE1, PA1, SE2, PA2>
@@ -54,33 +56,62 @@ where
         let (node1_tx, node1_rx) = mpsc::channel(1024);
         let (node2_tx, node2_rx) = mpsc::channel(1024);
 
-        // we have to register the senders with the nodes
+        // Exercise the same challenge-bound identity proof as network
+        // transports even though both peers share this trusted process.
+        let node1_handshake = node1.begin_peer_handshake();
+        let node2_handshake = node2.begin_peer_handshake();
+        let node1_challenge = node1_handshake.challenge();
+        let node2_challenge = node2_handshake.challenge();
+        let node2_presence = node2.presence(node1_challenge);
+        let node1_presence = node1.presence(node2_challenge);
         node1.register_peer(
-            proto::Presence { node_id: node2.id, durable: node2.durable, system_root: node2.system.root() },
+            node2_presence,
+            node1_handshake,
+            node2_challenge,
             Box::new(LocalProcessSender { sender: node2_tx, node_id: node2.id }),
-        );
-        node2.register_peer(
-            proto::Presence { node_id: node1.id, durable: node1.durable, system_root: node1.system.root() },
+        )?;
+
+        if let Err(rejection) = node2.register_peer(
+            node1_presence,
+            node2_handshake,
+            node1_challenge,
             Box::new(LocalProcessSender { sender: node1_tx, node_id: node1.id }),
-        );
+        ) {
+            node1.deregister_peer_session(node2.id, node1_challenge);
+            return Err(rejection.into());
+        }
 
-        let receiver1_task = Self::setup_receiver(node1.clone(), node1_rx);
-        let receiver2_task = Self::setup_receiver(node2.clone(), node2_rx);
+        let receiver1_task = Self::setup_receiver(node1.clone(), node2.id, node1_rx);
+        let receiver2_task = Self::setup_receiver(node2.clone(), node1.id, node2_rx);
 
-        Ok(Self { node1: node1.weak(), node2: node2.weak(), node1_id: node1.id, node2_id: node2.id, receiver1_task, receiver2_task })
+        Ok(Self {
+            node1: node1.weak(),
+            node2: node2.weak(),
+            node1_id: node1.id,
+            node2_id: node2.id,
+            node1_incoming_session: node1_challenge,
+            node2_incoming_session: node2_challenge,
+            receiver1_task,
+            receiver2_task,
+        })
     }
 
-    fn setup_receiver<SE, PA>(node: Node<SE, PA>, mut rx: mpsc::Receiver<proto::NodeMessage>) -> tokio::task::JoinHandle<()>
+    fn setup_receiver<SE, PA>(
+        node: Node<SE, PA>,
+        authenticated_peer: proto::NodeId,
+        mut rx: mpsc::Receiver<proto::SignedPeerMessage>,
+    ) -> tokio::task::JoinHandle<()>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
         tokio::spawn(async move {
             while let Some(message) = rx.recv().await {
-                let node = node.clone();
-                tokio::spawn(async move {
-                    let _ = node.handle_message(message).await;
-                });
+                let message = match node.verify_peer_message(authenticated_peer, message) {
+                    Ok(message) => message,
+                    Err(_) => break,
+                };
+                let _ = node.handle_verified_peer_message(message).await;
             }
         })
     }
@@ -97,10 +128,10 @@ where
         self.receiver1_task.abort();
         self.receiver2_task.abort();
         if let Some(node1) = self.node1.upgrade() {
-            node1.deregister_peer(self.node2_id);
+            node1.deregister_peer_session(self.node2_id, self.node1_incoming_session);
         }
         if let Some(node2) = self.node2.upgrade() {
-            node2.deregister_peer(self.node1_id);
+            node2.deregister_peer_session(self.node1_id, self.node2_incoming_session);
         }
     }
 }

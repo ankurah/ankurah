@@ -7,7 +7,7 @@ use ankurah_core::{
     error::ValidationError,
     livequery::EntityLiveQuery,
     node::{Node, NodeInner, WeakNode},
-    policy::{AccessDenied, PolicyAgent},
+    policy::{AccessDenied, Admission, PolicyAgent},
     selection::filter::evaluate_predicate,
     storage::StorageEngine,
     util::Iterable,
@@ -152,9 +152,9 @@ impl PolicyAgent for JwtAgent {
         entity_before: &Entity,
         entity_after: &Entity,
         _event: &proto::Event,
-    ) -> Result<Option<proto::Attestation>, AccessDenied> {
+    ) -> Result<Admission, AccessDenied> {
         if cdata.is_privileged() {
-            return Ok(None);
+            return Ok(Admission::Allow);
         }
         if entity_after.collection().as_str() == "jwtpolicy" {
             return Err(AccessDenied::ByPolicy("Only privileged contexts may write to jwtpolicy"));
@@ -170,24 +170,24 @@ impl PolicyAgent for JwtAgent {
             enforce_write_scope(&state.config, cdata, entity_before)?;
         }
         enforce_write_scope(&state.config, cdata, entity_after)?;
-        Ok(None)
+        Ok(Admission::Allow)
     }
 
     fn validate_received_event<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _from_node: &proto::EntityId,
+        _from_node: &proto::NodeId,
         _event: &Attested<proto::Event>,
     ) -> Result<(), AccessDenied> {
         Ok(())
     }
 
-    fn attest_state<SE: StorageEngine>(&self, _node: &Node<SE, Self>, _state: &proto::EntityState) -> Option<proto::Attestation> { None }
+    fn attest_state<SE: StorageEngine>(&self, _node: &Node<SE, Self>, _state: &proto::EntityState) -> Admission { Admission::Allow }
 
     fn validate_received_state<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _from_node: &proto::EntityId,
+        _from_node: &proto::NodeId,
         _state: &Attested<proto::EntityState>,
     ) -> Result<(), AccessDenied> {
         Ok(())
@@ -247,6 +247,7 @@ impl PolicyAgent for JwtAgent {
         id: &proto::EntityId,
         collection: &proto::CollectionId,
         state: &proto::State,
+        resolver: Option<std::sync::Weak<dyn ankurah_core::property::PropertyResolver>>,
     ) -> Result<(), AccessDenied>
     where
         C: Iterable<Self::ContextData>,
@@ -264,19 +265,23 @@ impl PolicyAgent for JwtAgent {
             return Ok(());
         }
 
-        let entity = TemporaryEntity::new(*id, collection.clone(), state)
+        // Scope filters are NAME-addressed (config strings) and post-epoch
+        // state is id-keyed: bind the inspection view through the node's
+        // catalog resolver or every filter reads nothing and denies.
+        let entity = TemporaryEntity::new_bound(*id, collection.clone(), state, resolver)
             .map_err(|_| AccessDenied::ByPolicy("Read scope entity state could not be evaluated"))?;
         enforce_read_scope(&guard.config, data, &entity)
     }
 
-    fn check_read_event<C>(&self, data: &C, event: &Attested<proto::Event>) -> Result<(), AccessDenied>
+    fn check_read_event<C>(&self, data: &C, collection: &proto::CollectionId, event: &Attested<proto::Event>) -> Result<(), AccessDenied>
     where C: Iterable<Self::ContextData> {
+        let _ = event;
         for ctx in data.iterable() {
             if ctx.is_privileged() {
                 return Ok(());
             }
         }
-        self.can_access_collection(data, &event.payload.collection)
+        self.can_access_collection(data, collection)
     }
 
     fn check_write(&self, cdata: &Self::ContextData, entity: &Entity, _event: Option<&proto::Event>) -> Result<(), AccessDenied> {
@@ -297,7 +302,7 @@ impl PolicyAgent for JwtAgent {
     fn validate_causal_assertion<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _peer_id: &proto::EntityId,
+        _peer_id: &proto::NodeId,
         _head_relation: &proto::CausalAssertion,
     ) -> Result<(), AccessDenied> {
         Ok(())
