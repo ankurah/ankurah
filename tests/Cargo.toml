@@ -1,23 +1,23 @@
 [package]
 name    = "ankurah-tests"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 publish = false
 
 [dependencies]
 anyhow = "1.0"
 tracing = "0.1"
-ankql = { path = "../ankql", version = "=0.9.0" }
+ankql = { path = "../ankql", version = "=0.10.0" }
 ankurah = { path = "../ankurah", features = [
     "derive",
     "instrument",
     "test-helpers",
-], version = "=0.9.0" }
-ankurah-storage-sled = { path = "../storage/sled", version = "=0.9.0" }
-ankurah-connector-local-process = { path = "../connectors/local-process", version = "=0.9.0" }
-ankurah-websocket-client = { path = "../connectors/websocket-client", version = "=0.9.0" }
-ankurah-websocket-server = { path = "../connectors/websocket-server", version = "=0.9.0" }
-ankurah-storage-common = { path = "../storage/common", version = "=0.9.0" }
+], version = "=0.10.0" }
+ankurah-storage-sled = { path = "../storage/sled", version = "=0.10.0" }
+ankurah-connector-local-process = { path = "../connectors/local-process", version = "=0.10.0" }
+ankurah-websocket-client = { path = "../connectors/websocket-client", version = "=0.10.0" }
+ankurah-websocket-server = { path = "../connectors/websocket-server", version = "=0.10.0" }
+ankurah-storage-common = { path = "../storage/common", version = "=0.10.0" }
 tokio = { version = "1.40", features = ["full", "test-util"] }
 tracing-subscriber = "0.3"
 ctor = "0.2"
@@ -49,7 +49,7 @@ trybuild = "1.0"
 # the postgres server survives; the parent reopens the same database and checks
 # the recovery invariants. Requires Docker, so it is off by default and out of
 # the plain `cargo test` job. Enable with `--features postgres-crash`.
-ankurah-storage-postgres = { path = "../storage/postgres", version = "=0.9.0", optional = true }
+ankurah-storage-postgres = { path = "../storage/postgres", version = "=0.10.0", optional = true }
 testcontainers           = { version = "0.23", features = ["reusable-containers"], optional = true }
 testcontainers-modules   = { version = "0.11.4", features = ["postgres"], optional = true }
 bb8                      = { version = "0.9", optional = true }

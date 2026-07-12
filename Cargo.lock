@@ -102,7 +102,7 @@ checksum = "4b46cbb362ab8752921c97e041f5e366ee6297bd428a31275b9fcf1e380f7299"
 
 [[package]]
 name = "ankql"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -121,7 +121,7 @@ dependencies = [
 
 [[package]]
 name = "ankurah"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "ankql",
  "ankurah-connector-local-process",
@@ -143,7 +143,7 @@ dependencies = [
 
 [[package]]
 name = "ankurah-connector-local-process"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "ankurah-core",
  "ankurah-proto",
@@ -155,7 +155,7 @@ dependencies = [
 
 [[package]]
 name = "ankurah-core"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "ankql",
  "ankurah-derive",
@@ -195,7 +195,7 @@ dependencies = [
 
 [[package]]
 name = "ankurah-derive"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "ankql",
  "maplit",
@@ -210,7 +210,7 @@ dependencies = [
 
 [[package]]
 name = "ankurah-doc-example-model"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "ankurah",
  "getrandom 0.3.4",
@@ -220,7 +220,7 @@ dependencies = [
 
 [[package]]
 name = "ankurah-doc-example-server"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "ankurah",
  "ankurah-doc-example-model",
@@ -237,7 +237,7 @@ dependencies = [
 
 [[package]]
 name = "ankurah-doc-example-wasm-bindings"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "ankurah",
  "ankurah-doc-example-model",
@@ -252,7 +252,7 @@ dependencies = [
 
 [[package]]
 name = "ankurah-example-server"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "ankurah",
  "ankurah-storage-sled",
@@ -268,7 +268,7 @@ dependencies = [
 
 [[package]]
 name = "ankurah-jwt-auth"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "ankql",
  "ankurah",
@@ -292,7 +292,7 @@ dependencies = [
 
 [[package]]
 name = "ankurah-proto"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "ankql",
  "anyhow",
@@ -316,7 +316,7 @@ dependencies = [
 
 [[package]]
 name = "ankurah-signals"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "js-sys",
  "reactive_graph",
@@ -332,7 +332,7 @@ dependencies = [
 
 [[package]]
 name = "ankurah-storage-common"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "ankql",
  "ankurah-core",
@@ -346,7 +346,7 @@ dependencies = [
 
 [[package]]
 name = "ankurah-storage-indexeddb-wasm"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "ankql",
  "ankurah",
@@ -383,7 +383,7 @@ dependencies = [
 
 [[package]]
 name = "ankurah-storage-postgres"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "ankql",
  "ankurah",
@@ -411,7 +411,7 @@ dependencies = [
 
 [[package]]
 name = "ankurah-storage-sled"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "ankql",
  "ankurah",
@@ -438,7 +438,7 @@ dependencies = [
 
 [[package]]
 name = "ankurah-storage-sqlite"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "ankql",
  "ankurah",
@@ -462,7 +462,7 @@ dependencies = [
 
 [[package]]
 name = "ankurah-tests"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "ankql",
  "ankurah",
@@ -502,7 +502,7 @@ dependencies = [
 
 [[package]]
 name = "ankurah-tests-wasm-bindings"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "ankurah",
  "ankurah-signals",
@@ -517,7 +517,7 @@ dependencies = [
 
 [[package]]
 name = "ankurah-websocket-client"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "ankurah",
  "ankurah-core",
@@ -540,7 +540,7 @@ dependencies = [
 
 [[package]]
 name = "ankurah-websocket-client-wasm"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "ankurah",
  "ankurah-core",
@@ -571,7 +571,7 @@ dependencies = [
 
 [[package]]
 name = "ankurah-websocket-server"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "ankurah-core",
  "ankurah-proto",
@@ -1745,7 +1745,7 @@ dependencies = [
 
 [[package]]
 name = "example-model"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "ankurah",
  "chrono",
@@ -1759,7 +1759,7 @@ dependencies = [
 
 [[package]]
 name = "example-wasm-bindings"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "ankurah",
  "ankurah-signals",
