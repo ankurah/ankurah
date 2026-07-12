@@ -1,6 +1,7 @@
 mod common;
 
 use ankurah::core::property::backend::{lww::LWWBackend, PropertyBackend};
+use ankurah::core::property::PropertyKey;
 use ankurah::core::value::Value;
 use ankurah::proto::{self, Attested};
 use ankurah::signals::Subscribe;
@@ -16,13 +17,13 @@ use common::{Record, RecordView, TestWatcher};
 
 /// Forge a Record LWW event setting `title`, parented on the given parent
 /// EVENTS (generation stamped from their payloads; the registry ban).
-fn forge_title_event(entity_id: proto::EntityId, parents: &[&proto::Event], title: &str) -> proto::Event {
+fn forge_title_event(title_property: proto::EntityId, entity_id: proto::EntityId, parents: &[&proto::Event], title: &str) -> proto::Event {
     let backend = LWWBackend::new();
-    backend.set("title".into(), Some(Value::String(title.to_owned())));
+    backend.set(PropertyKey::Id(title_property), Some(Value::String(title.to_owned())));
     let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
     ankurah_tests::forge::event_with_parents(
         entity_id,
-        Record::collection(),
+        parents.first().expect("the forged update has a creation parent").model,
         proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
         parents,
     )
@@ -32,10 +33,16 @@ fn forge_title_event(entity_id: proto::EntityId, parents: &[&proto::Event], titl
 /// event id. Post-0.9 LWW buffers carry per-property event provenance, so
 /// the state is built by applying operations attributed to that event,
 /// exactly as a real apply would.
-fn forge_state(title: &str, artist: &str, head_event: proto::EventId) -> proto::State {
+fn forge_state(
+    title_property: proto::EntityId,
+    artist_property: proto::EntityId,
+    title: &str,
+    artist: &str,
+    head_event: proto::EventId,
+) -> proto::State {
     let writer = LWWBackend::new();
-    writer.set("title".into(), Some(Value::String(title.to_owned())));
-    writer.set("artist".into(), Some(Value::String(artist.to_owned())));
+    writer.set(PropertyKey::Id(title_property), Some(Value::String(title.to_owned())));
+    writer.set(PropertyKey::Id(artist_property), Some(Value::String(artist.to_owned())));
     let ops = writer.to_operations().unwrap().expect("LWW backend with writes produces operations");
 
     let backend = LWWBackend::new();
@@ -59,11 +66,12 @@ fn event_only_update(server: &proto::EntityId, client: &proto::EntityId, ev: pro
         body: proto::NodeUpdateBody::SubscriptionUpdate {
             items: vec![proto::SubscriptionUpdateItem {
                 entity_id: ev.entity_id,
-                collection: ev.collection.clone(),
+                model: ev.model,
                 content: proto::UpdateContent::EventOnly(vec![Attested::opt(ev, None).into()]),
                 predicate_relevance: vec![],
             }],
         },
+        schema: vec![],
     }
 }
 
@@ -96,13 +104,16 @@ async fn test_get_fetch_notifies_established_matching_query() -> Result<()> {
     assert_eq!(query.ids(), vec![]);
     let watcher = TestWatcher::changeset();
     let _handle = query.subscribe(&watcher);
+    let record_model = server.catalog.model_id_for(Record::collection().as_str()).expect("Record registered by query");
+    let title_property = server.catalog.resolve(Record::collection().as_str(), "title").expect("Record.title registered by query");
+    let artist_property = server.catalog.resolve(Record::collection().as_str(), "artist").expect("Record.artist registered by query");
 
     // Forge the entity directly into SERVER storage. The server's reactor
     // never fires (raw storage write), so the client's remote subscription
     // cannot deliver it; only the Get lane can.
     let x_id = proto::EntityId::new();
-    let state = forge_state("fetched-title", "ghost-artist", proto::EventId::from_bytes([9u8; 32]));
-    let entity_state = proto::EntityState { entity_id: x_id, collection: Record::collection(), state };
+    let state = forge_state(title_property, artist_property, "fetched-title", "ghost-artist", proto::EventId::from_bytes([9u8; 32]));
+    let entity_state = proto::EntityState { entity_id: x_id, model: record_model, state };
     let server_collection = ctx_s.collection(&Record::collection()).await?;
     server_collection.set_state(Attested::opt(entity_state, None)).await?;
 
@@ -156,7 +167,8 @@ async fn test_stale_fetch_cannot_regress_newer_state() -> Result<()> {
     // Advance the CLIENT past the server with a forged linear descendant.
     // The server never sees this event, so its Get responses are now stale
     // relative to the client.
-    let ev = forge_title_event(rec_id, &[&genesis], "t1-client-ahead");
+    let title_property = server.catalog.resolve(Record::collection().as_str(), "title").expect("Record.title registered by create");
+    let ev = forge_title_event(title_property, rec_id, &[&genesis], "t1-client-ahead");
     let forged_head = proto::Clock::from(vec![ev.id()]);
     client.handle_message(proto::NodeMessage::Update(event_only_update(&server.id, &client.id, ev))).await?;
     assert_eq!(view.title().unwrap(), "t1-client-ahead");
@@ -222,9 +234,10 @@ async fn test_get_racing_notify_storm_does_not_deadlock() -> Result<()> {
     }
 
     // Notify storm: a forged linear chain delivered while the gets run.
+    let title_property = server.catalog.resolve(Record::collection().as_str(), "title").expect("Record.title registered by create");
     let mut parent = genesis;
     for i in 0..20 {
-        let ev = forge_title_event(rec_id, &[&parent], &format!("t{}", i + 1));
+        let ev = forge_title_event(title_property, rec_id, &[&parent], &format!("t{}", i + 1));
         client.handle_message(proto::NodeMessage::Update(event_only_update(&server.id, &client.id, ev.clone()))).await?;
         parent = ev;
     }

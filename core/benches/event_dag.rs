@@ -75,7 +75,10 @@ fn event(seed: u32, parents: &[&Event]) -> Event {
     entity_id_bytes[0..4].copy_from_slice(&seed.to_be_bytes());
     Event {
         entity_id: EntityId::from_bytes(entity_id_bytes),
-        model: EntityId::from_bytes([0; 16]),
+        // The benchmark has no catalog, so use one deterministic model id for
+        // every event in its synthetic collection. Model ids are deliberately
+        // excluded from EventId hashing, preserving the stable DAG shapes.
+        model: EntityId::from_bytes([0xBE; 16]),
         parent: Clock::from(parents.iter().map(|p| p.id()).collect::<Vec<_>>()),
         operations: OperationSet(BTreeMap::new()),
         generation: Event::generation_from_parents(parents.iter().map(|p| p.generation)),

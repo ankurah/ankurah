@@ -10,17 +10,34 @@
 mod common;
 
 use ankurah::proto::{self, Attested};
+use ankurah::{core::property::PropertyResolver, core::storage::StorageEngine};
 use ankurah_storage_indexeddb_wasm::IndexedDBStorageEngine;
 use common::*;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use wasm_bindgen_test::*;
 
 wasm_bindgen_test_configure!(run_in_browser);
 
+struct GClockModelResolver {
+    model: proto::EntityId,
+}
+
+impl PropertyResolver for GClockModelResolver {
+    fn resolve(&self, _collection: &str, _name: &str) -> Option<proto::EntityId> { None }
+    fn name_for(&self, _id: &proto::EntityId) -> Option<String> { None }
+    fn model_id_for(&self, collection: &str) -> Option<proto::EntityId> { (collection == "gclock_roundtrip").then_some(self.model) }
+}
+
 #[wasm_bindgen_test]
 pub async fn entity_head_generations_survive_indexeddb_roundtrip() -> Result<(), anyhow::Error> {
-    let (ctx, db_name) = setup_context().await?;
-    let collection = ctx.collection(&"gclock_roundtrip".into()).await?;
+    setup();
+    let db_name = format!("test_db_{}", ulid::Ulid::new());
+    let engine = IndexedDBStorageEngine::open(&db_name).await?;
+    let model = proto::EntityId::from_bytes([0xEE; 16]);
+    let resolver: Arc<dyn PropertyResolver> = Arc::new(GClockModelResolver { model });
+    engine.set_property_resolver(Arc::downgrade(&resolver));
+    let collection = engine.collection(&"gclock_roundtrip".into()).await?;
 
     let entity_id = proto::EntityId::new();
     let (e1, e2) = (proto::EventId::from_bytes([1; 32]), proto::EventId::from_bytes([2; 32]));
@@ -31,11 +48,12 @@ pub async fn entity_head_generations_survive_indexeddb_roundtrip() -> Result<(),
         head: head.clone(),
         head_generations: head_generations.clone(),
     };
-    let attested = Attested::opt(proto::EntityState { entity_id, collection: "gclock_roundtrip".into(), state }, None);
+    let attested = Attested::opt(proto::EntityState { entity_id, model, state }, None);
 
     collection.set_state(attested).await?;
 
     let read = collection.get_state(entity_id).await?;
+    assert_eq!(read.payload.model, model, "the bare engine restores the model envelope through its resolver");
     assert_eq!(read.payload.state.head, head, "the head round-trips (precondition)");
     assert_eq!(
         read.payload.state.head_generations, head_generations,

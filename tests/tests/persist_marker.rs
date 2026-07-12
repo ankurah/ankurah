@@ -9,7 +9,9 @@
 mod common;
 
 use ankurah::core::property::backend::{lww::LWWBackend, PropertyBackend};
+use ankurah::core::property::PropertyKey;
 use ankurah::core::storage::StorageEngine as _;
+use ankurah::core::value::Value;
 use ankurah::policy::DEFAULT_CONTEXT as c;
 use ankurah::{proto, Mutable, Node, PermissiveAgent};
 use anyhow::Result;
@@ -20,10 +22,9 @@ use std::time::Duration;
 
 /// The LWW OperationSet for a title write (forged events flow through the
 /// real ingest, so the operations must be honest LWW payloads).
-fn title_ops(title: &str) -> proto::OperationSet {
-    use ankurah::core::value::Value;
+fn title_ops(title_property: proto::EntityId, title: &str) -> proto::OperationSet {
     let backend = LWWBackend::new();
-    backend.set("title".into(), Some(Value::String(title.to_owned())));
+    backend.set(PropertyKey::Id(title_property), Some(Value::String(title.to_owned())));
     let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
     proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)]))
 }
@@ -80,9 +81,10 @@ async fn r_d2_4a_current_noop_redelivery_produces_zero_set_state_calls() -> Resu
 /// hard_reset clears the resident entity map. After the reset the map is
 /// EMPTY (no tombstones: dead weak entries leave too), the old id is
 /// unreachable from ingest (get_resident_entity answers None even though a
-/// strong reference exists), and a held view keeps reading its stale
-/// values unchanged (the successor system simply never hands that entity
-/// out again).
+/// strong reference exists), and a held entity keeps its stale id-keyed
+/// state unchanged. Typed getters intentionally lose their catalog binding
+/// when hard_reset flushes the old system's schema, so the frozen-state check
+/// reads by the pre-reset property id.
 #[tokio::test]
 async fn hard_reset_purges_the_entity_map_and_held_views_stay_frozen() -> Result<()> {
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
@@ -98,6 +100,8 @@ async fn hard_reset_purges_the_entity_map_and_held_views_stay_frozen() -> Result
     };
     // Hold a STRONG reference across the reset.
     let view = ctx.get::<RecordView>(rec_id).await?;
+    let held = node.get_resident_entity(rec_id).expect("precondition: the record is resident");
+    let title_property = node.catalog.resolve(Record::collection().as_str(), "title").expect("Record.title registered by create");
     assert!(node.get_resident_entity(rec_id).is_some(), "precondition: the record is resident");
     assert!(node.resident_count_for_test() >= 1, "precondition: the map holds entries");
 
@@ -109,7 +113,13 @@ async fn hard_reset_purges_the_entity_map_and_held_views_stay_frozen() -> Result
         "the purge pin: after hard_reset the entity map is EMPTY, live and dead entries alike (no tombstones)"
     );
     assert!(node.get_resident_entity(rec_id).is_none(), "the purge pin: the dead system's id is unreachable from ingest");
-    assert_eq!(view.title().unwrap(), "stale-title", "the held view still reads its stale values unchanged");
+    let lww = held.get_backend::<LWWBackend>().expect("the held entity keeps its LWW backend");
+    assert_eq!(
+        lww.get(&PropertyKey::Id(title_property)),
+        Some(Value::String("stale-title".to_owned())),
+        "the held entity keeps its stale id-keyed value unchanged"
+    );
+    let _ = view;
     Ok(())
 }
 
@@ -155,6 +165,7 @@ async fn r_d2_4c_two_lane_interleaving_serializes_where_current_markers_elide() 
         let mut events = trx.commit_and_return_events().await?;
         (id, view, events.remove(0))
     };
+    let title_property = node.catalog.resolve(Record::collection().as_str(), "title").expect("Record.title registered by create");
 
     // ELISION CONTROL: marker current, redelivery writes nothing.
     let baseline = instruments.set_state_attempts();
@@ -171,7 +182,7 @@ async fn r_d2_4c_two_lane_interleaving_serializes_where_current_markers_elide() 
     // persist parks at the selective hold AFTER the resident advanced (the
     // hold takes exactly one call, so lane B's funnel is free to reach the
     // engine if the serialization ever regressed).
-    let e1 = ankurah_tests::forge::event_with_parents(rec_id, Record::collection(), title_ops("t1"), &[&genesis]);
+    let e1 = ankurah_tests::forge::event_with_parents(rec_id, genesis.model, title_ops(title_property, "t1"), &[&genesis]);
     let baseline = instruments.set_state_attempts();
     instruments.hold_next(1);
 
@@ -232,7 +243,6 @@ async fn r_d2_4c_two_lane_interleaving_serializes_where_current_markers_elide() 
     );
     Ok(())
 }
-
 /// THE M4 REMEDIATION RED (adversarial review finding 2, MAJOR): once every
 /// concurrent funnel persist of ONE entity resolves, a fresh read from
 /// storage must yield the RESIDENT head. Every engine's set_state is a
@@ -277,9 +287,10 @@ async fn concurrent_same_entity_persists_leave_storage_at_the_resident_head() ->
         let mut events = trx.commit_and_return_events().await?;
         (id, view, events.remove(0))
     };
+    let title_property = node.catalog.resolve(Record::collection().as_str(), "title").expect("Record.title registered by create");
 
-    let e1 = ankurah_tests::forge::event_with_parents(rec_id, Record::collection(), title_ops("t1"), &[&genesis]);
-    let e2 = ankurah_tests::forge::event_with_parents(rec_id, Record::collection(), title_ops("t2"), &[&genesis]);
+    let e1 = ankurah_tests::forge::event_with_parents(rec_id, genesis.model, title_ops(title_property, "t1"), &[&genesis]);
+    let e2 = ankurah_tests::forge::event_with_parents(rec_id, genesis.model, title_ops(title_property, "t2"), &[&genesis]);
 
     // Lane A: applies E1, snapshots head [E1], parks at the engine. Only
     // this one call is held; the gate stays open for lane B's write.
@@ -385,10 +396,11 @@ async fn straddling_persist_is_never_trusted_end_to_end() -> Result<()> {
         let mut events = trx.commit_and_return_events().await?;
         (id, view, events.remove(0))
     };
+    let title_property = node.catalog.resolve(Record::collection().as_str(), "title").expect("Record.title registered by create");
 
     // Lane A: a fresh edit whose persist parks at the closed gate AFTER the
     // apply and the event commit (the epoch was captured before set_state).
-    let e1 = ankurah_tests::forge::event_with_parents(rec_id, Record::collection(), title_ops("t1"), &[&genesis]);
+    let e1 = ankurah_tests::forge::event_with_parents(rec_id, genesis.model, title_ops(title_property, "t1"), &[&genesis]);
     instruments.close_gate();
     let lane_a = {
         let node = node.clone();
@@ -418,12 +430,17 @@ async fn straddling_persist_is_never_trusted_end_to_end() -> Result<()> {
     reset.await??;
     assert_eq!(node.resident_count_for_test(), 0, "precondition: the reset purged the map");
 
-    // The successor system starts over: the record's GENESIS delivers into
-    // the wiped system (the one-id-one-system invariant makes redelivering
-    // descendants of the dead system illegitimate; this pin only needs A
-    // delivery on this id to persist for real). The purge made the stale
-    // marker unreachable, and even a reachable one would fail the epoch
-    // conjunct.
+    // This historical mechanism probe deliberately drives an illegitimate
+    // old-system delivery after the wipe. Seed only its old model route so
+    // model-metadata ingress can reach the marker path; this is not schema
+    // registration and does not model a valid successor-system flow. The
+    // purge made the stale marker unreachable, and even a reachable one
+    // would fail the epoch conjunct.
+    node.catalog.upsert_registered(
+        &[proto::RegisteredModel { id: genesis.model, collection: Record::collection().as_str().to_owned(), name: "Record".to_owned() }],
+        &[],
+        &[],
+    );
     let baseline = instruments.set_state_attempts();
     node.commit_remote_transaction(&c, proto::TransactionId::new(), vec![proto::Attested::opt(genesis.clone(), None)])
         .await
@@ -463,9 +480,10 @@ async fn hard_reset_drains_inflight_persists_before_wiping() -> Result<()> {
         let mut events = trx.commit_and_return_events().await?;
         (id, view, events.remove(0))
     };
+    let title_property = node.catalog.resolve(Record::collection().as_str(), "title").expect("Record.title registered by create");
 
     // Lane A: a persist in flight, parked at the engine.
-    let e1 = ankurah_tests::forge::event_with_parents(rec_id, Record::collection(), title_ops("t1"), &[&genesis]);
+    let e1 = ankurah_tests::forge::event_with_parents(rec_id, genesis.model, title_ops(title_property, "t1"), &[&genesis]);
     instruments.close_gate();
     let lane_a = {
         let node = node.clone();
@@ -623,12 +641,13 @@ async fn a_pre_reset_marker_at_an_unchanged_head_is_never_trusted() -> Result<()
         let mut events = trx.commit_and_return_events().await?;
         (id, view, events.remove(0))
     };
+    let title_property = node.catalog.resolve(Record::collection().as_str(), "title").expect("Record.title registered by create");
     // The held STRONG entity is the post-purge survivor this pin drives.
     let held = node.get_resident_entity(rec_id).expect("resident");
 
     // Lane A: E1 applies (head [E1]); its persist parks at the engine with
     // the pre-reset epoch captured inside its fenced span.
-    let e1 = ankurah_tests::forge::event_with_parents(rec_id, Record::collection(), title_ops("t1"), &[&genesis]);
+    let e1 = ankurah_tests::forge::event_with_parents(rec_id, genesis.model, title_ops(title_property, "t1"), &[&genesis]);
     instruments.close_gate();
     let lane_a = {
         let node = node.clone();
@@ -659,9 +678,15 @@ async fn a_pre_reset_marker_at_an_unchanged_head_is_never_trusted() -> Result<()
          even at an unchanged head"
     );
 
-    // And the funnel itself refuses the dead testimony: a driven persist
-    // of the held resident WRITES (the epoch conjunct is the only defense
-    // standing; an elision here would trust a dead epoch's marker).
+    // And the funnel itself refuses the dead testimony. Seed only the old
+    // model route needed to serialize this deliberately illegitimate held
+    // entity; doing so keeps the mechanism seam focused on the epoch
+    // conjunct rather than the independent catalog-reset rejection.
+    node.catalog.upsert_registered(
+        &[proto::RegisteredModel { id: genesis.model, collection: Record::collection().as_str().to_owned(), name: "Record".to_owned() }],
+        &[],
+        &[],
+    );
     let baseline = instruments.set_state_attempts();
     node.funnel_persist_for_test(&held).await?;
     assert_eq!(
@@ -716,6 +741,7 @@ async fn funnel_refuses_a_stale_duplicate_instance_and_storage_follows_the_canon
         let mut events = trx.commit_and_return_events().await?;
         (id, events.remove(0))
     };
+    let title_property = node.catalog.resolve(Record::collection().as_str(), "title").expect("Record.title registered by create");
     assert!(node.get_resident_entity(rec_id).is_none(), "precondition: no strong holder, the creating resident died");
 
     // Rehydrate: the soon-to-be-stale instance S at H1 = {genesis}. Its
@@ -733,7 +759,7 @@ async fn funnel_refuses_a_stale_duplicate_instance_and_storage_follows_the_canon
     // A delivery rebuilds the canonical at H2 = {e2} through the real
     // remote-commit lane, persisting H2 and stamping the NEW instance's
     // marker.
-    let e2 = ankurah_tests::forge::event_with_parents(rec_id, Record::collection(), title_ops("t1"), &[&genesis]);
+    let e2 = ankurah_tests::forge::event_with_parents(rec_id, genesis.model, title_ops(title_property, "t1"), &[&genesis]);
     node.commit_remote_transaction(
         &c,
         proto::TransactionId::new(),

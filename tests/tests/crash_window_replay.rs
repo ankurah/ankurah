@@ -2,6 +2,7 @@ mod common;
 
 use ankurah::core::node_applier::NodeApplier;
 use ankurah::core::property::backend::{lww::LWWBackend, PropertyBackend};
+use ankurah::core::property::PropertyKey;
 use ankurah::core::value::Value;
 use ankurah::proto::{self, Attested};
 use ankurah::{policy::DEFAULT_CONTEXT as c, Model, Node, PermissiveAgent, View};
@@ -15,13 +16,13 @@ use common::{Record, RecordView};
 
 /// Forge a Record LWW event setting one property, parented on the given
 /// parent EVENTS (generation stamped from their payloads; the registry ban).
-fn forge_lww_event(entity_id: proto::EntityId, parents: &[&proto::Event], property: &str, value: &str) -> proto::Event {
+fn forge_lww_event(entity_id: proto::EntityId, parents: &[&proto::Event], property: proto::EntityId, value: &str) -> proto::Event {
     let backend = LWWBackend::new();
-    backend.set(property.into(), Some(Value::String(value.to_owned())));
+    backend.set(PropertyKey::Id(property), Some(Value::String(value.to_owned())));
     let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
     ankurah_tests::forge::event_with_parents(
         entity_id,
-        Record::collection(),
+        parents.first().expect("the forged update has a creation parent").model,
         proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
         parents,
     )
@@ -30,7 +31,7 @@ fn forge_lww_event(entity_id: proto::EntityId, parents: &[&proto::Event], proper
 fn event_only_item(event: proto::Event) -> proto::SubscriptionUpdateItem {
     proto::SubscriptionUpdateItem {
         entity_id: event.entity_id,
-        collection: event.collection.clone(),
+        model: event.model,
         content: proto::UpdateContent::EventOnly(vec![Attested::opt(event, None).into()]),
         predicate_relevance: vec![],
     }
@@ -64,12 +65,14 @@ async fn r10_commit_lane_replays_committed_but_unincorporated_gap() -> Result<()
 
     // The crash simulation: e1 lands in the durable log but the entity never
     // applies it (no state write followed the commit).
-    let e1 = forge_lww_event(rec_id, &[&genesis], "artist", "a1");
+    let artist_property = node.catalog.resolve(Record::collection().as_str(), "artist").expect("Record.artist registered by create");
+    let title_property = node.catalog.resolve(Record::collection().as_str(), "title").expect("Record.title registered by create");
+    let e1 = forge_lww_event(rec_id, &[&genesis], artist_property, "a1");
     let collection = ctx.collection(&Record::collection()).await?;
     collection.add_event(&Attested::opt(e1.clone(), None)).await?;
 
     // A linear descendant-only transaction arrives through the commit lane.
-    let e2 = forge_lww_event(rec_id, &[&e1], "title", "t2");
+    let e2 = forge_lww_event(rec_id, &[&e1], title_property, "t2");
     let e2_id = e2.id();
     node.commit_remote_transaction(&c, proto::TransactionId::new(), vec![Attested::opt(e2, None)])
         .await
@@ -119,12 +122,14 @@ async fn r10_streaming_lane_replays_committed_but_unincorporated_gap() -> Result
 
     // Crash simulation on the client: e1 committed to the local log, never
     // incorporated.
-    let e1 = forge_lww_event(rec_id, &[&genesis], "artist", "a1");
+    let artist_property = server.catalog.resolve(Record::collection().as_str(), "artist").expect("Record.artist registered by create");
+    let title_property = server.catalog.resolve(Record::collection().as_str(), "title").expect("Record.title registered by create");
+    let e1 = forge_lww_event(rec_id, &[&genesis], artist_property, "a1");
     let collection = ctx_c.collection(&Record::collection()).await?;
     collection.add_event(&Attested::opt(e1.clone(), None)).await?;
 
     // EventOnly delivery of the linear descendant.
-    let e2 = forge_lww_event(rec_id, &[&e1], "title", "t2");
+    let e2 = forge_lww_event(rec_id, &[&e1], title_property, "t2");
     let e2_id = e2.id();
     NodeApplier::apply_updates_for_test(&client, &server.id, vec![event_only_item(e2)])
         .await

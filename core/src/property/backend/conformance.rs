@@ -154,7 +154,7 @@ fn make_event(seed: u16, backend_name: &str, operations: Vec<Operation>, parents
     let entity_id = EntityId::from_bytes(entity_id_bytes);
     Event {
         entity_id,
-        collection: "conformance".into(),
+        model: EntityId::from_bytes([0xEE; 16]),
         operations: OperationSet(BTreeMap::from([(backend_name.to_string(), operations)])),
         parent: Clock::from(parents.iter().map(|p| p.id()).collect::<Vec<_>>()),
         generation: Event::generation_from_parents(parents.iter().map(|p| p.generation)),

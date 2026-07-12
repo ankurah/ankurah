@@ -182,7 +182,7 @@ where
                         // Display names follow the most recent registration;
                         // emit only on difference.
                         if def.name != m.name {
-                            let (_, head) = self
+                            let (_, head, head_generations) = self
                                 .catalog_entity_snapshot(model_collection(), def.id)
                                 .await?
                                 .ok_or_else(|| RetrievalError::Other(format!("catalog map holds model {} absent from storage", def.id)))?;
@@ -193,7 +193,13 @@ where
                                 from: Some(Value::String(def.name.clone())),
                                 to: Some(Value::String(m.name.clone())),
                             });
-                            push(follow_up(model_collection(), def.id, head, vec![("name", Value::String(m.name.clone()))]));
+                            push(follow_up(
+                                model_collection(),
+                                def.id,
+                                head,
+                                head_generations,
+                                vec![("name", Value::String(m.name.clone()))],
+                            ));
                         } else {
                             plan.existing.push(def.id);
                         }
@@ -345,11 +351,11 @@ where
                     if fields.is_empty() {
                         plan.existing.push(def.id);
                     } else {
-                        let (_, head) = self
+                        let (_, head, head_generations) = self
                             .catalog_entity_snapshot(property_collection(), def.id)
                             .await?
                             .ok_or_else(|| RetrievalError::Other(format!("catalog map holds property {} absent from storage", def.id)))?;
-                        push(follow_up_patch(property_collection(), def.id, head, fields));
+                        push(follow_up_patch(property_collection(), def.id, head, head_generations, fields));
                     }
                     def.id
                 }
@@ -375,11 +381,11 @@ where
                         });
                         fields.push(("target_model", target_value));
                     }
-                    let (_, head) = self
+                    let (_, head, head_generations) = self
                         .catalog_entity_snapshot(property_collection(), def.id)
                         .await?
                         .ok_or_else(|| RetrievalError::Other(format!("catalog map holds property {} absent from storage", def.id)))?;
-                    push(follow_up_patch(property_collection(), def.id, head, fields));
+                    push(follow_up_patch(property_collection(), def.id, head, head_generations, fields));
                     def.id
                 }
                 (None, None) => {
@@ -453,7 +459,7 @@ where
             let membership_id = match self.membership_lookup_checked(&model_id, &property_id).await? {
                 Some(def) => {
                     if def.optional != Some(ms.optional) {
-                        let (_, head) = self
+                        let (_, head, head_generations) = self
                             .catalog_entity_snapshot(model_property_collection(), def.id)
                             .await?
                             .ok_or_else(|| RetrievalError::Other(format!("catalog map holds membership {} absent from storage", def.id)))?;
@@ -464,7 +470,13 @@ where
                             from: def.optional.map(Value::Bool),
                             to: Some(Value::Bool(ms.optional)),
                         });
-                        push(follow_up(model_property_collection(), def.id, head, vec![("optional", Value::Bool(ms.optional))]));
+                        push(follow_up(
+                            model_property_collection(),
+                            def.id,
+                            head,
+                            head_generations,
+                            vec![("optional", Value::Bool(ms.optional))],
+                        ));
                     } else {
                         plan.existing.push(def.id);
                     }
@@ -678,7 +690,7 @@ where
         id: EntityId,
         m: &ModelDescriptor,
     ) -> Result<BTreeMap<String, Option<Value>>, RegistrationError> {
-        let Some((values, _)) = self.catalog_entity_snapshot(model_collection(), id).await? else {
+        let Some((values, _, _)) = self.catalog_entity_snapshot(model_collection(), id).await? else {
             return Err(RegistrationError::ExplicitModelIdNotFound { model: id });
         };
         let found_collection = string_field(&values, "collection").unwrap_or_default();
@@ -695,7 +707,7 @@ where
         &self,
         collection: CollectionId,
         id: EntityId,
-    ) -> Result<Option<(BTreeMap<String, Option<Value>>, proto::Clock)>, RetrievalError> {
+    ) -> Result<Option<(BTreeMap<String, Option<Value>>, proto::Clock, proto::GClock)>, RetrievalError> {
         let storage = self.collections.get(&collection).await?;
         let state = match storage.get_state(id).await {
             Ok(state) => state,
@@ -703,11 +715,12 @@ where
             Err(e) => return Err(e),
         };
         let head = state.payload.state.head.clone();
+        let head_generations = state.payload.state.head_generations.clone();
         let Some(buffer) = state.payload.state.state_buffers.0.get("lww") else {
             return Ok(None);
         };
         let backend = LWWBackend::from_state_buffer(buffer)?;
-        Ok(Some((crate::property::name_keyed(backend.property_values()), head)))
+        Ok(Some((crate::property::name_keyed(backend.property_values()), head, head_generations)))
     }
 
     /// Values-only convenience over [`Self::catalog_entity_snapshot`].
@@ -716,7 +729,7 @@ where
         collection: CollectionId,
         id: EntityId,
     ) -> Result<Option<BTreeMap<String, Option<Value>>>, RetrievalError> {
-        Ok(self.catalog_entity_snapshot(collection, id).await?.map(|(values, _)| values))
+        Ok(self.catalog_entity_snapshot(collection, id).await?.map(|(values, _, _)| values))
     }
 }
 
@@ -803,14 +816,21 @@ fn entity_id_field(values: &BTreeMap<String, Option<Value>>, field: &str) -> Opt
 /// in every respect (RFC 5.1: no frozen encoder; catalog collections stay
 /// name-keyed at the backend layer permanently, the bootstrap exemption).
 fn creation(collection: CollectionId, entity_id: EntityId, fields: Vec<(&str, Value)>) -> proto::Event {
-    follow_up(collection, entity_id, proto::Clock::default(), fields)
+    follow_up(collection, entity_id, proto::Clock::default(), proto::GClock::default(), fields)
 }
 
 /// A follow-up event carrying changed metadata, parented at the entity's
-/// current head. It must descend the metadata it supersedes so LWW recency
-/// decides, not the concurrent tiebreak.
-fn follow_up(collection: CollectionId, entity_id: EntityId, parent: proto::Clock, fields: Vec<(&str, Value)>) -> proto::Event {
-    follow_up_patch(collection, entity_id, parent, fields.into_iter().map(|(name, value)| (name, Some(value))).collect())
+/// current head (provenance-ordered, plan decision 18: it must DESCEND the
+/// metadata it supersedes so LWW recency decides, not the concurrent
+/// tiebreak).
+fn follow_up(
+    collection: CollectionId,
+    entity_id: EntityId,
+    parent: proto::Clock,
+    parent_generations: proto::GClock,
+    fields: Vec<(&str, Value)>,
+) -> proto::Event {
+    follow_up_patch(collection, entity_id, parent, parent_generations, fields.into_iter().map(|(name, value)| (name, Some(value))).collect())
 }
 
 /// A metadata follow-up that may clear fields as well as replace them.
@@ -818,6 +838,7 @@ fn follow_up_patch(
     collection: CollectionId,
     entity_id: EntityId,
     parent: proto::Clock,
+    parent_generations: proto::GClock,
     fields: Vec<(&str, Option<Value>)>,
 ) -> proto::Event {
     let backend = LWWBackend::new();
@@ -829,5 +850,13 @@ fn follow_up_patch(
     // this helper is only ever called for them.
     let model = crate::schema::well_known_model_id(collection.as_str())
         .expect("registration events target the catalog collections, which have well-known model ids");
-    proto::Event { model, entity_id, operations: proto::OperationSet(BTreeMap::from([("lww".to_string(), operations)])), parent }
+    debug_assert!(parent_generations.matches_head(&parent), "catalog state generations must annotate exactly its head");
+    let generation = proto::Event::generation_from_parents(parent_generations.iter().map(|(generation, _)| *generation));
+    proto::Event {
+        model,
+        entity_id,
+        operations: proto::OperationSet(BTreeMap::from([("lww".to_string(), operations)])),
+        parent,
+        generation,
+    }
 }

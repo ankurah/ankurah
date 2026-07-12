@@ -15,6 +15,7 @@
 mod common;
 
 use ankurah::core::property::backend::{lww::LWWBackend, PropertyBackend};
+use ankurah::core::property::PropertyKey;
 use ankurah::policy::DEFAULT_CONTEXT as c;
 use ankurah::{proto, Mutable, Node, PermissiveAgent};
 use ankurah_tests::common::brute_force_depths;
@@ -23,10 +24,10 @@ use common::*;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-fn title_ops(title: &str) -> proto::OperationSet {
+fn title_ops(title_property: proto::EntityId, title: &str) -> proto::OperationSet {
     use ankurah::core::value::Value;
     let backend = LWWBackend::new();
-    backend.set("title".into(), Some(Value::String(title.to_owned())));
+    backend.set(PropertyKey::Id(title_property), Some(Value::String(title.to_owned())));
     let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
     proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)]))
 }
@@ -116,13 +117,14 @@ async fn multi_tip_unequal_gclock_survives_rehydration() -> Result<()> {
         let mut events = trx.commit_and_return_events().await?;
         (id, events.remove(0))
     };
+    let record_title = node.catalog.resolve(Record::collection().as_str(), "title").expect("Record.title registered by create");
 
     // Two concurrent branches off the genesis: e1 (generation 2) and
     // e2a <- e2b (generations 2, 3). After ingest the head is the antichain
     // {e1, e2b} with per-tip generations {2, 3}.
-    let e1 = ankurah_tests::forge::event_with_parents(rec_id, Record::collection(), title_ops("branch-a"), &[&genesis]);
-    let e2a = ankurah_tests::forge::event_with_parents(rec_id, Record::collection(), title_ops("branch-b"), &[&genesis]);
-    let e2b = ankurah_tests::forge::event_with_parents(rec_id, Record::collection(), title_ops("branch-b2"), &[&e2a]);
+    let e1 = ankurah_tests::forge::event_with_parents(rec_id, genesis.model, title_ops(record_title, "branch-a"), &[&genesis]);
+    let e2a = ankurah_tests::forge::event_with_parents(rec_id, genesis.model, title_ops(record_title, "branch-b"), &[&genesis]);
+    let e2b = ankurah_tests::forge::event_with_parents(rec_id, e2a.model, title_ops(record_title, "branch-b2"), &[&e2a]);
     let expected_tips = proto::GClock::new(vec![(2, e1.id()), (3, e2b.id())]);
 
     node.commit_remote_transaction(

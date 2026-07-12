@@ -18,7 +18,7 @@ pub(crate) fn event(entity_id: EntityId, parents: &[&Attested<Event>]) -> Attest
     Attested::opt(
         Event {
             entity_id,
-            collection: "test".into(),
+            model: EntityId::from_bytes([0xEE; 16]),
             operations: OperationSet(BTreeMap::new()),
             parent: ankurah_proto::Clock::from(parents.iter().map(|p| p.payload.id()).collect::<Vec<_>>()),
             generation: Event::generation_from_parents(parents.iter().map(|p| p.payload.generation)),
@@ -40,7 +40,7 @@ pub(crate) fn event_with_title(entity_id: EntityId, title: &str, parents: &[&Att
     Attested::opt(
         Event {
             entity_id,
-            collection: "test".into(),
+            model: EntityId::from_bytes([0xEE; 16]),
             operations: OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
             parent: ankurah_proto::Clock::from(parents.iter().map(|p| p.payload.id()).collect::<Vec<_>>()),
             generation: Event::generation_from_parents(parents.iter().map(|p| p.payload.generation)),

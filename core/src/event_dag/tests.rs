@@ -131,7 +131,7 @@ fn make_test_event(seed: u8, parents: &[&Event]) -> Event {
 
     Event {
         entity_id,
-        collection: "test".into(),
+        model: test_model_id(),
         operations: OperationSet(BTreeMap::new()),
         parent: Clock::from(parents.iter().map(|p| p.id()).collect::<Vec<_>>()),
         generation: Event::generation_from_parents(parents.iter().map(|p| p.generation)),
@@ -146,7 +146,7 @@ fn make_test_event_u16(seed: u16, parents: &[&Event]) -> Event {
     let entity_id = EntityId::from_bytes(entity_id_bytes);
     Event {
         entity_id,
-        collection: "test".into(),
+        model: test_model_id(),
         operations: OperationSet(BTreeMap::new()),
         parent: Clock::from(parents.iter().map(|p| p.id()).collect::<Vec<_>>()),
         generation: Event::generation_from_parents(parents.iter().map(|p| p.generation)),
@@ -178,7 +178,7 @@ fn make_lww_event_with_parent(seed: u8, properties: Vec<(&str, &str)>, parents: 
     let ops = backend.to_operations().unwrap().unwrap();
     Event {
         entity_id,
-        collection: "test".into(),
+        model: test_model_id(),
         operations: OperationSet(BTreeMap::from([("lww".to_string(), ops)])),
         parent: Clock::from(parents.iter().map(|p| p.id()).collect::<Vec<_>>()),
         generation: Event::generation_from_parents(parents.iter().map(|p| p.generation)),
@@ -1406,7 +1406,7 @@ mod yrs_layer_tests {
 
         Event {
             entity_id,
-            collection: "test".into(),
+            model: test_model_id(),
             operations: OperationSet(BTreeMap::from([("yrs".to_string(), ops)])),
             parent: Clock::default(),
             generation: 1, // genesis: no parents (266-A)
@@ -1643,7 +1643,7 @@ mod edge_case_tests {
         let entity_id = EntityId::from_bytes([99u8; 16]);
         let empty_event = Event {
             entity_id,
-            collection: "test".into(),
+            model: test_model_id(),
             operations: OperationSet(BTreeMap::new()),
             parent: Clock::default(),
             generation: 1, // genesis: no parents (266-A)
@@ -1710,7 +1710,7 @@ mod edge_case_tests {
         let ops = delete_backend.to_operations().unwrap().unwrap();
         let delete_event = Event {
             entity_id,
-            collection: "test".into(),
+            model: test_model_id(),
             operations: OperationSet(BTreeMap::from([("lww".to_string(), ops)])),
             parent: Clock::default(),
             generation: 1, // genesis: no parents (266-A)
@@ -1883,7 +1883,7 @@ mod phase4_duplicate_creation {
         // empty parent = creation event
         Event {
             entity_id,
-            collection: "test".into(),
+            model: test_model_id(),
             operations: OperationSet(BTreeMap::from([("lww".to_string(), ops)])),
             parent: Clock::default(),
             generation: 1, // genesis: no parents (266-A)
@@ -3022,7 +3022,7 @@ mod prechecks_suppress_only {
         let ops = backend.to_operations().unwrap().unwrap();
         Event {
             entity_id,
-            collection: "test".into(),
+            model: test_model_id(),
             operations: OperationSet(BTreeMap::from([("lww".to_string(), ops)])),
             parent: Clock::from(parents.iter().map(|p| p.id()).collect::<Vec<_>>()),
             generation: Event::generation_from_parents(parents.iter().map(|p| p.generation)),
@@ -3421,7 +3421,7 @@ mod generation_kill_switch {
         let ops = backend.to_operations().unwrap().unwrap();
         Event {
             entity_id,
-            collection: "test".into(),
+            model: test_model_id(),
             operations: OperationSet(BTreeMap::from([("lww".to_string(), ops)])),
             parent: Clock::from(parents.iter().map(|p| p.id()).collect::<Vec<_>>()),
             generation: Event::generation_from_parents(parents.iter().map(|p| p.generation)),
@@ -3543,7 +3543,7 @@ mod applied_set_cap_thrash {
         let ops = backend.to_operations().unwrap().unwrap();
         Event {
             entity_id,
-            collection: "test".into(),
+            model: test_model_id(),
             operations: OperationSet(BTreeMap::from([("lww".to_string(), ops)])),
             parent: Clock::from(parents.iter().map(|p| p.id()).collect::<Vec<_>>()),
             generation: Event::generation_from_parents(parents.iter().map(|p| p.generation)),
@@ -5278,7 +5278,7 @@ mod entity_change_batches {
         let ops = backend.to_operations().unwrap().unwrap();
         Event {
             entity_id,
-            collection: "test".into(),
+            model: test_model_id(),
             operations: OperationSet(BTreeMap::from([("lww".to_string(), ops)])),
             parent: Clock::from(parents.iter().map(|p| p.id()).collect::<Vec<_>>()),
             generation: Event::generation_from_parents(parents.iter().map(|p| p.generation)),
@@ -5331,7 +5331,7 @@ mod generation_identity {
     use std::collections::BTreeMap;
 
     fn event(entity: EntityId, parent: Clock, generation: u32) -> Event {
-        Event { entity_id: entity, collection: "test".into(), operations: OperationSet(BTreeMap::new()), parent, generation }
+        Event { entity_id: entity, model: super::test_model_id(), operations: OperationSet(BTreeMap::new()), parent, generation }
     }
 
     /// R-D2-1a: two events differing ONLY in generation get different ids.

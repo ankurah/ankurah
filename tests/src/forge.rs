@@ -24,13 +24,13 @@ use ankurah::proto::{self, Clock, Event};
 /// forges a genesis at generation 1).
 pub fn event_with_parents(
     entity_id: proto::EntityId,
-    collection: proto::CollectionId,
+    model: proto::EntityId,
     operations: proto::OperationSet,
     parents: &[&Event],
 ) -> Event {
     Event {
         entity_id,
-        collection,
+        model,
         operations,
         parent: Clock::from(parents.iter().map(|p| p.id()).collect::<Vec<_>>()),
         generation: Event::generation_from_parents(parents.iter().map(|p| p.generation)),
@@ -43,12 +43,12 @@ pub fn event_with_parents(
 /// [`event_with_parents`] or [`event_onto_stored_head`].
 pub fn event_claiming(
     entity_id: proto::EntityId,
-    collection: proto::CollectionId,
+    model: proto::EntityId,
     operations: proto::OperationSet,
     parent: Clock,
     generation: u32,
 ) -> Event {
-    Event { entity_id, collection, operations, parent, generation }
+    Event { entity_id, model, operations, parent, generation }
 }
 
 /// Forge an event onto `parent`, resolving every parent EVENT from the given
@@ -58,7 +58,7 @@ pub fn event_claiming(
 pub async fn event_onto_stored_head(
     storage: &StorageCollectionWrapper,
     entity_id: proto::EntityId,
-    collection: proto::CollectionId,
+    model: proto::EntityId,
     operations: proto::OperationSet,
     parent: Clock,
 ) -> Event {
@@ -75,5 +75,5 @@ pub async fn event_onto_stored_head(
                 .generation
         })
         .collect();
-    Event { entity_id, collection, operations, parent, generation: Event::generation_from_parents(generations) }
+    Event { entity_id, model, operations, parent, generation: Event::generation_from_parents(generations) }
 }

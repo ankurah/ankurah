@@ -815,7 +815,7 @@ mod tests {
         // 3 (e1 carries generation 2).
         let forged = Event {
             entity_id,
-            collection: "test".into(),
+            model: EntityId::from_bytes([0xEE; 16]),
             operations: ankurah_proto::OperationSet(BTreeMap::new()),
             parent: ankurah_proto::Clock::from(vec![e1_id.clone()]),
             generation: 4,
@@ -887,7 +887,7 @@ mod tests {
         // carries 2, so the one correct stamp is 3).
         let forged = Event {
             entity_id,
-            collection: "test".into(),
+            model: EntityId::from_bytes([0xEE; 16]),
             operations: ankurah_proto::OperationSet(BTreeMap::new()),
             parent: ankurah_proto::Clock::from(vec![e1_id.clone()]),
             generation: 4,
@@ -987,7 +987,7 @@ mod tests {
         // through the payload fallback, which is a different pin).
         let forged = Event {
             entity_id,
-            collection: "test".into(),
+            model: EntityId::from_bytes([0xEE; 16]),
             operations: ankurah_proto::OperationSet(BTreeMap::new()),
             parent: ankurah_proto::Clock::from(vec![a.payload.id()]),
             generation: 4,

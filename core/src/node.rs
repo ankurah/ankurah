@@ -1364,13 +1364,22 @@ where
                 for state in states {
                     let result = async {
                         self.policy_agent.validate_received_state(self, &peer_id, &state)?;
+                        let state_collection = self.resolve_model_wait(&state.payload.model).await.map_err(MutationError::from)?;
+                        if &state_collection != collection_id {
+                            return Err(MutationError::from(RetrievalError::Other(format!(
+                                "Get response model {} resolves to collection '{}', expected '{}'",
+                                state.payload.model.to_base64(),
+                                state_collection,
+                                collection_id
+                            ))));
+                        }
                         crate::ingest::apply_state_feed(
                             &self.entities,
                             &state_getter,
                             &event_getter,
                             &staging,
                             state.payload.entity_id,
-                            state.payload.collection.clone(),
+                            state_collection,
                             state.payload.state.clone(),
                             &[],
                             &persist,

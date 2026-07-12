@@ -1440,7 +1440,7 @@ mod persist_marker_tests {
         // about coverage and must not elide.
         entity.commit_head(&Event {
             entity_id: entity.id(),
-            collection: "test".into(),
+            model: EntityId::from_bytes([0xEE; 16]),
             operations: OperationSet(BTreeMap::new()),
             parent: Clock::default(),
             generation: 1,
@@ -1475,7 +1475,23 @@ mod saturation_stamp_tests {
     use super::*;
     use crate::ingest::testkit::{FailingCommitStore, NoState};
     use crate::ingest::{check_generation, GenerationCheck, StagingArea};
+    use crate::property::{PropertyKey, PropertyResolver};
     use ankurah_proto::StateBuffers;
+
+    struct TestResolver {
+        model: EntityId,
+        title: EntityId,
+    }
+
+    impl PropertyResolver for TestResolver {
+        fn resolve(&self, collection: &str, name: &str) -> Option<EntityId> {
+            (collection == "test" && name == "title").then_some(self.title)
+        }
+
+        fn name_for(&self, id: &EntityId) -> Option<String> { (*id == self.title).then(|| "title".to_string()) }
+
+        fn model_id_for(&self, collection: &str) -> Option<EntityId> { (collection == "test").then_some(self.model) }
+    }
 
     /// Stamping FROM a saturated adopted tip (M4 remediation item 9,
     /// test-adequacy panel MAJOR 3's entity-level arm): the trust envelope
@@ -1503,11 +1519,13 @@ mod saturation_stamp_tests {
         let staging = std::sync::Arc::new(StagingArea::with_default_cap());
         let getter = FailingCommitStore::ephemeral(staging, EventId::from_bytes([0xEE; 32]));
         let (_, entity) = set.with_state(&NoState, &getter, entity_id, "test".into(), adopted).await.expect("bodiless adoption");
+        let resolver: Arc<dyn PropertyResolver> =
+            Arc::new(TestResolver { model: EntityId::from_bytes([0xEE; 16]), title: EntityId::from_bytes([0xEF; 16]) });
+        entity.set_resolver(Arc::downgrade(&resolver));
 
         // A local write so the commit has operations to carry.
         let lww = entity.get_backend::<crate::property::backend::lww::LWWBackend>().expect("backend");
-        use crate::property::backend::PropertyBackend;
-        lww.set("title".into(), Some(Value::String("at-the-ceiling".to_owned())));
+        lww.set(PropertyKey::Id(EntityId::from_bytes([0xEF; 16])), Some(Value::String("at-the-ceiling".to_owned())));
 
         let event = entity.generate_commit_event().expect("the stamp reads the materialization").expect("a write produces an event");
         assert_eq!(event.generation, u32::MAX, "stamping from a saturated tip stays AT the sentinel (no wrap, no panic)");

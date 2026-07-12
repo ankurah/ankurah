@@ -279,7 +279,7 @@ mod tests {
         Attested::opt(
             Event {
                 entity_id,
-                collection: "test".into(),
+                model: EntityId::from_bytes([0xEE; 16]),
                 operations: OperationSet(BTreeMap::new()),
                 parent: ankurah_proto::Clock::from(parents.iter().map(|p| p.payload.id()).collect::<Vec<_>>()),
                 generation: Event::generation_from_parents(parents.iter().map(|p| p.payload.generation)),

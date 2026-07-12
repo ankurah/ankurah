@@ -3,6 +3,7 @@ mod common;
 use ankurah::core::error::{ApplyError, IngestError, LineageRejection, MutationError};
 use ankurah::core::node_applier::NodeApplier;
 use ankurah::core::property::backend::{lww::LWWBackend, PropertyBackend};
+use ankurah::core::property::PropertyKey;
 use ankurah::core::value::Value;
 use ankurah::proto::{self, Attested};
 use ankurah::{policy::DEFAULT_CONTEXT as c, Model, Node, PermissiveAgent, View};
@@ -15,9 +16,9 @@ use std::sync::Arc;
 use common::{Record, RecordView};
 
 /// The LWW OperationSet for a title write.
-fn title_ops(title: &str) -> proto::OperationSet {
+fn title_ops(title_property: proto::EntityId, title: &str) -> proto::OperationSet {
     let backend = LWWBackend::new();
-    backend.set("title".into(), Some(Value::String(title.to_owned())));
+    backend.set(PropertyKey::Id(title_property), Some(Value::String(title.to_owned())));
     let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
     proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)]))
 }
@@ -25,14 +26,21 @@ fn title_ops(title: &str) -> proto::OperationSet {
 /// Forge a title event onto `parent` with an EXPLICIT claimed generation:
 /// the mis-stamping constructor for these pins (and, with the correct claim,
 /// their honestly-stamped twins).
-fn forge_claiming(entity_id: proto::EntityId, parent: proto::Clock, title: &str, generation: u32) -> proto::Event {
-    ankurah_tests::forge::event_claiming(entity_id, Record::collection(), title_ops(title), parent, generation)
+fn forge_claiming(
+    model: proto::EntityId,
+    title_property: proto::EntityId,
+    entity_id: proto::EntityId,
+    parent: proto::Clock,
+    title: &str,
+    generation: u32,
+) -> proto::Event {
+    ankurah_tests::forge::event_claiming(entity_id, model, title_ops(title_property, title), parent, generation)
 }
 
 fn event_only_item(event: proto::Event) -> proto::SubscriptionUpdateItem {
     proto::SubscriptionUpdateItem {
         entity_id: event.entity_id,
-        collection: event.collection.clone(),
+        model: event.model,
         content: proto::UpdateContent::EventOnly(vec![Attested::opt(event, None).into()]),
         predicate_relevance: vec![],
     }
@@ -42,13 +50,13 @@ fn event_only_item(event: proto::Event) -> proto::SubscriptionUpdateItem {
 /// wire shape a durable peer's subscription push uses).
 fn state_and_event_item(
     entity_id: proto::EntityId,
-    collection: proto::CollectionId,
+    model: proto::EntityId,
     state: proto::State,
     events: Vec<proto::Event>,
 ) -> proto::SubscriptionUpdateItem {
     proto::SubscriptionUpdateItem {
         entity_id,
-        collection,
+        model,
         content: proto::UpdateContent::StateAndEvent(
             proto::StateFragment { state, attestations: Default::default() },
             events.into_iter().map(|e| Attested::opt(e, None).into()).collect(),
@@ -97,6 +105,7 @@ async fn r_d2_2b_streaming_lane_rejects_mis_stamp_and_applies_correct_stamp() ->
     };
     let view = ctx_c.get::<RecordView>(rec_id).await?;
     assert_eq!(view.title().unwrap(), "t0");
+    let title_property = server.catalog.resolve(Record::collection().as_str(), "title").expect("Record.title registered by create");
 
     // Make the parent LOCALLY RESOLVABLE on the client: the snapshot-adopted
     // head has no local event body, so deliver the genesis itself first (the
@@ -110,7 +119,7 @@ async fn r_d2_2b_streaming_lane_rejects_mis_stamp_and_applies_correct_stamp() ->
     // The forgery: a child of the (generation 1) genesis claiming 3; the
     // one correct claim is 2.
     let parent = proto::Clock::from(vec![genesis.id()]);
-    let forged = forge_claiming(rec_id, parent.clone(), "forged-title", 3);
+    let forged = forge_claiming(genesis.model, title_property, rec_id, parent.clone(), "forged-title", 3);
     let forged_id = forged.id();
 
     let err = NodeApplier::apply_updates_for_test(&client, &server.id, vec![event_only_item(forged)])
@@ -128,7 +137,7 @@ async fn r_d2_2b_streaming_lane_rejects_mis_stamp_and_applies_correct_stamp() ->
     assert!(!collection.has_event(&forged_id).await?, "the forgery must not be committed");
 
     // The other direction: the same operations CORRECTLY stamped (2) apply.
-    let honest = forge_claiming(rec_id, parent, "forged-title", 2);
+    let honest = forge_claiming(genesis.model, title_property, rec_id, parent, "forged-title", 2);
     let honest_id = honest.id();
     NodeApplier::apply_updates_for_test(&client, &server.id, vec![event_only_item(honest)])
         .await
@@ -157,9 +166,10 @@ async fn r_d2_2b_commit_lane_rejects_mis_stamp_and_applies_correct_stamp() -> Re
     };
     let collection = ctx_s.collection(&Record::collection()).await?;
     assert!(collection.has_event(&genesis.id()).await?, "precondition: parent local on the durable receiver");
+    let title_property = server.catalog.resolve(Record::collection().as_str(), "title").expect("Record.title registered by create");
 
     let parent = proto::Clock::from(vec![genesis.id()]);
-    let forged = forge_claiming(rec_id, parent.clone(), "commit-forged", 7);
+    let forged = forge_claiming(genesis.model, title_property, rec_id, parent.clone(), "commit-forged", 7);
     let forged_id = forged.id();
 
     let err = server
@@ -174,7 +184,7 @@ async fn r_d2_2b_commit_lane_rejects_mis_stamp_and_applies_correct_stamp() -> Re
     assert_eq!(stored_head, proto::Clock::from(vec![genesis.id()]), "the persisted head must not move");
 
     // The correctly stamped twin commits cleanly.
-    let honest = forge_claiming(rec_id, parent, "commit-forged", 2);
+    let honest = forge_claiming(genesis.model, title_property, rec_id, parent, "commit-forged", 2);
     let honest_id = honest.id();
     server
         .commit_remote_transaction(&c, proto::TransactionId::new(), vec![Attested::opt(honest, None)])
@@ -193,11 +203,14 @@ async fn r_d2_2b_genesis_must_claim_exactly_one() -> Result<()> {
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     server.system.create().await?;
     let ctx_s = server.context(c)?;
+    ctx_s.register::<Record>().await?;
+    let record_model = server.catalog.model_id_for(Record::collection().as_str()).expect("Record registered explicitly");
+    let title_property = server.catalog.resolve(Record::collection().as_str(), "title").expect("Record.title registered explicitly");
     let collection = ctx_s.collection(&Record::collection()).await?;
 
     // A brand-new entity whose creation event claims generation 2.
     let bad_entity = proto::EntityId::new();
-    let bad_genesis = forge_claiming(bad_entity, proto::Clock::default(), "bad-genesis", 2);
+    let bad_genesis = forge_claiming(record_model, title_property, bad_entity, proto::Clock::default(), "bad-genesis", 2);
     let bad_id = bad_genesis.id();
 
     let err = server
@@ -210,7 +223,7 @@ async fn r_d2_2b_genesis_must_claim_exactly_one() -> Result<()> {
 
     // The correct claim (1) applies.
     let good_entity = proto::EntityId::new();
-    let good_genesis = forge_claiming(good_entity, proto::Clock::default(), "good-genesis", 1);
+    let good_genesis = forge_claiming(record_model, title_property, good_entity, proto::Clock::default(), "good-genesis", 1);
     let good_id = good_genesis.id();
     server
         .commit_remote_transaction(&c, proto::TransactionId::new(), vec![Attested::opt(good_genesis, None)])
@@ -268,6 +281,7 @@ async fn kill_switch_leaves_stamping_and_admission_verification_on() -> Result<(
         let mut events = trx.commit_and_return_events().await?;
         events.remove(0)
     };
+    let title_property = server.catalog.resolve(Record::collection().as_str(), "title").expect("Record.title registered by create");
     assert_eq!(edit_event.generation, 2, "stamping stays on: the child stamps 1 + max(parent generations)");
 
     // The client adopted the entity through subscription relay; make the
@@ -284,7 +298,7 @@ async fn kill_switch_leaves_stamping_and_admission_verification_on() -> Result<(
     // (generation 2) edit claiming 5 is rejected typed; the one correct
     // claim is 3.
     let parent = proto::Clock::from(vec![edit_event.id()]);
-    let forged = forge_claiming(rec_id, parent.clone(), "forged-title", 5);
+    let forged = forge_claiming(edit_event.model, title_property, rec_id, parent.clone(), "forged-title", 5);
     let forged_id = forged.id();
     let err = NodeApplier::apply_updates_for_test(&client, &server.id, vec![event_only_item(forged)])
         .await
@@ -298,7 +312,7 @@ async fn kill_switch_leaves_stamping_and_admission_verification_on() -> Result<(
 
     // The honestly stamped twin still applies (both directions, as in
     // R-D2-2b), through a comparison whose consumers are all dormant.
-    let honest = forge_claiming(rec_id, parent, "forged-title", 3);
+    let honest = forge_claiming(edit_event.model, title_property, rec_id, parent, "forged-title", 3);
     let honest_id = honest.id();
     NodeApplier::apply_updates_for_test(&client, &server.id, vec![event_only_item(honest)])
         .await
@@ -340,6 +354,7 @@ async fn r_l_provably_mis_stamped_state_and_event_cargo_aborts_the_item() -> Res
     };
     let view = ctx_c.get::<RecordView>(rec_id).await?;
     assert_eq!(view.title().unwrap(), "t0");
+    let title_property = server.catalog.resolve(Record::collection().as_str(), "title").expect("Record.title registered by create");
 
     // Make the parent LOCALLY HELD on the client (the forgery must be
     // PROVABLY wrong, not merely unverifiable): deliver the genesis body so
@@ -355,7 +370,7 @@ async fn r_l_provably_mis_stamped_state_and_event_cargo_aborts_the_item() -> Res
     // the one correct claim is 2. The state vouching for it heads at the
     // forgery.
     let parent = proto::Clock::from(vec![genesis.id()]);
-    let forged = forge_claiming(rec_id, parent.clone(), "tampered-title", 3);
+    let forged = forge_claiming(genesis.model, title_property, rec_id, parent.clone(), "tampered-title", 3);
     let forged_id = forged.id();
     let mut crafted_state = collection.get_state(rec_id).await?.payload.state.clone();
     crafted_state.head = proto::Clock::from(vec![forged_id.clone()]);
@@ -365,7 +380,7 @@ async fn r_l_provably_mis_stamped_state_and_event_cargo_aborts_the_item() -> Res
     let err = NodeApplier::apply_updates_for_test(
         &client,
         &server.id,
-        vec![state_and_event_item(rec_id, Record::collection(), crafted_state, vec![forged])],
+        vec![state_and_event_item(rec_id, genesis.model, crafted_state, vec![forged])],
     )
     .await
     .expect_err("a provably mis-stamped cargo event must abort the ENTIRE update item");
@@ -386,18 +401,14 @@ async fn r_l_provably_mis_stamped_state_and_event_cargo_aborts_the_item() -> Res
 
     // The honest twin (same operations, correct stamp 2) adopts cleanly:
     // the reversal must reject forgeries, not the lane.
-    let honest = forge_claiming(rec_id, parent, "tampered-title", 2);
+    let honest = forge_claiming(genesis.model, title_property, rec_id, parent, "tampered-title", 2);
     let honest_id = honest.id();
     let mut honest_state = collection.get_state(rec_id).await?.payload.state.clone();
     honest_state.head = proto::Clock::from(vec![honest_id.clone()]);
     honest_state.head_generations = proto::GClock::from((honest.generation, honest_id.clone()));
-    NodeApplier::apply_updates_for_test(
-        &client,
-        &server.id,
-        vec![state_and_event_item(rec_id, Record::collection(), honest_state, vec![honest])],
-    )
-    .await
-    .expect("the correctly stamped twin adopts cleanly");
+    NodeApplier::apply_updates_for_test(&client, &server.id, vec![state_and_event_item(rec_id, genesis.model, honest_state, vec![honest])])
+        .await
+        .expect("the correctly stamped twin adopts cleanly");
     assert!(view.entity().head().contains(&honest_id), "the honest twin advances the resident head");
     assert!(collection.has_event(&honest_id).await?, "the honest cargo is committed");
 
@@ -405,8 +416,8 @@ async fn r_l_provably_mis_stamped_state_and_event_cargo_aborts_the_item() -> Res
     // remains unaffected: store the body, adopt the state (the M2 arm the
     // ruling expressly keeps).
     let fresh_id = proto::EntityId::new();
-    let h1 = forge_claiming(fresh_id, proto::Clock::default(), "fresh", 1);
-    let h2 = ankurah_tests::forge::event_with_parents(fresh_id, Record::collection(), title_ops("fresh-2"), &[&h1]);
+    let h1 = forge_claiming(genesis.model, title_property, fresh_id, proto::Clock::default(), "fresh", 1);
+    let h2 = ankurah_tests::forge::event_with_parents(fresh_id, h1.model, title_ops(title_property, "fresh-2"), &[&h1]);
     let h2_id = h2.id();
     // Only h2 travels; its parent h1 is never given to the client, so the
     // check is UNVERIFIABLE, not provably wrong.
@@ -415,13 +426,9 @@ async fn r_l_provably_mis_stamped_state_and_event_cargo_aborts_the_item() -> Res
         head: proto::Clock::from(vec![h2_id.clone()]),
         head_generations: proto::GClock::from((h2.generation, h2_id.clone())),
     };
-    NodeApplier::apply_updates_for_test(
-        &client,
-        &server.id,
-        vec![state_and_event_item(fresh_id, Record::collection(), fresh_state, vec![h2])],
-    )
-    .await
-    .expect("fresh adoption with unverifiable cargo must remain unaffected");
+    NodeApplier::apply_updates_for_test(&client, &server.id, vec![state_and_event_item(fresh_id, genesis.model, fresh_state, vec![h2])])
+        .await
+        .expect("fresh adoption with unverifiable cargo must remain unaffected");
     assert!(collection.has_event(&h2_id).await?, "unverifiable cargo is stored (acceleration-ineligible), not rejected");
 
     Ok(())

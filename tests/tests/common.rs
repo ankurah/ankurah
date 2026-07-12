@@ -896,6 +896,14 @@ where E: ankurah::core::storage::StorageEngine + Send + Sync
     }
 
     async fn delete_all_collections(&self) -> Result<bool, MutationError> { self.inner.delete_all_collections().await }
+
+    async fn list_collections(&self) -> Result<Vec<proto::CollectionId>, ankurah::core::error::RetrievalError> {
+        self.inner.list_collections().await
+    }
+
+    fn set_property_resolver(&self, resolver: std::sync::Weak<dyn ankurah::core::property::PropertyResolver>) {
+        self.inner.set_property_resolver(resolver);
+    }
 }
 
 pub struct InstrumentedCollection {

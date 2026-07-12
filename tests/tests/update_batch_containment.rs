@@ -15,13 +15,13 @@ use common::{Record, RecordView};
 
 /// Forge a Record LWW event setting `title`, parented on the given parent
 /// EVENTS (generation stamped from their payloads; the registry ban).
-fn forge_title_event(entity_id: proto::EntityId, parents: &[&proto::Event], title: &str) -> proto::Event {
+fn forge_title_event(title_property: proto::EntityId, entity_id: proto::EntityId, parents: &[&proto::Event], title: &str) -> proto::Event {
     let backend = LWWBackend::new();
-    backend.set(PropertyKey::Id(title_prop), Some(Value::String(title.to_owned())));
+    backend.set(PropertyKey::Id(title_property), Some(Value::String(title.to_owned())));
     let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
     ankurah_tests::forge::event_with_parents(
         entity_id,
-        Record::collection(),
+        parents.first().expect("the forged update has a creation parent").model,
         proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
         parents,
     )
@@ -66,6 +66,8 @@ async fn test_event_only_multi_event_wire_order_is_untrusted() -> Result<()> {
     let view = ctx_c.get::<RecordView>(rec_id).await?;
     assert_eq!(view.title().unwrap(), "t0");
     assert_eq!(view.entity().head(), proto::Clock::from(vec![genesis.id()]));
+    let record_title = server.catalog.resolve(Record::collection().as_str(), "title").expect("Record.title registered by create");
+    let record_artist = server.catalog.resolve(Record::collection().as_str(), "artist").expect("Record.artist registered by create");
 
     // Forge parent (writes artist) then child (writes title), and put the
     // CHILD first on the wire.
@@ -78,17 +80,17 @@ async fn test_event_only_multi_event_wire_order_is_untrusted() -> Result<()> {
         let ops = backend.to_operations().unwrap().expect("ops");
         ankurah_tests::forge::event_with_parents(
             rec_id,
-            Record::collection(),
+            genesis.model,
             proto::OperationSet(std::collections::BTreeMap::from([("lww".to_owned(), ops)])),
             &[&genesis],
         )
     };
-    let ev_child = forge_title_event(rec_id, &[&ev_parent], "t-child");
+    let ev_child = forge_title_event(record_title, rec_id, &[&ev_parent], "t-child");
     let (id_parent, id_child) = (ev_parent.id(), ev_child.id());
 
     let item = proto::SubscriptionUpdateItem {
         entity_id: rec_id,
-        model: record_model,
+        model: ev_parent.model,
         content: proto::UpdateContent::EventOnly(vec![Attested::opt(ev_child, None).into(), Attested::opt(ev_parent, None).into()]),
         predicate_relevance: vec![],
         source_queries: vec![relay_context.query_id()],
@@ -157,18 +159,18 @@ async fn test_event_only_unknown_entity_does_not_poison_batch() -> Result<()> {
     // Forge the batch: valid events for A and B (parented on their current
     // heads), and a non-creation event for an entity the client knows nothing
     // about in the middle.
-    let ev_a = forge_title_event(a_id, &[&genesis_a], "a1");
-    let ev_b = forge_title_event(b_id, &[&genesis_b], "b1");
+    let ev_a = forge_title_event(record_title, a_id, &[&genesis_a], "a1");
+    let ev_b = forge_title_event(record_title, b_id, &[&genesis_b], "b1");
     let unknown_id = proto::EntityId::new();
     // The parent id is fabricated (no true generation exists); the explicit
     // claim of 2 is plausible and admission can never verify it.
     let ev_unknown = {
         let backend = LWWBackend::new();
-        backend.set("title".into(), Some(Value::String("ghost".to_owned())));
+        backend.set(PropertyKey::Id(record_title), Some(Value::String("ghost".to_owned())));
         let ops = backend.to_operations().unwrap().expect("ops");
         ankurah_tests::forge::event_claiming(
             unknown_id,
-            Record::collection(),
+            record_model,
             proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
             proto::Clock::from(vec![proto::EventId::from_bytes([7u8; 32])]),
             2,

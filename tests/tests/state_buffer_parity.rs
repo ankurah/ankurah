@@ -1,6 +1,7 @@
 mod common;
 
 use ankurah::core::property::backend::{lww::LWWBackend, PropertyBackend};
+use ankurah::core::property::PropertyKey;
 use ankurah::core::value::Value;
 use ankurah::proto::{self, Attested};
 use ankurah::{policy::DEFAULT_CONTEXT as c, Model, Node, PermissiveAgent, View};
@@ -14,13 +15,13 @@ use common::{Record, RecordView};
 
 /// Forge a Record LWW event setting `title`, parented on the given parent
 /// EVENTS (generation stamped from their payloads; the registry ban).
-fn forge_title_event(entity_id: proto::EntityId, parents: &[&proto::Event], title: &str) -> proto::Event {
+fn forge_title_event(title_property: proto::EntityId, entity_id: proto::EntityId, parents: &[&proto::Event], title: &str) -> proto::Event {
     let backend = LWWBackend::new();
-    backend.set("title".into(), Some(Value::String(title.to_owned())));
+    backend.set(PropertyKey::Id(title_property), Some(Value::String(title.to_owned())));
     let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
     ankurah_tests::forge::event_with_parents(
         entity_id,
-        Record::collection(),
+        parents.first().expect("the forged update has a creation parent").model,
         proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
         parents,
     )
@@ -63,11 +64,12 @@ async fn test_event_only_state_buffer_parity_and_cold_rehydration() -> Result<()
 
     // Forge a linear descendant of the client's current head and deliver it
     // through the streaming EventOnly arm.
-    let ev = forge_title_event(rec_id, &[&genesis], "t1");
+    let title_property = server.catalog.resolve(Record::collection().as_str(), "title").expect("Record.title registered by create");
+    let ev = forge_title_event(title_property, rec_id, &[&genesis], "t1");
     let ev_id = ev.id();
     let item = proto::SubscriptionUpdateItem {
         entity_id: rec_id,
-        collection: Record::collection(),
+        model: ev.model,
         content: proto::UpdateContent::EventOnly(vec![Attested::opt(ev, None).into()]),
         predicate_relevance: vec![],
     };
@@ -76,6 +78,7 @@ async fn test_event_only_state_buffer_parity_and_cold_rehydration() -> Result<()
         from: server.id,
         to: client.id,
         body: proto::NodeUpdateBody::SubscriptionUpdate { items: vec![item] },
+        schema: vec![],
     };
     client.handle_message(proto::NodeMessage::Update(update)).await?;
 

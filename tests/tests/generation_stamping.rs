@@ -145,6 +145,7 @@ async fn r_d2_2a_crossed_stamps_equal_brute_force_depth() -> Result<()> {
 #[tokio::test]
 async fn r_d2_2a_unequal_depth_merge_stamps_equal_brute_force_depth() -> Result<()> {
     use ankurah::core::property::backend::{lww::LWWBackend, PropertyBackend};
+    use ankurah::core::property::PropertyKey;
     use ankurah::core::value::Value;
     use ankurah::Mutable;
     use std::collections::BTreeMap;
@@ -160,6 +161,7 @@ async fn r_d2_2a_unequal_depth_merge_stamps_equal_brute_force_depth() -> Result<
         let mut events = trx.commit_and_return_events().await?;
         (id, view, events.remove(0))
     };
+    let record_title = node.catalog.resolve(Record::collection().as_str(), "title").expect("Record.title registered by create");
 
     // Local edit A: generation 2, head {A}.
     {
@@ -173,11 +175,11 @@ async fn r_d2_2a_unequal_depth_merge_stamps_equal_brute_force_depth() -> Result<
     // resident head to the UNEQUAL antichain {A, C}.
     let title_ops = |title: &str| {
         let backend = LWWBackend::new();
-        backend.set("title".into(), Some(Value::String(title.to_owned())));
+        backend.set(PropertyKey::Id(record_title), Some(Value::String(title.to_owned())));
         proto::OperationSet(BTreeMap::from([("lww".to_owned(), backend.to_operations().unwrap().expect("ops"))]))
     };
-    let b = ankurah_tests::forge::event_with_parents(rec_id, Record::collection(), title_ops("b"), &[&genesis]);
-    let c = ankurah_tests::forge::event_with_parents(rec_id, Record::collection(), title_ops("c"), &[&b]);
+    let b = ankurah_tests::forge::event_with_parents(rec_id, genesis.model, title_ops("b"), &[&genesis]);
+    let c = ankurah_tests::forge::event_with_parents(rec_id, b.model, title_ops("c"), &[&b]);
     let c_id = c.id();
     node.commit_remote_transaction(
         &DEFAULT_CONTEXT,

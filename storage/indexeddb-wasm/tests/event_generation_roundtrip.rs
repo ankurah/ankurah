@@ -9,13 +9,26 @@
 mod common;
 
 use ankurah::proto::{self, Attested};
+use ankurah::{core::property::PropertyResolver, core::storage::StorageEngine};
 use ankurah_storage_indexeddb_wasm::IndexedDBStorageEngine;
 use common::*;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_test::*;
 
 wasm_bindgen_test_configure!(run_in_browser);
+
+struct TestModelResolver {
+    collection: &'static str,
+    model: proto::EntityId,
+}
+
+impl PropertyResolver for TestModelResolver {
+    fn resolve(&self, _collection: &str, _name: &str) -> Option<proto::EntityId> { None }
+    fn name_for(&self, _id: &proto::EntityId) -> Option<String> { None }
+    fn model_id_for(&self, collection: &str) -> Option<proto::EntityId> { (collection == self.collection).then_some(self.model) }
+}
 
 /// Await one IdbRequest's success (returning its result) through a Promise
 /// bridge; the crate's own cb_future util is private to it.
@@ -61,21 +74,21 @@ async fn doctor_stored_generation(db_name: &str, event_key: &str, generation: Js
 
 #[wasm_bindgen_test]
 pub async fn event_generation_survives_indexeddb_roundtrip() -> Result<(), anyhow::Error> {
-    let (ctx, db_name) = setup_context().await?;
-    let collection = ctx.collection(&"gen_roundtrip".into()).await?;
+    setup();
+    let db_name = format!("test_db_{}", ulid::Ulid::new());
+    let engine = IndexedDBStorageEngine::open(&db_name).await?;
+    let model = proto::EntityId::from_bytes([0xE1; 16]);
+    let resolver: Arc<dyn PropertyResolver> = Arc::new(TestModelResolver { collection: "gen_roundtrip", model });
+    engine.set_property_resolver(Arc::downgrade(&resolver));
+    let collection = engine.collection(&"gen_roundtrip".into()).await?;
 
     let entity_id = proto::EntityId::new();
-    let genesis = proto::Event {
-        collection: "gen_roundtrip".into(),
-        entity_id,
-        operations: proto::OperationSet(BTreeMap::new()),
-        parent: proto::Clock::default(),
-        generation: 1,
-    };
+    let genesis =
+        proto::Event { model, entity_id, operations: proto::OperationSet(BTreeMap::new()), parent: proto::Clock::default(), generation: 1 };
     // A saturated stamp: u32::MAX rides through JsValue::from(u32) and
     // as_f64 (exact through 2^53) and must come back bit-identical.
     let saturated = proto::Event {
-        collection: "gen_roundtrip".into(),
+        model,
         entity_id,
         operations: proto::OperationSet(BTreeMap::new()),
         parent: proto::Clock::from(vec![genesis.id()]),
@@ -90,8 +103,10 @@ pub async fn event_generation_survives_indexeddb_roundtrip() -> Result<(), anyho
     let fetch = |id: &proto::EventId| fetched.iter().find(|e| e.payload.id() == *id).expect("event round-trips").payload.clone();
 
     let genesis_back = fetch(&genesis.id());
+    assert_eq!(genesis_back.model, model, "the bare engine restores the model envelope through its resolver");
     assert_eq!(genesis_back.generation, 1, "genesis generation survives");
     let saturated_back = fetch(&saturated.id());
+    assert_eq!(saturated_back.model, model, "the saturated event carries the same resolved model envelope");
     assert_eq!(saturated_back.generation, u32::MAX, "the u32::MAX saturation sentinel survives exactly");
 
     // The generation is inside the hashed content: recomputing the id from
@@ -124,17 +139,17 @@ pub async fn event_generation_survives_indexeddb_roundtrip() -> Result<(), anyho
 pub async fn doctored_stored_event_generation_fails_loudly_on_read() -> Result<(), anyhow::Error> {
     use ankurah::core::error::RetrievalError;
 
-    let (ctx, db_name) = setup_context().await?;
-    let collection = ctx.collection(&"gen_doctor".into()).await?;
+    setup();
+    let db_name = format!("test_db_{}", ulid::Ulid::new());
+    let engine = IndexedDBStorageEngine::open(&db_name).await?;
+    let model = proto::EntityId::from_bytes([0xE2; 16]);
+    let resolver: Arc<dyn PropertyResolver> = Arc::new(TestModelResolver { collection: "gen_doctor", model });
+    engine.set_property_resolver(Arc::downgrade(&resolver));
+    let collection = engine.collection(&"gen_doctor".into()).await?;
 
     let entity_id = proto::EntityId::new();
-    let genesis = proto::Event {
-        collection: "gen_doctor".into(),
-        entity_id,
-        operations: proto::OperationSet(BTreeMap::new()),
-        parent: proto::Clock::default(),
-        generation: 1,
-    };
+    let genesis =
+        proto::Event { model, entity_id, operations: proto::OperationSet(BTreeMap::new()), parent: proto::Clock::default(), generation: 1 };
     collection.add_event(&Attested::opt(genesis.clone(), None)).await?;
     let key = genesis.id().to_base64();
 
@@ -163,6 +178,7 @@ pub async fn doctored_stored_event_generation_fails_loudly_on_read() -> Result<(
     doctor_stored_generation(&db_name, &key, JsValue::from_f64(1.0)).await;
     let events = collection.get_events(vec![genesis.id()]).await?;
     assert_eq!(events.len(), 1, "the restored row decodes");
+    assert_eq!(events[0].payload.model, model, "the restored row carries the resolved model envelope");
     assert_eq!(events[0].payload.generation, 1, "the restored generation reads back exact");
     assert_eq!(events[0].payload.id(), genesis.id(), "the restored payload recomputes to the original id");
 

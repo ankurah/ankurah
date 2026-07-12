@@ -3,6 +3,7 @@ mod common;
 use ankurah::core::error::{ApplyError, IngestError, LineageRejection, MutationError};
 use ankurah::core::node_applier::NodeApplier;
 use ankurah::core::property::backend::{lww::LWWBackend, PropertyBackend};
+use ankurah::core::property::PropertyKey;
 use ankurah::core::value::Value;
 use ankurah::proto::{self, Attested};
 use ankurah::{policy::DEFAULT_CONTEXT as c, Model, Node, PermissiveAgent, View};
@@ -18,13 +19,20 @@ use common::{Record, RecordView};
 /// with an EXPLICIT claimed generation (both forges in this file parent on
 /// clocks with no resolvable true generation: a fabricated id and an empty
 /// genesis clock).
-fn forge_title_event(entity_id: proto::EntityId, parent: proto::Clock, title: &str, generation: u32) -> proto::Event {
+fn forge_title_event(
+    model: proto::EntityId,
+    title_property: proto::EntityId,
+    entity_id: proto::EntityId,
+    parent: proto::Clock,
+    title: &str,
+    generation: u32,
+) -> proto::Event {
     let backend = LWWBackend::new();
-    backend.set("title".into(), Some(Value::String(title.to_owned())));
+    backend.set(PropertyKey::Id(title_property), Some(Value::String(title.to_owned())));
     let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
     ankurah_tests::forge::event_claiming(
         entity_id,
-        Record::collection(),
+        model,
         proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
         parent,
         generation,
@@ -34,7 +42,7 @@ fn forge_title_event(entity_id: proto::EntityId, parent: proto::Clock, title: &s
 fn event_only_item(event: proto::Event) -> proto::SubscriptionUpdateItem {
     proto::SubscriptionUpdateItem {
         entity_id: event.entity_id,
-        collection: event.collection.clone(),
+        model: event.model,
         content: proto::UpdateContent::EventOnly(vec![Attested::opt(event, None).into()]),
         predicate_relevance: vec![],
     }
@@ -56,11 +64,20 @@ async fn test_unknown_entity_event_yields_typed_lineage_rejection() -> Result<()
 
     // Relay context so apply_updates accepts updates from this peer.
     let _relay_context = ctx_c.query_wait::<RecordView>("title = 'no-such-title'").await?;
+    let record_model = client.catalog.model_id_for(Record::collection().as_str()).expect("Record registered by query");
+    let title_property = client.catalog.resolve(Record::collection().as_str(), "title").expect("Record.title registered by query");
 
     let unknown = proto::EntityId::new();
     // The parent id is fabricated, so no true generation exists; 2 is a
     // plausible claim and admission can never verify it (NeedsState preempts).
-    let ev = forge_title_event(unknown, proto::Clock::from(vec![proto::EventId::from_bytes([7u8; 32])]), "ghost", 2);
+    let ev = forge_title_event(
+        record_model,
+        title_property,
+        unknown,
+        proto::Clock::from(vec![proto::EventId::from_bytes([7u8; 32])]),
+        "ghost",
+        2,
+    );
 
     let err = NodeApplier::apply_updates_for_test(&client, &server.id, vec![event_only_item(ev)])
         .await
@@ -104,12 +121,14 @@ async fn test_second_genesis_yields_typed_disjoint() -> Result<()> {
     };
     let view = ctx_c.get::<RecordView>(rec_id).await?;
     assert_eq!(view.title().unwrap(), "t0");
+    let record_model = client.catalog.model_id_for(Record::collection().as_str()).expect("Record registered by create");
+    let title_property = client.catalog.resolve(Record::collection().as_str(), "title").expect("Record.title registered by create");
 
     // A creation event (empty parents) for an entity that already has
     // committed history: different genesis, provably disjoint. Claims the
     // correct genesis generation (1) so the Disjoint verdict, not a
     // generation check, is what rejects it.
-    let evil_genesis = forge_title_event(rec_id, proto::Clock::default(), "evil-genesis", 1);
+    let evil_genesis = forge_title_event(record_model, title_property, rec_id, proto::Clock::default(), "evil-genesis", 1);
 
     let err = NodeApplier::apply_updates_for_test(&client, &server.id, vec![event_only_item(evil_genesis)])
         .await

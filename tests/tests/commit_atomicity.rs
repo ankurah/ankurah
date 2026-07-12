@@ -226,7 +226,7 @@ impl PolicyAgent for RecordingAgent {
         entity_after: &Entity,
         event: &proto::Event,
     ) -> Result<Option<proto::Attestation>, AccessDenied> {
-        if event.collection.as_str() == "album" {
+        if entity_after.collection().as_str() == "album" {
             self.observed.lock().unwrap().push((event.id(), entity_before.head(), entity_after.head()));
         }
         Ok(None)
@@ -270,6 +270,7 @@ impl PolicyAgent for RecordingAgent {
         _id: &proto::EntityId,
         _collection: &proto::CollectionId,
         _state: &proto::State,
+        _resolver: Option<std::sync::Weak<dyn ankurah::core::property::PropertyResolver>>,
     ) -> Result<(), AccessDenied>
     where
         C: Iterable<Self::ContextData>,
@@ -277,8 +278,15 @@ impl PolicyAgent for RecordingAgent {
         Ok(())
     }
 
-    fn check_read_event<C>(&self, _data: &C, _event: &Attested<proto::Event>) -> Result<(), AccessDenied>
-    where C: Iterable<Self::ContextData> {
+    fn check_read_event<C>(
+        &self,
+        _data: &C,
+        _collection: &proto::CollectionId,
+        _event: &Attested<proto::Event>,
+    ) -> Result<(), AccessDenied>
+    where
+        C: Iterable<Self::ContextData>,
+    {
         Ok(())
     }
 
@@ -377,10 +385,10 @@ impl PolicyAgent for AttestingAgent {
         _node: &NodeInnerAlias<SE, Self>,
         _cdata: &Self::ContextData,
         _entity_before: &Entity,
-        _entity_after: &Entity,
+        entity_after: &Entity,
         event: &proto::Event,
     ) -> Result<Option<proto::Attestation>, AccessDenied> {
-        if event.collection.as_str() == "album" {
+        if entity_after.collection().as_str() == "album" {
             return Ok(Some(proto::Attestation(vec![0xA7])));
         }
         Ok(None)
@@ -424,6 +432,7 @@ impl PolicyAgent for AttestingAgent {
         _id: &proto::EntityId,
         _collection: &proto::CollectionId,
         _state: &proto::State,
+        _resolver: Option<std::sync::Weak<dyn ankurah::core::property::PropertyResolver>>,
     ) -> Result<(), AccessDenied>
     where
         C: Iterable<Self::ContextData>,
@@ -431,8 +440,15 @@ impl PolicyAgent for AttestingAgent {
         Ok(())
     }
 
-    fn check_read_event<C>(&self, _data: &C, _event: &Attested<proto::Event>) -> Result<(), AccessDenied>
-    where C: Iterable<Self::ContextData> {
+    fn check_read_event<C>(
+        &self,
+        _data: &C,
+        _collection: &proto::CollectionId,
+        _event: &Attested<proto::Event>,
+    ) -> Result<(), AccessDenied>
+    where
+        C: Iterable<Self::ContextData>,
+    {
         Ok(())
     }
 

@@ -211,7 +211,11 @@ async fn legacy_v1_state_reads_then_rewrites_to_0xa2_on_edit() -> Result<()> {
         assert_eq!(buffer[0], LWW_STATE_V1, "seeded legacy buffer must be 0xA1");
         let mut state_buffers = BTreeMap::new();
         state_buffers.insert("lww".to_owned(), buffer);
-        proto::State { state_buffers: proto::StateBuffers(state_buffers), head: proto::Clock::from(vec![legacy_event_id]) }
+        proto::State {
+            state_buffers: proto::StateBuffers(state_buffers),
+            head: proto::Clock::from(vec![legacy_event_id.clone()]),
+            head_generations: proto::GClock::from((1, legacy_event_id)),
+        }
     };
     let storage = node.collections.get(&"record".into()).await?;
     // #330: EntityState carries a model id; Record was registered by the warming

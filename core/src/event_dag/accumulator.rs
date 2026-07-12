@@ -344,7 +344,7 @@ mod tests {
         entity_id_bytes[0..2].copy_from_slice(&seed.to_be_bytes());
         Event {
             entity_id: EntityId::from_bytes(entity_id_bytes),
-            collection: "test".into(),
+            model: EntityId::from_bytes([0xEE; 16]),
             operations: OperationSet(BTreeMap::new()),
             parent: Clock::from(parents.iter().map(|p| p.id()).collect::<Vec<_>>()),
             generation: Event::generation_from_parents(parents.iter().map(|p| p.generation)),

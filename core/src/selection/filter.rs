@@ -426,8 +426,11 @@ mod tests {
         writer.apply_operations_with_event(&ops, proto::EventId::from_bytes([3; 32])).unwrap();
         let buffer = writer.to_state_buffer().unwrap();
 
-        let state =
-            proto::State { state_buffers: proto::StateBuffers(BTreeMap::from([("lww".to_string(), buffer)])), head: Default::default() };
+        let state = proto::State {
+            state_buffers: proto::StateBuffers(BTreeMap::from([("lww".to_string(), buffer)])),
+            head: Default::default(),
+            head_generations: Default::default(),
+        };
         let entity = TemporaryEntity::new(proto::EntityId::from_bytes([0x77; 16]), "album".into(), &state).unwrap();
 
         // Resolved-Identifier predicate (the checked read path).

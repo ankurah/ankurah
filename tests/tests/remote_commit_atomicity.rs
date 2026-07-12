@@ -6,7 +6,10 @@ use ankurah::core::{
     error::{IngestError, MutationError, ValidationError},
     node::{Node as NodeAlias, NodeInner},
     policy::{AccessDenied, DefaultContext, PolicyAgent, DEFAULT_CONTEXT},
-    property::backend::{lww::LWWBackend, PropertyBackend},
+    property::{
+        backend::{lww::LWWBackend, PropertyBackend},
+        PropertyKey,
+    },
     storage::StorageEngine,
     util::Iterable,
     value::Value,
@@ -116,6 +119,7 @@ impl PolicyAgent for DenyingWriteAgent {
         _id: &proto::EntityId,
         _collection: &proto::CollectionId,
         _state: &proto::State,
+        _resolver: Option<std::sync::Weak<dyn ankurah::core::property::PropertyResolver>>,
     ) -> Result<(), AccessDenied>
     where
         C: Iterable<Self::ContextData>,
@@ -123,8 +127,15 @@ impl PolicyAgent for DenyingWriteAgent {
         Ok(())
     }
 
-    fn check_read_event<C>(&self, _data: &C, _event: &Attested<proto::Event>) -> Result<(), AccessDenied>
-    where C: Iterable<Self::ContextData> {
+    fn check_read_event<C>(
+        &self,
+        _data: &C,
+        _collection: &proto::CollectionId,
+        _event: &Attested<proto::Event>,
+    ) -> Result<(), AccessDenied>
+    where
+        C: Iterable<Self::ContextData>,
+    {
         Ok(())
     }
 
@@ -142,16 +153,17 @@ impl PolicyAgent for DenyingWriteAgent {
 
 /// Forge a Record LWW event setting `title`, parented on the given parent
 /// EVENTS (generation stamped from their payloads; the registry ban).
-fn forge_title_event(entity_id: proto::EntityId, parents: &[&proto::Event], title: &str) -> proto::Event {
+fn forge_title_event(
+    model: proto::EntityId,
+    title_property: proto::EntityId,
+    entity_id: proto::EntityId,
+    parents: &[&proto::Event],
+    title: &str,
+) -> proto::Event {
     let backend = LWWBackend::new();
-    backend.set("title".into(), Some(Value::String(title.to_owned())));
+    backend.set(PropertyKey::Id(title_property), Some(Value::String(title.to_owned())));
     let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
-    ankurah_tests::forge::event_with_parents(
-        entity_id,
-        Record::collection(),
-        proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
-        parents,
-    )
+    ankurah_tests::forge::event_with_parents(entity_id, model, proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])), parents)
 }
 
 /// R2 (D1 plan section 5): remote-commit atomicity. A policy denial mid
@@ -165,11 +177,16 @@ async fn test_remote_commit_denial_leaves_nothing_durable() -> Result<()> {
     let agent = DenyingWriteAgent::new();
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), agent.clone());
     server.system.create().await?;
+    let ctx = server.context(DEFAULT_CONTEXT)?;
+    ctx.register::<Record>().await?;
+    let record_model = server.catalog.model_id_for(Record::collection().as_str()).expect("Record registered explicitly");
+    let title_property = server.catalog.resolve(Record::collection().as_str(), "title").expect("Record.title registered explicitly");
+    agent.observed.lock().unwrap().clear();
 
     let entity_id = proto::EntityId::new();
-    let e0 = forge_title_event(entity_id, &[], "t0");
-    let e1 = forge_title_event(entity_id, &[&e0], "t1");
-    let e2 = forge_title_event(entity_id, &[&e1], "t2");
+    let e0 = forge_title_event(record_model, title_property, entity_id, &[], "t0");
+    let e1 = forge_title_event(record_model, title_property, entity_id, &[&e0], "t1");
+    let e2 = forge_title_event(record_model, title_property, entity_id, &[&e1], "t2");
     agent.deny_events.lock().unwrap().insert(e1.id());
 
     let events = vec![Attested::opt(e0, None), Attested::opt(e1, None), Attested::opt(e2, None)];
@@ -209,9 +226,14 @@ async fn test_rejected_creation_previews_and_leaves_no_resident() -> Result<()> 
     let agent = DenyingWriteAgent::new();
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), agent.clone());
     server.system.create().await?;
+    let ctx = server.context(DEFAULT_CONTEXT)?;
+    ctx.register::<Record>().await?;
+    let record_model = server.catalog.model_id_for(Record::collection().as_str()).expect("Record registered explicitly");
+    let title_property = server.catalog.resolve(Record::collection().as_str(), "title").expect("Record.title registered explicitly");
+    agent.observed.lock().unwrap().clear();
 
     let entity_id = proto::EntityId::new();
-    let creation = forge_title_event(entity_id, &[], "denied-at-birth");
+    let creation = forge_title_event(record_model, title_property, entity_id, &[], "denied-at-birth");
     let creation_id = creation.id();
     agent.deny_events.lock().unwrap().insert(creation_id.clone());
 

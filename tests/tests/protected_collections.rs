@@ -26,6 +26,7 @@ async fn server_refuses_commits_into_protected_collections() -> anyhow::Result<(
             entity_id: EntityId::new(),
             operations: proto::OperationSet(BTreeMap::new()),
             parent: proto::Clock::default(),
+            generation: 1,
         };
         let resp = client
             .request(

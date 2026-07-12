@@ -211,6 +211,8 @@ impl<E: StorageEngine + CrashFlushable + 'static> StorageEngine for CrashStorage
 
     async fn delete_all_collections(&self) -> Result<bool, MutationError> { self.inner.delete_all_collections().await }
 
+    async fn list_collections(&self) -> Result<Vec<CollectionId>, RetrievalError> { self.inner.list_collections().await }
+
     // A wrapper must FORWARD the resolver injection: the trait default is a
     // no-op, and swallowing it leaves the inner engine unable to stamp model
     // ids on reconstructed envelopes (#330) or name columns from the catalog.

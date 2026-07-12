@@ -319,6 +319,7 @@ fn membership_genesis(model: &EntityId, property: &EntityId) -> proto::Event {
         entity_id: EntityId::new(),
         operations: proto::OperationSet(BTreeMap::from([("lww".to_string(), operations)])),
         parent: proto::Clock::default(),
+        generation: 1,
     }
 }
 

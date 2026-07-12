@@ -48,7 +48,7 @@ async fn measure_noop_state_delivery_cost() -> Result<()> {
     let fragment = proto::StateFragment { state: stored.payload.state.clone(), attestations: stored.attestations.clone() };
     let item = proto::SubscriptionUpdateItem {
         entity_id: rec_id,
-        collection: Record::collection(),
+        model: stored.payload.model,
         content: proto::UpdateContent::StateAndEvent(fragment, vec![]),
         predicate_relevance: vec![],
     };

@@ -339,7 +339,7 @@ mod tests {
         // this node), so the typed rejection binds the consult itself.
         let lying = ankurah_proto::Event {
             entity_id,
-            collection: "test".into(),
+            model: EntityId::from_bytes([0xEE; 16]),
             operations: ankurah_proto::OperationSet(BTreeMap::new()),
             parent: ankurah_proto::Clock::from(vec![h2_id.clone()]),
             generation: 4,
@@ -377,7 +377,7 @@ mod tests {
         // state heading {h3} annotated with h3's stamp.
         let h3 = ankurah_proto::Event {
             entity_id,
-            collection: "test".into(),
+            model: EntityId::from_bytes([0xEE; 16]),
             operations: ankurah_proto::OperationSet(BTreeMap::new()),
             parent: ankurah_proto::Clock::from(vec![h2_id.clone()]),
             generation: 3,
