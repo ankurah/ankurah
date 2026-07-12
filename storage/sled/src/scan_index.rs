@@ -97,23 +97,21 @@ impl Stream for SledIndexScanner<'_> {
 
     fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         // Synchronous implementation - always returns Ready
-        loop {
-            let (key_bytes, _value_bytes) = match self.iter.next() {
-                Some(Ok(kv)) => kv,
-                Some(Err(e)) => return Poll::Ready(Some(Err(RetrievalError::StorageError(e.to_string().into())))),
-                None => return Poll::Ready(None),
-            };
+        let (key_bytes, _value_bytes) = match self.iter.next() {
+            Some(Ok(kv)) => kv,
+            Some(Err(e)) => return Poll::Ready(Some(Err(RetrievalError::StorageError(e.to_string().into())))),
+            None => return Poll::Ready(None),
+        };
 
-            // Apply prefix guard if needed
-            if self.use_prefix_guard && !self.eq_prefix_bytes.is_empty() && !key_bytes.starts_with(&self.eq_prefix_bytes) {
-                return Poll::Ready(None); // End of prefix range
-            }
+        // Apply prefix guard if needed
+        if self.use_prefix_guard && !self.eq_prefix_bytes.is_empty() && !key_bytes.starts_with(&self.eq_prefix_bytes) {
+            return Poll::Ready(None); // End of prefix range
+        }
 
-            // Decode EntityId from key suffix
-            match decode_entity_id_from_index_key(&key_bytes) {
-                Ok(entity_id) => return Poll::Ready(Some(Ok(entity_id))),
-                Err(e) => return Poll::Ready(Some(Err(e))),
-            }
+        // Decode EntityId from key suffix
+        match decode_entity_id_from_index_key(&key_bytes) {
+            Ok(entity_id) => Poll::Ready(Some(Ok(entity_id))),
+            Err(e) => Poll::Ready(Some(Err(e))),
         }
     }
 }

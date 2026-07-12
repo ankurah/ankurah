@@ -139,28 +139,25 @@ impl PropertyManager {
             return Ok(u32::from_be_bytes(arr));
         }
 
-        // Slow path: try to insert atomically
-        loop {
-            let new_id = self.0.next_property_id.fetch_add(1, Ordering::Relaxed);
-            let new_id_bytes = new_id.to_be_bytes();
+        // Slow path: one atomic insert attempt resolves either way -- we
+        // install our fresh id, or the CAS loser adopts the winner's value.
+        let new_id = self.0.next_property_id.fetch_add(1, Ordering::Relaxed);
+        let new_id_bytes = new_id.to_be_bytes();
 
-            // Atomically insert only if key doesn't exist (expected = None)
-            match self.0.property_config_tree.compare_and_swap(name.as_bytes(), None::<&[u8]>, Some(&new_id_bytes[..])) {
-                Ok(Ok(())) => {
-                    // Successfully inserted our new ID
-                    return Ok(new_id);
-                }
-                Ok(Err(cas_error)) => {
-                    // Another thread inserted first - use their value
-                    let existing = cas_error.current.expect("CAS failed but no current value");
-                    let mut arr = [0u8; 4];
-                    arr.copy_from_slice(&existing);
-                    return Ok(u32::from_be_bytes(arr));
-                }
-                Err(e) => {
-                    return Err(sled_error(e));
-                }
+        // Atomically insert only if key doesn't exist (expected = None)
+        match self.0.property_config_tree.compare_and_swap(name.as_bytes(), None::<&[u8]>, Some(&new_id_bytes[..])) {
+            Ok(Ok(())) => {
+                // Successfully inserted our new ID
+                Ok(new_id)
             }
+            Ok(Err(cas_error)) => {
+                // Another thread inserted first - use their value
+                let existing = cas_error.current.expect("CAS failed but no current value");
+                let mut arr = [0u8; 4];
+                arr.copy_from_slice(&existing);
+                Ok(u32::from_be_bytes(arr))
+            }
+            Err(e) => Err(sled_error(e)),
         }
     }
 
