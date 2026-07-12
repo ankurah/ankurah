@@ -82,11 +82,11 @@ struct ReactorInner<E: AbstractEntity + Filterable, Ev> {
     /// Serializes notify_change invocations to ensure consistent watcher state
     notify_lock: tokio::sync::Mutex<()>,
     /// The catalog resolver, injected post-construction by `Node` (the same
-    /// pattern as `StorageEngine::set_property_resolver`): ORDER BY sort keys
+    /// pattern as `StorageEngine::set_catalog_resolver`): ORDER BY sort keys
     /// collate in each property's CANONICAL value_type (the canonical
     /// value_type ruling). `None` (standalone reactors, tests) falls back to
     /// sample-based inference.
-    property_resolver: std::sync::RwLock<Option<std::sync::Weak<dyn crate::property::PropertyResolver>>>,
+    catalog_resolver: std::sync::RwLock<Option<std::sync::Weak<dyn crate::schema::CatalogResolver>>>,
 }
 // don't require Clone SE or PA, because we have an Arc
 impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static> Clone for Reactor<E, Ev> {
@@ -103,21 +103,21 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
             subscriptions: Mutex::new(HashMap::new()),
             watcher_set: Arc::new(Mutex::new(WatcherSet::new())),
             notify_lock: tokio::sync::Mutex::new(()),
-            property_resolver: std::sync::RwLock::new(None),
+            catalog_resolver: std::sync::RwLock::new(None),
         }))
     }
 
     /// Inject the catalog resolver (called once at Node construction, after
     /// the catalog exists). Subscriptions created afterward type their ORDER
     /// BY sort keys from the catalog's canonical value_type.
-    pub fn set_property_resolver(&self, resolver: std::sync::Weak<dyn crate::property::PropertyResolver>) {
-        *self.0.property_resolver.write().unwrap() = Some(resolver);
+    pub fn set_catalog_resolver(&self, resolver: std::sync::Weak<dyn crate::schema::CatalogResolver>) {
+        *self.0.catalog_resolver.write().unwrap() = Some(resolver);
     }
 
     /// Create a new subscription container
     pub fn subscribe(&self) -> ReactorSubscription<E, Ev> {
         let broadcast = ankurah_signals::broadcast::Broadcast::new();
-        let resolver = self.0.property_resolver.read().unwrap().clone();
+        let resolver = self.0.catalog_resolver.read().unwrap().clone();
         let subscription = Subscription::new(broadcast.clone(), self.0.watcher_set.clone(), resolver);
         let subscription_id = subscription.id();
         self.0.subscriptions.lock().unwrap().insert(subscription_id, subscription);
@@ -224,7 +224,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
 pub(crate) fn build_key_spec_from_selection<E: AbstractEntity>(
     order_by: &[ankql::ast::OrderByItem],
     resultset: &EntityResultSet<E>,
-    resolver: Option<&dyn crate::property::PropertyResolver>,
+    resolver: Option<&dyn crate::schema::CatalogResolver>,
     collection: &str,
 ) -> anyhow::Result<crate::resultset::ResultKeySpec> {
     let mut keyparts = Vec::new();

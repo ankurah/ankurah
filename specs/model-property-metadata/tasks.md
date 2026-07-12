@@ -61,8 +61,8 @@ v3.
 ## 3. Catalog collections, protection, registration operation
 
 - [x] Collection constants `_ankurah_model`, `_ankurah_property`,
-      `_ankurah_model_property`; PROTECTED_COLLECTIONS extended to all
-      four system collections.
+      `_ankurah_model_property`; the central protected-collection classifier
+      covers all four system collections.
 - [x] `_ankurah_` prefix reservation in CollectionSet::get (user paths
       refused, system callers allowed); test.
 - [x] Catalog entities use raw parsers in `core/src/schema/catalog.rs` and

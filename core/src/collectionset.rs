@@ -28,9 +28,7 @@ impl<SE: StorageEngine> CollectionSet<SE> {
     pub async fn get(&self, id: &CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
         // The `_ankurah_` prefix is reserved for the system and catalog
         // collections; anything else under it never gets storage.
-        if id.as_str().starts_with(crate::schema::RESERVED_COLLECTION_PREFIX)
-            && !crate::system::PROTECTED_COLLECTIONS.contains(&id.as_str())
-        {
+        if id.as_str().starts_with(crate::schema::RESERVED_COLLECTION_PREFIX) && !crate::schema::is_protected_collection(id) {
             return Err(RetrievalError::Other(format!(
                 "collection id '{id}' uses the reserved prefix '{}'",
                 crate::schema::RESERVED_COLLECTION_PREFIX
@@ -72,10 +70,10 @@ impl<SE: StorageEngine> CollectionSet<SE> {
     pub async fn engine_collections(&self) -> Result<Vec<CollectionId>, RetrievalError> { self.0.storage_engine.list_collections().await }
 
     /// Forward the catalog resolver to the engine (see
-    /// [`StorageEngine::set_property_resolver`]). Called once from `Node`
+    /// [`StorageEngine::set_catalog_resolver`]). Called once from `Node`
     /// construction.
-    pub(crate) fn set_property_resolver(&self, resolver: std::sync::Weak<dyn crate::property::PropertyResolver>) {
-        self.0.storage_engine.set_property_resolver(resolver);
+    pub(crate) fn set_catalog_resolver(&self, resolver: std::sync::Weak<dyn crate::schema::CatalogResolver>) {
+        self.0.storage_engine.set_catalog_resolver(resolver);
     }
 
     pub async fn delete_all_collections(&self) -> Result<bool, MutationError> {

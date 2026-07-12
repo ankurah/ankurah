@@ -110,11 +110,11 @@ values instead of derived ones. No public API.
 - Collection ids `_ankurah_model`, `_ankurah_property`,
   `_ankurah_model_property` via `CollectionId::fixed_name`, beside the
   system collection's (core/src/system.rs:121).
-- `PROTECTED_COLLECTIONS` (core/src/system.rs:21, currently read by
-  nothing) becomes the four-entry set and finally gets readers: the
-  receiver-side commit guard (A6) and `CollectionSet::get` prefix
-  enforcement (`_ankurah_` reserved; reject for user collections, allow
-  for system callers).
+- The dead protected-collection constant becomes the central
+  `schema::is_protected_collection` classifier and finally gets readers: the
+  receiver-side commit guard (A6) and `CollectionSet::get` prefix enforcement
+  (`_ankurah_` reserved; reject for user collections, allow for system
+  callers).
 - Catalog entity accessors: raw Entity/backend read-write helpers in the
   SysRoot style (core/src/system.rs:124-127). SYSTEM MODELS, never
   derive(Model) (the ouroboros rule, RFC 4); enforce by comment and by
@@ -362,8 +362,8 @@ read back "".
   mismatch or absence, policy denial, and the strict never-registered-offline
   create/commit path. `TypeSkew`, CatalogGenesisError, and the anchor-reuse
   refusal are deleted.
-- PROTECTED_COLLECTIONS readers (with A4/A6); hard_reset flush (with
-  A7). The ulid-timestamp audit is moot under allocation.
+- Protected-collection classifier readers (with A4/A6); hard_reset flush
+  (with A7). The ulid-timestamp audit is moot under allocation.
 - Docs: brief internals note under docs/internals/ once shapes settle
   (the schema-evolution book chapter waits on #291).
 
@@ -685,7 +685,7 @@ model <-> table map half deferred with #304.
     history at commit. Reads use MAP-LEVEL presence: an `Id` entry present, even
     a cleared `None` tombstone, is authoritative and never falls back to a stale
     `Name` value; only an absent id consults the bare `Name` residue. The
-    catalog-blind `Entity` carries a stamped `Weak<dyn PropertyResolver>` (the
+    catalog-blind `Entity` carries a stamped `Weak<dyn CatalogResolver>` (the
     live catalog) for the sync read path, replacing the old `Node::bind_entity`
     backend flip. INVARIANT: writes are always id-keyed for a registered user
     collection; a `Name` key is emitted only for system and catalog collections
@@ -721,14 +721,14 @@ model <-> table map half deferred with #304.
     (each storage engine alone owns and remembers its internal id <-> name
     mappings; neither Node, System, nor CatalogManager bears it): every
     engine persists a property-id -> column map, seeded from an injected
-    resolver (StorageEngine::set_property_resolver, wired at Node::build)
+    resolver (`StorageEngine::set_catalog_resolver`, wired at `Node::build`)
     at set_state and consulted on every read. Postgres/sqlite:
     ankurah_property_columns table, UNIQUE(collection, column_name),
     insert-if-absent plus winner read-back so concurrent claimants
     converge. Sled: property_columns tree under an assignment lock.
     IndexedDB: property_columns object store, assigned in a pre-pass
     before the entities transaction (IndexedDB auto-commits across foreign
-    awaits). Naming rules (core/src/storage.rs naming module): sanitized
+    awaits). Naming rules (`core/src/storage/naming.rs`): sanitized
     display name; collisions append the property id's TRAILING 4+ base64
     characters, widening until unique (trailing because ULIDs share
     leading timestamp characters); unresolvable names fall back to p_ plus
@@ -796,7 +796,7 @@ model <-> table map half deferred with #304.
     state is now id-keyed, so hooks must receive what they need to
     resolve): check_read_event gains a collection parameter (core
     resolves, agents keep authorizing by collection), and check_read gains
-    the node's catalog resolver (Option<Weak<dyn PropertyResolver>>) --
+    the node's catalog resolver (`Option<Weak<dyn CatalogResolver>>`) --
     an agent that evaluates NAME-addressed policy predicates against
     entity state (scope filters) must bind its inspection view through it
     (TemporaryEntity::new_bound; the unbound TemporaryEntity remains the
@@ -863,6 +863,6 @@ model <-> table map half deferred with #304.
     in generic core (entity.rs read paths, resolve_pending_keys) is
     removed -- LWW is an ordinary registered backend with no special
     status in core, and `backend_from_string` is the one sanctioned
-    by-name seam (the registry constructor). PropertyResolver::siblings
+    by-name seam (the registry constructor). The former resolver `siblings`
     and the entity's catalog_knows_id helper die with the gates;
     Filterable::value_checked becomes the infallible value_resolved.

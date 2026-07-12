@@ -8,12 +8,9 @@ use std::{
     fmt,
     hash::Hash,
     ops::Deref,
-    sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Mutex, Weak,
-    },
+    sync::{Arc, Mutex, Weak},
 };
-use tokio::sync::{oneshot, Notify};
+use tokio::sync::oneshot;
 
 use crate::{
     action_error, action_info,
@@ -31,6 +28,7 @@ use crate::{
     schema::catalog::CatalogManager,
     storage::StorageEngine,
     system::SystemManager,
+    util::request_fence::{RequestLease, RequestValidity},
     util::{safemap::SafeMap, safeset::SafeSet, Iterable},
 };
 use itertools::Itertools;
@@ -49,129 +47,6 @@ pub struct PeerState {
     /// connection (#330 once-per-connection descriptor shipping). A
     /// reconnection builds a fresh `PeerState`, so the peer is re-announced.
     announced_models: std::sync::Mutex<std::collections::BTreeSet<proto::EntityId>>,
-}
-
-/// A lifecycle fence for requests whose effects must finish before their
-/// owner can be reset. Invalidation rejects new leases and then waits for any
-/// response already admitted at the schema-ingress boundary to finish its
-/// application.
-#[derive(Clone, Debug)]
-pub(crate) struct RequestFence(Arc<RequestFenceInner>);
-
-#[derive(Debug)]
-struct RequestFenceInner {
-    current: AtomicBool,
-    in_flight: AtomicUsize,
-    drained: Notify,
-}
-
-impl RequestFence {
-    pub(crate) fn new() -> Self {
-        Self(Arc::new(RequestFenceInner { current: AtomicBool::new(true), in_flight: AtomicUsize::new(0), drained: Notify::new() }))
-    }
-
-    pub(crate) fn is_current(&self) -> bool { self.0.current.load(Ordering::Acquire) }
-
-    /// Stop admitting effects immediately. Callers that need a reset barrier
-    /// must follow this with [`Self::wait_drained`].
-    pub(crate) fn invalidate(&self) { self.0.current.store(false, Ordering::Release); }
-
-    pub(crate) async fn wait_drained(&self) {
-        loop {
-            // Notify does not retain notify_waiters permits. Arm the waiter
-            // before reading the count so the final lease cannot disappear
-            // between our observation and await.
-            let drained = self.0.drained.notified();
-            tokio::pin!(drained);
-            drained.as_mut().enable();
-            if self.0.in_flight.load(Ordering::Acquire) == 0 {
-                return;
-            }
-            drained.await;
-        }
-    }
-
-    pub(crate) fn try_acquire(&self) -> Option<RequestLease> {
-        if !self.is_current() {
-            return None;
-        }
-        self.0.in_flight.fetch_add(1, Ordering::AcqRel);
-        // Invalidation may have won between the first check and increment.
-        // In that case this lease was never admitted and must not escape.
-        if !self.is_current() {
-            RequestLease::release(&self.0);
-            return None;
-        }
-        Some(RequestLease(Some(self.0.clone())))
-    }
-}
-
-/// Owned admission held continuously from schema ingestion through body
-/// application. It is deliberately Send, unlike a blocking lock guard.
-#[derive(Debug)]
-pub(crate) struct RequestLease(Option<Arc<RequestFenceInner>>);
-
-impl RequestLease {
-    fn unguarded() -> Self { Self(None) }
-
-    fn release(inner: &RequestFenceInner) {
-        if inner.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
-            inner.drained.notify_waiters();
-        }
-    }
-}
-
-impl Drop for RequestLease {
-    fn drop(&mut self) {
-        if let Some(inner) = self.0.take() {
-            Self::release(&inner);
-        }
-    }
-}
-
-/// A validity check owned by one asynchronous request attempt. Relay requests
-/// use the predicate to reject superseded attempts; reset-sensitive owners
-/// additionally attach a [`RequestFence`] so reset can quiesce effects that
-/// already passed the predicate.
-#[derive(Clone)]
-pub(crate) struct RequestValidity {
-    check: Arc<dyn Fn() -> bool + Send + Sync>,
-    fence: Option<RequestFence>,
-}
-
-impl fmt::Debug for RequestValidity {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("RequestValidity(..)") }
-}
-
-impl RequestValidity {
-    pub(crate) fn new(check: impl Fn() -> bool + Send + Sync + 'static) -> Self { Self { check: Arc::new(check), fence: None } }
-
-    pub(crate) fn fenced(fence: RequestFence) -> Self {
-        let current = fence.clone();
-        Self { check: Arc::new(move || current.is_current()), fence: Some(fence) }
-    }
-
-    /// Compose another attempt-local predicate without losing the owner's
-    /// quiescing fence.
-    pub(crate) fn and(self, check: impl Fn() -> bool + Send + Sync + 'static) -> Self {
-        let previous = self.check.clone();
-        Self { check: Arc::new(move || previous() && check()), fence: self.fence }
-    }
-
-    pub(crate) fn is_current(&self) -> bool { (self.check)() }
-
-    pub(crate) fn try_acquire(&self) -> Option<RequestLease> {
-        if !self.is_current() {
-            return None;
-        }
-        let lease = match &self.fence {
-            Some(fence) => fence.try_acquire()?,
-            None => RequestLease::unguarded(),
-        };
-        // A relay generation can change independently of the owner fence.
-        // Recheck after admission before permitting schema ingestion.
-        self.is_current().then_some(lease)
-    }
 }
 
 struct PendingRequest {
@@ -384,10 +259,10 @@ where
         // naming) from the catalog resolver at materialization time. Injected
         // here, not at engine construction, because the engine is built before
         // the node/catalog exist.
-        node.collections.set_property_resolver(node.catalog.resolver_weak());
+        node.collections.set_catalog_resolver(node.catalog.resolver_weak());
         // The reactor types ORDER BY sort keys from the same catalog resolver
         // (canonical value_type collation).
-        node.reactor.set_property_resolver(node.catalog.resolver_weak());
+        node.reactor.set_catalog_resolver(node.catalog.resolver_weak());
         // Assembly-time choke point (the PropertyKey amendment, #289): every
         // entity handed out by the entity set gets the catalog resolver
         // stamped, so no assembly path can forget it and the sync read path can
@@ -477,30 +352,6 @@ where
             relay.notify_peer_disconnected(node_id);
         }
     }
-    /// The model ids a response body references (#330 descriptor shipping):
-    /// the sender ships catalog defs for any of these not yet announced on
-    /// the connection.
-    fn models_in_response(body: &proto::NodeResponseBody) -> std::collections::BTreeSet<proto::EntityId> {
-        let mut models = std::collections::BTreeSet::new();
-        match body {
-            proto::NodeResponseBody::Fetch(deltas) => models.extend(deltas.iter().map(|delta| delta.model)),
-            proto::NodeResponseBody::QuerySubscribed { deltas, .. } => models.extend(deltas.iter().map(|delta| delta.model)),
-            proto::NodeResponseBody::Get(states) => models.extend(states.iter().map(|state| state.payload.model)),
-            proto::NodeResponseBody::GetEvents(events) => models.extend(events.iter().map(|event| event.payload.model)),
-            _ => {}
-        }
-        models
-    }
-
-    /// The model ids an update body references; see [`Self::models_in_response`].
-    fn models_in_update(body: &proto::NodeUpdateBody) -> std::collections::BTreeSet<proto::EntityId> {
-        let mut models = std::collections::BTreeSet::new();
-        match body {
-            proto::NodeUpdateBody::SubscriptionUpdate { items } => models.extend(items.iter().map(|item| item.model)),
-        }
-        models
-    }
-
     /// Catalog definition states for the `models` not yet announced on
     /// `connection` (#330 once-per-connection descriptor shipping). Well-known
     /// system/catalog ids need no defs (they are static). The defs are the
@@ -524,41 +375,11 @@ where
         if fresh.is_empty() {
             return Vec::new();
         }
-        let mut states = Vec::new();
-        let (Ok(model_col), Ok(property_col), Ok(membership_col)) = (
-            self.collections.get(&crate::schema::model_collection()).await,
-            self.collections.get(&crate::schema::property_collection()).await,
-            self.collections.get(&crate::schema::model_property_collection()).await,
-        ) else {
-            warn!("Node({}) could not open catalog collections to ship schema defs", self.id);
-            // Nothing was shipped: roll these back out of `announced` so a
-            // later update retries them (otherwise a transient catalog-open
-            // failure would strand every future body referencing these models).
+        let (states, failed) = self.catalog.definition_states_for_models(&fresh).await;
+        if !failed.is_empty() {
             let mut announced = connection.announced_models.lock().unwrap();
-            for model in &fresh {
-                announced.remove(model);
-            }
-            return Vec::new();
-        };
-        for model in &fresh {
-            match model_col.get_state(*model).await {
-                Ok(state) => states.push(state),
-                Err(e) => {
-                    warn!("Node({}) cannot ship model def {}: {}", self.id, model.to_base64_short(), e);
-                    // Same rollback for a single model whose def we could not
-                    // fetch: leave it un-announced so it is retried rather than
-                    // marked-but-never-shipped.
-                    connection.announced_models.lock().unwrap().remove(model);
-                    continue;
-                }
-            }
-            for membership in self.catalog.memberships_of(model) {
-                if let Ok(state) = property_col.get_state(membership.property).await {
-                    states.push(state);
-                }
-                if let Ok(state) = membership_col.get_state(membership.id).await {
-                    states.push(state);
-                }
+            for model in failed {
+                announced.remove(&model);
             }
         }
         states
@@ -663,7 +484,7 @@ where
         // untrusted (events topo-sort, snapshots compare heads).
         let node = self.clone();
         crate::task::spawn(async move {
-            let schema = node.schema_states_for_models(&connection, Node::<SE, PA>::models_in_update(&notification)).await;
+            let schema = node.schema_states_for_models(&connection, notification.referenced_models()).await;
             let message = proto::NodeMessage::Update(proto::NodeUpdate { id, from: node.id, to: node_id, body: notification, schema });
             if let Err(e) = connection.send_message(message) {
                 warn!("Failed to send update to peer {}: {}", node_id, e);
@@ -789,7 +610,7 @@ where
                     };
                     // Descriptor shipping (#330): catalog defs for any model id
                     // this response references that the connection has not seen.
-                    let schema = self.schema_states_for_models(&connection, Self::models_in_response(&body)).await;
+                    let schema = self.schema_states_for_models(&connection, body.referenced_models()).await;
                     let _result = sender.send_message(proto::NodeMessage::Response(proto::NodeResponse {
                         request_id,
                         from: self.id,
@@ -857,7 +678,7 @@ where
                 // this ingress guard, so this does not block it.)
                 for event in &events {
                     let collection_id = self.resolve_model_wait(&event.payload.model).await?;
-                    if crate::system::PROTECTED_COLLECTIONS.contains(&collection_id.as_str()) {
+                    if crate::schema::is_protected_collection(&collection_id) {
                         return Ok(proto::NodeResponseBody::Error(format!(
                             "collection '{}' is protected and not writable by transactions",
                             collection_id
@@ -1674,31 +1495,6 @@ mod tests {
             },
             None,
         )
-    }
-
-    #[tokio::test]
-    async fn request_fence_invalidation_rejects_new_work_and_waits_for_admitted_work() {
-        let fence = RequestFence::new();
-        let validity = RequestValidity::fenced(fence.clone());
-        let admitted = validity.try_acquire().expect("current validity must admit a lease");
-
-        let reset = {
-            let fence = fence.clone();
-            tokio::spawn(async move {
-                fence.invalidate();
-                fence.wait_drained().await;
-            })
-        };
-        tokio::task::yield_now().await;
-
-        assert!(!reset.is_finished(), "reset must wait while an admitted response is still applying");
-        assert!(validity.try_acquire().is_none(), "invalidation must reject later response effects");
-
-        drop(admitted);
-        tokio::time::timeout(std::time::Duration::from_secs(1), reset)
-            .await
-            .expect("reset must wake when the final admitted response finishes")
-            .expect("reset task must not panic");
     }
 
     #[tokio::test]

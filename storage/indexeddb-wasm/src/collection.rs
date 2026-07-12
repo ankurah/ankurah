@@ -5,7 +5,8 @@ use std::sync::{Arc, RwLock};
 use ankurah_core::{
     action_debug,
     error::{MutationError, RetrievalError},
-    property::{PropertyKey, PropertyResolver},
+    property::PropertyKey,
+    schema::CatalogResolver,
     selection::filter::{evaluate_predicate, Filterable},
     storage::{naming, StorageCollection},
 };
@@ -32,7 +33,7 @@ pub struct IndexedDBBucket {
     pub(crate) invocation_count: AtomicUsize,
     /// The injected catalog resolver (shared with the engine): the NAME SOURCE
     /// for [`Self::field_for_key`]. Weak so storage never keeps the node alive.
-    pub(crate) resolver: Arc<RwLock<Option<std::sync::Weak<dyn PropertyResolver>>>>,
+    pub(crate) resolver: Arc<RwLock<Option<std::sync::Weak<dyn CatalogResolver>>>>,
     /// This collection's slice of the engine-owned durable id-to-field map (the
     /// `property_columns` object store), cached in memory. The map -- not the
     /// display name -- is what addresses a property's field once assigned:
@@ -63,7 +64,7 @@ fn property_columns_key(collection: &str, id: &EntityId) -> String { format!("{}
 fn order_types_in_column_space(
     collection: &str,
     selection: &ankql::ast::Selection,
-    resolver: Option<&dyn PropertyResolver>,
+    resolver: Option<&dyn CatalogResolver>,
     column_of: &dyn Fn(&EntityId) -> Option<String>,
 ) -> BTreeMap<String, ankurah_core::value::ValueType> {
     selection
@@ -834,11 +835,11 @@ mod tests {
     use ankql::ast::{OrderByItem, OrderDirection, PathExpr, Predicate, Selection};
     use ankurah_core::value::ValueType;
 
-    struct RenamedPropertyResolver {
+    struct RenamedCatalogResolver {
         property: EntityId,
     }
 
-    impl PropertyResolver for RenamedPropertyResolver {
+    impl CatalogResolver for RenamedCatalogResolver {
         fn resolve(&self, collection: &str, name: &str) -> Option<EntityId> {
             (collection == "record" && name == "score").then_some(self.property)
         }
@@ -851,7 +852,7 @@ mod tests {
     #[test]
     fn resolved_order_type_survives_sticky_physical_name() {
         let property = EntityId::from_bytes([7; 16]);
-        let resolver = RenamedPropertyResolver { property };
+        let resolver = RenamedCatalogResolver { property };
         let selection = Selection {
             predicate: Predicate::True,
             order_by: Some(vec![OrderByItem {

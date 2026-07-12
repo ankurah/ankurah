@@ -18,7 +18,7 @@ use crate::{
     entity::Entity,
     error::RetrievalError,
     model::View,
-    node::{MatchArgs, NodeInner, RequestValidity, TNodeErased},
+    node::{MatchArgs, NodeInner, TNodeErased},
     policy::PolicyAgent,
     reactor::{
         fetch_gap::{GapFetcher, QueryGapFetcher},
@@ -26,6 +26,7 @@ use crate::{
     },
     resultset::{EntityResultSet, ResultSet},
     storage::StorageEngine,
+    util::request_fence::RequestValidity,
     Node,
 };
 

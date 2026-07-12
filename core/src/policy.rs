@@ -226,7 +226,7 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
         id: &proto::EntityId,
         collection: &proto::CollectionId,
         state: &proto::State,
-        resolver: Option<std::sync::Weak<dyn crate::property::PropertyResolver>>,
+        resolver: Option<std::sync::Weak<dyn crate::schema::CatalogResolver>>,
     ) -> Result<(), AccessDenied>
     where
         C: Iterable<Self::ContextData>;
@@ -351,7 +351,7 @@ impl PolicyAgent for PermissiveAgent {
         _id: &proto::EntityId,
         _collection: &proto::CollectionId,
         _state: &proto::State,
-        _resolver: Option<std::sync::Weak<dyn crate::property::PropertyResolver>>,
+        _resolver: Option<std::sync::Weak<dyn crate::schema::CatalogResolver>>,
     ) -> Result<(), AccessDenied>
     where
         C: Iterable<Self::ContextData>,

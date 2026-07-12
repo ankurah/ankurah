@@ -7,9 +7,9 @@ use std::sync::Arc;
 use ankurah_core::entity::TemporaryEntity;
 use ankurah_core::error::{MutationError, RetrievalError};
 use ankurah_core::property::backend::backend_from_string;
-use ankurah_core::property::{PropertyKey, PropertyResolver};
 use ankurah_core::selection::filter::evaluate_predicate;
 use ankurah_core::storage::{naming, StorageCollection, StorageEngine};
+use ankurah_core::{property::PropertyKey, schema::CatalogResolver};
 use ankurah_proto::{
     AttestationSet, Attested, Clock, CollectionId, EntityId, EntityState, Event, EventId, OperationSet, State, StateBuffers,
 };
@@ -29,9 +29,9 @@ pub const DEFAULT_POOL_SIZE: u32 = 10;
 pub struct SqliteStorageEngine {
     pool: bb8::Pool<SqliteConnectionManager>,
     /// The catalog resolver, injected post-construction by `Node` (see
-    /// `StorageEngine::set_property_resolver`). Shared with every bucket:
+    /// `StorageEngine::set_catalog_resolver`). Shared with every bucket:
     /// the name SOURCE for the engine-owned durable id-to-column map.
-    resolver: Arc<std::sync::RwLock<Option<std::sync::Weak<dyn PropertyResolver>>>>,
+    resolver: Arc<std::sync::RwLock<Option<std::sync::Weak<dyn CatalogResolver>>>>,
 }
 
 impl SqliteStorageEngine {
@@ -100,7 +100,7 @@ impl StorageEngine for SqliteStorageEngine {
         Ok(Arc::new(bucket))
     }
 
-    fn set_property_resolver(&self, resolver: std::sync::Weak<dyn PropertyResolver>) {
+    fn set_catalog_resolver(&self, resolver: std::sync::Weak<dyn CatalogResolver>) {
         *self.resolver.write().expect("RwLock poisoned") = Some(resolver);
     }
 
@@ -234,7 +234,7 @@ pub struct SqliteBucket {
     ddl_lock: Arc<tokio::sync::Mutex<()>>,
     /// The injected catalog resolver (shared with the engine): the NAME SOURCE
     /// for [`Self::column_for_key`]. Weak so storage never keeps the node alive.
-    resolver: Arc<std::sync::RwLock<Option<std::sync::Weak<dyn PropertyResolver>>>>,
+    resolver: Arc<std::sync::RwLock<Option<std::sync::Weak<dyn CatalogResolver>>>>,
     /// This collection's slice of the engine-owned durable id-to-column map
     /// (the `_ankurah_property_columns` table), cached. The map -- not the
     /// display name -- is what addresses a property's column once assigned:
@@ -250,7 +250,7 @@ impl SqliteBucket {
     fn new(
         pool: bb8::Pool<SqliteConnectionManager>,
         collection_id: CollectionId,
-        resolver: Arc<std::sync::RwLock<Option<std::sync::Weak<dyn PropertyResolver>>>>,
+        resolver: Arc<std::sync::RwLock<Option<std::sync::Weak<dyn CatalogResolver>>>>,
     ) -> Self {
         let state_table_name = collection_id.as_str().to_string();
         let event_table_name = format!("{}_event", collection_id.as_str());

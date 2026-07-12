@@ -289,8 +289,8 @@ impl StorageEngine for GatedCatalogFetchEngine {
         <SledStorageEngine as StorageEngine>::list_collections(self.inner.as_ref()).await
     }
 
-    fn set_property_resolver(&self, resolver: std::sync::Weak<dyn ankurah::core::property::PropertyResolver>) {
-        <SledStorageEngine as StorageEngine>::set_property_resolver(self.inner.as_ref(), resolver);
+    fn set_catalog_resolver(&self, resolver: std::sync::Weak<dyn ankurah::core::schema::CatalogResolver>) {
+        <SledStorageEngine as StorageEngine>::set_catalog_resolver(self.inner.as_ref(), resolver);
     }
 }
 
@@ -324,8 +324,8 @@ impl StorageEngine for GatedListEngine {
         Ok(collections)
     }
 
-    fn set_property_resolver(&self, resolver: std::sync::Weak<dyn ankurah::core::property::PropertyResolver>) {
-        <SledStorageEngine as StorageEngine>::set_property_resolver(self.inner.as_ref(), resolver);
+    fn set_catalog_resolver(&self, resolver: std::sync::Weak<dyn ankurah::core::schema::CatalogResolver>) {
+        <SledStorageEngine as StorageEngine>::set_catalog_resolver(self.inner.as_ref(), resolver);
     }
 }
 

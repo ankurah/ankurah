@@ -214,8 +214,8 @@ impl<E: StorageEngine + CrashFlushable + 'static> StorageEngine for CrashStorage
     // A wrapper must FORWARD the resolver injection: the trait default is a
     // no-op, and swallowing it leaves the inner engine unable to stamp model
     // ids on reconstructed envelopes (#330) or name columns from the catalog.
-    fn set_property_resolver(&self, resolver: std::sync::Weak<dyn ankurah::core::property::PropertyResolver>) {
-        self.inner.set_property_resolver(resolver);
+    fn set_catalog_resolver(&self, resolver: std::sync::Weak<dyn ankurah::core::schema::CatalogResolver>) {
+        self.inner.set_catalog_resolver(resolver);
     }
 }
 
@@ -424,7 +424,7 @@ pub fn fresh_sled_dir(label: &str) -> PathBuf {
 /// the real reopen path, not a test shortcut.
 pub fn reopen_sled(dir: &Path) -> Result<SledStorageEngine> { SledStorageEngine::with_path(dir.to_path_buf()) }
 
-/// Minimal [`PropertyResolver`] for bare-engine (node-less) recovery probes:
+/// Minimal [`CatalogResolver`] for bare-engine (node-less) recovery probes:
 /// the parent reads persisted states straight off the reopened engine, and the
 /// bucket needs a model id to stamp reconstructed envelopes (#330). Maps
 /// exactly the one collection under test to the model id the child allocated
@@ -434,7 +434,7 @@ struct HandoffModelResolver {
     model: EntityId,
 }
 
-impl ankurah::core::property::PropertyResolver for HandoffModelResolver {
+impl ankurah::core::schema::CatalogResolver for HandoffModelResolver {
     fn resolve(&self, _collection: &str, _name: &str) -> Option<EntityId> { None }
     fn name_for(&self, _id: &EntityId) -> Option<String> { None }
     fn model_id_for(&self, collection: &str) -> Option<EntityId> { (collection == self.collection).then_some(self.model) }
@@ -447,10 +447,10 @@ pub fn handoff_model_resolver(
     engine: &SledStorageEngine,
     collection: &str,
     model: EntityId,
-) -> Arc<dyn ankurah::core::property::PropertyResolver> {
-    let resolver: Arc<dyn ankurah::core::property::PropertyResolver> =
+) -> Arc<dyn ankurah::core::schema::CatalogResolver> {
+    let resolver: Arc<dyn ankurah::core::schema::CatalogResolver> =
         Arc::new(HandoffModelResolver { collection: collection.to_string(), model });
-    engine.set_property_resolver(Arc::downgrade(&resolver));
+    engine.set_catalog_resolver(Arc::downgrade(&resolver));
     resolver
 }
 

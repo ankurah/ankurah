@@ -100,9 +100,9 @@ pub(super) struct Inner<E: AbstractEntity + Filterable, Ev> {
     state: std::sync::Mutex<State<E, Ev>>,
     watcher_set: Arc<std::sync::Mutex<crate::reactor::watcherset::WatcherSet>>,
     /// The catalog resolver captured at subscribe time (see
-    /// `Reactor::set_property_resolver`): types ORDER BY sort keys from the
+    /// `Reactor::set_catalog_resolver`): types ORDER BY sort keys from the
     /// canonical value_type.
-    resolver: Option<std::sync::Weak<dyn crate::property::PropertyResolver>>,
+    resolver: Option<std::sync::Weak<dyn crate::schema::CatalogResolver>>,
 }
 struct State<E: AbstractEntity + Filterable, Ev> {
     pub(crate) queries: HashMap<proto::QueryId, QueryState<E>>,
@@ -117,7 +117,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
     pub fn new(
         broadcast: ankurah_signals::broadcast::Broadcast<ReactorUpdate<E, Ev>>,
         watcher_set: Arc<std::sync::Mutex<crate::reactor::watcherset::WatcherSet>>,
-        resolver: Option<std::sync::Weak<dyn crate::property::PropertyResolver>>,
+        resolver: Option<std::sync::Weak<dyn crate::schema::CatalogResolver>>,
     ) -> Self {
         Self(Arc::new(Inner {
             id: ReactorSubscriptionId::new(),

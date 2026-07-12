@@ -838,7 +838,7 @@ impl ankurah::policy::PolicyAgent for ProbeAgent {
         _id: &proto::EntityId,
         _collection: &proto::CollectionId,
         _state: &proto::State,
-        _resolver: Option<std::sync::Weak<dyn ankurah::core::property::PropertyResolver>>,
+        _resolver: Option<std::sync::Weak<dyn ankurah::core::schema::CatalogResolver>>,
     ) -> Result<(), ankurah::policy::AccessDenied>
     where
         C: ankurah::core::util::Iterable<Self::ContextData>,

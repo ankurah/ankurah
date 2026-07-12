@@ -7,7 +7,8 @@ use std::{
 
 use ankurah_core::{
     error::{MutationError, RetrievalError, StateError},
-    property::{backend::backend_from_string, PropertyKey, PropertyResolver},
+    property::{backend::backend_from_string, PropertyKey},
+    schema::CatalogResolver,
     storage::{naming, StorageCollection, StorageEngine},
 };
 use ankurah_proto::{Attestation, AttestationSet, Attested, EntityState, EventId, OperationSet, State, StateBuffers};
@@ -35,9 +36,9 @@ pub const DEFAULT_CONNECTION_TIMEOUT_SECS: u64 = 30;
 pub struct Postgres {
     pool: bb8::Pool<PostgresConnectionManager<NoTls>>,
     /// The catalog resolver, injected post-construction by `Node` (see
-    /// `StorageEngine::set_property_resolver`). Shared with every bucket:
+    /// `StorageEngine::set_catalog_resolver`). Shared with every bucket:
     /// the name SOURCE for the engine-owned durable id-to-column map.
-    resolver: Arc<RwLock<Option<std::sync::Weak<dyn PropertyResolver>>>>,
+    resolver: Arc<RwLock<Option<std::sync::Weak<dyn CatalogResolver>>>>,
 }
 
 impl Postgres {
@@ -146,7 +147,7 @@ impl StorageEngine for Postgres {
         Ok(Arc::new(bucket))
     }
 
-    fn set_property_resolver(&self, resolver: std::sync::Weak<dyn PropertyResolver>) { *self.resolver.write().unwrap() = Some(resolver); }
+    fn set_catalog_resolver(&self, resolver: std::sync::Weak<dyn CatalogResolver>) { *self.resolver.write().unwrap() = Some(resolver); }
 
     async fn delete_all_collections(&self) -> Result<bool, MutationError> {
         let mut client = self.pool.get().await.map_err(|err| MutationError::General(Box::new(err)))?;
@@ -217,7 +218,7 @@ pub struct PostgresBucket {
     columns: Arc<RwLock<Vec<PostgresColumn>>>,
     /// The injected catalog resolver (shared with the engine): the NAME SOURCE
     /// for [`Self::column_for_key`]. Weak so storage never keeps the node alive.
-    resolver: Arc<RwLock<Option<std::sync::Weak<dyn PropertyResolver>>>>,
+    resolver: Arc<RwLock<Option<std::sync::Weak<dyn CatalogResolver>>>>,
     /// This collection's slice of the engine-owned durable id-to-column map
     /// (the `_ankurah_property_columns` table), cached. The map -- not the
     /// display name -- is what addresses a property's column once assigned:

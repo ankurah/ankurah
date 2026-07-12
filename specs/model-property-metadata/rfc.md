@@ -89,8 +89,8 @@ keys on those names (the name-as-identity register):
   prefix enforcement (proto/src/collection.rs:3-23); the collection id is the
   lowercased struct name (derive/src/model/description.rs:50); renaming a
   Rust struct silently re-homes the model to a fresh collection.
-  `PROTECTED_COLLECTIONS` exists but is read by no code at all
-  (core/src/system.rs:21).
+  A protected-collection constant exists but is read by no code at all
+  (the pre-implementation `core/src/system.rs:21`).
 - The TypeResolver that infers JSON semantics from path arity carries the
   comment "TODO(Phase 3): Replace heuristics with proper schema lookup from
   System tables" (core/src/type_resolver.rs:24-26), pointing at the
@@ -463,9 +463,10 @@ upgrade path to hardcoded well-known constant ids for the meta-schema stays open
 and non-load-bearing (this paragraph already records that nothing depends on
 materializing it). See plan.md decision 27.
 
-**Protection (rev 3: structural and receiver-side).** `PROTECTED_COLLECTIONS`
-is currently dead code: no reader exists (core/src/system.rs:21, exhaustive
-grep). This RFC makes it real and structural: the catalog collections
+**Protection (rev 3: structural and receiver-side).** The pre-implementation
+protected-collection constant is dead code: no reader exists
+(`core/src/system.rs:21` at the time, exhaustive grep). This RFC makes the
+classification real and structural: the catalog collections
 (`_ankurah_system`, `_ankurah_model`, `_ankurah_property`,
 `_ankurah_model_property`) are NOT mutable through ordinary transactions at
 all. A receiving durable node rejects any CommitTransaction event targeting
@@ -496,9 +497,10 @@ STATIC well-known-ness was found to be bypassable, because the actual write
 target is the collection that id RESOLVES to through the (mutable) catalog map;
 a poisoned map entry -- a non-reserved model id routed to a catalog collection
 -- walked past the static check. The guard now resolves every CommitTransaction
-event's model up front and rejects the transaction if any resolves into
-PROTECTED_COLLECTIONS, before any event is written (registration writes the
-catalog through a direct commit path that bypasses this ingress guard). The
+event's model up front and rejects the transaction if any resolves to a
+collection accepted by `schema::is_protected_collection`, before any event is
+written (registration writes the catalog through a direct commit path that
+bypasses this ingress guard). The
 descriptor-ingest path was hardened to match: shipped catalog defs are ingested
 only after the recipient/connection checks, a wire model def naming a reserved
 collection is rejected, and a wire def cannot rebind a collection already mapped

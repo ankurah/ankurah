@@ -1,5 +1,6 @@
 use ankql::ast;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use ulid::Ulid;
 
 use crate::{
@@ -299,6 +300,21 @@ pub enum NodeResponseBody {
     },
     Success,
     Error(String),
+}
+
+impl NodeResponseBody {
+    /// Model ids carried by entity data in this response. Senders use this to
+    /// attach any catalog definitions the connection has not seen yet.
+    pub fn referenced_models(&self) -> BTreeSet<EntityId> {
+        let mut models = BTreeSet::new();
+        match self {
+            Self::Fetch(deltas) | Self::QuerySubscribed { deltas, .. } => models.extend(deltas.iter().map(|delta| delta.model)),
+            Self::Get(states) => models.extend(states.iter().map(|state| state.payload.model)),
+            Self::GetEvents(events) => models.extend(events.iter().map(|event| event.payload.model)),
+            Self::CommitComplete { .. } | Self::SchemaRegistered { .. } | Self::Success | Self::Error(_) => {}
+        }
+        models
+    }
 }
 
 impl std::fmt::Display for NodeRequest {

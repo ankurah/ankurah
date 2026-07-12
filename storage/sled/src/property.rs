@@ -1,7 +1,7 @@
 use crate::error::sled_error;
 use ankurah_core::error::RetrievalError;
-use ankurah_core::property::{PropertyKey, PropertyResolver};
 use ankurah_core::storage::naming;
+use ankurah_core::{property::PropertyKey, schema::CatalogResolver};
 use ankurah_proto::EntityId;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -75,7 +75,7 @@ impl PropertyManager {
         &self,
         collection: &str,
         key: &PropertyKey,
-        resolver: Option<&dyn PropertyResolver>,
+        resolver: Option<&dyn CatalogResolver>,
     ) -> Result<String, RetrievalError> {
         let id = match key {
             PropertyKey::Name(name) => return Ok(name.clone()),

@@ -46,13 +46,12 @@ use crate::{
     collectionset::CollectionSet,
     entity::{Entity, WeakEntitySet},
     livequery::EntityLiveQuery,
-    node::{Node, RequestFence, RequestLease, RequestValidity, WeakNode},
+    node::{Node, WeakNode},
     policy::PolicyAgent,
-    property::backend::{LWWBackend, PropertyBackend},
     reactor::{AbstractEntity, GapFetcher, MembershipChange, Reactor, ReactorSubscription, ReactorUpdate},
     resultset::EntityResultSet,
     storage::StorageEngine,
-    value::Value,
+    util::request_fence::{RequestFence, RequestLease, RequestValidity},
 };
 
 use super::{model_collection, model_property_collection, property_collection, registration::RegistrationError, ModelSchema};
@@ -84,336 +83,9 @@ impl<F: FnOnce()> Drop for RollbackGuard<F> {
     }
 }
 
-/// A parsed model definition entity (`_ankurah_model`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModelDef {
-    pub id: EntityId,
-    pub collection: String,
-    pub name: String,
-}
-
-/// A parsed property definition entity (`_ankurah_property`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PropertyDef {
-    pub id: EntityId,
-    /// The model in whose scope this property was first derived (provenance,
-    /// not ownership; RFC section 4).
-    pub minted_for: Option<EntityId>,
-    pub name: String,
-    pub backend: String,
-    pub value_type: String,
-    /// For reference-typed properties.
-    pub target_model: Option<EntityId>,
-}
-
-/// A parsed contract-membership entity (`_ankurah_model_property`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MembershipDef {
-    pub id: EntityId,
-    pub model: EntityId,
-    pub property: EntityId,
-    /// `None` until the `optional` follow-up event arrives; a membership
-    /// with no flag yet is TREATED as optional (RFC 5.4), never defaulted.
-    pub optional: Option<bool>,
-}
-
-/// The exact catalog identities admitted for one compiled model shape.
-///
-/// Keeping this result is essential: catalog display names are mutable, and
-/// re-deriving a binding from the current name index after registration can
-/// silently move an old binary to a different property (or lose the binding
-/// after a rename). The schema pointer describes the local declaration; the
-/// model and field ids are the durable identities returned by registration or
-/// proven from an already-compatible catalog while offline.
-#[derive(Debug, Clone)]
-struct EnsuredSchemaBinding {
-    schema: &'static ModelSchema,
-    model: EntityId,
-    fields: BTreeMap<&'static str, EntityId>,
-    /// True only after the allocator accepted this exact declaration. A local
-    /// no-peer proof can supply safe ids for offline work, but must reassert
-    /// mutable metadata and policy when connectivity returns.
-    confirmed: bool,
-}
-
-/// The catalog map's inner state. All lookups return cheap clones.
-#[derive(Debug, Default)]
-struct CatalogMapInner {
-    properties: BTreeMap<EntityId, PropertyDef>,
-    models: BTreeMap<EntityId, ModelDef>,
-    memberships: BTreeMap<EntityId, MembershipDef>,
-    /// collection -> model id.
-    by_collection: BTreeMap<String, EntityId>,
-    /// model id -> its membership ids (the contract edge set).
-    model_memberships: BTreeMap<EntityId, BTreeSet<EntityId>>,
-    /// property display name -> property ids, across ALL contracts. Backs
-    /// the by-name allocator lookup and the name index queries.
-    names_global: BTreeMap<String, BTreeSet<EntityId>>,
-}
-
-impl CatalogMapInner {
-    fn clear(&mut self) {
-        self.properties.clear();
-        self.models.clear();
-        self.memberships.clear();
-        self.by_collection.clear();
-        self.model_memberships.clear();
-        self.names_global.clear();
-    }
-
-    /// Upsert an entity (Initial/Add/Update). Dispatches on the collection.
-    fn upsert(&mut self, entity: &Entity) {
-        let collection = AbstractEntity::collection(entity);
-        let id = *AbstractEntity::id(entity);
-        if collection == model_collection() {
-            if let Some(def) = parse_model(entity, id) {
-                self.upsert_model(def);
-            }
-        } else if collection == property_collection() {
-            if let Some(def) = parse_property(entity, id) {
-                self.upsert_property(def);
-            }
-        } else if collection == model_property_collection() {
-            if let Some(def) = parse_membership(entity, id) {
-                self.upsert_membership(def);
-            }
-        }
-    }
-
-    /// Remove an entity by (collection, id).
-    fn remove(&mut self, collection: &CollectionId, id: &EntityId) {
-        if *collection == model_collection() {
-            self.remove_model(id);
-        } else if *collection == property_collection() {
-            self.remove_property(id);
-        } else if *collection == model_property_collection() {
-            self.remove_membership(id);
-        }
-    }
-
-    fn upsert_model(&mut self, def: ModelDef) {
-        // A model's collection is its identity anchor and never changes for a
-        // given id, but re-index defensively in case a prior partial entry
-        // pointed elsewhere.
-        if let Some(old) = self.models.get(&def.id) {
-            if old.collection != def.collection {
-                self.by_collection.remove(&old.collection);
-            }
-        }
-        self.by_collection.insert(def.collection.clone(), def.id);
-        self.models.insert(def.id, def);
-    }
-
-    fn remove_model(&mut self, id: &EntityId) {
-        if let Some(def) = self.models.remove(id) {
-            if self.by_collection.get(&def.collection) == Some(id) {
-                self.by_collection.remove(&def.collection);
-            }
-        }
-    }
-
-    fn upsert_property(&mut self, def: PropertyDef) {
-        if let Some(old) = self.properties.get(&def.id).cloned() {
-            self.deindex_property_names(&old);
-        }
-        self.index_property_names(&def);
-        self.properties.insert(def.id, def);
-    }
-
-    fn remove_property(&mut self, id: &EntityId) {
-        if let Some(def) = self.properties.remove(id) {
-            self.deindex_property_names(&def);
-        }
-    }
-
-    fn upsert_membership(&mut self, def: MembershipDef) {
-        self.model_memberships.entry(def.model).or_default().insert(def.id);
-        self.memberships.insert(def.id, def);
-    }
-
-    fn remove_membership(&mut self, id: &EntityId) {
-        if let Some(def) = self.memberships.remove(id) {
-            if let Some(set) = self.model_memberships.get_mut(&def.model) {
-                set.remove(id);
-                if set.is_empty() {
-                    self.model_memberships.remove(&def.model);
-                }
-            }
-        }
-    }
-
-    fn index_property_names(&mut self, def: &PropertyDef) { self.names_global.entry(def.name.clone()).or_default().insert(def.id); }
-
-    fn deindex_property_names(&mut self, def: &PropertyDef) {
-        if let Some(set) = self.names_global.get_mut(&def.name) {
-            set.remove(&def.id);
-            if set.is_empty() {
-                self.names_global.remove(&def.name);
-            }
-        }
-    }
-
-    /// The property named `name` in `collection`, resolved through the
-    /// collection's model and its memberships (RFC 5.2). Authoritative.
-    ///
-    /// One live membership per (model, name) is an allocator invariant under
-    /// the canonical value_type ruling (registration compat-checks, never
-    /// forks), so multi-candidate election cannot arise from a well-formed
-    /// catalog; a second match here means a corrupted or pre-ruling map and
-    /// is worth a loud trace.
-    fn resolve(&self, collection: &str, name: &str) -> Option<EntityId> {
-        let model_id = self.by_collection.get(collection)?;
-        let membership_ids = self.model_memberships.get(model_id)?;
-        let mut found: Option<EntityId> = None;
-        for mid in membership_ids {
-            if let Some(membership) = self.memberships.get(mid) {
-                if let Some(prop) = self.properties.get(&membership.property) {
-                    if prop.name == name {
-                        match found {
-                            None => found = Some(prop.id),
-                            Some(first) => {
-                                tracing::warn!(
-                                    "catalog map holds multiple live properties named '{}' in '{}' ({} and {}); resolving to the first",
-                                    name,
-                                    collection,
-                                    first,
-                                    prop.id
-                                );
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        found
-    }
-
-    fn memberships_of(&self, model: &EntityId) -> Vec<MembershipDef> {
-        self.model_memberships
-            .get(model)
-            .into_iter()
-            .flat_map(|ids| ids.iter())
-            .filter_map(|id| self.memberships.get(id).cloned())
-            .collect()
-    }
-
-    fn membership(&self, model: &EntityId, property: &EntityId) -> Option<MembershipDef> {
-        self.model_memberships.get(model)?.iter().find_map(|id| {
-            let m = self.memberships.get(id)?;
-            (m.property == *property).then(|| m.clone())
-        })
-    }
-}
-
-// -- entity parsing ---------------------------------------------------------
-
-fn field_string(entity: &Entity, field: &str) -> Option<String> {
-    match AbstractEntity::value(entity, field) {
-        Some(Value::String(s)) => Some(s),
-        _ => None,
-    }
-}
-
-fn field_entity_id(entity: &Entity, field: &str) -> Option<EntityId> {
-    match AbstractEntity::value(entity, field) {
-        Some(Value::EntityId(id)) => Some(id),
-        _ => None,
-    }
-}
-
-fn field_bool(entity: &Entity, field: &str) -> Option<bool> {
-    match AbstractEntity::value(entity, field) {
-        Some(Value::Bool(b)) => Some(b),
-        _ => None,
-    }
-}
-
-fn parse_model(entity: &Entity, id: EntityId) -> Option<ModelDef> {
-    // `collection` is a genesis (identity) field; without it the entity is
-    // not yet materialized enough to index.
-    let collection = field_string(entity, "collection")?;
-    // `name` is a follow-up; falls back to the collection until it arrives.
-    let name = field_string(entity, "name").unwrap_or_else(|| collection.clone());
-    Some(ModelDef { id, collection, name })
-}
-
-fn parse_property(entity: &Entity, id: EntityId) -> Option<PropertyDef> {
-    // Creation fields: name, backend, and value_type are always present on a
-    // materialized property; name may be overwritten by a rename follow-up.
-    let name = field_string(entity, "name")?;
-    let backend = field_string(entity, "backend")?;
-    let value_type = field_string(entity, "value_type")?;
-    Some(PropertyDef {
-        id,
-        minted_for: field_entity_id(entity, "minted_for"),
-        name,
-        backend,
-        value_type,
-        target_model: field_entity_id(entity, "target_model"),
-    })
-}
-
-fn parse_membership(entity: &Entity, id: EntityId) -> Option<MembershipDef> {
-    let model = field_entity_id(entity, "model")?;
-    let property = field_entity_id(entity, "property")?;
-    // `optional` is always a follow-up (RFC 5.4): None here means "not yet
-    // known", treated optional by readers.
-    Some(MembershipDef { id, model, property, optional: field_bool(entity, "optional") })
-}
-
-/// Parse a stored catalog state (durable warm path). Catalog entities are
-/// LWW system models: read the "lww" state buffer directly, exactly like
-/// `registration::catalog_entity_values`.
-fn parse_state(collection: &CollectionId, id: EntityId, state: &proto::EntityState) -> Option<Entry> {
-    let buffer = state.state.state_buffers.0.get("lww")?;
-    let backend = LWWBackend::from_state_buffer(buffer).ok()?;
-    // Catalog entities are name-keyed (RFC section 4 bootstrap exemption).
-    let values = crate::property::name_keyed(backend.property_values());
-    let get_string = |field: &str| match values.get(field) {
-        Some(Some(Value::String(s))) => Some(s.clone()),
-        _ => None,
-    };
-    let get_entity_id = |field: &str| match values.get(field) {
-        Some(Some(Value::EntityId(v))) => Some(*v),
-        _ => None,
-    };
-    let get_bool = |field: &str| match values.get(field) {
-        Some(Some(Value::Bool(b))) => Some(*b),
-        _ => None,
-    };
-
-    if *collection == model_collection() {
-        let collection = get_string("collection")?;
-        let name = get_string("name").unwrap_or_else(|| collection.clone());
-        Some(Entry::Model(ModelDef { id, collection, name }))
-    } else if *collection == property_collection() {
-        let name = get_string("name")?;
-        let backend = get_string("backend")?;
-        let value_type = get_string("value_type")?;
-        Some(Entry::Property(PropertyDef {
-            id,
-            minted_for: get_entity_id("minted_for"),
-            name,
-            backend,
-            value_type,
-            target_model: get_entity_id("target_model"),
-        }))
-    } else if *collection == model_property_collection() {
-        let model = get_entity_id("model")?;
-        let property = get_entity_id("property")?;
-        Some(Entry::Membership(MembershipDef { id, model, property, optional: get_bool("optional") }))
-    } else {
-        None
-    }
-}
-
-/// A parsed catalog entry, kind-tagged, from a storage state.
-enum Entry {
-    Model(ModelDef),
-    Property(PropertyDef),
-    Membership(MembershipDef),
-}
+mod map;
+use map::{apply_entry, parse_state, CatalogMapInner, EnsuredSchemaBinding, Entry};
+pub use map::{MembershipDef, ModelDef, PropertyDef};
 
 // -- gap fetcher ------------------------------------------------------------
 
@@ -580,7 +252,7 @@ where PA: PolicyAgent
     }
 }
 
-impl<SE, PA> crate::property::PropertyResolver for CatalogInner<SE, PA>
+impl<SE, PA> crate::schema::CatalogResolver for CatalogInner<SE, PA>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
@@ -598,6 +270,48 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
+    /// Stored catalog definition states needed to describe `models` on the
+    /// wire. Returns model ids whose definition could not be loaded so the
+    /// connection can make them eligible for a later announcement retry.
+    pub(crate) async fn definition_states_for_models(
+        &self,
+        models: &[EntityId],
+    ) -> (Vec<proto::Attested<proto::EntityState>>, Vec<EntityId>) {
+        if models.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+
+        let (Ok(model_col), Ok(property_col), Ok(membership_col)) = (
+            self.0.collectionset.get(&model_collection()).await,
+            self.0.collectionset.get(&property_collection()).await,
+            self.0.collectionset.get(&model_property_collection()).await,
+        ) else {
+            return (Vec::new(), models.to_vec());
+        };
+
+        let mut states = Vec::new();
+        let mut failed = Vec::new();
+        for model in models {
+            match model_col.get_state(*model).await {
+                Ok(state) => states.push(state),
+                Err(error) => {
+                    warn!("Cannot load model definition {} for wire announcement: {}", model.to_base64_short(), error);
+                    failed.push(*model);
+                    continue;
+                }
+            }
+            for membership in self.memberships_of(model) {
+                if let Ok(state) = property_col.get_state(membership.property).await {
+                    states.push(state);
+                }
+                if let Ok(state) = membership_col.get_state(membership.id).await {
+                    states.push(state);
+                }
+            }
+        }
+        (states, failed)
+    }
+
     pub(crate) fn new(collections: CollectionSet<SE>, entities: WeakEntitySet, reactor: Reactor, durable: bool) -> Self {
         Self(Arc::new(CatalogInner {
             collectionset: collections,
@@ -1298,7 +1012,7 @@ where
     /// #289). Replaces the old per-collection `SchemaBinding` push: identity is
     /// carried by the [`crate::property::PropertyKey`], not by a binding
     /// injected into a property backend.
-    pub(crate) fn resolver_weak(&self) -> std::sync::Weak<dyn crate::property::PropertyResolver> {
+    pub(crate) fn resolver_weak(&self) -> std::sync::Weak<dyn crate::schema::CatalogResolver> {
         // Downgrade to the concrete Weak first, then let the return type coerce
         // it to the trait object (CoerceUnsized on Weak); annotating the local
         // as the dyn type instead would wrongly force `downgrade`'s parameter.
@@ -1520,7 +1234,7 @@ where
 
     /// The canonical value_type of a property-definition id, if the map knows
     /// it (the CatalogManager-side twin of
-    /// [`crate::property::PropertyResolver::canonical_value_type`]; rfc.md
+    /// [`crate::schema::CatalogResolver::canonical_value_type`]; rfc.md
     /// 5.6 as amended 2026-07-10). The resolution pass casts comparison
     /// literals to this type so predicate evaluation and the reactor's
     /// watcher index collate in the type the backends store.
@@ -1698,14 +1412,5 @@ where
     pub fn counts(&self) -> (usize, usize, usize) {
         let map = self.0.map.read().unwrap();
         (map.models.len(), map.properties.len(), map.memberships.len())
-    }
-}
-
-/// Apply a parsed storage `Entry` to a map (durable warm).
-fn apply_entry(map: &mut CatalogMapInner, entry: Entry) {
-    match entry {
-        Entry::Model(def) => map.upsert_model(def),
-        Entry::Property(def) => map.upsert_property(def),
-        Entry::Membership(def) => map.upsert_membership(def),
     }
 }

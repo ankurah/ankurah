@@ -6,8 +6,9 @@ use crate::{
     event_dag::AbstractCausalRelation,
     model::View,
     property::backend::{backend_from_string, PropertyBackend},
-    property::{PropertyKey, PropertyResolver},
+    property::PropertyKey,
     reactor::AbstractEntity,
+    schema::CatalogResolver,
     value::Value,
 };
 use ankurah_proto::{Clock, CollectionId, EntityId, EntityState, Event, EventId, OperationSet, State};
@@ -82,7 +83,7 @@ pub struct EntityInner {
     /// lets this catalog-blind entity resolve a display name to the
     /// property-definition id its data is keyed under, for the sync read path.
     /// Absent for bare and temporary entities (they read name-keyed data only).
-    resolver: std::sync::RwLock<Option<Weak<dyn PropertyResolver>>>,
+    resolver: std::sync::RwLock<Option<Weak<dyn CatalogResolver>>>,
 }
 
 #[derive(Debug)]
@@ -119,12 +120,12 @@ impl WeakEntity {
 /// constructed via [`TemporaryEntity::new_bound`]). Both deref here.
 impl EntityInner {
     /// The catalog resolver stamped at assembly, if still live.
-    fn resolver(&self) -> Option<Arc<dyn PropertyResolver>> { self.resolver.read().unwrap().as_ref().and_then(|w| w.upgrade()) }
+    fn resolver(&self) -> Option<Arc<dyn CatalogResolver>> { self.resolver.read().unwrap().as_ref().and_then(|w| w.upgrade()) }
 
     /// Stamp the catalog resolver (assembly-time). Replaces the old
     /// backend-binding push (`Node::bind_entity`): the backend stays dumb and
     /// the entity resolves names to ids for the sync read path.
-    pub(crate) fn set_resolver(&self, resolver: Weak<dyn PropertyResolver>) { *self.resolver.write().unwrap() = Some(resolver); }
+    pub(crate) fn set_resolver(&self, resolver: Weak<dyn CatalogResolver>) { *self.resolver.write().unwrap() = Some(resolver); }
 
     /// Resolve a display name to the key its data is stored under: the
     /// property-definition id when the catalog knows the field, else the bare
@@ -784,7 +785,7 @@ impl TemporaryEntity {
         id: EntityId,
         collection: CollectionId,
         state: &State,
-        resolver: Option<std::sync::Weak<dyn PropertyResolver>>,
+        resolver: Option<std::sync::Weak<dyn CatalogResolver>>,
     ) -> Result<Self, RetrievalError> {
         // Inline from_state_buffers logic
         let mut backends = BTreeMap::new();
@@ -845,7 +846,7 @@ impl std::fmt::Display for TemporaryEntity {
 ///
 /// Assembly is the single choke point for catalog-aware property access:
 /// every method that hands out an `Entity` runs the `bind_hook`, installed by
-/// `Node` to stamp its live property resolver. The hook is idempotent and
+/// `Node` to stamp its live catalog resolver. The hook is idempotent and
 /// re-fires on resident hand-outs, so an entity assembled before the catalog
 /// warmed observes the catalog on its next access.
 #[derive(Clone, Default)]

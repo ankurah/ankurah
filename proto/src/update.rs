@@ -1,5 +1,6 @@
 use crate::{auth::Attested, data::EntityState, id::EntityId, subscription::QueryId, EventFragment, StateFragment};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use ulid::Ulid;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -9,6 +10,16 @@ pub struct UpdateId(Ulid);
 pub enum NodeUpdateBody {
     /// New events for a subscription
     SubscriptionUpdate { items: Vec<SubscriptionUpdateItem> },
+}
+
+impl NodeUpdateBody {
+    /// Model ids carried by entity data in this update. Senders use this to
+    /// attach any catalog definitions the connection has not seen yet.
+    pub fn referenced_models(&self) -> BTreeSet<EntityId> {
+        match self {
+            Self::SubscriptionUpdate { items } => items.iter().map(|item| item.model).collect(),
+        }
+    }
 }
 
 /// Content of an update - either events or state with events
