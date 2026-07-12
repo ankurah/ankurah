@@ -240,6 +240,13 @@ impl NodeApplier {
             node.policy_agent.validate_received_event(node, from_peer_id, &attested_event)?;
             attested_events.push(attested_event);
         }
+        // Collapse duplicates by id to their first occurrence. Staging is
+        // id-keyed and the planner dedups anyway; this protects the batch
+        // returned here, which the StateAndEvent fast path echoes into its
+        // EntityChange. The wire is untrusted, so any sender may repeat a
+        // fragment.
+        let mut seen = std::collections::BTreeSet::new();
+        attested_events.retain(|event| seen.insert(event.payload.id()));
         for attested_event in &attested_events {
             staging.stage(attested_event.clone());
         }
