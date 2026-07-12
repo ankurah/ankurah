@@ -34,7 +34,7 @@ pub struct SledStorageCollectionInner {
     pub tree: sled::Tree,
     /// The injected catalog resolver (shared with the engine): the name
     /// source for column assignment at materialization time.
-    pub(crate) resolver: Arc<std::sync::RwLock<Option<std::sync::Weak<dyn ankurah_core::property::PropertyResolver>>>>,
+    pub(crate) resolver: Arc<std::sync::RwLock<Option<std::sync::Weak<dyn ankurah_core::schema::CatalogResolver>>>>,
     #[cfg(debug_assertions)]
     pub prefix_guard_disabled: Arc<AtomicBool>,
 }
@@ -46,7 +46,7 @@ impl SledStorageCollection {
         collection_id: CollectionId,
         database: Arc<Database>,
         tree: sled::Tree,
-        resolver: Arc<std::sync::RwLock<Option<std::sync::Weak<dyn ankurah_core::property::PropertyResolver>>>>,
+        resolver: Arc<std::sync::RwLock<Option<std::sync::Weak<dyn ankurah_core::schema::CatalogResolver>>>>,
         #[cfg(debug_assertions)] prefix_guard_disabled: Arc<AtomicBool>,
     ) -> Self {
         Self(SledStorageCollectionInner {

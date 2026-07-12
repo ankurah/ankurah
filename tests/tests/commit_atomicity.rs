@@ -114,7 +114,7 @@ impl PolicyAgent for DenySecondAlbumEventAgent {
         _id: &proto::EntityId,
         _collection: &proto::CollectionId,
         _state: &proto::State,
-        _resolver: Option<std::sync::Weak<dyn ankurah::core::property::PropertyResolver>>,
+        _resolver: Option<std::sync::Weak<dyn ankurah::core::schema::CatalogResolver>>,
     ) -> Result<(), AccessDenied>
     where
         C: Iterable<Self::ContextData>,

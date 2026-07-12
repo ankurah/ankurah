@@ -122,11 +122,11 @@ derived content-hash EntityId. No public API.
 - Collection ids `_ankurah_model`, `_ankurah_property`,
   `_ankurah_model_property` via `CollectionId::fixed_name`, beside the
   system collection's (core/src/system.rs:121).
-- `PROTECTED_COLLECTIONS` (core/src/system.rs:21, currently read by
-  nothing) becomes the four-entry set and finally gets readers: the
-  receiver-side commit guard (A6) and `CollectionSet::get` prefix
-  enforcement (`_ankurah_` reserved; reject for user collections, allow
-  for system callers).
+- The dead protected-collection constant becomes the central
+  `schema::is_protected_collection` classifier and finally gets readers: the
+  receiver-side commit guard (A6) and `CollectionSet::get` prefix enforcement
+  (`_ankurah_` reserved; reject for user collections, allow for system
+  callers).
 - Catalog entity accessors: raw Entity/backend read-write helpers in the
   SysRoot style (core/src/system.rs:124-127). SYSTEM MODELS, never
   derive(Model) (the ouroboros rule, RFC 4); enforce by comment and by
@@ -249,10 +249,18 @@ strict never-registered-offline error at create/commit.
 - `hard_reset` flushes the catalog map and every cached registration state
   along with what it already clears (core/src/system.rs:208-234):
   allocated ids belong to one system and must not leak across a root
-  change.
+  change. A durable node reused in place resumes one generation-fenced
+  catalog warm only after the replacement root is ready. Reset invalidates
+  and drains durable warming, ephemeral setup/local activation/wire effects,
+  and schema-registration folds before deletion. Registration and ephemeral
+  setup remain closed through the rootless reset-to-join gap and rearm from
+  the system-ready hook. System lifecycle transitions serialize, and canceled
+  reset barriers retain their invalidated fences for the retry to drain. An
+  incomplete-reset marker survives cancellation or deletion failure so that
+  load, create, or join resumes reset before reading or publishing a root.
 - Tests: map warms from a peer with existing catalog; updates arrive via
   subscription; response-fed upsert observed ahead of the subscription;
-  hard_reset flush verified.
+  hard_reset flush and durable post-reset resume verified.
 
 ### A8. Uniform PropertyKey wire and state (RFC 5.5)
 
@@ -366,9 +374,9 @@ read back "".
   mismatch or absence, policy denial, and the strict never-registered-offline
   create/commit path. `TypeSkew`, CatalogGenesisError, and the anchor-reuse
   refusal are deleted.
-- PROTECTED_COLLECTIONS readers (with A4/A6); hard_reset flush (with
-  A7). The later identity-attestation RFC owns the 32-byte content-hash
-  EntityId migration and timestamp-locality audit.
+- Protected-collection classifier readers (with A4/A6); hard_reset flush
+  (with A7). The later identity-attestation RFC owns the 32-byte
+  content-hash EntityId migration and timestamp-locality audit.
 - Docs: brief internals note under docs/internals/ once shapes settle
   (the schema-evolution book chapter waits on #291).
 
@@ -593,9 +601,9 @@ model <-> table map half deferred with #304.
     5.2): the response carries the full resolved definitions;
     ensure_registered upserts them into the CatalogManager map
     immediately on ack, ahead of reactor delivery, so binding and
-    id-keyed writes proceed right behind registration. cache_compiled
-    reduces to recording compiled_schemas for the
-    commit-time-registration gap; its local id derivation is deleted.
+    id-keyed writes proceed right behind registration. The exact returned
+    model/property ids are retained as the compiled schema's binding;
+    transactions record their own exact schemas for commit-time admission.
 22. **Strict never-registered-offline error** (rev 4 maintainer
     ruling, RFC 5.2): creating entities in a collection with no cached
     binding while no durable peer is reachable fails at create/commit
@@ -695,7 +703,7 @@ model <-> table map half deferred with #304.
     history at commit. Reads use MAP-LEVEL presence: an `Id` entry present, even
     a cleared `None` tombstone, is authoritative and never falls back to a stale
     `Name` value; only an absent id consults the bare `Name` residue. The
-    catalog-blind `Entity` carries a stamped `Weak<dyn PropertyResolver>` (the
+    catalog-blind `Entity` carries a stamped `Weak<dyn CatalogResolver>` (the
     live catalog) for the sync read path, replacing the old `Node::bind_entity`
     backend flip. INVARIANT: writes are always id-keyed for a registered user
     collection; a `Name` key is emitted only for system and catalog collections
@@ -731,14 +739,14 @@ model <-> table map half deferred with #304.
     (each storage engine alone owns and remembers its internal id <-> name
     mappings; neither Node, System, nor CatalogManager bears it): every
     engine persists a property-id -> column map, seeded from an injected
-    resolver (StorageEngine::set_property_resolver, wired at Node::build)
+    resolver (`StorageEngine::set_catalog_resolver`, wired at `Node::build`)
     at set_state and consulted on every read. Postgres/sqlite:
     ankurah_property_columns table, UNIQUE(collection, column_name),
     insert-if-absent plus winner read-back so concurrent claimants
     converge. Sled: property_columns tree under an assignment lock.
     IndexedDB: property_columns object store, assigned in a pre-pass
     before the entities transaction (IndexedDB auto-commits across foreign
-    awaits). Naming rules (core/src/storage.rs naming module): sanitized
+    awaits). Naming rules (`core/src/storage/naming.rs`): sanitized
     display name; collisions append the trailing 4+ characters of an
     identifier-safe, injective base32 encoding of the property id, widening
     through all 256 bits until unique; unresolvable names use the same token
@@ -794,13 +802,21 @@ model <-> table map half deferred with #304.
     Ephemeral ingress never waits -- definitions arrive inline, so a miss
     is final. (d) The
     decision-28 fallback naming stays as the loud never-fired net.
+    Streaming SubscriptionUpdateItem also carries `source_queries`, populated
+    even when predicate membership is unchanged. The receiver verifies those
+    query ids against the sending peer before ingesting attached schema and,
+    for catalog queries, retains the owning reset-fence lease through
+    persistence and acknowledgement. Hard reset invalidates and drains that
+    generation before deleting storage, then clears reactor/catalog state
+    before a replacement warm may start; queued old traffic is rejected
+    without depending on unsubscribe ordering.
     Storage engines stamp reconstructed envelopes via a shared
     bucket_model_id helper (well-knowns -> resolver -> loud retrieval
     error). Two policy-surface changes, both forced by the same fact (raw
     state is now id-keyed, so hooks must receive what they need to
     resolve): check_read_event gains a collection parameter (core
     resolves, agents keep authorizing by collection), and check_read gains
-    the node's catalog resolver (Option<Weak<dyn PropertyResolver>>) --
+    the node's catalog resolver (`Option<Weak<dyn CatalogResolver>>`) --
     an agent that evaluates NAME-addressed policy predicates against
     entity state (scope filters) must bind its inspection view through it
     (TemporaryEntity::new_bound; the unbound TemporaryEntity remains the
@@ -867,6 +883,6 @@ model <-> table map half deferred with #304.
     in generic core (entity.rs read paths, resolve_pending_keys) is
     removed -- LWW is an ordinary registered backend with no special
     status in core, and `backend_from_string` is the one sanctioned
-    by-name seam (the registry constructor). PropertyResolver::siblings
+    by-name seam (the registry constructor). The former resolver `siblings`
     and the entity's catalog_knows_id helper die with the gates;
     Filterable::value_checked becomes the infallible value_resolved.

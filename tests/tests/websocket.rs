@@ -135,7 +135,9 @@ async fn test_websocket_subscription_propagation() -> Result<()> {
     use ankurah::signals::Subscribe;
     // Create and initialize LiveQueries, then subscribe
     let _server_sub = server_ctx.query_wait::<AlbumView>("name = 'Abbey Road'").await?.subscribe(&server_watcher);
-    let _client_sub = client_ctx.query_wait::<AlbumView>("name = 'Abbey Road'").await?.subscribe(&client_watcher);
+    // This test uses query_wait as a remote-readiness barrier. A cached
+    // ephemeral query may initialize locally before its peer watcher exists.
+    let _client_sub = client_ctx.query_wait::<AlbumView>(nocache("name = 'Abbey Road'")?).await?.subscribe(&client_watcher);
 
     // No notifications because we waited for initialization before subscribing
     assert_eq!(server_watcher.drain(), vec![] as Vec<Vec<(EntityId, ChangeKind)>>);
@@ -192,9 +194,18 @@ async fn test_websocket_bidirectional_subscription_impl() -> Result<()> {
     let client_watcher = TestWatcher::changeset();
 
     // Subscribe to pets with age > 5
-    use ankurah::signals::Subscribe;
+    use ankurah::signals::{Subscribe, With};
     let server_livequery = server_ctx.query_wait::<PetView>("age > 5").await?;
-    let client_livequery = client_ctx.query_wait::<PetView>("age > 5").await?;
+    // As above, the mutation follows query_wait and therefore needs remote,
+    // not merely local-cache, initialization to have completed.
+    let client_livequery = client_ctx.query_wait::<PetView>(nocache("age > 5")?).await?;
+
+    server_livequery.error().with(|error| {
+        assert!(error.is_none(), "server Pet query_wait returned after terminal initialization error: {error:?}");
+    });
+    client_livequery.error().with(|error| {
+        assert!(error.is_none(), "client Pet query_wait returned after terminal initialization error: {error:?}");
+    });
 
     let _server_sub = server_livequery.subscribe(&server_watcher);
     let _client_sub = client_livequery.subscribe(&client_watcher);
@@ -213,8 +224,12 @@ async fn test_websocket_bidirectional_subscription_impl() -> Result<()> {
     };
 
     // Wait for propagation and check changes
-    assert_expected_change(server_watcher.take_one_with_timeout(Duration::from_secs(30)).await, rex_id, &[rex_id]);
-    assert_expected_change(client_watcher.take_one_with_timeout(Duration::from_secs(30)).await, rex_id, &[rex_id]);
+    let notified = server_watcher.wait_for_count(1, Some(Duration::from_secs(30))).await;
+    assert!(notified || server_watcher.count() > 0, "server-local watcher did not observe server-created Rex");
+    assert_expected_change(server_watcher.take_one().await, rex_id, &[rex_id]);
+    let notified = client_watcher.wait_for_count(1, Some(Duration::from_secs(30))).await;
+    assert!(notified || client_watcher.count() > 0, "client watcher did not observe server-created Rex");
+    assert_expected_change(client_watcher.take_one().await, rex_id, &[rex_id]);
 
     // Create pet on client
     let buddy_id = {
@@ -226,8 +241,12 @@ async fn test_websocket_bidirectional_subscription_impl() -> Result<()> {
     };
 
     // Wait for propagation and check changes
-    assert_expected_change(server_watcher.take_one_with_timeout(Duration::from_secs(30)).await, buddy_id, &[rex_id, buddy_id]);
-    assert_expected_change(client_watcher.take_one_with_timeout(Duration::from_secs(30)).await, buddy_id, &[rex_id, buddy_id]);
+    let notified = server_watcher.wait_for_count(1, Some(Duration::from_secs(30))).await;
+    assert!(notified || server_watcher.count() > 0, "server watcher did not observe client-created Buddy");
+    assert_expected_change(server_watcher.take_one().await, buddy_id, &[rex_id, buddy_id]);
+    let notified = client_watcher.wait_for_count(1, Some(Duration::from_secs(30))).await;
+    assert!(notified || client_watcher.count() > 0, "client-local watcher did not observe client-created Buddy");
+    assert_expected_change(client_watcher.take_one().await, buddy_id, &[rex_id, buddy_id]);
 
     use ankurah::signals::Peek;
     let mut server_pets = server_livequery.peek().iter().map(|p| p.id()).collect::<Vec<EntityId>>();

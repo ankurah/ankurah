@@ -104,8 +104,8 @@ pub struct LWWDiff {
 
 /// A committed entry in a state buffer: value plus the provenance event that
 /// last wrote it. No display name: materialization needs are not the backend's
-/// concern (the PropertyKey amendment withdrew the 0xA2 display-name hint,
-/// plan decision 13). The same shape decodes both the legacy 0xA1 (name-keyed)
+/// concern (the PropertyKey amendment withdrew the 0xA2 display-name hint).
+/// The same shape decodes both the legacy 0xA1 (name-keyed)
 /// payload and the current 0xA2 ([`PropertyKey`]-keyed) payload.
 #[derive(Serialize, Deserialize, Clone)]
 struct CommittedEntry {
@@ -146,6 +146,17 @@ impl LWWBackend {
     /// PropertyKey amendment, #289); the dispatch lives entirely on the
     /// caller.
     pub fn entry(&self, key: &PropertyKey) -> Option<Option<Value>> { self.values.read().unwrap().get(key).map(|e| e.value()) }
+
+    /// Presence-distinguishing read restricted to a transaction-local staged
+    /// write. This lets an ordinary name-addressed accessor read its own
+    /// write before commit without giving committed legacy `Name` residue
+    /// precedence over the authoritative id-keyed entry.
+    pub(crate) fn uncommitted_entry(&self, key: &PropertyKey) -> Option<Option<Value>> {
+        self.values.read().unwrap().get(key).and_then(|entry| match entry {
+            ValueEntry::Uncommitted { value } => Some(value.clone()),
+            ValueEntry::Pending { .. } | ValueEntry::Committed { .. } => None,
+        })
+    }
 
     /// The event_id that last wrote a key's value (if tracked). Raw single-key
     /// lookup, same keying as [`get`].

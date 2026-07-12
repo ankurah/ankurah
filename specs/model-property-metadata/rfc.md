@@ -96,8 +96,8 @@ keys on those names (the name-as-identity register):
   prefix enforcement (proto/src/collection.rs:3-23); the collection id is the
   lowercased struct name (derive/src/model/description.rs:50); renaming a
   Rust struct silently re-homes the model to a fresh collection.
-  `PROTECTED_COLLECTIONS` exists but is read by no code at all
-  (core/src/system.rs:21).
+  A protected-collection constant exists but is read by no code at all
+  (the pre-implementation `core/src/system.rs:21`).
 - The TypeResolver that infers JSON semantics from path arity carries the
   comment "TODO(Phase 3): Replace heuristics with proper schema lookup from
   System tables" (core/src/type_resolver.rs:24-26), pointing at the
@@ -471,9 +471,10 @@ upgrade path to hardcoded well-known constant ids for the meta-schema stays open
 and non-load-bearing (this paragraph already records that nothing depends on
 materializing it). See plan.md decision 27.
 
-**Protection (rev 3: structural and receiver-side).** `PROTECTED_COLLECTIONS`
-is currently dead code: no reader exists (core/src/system.rs:21, exhaustive
-grep). This RFC makes it real and structural: the catalog collections
+**Protection (rev 3: structural and receiver-side).** The pre-implementation
+protected-collection constant is dead code: no reader exists
+(`core/src/system.rs:21` at the time, exhaustive grep). This RFC makes the
+classification real and structural: the catalog collections
 (`_ankurah_system`, `_ankurah_model`, `_ankurah_property`,
 `_ankurah_model_property`) are NOT mutable through ordinary transactions at
 all. A receiving durable node rejects any CommitTransaction event targeting
@@ -504,9 +505,10 @@ STATIC well-known-ness was found to be bypassable, because the actual write
 target is the collection that id RESOLVES to through the (mutable) catalog map;
 a poisoned map entry -- a non-reserved model id routed to a catalog collection
 -- walked past the static check. The guard now resolves every CommitTransaction
-event's model up front and rejects the transaction if any resolves into
-PROTECTED_COLLECTIONS, before any event is written (registration writes the
-catalog through a direct commit path that bypasses this ingress guard). The
+event's model up front and rejects the transaction if any resolves to a
+collection accepted by `schema::is_protected_collection`, before any event is
+written (registration writes the catalog through a direct commit path that
+bypasses this ingress guard). The
 descriptor-ingest path was hardened to match: shipped catalog defs are ingested
 only after the recipient/connection checks, a wire model def naming a reserved
 collection is rejected, and a wire def cannot rebind a collection already mapped
@@ -645,10 +647,11 @@ ephemeral catalog queries run cached) -- never the arbiter: registration is
 the doubt-resolver.
 
 A direct get by entity id is the deliberate exception. It does not need a
-predicate binding to locate the row, so it only caches the compiled schema
-for a possible later edit and loads the entity; it does not mint or await
-schema registration. Typed projection then follows the ordinary property
-rules, including `Missing` or per-value `NonCastable` where applicable.
+predicate binding to locate the row, so it loads the entity without minting
+or awaiting schema registration. If that view is later edited, the transaction
+records its exact compiled schema and commit ensures it before resolving staged
+keys or writing. Typed projection follows the ordinary property rules,
+including `Missing` or per-value `NonCastable` where applicable.
 When registration cannot run on a schema-dependent path (policy denial, no
 durable peer), that path FAILS LOUD with the registration error; mutating
 paths enforce strictly before a write lands. An explicit
@@ -750,7 +753,24 @@ binding along with the state it already clears
 (core/src/system.rs:208-234), because allocated ids belong to one system
 and a node that hard-resets into a different system must re-register
 against that system's allocator; a stale cache would leak the old
-system's ids into the new one.
+system's ids into the new one. A durable node reused in place remains
+catalog-unready until its replacement system root is ready, then starts one
+warm/listener for the current reset generation. A superseded generation MUST
+NOT publish readiness or catalog state afterward.
+Every catalog effect that can overlap reset is owned by that system epoch:
+the durable storage warm, the ephemeral setup and cached local activation,
+admitted relay responses/updates, and schema registration. Hard reset first
+invalidates their fences and drains admitted work, then deletes storage and
+clears the map/bindings. Registration remains closed until a ready system root
+rearms it; a forwarded `SchemaRegistered` response retains its admission lease
+through both the map fold and exact compiled-schema latch. An ephemeral warm
+may not claim the rootless reset-to-join gap. System load/create/join/reset
+transitions are serialized; if a reset future is canceled while draining, the
+invalidated owner fences remain attached to the reset state so its retry must
+finish the same drain before deletion. An incomplete-reset marker also survives
+cancellation or deletion failure; load, create, and join must resume that reset
+before reading or publishing a system root, including when physical deletion
+completed before the canceled future returned.
 
 **Idempotence across restarts and peers.** Ensure-registration re-issues
 RegisterSchema whenever the local map lacks a binding; the executor's
@@ -920,6 +940,17 @@ amendment below) stays as a loud belt-and-suspenders net that should never
 fire. This metadata envelope shipped as PROTOCOL_VERSION = 3
 (proto/src/peering.rs); the identity-attestation amendment below advances the
 current protocol to v6 without changing its schema semantics.
+
+Streaming `SubscriptionUpdateItem`s also carry `source_queries`: the query ids
+whose result sets caused the item to be emitted, including steady-state
+updates where `predicate_relevance` is empty. A receiver admits the envelope
+only while every item has a current source query on the sending peer. For the
+catalog's reset-sensitive queries, the receiver holds the generation's
+request-fence lease from attached-schema ingestion through delta persistence
+and acknowledgement. Hard reset invalidates the old generation, waits for
+admitted leases to drain, deletes storage, clears reactor/catalog state, and
+only then permits a replacement warm. Queued old responses and updates
+therefore fail closed without relying on unsubscribe delivery order.
 
 The delivered storage contract is uniform across property backends. Backends
 hold no schema binding or wire mode; every entry is addressed by a tagged
@@ -1428,8 +1459,9 @@ Phase A.)
    durable-side lookup-or-create) rather than derivational.
 2. AC2 read-path timing: schema-dependent predicate fetch/query/subscribe
    paths register at first use through the idempotent upsert. Direct entity-id
-   gets are the implemented exception: they cache the compiled schema and
-   load the entity without minting identity. Denied or offline registration
+   gets are the implemented exception: they load the entity without minting
+   identity; a later edit records the exact schema for commit-time admission.
+   Denied or offline registration
    fails loud on paths that require it (5.3); an already-complete schema
    resolves to a no-op plan that emits nothing and skips the policy verb
    (5.7).
@@ -1461,8 +1493,9 @@ Everything else in #85 is adopted as written, including the
    prefix.
 2. **Registration writes from read-only contexts** (5.2): RESOLVED by the
    implemented path split. Predicate fetch/query/subscribe registers at first
-   use through the idempotent upsert; direct entity-id get only caches and
-   loads. An existing schema is a no-op plan, while denial/offline fails loud
+   use through the idempotent upsert; direct entity-id get only loads, and a
+   later edit records the exact schema for commit-time admission. An existing
+   schema is a no-op plan, while denial/offline fails loud
    only on paths that require registration. See renegotiation 2.
 3. **sys::Item::Collection disposition** (4): superseded by the
    Collection-vs-Model terminology deconfliction, tracked as #305

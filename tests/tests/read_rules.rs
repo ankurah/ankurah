@@ -31,7 +31,14 @@ use ankurah::model::View;
 use ankurah::proto::{self, EntityId};
 use ankurah::value::Value;
 use common::*;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+
+#[derive(Model, Debug, Serialize, Deserialize)]
+pub struct OptionalLwwRecord {
+    #[active_type(LWW)]
+    count: Option<i64>,
+}
 
 /// Build a 0xA2 LWW state buffer holding `value` under `foreign_id` -- exactly
 /// what a prior contract's data looks like on disk: a value keyed by a property
@@ -145,6 +152,39 @@ async fn optional_absent_reads_none_and_is_null_matches() -> anyhow::Result<()> 
     // `note = 'x'` does NOT match (absent evaluates false, not an error).
     let eq = node.catalog.resolve_selection(&"record".into(), &ankql::parser::parse_selection("note = 'x'")?).unwrap();
     assert!(!evaluate_predicate(view.entity(), &eq.predicate)?, "comparison against absent optional is false");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn lww_edit_reads_its_staged_write_and_clear_before_commit() -> anyhow::Result<()> {
+    let node = durable_sled_setup().await?;
+    let ctx = node.context_async(DEFAULT_CONTEXT).await;
+    let id = {
+        let trx = ctx.begin();
+        let record = trx.create(&OptionalLwwRecord { count: Some(7) }).await?;
+        let id = record.id();
+        trx.commit().await?;
+        id
+    };
+
+    let view = ctx.get::<OptionalLwwRecordView>(id).await?;
+
+    let trx = ctx.begin();
+    let edit = view.edit(&trx)?;
+    let count = edit.count();
+    assert_eq!(count.get()?, Some(7));
+
+    count.set(&Some(9))?;
+    assert_eq!(count.get()?, Some(9), "an ordinary LWW accessor must read its own staged value");
+    assert_eq!(view.count()?, Some(7), "the resident view stays unchanged before commit");
+
+    count.set(&None)?;
+    assert_eq!(count.get()?, None, "a staged clear must shadow the committed id-keyed value");
+    assert_eq!(view.count()?, Some(7), "the staged clear remains transaction-local");
+
+    trx.commit().await?;
+    assert_eq!(view.count()?, None, "the committed id tombstone remains authoritative");
 
     Ok(())
 }

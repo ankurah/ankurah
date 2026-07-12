@@ -1,6 +1,6 @@
 use ankurah_core::{
     error::{MutationError, RetrievalError},
-    property::PropertyResolver,
+    schema::CatalogResolver,
     storage::{StorageCollection, StorageEngine, SystemRootClaim},
 };
 use ankurah_proto::{self as proto, SystemRootProof};
@@ -43,12 +43,12 @@ pub struct IndexedDBStorageEngine {
     // https://users.rust-lang.org/t/send-not-send-variant-of-async-trait-object-without-duplication/115294
     pub db: Database,
     /// The catalog resolver, injected post-construction by `Node` (see
-    /// `StorageEngine::set_property_resolver`). Shared with every bucket: the
+    /// `StorageEngine::set_catalog_resolver`). Shared with every bucket: the
     /// name SOURCE for the engine-owned durable id-to-field map (the
     /// `property_columns` object store). Weak so storage never keeps the node
     /// alive. (Wasm is single-threaded, but the trait signature requires these
     /// `Sync` types; `std::sync` works fine here.)
-    resolver: Arc<RwLock<Option<std::sync::Weak<dyn PropertyResolver>>>>,
+    resolver: Arc<RwLock<Option<std::sync::Weak<dyn CatalogResolver>>>>,
     #[cfg(debug_assertions)]
     pub prefix_guard_disabled: std::sync::Arc<AtomicBool>,
 }
@@ -91,7 +91,7 @@ impl StorageEngine for IndexedDBStorageEngine {
         }))
     }
 
-    fn set_property_resolver(&self, resolver: std::sync::Weak<dyn PropertyResolver>) { *self.resolver.write().unwrap() = Some(resolver); }
+    fn set_catalog_resolver(&self, resolver: std::sync::Weak<dyn CatalogResolver>) { *self.resolver.write().unwrap() = Some(resolver); }
 
     async fn claim_system_root(&self, candidate: &SystemRootProof) -> Result<SystemRootClaim, MutationError> {
         let candidate = candidate.clone();
@@ -198,9 +198,9 @@ impl StorageEngine for IndexedDBStorageEngine {
         .await
     }
 
-    /// Non-creating collection discovery (the trait default returns nothing,
-    /// which would make a durable node warm an empty catalog on restart --
-    /// Codex F3). Unlike sled/SQL, IndexedDB keeps every collection's entities
+    /// Non-creating collection discovery. The trait default returns nothing,
+    /// which would make a durable node warm an empty catalog on restart.
+    /// Unlike sled/SQL, IndexedDB keeps every collection's entities
     /// in one shared `entities` store addressed by the compound
     /// `(__collection, id)` index, so the collections are the distinct
     /// `__collection` values. Reads the entities via the shared cursor scanner

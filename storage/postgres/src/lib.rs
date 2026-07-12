@@ -7,7 +7,8 @@ use std::{
 
 use ankurah_core::{
     error::{MutationError, RetrievalError, StateError},
-    property::{backend::backend_from_string, PropertyKey, PropertyResolver},
+    property::{backend::backend_from_string, PropertyKey},
+    schema::CatalogResolver,
     storage::{naming, StorageCollection, StorageEngine, SystemRootClaim},
 };
 use ankurah_proto::{Attestation, AttestationSet, Attested, EntityState, EventBody, EventId, State, StateBuffers};
@@ -37,9 +38,9 @@ const SYSTEM_ROOT_CLAIM_KEY: &str = "system_root";
 pub struct Postgres {
     pool: bb8::Pool<PostgresConnectionManager<NoTls>>,
     /// The catalog resolver, injected post-construction by `Node` (see
-    /// `StorageEngine::set_property_resolver`). Shared with every bucket:
+    /// `StorageEngine::set_catalog_resolver`). Shared with every bucket:
     /// the name SOURCE for the engine-owned durable id-to-column map.
-    resolver: Arc<RwLock<Option<std::sync::Weak<dyn PropertyResolver>>>>,
+    resolver: Arc<RwLock<Option<std::sync::Weak<dyn CatalogResolver>>>>,
 }
 
 impl Postgres {
@@ -168,7 +169,7 @@ impl StorageEngine for Postgres {
         Ok(Arc::new(bucket))
     }
 
-    fn set_property_resolver(&self, resolver: std::sync::Weak<dyn PropertyResolver>) { *self.resolver.write().unwrap() = Some(resolver); }
+    fn set_catalog_resolver(&self, resolver: std::sync::Weak<dyn CatalogResolver>) { *self.resolver.write().unwrap() = Some(resolver); }
 
     async fn claim_system_root(&self, candidate: &SystemRootProof) -> Result<SystemRootClaim, MutationError> {
         let client = self.pool.get().await.map_err(|error| MutationError::General(Box::new(error)))?;
@@ -260,7 +261,7 @@ impl StorageEngine for Postgres {
         Ok(deleted)
     }
 
-    /// Non-creating collection discovery (see the sqlite impl / Codex F3): the
+    /// Non-creating collection discovery. The
     /// trait default returns nothing, which would make a durable node warm an
     /// empty catalog on restart. A collection's state table is named exactly
     /// its id, paired with an `{id}_event` companion; the engine-wide
@@ -298,7 +299,7 @@ pub struct PostgresBucket {
     columns: Arc<RwLock<Vec<PostgresColumn>>>,
     /// The injected catalog resolver (shared with the engine): the NAME SOURCE
     /// for [`Self::column_for_key`]. Weak so storage never keeps the node alive.
-    resolver: Arc<RwLock<Option<std::sync::Weak<dyn PropertyResolver>>>>,
+    resolver: Arc<RwLock<Option<std::sync::Weak<dyn CatalogResolver>>>>,
     /// This collection's slice of the engine-owned durable id-to-column map
     /// (the `_ankurah_property_columns` table), cached. The map -- not the
     /// display name -- is what addresses a property's column once assigned:

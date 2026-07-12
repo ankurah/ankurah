@@ -13,7 +13,7 @@ use axum::{
 use axum_extra::{headers, TypedHeader};
 use futures_util::StreamExt;
 use std::net::IpAddr;
-use std::{future::Future, net::SocketAddr, ops::ControlFlow, pin::Pin};
+use std::{future::Future, net::SocketAddr, ops::ControlFlow, pin::Pin, time::Duration};
 use tower::ServiceBuilder;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
 #[cfg(feature = "instrument")]
@@ -25,6 +25,10 @@ use ankurah_core::{node::Node, policy::PolicyAgent};
 use crate::{client_ip::SmartClientIp, OptionalUserAgent};
 
 use super::state::Connection;
+
+// A peer that cannot decode our Presence will never send its own, so the
+// pre-establishment state must not be allowed to live for the socket lifetime.
+const INITIAL_PRESENCE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct WebsocketServer<SE, PA>
 where
@@ -116,6 +120,7 @@ where
     let handshake = node.begin_peer_handshake();
     let challenge = handshake.challenge();
     let mut conn = Connection::Initial { sender: Some(sender), handshake: Some(handshake), outgoing_session: None };
+    let initial_presence_deadline = tokio::time::Instant::now() + INITIAL_PRESENCE_TIMEOUT;
 
     // Require a live proof of key possession for this connection. The server
     // sends its Presence only after answering the client's own challenge.
@@ -125,10 +130,17 @@ where
     }
 
     loop {
+        // A peer that never completes the handshake must not hold the socket
+        // open indefinitely; established sessions have no read deadline.
+        let handshaking = matches!(conn, Connection::Initial { .. });
         tokio::select! {
             biased;
             _ = conn.close_requested() => {
                 debug!("Peer registration requested websocket transport close for {client_ip}");
+                break;
+            }
+            _ = tokio::time::sleep_until(initial_presence_deadline), if handshaking => {
+                warn!("Peer at {client_ip} did not complete the handshake within {INITIAL_PRESENCE_TIMEOUT:?}; closing");
                 break;
             }
             msg = receiver.next() => {

@@ -149,7 +149,7 @@ impl PolicyAgent for RecordingAgent {
         _id: &proto::EntityId,
         _collection: &proto::CollectionId,
         _state: &proto::State,
-        _resolver: Option<std::sync::Weak<dyn ankurah::core::property::PropertyResolver>>,
+        _resolver: Option<std::sync::Weak<dyn ankurah::core::schema::CatalogResolver>>,
     ) -> Result<(), AccessDenied>
     where
         C: Iterable<Self::ContextData>,
@@ -700,6 +700,7 @@ async fn transplanted_attestation_is_stripped_before_policy_sees_it() -> Result<
                     model,
                     content: proto::UpdateContent::EventOnly(vec![fragment]),
                     predicate_relevance: vec![],
+                    source_queries: vec![_relay.query_id()],
                 }],
             },
             schema: vec![],
@@ -861,6 +862,7 @@ async fn state_snapshot_with_mismatched_genesis_cannot_create_an_entity() -> Res
                     model,
                     content: proto::UpdateContent::StateAndEvent(proof, vec![]),
                     predicate_relevance: vec![],
+                    source_queries: vec![_relay.query_id()],
                 }],
             },
             schema: vec![],

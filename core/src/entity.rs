@@ -6,8 +6,9 @@ use crate::{
     event_dag::AbstractCausalRelation,
     model::View,
     property::backend::{backend_from_string, PropertyBackend},
-    property::{PropertyKey, PropertyResolver},
+    property::PropertyKey,
     reactor::AbstractEntity,
+    schema::CatalogResolver,
     value::Value,
 };
 use ankurah_proto::{Clock, CollectionId, EntityId, EntityState, Event, EventBody, EventId, OperationSet, State};
@@ -82,7 +83,7 @@ pub struct EntityInner {
     /// lets this catalog-blind entity resolve a display name to the
     /// property-definition id its data is keyed under, for the sync read path.
     /// Absent for bare and temporary entities (they read name-keyed data only).
-    resolver: std::sync::RwLock<Option<Weak<dyn PropertyResolver>>>,
+    resolver: std::sync::RwLock<Option<Weak<dyn CatalogResolver>>>,
     /// Shared liveness token for the system generation that assembled this
     /// entity. A hard reset flips the token before deleting storage, so even
     /// strong Entity/View handles retained by callers immediately become
@@ -126,12 +127,12 @@ impl EntityInner {
     fn is_system_alive(&self) -> bool { self.system_alive.load(Ordering::Acquire) }
 
     /// The catalog resolver stamped at assembly, if still live.
-    fn resolver(&self) -> Option<Arc<dyn PropertyResolver>> { self.resolver.read().unwrap().as_ref().and_then(|w| w.upgrade()) }
+    fn resolver(&self) -> Option<Arc<dyn CatalogResolver>> { self.resolver.read().unwrap().as_ref().and_then(|w| w.upgrade()) }
 
     /// Stamp the catalog resolver (assembly-time). Replaces the old
     /// backend-binding push (`Node::bind_entity`): the backend stays dumb and
     /// the entity resolves names to ids for the sync read path.
-    pub(crate) fn set_resolver(&self, resolver: Weak<dyn PropertyResolver>) { *self.resolver.write().unwrap() = Some(resolver); }
+    pub(crate) fn set_resolver(&self, resolver: Weak<dyn CatalogResolver>) { *self.resolver.write().unwrap() = Some(resolver); }
 
     /// Resolve a display name to the key its data is stored under: the
     /// property-definition id when the catalog knows the field, else the bare
@@ -175,7 +176,7 @@ impl EntityInner {
     /// payload can sit under a property id. Comparisons and the reactor's
     /// watcher index collate canonical bytes, so an off-type value casts to
     /// the canonical type here; a value the canonical type cannot represent
-    /// reads as NULL (plan decision 14) with a warning, never a poisoned
+    /// reads as NULL with a warning, never a poisoned
     /// evaluation. No resolver, unknown id, or unknown type string: the value
     /// passes through unchanged.
     fn canonicalize_lenient(&self, id: &EntityId, value: Value) -> Option<Value> {
@@ -226,8 +227,8 @@ impl EntityInner {
 
     /// Read for RESOLVED-identifier predicate evaluation: the same generic
     /// dispatch with the caller-supplied property id (no name re-resolution),
-    /// canonicalized at the evaluation boundary. Absent evaluates NULL (plan
-    /// decision 14). Evaluation has no error surface: type admission is
+    /// canonicalized at the evaluation boundary. Absent evaluates NULL.
+    /// Evaluation has no error surface: type admission is
     /// registration's job (the canonical value_type ruling, 2026-07-10), and
     /// an ill-typed stored value reads as NULL with a warning.
     pub(crate) fn read_resolved_eval(&self, property_id: EntityId, name: &str) -> Option<Value> {
@@ -908,7 +909,7 @@ impl TemporaryEntity {
         id: EntityId,
         collection: CollectionId,
         state: &State,
-        resolver: Option<std::sync::Weak<dyn PropertyResolver>>,
+        resolver: Option<std::sync::Weak<dyn CatalogResolver>>,
     ) -> Result<Self, RetrievalError> {
         // Inline from_state_buffers logic
         let mut backends = BTreeMap::new();
@@ -950,8 +951,7 @@ impl Filterable for TemporaryEntity {
             // its id and reads id-keyed data; unbound (the engine
             // post-filter tier) it degenerates to the bare name-keyed scan,
             // exactly the pre-binding behavior. Schema-blind name projection
-            // of id-keyed entries remains #312 territory (plan decision 13
-            // withdrawn).
+            // of id-keyed entries remains tracked by #312.
             self.0.read_lenient(name)
         }
     }
@@ -1092,7 +1092,7 @@ mod eager_genesis_tests {
 ///
 /// Assembly is the single choke point for catalog-aware property access:
 /// every method that hands out an `Entity` runs the `bind_hook`, installed by
-/// `Node` to stamp its live property resolver. The hook is idempotent and
+/// `Node` to stamp its live catalog resolver. The hook is idempotent and
 /// re-fires on resident hand-outs, so an entity assembled before the catalog
 /// warmed observes the catalog on its next access.
 #[derive(Clone)]

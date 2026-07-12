@@ -262,6 +262,52 @@ async fn server_refuses_mismatched_version() -> Result<()> {
     Ok(())
 }
 
+/// A legacy browser client waits for the server Presence before sending its
+/// own. A durable v3 Presence is undecodable by that client, so it remains
+/// silent; the server must still bound the incomplete handshake.
+#[tokio::test(start_paused = true)]
+async fn server_closes_silent_client_after_durable_presence() -> Result<()> {
+    let (_server_node, server_url, server_task) = start_test_server().await?;
+    let (ws, _) = tokio_tungstenite::connect_async(format!("{}/ws", server_url)).await?;
+    let (_sink, mut stream) = ws.split();
+
+    let server_presence = loop {
+        match stream.next().await {
+            Some(Ok(WsMessage::Binary(data))) => match bincode::deserialize::<proto::Message>(&data)? {
+                proto::Message::Presence(presence) => break presence,
+                other => panic!("server sent {other:?} before its presence"),
+            },
+            Some(Ok(other)) => panic!("server sent {other:?} before its presence"),
+            Some(Err(e)) => return Err(e.into()),
+            None => panic!("server closed before sending its presence"),
+        }
+    };
+    assert!(server_presence.durable, "test server must reproduce the durable Presence shape");
+    assert!(server_presence.system_root.is_some(), "durable Presence must carry the v3 system-root state");
+
+    // Send nothing. Advancing beyond the production deadline keeps this test
+    // deterministic and avoids adding ten seconds to the native test suite.
+    tokio::time::advance(Duration::from_secs(60)).await;
+    tokio::task::yield_now().await;
+
+    // The production deadline has fired in virtual time. Resume the clock
+    // before bounding the socket read: a timeout on a still-paused clock can
+    // win immediately, before the OS close becomes readable, which makes this
+    // assertion scheduler-dependent in the full parallel test run.
+    tokio::time::resume();
+
+    let next = tokio::time::timeout(Duration::from_secs(1), stream.next())
+        .await
+        .expect("server did not close the silent handshake after its deadline");
+    match next {
+        None | Some(Ok(WsMessage::Close(_))) | Some(Err(_)) => {}
+        Some(Ok(other)) => panic!("server left the silent handshake open and sent {other:?}"),
+    }
+
+    server_task.abort();
+    Ok(())
+}
+
 /// The client side of the same handshake: a server speaking a different
 /// version is refused, told why, and never treated as connected.
 #[tokio::test]

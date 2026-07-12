@@ -101,8 +101,8 @@ impl StorageEngine for PausingStorageEngine {
         <SledStorageEngine as StorageEngine>::list_collections(self.inner.as_ref()).await
     }
 
-    fn set_property_resolver(&self, resolver: std::sync::Weak<dyn ankurah::core::property::PropertyResolver>) {
-        <SledStorageEngine as StorageEngine>::set_property_resolver(self.inner.as_ref(), resolver);
+    fn set_catalog_resolver(&self, resolver: std::sync::Weak<dyn ankurah::core::schema::CatalogResolver>) {
+        <SledStorageEngine as StorageEngine>::set_catalog_resolver(self.inner.as_ref(), resolver);
     }
 }
 
@@ -488,6 +488,10 @@ async fn test_system_root_change_behavior() -> Result<()> {
         assert!(!durable_node.system.is_system_ready());
 
         durable_node.system.create().await?;
+        tokio::time::timeout(std::time::Duration::from_secs(2), durable_node.catalog.wait_catalog_ready())
+            .await
+            .expect("durable catalog should rewarm promptly after recreating the system root");
+        assert!(durable_node.catalog.is_catalog_ready(), "durable catalog should rewarm after recreating the system root");
 
         // Only the system data collection (catalog collections filtered out:
         // a previously-constructed durable node sharing this engine may warm

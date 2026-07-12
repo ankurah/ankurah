@@ -6,8 +6,8 @@ use anyhow::Result;
 
 /// The parse-time path a resolved Identifier is equivalent to: [name, ..subpath].
 /// Used to look up the field type via `CollectionSchema::field_type`, which is
-/// keyed on `PathExpr`. Phase A: schema lookup remains name-based, so this
-/// mirrors what the equivalent Path would resolve to.
+/// keyed on `PathExpr`. Schema lookup remains name-based, so this mirrors what
+/// the equivalent Path would resolve to.
 fn identifier_as_path(identifier: &Identifier) -> PathExpr { PathExpr { steps: identifier.path_steps() } }
 
 /// Cast all literals in a predicate based on field names using a CollectionSchema

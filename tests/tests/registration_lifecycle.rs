@@ -76,6 +76,36 @@ mod offline_v2 {
     }
 }
 
+mod wrong_explicit_widget {
+    use ankurah::Model;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Model, Debug, Serialize, Deserialize)]
+    #[model(id = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")]
+    pub struct Widget {
+        pub label: String,
+        pub size: i32,
+    }
+}
+
+mod warm_optional_v1 {
+    use super::*;
+
+    #[derive(Model, Debug, Serialize, Deserialize)]
+    pub struct OfflineWarm {
+        pub value: Option<i64>,
+    }
+}
+
+mod warm_optional_v2 {
+    use super::*;
+
+    #[derive(Model, Debug, Serialize, Deserialize)]
+    pub struct OfflineWarm {
+        pub value: i64,
+    }
+}
+
 async fn connected_pair(
 ) -> anyhow::Result<(TestNode, TestNode, LocalProcessConnection<SledStorageEngine, PermissiveAgent, SledStorageEngine, PermissiveAgent>)> {
     let server = durable_sled_setup().await?;
@@ -180,6 +210,18 @@ async fn offline_create_unregistered_is_strict_registered_proceeds() -> anyhow::
     assert!(server.catalog.resolve("gadget", "name").is_none(), "nothing reached the durable");
     assert!(!client.catalog.is_ensured("gadget"), "a strict failure must not latch");
 
+    // An explicit model id is part of the exact binding. The ordinary Widget
+    // model and its compatible fields must not satisfy a declaration bound to
+    // a different, nonexistent model id.
+    {
+        let trx = ctx.begin();
+        let err = trx
+            .create(&wrong_explicit_widget::Widget { label: "wrong-model".into(), size: 2 })
+            .await
+            .expect_err("offline fallback must validate the compiled explicit model id");
+        assert!(err.to_string().contains("unconfirmed schema"), "expected an exact-binding failure, got: {err}");
+    }
+
     // The fully and compatibly bound Widget shape keeps writing offline (no
     // commit attempted: an ephemeral cannot relay a commit without a peer;
     // create alone exercises the registration trigger).
@@ -231,6 +273,55 @@ async fn offline_reassert_requires_every_compiled_field_to_be_bound() -> anyhow:
         .await
         .expect_err("an unavailable reassertion must not emit an unregistered field as Name residue");
     assert!(error.to_string().contains("unconfirmed schema"), "expected a schema confirmation failure, got: {error}");
+
+    Ok(())
+}
+
+/// A catalog-proven no-peer binding is sufficient to address an offline
+/// write, but it is not an allocator confirmation. Reconnecting must still
+/// reassert the exact schema so mutable metadata such as membership
+/// optionality converges.
+#[tokio::test]
+async fn offline_binding_reasserts_mutable_metadata_after_reconnect() -> anyhow::Result<()> {
+    let server = durable_sled_setup().await?;
+    server.catalog.wait_catalog_ready().await;
+    let server_ctx = server.context_async(DEFAULT_CONTEXT).await;
+    server_ctx.register::<warm_optional_v1::OfflineWarm>().await?;
+
+    let client = ephemeral_sled_setup().await?;
+    let connection = LocalProcessConnection::new(&server, &client).await?;
+    client.system.wait_system_ready().await;
+    let ctx = client.context_async(DEFAULT_CONTEXT).await;
+    wait_resolve(&client, "offlinewarm", "value").await.expect("catalog warm copied the existing definition");
+    assert!(!client.catalog.is_ensured("offlinewarm"), "catalog knowledge alone is not local registration confirmation");
+
+    drop(connection);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !client.get_durable_peers().is_empty() {
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("client still has a durable peer after disconnect");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let trx = ctx.begin();
+    trx.create(&warm_optional_v2::OfflineWarm { value: 7 }).await?;
+    assert!(!client.catalog.is_ensured("offlinewarm"), "a local no-peer proof must not latch allocator confirmation");
+
+    let _reconnected = LocalProcessConnection::new(&server, &client).await?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while client.get_durable_peers().is_empty() {
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("client did not reconnect");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    ctx.register::<warm_optional_v2::OfflineWarm>().await?;
+    assert!(client.catalog.is_ensured("offlinewarm"), "successful reassertion confirms the exact declaration");
+    let model = server.catalog.model_by_collection("offlinewarm").unwrap().id;
+    let property = server.catalog.resolve("offlinewarm", "value").unwrap();
+    assert_eq!(server.catalog.membership(&model, &property).unwrap().optional, Some(false));
 
     Ok(())
 }

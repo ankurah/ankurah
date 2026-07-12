@@ -1,7 +1,9 @@
 use ankurah_proto::{self as proto, Attested, CollectionId, EntityState, Event};
 use anyhow::{anyhow, Result};
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::marker::PhantomData;
+use std::pin::Pin;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, OnceLock, RwLock,
@@ -24,16 +26,6 @@ use crate::{
     value::Value,
 };
 pub const SYSTEM_COLLECTION_ID: &str = "_ankurah_system";
-/// Collections that are not mutable through ordinary transactions: the
-/// system collection and the metadata catalog (RFC section 4 in specs/model-property-metadata/rfc.md). Consulted
-/// by the commit path (durable nodes refuse CommitTransaction events
-/// targeting these) and by CollectionSet::get's reserved-prefix check.
-pub const PROTECTED_COLLECTIONS: &[&str] = &[
-    SYSTEM_COLLECTION_ID,
-    crate::schema::MODEL_COLLECTION_ID,
-    crate::schema::PROPERTY_COLLECTION_ID,
-    crate::schema::MODEL_PROPERTY_COLLECTION_ID,
-];
 
 /// System catalog manager for storing various metadata about the system
 /// * root clock
@@ -66,13 +58,26 @@ struct Inner<SE, PA> {
     loading: Notify,
     system_ready: RwLock<bool>,
     system_ready_notify: Notify,
+    /// Serializes system-epoch transitions and initial storage load. Reset's
+    /// catalog drain guarantee is only meaningful when no second reset/join
+    /// can bypass it and delete or republish state concurrently.
+    lifecycle: tokio::sync::Mutex<()>,
+    /// Remains set across cancellation or deletion failure so the next
+    /// lifecycle operation resumes reset before reading or publishing a root.
+    /// Access is serialized by `lifecycle`; atomic storage provides interior
+    /// mutability without a second lock.
+    reset_incomplete: AtomicBool,
+    /// Whether the incomplete reset intended to drop the root binding. A
+    /// resumed reset must not clear a pinned first-join reservation that the
+    /// original (cancelled) clear deliberately preserved.
+    reset_incomplete_clear_root: AtomicBool,
     reactor: Reactor,
-    /// Installed by `CatalogManager::start`. `hard_reset` invokes it to flush
-    /// the in-memory catalog map, which the SystemManager cannot reach
-    /// directly (the Node owns the CatalogManager). RFC 5.2 requires the
-    /// catalog map to be flushed alongside the state hard_reset clears,
-    /// because allocated catalog ids belong to one system's allocator.
-    catalog_reset_hook: RwLock<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Installed by `CatalogManager::start`. Reset has two phases because the
+    /// catalog owns asynchronous relay work while SystemManager owns storage:
+    /// begin invalidates and drains old catalog effects before deletion,
+    /// finish clears catalog state after system/reactor reset, and resume
+    /// re-arms durable catalog maintenance after the replacement root is ready.
+    catalog_reset_hook: RwLock<Option<CatalogResetHook>>,
     /// Node-owned peer teardown, installed after Node construction. The
     /// optional id is a Reserved root whose pending founder connection must
     /// survive an old-system replacement long enough to be promoted.
@@ -84,6 +89,15 @@ struct Inner<SE, PA> {
     resetting: AtomicBool,
     destructive_resetting: AtomicBool,
     _phantom: PhantomData<PA>,
+}
+
+type CatalogResetFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+#[derive(Clone)]
+struct CatalogResetHook {
+    begin: Arc<dyn Fn() -> CatalogResetFuture + Send + Sync>,
+    finish: Arc<dyn Fn() + Send + Sync>,
+    resume: Arc<dyn Fn() + Send + Sync>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -189,6 +203,9 @@ where
             collection_map: RwLock::new(BTreeMap::new()),
             system_ready: RwLock::new(false),
             system_ready_notify: Notify::new(),
+            lifecycle: tokio::sync::Mutex::new(()),
+            reset_incomplete: AtomicBool::new(false),
+            reset_incomplete_clear_root: AtomicBool::new(false),
             reactor,
             catalog_reset_hook: RwLock::new(None),
             peer_reset_hook: RwLock::new(None),
@@ -388,12 +405,15 @@ where
         }
     }
 
-    /// Install the catalog-map flush hook (called by `CatalogManager::start`).
-    /// `hard_reset` invokes it so the in-memory catalog map is cleared
-    /// together with the state this manager resets; the SystemManager cannot
-    /// see the CatalogManager (the Node holds it), so it holds this handle.
-    pub(crate) fn set_catalog_reset_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
-        *self.0.catalog_reset_hook.write().unwrap() = Some(hook);
+    /// Install the catalog reset barrier (called by `CatalogManager::start`).
+    /// SystemManager remains the sole owner of destructive storage deletion.
+    pub(crate) fn set_catalog_reset_hook(
+        &self,
+        begin: Arc<dyn Fn() -> CatalogResetFuture + Send + Sync>,
+        finish: Arc<dyn Fn() + Send + Sync>,
+        resume: Arc<dyn Fn() + Send + Sync>,
+    ) {
+        *self.0.catalog_reset_hook.write().unwrap() = Some(CatalogResetHook { begin, finish, resume });
     }
 
     pub(crate) fn set_peer_reset_hook(&self, hook: Arc<dyn Fn(Option<proto::EntityId>) + Send + Sync>) {
@@ -452,6 +472,10 @@ where
 
         // Wait for local system catalog to be loaded
         self.wait_loaded().await;
+        let _lifecycle = self.0.lifecycle.lock().await;
+        if self.0.reset_incomplete.load(Ordering::Acquire) {
+            self.resume_incomplete_reset().await?;
+        }
         if let Some(error) = self.0.load_error.read().unwrap().clone() {
             return Err(anyhow!("system catalog failed to load: {error}"));
         }
@@ -474,6 +498,12 @@ where
         let (new_storage_epoch, fresh_generation) = self.0.collectionset.advance_storage_epoch();
         self.0.bound_storage_epoch.store(new_storage_epoch, Ordering::Release);
         self.invalidate_local_state_with_generation(true, None, Some(fresh_generation));
+        // No drain is needed: the catalog cannot be warm before the system is
+        // ready, so `finish` alone flushes any name-staged residue and arms
+        // the resume that fires once this create publishes readiness.
+        if let Some(hook) = self.0.catalog_reset_hook.read().unwrap().clone() {
+            (hook.finish)();
+        }
         self.0.collectionset.publish_storage_epoch();
 
         // TODO - see if we can use the Model derive macro for a SysCatalogItem model rather than doing this manually
@@ -532,6 +562,9 @@ where
         // Mark system as ready and notify waiters
         *self.0.system_ready.write().unwrap() = true;
         self.0.system_ready_notify.notify_waiters();
+        if let Some(hook) = self.0.catalog_reset_hook.read().unwrap().clone() {
+            (hook.resume)();
+        }
 
         Ok(())
     }
@@ -542,10 +575,31 @@ where
     /// enter durable routing during the async portion of join.
     pub(crate) async fn finish_reserved_join(&self, proof: proto::SystemRootProof) -> Result<(), MutationError> {
         self.wait_loaded().await;
+        let _lifecycle = self.0.lifecycle.lock().await;
+        if self.0.reset_incomplete.load(Ordering::Acquire) {
+            self.resume_incomplete_reset().await?;
+        }
         if self.0.durable {
             return Err(MutationError::General(Box::new(std::io::Error::other("Durable nodes cannot join an existing system"))));
         }
         Self::verify_root_proof(&proof).map_err(MutationError::from)?;
+
+        // Advisory pre-read: a replacement join must drain the catalog BEFORE
+        // taking the exclusive storage gate, because draining waits for
+        // admitted catalog effects whose application may need a storage read
+        // lease. The values read here are stable (load has completed and a
+        // pinned reservation's needs_reset never changes); the authoritative
+        // re-read still happens under the gate below.
+        let advisory_needs_reset = self.0.load_error.read().unwrap().is_some()
+            || self.0.root.read().unwrap().as_ref().is_some_and(|binding| {
+                binding.proof.entity_id() == proof.entity_id() && matches!(binding.status, RootStatus::Reserved { needs_reset: true })
+            });
+        let catalog_reset_hook = self.0.catalog_reset_hook.read().unwrap().clone();
+        if advisory_needs_reset {
+            if let Some(hook) = &catalog_reset_hook {
+                (hook.begin)().await;
+            }
+        }
 
         // Serialize the complete switch -- invalidation, deletion, root
         // proof persistence, and publication. This prevents hard_reset or an
@@ -576,7 +630,7 @@ where
 
             if needs_reset {
                 tracing::info!("Resetting storage to replace mismatched reserved root");
-                self.clear_local_state_locked(false).await?;
+                self.clear_local_state_locked(false, catalog_reset_hook.as_ref()).await?;
             }
 
             let collection_id = CollectionId::fixed_name(SYSTEM_COLLECTION_ID);
@@ -591,6 +645,12 @@ where
                         let (new_storage_epoch, fresh_generation) = self.0.collectionset.advance_storage_epoch();
                         self.0.bound_storage_epoch.store(new_storage_epoch, Ordering::Release);
                         self.invalidate_local_state_with_generation(false, Some(proof.entity_id()), Some(fresh_generation));
+                        // First join from empty: the catalog was never warm,
+                        // so `finish` alone flushes staged residue and arms
+                        // the resume fired at readiness below.
+                        if let Some(hook) = self.0.catalog_reset_hook.read().unwrap().clone() {
+                            (hook.finish)();
+                        }
                         self.0.collectionset.publish_storage_epoch();
                     }
                 }
@@ -620,10 +680,21 @@ where
             }
             *self.0.system_ready.write().unwrap() = true;
             self.0.system_ready_notify.notify_waiters();
+            if let Some(hook) = self.0.catalog_reset_hook.read().unwrap().clone() {
+                (hook.resume)();
+            }
             notice_info!("Persisted verified system root and completed join");
             Ok(())
         }
         .await;
+        if result.is_err() && advisory_needs_reset {
+            // The drain ran but its reset never reached `clear_local_state_locked`
+            // (or failed before finishing). Release the catalog latch so later
+            // lifecycle operations are not stranded behind `resetting`.
+            if let Some(hook) = &catalog_reset_hook {
+                (hook.finish)();
+            }
+        }
         result
     }
 
@@ -643,6 +714,17 @@ where
     /// Destructively clear every artifact accepted while `abort` was the
     /// pending root, then remove only that exact fenced reservation.
     pub(crate) async fn finish_abort_reserved_join(&self, abort: RootJoinAbort) -> Result<(), MutationError> {
+        // Serialize with the other lifecycle transitions so a second reset or
+        // join cannot interleave between this drain and the deletion below,
+        // and so the catalog's begin/finish phases cannot cross-pair between
+        // two concurrent destructive operations on this manager.
+        let _lifecycle = self.0.lifecycle.lock().await;
+        // Drain BEFORE the exclusive gate: admitted catalog effects may need a
+        // storage read lease to complete, which the write lease would block.
+        let catalog_reset_hook = self.0.catalog_reset_hook.read().unwrap().clone();
+        if let Some(hook) = &catalog_reset_hook {
+            (hook.begin)().await;
+        }
         let _reset_activity = ResetActivity::new(self.0.collectionset.storage_write_lease().await, &self.0.resetting);
         let _destructive_reset = FlagActivity::new(&self.0.destructive_resetting);
         let result = async {
@@ -652,6 +734,9 @@ where
             // it must never advance the epoch or delete the new owner's rows.
             if !self.is_storage_generation_current() {
                 self.invalidate_local_state(true, None);
+                if let Some(hook) = &catalog_reset_hook {
+                    (hook.finish)();
+                }
                 return Ok(());
             }
             if self.0.collectionset.system_root_claim().await?.is_some_and(|claimed| claimed != abort.proof) {
@@ -659,9 +744,12 @@ where
                 // queued. Even on a legacy/non-advanced epoch, never erase a
                 // durable claim that does not belong to this reservation.
                 self.invalidate_local_state(true, None);
+                if let Some(hook) = &catalog_reset_hook {
+                    (hook.finish)();
+                }
                 return Ok(());
             }
-            self.clear_local_state_locked(false).await?;
+            self.clear_local_state_locked(false, catalog_reset_hook.as_ref()).await?;
             let mut root = self.0.root.write().unwrap();
             match root.as_ref() {
                 Some(binding) if binding.status == RootStatus::Aborting && binding.proof == abort.proof => {
@@ -672,28 +760,78 @@ where
             }
         }
         .await;
+        if result.is_err() {
+            // Pair the drain above with a latch release even when cleanup
+            // errored before (or inside) the locked clear. `finish` is
+            // idempotent, so a second call after the locked clear is safe.
+            if let Some(hook) = &catalog_reset_hook {
+                (hook.finish)();
+            }
+        }
         result
     }
 
     /// Resets all storage by deleting all collections, including the system collection.
-    /// This is used when an ephemeral node needs to join a system with a different root.
+    /// Ephemeral nodes use this when joining a different system; durable nodes
+    /// may use it before creating a replacement root in place.
     /// **This is a destructive operation and should be used with extreme caution.**
-    pub async fn hard_reset(&self) -> Result<()> { self.clear_local_state(true).await.map_err(anyhow::Error::from) }
+    pub async fn hard_reset(&self) -> Result<()> {
+        let _lifecycle = self.0.lifecycle.lock().await;
+        self.clear_local_state(true).await.map_err(anyhow::Error::from)
+    }
+
+    /// Resume a reset that a cancelled or failed earlier transition left
+    /// incomplete. Caller holds `lifecycle`.
+    async fn resume_incomplete_reset(&self) -> Result<(), MutationError> {
+        let clear_root = self.0.reset_incomplete_clear_root.load(Ordering::Acquire);
+        self.clear_local_state(clear_root).await?;
+        if !clear_root {
+            // Complete a cancelled abort's intent: its cleanup owned the
+            // reservation, and nothing else will ever remove an Aborting
+            // binding whose cleanup task died.
+            let mut root = self.0.root.write().unwrap();
+            if matches!(root.as_ref(), Some(binding) if binding.status == RootStatus::Aborting) {
+                *root = None;
+            }
+        }
+        Ok(())
+    }
 
     /// Clear system-owned storage and caches. A reserved first-join root can be
     /// preserved while the old system's storage is deleted; this is what keeps
-    /// the reservation race-free across the async reset.
+    /// the reservation race-free across the async reset. Caller holds
+    /// `lifecycle`; the catalog drain runs BEFORE the exclusive storage gate is
+    /// taken, because draining waits for admitted catalog effects whose
+    /// application may itself need a storage read lease.
     async fn clear_local_state(&self, clear_root: bool) -> Result<(), MutationError> {
+        self.0.reset_incomplete.store(true, Ordering::Release);
+        self.0.reset_incomplete_clear_root.store(clear_root, Ordering::Release);
+        // Close readiness before the catalog barrier so no concurrent caller
+        // can treat the system as usable while its prior epoch is draining.
+        *self.0.system_ready.write().unwrap() = false;
+
+        // Invalidate the old catalog generation, tear down its live queries,
+        // and wait for responses already admitted at schema ingress to finish
+        // applying. The hook is cloned out of the lock before await.
+        let catalog_reset_hook = self.0.catalog_reset_hook.read().unwrap().clone();
+        if let Some(hook) = &catalog_reset_hook {
+            (hook.begin)().await;
+        }
+
         let _reset_activity = ResetActivity::new(self.0.collectionset.storage_write_lease().await, &self.0.resetting);
         let _destructive_reset = FlagActivity::new(&self.0.destructive_resetting);
-        let result = self.clear_local_state_locked(clear_root).await;
-        result
+        self.clear_local_state_locked(clear_root, catalog_reset_hook.as_ref()).await
     }
 
-    /// Clear while the caller owns the reset writer. Root reservation status
-    /// decides whether one pending new-founder PeerState is preserved; old
-    /// ready peers and all other sessions are always drained.
-    async fn clear_local_state_locked(&self, clear_root: bool) -> Result<(), MutationError> {
+    /// Clear while the caller owns the reset writer AND has already run the
+    /// catalog drain (`hook.begin`). Root reservation status decides whether
+    /// one pending new-founder PeerState is preserved; old ready peers and all
+    /// other sessions are always drained. Exactly one `hook.finish` runs on
+    /// every path, only after storage deletion settles, so the catalog cannot
+    /// warm a new generation against rows that are still being deleted.
+    async fn clear_local_state_locked(&self, clear_root: bool, catalog_reset_hook: Option<&CatalogResetHook>) -> Result<(), MutationError> {
+        self.0.reset_incomplete.store(true, Ordering::Release);
+        self.0.reset_incomplete_clear_root.store(clear_root, Ordering::Release);
         let (new_storage_epoch, fresh_generation) = self.0.collectionset.advance_storage_epoch();
         self.0.bound_storage_epoch.store(new_storage_epoch, Ordering::Release);
         let preserved_pending_root = if clear_root {
@@ -710,8 +848,22 @@ where
         self.invalidate_local_state_with_generation(clear_root, preserved_pending_root, Some(fresh_generation));
         self.0.collectionset.publish_storage_epoch();
 
-        // Delete all collections from storage
-        self.0.collectionset.delete_all_collections().await?;
+        // Delete all collections from storage. Even a failed deletion must
+        // release the catalog's resetting latch so callers are not stranded;
+        // the incomplete-reset latch stays set for the retry.
+        if let Err(error) = self.0.collectionset.delete_all_collections().await {
+            if let Some(hook) = catalog_reset_hook {
+                (hook.finish)();
+            }
+            return Err(error);
+        }
+
+        if let Some(hook) = catalog_reset_hook {
+            (hook.finish)();
+        }
+        // No await exists between successful deletion and this store, so
+        // cancellation leaves the flag set exactly for incomplete transitions.
+        self.0.reset_incomplete.store(false, Ordering::Release);
 
         Ok(())
     }
@@ -747,22 +899,12 @@ where
         }
         self.0.collection_map.write().unwrap().clear();
 
-        // Flush the in-memory catalog map (RFC 5.2): allocated catalog ids
-        // belong to one system, so a node re-joining a different system must
-        // re-register against that system's allocator; a stale map would leak
-        // the old system's ids. Runs after
-        // collection_map.clear() and before reactor.system_reset(), which the
-        // catalog's own reactor subscriptions also observe. The hook clears
-        // maps and drops subscriptions but never deletes storage collections
-        // (that is delete_all_collections above).
-        let catalog_reset_hook = self.0.catalog_reset_hook.read().unwrap().clone();
-        if let Some(hook) = catalog_reset_hook {
-            hook();
-        }
-
         *self.0.load_error.write().unwrap() = None;
 
-        // Reset the reactor state to notify subscriptions
+        // Reset the reactor state to notify subscriptions. Catalog map
+        // flushing is NOT done here: the three-phase catalog hook (begin
+        // drain / finish / resume) is driven by the owning lifecycle
+        // operation, which sequences `finish` after any storage deletion.
         self.0.reactor.system_reset();
         self.0.system_ready_notify.notify_waiters();
     }
@@ -772,13 +914,16 @@ where
 
     /// Waits for the local system catalog to be loaded
     pub async fn wait_loaded(&self) {
-        if self.is_loaded() {
-            return;
-        }
-        let notified = self.0.loading.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        if !self.is_loaded() {
+        loop {
+            // notify_waiters stores no permit. Arm the waiter before reading
+            // the flag so a transition between the check and await cannot
+            // strand a caller.
+            let notified = self.0.loading.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_loaded() {
+                return;
+            }
             notified.await;
         }
     }
@@ -789,6 +934,10 @@ where
     }
 
     async fn load_system_catalog(&self) -> Result<()> {
+        let _lifecycle = self.0.lifecycle.lock().await;
+        if self.0.reset_incomplete.load(Ordering::Acquire) {
+            self.resume_incomplete_reset().await?;
+        }
         if self.is_loaded() {
             return Err(anyhow!("System catalog already loaded"));
         }
@@ -921,6 +1070,9 @@ where
         if durable_root_ready {
             *self.0.system_ready.write().unwrap() = true;
             self.0.system_ready_notify.notify_waiters();
+            if let Some(hook) = self.0.catalog_reset_hook.read().unwrap().clone() {
+                (hook.resume)();
+            }
         }
 
         self.mark_loaded();

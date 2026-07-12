@@ -45,6 +45,9 @@ impl SubscriptionHandler {
                             items.push(item);
                         }
                     }
+                    if items.is_empty() {
+                        return;
+                    }
                     tracing::debug!("SubscriptionHandler[{}] sending update to peer {}", peer_id, peer_id);
                     node.send_update(peer_id, proto::NodeUpdateBody::SubscriptionUpdate { items });
                 });
@@ -154,6 +157,14 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
+    let mut source_queries = item.source_queries.clone();
+    source_queries.sort_unstable();
+    source_queries.dedup();
+    if source_queries.is_empty() {
+        tracing::debug!("Dropping reactor update for peer {} because no current query caused it", peer_id);
+        return None;
+    }
+
     // Convert entity to EntityState and attest it
     let entity_state = match item.entity.to_entity_state() {
         Ok(entity_state) => entity_state,
@@ -217,5 +228,5 @@ where
     let content = proto::UpdateContent::StateAndEvent(proof, attested_events.into_iter().map(|e| e.into()).collect());
 
     // Create subscription update item
-    Some(proto::SubscriptionUpdateItem { entity_id, model, content, predicate_relevance })
+    Some(proto::SubscriptionUpdateItem { entity_id, model, content, predicate_relevance, source_queries })
 }

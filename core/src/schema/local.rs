@@ -1,6 +1,6 @@
 //! The local compiled schema: the derive macro's static description of a
-//! model and its properties (work package A11a;
-//! specs/model-property-metadata/rfc.md sections 4, 5.8, 5.9, and section 7's
+//! model and its properties (specs/model-property-metadata/rfc.md sections 4,
+//! 5.8, 5.9, and section 7's
 //! reconciliation of the phase-3 SchemaRegistry).
 //!
 //! Rust structs are ONE binding to the catalog, not the definitive schema

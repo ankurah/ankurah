@@ -107,6 +107,7 @@ fn event_only_item(event: proto::Event) -> proto::SubscriptionUpdateItem {
         model: event.model,
         content: proto::UpdateContent::EventOnly(vec![Attested::opt(event, None).into()]),
         predicate_relevance: vec![],
+        source_queries: vec![],
     }
 }
 
@@ -118,10 +119,19 @@ fn event_only_multi(entity_id: proto::EntityId, model: proto::EntityId, events: 
         model,
         content: proto::UpdateContent::EventOnly(events.into_iter().map(|e| Attested::opt(e, None).into()).collect()),
         predicate_relevance: vec![],
+        source_queries: vec![],
     }
 }
 
-fn deliver(from: proto::NodeId, to: proto::NodeId, items: Vec<proto::SubscriptionUpdateItem>) -> proto::NodeMessage {
+fn deliver(
+    from: proto::NodeId,
+    to: proto::NodeId,
+    source_query: proto::QueryId,
+    mut items: Vec<proto::SubscriptionUpdateItem>,
+) -> proto::NodeMessage {
+    for item in &mut items {
+        item.source_queries.push(source_query);
+    }
     proto::NodeMessage::Update(proto::NodeUpdate {
         id: proto::UpdateId::new(),
         from,
@@ -129,6 +139,95 @@ fn deliver(from: proto::NodeId, to: proto::NodeId, items: Vec<proto::Subscriptio
         body: proto::NodeUpdateBody::SubscriptionUpdate { items },
         schema: vec![],
     })
+}
+
+fn deliver_with_schema(
+    from: proto::NodeId,
+    to: proto::NodeId,
+    source_query: proto::QueryId,
+    mut item: proto::SubscriptionUpdateItem,
+    schema: Vec<proto::StateWithGenesis>,
+) -> proto::NodeMessage {
+    item.source_queries.push(source_query);
+    proto::NodeMessage::Update(proto::NodeUpdate {
+        id: proto::UpdateId::new(),
+        from,
+        to,
+        body: proto::NodeUpdateBody::SubscriptionUpdate { items: vec![item] },
+        schema,
+    })
+}
+
+/// Forge a completely valid, self-certifying catalog descriptor that never
+/// existed on the sender: the fields ride the genesis, the entity id derives
+/// from that genesis, and the state is its exact materialization. Nothing
+/// about the FORMAT is rejectable, so the receiver's fill-missing-only and
+/// staleness rules are the only defenses under test.
+fn forge_catalog_proof(system: proto::EntityId, collection: &str, fields: Vec<(&str, Option<Value>)>) -> (proto::EntityId, proto::StateWithGenesis) {
+    let backend = LWWBackend::new();
+    for (name, value) in fields {
+        backend.set(PropertyKey::Name(name.to_owned()), value);
+    }
+    let lww = backend.to_operations().unwrap().expect("catalog state has fields");
+    let model = ankurah::core::schema::well_known_model_id(collection).expect("catalog collection has a well-known model id");
+    let genesis = proto::Event::genesis(model, Some(system), proto::OperationSet(BTreeMap::from([("lww".to_owned(), lww.clone())])));
+    let event_id = genesis.id();
+    let entity_id = genesis.entity_id;
+    let backend = LWWBackend::new();
+    backend.apply_operations_with_event(&lww, event_id.clone()).unwrap();
+    let state = Attested::opt(
+        proto::EntityState {
+            entity_id,
+            model,
+            state: proto::State {
+                state_buffers: proto::StateBuffers(BTreeMap::from([("lww".to_owned(), backend.to_state_buffer().unwrap())])),
+                head: proto::Clock::from(vec![event_id]),
+            },
+        },
+        None,
+    );
+    (entity_id, proto::StateWithGenesis { genesis: Attested::opt(genesis, None), state })
+}
+
+/// Pair an EXISTING catalog entity's real genesis (fetched from the serving
+/// node's storage) with a forged replacement state, so the proof passes every
+/// identity check and only the receiver's never-overwrite rule stands between
+/// the forged fields and the cache.
+async fn forged_state_with_real_genesis(
+    server: &Node<SledStorageEngine, PermissiveAgent>,
+    collection: &str,
+    entity_id: proto::EntityId,
+    fields: Vec<(&str, Option<Value>)>,
+) -> anyhow::Result<proto::StateWithGenesis> {
+    let storage = server.collections.get(&proto::CollectionId::from(collection)).await?;
+    let genesis_id = proto::EventId::from_bytes(entity_id.to_bytes());
+    let genesis = storage
+        .get_events(vec![genesis_id.clone()])
+        .await?
+        .into_iter()
+        .find(|event| event.payload.id() == genesis_id)
+        .expect("catalog entity has a stored genesis");
+    let backend = LWWBackend::new();
+    for (name, value) in fields {
+        backend.set(PropertyKey::Name(name.to_owned()), value);
+    }
+    let lww = backend.to_operations().unwrap().expect("catalog state has fields");
+    let forged_event_id = proto::EventId::from_bytes([0x5A; 32]);
+    let backend2 = LWWBackend::new();
+    backend2.apply_operations_with_event(&lww, forged_event_id.clone()).unwrap();
+    let model = ankurah::core::schema::well_known_model_id(collection).expect("catalog collection has a well-known model id");
+    let state = Attested::opt(
+        proto::EntityState {
+            entity_id,
+            model,
+            state: proto::State {
+                state_buffers: proto::StateBuffers(BTreeMap::from([("lww".to_owned(), backend2.to_state_buffer().unwrap())])),
+                head: proto::Clock::from(vec![forged_event_id]),
+            },
+        },
+        None,
+    );
+    Ok(proto::StateWithGenesis { genesis, state })
 }
 
 /// Standard two-node fixture: a durable server that owns the data and an
@@ -152,6 +251,12 @@ struct Fixture {
     record_artist: proto::EntityId,
 }
 
+impl Fixture {
+    fn delivery(&self, items: Vec<proto::SubscriptionUpdateItem>) -> proto::NodeMessage {
+        deliver(self.server.id, self.client.id, self._relay.query_id(), items)
+    }
+}
+
 async fn fixture() -> Result<Fixture> {
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     server.system.create().await?;
@@ -162,7 +267,7 @@ async fn fixture() -> Result<Fixture> {
     let ctx_c = client.context(c)?;
     // A live subscription establishes the relay context apply_updates requires
     // for this peer; held for the test's duration.
-    let _relay = ctx_c.query_wait::<RecordView>("title = 'no-such-title'").await?;
+    let _relay = ctx_c.query_wait::<RecordView>("true").await?;
     // The relay query resolves the Record predicate, which first-use-registers
     // the model (REN 2), so the durable server now holds its allocated id.
     let record_model = server.catalog.model_id_for(Record::collection().as_str()).expect("Record registered by the relay query");
@@ -189,6 +294,150 @@ async fn seed_record(f: &Fixture, title: &str, artist: &str) -> Result<(proto::E
 async fn committed_event_ids(ctx: &ankurah::Context, id: proto::EntityId) -> Result<Vec<proto::EventId>> {
     let collection = ctx.collection(&Record::collection()).await?;
     Ok(collection.dump_entity_events(id).await?.iter().map(|e| e.payload.id()).collect())
+}
+
+// ===========================================================================
+// Schema-envelope cache invariants
+// ===========================================================================
+
+/// A stream attributed to a query that is no longer current must be rejected
+/// as one envelope before either its shipped schema or its event body can
+/// mutate the receiver.
+#[tokio::test]
+async fn stale_stream_is_rejected_before_schema_and_body() -> Result<()> {
+    let f = fixture().await?;
+    let (rec_id, view) = seed_record(&f, "before", "artist").await?;
+    let forged = forge_title_event(rec_id, f.record_model, f.record_title, view.entity().head().clone(), "after");
+    let forged_id = forged.id();
+    let mut item = event_only_item(forged);
+    item.source_queries.push(proto::QueryId::new());
+
+    let system = f.client.system.root_id().expect("client joined the fixture system");
+    let (_stale_model_id, stale_schema) = forge_catalog_proof(
+        system,
+        "_ankurah_model",
+        vec![("collection", Some(Value::String("stale_wire".to_owned()))), ("name", Some(Value::String("StaleWire".to_owned())))],
+    );
+    let update = proto::NodeUpdate {
+        id: proto::UpdateId::new(),
+        from: f.server.id,
+        to: f.client.id,
+        body: proto::NodeUpdateBody::SubscriptionUpdate { items: vec![item] },
+        schema: vec![stale_schema],
+    };
+    f.client.handle_message(proto::NodeMessage::Update(update)).await?;
+
+    assert_eq!(view.title().unwrap(), "before", "a stale stream must not apply its event body");
+    assert!(!committed_event_ids(&f.ctx_c, rec_id).await?.contains(&forged_id));
+    assert!(f.client.catalog.model_by_collection("stale_wire").is_none(), "a stale stream must not warm schema first");
+    Ok(())
+}
+
+/// Shipped catalog descriptor proofs may only FILL MISSING cache entries
+/// (identity RFC I.4): they never overwrite an existing descriptor, mutable
+/// field or not, and an immutable-identity conflict rejects the whole batch.
+/// The ordinary catalog entity stream remains the sole update path. Exercise
+/// the real connected, recipient-checked, permissive-policy envelope seam
+/// with fully valid proofs, so the fill-missing-only rule is the only defense
+/// between the forged fields and the cache.
+#[tokio::test]
+async fn schema_envelope_never_overwrites_existing_catalog_entries() -> Result<()> {
+    let f = fixture().await?;
+    let (probe_id, _) = seed_record(&f, "schema-probe", "schema-probe").await?;
+    let probe_event = f
+        .ctx_s
+        .collection(&Record::collection())
+        .await?
+        .dump_entity_events(probe_id)
+        .await?
+        .into_iter()
+        .next()
+        .expect("probe record has a genesis event")
+        .payload;
+    let probe_item = event_only_item(probe_event);
+    let model = f.client.catalog.model_by_collection("record").expect("record model warmed");
+    let property = f.client.catalog.property_by_id(&f.record_title).expect("title property warmed");
+    let membership = f.client.catalog.membership(&f.record_model, &f.record_title).expect("record-title membership warmed");
+    let system = f.client.system.root_id().expect("client joined the fixture system");
+
+    let ship = |proof| {
+        f.client.handle_message(deliver_with_schema(f.server.id, f.client.id, f._relay.query_id(), probe_item.clone(), vec![proof]))
+    };
+
+    // Same model id, new unused collection: immutable identity conflict.
+    let poisoned_model = forged_state_with_real_genesis(
+        &f.server,
+        "_ankurah_model",
+        model.id,
+        vec![("collection", Some(Value::String("wire_hijack".to_owned()))), ("name", Some(Value::String("Poisoned".to_owned())))],
+    )
+    .await?;
+    ship(poisoned_model).await?;
+    assert_eq!(f.client.catalog.model_by_collection("record"), Some(model.clone()));
+    assert!(f.client.catalog.model_by_collection("wire_hijack").is_none());
+
+    // Every property field is protected: allocation identity conflicts reject
+    // the batch, and even an otherwise-mutable name never overwrites an
+    // existing entry through this bootstrap cache.
+    let property_fields = |minted_for: Option<proto::EntityId>, backend: &str, value_type: &str, name: &str| {
+        vec![
+            ("minted_for", minted_for.map(Value::EntityId)),
+            ("name", Some(Value::String(name.to_owned()))),
+            ("backend", Some(Value::String(backend.to_owned()))),
+            ("value_type", Some(Value::String(value_type.to_owned()))),
+        ]
+    };
+    let property_attacks = [
+        property_fields(Some(proto::EntityId::from_bytes([0x6E; 32])), &property.backend, &property.value_type, "poisoned_name"),
+        property_fields(None, &property.backend, &property.value_type, "poisoned_name"),
+        property_fields(property.minted_for, "lww", &property.value_type, "poisoned_name"),
+        property_fields(property.minted_for, &property.backend, "i64", "poisoned_name"),
+        // All identity fields match; only the mutable name differs. Still
+        // ignored: descriptor shipping fills missing entries only.
+        property_fields(property.minted_for, &property.backend, &property.value_type, "renamed_title"),
+    ];
+    for fields in property_attacks {
+        let attack = forged_state_with_real_genesis(&f.server, "_ankurah_property", property.id, fields).await?;
+        ship(attack).await?;
+        assert_eq!(f.client.catalog.property_by_id(&property.id), Some(property.clone()));
+    }
+
+    // The membership id cannot move either endpoint, and its mutable
+    // optionality is equally frozen against the bootstrap cache.
+    let membership_fields = |model_id: proto::EntityId, property_id: proto::EntityId, optional: bool| {
+        vec![
+            ("model", Some(Value::EntityId(model_id))),
+            ("property", Some(Value::EntityId(property_id))),
+            ("optional", Some(Value::Bool(optional))),
+        ]
+    };
+    let flipped = !membership.optional.unwrap_or(true);
+    let membership_attacks = [
+        membership_fields(proto::EntityId::from_bytes([0x6F; 32]), membership.property, flipped),
+        membership_fields(membership.model, proto::EntityId::from_bytes([0x70; 32]), flipped),
+        membership_fields(membership.model, membership.property, flipped),
+    ];
+    for fields in membership_attacks {
+        let attack = forged_state_with_real_genesis(&f.server, "_ankurah_model_property", membership.id, fields).await?;
+        ship(attack).await?;
+        assert_eq!(f.client.catalog.membership(&membership.model, &membership.property), Some(membership.clone()));
+    }
+
+    // A genuinely missing entry under a fresh self-certifying identity DOES
+    // fill: that is the bootstrap purpose of the envelope.
+    let (fresh_id, fresh_model) = forge_catalog_proof(
+        system,
+        "_ankurah_model",
+        vec![("collection", Some(Value::String("wire_fill".to_owned()))), ("name", Some(Value::String("WireFill".to_owned())))],
+    );
+    ship(fresh_model).await?;
+    assert_eq!(
+        f.client.catalog.model_by_collection("wire_fill").map(|def| def.id),
+        Some(fresh_id),
+        "a missing descriptor with a valid proof fills the cache"
+    );
+
+    Ok(())
 }
 
 // ===========================================================================
@@ -276,9 +525,7 @@ async fn malformed_clock_identity_is_order_independent_end_to_end() -> Result<()
             parent: head0.clone(),
         }
     };
-    f.client
-        .handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, f.record_model, vec![ev_b.clone(), ev_c.clone()])]))
-        .await?;
+    f.client.handle_message(f.delivery(vec![event_only_multi(rec_id, f.record_model, vec![ev_b.clone(), ev_c.clone()])])).await?;
 
     // The head is now the antichain {ev_b, ev_c}. Build a merge event whose
     // parent lists those two ids in two different orders; both must hash equal.
@@ -290,7 +537,7 @@ async fn malformed_clock_identity_is_order_independent_end_to_end() -> Result<()
     assert_eq!(ev_merge_a.id(), ev_merge_b.id(), "parent-clock input order must not change event identity");
 
     // Deliver the merge event; the resulting head is a single valid tip.
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(ev_merge_a.clone())])).await?;
+    f.client.handle_message(f.delivery(vec![event_only_item(ev_merge_a.clone())])).await?;
     let head = view.entity().head();
     assert_eq!(head.len(), 1, "merge collapses the antichain to one tip");
     assert!(head.contains(&ev_merge_a.id()), "the merge event is the head");
@@ -324,7 +571,7 @@ async fn forged_dangling_parent_is_contained() -> Result<()> {
     let id_forged = ev_b_forged.id();
 
     // handle_message returns Ok; the per-item failure rides the ack path.
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(ev_a), event_only_item(ev_b_forged)])).await?;
+    f.client.handle_message(f.delivery(vec![event_only_item(ev_a), event_only_item(ev_b_forged)])).await?;
 
     // A applied; B is unchanged, its head did not move, the forged event is not
     // committed, and B's real state survives.
@@ -361,7 +608,7 @@ async fn forged_extra_genesis_head_does_not_trigger_wholesale_adoption() -> Resu
     // security property is: the legitimate child's write is not lost, and the
     // foreign root does not get adopted as the sole head (which would discard
     // the real genesis lineage).
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, f.record_model, vec![ev_b, ev_x])])).await?;
+    f.client.handle_message(f.delivery(vec![event_only_multi(rec_id, f.record_model, vec![ev_b, ev_x])])).await?;
 
     let head = view.entity().head();
     // The original genesis lineage must not have been wholesale-replaced by the
@@ -443,7 +690,7 @@ async fn fabricated_cycle_batch_is_contained() -> Result<()> {
     let id1 = ev1.id();
     let id2 = ev2.id();
 
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, f.record_model, vec![ev1, ev2])])).await?;
+    f.client.handle_message(f.delivery(vec![event_only_multi(rec_id, f.record_model, vec![ev1, ev2])])).await?;
 
     // Neither fabricated-parent event grounds (their parents do not exist), so
     // the entity is unchanged and no fabricated event enters the head.
@@ -478,13 +725,11 @@ async fn replay_flood_is_idempotent() -> Result<()> {
 
     // Flood: 10 identical single-event deliveries, none may error.
     for _ in 0..10 {
-        f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(ev.clone())])).await?;
+        f.client.handle_message(f.delivery(vec![event_only_item(ev.clone())])).await?;
     }
     // And the same event redelivered inside a multi-event batch alongside
     // itself (duplicate within one item), out of order.
-    f.client
-        .handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, f.record_model, vec![ev.clone(), ev.clone()])]))
-        .await?;
+    f.client.handle_message(f.delivery(vec![event_only_multi(rec_id, f.record_model, vec![ev.clone(), ev.clone()])])).await?;
 
     assert_eq!(view.title().unwrap(), "t1", "state reflects exactly one application");
     let head = view.entity().head();
@@ -519,7 +764,8 @@ async fn forged_second_genesis_rejected_on_durable_node() -> Result<()> {
     let alt = forge_mismatched_genesis(rec_id, f.record_model, f.record_title, "ALT-GENESIS", 0xA1);
     assert!(alt.is_entity_create(), "alt is a creation event");
     let alt_id = alt.id();
-    f.server.handle_message(deliver(f.client.id, f.server.id, vec![event_only_item(alt)])).await?;
+    let result = f.server.commit_remote_transaction(&c, proto::TransactionId::new(), vec![Attested::opt(alt, None)]).await;
+    assert!(result.is_err(), "the durable apply path must reject a second genesis");
 
     // The durable node rejected it (Disjoint): the committed event set is
     // unchanged and the alt genesis is not present.
@@ -546,7 +792,7 @@ async fn forged_second_genesis_rejected_on_ephemeral_node() -> Result<()> {
 
     let alt = forge_mismatched_genesis(rec_id, f.record_model, f.record_title, "ALT-EPH", 0xA2);
     let alt_id = alt.id();
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(alt)])).await?;
+    f.client.handle_message(f.delivery(vec![event_only_item(alt)])).await?;
 
     assert_eq!(view.title().unwrap(), "t0", "ephemeral node must not adopt the forged genesis' value");
     let head_after = view.entity().head();
@@ -576,7 +822,7 @@ async fn phantom_entity_is_evicted_on_failed_apply() -> Result<()> {
         "ghost",
     );
 
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(ev_a), event_only_item(ev_unknown)])).await?;
+    f.client.handle_message(f.delivery(vec![event_only_item(ev_a), event_only_item(ev_unknown)])).await?;
 
     assert_eq!(view_a.title().unwrap(), "a1", "sibling valid item applies");
     // The phantom empty-head resident was evicted: get() forces a retrieval
@@ -625,7 +871,7 @@ async fn oversized_event_batch_is_rejected() -> Result<()> {
     // handle_message returns Ok regardless (error rides the ack path); the
     // observable expectation once #246 lands is that NOTHING from an oversized
     // batch is committed. Today many events commit, so this assertion fails.
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, f.record_model, events)])).await?;
+    f.client.handle_message(f.delivery(vec![event_only_multi(rec_id, f.record_model, events)])).await?;
     let after = committed_event_ids(&f.ctx_c, rec_id).await?.len();
 
     assert_eq!(after, before, "an oversized batch must be rejected wholesale, committing nothing (G-3, #246)");
@@ -728,7 +974,7 @@ impl PolicyAgent for BfsPolicyAgent {
         _id: &proto::EntityId,
         _collection: &proto::CollectionId,
         _state: &proto::State,
-        _resolver: Option<std::sync::Weak<dyn ankurah::core::property::PropertyResolver>>,
+        _resolver: Option<std::sync::Weak<dyn ankurah::core::schema::CatalogResolver>>,
     ) -> Result<(), AccessDenied>
     where
         C: Iterable<Self::ContextData>,
@@ -814,11 +1060,13 @@ async fn bfs_fetched_events_are_policy_validated() -> Result<()> {
         .handle_message(deliver(
             server.id,
             client.id,
+            _relay.query_id(),
             vec![proto::SubscriptionUpdateItem {
                 entity_id: record_id,
                 model,
                 content: proto::UpdateContent::StateAndEvent(proto::StateWithGenesis { genesis, state: latest }, vec![]),
                 predicate_relevance: vec![],
+                source_queries: vec![],
             }],
         ))
         .await?;
@@ -863,7 +1111,7 @@ async fn equivocation_flood_antichain_is_bounded() -> Result<()> {
     let siblings: Vec<proto::Event> =
         (0..FLOOD).map(|i| forge_title_event(rec_id, f.record_model, f.record_title, head0.clone(), &format!("equiv-{i}"))).collect();
     for ev in siblings {
-        f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(ev)])).await?;
+        f.client.handle_message(f.delivery(vec![event_only_item(ev)])).await?;
     }
 
     // A finite cap (whatever #246 chooses) would keep the head far below the

@@ -20,8 +20,10 @@ pub mod catalog;
 pub mod local;
 pub mod registration;
 pub mod resolve;
+mod resolver;
 
 pub use local::{registration_request, FieldSchema, ModelSchema};
+pub use resolver::CatalogResolver;
 
 use crate::property::PropertyError;
 use crate::value::ValueType;
@@ -57,6 +59,13 @@ pub fn model_property_collection() -> CollectionId { CollectionId::fixed_name(MO
 pub fn is_catalog_collection(id: &CollectionId) -> bool {
     let s = id.as_str();
     s == MODEL_COLLECTION_ID || s == PROPERTY_COLLECTION_ID || s == MODEL_PROPERTY_COLLECTION_ID
+}
+
+/// Whether `id` names one of Ankurah's built-in collections. Built-ins are
+/// the only collections permitted under [`RESERVED_COLLECTION_PREFIX`] and
+/// cannot be mutated through ordinary user transactions.
+pub fn is_protected_collection(id: &CollectionId) -> bool {
+    id.as_str() == crate::system::SYSTEM_COLLECTION_ID || is_catalog_collection(id)
 }
 
 /// Well-known (reserved) model-definition entity ids for the system and

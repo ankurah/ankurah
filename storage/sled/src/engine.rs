@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use ankurah_core::{
     error::{MutationError, RetrievalError},
-    property::PropertyResolver,
+    schema::CatalogResolver,
     storage::{StorageCollection, StorageEngine, SystemRootClaim},
 };
 use ankurah_proto::{CollectionId, SystemRootProof};
@@ -23,10 +23,10 @@ fn decode_root_claim(bytes: &[u8]) -> Result<SystemRootProof, bincode::Error> { 
 pub struct SledStorageEngine {
     pub database: Mutex<Arc<Database>>,
     /// The catalog resolver, injected post-construction by `Node` (see
-    /// `StorageEngine::set_property_resolver`). Lives on the engine -- not on
+    /// `StorageEngine::set_catalog_resolver`). Lives on the engine -- not on
     /// [`Database`] -- so a hard reset (which recreates the `Database`) keeps
     /// it; buckets get a clone at creation.
-    pub(crate) resolver: Arc<std::sync::RwLock<Option<std::sync::Weak<dyn PropertyResolver>>>>,
+    pub(crate) resolver: Arc<std::sync::RwLock<Option<std::sync::Weak<dyn CatalogResolver>>>>,
     #[cfg(debug_assertions)]
     pub prefix_guard_disabled: Arc<AtomicBool>,
 }
@@ -120,7 +120,7 @@ impl StorageEngine for SledStorageEngine {
         )))
     }
 
-    fn set_property_resolver(&self, resolver: std::sync::Weak<dyn PropertyResolver>) { *self.resolver.write().unwrap() = Some(resolver); }
+    fn set_catalog_resolver(&self, resolver: std::sync::Weak<dyn CatalogResolver>) { *self.resolver.write().unwrap() = Some(resolver); }
 
     async fn claim_system_root(&self, candidate: &SystemRootProof) -> Result<SystemRootClaim, MutationError> {
         let database = self.database.lock().unwrap().clone();

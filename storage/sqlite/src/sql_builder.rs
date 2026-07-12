@@ -183,7 +183,9 @@ impl SqlBuilder {
             Expr::Path(path) => self.path_steps_sql(&path.steps),
             // A resolved Identifier renders exactly like the equivalent Path with
             // steps [name, ..subpath]: a column reference, or json_extract() for a
-            // JSON sub-path. Phase A: the resolved name is the SQLite column.
+            // JSON sub-path. The resolved display name addresses the physical
+            // SQLite column; the property id remains available to the planner
+            // and column map.
             Expr::Identifier(identifier) => self.path_steps_sql(&identifier.path_steps()),
             Expr::ExprList(exprs) => {
                 self.push_sql("(");

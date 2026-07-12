@@ -434,6 +434,7 @@ dependencies = [
  "futures",
  "serde",
  "sled",
+ "tempfile",
  "thiserror 2.0.17",
  "tokio",
  "tracing",

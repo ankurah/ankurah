@@ -247,7 +247,7 @@ impl PolicyAgent for JwtAgent {
         id: &proto::EntityId,
         collection: &proto::CollectionId,
         state: &proto::State,
-        resolver: Option<std::sync::Weak<dyn ankurah_core::property::PropertyResolver>>,
+        resolver: Option<std::sync::Weak<dyn ankurah_core::schema::CatalogResolver>>,
     ) -> Result<(), AccessDenied>
     where
         C: Iterable<Self::ContextData>,

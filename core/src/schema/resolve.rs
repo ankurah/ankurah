@@ -1,4 +1,5 @@
-//! The resolution pass: `PathExpr` -> `Identifier` (RFC 5.3 in specs/model-property-metadata/rfc.md, AC4/AC5).
+//! The resolution pass: `PathExpr` -> `Identifier` (RFC 5.3 in
+//! specs/model-property-metadata/rfc.md).
 //!
 //! Resolution binds a property reference's first step against the catalog
 //! map, producing the resolved `Expr::Identifier` form and failing CLOSED
@@ -16,6 +17,9 @@
 //! `OrderByItem`s retain their ids while refreshing renamed display paths).
 //!
 //! Special cases:
+//! - The frozen system/catalog bootstrap schemas remain name-keyed, so their
+//!   selections retain `PathExpr` references rather than consulting the
+//!   catalog for property identities it deliberately does not define.
 //! - `id` is the entity-id pseudo-property, not a catalog property: it
 //!   stays a `PathExpr` untouched.
 //! - The legacy collection-qualified form (`album.name` queried against
@@ -39,13 +43,11 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    /// Resolve a selection with the Phase A CATALOG-LAG DEFERRAL rule (RFC
-    /// 5.5): attempt [`resolve_selection`]; if it fails `UnknownProperty`
-    /// only because the catalog is not warm yet, warm it and retry ONCE,
-    /// then propagate. Rev 4: ids exist only in the catalog and its
-    /// registration responses (the compiled-schema overlay is gone), so
-    /// resolution is the point where a cold catalog must actually get
-    /// warmed:
+    /// Resolve a selection after admitting its exact compiled model shape.
+    /// Typed query origins pass `schema`; internal or already-resolved fetches
+    /// pass `None`. Registration happens before name resolution so a catalog
+    /// property that merely shares the requested spelling cannot bypass the
+    /// declaring model's compatibility check.
     ///
     /// - DURABLE node: the storage warm always completes; await readiness.
     /// - EPHEMERAL node with `cdata`: the subscription may never have been
@@ -55,187 +57,71 @@ where
     ///   catalog is still not ready afterwards (no durable peer, subscribe
     ///   failed), FAIL CLOSED rather than wait for a warm that cannot
     ///   arrive.
-    /// - EPHEMERAL node without `cdata` (the update path of an
-    ///   already-registered query): the original subscribe already kicked
-    ///   the catalog, so awaiting readiness is bounded.
+    /// - Node without `cdata` (the update path of an already-admitted typed
+    ///   query): the retained exact binding is the admission proof. Resolve
+    ///   from the state already held locally; an unknown property fails
+    ///   immediately because this path cannot initiate a policy-aware warm.
     ///
-    /// If the WARM catalog still cannot resolve the reference and the
-    /// binary carries a compiled schema for the collection, the model
-    /// REGISTERS AT FIRST USE ([`Self::register_first_use`], REN 2 revised)
-    /// and resolution retries against the authoritative rows fed by the
-    /// response. The catalog map is a CACHE; registration is the source of
-    /// truth and the doubt-resolver. When registration cannot run either
-    /// (policy denial, no durable peer), the miss surfaces LOUD as
-    /// [`PropertyError::UnregisteredCollection`] -- callers error rather
-    /// than idle.
-    ///
-    /// Any other error propagates without waiting (fail closed, AC5).
+    /// A registration response feeds the catalog map directly, so an
+    /// ephemeral query can still resolve even if its background catalog
+    /// subscription is unavailable. A reference absent after the one warm
+    /// attempt is an ordinary `UnknownProperty` error.
     pub async fn resolve_selection_deferred(
         &self,
         node: &crate::node::Node<SE, PA>,
         cdata: Option<&PA::ContextData>,
         collection: &CollectionId,
+        schema: Option<&'static crate::schema::ModelSchema>,
         selection: &Selection,
     ) -> Result<Selection, PropertyError> {
-        let generation = node.entities.system_generation();
-        self.resolve_selection_deferred_in_generation(node, cdata, collection, selection, &generation).await
-    }
-
-    /// Generation-pinned form used when an outer operation (such as
-    /// `Context::fetch_entities`) already captured its exact token before
-    /// entering predicate resolution.
-    pub(crate) async fn resolve_selection_deferred_in_generation(
-        &self,
-        node: &crate::node::Node<SE, PA>,
-        cdata: Option<&PA::ContextData>,
-        collection: &CollectionId,
-        selection: &Selection,
-        generation: &Arc<AtomicBool>,
-    ) -> Result<Selection, PropertyError> {
-        // Predicate first-use is an operation in the same sense as a
-        // transaction: every retry belongs to the system generation in
-        // which resolution began, even if catalog warm-up or registration
-        // awaits a peer and a reset completes meanwhile.
-        match self.resolve_selection_in_generation(node, generation, collection, selection).await {
-            Ok(resolved) => Ok(resolved),
-            Err(PropertyError::UnknownProperty { collection: c, name }) => {
-                if !self.is_catalog_ready() {
-                    if self.is_durable() {
-                        // The storage warm is in flight and always completes.
-                        self.wait_catalog_ready_in_generation(node, generation).await.map_err(|_| PropertyError::SystemReset)?;
-                    } else if let Some(cdata) = cdata {
-                        self.ensure_subscribed(cdata.clone(), node).await;
-                        if !self.is_catalog_ready() {
-                            // The kick could not warm the catalog (offline or
-                            // subscribe failure). First-use registration may
-                            // still succeed -- it needs a durable peer, not a
-                            // working subscription -- and its response feeds
-                            // the map directly. Otherwise classify exactly as
-                            // the warm path does: a compiled-but-unregisterable
-                            // collection surfaces the loud UnregisteredCollection
-                            // error (RFC 5.3), anything else fails closed.
-                            if self.register_first_use(node, Some(cdata), collection, generation).await? {
-                                return match self.resolve_selection_in_generation(node, generation, collection, selection).await {
-                                    Err(PropertyError::UnknownProperty { collection: c, name }) => {
-                                        Err(self.classify_unknown(collection, c, name))
-                                    }
-                                    other => other,
-                                };
-                            }
-                            return Err(self.classify_unknown(collection, c, name));
-                        }
+        if let Some(schema) = schema {
+            if let Some(cdata) = cdata {
+                self.ensure_schema_for_use(node, cdata, schema).await.map_err(|error| {
+                    if self.model_by_collection(schema.collection).is_none() {
+                        PropertyError::UnregisteredCollection { collection: schema.collection.to_string() }
                     } else {
-                        self.wait_catalog_ready_in_generation(node, generation).await.map_err(|_| PropertyError::SystemReset)?;
+                        PropertyError::RetrievalError(crate::error::RetrievalError::Other(error.to_string()))
                     }
-                }
-                match self.resolve_selection_in_generation(node, generation, collection, selection).await {
-                    Err(PropertyError::UnknownProperty { collection: c, name }) => {
-                        // Warm catalog, still unresolvable. First-use
-                        // registration (REN 2 revised, plan decision 25b): a
-                        // compiled model registers at first use -- an
-                        // idempotent upsert that no-ops (zero events, policy
-                        // verb skipped) when the catalog already carries the
-                        // schema -- so a replica lagging the authority learns
-                        // the rows synchronously from the response. If no
-                        // registration is possible (no cdata, no compiled
-                        // schema, already ensured, denied, offline), classify:
-                        // a real unknown reference fails closed, and a
-                        // compiled-but-unregisterable collection surfaces as
-                        // the loud UnregisteredCollection error.
-                        if self.register_first_use(node, cdata, collection, generation).await? {
-                            return match self.resolve_selection_in_generation(node, generation, collection, selection).await {
-                                Err(PropertyError::UnknownProperty { collection: c, name }) => {
-                                    Err(self.classify_unknown(collection, c, name))
-                                }
-                                other => other,
-                            };
-                        }
-                        Err(self.classify_unknown(collection, c, name))
-                    }
-                    other => other,
-                }
-            }
-            Err(other) => Err(other),
-        }
-    }
-
-    /// Resolve while holding a short exact-generation lease. The lease never
-    /// spans catalog warm-up or peer I/O; each retry reacquires it, turning a
-    /// reset during an await into `SystemReset` rather than an ABA read from
-    /// a newly populated catalog map.
-    async fn resolve_selection_in_generation(
-        &self,
-        node: &crate::node::Node<SE, PA>,
-        generation: &Arc<AtomicBool>,
-        collection: &CollectionId,
-        selection: &Selection,
-    ) -> Result<Selection, PropertyError> {
-        let _generation_guard = node.system.guard_generation(generation).await.map_err(|_| PropertyError::SystemReset)?;
-        self.resolve_selection(collection, selection)
-    }
-
-    /// Attempt first-use registration of `collection`'s compiled schema
-    /// (rev 4 + REN 2 revision: reads may trigger the idempotent
-    /// registration upsert; an existing schema is a no-op plan that emits
-    /// nothing and skips the policy verb). Returns true only when a
-    /// registration ran and the map was fed, so the caller should
-    /// re-resolve. Returns false when no attempt applies (no cdata on this
-    /// path, no compiled schema, or that compiled shape is already ensured this
-    /// process) or the attempt failed (policy denial, no durable peer) --
-    /// those surface as `UnregisteredCollection` via `classify_unknown`.
-    async fn register_first_use(
-        &self,
-        node: &crate::node::Node<SE, PA>,
-        cdata: Option<&PA::ContextData>,
-        collection: &CollectionId,
-        generation: &Arc<AtomicBool>,
-    ) -> Result<bool, PropertyError> {
-        let Some(cdata) = cdata else { return Ok(false) };
-        let schemas = {
-            let _generation_guard = node.system.guard_generation(generation).await.map_err(|_| PropertyError::SystemReset)?;
-            self.unensured_schemas_for(collection.as_str())
-        };
-        if schemas.is_empty() {
-            let _generation_guard = node.system.guard_generation(generation).await.map_err(|_| PropertyError::SystemReset)?;
-            return Ok(false);
-        }
-        let mut registered_any = false;
-        for schema in schemas {
-            match self.ensure_registered_in_generation(node, cdata, schema, generation).await {
-                Ok(()) => registered_any = true,
-                Err(crate::schema::registration::RegistrationError::Mutation(crate::error::MutationError::SystemReset)) => {
-                    return Err(PropertyError::SystemReset);
-                }
-                Err(e) => {
-                    tracing::debug!("first-use registration of '{}' failed; unresolved references still surface loud: {}", collection, e);
-                }
+                })?;
+            } else if !self.has_schema_binding(schema) {
+                return Err(PropertyError::UnregisteredCollection { collection: schema.collection.to_string() });
             }
         }
-        let _generation_guard = node.system.guard_generation(generation).await.map_err(|_| PropertyError::SystemReset)?;
-        Ok(registered_any)
-    }
 
-    /// Classify an `UnknownProperty` from a WARM catalog (rev 4, RFC 5.3):
-    /// if the queried collection has no model in the catalog but this
-    /// binary carries a compiled schema for it, the reference failed
-    /// DESPITE first-use registration being the resolution path --
-    /// registration was denied or unreachable -- and the caller surfaces
-    /// `UnregisteredCollection` as a loud, actionable error. Anything else
-    /// is a genuinely unresolvable reference: fail closed (AC5).
-    fn classify_unknown(&self, collection: &CollectionId, c: String, name: String) -> PropertyError {
-        if self.model_by_collection(collection.as_str()).is_none() && self.has_compiled(collection.as_str()) {
-            PropertyError::UnregisteredCollection { collection: c }
+        match self.resolve_selection(collection, selection) {
+            Ok(resolved) => return Ok(resolved),
+            Err(error @ PropertyError::UnknownProperty { .. }) if schema.is_some() && cdata.is_none() => return Err(error),
+            Err(PropertyError::UnknownProperty { .. }) if !self.is_catalog_ready() => {}
+            Err(other) => return Err(other),
+        }
+
+        if self.is_durable() {
+            self.wait_catalog_ready().await;
+        } else if let Some(cdata) = cdata {
+            self.ensure_subscribed(cdata.clone(), node).await;
         } else {
-            PropertyError::UnknownProperty { collection: c, name }
+            self.wait_catalog_ready().await;
         }
+
+        self.resolve_selection(collection, selection)
     }
 
     /// Resolve every property reference in `selection` against the catalog
     /// for `collection`. Errors with `UnknownProperty` on the first
-    /// reference nothing defines (fail closed, AC5). Already-resolved
+    /// reference nothing defines (fail closed). Already-resolved
     /// `Identifier` expressions pass through untouched, so the pass is
     /// idempotent.
     pub fn resolve_selection(&self, collection: &CollectionId, selection: &Selection) -> Result<Selection, PropertyError> {
+        // The system collection and the metadata catalog are the bootstrap
+        // base case: their frozen schemas stay name-keyed and deliberately
+        // have no property-definition entities of their own (RFC section 4).
+        // Leaving their paths untouched also lets a PolicyAgent add a
+        // property-based catalog filter without recursively trying to warm the
+        // catalog that filter is meant to read.
+        if collection.as_str() == crate::system::SYSTEM_COLLECTION_ID || crate::schema::is_catalog_collection(collection) {
+            return Ok(selection.clone());
+        }
+
         let order_by = match &selection.order_by {
             Some(items) => Some(items.iter().map(|item| self.resolve_order_by(collection, item)).collect::<Result<Vec<_>, _>>()?),
             None => None,

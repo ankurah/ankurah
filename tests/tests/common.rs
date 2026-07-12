@@ -95,7 +95,38 @@ impl MessageGate {
         SE: ankurah::core::storage::StorageEngine + Send + Sync + 'static,
         PA: ankurah::policy::PolicyAgent + Send + Sync + 'static,
     {
-        let drained: Vec<_> = { self.held.lock().unwrap().drain(..).collect() };
+        self.release_first(node, usize::MAX).await;
+    }
+
+    /// Release at most the first `count` held messages, preserving arrival
+    /// order and leaving later generations gated.
+    pub async fn release_first<SE, PA>(&self, node: &Node<SE, PA>, count: usize)
+    where
+        SE: ankurah::core::storage::StorageEngine + Send + Sync + 'static,
+        PA: ankurah::policy::PolicyAgent + Send + Sync + 'static,
+    {
+        let drained: Vec<_> = {
+            let mut held = self.held.lock().unwrap();
+            let count = count.min(held.len());
+            held.drain(..count).collect()
+        };
+        for message in drained {
+            let _ = node.handle_verified_peer_message(message).await;
+        }
+    }
+
+    /// Release at most the last `count` held messages, preserving their
+    /// arrival order and leaving earlier generations gated.
+    pub async fn release_last<SE, PA>(&self, node: &Node<SE, PA>, count: usize)
+    where
+        SE: ankurah::core::storage::StorageEngine + Send + Sync + 'static,
+        PA: ankurah::policy::PolicyAgent + Send + Sync + 'static,
+    {
+        let drained: Vec<_> = {
+            let mut held = self.held.lock().unwrap();
+            let start = held.len().saturating_sub(count);
+            held.drain(start..).collect()
+        };
         for message in drained {
             let _ = node.handle_verified_peer_message(message).await;
         }
@@ -117,6 +148,23 @@ impl GatedConnection {
         gated: &Node<SE2, PA2>,
         filter: impl Fn(&proto::NodeMessage) -> bool + Send + Sync + 'static,
     ) -> (Self, MessageGate)
+    where
+        SE1: ankurah::core::storage::StorageEngine + Send + Sync + 'static,
+        PA1: ankurah::policy::PolicyAgent + Send + Sync + 'static,
+        SE2: ankurah::core::storage::StorageEngine + Send + Sync + 'static,
+        PA2: ankurah::policy::PolicyAgent + Send + Sync + 'static,
+    {
+        let gate = MessageGate { filter: Arc::new(filter), held: Arc::new(Mutex::new(Vec::new())) };
+        let connection = Self::new_with_gate(other, gated, gate.clone());
+        (connection, gate)
+    }
+
+    /// Re-handshake `other` <-> `gated` on a fresh transport that shares an
+    /// existing gate (filter, held queue, and any counters captured by the
+    /// filter). Reset tests use this to rejoin the same authority after a
+    /// hard reset closed the previous sessions, while keeping the messages
+    /// held from the old generation observable.
+    pub fn new_with_gate<SE1, PA1, SE2, PA2>(other: &Node<SE1, PA1>, gated: &Node<SE2, PA2>, gate: MessageGate) -> Self
     where
         SE1: ankurah::core::storage::StorageEngine + Send + Sync + 'static,
         PA1: ankurah::policy::PolicyAgent + Send + Sync + 'static,
@@ -147,7 +195,6 @@ impl GatedConnection {
             )
             .expect("other peer has a valid signed presence");
 
-        let gate = MessageGate { filter: Arc::new(filter), held: Arc::new(Mutex::new(Vec::new())) };
         let other_id = other.id;
         let gated_id = gated.id;
 
@@ -184,7 +231,7 @@ impl GatedConnection {
             })
         };
 
-        (Self { task_a, task_b }, gate)
+        Self { task_a, task_b }
     }
 }
 

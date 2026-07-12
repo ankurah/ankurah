@@ -87,11 +87,23 @@ impl<T: Property> LWW<T> {
         }
     }
 
-    /// The stored value: `Some` present, `None` absent, via the generic
-    /// resolved-property dispatch ([`crate::property::read_resolved`]).
+    /// The stored value: `Some` present, `None` absent. An ordinary field's
+    /// transaction-local staged write overlays the generic resolved-property
+    /// dispatch ([`crate::property::read_resolved`]); committed reads retain
+    /// the dispatcher's authoritative Id-then-legacy-Name ordering.
     pub fn stored_value(&self) -> Option<Value> {
         if !self.entity.is_system_alive() {
             return None;
+        }
+        // Ordinary accessors stage under their compiled name until commit can
+        // confirm and re-key the write. Give only that transaction-local
+        // write precedence here so `set` followed by `get` observes the new
+        // value (including a clear). A committed Name entry is legacy residue
+        // and must never override a present Id entry or Id tombstone.
+        if self.property_id.is_none() {
+            if let Some(value) = self.backend.uncommitted_entry(&self.staging_key()) {
+                return value;
+            }
         }
         match self.addressed_key() {
             PropertyKey::Id(id) => crate::property::read_resolved(self.backend.as_ref(), id, &self.property_name),

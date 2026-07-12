@@ -7,9 +7,9 @@ use std::sync::Arc;
 use ankurah_core::entity::TemporaryEntity;
 use ankurah_core::error::{MutationError, RetrievalError};
 use ankurah_core::property::backend::backend_from_string;
-use ankurah_core::property::{PropertyKey, PropertyResolver};
 use ankurah_core::selection::filter::evaluate_predicate;
 use ankurah_core::storage::{naming, StorageCollection, StorageEngine, SystemRootClaim};
+use ankurah_core::{property::PropertyKey, schema::CatalogResolver};
 use ankurah_proto::{
     AttestationSet, Attested, Clock, CollectionId, EntityId, EntityState, Event, EventBody, EventId, State, StateBuffers, SystemRootProof,
 };
@@ -31,9 +31,9 @@ const SYSTEM_ROOT_CLAIM_KEY: &str = "system_root";
 pub struct SqliteStorageEngine {
     pool: bb8::Pool<SqliteConnectionManager>,
     /// The catalog resolver, injected post-construction by `Node` (see
-    /// `StorageEngine::set_property_resolver`). Shared with every bucket:
+    /// `StorageEngine::set_catalog_resolver`). Shared with every bucket:
     /// the name SOURCE for the engine-owned durable id-to-column map.
-    resolver: Arc<std::sync::RwLock<Option<std::sync::Weak<dyn PropertyResolver>>>>,
+    resolver: Arc<std::sync::RwLock<Option<std::sync::Weak<dyn CatalogResolver>>>>,
 }
 
 impl SqliteStorageEngine {
@@ -103,7 +103,7 @@ impl StorageEngine for SqliteStorageEngine {
         Ok(Arc::new(bucket))
     }
 
-    fn set_property_resolver(&self, resolver: std::sync::Weak<dyn PropertyResolver>) {
+    fn set_catalog_resolver(&self, resolver: std::sync::Weak<dyn CatalogResolver>) {
         *self.resolver.write().expect("RwLock poisoned") = Some(resolver);
     }
 
@@ -187,9 +187,9 @@ impl StorageEngine for SqliteStorageEngine {
         .map_err(|e| MutationError::General(Box::new(e)))
     }
 
-    /// Non-creating collection discovery (the trait default returns nothing,
-    /// which would make a durable node warm an empty catalog on restart --
-    /// Codex F3). A collection's state table is named exactly its id
+    /// Non-creating collection discovery. The trait default returns nothing,
+    /// which would make a durable node warm an empty catalog on restart. A
+    /// collection's state table is named exactly its id
     /// (`create_state_table`), paired with an `{id}_event` companion; the
     /// engine-wide `_ankurah_property_columns` map and sqlite's own tables are
     /// the only other tables. So a table is a collection iff its `{name}_event`
@@ -308,7 +308,7 @@ pub struct SqliteBucket {
     ddl_lock: Arc<tokio::sync::Mutex<()>>,
     /// The injected catalog resolver (shared with the engine): the NAME SOURCE
     /// for [`Self::column_for_key`]. Weak so storage never keeps the node alive.
-    resolver: Arc<std::sync::RwLock<Option<std::sync::Weak<dyn PropertyResolver>>>>,
+    resolver: Arc<std::sync::RwLock<Option<std::sync::Weak<dyn CatalogResolver>>>>,
     /// This collection's slice of the engine-owned durable id-to-column map
     /// (the `_ankurah_property_columns` table), cached. The map -- not the
     /// display name -- is what addresses a property's column once assigned:
@@ -324,7 +324,7 @@ impl SqliteBucket {
     fn new(
         pool: bb8::Pool<SqliteConnectionManager>,
         collection_id: CollectionId,
-        resolver: Arc<std::sync::RwLock<Option<std::sync::Weak<dyn PropertyResolver>>>>,
+        resolver: Arc<std::sync::RwLock<Option<std::sync::Weak<dyn CatalogResolver>>>>,
     ) -> Self {
         let state_table_name = collection_id.as_str().to_string();
         let event_table_name = format!("{}_event", collection_id.as_str());

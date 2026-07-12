@@ -18,7 +18,7 @@ ankurah-connector-local-process = { path = "../connectors/local-process", versio
 ankurah-websocket-client = { path = "../connectors/websocket-client", version = "=0.9.0" }
 ankurah-websocket-server = { path = "../connectors/websocket-server", version = "=0.9.0" }
 ankurah-storage-common = { path = "../storage/common", version = "=0.9.0" }
-tokio = { version = "1.40", features = ["full"] }
+tokio = { version = "1.40", features = ["full", "test-util"] }
 tracing-subscriber = "0.3"
 ctor = "0.2"
 wasm-bindgen = "0"

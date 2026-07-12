@@ -98,8 +98,9 @@ impl NodeApplier {
         let mut attested_events = Vec::new();
         for fragment in event_fragments {
             let attested_event: Attested<proto::Event> = (entity_id, model, fragment).into();
-            // Relayed catalog events are trusted FROM THE SERVING PEER the
-            // way every other served event is (RFC section 4 in specs/model-property-metadata/rfc.md, rev 4). The
+            // Relayed catalog events are trusted from the serving peer the
+            // way every other served event is (RFC section 4 in
+            // specs/model-property-metadata/rfc.md). The
             // structural write ban covers the transaction paths
             // (CommitTransaction and local commits); this ingest path has
             // no allocator-identity check -- in the single-allocator
@@ -131,7 +132,7 @@ impl NodeApplier {
         S: GetState + Send + Sync,
     {
         // TODO: do we actually need predicate_relevance?
-        let proto::SubscriptionUpdateItem { entity_id, model, content, predicate_relevance: _ } = update;
+        let proto::SubscriptionUpdateItem { entity_id, model, content, predicate_relevance: _, source_queries: _ } = update;
         let collection_id = node.resolve_model_wait(&model).await?;
         let collection = node.collections.get(&collection_id).await?;
 

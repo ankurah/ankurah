@@ -211,6 +211,34 @@ mod explicit_yrs_alias {
     }
 }
 
+mod explicitly_shared_name {
+    use super::*;
+
+    /// The deterministic DDL genesis id for the shared property (see
+    /// `offline_ordinary_field_does_not_capture_explicitly_shared_same_name`,
+    /// which asserts this literal equals the derived genesis id).
+    pub const SHARED_NAME_PROPERTY_ID: &str = "3Zn4o_3SVCBqOABAPGr1VuP3lL7JQZAOjSLRfntHMcg";
+
+    /// This collection deliberately shares a property minted in another
+    /// model's scope. The literal id is what makes that sharing intentional.
+    #[derive(Model, Debug, Serialize, Deserialize)]
+    pub struct SharedPlaylist {
+        #[property(id = "3Zn4o_3SVCBqOABAPGr1VuP3lL7JQZAOjSLRfntHMcg")]
+        pub name: String,
+    }
+}
+
+mod ordinary_same_name {
+    use super::*;
+
+    /// The same local shape without the explicit id is an ordinary allocator
+    /// request and must not inherit an explicitly shared property by name.
+    #[derive(Model, Debug, Serialize, Deserialize)]
+    pub struct SharedPlaylist {
+        pub name: String,
+    }
+}
+
 #[test]
 fn explicit_id_attributes_reflected() {
     let schema = DescBound::schema();
@@ -634,6 +662,79 @@ async fn explicit_id_drives_derived_access_and_query_aliases() -> anyhow::Result
     Ok(())
 }
 
+/// A membership can intentionally share a property minted for another model,
+/// but that membership does not turn the property into an ordinary by-name
+/// allocation in the receiving model's scope. In particular, the no-peer
+/// fallback must not mistake the shared membership for proof that an ordinary
+/// compiled field is fully bound.
+#[tokio::test]
+async fn offline_ordinary_field_does_not_capture_explicitly_shared_same_name() -> anyhow::Result<()> {
+    let property_id = EntityId::from_base64(explicitly_shared_name::SHARED_NAME_PROPERTY_ID)?;
+    let foreign_minting_model = EntityId::from_bytes([0xA4; 32]);
+    let server = deterministic_system_setup().await?;
+    server.catalog.wait_catalog_ready().await;
+    let system = server.system.root_id().expect("deterministic system is ready");
+
+    let shared_property_genesis = catalog_genesis(system, 0x24, 1_700_000_000_104);
+    assert_eq!(shared_property_genesis.entity_id, property_id, "compiled shared id matches deterministic DDL genesis");
+    let shared_property = catalog_lww_update(
+        "_ankurah_property",
+        property_id,
+        proto::Clock::from(vec![shared_property_genesis.id()]),
+        vec![
+            ("minted_for", Value::EntityId(foreign_minting_model)),
+            ("name", Value::String("name".into())),
+            ("backend", Value::String("yrs".into())),
+            ("value_type", Value::String("string".into())),
+        ],
+    );
+    server
+        .commit_remote_transaction(
+            &DEFAULT_CONTEXT,
+            proto::TransactionId::new(),
+            vec![proto::Attested::opt(shared_property_genesis, None), proto::Attested::opt(shared_property, None)],
+        )
+        .await?;
+    wait_property_name(&server, property_id, "name").await?;
+
+    let client = ephemeral_sled_setup().await?;
+    let connection = LocalProcessConnection::new(&server, &client).await?;
+    client.system.wait_system_ready().await;
+    let ctx = client.context_async(DEFAULT_CONTEXT).await;
+    ctx.register::<explicitly_shared_name::SharedPlaylist>().await?;
+
+    let receiving_model = client.catalog.model_by_collection("sharedplaylist").expect("receiving model registered").id;
+    assert_ne!(receiving_model, foreign_minting_model);
+    assert_eq!(client.catalog.property_by_id(&property_id).expect("shared property present").minted_for, Some(foreign_minting_model));
+    assert!(client.catalog.membership(&receiving_model, &property_id).is_some(), "explicit registration created the sharing membership");
+    assert_eq!(
+        client.catalog.resolve("sharedplaylist", "name"),
+        Some(property_id),
+        "the explicit compiled binding legitimately resolves the shared local alias"
+    );
+
+    drop(connection);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !client.get_durable_peers().is_empty() {
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("client still has a durable peer after disconnect");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let trx = ctx.begin();
+    let error = trx
+        .create(&ordinary_same_name::SharedPlaylist { name: "must not capture sharing".into() })
+        .await
+        .expect_err("ordinary offline fallback must require matching minting provenance");
+    assert!(
+        error.to_string().contains("unconfirmed schema"),
+        "expected the ordinary declaration to require allocator confirmation, got: {error}"
+    );
+
+    Ok(())
+}
+
 /// Yrs must resolve a new ordinary field before touching its CRDT document:
 /// unlike LWW, its root history cannot be re-keyed at commit. An ambiguity
 /// introduced after an ordinary entity was created therefore fails reads,
@@ -683,7 +784,14 @@ async fn yrs_ordinary_alias_ambiguity_never_uses_a_name_root() -> anyhow::Result
     };
     assert_eq!(ctx.get::<ordinary_yrs_alias::ClashingTextView>(ordinary_id).await?.local_text()?, "ordinary");
 
-    ctx.register::<explicit_yrs_alias::ClashingText>().await?;
+    let first_use_error = ctx
+        .fetch::<explicit_yrs_alias::ClashingTextView>("local_text = 'ordinary'")
+        .await
+        .expect_err("exact explicit-id first use must not resolve through the ordinary same-named binding");
+    assert!(
+        first_use_error.to_string().contains("unknown property 'local_text' in collection 'clashingtext'"),
+        "the newly admitted explicit binding must make the local alias ambiguous, got: {first_use_error}"
+    );
     assert_eq!(
         client.catalog.resolve("clashingtext", "local_text"),
         None,

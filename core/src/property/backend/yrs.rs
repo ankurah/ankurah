@@ -21,8 +21,8 @@ use crate::{
 /// `#`-prefixed base64 id (a leading `#` is illegal in a Rust field
 /// identifier and in a system-table property name, so it can never collide
 /// with a `Name` root); a `Name` key uses the bare name. yrs stores id-keyed
-/// like every other backend (the PropertyKey amendment on #289, overriding the
-/// old RFC 5.5 Phase C "yrs roots stay name-keyed" decision).
+/// like every other backend (the PropertyKey amendment on #289 superseded the
+/// earlier name-keyed-root design).
 fn root_name(key: &PropertyKey) -> String {
     match key {
         PropertyKey::Id(id) => format!("#{}", id.to_base64()),

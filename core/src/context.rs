@@ -65,32 +65,29 @@ pub trait TContext {
     fn get_resident_entity(&self, id: proto::EntityId) -> Option<Entity>;
     async fn fetch_entities(&self, collection: &proto::CollectionId, args: MatchArgs) -> Result<Vec<Entity>, RetrievalError>;
     async fn commit_local_trx(&self, trx: &Transaction) -> Result<Vec<Event>, MutationError>;
-    fn query(&self, collection_id: proto::CollectionId, args: MatchArgs) -> Result<EntityLiveQuery, RetrievalError>;
+    fn query(
+        &self,
+        collection_id: proto::CollectionId,
+        schema: &'static crate::schema::ModelSchema,
+        args: MatchArgs,
+    ) -> Result<EntityLiveQuery, RetrievalError>;
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError>;
     /// RFC 5.2 (specs/model-property-metadata/rfc.md) model first-use registration, object-safe so the mutating
     /// transaction paths (`create`/`edit`) can trigger it without the
-    /// concrete `<SE, PA>`. Discriminates per plan decision 16 (rev 4): a
-    /// failed reassertion may warn and proceed only when every field in this
-    /// exact compiled shape already has a compatible canonical binding. A
-    /// never-registered collection, missing field, or incompatible field
-    /// fails the write.
-    async fn ensure_registered(
-        &self,
-        schema: &'static crate::schema::ModelSchema,
-        system_generation: &Arc<AtomicBool>,
-    ) -> Result<(), MutationError>;
-    /// Record a binary-known compiled schema for predicate first-use
-    /// registration and unknown-collection classification. Object-safe so
-    /// read paths (`get`/`fetch`/`query`) and the sync `edit` path can call it
-    /// without the concrete `<SE, PA>`. Commit provenance is recorded on the
-    /// transaction itself, not inferred from this process-global cache.
-    fn cache_compiled(&self, schema: &'static crate::schema::ModelSchema);
+    /// concrete `<SE, PA>`. If no durable peer is available, use may proceed
+    /// only when the local catalog proves every model and field identity in
+    /// this exact compiled shape. Policy, executor, missing-field, and
+    /// incompatible-field failures remain strict.
+    async fn ensure_registered(&self, schema: &'static crate::schema::ModelSchema) -> Result<(), MutationError>;
     /// RFC 5.2 STRICT registration (the eager explicit `ctx.register::<M>()`
     /// form): propagate the error instead of swallowing it. Object-safe.
     async fn register_strict(
         &self,
         schema: &'static crate::schema::ModelSchema,
     ) -> Result<(), crate::schema::registration::RegistrationError>;
+    /// Admit the exact compiled schema for a predicate read. Kept separate
+    /// from the mutation helper so read failures do not claim a write failed.
+    async fn ensure_query_schema(&self, schema: &'static crate::schema::ModelSchema) -> Result<(), RetrievalError>;
 }
 
 #[async_trait]
@@ -142,12 +139,11 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         // this transaction used. Transaction scope matters: a historically
         // failed declaration for the same collection must not poison later
         // transactions using a compatible shape.
-        // Same discrimination as the create-path trigger (plan decision 16):
-        // a failed reassertion proceeds only when every compiled field already
-        // has a compatible canonical binding; otherwise the commit fails.
+        // As on create, the no-peer fallback requires a complete compatible
+        // binding for this exact declaration; every other failure is strict.
         let schemas = trx.schemas.read().unwrap().clone();
         for schema in schemas {
-            TContext::ensure_registered(self, schema, &trx.system_generation).await?;
+            TContext::ensure_registered(self, schema).await?;
         }
 
         // Registration may await the network, so acquire the reset fence only
@@ -312,59 +308,41 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
 
         Ok(attested_events.into_iter().map(|a| a.payload).collect())
     }
-    fn query(&self, collection_id: proto::CollectionId, args: MatchArgs) -> Result<EntityLiveQuery, RetrievalError> {
-        EntityLiveQuery::new(&self.node, collection_id, args, self.cdata.clone())
+    fn query(
+        &self,
+        collection_id: proto::CollectionId,
+        schema: &'static crate::schema::ModelSchema,
+        args: MatchArgs,
+    ) -> Result<EntityLiveQuery, RetrievalError> {
+        EntityLiveQuery::new_for_model(&self.node, collection_id, schema, args, self.cdata.clone())
     }
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
         self.node.system.collection(id).await
     }
-    async fn ensure_registered(
-        &self,
-        schema: &'static crate::schema::ModelSchema,
-        system_generation: &Arc<AtomicBool>,
-    ) -> Result<(), MutationError> {
-        let registration = self.node.catalog.ensure_registered_in_generation(&self.node, &self.cdata, schema, system_generation).await;
-        // Recheck even when the round-trip itself failed: reset tears down
-        // pending requests, and that transport error must not mask the exact
-        // transaction-generation failure or be downgraded through a new
-        // generation's compatible map.
-        let _generation_guard = self.node.system.guard_generation(system_generation).await?;
-        if let Err(e) = registration {
-            // A stale operation must never use the new generation's fully
-            // bound map as grounds to downgrade SystemReset into a warning.
-            if matches!(&e, crate::schema::registration::RegistrationError::Mutation(MutationError::SystemReset)) {
-                return Err(MutationError::SystemReset);
-            }
-            // An unavailable reassertion may proceed only when this exact
-            // compiled shape can already resolve every field to a compatible
-            // canonical definition. Otherwise an unregistered or incompatible
-            // field would escape as Name residue in a registered user model.
-            if self.node.catalog.schema_is_fully_bound_compatible(schema) {
-                tracing::warn!(
-                    "ensure_registered for fully bound collection '{}' failed (data write proceeds with cached canonical bindings): {}",
-                    schema.collection,
-                    e
-                );
+    async fn ensure_registered(&self, schema: &'static crate::schema::ModelSchema) -> Result<(), MutationError> {
+        self.node.catalog.ensure_schema_for_use(&self.node, &self.cdata, schema).await.map_err(|error| {
+            let message = if self.node.catalog.model_by_collection(schema.collection).is_none() {
+                format!("cannot write into unregistered collection '{}': {error}", schema.collection)
             } else {
-                let message = if self.node.catalog.model_by_collection(schema.collection).is_none() {
-                    format!("cannot write into unregistered collection '{}': {e}", schema.collection)
-                } else {
-                    format!("cannot write using an unconfirmed schema for collection '{}': {e}", schema.collection)
-                };
-                return Err(MutationError::General(message.into()));
-            }
-        }
-        Ok(())
+                format!("cannot write using an unconfirmed schema for collection '{}': {error}", schema.collection)
+            };
+            MutationError::General(message.into())
+        })
     }
-    fn cache_compiled(&self, schema: &'static crate::schema::ModelSchema) { self.node.catalog.cache_compiled(schema); }
     async fn register_strict(
         &self,
         schema: &'static crate::schema::ModelSchema,
     ) -> Result<(), crate::schema::registration::RegistrationError> {
-        let generation = self.node.entities.system_generation();
-        let registration = self.node.catalog.ensure_registered_in_generation(&self.node, &self.cdata, schema, &generation).await;
-        let _generation_guard = self.node.system.guard_generation(&generation).await?;
-        registration
+        self.node.catalog.ensure_registered(&self.node, &self.cdata, schema).await
+    }
+    async fn ensure_query_schema(&self, schema: &'static crate::schema::ModelSchema) -> Result<(), RetrievalError> {
+        self.node.catalog.ensure_schema_for_use(&self.node, &self.cdata, schema).await.map_err(|error| {
+            if self.node.catalog.model_by_collection(schema.collection).is_none() {
+                RetrievalError::Other(format!("collection '{}' is not registered: {error}", schema.collection))
+            } else {
+                RetrievalError::Other(error.to_string())
+            }
+        })
     }
 }
 
@@ -417,17 +395,12 @@ impl Context {
     }
 
     pub async fn get<R: View>(&self, id: proto::EntityId) -> Result<R, RetrievalError> {
-        // Record the compiled schema. Gets (id addressed, no predicate
-        // resolution) do not trigger first-use registration; a later
-        // predicate use can still identify this as a binary-known schema.
-        self.0.cache_compiled(<R::Model as crate::model::Model>::schema());
         let entity = self.0.get_entity(id, &R::collection(), false).await?;
         Ok(R::from_entity(entity))
     }
 
     /// Get an entity, but its ok to return early if the entity is already in the local node storage
     pub async fn get_cached<R: View>(&self, id: proto::EntityId) -> Result<R, RetrievalError> {
-        self.0.cache_compiled(<R::Model as crate::model::Model>::schema());
         let entity = self.0.get_entity(id, &R::collection(), true).await?;
         Ok(R::from_entity(entity))
     }
@@ -437,12 +410,10 @@ impl Context {
         use crate::model::Model;
         let collection_id = R::Model::collection();
 
-        // Record the compiled schema. Resolution registers it at first use
-        // (REN 2 revised, plan decision 25b): an idempotent upsert that
-        // no-ops when the catalog already carries the schema. Denied or
-        // offline registration surfaces as the loud UnregisteredCollection
-        // error (RFC 5.3 addendum).
-        self.0.cache_compiled(R::Model::schema());
+        // Predicate reads are schema-dependent and registration is their
+        // admission point. Ensure this exact declaration before any catalog
+        // name can resolve the selection through a different cached shape.
+        self.0.ensure_query_schema(R::Model::schema()).await?;
 
         let entities = self.0.fetch_entities(&collection_id, args).await?;
 
@@ -461,10 +432,7 @@ impl Context {
     where R: View {
         let args: MatchArgs = args.try_into().map_err(|e| e.into())?;
         use crate::model::Model;
-        // Record the compiled schema before building the query; the async
-        // resolution path registers it at first use (REN 2 revised).
-        self.0.cache_compiled(R::Model::schema());
-        Ok(self.0.query(R::Model::collection(), args)?.map::<R>())
+        Ok(self.0.query(R::Model::collection(), R::Model::schema(), args)?.map::<R>())
     }
 
     /// Subscribe to changes in entities matching a selection and wait for initialization
@@ -562,9 +530,8 @@ where
 
         args.selection.predicate = self.node.policy_agent.filter_predicate(&self.cdata, collection_id, args.selection.predicate)?;
 
-        // Resolve property references against the catalog (RFC 5.5 Phase A):
-        // PathExpr -> Identifier, failing closed on unknown properties,
-        // registering compiled models at first use (REN 2 revised).
+        // Resolve property references against the catalog: PathExpr becomes a
+        // stable Identifier and unknown properties fail closed.
         // Idempotent, so a selection resolved by an outer caller passes
         // through unchanged here. A collection that neither the catalog
         // cache nor first-use registration can resolve fails LOUD
@@ -574,7 +541,7 @@ where
         args.selection = self
             .node
             .catalog
-            .resolve_selection_deferred_in_generation(&self.node, Some(&self.cdata), collection_id, &args.selection, &generation)
+            .resolve_selection_deferred(&self.node, Some(&self.cdata), collection_id, None, &args.selection)
             .await
             .map_err(RetrievalError::from)?;
 

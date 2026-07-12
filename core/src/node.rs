@@ -16,8 +16,6 @@ use std::{
 };
 use tokio::sync::oneshot;
 
-#[cfg(any(test, feature = "test-helpers"))]
-use crate::util::safeset::SafeSet;
 use crate::{
     action_error, action_info,
     changes::EntityChange,
@@ -34,7 +32,8 @@ use crate::{
     schema::catalog::CatalogManager,
     storage::{StorageCollectionWrapper, StorageEngine},
     system::{RootReservation, SystemManager},
-    util::{safemap::SafeMap, Iterable},
+    util::request_fence::{RequestLease, RequestValidity},
+    util::{safemap::SafeMap, safeset::SafeSet, Iterable},
 };
 use itertools::Itertools;
 #[cfg(feature = "instrument")]
@@ -60,7 +59,7 @@ pub struct PeerState {
     /// traffic. Shared across reconnects from the same pending founder.
     pending_root: Option<proto::EntityId>,
     subscription_handler: SubscriptionHandler,
-    pending_requests: SafeMap<proto::RequestId, oneshot::Sender<Result<proto::NodeResponseBody, RequestError>>>,
+    pending_requests: SafeMap<proto::RequestId, PendingRequest>,
     pending_updates: SafeMap<proto::UpdateId, oneshot::Sender<Result<proto::NodeResponseBody, RequestError>>>,
     /// Model-definition ids whose catalog defs were already shipped on this
     /// connection (#330 once-per-connection descriptor shipping). A
@@ -93,12 +92,27 @@ impl ReplayWindow {
     }
 }
 
+struct PendingRequest {
+    response: oneshot::Sender<Result<GuardedResponse, RequestError>>,
+    validity: Option<RequestValidity>,
+}
+
+#[derive(Debug)]
+pub(crate) struct GuardedResponse {
+    body: proto::NodeResponseBody,
+    lease: RequestLease,
+}
+
+impl GuardedResponse {
+    pub(crate) fn into_parts(self) -> (proto::NodeResponseBody, RequestLease) { (self.body, self.lease) }
+}
+
 impl PeerState {
     fn generation_alive(&self) -> bool { self.system_generation.read().unwrap().load(Ordering::Acquire) }
 
     fn close_pending(&self) {
-        for sender in self.pending_requests.drain_values() {
-            let _ = sender.send(Err(RequestError::ConnectionLost));
+        for pending in self.pending_requests.drain_values() {
+            let _ = pending.response.send(Err(RequestError::ConnectionLost));
         }
         for sender in self.pending_updates.drain_values() {
             let _ = sender.send(Err(RequestError::ConnectionLost));
@@ -367,10 +381,10 @@ where
         // naming) from the catalog resolver at materialization time. Injected
         // here, not at engine construction, because the engine is built before
         // the node/catalog exist.
-        node.collections.set_property_resolver(node.catalog.resolver_weak());
+        node.collections.set_catalog_resolver(node.catalog.resolver_weak());
         // The reactor types ORDER BY sort keys from the same catalog resolver
         // (canonical value_type collation).
-        node.reactor.set_property_resolver(node.catalog.resolver_weak());
+        node.reactor.set_catalog_resolver(node.catalog.resolver_weak());
         // Assembly-time choke point (the PropertyKey amendment, #289): every
         // entity handed out by the entity set gets the catalog resolver
         // stamped, so no assembly path can forget it and the sync read path can
@@ -707,30 +721,6 @@ where
         true
     }
 
-    /// The model ids a response body references (#330 descriptor shipping):
-    /// the sender ships catalog defs for any of these not yet announced on
-    /// the connection.
-    fn models_in_response(body: &proto::NodeResponseBody) -> std::collections::BTreeSet<proto::EntityId> {
-        let mut models = std::collections::BTreeSet::new();
-        match body {
-            proto::NodeResponseBody::Fetch(deltas) => models.extend(deltas.iter().map(|delta| delta.model)),
-            proto::NodeResponseBody::QuerySubscribed { deltas, .. } => models.extend(deltas.iter().map(|delta| delta.model)),
-            proto::NodeResponseBody::Get(states) => models.extend(states.iter().map(|state| state.payload.model)),
-            proto::NodeResponseBody::GetEvents(events) => models.extend(events.iter().map(|event| event.payload.model)),
-            _ => {}
-        }
-        models
-    }
-
-    /// The model ids an update body references; see [`Self::models_in_response`].
-    fn models_in_update(body: &proto::NodeUpdateBody) -> std::collections::BTreeSet<proto::EntityId> {
-        let mut models = std::collections::BTreeSet::new();
-        match body {
-            proto::NodeUpdateBody::SubscriptionUpdate { items } => models.extend(items.iter().map(|item| item.model)),
-        }
-        models
-    }
-
     /// Catalog definition states for the `models` not yet announced on
     /// `connection` (#330 once-per-connection descriptor shipping). Well-known
     /// system/catalog ids need no defs (they are static). The defs are the
@@ -883,7 +873,36 @@ where
     where
         C: Iterable<PA::ContextData>,
     {
-        let (response_tx, response_rx) = oneshot::channel::<Result<proto::NodeResponseBody, RequestError>>();
+        self.request_inner(node_id, cdata, request_body, None).await.map(|response| response.into_parts().0)
+    }
+
+    /// Send a request whose response is useful only while `validity` remains
+    /// current. Response handling checks it before ingesting attached schema;
+    /// the caller may recheck it before applying the response body.
+    pub(crate) async fn request_if_current<C>(
+        &self,
+        node_id: proto::NodeId,
+        cdata: &C,
+        request_body: proto::NodeRequestBody,
+        validity: RequestValidity,
+    ) -> Result<GuardedResponse, RequestError>
+    where
+        C: Iterable<PA::ContextData>,
+    {
+        self.request_inner(node_id, cdata, request_body, Some(validity)).await
+    }
+
+    async fn request_inner<C>(
+        &self,
+        node_id: proto::NodeId,
+        cdata: &C,
+        request_body: proto::NodeRequestBody,
+        validity: Option<RequestValidity>,
+    ) -> Result<GuardedResponse, RequestError>
+    where
+        C: Iterable<PA::ContextData>,
+    {
+        let (response_tx, response_rx) = oneshot::channel::<Result<GuardedResponse, RequestError>>();
         let request_id = proto::RequestId::new();
 
         let request = proto::NodeRequest { id: request_id.clone(), to: node_id, from: self.id, body: request_body };
@@ -899,7 +918,7 @@ where
             if !connection.ready.load(Ordering::Acquire) {
                 return Err(RequestError::PeerNotConnected);
             }
-            connection.pending_requests.insert(request_id.clone(), response_tx);
+            connection.pending_requests.insert(request_id.clone(), PendingRequest { response: response_tx, validity });
             if let Err(error) = connection.send_message(proto::NodeMessage::Request { auth, request }) {
                 connection.pending_requests.remove(&request_id);
                 return Err(error.into());
@@ -938,7 +957,7 @@ where
         // schema fields backward; the ordinary catalog stream owns updates.
         let node = self.clone();
         crate::task::spawn(async move {
-            let schema = node.schema_states_for_models(&connection, Node::<SE, PA>::models_in_update(&notification)).await;
+            let schema = node.schema_states_for_models(&connection, notification.referenced_models()).await;
             let message = proto::NodeMessage::Update(proto::NodeUpdate { id, from: node.id, to: node_id, body: notification, schema });
             let _registry_guard = node.peer_registry_lock.lock().unwrap_or_else(|e| e.into_inner());
             let still_current = node.peer_connections.get(&node_id).is_some_and(|current| Arc::ptr_eq(&current, &connection));
@@ -1080,6 +1099,49 @@ where
                 let to = update.from;
                 let from = self.id;
 
+                // A streamed item is admissible only while at least one
+                // query that caused it is still current on this peer. For
+                // reset-sensitive catalog queries, retain the owner fence
+                // lease through schema ingestion, persistence, and the
+                // acknowledgement so hard reset can quiesce the whole
+                // mutation boundary before deleting storage.
+                let _stream_leases: Vec<RequestLease> = match (&self.subscription_relay, &update.body) {
+                    (Some(relay), proto::NodeUpdateBody::SubscriptionUpdate { items }) => {
+                        let leases = relay
+                            .validities_for_stream_update(&update.from, items)
+                            .and_then(|validities| validities.into_iter().map(|validity| validity.try_acquire()).collect());
+                        match leases {
+                            Some(leases) => leases,
+                            None => {
+                                debug!(
+                                    "Node({}) discarded stale subscription update {} from {} before schema ingestion",
+                                    self.id, update.id, update.from
+                                );
+                                let connection = self.peer_for_dispatch(to, verified_session, &expected_generation)?;
+                                connection.send_message(proto::NodeMessage::UpdateAck(proto::NodeUpdateAck {
+                                    id,
+                                    from,
+                                    to,
+                                    body: proto::NodeUpdateAckBody::Error(
+                                        "subscription update has no current source query".to_string(),
+                                    ),
+                                }))?;
+                                return Ok(());
+                            }
+                        }
+                    }
+                    (None, proto::NodeUpdateBody::SubscriptionUpdate { .. }) => {
+                        let connection = self.peer_for_dispatch(to, verified_session, &expected_generation)?;
+                        connection.send_message(proto::NodeMessage::UpdateAck(proto::NodeUpdateAck {
+                            id,
+                            from,
+                            to,
+                            body: proto::NodeUpdateAckBody::Error("subscription update has no current source query".to_string()),
+                        }))?;
+                        return Ok(());
+                    }
+                };
+
                 // Descriptor shipping (#330): warm the catalog map from the
                 // attached defs BEFORE applying the body. Hold the exact
                 // generation lease only across this synchronous map fold;
@@ -1141,7 +1203,7 @@ where
                 let connection = self.peer_for_dispatch(from, verified_session, &expected_generation)?;
                 // Descriptor shipping (#330): catalog defs for any model id
                 // this response references that the connection has not seen.
-                let schema = self.schema_states_for_models(&connection, Self::models_in_response(&body)).await;
+                let schema = self.schema_states_for_models(&connection, body.referenced_models()).await;
                 let connection = self.peer_for_dispatch(from, verified_session, &expected_generation)?;
                 let _result = connection.send_message(proto::NodeMessage::Response(proto::NodeResponse {
                     request_id,
@@ -1158,15 +1220,32 @@ where
                 // requester consumes the body -- but only for a response that
                 // matches a request we actually sent, so an unsolicited or
                 // misattributed response cannot poison the catalog map.
-                if let Some(tx) = connection.pending_requests.remove(&response.request_id) {
+                if let Some(pending) = connection.pending_requests.remove(&response.request_id) {
+                    // Owner-fence admission (epoch hardening): a response for
+                    // a reset-sensitive request must acquire its owner lease
+                    // BEFORE schema ingestion, and hold it until the caller
+                    // finishes applying the body.
+                    let lease = match &pending.validity {
+                        Some(validity) => match validity.try_acquire() {
+                            Some(lease) => lease,
+                            None => {
+                                debug!(
+                                    "Node({}) discarded stale response {} from {} before schema ingestion",
+                                    self.id, response.request_id, response.from
+                                );
+                                return Ok(());
+                            }
+                        },
+                        None => RequestLease::unguarded(),
+                    };
                     let body = {
                         let _guard = self.system.guard_generation(&expected_generation).await?;
                         self.peer_for_dispatch(response.from, verified_session, &expected_generation)?;
                         self.ingest_schema(&response.from, &response.schema)
-                            .map(|()| response.body)
+                            .map(|()| GuardedResponse { body: response.body, lease })
                             .map_err(|error| RequestError::ServerError(error.to_string()))
                     };
-                    tx.send(body).map_err(|e| anyhow!("Failed to send response: {:?}", e))?;
+                    pending.response.send(body).map_err(|e| anyhow!("Failed to send response: {:?}", e))?;
                 }
             }
             proto::NodeMessage::UnsubscribeQuery { from, query_id } => {
@@ -1206,7 +1285,7 @@ where
                 // this ingress guard, so this does not block it.)
                 for event in &events {
                     let collection_id = self.resolve_model_wait(&event.payload.model).await?;
-                    if crate::system::PROTECTED_COLLECTIONS.contains(&collection_id.as_str()) {
+                    if crate::schema::is_protected_collection(&collection_id) {
                         return Ok(proto::NodeResponseBody::Error(format!(
                             "collection '{}' is protected and not writable by transactions",
                             collection_id
@@ -1830,28 +1909,30 @@ where
         &self,
         query_id: proto::QueryId,
         collection_id: CollectionId,
+        schema: Option<&'static crate::schema::ModelSchema>,
         selection: ankql::ast::Selection,
         cdata: PA::ContextData,
         version: u32,
+        request_validity: Option<RequestValidity>,
         livequery: crate::livequery::WeakEntityLiveQuery,
     ) {
         if self.subscription_relay.is_none() {
             return;
         }
         // The selection this ephemeral node forwards to its durable peer must
-        // be RESOLVED (PathExpr -> Identifier, RFC 5.5 Phase A), and
+        // be resolved from PathExpr to stable Identifier, and
         // resolution can await (catalog warm-up, first-use registration).
         // This path is sync (called from the LiveQuery constructor), so
         // resolve + forward inside a spawned task. The relay registration is
         // already asynchronous with respect to activation, so deferring it
-        // one hop is safe. Compiled models REGISTER AT FIRST USE inside the
-        // resolve (REN 2 revised); if neither the catalog cache nor
-        // registration can resolve the reference (policy denial, no durable
+        // one hop is safe. The exact compiled model registers inside the
+        // resolve; if neither the catalog cache nor registration can resolve
+        // the reference (policy denial, no durable
         // peer), the query fails LOUD on the livequery's `error` -- there is
         // nothing truthful a subscription could ask for.
         let node = self.clone();
         crate::task::spawn(async move {
-            let resolved = match node.catalog.resolve_selection_deferred(&node, Some(&cdata), &collection_id, &selection).await {
+            let resolved = match node.catalog.resolve_selection_deferred(&node, Some(&cdata), &collection_id, schema, &selection).await {
                 Ok(resolved) => resolved,
                 Err(e) => {
                     debug!("subscribe_remote_query resolution failed for {query_id}: {e}");
@@ -1872,9 +1953,17 @@ where
             // entry is still required as its serialization point; that newer
             // task waits for this registration and then updates it.
             lq.set_resolved_selection(selection.clone(), version);
+            // Resolution may outlive the catalog generation that requested
+            // it. Refuse a late relay entry after reset invalidation; local
+            // cached activation holds the same fence through its storage
+            // fetch, while relay responses acquire it at schema ingress.
+            if request_validity.as_ref().is_some_and(|validity| !validity.is_current()) {
+                lq.mark_initial_query_failed();
+                return;
+            }
             node.predicate_context.insert(query_id, cdata.clone());
             if let Some(ref relay) = node.subscription_relay {
-                relay.subscribe_query(query_id, collection_id, selection, cdata, version, livequery);
+                relay.subscribe_query_with_validity(query_id, collection_id, selection, cdata, version, request_validity, livequery);
                 lq.mark_initial_query_ready();
             }
         });
@@ -1954,17 +2043,23 @@ where
                 lq.set_error_for_version(version, RetrievalError::Other("initial query resolution failed".to_string()));
                 return;
             }
-            // No cdata on this sync trait path: the original subscribe
-            // already resolved (registering at first use if needed), so a
-            // failure here is a genuinely unresolvable update.
-            let selection = match node.catalog.resolve_selection_deferred(&node, None, &collection_id, &selection).await {
-                Ok(resolved) => resolved,
-                Err(e) => {
-                    debug!("update_query_selection resolution failed for {query_id}: {e}");
-                    lq.set_error_for_version(version, e.into());
-                    return;
-                }
-            };
+            // This sync trait path does not carry context data, but an
+            // ephemeral query retained its original context before marking
+            // the initial subscription ready. Reuse it so a schema-less
+            // update can warm a cold catalog instead of waiting on readiness
+            // that no task started. Durable queries have no relay context;
+            // their startup catalog warm is independently bounded.
+            let schema = lq.schema();
+            let resolve_cdata = schema.is_none().then(|| node.predicate_context.get(&query_id)).flatten();
+            let selection =
+                match node.catalog.resolve_selection_deferred(&node, resolve_cdata.as_ref(), &collection_id, schema, &selection).await {
+                    Ok(resolved) => resolved,
+                    Err(e) => {
+                        debug!("update_query_selection resolution failed for {query_id}: {e}");
+                        lq.set_error_for_version(version, e.into());
+                        return;
+                    }
+                };
             // Resolve types in the AST (converts literals for JSON path comparisons).
             let selection = node.type_resolver.resolve_selection_types(selection);
             if !lq.set_resolved_selection(selection.clone(), version) {
@@ -2000,5 +2095,152 @@ where PA: PolicyAgent
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // bold blue, dimmed brackets
         write!(f, "\x1b[1;34mnode\x1b[2m[\x1b[1;34m{}\x1b[2m]\x1b[0m", self.id.to_base64_short())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        policy::{PermissiveAgent, DEFAULT_CONTEXT},
+        property::{backend::lww::LWWBackend, backend::PropertyBackend, PropertyKey},
+        storage::{StorageCollection, StorageEngine},
+        value::Value,
+    };
+    use std::{
+        collections::BTreeMap,
+        sync::atomic::{AtomicBool, Ordering},
+    };
+
+    struct EmptyEngine;
+    struct EmptyCollection;
+
+    #[async_trait::async_trait]
+    impl StorageEngine for EmptyEngine {
+        type Value = ();
+
+        async fn collection(&self, _id: &CollectionId) -> Result<Arc<dyn StorageCollection>, RetrievalError> {
+            Ok(Arc::new(EmptyCollection))
+        }
+
+        async fn delete_all_collections(&self) -> Result<bool, MutationError> { Ok(true) }
+    }
+
+    #[async_trait::async_trait]
+    impl StorageCollection for EmptyCollection {
+        async fn set_state(&self, _state: Attested<EntityState>) -> Result<bool, MutationError> { Ok(true) }
+
+        async fn get_state(&self, id: proto::EntityId) -> Result<Attested<EntityState>, RetrievalError> {
+            Err(RetrievalError::EntityNotFound(id))
+        }
+
+        async fn fetch_states(&self, _selection: &ankql::ast::Selection) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+            Ok(Vec::new())
+        }
+
+        async fn add_event(&self, _event: &Attested<proto::Event>) -> Result<bool, MutationError> { Ok(true) }
+
+        async fn get_events(&self, _event_ids: Vec<proto::EventId>) -> Result<Vec<Attested<proto::Event>>, RetrievalError> {
+            Ok(Vec::new())
+        }
+
+        async fn dump_entity_events(&self, _id: proto::EntityId) -> Result<Vec<Attested<proto::Event>>, RetrievalError> { Ok(Vec::new()) }
+    }
+
+    #[derive(Clone)]
+    struct CapturingSender {
+        peer: proto::EntityId,
+        sent: Arc<Mutex<Vec<proto::NodeMessage>>>,
+    }
+
+    impl PeerSender for CapturingSender {
+        fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError> {
+            self.sent.lock().unwrap().push(message);
+            Ok(())
+        }
+
+        fn recipient_node_id(&self) -> proto::EntityId { self.peer }
+
+        fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
+    }
+
+    fn forged_model_state(collection: &str) -> Attested<EntityState> {
+        let backend = LWWBackend::new();
+        backend.set(PropertyKey::Name("collection".to_owned()), Some(Value::String(collection.to_owned())));
+        backend.set(PropertyKey::Name("name".to_owned()), Some(Value::String("Stale model".to_owned())));
+        let operations = backend.to_operations().unwrap().expect("catalog state has fields");
+        let event_id = proto::EventId::from_bytes([0x5A; 32]);
+        backend.apply_operations_with_event(&operations, event_id.clone()).unwrap();
+        Attested::opt(
+            EntityState {
+                entity_id: proto::EntityId::new(),
+                model: crate::schema::well_known_model_id(crate::schema::MODEL_COLLECTION_ID).unwrap(),
+                state: proto::State {
+                    state_buffers: proto::StateBuffers(BTreeMap::from([("lww".to_owned(), backend.to_state_buffer().unwrap())])),
+                    head: proto::Clock::from(vec![event_id]),
+                },
+            },
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn invalid_request_response_is_dropped_before_schema_ingestion() {
+        let node = Node::new(Arc::new(EmptyEngine), PermissiveAgent::new());
+        let peer = proto::EntityId::new();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        node.register_peer(
+            proto::Presence { node_id: peer, durable: false, system_root: None, protocol_version: proto::PROTOCOL_VERSION },
+            Box::new(CapturingSender { peer, sent: sent.clone() }),
+        )
+        .unwrap();
+
+        let owner_current = Arc::new(AtomicBool::new(true));
+        let validity = RequestValidity::new({
+            let owner_current = owner_current.clone();
+            move || owner_current.load(Ordering::Acquire)
+        });
+        let request = {
+            let node = node.clone();
+            tokio::spawn(async move {
+                node.request_if_current(
+                    peer,
+                    &DEFAULT_CONTEXT,
+                    proto::NodeRequestBody::Get { collection: CollectionId::fixed_name("ignored"), ids: Vec::new() },
+                    validity,
+                )
+                .await
+            })
+        };
+
+        let request_id = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Some(proto::NodeMessage::Request { request, .. }) = sent.lock().unwrap().first() {
+                    break request.id.clone();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("guarded request must be sent");
+
+        owner_current.store(false, Ordering::Release);
+        node.handle_message(proto::NodeMessage::Response(proto::NodeResponse {
+            request_id,
+            from: peer,
+            to: node.id,
+            body: proto::NodeResponseBody::Get(Vec::new()),
+            schema: vec![forged_model_state("must_not_ingest")],
+        }))
+        .await
+        .unwrap();
+
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), request)
+            .await
+            .expect("stale response must release its requester")
+            .expect("request task must not panic")
+            .expect_err("stale response body must not be delivered");
+        assert!(matches!(error, RequestError::InternalChannelClosed));
+        assert!(node.catalog.model_by_collection("must_not_ingest").is_none(), "stale attached schema must not enter the catalog");
     }
 }

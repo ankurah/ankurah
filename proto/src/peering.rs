@@ -15,12 +15,13 @@ use crate::{id::EntityId, node_id::NodeId, node_id::Signature, Attested, EntityS
 /// - absent: 0.9.x and earlier carried no version in Presence. Such peers
 ///   are classified as version 0 (see [`is_version0_presence`]) and refused.
 /// - 1: the 0.9 wire shapes plus the versioned Presence handshake (#294).
-/// - 2: the Phase A id-keyed epoch: LWW diff v2 / state 0xA2, resolved
-///   predicate Identifiers and ORDER BY property identities, RegisterSchema.
+/// - 2: LWW diff v2 / state 0xA2, resolved predicate Identifiers, and
+///   RegisterSchema.
 /// - 3: the model-id wire envelope (#330): Event/EntityState/EntityDelta/
 ///   SubscriptionUpdateItem carry the model-definition entity id instead of a
 ///   collection name, and NodeUpdate/NodeResponse carry once-per-connection
-///   catalog schema defs.
+///   catalog schema defs. SubscriptionUpdateItem also carries the source query
+///   ids used for admission, and ORDER BY items carry stable property identities.
 /// - 4: the identity/attestation substrate (specs/identity-attestation/
 ///   spec.md): 32-byte content-hash EntityIds, the EventBody genesis/update
 ///   split with domain-tagged ids, ed25519 NodeIds with signed Presence, and

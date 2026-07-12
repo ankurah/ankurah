@@ -58,8 +58,9 @@ pub enum PropertyError {
     #[error("not castable: {0}")]
     NonCastable(CastError),
 
-    /// A property reference that neither the local compiled schema nor the
-    /// catalog defines: predicate building fails closed (RFC 5.3 in specs/model-property-metadata/rfc.md, AC5).
+    /// A property reference that neither the admitted compiled binding nor the
+    /// catalog defines. Predicate building fails closed rather than treating a
+    /// typo as NULL (RFC 5.3 in specs/model-property-metadata/rfc.md).
     #[error("unknown property '{name}' in collection '{collection}'")]
     UnknownProperty { collection: String, name: String },
 
@@ -67,7 +68,7 @@ pub enum PropertyError {
     /// carries a compiled schema for it, and FIRST-USE REGISTRATION could
     /// not resolve the doubt (policy denied the definition, or no durable
     /// peer is reachable). Surfaced as a loud error on query and fetch
-    /// paths (REN 2 second ruling, 2026-07-06): a lagging catalog cache
+    /// paths: a lagging catalog cache
     /// cannot prove emptiness, and idling on an unanswerable subscription
     /// helps no one -- retry once the schema is registered or connectivity
     /// returns.

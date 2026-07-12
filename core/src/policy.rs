@@ -54,8 +54,9 @@ pub enum Admission {
 }
 
 /// What a RegisterSchema request will ACTUALLY do, resolved by the
-/// registration executor under the allocation mutex (RFC 5.7 in specs/model-property-metadata/rfc.md; plan
-/// decision 26). Passed to [`PolicyAgent::check_schema_registration`]
+/// registration executor under the allocation mutex (RFC 5.7 in
+/// specs/model-property-metadata/rfc.md). Passed to
+/// [`PolicyAgent::check_schema_registration`]
 /// before any event is emitted, so an agent can judge real creations and
 /// metadata changes without performing its own catalog lookups:
 /// `check_request` cannot know whether a descriptor already exists, and
@@ -111,7 +112,8 @@ pub struct PlannedUpdate {
     pub field: String,
     /// The current catalog value, when one exists.
     pub from: Option<crate::value::Value>,
-    pub to: crate::value::Value,
+    /// The requested catalog value. `None` means the field will be cleared.
+    pub to: Option<crate::value::Value>,
 }
 
 /// PolicyAgents control access to resources, by:
@@ -168,8 +170,8 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
         event: &proto::Event,
     ) -> Result<Admission, AccessDenied>;
 
-    /// Gate a schema registration on its RESOLVED effect (RFC 5.7; plan
-    /// decision 26). Called by the registration executor after its lookup
+    /// Gate a schema registration on its resolved effect (RFC 5.7). Called by
+    /// the registration executor after its lookup
     /// phase and before any event is emitted, still under the allocation
     /// mutex, with the request's actual consequences: what will be created,
     /// what will be updated, what already exists. Agents may discriminate
@@ -237,7 +239,7 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
         id: &proto::EntityId,
         collection: &proto::CollectionId,
         state: &proto::State,
-        resolver: Option<std::sync::Weak<dyn crate::property::PropertyResolver>>,
+        resolver: Option<std::sync::Weak<dyn crate::schema::CatalogResolver>>,
     ) -> Result<(), AccessDenied>
     where
         C: Iterable<Self::ContextData>;
@@ -358,7 +360,7 @@ impl PolicyAgent for PermissiveAgent {
         _id: &proto::EntityId,
         _collection: &proto::CollectionId,
         _state: &proto::State,
-        _resolver: Option<std::sync::Weak<dyn crate::property::PropertyResolver>>,
+        _resolver: Option<std::sync::Weak<dyn crate::schema::CatalogResolver>>,
     ) -> Result<(), AccessDenied>
     where
         C: Iterable<Self::ContextData>,

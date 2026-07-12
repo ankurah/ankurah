@@ -1,5 +1,6 @@
 use crate::{auth::Attested, data::EntityState, id::EntityId, node_id::NodeId, subscription::QueryId, EventFragment, StateWithGenesis};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use ulid::Ulid;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -9,6 +10,16 @@ pub struct UpdateId(Ulid);
 pub enum NodeUpdateBody {
     /// New events for a subscription
     SubscriptionUpdate { items: Vec<SubscriptionUpdateItem> },
+}
+
+impl NodeUpdateBody {
+    /// Model ids carried by entity data in this update. Senders use this to
+    /// attach any catalog definitions the connection has not seen yet.
+    pub fn referenced_models(&self) -> BTreeSet<EntityId> {
+        match self {
+            Self::SubscriptionUpdate { items } => items.iter().map(|item| item.model).collect(),
+        }
+    }
 }
 
 /// Content of an update - either events or state with events
@@ -56,6 +67,10 @@ pub struct SubscriptionUpdateItem {
     /// Which predicates this update is relevant to and how
     /// Uses PredicateId for remote subscriptions
     pub predicate_relevance: Vec<(QueryId, MembershipChange)>,
+    /// Queries whose subscriptions caused this item to be emitted. Always
+    /// populated for subscription traffic, including ordinary updates whose
+    /// predicate membership did not change.
+    pub source_queries: Vec<QueryId>,
 }
 
 impl TryFrom<SubscriptionUpdateItem> for Attested<EntityState> {

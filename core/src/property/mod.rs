@@ -78,50 +78,12 @@ impl PropertyKey {
 
 // A bare string IS a display name, so it keys as `Name`. This is safe against
 // the id-keyed invariant: an uncommitted `Name` key a user-collection write
-// stages this way is still resolved to its `Id` at commit (decision 27).
+// stages this way is still resolved to its `Id` before commit serialization.
 impl From<&str> for PropertyKey {
     fn from(name: &str) -> Self { PropertyKey::Name(name.to_string()) }
 }
 impl From<String> for PropertyKey {
     fn from(name: String) -> Self { PropertyKey::Name(name) }
-}
-
-/// Name-to-id resolution for the property read/write paths, implemented by the
-/// catalog. It lets the catalog-blind [`crate::entity::Entity`] resolve a
-/// display name to the property-definition id its data is keyed under, without
-/// any property backend holding schema state: the id-keyed contract is carried
-/// by the [`PropertyKey`], not by a binding injected into the backend.
-pub trait PropertyResolver: Send + Sync {
-    /// The property-definition id for `name` in `collection`, if the catalog
-    /// knows it. `None` for a system/catalog field or a user field not yet
-    /// registered, which a sync accessor may stage transiently as
-    /// [`PropertyKey::Name`]. A registered user commit must resolve that key or
-    /// fail schema confirmation before emitting an event.
-    fn resolve(&self, collection: &str, name: &str) -> Option<EntityId>;
-    /// The display name of a property-definition id, if the catalog knows it:
-    /// the reverse of [`resolve`](Self::resolve). Storage engines seed their
-    /// durable id-to-column-name maps from this at materialization time.
-    fn name_for(&self, id: &EntityId) -> Option<String>;
-    /// The model-definition id for `collection`, if the catalog knows it --
-    /// the wire-envelope egress lookup (#330) for entities, which are
-    /// catalog-blind but resolver-stamped. Well-known system/catalog ids are
-    /// NOT the resolver's concern (callers consult
-    /// `crate::schema::well_known_model_id` first). Defaults to `None` so
-    /// test resolvers only implement what they exercise.
-    fn model_id_for(&self, collection: &str) -> Option<EntityId> {
-        let _ = collection;
-        None
-    }
-    /// The property's canonical value_type (the catalog string form, e.g.
-    /// "string" / "i64"), fixed at allocation and never changed by
-    /// registration (rfc.md 5.6 as amended 2026-07-10). Writers cast to it
-    /// before values reach the backends. Defaults to `None` (unknown id, or a
-    /// resolver without catalog access), which callers treat as "write the
-    /// value as compiled".
-    fn canonical_value_type(&self, id: &EntityId) -> Option<String> {
-        let _ = id;
-        None
-    }
 }
 
 /// Read a resolved property from ONE backend: the read dispatch (rfc.md 5.4
