@@ -1,6 +1,7 @@
 # RFC: Identity and Attestation Substrate
 
-Status: ACCEPTED (rulings 2026-07-11), implementation in same PR.
+Status: ACCEPTED (rulings 2026-07-11; genesis shape refined to eager freeze
+same date), implementation in same PR.
 Scope: node identity, entity identity, attestation envelope, PolicyAgent
 admission surface. This is RFC-1 of a pair; RFC-2 (multi-durable sync and
 peer-to-peer reads) builds on it and is deliberately excluded here.
@@ -61,7 +62,8 @@ These were decided in design review and are not re-opened by this document:
   v3 (v2's 80-bit truncated ids deprecated ecosystem-wide) all converged on
   32 bytes.
 - **R4. Genesis preimage contents.** The genesis binds (system id, nonce,
-  timestamp) and carries **no creator field and no collection**. Creator: an
+  timestamp, initial operations) and carries **no creator field and no
+  collection**. Creator: an
   unauthenticated creator claim is forgeable and a signed one requires the
   parked author-signature machinery; attribution instead lives in the
   admitting node's attestation claims, where it is already authenticated by
@@ -78,6 +80,12 @@ These were decided in design review and are not re-opened by this document:
   verifiably) is agent-independent and is alone sufficient for the core
   admission-trust decision; claims are extension space, not load-bearing for
   it.
+- **R6. Creation cost and id availability.** Entity creation adds no extra
+  event: the genesis IS the single creation event and carries the entity's
+  initial operations. The entity id remains available at `create()` return;
+  genesis content freezes when `create()` returns (eager freeze). The
+  operation-free "birth certificate" genesis was rejected for its per-entity
+  event overhead; rejected shapes are recorded in II.2.1.
 
 ## Part I: Node identity
 
@@ -186,6 +194,7 @@ pub enum EventBody {
         system: Option<EntityId>,   // None ONLY for the system root entity itself
         nonce: [u8; 16],            // creator-random
         timestamp: u64,             // unix ms, advisory
+        operations: OperationSet,   // the entity's initial property values
     },
     Update {
         operations: OperationSet,
@@ -193,30 +202,71 @@ pub enum EventBody {
 }
 ```
 
-Genesis events carry **no operations**. An entity's initial property values
-ride the first Update event (parent = [genesis id]), committed in the same
-transaction. Consequences, in order of importance:
+The genesis is the single creation event and carries the entity's initial
+operations, frozen when `create()` returns (eager freeze, R6).
+Mechanically: `trx.create(&model)` already applies the model's initial
+values to the property backends inside the call (`initialize_new_entity`,
+core/src/transaction.rs); the creation path extracts them right there via
+the same `to_operations()` machinery the commit path uses, assembles the
+genesis, derives the entity id from it, and constructs the entity under
+that id. Consequences:
 
-- The entity id is derivable at `create()` time, before commit, preserving
-  the current API property that a created entity's id is immediately
-  available.
-- Identical create retries (same nonce) are idempotent: same genesis, same
-  id, deduplicated by content addressing (C4-05).
-- Every entity costs one extra event. Accepted; genesis events are tiny.
+- One creation event per entity; today's event count is unchanged.
+- The entity id is available at `create()` return, preserving the current
+  API property and intra-transaction references to created entities.
+- The model snapshot passed to `create()` IS the genesis. Mutating the
+  created entity later in the same transaction produces an ordinary Update
+  event, exactly as the same mutation would after commit.
+- A create retry that reuses the nonce (and payload) is idempotent: same
+  genesis, same id, deduplicated by content addressing (C4-05). Distinct
+  create calls draw distinct nonces and are distinct entities even under
+  identical payloads.
 - `is_entity_create()` becomes a match on `EventBody::Genesis` instead of
   the parent-emptiness hack. The invariant "parent empty iff genesis" is
   enforced at validation.
+- Create-path surgery: today the id is allocated before the values are
+  applied; the order inverts (apply values, extract, derive id, construct
+  the entity under the derived id). Localized to the create path.
 
-Considered alternative: genesis carries the initial operations (one event
-per create, id known only once initial values are frozen). Rejected because
-it couples the id to content-freezing semantics inside the transaction and
-makes create-then-mutate-within-trx ambiguous; the empty genesis is
-insensitive to transaction-internal mutation order.
+### II.2.1 Rejected genesis shapes (recorded so they are not re-litigated)
+
+1. **Operation-free genesis**: a "birth certificate" event binding only
+   (system, nonce, timestamp), with initial values riding a first Update
+   event in the same transaction. Same properties, simpler create-path
+   mechanics, but one extra event per entity, one extra hop on every walk
+   to root, and a permanent event-count change. Rejected 2026-07-11 (R6).
+2. **Partial binding**: entity id = hash of (system, nonce, timestamp)
+   only, with the initial operations riding UNBOUND in the same creation
+   event. Rejected as unsound, in both variants. If the entity id doubles
+   as the genesis event id, two creation events differing only in
+   operations share one event id, breaking event content-addressing itself
+   (C4-01: staging, the accumulator, and dedup all key on `event.id()`).
+   If instead the entity id is split from a full-content genesis event id
+   to preserve C4-01, twins become free: any authorized writer reuses its
+   own triple with different operations and obtains two structurally valid
+   genesis events claiming one entity id; creation uniqueness reverts to
+   authority-enforced first-writer-wins, the multi-durable genesis race
+   returns, and the coordination/eviction machinery ruling R3 was purchased
+   to delete comes back. The entity id also stops naming its genesis,
+   forfeiting the #271 simplification (II.4). General rule, recorded: the
+   entity id must be a commitment to the FULL distinguishing content of the
+   genesis; any creator-controlled field left outside the commitment is a
+   free twin channel.
+3. **Commit-time ids**: genesis operations frozen at commit, no id before
+   commit. Breaks the id-at-create API property (the id is allocated as the
+   first act of `create()` today, and the transaction's entity tracking,
+   the returned handle, and intra-transaction references all key on it),
+   and mutually referencing entities created in one transaction would make
+   ids circularly dependent with no resolution order.
+4. **Accountable equivocation**: partial binding plus creator signatures,
+   with twins detected and punished after the fact. Requires the author
+   signature machinery parked by R1, and is reactive where R3's scheme is
+   structural: divergence has already happened by the time twins meet.
 
 ### II.3 Identity derivation (domain-tagged)
 
 ```
-genesis id = SHA-256( "ankurah.genesis.v0" || bincode(system, nonce, timestamp) )
+genesis id = SHA-256( "ankurah.genesis.v0" || bincode(system, nonce, timestamp, operations) )
 update  id = SHA-256( "ankurah.event.v0"   || bincode(entity_id, operations, parent) )
 entity  id = genesis id
 ```
@@ -453,8 +503,9 @@ conflicts with the current text, this list governs:
 2. core: Node keypair custody, presence sign/verify at register_peer,
    durable recognition against the system-root founder record, Admission
    enum + envelope minting at commit paths, core-side envelope verification
-   ahead of the agent hooks, entity-id derivation in the create path,
-   creation-guard simplification, G-1 seam patch.
+   ahead of the agent hooks, entity-id derivation in the create path
+   (eager freeze: extraction at create() return, construction-order
+   inversion), creation-guard simplification, G-1 seam patch.
 3. Sweep: ankql literal, storage engines, wasm/uniffi bindings, examples,
    tests (fixtures move to create-path helpers).
 4. specs/concurrency/threat-model.md re-dispositions per the list above;
