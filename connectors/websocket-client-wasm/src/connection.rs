@@ -100,6 +100,19 @@ impl Connection {
 
     fn handle_open(&self, e: Event) {
         action_info!(self, "connection open", "{}", &e.type_());
+
+        let presence = proto::Presence {
+            node_id: self.node.id(),
+            durable: self.node.durable(),
+            system_root: self.node.system_root(),
+            protocol_version: proto::PROTOCOL_VERSION,
+        };
+        if let Err(e) = self.send_message(proto::Message::Presence(presence)) {
+            let message = format!("Failed to send presence to {}: {:?}", self.url, e);
+            error!("{}", message);
+            self.disconnect();
+            self.set_state(ConnectionState::Error { message });
+        }
     }
     fn handle_close(&self, e: CloseEvent) {
         action_info!(self, "connection closed", "{}", &e.code());
@@ -158,16 +171,6 @@ impl Connection {
                                     self.disconnect();
                                     self.set_state(ConnectionState::Error { message: rejection.to_string() });
                                     return;
-                                }
-                                let presence = proto::Presence {
-                                    node_id: self.node.id(),
-                                    durable: self.node.durable(),
-                                    system_root: self.node.system_root(),
-                                    protocol_version: proto::PROTOCOL_VERSION,
-                                };
-                                // Send our presence message
-                                if let Err(e) = self.send_message(proto::Message::Presence(presence)) {
-                                    error!("Failed to send presence message: {:?}", e);
                                 }
                             }
                         }

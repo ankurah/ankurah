@@ -17,7 +17,7 @@ use ankurah::{Node, PermissiveAgent};
 use ankurah_storage_sled::SledStorageEngine;
 use std::sync::Arc;
 
-use super::model::SimRecord;
+use super::model::{Field, SimRecord};
 use super::transport::{Captured, SimSender};
 use ankurah::Model;
 
@@ -144,21 +144,39 @@ pub async fn build_nodes(n: usize, captured: Captured) -> anyhow::Result<Vec<Sim
         nodes.push(SimNode { index, durable: false, node, captured: captured.clone() });
     }
 
-    // #330: forged wire envelopes carry a model-definition id, and ingress
-    // `resolve_model` rejects any id its catalog cannot route. The harness
-    // forges events/states directly (bypassing schema registration and the
-    // catalog relay), so seed every node's catalog with the `SimRecord` model
-    // at the fixed `sim_model_id()`. A direct upsert (not the durable
-    // allocator) keeps the id byte-identical across nodes and across runs; the
-    // map is only ever cleared by hard_reset, which the clean system-join here
-    // never triggers, so the seed persists for the run.
+    // The harness forges events and states directly, bypassing schema
+    // registration and the catalog relay. Seed a complete deterministic
+    // `SimRecord` catalog on every node so ingress can route the model and the
+    // forged payloads use the same property ids that typed query registration
+    // retains. Direct upserts keep every id byte-identical across nodes and
+    // runs; hard_reset is not part of these scenarios.
     let sim_model = proto::RegisteredModel {
         id: super::model::sim_model_id(),
         collection: SimRecord::collection().as_str().to_string(),
         name: "SimRecord".to_string(),
     };
+    let sim_properties: Vec<_> = [Field::Title, Field::Body]
+        .into_iter()
+        .map(|field| proto::RegisteredProperty {
+            id: super::model::sim_property_id(field),
+            model: sim_model.id,
+            name: field.name().to_string(),
+            backend: "lww".to_string(),
+            value_type: "string".to_string(),
+            target_model: None,
+        })
+        .collect();
+    let sim_memberships: Vec<_> = [Field::Title, Field::Body]
+        .into_iter()
+        .map(|field| proto::RegisteredMembership {
+            id: super::model::sim_membership_id(field),
+            model: sim_model.id,
+            property: super::model::sim_property_id(field),
+            optional: false,
+        })
+        .collect();
     for node in &nodes {
-        node.node.catalog.upsert_registered(std::slice::from_ref(&sim_model), &[], &[]);
+        node.node.catalog.upsert_registered(std::slice::from_ref(&sim_model), &sim_properties, &sim_memberships);
     }
 
     Ok(nodes)

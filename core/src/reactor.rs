@@ -277,6 +277,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         node: &dyn crate::node::TNodeErased<E>,
         resultset: EntityResultSet<E>,
         gap_fetcher: std::sync::Arc<dyn GapFetcher<E>>,
+        version: u32,
         pre_notify_hook: H,
     ) -> anyhow::Result<()> {
         // Get subscription reference
@@ -299,7 +300,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
             collection_id.clone(),
             selection.clone(),
             included_entities,
-            1, // version 1 for initial add
+            version,
             &mut reactor_update_items,
         )?;
 
@@ -312,8 +313,10 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         // Mark as loaded
         resultset.set_loaded(true);
 
-        // Call pre-notify hook (e.g., mark LiveQuery as initialized) with version 1
-        pre_notify_hook.pre_notify(1);
+        // A later selection can win before the first activation reaches the
+        // reactor. Publish the version that was actually activated so its
+        // initialization waiter is released.
+        pre_notify_hook.pre_notify(version);
 
         // Send the notification with collected items. We always notify because we're initializing the query.
         subscription.send_update(reactor_update_items);
@@ -668,7 +671,7 @@ mod tests {
 
         // Add query using the reactor - this should send Initial notification
         reactor
-            .add_query_and_notify(rsub.id(), query_id, collection_id, selection, &mock_node, resultset, mock_gap_fetcher, ())
+            .add_query_and_notify(rsub.id(), query_id, collection_id, selection, &mock_node, resultset, mock_gap_fetcher, 1, ())
             .await
             .unwrap();
 
@@ -680,6 +683,7 @@ mod tests {
                     entity: entity1.clone(),
                     events: vec![],
                     predicate_relevance: vec![(query_id, MembershipChange::Initial)],
+                    source_queries: vec![query_id],
                 }],
             }]
         );
@@ -802,24 +806,18 @@ mod tests {
 
         let collection_id = CollectionId::fixed_name("album");
         let entity = TestEntity::new("Test Album", "pending");
+        let mut query_ids = Vec::new();
 
         // Two queries on one subscription, both matching the entity.
         for selection_str in ["status = 'pending'", "name = 'Test Album'"] {
+            let query_id = QueryId::new();
+            query_ids.push(query_id);
             let selection: ankql::ast::Selection = selection_str.try_into().unwrap();
             let resultset: EntityResultSet<TestEntity> = EntityResultSet::empty();
             let mock_gap_fetcher = Arc::new(MockGapFetcher::new());
             let mock_node = MockNode { entities: vec![entity.clone()] };
             reactor
-                .add_query_and_notify(
-                    rsub.id(),
-                    QueryId::new(),
-                    collection_id.clone(),
-                    selection,
-                    &mock_node,
-                    resultset,
-                    mock_gap_fetcher,
-                    (),
-                )
+                .add_query_and_notify(rsub.id(), query_id, collection_id.clone(), selection, &mock_node, resultset, mock_gap_fetcher, 1, ())
                 .await
                 .unwrap();
         }
@@ -838,5 +836,10 @@ mod tests {
             vec![event],
             "the change's events must appear once in the item, not once per matching query"
         );
+        assert!(updates[0].items[0].predicate_relevance.is_empty(), "an unchanged match has no membership delta");
+        query_ids.sort();
+        let mut source_queries = updates[0].items[0].source_queries.clone();
+        source_queries.sort();
+        assert_eq!(source_queries, query_ids, "ordinary matching updates must retain every source query even without membership changes");
     }
 }

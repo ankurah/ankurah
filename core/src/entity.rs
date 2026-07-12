@@ -168,7 +168,7 @@ impl EntityInner {
     /// payload can sit under a property id. Comparisons and the reactor's
     /// watcher index collate canonical bytes, so an off-type value casts to
     /// the canonical type here; a value the canonical type cannot represent
-    /// reads as NULL (plan decision 14) with a warning, never a poisoned
+    /// reads as NULL with a warning, never a poisoned
     /// evaluation. No resolver, unknown id, or unknown type string: the value
     /// passes through unchanged.
     fn canonicalize_lenient(&self, id: &EntityId, value: Value) -> Option<Value> {
@@ -216,8 +216,8 @@ impl EntityInner {
 
     /// Read for RESOLVED-identifier predicate evaluation: the same generic
     /// dispatch with the caller-supplied property id (no name re-resolution),
-    /// canonicalized at the evaluation boundary. Absent evaluates NULL (plan
-    /// decision 14). Evaluation has no error surface: type admission is
+    /// canonicalized at the evaluation boundary. Absent evaluates NULL.
+    /// Evaluation has no error surface: type admission is
     /// registration's job (the canonical value_type ruling, 2026-07-10), and
     /// an ill-typed stored value reads as NULL with a warning.
     pub(crate) fn read_resolved_eval(&self, property_id: EntityId, name: &str) -> Option<Value> {
@@ -822,8 +822,7 @@ impl Filterable for TemporaryEntity {
             // its id and reads id-keyed data; unbound (the engine
             // post-filter tier) it degenerates to the bare name-keyed scan,
             // exactly the pre-binding behavior. Schema-blind name projection
-            // of id-keyed entries remains #312 territory (plan decision 13
-            // withdrawn).
+            // of id-keyed entries remains tracked by #312.
             self.0.read_lenient(name)
         }
     }

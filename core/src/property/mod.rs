@@ -78,7 +78,7 @@ impl PropertyKey {
 
 // A bare string IS a display name, so it keys as `Name`. This is safe against
 // the id-keyed invariant: an uncommitted `Name` key a user-collection write
-// stages this way is still resolved to its `Id` at commit (decision 27).
+// stages this way is still resolved to its `Id` before commit serialization.
 impl From<&str> for PropertyKey {
     fn from(name: &str) -> Self { PropertyKey::Name(name.to_string()) }
 }

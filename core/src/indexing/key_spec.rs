@@ -135,8 +135,13 @@ impl KeySpec {
         let mut inverse_match = true;
 
         for (self_keypart, other_keypart) in self.keyparts.iter().zip(other.keyparts.iter()) {
-            // Both column and sub_path must match
-            if self_keypart.column != other_keypart.column || self_keypart.sub_path != other_keypart.sub_path {
+            // A matching index must use the same source and byte encoding.
+            // In particular, String and numeric encodings have different sort
+            // orders even when they refer to the same property.
+            if self_keypart.column != other_keypart.column
+                || self_keypart.sub_path != other_keypart.sub_path
+                || self_keypart.value_type != other_keypart.value_type
+            {
                 return None;
             }
 
@@ -250,6 +255,14 @@ mod tests {
         let index_spec = KeySpec { keyparts: vec![IndexKeyPart::asc("x", ValueType::String), IndexKeyPart::desc("y", ValueType::String)] };
 
         assert_eq!(query_spec.matches(&index_spec), None);
+    }
+
+    #[test]
+    fn test_no_match_different_value_type() {
+        let query_spec = KeySpec { keyparts: vec![IndexKeyPart::asc("price", ValueType::I64)] };
+        let string_collated_index = KeySpec { keyparts: vec![IndexKeyPart::asc("price", ValueType::String)] };
+
+        assert_eq!(query_spec.matches(&string_collated_index), None);
     }
 
     #[test]

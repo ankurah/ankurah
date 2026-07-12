@@ -126,9 +126,9 @@ impl StorageEngine for SqliteStorageEngine {
         .map_err(|e| MutationError::General(Box::new(e)))
     }
 
-    /// Non-creating collection discovery (the trait default returns nothing,
-    /// which would make a durable node warm an empty catalog on restart --
-    /// Codex F3). A collection's state table is named exactly its id
+    /// Non-creating collection discovery. The trait default returns nothing,
+    /// which would make a durable node warm an empty catalog on restart. A
+    /// collection's state table is named exactly its id
     /// (`create_state_table`), paired with an `{id}_event` companion; the
     /// engine-wide `_ankurah_property_columns` map and sqlite's own tables are
     /// the only other tables. So a table is a collection iff its `{name}_event`

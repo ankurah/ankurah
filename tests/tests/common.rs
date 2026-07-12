@@ -89,7 +89,38 @@ impl MessageGate {
         SE: ankurah::core::storage::StorageEngine + Send + Sync + 'static,
         PA: ankurah::policy::PolicyAgent + Send + Sync + 'static,
     {
-        let drained: Vec<_> = { self.held.lock().unwrap().drain(..).collect() };
+        self.release_first(node, usize::MAX).await;
+    }
+
+    /// Release at most the first `count` held messages, preserving arrival
+    /// order and leaving later generations gated.
+    pub async fn release_first<SE, PA>(&self, node: &Node<SE, PA>, count: usize)
+    where
+        SE: ankurah::core::storage::StorageEngine + Send + Sync + 'static,
+        PA: ankurah::policy::PolicyAgent + Send + Sync + 'static,
+    {
+        let drained: Vec<_> = {
+            let mut held = self.held.lock().unwrap();
+            let count = count.min(held.len());
+            held.drain(..count).collect()
+        };
+        for message in drained {
+            let _ = node.handle_message(message).await;
+        }
+    }
+
+    /// Release at most the last `count` held messages, preserving their
+    /// arrival order and leaving earlier generations gated.
+    pub async fn release_last<SE, PA>(&self, node: &Node<SE, PA>, count: usize)
+    where
+        SE: ankurah::core::storage::StorageEngine + Send + Sync + 'static,
+        PA: ankurah::policy::PolicyAgent + Send + Sync + 'static,
+    {
+        let drained: Vec<_> = {
+            let mut held = self.held.lock().unwrap();
+            let start = held.len().saturating_sub(count);
+            held.drain(start..).collect()
+        };
         for message in drained {
             let _ = node.handle_message(message).await;
         }

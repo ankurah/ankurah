@@ -433,10 +433,22 @@ fn decode_base64url_no_pad(s: &str) -> Result<Vec<u8>, String> {
                 out.push((buf[2] << 6) | buf[3]);
             }
             3 => {
+                // A 3-symbol tail carries 16 bits. The low two bits of the
+                // final symbol are padding and must be zero; accepting them
+                // would allow multiple spellings for the same byte string.
+                if buf[2] & 0b11 != 0 {
+                    return Err("nonzero trailing bits in base64url encoding".to_string());
+                }
                 out.push((buf[0] << 2) | (buf[1] >> 4));
                 out.push((buf[1] << 4) | (buf[2] >> 2));
             }
             2 => {
+                // A 2-symbol tail carries 8 bits. The low four bits of the
+                // final symbol are padding and must be zero for canonical
+                // RFC 4648 no-pad spelling.
+                if buf[1] & 0b1111 != 0 {
+                    return Err("nonzero trailing bits in base64url encoding".to_string());
+                }
                 out.push((buf[0] << 2) | (buf[1] >> 4));
             }
             _ => unreachable!("chunk length is 2..=4"),
@@ -468,6 +480,18 @@ mod tests {
         assert!(decode_base64url_no_pad("****").is_err());
         assert!(decode_base64url_no_pad("AA==").is_err());
         assert!(decode_base64url_no_pad("A").is_err()); // len % 4 == 1
+    }
+
+    #[test]
+    fn base64url_rejects_noncanonical_trailing_bits() {
+        // Both pairs decode to the same zero bytes in a permissive decoder,
+        // but only the all-zero suffix has canonical unused bits.
+        assert!(validate_explicit_id("AAAAAAAAAAAAAAAAAAAAAA").is_ok());
+        assert!(validate_explicit_id("AAAAAAAAAAAAAAAAAAAAAB").is_err());
+
+        // Exercise the three-symbol-tail rule independently as well.
+        assert_eq!(decode_base64url_no_pad("AAA").unwrap(), vec![0, 0]);
+        assert!(decode_base64url_no_pad("AAB").is_err());
     }
 
     #[test]

@@ -231,8 +231,9 @@ v3.
       registration when necessary; direct id gets cache the binary-known
       schema and project whatever state already exists. Strict
       ctx.register::<M>(), the never-registered-offline create/commit error,
-      and hard_reset clearing the latch and map are covered
-      (tests/tests/registration_lifecycle.rs, 9 tests).
+      hard_reset clearing the latch and map, and generation-fenced durable
+      catalog resume after replacement-root readiness are covered
+      (tests/tests/registration_lifecycle.rs and tests/tests/system.rs).
 
 ## 9. Cross-cutting and pre-PR
 
@@ -274,7 +275,7 @@ DONE in one train on this branch (ratification trail on #289):
       RegistrationPlan/PlannedMembership/PlannedUpdate; called on the
       resolved plan before any event is emitted.
 - [x] Client lifecycle: ensure_registered consumes SchemaRegistered
-      into the map; cache_compiled reduced to schema-pointer recording;
+      into the map and retains the exact returned binding;
       strict never-registered-offline error at create/commit (an unavailable
       reassert proceeds only for an exact, fully compatible bound shape);
       TContext::ensure_registered returns Result and commit_local_trx enforces

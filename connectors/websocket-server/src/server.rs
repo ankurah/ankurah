@@ -14,7 +14,7 @@ use axum_extra::{headers, TypedHeader};
 use bincode::deserialize;
 use futures_util::StreamExt;
 use std::net::IpAddr;
-use std::{future::Future, net::SocketAddr, ops::ControlFlow, pin::Pin};
+use std::{future::Future, net::SocketAddr, ops::ControlFlow, pin::Pin, time::Duration};
 use tower::ServiceBuilder;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
 #[cfg(feature = "instrument")]
@@ -26,6 +26,10 @@ use ankurah_core::{node::Node, policy::PolicyAgent};
 use crate::{client_ip::SmartClientIp, OptionalUserAgent};
 
 use super::state::Connection;
+
+// A peer that cannot decode our Presence will never send its own, so the
+// pre-establishment state must not be allowed to live for the socket lifetime.
+const INITIAL_PRESENCE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct WebsocketServer<SE, PA>
 where
@@ -115,6 +119,7 @@ where
 
     let (sender, mut receiver) = socket.split();
     let mut conn = Connection::Initial(Some(sender));
+    let initial_presence_deadline = tokio::time::Instant::now() + INITIAL_PRESENCE_TIMEOUT;
 
     // Immediately send server presence after connection
     if let Err(e) = conn
@@ -130,7 +135,20 @@ where
         return;
     }
 
-    while let Some(msg) = receiver.next().await {
+    loop {
+        let next = if matches!(conn, Connection::Initial(_)) {
+            match tokio::time::timeout_at(initial_presence_deadline, receiver.next()).await {
+                Ok(next) => next,
+                Err(_) => {
+                    warn!("Peer at {client_ip} did not send presence within {INITIAL_PRESENCE_TIMEOUT:?}; closing");
+                    break;
+                }
+            }
+        } else {
+            receiver.next().await
+        };
+        let Some(msg) = next else { break };
+
         if let Ok(msg) = msg {
             if process_message(msg, client_ip, &mut conn, node.clone()).await.is_break() {
                 break;

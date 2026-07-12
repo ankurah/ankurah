@@ -633,10 +633,11 @@ ephemeral catalog queries run cached) -- never the arbiter: registration is
 the doubt-resolver.
 
 A direct get by entity id is the deliberate exception. It does not need a
-predicate binding to locate the row, so it only caches the compiled schema
-for a possible later edit and loads the entity; it does not mint or await
-schema registration. Typed projection then follows the ordinary property
-rules, including `Missing` or per-value `NonCastable` where applicable.
+predicate binding to locate the row, so it loads the entity without minting
+or awaiting schema registration. If that view is later edited, the transaction
+records its exact compiled schema and commit ensures it before resolving staged
+keys or writing. Typed projection follows the ordinary property rules,
+including `Missing` or per-value `NonCastable` where applicable.
 When registration cannot run on a schema-dependent path (policy denial, no
 durable peer), that path FAILS LOUD with the registration error; mutating
 paths enforce strictly before a write lands. An explicit
@@ -738,7 +739,24 @@ binding along with the state it already clears
 (core/src/system.rs:208-234), because allocated ids belong to one system
 and a node that hard-resets into a different system must re-register
 against that system's allocator; a stale cache would leak the old
-system's ids into the new one.
+system's ids into the new one. A durable node reused in place remains
+catalog-unready until its replacement system root is ready, then starts one
+warm/listener for the current reset generation. A superseded generation MUST
+NOT publish readiness or catalog state afterward.
+Every catalog effect that can overlap reset is owned by that system epoch:
+the durable storage warm, the ephemeral setup and cached local activation,
+admitted relay responses/updates, and schema registration. Hard reset first
+invalidates their fences and drains admitted work, then deletes storage and
+clears the map/bindings. Registration remains closed until a ready system root
+rearms it; a forwarded `SchemaRegistered` response retains its admission lease
+through both the map fold and exact compiled-schema latch. An ephemeral warm
+may not claim the rootless reset-to-join gap. System load/create/join/reset
+transitions are serialized; if a reset future is canceled while draining, the
+invalidated owner fences remain attached to the reset state so its retry must
+finish the same drain before deletion. An incomplete-reset marker also survives
+cancellation or deletion failure; load, create, and join must resume that reset
+before reading or publishing a system root, including when physical deletion
+completed before the canceled future returned.
 
 **Idempotence across restarts and peers.** Ensure-registration re-issues
 RegisterSchema whenever the local map lacks a binding; the executor's
@@ -901,6 +919,17 @@ participates in readiness through the existing ensure_subscribed /
 context_async gates. (d) The engines' truncated-id fallback naming (Phase C
 amendment below) stays as a loud belt-and-suspenders net that should never
 fire. Ships as PROTOCOL_VERSION = 3 (proto/src/peering.rs).
+
+Streaming `SubscriptionUpdateItem`s also carry `source_queries`: the query ids
+whose result sets caused the item to be emitted, including steady-state
+updates where `predicate_relevance` is empty. A receiver admits the envelope
+only while every item has a current source query on the sending peer. For the
+catalog's reset-sensitive queries, the receiver holds the generation's
+request-fence lease from attached-schema ingestion through delta persistence
+and acknowledgement. Hard reset invalidates the old generation, waits for
+admitted leases to drain, deletes storage, clears reactor/catalog state, and
+only then permits a replacement warm. Queued old responses and updates
+therefore fail closed without relying on unsubscribe delivery order.
 
 The delivered storage contract is uniform across property backends. Backends
 hold no schema binding or wire mode; every entry is addressed by a tagged
@@ -1396,8 +1425,9 @@ Phase A.)
    durable-side lookup-or-create) rather than derivational.
 2. AC2 read-path timing: schema-dependent predicate fetch/query/subscribe
    paths register at first use through the idempotent upsert. Direct entity-id
-   gets are the implemented exception: they cache the compiled schema and
-   load the entity without minting identity. Denied or offline registration
+   gets are the implemented exception: they load the entity without minting
+   identity; a later edit records the exact schema for commit-time admission.
+   Denied or offline registration
    fails loud on paths that require it (5.3); an already-complete schema
    resolves to a no-op plan that emits nothing and skips the policy verb
    (5.7).
@@ -1427,8 +1457,9 @@ Everything else in #85 is adopted as written, including the
    the question no longer exists.
 2. **Registration writes from read-only contexts** (5.2): RESOLVED by the
    implemented path split. Predicate fetch/query/subscribe registers at first
-   use through the idempotent upsert; direct entity-id get only caches and
-   loads. An existing schema is a no-op plan, while denial/offline fails loud
+   use through the idempotent upsert; direct entity-id get only loads, and a
+   later edit records the exact schema for commit-time admission. An existing
+   schema is a no-op plan, while denial/offline fails loud
    only on paths that require registration. See renegotiation 2.
 3. **sys::Item::Collection disposition** (4): superseded by the
    Collection-vs-Model terminology deconfliction, tracked as #305

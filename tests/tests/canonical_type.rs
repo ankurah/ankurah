@@ -170,6 +170,20 @@ async fn distinct_schema_for_ensured_collection_still_runs_compatibility_gate() 
     trx.create(&canonical_backend::Profile { name: "canonical yrs".into() }).await?;
     trx.commit().await?;
 
+    let fetch_error = ctx
+        .fetch::<incompatible_backend::ProfileView>("name = 'canonical yrs'")
+        .await
+        .expect_err("fetch must admit its exact schema even when the catalog already resolves the field name");
+    assert!(fetch_error.to_string().contains("not castable"), "the incompatible fetch must fail registration, got: {fetch_error}");
+
+    use ankurah::signals::With;
+    let query = ctx.query::<incompatible_backend::ProfileView>("name = 'canonical yrs'")?;
+    query.wait_initialized().await;
+    query.error().with(|error| {
+        let message = error.as_ref().expect("live query must surface exact-schema registration failure").to_string();
+        assert!(message.contains("not castable"), "the incompatible query must fail registration, got: {message}");
+    });
+
     let trx = ctx.begin();
     let error = trx
         .create(&incompatible_backend::Profile { name: "incompatible lww".into() })
@@ -177,9 +191,8 @@ async fn distinct_schema_for_ensured_collection_still_runs_compatibility_gate() 
         .expect_err("a different schema shape must not reuse the collection-only registration latch");
     assert!(error.to_string().contains("unconfirmed schema"), "the incompatible backend must fail before writing, got: {error}");
 
-    // The failed declaration remains known to the process for future
-    // first-use resolution, but must not poison a later transaction that uses
-    // the already-confirmed compatible shape for this collection.
+    // A failed declaration must not poison a later transaction that uses the
+    // already-confirmed compatible shape for this collection.
     let trx = ctx.begin();
     trx.create(&canonical_backend::Profile { name: "still canonical".into() }).await?;
     trx.commit().await?;
@@ -372,7 +385,9 @@ async fn live_query_initial_and_updated_selections_stay_resolved() -> Result<()>
     // An update may be requested immediately after construction, while the
     // initial ephemeral resolution/registration task is still in flight.
     let eager = client_ctx.query::<float_model::MetricView>(nocache("score = 8")?)?;
-    eager.update_selection_wait("score = 9").await?;
+    tokio::time::timeout(std::time::Duration::from_secs(5), eager.update_selection_wait("score = 9"))
+        .await
+        .expect("eager update must complete instead of waiting on an obsolete initial version")?;
     let (selection, version) = eager.selection().peek();
     assert_eq!(version, 2);
     assert_resolved_f64_comparison(&selection, 9.0);
@@ -454,6 +469,19 @@ async fn renamed_numeric_property_keeps_canonical_sled_collation() -> Result<()>
         .await?;
     assert!(matches!(response, proto::NodeResponseBody::SchemaRegistered { .. }));
 
+    // A binary that registered before the rename keeps the exact property id
+    // behind its old local alias. Fresh reads, queries, and staged writes must
+    // not reconstruct identity from the catalog's new display name.
+    let stale = ctx.get::<before_rename::LedgerView>(ten_id).await?;
+    assert_eq!(stale.release_year()?, 10.0);
+    let stale_results: Vec<before_rename::LedgerView> = ctx.fetch("release_year > 0 ORDER BY release_year ASC").await?;
+    assert_eq!(stale_results.iter().map(|ledger| ledger.id()).collect::<Vec<_>>(), vec![two_id, three_id, ten_id]);
+    let trx = ctx.begin();
+    stale.edit(&trx)?.release_year().set(&12.0)?;
+    trx.commit().await?;
+    assert_eq!(ctx.get::<before_rename::LedgerView>(ten_id).await?.release_year()?, 12.0);
+    watcher.quiesce_drain().await;
+
     // Rebuild the installed query from its serialized/stored resolved
     // selection, the same shape a relay reconnect re-upserts. The display
     // name refreshes, while the property id remains the pre-rename identity.
@@ -468,7 +496,7 @@ async fn renamed_numeric_property_keeps_canonical_sled_collation() -> Result<()>
 
     let ledgers: Vec<after_rename::LedgerView> = ctx.fetch("year > 0 ORDER BY year ASC").await?;
     let years: Vec<f64> = ledgers.iter().map(|ledger| ledger.year().unwrap()).collect();
-    assert_eq!(years, vec![2.0, 3.0, 10.0], "renamed physical column must retain canonical numeric collation");
+    assert_eq!(years, vec![2.0, 3.0, 12.0], "renamed physical column must retain canonical numeric collation");
 
     let trx = ctx.begin();
     let seven_id = trx.create(&after_rename::Ledger { year: 7.0 }).await?.id();

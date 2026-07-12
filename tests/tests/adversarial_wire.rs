@@ -62,6 +62,7 @@ fn event_only_item(event: proto::Event) -> proto::SubscriptionUpdateItem {
         model: event.model,
         content: proto::UpdateContent::EventOnly(vec![Attested::opt(event, None).into()]),
         predicate_relevance: vec![],
+        source_queries: vec![],
     }
 }
 
@@ -73,10 +74,19 @@ fn event_only_multi(entity_id: proto::EntityId, model: proto::EntityId, events: 
         model,
         content: proto::UpdateContent::EventOnly(events.into_iter().map(|e| Attested::opt(e, None).into()).collect()),
         predicate_relevance: vec![],
+        source_queries: vec![],
     }
 }
 
-fn deliver(from: proto::EntityId, to: proto::EntityId, items: Vec<proto::SubscriptionUpdateItem>) -> proto::NodeMessage {
+fn deliver(
+    from: proto::EntityId,
+    to: proto::EntityId,
+    source_query: proto::QueryId,
+    mut items: Vec<proto::SubscriptionUpdateItem>,
+) -> proto::NodeMessage {
+    for item in &mut items {
+        item.source_queries.push(source_query);
+    }
     proto::NodeMessage::Update(proto::NodeUpdate {
         id: proto::UpdateId::new(),
         from,
@@ -84,6 +94,48 @@ fn deliver(from: proto::EntityId, to: proto::EntityId, items: Vec<proto::Subscri
         body: proto::NodeUpdateBody::SubscriptionUpdate { items },
         schema: vec![],
     })
+}
+
+fn deliver_with_schema(
+    from: proto::EntityId,
+    to: proto::EntityId,
+    source_query: proto::QueryId,
+    mut item: proto::SubscriptionUpdateItem,
+    schema: Vec<Attested<proto::EntityState>>,
+) -> proto::NodeMessage {
+    item.source_queries.push(source_query);
+    proto::NodeMessage::Update(proto::NodeUpdate {
+        id: proto::UpdateId::new(),
+        from,
+        to,
+        body: proto::NodeUpdateBody::SubscriptionUpdate { items: vec![item] },
+        schema,
+    })
+}
+
+/// Build the full name-keyed LWW state used by catalog entities. The schema
+/// envelope is a cache warm, so this deliberately forges states directly
+/// rather than committing catalog events on the sender.
+fn forge_catalog_state(collection: &str, entity_id: proto::EntityId, fields: Vec<(&str, Option<Value>)>) -> Attested<proto::EntityState> {
+    let backend = LWWBackend::new();
+    for (name, value) in fields {
+        backend.set(PropertyKey::Name(name.to_owned()), value);
+    }
+    let operations = backend.to_operations().unwrap().expect("catalog state has fields");
+    let event_id = proto::EventId::from_bytes([0x5A; 32]);
+    backend.apply_operations_with_event(&operations, event_id.clone()).unwrap();
+    let model = ankurah::core::schema::well_known_model_id(collection).expect("catalog collection has a well-known model id");
+    Attested::opt(
+        proto::EntityState {
+            entity_id,
+            model,
+            state: proto::State {
+                state_buffers: proto::StateBuffers(BTreeMap::from([("lww".to_owned(), backend.to_state_buffer().unwrap())])),
+                head: proto::Clock::from(vec![event_id]),
+            },
+        },
+        None,
+    )
 }
 
 /// Standard two-node fixture: a durable server that owns the data and an
@@ -107,6 +159,12 @@ struct Fixture {
     record_artist: proto::EntityId,
 }
 
+impl Fixture {
+    fn delivery(&self, items: Vec<proto::SubscriptionUpdateItem>) -> proto::NodeMessage {
+        deliver(self.server.id, self.client.id, self._relay.query_id(), items)
+    }
+}
+
 async fn fixture() -> Result<Fixture> {
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     server.system.create().await?;
@@ -117,7 +175,7 @@ async fn fixture() -> Result<Fixture> {
     let ctx_c = client.context(c)?;
     // A live subscription establishes the relay context apply_updates requires
     // for this peer; held for the test's duration.
-    let _relay = ctx_c.query_wait::<RecordView>("title = 'no-such-title'").await?;
+    let _relay = ctx_c.query_wait::<RecordView>("true").await?;
     // The relay query resolves the Record predicate, which first-use-registers
     // the model (REN 2), so the durable server now holds its allocated id.
     let record_model = server.catalog.model_id_for(Record::collection().as_str()).expect("Record registered by the relay query");
@@ -144,6 +202,146 @@ async fn seed_record(f: &Fixture, title: &str, artist: &str) -> Result<(proto::E
 async fn committed_event_ids(ctx: &ankurah::Context, id: proto::EntityId) -> Result<Vec<proto::EventId>> {
     let collection = ctx.collection(&Record::collection()).await?;
     Ok(collection.dump_entity_events(id).await?.iter().map(|e| e.payload.id()).collect())
+}
+
+// ===========================================================================
+// Schema-envelope cache invariants
+// ===========================================================================
+
+/// A stream attributed to a query that is no longer current must be rejected
+/// as one envelope before either its shipped schema or its event body can
+/// mutate the receiver.
+#[tokio::test]
+async fn stale_stream_is_rejected_before_schema_and_body() -> Result<()> {
+    let f = fixture().await?;
+    let (rec_id, view) = seed_record(&f, "before", "artist").await?;
+    let forged = forge_title_event(rec_id, f.record_model, f.record_title, view.entity().head().clone(), "after");
+    let forged_id = forged.id();
+    let mut item = event_only_item(forged);
+    item.source_queries.push(proto::QueryId::new());
+
+    let stale_model_id = proto::EntityId::new();
+    let stale_schema = forge_catalog_state(
+        "_ankurah_model",
+        stale_model_id,
+        vec![("collection", Some(Value::String("stale_wire".to_owned()))), ("name", Some(Value::String("StaleWire".to_owned())))],
+    );
+    let update = proto::NodeUpdate {
+        id: proto::UpdateId::new(),
+        from: f.server.id,
+        to: f.client.id,
+        body: proto::NodeUpdateBody::SubscriptionUpdate { items: vec![item] },
+        schema: vec![stale_schema],
+    };
+    f.client.handle_message(proto::NodeMessage::Update(update)).await?;
+
+    assert_eq!(view.title().unwrap(), "before", "a stale stream must not apply its event body");
+    assert!(!committed_event_ids(&f.ctx_c, rec_id).await?.contains(&forged_id));
+    assert!(f.client.catalog.model_by_collection("stale_wire").is_none(), "a stale stream must not warm schema first");
+    Ok(())
+}
+
+/// Shipped catalog states may refresh mutable metadata, but may never rewrite
+/// allocation identity in the receiver's cache. Exercise the real connected,
+/// recipient-checked, permissive-policy envelope seam for every immutable
+/// field, then prove the intentionally mutable fields still update.
+#[tokio::test]
+async fn schema_envelope_preserves_immutable_catalog_identity() -> Result<()> {
+    let f = fixture().await?;
+    let (probe_id, _) = seed_record(&f, "schema-probe", "schema-probe").await?;
+    let probe_event = f
+        .ctx_s
+        .collection(&Record::collection())
+        .await?
+        .dump_entity_events(probe_id)
+        .await?
+        .into_iter()
+        .next()
+        .expect("probe record has a genesis event")
+        .payload;
+    let probe_item = event_only_item(probe_event);
+    let model = f.client.catalog.model_by_collection("record").expect("record model warmed");
+    let property = f.client.catalog.property_by_id(&f.record_title).expect("title property warmed");
+    let membership = f.client.catalog.membership(&f.record_model, &f.record_title).expect("record-title membership warmed");
+
+    let ship = |state| {
+        f.client.handle_message(deliver_with_schema(f.server.id, f.client.id, f._relay.query_id(), probe_item.clone(), vec![state]))
+    };
+    let model_state = |collection: &str, name: &str| {
+        forge_catalog_state(
+            "_ankurah_model",
+            model.id,
+            vec![("collection", Some(Value::String(collection.to_owned()))), ("name", Some(Value::String(name.to_owned())))],
+        )
+    };
+    let property_state =
+        |minted_for: Option<proto::EntityId>, backend: &str, value_type: &str, name: &str, target_model: Option<proto::EntityId>| {
+            forge_catalog_state(
+                "_ankurah_property",
+                property.id,
+                vec![
+                    ("minted_for", minted_for.map(Value::EntityId)),
+                    ("name", Some(Value::String(name.to_owned()))),
+                    ("backend", Some(Value::String(backend.to_owned()))),
+                    ("value_type", Some(Value::String(value_type.to_owned()))),
+                    ("target_model", target_model.map(Value::EntityId)),
+                ],
+            )
+        };
+    let membership_state = |model_id, property_id, optional| {
+        forge_catalog_state(
+            "_ankurah_model_property",
+            membership.id,
+            vec![
+                ("model", Some(Value::EntityId(model_id))),
+                ("property", Some(Value::EntityId(property_id))),
+                ("optional", Some(Value::Bool(optional))),
+            ],
+        )
+    };
+
+    // Same model id, new unused collection.
+    ship(model_state("wire_hijack", "Poisoned")).await?;
+    assert_eq!(f.client.catalog.model_by_collection("record"), Some(model.clone()));
+    assert!(f.client.catalog.model_by_collection("wire_hijack").is_none());
+
+    // Each property allocation field is independently immutable. A poisoned
+    // state is rejected wholesale, including its otherwise-mutable name.
+    let property_attacks = [
+        property_state(Some(proto::EntityId::new()), &property.backend, &property.value_type, "poisoned_name", property.target_model),
+        property_state(None, &property.backend, &property.value_type, "poisoned_name", property.target_model),
+        property_state(property.minted_for, "yrs", &property.value_type, "poisoned_name", property.target_model),
+        property_state(property.minted_for, &property.backend, "i64", "poisoned_name", property.target_model),
+    ];
+    for attack in property_attacks {
+        ship(attack).await?;
+        assert_eq!(f.client.catalog.property_by_id(&property.id), Some(property.clone()));
+    }
+
+    // The membership id cannot move either endpoint.
+    ship(membership_state(proto::EntityId::new(), membership.property, !membership.optional.unwrap_or(true))).await?;
+    assert_eq!(f.client.catalog.membership(&membership.model, &membership.property), Some(membership.clone()));
+    ship(membership_state(membership.model, proto::EntityId::new(), !membership.optional.unwrap_or(true))).await?;
+    assert_eq!(f.client.catalog.membership(&membership.model, &membership.property), Some(membership.clone()));
+
+    // Names, reference targets, and optionality are mutable metadata when all
+    // immutable identity fields match.
+    ship(model_state(&model.collection, "RenamedRecord")).await?;
+    assert_eq!(f.client.catalog.model_by_collection("record").unwrap().name, "RenamedRecord");
+
+    let target = proto::EntityId::new();
+    ship(property_state(property.minted_for, &property.backend, &property.value_type, "renamed_title", Some(target))).await?;
+    let updated_property = f.client.catalog.property_by_id(&property.id).unwrap();
+    assert_eq!(updated_property.name, "renamed_title");
+    assert_eq!(updated_property.target_model, Some(target));
+    ship(property_state(property.minted_for, &property.backend, &property.value_type, "renamed_title", None)).await?;
+    assert_eq!(f.client.catalog.property_by_id(&property.id).unwrap().target_model, None);
+
+    let new_optional = !membership.optional.unwrap_or(true);
+    ship(membership_state(membership.model, membership.property, new_optional)).await?;
+    assert_eq!(f.client.catalog.membership(&membership.model, &membership.property).unwrap().optional, Some(new_optional));
+
+    Ok(())
 }
 
 // ===========================================================================
@@ -231,9 +429,7 @@ async fn malformed_clock_identity_is_order_independent_end_to_end() -> Result<()
             parent: head0.clone(),
         }
     };
-    f.client
-        .handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, f.record_model, vec![ev_b.clone(), ev_c.clone()])]))
-        .await?;
+    f.client.handle_message(f.delivery(vec![event_only_multi(rec_id, f.record_model, vec![ev_b.clone(), ev_c.clone()])])).await?;
 
     // The head is now the antichain {ev_b, ev_c}. Build a merge event whose
     // parent lists those two ids in two different orders; both must hash equal.
@@ -245,7 +441,7 @@ async fn malformed_clock_identity_is_order_independent_end_to_end() -> Result<()
     assert_eq!(ev_merge_a.id(), ev_merge_b.id(), "parent-clock input order must not change event identity");
 
     // Deliver the merge event; the resulting head is a single valid tip.
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(ev_merge_a.clone())])).await?;
+    f.client.handle_message(f.delivery(vec![event_only_item(ev_merge_a.clone())])).await?;
     let head = view.entity().head();
     assert_eq!(head.len(), 1, "merge collapses the antichain to one tip");
     assert!(head.contains(&ev_merge_a.id()), "the merge event is the head");
@@ -279,7 +475,7 @@ async fn forged_dangling_parent_is_contained() -> Result<()> {
     let id_forged = ev_b_forged.id();
 
     // handle_message returns Ok; the per-item failure rides the ack path.
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(ev_a), event_only_item(ev_b_forged)])).await?;
+    f.client.handle_message(f.delivery(vec![event_only_item(ev_a), event_only_item(ev_b_forged)])).await?;
 
     // A applied; B is unchanged, its head did not move, the forged event is not
     // committed, and B's real state survives.
@@ -326,7 +522,7 @@ async fn forged_extra_genesis_head_does_not_trigger_wholesale_adoption() -> Resu
     // security property is: the legitimate child's write is not lost, and the
     // foreign root does not get adopted as the sole head (which would discard
     // the real genesis lineage).
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, f.record_model, vec![ev_b, ev_x])])).await?;
+    f.client.handle_message(f.delivery(vec![event_only_multi(rec_id, f.record_model, vec![ev_b, ev_x])])).await?;
 
     let head = view.entity().head();
     // The original genesis lineage must not have been wholesale-replaced by the
@@ -408,7 +604,7 @@ async fn fabricated_cycle_batch_is_contained() -> Result<()> {
     let id1 = ev1.id();
     let id2 = ev2.id();
 
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, f.record_model, vec![ev1, ev2])])).await?;
+    f.client.handle_message(f.delivery(vec![event_only_multi(rec_id, f.record_model, vec![ev1, ev2])])).await?;
 
     // Neither fabricated-parent event grounds (their parents do not exist), so
     // the entity is unchanged and no fabricated event enters the head.
@@ -443,13 +639,11 @@ async fn replay_flood_is_idempotent() -> Result<()> {
 
     // Flood: 10 identical single-event deliveries, none may error.
     for _ in 0..10 {
-        f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(ev.clone())])).await?;
+        f.client.handle_message(f.delivery(vec![event_only_item(ev.clone())])).await?;
     }
     // And the same event redelivered inside a multi-event batch alongside
     // itself (duplicate within one item), out of order.
-    f.client
-        .handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, f.record_model, vec![ev.clone(), ev.clone()])]))
-        .await?;
+    f.client.handle_message(f.delivery(vec![event_only_multi(rec_id, f.record_model, vec![ev.clone(), ev.clone()])])).await?;
 
     assert_eq!(view.title().unwrap(), "t1", "state reflects exactly one application");
     let head = view.entity().head();
@@ -484,7 +678,8 @@ async fn forged_second_genesis_rejected_on_durable_node() -> Result<()> {
     let alt = forge_title_event(rec_id, f.record_model, f.record_title, proto::Clock::default(), "ALT-GENESIS");
     assert!(alt.is_entity_create(), "alt is a creation event");
     let alt_id = alt.id();
-    f.server.handle_message(deliver(f.client.id, f.server.id, vec![event_only_item(alt)])).await?;
+    let result = f.server.commit_remote_transaction(&c, proto::TransactionId::new(), vec![Attested::opt(alt, None)]).await;
+    assert!(result.is_err(), "the durable apply path must reject a second genesis");
 
     // The durable node rejected it (Disjoint): the committed event set is
     // unchanged and the alt genesis is not present.
@@ -511,7 +706,7 @@ async fn forged_second_genesis_rejected_on_ephemeral_node() -> Result<()> {
 
     let alt = forge_title_event(rec_id, f.record_model, f.record_title, proto::Clock::default(), "ALT-EPH");
     let alt_id = alt.id();
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(alt)])).await?;
+    f.client.handle_message(f.delivery(vec![event_only_item(alt)])).await?;
 
     assert_eq!(view.title().unwrap(), "t0", "ephemeral node must not adopt the forged genesis' value");
     let head_after = view.entity().head();
@@ -541,7 +736,7 @@ async fn phantom_entity_is_evicted_on_failed_apply() -> Result<()> {
         "ghost",
     );
 
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(ev_a), event_only_item(ev_unknown)])).await?;
+    f.client.handle_message(f.delivery(vec![event_only_item(ev_a), event_only_item(ev_unknown)])).await?;
 
     assert_eq!(view_a.title().unwrap(), "a1", "sibling valid item applies");
     // The phantom empty-head resident was evicted: get() forces a retrieval
@@ -590,7 +785,7 @@ async fn oversized_event_batch_is_rejected() -> Result<()> {
     // handle_message returns Ok regardless (error rides the ack path); the
     // observable expectation once #246 lands is that NOTHING from an oversized
     // batch is committed. Today many events commit, so this assertion fails.
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, f.record_model, events)])).await?;
+    f.client.handle_message(f.delivery(vec![event_only_multi(rec_id, f.record_model, events)])).await?;
     let after = committed_event_ids(&f.ctx_c, rec_id).await?.len();
 
     assert_eq!(after, before, "an oversized batch must be rejected wholesale, committing nothing (G-3, #246)");
@@ -653,7 +848,7 @@ async fn equivocation_flood_antichain_is_bounded() -> Result<()> {
     let siblings: Vec<proto::Event> =
         (0..FLOOD).map(|i| forge_title_event(rec_id, f.record_model, f.record_title, head0.clone(), &format!("equiv-{i}"))).collect();
     for ev in siblings {
-        f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(ev)])).await?;
+        f.client.handle_message(f.delivery(vec![event_only_item(ev)])).await?;
     }
 
     // A finite cap (whatever #246 chooses) would keep the head far below the

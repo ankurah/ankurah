@@ -117,9 +117,9 @@ impl StorageEngine for IndexedDBStorageEngine {
         .await
     }
 
-    /// Non-creating collection discovery (the trait default returns nothing,
-    /// which would make a durable node warm an empty catalog on restart --
-    /// Codex F3). Unlike sled/SQL, IndexedDB keeps every collection's entities
+    /// Non-creating collection discovery. The trait default returns nothing,
+    /// which would make a durable node warm an empty catalog on restart.
+    /// Unlike sled/SQL, IndexedDB keeps every collection's entities
     /// in one shared `entities` store addressed by the compound
     /// `(__collection, id)` index, so the collections are the distinct
     /// `__collection` values. Reads the entities via the shared cursor scanner

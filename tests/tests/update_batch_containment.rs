@@ -30,12 +30,13 @@ fn forge_title_event(
     proto::Event { entity_id, model, operations: proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])), parent }
 }
 
-fn event_only_item(event: proto::Event) -> proto::SubscriptionUpdateItem {
+fn event_only_item(event: proto::Event, source_query: proto::QueryId) -> proto::SubscriptionUpdateItem {
     proto::SubscriptionUpdateItem {
         entity_id: event.entity_id,
         model: event.model,
         content: proto::UpdateContent::EventOnly(vec![Attested::opt(event, None).into()]),
         predicate_relevance: vec![],
+        source_queries: vec![source_query],
     }
 }
 
@@ -56,7 +57,7 @@ async fn test_event_only_multi_event_wire_order_is_untrusted() -> Result<()> {
     let ctx_s = server.context(c)?;
     let ctx_c = client.context(c)?;
 
-    let _relay_context = ctx_c.query_wait::<RecordView>("title = 'no-such-title'").await?;
+    let relay_context = ctx_c.query_wait::<RecordView>("true").await?;
 
     let rec_id = {
         let trx = ctx_s.begin();
@@ -98,6 +99,7 @@ async fn test_event_only_multi_event_wire_order_is_untrusted() -> Result<()> {
         model: record_model,
         content: proto::UpdateContent::EventOnly(vec![Attested::opt(ev_child, None).into(), Attested::opt(ev_parent, None).into()]),
         predicate_relevance: vec![],
+        source_queries: vec![relay_context.query_id()],
     };
     let update = proto::NodeUpdate {
         id: proto::UpdateId::new(),
@@ -138,7 +140,7 @@ async fn test_event_only_unknown_entity_does_not_poison_batch() -> Result<()> {
 
     // A live subscription (to anything) establishes the relay context that
     // apply_updates requires for this peer. Held for the test's duration.
-    let _relay_context = ctx_c.query_wait::<RecordView>("title = 'no-such-title'").await?;
+    let relay_context = ctx_c.query_wait::<RecordView>("true").await?;
 
     // Two records created on the server; the client materializes them at
     // their creation heads and holds them resident.
@@ -173,7 +175,11 @@ async fn test_event_only_unknown_entity_does_not_poison_batch() -> Result<()> {
         from: server.id,
         to: client.id,
         body: proto::NodeUpdateBody::SubscriptionUpdate {
-            items: vec![event_only_item(ev_a), event_only_item(ev_unknown), event_only_item(ev_b)],
+            items: vec![
+                event_only_item(ev_a, relay_context.query_id()),
+                event_only_item(ev_unknown, relay_context.query_id()),
+                event_only_item(ev_b, relay_context.query_id()),
+            ],
         },
         schema: vec![],
     };

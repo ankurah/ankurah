@@ -179,7 +179,7 @@ impl StorageEngine for Postgres {
         Ok(true)
     }
 
-    /// Non-creating collection discovery (see the sqlite impl / Codex F3): the
+    /// Non-creating collection discovery. The
     /// trait default returns nothing, which would make a durable node warm an
     /// empty catalog on restart. A collection's state table is named exactly
     /// its id, paired with an `{id}_event` companion; the engine-wide

@@ -23,6 +23,7 @@ fn event_only_message(entity: proto::EntityId, ev: Attested<proto::Event>) -> pr
                 model: model::sim_model_id(),
                 content: proto::UpdateContent::EventOnly(vec![frag]),
                 predicate_relevance: vec![],
+                source_queries: vec![proto::QueryId::test(1)],
             }],
         },
         schema: vec![],

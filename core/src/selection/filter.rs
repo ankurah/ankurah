@@ -445,7 +445,7 @@ mod tests {
         // (The old lenient hint-projection sub-case is gone: an UNRESOLVED path
         // over a schema-blind TemporaryEntity cannot resolve "title" to its id,
         // so id-keyed data is not readable by bare name -- deferred to the
-        // catalog-bound engines, #312, plan.md decision 27.)
+        // catalog-bound engines; dynamic schema-blind projection remains #312.)
 
         // A property nothing claims evaluates as NULL: comparison false, no error.
         let absent_pred = Predicate::Comparison {

@@ -237,10 +237,18 @@ strict never-registered-offline error at create/commit.
 - `hard_reset` flushes the catalog map and every cached registration state
   along with what it already clears (core/src/system.rs:208-234):
   allocated ids belong to one system and must not leak across a root
-  change.
+  change. A durable node reused in place resumes one generation-fenced
+  catalog warm only after the replacement root is ready. Reset invalidates
+  and drains durable warming, ephemeral setup/local activation/wire effects,
+  and schema-registration folds before deletion. Registration and ephemeral
+  setup remain closed through the rootless reset-to-join gap and rearm from
+  the system-ready hook. System lifecycle transitions serialize, and canceled
+  reset barriers retain their invalidated fences for the retry to drain. An
+  incomplete-reset marker survives cancellation or deletion failure so that
+  load, create, or join resumes reset before reading or publishing a root.
 - Tests: map warms from a peer with existing catalog; updates arrive via
   subscription; response-fed upsert observed ahead of the subscription;
-  hard_reset flush verified.
+  hard_reset flush and durable post-reset resume verified.
 
 ### A8. Uniform PropertyKey wire and state (RFC 5.5)
 
@@ -575,9 +583,9 @@ model <-> table map half deferred with #304.
     5.2): the response carries the full resolved definitions;
     ensure_registered upserts them into the CatalogManager map
     immediately on ack, ahead of reactor delivery, so binding and
-    id-keyed writes proceed right behind registration. cache_compiled
-    reduces to recording compiled_schemas for the
-    commit-time-registration gap; its local id derivation is deleted.
+    id-keyed writes proceed right behind registration. The exact returned
+    model/property ids are retained as the compiled schema's binding;
+    transactions record their own exact schemas for commit-time admission.
 22. **Strict never-registered-offline error** (rev 4 maintainer
     ruling, RFC 5.2): creating entities in a collection with no cached
     binding while no durable peer is reachable fails at create/commit
@@ -774,6 +782,14 @@ model <-> table map half deferred with #304.
     Ephemeral ingress never waits -- definitions arrive inline, so a miss
     is final. (d) The
     decision-28 fallback naming stays as the loud never-fired net.
+    Streaming SubscriptionUpdateItem also carries `source_queries`, populated
+    even when predicate membership is unchanged. The receiver verifies those
+    query ids against the sending peer before ingesting attached schema and,
+    for catalog queries, retains the owning reset-fence lease through
+    persistence and acknowledgement. Hard reset invalidates and drains that
+    generation before deleting storage, then clears reactor/catalog state
+    before a replacement warm may start; queued old traffic is rejected
+    without depending on unsubscribe ordering.
     Storage engines stamp reconstructed envelopes via a shared
     bucket_model_id helper (well-knowns -> resolver -> loud retrieval
     error). Two policy-surface changes, both forced by the same fact (raw

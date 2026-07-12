@@ -94,7 +94,7 @@ impl Transaction {
         // RFC 5.2 model first-use on the mutating fetch-to-edit path.
         // Fetching does not mint identity, so a strict registration failure
         // is deferred here (warn only); commit_local_trx enforces it before
-        // any write lands (plan decision 16).
+        // any write lands.
         if let Err(e) = self.dyncontext.ensure_registered(M::schema()).await {
             tracing::warn!("registration unavailable on fetch-to-edit for '{}'; commit will enforce: {}", M::collection(), e);
         }
@@ -125,14 +125,9 @@ impl Transaction {
         // RFC 5.2 model first-use on the edit path. This entry is
         // SYNCHRONOUS (it is what the derive-generated `View::edit` calls, so
         // it cannot become async without touching derive and every
-        // `.edit()?` call site), so it overlays the compiled schema via the
-        // cheap sync cache rather than issuing the durable async
-        // registration. The durable write still happens on the async mutating
-        // entries (`create`, `get`); the entity being edited was itself
-        // created or fetched through one of those, so the model reaches the
-        // durable catalog. This overlay guarantees local resolution here and
-        // now.
-        self.dyncontext.cache_compiled(M::schema());
+        // `.edit()?` call site). Record the exact schema on the transaction;
+        // the async commit admits it before resolving staged property keys or
+        // writing any event.
         if let Some(entity) = self.get_trx_entity(&entity.id) {
             self.record_schema(M::schema());
             return Ok(MutableBorrow::new(entity));

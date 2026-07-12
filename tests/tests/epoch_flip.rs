@@ -300,12 +300,10 @@ async fn resolution_fails_closed_on_unknown_property() -> Result<()> {
 
 #[tokio::test]
 async fn untouched_model_fetch_answers_empty() -> Result<()> {
-    // A model that is READ before any write. Rev 4 (RFC 5.1) deleted the
-    // cache_compiled id overlay: ids exist only in the catalog and its
-    // registration responses. Under the REN 2 revision (plan decision 25b)
-    // the read REGISTERS the compiled model at first use -- an idempotent
-    // upsert -- and then answers EMPTY because the freshly registered
-    // collection holds no entities.
+    // A model that is read before any write. Ids exist only in the catalog
+    // and registration responses, so the predicate read registers this exact
+    // compiled model through an idempotent upsert, then answers empty because
+    // the freshly registered collection holds no entities.
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await;

@@ -57,6 +57,28 @@ pub fn sim_collection() -> proto::CollectionId { SimRecord::collection() }
 /// eight bytes, leaving the high bytes zero).
 pub fn sim_model_id() -> proto::EntityId { proto::EntityId::from_bytes([0x5B; 16]) }
 
+/// Stable catalog identity for each simulated property. The simulation
+/// bypasses ordinary transactions and forges events directly, so its payloads
+/// must use the same id-keyed address that typed query registration retains.
+pub fn sim_property_id(field: Field) -> proto::EntityId {
+    let mut bytes = [0x5C; 16];
+    bytes[15] = match field {
+        Field::Title => 1,
+        Field::Body => 2,
+    };
+    proto::EntityId::from_bytes(bytes)
+}
+
+/// Stable membership identity for each simulated property.
+pub fn sim_membership_id(field: Field) -> proto::EntityId {
+    let mut bytes = [0x5D; 16];
+    bytes[15] = match field {
+        Field::Title => 1,
+        Field::Body => 2,
+    };
+    proto::EntityId::from_bytes(bytes)
+}
+
 /// Decode the `(title, body)` LWW field values from a materialized `proto::State`
 /// as a subscriber would read them, for the C5 coherence checks that compare a
 /// recorded read against the converged truth. An unset field, or a state with no
@@ -66,11 +88,11 @@ pub fn sim_model_id() -> proto::EntityId { proto::EntityId::from_bytes([0x5B; 16
 pub fn field_values(state: &proto::State) -> (Option<String>, Option<String>) {
     let Some(buffer) = state.state_buffers.0.get("lww") else { return (None, None) };
     let Ok(backend) = LWWBackend::from_state_buffer(buffer) else { return (None, None) };
-    let read = |name: &str| match backend.get(&PropertyKey::name(name)) {
+    let read = |field| match backend.get(&PropertyKey::Id(sim_property_id(field))) {
         Some(Value::String(s)) => Some(s),
         _ => None,
     };
-    (read("title"), read("body"))
+    (read(Field::Title), read(Field::Body))
 }
 
 /// Which LWW field a write targets.
@@ -92,7 +114,7 @@ impl Field {
 /// Build the LWW `OperationSet` for setting one field to a value.
 fn lww_ops(field: Field, value: &str) -> proto::OperationSet {
     let backend = LWWBackend::new();
-    backend.set(PropertyKey::name(field.name()), Some(Value::String(value.to_owned())));
+    backend.set(PropertyKey::Id(sim_property_id(field)), Some(Value::String(value.to_owned())));
     let ops = backend.to_operations().unwrap().expect("a written LWW backend yields operations");
     proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)]))
 }

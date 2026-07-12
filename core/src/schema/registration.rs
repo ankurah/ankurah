@@ -1,5 +1,5 @@
 //! The durable-side executor for the RegisterSchema protocol operation
-//! (specs/model-property-metadata/rfc.md section 5.2, rev 4).
+//! (specs/model-property-metadata/rfc.md section 5.2).
 //!
 //! Registration is an UPSERT: the executor looks each definition up by its
 //! lookup key (model by collection; property by (model, name); membership by
@@ -105,6 +105,7 @@ where
         if self.system.root().is_none() {
             return Err(RegistrationError::SystemNotReady);
         }
+        let registration_validity = self.catalog.registration_validity().ok_or(RegistrationError::SystemNotReady)?;
         // Schema knowledge follows collection access (RFC 5.7 addendum,
         // maintainer ruling 2026-07-06): every collection this request
         // names must pass can_access_collection for the requesting
@@ -137,7 +138,10 @@ where
         // storage before minting (see the *_lookup_checked helpers), so a
         // lagging or cold map (partial-commit abort skipped the fold, or a
         // lazily-warming engine, #310) can never fork identity.
-        self.catalog.wait_catalog_ready().await;
+        if !self.catalog.wait_catalog_ready_if_current(&registration_validity).await {
+            return Err(RegistrationError::SystemNotReady);
+        }
+        let _registration_lease = registration_validity.try_acquire().ok_or(RegistrationError::SystemNotReady)?;
 
         // RFC 5.1 executor discipline: the whole upsert -- lookups,
         // allocation, commit, and the synchronous map update -- serializes
@@ -148,8 +152,8 @@ where
         let mut plan = RegistrationPlan::default();
         // Creation events carry the FULL definition state (no frozen
         // encoder, no identity/metadata split; RFC 5.1); follow-ups carry
-        // only fields that differ, parented at the entity's current head
-        // (provenance-ordered, plan decision 18).
+        // only fields that differ, parented at the entity's current head so
+        // LWW recency, rather than a concurrent tiebreak, decides.
         let mut events: Vec<Attested<proto::Event>> = Vec::new();
         let mut push = |event: proto::Event| events.push(Attested::opt(event, None));
 
@@ -175,8 +179,8 @@ where
                 }
                 None => match self.model_lookup_checked(&m.collection).await? {
                     Some(def) => {
-                        // Display names follow the most recent registration
-                        // (plan decision 18); emit only on difference.
+                        // Display names follow the most recent registration;
+                        // emit only on difference.
                         if def.name != m.name {
                             let (_, head) = self
                                 .catalog_entity_snapshot(model_collection(), def.id)
@@ -187,7 +191,7 @@ where
                                 entity: def.id,
                                 field: "name".into(),
                                 from: Some(Value::String(def.name.clone())),
-                                to: Value::String(m.name.clone()),
+                                to: Some(Value::String(m.name.clone())),
                             });
                             push(follow_up(model_collection(), def.id, head, vec![("name", Value::String(m.name.clone()))]));
                         } else {
@@ -250,8 +254,8 @@ where
         for p in &properties {
             // Duplicate descriptor in one request: the first occurrence fixes
             // the resolution (same in-flight rule as models), and a later
-            // duplicate coalesces onto it under the SAME compatibility bar as
-            // a catalog hit (decision 30): a different backend or a
+            // duplicate coalesces onto it under the same compatibility bar as
+            // a catalog hit: a different backend or a
             // non-castable value_type refuses the request rather than being
             // silently absorbed.
             if let Some((_, canon_backend, canon_vt)) = property_ids.get(&(p.minting_collection.clone(), p.name.clone())) {
@@ -326,18 +330,17 @@ where
                 (Some(def), _) => {
                     // Plain hit: name matches by construction; only the
                     // target reference can differ.
-                    let mut fields: Vec<(&str, Value)> = Vec::new();
-                    if let Some(t) = target {
-                        if def.target_model != Some(t) {
-                            plan.updates.push(PlannedUpdate {
-                                collection: property_collection(),
-                                entity: def.id,
-                                field: "target_model".into(),
-                                from: def.target_model.map(Value::EntityId),
-                                to: Value::EntityId(t),
-                            });
-                            fields.push(("target_model", Value::EntityId(t)));
-                        }
+                    let mut fields: Vec<(&str, Option<Value>)> = Vec::new();
+                    if def.target_model != target {
+                        let target_value = target.map(Value::EntityId);
+                        plan.updates.push(PlannedUpdate {
+                            collection: property_collection(),
+                            entity: def.id,
+                            field: "target_model".into(),
+                            from: def.target_model.map(Value::EntityId),
+                            to: target_value.clone(),
+                        });
+                        fields.push(("target_model", target_value));
                     }
                     if fields.is_empty() {
                         plan.existing.push(def.id);
@@ -346,38 +349,37 @@ where
                             .catalog_entity_snapshot(property_collection(), def.id)
                             .await?
                             .ok_or_else(|| RetrievalError::Other(format!("catalog map holds property {} absent from storage", def.id)))?;
-                        push(follow_up(property_collection(), def.id, head, fields));
+                        push(follow_up_patch(property_collection(), def.id, head, fields));
                     }
                     def.id
                 }
                 (None, Some(def)) => {
                     // The rename hint applies: update `name` on the existing
                     // lineage, plus any target change, in one follow-up.
-                    let mut fields: Vec<(&str, Value)> = vec![("name", Value::String(p.name.clone()))];
+                    let mut fields: Vec<(&str, Option<Value>)> = vec![("name", Some(Value::String(p.name.clone())))];
                     plan.updates.push(PlannedUpdate {
                         collection: property_collection(),
                         entity: def.id,
                         field: "name".into(),
                         from: Some(Value::String(def.name.clone())),
-                        to: Value::String(p.name.clone()),
+                        to: Some(Value::String(p.name.clone())),
                     });
-                    if let Some(t) = target {
-                        if def.target_model != Some(t) {
-                            plan.updates.push(PlannedUpdate {
-                                collection: property_collection(),
-                                entity: def.id,
-                                field: "target_model".into(),
-                                from: def.target_model.map(Value::EntityId),
-                                to: Value::EntityId(t),
-                            });
-                            fields.push(("target_model", Value::EntityId(t)));
-                        }
+                    if def.target_model != target {
+                        let target_value = target.map(Value::EntityId);
+                        plan.updates.push(PlannedUpdate {
+                            collection: property_collection(),
+                            entity: def.id,
+                            field: "target_model".into(),
+                            from: def.target_model.map(Value::EntityId),
+                            to: target_value.clone(),
+                        });
+                        fields.push(("target_model", target_value));
                     }
                     let (_, head) = self
                         .catalog_entity_snapshot(property_collection(), def.id)
                         .await?
                         .ok_or_else(|| RetrievalError::Other(format!("catalog map holds property {} absent from storage", def.id)))?;
-                    push(follow_up(property_collection(), def.id, head, fields));
+                    push(follow_up_patch(property_collection(), def.id, head, fields));
                     def.id
                 }
                 (None, None) => {
@@ -407,7 +409,7 @@ where
                 name: p.name.clone(),
                 backend,
                 value_type,
-                target_model: target.or_else(|| current.as_ref().or(renamed.as_ref()).and_then(|d| d.target_model)),
+                target_model: target,
             });
         }
 
@@ -460,7 +462,7 @@ where
                             entity: def.id,
                             field: "optional".into(),
                             from: def.optional.map(Value::Bool),
-                            to: Value::Bool(ms.optional),
+                            to: Some(Value::Bool(ms.optional)),
                         });
                         push(follow_up(model_property_collection(), def.id, head, vec![("optional", Value::Bool(ms.optional))]));
                     } else {
@@ -493,8 +495,8 @@ where
             return Ok((out_models, out_properties, out_memberships));
         }
 
-        // RFC 5.7 / plan decision 26: the exists-aware policy gate judges
-        // the resolved plan before anything is emitted; refusal fails the
+        // The RFC 5.7 exists-aware policy gate judges the resolved plan before
+        // anything is emitted; refusal fails the
         // request before any write. Underneath, check_event still gates
         // each event individually inside the commit pipeline, and the batch
         // is NOT transactional: a mid-batch event denial leaves the earlier
@@ -518,7 +520,7 @@ where
     }
 
     /// Allocator lookup for a model: the catalog map first, then durable
-    /// STORAGE on a miss (rev 4 hardening). The in-memory map can lag
+    /// storage on a miss. The in-memory map can lag
     /// durable truth -- a partial-commit abort skips the post-commit fold,
     /// and non-sled engines warm lazily (#310) -- and minting from a cold
     /// map would fork identity for a key that already exists. A storage hit
@@ -805,13 +807,22 @@ fn creation(collection: CollectionId, entity_id: EntityId, fields: Vec<(&str, Va
 }
 
 /// A follow-up event carrying changed metadata, parented at the entity's
-/// current head (provenance-ordered, plan decision 18: it must DESCEND the
-/// metadata it supersedes so LWW recency decides, not the concurrent
-/// tiebreak).
+/// current head. It must descend the metadata it supersedes so LWW recency
+/// decides, not the concurrent tiebreak.
 fn follow_up(collection: CollectionId, entity_id: EntityId, parent: proto::Clock, fields: Vec<(&str, Value)>) -> proto::Event {
+    follow_up_patch(collection, entity_id, parent, fields.into_iter().map(|(name, value)| (name, Some(value))).collect())
+}
+
+/// A metadata follow-up that may clear fields as well as replace them.
+fn follow_up_patch(
+    collection: CollectionId,
+    entity_id: EntityId,
+    parent: proto::Clock,
+    fields: Vec<(&str, Option<Value>)>,
+) -> proto::Event {
     let backend = LWWBackend::new();
     for (name, value) in fields {
-        backend.set(crate::property::PropertyKey::Name(name.to_string()), Some(value));
+        backend.set(crate::property::PropertyKey::Name(name.to_string()), value);
     }
     let operations = backend.to_operations().expect("LWW encoding of scalar values is infallible").expect("fields are non-empty");
     // Catalog collections have well-known model ids by construction (#330);

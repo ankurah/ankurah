@@ -173,10 +173,10 @@ async fn renamed_from_moves_the_lineage() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A rename without a new target declaration preserves the existing
-/// reference target in the response as well as in storage.
+/// A full descriptor's absent reference target means clear. Both the ordinary
+/// hit and rename paths emit a tombstone, and a later retarget remains mutable.
 #[tokio::test]
-async fn rename_response_preserves_existing_target_model() -> anyhow::Result<()> {
+async fn target_model_can_be_cleared_retargeted_and_cleared_on_rename() -> anyhow::Result<()> {
     let (server, client, _conn) = connected_pair().await?;
 
     let initial = proto::NodeRequestBody::RegisterSchema {
@@ -196,6 +196,40 @@ async fn rename_response_preserves_existing_target_model() -> anyhow::Result<()>
     let property_id = first.1[0].id;
     let target_model = first.1[0].target_model.expect("initial target resolved");
 
+    let clear = proto::NodeRequestBody::RegisterSchema {
+        models: vec![],
+        properties: vec![proto::PropertyDescriptor {
+            minting_collection: "album".into(),
+            name: "artist".into(),
+            renamed_from: None,
+            backend: "lww".into(),
+            value_type: "entityid".into(),
+            target_collection: None,
+            explicit_id: None,
+        }],
+        memberships: vec![],
+    };
+    let cleared = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, clear).await?);
+    assert_eq!(cleared.1[0].id, property_id);
+    assert_eq!(cleared.1[0].target_model, None);
+    assert_eq!(catalog_values(&server, PROPERTY, property_id).await?.get("target_model"), Some(&None));
+
+    let retarget = proto::NodeRequestBody::RegisterSchema {
+        models: vec![],
+        properties: vec![proto::PropertyDescriptor {
+            minting_collection: "album".into(),
+            name: "artist".into(),
+            renamed_from: None,
+            backend: "lww".into(),
+            value_type: "entityid".into(),
+            target_collection: Some("artist".into()),
+            explicit_id: None,
+        }],
+        memberships: vec![],
+    };
+    let retargeted = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, retarget).await?);
+    assert_eq!(retargeted.1[0].target_model, Some(target_model));
+
     let rename = proto::NodeRequestBody::RegisterSchema {
         models: vec![],
         properties: vec![proto::PropertyDescriptor {
@@ -211,9 +245,9 @@ async fn rename_response_preserves_existing_target_model() -> anyhow::Result<()>
     };
     let renamed = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, rename).await?);
     assert_eq!(renamed.1[0].id, property_id);
-    assert_eq!(renamed.1[0].target_model, Some(target_model));
+    assert_eq!(renamed.1[0].target_model, None);
     let values = catalog_values(&server, PROPERTY, property_id).await?;
-    assert_eq!(values.get("target_model"), Some(&Some(Value::EntityId(target_model))));
+    assert_eq!(values.get("target_model"), Some(&None));
 
     Ok(())
 }
@@ -681,16 +715,17 @@ async fn ephemeral_node_refuses_execution() -> anyhow::Result<()> {
 // -- the exists-aware policy verb (RFC 5.7, plan decision 26) ---------------
 
 /// One configurable PermissiveAgent clone driving every policy-verb test in
-/// this file. It is permissive everywhere except the three customization
-/// points the tests exercise, each an optional hook closure: a schema plan
-/// gate, a per-event gate, and a collection-access gate. A `Default` (all
-/// hooks unset) instance is fully permissive -- the inert client side.
+/// this file. It is permissive everywhere except the customization points the
+/// tests exercise: a schema plan gate, a per-event gate, a collection-access
+/// gate, and an optional name-keyed catalog filter. A `Default` instance is
+/// fully permissive -- the inert client side.
 #[derive(Clone, Default)]
 struct ProbeAgent {
     on_schema_registration:
         Option<std::sync::Arc<dyn Fn(&ankurah::policy::RegistrationPlan) -> Result<(), ankurah::policy::AccessDenied> + Send + Sync>>,
     on_event: Option<std::sync::Arc<dyn Fn(&proto::Event) -> Result<(), ankurah::policy::AccessDenied> + Send + Sync>>,
     on_collection_access: Option<std::sync::Arc<dyn Fn(&proto::CollectionId) -> Result<(), ankurah::policy::AccessDenied> + Send + Sync>>,
+    filter_catalog_properties: bool,
 }
 
 #[async_trait::async_trait]
@@ -784,12 +819,16 @@ impl ankurah::policy::PolicyAgent for ProbeAgent {
     fn filter_predicate<C>(
         &self,
         _data: &C,
-        _collection: &proto::CollectionId,
+        collection: &proto::CollectionId,
         predicate: ankql::ast::Predicate,
     ) -> Result<ankql::ast::Predicate, ankurah::policy::AccessDenied>
     where
         C: ankurah::core::util::Iterable<Self::ContextData>,
     {
+        if self.filter_catalog_properties && collection.as_str() == PROPERTY {
+            let name_filter = ankql::parser::parse_selection("name != '__never__'").expect("static catalog policy filter parses").predicate;
+            return Ok(ankql::ast::Predicate::And(Box::new(predicate), Box::new(name_filter)));
+        }
         Ok(predicate)
     }
 
@@ -836,6 +875,32 @@ impl ankurah::policy::PolicyAgent for ProbeAgent {
     ) -> Result<(), ankurah::policy::AccessDenied> {
         Ok(())
     }
+}
+
+/// Catalog fields are the frozen, name-keyed bootstrap schema. A policy
+/// filter that references one of those fields must therefore pass through
+/// without trying to resolve it through the catalog being initialized. Doing
+/// so would make the property-catalog query recursively call
+/// `ensure_subscribed` and wait on its own readiness latch forever.
+#[tokio::test]
+async fn name_filtered_catalog_subscription_bootstraps_without_recursion() -> anyhow::Result<()> {
+    let agent = ProbeAgent { filter_catalog_properties: true, ..Default::default() };
+    let server = Node::new_durable(std::sync::Arc::new(SledStorageEngine::new_test()?), agent.clone());
+    server.system.create().await?;
+    let client = Node::new(std::sync::Arc::new(SledStorageEngine::new_test()?), agent);
+    let _conn = LocalProcessConnection::new(&server, &client).await?;
+    client.system.wait_system_ready().await;
+
+    let (_, properties, _) = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+    let property_id = properties[0].id;
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), client.context_async(DEFAULT_CONTEXT))
+        .await
+        .expect("a name-filtered catalog subscription must not recurse into its own warm");
+    assert!(client.catalog.is_catalog_ready());
+    assert_eq!(client.catalog.resolve("album", "name"), Some(property_id));
+
+    Ok(())
 }
 
 /// The exists-aware gate: a plan that would CREATE a forbidden definition
