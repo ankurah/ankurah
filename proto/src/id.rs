@@ -1,42 +1,59 @@
 use base64::{engine::general_purpose, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use ulid::Ulid;
 
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
-use crate::error::{DecodeError, IdParseError};
-// TODO - split out the different id types. Presently there's a lot of not-entities that are using this type for their ID
+use crate::error::DecodeError;
+#[cfg(feature = "uniffi")]
+use crate::error::IdParseError;
+
+/// Self-certifying entity identity: the 32-byte content hash of the entity's
+/// genesis event (`EntityId` = genesis [`crate::EventId`], RFC
+/// specs/identity-attestation/spec.md II.1). There is no allocation step and
+/// no randomness beyond what the genesis preimage carries, so a "different
+/// genesis for an existing id" is unrepresentable: a different genesis is a
+/// different id, hence a different entity.
+///
+/// Ids are DERIVED, never minted: construct one through
+/// [`crate::Event::genesis`] (which hashes the genesis body) or decode one
+/// from stored/wire bytes. Node identity is [`crate::NodeId`]; request/query
+/// correlation ids are their own ULID-backed newtypes.
 #[derive(PartialEq, Eq, Hash, Clone, Copy, Ord, PartialOrd)]
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
-pub struct EntityId(pub(crate) Ulid);
+pub struct EntityId(pub(crate) [u8; 32]);
 
 impl EntityId {
-    pub fn new() -> Self { EntityId(Ulid::new()) }
+    pub fn from_bytes(bytes: [u8; 32]) -> Self { EntityId(bytes) }
 
-    pub fn from_bytes(bytes: [u8; 16]) -> Self { EntityId(Ulid::from_bytes(bytes)) }
+    pub fn to_bytes(&self) -> [u8; 32] { self.0 }
 
-    pub fn to_bytes(&self) -> [u8; 16] { self.0.to_bytes() }
+    pub fn as_bytes(&self) -> &[u8] { &self.0 }
 
     pub fn from_base64<T: AsRef<[u8]>>(input: T) -> Result<Self, DecodeError> {
         let decoded = general_purpose::URL_SAFE_NO_PAD.decode(input).map_err(DecodeError::InvalidBase64)?;
-        let bytes: [u8; 16] = decoded[..].try_into().map_err(|_| DecodeError::InvalidLength)?;
+        let bytes: [u8; 32] = decoded[..].try_into().map_err(|_| DecodeError::InvalidLength)?;
 
-        Ok(EntityId(Ulid::from_bytes(bytes)))
+        Ok(EntityId(bytes))
     }
 
-    pub fn to_base64(&self) -> String { general_purpose::URL_SAFE_NO_PAD.encode(self.0.to_bytes()) }
+    pub fn to_base64(&self) -> String { general_purpose::URL_SAFE_NO_PAD.encode(self.0) }
 
     pub fn to_base64_short(&self) -> String {
         // take the last 6 characters of the base64 encoded string
         let value = self.to_base64();
         value[value.len() - 6..].to_string()
     }
+}
 
-    pub fn to_ulid(&self) -> Ulid { self.0 }
-    pub fn from_ulid(ulid: Ulid) -> Self { EntityId(ulid) }
+/// The genesis derivation (RFC specs/identity-attestation/spec.md II.1): an
+/// entity's id IS its genesis event id. Meaningful only for genesis event
+/// ids; used by derivation and by the structural creation guard
+/// (`event.id() == entity_id`).
+impl From<crate::EventId> for EntityId {
+    fn from(id: crate::EventId) -> Self { EntityId(id.to_bytes()) }
 }
 
 // Methods exported to both WASM and UniFFI
@@ -52,7 +69,7 @@ impl EntityId {
 #[wasm_bindgen]
 impl EntityId {
     #[wasm_bindgen(js_name = to_base64)]
-    pub fn to_base64_js(&self) -> String { general_purpose::URL_SAFE_NO_PAD.encode(self.0.to_bytes()) }
+    pub fn to_base64_js(&self) -> String { general_purpose::URL_SAFE_NO_PAD.encode(self.0) }
 
     #[wasm_bindgen(js_name = from_base64)]
     pub fn from_base64_js(s: &str) -> Result<Self, JsValue> { Self::from_base64(s).map_err(|e| JsValue::from_str(&e.to_string())) }
@@ -118,17 +135,9 @@ impl From<&EntityId> for String {
 impl TryInto<EntityId> for Vec<u8> {
     type Error = DecodeError;
     fn try_into(self) -> Result<EntityId, Self::Error> {
-        let bytes: [u8; 16] = self.try_into().map_err(|_| DecodeError::InvalidLength)?;
-        Ok(EntityId(Ulid::from_bytes(bytes)))
+        let bytes: [u8; 32] = self.try_into().map_err(|_| DecodeError::InvalidLength)?;
+        Ok(EntityId(bytes))
     }
-}
-
-impl From<EntityId> for Ulid {
-    fn from(id: EntityId) -> Self { id.0 }
-}
-
-impl Default for EntityId {
-    fn default() -> Self { Self::new() }
 }
 
 impl Serialize for EntityId {
@@ -139,7 +148,7 @@ impl Serialize for EntityId {
             serializer.serialize_str(&self.to_base64())
         } else {
             // Use raw bytes as a fixed-size array for binary formats like bincode
-            self.to_bytes().serialize(serializer)
+            self.0.serialize(serializer)
         }
     }
 }
@@ -153,7 +162,7 @@ impl<'de> Deserialize<'de> for EntityId {
             EntityId::from_base64(s).map_err(serde::de::Error::custom)
         } else {
             // Deserialize from raw bytes as a fixed-size array for binary formats
-            let bytes = <[u8; 16]>::deserialize(deserializer)?;
+            let bytes = <[u8; 32]>::deserialize(deserializer)?;
             Ok(EntityId::from_bytes(bytes))
         }
     }
@@ -163,19 +172,23 @@ impl<'de> Deserialize<'de> for EntityId {
 mod tests {
     use super::*;
 
+    fn test_bytes() -> [u8; 32] {
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
+    }
+
     #[test]
     fn test_entity_id_json_serialization() {
-        let id = EntityId::from_bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+        let id = EntityId::from_bytes(test_bytes());
         let json = serde_json::to_string(&id).unwrap();
-        assert_eq!(json, "\"AQIDBAUGBwgJCgsMDQ4PEA\"");
+        assert_eq!(json, "\"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA\"");
         assert_eq!(id, serde_json::from_str(&json).unwrap());
     }
 
     #[test]
     fn test_entity_id_bincode_serialization() {
-        let id = EntityId::from_bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+        let id = EntityId::from_bytes(test_bytes());
         let bytes = bincode::serialize(&id).unwrap();
-        assert_eq!(bytes, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+        assert_eq!(bytes, test_bytes());
         assert_eq!(id, bincode::deserialize(&bytes).unwrap());
     }
 }
@@ -183,9 +196,9 @@ mod tests {
 // EntityId support for predicates
 
 impl From<EntityId> for ankql::ast::Expr {
-    fn from(id: EntityId) -> ankql::ast::Expr { ankql::ast::Expr::Literal(ankql::ast::Literal::EntityId(id.to_ulid())) }
+    fn from(id: EntityId) -> ankql::ast::Expr { ankql::ast::Expr::Literal(ankql::ast::Literal::EntityId(id.to_bytes())) }
 }
 
 impl From<&EntityId> for ankql::ast::Expr {
-    fn from(id: &EntityId) -> ankql::ast::Expr { ankql::ast::Expr::Literal(ankql::ast::Literal::EntityId(id.to_ulid())) }
+    fn from(id: &EntityId) -> ankql::ast::Expr { ankql::ast::Expr::Literal(ankql::ast::Literal::EntityId(id.to_bytes())) }
 }

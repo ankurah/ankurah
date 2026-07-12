@@ -1,4 +1,4 @@
-use crate::{auth::Attested, data::EntityState, id::EntityId, subscription::QueryId, EventFragment, StateFragment};
+use crate::{auth::Attested, data::EntityState, id::EntityId, node_id::NodeId, subscription::QueryId, EventFragment, StateFragment};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -67,8 +67,8 @@ impl TryFrom<SubscriptionUpdateItem> for Attested<EntityState> {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NodeUpdate {
     pub id: UpdateId,
-    pub from: EntityId,
-    pub to: EntityId,
+    pub from: NodeId,
+    pub to: NodeId,
     pub body: NodeUpdateBody,
     /// Catalog definition entities (model/property/membership states) the
     /// receiver needs to resolve this update's model ids (#330). Shipped once
@@ -83,8 +83,8 @@ pub struct NodeUpdate {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NodeUpdateAck {
     pub id: UpdateId,
-    pub from: EntityId,
-    pub to: EntityId,
+    pub from: NodeId,
+    pub to: NodeId,
     pub body: NodeUpdateAckBody,
 }
 

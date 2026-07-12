@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::{
-    auth::Attested, clock::Clock, collection::CollectionId, data::Event, id::EntityId, subscription::QueryId, transaction::TransactionId,
-    EntityState, EventFragment, EventId, StateFragment,
+    auth::Attested, clock::Clock, collection::CollectionId, data::Event, id::EntityId, node_id::NodeId, subscription::QueryId,
+    transaction::TransactionId, EntityState, EventFragment, EventId, StateFragment,
 };
 
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Serialize, Deserialize, Hash, Default)]
@@ -25,8 +25,8 @@ impl RequestId {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NodeRequest {
     pub id: RequestId,
-    pub to: EntityId,
-    pub from: EntityId,
+    pub to: NodeId,
+    pub from: NodeId,
     pub body: NodeRequestBody,
 }
 
@@ -265,8 +265,8 @@ pub struct RegisteredMembership {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NodeResponse {
     pub request_id: RequestId,
-    pub from: EntityId,
-    pub to: EntityId,
+    pub from: NodeId,
+    pub to: NodeId,
     pub body: NodeResponseBody,
     /// Catalog definition entities the receiver needs to resolve this
     /// response's model ids (#330); see `NodeUpdate::schema` in update.rs.
@@ -372,7 +372,9 @@ impl std::fmt::Display for EntityDelta {
                 }
                 write!(f, "EntityDelta {}: EventBridge({})", self.entity_id, event_strs.join(", "))
             }
-            DeltaContent::StateAndRelation { state, relation } => write!(f, "EntityDelta {}: StateAndRelation({})", self.entity_id, state),
+            DeltaContent::StateAndRelation { state, relation: _ } => {
+                write!(f, "EntityDelta {}: StateAndRelation({})", self.entity_id, state)
+            }
         }
     }
 }

@@ -1,7 +1,6 @@
 use crate::error::ParseError;
 use crate::selection::sql::generate_selection_sql;
 use serde::{Deserialize, Serialize};
-use ulid::Ulid;
 
 /// Custom serialization for serde_json::Value that stores as bytes.
 /// This is needed because bincode doesn't support deserialize_any.
@@ -40,7 +39,9 @@ pub enum Literal {
     F64(f64),
     Bool(bool),
     String(String),
-    EntityId(Ulid),
+    /// A 32-byte entity id (the raw bytes of proto's content-hash
+    /// `EntityId`, which ankql cannot depend on).
+    EntityId([u8; 32]),
     Object(Vec<u8>),
     Binary(Vec<u8>),
     /// JSON value - used for comparisons against JSON property subfields.
@@ -82,9 +83,10 @@ impl std::fmt::Display for PathExpr {
 /// bound that name to an id.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Identifier {
-    /// The property's stable entity id. Held as a raw `Ulid` because ankql
-    /// cannot depend on proto's `EntityId` (same as [`Literal::EntityId`]).
-    pub property: Ulid,
+    /// The property's stable entity id. Held as raw 32-byte content-hash id
+    /// bytes because ankql cannot depend on proto's `EntityId` (same as
+    /// [`Literal::EntityId`]).
+    pub property: [u8; 32],
     /// The property's display name, used for SQL columns and rendered output.
     pub name: String,
     /// JSON sub-path into the property's value; empty for a plain reference.
@@ -644,7 +646,7 @@ mod tests {
         Selection {
             predicate: Predicate::Comparison {
                 left: Box::new(Expr::Identifier(Identifier {
-                    property: Ulid::from_bytes([7u8; 16]),
+                    property: [7u8; 32],
                     name: name.to_string(),
                     subpath: subpath.into_iter().map(|s| s.to_string()).collect(),
                 })),
@@ -739,12 +741,11 @@ mod tests {
     #[test]
     fn identifier_display_matches_path() {
         // Display renders name then dotted subpath, consistent with PathExpr.
-        let ident =
-            Identifier { property: Ulid::from_bytes([1u8; 16]), name: "licensing".to_string(), subpath: vec!["territory".to_string()] };
+        let ident = Identifier { property: [1u8; 32], name: "licensing".to_string(), subpath: vec!["territory".to_string()] };
         assert_eq!(ident.to_string(), "licensing.territory");
         assert_eq!(ident.to_string(), PathExpr { steps: vec!["licensing".to_string(), "territory".to_string()] }.to_string());
 
-        let simple = Identifier { property: Ulid::from_bytes([1u8; 16]), name: "status".to_string(), subpath: vec![] };
+        let simple = Identifier { property: [1u8; 32], name: "status".to_string(), subpath: vec![] };
         assert_eq!(simple.to_string(), "status");
     }
 }

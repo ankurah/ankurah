@@ -12,7 +12,7 @@ use std::io::Write;
 impl ToSql for EntityId {
     fn to_sql(&self, _: &Type, out: &mut BytesMut) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
         let mut enc = EncoderWriter::new(out.writer(), &general_purpose::URL_SAFE_NO_PAD);
-        enc.write_all(self.0.to_bytes().as_slice())?;
+        enc.write_all(self.as_bytes())?;
         enc.finish()?;
         Ok(IsNull::No)
     }
