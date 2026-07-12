@@ -1153,9 +1153,7 @@ where
                                     id,
                                     from,
                                     to,
-                                    body: proto::NodeUpdateAckBody::Error(
-                                        "subscription update has no current source query".to_string(),
-                                    ),
+                                    body: proto::NodeUpdateAckBody::Error("subscription update has no current source query".to_string()),
                                 }))?;
                                 return Ok(());
                             }
