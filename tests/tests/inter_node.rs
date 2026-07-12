@@ -1,8 +1,9 @@
 mod common;
 
 use ankurah::core::node::nocache;
+use ankurah::core::node_applier::NodeApplier;
 use ankurah::signals::Subscribe;
-use ankurah::{changes::ChangeKind, policy::DEFAULT_CONTEXT as c, EntityId, Mutable, Node, PermissiveAgent};
+use ankurah::{changes::ChangeKind, policy::DEFAULT_CONTEXT as c, EntityId, Model, Mutable, Node, PermissiveAgent};
 use ankurah_connector_local_process::LocalProcessConnection;
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
@@ -157,6 +158,73 @@ async fn server_edits_subscription() -> Result<()> {
 
     // Ensure no additional unexpected changes
     assert_eq!(client_watcher.quiesce().await, 0);
+    Ok(())
+}
+
+/// One wire item may repeat an EventFragment, but one logical event must
+/// still appear only once in the EntityChange the client publishes. Staging
+/// and planning are id-keyed already; this pins the StateAndEvent fast path,
+/// which echoes the validated batch directly into the change.
+#[tokio::test]
+async fn duplicated_fragment_in_one_item_yields_a_single_event_change() -> Result<()> {
+    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    server.system.create().await?;
+    let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+
+    // Once armed, hold the server's ordinary subscription push so this test
+    // can deliver one deliberately duplicated item through the same peer
+    // context without racing the honest copy.
+    let hold_updates = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (_conn, _gate) = {
+        let hold_updates = hold_updates.clone();
+        GatedConnection::new(&server, &client, move |message| {
+            hold_updates.load(std::sync::atomic::Ordering::SeqCst) && matches!(message, proto::NodeMessage::Update(_))
+        })
+    };
+    client.system.wait_system_ready().await;
+
+    let server_ctx = server.context(c)?;
+    let client_ctx = client.context(c)?;
+    let pet_id = {
+        let trx = server_ctx.begin();
+        let pet = trx.create(&Pet { name: "Duplicate Wire".to_owned(), age: "1".to_owned() }).await?;
+        let id = pet.id();
+        trx.commit().await?;
+        id
+    };
+
+    let query = client_ctx.query_wait::<PetView>(nocache("name = 'Duplicate Wire'")?).await?;
+    assert_eq!(query.ids(), vec![pet_id]);
+    let watcher = TestWatcher::changeset_with_event_ids();
+    let _watcher_guard = query.subscribe(&watcher);
+
+    hold_updates.store(true, std::sync::atomic::Ordering::SeqCst);
+    let event = {
+        let trx = server_ctx.begin();
+        let pet = server_ctx.get::<PetView>(pet_id).await?;
+        pet.edit(&trx)?.age().replace("2")?;
+        let mut events = trx.commit_and_return_events().await?;
+        assert_eq!(events.len(), 1, "the edit produces one logical event");
+        events.remove(0)
+    };
+
+    let collection = server_ctx.collection(&Pet::collection()).await?;
+    let state_fragment: proto::StateFragment = collection.get_state(pet_id).await?.into();
+    let event_fragment: proto::EventFragment = proto::Attested::opt(event.clone(), None).into();
+    let item = proto::SubscriptionUpdateItem {
+        entity_id: pet_id,
+        model: event.model,
+        content: proto::UpdateContent::StateAndEvent(state_fragment, vec![event_fragment.clone(), event_fragment]),
+        predicate_relevance: vec![],
+    };
+
+    NodeApplier::apply_updates_for_test(&client, &server.id, vec![item]).await.expect("the duplicated item applies cleanly");
+    assert_eq!(
+        watcher.take_one().await,
+        vec![(pet_id, ChangeKind::Update, vec![event.id()])],
+        "one wire event id must yield one published event change"
+    );
+    assert_eq!(watcher.quiesce().await, 0, "the item publishes one changeset");
     Ok(())
 }
 
