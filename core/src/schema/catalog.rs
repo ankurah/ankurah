@@ -466,48 +466,6 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    /// Stored catalog definition states needed to describe `models` on the
-    /// wire. Returns model ids whose definition could not be loaded so the
-    /// connection can make them eligible for a later announcement retry.
-    pub(crate) async fn definition_states_for_models(
-        &self,
-        models: &[EntityId],
-    ) -> (Vec<proto::Attested<proto::EntityState>>, Vec<EntityId>) {
-        if models.is_empty() {
-            return (Vec::new(), Vec::new());
-        }
-
-        let (Ok(model_col), Ok(property_col), Ok(membership_col)) = (
-            self.0.collectionset.get(&model_collection()).await,
-            self.0.collectionset.get(&property_collection()).await,
-            self.0.collectionset.get(&model_property_collection()).await,
-        ) else {
-            return (Vec::new(), models.to_vec());
-        };
-
-        let mut states = Vec::new();
-        let mut failed = Vec::new();
-        for model in models {
-            match model_col.get_state(*model).await {
-                Ok(state) => states.push(state),
-                Err(error) => {
-                    warn!("Cannot load model definition {} for wire announcement: {}", model.to_base64_short(), error);
-                    failed.push(*model);
-                    continue;
-                }
-            }
-            for membership in self.memberships_of(model) {
-                if let Ok(state) = property_col.get_state(membership.property).await {
-                    states.push(state);
-                }
-                if let Ok(state) = membership_col.get_state(membership.id).await {
-                    states.push(state);
-                }
-            }
-        }
-        (states, failed)
-    }
-
     pub(crate) fn new(collections: CollectionSet<SE>, entities: WeakEntitySet, reactor: Reactor, durable: bool) -> Self {
         Self(Arc::new(CatalogInner {
             collectionset: collections,

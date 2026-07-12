@@ -30,7 +30,6 @@
 
 use ankql::ast::{Expr, Identifier, OrderByItem, PathExpr, Predicate, Selection};
 use ankurah_proto::{CollectionId, EntityId};
-use std::sync::{atomic::AtomicBool, Arc};
 
 use crate::policy::PolicyAgent;
 use crate::property::PropertyError;

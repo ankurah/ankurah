@@ -462,18 +462,6 @@ where
         Ok(guard)
     }
 
-    /// Fence an incoming/current-generation apply against reset. Unlike a
-    /// local transaction, the authenticated connection does not carry a
-    /// creation-time token, so readiness plus the exclusive gate is the
-    /// generation boundary.
-    pub(crate) async fn guard_current_generation(&self) -> Result<tokio::sync::OwnedRwLockReadGuard<()>, MutationError> {
-        let guard = self.0.collectionset.storage_read_lease().await;
-        if !self.is_storage_generation_current() || !*self.0.system_ready.read().unwrap() {
-            return Err(MutationError::SystemReset);
-        }
-        Ok(guard)
-    }
-
     async fn guard_generation_allow_unready(
         &self,
         generation: &Arc<AtomicBool>,

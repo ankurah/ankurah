@@ -190,10 +190,6 @@ impl<SE: StorageEngine> CollectionSet<SE> {
         self.0.storage_engine.system_root_claim().await
     }
 
-    pub(crate) async fn release_system_root_claim(&self, expected: &SystemRootProof) -> Result<bool, MutationError> {
-        self.0.storage_engine.release_system_root_claim(expected).await
-    }
-
     pub async fn delete_all_collections(&self) -> Result<bool, MutationError> {
         // Keep the complete proposal as a cross-instance fence while data is
         // deleted. Engines deliberately preserve metadata during their raw
