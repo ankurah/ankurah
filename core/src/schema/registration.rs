@@ -868,7 +868,13 @@ fn follow_up(
     parent_generations: proto::GClock,
     fields: Vec<(&str, Value)>,
 ) -> proto::Event {
-    follow_up_patch(collection, entity_id, parent, parent_generations, fields.into_iter().map(|(name, value)| (name, Some(value))).collect())
+    follow_up_patch(
+        collection,
+        entity_id,
+        parent,
+        parent_generations,
+        fields.into_iter().map(|(name, value)| (name, Some(value))).collect(),
+    )
 }
 
 /// A metadata follow-up that may clear fields as well as replace them.
