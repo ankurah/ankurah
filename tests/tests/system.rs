@@ -562,12 +562,15 @@ async fn hard_reset_invalidates_old_handles_transactions_and_peer_routes() -> Re
     client.system.wait_loaded().await;
     let _old_connection = LocalProcessConnection::new(&founder_a, &client).await?;
     client.system.wait_system_ready().await;
-    for _ in 0..100 {
-        if client.get_durable_peers() == vec![founder_a.id] {
-            break;
+    // Durable promotion runs in the register task after readiness publishes;
+    // bound the wait by time, not scheduler-dependent yield counts.
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while client.get_durable_peers() != vec![founder_a.id] {
+            tokio::task::yield_now().await;
         }
-        tokio::task::yield_now().await;
-    }
+    })
+    .await
+    .expect("the founder must be promoted into durable routing after join");
     assert_eq!(client.get_durable_peers(), vec![founder_a.id]);
 
     // Warm the client catalog before creating the application entity so the
