@@ -74,7 +74,7 @@ async fn legacy_name_root_can_be_replaced_after_property_id_resolution() -> Resu
     legacy.insert(&PropertyKey::Name("content".into()), 0, "legacy text")?;
     let mut state_buffers = std::collections::BTreeMap::new();
     state_buffers.insert("yrs".to_owned(), legacy.to_state_buffer()?);
-    let legacy_id = proto::EntityId::new();
+    let legacy_id = proto::EntityId::from_bytes([0x77; 32]);
     let model = node.catalog.model_id_for("document").expect("Document registered by the warming create");
     let state = proto::State {
         state_buffers: proto::StateBuffers(state_buffers),

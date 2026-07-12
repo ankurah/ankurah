@@ -8,8 +8,9 @@
 //! it to a digest two runs can compare.
 //!
 //! The trace records logical node indices and content-derived ids, never the
-//! nodes' random ULID ids or wall-clock timestamps, so it is a pure function
-//! of (seed, scenario). That is the point: if anything nondeterministic leaks
+//! nodes' randomly generated Ed25519 public-key identities or wall-clock
+//! timestamps, so it is a pure function of (seed, scenario). That is the
+//! point: if anything nondeterministic leaks
 //! into the schedule, the two hashes diverge and the audit fails loudly.
 
 use sha2::{Digest, Sha256};

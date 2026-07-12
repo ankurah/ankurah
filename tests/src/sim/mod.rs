@@ -24,29 +24,23 @@
 //! Determinism boundaries (production entropy the harness must route around,
 //! since it cannot change production code):
 //!
-//! - `EntityId::new()` mints a random ULID and `EventId` is a content hash over
-//!   it, so the harness forges events with seed-derived entity ids rather than
-//!   committing through `trx.create`. This is the one entropy source in the
-//!   write path and it is fully neutralized.
+//! - `trx.create` draws a random genesis nonce, and `EntityId` is that genesis
+//!   event's content hash. The harness supplies deterministic genesis entropy
+//!   and derives ids from the complete preimage, neutralizing that write-path
+//!   entropy without weakening the structural identity rule.
 //! - Correlation ids (`RequestId`, `TransactionId`, `UpdateId`, `QueryId`) stay
 //!   random, but they never affect scheduling (the scheduler keys on queue
 //!   position and the seeded RNG) and are excluded from the semantic trace
 //!   digest, so they do not perturb the audit.
-//! - `Node::get_durable_peer_random()` uses `rand::thread_rng()` and is reached
-//!   by the event-gap-fill path in the SubscriptionUpdate applier
-//!   (`CachedEventGetter`) when an event's parents are missing locally. The
-//!   harness avoids triggering it: every event a scenario delivers arrives with
-//!   its parents already present (single-event acceptance-retry on the
-//!   CommitTransaction path; pre-placed lineages on the SubscriptionUpdate
-//!   path). A future scenario that deliberately induces a cross-peer gap would
-//!   reach this `thread_rng` and must expect a determinism-audit failure until
-//!   that production path is made seedable. This boundary is flagged in the PR.
+//! - `Node::get_durable_peer_random()` draws from the node-owned seeded RNG.
+//!   Durable peer candidates are sorted before selection, so event-gap filling
+//!   remains deterministic for a fixed simulation seed.
 //! - Container iteration order: the scheduler holds cut links in a `BTreeSet`
 //!   (not `HashSet`) so heal order is sorted, and all schedule-affecting
 //!   collections are `Vec`/`BTreeSet`/`BTreeMap`. HashMaps in the harness are
 //!   membership-only and never feed the trace. The scaled determinism audit is
 //!   what guards this invariant against regression.
-//! - Node-side emission order. When a single `handle_message` emits more than
+//! - Node-side emission order. When a single bound ingress call emits more than
 //!   one outbound message, their relative order in the capture queue is the
 //!   order the production code emitted them. Two paths that once ordered emission
 //!   by hash iteration were made deterministic by PR #285: the reactor now

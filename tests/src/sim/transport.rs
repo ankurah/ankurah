@@ -16,14 +16,17 @@
 
 use ankurah::core::connector::{PeerSender, SendError};
 use ankurah::proto;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 
 /// A message a node emitted, tagged with the logical index of its sender.
 /// (`NodeMessage` already carries the logical-free routing ids; the harness
 /// keys everything on `src`/`dst` logical indices instead.)
 pub struct Outbound {
     pub src: usize,
-    pub message: proto::NodeMessage,
+    pub message: proto::SignedPeerMessage,
 }
 
 /// Shared sink for node-emitted messages, drained by the scheduler each step.
@@ -47,22 +50,30 @@ impl Captured {
 pub struct SimSender {
     src: usize,
     /// The recipient's real node id, required by the `PeerSender` contract.
-    recipient: proto::EntityId,
+    recipient: proto::NodeId,
     captured: Captured,
+    closed: Arc<AtomicBool>,
 }
 
 impl SimSender {
-    pub fn new(src: usize, recipient: proto::EntityId, captured: Captured) -> Self { Self { src, recipient, captured } }
+    pub fn new(src: usize, recipient: proto::NodeId, captured: Captured) -> Self {
+        Self { src, recipient, captured, closed: Arc::new(AtomicBool::new(false)) }
+    }
 }
 
 #[async_trait::async_trait]
 impl PeerSender for SimSender {
-    fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError> {
+    fn send_message(&self, message: proto::SignedPeerMessage) -> Result<(), SendError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(SendError::ConnectionClosed);
+        }
         self.captured.push(Outbound { src: self.src, message });
         Ok(())
     }
 
-    fn recipient_node_id(&self) -> proto::EntityId { self.recipient }
+    fn close(&self) { self.closed.store(true, Ordering::Release); }
+
+    fn recipient_node_id(&self) -> proto::NodeId { self.recipient }
 
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
@@ -150,8 +161,8 @@ fn response_descriptor(body: &proto::NodeResponseBody) -> String {
         }
         proto::NodeResponseBody::GetEvents(events) => format!("getevents {}", event_ids(events)),
         proto::NodeResponseBody::QuerySubscribed { deltas, .. } => format!("subscribed {}", deltas.len()),
-        // Counts only: allocated ids are ULIDs and would perturb the
-        // determinism digest without adding discriminating power.
+        // Counts only: allocated genesis-hash ids include fresh entropy and
+        // would perturb the determinism digest without adding discriminating power.
         proto::NodeResponseBody::SchemaRegistered { models, properties, memberships } => {
             format!("schemaregistered m{} p{} ms{}", models.len(), properties.len(), memberships.len())
         }
@@ -166,26 +177,34 @@ fn update_item_descriptor(item: &proto::SubscriptionUpdateItem) -> String {
     let entity = item.entity_id;
     let kind = match &item.content {
         proto::UpdateContent::EventOnly(fragments) => format!("eventonly:{}", fragment_ids(entity, fragments)),
-        proto::UpdateContent::StateAndEvent(state, fragments) => {
+        proto::UpdateContent::StateAndEvent(proof, fragments) => {
             // The state fragment's head clock identifies the snapshot content
             // deterministically (state buffers are a BTreeMap, the head is
             // sorted), so hashing the head plus the event ids distinguishes two
             // batches that differ only in payload.
-            format!("stateandevent:head={}:{}", state.state.head.to_base64_short(), fragment_ids(entity, fragments))
+            format!("stateandevent:head={}:{}", proof.state.payload.state.head.to_base64_short(), fragment_ids(entity, fragments))
         }
     };
     format!("{}/{}", entity.to_base64_short(), kind)
 }
 
 /// Sorted, joined content-derived event ids for a set of `EventFragment`s.
-/// `EventFragment` omits the event id, but it is a pure hash of
-/// `(entity_id, operations, parent)`, so we recompute it: this makes the digest
+/// `EventFragment` omits the event id, but it is a pure hash of its body (and,
+/// for updates, entity id + parent), so we recompute it: this makes the digest
 /// faithful to the batch's actual events, not merely their count. Keying on the
 /// count alone would let two different batches for one entity share a digest and
 /// false-pass the determinism audit.
 fn fragment_ids(entity: proto::EntityId, fragments: &[proto::EventFragment]) -> String {
-    let mut ids: Vec<String> =
-        fragments.iter().map(|f| proto::EventId::from_parts(&entity, &f.operations, &f.parent).to_base64_short()).collect();
+    let mut ids: Vec<String> = fragments
+        .iter()
+        .map(|f| match &f.body {
+            proto::EventBody::Genesis { system, nonce, timestamp, operations } => {
+                proto::EventId::from_genesis_parts(system, nonce, *timestamp, operations)
+            }
+            proto::EventBody::Update { operations } => proto::EventId::from_update_parts(&entity, operations, &f.parent),
+        })
+        .map(|id| id.to_base64_short())
+        .collect();
     ids.sort();
     ids.join("+")
 }

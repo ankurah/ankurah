@@ -167,6 +167,8 @@ pub enum MutationError {
     Anyhow(anyhow::Error),
     #[error("TOCTOU attempts exhausted")]
     TOCTOUAttemptsExhausted,
+    #[error("operation belongs to a system generation that has been reset")]
+    SystemReset,
 }
 
 impl From<tokio::task::JoinError> for MutationError {
@@ -255,6 +257,8 @@ pub enum StateError {
     /// commit-before-registration, a bug rather than a race.
     #[error("no model id for collection '{0}'")]
     UnknownModel(String),
+    #[error("entity belongs to a system generation that has been reset")]
+    SystemReset,
 }
 
 impl From<bincode::Error> for StateError {

@@ -1,13 +1,13 @@
-//! Deterministic entity ids and hand-forged events.
+//! Deterministic seed ids and hand-forged events.
 //!
-//! The commit path (`trx.create`) mints a random ULID `EntityId`, and
-//! `EventId` is a SHA-256 over `(entity_id, operations, parent)`, so a random
-//! entity id poisons every downstream id and defeats the determinism audit.
+//! The commit path (`trx.create`) draws a random genesis nonce, and `EntityId`
+//! is the genesis event's content hash, so that entropy poisons every downstream
+//! id and defeats the determinism audit.
 //! The harness sidesteps this the way the containment tests already do
 //! (`tests/tests/update_batch_containment.rs::forge_title_event`): it
 //! constructs `proto::Event` values directly with entity ids derived from the
 //! seed, so ids are a pure function of the schedule. Events still flow through
-//! the real Node ingest (`handle_message` / `add_event` / `set_state`), so the
+//! the real Node ingest (`handle_peer_message` / `add_event` / `set_state`), so the
 //! applier, staging, containment, and head-maintenance logic under test is the
 //! production code, not a mock.
 
@@ -31,14 +31,13 @@ pub struct SimRecord {
     pub body: String,
 }
 
-/// A deterministic `EntityId` from a small integer. `EntityId` is a ULID
-/// (16 bytes); we fill the low 8 bytes with the counter so distinct counters
-/// give distinct, stable ids with no entropy. The high bytes are zero, so the
-/// ids sort by counter, keeping any id-ordered comparison (LWW tiebreak,
-/// clock sort) reproducible.
+/// A deterministic 32-byte id-shaped seed from a small integer. These bytes are
+/// used directly for deliberately unknown ids and as deterministic genesis
+/// entropy; created entity ids themselves are always derived from the complete
+/// genesis preimage.
 pub fn entity_id(counter: u64) -> proto::EntityId {
-    let mut bytes = [0u8; 16];
-    bytes[8..].copy_from_slice(&counter.to_be_bytes());
+    let mut bytes = [0u8; 32];
+    bytes[24..].copy_from_slice(&counter.to_be_bytes());
     proto::EntityId::from_bytes(bytes)
 }
 
@@ -51,11 +50,10 @@ pub fn sim_collection() -> proto::CollectionId { SimRecord::collection() }
 /// would reject an unknown id; [`super::node::build_nodes`] seeds this exact id
 /// into every node's catalog so resolution routes it to the `SimRecord`
 /// collection. Constant and deterministic, so it is identical across every node
-/// in a run and across the two determinism-audit runs. The high bytes are
-/// non-zero, so it can never collide with a well-known model id (all-zero
-/// prefix) nor with a seed-derived entity id ([`entity_id`] fills only the low
-/// eight bytes, leaving the high bytes zero).
-pub fn sim_model_id() -> proto::EntityId { proto::EntityId::from_bytes([0x5B; 16]) }
+/// in a run and across the two determinism-audit runs. It is deliberately
+/// distinct from the domain-hashed well-known model ids and from the
+/// seed-shaped unknown ids used by this harness.
+pub fn sim_model_id() -> proto::EntityId { proto::EntityId::from_bytes([0x5B; 32]) }
 
 /// Decode the `(title, body)` LWW field values from a materialized `proto::State`
 /// as a subscriber would read them, for the C5 coherence checks that compare a
@@ -97,16 +95,26 @@ fn lww_ops(field: Field, value: &str) -> proto::OperationSet {
     proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)]))
 }
 
-/// Forge the genesis (creation) event for an entity: empty parent clock marks
-/// it as a create (`Event::is_entity_create`). `field`/`value` seed the initial
-/// state.
-pub fn genesis_event(entity: proto::EntityId, field: Field, value: &str) -> proto::Event {
-    proto::Event { model: sim_model_id(), entity_id: entity, operations: lww_ops(field, value), parent: proto::Clock::default() }
+/// Forge a deterministic, structurally valid genesis event. `seed` supplies
+/// the nonce/timestamp entropy, while the returned entity id is derived from
+/// the full genesis preimage exactly as production does.
+pub fn genesis_event(seed: proto::EntityId, system: Option<proto::EntityId>, field: Field, value: &str) -> proto::Event {
+    let seed_bytes = seed.to_bytes();
+    let nonce = seed_bytes;
+    let timestamp = u64::from_be_bytes(seed_bytes[24..].try_into().expect("fixed slice length"));
+    let operations = lww_ops(field, value);
+    let entity_id = proto::EntityId::from(proto::EventId::from_genesis_parts(&system, &nonce, timestamp, &operations));
+    proto::Event {
+        model: sim_model_id(),
+        entity_id,
+        parent: proto::Clock::default(),
+        body: proto::EventBody::Genesis { system, nonce, timestamp, operations },
+    }
 }
 
 /// Forge a non-genesis event parented on `parent`, setting `field` to `value`.
 pub fn edit_event(entity: proto::EntityId, parent: proto::Clock, field: Field, value: &str) -> proto::Event {
-    proto::Event { model: sim_model_id(), entity_id: entity, operations: lww_ops(field, value), parent }
+    proto::Event { model: sim_model_id(), entity_id: entity, body: proto::EventBody::Update { operations: lww_ops(field, value) }, parent }
 }
 
 /// Wrap a forged event as an unsigned `Attested<Event>`. Under `PermissiveAgent`

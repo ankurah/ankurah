@@ -7,7 +7,8 @@
 //! collate one consistent type), its getters cast canonical values back out
 //! to the compiled type, and comparison literals canonicalize at resolution
 //! so predicate evaluation matches the stored type. A value the canonical
-//! type cannot represent fails ITS OWN commit, at the writer.
+//! type cannot represent fails at the writer: during eager `create()` when it
+//! is part of the identity-bearing genesis, or at commit for later edits.
 //!
 //! The two fleet versions are modeled as two same-name structs in sibling
 //! modules: both derive collection "film"; v1 (i32) registers first and fixes
@@ -148,11 +149,15 @@ async fn castable_drift_writes_and_reads_through_the_canonical_type() -> Result<
     assert_eq!(hits.len(), 1, "the i64 literal must match the canonically stored I32");
     assert_eq!(hits[0].id(), v2_film_id);
 
-    // A value the canonical type cannot represent fails ITS commit, at the
-    // writer: 5_000_000_000 does not fit i32.
+    // A genesis value the canonical type cannot represent fails eager
+    // create, at the writer: genesis operations freeze (and determine the
+    // entity id) before create returns, so this cannot be deferred to commit.
+    // 5_000_000_000 does not fit i32.
     let trx = ctx.begin();
-    trx.create(&v2::Film { year: 5_000_000_000 }).await?;
-    let err = trx.commit().await.expect_err("an i64 value exceeding the canonical i32 must fail the commit");
+    let err = match trx.create(&v2::Film { year: 5_000_000_000 }).await {
+        Ok(_) => panic!("an i64 genesis value exceeding canonical i32 must fail eager create"),
+        Err(err) => err,
+    };
     assert!(err.to_string().to_lowercase().contains("overflow"), "expected a numeric-overflow cast error, got: {err}");
 
     Ok(())

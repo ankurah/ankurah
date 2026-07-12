@@ -4,7 +4,20 @@ use async_trait::async_trait;
 use tracing::warn;
 
 use crate::error::{MutationError, RetrievalError};
-use ankurah_proto::{Attested, CollectionId, EntityId, EntityState, Event, EventId};
+use ankurah_proto::{Attested, CollectionId, EntityId, EntityState, Event, EventId, SystemRootProof};
+
+/// Result of the storage-wide atomic system-root claim operation.
+///
+/// The claim is engine metadata, not a collection entity. It serializes root
+/// creation across independent Node/SystemManager instances and, for engines
+/// that support it, across processes sharing the same database.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SystemRootClaim {
+    /// This caller atomically installed the candidate root.
+    Claimed,
+    /// A claim already existed; its root is returned without modification.
+    Existing(SystemRootProof),
+}
 
 pub fn state_name(name: &str) -> String { format!("{}_state", name) }
 
@@ -72,7 +85,7 @@ pub fn selection_to_column_space(
     fn walk_expr(expr: &Expr, translate_id: &dyn Fn(&EntityId, &str) -> String, translate_name: &dyn Fn(&str) -> Option<String>) -> Expr {
         match expr {
             Expr::Identifier(identifier) => {
-                let column = translate_id(&EntityId::from_ulid(identifier.property), &identifier.name);
+                let column = translate_id(&EntityId::from_bytes(identifier.property), &identifier.name);
                 Expr::Identifier(ankql::ast::Identifier {
                     property: identifier.property,
                     name: column,
@@ -135,7 +148,7 @@ pub fn selection_to_column_space(
             .map(|item| match item.path.steps.split_first() {
                 Some((first, rest)) => match item
                     .property
-                    .map(|property| translate_id(&EntityId::from_ulid(property), first))
+                    .map(|property| translate_id(&EntityId::from_bytes(property), first))
                     .or_else(|| translate_name(first))
                 {
                     Some(column) => {
@@ -166,7 +179,7 @@ mod column_space_tests {
     use ankurah_proto::EntityId;
 
     fn id(byte: u8) -> EntityId {
-        let mut bytes = [0u8; 16];
+        let mut bytes = [0u8; 32];
         bytes[0] = byte;
         EntityId::from_bytes(bytes)
     }
@@ -183,7 +196,7 @@ mod column_space_tests {
     fn title_selection(property: EntityId, order_step: &str) -> Selection {
         Selection {
             predicate: Predicate::Comparison {
-                left: Box::new(Expr::Identifier(Identifier { property: property.to_ulid(), name: "title".into(), subpath: vec![] })),
+                left: Box::new(Expr::Identifier(Identifier { property: property.to_bytes(), name: "title".into(), subpath: vec![] })),
                 operator: ComparisonOperator::Equal,
                 right: Box::new(Expr::Literal(Literal::String("x".into()))),
             },
@@ -222,7 +235,7 @@ mod column_space_tests {
     fn resolved_order_by_translates_by_id_after_display_rename() {
         let property = id(0x11);
         let mut selection = title_selection(property, "old_title");
-        selection.order_by.as_mut().unwrap()[0].property = Some(property.to_ulid());
+        selection.order_by.as_mut().unwrap()[0].property = Some(property.to_bytes());
 
         // The current resolver no longer knows the old display name. Stable
         // identity still reaches the sticky physical column directly.
@@ -232,7 +245,7 @@ mod column_space_tests {
         });
         let order = &out.order_by.unwrap()[0];
         assert_eq!(order.path.first(), "old_title");
-        assert_eq!(order.property, Some(property.to_ulid()));
+        assert_eq!(order.property, Some(property.to_bytes()));
     }
 
     #[test]
@@ -282,15 +295,22 @@ mod column_space_tests {
 /// - Names are SEEDS, ids are identity: a friendly name comes from the catalog
 ///   resolver at materialization time, correctness never depends on it (reads
 ///   translate ids through the engine's map).
-/// - Collisions dedupe as `{name}_{suffix}` where the suffix is the TRAILING
-///   4+ characters of the definition id's base64 (trailing, because ULIDs
-///   share their leading timestamp characters), widening until unique.
+/// - Collisions dedupe as `{name}_{suffix}` where the suffix is the trailing
+///   4+ characters of an injective base32 encoding of the full definition id,
+///   widening to all 256 bits until unique.
 /// - An id whose name the resolver cannot supply falls back to a synthetic
 ///   `{prefix}_{suffix}` name from the id alone -- the belt-and-suspenders
 ///   net for the intra-node descriptor race. Callers log loudly when it
 ///   fires; with descriptor shipping it should effectively never fire.
 pub mod naming {
     use ankurah_proto::EntityId;
+
+    // PostgreSQL's shortest cross-engine identifier limit. Staying within it
+    // avoids silent server-side truncation turning two names into one.
+    const MAX_IDENTIFIER_LEN: usize = 63;
+    // Synthetic fully-qualified names live here. `sanitize` prevents a
+    // catalog display name from entering the namespace unqualified.
+    const QUALIFIED_PREFIX: &str = "__a_";
 
     /// Sanitize a display name into a storage identifier seed: every char
     /// outside `[A-Za-z0-9_]` becomes `_`, and a leading digit is prefixed
@@ -302,18 +322,51 @@ pub mod naming {
         if out.is_empty() || out.chars().next().is_some_and(|c| c.is_ascii_digit()) {
             out.insert(0, '_');
         }
+        if out.starts_with(QUALIFIED_PREFIX) {
+            out.insert(0, '_');
+        }
+        out.truncate(MAX_IDENTIFIER_LEN);
         out
     }
 
-    /// The dedup/fallback suffix: the trailing `len` base64 characters of the
-    /// id, filtered to `[A-Za-z0-9]` (drops the url-safe `-`/`_` so the suffix
-    /// survives [`sanitize`] unchanged; the widening loop absorbs the rare
-    /// ambiguity this creates).
+    /// Identifier-safe RFC 4648 base32 (lowercase, no padding). Unlike
+    /// filtered base64, this is injective over all 32 id bytes.
+    fn id_token(id: &EntityId) -> String {
+        const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+        let mut out = String::with_capacity(52);
+        let mut accumulator = 0u16;
+        let mut bits = 0u8;
+        for byte in id.as_bytes() {
+            accumulator = (accumulator << 8) | u16::from(*byte);
+            bits += 8;
+            while bits >= 5 {
+                bits -= 5;
+                out.push(ALPHABET[((accumulator >> bits) & 0x1f) as usize] as char);
+                accumulator &= (1u16 << bits) - 1;
+            }
+        }
+        if bits != 0 {
+            out.push(ALPHABET[((accumulator << (5 - bits)) & 0x1f) as usize] as char);
+        }
+        debug_assert_eq!(out.len(), 52);
+        out
+    }
+
+    /// The trailing `len` characters of the injective id token.
     fn id_suffix(id: &EntityId, len: usize) -> String {
-        let base64 = id.to_base64();
-        let clean: Vec<char> = base64.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
-        let start = clean.len().saturating_sub(len);
-        clean[start..].iter().collect()
+        let token = id_token(id);
+        token[token.len().saturating_sub(len)..].to_owned()
+    }
+
+    fn suffixed(seed: &str, id: &EntityId, len: usize) -> String {
+        let suffix = id_suffix(id, len);
+        let seed_len = seed.len().min(MAX_IDENTIFIER_LEN - 1 - suffix.len());
+        format!("{}_{}", &seed[..seed_len], suffix)
+    }
+
+    fn fully_qualified(kind: &str, id: &EntityId) -> String {
+        let kind_len = kind.len().min(4);
+        format!("{QUALIFIED_PREFIX}{}_{}", &kind[..kind_len], id_token(id))
     }
 
     /// Pick the storage name for `desired` (an already-[`sanitize`]d seed):
@@ -325,29 +378,29 @@ pub mod naming {
         if !is_taken(desired) {
             return desired.to_string();
         }
-        for len in 4..=22 {
-            let candidate = format!("{}_{}", desired, id_suffix(id, len));
+        for len in 4..=52 {
+            let candidate = suffixed(desired, id, len);
             if !is_taken(&candidate) {
                 return candidate;
             }
         }
-        // 22 base64 chars = the full id: collision here means the same id was
-        // already mapped, which callers check before naming. Unreachable, but
-        // return the fully-qualified form rather than panic.
-        format!("{}_{}", desired, id_suffix(id, 22))
+        // A plain or previously shortened name can theoretically occupy every
+        // friendly candidate. The reserved namespace plus the complete token
+        // is injective by id, so correctly formed maps cannot collide here.
+        fully_qualified("d", id)
     }
 
     /// Synthetic name for an id the resolver cannot name: `{prefix}_{suffix}`
     /// through the same widening dedup. `prefix` is `p` for properties, `m`
     /// for models, keeping the fallback visibly synthetic in raw data.
     pub fn fallback(prefix: &str, id: &EntityId, is_taken: impl Fn(&str) -> bool) -> String {
-        for len in 4..=22 {
-            let candidate = format!("{}_{}", prefix, id_suffix(id, len));
+        for len in 4..=52 {
+            let candidate = suffixed(prefix, id, len);
             if !is_taken(&candidate) {
                 return candidate;
             }
         }
-        format!("{}_{}", prefix, id_suffix(id, 22))
+        fully_qualified(prefix, id)
     }
 
     #[cfg(test)]
@@ -355,9 +408,9 @@ pub mod naming {
         use super::*;
 
         fn id(byte: u8) -> EntityId {
-            let mut bytes = [0u8; 16];
+            let mut bytes = [0u8; 32];
             bytes[0] = byte;
-            bytes[15] = byte.wrapping_add(1);
+            bytes[31] = byte.wrapping_add(1);
             EntityId::from_bytes(bytes)
         }
 
@@ -367,6 +420,8 @@ pub mod naming {
             assert_eq!(sanitize("my-field.x"), "my_field_x");
             assert_eq!(sanitize("9lives"), "_9lives");
             assert_eq!(sanitize(""), "_");
+            assert_eq!(sanitize("__a_reserved"), "___a_reserved");
+            assert_eq!(sanitize(&"x".repeat(80)).len(), MAX_IDENTIFIER_LEN);
         }
 
         #[test]
@@ -377,15 +432,38 @@ pub mod naming {
         #[test]
         fn dedupe_suffixes_with_trailing_id_chars_and_widens() {
             let property = id(1);
-            let suffix4 = {
-                let clean: String = property.to_base64().chars().filter(|c| c.is_ascii_alphanumeric()).collect();
-                clean[clean.len() - 4..].to_string()
-            };
+            let suffix4 = id_suffix(&property, 4);
             // Plain name taken -> first widening step.
             assert_eq!(dedupe("title", &property, |n| n == "title"), format!("title_{suffix4}"));
             // That taken too -> widens to 5.
-            let five = dedupe("title", &property, |n| n == "title" || n.ends_with(&suffix4));
+            let candidate4 = format!("title_{suffix4}");
+            let five = dedupe("title", &property, |n| n == "title" || n == candidate4);
             assert!(five.starts_with("title_") && five.len() > format!("title_{suffix4}").len());
+        }
+
+        #[test]
+        fn long_common_suffixes_widen_to_an_injective_full_id_token() {
+            let first = EntityId::from_bytes([0; 32]);
+            let mut second_bytes = [0; 32];
+            second_bytes[0] = 1;
+            let second = EntityId::from_bytes(second_bytes);
+            assert_eq!(id_token(&first).len(), 52);
+            assert_ne!(id_token(&first), id_token(&second));
+
+            let mut taken = std::collections::HashSet::from(["title".to_owned()]);
+            for len in 4..=52 {
+                taken.insert(suffixed("title", &first, len));
+            }
+            let assigned = dedupe("title", &second, |candidate| taken.contains(candidate));
+            assert!(!taken.contains(&assigned));
+            assert!(assigned.len() <= MAX_IDENTIFIER_LEN);
+        }
+
+        #[test]
+        fn exhausted_friendly_names_use_the_reserved_full_id_namespace() {
+            let assigned = fallback("p", &id(9), |candidate| !candidate.starts_with(QUALIFIED_PREFIX));
+            assert!(assigned.starts_with("__a_p_"));
+            assert!(assigned.len() <= MAX_IDENTIFIER_LEN);
         }
 
         #[test]
@@ -403,6 +481,17 @@ pub trait StorageEngine: Send + Sync {
     async fn collection(&self, id: &CollectionId) -> Result<Arc<dyn StorageCollection>, RetrievalError>;
     // Delete all collections and their data from the storage engine
     async fn delete_all_collections(&self) -> Result<bool, MutationError>;
+
+    /// Atomically install `candidate` iff no system-root claim exists.
+    async fn claim_system_root(&self, candidate: &SystemRootProof) -> Result<SystemRootClaim, MutationError>;
+
+    /// Read the currently persisted system-root claim, if any.
+    async fn system_root_claim(&self) -> Result<Option<SystemRootProof>, RetrievalError>;
+
+    /// Atomically remove the claim only when it still equals `expected`.
+    /// Used to clean up a failed create without deleting a winner installed by
+    /// another caller.
+    async fn release_system_root_claim(&self, expected: &SystemRootProof) -> Result<bool, MutationError>;
 
     /// List the collections that already have durable storage, WITHOUT
     /// creating any. Used by the catalog manager to warm only the catalog

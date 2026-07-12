@@ -33,10 +33,11 @@ A SQLite-based storage engine for Ankurah, providing a lightweight embedded data
 
 ### Data Format Compatibility
 
-1. **ULID storage**: TEXT (base64) matching Postgres format
+1. **Identity storage**: 32-byte EntityId/EventId values as 43-character
+   base64url TEXT, matching Postgres format
 2. **State buffer**: BLOB (bincode-serialized BTreeMap)
-3. **Head/Clock**: JSON array of ULID strings
-4. **Attestations**: BLOB (bincode-serialized Vec)
+3. **Head/Clock**: JSON array of base64url EventId strings
+4. **Attestations**: BLOB (bincode-serialized structured AttestationSet)
 5. **JSON values**: Stored as BLOB (using SQLite JSONB format via `jsonb()` function), queried via `json_extract()` for type-aware comparisons
 
 ### Performance & Reliability
@@ -49,7 +50,8 @@ A SQLite-based storage engine for Ankurah, providing a lightweight embedded data
 ### Event Storage
 
 1. **Event tables**: Create `{collection}_event` tables for event sourcing
-2. **Event schema**: Store event id, entity_id, operations (BLOB), parent (JSON), attestations (BLOB)
+2. **Event schema**: Store event id, entity_id, typed EventBody (BLOB), parent
+   (JSON), and structured attestations (BLOB)
 3. **Entity index**: Index on entity_id for efficient event retrieval
 
 ## Non-Functional Requirements
@@ -61,3 +63,5 @@ A SQLite-based storage engine for Ankurah, providing a lightweight embedded data
 ## Out of Scope (Deferred)
 
 1. **WASM support**: Not needed for initial implementation
+2. **In-place conversion of pre-identity-substrate stores**: development stores
+   using ULID entity ids and the legacy event schema must be reset

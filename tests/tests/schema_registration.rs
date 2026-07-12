@@ -545,7 +545,7 @@ async fn explicit_id_binding_and_sharing() -> anyhow::Result<()> {
             backend: "lww".into(),
             value_type: "string".into(),
             target_collection: None,
-            explicit_id: Some(EntityId::new()),
+            explicit_id: Some(test_entity_id(0xE1)),
         }],
         memberships: vec![],
     };
@@ -611,7 +611,7 @@ async fn explicit_id_binding_accepts_castable_type_drift() -> anyhow::Result<()>
 #[tokio::test]
 async fn dangling_membership_property_id_refuses_before_writes() -> anyhow::Result<()> {
     let (server, client, _conn) = connected_pair().await?;
-    let missing = EntityId::new();
+    let missing = EntityId::from_bytes([0xEE; 32]);
     let request = proto::NodeRequestBody::RegisterSchema {
         models: vec![proto::ModelDescriptor { collection: "dangling".into(), name: "Dangling".into(), explicit_id: None }],
         properties: vec![],
@@ -643,7 +643,7 @@ async fn explicit_model_id_binding() -> anyhow::Result<()> {
     };
 
     // Binding an id that does not exist never mints.
-    expect_error(client.request(server.id, &DEFAULT_CONTEXT, bind("album", Some(EntityId::new()), vec![])).await?, "does not exist");
+    expect_error(client.request(server.id, &DEFAULT_CONTEXT, bind("album", Some(test_entity_id(0xE2)), vec![])).await?, "does not exist");
 
     // Binding a different collection to album's model entity is a mismatch.
     expect_error(client.request(server.id, &DEFAULT_CONTEXT, bind("albumx", Some(album_model), vec![])).await?, "binder declares");
@@ -728,11 +728,11 @@ impl ankurah::policy::PolicyAgent for ProbeAgent {
         _entity_before: &ankurah::core::entity::Entity,
         _entity_after: &ankurah::core::entity::Entity,
         event: &proto::Event,
-    ) -> Result<Option<proto::Attestation>, ankurah::policy::AccessDenied> {
+    ) -> Result<ankurah::policy::Admission, ankurah::policy::AccessDenied> {
         if let Some(hook) = &self.on_event {
             hook(event)?;
         }
-        Ok(None)
+        Ok(ankurah::policy::Admission::Allow)
     }
 
     fn check_schema_registration<SE: ankurah::core::storage::StorageEngine>(
@@ -750,7 +750,7 @@ impl ankurah::policy::PolicyAgent for ProbeAgent {
     fn validate_received_event<SE: ankurah::core::storage::StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _from_node: &proto::EntityId,
+        _from_node: &proto::NodeId,
         _event: &proto::Attested<proto::Event>,
     ) -> Result<(), ankurah::policy::AccessDenied> {
         Ok(())
@@ -760,14 +760,14 @@ impl ankurah::policy::PolicyAgent for ProbeAgent {
         &self,
         _node: &Node<SE, Self>,
         _state: &proto::EntityState,
-    ) -> Option<proto::Attestation> {
-        None
+    ) -> ankurah::policy::Admission {
+        ankurah::policy::Admission::Allow
     }
 
     fn validate_received_state<SE: ankurah::core::storage::StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _from_node: &proto::EntityId,
+        _from_node: &proto::NodeId,
         _state: &proto::Attested<proto::EntityState>,
     ) -> Result<(), ankurah::policy::AccessDenied> {
         Ok(())
@@ -831,7 +831,7 @@ impl ankurah::policy::PolicyAgent for ProbeAgent {
     fn validate_causal_assertion<SE: ankurah::core::storage::StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _peer_id: &proto::EntityId,
+        _peer_id: &proto::NodeId,
         _head_relation: &proto::CausalAssertion,
     ) -> Result<(), ankurah::policy::AccessDenied> {
         Ok(())

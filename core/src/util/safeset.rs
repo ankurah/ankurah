@@ -17,6 +17,8 @@ impl<T: Hash + Eq> SafeSet<T> {
     pub fn is_empty(&self) -> bool { self.0.read().expect("Failed to lock the set").is_empty() }
 
     pub fn len(&self) -> usize { self.0.read().expect("Failed to lock the set").len() }
+
+    pub fn clear(&self) { self.0.write().expect("Failed to lock the set").clear(); }
 }
 
 impl<T: Hash + Eq + Clone> SafeSet<T> {

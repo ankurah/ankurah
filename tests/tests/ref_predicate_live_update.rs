@@ -66,7 +66,7 @@ async fn typed_ref_literal_receives_live_updates() -> Result<()> {
 
     let mut selection: ankurah::ankql::ast::Selection = "room = ?".try_into()?;
     selection.predicate =
-        selection.predicate.populate([ankurah::ankql::ast::Expr::Literal(ankurah::ankql::ast::Literal::EntityId(room_a.to_ulid()))])?;
+        selection.predicate.populate([ankurah::ankql::ast::Expr::Literal(ankurah::ankql::ast::Literal::EntityId(room_a.to_bytes()))])?;
 
     let lq = ctx.query::<RefPredMessageView>(selection)?;
     lq.wait_initialized().await;

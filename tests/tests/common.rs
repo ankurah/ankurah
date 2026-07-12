@@ -27,6 +27,11 @@ use std::{
 };
 use tokio::sync::Notify;
 
+/// Deterministic id-shaped bytes for tests that intentionally need an unknown
+/// or synthetic entity rather than a production-derived genesis id.
+#[allow(unused)]
+pub fn test_entity_id(tag: u8) -> EntityId { EntityId::from_bytes([tag; 32]) }
+
 #[derive(Debug, Clone, Model, Serialize, Deserialize)]
 pub struct Pet {
     pub name: String,
@@ -56,22 +61,23 @@ pub struct Record {
 // crate so the shipped connector keeps its minimal API.
 // ---------------------------------------------------------------------------
 
-use ankurah::core::connector::{PeerSender, SendError};
+use ankurah::core::connector::{PeerSender, SendError, VerifiedPeerMessage};
 use tokio::sync::mpsc;
 
 #[derive(Clone)]
 struct GatedSender {
-    sender: mpsc::Sender<proto::NodeMessage>,
-    node_id: proto::EntityId,
+    sender: mpsc::Sender<proto::SignedPeerMessage>,
+    node_id: proto::NodeId,
 }
 
 #[async_trait::async_trait]
 impl PeerSender for GatedSender {
-    fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError> {
+    fn send_message(&self, message: proto::SignedPeerMessage) -> Result<(), SendError> {
         self.sender.try_send(message).map_err(|_| SendError::ConnectionClosed)?;
         Ok(())
     }
-    fn recipient_node_id(&self) -> proto::EntityId { self.node_id }
+    fn close(&self) {}
+    fn recipient_node_id(&self) -> proto::NodeId { self.node_id }
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
 
@@ -79,7 +85,7 @@ impl PeerSender for GatedSender {
 #[derive(Clone)]
 pub struct MessageGate {
     filter: Arc<dyn Fn(&proto::NodeMessage) -> bool + Send + Sync>,
-    held: Arc<Mutex<Vec<proto::NodeMessage>>>,
+    held: Arc<Mutex<Vec<VerifiedPeerMessage>>>,
 }
 
 impl MessageGate {
@@ -91,7 +97,7 @@ impl MessageGate {
     {
         let drained: Vec<_> = { self.held.lock().unwrap().drain(..).collect() };
         for message in drained {
-            let _ = node.handle_message(message).await;
+            let _ = node.handle_verified_peer_message(message).await;
         }
     }
 }
@@ -120,40 +126,41 @@ impl GatedConnection {
         let (other_tx, mut other_rx) = mpsc::channel(1024);
         let (gated_tx, mut gated_rx) = mpsc::channel(1024);
 
+        let other_handshake = other.begin_peer_handshake();
+        let gated_handshake = gated.begin_peer_handshake();
+        let other_challenge = other_handshake.challenge();
+        let gated_challenge = gated_handshake.challenge();
         other
             .register_peer(
-                proto::Presence {
-                    node_id: gated.id,
-                    durable: gated.durable,
-                    system_root: gated.system.root(),
-                    protocol_version: proto::PROTOCOL_VERSION,
-                },
+                gated.presence(other_challenge),
+                other_handshake,
+                gated_challenge,
                 Box::new(GatedSender { sender: gated_tx, node_id: gated.id }),
             )
-            .expect("gated peers use the current protocol version");
+            .expect("gated peer has a valid signed presence");
         gated
             .register_peer(
-                proto::Presence {
-                    node_id: other.id,
-                    durable: other.durable,
-                    system_root: other.system.root(),
-                    protocol_version: proto::PROTOCOL_VERSION,
-                },
+                other.presence(gated_challenge),
+                gated_handshake,
+                other_challenge,
                 Box::new(GatedSender { sender: other_tx, node_id: other.id }),
             )
-            .expect("gated peers use the current protocol version");
+            .expect("other peer has a valid signed presence");
 
         let gate = MessageGate { filter: Arc::new(filter), held: Arc::new(Mutex::new(Vec::new())) };
+        let other_id = other.id;
+        let gated_id = gated.id;
 
         // Messages flowing INTO `other` are always handled immediately.
         let task_a = {
             let node = other.clone();
             tokio::spawn(async move {
                 while let Some(message) = other_rx.recv().await {
-                    let node = node.clone();
-                    tokio::spawn(async move {
-                        let _ = node.handle_message(message).await;
-                    });
+                    let message = match node.verify_peer_message(gated_id, message) {
+                        Ok(message) => message,
+                        Err(_) => break,
+                    };
+                    let _ = node.handle_verified_peer_message(message).await;
                 }
             })
         };
@@ -164,14 +171,15 @@ impl GatedConnection {
             let gate = gate.clone();
             tokio::spawn(async move {
                 while let Some(message) = gated_rx.recv().await {
-                    if (gate.filter)(&message) {
+                    let message = match node.verify_peer_message(other_id, message) {
+                        Ok(message) => message,
+                        Err(_) => break,
+                    };
+                    if (gate.filter)(message.message()) {
                         gate.held.lock().unwrap().push(message);
                         continue;
                     }
-                    let node = node.clone();
-                    tokio::spawn(async move {
-                        let _ = node.handle_message(message).await;
-                    });
+                    let _ = node.handle_verified_peer_message(message).await;
                 }
             })
         };

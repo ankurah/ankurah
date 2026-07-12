@@ -55,6 +55,15 @@ const RESERVED_FIELDS: [&str; 5] = ["id", "__collection", "__state_buffer", "__h
 /// other string keys) so a collection's whole slice is one prefix range.
 fn property_columns_key(collection: &str, id: &EntityId) -> String { format!("{}\0{}", collection, id.to_base64()) }
 
+fn event_body_from_object(event_obj: &Object) -> Result<proto::EventBody, RetrievalError> {
+    let value: JsValue = event_obj.get(&BODY_KEY)?;
+    let bytes = value
+        .dyn_into::<js_sys::Uint8Array>()
+        .map_err(|_| RetrievalError::StorageError(anyhow::anyhow!("event body is not binary").into()))?
+        .to_vec();
+    bincode::deserialize(&bytes).map_err(RetrievalError::storage)
+}
+
 /// Capture ORDER BY types while the selection still carries catalog identity,
 /// then key them by the physical field name the planner will receive. A
 /// durable field assignment is sticky across catalog renames and may be
@@ -76,7 +85,7 @@ fn order_types_in_column_space(
                 return None;
             }
             let resolver = resolver?;
-            let id = item.property.map(EntityId::from_ulid).or_else(|| resolver.resolve(collection, name))?;
+            let id = item.property.map(EntityId::from_bytes).or_else(|| resolver.resolve(collection, name))?;
             let value_type = ankurah_core::value::ValueType::from_property_str(&resolver.canonical_value_type(&id)?)?;
             let column = column_of(&id).unwrap_or_else(|| name.to_string());
             Some((column, value_type))
@@ -303,7 +312,8 @@ impl StorageCollection for IndexedDBBucket {
             let payload = &attested_event.payload;
             event_obj.set(&*ID_KEY, &payload.id())?;
             event_obj.set(&*ENTITY_ID_KEY, payload.entity_id.to_base64())?;
-            event_obj.set(&*OPERATIONS_KEY, &payload.operations)?;
+            let body = bincode::serialize(&payload.body)?;
+            event_obj.set(&*BODY_KEY, JsValue::from(js_sys::Uint8Array::from(body.as_slice())))?;
             event_obj.set(&*ATTESTATIONS_KEY, &attested_event.attestations)?;
             event_obj.set(&*PARENT_KEY, &payload.parent)?;
 
@@ -345,7 +355,7 @@ impl StorageCollection for IndexedDBBucket {
                     payload: ankurah_proto::Event {
                         model: self.model_id()?,
                         entity_id: event_obj.get(&ENTITY_ID_KEY)?,
-                        operations: event_obj.get(&OPERATIONS_KEY)?,
+                        body: event_body_from_object(&event_obj)?,
                         parent: event_obj.get(&PARENT_KEY)?,
                     },
                     attestations: event_obj.get(&ATTESTATIONS_KEY)?,
@@ -386,7 +396,7 @@ impl StorageCollection for IndexedDBBucket {
                         model: self.model_id()?,
                         // id: event_obj.get(&ID_KEY)?.try_into()?,
                         entity_id: event_obj.get(&ENTITY_ID_KEY)?,
-                        operations: event_obj.get(&OPERATIONS_KEY)?,
+                        body: event_body_from_object(&event_obj)?,
                         parent: event_obj.get(&PARENT_KEY)?,
                     },
                     attestations: event_obj.get(&ATTESTATIONS_KEY)?,
@@ -850,14 +860,14 @@ mod tests {
 
     #[test]
     fn resolved_order_type_survives_sticky_physical_name() {
-        let property = EntityId::from_bytes([7; 16]);
+        let property = EntityId::from_bytes([7; 32]);
         let resolver = RenamedPropertyResolver { property };
         let selection = Selection {
             predicate: Predicate::True,
             order_by: Some(vec![OrderByItem {
                 path: PathExpr::simple("score"),
                 direction: OrderDirection::Asc,
-                property: Some(property.to_ulid()),
+                property: Some(property.to_bytes()),
             }]),
             limit: None,
         };

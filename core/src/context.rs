@@ -10,7 +10,7 @@ use crate::{
     storage::{StorageCollectionWrapper, StorageEngine},
     transaction::Transaction,
 };
-use ankurah_proto::{self as proto, Attested, Clock, CollectionId, EntityState, Event};
+use ankurah_proto::{self as proto, Clock, CollectionId, EntityState, Event};
 use async_trait::async_trait;
 use std::sync::{atomic::AtomicBool, Arc};
 use tracing::debug;
@@ -38,11 +38,28 @@ where
 
 #[async_trait]
 pub trait TContext {
-    fn node_id(&self) -> proto::EntityId;
-    /// Create a brand new entity for a transaction, and add it to the WeakEntitySet
-    /// Note that this does not actually persist the entity to the storage engine
-    /// It merely ensures that there are no duplicate entities with the same ID (except forked entities)
-    fn create_entity(&self, collection: proto::CollectionId, trx_alive: Arc<AtomicBool>) -> Entity;
+    fn node_id(&self) -> proto::NodeId;
+    /// The pinned system root id bound into every ordinary entity genesis.
+    fn system_id(&self) -> Option<proto::EntityId>;
+    /// Resident/system generation captured by a transaction at begin time.
+    fn system_generation(&self) -> Arc<AtomicBool>;
+    /// Create the writable pre-identity entity used to collect initial model
+    /// values. It is not inserted into the resident set.
+    fn create_provisional_entity(
+        &self,
+        collection: proto::CollectionId,
+        trx_alive: Arc<AtomicBool>,
+        system_generation: &Arc<AtomicBool>,
+    ) -> Result<Entity, MutationError>;
+    /// Insert an empty resident primary under the genesis-derived id and return
+    /// the transaction snapshot materialized at the genesis head.
+    fn create_transaction_entity(
+        &self,
+        collection: proto::CollectionId,
+        genesis: &Event,
+        trx_alive: Arc<AtomicBool>,
+        system_generation: &Arc<AtomicBool>,
+    ) -> Result<Entity, MutationError>;
     fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied>;
     async fn get_entity(&self, id: proto::EntityId, collection: &proto::CollectionId, cached: bool) -> Result<Entity, RetrievalError>;
     fn get_resident_entity(&self, id: proto::EntityId) -> Option<Entity>;
@@ -57,7 +74,11 @@ pub trait TContext {
     /// exact compiled shape already has a compatible canonical binding. A
     /// never-registered collection, missing field, or incompatible field
     /// fails the write.
-    async fn ensure_registered(&self, schema: &'static crate::schema::ModelSchema) -> Result<(), MutationError>;
+    async fn ensure_registered(
+        &self,
+        schema: &'static crate::schema::ModelSchema,
+        system_generation: &Arc<AtomicBool>,
+    ) -> Result<(), MutationError>;
     /// Record a binary-known compiled schema for predicate first-use
     /// registration and unknown-collection classification. Object-safe so
     /// read paths (`get`/`fetch`/`query`) and the sync `edit` path can call it
@@ -74,12 +95,25 @@ pub trait TContext {
 
 #[async_trait]
 impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> TContext for NodeAndContext<SE, PA> {
-    fn node_id(&self) -> proto::EntityId { self.node.id }
-    fn create_entity(&self, collection: proto::CollectionId, trx_alive: Arc<AtomicBool>) -> Entity {
-        // WeakEntitySet::create stamps the PRIMARY with the live catalog
-        // resolver before this snapshot, so the transaction fork inherits it.
-        let primary_entity = self.node.entities.create(collection);
-        primary_entity.snapshot(trx_alive)
+    fn node_id(&self) -> proto::NodeId { self.node.id }
+    fn system_id(&self) -> Option<proto::EntityId> { self.node.system.root_id() }
+    fn system_generation(&self) -> Arc<AtomicBool> { self.node.entities.system_generation() }
+    fn create_provisional_entity(
+        &self,
+        collection: proto::CollectionId,
+        trx_alive: Arc<AtomicBool>,
+        system_generation: &Arc<AtomicBool>,
+    ) -> Result<Entity, MutationError> {
+        self.node.entities.create_provisional_in_generation(collection, trx_alive, system_generation)
+    }
+    fn create_transaction_entity(
+        &self,
+        collection: proto::CollectionId,
+        genesis: &Event,
+        trx_alive: Arc<AtomicBool>,
+        system_generation: &Arc<AtomicBool>,
+    ) -> Result<Entity, MutationError> {
+        self.node.entities.create_transaction_entity_in_generation(collection, genesis, trx_alive, system_generation)
     }
     fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied> { self.node.policy_agent.check_write(&self.cdata, entity, None) }
     async fn get_entity(&self, id: proto::EntityId, collection: &proto::CollectionId, cached: bool) -> Result<Entity, RetrievalError> {
@@ -91,6 +125,10 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     }
     async fn commit_local_trx(&self, trx: &Transaction) -> Result<Vec<Event>, MutationError> {
         use std::sync::atomic::Ordering;
+
+        if !trx.system_generation.load(Ordering::Acquire) {
+            return Err(MutationError::SystemReset);
+        }
 
         // Atomically mark transaction as no longer alive, preventing double-commit.
         // compare_exchange returns Err if the value was already false (already committed/rolled back).
@@ -109,8 +147,15 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         // has a compatible canonical binding; otherwise the commit fails.
         let schemas = trx.schemas.read().unwrap().clone();
         for schema in schemas {
-            TContext::ensure_registered(self, schema).await?;
+            TContext::ensure_registered(self, schema, &trx.system_generation).await?;
         }
+
+        // Registration may await the network, so acquire the reset fence only
+        // after it completes. The exact transaction-generation check under
+        // the read guard catches any reset that happened meanwhile; holding
+        // the guard through persistence prevents a reset/delete from racing
+        // behind a successful check.
+        let system_generation_guard = self.node.system.guard_generation(&trx.system_generation).await?;
 
         // Resolve ordinary fields' transient uncommitted Name keys to their
         // property id now the catalog is warm (the PropertyKey amendment,
@@ -123,11 +168,37 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
             entity.resolve_pending_keys()?;
         }
 
-        // Generate events from the transaction entities
+        // Generate the causally ordered event sequence for each transaction
+        // entity. A created entity always contributes its already-frozen
+        // genesis first, then at most one Update for post-create edits.
         let trx_id = trx.id.clone();
+        let genesis_events = trx.genesis_events.read().unwrap().clone();
+        let created_entity_ids = trx.created_entity_ids.read().unwrap().clone();
+        if genesis_events.keys().copied().collect::<std::collections::HashSet<_>>() != created_entity_ids {
+            return Err(MutationError::InvalidEvent);
+        }
+
         let mut entity_events = Vec::new();
+        let mut seen_created = std::collections::HashSet::new();
         for entity in trx.entities.iter() {
+            let mut events = Vec::with_capacity(2);
+            if let Some(genesis) = genesis_events.get(&entity.id) {
+                if !seen_created.insert(entity.id)
+                    || genesis.entity_id != entity.id
+                    || !genesis.is_entity_create()
+                    || genesis.validate_structure().is_err()
+                    || entity.head() != Clock::new([genesis.id()])
+                {
+                    return Err(MutationError::InvalidEvent);
+                }
+                events.push(genesis.clone());
+            }
+
             if let Some(event) = entity.generate_commit_event()? {
+                events.push(event);
+            }
+
+            for event in &events {
                 // Protected collections (system + metadata catalog) are not
                 // mutable through ordinary transactions; the catalog's only
                 // mutation path is the registration operation (RFC 4).
@@ -136,82 +207,91 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
                         format!("collection '{}' is protected and not writable by transactions", protected).into(),
                     ));
                 }
-                // Validate creation events: if parent is empty, this is a creation event
-                // and the entity must have been created in this transaction via create()
-                if event.is_entity_create() {
-                    let created_ids = trx.created_entity_ids.read().unwrap();
-                    if !created_ids.contains(&entity.id) {
-                        return Err(MutationError::General(
-                            format!(
-                                "Cannot commit phantom entity {}: entity has empty parent (creation event) \
-                             but was not created in this transaction via create()",
-                                entity.id
-                            )
-                            .into(),
-                        ));
-                    }
-                }
-                entity_events.push((entity.clone(), event));
+                self.node.validate_event_scope(event)?;
+            }
+
+            if !events.is_empty() {
+                entity_events.push((entity.clone(), events));
             }
         }
+        if seen_created != created_entity_ids {
+            return Err(MutationError::InvalidEvent);
+        }
 
-        // Now commit the events
+        // Now validate and commit the events.
         let mut attested_events = Vec::new();
         let mut entity_attested_events = Vec::new();
 
         // Phase 1: check policy and collect attestations for EVERY event
         // before persisting ANY of them, so a later denial leaves nothing
-        // durable (failure atomicity, V7).
-        for (entity, event) in entity_events {
-            // Create a temporary fork to apply the event for validation
+        // durable (failure atomicity, V7). For a created entity, walk the
+        // states sequentially: empty -> genesis -> optional update.
+        for (entity, events) in entity_events {
             use std::sync::atomic::AtomicBool;
-            let trx_alive = Arc::new(AtomicBool::new(true));
-            let forked = entity.snapshot(trx_alive);
-
-            // Get the canonical (upstream) entity for before state
-            let entity_before = match &entity.kind {
+            let validation_alive = Arc::new(AtomicBool::new(true));
+            let mut entity_before = match &entity.kind {
                 crate::entity::EntityKind::Transacted { upstream, .. } => upstream.clone(),
                 crate::entity::EntityKind::Primary => entity.clone(),
             };
-
-            // Stage event and apply to fork for after state (no commit_event call here)
             let collection = self.node.collections.get(entity.collection()).await?;
             let event_getter = crate::retrieval::LocalEventGetter::new(collection, self.node.durable);
-            event_getter.stage_event(event.clone());
-            forked.apply_event(&event_getter, &event).await?;
+            let mut entity_attested = Vec::with_capacity(events.len());
 
-            let attestation = self.node.policy_agent.check_event(&self.node, &self.cdata, &entity_before, &forked, &event)?;
-            let attested = Attested::opt(event.clone(), attestation);
+            for event in events {
+                event_getter.stage_event(event.clone());
+                let entity_after = entity_before.snapshot(validation_alive.clone());
+                entity_after.apply_event(&event_getter, &event).await?;
 
-            attested_events.push(attested.clone());
-            entity_attested_events.push((entity, attested));
+                let admission = self.node.policy_agent.check_event(&self.node, &self.cdata, &entity_before, &entity_after, &event)?;
+                let attested = self.node.attest_event(event, admission);
+
+                attested_events.push(attested.clone());
+                entity_attested.push(attested);
+                entity_before = entity_after;
+            }
+            entity_attested_events.push((entity, entity_attested));
         }
 
         // Phase 2: all events attested; persist them.
-        for (entity, attested) in &entity_attested_events {
+        for (entity, events) in &entity_attested_events {
             let collection = self.node.collections.get(entity.collection()).await?;
             let event_getter = crate::retrieval::LocalEventGetter::new(collection, self.node.durable);
-            event_getter.commit_event(attested).await?;
+            for attested in events {
+                event_getter.commit_event(attested).await?;
+            }
         }
 
         // Update heads BEFORE relaying (makes entities visible to server echo)
-        for (entity, attested_event) in &entity_attested_events {
-            entity.commit_head(Clock::new([attested_event.payload.id()]));
+        for (entity, events) in &entity_attested_events {
+            if let Some(last) = events.last() {
+                entity.commit_head(Clock::new([last.payload.id()]));
+            }
         }
+        // Do not hold reset hostage to an unresponsive peer. Everything
+        // durable so far is local and will be deleted if reset wins; release
+        // the fence for network relay, then re-acquire the exact generation
+        // before any post-relay state write.
+        drop(system_generation_guard);
         // Relay to peers and wait for confirmation
         self.node.relay_to_required_peers(&self.cdata, trx_id, &attested_events).await?;
 
+        let _post_relay_generation_guard = self.node.system.guard_generation(&trx.system_generation).await?;
+
         // All peers confirmed, persist state to storage
         let mut changes: Vec<EntityChange> = Vec::new();
-        for (entity, attested_event) in entity_attested_events {
+        for (entity, events) in entity_attested_events {
             let collection = self.node.collections.get(entity.collection()).await?;
 
             // Persist canonical entity (upstream for transactional forks, entity itself for primary)
             let canonical_entity = match &entity.kind {
                 crate::entity::EntityKind::Transacted { upstream, .. } => {
-                    // Event is now in storage, construct fresh getter for upstream apply
+                    // Events are now in storage. Apply the entire ordered
+                    // sequence to the previously-empty (for creation) or
+                    // existing canonical entity.
                     let event_getter = crate::retrieval::LocalEventGetter::new(collection.clone(), self.node.durable);
-                    upstream.apply_event(&event_getter, &attested_event.payload).await?;
+                    for attested in &events {
+                        upstream.apply_event(&event_getter, &attested.payload).await?;
+                    }
                     upstream.clone()
                 }
                 crate::entity::EntityKind::Primary => entity,
@@ -220,11 +300,11 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
             let state = canonical_entity.to_state()?;
 
             let entity_state = EntityState { entity_id: canonical_entity.id(), model: canonical_entity.model_id()?, state };
-            let attestation = self.node.policy_agent.attest_state(&self.node, &entity_state);
-            let attested = Attested::opt(entity_state, attestation);
+            let admission = self.node.policy_agent.attest_state(&self.node, &entity_state);
+            let attested = self.node.attest_state(entity_state, admission);
             collection.set_state(attested).await?;
 
-            changes.push(EntityChange::new(canonical_entity, vec![attested_event])?);
+            changes.push(EntityChange::new(canonical_entity, events)?);
         }
 
         // Notify reactor of ALL changes
@@ -238,8 +318,23 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
         self.node.system.collection(id).await
     }
-    async fn ensure_registered(&self, schema: &'static crate::schema::ModelSchema) -> Result<(), MutationError> {
-        if let Err(e) = self.node.catalog.ensure_registered(&self.node, &self.cdata, schema).await {
+    async fn ensure_registered(
+        &self,
+        schema: &'static crate::schema::ModelSchema,
+        system_generation: &Arc<AtomicBool>,
+    ) -> Result<(), MutationError> {
+        let registration = self.node.catalog.ensure_registered_in_generation(&self.node, &self.cdata, schema, system_generation).await;
+        // Recheck even when the round-trip itself failed: reset tears down
+        // pending requests, and that transport error must not mask the exact
+        // transaction-generation failure or be downgraded through a new
+        // generation's compatible map.
+        let _generation_guard = self.node.system.guard_generation(system_generation).await?;
+        if let Err(e) = registration {
+            // A stale operation must never use the new generation's fully
+            // bound map as grounds to downgrade SystemReset into a warning.
+            if matches!(&e, crate::schema::registration::RegistrationError::Mutation(MutationError::SystemReset)) {
+                return Err(MutationError::SystemReset);
+            }
             // An unavailable reassertion may proceed only when this exact
             // compiled shape can already resolve every field to a compatible
             // canonical definition. Otherwise an unregistered or incompatible
@@ -266,7 +361,10 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         &self,
         schema: &'static crate::schema::ModelSchema,
     ) -> Result<(), crate::schema::registration::RegistrationError> {
-        self.node.catalog.ensure_registered(&self.node, &self.cdata, schema).await
+        let generation = self.node.entities.system_generation();
+        let registration = self.node.catalog.ensure_registered_in_generation(&self.node, &self.cdata, schema, &generation).await;
+        let _generation_guard = self.node.system.guard_generation(&generation).await?;
+        registration
     }
 }
 
@@ -275,7 +373,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
 #[wasm_bindgen]
 impl Context {
     #[wasm_bindgen(js_name = "node_id")]
-    pub fn js_node_id(&self) -> proto::EntityId { self.0.node_id() }
+    pub fn js_node_id(&self) -> proto::NodeId { self.0.node_id() }
 }
 
 // This impl may or may not have the wasm_bindgen attribute but the functions will always be defined
@@ -294,7 +392,7 @@ impl Context {
         Self(Arc::new(NodeAndContext { node, cdata: data }))
     }
 
-    pub fn node_id(&self) -> proto::EntityId { self.0.node_id() }
+    pub fn node_id(&self) -> proto::NodeId { self.0.node_id() }
 
     // TODO: Fix this - arghhh async lifetimes
     // pub async fn trx<T, F, Fut>(self: &Arc<Self>, f: F) -> anyhow::Result<T>
@@ -399,6 +497,7 @@ where
         cached: bool,
     ) -> Result<Entity, RetrievalError> {
         debug!("Node({}).get_entity {:?}-{:?}", self.node.id, id, collection_id);
+        let generation = self.node.entities.system_generation();
 
         if !self.node.durable {
             // Fetch from peers and commit first response
@@ -412,6 +511,9 @@ where
         }
 
         if let Some(local) = self.node.entities.get(&id) {
+            if !self.node.entities.is_current_generation(&generation) {
+                return Err(RetrievalError::MutationError(Box::new(MutationError::SystemReset)));
+            }
             debug!("Node({}).get_entity found local entity - returning", self.node.id);
             let state = local.to_state()?;
             let entity_id = local.id();
@@ -423,6 +525,9 @@ where
         let collection = self.node.collections.get(collection_id).await?;
         match collection.get_state(id).await {
             Ok(entity_state) => {
+                if !self.node.entities.is_current_generation(&generation) {
+                    return Err(RetrievalError::MutationError(Box::new(MutationError::SystemReset)));
+                }
                 self.node.policy_agent.check_read(
                     &self.cdata,
                     &entity_state.payload.entity_id,
@@ -435,7 +540,14 @@ where
                 let (_changed, entity) = self
                     .node
                     .entities
-                    .with_state(&state_getter, &event_getter, id, collection_id.clone(), entity_state.payload.state)
+                    .with_state_in_generation(
+                        &state_getter,
+                        &event_getter,
+                        id,
+                        collection_id.clone(),
+                        entity_state.payload.state,
+                        generation,
+                    )
                     .await?;
                 Ok(entity)
             }
@@ -444,6 +556,7 @@ where
     }
     /// Fetch a list of entities based on a selection
     pub async fn fetch_entities(&self, collection_id: &CollectionId, mut args: MatchArgs) -> Result<Vec<Entity>, RetrievalError> {
+        let generation = self.node.entities.system_generation();
         self.node.policy_agent.can_access_collection(&self.cdata, collection_id)?;
         // Fetch raw states from storage
 
@@ -461,7 +574,7 @@ where
         args.selection = self
             .node
             .catalog
-            .resolve_selection_deferred(&self.node, Some(&self.cdata), collection_id, &args.selection)
+            .resolve_selection_deferred_in_generation(&self.node, Some(&self.cdata), collection_id, &args.selection, &generation)
             .await
             .map_err(RetrievalError::from)?;
 
@@ -471,7 +584,11 @@ where
         // TODO implement cached: true
         if !self.node.durable {
             // Fetch from peers and commit first response
-            Ok(self.fetch_from_peer(collection_id, args.selection).await?)
+            let entities = self.fetch_from_peer(collection_id, args.selection).await?;
+            if !self.node.entities.is_current_generation(&generation) {
+                return Err(RetrievalError::MutationError(Box::new(MutationError::SystemReset)));
+            }
+            Ok(entities)
         } else {
             let storage_collection = self.node.collections.get(collection_id).await?;
             let states = storage_collection.fetch_states(&args.selection).await?;
@@ -484,9 +601,19 @@ where
                 let (_, entity) = self
                     .node
                     .entities
-                    .with_state(&state_getter, &event_getter, state.payload.entity_id, collection_id.clone(), state.payload.state)
+                    .with_state_in_generation(
+                        &state_getter,
+                        &event_getter,
+                        state.payload.entity_id,
+                        collection_id.clone(),
+                        state.payload.state,
+                        generation.clone(),
+                    )
                     .await?;
                 entities.push(entity);
+            }
+            if !self.node.entities.is_current_generation(&generation) {
+                return Err(RetrievalError::MutationError(Box::new(MutationError::SystemReset)));
             }
             Ok(entities)
         }

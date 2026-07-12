@@ -298,7 +298,7 @@ impl SqlBuilder {
                 Literal::Bool(bool) => self.arg(*bool),
                 Literal::I16(i) => self.arg(*i),
                 Literal::I32(i) => self.arg(*i),
-                Literal::EntityId(ulid) => self.arg(EntityId::from_ulid(*ulid).to_base64()),
+                Literal::EntityId(bytes) => self.arg(EntityId::from_bytes(*bytes).to_base64()),
                 Literal::Object(bytes) => self.arg(bytes.clone()),
                 Literal::Binary(bytes) => self.arg(bytes.clone()),
                 Literal::Json(json) => self.arg(json.clone()),
@@ -323,7 +323,7 @@ impl SqlBuilder {
                             Literal::Bool(bool) => self.arg(*bool),
                             Literal::I16(i) => self.arg(*i),
                             Literal::I32(i) => self.arg(*i),
-                            Literal::EntityId(ulid) => self.arg(EntityId::from_ulid(*ulid).to_base64()),
+                            Literal::EntityId(bytes) => self.arg(EntityId::from_bytes(*bytes).to_base64()),
                             Literal::Object(bytes) => self.arg(bytes.clone()),
                             Literal::Binary(bytes) => self.arg(bytes.clone()),
                             Literal::Json(json) => self.arg(json.clone()),
@@ -545,6 +545,28 @@ mod tests {
         let (sql_string, args) = sql.build_where_clause();
         assert_eq!(sql_string, r#""name" = $1"#);
         let expected: Vec<Box<dyn ToSql + Send + Sync>> = vec![Box::new("Alice")];
+        assert_args(&args, &expected);
+        Ok(())
+    }
+
+    #[test]
+    fn test_entity_id_literal_uses_43_character_base64url() -> Result<()> {
+        use ankql::ast::{ComparisonOperator, PathExpr};
+
+        let bytes = [7u8; 32];
+        let predicate = Predicate::Comparison {
+            left: Box::new(Expr::Path(PathExpr::simple("id"))),
+            operator: ComparisonOperator::Equal,
+            right: Box::new(Expr::Literal(Literal::EntityId(bytes))),
+        };
+        let mut sql = SqlBuilder::new();
+        sql.predicate(&predicate)?;
+
+        let (sql_string, args) = sql.build_where_clause();
+        let encoded = EntityId::from_bytes(bytes).to_base64();
+        assert_eq!(encoded.len(), 43);
+        assert_eq!(sql_string, r#""id" = $1"#);
+        let expected: Vec<Box<dyn ToSql + Send + Sync>> = vec![Box::new(encoded)];
         assert_args(&args, &expected);
         Ok(())
     }
@@ -834,16 +856,11 @@ mod tests {
         #[test]
         fn test_identifier_renders_like_path_simple() {
             use ankql::ast::Identifier;
-            use ulid::Ulid;
 
             // A simple resolved Identifier renders as the column named `name`, exactly
             // like the equivalent single-step Path. (The parser never produces Identifier,
             // so we construct it programmatically.)
-            let id_sql = where_for(Expr::Identifier(Identifier {
-                property: Ulid::from_bytes([5u8; 16]),
-                name: "status".to_string(),
-                subpath: vec![],
-            }));
+            let id_sql = where_for(Expr::Identifier(Identifier { property: [5u8; 32], name: "status".to_string(), subpath: vec![] }));
             let path_sql = where_for(Expr::Path(PathExpr::simple("status")));
 
             assert_eq!(id_sql, r#""status" = $1"#);
@@ -853,12 +870,11 @@ mod tests {
         #[test]
         fn test_identifier_renders_like_path_json_subpath() {
             use ankql::ast::Identifier;
-            use ulid::Ulid;
 
             // An Identifier with a JSON subpath renders the same "->" traversal and
             // ::jsonb cast as the equivalent multi-step Path.
             let id_sql = where_for(Expr::Identifier(Identifier {
-                property: Ulid::from_bytes([5u8; 16]),
+                property: [5u8; 32],
                 name: "licensing".to_string(),
                 subpath: vec!["territory".to_string()],
             }));

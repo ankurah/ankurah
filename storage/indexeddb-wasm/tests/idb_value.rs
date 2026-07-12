@@ -6,6 +6,7 @@
 //! - Negative values → f64 numbers (with precision loss warning if beyond MIN_SAFE_INTEGER)
 mod common;
 use ankurah_core::value::{Value, ValueType};
+use ankurah_proto::EntityId;
 use ankurah_storage_indexeddb_wasm::idb_value::{IdbValue, MAX_SAFE_INTEGER, MIN_SAFE_INTEGER};
 use wasm_bindgen::JsValue;
 use wasm_bindgen_test::*;
@@ -96,4 +97,14 @@ fn test_i64_ordering_across_threshold() {
 
     // IndexedDB guarantees: all numbers < all strings
     // So this maintains correct ordering: before < after
+}
+
+#[wasm_bindgen_test]
+fn test_entity_id_as_43_character_base64url_string() {
+    let entity_id = EntityId::from_bytes([7u8; 32]);
+    let js_val: JsValue = IdbValue::from(Value::EntityId(entity_id)).into();
+    let encoded = js_val.as_string().expect("EntityId should be stored as a string");
+
+    assert_eq!(encoded.len(), 43);
+    assert_eq!(EntityId::from_base64(&encoded).unwrap(), entity_id);
 }

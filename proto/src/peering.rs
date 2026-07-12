@@ -1,7 +1,7 @@
-use bincode::Options;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
-use crate::{id::EntityId, Attested, CollectionId, EntityState, State};
+use crate::{id::EntityId, node_id::NodeId, node_id::Signature, Attested, EntityState, Event};
 
 /// The wire protocol version this binary speaks.
 ///
@@ -21,7 +21,41 @@ use crate::{id::EntityId, Attested, CollectionId, EntityState, State};
 ///   SubscriptionUpdateItem carry the model-definition entity id instead of a
 ///   collection name, and NodeUpdate/NodeResponse carry once-per-connection
 ///   catalog schema defs.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// - 4: the identity/attestation substrate (specs/identity-attestation/
+///   spec.md): 32-byte content-hash EntityIds, the EventBody genesis/update
+///   split with domain-tagged ids, ed25519 NodeIds with signed Presence, and
+///   the structured attestation envelope.
+/// - 5: Presence carries the system-root genesis proof in addition to its
+///   materialized state, so first join can verify the self-certifying root
+///   before granting durable routing.
+/// - 6: the handshake is challenge-bound (replayed Presence frames no longer
+///   authenticate a fresh connection), and shipped schema states carry their
+///   self-certifying genesis proof.
+pub const PROTOCOL_VERSION: u32 = 6;
+
+/// Domain tag for presence signatures (RFC specs/identity-attestation/
+/// spec.md I.2): the signature covers `PRESENCE_TAG ||
+/// bincode(PresenceClaims)`.
+pub const PRESENCE_TAG: &[u8] = b"ankurah.presence.v1";
+
+/// A fresh, receiver-generated nonce that binds one signed Presence to one
+/// connection attempt. Both sides send a challenge before accepting the
+/// other's Presence, so possession of an old signed frame is insufficient to
+/// impersonate its node on a new transport connection.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HandshakeChallenge {
+    /// The node that generated the challenge and must receive the answer.
+    issuer: NodeId,
+    nonce: [u8; 32],
+}
+
+impl HandshakeChallenge {
+    pub fn new(issuer: NodeId, nonce: [u8; 32]) -> Self { Self { issuer, nonce } }
+
+    pub fn issuer(self) -> NodeId { self.issuer }
+
+    pub fn nonce(self) -> [u8; 32] { self.nonce }
+}
 
 /// Whether a peer advertising `remote` can interoperate with this binary.
 ///
@@ -31,17 +65,90 @@ pub const PROTOCOL_VERSION: u32 = 3;
 /// to a range without touching the handshake again.
 pub fn protocol_compatible(remote: u32) -> bool { remote == PROTOCOL_VERSION }
 
+/// A signed presence claim (RFC specs/identity-attestation/spec.md I.2).
+/// `register_peer` verifies the signature before inserting the peer, making
+/// node identity unforgeable at the handshake; the `durable` flag is
+/// separately verified against the system-root founder record.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Presence {
-    pub node_id: EntityId,
+    pub node_id: NodeId,
     pub durable: bool,
-    pub system_root: Option<Attested<EntityState>>,
-    /// See [`PROTOCOL_VERSION`]. Kept as the LAST field so an ephemeral
-    /// pre-#294 Presence (`system_root: None`) is a strict prefix of this one.
-    /// A durable legacy Presence also uses the old collection-bearing nested
-    /// EntityState shape; [`is_version0_presence`] mirrors that shape when
-    /// classifying an otherwise-undecodable handshake.
+    pub system_root: Option<SystemRootProof>,
+    /// The receiver-generated challenge this Presence answers.
+    pub challenge: HandshakeChallenge,
+    /// Unix ms, freshness signal (advisory).
+    pub timestamp: u64,
+    /// By `node_id`'s key, over [`PRESENCE_TAG`] `||`
+    /// `bincode(`[`PresenceClaims`]`)`.
+    pub signature: Signature,
+    /// See [`PROTOCOL_VERSION`]. Kept as the LAST field (the #294
+    /// convention) so any future field additions keep the version readable
+    /// by the same suffix position. The pre-#294 prefix property itself did
+    /// not survive protocol 4's id-width change; version-0 peers are still
+    /// classified by [`is_version0_presence`], which pins the OLD widths.
     pub protocol_version: u32,
+}
+
+/// The complete RFC-1 proof for a system root.
+///
+/// `genesis` is content-addressed and therefore proves which root is named;
+/// `state` must be the exact materialization of that genesis. Core validates
+/// both before reserving a first-join root. The Presence signature binds this
+/// proof through [`Self::entity_id`], which is included in
+/// [`PresenceClaims`]. RFC-1 keeps the root immutable, so no later root-state
+/// lineage is needed here.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct SystemRootProof {
+    pub genesis: Event,
+    pub state: Attested<EntityState>,
+}
+
+impl SystemRootProof {
+    pub fn entity_id(&self) -> EntityId { self.genesis.entity_id }
+}
+
+/// The projection of [`Presence`] the signature covers: everything a peer
+/// asserts about itself (identity, class, which system it roots, freshness).
+/// The full root proof stays outside the signature; its content-addressed
+/// genesis id binds the proof bytes after core verifies that the carried state
+/// is the exact genesis materialization.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct PresenceClaims {
+    pub node_id: NodeId,
+    pub durable: bool,
+    pub system_root: Option<EntityId>,
+    pub challenge: HandshakeChallenge,
+    pub timestamp: u64,
+    pub protocol_version: u32,
+}
+
+impl Presence {
+    /// The claims projection this presence asserts.
+    pub fn claims(&self) -> PresenceClaims {
+        PresenceClaims {
+            node_id: self.node_id,
+            durable: self.durable,
+            system_root: self.system_root.as_ref().map(SystemRootProof::entity_id),
+            challenge: self.challenge,
+            timestamp: self.timestamp,
+            protocol_version: self.protocol_version,
+        }
+    }
+
+    /// The exact bytes a presence signature covers.
+    pub fn signable_bytes(claims: &PresenceClaims) -> Vec<u8> {
+        let mut bytes = PRESENCE_TAG.to_vec();
+        bytes.extend(bincode::serialize(claims).expect("presence claims serialize"));
+        bytes
+    }
+
+    /// Whether the signature is valid under `node_id`'s key for this
+    /// presence's claims.
+    pub fn verify_signature(&self) -> bool { self.node_id.verify(&Self::signable_bytes(&self.claims()), &self.signature) }
+
+    /// Verify both proof of key possession and binding to the challenge issued
+    /// for this connection.
+    pub fn verify_for(&self, expected: HandshakeChallenge) -> bool { self.challenge == expected && self.verify_signature() }
 }
 
 impl std::fmt::Display for Presence {
@@ -54,7 +161,7 @@ impl std::fmt::Display for Presence {
                     self.node_id.to_base64_short(),
                     self.durable,
                     self.protocol_version,
-                    r.payload
+                    r.state.payload
                 )
             }
             None => {
@@ -83,26 +190,62 @@ impl std::fmt::Display for PresenceRejection {
 
 impl std::error::Error for PresenceRejection {}
 
-/// The Presence shape that pre-#294 binaries (0.9.x and earlier) send: no
-/// protocol_version field. Used only to classify an undecodable handshake,
-/// never constructed.
-#[derive(Serialize, Deserialize)]
-#[allow(dead_code)]
-struct LegacyPresence {
-    node_id: EntityId,
-    durable: bool,
-    system_root: Option<Attested<LegacyEntityState>>,
+/// Why `register_peer` refused a Presence. Connectors relay the version
+/// rejection best-effort (older peers understand the close, newer ones the
+/// message) and simply close on an invalid signature: there is no
+/// authenticated channel to explain anything over.
+#[derive(Debug, thiserror::Error)]
+pub enum PresenceRefusal {
+    #[error("{0}")]
+    IncompatibleVersion(#[from] PresenceRejection),
+    #[error("presence signature invalid for node {0}")]
+    InvalidSignature(NodeId),
+    #[error("presence from node {0} answered a different connection challenge")]
+    UnexpectedChallenge(NodeId),
+    #[error("node {0} cannot register a connection to itself")]
+    SelfConnection(NodeId),
+    #[error("system-root proof invalid for node {0}")]
+    InvalidSystemRoot(NodeId),
 }
 
-/// The EntityState nested inside a 0.9.x durable Presence. Protocol v3
-/// replaced `collection` with `model`, so using the current EntityState here
-/// would recognize only legacy ephemeral nodes whose system_root is absent.
+/// The complete Presence shape that pre-#294 binaries (0.9.x and earlier)
+/// sent: 16-byte ULID node/entity ids, a collection-bearing EntityState, and
+/// the old opaque attestation envelope. These private mirrors deliberately do
+/// not reuse current identity-bearing types, whose wire widths and envelope
+/// shapes have changed since 0.9.
+#[derive(Serialize, Deserialize)]
+#[allow(dead_code)]
+struct LegacyPresenceProbe {
+    node_id: [u8; 16],
+    durable: bool,
+    system_root: Option<LegacyAttested<LegacyEntityState>>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[allow(dead_code)]
+struct LegacyAttested<T> {
+    payload: T,
+    // Legacy Attestation was a Vec<u8> newtype and AttestationSet was a Vec
+    // newtype, both transparent in bincode's data model.
+    attestations: Vec<Vec<u8>>,
+}
+
 #[derive(Serialize, Deserialize)]
 #[allow(dead_code)]
 struct LegacyEntityState {
-    entity_id: EntityId,
-    collection: CollectionId,
-    state: State,
+    entity_id: [u8; 16],
+    // Legacy CollectionId was a String newtype.
+    collection: String,
+    state: LegacyState,
+}
+
+#[derive(Serialize, Deserialize)]
+#[allow(dead_code)]
+struct LegacyState {
+    // Legacy StateBuffers and Clock were transparent newtypes around these
+    // containers. EventId was already a 32-byte content hash in 0.9.
+    state_buffers: BTreeMap<String, Vec<u8>>,
+    head: Vec<[u8; 32]>,
 }
 
 /// True if `data` (an entire [`crate::Message`] frame that failed normal
@@ -112,26 +255,50 @@ struct LegacyEntityState {
 /// Only meaningful after normal decode fails: a current-version Presence
 /// decodes normally and never reaches this classifier.
 pub fn is_version0_presence(data: &[u8]) -> bool {
-    // Message is a bincode enum: u32 little-endian variant index, and
-    // Message::Presence is variant 0.
+    // Legacy Message is a bincode enum whose Presence was u32 little-endian
+    // variant 0. V6 preserves that discriminant and appends its challenge at
+    // variant 3, so an old Presence is never reinterpreted as a challenge.
     if data.len() < 4 || data[..4] != [0, 0, 0, 0] {
         return false;
     }
-    bincode::DefaultOptions::new().with_fixint_encoding().reject_trailing_bytes().deserialize::<LegacyPresence>(&data[4..]).is_ok()
+    crate::message::decode_exact::<LegacyPresenceProbe>(&data[4..]).is_ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::Signer;
 
     fn presence() -> Presence {
-        Presence { node_id: EntityId::new(), durable: true, system_root: None, protocol_version: PROTOCOL_VERSION }
+        let key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let node_id = NodeId::from(key.verifying_key());
+        let receiver = NodeId::from(ed25519_dalek::SigningKey::from_bytes(&[41u8; 32]).verifying_key());
+        let challenge = HandshakeChallenge::new(receiver, [0xA5; 32]);
+        let claims = PresenceClaims {
+            node_id,
+            durable: true,
+            system_root: None,
+            challenge,
+            timestamp: 1_720_000_000_000,
+            protocol_version: PROTOCOL_VERSION,
+        };
+        let signature: Signature = key.sign(&Presence::signable_bytes(&claims)).into();
+        Presence {
+            node_id,
+            durable: true,
+            system_root: None,
+            challenge,
+            timestamp: claims.timestamp,
+            signature,
+            protocol_version: PROTOCOL_VERSION,
+        }
     }
 
-    /// The 0.9.x wire shapes, mirrored for compatibility tests.
+    /// The 0.9.x wire shapes, mirrored at their ORIGINAL widths for the
+    /// version-0 classification tests (node ids were 16-byte ULIDs).
     #[derive(Serialize)]
     enum LegacyMessage {
-        Presence(LegacyPresence),
+        Presence(LegacyPresenceProbe),
         #[allow(dead_code)]
         PeerMessage(()),
     }
@@ -139,34 +306,56 @@ mod tests {
     #[test]
     fn presence_round_trip() {
         let p = presence();
-        let bytes = bincode::serialize(&crate::Message::Presence(p.clone())).unwrap();
-        match bincode::deserialize::<crate::Message>(&bytes).unwrap() {
+        let bytes = crate::encode_message(&crate::Message::Presence(p.clone())).unwrap();
+        match crate::decode_message(&bytes).unwrap() {
             crate::Message::Presence(q) => assert_eq!(p, q),
             other => panic!("expected Presence, got {other}"),
         }
     }
 
-    /// With no nested system root, the pre-#294 encoding remains a strict
-    /// prefix of the current one because protocol_version is last.
     #[test]
-    fn legacy_encoding_is_a_prefix() {
+    fn signature_verifies_and_tamper_fails() {
         let p = presence();
-        let new_bytes = bincode::serialize(&crate::Message::Presence(p.clone())).unwrap();
-        let old_bytes =
-            bincode::serialize(&LegacyMessage::Presence(LegacyPresence { node_id: p.node_id, durable: p.durable, system_root: None }))
-                .unwrap();
-        assert_eq!(new_bytes[..old_bytes.len()], old_bytes[..]);
-        assert_eq!(new_bytes.len(), old_bytes.len() + 4);
-        assert_eq!(new_bytes[old_bytes.len()..], PROTOCOL_VERSION.to_le_bytes());
+        assert!(p.verify_signature());
+        assert!(p.verify_for(p.challenge));
+
+        // A genuine Presence from another connection is not valid for this
+        // receiver-generated challenge, even though its signature is intact.
+        let another_challenge = HandshakeChallenge::new(p.challenge.issuer(), [0xA6; 32]);
+        assert!(p.verify_signature());
+        assert!(!p.verify_for(another_challenge));
+
+        // Flipping any signed claim invalidates the signature.
+        let mut forged = p.clone();
+        forged.durable = false;
+        assert!(!forged.verify_signature());
+
+        let mut forged = p.clone();
+        forged.timestamp += 1;
+        assert!(!forged.verify_signature());
+
+        let mut forged = p.clone();
+        forged.protocol_version += 1;
+        assert!(!forged.verify_signature());
+
+        let mut forged = p.clone();
+        forged.challenge = another_challenge;
+        assert!(!forged.verify_signature());
+
+        // A different node id cannot claim this signature.
+        let other = ed25519_dalek::SigningKey::from_bytes(&[43u8; 32]);
+        let mut forged = p.clone();
+        forged.node_id = NodeId::from(other.verifying_key());
+        assert!(!forged.verify_signature());
     }
 
     #[test]
     fn classifies_version0_presence() {
         let old_bytes =
-            bincode::serialize(&LegacyMessage::Presence(LegacyPresence { node_id: EntityId::new(), durable: false, system_root: None }))
+            bincode::serialize(&LegacyMessage::Presence(LegacyPresenceProbe { node_id: [7u8; 16], durable: false, system_root: None }))
                 .unwrap();
         // An old presence fails current decoding and classifies as version 0.
-        assert!(bincode::deserialize::<crate::Message>(&old_bytes).is_err());
+        assert!(crate::decode_message(&old_bytes).is_err());
         assert!(is_version0_presence(&old_bytes));
 
         // The same legacy payload with an advertised protocol version is a
@@ -184,21 +373,21 @@ mod tests {
 
     #[test]
     fn classifies_durable_version0_presence_with_legacy_system_root() {
-        let old_bytes = bincode::serialize(&LegacyMessage::Presence(LegacyPresence {
-            node_id: EntityId::new(),
+        let old_bytes = bincode::serialize(&LegacyMessage::Presence(LegacyPresenceProbe {
+            node_id: [8u8; 16],
             durable: true,
-            system_root: Some(Attested::opt(
-                LegacyEntityState {
-                    entity_id: EntityId::new(),
-                    collection: CollectionId::fixed_name("_ankurah_system"),
-                    state: State::default(),
+            system_root: Some(LegacyAttested {
+                payload: LegacyEntityState {
+                    entity_id: [9u8; 16],
+                    collection: "_ankurah_system".to_owned(),
+                    state: LegacyState { state_buffers: BTreeMap::from([("lww".to_owned(), vec![1, 2, 3])]), head: vec![[0x31; 32]] },
                 },
-                None,
-            )),
+                attestations: vec![vec![0xA5, 0x5A]],
+            }),
         }))
         .unwrap();
 
-        assert!(bincode::deserialize::<crate::Message>(&old_bytes).is_err());
+        assert!(crate::decode_message(&old_bytes).is_err());
         assert!(is_version0_presence(&old_bytes));
     }
 

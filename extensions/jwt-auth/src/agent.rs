@@ -7,7 +7,7 @@ use ankurah_core::{
     error::ValidationError,
     livequery::EntityLiveQuery,
     node::{Node, NodeInner, WeakNode},
-    policy::{AccessDenied, PolicyAgent},
+    policy::{AccessDenied, Admission, PolicyAgent},
     selection::filter::evaluate_predicate,
     storage::StorageEngine,
     util::Iterable,
@@ -152,9 +152,9 @@ impl PolicyAgent for JwtAgent {
         entity_before: &Entity,
         entity_after: &Entity,
         _event: &proto::Event,
-    ) -> Result<Option<proto::Attestation>, AccessDenied> {
+    ) -> Result<Admission, AccessDenied> {
         if cdata.is_privileged() {
-            return Ok(None);
+            return Ok(Admission::Allow);
         }
         if entity_after.collection().as_str() == "jwtpolicy" {
             return Err(AccessDenied::ByPolicy("Only privileged contexts may write to jwtpolicy"));
@@ -170,24 +170,24 @@ impl PolicyAgent for JwtAgent {
             enforce_write_scope(&state.config, cdata, entity_before)?;
         }
         enforce_write_scope(&state.config, cdata, entity_after)?;
-        Ok(None)
+        Ok(Admission::Allow)
     }
 
     fn validate_received_event<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _from_node: &proto::EntityId,
+        _from_node: &proto::NodeId,
         _event: &Attested<proto::Event>,
     ) -> Result<(), AccessDenied> {
         Ok(())
     }
 
-    fn attest_state<SE: StorageEngine>(&self, _node: &Node<SE, Self>, _state: &proto::EntityState) -> Option<proto::Attestation> { None }
+    fn attest_state<SE: StorageEngine>(&self, _node: &Node<SE, Self>, _state: &proto::EntityState) -> Admission { Admission::Allow }
 
     fn validate_received_state<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _from_node: &proto::EntityId,
+        _from_node: &proto::NodeId,
         _state: &Attested<proto::EntityState>,
     ) -> Result<(), AccessDenied> {
         Ok(())
@@ -302,7 +302,7 @@ impl PolicyAgent for JwtAgent {
     fn validate_causal_assertion<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _peer_id: &proto::EntityId,
+        _peer_id: &proto::NodeId,
         _head_relation: &proto::CausalAssertion,
     ) -> Result<(), AccessDenied> {
         Ok(())

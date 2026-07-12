@@ -119,7 +119,7 @@ pub fn build_continuation_predicate<E: AbstractEntity>(
     // Add ORDER BY continuation conditions
     for order_item in order_by {
         let field_name = order_item.path.first();
-        let property_id = order_item.property.map(ankurah_proto::EntityId::from_ulid);
+        let property_id = order_item.property.map(ankurah_proto::EntityId::from_bytes);
 
         // Get the field value from the last entity
         let field_value = match property_id {
@@ -134,7 +134,7 @@ pub fn build_continuation_predicate<E: AbstractEntity>(
                 Value::I64(i) => Literal::I64(i),
                 Value::F64(f) => Literal::F64(f),
                 Value::Bool(b) => Literal::Bool(b),
-                Value::EntityId(id) => Literal::EntityId(id.into()),
+                Value::EntityId(id) => Literal::EntityId(id.to_bytes()),
                 // Skip Object, Binary, and Json for now - they're not commonly used in ORDER BY
                 Value::Object(_) | Value::Binary(_) | Value::Json(_) => continue,
             };
@@ -160,7 +160,7 @@ pub fn build_continuation_predicate<E: AbstractEntity>(
     let id_exclusion = Predicate::Comparison {
         left: Box::new(Expr::Path(PathExpr::simple("id"))),
         operator: ComparisonOperator::NotEqual,
-        right: Box::new(Expr::Literal(Literal::EntityId((*last_entity.id()).into()))),
+        right: Box::new(Expr::Literal(Literal::EntityId(last_entity.id().to_bytes()))),
     };
     gap_conditions.push(id_exclusion);
 
@@ -203,8 +203,8 @@ mod tests {
 
     impl TestEntity {
         fn new(id: u8, data: HashMap<String, Value>) -> Self {
-            let mut id_bytes = [0u8; 16];
-            id_bytes[15] = id;
+            let mut id_bytes = [0u8; 32];
+            id_bytes[31] = id;
             Self {
                 id: proto::EntityId::from_bytes(id_bytes),
                 collection: proto::CollectionId::fixed_name("test"),

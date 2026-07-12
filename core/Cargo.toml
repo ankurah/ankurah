@@ -39,6 +39,7 @@ ankurah-proto   = { path = "../proto", version = "=0.9.0" }
 ankurah-signals = { path = "../signals", version = "=0.9.0" }
 
 rand                 = { version = "0.8", features = ["small_rng"] }
+ed25519-dalek        = { version = "2", features = ["rand_core"] }
 anyhow               = "1.0"
 thiserror            = "2"
 chrono               = { version = "0.4", default-features = false }
@@ -60,6 +61,7 @@ serde-wasm-bindgen   = { version = "0.6", optional = true }
 js-sys               = { version = "0.3", optional = true }
 send_wrapper         = { version = "0.6", optional = true }
 serde_json           = "1.0"
+sha2                 = "0.10"
 smallvec             = "1.15.0"
 itertools            = "0.14.0"
 indexmap             = "2.0"
@@ -71,6 +73,7 @@ uniffi               = { version = "0.29", optional = true }
 maplit         = "1.0"
 ankurah-derive = { path = "../derive", version = "=0.9.0" }
 criterion      = { version = "0.5", features = ["async_tokio"] }
+tempfile       = "3"
 
 # Event DAG engine benchmarks (workstream E). harness = false because criterion
 # provides its own harness; requires the `bench-internals` feature to reach the

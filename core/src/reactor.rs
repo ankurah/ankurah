@@ -237,7 +237,7 @@ pub(crate) fn build_key_spec_from_selection<E: AbstractEntity>(
         // selection resolution. Name lookup is only the raw/legacy fallback.
         let column = item.path.property().to_string();
 
-        let property_id = item.property.map(proto::EntityId::from_ulid).or_else(|| resolver.and_then(|r| r.resolve(collection, &column)));
+        let property_id = item.property.map(proto::EntityId::from_bytes).or_else(|| resolver.and_then(|r| r.resolve(collection, &column)));
         property_paths.push(crate::reactor::PropertyPath::simple(column.clone(), property_id));
 
         let value_type = property_id
@@ -570,8 +570,13 @@ mod tests {
     }
     impl TestEntity {
         fn new(name: &str, status: &str) -> Self {
+            let mut id = [0u8; 32];
+            for (index, byte) in name.bytes().chain([0xff]).chain(status.bytes()).enumerate() {
+                let slot = index % id.len();
+                id[slot] = id[slot].wrapping_add(byte);
+            }
             Self {
-                id: proto::EntityId::new(),
+                id: proto::EntityId::from_bytes(id),
                 collection: proto::CollectionId::fixed_name("album"),
                 state: Arc::new(Mutex::new(HashMap::from([
                     ("name".to_string(), name.to_string()),

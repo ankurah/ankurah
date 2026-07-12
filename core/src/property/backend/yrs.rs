@@ -216,7 +216,7 @@ impl PropertyBackend for YrsBackend {
 
         for event in &layer.to_apply {
             // Extract Yrs operations from this event
-            if let Some(operations) = event.operations.get(&Self::property_backend_name().to_string()) {
+            if let Some(operations) = event.operations().get(Self::property_backend_name()) {
                 for operation in operations {
                     self.apply_update(&operation.diff, &changed_fields)?;
                 }

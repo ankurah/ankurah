@@ -26,9 +26,6 @@ async fn test_id_range_optimization_integration() -> Result<()> {
         let entity = trx.create(&TestEntity { name: format!("Entity {}", i), value: i as i64 }).await?;
         entity_ids.push(entity.id());
         trx.commit().await?;
-
-        // Small delay to ensure different timestamps in EntityId
-        tokio::time::sleep(tokio::time::Duration::from_millis(2)).await;
     }
 
     // Test 1: Simple ORDER BY id ASC with LIMIT (should use optimization)
@@ -101,9 +98,6 @@ async fn test_id_range_with_where_clause() -> Result<()> {
         let entity = trx.create(&TestEntity { name: format!("Entity {}", i), value: i as i64 }).await?;
         entity_ids.push(entity.id());
         trx.commit().await?;
-
-        // Ensure different timestamps for EntityIDs
-        tokio::time::sleep(tokio::time::Duration::from_millis(3)).await;
     }
 
     entity_ids.sort();

@@ -86,7 +86,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use ankurah_proto::{Clock, EntityId, Event, EventId, Operation, OperationSet};
+use ankurah_proto::{Clock, EntityId, Event, EventBody, EventId, Operation, OperationSet};
 
 use crate::event_dag::EventLayer;
 use crate::property::backend::PropertyBackend;
@@ -147,21 +147,28 @@ pub(crate) trait ConformanceBackend {
 /// content-hashed event ids. Mirrors the event-building idiom in
 /// `event_dag::tests`.
 fn make_event(seed: u16, backend_name: &str, operations: Vec<Operation>, parents: &[EventId]) -> Event {
-    let mut entity_id_bytes = [0u8; 16];
+    let mut entity_id_bytes = [0u8; 32];
     entity_id_bytes[0..2].copy_from_slice(&seed.to_be_bytes());
-    let entity_id = EntityId::from_bytes(entity_id_bytes);
+    let update_entity_id = EntityId::from_bytes(entity_id_bytes);
     // Deterministic fake model id (#330): the conformance kit builds events by
     // hand and applies them straight to a backend, never routing through a
     // node's catalog; the model field is also excluded from `EventId` hashing.
-    let mut model_bytes = [0u8; 16];
+    let mut model_bytes = [0u8; 32];
     model_bytes[0] = 0xEE;
     let model = EntityId::from_bytes(model_bytes);
-    Event {
-        entity_id,
-        model,
-        parent: Clock::from(parents.to_vec()),
-        operations: OperationSet(BTreeMap::from([(backend_name.to_string(), operations)])),
-    }
+    let parent = Clock::from(parents.to_vec());
+    let operations = OperationSet(BTreeMap::from([(backend_name.to_string(), operations)]));
+    let (entity_id, body) = if parent.is_empty() {
+        let system = None;
+        let mut nonce = [0u8; 32];
+        nonce[0..2].copy_from_slice(&seed.to_be_bytes());
+        let timestamp = seed as u64;
+        let entity_id = EntityId::from(EventId::from_genesis_parts(&system, &nonce, timestamp, &operations));
+        (entity_id, EventBody::Genesis { system, nonce, timestamp, operations })
+    } else {
+        (update_entity_id, EventBody::Update { operations })
+    };
+    Event { entity_id, model, parent, body }
 }
 
 /// Assemble an [`EventLayer`] from event references, deriving the DAG skeleton
@@ -321,7 +328,7 @@ pub(crate) fn law_within_layer_permutation_invariance<B: ConformanceBackend>() {
     for perm in &permutations {
         let backend = B::new_backend();
         // Seed the root as committed state (the meet the layer branches from).
-        if let Some(ops) = root.operations.get(B::backend_name()) {
+        if let Some(ops) = root.operations().get(B::backend_name()) {
             backend.apply_operations_with_event(ops, root.id()).expect("apply root");
         }
 
@@ -408,7 +415,7 @@ pub(crate) fn law_cross_order_determinism<B: ConformanceBackend>() {
 /// Apply the backend-relevant operations of `root` as committed state, so the
 /// root is the meet the subsequent layers branch from.
 fn apply_committed_root<B: ConformanceBackend>(backend: &Arc<dyn PropertyBackend>, root: &Event) {
-    if let Some(ops) = root.operations.get(B::backend_name()) {
+    if let Some(ops) = root.operations().get(B::backend_name()) {
         backend.apply_operations_with_event(ops, root.id()).expect("apply committed root");
     }
 }
@@ -537,7 +544,7 @@ mod lww_conformance {
 
         // Apply earlier as committed state, then the later event via a layer.
         let backend: Arc<dyn PropertyBackend> = Arc::new(LWWBackend::new());
-        if let Some(ops) = earlier.operations.get(LwwAdopter::backend_name()) {
+        if let Some(ops) = earlier.operations().get(LwwAdopter::backend_name()) {
             backend.apply_operations_with_event(ops, earlier.id()).unwrap();
         }
         backend.apply_layer(&layer).unwrap();

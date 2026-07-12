@@ -8,7 +8,7 @@ lazy_static! {
     pub static ref COLLECTION_KEY: Property = Property::new("__collection");
     pub static ref STATE_BUFFER_KEY: Property = Property::new("__state_buffer");
     pub static ref ENTITY_ID_KEY: Property = Property::new("__entity_id");
-    pub static ref OPERATIONS_KEY: Property = Property::new("__operations");
+    pub static ref BODY_KEY: Property = Property::new("__body");
     pub static ref ATTESTATIONS_KEY: Property = Property::new("__attestations");
     pub static ref PARENT_KEY: Property = Property::new("__parent");
 }

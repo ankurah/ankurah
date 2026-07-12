@@ -53,9 +53,9 @@ fn generate_expr_sql(
                 }
                 buffer.push('\'');
             }
-            Literal::EntityId(ulid) => {
+            Literal::EntityId(id) => {
                 buffer.push('\'');
-                buffer.push_str(&general_purpose::URL_SAFE_NO_PAD.encode(ulid.to_bytes()));
+                buffer.push_str(&general_purpose::URL_SAFE_NO_PAD.encode(id));
                 buffer.push('\'');
             }
             Literal::Object(bytes) | Literal::Binary(bytes) => {
@@ -147,9 +147,9 @@ fn generate_expr_sql(
                         Literal::Bool(b) => {
                             buffer.push_str(if *b { "true" } else { "false" });
                         }
-                        Literal::EntityId(ulid) => {
+                        Literal::EntityId(id) => {
                             buffer.push('\'');
-                            buffer.push_str(&general_purpose::URL_SAFE_NO_PAD.encode(ulid.to_bytes()));
+                            buffer.push_str(&general_purpose::URL_SAFE_NO_PAD.encode(id));
                             buffer.push('\'');
                         }
                         Literal::Object(_bytes) | Literal::Binary(_bytes) => {

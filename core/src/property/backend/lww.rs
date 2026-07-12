@@ -371,7 +371,7 @@ impl PropertyBackend for LWWBackend {
 
         // Add candidates from events in this layer.
         for (event, from_to_apply) in layer.already_applied.iter().map(|e| (e, false)).chain(layer.to_apply.iter().map(|e| (e, true))) {
-            if let Some(operations) = event.operations.get(&Self::property_backend_name().to_string()) {
+            if let Some(operations) = event.operations().get(Self::property_backend_name()) {
                 for operation in operations {
                     // Both wire versions normalize to (PropertyKey, value);
                     // election below is version-agnostic.
@@ -456,7 +456,7 @@ mod tests {
     use ankurah_proto::EntityId;
 
     fn id(byte: u8) -> EntityId {
-        let mut bytes = [0u8; 16];
+        let mut bytes = [0u8; 32];
         bytes[0] = byte;
         EntityId::from_bytes(bytes)
     }

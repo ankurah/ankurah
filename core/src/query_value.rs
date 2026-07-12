@@ -43,7 +43,7 @@ impl TryFrom<QueryValue> for ankql::ast::Expr {
             QueryValue::EntityId(s) => {
                 let id = EntityId::from_base64(&s)
                     .map_err(|e| ankql::error::ParseError::InvalidPredicate(format!("Invalid EntityId: {}", e)))?;
-                Expr::Literal(Literal::EntityId(id.to_ulid()))
+                Expr::Literal(Literal::EntityId(id.to_bytes()))
             }
         })
     }

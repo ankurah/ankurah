@@ -325,6 +325,56 @@ async fn hard_reset_clears_ensured_and_map() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A SchemaRegistered response is scoped to the exact client system
+/// generation that issued the request. Holding the response across a reset
+/// and a join to a different founder must neither satisfy the old
+/// transaction nor seed the new system's catalog map/latch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delayed_schema_response_cannot_repopulate_after_system_reset() -> anyhow::Result<()> {
+    let old_founder = durable_sled_setup().await?;
+    let new_founder = durable_sled_setup().await?;
+    let client = ephemeral_sled_setup().await?;
+
+    let (_old_connection, gate) = GatedConnection::new(&old_founder, &client, |message| {
+        matches!(
+            message,
+            proto::NodeMessage::Response(response)
+                if matches!(&response.body, proto::NodeResponseBody::SchemaRegistered { .. })
+        )
+    });
+    client.system.wait_system_ready().await;
+    old_founder.catalog.wait_catalog_ready().await;
+
+    let old_context = client.context_async(DEFAULT_CONTEXT).await;
+    let mut registration = tokio::spawn(async move {
+        let transaction = old_context.begin();
+        transaction.create(&Gadget { name: "old system".into() }).await.map(|_| ())
+    });
+
+    wait_resolve(&old_founder, "gadget", "name").await.expect("old founder executes registration before its response is released");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), &mut registration).await.is_err(),
+        "the gated SchemaRegistered response should leave registration pending"
+    );
+
+    client.system.hard_reset().await?;
+    let _new_connection = LocalProcessConnection::new(&new_founder, &client).await?;
+    client.system.wait_system_ready().await;
+    let _new_context = client.context_async(DEFAULT_CONTEXT).await;
+
+    // Deliver the already-authenticated old response only after the client
+    // is ready in the new generation. Either peer teardown has already
+    // failed the request, or the response reaches the catalog fence and is
+    // rejected there; neither path may fold its definitions.
+    gate.release_held(&client).await;
+    let registration_result = tokio::time::timeout(Duration::from_secs(5), registration).await??;
+    assert!(matches!(registration_result, Err(MutationError::SystemReset)), "stale registration must report SystemReset");
+    assert!(client.catalog.resolve("gadget", "name").is_none(), "old response must not seed the new generation's map");
+    assert!(!client.catalog.is_ensured("gadget"), "old response must not seed the new generation's ensured latch");
+
+    Ok(())
+}
+
 // (f) Fail-loud offline read (RFC 5.3 addendum, plan decision 25b second
 // ruling): with no durable peer, a fetch over a NEVER-registered compiled
 // collection cannot run first-use registration, and the reference surfaces

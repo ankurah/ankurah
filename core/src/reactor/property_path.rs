@@ -27,7 +27,7 @@ impl PropertyPath {
     /// address; the resolved-at name remains available for legacy Name residue.
     pub fn from_identifier(identifier: &ankql::ast::Identifier) -> Self {
         Self {
-            property: Some(ankurah_proto::EntityId::from_ulid(identifier.property)),
+            property: Some(ankurah_proto::EntityId::from_bytes(identifier.property)),
             root: identifier.name.clone(),
             sub_path: identifier.subpath.clone(),
         }

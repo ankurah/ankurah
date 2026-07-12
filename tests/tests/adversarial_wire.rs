@@ -9,23 +9,36 @@
 //! The injection seam is `handle_message` with a hand-forged `NodeUpdate`,
 //! matching tests/tests/update_batch_containment.rs.
 //!
-//! Arms targeting OPEN gaps (G-1, G-3, G-4) are `#[ignore]` red tests naming
+//! Arms targeting OPEN gaps (G-3, G-4) are `#[ignore]` red tests naming
 //! the gap id and owning issue; they pin what SHOULD happen and un-ignore when
-//! the fix lands. They do NOT implement the fix.
+//! the fix lands. Closed G-1 is covered by the active C4-15 BFS test below.
 
 mod common;
 
+use ankql::ast::Predicate;
 use ankurah::core::property::backend::{lww::LWWBackend, PropertyBackend};
 use ankurah::core::property::PropertyKey;
 use ankurah::core::value::Value;
+use ankurah::core::{
+    entity::Entity,
+    error::ValidationError,
+    node::{Node as NodeAlias, NodeInner},
+    policy::{AccessDenied, Admission, DefaultContext, PolicyAgent},
+    storage::StorageEngine,
+    util::Iterable,
+};
 use ankurah::proto::{self, Attested};
 use ankurah::{policy::DEFAULT_CONTEXT as c, Model, Node, PermissiveAgent, View};
 use ankurah_connector_local_process::LocalProcessConnection;
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
+use async_trait::async_trait;
 use common::*;
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+};
 
 use common::{Record, RecordView};
 
@@ -53,7 +66,39 @@ fn forge_title_event(
     let backend = LWWBackend::new();
     backend.set(PropertyKey::Id(title_prop), Some(Value::String(title.to_owned())));
     let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
-    proto::Event { entity_id, model, operations: proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])), parent }
+    proto::Event {
+        entity_id,
+        model,
+        body: proto::EventBody::Update { operations: proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])) },
+        parent,
+    }
+}
+
+/// Forge a genesis-shaped attack that falsely claims an existing entity id.
+/// Content-addressed identity makes a second valid genesis for that id
+/// impossible; ingress must reject this body because its recomputed genesis id
+/// differs from `claimed_entity`.
+fn forge_mismatched_genesis(
+    claimed_entity: proto::EntityId,
+    model: proto::EntityId,
+    property: proto::EntityId,
+    value: &str,
+    nonce_tag: u8,
+) -> proto::Event {
+    let backend = LWWBackend::new();
+    backend.set(PropertyKey::Id(property), Some(Value::String(value.to_owned())));
+    let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
+    proto::Event {
+        entity_id: claimed_entity,
+        model,
+        body: proto::EventBody::Genesis {
+            system: None,
+            nonce: [nonce_tag; 32],
+            timestamp: nonce_tag as u64,
+            operations: proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
+        },
+        parent: proto::Clock::default(),
+    }
 }
 
 fn event_only_item(event: proto::Event) -> proto::SubscriptionUpdateItem {
@@ -76,7 +121,7 @@ fn event_only_multi(entity_id: proto::EntityId, model: proto::EntityId, events: 
     }
 }
 
-fn deliver(from: proto::EntityId, to: proto::EntityId, items: Vec<proto::SubscriptionUpdateItem>) -> proto::NodeMessage {
+fn deliver(from: proto::NodeId, to: proto::NodeId, items: Vec<proto::SubscriptionUpdateItem>) -> proto::NodeMessage {
     proto::NodeMessage::Update(proto::NodeUpdate {
         id: proto::UpdateId::new(),
         from,
@@ -227,7 +272,7 @@ async fn malformed_clock_identity_is_order_independent_end_to_end() -> Result<()
         proto::Event {
             entity_id: rec_id,
             model: f.record_model,
-            operations: proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
+            body: proto::EventBody::Update { operations: proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])) },
             parent: head0.clone(),
         }
     };
@@ -308,17 +353,7 @@ async fn forged_extra_genesis_head_does_not_trigger_wholesale_adoption() -> Resu
     // A legitimate child B of the current head, and an independent genesis X
     // (empty parent) for the same entity id: X shares no lineage with the head.
     let ev_b = forge_title_event(rec_id, f.record_model, f.record_title, head0.clone(), "child-b");
-    let ev_x = {
-        let backend = LWWBackend::new();
-        backend.set(PropertyKey::Id(f.record_artist), Some(Value::String("foreign-x".to_owned())));
-        let ops = backend.to_operations().unwrap().expect("ops");
-        proto::Event {
-            entity_id: rec_id,
-            model: f.record_model,
-            operations: proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
-            parent: proto::Clock::default(),
-        }
-    };
+    let ev_x = { forge_mismatched_genesis(rec_id, f.record_model, f.record_artist, "foreign-x", 0x58) };
     let id_b = ev_b.id();
     let id_x = ev_x.id();
 
@@ -358,11 +393,11 @@ async fn forged_extra_genesis_head_does_not_trigger_wholesale_adoption() -> Resu
 /// addressing.
 #[test]
 fn declared_cycle_is_unconstructible_content_addressing() {
-    let entity = proto::EntityId::new();
+    let entity = proto::EntityId::from_bytes([0xED; 32]);
     // #330: this pure content-addressing check never routes these events to a
     // node, so any model id works; use a fixed fabricated one.
-    let model = proto::EntityId::from_bytes([0xEE; 16]);
-    let title_prop = proto::EntityId::from_bytes([0xEF; 16]);
+    let model = proto::EntityId::from_bytes([0xEE; 32]);
+    let title_prop = proto::EntityId::from_bytes([0xEF; 32]);
     let mk = |title: &str, parent: proto::Clock| forge_title_event(entity, model, title_prop, parent, title);
 
     // Start from two independent events and try to wire A.parent := [B.id()]
@@ -370,7 +405,7 @@ fn declared_cycle_is_unconstructible_content_addressing() {
     // has a concrete id. To close the cycle we would need B to have referenced
     // *that* id, but B was built referencing an empty parent, so B.id() is
     // fixed and does not name A.
-    let b = mk("b", proto::Clock::default());
+    let b = mk("b", proto::Clock::from(vec![proto::EventId::from_bytes([0x01; 32])]));
     let a = mk("a", proto::Clock::from(vec![b.id()]));
     // A names B, but B does NOT name A: no cycle among {a, b}.
     assert!(a.parent.contains(&b.id()), "A references B");
@@ -481,7 +516,7 @@ async fn forged_second_genesis_rejected_on_durable_node() -> Result<()> {
 
     // Forge a DISTINCT second genesis (empty parent, different ops => different
     // id) and deliver it to the SERVER attributed to the client peer.
-    let alt = forge_title_event(rec_id, f.record_model, f.record_title, proto::Clock::default(), "ALT-GENESIS");
+    let alt = forge_mismatched_genesis(rec_id, f.record_model, f.record_title, "ALT-GENESIS", 0xA1);
     assert!(alt.is_entity_create(), "alt is a creation event");
     let alt_id = alt.id();
     f.server.handle_message(deliver(f.client.id, f.server.id, vec![event_only_item(alt)])).await?;
@@ -509,7 +544,7 @@ async fn forged_second_genesis_rejected_on_ephemeral_node() -> Result<()> {
     let (rec_id, view) = seed_record(&f, "t0", "a0").await?;
     let head_before = view.entity().head().clone();
 
-    let alt = forge_title_event(rec_id, f.record_model, f.record_title, proto::Clock::default(), "ALT-EPH");
+    let alt = forge_mismatched_genesis(rec_id, f.record_model, f.record_title, "ALT-EPH", 0xA2);
     let alt_id = alt.id();
     f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(alt)])).await?;
 
@@ -531,7 +566,7 @@ async fn phantom_entity_is_evicted_on_failed_apply() -> Result<()> {
     let (a_id, view_a) = seed_record(&f, "a0", "artist-a").await?;
 
     let ev_a = forge_title_event(a_id, f.record_model, f.record_title, view_a.entity().head().clone(), "a1");
-    let unknown_id = proto::EntityId::new();
+    let unknown_id = proto::EntityId::from_bytes([0x7F; 32]);
     // Non-creation event (non-empty parent) for an entity the client never saw.
     let ev_unknown = forge_title_event(
         unknown_id,
@@ -598,31 +633,206 @@ async fn oversized_event_batch_is_rejected() -> Result<()> {
 }
 
 // ===========================================================================
-// OPEN GAP red tests (ignored): BFS fetch validation (G-1, #244)
+// BFS fetch validation (C4-15, formerly G-1 / #244)
 // ===========================================================================
 
-/// G-1 / OPEN GAP (#244): an event fetched from a peer DURING BFS is written
-/// to storage without passing `validate_received_event`, unlike every
-/// application arm (C4-14 vs C4-15). This red test pins what SHOULD happen once
-/// #274 lands: events pulled in by a mid-BFS `GetEvents` pass the same policy
-/// gate as the application arms. It does NOT implement the gate.
-///
-/// The arm is expressed as an invariant a validating agent could enforce; with
-/// the seam absent today, the BFS-fetched parent bypasses validation, so the
-/// count of validate calls does not cover the fetched event and this fails.
-/// Marked ignore until the validated-ingress seam exists.
+/// Counts receive-side event validation and can deny one exact event. The
+/// state hook remains permissive so the test reaches lineage comparison; the
+/// missing events fetched by that comparison are where the event gate belongs.
+#[derive(Clone)]
+struct BfsPolicyAgent {
+    validate_calls: Arc<AtomicUsize>,
+    denied_events: Arc<Mutex<HashSet<proto::EventId>>>,
+}
+
+impl BfsPolicyAgent {
+    fn new() -> Self { Self { validate_calls: Arc::new(AtomicUsize::new(0)), denied_events: Arc::new(Mutex::new(HashSet::new())) } }
+}
+
+#[async_trait]
+impl PolicyAgent for BfsPolicyAgent {
+    type ContextData = &'static DefaultContext;
+
+    fn sign_request<SE: StorageEngine, C>(
+        &self,
+        _node: &NodeInner<SE, Self>,
+        cdata: &C,
+        _request: &proto::NodeRequest,
+    ) -> Result<Vec<proto::AuthData>, AccessDenied>
+    where
+        C: Iterable<Self::ContextData>,
+    {
+        Ok(cdata.iterable().map(|_| proto::AuthData(vec![])).collect())
+    }
+
+    async fn check_request<SE: StorageEngine, A>(
+        &self,
+        _node: &NodeAlias<SE, Self>,
+        auth: &A,
+        _request: &proto::NodeRequest,
+    ) -> Result<Vec<Self::ContextData>, ValidationError>
+    where
+        A: Iterable<proto::AuthData> + Send + Sync,
+    {
+        Ok(auth.iterable().map(|_| c).collect())
+    }
+
+    fn check_event<SE: StorageEngine>(
+        &self,
+        _node: &NodeAlias<SE, Self>,
+        _cdata: &Self::ContextData,
+        _entity_before: &Entity,
+        _entity_after: &Entity,
+        _event: &proto::Event,
+    ) -> Result<Admission, AccessDenied> {
+        Ok(Admission::Allow)
+    }
+
+    fn validate_received_event<SE: StorageEngine>(
+        &self,
+        _node: &NodeAlias<SE, Self>,
+        _from_node: &proto::NodeId,
+        event: &Attested<proto::Event>,
+    ) -> Result<(), AccessDenied> {
+        self.validate_calls.fetch_add(1, Ordering::SeqCst);
+        if self.denied_events.lock().unwrap().contains(&event.payload.id()) {
+            return Err(AccessDenied::ByPolicy("BFS-fetched event denied by test policy"));
+        }
+        Ok(())
+    }
+
+    fn attest_state<SE: StorageEngine>(&self, _node: &NodeAlias<SE, Self>, _state: &proto::EntityState) -> Admission { Admission::Allow }
+
+    fn validate_received_state<SE: StorageEngine>(
+        &self,
+        _node: &NodeAlias<SE, Self>,
+        _from_node: &proto::NodeId,
+        _state: &Attested<proto::EntityState>,
+    ) -> Result<(), AccessDenied> {
+        Ok(())
+    }
+
+    fn can_access_collection<C>(&self, _data: &C, _collection: &proto::CollectionId) -> Result<(), AccessDenied>
+    where C: Iterable<Self::ContextData> {
+        Ok(())
+    }
+
+    fn filter_predicate<C>(&self, _data: &C, _collection: &proto::CollectionId, predicate: Predicate) -> Result<Predicate, AccessDenied>
+    where C: Iterable<Self::ContextData> {
+        Ok(predicate)
+    }
+
+    fn check_read<C>(
+        &self,
+        _data: &C,
+        _id: &proto::EntityId,
+        _collection: &proto::CollectionId,
+        _state: &proto::State,
+        _resolver: Option<std::sync::Weak<dyn ankurah::core::property::PropertyResolver>>,
+    ) -> Result<(), AccessDenied>
+    where
+        C: Iterable<Self::ContextData>,
+    {
+        Ok(())
+    }
+
+    fn check_read_event<C>(
+        &self,
+        _data: &C,
+        _collection: &proto::CollectionId,
+        _event: &Attested<proto::Event>,
+    ) -> Result<(), AccessDenied>
+    where
+        C: Iterable<Self::ContextData>,
+    {
+        Ok(())
+    }
+
+    fn check_write(&self, _data: &Self::ContextData, _entity: &Entity, _event: Option<&proto::Event>) -> Result<(), AccessDenied> { Ok(()) }
+
+    fn validate_causal_assertion<SE: StorageEngine>(
+        &self,
+        _node: &NodeAlias<SE, Self>,
+        _peer_id: &proto::NodeId,
+        _assertion: &proto::CausalAssertion,
+    ) -> Result<(), AccessDenied> {
+        Ok(())
+    }
+}
+
+/// C4-15: a state snapshot can force the receiver's lineage walk to fetch
+/// missing events by `GetEvents`. Each fetched payload passes the same policy
+/// gate as directly delivered events, and a denied parent is not cached.
 #[tokio::test]
-#[ignore = "OPEN GAP G-1: BFS-time remote fetch skips validate_received_event (issue #244, closed by #274)"]
 async fn bfs_fetched_events_are_policy_validated() -> Result<()> {
-    // Pinning note: closing G-1 means CachedEventGetter::get_event routes
-    // peer-returned events through validate_received_event (and filters that
-    // returned ids match the request) before add_event. A green version of
-    // this test would install a counting/denying agent, force an ephemeral BFS
-    // fetch of a missing parent, and assert the fetched event was validated
-    // (and a denied one rejected without touching storage). The seam does not
-    // exist yet, so there is nothing to assert against; failing here keeps the
-    // gap visible until #274.
-    panic!("OPEN GAP G-1 (#244): no validate_received_event on the BFS fetch path; pin activates with #274");
+    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    server.system.create().await?;
+    let client_agent = BfsPolicyAgent::new();
+    let client = Node::new(Arc::new(SledStorageEngine::new_test()?), client_agent.clone());
+    let _connection = LocalProcessConnection::new(&client, &server).await?;
+    client.system.wait_system_ready().await;
+
+    let ctx_s = server.context(c)?;
+    let ctx_c = client.context(c)?;
+    let _relay = ctx_c.query_wait::<RecordView>("title = 'never-match'").await?;
+    let record_id = {
+        let trx = ctx_s.begin();
+        let record = trx.create(&Record { title: "before".to_owned(), artist: "artist".to_owned() }).await?;
+        let id = record.id();
+        trx.commit().await?;
+        id
+    };
+    let view = ctx_c.get::<RecordView>(record_id).await?;
+    assert_eq!(view.title()?, "before");
+
+    let denied_id = {
+        let trx = ctx_s.begin();
+        ctx_s.get::<RecordView>(record_id).await?.edit(&trx)?.title().set(&"one".to_owned())?;
+        trx.commit_and_return_events().await?[0].id()
+    };
+    {
+        let trx = ctx_s.begin();
+        ctx_s.get::<RecordView>(record_id).await?.edit(&trx)?.title().set(&"two".to_owned())?;
+        trx.commit().await?;
+    }
+    client_agent.denied_events.lock().unwrap().insert(denied_id.clone());
+    client_agent.validate_calls.store(0, Ordering::SeqCst);
+
+    // Deliver only the latest state. Comparing it with the client's genesis
+    // head has to fetch both missing update events from the server.
+    let model = server.catalog.model_id_for(Record::collection().as_str()).expect("Record registered");
+    let server_collection = ctx_s.collection(&Record::collection()).await?;
+    let latest = server_collection.get_state(record_id).await?;
+    let genesis_id = proto::EventId::from_bytes(record_id.to_bytes());
+    let genesis = server_collection
+        .get_events(vec![genesis_id.clone()])
+        .await?
+        .into_iter()
+        .find(|event| event.payload.id() == genesis_id)
+        .expect("server stores the record genesis");
+    client
+        .handle_message(deliver(
+            server.id,
+            client.id,
+            vec![proto::SubscriptionUpdateItem {
+                entity_id: record_id,
+                model,
+                content: proto::UpdateContent::StateAndEvent(proto::StateWithGenesis { genesis, state: latest }, vec![]),
+                predicate_relevance: vec![],
+            }],
+        ))
+        .await?;
+
+    assert!(
+        client_agent.validate_calls.load(Ordering::SeqCst) >= 2,
+        "the tip and its missing parent must both pass validate_received_event"
+    );
+    let client_collection = ctx_c.collection(&Record::collection()).await?;
+    let stored_ids: HashSet<_> =
+        client_collection.dump_entity_events(record_id).await?.into_iter().map(|event| event.payload.id()).collect();
+    assert!(!stored_ids.contains(&denied_id), "a policy-denied BFS event must not enter the permanent cache");
+    assert_eq!(view.title()?, "before", "a snapshot with a denied lineage must not advance materialized state");
+    Ok(())
 }
 
 // ===========================================================================

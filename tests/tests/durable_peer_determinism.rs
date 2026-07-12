@@ -14,11 +14,13 @@ use anyhow::Result;
 use std::sync::Arc;
 
 /// Insert a batch of durable peers into a node via the test-only seam.
-fn seed_peers(node: &Node<SledStorageEngine, PermissiveAgent>, peers: &[proto::EntityId]) {
+fn seed_peers(node: &Node<SledStorageEngine, PermissiveAgent>, peers: &[proto::NodeId]) {
     for p in peers {
         node.insert_durable_peer_for_test(*p);
     }
 }
+
+fn peer_ids(count: u8) -> Vec<proto::NodeId> { (1..=count).map(|tag| proto::NodeId::from_bytes([tag; 32])).collect() }
 
 /// Path 2: get_durable_peers returns a stable, id-sorted order across repeated calls.
 ///
@@ -30,7 +32,7 @@ async fn test_get_durable_peers_is_stable_and_sorted() -> Result<()> {
     let node = common::durable_sled_setup().await?;
 
     // Generate several peer ids, then insert them in an order that is not their sorted order.
-    let mut peers: Vec<proto::EntityId> = (0..8).map(|_| proto::EntityId::new()).collect();
+    let mut peers = peer_ids(8);
     peers.sort();
     let mut insertion = peers.clone();
     insertion.reverse();
@@ -53,9 +55,9 @@ async fn test_get_durable_peers_is_stable_and_sorted() -> Result<()> {
 #[tokio::test]
 async fn test_get_durable_peer_random_same_seed_same_sequence() -> Result<()> {
     // Shared peer set; both seeded nodes see the identical set.
-    let peers: Vec<proto::EntityId> = (0..16).map(|_| proto::EntityId::new()).collect();
+    let peers = peer_ids(16);
 
-    let draw_sequence = |seed: u64| -> Vec<proto::EntityId> {
+    let draw_sequence = |seed: u64| -> Vec<proto::NodeId> {
         let node = Node::new_durable_with_seed(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new(), seed);
         seed_peers(&node, &peers);
         (0..64).map(|_| node.get_durable_peer_random().expect("peer set is non-empty")).collect()
@@ -80,7 +82,7 @@ async fn test_get_durable_peer_random_same_seed_same_sequence() -> Result<()> {
 #[tokio::test]
 async fn test_get_durable_peer_random_default_stays_in_set() -> Result<()> {
     let node = common::durable_sled_setup().await?;
-    let peers: Vec<proto::EntityId> = (0..4).map(|_| proto::EntityId::new()).collect();
+    let peers = peer_ids(4);
     seed_peers(&node, &peers);
 
     let peer_set: std::collections::HashSet<_> = peers.iter().copied().collect();

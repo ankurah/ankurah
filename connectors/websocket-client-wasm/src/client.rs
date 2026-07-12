@@ -86,6 +86,10 @@ impl fmt::Display for ClientInner {
 }
 
 impl ClientInner {
+    pub(crate) fn is_current_connection(&self, connection: &Connection) -> bool {
+        self.connection.borrow().as_ref().is_some_and(|existing| existing == connection)
+    }
+
     pub(crate) fn handle_state_change(self: &Arc<Self>, connection: &Connection, new_state: ConnectionState) -> bool {
         // we are only interested in state changes for the current connection
         {
@@ -114,7 +118,10 @@ impl ClientInner {
             }
             ConnectionState::Connecting { .. } => (),
             ConnectionState::None => {
-                // self.connect().expect("Failed to connect");
+                // A core-requested peer close is terminal for this connector:
+                // hard reset must not reconnect to and immediately rejoin the
+                // old founder system.
+                *self.connection.borrow_mut() = None;
             }
             ConnectionState::Closed | ConnectionState::Error { .. } => {
                 // Clear the existing connection before attempting to reconnect
@@ -135,7 +142,12 @@ impl ClientInner {
             Connection::new(self.node.cloned(), self.server_url.clone(), Arc::downgrade(self)).map_err(|e| anyhow::anyhow!("{:?}", e))?;
 
         action_info!(self, "connecting to", "{}", &self.server_url);
-        *self.connection.borrow_mut() = Some(connection);
+        let replaced = self.connection.borrow_mut().replace(connection);
+        if let Some(replaced) = replaced {
+            // A superseded browser transport must not retain its verified
+            // dispatch worker or continue delivering already-queued frames.
+            replaced.disconnect();
+        }
         self.state.set(ConnectionState::Connecting { url: self.server_url.clone() });
 
         Ok(())
@@ -157,6 +169,9 @@ impl ClientInner {
 impl std::ops::Drop for ClientInner {
     fn drop(&mut self) {
         info!("Websocket client inner dropped for node {}", self.node.id());
+        if let Some(connection) = self.connection.get_mut().take() {
+            connection.disconnect();
+        }
     }
 }
 

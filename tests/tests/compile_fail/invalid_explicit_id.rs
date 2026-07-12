@@ -1,4 +1,4 @@
-//! An explicit-id binding (RFC 5.9 in specs/model-property-metadata/rfc.md) must be URL-safe base64 of exactly 16
+//! An explicit-id binding (RFC 5.9 in specs/model-property-metadata/rfc.md) must be URL-safe base64 of exactly 32
 //! bytes (an EntityId); a too-short value is refused at derive time.
 
 use ankurah::Model;

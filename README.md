@@ -126,9 +126,13 @@ WebSocket server & client • Embeddable axum routes • Authentication hooks �
 ## Quick Example
 
 **Server**
-<pre><code transclude="docs/example/server/src/main.rs#server-example">let storage = SledStorageEngine::with_path(storage_dir)?;
-let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
-node.system.create().await?;
+<pre><code transclude="docs/example/server/src/main.rs#server-example">let signing_key = ankurah::core::node_key::load_or_create_signing_key(storage_dir.with_extension(&quot;node-key&quot;))?;
+	let storage = SledStorageEngine::with_path(storage_dir)?;
+	let node = Node::new_durable_with_signing_key(Arc::new(storage), PermissiveAgent::new(), signing_key);
+	node.system.wait_loaded().await;
+	if node.system.root().is_none() {
+	    node.system.create().await?;
+	}
 
 let mut server = WebsocketServer::new(node);
 println!(&quot;Running server...&quot;);

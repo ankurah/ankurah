@@ -8,13 +8,16 @@
 
 mod common;
 use ankurah::core::schema::registration_request;
-use ankurah::property::{Json, Ref};
+use ankurah::property::{Json, Property, Ref};
 use ankurah::proto::{self, PropertyRef};
+use ankurah::storage::{StorageEngine, SystemRootClaim};
 use ankurah::value::Value;
-use ankurah::Model;
+use ankurah::{Model, Node, PermissiveAgent};
 use common::*;
+use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 // A referenced model, so Ref<T> has a target.
 #[derive(Model, Debug, Serialize, Deserialize)]
@@ -128,13 +131,16 @@ fn renamed_from_attribute_carries_the_hint() {
 
 // -- explicit id attributes --------------------------------------------------
 
-// 16 zero bytes as URL-safe base64 (no padding) = 22 'A's; a valid EntityId.
-const ZERO_ID_B64: &str = "AAAAAAAAAAAAAAAAAAAAAA";
+// 32 zero bytes as URL-safe base64 (no padding) = 43 'A's; a valid EntityId.
+const ZERO_ID_B64: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+const SCORE_ID_B64: &str = "CwYKzeK1nFDphHhSWafUOi6FJhUHHSstHZH0Tv4ZoLc";
+const TEXT_ID_B64: &str = "Yv3sWwRU4nNt3UAmBznJu7wI6ExdxMPtW3XOq8SPpBk";
+const YRS_ID_B64: &str = "j31rzKNH1FLLaWosugiEjDQhx7BeDX_pYxRaT9xY2kM";
 
 #[derive(Model, Debug, Serialize, Deserialize)]
-#[model(id = "AAAAAAAAAAAAAAAAAAAAAA")]
+#[model(id = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")]
 pub struct DescBound {
-    #[property(id = "AAAAAAAAAAAAAAAAAAAAAA")]
+    #[property(id = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")]
     pub label: String,
     pub other: String,
 }
@@ -147,7 +153,7 @@ mod explicit_binding_v1 {
     /// type is also narrower than this binder's castable i64 declaration.
     #[derive(Model, Debug, Serialize, Deserialize)]
     pub struct BoundMetric {
-        #[property(id = "AAAAAAAAAAAAAAAAAAAAAA")]
+        #[property(id = "CwYKzeK1nFDphHhSWafUOi6FJhUHHSstHZH0Tv4ZoLc")]
         pub local_score: i64,
     }
 }
@@ -159,7 +165,7 @@ mod explicit_binding_v2 {
     /// used to exercise the offline fully-bound reassertion path.
     #[derive(Model, Debug, Serialize, Deserialize)]
     pub struct BoundMetric {
-        #[property(id = "AAAAAAAAAAAAAAAAAAAAAA")]
+        #[property(id = "CwYKzeK1nFDphHhSWafUOi6FJhUHHSstHZH0Tv4ZoLc")]
         pub offline_alias: i64,
     }
 }
@@ -181,7 +187,7 @@ mod explicit_text_binding {
 
     #[derive(Model, Debug, Serialize, Deserialize)]
     pub struct BoundText {
-        #[property(id = "AQEBAQEBAQEBAQEBAQEBAQ")]
+        #[property(id = "Yv3sWwRU4nNt3UAmBznJu7wI6ExdxMPtW3XOq8SPpBk")]
         pub local_text: String,
     }
 }
@@ -200,7 +206,7 @@ mod explicit_yrs_alias {
 
     #[derive(Model, Debug, Serialize, Deserialize)]
     pub struct ClashingText {
-        #[property(id = "AgICAgICAgICAgICAgICAg")]
+        #[property(id = "j31rzKNH1FLLaWosugiEjDQhx7BeDX_pYxRaT9xY2kM")]
         pub local_text: String,
     }
 }
@@ -276,19 +282,80 @@ async fn catalog_values(
     Ok(LWWBackend::from_state_buffer(&buffer)?.property_values().into_iter().map(|(k, v)| (k.display_name(), v)).collect())
 }
 
-fn catalog_lww_event(collection: &str, id: EntityId, parent: proto::Clock, fields: Vec<(&str, Value)>) -> proto::Event {
+fn lww_operations(fields: Vec<(&str, Value)>) -> proto::OperationSet {
     use ankurah::core::property::{backend::PropertyBackend, PropertyKey};
     let backend = ankurah::core::property::backend::LWWBackend::new();
     for (name, value) in fields {
         backend.set(PropertyKey::Name(name.to_string()), Some(value));
     }
     let operations = backend.to_operations().unwrap().expect("catalog event has fields");
+    proto::OperationSet(BTreeMap::from([("lww".to_string(), operations)]))
+}
+
+fn deterministic_genesis(
+    model: EntityId,
+    system: Option<EntityId>,
+    nonce_byte: u8,
+    timestamp: u64,
+    operations: proto::OperationSet,
+) -> proto::Event {
+    let nonce = [nonce_byte; 32];
+    let entity_id = EntityId::from(proto::EventId::from_genesis_parts(&system, &nonce, timestamp, &operations));
+    proto::Event {
+        model,
+        entity_id,
+        parent: proto::Clock::default(),
+        body: proto::EventBody::Genesis { system, nonce, timestamp, operations },
+    }
+}
+
+fn catalog_genesis(system: EntityId, nonce_byte: u8, timestamp: u64) -> proto::Event {
+    let model = ankurah::core::schema::well_known_model_id("_ankurah_property").expect("property catalog has a well-known model");
+    deterministic_genesis(model, Some(system), nonce_byte, timestamp, proto::OperationSet(BTreeMap::new()))
+}
+
+fn catalog_lww_update(collection: &str, id: EntityId, parent: proto::Clock, fields: Vec<(&str, Value)>) -> proto::Event {
+    assert!(!parent.is_empty(), "catalog update must descend from a genesis event");
     proto::Event {
         model: ankurah::core::schema::well_known_model_id(collection).expect("catalog collection has a well-known model"),
         entity_id: id,
-        operations: proto::OperationSet(BTreeMap::from([("lww".to_string(), operations)])),
+        body: proto::EventBody::Update { operations: lww_operations(fields) },
         parent,
     }
+}
+
+fn deterministic_system_root() -> anyhow::Result<(SigningKey, proto::SystemRootProof)> {
+    use ankurah::core::property::backend::{LWWBackend, PropertyBackend};
+
+    let signing_key = SigningKey::from_bytes(&[0x5A; 32]);
+    let founder = proto::NodeId::from(signing_key.verifying_key());
+    let item = proto::sys::Item::SysRoot { founder }.into_value()?.expect("system item serializes to a value");
+    let operations = lww_operations(vec![("item", item)]);
+    let model = ankurah::core::schema::well_known_model_id(ankurah::core::system::SYSTEM_COLLECTION_ID)
+        .expect("system catalog has a well-known model");
+    let genesis = deterministic_genesis(model, None, 0x10, 1_700_000_000_000, operations);
+
+    let backend = LWWBackend::new();
+    backend.apply_operations_with_event(genesis.operations().get("lww").expect("root has lww operations"), genesis.id())?;
+    let state = proto::EntityState {
+        entity_id: genesis.entity_id,
+        model,
+        state: proto::State {
+            state_buffers: proto::StateBuffers(BTreeMap::from([("lww".to_string(), backend.to_state_buffer()?)])),
+            head: proto::Clock::from(vec![genesis.id()]),
+        },
+    };
+    Ok((signing_key, proto::SystemRootProof { genesis, state: proto::Attested::opt(state, None) }))
+}
+
+async fn deterministic_system_setup() -> anyhow::Result<Node<SledStorageEngine, PermissiveAgent>> {
+    let (signing_key, proof) = deterministic_system_root()?;
+    let engine = Arc::new(SledStorageEngine::new_test()?);
+    anyhow::ensure!(engine.claim_system_root(&proof).await? == SystemRootClaim::Claimed, "fresh engine rejected deterministic root");
+    let node = Node::new_durable_with_signing_key(engine, PermissiveAgent::new(), signing_key);
+    node.system.wait_loaded().await;
+    anyhow::ensure!(node.system.is_system_ready(), "deterministic system root did not become ready");
+    Ok(node)
 }
 
 async fn wait_property_name(node: &Node<SledStorageEngine, PermissiveAgent>, id: EntityId, expected: &str) -> anyhow::Result<()> {
@@ -404,30 +471,35 @@ async fn register_from_model_schema_end_to_end() -> anyhow::Result<()> {
 /// stability, and the offline fully-bound reassertion path.
 #[tokio::test]
 async fn explicit_id_drives_derived_access_and_query_aliases() -> anyhow::Result<()> {
-    let property_id = EntityId::from_base64(ZERO_ID_B64)?;
-    let text_property_id = EntityId::from_base64("AQEBAQEBAQEBAQEBAQEBAQ")?;
-    let server = durable_sled_setup().await?;
+    let property_id = EntityId::from_base64(SCORE_ID_B64)?;
+    let text_property_id = EntityId::from_base64(TEXT_ID_B64)?;
+    let server = deterministic_system_setup().await?;
     server.catalog.wait_catalog_ready().await;
+    let system = server.system.root_id().expect("deterministic system is ready");
 
     // Preseed a DDL-authored property at the fixed id. Explicit registration
     // references definitions authored elsewhere; it never mints its id.
-    let property_event = catalog_lww_event(
+    let property_genesis = catalog_genesis(system, 0x21, 1_700_000_000_101);
+    let text_property_genesis = catalog_genesis(system, 0x22, 1_700_000_000_102);
+    assert_eq!(property_genesis.entity_id, property_id, "compiled score id matches deterministic DDL genesis");
+    assert_eq!(text_property_genesis.entity_id, text_property_id, "compiled text id matches deterministic DDL genesis");
+    let property_event = catalog_lww_update(
         "_ankurah_property",
         property_id,
-        proto::Clock::default(),
+        proto::Clock::from(vec![property_genesis.id()]),
         vec![
-            ("minted_for", Value::EntityId(EntityId::new())),
+            ("minted_for", Value::EntityId(EntityId::from_bytes([0xA1; 32]))),
             ("name", Value::String("catalog_score".into())),
             ("backend", Value::String("lww".into())),
             ("value_type", Value::String("i32".into())),
         ],
     );
-    let text_property_event = catalog_lww_event(
+    let text_property_event = catalog_lww_update(
         "_ankurah_property",
         text_property_id,
-        proto::Clock::default(),
+        proto::Clock::from(vec![text_property_genesis.id()]),
         vec![
-            ("minted_for", Value::EntityId(EntityId::new())),
+            ("minted_for", Value::EntityId(EntityId::from_bytes([0xA2; 32]))),
             ("name", Value::String("catalog_text".into())),
             ("backend", Value::String("yrs".into())),
             ("value_type", Value::String("string".into())),
@@ -437,7 +509,12 @@ async fn explicit_id_drives_derived_access_and_query_aliases() -> anyhow::Result
         .commit_remote_transaction(
             &DEFAULT_CONTEXT,
             proto::TransactionId::new(),
-            vec![proto::Attested::opt(property_event, None), proto::Attested::opt(text_property_event, None)],
+            vec![
+                proto::Attested::opt(property_genesis, None),
+                proto::Attested::opt(property_event, None),
+                proto::Attested::opt(text_property_genesis, None),
+                proto::Attested::opt(text_property_event, None),
+            ],
         )
         .await?;
     wait_property_name(&server, property_id, "catalog_score").await?;
@@ -491,7 +568,7 @@ async fn explicit_id_drives_derived_access_and_query_aliases() -> anyhow::Result
     // every generated accessor keep addressing the same property id.
     let property_storage = server.collections.get(&"_ankurah_property".into()).await?;
     let property_head = property_storage.get_state(property_id).await?.payload.state.head;
-    let rename = catalog_lww_event("_ankurah_property", property_id, property_head, vec![("name", Value::String("renamed_score".into()))]);
+    let rename = catalog_lww_update("_ankurah_property", property_id, property_head, vec![("name", Value::String("renamed_score".into()))]);
     server.commit_remote_transaction(&DEFAULT_CONTEXT, proto::TransactionId::new(), vec![proto::Attested::opt(rename, None)]).await?;
     wait_property_name(&server, property_id, "renamed_score").await?;
     wait_property_name(&client, property_id, "renamed_score").await?;
@@ -545,8 +622,10 @@ async fn explicit_id_drives_derived_access_and_query_aliases() -> anyhow::Result
     // accessor stages by Name, but commit may never serialize that unresolved
     // key into a registered user-model event.
     let trx = ctx.begin();
-    trx.create(&explicit_binding_conflict::BoundMetric { local_score: 99 }).await?;
-    let error = trx.commit().await.expect_err("an ambiguous ordinary field must fail before emitting Name residue");
+    let error = match trx.create(&explicit_binding_conflict::BoundMetric { local_score: 99 }).await {
+        Ok(_) => trx.commit().await.expect_err("an ambiguous ordinary field must fail before emitting Name residue"),
+        Err(error) => error,
+    };
     assert!(
         error.to_string().contains("unknown property 'local_score' in collection 'boundmetric'"),
         "expected the unresolved staged-name error, got: {error}"
@@ -562,23 +641,30 @@ async fn explicit_id_drives_derived_access_and_query_aliases() -> anyhow::Result
 /// remains usable by its literal id.
 #[tokio::test]
 async fn yrs_ordinary_alias_ambiguity_never_uses_a_name_root() -> anyhow::Result<()> {
-    let explicit_id = EntityId::from_base64("AgICAgICAgICAgICAgICAg")?;
-    let server = durable_sled_setup().await?;
+    let explicit_id = EntityId::from_base64(YRS_ID_B64)?;
+    let server = deterministic_system_setup().await?;
     server.catalog.wait_catalog_ready().await;
+    let system = server.system.root_id().expect("deterministic system is ready");
 
-    let explicit_property = catalog_lww_event(
+    let explicit_property_genesis = catalog_genesis(system, 0x23, 1_700_000_000_103);
+    assert_eq!(explicit_property_genesis.entity_id, explicit_id, "compiled Yrs id matches deterministic DDL genesis");
+    let explicit_property = catalog_lww_update(
         "_ankurah_property",
         explicit_id,
-        proto::Clock::default(),
+        proto::Clock::from(vec![explicit_property_genesis.id()]),
         vec![
-            ("minted_for", Value::EntityId(EntityId::new())),
+            ("minted_for", Value::EntityId(EntityId::from_bytes([0xA3; 32]))),
             ("name", Value::String("catalog_clash_text".into())),
             ("backend", Value::String("yrs".into())),
             ("value_type", Value::String("string".into())),
         ],
     );
     server
-        .commit_remote_transaction(&DEFAULT_CONTEXT, proto::TransactionId::new(), vec![proto::Attested::opt(explicit_property, None)])
+        .commit_remote_transaction(
+            &DEFAULT_CONTEXT,
+            proto::TransactionId::new(),
+            vec![proto::Attested::opt(explicit_property_genesis, None), proto::Attested::opt(explicit_property, None)],
+        )
         .await?;
     wait_property_name(&server, explicit_id, "catalog_clash_text").await?;
 

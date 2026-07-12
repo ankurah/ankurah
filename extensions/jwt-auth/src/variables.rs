@@ -204,10 +204,10 @@ mod tests {
     fn test_entity_id_value_becomes_typed_literal() {
         // Values that parse as EntityIds must produce typed literals so Ref
         // comparisons collate correctly in the watcher index (ankurah#259).
-        let id = ankurah_proto::EntityId::new();
+        let id = ankurah_proto::EntityId::from_bytes([0xA5; 32]);
         let claims = test_claims(&id.to_base64());
         let result = parse_and_substitute("owner = $jwt.sub", &claims).unwrap();
-        assert_eq!(rhs_literal(&result), &Literal::EntityId(id.to_ulid()));
+        assert_eq!(rhs_literal(&result), &Literal::EntityId(id.to_bytes()));
     }
 
     #[test]

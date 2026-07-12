@@ -39,7 +39,7 @@ pub struct ModelSchema {
     /// `#[model(id = "...")]`: bind this model to a KNOWN model entity by
     /// explicit id (RFC 5.9), bypassing by-collection registration. `None`
     /// for the default by-name/by-collection registration path. The value is
-    /// URL-safe base64 of a 16-byte EntityId, validated at derive time.
+    /// URL-safe base64 of a 32-byte EntityId, validated at derive time.
     pub explicit_id: Option<&'static str>,
 }
 
@@ -80,7 +80,7 @@ pub struct FieldSchema {
     pub optional: bool,
     /// `#[property(id = "...")]`: bind this field to a KNOWN, possibly
     /// shared, property entity by explicit id (RFC 5.9). `None` for the
-    /// default by-name registration. URL-safe base64 of a 16-byte EntityId,
+    /// default by-name registration. URL-safe base64 of a 32-byte EntityId,
     /// validated at derive time.
     pub explicit_id: Option<&'static str>,
 }
@@ -145,7 +145,7 @@ pub fn registration_request(schema: &ModelSchema) -> (Vec<ModelDescriptor>, Vec<
 }
 
 /// Decode an explicit-id attribute value into an `EntityId`. The derive
-/// macro already validated the shape at compile time (URL-safe base64 of 16
+/// macro already validated the shape at compile time (URL-safe base64 of 32
 /// bytes), so a malformed value here is a bug in that validation, not user
 /// error; hence the panic carries the offending string.
 pub(crate) fn parse_explicit_id(s: &str) -> ankurah_proto::EntityId {

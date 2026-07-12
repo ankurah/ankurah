@@ -27,7 +27,12 @@ fn forge_title_event(
     let backend = LWWBackend::new();
     backend.set(PropertyKey::Id(title_prop), Some(Value::String(title.to_owned())));
     let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
-    proto::Event { entity_id, model, operations: proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])), parent }
+    proto::Event {
+        entity_id,
+        model,
+        body: proto::EventBody::Update { operations: proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])) },
+        parent,
+    }
 }
 
 fn event_only_item(event: proto::Event) -> proto::SubscriptionUpdateItem {
@@ -86,7 +91,7 @@ async fn test_event_only_multi_event_wire_order_is_untrusted() -> Result<()> {
         proto::Event {
             entity_id: rec_id,
             model: ev_parent.model,
-            operations: proto::OperationSet(std::collections::BTreeMap::from([("lww".to_owned(), ops)])),
+            body: proto::EventBody::Update { operations: proto::OperationSet(std::collections::BTreeMap::from([("lww".to_owned(), ops)])) },
             parent: ev_parent.parent.clone(),
         }
     };
@@ -163,7 +168,7 @@ async fn test_event_only_unknown_entity_does_not_poison_batch() -> Result<()> {
     // about in the middle.
     let ev_a = forge_title_event(a_id, record_model, record_title, view_a.entity().head().clone(), "a1");
     let ev_b = forge_title_event(b_id, record_model, record_title, view_b.entity().head().clone(), "b1");
-    let unknown_id = proto::EntityId::new();
+    let unknown_id = proto::EntityId::from_bytes([0x77; 32]);
     let ev_unknown =
         forge_title_event(unknown_id, record_model, record_title, proto::Clock::from(vec![proto::EventId::from_bytes([7u8; 32])]), "ghost");
     let (id_ev_a, id_ev_b) = (ev_a.id(), ev_b.id());

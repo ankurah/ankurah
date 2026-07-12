@@ -68,15 +68,25 @@ Delivered as part of PR #307:
 - Tests cover same-version connection, mismatches in both directions,
   hand-crafted version-0 bytes, explicit rejection, and reconnect backoff.
 
+AMENDED by the identity-attestation RFC (2026-07-11): protocol v6 changes
+the Presence body and adds a symmetric challenge, so the original
+prefix/suffix compatibility applies only to the v1 transition described
+above. The outer `Message` discriminants from v5 remain fixed and new kinds
+append; decoding is exact, bounded, and rejects trailing bytes. A frozen v5
+Presence is therefore closed cleanly rather than being reinterpreted as a v6
+challenge. Explicit `PresenceRejected` remains best-effort when the older
+payload cannot be decoded far enough to name its version.
+
 ## Phase A: the id-keyed epoch
 
 ### A1. Identity allocation (RFC 5.1; rev 4, was "Identity derivation")
 
 The rev 3 derivation module (proto/src/schema_id.rs: the three
 `*_entity_id` functions, golden vectors, the standalone-DDL zero scope)
-is DELETED, together with its tests. Identity is allocated: the
-registration executor (A5) mints `EntityId::new()` -- a true ULID -- on
-lookup miss. What A1 contributes now is the normative LOOKUP KEYS, which
+is DELETED, together with its tests. Identity is allocated: on lookup miss,
+the registration executor (A5) emits an ordinary genesis with fresh entropy
+and uses its full content hash as the EntityId. What A1 contributes now is
+the normative LOOKUP KEYS, which
 live with the executor rather than in proto:
 
 - model: by `collection`
@@ -84,26 +94,28 @@ live with the executor rather than in proto:
   against the found property's fixed canonical pair and never enter identity
 - membership: by (model id, property id)
 
-There is nothing to golden-vector: no byte surface participates in
-identity. The Ulid audit (old RFC 11.1) is moot; allocated ids carry
-real timestamps.
+There is no catalog-specific identity encoder to golden-vector. The shared
+genesis encoder and its identity surface are owned by the later
+identity-attestation RFC. The old ULID audit is superseded by fixed-width
+32-byte content-hash EntityIds.
 
 ### A2. Frozen genesis encoder + self-certification -- DELETED (rev 4)
 
 core/src/schema/genesis.rs (the frozen encoder, FrozenValue,
 validate_catalog_genesis) and its golden/tamper suites are deleted with
 derivation. Catalog entities are created via ORDINARY events through the
-normal commit machinery; no identity-bearing byte surface exists to
-freeze, and there is nothing for receivers to recompute (RFC 5.1,
-section 4: single-allocator authority replaces self-certification).
+normal commit machinery; there is no catalog-specific byte surface to
+freeze. Receivers apply the shared genesis validation from the
+identity-attestation RFC, while this RFC's single-allocator authority still
+decides the name-keyed upsert.
 
 ### A3. Creation inside the executor (rev 4, was "Create-with-derived-id")
 
 The known-id create path threaded through the phantom-entity guard
 (Transaction::create recording, core/src/transaction.rs:62-72; enforced
-in commit_local_trx, core/src/context.rs:84-98) survives, but the
-registration executor now feeds it freshly allocated `EntityId::new()`
-values instead of derived ones. No public API.
+in commit_local_trx, core/src/context.rs:84-98) survives conceptually, but
+the registration executor now creates an ordinary genesis and takes its
+derived content-hash EntityId. No public API.
 
 ### A4. Catalog collections, protection constants, prefix reservation
 
@@ -153,8 +165,8 @@ response returns every id the client needs to bind.)
 Durable-side executor in core, under a process-local mutex end to end:
 
 - Look up each definition by its lookup key (A1) against the executor's
-  authoritative lookup state; allocate `EntityId::new()` on miss and
-  create via ordinary events; on hit, emit head-parented follow-ups only
+  authoritative lookup state; create an ordinary genesis on miss and use
+  its content-hash EntityId; on hit, emit head-parented follow-ups only
   where the requested metadata differs (decision 18's machinery,
   unchanged).
 - Apply rename hints BEFORE lookup-or-create, guarded (RFC 5.8): only
@@ -355,7 +367,8 @@ read back "".
   create/commit path. `TypeSkew`, CatalogGenesisError, and the anchor-reuse
   refusal are deleted.
 - PROTECTED_COLLECTIONS readers (with A4/A6); hard_reset flush (with
-  A7). The ulid-timestamp audit is moot under allocation.
+  A7). The later identity-attestation RFC owns the 32-byte content-hash
+  EntityId migration and timestamp-locality audit.
 - Docs: brief internals note under docs/internals/ once shapes settle
   (the schema-evolution book chapter waits on #291).
 
@@ -413,13 +426,17 @@ model <-> table map half deferred with #304.
 1. **Refuse, not degrade** (#294): version equality required; comparison
    isolated in one function so a future release can widen it to a range.
    Degrade contradicts rev 3's no-dual-encoding stance.
-2. **Presence field appended last** so an ephemeral old encoding is a prefix
-   of the new one and detectable by EOF. Durable old encodings also carry the
-   pre-v3 nested EntityState shape and are classified by an exact mirrored
-   legacy decoder; trailing bytes distinguish versioned v1/v2 peers.
-3. **PROTOCOL_VERSION is u32; the released metadata epoch is v3.**
-   Pre-versioning binaries are implicitly version 0. Protocol 2 was an
-   intermediate branch value before model-id envelopes joined the epoch.
+2. **Presence field appended last** for the original metadata transition, so
+   an ephemeral old encoding is a prefix of the new one and detectable by EOF.
+   Durable old encodings also carry the pre-v3 nested EntityState shape and are
+   classified by an exact mirrored legacy decoder; trailing bytes distinguish
+   versioned v1/v2 peers. Protocol v6 supersedes that compatibility shape with
+   a symmetric challenge, stable v5 outer discriminants, and exact bounded
+   decoding, so a v5 Presence cannot be reinterpreted as a v6 challenge.
+3. **PROTOCOL_VERSION is u32; the released metadata epoch is v3 and the
+   identity-attestation epoch is v6.** Pre-versioning binaries are implicitly
+   version 0. Protocol 2 was an intermediate branch value before model-id
+   envelopes joined the metadata epoch.
 4. **One tagged PropertyKey map** in LWW diff v2/state 0xA2. `Id` and
    lossless legacy `Name` residue coexist without a parallel-map shape.
 5. **Uniform PropertyKey::{Id, Name}** across every backend, with no
@@ -567,7 +584,8 @@ model <-> table map half deferred with #304.
     fixed at first allocation.
 20. **Upsert executor under a process-local mutex** (rev 4, RFC 5.1):
     the whole RegisterSchema execution serializes on one async mutex;
-    ids are allocated with `EntityId::new()`; the executor's lookup
+    ids are allocated by emitting an ordinary genesis and using its full
+    content hash; the executor's lookup
     state is updated synchronously post-commit BEFORE the mutex
     releases, because the reactor-fed catalog map lags commit and the
     executor must not race itself into double-allocation.
@@ -721,10 +739,11 @@ model <-> table map half deferred with #304.
     IndexedDB: property_columns object store, assigned in a pre-pass
     before the entities transaction (IndexedDB auto-commits across foreign
     awaits). Naming rules (core/src/storage.rs naming module): sanitized
-    display name; collisions append the property id's TRAILING 4+ base64
-    characters, widening until unique (trailing because ULIDs share
-    leading timestamp characters); unresolvable names fall back to p_ plus
-    trailing id characters, loudly (never expected to fire). Bare property
+    display name; collisions append the trailing 4+ characters of an
+    identifier-safe, injective base32 encoding of the property id, widening
+    through all 256 bits until unique; unresolvable names use the same token
+    behind a synthetic prefix, loudly (never expected to fire). Names remain
+    within PostgreSQL's 63-byte identifier limit. Bare property
     ids never appear as column names; collisions DEDUPE rather than
     hard-error (hard-error is unmergeable: retype is a supported flow).
     Reads: fetch_states translates the resolved Selection into engine
@@ -752,18 +771,19 @@ model <-> table map half deferred with #304.
     identity, so event ids are unchanged. Collection strings survive only
     in query/API surfaces and registration payloads (collection is the
     data there, #305). System and catalog collections use well-known model
-    ids ([0u8; 15] plus ordinal: 1 = _ankurah_system, 2 = _ankurah_model,
-    3 = _ankurah_property, 4 = _ankurah_model_property; unmintable ULID
-    range; core/src/schema/mod.rs); the receiver-side protection guard
+    ids (domain-hashed virtual identities under
+    `ankurah.well-known-model.v0`; core/src/schema/mod.rs); the receiver-side protection guard
     (A6) keys on them. Ingress: Node::resolve_model maps model id ->
     collection via well-knowns then the catalog; unknown model ids REJECT
     loud and retryable, never synthesize a collection. Cold-catalog
     policy is maintainer-ruled c + e + d: (c) NodeUpdate and NodeResponse
-    carry `#[serde(default)] schema: Vec<Attested<EntityState>>` -- the
-    real attested catalog entity states for any non-well-known model the
+    carry `#[serde(default)] schema: Vec<StateWithGenesis>` -- the real
+    attested catalog entity states plus their exact self-certifying genesis
+    events for any non-well-known model the
     payload references, shipped once per connection per model
     (PeerState.announced_models), policy-validated and ingested by the
-    receiver BEFORE body processing; definitions never ride inside events
+    receiver BEFORE body processing. Non-empty batches are founder-only,
+    strict, and atomic; definitions never ride inside events
     or state buffers. (e) Catalog warmth participates in readiness via
     the existing ensure_subscribed / context_async gates, and on the
     INGRESS side via resolve_model_wait: a durable node whose startup

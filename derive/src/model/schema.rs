@@ -18,7 +18,7 @@
 //! Attributes parsed here: `#[property(renamed_from = "...")]` (the
 //! transient rename hint, RFC 5.8) and `#[property(id = "...")]` /
 //! `#[model(id = "...")]` (explicit binding, RFC 5.9). Explicit-id values
-//! are validated at compile time as URL-safe base64 of exactly 16 bytes.
+//! are validated at compile time as URL-safe base64 of exactly 32 bytes.
 
 use proc_macro2::TokenStream;
 use quote::quote;
@@ -57,7 +57,7 @@ struct ValueTypeMapping<'a> {
 /// trait-bound errors.
 ///
 /// Checks: the reserved `_ankurah_` collection prefix (RFC section 4), and
-/// the URL-safe-base64/16-byte shape of every `#[property(id = "...")]` and
+/// the URL-safe-base64/32-byte shape of every `#[property(id = "...")]` and
 /// `#[model(id = "...")]` explicit binding (RFC 5.9). It also surfaces any
 /// malformed `#[property(...)]` list.
 pub fn validate_schema_attrs(model: &ModelDescription) -> syn::Result<()> {
@@ -142,7 +142,7 @@ pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
         let renamed_from_tokens = option_str_tokens(renamed_from.as_deref());
 
         // #[property(id = "...")]: explicit binding to a known property
-        // entity (RFC 5.9). Validated as URL-safe base64 / 16 bytes.
+        // entity (RFC 5.9). Validated as URL-safe base64 / 32 bytes.
         let explicit_id = property_str_attr(&field.attrs, "id")?;
         if let Some(ref id) = explicit_id {
             validate_explicit_id(id).map_err(|msg| syn::Error::new(field.ty.span(), msg))?;
@@ -190,7 +190,7 @@ pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
 
 /// Generate the runtime address carried by each derive-generated accessor.
 /// Ordinary fields carry only their display name; an explicit binding embeds
-/// the already-validated 16-byte entity id directly, avoiding both catalog
+/// the already-validated 32-byte entity id directly, avoiding both catalog
 /// name lookup and repeated base64 decoding at runtime.
 pub(crate) fn active_field_address_tokens(model: &ModelDescription) -> syn::Result<Vec<TokenStream>> {
     model
@@ -203,10 +203,10 @@ pub(crate) fn active_field_address_tokens(model: &ModelDescription) -> syn::Resu
             let explicit_id_tokens = match explicit_id {
                 Some(id) => {
                     let bytes = decode_base64url_no_pad(&id).map_err(|msg| syn::Error::new(field.ty.span(), msg))?;
-                    let bytes: [u8; 16] = bytes.try_into().map_err(|bytes: Vec<u8>| {
+                    let bytes: [u8; 32] = bytes.try_into().map_err(|bytes: Vec<u8>| {
                         syn::Error::new(
                             field.ty.span(),
-                            format!("explicit id {id:?} decodes to {} bytes; an EntityId is exactly 16 bytes", bytes.len()),
+                            format!("explicit id {id:?} decodes to {} bytes; an EntityId is exactly 32 bytes", bytes.len()),
                         )
                     })?;
                     quote! { ::core::option::Option::Some(::ankurah::proto::EntityId::from_bytes([#(#bytes),*])) }
@@ -385,14 +385,14 @@ fn option_str_tokens(value: Option<&str>) -> TokenStream {
 }
 
 /// Validate an explicit-id attribute value as URL-safe base64 (no padding)
-/// decoding to exactly 16 bytes (an EntityId; RFC 5.9). Hand-rolled because
+/// decoding to exactly 32 bytes (an EntityId; RFC 5.9). Hand-rolled because
 /// the derive crate has no base64 dependency and adding one for a length
 /// check is not warranted.
 fn validate_explicit_id(s: &str) -> Result<(), String> {
     let bytes = decode_base64url_no_pad(s)
-        .map_err(|e| format!("explicit id {s:?} is not valid URL-safe base64: {e} (expected 16 bytes as an EntityId, RFC 5.9)"))?;
-    if bytes.len() != 16 {
-        return Err(format!("explicit id {s:?} decodes to {} bytes; an EntityId is exactly 16 bytes (RFC 5.9)", bytes.len()));
+        .map_err(|e| format!("explicit id {s:?} is not valid URL-safe base64: {e} (expected 32 bytes as an EntityId, RFC 5.9)"))?;
+    if bytes.len() != 32 {
+        return Err(format!("explicit id {s:?} decodes to {} bytes; an EntityId is exactly 32 bytes (RFC 5.9)", bytes.len()));
     }
     Ok(())
 }
@@ -450,17 +450,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn base64url_16_bytes_roundtrips() {
-        // 16 zero bytes -> "AAAAAAAAAAAAAAAAAAAAAA" (22 chars).
-        let s = "AAAAAAAAAAAAAAAAAAAAAA";
-        assert_eq!(decode_base64url_no_pad(s).unwrap(), vec![0u8; 16]);
+    fn base64url_32_bytes_roundtrips() {
+        // 32 zero bytes -> 43 'A's.
+        let s = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        assert_eq!(decode_base64url_no_pad(s).unwrap(), vec![0u8; 32]);
         assert!(validate_explicit_id(s).is_ok());
     }
 
     #[test]
     fn base64url_rejects_wrong_length() {
-        // 22 valid chars is 16 bytes; 20 chars is fewer.
-        assert!(validate_explicit_id("AAAAAAAAAAAAAAAAAAAA").is_err());
+        // 22 valid chars is only 16 bytes.
+        assert!(validate_explicit_id("AAAAAAAAAAAAAAAAAAAAAA").is_err());
     }
 
     #[test]

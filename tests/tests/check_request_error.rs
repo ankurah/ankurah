@@ -9,7 +9,7 @@ use ankql::ast::Predicate;
 use ankurah::core::node::ContextData;
 use ankurah::core::util::Iterable;
 use ankurah::error::ValidationError;
-use ankurah::policy::{AccessDenied, PolicyAgent, DEFAULT_CONTEXT};
+use ankurah::policy::{AccessDenied, Admission, PolicyAgent, DEFAULT_CONTEXT};
 use ankurah::proto::{self, AuthData};
 use ankurah::storage::StorageEngine;
 use ankurah::{Node, PermissiveAgent};
@@ -68,25 +68,25 @@ impl PolicyAgent for RejectingAgent {
         _entity_before: &ankurah::entity::Entity,
         _entity_after: &ankurah::entity::Entity,
         _event: &proto::Event,
-    ) -> std::result::Result<Option<proto::Attestation>, AccessDenied> {
-        Ok(None)
+    ) -> std::result::Result<Admission, AccessDenied> {
+        Ok(Admission::Allow)
     }
 
     fn validate_received_event<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _received_from_node: &proto::EntityId,
+        _received_from_node: &proto::NodeId,
         _event: &proto::Attested<proto::Event>,
     ) -> std::result::Result<(), AccessDenied> {
         Ok(())
     }
 
-    fn attest_state<SE: StorageEngine>(&self, _node: &Node<SE, Self>, _state: &proto::EntityState) -> Option<proto::Attestation> { None }
+    fn attest_state<SE: StorageEngine>(&self, _node: &Node<SE, Self>, _state: &proto::EntityState) -> Admission { Admission::Allow }
 
     fn validate_received_state<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _received_from_node: &proto::EntityId,
+        _received_from_node: &proto::NodeId,
         _state: &proto::Attested<proto::EntityState>,
     ) -> std::result::Result<(), AccessDenied> {
         Ok(())
@@ -147,7 +147,7 @@ impl PolicyAgent for RejectingAgent {
     fn validate_causal_assertion<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _peer_id: &proto::EntityId,
+        _peer_id: &proto::NodeId,
         _head_relation: &proto::CausalAssertion,
     ) -> std::result::Result<(), AccessDenied> {
         Ok(())

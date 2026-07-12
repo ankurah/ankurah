@@ -10,7 +10,8 @@ Sections: (1) trust context, node classes, and the content-addressing ledger;
 (2) adversary tiers and per-wire-arm attack surface; (3) the numbered claims
 registry, the core artifact; (4) the attestation load-bearing map; (5) the
 known-gaps table. Every claim about current behavior cites the code seam verified
-against commit 90f9a67d (PR #201). Where the literature challenges a claim it is
+against commit 90f9a67d (PR #201), with identity/attestation claims re-verified by
+the RFC-1 implementation in this branch. Where the literature challenges a claim it is
 incorporated or rebutted inline. Where enforcement does not exist, the claim
 records the status honestly (open gap, owning RFC) rather than aspirationally.
 
@@ -22,18 +23,20 @@ records the status honestly (open gap, owning RFC) rather than aspirationally.
 - **Trusted-peer**: holds only if peers are honest but possibly buggy; a malicious
   peer can violate it. These are the invariants a real PolicyAgent or a hardening
   item (#274, #246, #271) must convert to Byzantine-safe.
-- **Attestation-dependent**: holds iff the attestations involved verify; exactly as
-  strong as the PolicyAgent's signature scheme, and nil under the default
-  PermissiveAgent.
+- **Attestation-dependent**: holds iff a recognized durable signed the exact
+  event/state envelope and the receiving PolicyAgent requires sufficient verified
+  attestations. Core verification is uniform and agent-independent; sufficiency is
+  still nil under the default PermissiveAgent.
 
 The Byzantine guarantee at its true precision (lit review topic 3, sources 4/5/6,
 design-delta 274-B): the content-addressed DAG delivers **weak-safety causal order
 and strong eventual consistency among correct nodes for arbitrarily many Byzantine
-peers, without authorship attribution, authorization, strong-safety causal order,
-or a DoS bound**. The last four require a signature layer the codebase does not
-carry. That is the difference between "the algorithm converges" (true, proven by
-the construction) and "the system resists a malicious peer" (false by default,
-only as true as the deployed PolicyAgent).
+peers, without event authorship attribution, a strict admission policy,
+strong-safety causal order, or a DoS bound**. Core now carries node-signed admission
+envelopes, but they are not author signatures and the default PermissiveAgent requires
+no admission evidence. That is the difference between "the algorithm converges"
+(true, proven by the construction) and "the system resists a malicious peer" (false
+by default, only as true as the deployed PolicyAgent).
 
 ---
 
@@ -42,18 +45,24 @@ only as true as the deployed PolicyAgent).
 ### 1.1 Node classes
 
 Two classes, distinguished by the `durable` flag threaded through retrieval and the
-applier. **Durable nodes** hold authoritative, definitive storage:
+applier. Every node has an ed25519 identity (`NodeId` is the verifying key), and its
+challenge-bound signed `Presence` binds the claimed class, system root id,
+protocol version, and receiver-issued session nonce. **Durable nodes** hold
+authoritative, definitive storage:
 `LocalEventGetter::storage_is_definitive() == self.durable` (`core/src/retrieval.rs`),
-so "event absent" is a real negative the creation-uniqueness guard relies on (C4-06);
 they serve events/state and are the fallback ephemeral nodes fetch from. **Ephemeral
 nodes** have non-definitive storage (`storage_is_definitive()` defaults to `false`)
 and fall back to a durable peer: `CachedEventGetter::get_event` checks staging, then
 local storage, then `node.get_durable_peer_random()`.
 
-Peer class is **self-asserted, not authenticated**: `node.rs` `register_peer` inserts
-into `durable_peers` when `presence.durable` is true, with no signature. Any peer can
-advertise durable and be selected by `get_durable_peer_random`, which an ephemeral
-node then trusts for fetches (C4-16, gap G-8).
+Peer identity is authenticated by the presence signature and bound to every later
+frame at connector dispatch. Durable class is accepted only when the NodeId equals
+the founder in a verified, content-addressed `SystemRootProof`; the first valid proof
+is atomically reserved before durable routing. An unrecognized claimant may remain
+connected but is treated as non-durable and is never selected by
+`get_durable_peer_random`. First join remains explicitly TOFU: before a root is
+pinned, an ephemeral node trusts the first internally valid signed founder/root pair
+it accepts (C4-16, residual G-8).
 
 ### 1.2 What peers are trusted with today
 
@@ -61,22 +70,26 @@ node then trusts for fetches (C4-16, gap G-8).
 hooks that make peer input trustworthy: `validate_received_event`,
 `validate_received_state`, `check_event`, `check_read_event`,
 `validate_causal_assertion`, `attest_state`, and the read/write/collection gates.
-The **default agent is `PermissiveAgent`**, which trusts everything: the two
-`validate_received_*` and `validate_causal_assertion` return `Ok(())`,
-`check_event` and `attest_state` return `None`, and every read/write check returns
-`Ok(())`. Under PermissiveAgent, **every attestation-dependent and trusted-peer
-claim below provides no guarantee**; only the Byzantine-safe structural ones
-survive. Real PolicyAgents exist (jwt-auth ships `adversarial_tests.rs` and
+The **default agent is `PermissiveAgent`**, which requires no admission evidence:
+the two `validate_received_*` and `validate_causal_assertion` return `Ok(())`,
+`check_event` and `attest_state` return `Admission::Allow`, and every read/write
+check returns `Ok(())`. Core nevertheless strips wrong-system, wrong-kind,
+subject-mismatched, bad-signature, and unrecognized-attester envelopes before those
+hooks run. Under
+PermissiveAgent, **attestation sufficiency and trusted-peer claims provide no
+guarantee**, while structural checks and envelope authenticity still survive. Real
+PolicyAgents exist (jwt-auth ships `adversarial_tests.rs` and
 `adversarial_rbac_tests.rs`) and are the intended production posture; this document
 is written for that posture, stating which invariants a correct agent can enforce
 versus which no agent can (missing seam, or not I-confluent).
 
 ### 1.3 What content addressing buys, and what it does not
 
-The per-entity DAG is structurally a Merkle-CRDT (lit review topic 3): an `EventId`
-is a SHA-256 hash over `(entity_id, operations, parent)`; events reference
-predecessors by hash; the head is the tip antichain; identity is anchored at a
-creation event (empty `parent`). It buys **for free** (Byzantine-safe):
+The per-entity DAG is structurally a Merkle-CRDT (lit review topic 3). Update ids are
+domain-tagged SHA-256 hashes over `(entity_id, operations, parent)`; genesis ids are
+domain-tagged hashes over `(system, nonce, timestamp, initial_operations)`, and the
+full genesis id is the `EntityId`. Events reference predecessors by hash and the
+head is the tip antichain. It buys **for free** (Byzantine-safe):
 
 - **Self-verifying ids / tamper evidence**: the id is recomputed from contents on
   every use (`Event::id()`), never read from the wire (C4-01).
@@ -89,10 +102,9 @@ creation event (empty `parent`). It buys **for free** (Byzantine-safe):
 
 It does **not** buy (each on a named gap or agent responsibility):
 
-- **Attribution / authorization**: the hash says nothing about who authored or
-  whether they were allowed; both need signatures layered above the DAG (Finding 6;
-  274-B; OrbitDB `canAppend`). `Attestation` is opaque bytes (`proto/src/auth.rs`,
-  `Attestation(pub Vec<u8>)`), meaningful only via the agent.
+- **Authorship**: the hash says nothing about who authored an event. Admission and
+  state authorization now have structured, core-verified node signatures, but
+  author signatures remain deliberately out of scope (C4-20).
 - **Equivocation resistance / DoS bound**: every forged concurrent event is a
   distinct genuine hash, so de-dup stops identical replays but not flooding of
   distinct ones; unsigned hash-DAG CRDTs permit unbounded distinct valid
@@ -124,9 +136,9 @@ It does **not** buy (each on a named gap or agent responsibility):
 - **T3. Compromised durable node.** T2 plus authoritative storage and the durable
   role: the fetch source for ephemeral peers (C4-16), the `GetEvents`/`EventBridge`
   server, a node the relay quorum waits on, and (once #271 lands) a seal signer. It
-  can equivocate on served history and inject unvalidated events into an ephemeral
-  peer's storage. The strongest in-scope adversary; defenses are mostly future work
-  (attestation verification, phase 3 multi-durable quorum).
+  can equivocate on served history and sign false admissions with the recognized
+  authority key. The strongest in-scope adversary; a single-founder signature cannot
+  defend against founder compromise (RFC-2 membership/quorum/revocation territory).
 
 ### 2.2 Wire arms and the validation each receives today
 
@@ -140,13 +152,14 @@ Receive-side arms and the policy hook each gets (verified in
 | `StateSnapshot` | `apply_delta_inner` | n/a | yes | n/a | state-only |
 | `EventBridge` | `apply_delta_inner` | yes | n/a | yes | catch-up batch |
 | `StateAndRelation` | `apply_delta_inner` | unimpl | unimpl | n/a | returns `InvalidUpdate` |
-| `GetEvents` resp, mid-BFS | `CachedEventGetter::get_event` | **NO** (#244) | n/a | n/a | stored via `add_event` unvalidated |
+| `GetEvents` resp, mid-BFS | `CachedEventGetter::get_event` | yes | n/a | n/a | requested-id filter + core envelope verification before storage |
 | `GetEvents` req, served | `node.rs` `GetEvents` arm | n/a | n/a | n/a | serve side DOES `can_access_collection` + `check_read_event` |
-| `commit_remote_transaction` | `node.rs` same | via `check_event` | via `attest_state` | n/a | creation-event fork asymmetry (#243) |
+| `commit_remote_transaction` | `node.rs` same | via `check_event` | via `attest_state` | n/a | all event shapes previewed on a fork |
 
-("yes" = via `validate_and_stage`.) The key asymmetry: **every `apply_*` arm
-validates before staging, but the BFS-time remote fetch does not** (#244). Section 3
-gives each row its own claim.
+("yes" = mechanical envelope/subject/signature/attester verification in core,
+followed by the PolicyAgent sufficiency hook.) The former BFS-time asymmetry is
+closed at its existing seam; #274 still owns the structural single-ingress refactor,
+size limits, and rate limits. Section 3 gives each row its own claim.
 
 ---
 
@@ -161,12 +174,15 @@ arm** (the C4 part-2 test that pins it), and **Status** (enforced | open gap (ow
 ### 3.1 Structural integrity claims (content addressing)
 
 **C4-01. Event identity is a verifiable content hash.**
-Invariant: an event's id equals `SHA-256(bincode(entity_id) || bincode(operations)
-|| bincode(parent))`, recomputed from contents on every use, never read from the
-wire; a peer cannot present an event under an id its contents do not hash to.
+Invariant: an update id equals `SHA-256("ankurah.event.v0" ||
+bincode(entity_id, operations, parent))`; a genesis id equals
+`SHA-256("ankurah.genesis.v0" || bincode(system, nonce, timestamp,
+initial_operations))`. Both are recomputed from contents, never read from the wire;
+a peer cannot present an event under an id its contents do not hash to.
 Trust tier: Byzantine-safe.
-Enforcing seam: `proto/src/data.rs` `EventId::from_parts` (the hash) and `Event::id()`
-(recomputes on every call; no id field is stored or deserialized). `accumulator.rs`
+Enforcing seam: `proto/src/data.rs` `EventId::{from_genesis_parts,
+from_update_parts}` and `Event::id()` (no id field is stored or deserialized).
+`accumulator.rs`
 `accumulate` keys the DAG by `event.id()` and `retrieval.rs` `stage_event` keys
 staging by `event.id()`, so a lying declared id cannot enter the graph or be
 discovered.
@@ -177,20 +193,24 @@ staging key on, and a mismatched declared id is inert.
 Status: enforced. Content addressing gives inherent identity and tamper-evidence,
 not authorship (Finding 6; see C4-20).
 
-**C4-02. Collection is excluded from event identity.**
-Invariant: two events differing only in `collection` hash to the same `EventId`;
-identity is `(entity_id, operations, parent)` only.
-Trust tier: Byzantine-safe as a hashing fact; collection *attribution* is
-trusted-peer.
-Enforcing seam: `proto/src/data.rs` `EventId::from_parts` hashes entity_id,
-operations, parent, deliberately omitting collection; `From<(EntityId, CollectionId,
-EventFragment)>` supplies collection from the receiving envelope, not the event body.
-Falsifying attack (T1): deliver an event for entity E under collection X in the
-envelope while identical content belongs to Y; both produce one id, so the envelope
-decides which collection's storage receives it.
-Planned test arm: cross-collection id-collision arm asserting no cross-contamination
-and that policy is checked against the envelope-supplied collection.
-Status: enforced as a hashing fact; collection attribution is gap G-2.
+**C4-02. Model and collection are excluded from event identity by design.**
+Invariant: two events differing only in the model envelope have the same `EventId`;
+collection is no longer a wire event field at all. Entity identity and event history
+are independent of storage organization and of the model under which a node reads
+the entity.
+Trust tier: Byzantine-safe as a hashing fact. Admission attribution is
+attestation-dependent.
+Enforcing seam: `proto/src/data.rs` hashes the two typed `EventBody` preimages and
+deliberately omits `model`; `EventAdmitted` separately signs `(event_id, model)` so
+an admission envelope cannot be transplanted onto the same event relabeled under a
+different model. Receivers resolve the model id to a local collection before use.
+Falsifying attack (T1/T2): relabel an admitted event under another model while
+reusing its attestation; core strips the subject-mismatched envelope before policy.
+Planned test arm: attestation-transplant arm asserting model relabeling preserves
+the event id but invalidates the admission envelope.
+Status: hashing exclusion is BY DESIGN and envelope binding is enforced. The former
+G-2 is retired; #274 still owns consolidating model-resolution and structural checks
+behind one ingress type.
 
 **C4-03. Clock deserialization normalizes to sorted, deduplicated order.**
 Invariant: any `Clock` reconstructed from the wire is sorted and deduplicated before
@@ -249,22 +269,28 @@ Status: enforced for correctness. Caveat: de-dup stops *identical* replays only,
 
 ### 3.2 Causal-comparison claims (the BFS state machine)
 
-**C4-06. A conflicting second genesis is rejected on durable nodes.**
-Invariant: an entity is anchored at a single creation event; a creation event for an
-entity with a non-empty head is either a re-delivery (no-op) or a distinct genesis
-(rejected `Disjoint`), distinguished cheaply on durable nodes.
-Trust tier: Byzantine-safe on durable nodes; trusted-peer-plus-BFS on ephemeral.
-Enforcing seam: `entity.rs` `apply_event` creation guard: if `event.is_entity_create()
-&& !self.head().is_empty()`, `event_stored()` true means re-delivery (`Ok(false)`),
-and on definitive storage a not-stored creation event returns `LineageError::Disjoint`.
-Ephemeral nodes fall through to BFS, which returns `Disjoint` on different roots
-(`comparison.rs` `check_result`, `subject_root != other_root`).
-Falsifying attack (T1): a fabricated alternate creation event for an existing entity
-id, to fork identity or reset state.
-Planned test arm: disjoint-genesis arm on both node classes; assert reject, and that
-an ephemeral node reaches it via BFS grounding, not budget exhaustion.
-Status: enforced. Depends on C4-08 (Disjoint must be grounded, not reached via
-`BudgetExceeded`).
+**C4-06. Creation uniqueness is self-certifying on every node class.**
+Invariant: an entity is anchored at exactly the genesis whose full 32-byte event id
+is its `EntityId`. A different genesis is a different entity; claiming an existing
+id with different genesis contents is structurally invalid.
+Trust tier: Byzantine-safe on durable and ephemeral nodes.
+Enforcing seam: `Event::validate_structure` requires a genesis body, an empty parent
+clock, and `EntityId::from(event.id()) == event.entity_id`; every application seam
+checks it before mutation or storage. `Node::validate_event_scope` additionally
+requires ordinary genesis bodies to name the pinned local system; the sole
+`system: None` exception is that pinned root's own genesis. No definitive-storage
+negative is involved. A state-only snapshot cannot establish a fresh identity by
+assertion: `Node::validate_state_identity` retrieves the event whose EventId bytes equal
+the claimed EntityId, validates its structure/system/model, and only then allows state
+materialization or direct-get storage.
+Falsifying attack (T1): fabricate alternate genesis contents while retaining an
+existing entity id, put a genesis body under a non-empty parent, or replay a valid
+foreign-system genesis into local storage.
+Planned test arm: genesis-id-mismatch, genesis-with-parent, cross-system replay, and
+state-without-named-genesis arms, asserting rejection before storage.
+Status: enforced structurally. The former durable/ephemeral asymmetry and
+multi-durable same-id creation race are dissolved; a SHA-256 collision is the only
+remaining route to two genesis preimages for one id.
 
 **C4-07. StrictDescends adoption requires a grounded exploration boundary.**
 Invariant: wholesale adoption (StrictDescends: replace head, replay chain) fires
@@ -406,57 +432,70 @@ contention, a clean error, not corruption.
 
 **C4-14. Every application arm validates events before staging.**
 Invariant: on the `EventOnly`, `StateAndEvent`, and `EventBridge` arms, each event
-fragment passes `validate_received_event` before it is staged or applied; transport
-does not decide trust.
-Trust tier: attestation-dependent (nil under PermissiveAgent).
+fragment passes structural validation and core envelope verification, then
+`validate_received_event`, before it is staged or applied; transport does not decide
+trust.
+Trust tier: structural/envelope authenticity is Byzantine-safe; admission
+sufficiency is attestation-dependent (nil under PermissiveAgent).
 Enforcing seam: `node_applier.rs` `validate_and_stage` calls
-`node.policy_agent.validate_received_event(node, from_peer_id, &attested_event)`
-before `stage_event`, in all three arms; `from_peer_id` is threaded from `node.rs`
-`handle_update` through `apply_updates`.
+`Node::validate_incoming_event`, which rejects malformed events, strips wrong-kind,
+subject-mismatched, invalid-signature, and unrecognized-attester envelopes, and only
+then invokes the PolicyAgent. It runs before `stage_event` in all three arms.
 Falsifying attack (T2): craft an event a real agent rejects and send it on one of
 these arms; defeated only if the agent's validation is correct.
 Planned test arm: policy-rejection arm on each arm with a rejecting agent (mirrors
 jwt-auth `adversarial_tests.rs`); assert no apply, no commit.
-Status: enforced as a call site; effectiveness is the agent's responsibility. The
-*asymmetry* with C4-15 (BFS fetch) is the gap.
+Status: enforced as a call site; envelope authenticity is core's responsibility and
+the minimum verified-attestation requirement remains the agent's responsibility.
 
-**C4-15. BFS-time remote event fetch is unvalidated (OPEN GAP).**
-Invariant (desired): an event fetched from a peer during BFS passes the same
+**C4-15. BFS-time remote event fetch is validated (PARTIAL #274 closure).**
+Invariant: an event fetched from a peer during BFS passes the same
 `validate_received_event` gate and response-id filtering as the application arms
 before it is written to storage.
-Trust tier: currently trusted-peer (should be attestation-dependent).
-Enforcing seam: **none today.** `retrieval.rs` `CachedEventGetter::get_event`, the
-remote branch: on `NodeResponseBody::GetEvents(peer_events)` it loops
-`self.collection.add_event(event)` with no `validate_received_event`, no attestation
-check, and no filter that returned ids match the requested id (contrast
-`validate_and_stage`).
-Falsifying attack (T1/T3): during an ephemeral node's BFS fetch of a missing parent,
-the durable peer returns crafted events (including unrequested ids), written straight
-to permanent storage, altering state and polluting the store, bypassing policy.
-Planned test arm: BFS-injection arm (peer returns unrequested/crafted events to a
-mid-BFS `GetEvents`) asserting rejection once #274 lands; today it documents the gap.
-Status: **open gap, issue #244, closed by #274.** #244 is the existence proof #274
-cites for the "no unvalidated event touches state" class. Its original code names
-(`EphemeralNodeRetriever::retrieve_event`, `NodeApplier::save_events`) predate the
-refactor; the gap now lives at `CachedEventGetter::get_event`. Nil impact under
-PermissiveAgent, critical under a real agent. Gap G-1.
+Trust tier: structural/envelope authenticity is Byzantine-safe; admission
+sufficiency is attestation-dependent.
+Enforcing seam: `retrieval.rs` `CachedEventGetter::get_event` recomputes each returned
+payload id, selects only the requested id, calls `Node::validate_incoming_event`, and
+only then calls `add_event`. Unrequested, malformed, forged, or policy-insufficient
+events do not enter permanent storage.
+Falsifying attack (T1/T3): return an unrequested event or a requested payload carrying
+a forged/transplanted envelope during an ephemeral node's missing-parent walk.
+Planned test arm: `bfs_fetched_events_are_policy_validated`, now green, plus the
+requested-id filter unit test.
+Status: **partial closure complete; G-1 retired.** #274 still owns routing every arm
+through one `ValidatedEvent` type plus size/rate/clock limits; this patch deliberately
+closes the existing sharp seam without preempting that refactor.
 
-**C4-16. Durable-peer selection is unauthenticated (OPEN GAP).**
-Invariant (desired): the peer an ephemeral node fetches authoritative events from is
-authenticated as genuinely durable, not merely self-asserting.
-Trust tier: currently trusted-peer.
-Enforcing seam: **none today.** `node.rs` `register_peer` inserts into
-`durable_peers` from `presence.durable` (self-asserted, no signature);
-`get_durable_peer_random` picks from it; `CachedEventGetter::get_event` fetches
-there.
-Falsifying attack (T1): advertise `durable: true` in a `Presence` to become the fetch
-source, then chain with C4-15 to inject events.
-Planned test arm: rogue-durable arm (a peer self-advertises durable and answers
-fetches) asserting authentication rejects it once presence/identity gains
-attestation.
-Status: open gap, a PolicyAgent/presence-authentication concern adjacent to #274 and
-phase 3 (durable-tier story). Gap G-8. Note: the *serving* side is better off, since
-the `GetEvents` handler does run `can_access_collection` + `check_read_event` (C4-18).
+**C4-16. Node identity is authenticated; durable recognition is founder-scoped.**
+Invariant: a peer cannot claim another NodeId or enter `durable_peers` merely by
+setting `durable: true`. In RFC-1, only the system-root founder is recognized as
+durable.
+Trust tier: Byzantine-safe for identity and root proof; first choice among valid roots
+is TOFU.
+Enforcing seam: both peers issue a fresh `HandshakeChallenge`; `Presence` is
+signed under its NodeId over all claims including the receiver's challenge,
+and `node.rs::register_peer` consumes the single-use verifier before insertion.
+`SystemRootProof` carries the
+content-addressed root genesis and exact genesis-materialized state; core checks its
+system model/body/id, founder operation, and state before atomically reserving the
+first root. A conflicting first root never enters durable routing. Production
+connectors carry later traffic in `SignedPeerMessage`, binding the complete
+message to that receiver-issued session and a sequence number. Core verifies
+session, signature, declared sender, and a bounded replay window before dispatch;
+duplicates and stale frames are rejected while unique in-window reordering is allowed.
+`get_durable_peer_random` draws only from the verified set.
+Falsifying attack (T1): replay a captured Presence on a fresh connection, reflect a
+node's own Presence, alter a signed presence, substitute state under a known root id,
+race two first roots, forge/replay/stale a post-handshake frame, spoof another
+connected node's `from`, or advertise durable using a valid but non-founder key.
+Planned test arms: captured/forged/reflected Presence, unproven-root-state,
+concurrent-first-root, frame signature/session/replay-window, post-handshake
+sender-spoof, and unrecognized-durable tests.
+Status: identity enforcement and single-founder recognition are complete. Residual G-8
+is the named TOFU choice among valid first roots and RFC-2 multi-durable membership,
+not a self-asserted role. Authenticated TLS/QUIC remains responsible for secrecy;
+an active relay can forward genuine frames or deny service but cannot inject accepted
+traffic as the relayed node.
 
 **C4-17. No size or count limit on incoming event messages (OPEN GAP).**
 Invariant (desired): a single peer message cannot carry unbounded events or payload;
@@ -496,47 +535,45 @@ full traversal.
 
 ### 3.5 Local-commit policy claims
 
-**C4-19. Local commit previews policy on a fork; remote creation events do not
-(PARTIAL / OPEN GAP).**
-Invariant (desired): before an event is committed, the PolicyAgent sees a clean
+**C4-19. Local and remote commits preview policy on a fork.**
+Invariant: before an event is committed, the PolicyAgent sees a clean
 before/after pair produced on a throwaway fork, so a rejected event never touches
 the canonical entity or storage.
 Trust tier: attestation-dependent.
 Enforcing seam: `core/src/context.rs` `commit_local_trx` forks (`entity.snapshot`),
 applies the event to the fork, and calls `check_event(&entity_before, &forked, ..)`
 before real application, for all events. `core/src/node.rs`
-`commit_remote_transaction` does this **only for update events**: creation events
-(`event.is_entity_create() && entity.head().is_empty()`) are applied directly to the
-real entity and passed to `check_event` as both `entity_before` and `entity_after`,
-so a rejected creation event has already mutated the in-memory entity and the policy
-sees no genuine before-state.
+`commit_remote_transaction` now uses the same isolated-fork preview for both genesis
+and update bodies, then mints any core-owned attestation and persists/applies.
 Falsifying attack (T2): send a creation event via the remote-transaction path that a
 real agent rejects, leaving the entity in a poisoned in-memory state (rejected but
 applied).
 Planned test arm: creation-rejection arm on the remote-transaction path asserting the
-entity is not mutated on rejection (currently fails; pins the #243 fix).
-Status: **partial. Open gap, issue #243** (interacting with #242, the fork-preview
-questions). Nil impact under PermissiveAgent; #274 answers the fork-preview design at
-the ingress seam. Gap G-6.
+entity is not mutated or persisted on rejection.
+Status: enforced; G-6/#243 is closed at the existing path. Batch-level atomicity is a
+separate transaction concern and is not claimed here.
 
 ### 3.6 Convergence-boundary claims (what no ingress can enforce)
 
 **C4-20. Authorship and authorization are not structural.**
 Invariant: the DAG proves *what* an event contains and *that* it happened-before its
 named ancestors; it does not prove *who* wrote it or *whether they were allowed*.
-Any authorship or authorization guarantee is exactly the PolicyAgent's signature
-scheme, layered above content addressing.
+Authorship remains out of scope. Admission authorization is represented by a
+structured node-signed envelope layered above content addressing.
 Trust tier: attestation-dependent by construction.
-Enforcing seam: `proto/src/auth.rs` `Attestation(pub Vec<u8>)` is opaque bytes with
-no verification in the proto crate; all meaning is delegated to
-`PolicyAgent::validate_received_event`/`validate_received_state`/`check_event`. The
-event id (C4-01) binds contents, not identity.
-Falsifying attack (T2): forge authorship, defeated only by a signature scheme the
-agent enforces; PermissiveAgent enforces none.
-Planned test arm: authorship-spoof arm with a signing agent asserting a wrong-author
-event is rejected, and that PermissiveAgent accepts it.
-Status: enforced-by-design boundary (Finding 6, 274-B); a documented property, not a
-defect, telling the reader where the signature layer must live.
+Enforcing seam: `proto/src/auth.rs` defines domain-tagged `EventAdmitted` and
+`StateAttested` envelopes. Core binds them to the pinned system plus exact event+model
+or complete state digest, verifies ed25519 signatures, and recognizes attesters
+against the system founder before agent sufficiency checks. Verified founder state
+envelopes survive exact-state storage/replay; merges strip them as subject mismatches.
+The envelope proves what a recognized node admitted; it does not identify the original
+human/device author.
+Falsifying attack (T2): forge or transplant an admission (rejected mechanically), or
+compromise the recognized durable/policy authority (outside the envelope's promise).
+Planned test arms: forged-signature, cross-kind/subject-transplant, and state-tamper
+tests; authorship spoof remains a design-boundary test.
+Status: structured admission authenticity is enforced; authorship remains the
+explicit R1 non-goal (Finding 6, 274-B).
 
 **C4-21. Validated ingress can enforce only I-confluent, before(u)-local invariants.**
 Invariant: a validated-ingress check (#274) is load-bearing for convergence only if it
@@ -582,58 +619,63 @@ convergent design.
 By primary trust tier (some claims are split; the canonical wording is in the claim
 body):
 
-- **Byzantine-safe (13):** C4-01, C4-03, C4-04, C4-05, C4-06 (durable path), C4-07,
-  C4-08, C4-09, C4-10, C4-12, C4-13, C4-21 (within the I-confluent boundary), C4-22.
-- **Attestation-dependent (4):** C4-14, C4-18, C4-19 (partial), C4-20.
-- **Trusted-peer / open gap (5):** C4-02 (attribution), C4-11 (batch set), C4-15,
-  C4-16, C4-17.
+- **Byzantine-safe structural core:** C4-01, C4-03, C4-04, C4-05, C4-06, C4-07,
+  C4-08, C4-09, C4-10, C4-12, C4-13, C4-16 after root pinning, C4-21 within the
+  I-confluent boundary, and C4-22. C4-02's hash exclusion and C4-14/C4-15's
+  mechanical envelope checks are also Byzantine-safe subclaims.
+- **Attestation-dependent sufficiency:** C4-02's admission attribution, C4-14,
+  C4-15, C4-18, C4-19, and C4-20.
+- **Trusted-peer / open gap:** C4-11 (batch set) and C4-17 (size bounds), plus the
+  first-contact TOFU and future membership portion of C4-16.
 
-Open-gap claims C4-15, C4-16, C4-17, and C4-19 each name their owning issue/RFC and
-their status honestly (open gap, not aspirational enforcement).
+The former C4-15 and C4-19 gaps are closed at their existing seams. C4-17 remains an
+open ingress/DoS gap; C4-16 names its TOFU and multi-durable residual explicitly.
 
 ---
 
 ## 4. Attestation load-bearing map
 
 Every place an attestation is produced, consumed, or assumed, and what breaks if it
-lies. Under PermissiveAgent every row degrades to "no guarantee"; the map is written
-for a real PolicyAgent.
+lies. Core always rejects forged or transplanted envelopes; under PermissiveAgent the
+remaining *sufficiency* requirement degrades to no guarantee.
 
 | Site | Attestation role | Verified by | If it lies (T2) |
 |---|---|---|---|
-| `node_applier::validate_and_stage` (`validate_received_event`) | admits an event fragment on EventOnly/StateAndEvent/EventBridge | `PolicyAgent::validate_received_event` | a forbidden event is staged, applied, and committed; the head advances on unauthorized data (C4-14) |
-| `node_applier::apply_delta_inner` + `apply_update` (`validate_received_state`) | admits a state snapshot | `PolicyAgent::validate_received_state` | a forged state is adopted as the entity's state on the StrictDescends fast path, bypassing event history (C4-14) |
-| `node.rs commit_remote_transaction` (`check_event`) | attests a remote transaction's event and yields an attestation stored on the event | `PolicyAgent::check_event` | an unauthorized remote transaction is attested and persisted; on the creation-event path the entity is already mutated before the check (C4-19, #243) |
-| `context.rs commit_local_trx` (`check_event`) | attests a locally generated event on a fork | `PolicyAgent::check_event` | a local event that policy should reject is attested and committed |
-| `node_applier::save_state` and `apply_delta` (`attest_state`) | attaches an attestation to a saved state served to peers | `PolicyAgent::attest_state` (produces) / `validate_received_state` (consumes downstream) | a peer accepts a state the origin never legitimately attested; state authority is only as strong as this signature |
+| `Node::validate_incoming_event` from application arms and BFS retrieval | strips wrong-system, malformed, wrong-kind, wrong-subject, invalid-signature, and unrecognized-attester envelopes, then asks whether verified evidence is sufficient | core ed25519/system/subject checks, then `PolicyAgent::validate_received_event` | a compromised recognized durable can sign an unauthorized event; a strict agent must still judge claims/sufficiency (C4-14/C4-15) |
+| `Node::validate_incoming_state` from snapshot, subscription, schema, and direct-get paths | binds the pinned system and complete `EntityState` digest before policy; exact verified envelopes are retained in storage | core ed25519/system/subject checks, then `PolicyAgent::validate_received_state` | a compromised recognized durable can sign a false snapshot; forged, cross-system, or state-substituted snapshots lose their envelope before policy |
+| `node.rs commit_remote_transaction` (`check_event`) | policy returns `Admission`; core signs `EventAdmitted(event, model, claims)` after fork preview | `PolicyAgent::check_event` (decision), core node key (signature) | a faulty policy admits an unauthorized remote transaction; envelope cryptography remains authentic but the verdict is wrong |
+| `context.rs commit_local_trx` (`check_event`) | same produce split for locally generated events | `PolicyAgent::check_event` (decision), core node key (signature) | a faulty policy admits a local event it should reject |
+| state-save/serve paths (`attest_state`) | policy returns `Admission`; core signs entity/model/head plus complete state digest | `PolicyAgent::attest_state` (decision), core node key (signature), downstream core+agent validation | a faulty authority signs a false state; tampering after signature is rejected mechanically |
 | `node.rs GetEvents` + `collect_event_bridge` (`check_read_event`) | read-filters served events | `PolicyAgent::check_read_event` | events leak to an unauthorized reader (C4-18) |
 | `PolicyAgent::validate_causal_assertion` (`CausalAssertion`) | would validate a peer's *claim* about lineage between two heads | **no consumer today** | defined but unused: `validate_causal_assertion` has zero call sites in core; `CausalAssertion`/`CausalAssertionFragment` (`proto/src/request.rs`) carry a `CausalRelation` + `AttestationSet` that nothing in the applier or comparison path consumes. If a future path trusts an asserted relation without re-deriving it, a lying peer substitutes a false `StrictDescends`/`Disjoint` for a real divergence. Gap G-9. |
 | `#271` sealed-prefix checkpoint (future) | a durable-tier attestation that a history prefix is canonical, carrying a genesis attestation so identity survives pruning | future `PolicyAgent` seal-validation | a lying seal lets a T3 durable node rewrite or amputate history below the seal, or forge the genesis binding so Disjoint detection accepts a foreign lineage. This is why #271 must justify sealing by *authority scope*, not by "everyone has it" (lit review Finding 4). |
 
-Load-bearing summary: today the only attestations with a live consumer are the
-event/state admission hooks and the read-filter hooks; the `CausalAssertion` and #271
-seal attestations are *designed* surfaces with no enforcement yet. The sharpest risk
-is C4-15 (unvalidated BFS fetch) with a T3 durable node: no attestation is consulted
-at all, so even a correct PolicyAgent is bypassed.
+Load-bearing summary: event and state envelopes now have a uniform live producer and
+consumer split: agents decide, core signs/verifies/binds, agents decide sufficiency.
+The `CausalAssertion` and #271 seal attestations remain designed surfaces with no
+enforcement yet. A compromised recognized durable still defeats admission evidence;
+RFC-2 owns quorum/membership/revocation rather than pretending one signature solves
+authority compromise.
 
 ---
 
 ## 5. Known gaps
 
-Severity is rated for the intended production posture (a real PolicyAgent); under
-PermissiveAgent every security gap is moot, which is itself meta-gap G-0.
+Severity is rated for the intended production posture (a strict PolicyAgent).
+PermissiveAgent still receives mechanically verified envelopes but requires none,
+which is itself meta-gap G-0.
 
 | Gap | Description | Severity rationale | Owner |
 |---|---|---|---|
-| G-0 | PermissiveAgent is the default and enforces nothing | Meta: every attestation-dependent claim is nil until a real agent is deployed. Not a bug (it is the intended default for open development) but the reader must know the security claims are conditional. | Deployment choice; #274 designs the agent surface |
-| G-1 | BFS-time remote event fetch skips `validate_received_event`, attestation check, and response-id filtering (C4-15) | Critical with a real agent: a peer injects unvalidated events straight into permanent storage mid-BFS, altering state and bypassing policy. No impact under PermissiveAgent. | #244, closed by #274 |
-| G-2 | Collection is not bound into the event id; attribution rides the message envelope (C4-02) | Medium: a peer can steer identical content into a chosen collection's storage; cross-collection contamination is possible if policy keys on the wrong collection. | #274 (bind or validate collection at ingress) |
+| G-0 | PermissiveAgent requires no admission evidence | Meta: core still strips forged/transplanted envelopes, but a payload with zero verified attestations is accepted. This is the intended open-development default; deployments that require durable admission must use a strict agent. | Deployment choice; RFC identity-attestation supplies the seam |
+| G-1 | **Closed here:** BFS-time fetch now filters requested ids and validates structure/envelopes/policy before storage (C4-15) | The former critical bypass is gone at `CachedEventGetter`; #274 still owns the one-ingress refactor and resource limits. | identity-attestation RFC; #274 residual structure |
+| G-2 | **Retired by design:** model/collection are outside event identity (C4-02) | Entity history is model-independent; `EventAdmitted` separately binds event+model and receivers resolve that model before storage. | identity-attestation RFC; #274 consolidates ingress |
 | G-3 | No size/count limit on incoming event messages, and no bound on the `collect_event_bridge` backward walk (C4-17) | Medium DoS: memory exhaustion on receive (#246) or forced full-history serialization on serve (#247). Rated low in the issues; genuine under an adversarial peer. | #246, #247, closed by #274 (ingress size limits) |
 | G-4 | Equivocation / concurrency flooding: content-hash de-dup stops identical replays but not unbounded distinct valid concurrent events (C4-13) | High DoS: an adversary inflates the antichain and forces unbounded staging and deep/wide merges with no finite-harm bound. Unsigned hash-DAG CRDTs have no structural cap (lit review Finding 7, Blocklace). | #246/#274 (rate/quantity cap) or a signature-attribution layer; cross-referenced from #271 horizon |
 | G-5 | Deep-divergence rejection is error-shaped, not policy-shaped: a stale-but-honest branch and a forged deep branch both terminate in `BudgetExceeded` (C4-09) | Medium: no deterministic horizon; budget is the only backstop and its outcome is an anomaly, not a decision. The convergence risk is bounded because verdicts are grounded (C4-08), but the DoS/thrash surface is open. | #271 (rejection horizon) + #266 (generation distance) |
-| G-6 | `commit_remote_transaction` applies creation events to the real entity before the policy check (C4-19) | Medium with a real agent: a rejected creation event poisons in-memory state; policy sees no genuine before-state. No impact under PermissiveAgent. | #243, design answered by #274/#242 |
+| G-6 | **Closed here:** remote genesis and updates both preview on an isolated fork before policy/storage (C4-19) | A rejected creation no longer poisons the resident entity. | identity-attestation RFC / #243 |
 | G-7 | `ValidatedEvent` (future) risks implying "globally valid"; only I-confluent, before(u)-local invariants are convergently enforceable (C4-21) | Documentation/design: if #274 lets validated ingress promise cross-entity uniqueness or referential integrity, it promises something no convergent rule can deliver (lit review Finding 3). | #274 (state the I-confluence boundary) |
-| G-8 | Durable-peer role is self-asserted, not authenticated (C4-16) | High when chained with G-1: a rogue "durable" peer becomes the fetch source and injects events. | #274 + phase 3 durable-tier story |
+| G-8 | Signed identity, connection-bound dispatch, self-certifying root proof, and founder-scoped durable recognition are enforced; first-root choice is TOFU and additional durable membership is absent (C4-16) | A rogue key cannot fabricate state for a chosen root id or become a fetch source after pinning. At first contact it can still present its own internally valid founder/root pair; core cannot infer which valid system the user intended. | RFC-2 membership/configured expected-root API |
 | G-9 | The `CausalAssertion` attestation surface is defined but has no consumer; `validate_causal_assertion` is never called (Section 4) | Low today (unused), Medium latent: if a future optimization trusts a peer's asserted lineage relation without re-deriving it, a lying peer substitutes a false relation. | whichever workstream introduces relation-assertion shortcuts; must re-derive, not trust |
 
 ---
@@ -656,51 +698,46 @@ assertion, not a wire arm, per the claim body).
 | Claim | Test `path::name` | Status |
 |---|---|---|
 | C4-01 | `adversarial_wire::malformed_clock_identity_is_order_independent_end_to_end` (id recomputed from contents, order-independent) | enforced-pass |
-| C4-02 | none (collection-attribution is gap G-2, deferred to #274; the hashing fact is exercised transitively by every event build) | design-boundary |
+| C4-02 | proto attestation subject-matching test (model relabel preserves event id but invalidates envelope) | enforced-pass |
 | C4-03 | `adversarial_wire::{malformed_clock_deserialization_normalizes, no_public_non_normalizing_clock_constructor, malformed_clock_identity_is_order_independent_end_to_end}` | enforced-pass |
 | C4-04 | `adversarial_wire::{declared_cycle_is_unconstructible_content_addressing, fabricated_cycle_batch_is_contained}` | enforced-pass |
 | C4-05 | `adversarial_wire::replay_flood_is_idempotent` | enforced-pass |
-| C4-06 | `adversarial_wire::{forged_second_genesis_rejected_on_durable_node, forged_second_genesis_rejected_on_ephemeral_node}` | enforced-pass |
+| C4-06 | proto `structural_validation_rejects_malformed_events`; identity-attestation genesis-id-mismatch, cross-system, and state-without-genesis arms | enforced-pass |
 | C4-07 | `adversarial_wire::forged_extra_genesis_head_does_not_trigger_wholesale_adoption` | enforced-pass |
-| C4-08 | exercised via the ephemeral second-genesis reject (grounded `Disjoint`, not a budget artifact) in `forged_second_genesis_rejected_on_ephemeral_node`; a dedicated budget-boundary arm is a C1 simulation scenario | design-boundary |
+| C4-08 | grounded comparison/budget-boundary coverage in the event-DAG suite; creation identity no longer needs BFS grounding | existing-suite/design-boundary |
 | C4-09 | fetch-failure termination exercised by `adversarial_wire::forged_dangling_parent_is_contained`; deep/wide-parent budget-exhaustion timing is a C1 simulation scenario, not a fast wire arm | enforced-pass (partial) |
 | C4-10 | conservative-meet / merge correctness is a DAG-merge concern covered by the C1 simulation and `dag_auditing.rs`; no dedicated adversarial arm here | design-boundary |
 | C4-11 | `adversarial_wire::{forged_dangling_parent_is_contained, phantom_entity_is_evicted_on_failed_apply}`; `update_batch_containment::test_event_only_unknown_entity_does_not_poison_batch` | enforced-pass |
 | C4-12 | `adversarial_wire::phantom_entity_is_evicted_on_failed_apply` | enforced-pass |
 | C4-13 | TOCTOU atomicity is a concurrent-writer scenario owned by the C1 simulation; not a single-node wire arm | design-boundary |
 | C4-14 | `bridge_policy::test_event_bridge_events_are_policy_validated_on_receive`; `commit_atomicity` (check_event denial) | existing-suite |
-| C4-15 | `adversarial_wire::bfs_fetched_events_are_policy_validated` | gap-red-ignored (G-1, #244/#274) |
-| C4-16 | none (durable-peer authentication is gap G-8; no seam to assert against, adjacent to #274/phase 3) | design-boundary |
+| C4-15 | `adversarial_wire::bfs_fetched_events_are_policy_validated`; retrieval requested-id filter unit test | enforced-pass; #274 refactor residual |
+| C4-16 | identity-attestation forged-presence, unproven-root-state, concurrent-first-root, sender-spoof, and unrecognized-durable arms | enforced-pass; valid-first-root choice remains TOFU |
 | C4-17 | `adversarial_wire::oversized_event_batch_is_rejected` | gap-red-ignored (G-3, #246/#247) |
 | C4-18 | `bridge_policy::test_event_bridge_respects_read_policy_on_send` | existing-suite |
-| C4-19 | none here (creation-event fork asymmetry is gap G-6; the remote-transaction path with a rejecting agent is owned by #243) | design-boundary |
-| C4-20 | authorship-is-not-structural is demonstrated by every arm accepting unsigned forged events under PermissiveAgent; the signing-agent rejection arm belongs with the jwt-auth suite | design-boundary |
+| C4-19 | `identity_attestation::denied_remote_genesis_leaves_no_storage_or_resident_phantom`; local multi-entity denial in `commit_atomicity` | enforced-pass |
+| C4-20 | proto forged/transplanted/cross-system/state-tamper tests; identity-attestation state-portability arm; authorship itself remains a design boundary | enforced-pass plus design-boundary |
 | C4-21 | I-confluence boundary is a design assertion for #274 and a C3 conformance audit, not a wire arm (per the claim body) | design-boundary |
 | C4-22 | enforced by absence: `Event` carries no depth/generation field to forge; the forged-generation arm activates when #266 lands | design-boundary |
 | G-4 | `adversarial_wire::equivocation_flood_antichain_is_bounded` | gap-red-ignored (G-4, #246 / signature layer) |
 
-Coverage summary: of the twenty-two claims, the Byzantine-safe structural and
-containment claims that a single-node wire delivery can falsify are pinned by
-green arms (C4-01, C4-03, C4-04, C4-05, C4-06, C4-07, C4-09 partial, C4-11,
-C4-12); the three open ingress gaps are pinned by red-ignored arms (C4-15/G-1,
-C4-17/G-3, plus G-4); the attestation-dependent admission/read claims are
-already pinned by the existing policy suite (C4-14, C4-18); and the remaining
-claims are documented boundaries a wire arm cannot cheaply or meaningfully add
-here (C4-02, C4-08, C4-10, C4-13, C4-16, C4-19, C4-20, C4-21, C4-22), each with
-its owning issue or workstream named above.
+Coverage summary: the content, creation, presence, and envelope-authenticity claims
+are pinned by green proto/core/wire arms. C4-15/G-1 and C4-19/G-6 moved from gaps to
+green enforcement in this RFC. Resource limits remain red-ignored (C4-17/G-3 and
+G-4); TOFU, authorship, I-confluence, and future causal/seal evidence remain honest
+design boundaries with their owners named above.
 
-No arm contradicted a claim. One behavior warranted a precise assertion choice:
-on an ephemeral node a rejected second genesis (C4-06) still causes BFS to pull
-the real genesis into local storage as a grounding side effect (the documented
-C4-15 fetch behavior), so `forged_second_genesis_rejected_on_ephemeral_node`
-asserts the semantic outcome (head unchanged, forged root not adopted, forged
-event not committed) rather than a raw stored-event count.
+No arm contradicted a claim. Creation identity no longer depends on an
+ephemeral-versus-durable storage distinction: malformed same-id genesis attempts are
+rejected structurally before ancestry retrieval.
 
 ---
 
 ## Appendix: source grounding
 
-Claims verified by reading, at commit 90f9a67d:
+The original concurrency claims were verified at commit 90f9a67d. Identity,
+creation, presence, attestation, and BFS-ingress dispositions were re-verified against
+the RFC-1 implementation in this branch:
 `core/src/event_dag/{comparison,ordering,accumulator,relation,mod}.rs`,
 `core/src/{entity,node,node_applier,retrieval,policy,context}.rs`,
 `proto/src/{data,clock,auth,id,request}.rs`; issues #242, #243, #244, #246, #247;
@@ -711,8 +748,9 @@ Two places the code contradicts a prior description, noted at their claims: (1) 
 verification review lists **V5 (clock sortedness) as unenforced MEDIUM**, but the tree
 now normalizes at the deserialization boundary via `#[serde(from = "Vec<EventId>")]`
 -> `normalized()` (C4-03); #274 is still asked to make it an explicit ingress check.
-(2) Issue **#244 names symbols that predate the refactor**; the gap is real and
-unchanged, now at `CachedEventGetter::get_event` (C4-15).
+(2) Issue **#244 names symbols that predate the refactor**; its live seam was
+`CachedEventGetter::get_event`, where this RFC now filters and validates before
+storage (C4-15).
 
 The wire-level adversarial suite (part 2 of C4) maps every claim above to a test or
 a named boundary in section 6 (Claims to tests); the C4 checklist line in

@@ -9,7 +9,7 @@ async fn get_nonexistent_entity_errors() -> anyhow::Result<()> {
     let node = durable_sled_setup().await?;
     let ctx = node.context(DEFAULT_CONTEXT)?;
 
-    let result = ctx.get::<AlbumView>(EntityId::new()).await;
+    let result = ctx.get::<AlbumView>(test_entity_id(0x01)).await;
     assert!(matches!(result, Err(RetrievalError::EntityNotFound(_))));
     Ok(())
 }
@@ -20,7 +20,7 @@ async fn local_rejects_phantom_commit() -> anyhow::Result<()> {
     let node = durable_sled_setup().await?;
     let ctx = node.context(DEFAULT_CONTEXT)?;
 
-    let phantom = AlbumView::from_entity(node.conjure_evil_phantom(EntityId::new(), Album::collection()));
+    let phantom = AlbumView::from_entity(node.conjure_evil_phantom(test_entity_id(0x02), Album::collection()));
     let trx = ctx.begin();
     phantom.edit(&trx)?.name().replace("inside your mind")?;
 
@@ -52,8 +52,8 @@ async fn server_rejects_update_for_nonexistent() -> anyhow::Result<()> {
 
     let fake_update = proto::Event {
         model: album_model,
-        entity_id: EntityId::new(),
-        operations: proto::OperationSet(BTreeMap::new()),
+        entity_id: test_entity_id(0x03),
+        body: proto::EventBody::Update { operations: proto::OperationSet(BTreeMap::new()) },
         parent: proto::Clock::new([proto::EventId::from_bytes([1u8; 32])]),
     };
 
@@ -92,7 +92,12 @@ async fn server_rejects_create_for_existing() -> anyhow::Result<()> {
         // reject it.
         model: server.catalog.model_id_for(Album::collection().as_str()).expect("Album registered by the create above"),
         entity_id: existing_id,
-        operations: proto::OperationSet(BTreeMap::new()),
+        body: proto::EventBody::Genesis {
+            system: server.system.root().map(|root| root.payload.entity_id),
+            nonce: [0x44; 32],
+            timestamp: 1,
+            operations: proto::OperationSet(BTreeMap::new()),
+        },
         parent: proto::Clock::new([]),
     };
 

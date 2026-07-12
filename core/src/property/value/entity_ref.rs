@@ -151,7 +151,7 @@ mod tests {
 
     #[test]
     fn test_ref_roundtrip() {
-        let id = EntityId::new();
+        let id = EntityId::from_bytes([0x11; 32]);
         let r: Ref<TestModel> = Ref::new(id.clone());
 
         let value = r.into_value().unwrap().unwrap();
@@ -163,14 +163,14 @@ mod tests {
 
     #[test]
     fn test_ref_from_entity_id() {
-        let id = EntityId::new();
+        let id = EntityId::from_bytes([0x22; 32]);
         let r: Ref<TestModel> = id.clone().into();
         assert_eq!(r.id(), id);
     }
 
     #[test]
     fn test_ref_into_entity_id() {
-        let id = EntityId::new();
+        let id = EntityId::from_bytes([0x33; 32]);
         let r: Ref<TestModel> = Ref::new(id.clone());
         let recovered: EntityId = r.into();
         assert_eq!(recovered, id);

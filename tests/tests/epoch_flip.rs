@@ -85,7 +85,7 @@ async fn lww_state_version(node: &Node<SledStorageEngine, PermissiveAgent>, coll
 
 /// The LWW diff version byte carried by `event` (its "lww" operation).
 fn lww_diff_version(event: &proto::Event) -> u8 {
-    let ops = event.operations.0.get("lww").expect("commit event carries an lww operation");
+    let ops = event.operations().0.get("lww").expect("commit event carries an lww operation");
     let header: LwwDiffHeader = bincode::deserialize(&ops[0].diff).expect("lww diff decodes");
     header.version
 }
@@ -204,7 +204,7 @@ async fn legacy_v1_state_reads_then_rewrites_to_0xa2_on_edit() -> Result<()> {
     // exactly as a pre-flip node would have written it, and set it directly into
     // storage. This build no longer EMITS 0xA1 (single encoding), so the buffer
     // is forged from the on-disk layout core still DECODES.
-    let legacy_id = proto::EntityId::new();
+    let legacy_id = proto::EntityId::from_bytes([0xA1; 32]);
     let legacy_event_id = proto::EventId::from_bytes([5u8; 32]);
     let legacy_state = {
         let buffer = build_legacy_v1_buffer(&[("title", "legacy-title"), ("artist", "legacy-artist")], legacy_event_id.clone());

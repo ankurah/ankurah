@@ -212,7 +212,7 @@ impl SledStorageCollectionInner {
                     return None;
                 }
                 let resolver = resolver.as_deref()?;
-                let id = item.property.map(ankurah_proto::EntityId::from_ulid).or_else(|| resolver.resolve(collection, name))?;
+                let id = item.property.map(ankurah_proto::EntityId::from_bytes).or_else(|| resolver.resolve(collection, name))?;
                 let value_type = ankurah_core::value::ValueType::from_property_str(&resolver.canonical_value_type(&id)?)?;
                 let column = manager.column_of(collection, &id).unwrap_or_else(|| name.to_string());
                 Some((column, value_type))

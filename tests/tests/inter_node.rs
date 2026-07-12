@@ -160,6 +160,52 @@ async fn server_edits_subscription() -> Result<()> {
     Ok(())
 }
 
+/// A newly matching entity is not present in the ephemeral cache. Its
+/// StateAndEvent update must therefore carry genesis inline: LocalProcess (like
+/// the websocket connectors) dispatches frames sequentially, so trying to
+/// issue GetEvents back to the sender from inside this handler would deadlock
+/// waiting for a response that the same receiver task cannot yet consume.
+#[tokio::test]
+async fn subscription_add_for_uncached_entity_carries_inline_genesis() -> Result<()> {
+    let server_node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    server_node.system.create().await?;
+    let client_node = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    let _connection = LocalProcessConnection::new(&server_node, &client_node).await?;
+    client_node.system.wait_system_ready().await;
+
+    let server = server_node.context(c)?;
+    let client = client_node.context(c)?;
+    let hidden = {
+        let trx = server.begin();
+        let pet = trx.create(&Pet { name: "Hidden".to_owned(), age: "2".to_owned() }).await?;
+        let read = pet.read();
+        trx.commit().await?;
+        read
+    };
+
+    let query = client.query_wait::<PetView>("age > 5").await?;
+    assert!(query.ids().is_empty());
+    let watcher = TestWatcher::changeset();
+    let _guard = query.subscribe(&watcher);
+
+    {
+        let trx = server.begin();
+        hidden.edit(&trx)?.age().overwrite(0, 1, "6")?;
+        trx.commit().await?;
+    }
+
+    assert_eq!(watcher.take_one_with_timeout(std::time::Duration::from_secs(5)).await, vec![(hidden.id(), ChangeKind::Add)]);
+    assert_eq!(query.ids(), vec![hidden.id()]);
+
+    let collection = client.collection(&Pet::collection()).await?;
+    let genesis_id = ankurah::proto::EventId::from_bytes(hidden.id().to_bytes());
+    assert!(
+        collection.get_events(vec![genesis_id.clone()]).await?.iter().any(|event| event.payload.id() == genesis_id),
+        "verified inline genesis must be cached with the newly materialized state"
+    );
+    Ok(())
+}
+
 // Deterministic red repro for the subscription-notification race behind the
 // intermittent `server_edits_subscription` failure (flaky-test tracker #202).
 //

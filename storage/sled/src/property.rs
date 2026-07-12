@@ -31,7 +31,7 @@ struct Inner {
 const RESERVED_COLUMNS: [&str; 1] = ["id"];
 
 fn column_map_key(collection: &str, id: &EntityId) -> Vec<u8> {
-    let mut key = Vec::with_capacity(collection.len() + 1 + 16);
+    let mut key = Vec::with_capacity(collection.len() + 1 + 32);
     key.extend_from_slice(collection.as_bytes());
     key.push(0);
     key.extend_from_slice(&id.to_bytes());

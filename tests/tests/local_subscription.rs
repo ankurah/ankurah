@@ -36,7 +36,7 @@ async fn basic_local_subscription() -> Result<(), Box<dyn std::error::Error + Se
     // Initial state should have Two Vines and Ask That God
     assert_eq!(watcher.quiesce().await, 0);
     use ankurah::signals::Peek;
-    // Order depends on ULID random component when created in same millisecond
+    // Order depends on the genesis nonce when entities are created together.
     let mut actual_ids = query.peek().iter().map(|p| p.id()).collect::<Vec<EntityId>>();
     actual_ids.sort();
     let mut expected_ids = vec![two_vines.id(), ask_that_god.id()];
@@ -53,7 +53,7 @@ async fn basic_local_subscription() -> Result<(), Box<dyn std::error::Error + Se
     }
 
     // After update, should have all three albums
-    // Order depends on ULID random component when created in same millisecond
+    // Order depends on the genesis nonce when entities are created together.
     let mut actual_ids = query.peek().iter().map(|p| p.id()).collect::<Vec<EntityId>>();
     actual_ids.sort();
     let mut expected_ids = vec![two_vines.id(), ask_that_god.id(), ice_on_the_dune.id()];

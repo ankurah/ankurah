@@ -124,7 +124,7 @@
 //! Ankurah follows an event-sourced architecture where:
 //! - All operations have unique IDs and precursor operations
 //! - Entity state is maintained per node with operation tree tracking
-//! - Operations use ULID for distributed ID generation
+//! - Events use domain-separated content hashes for distributed identity
 //! - Entity IDs are derived from their creation operation
 //!
 //! For more details, see the [repository documentation](https://github.com/ankurah/ankurah).

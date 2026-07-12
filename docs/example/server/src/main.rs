@@ -10,9 +10,13 @@ use std::sync::Arc;
 async fn main() -> Result<()> {
     let storage_dir = dirs::home_dir().unwrap().join(".ankurah");
     // liaison id=server-example
+    let signing_key = ankurah::core::node_key::load_or_create_signing_key(storage_dir.with_extension("node-key"))?;
     let storage = SledStorageEngine::with_path(storage_dir)?;
-    let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
-    node.system.create().await?;
+    let node = Node::new_durable_with_signing_key(Arc::new(storage), PermissiveAgent::new(), signing_key);
+    node.system.wait_loaded().await;
+    if node.system.root().is_none() {
+        node.system.create().await?;
+    }
 
     let mut server = WebsocketServer::new(node);
     println!("Running server...");
@@ -42,8 +46,10 @@ async fn postgres_example() -> anyhow::Result<()> {
     let uri = "postgresql://localhost/mydb";
     // liaison id=storage-postgres
     let storage = Postgres::open(uri).await?;
+    let key_path = dirs::home_dir().unwrap().join(".ankurah-postgres-node-key");
+    let signing_key = ankurah::core::node_key::load_or_create_signing_key(key_path)?;
     // liaison end
-    let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
+    let node = Node::new_durable_with_signing_key(Arc::new(storage), PermissiveAgent::new(), signing_key);
 
     let _ = node;
     Ok(())

@@ -7,8 +7,8 @@ use std::sync::Arc;
 /// RT165: PostgreSQL storage should be idempotent when inserting duplicate events
 ///
 /// This test demonstrates that duplicate event insertions (e.g., from network retries,
-/// peer sync, etc.) should not cause errors. EventIDs are content-addressed (SHA256 hash
-/// of entity_id + operations + parent), so duplicate insertions are safe and should be
+/// peer sync, etc.) should not cause errors. EventIDs are content-addressed (SHA256 hashes
+/// of canonical genesis or update preimages), so duplicate insertions are safe and should be
 /// idempotent - returning false on subsequent attempts rather than erroring.
 #[tokio::test]
 async fn postgres_duplicate_event_idempotency() -> Result<()> {

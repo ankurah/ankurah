@@ -17,14 +17,19 @@ async fn server_refuses_commits_into_protected_collections() -> anyhow::Result<(
     let _conn = LocalProcessConnection::new(&server, &client).await?;
     client.system.wait_system_ready().await;
 
-    for collection in PROTECTED {
+    for (index, collection) in PROTECTED.into_iter().enumerate() {
+        let system = server.system.root().map(|root| root.payload.entity_id);
+        let nonce = [0x50 + index as u8; 32];
+        let timestamp = index as u64;
+        let operations = proto::OperationSet(BTreeMap::new());
+        let entity_id = EntityId::from(proto::EventId::from_genesis_parts(&system, &nonce, timestamp, &operations));
         let event = proto::Event {
             // #330: the protected-write guard now keys on well-known model ids
             // (`well_known_collection(&event.model)`), so the forged event must
             // carry the collection's well-known model id for the guard to fire.
             model: ankurah::core::schema::well_known_model_id(collection).expect("every protected collection has a well-known model id"),
-            entity_id: EntityId::new(),
-            operations: proto::OperationSet(BTreeMap::new()),
+            entity_id,
+            body: proto::EventBody::Genesis { system, nonce, timestamp, operations },
             parent: proto::Clock::default(),
         };
         let resp = client

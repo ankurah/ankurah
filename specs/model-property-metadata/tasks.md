@@ -42,10 +42,10 @@ v3.
 
 ## 2. Phase A foundation: derivation, frozen encoder, create-with-id
 
-- [x] [REMOVED rev 4] `proto/src/schema_id.rs`: id derivation + golden
-      vectors + standalone scope. Deleted with the pivot; identity is
-      allocated (`EntityId::new()`) by the executor.
-- [x] [REMOVED rev 4] Ulid audit: moot under allocation (real ULIDs).
+- [x] [REMOVED rev 4] `proto/src/schema_id.rs`: schema-specific id derivation
+      + golden vectors + standalone scope. Deleted with the pivot; the
+      executor now allocates by emitting an ordinary content-hashed genesis.
+- [x] [REMOVED rev 4] ULID audit: superseded by 32-byte content-hash EntityIds.
 - [x] [REMOVED rev 4] `core/src/schema/genesis.rs`: frozen genesis
       encoder + golden byte vectors. Deleted; creation events are
       ordinary and carry the full definition state.
@@ -71,7 +71,7 @@ v3.
 - [x] proto descriptors (ModelDescriptor, PropertyDescriptor,
       MembershipDescriptor) + `NodeRequestBody::RegisterSchema`.
 - [x] Durable-side executor (REWORKED by rev 4, group 12): upsert by
-      lookup key under the allocator mutex, `EntityId::new()` on miss,
+      lookup key under the allocator mutex, content-hashed genesis on miss,
       rename-hint pre-pass, explicit-id verification, ordinary creation
       + difference-only follow-up events, check_schema_registration on
       the resolved plan, PolicyAgent::check_event on every event,
@@ -148,7 +148,7 @@ v3.
 ## 6. ankql Identifier and resolution
 
 - [x] `Identifier { property, name, subpath }` AST node (property is a
-      raw Ulid; ankql cannot dep on proto); PathExpr stays the parse
+      raw 32-byte id; ankql cannot dep on proto); PathExpr stays the parse
       form; every Expr match site across ankql/core/storage handles
       Identifier with the dedicated resolved evaluator; assume_null keys on
       the resolved name for subpaths BY DESIGN (the first-vs-last-step fix).
@@ -214,7 +214,7 @@ v3.
       FieldSchema (rev 4; replaced the anchor attribute; executor-side
       hint semantics tested in group 3's reworked suite).
 - [x] `#[model(id = "...")]` / `#[property(id = "...")]`: compile-time
-      base64/16-byte validation; carried on the schema and into
+      base64/32-byte validation; carried on the schema and into
       descriptors; property ids also flow through generated Model/View/Mutable
       accessors and ensured-schema predicate/ORDER BY aliases, with
       registration-time verification already tested in group 3.
@@ -265,7 +265,7 @@ DONE in one train on this branch (ratification trail on #289):
       NodeResponseBody::SchemaRegistered + Registered{Model,Property,
       Membership}.
 - [x] Executor rework: upsert by lookup key under the allocator mutex;
-      EntityId::new() on miss; rename-hint pre-pass (guarded); ordinary
+      content-hashed genesis on miss; rename-hint pre-pass (guarded); ordinary
       full-state creation events; difference-only head-parented
       follow-ups; target_collection resolution (stub model on miss);
       synchronous map upsert before mutex release; RegisteredDefs
@@ -298,7 +298,8 @@ DONE in one train on this branch (ratification trail on #289):
   transformed to full property EntityIds at the wire/memory boundary,
   mirroring the injected encryptor/decryptor seam the future E2EE phase
   needs for values. This subsumes and removes Phase A's 0xA2
-  display-name hints AND shrinks the stored 16-byte ids. Events are
+  display-name hints AND replaces full 32-byte ids with compact local ids.
+  Events are
   exempt by nature (hashed identity: full ids forever). Design it once
   with the E2EE transform seam in view.
 - CatalogManager split (pre-PR architectural review, 2026-07-05): the

@@ -7,13 +7,18 @@ use std::sync::{Arc, Mutex};
 use ankurah_core::{
     error::{MutationError, RetrievalError},
     property::PropertyResolver,
-    storage::{StorageCollection, StorageEngine},
+    storage::{StorageCollection, StorageEngine, SystemRootClaim},
 };
-use ankurah_proto::CollectionId;
+use ankurah_proto::{CollectionId, SystemRootProof};
 use async_trait::async_trait;
 use sled::Config;
 
 use crate::{collection::SledStorageCollection, database::Database, error::SledRetrievalError};
+
+const ENGINE_METADATA_TREE: &str = "ankurah_engine_metadata";
+const SYSTEM_ROOT_CLAIM_KEY: &[u8] = b"system_root";
+
+fn decode_root_claim(bytes: &[u8]) -> Result<SystemRootProof, bincode::Error> { bincode::deserialize(bytes) }
 
 pub struct SledStorageEngine {
     pub database: Mutex<Arc<Database>>,
@@ -117,6 +122,51 @@ impl StorageEngine for SledStorageEngine {
 
     fn set_property_resolver(&self, resolver: std::sync::Weak<dyn PropertyResolver>) { *self.resolver.write().unwrap() = Some(resolver); }
 
+    async fn claim_system_root(&self, candidate: &SystemRootProof) -> Result<SystemRootClaim, MutationError> {
+        let database = self.database.lock().unwrap().clone();
+        let tree = database.db.open_tree(ENGINE_METADATA_TREE).map_err(|error| MutationError::General(Box::new(error)))?;
+        let bytes = bincode::serialize(candidate)?;
+        match tree
+            .compare_and_swap(SYSTEM_ROOT_CLAIM_KEY, None::<&[u8]>, Some(bytes.as_slice()))
+            .map_err(|error| MutationError::General(Box::new(error)))?
+        {
+            Ok(()) => {
+                tree.flush_async().await.map_err(|error| MutationError::General(Box::new(error)))?;
+                Ok(SystemRootClaim::Claimed)
+            }
+            Err(conflict) => {
+                let current = conflict.current.ok_or_else(|| {
+                    MutationError::General(Box::new(std::io::Error::other("system-root claim CAS conflicted without a current value")))
+                })?;
+                let existing = decode_root_claim(current.as_ref())?;
+                Ok(SystemRootClaim::Existing(existing))
+            }
+        }
+    }
+
+    async fn system_root_claim(&self) -> Result<Option<SystemRootProof>, RetrievalError> {
+        let database = self.database.lock().unwrap().clone();
+        let tree = database.db.open_tree(ENGINE_METADATA_TREE).map_err(SledRetrievalError::StorageError)?;
+        tree.get(SYSTEM_ROOT_CLAIM_KEY)
+            .map_err(SledRetrievalError::StorageError)?
+            .map(|bytes| decode_root_claim(bytes.as_ref()).map_err(RetrievalError::from))
+            .transpose()
+    }
+
+    async fn release_system_root_claim(&self, expected: &SystemRootProof) -> Result<bool, MutationError> {
+        let database = self.database.lock().unwrap().clone();
+        let tree = database.db.open_tree(ENGINE_METADATA_TREE).map_err(|error| MutationError::General(Box::new(error)))?;
+        let expected = bincode::serialize(expected)?;
+        let released = tree
+            .compare_and_swap(SYSTEM_ROOT_CLAIM_KEY, Some(expected.as_slice()), None::<&[u8]>)
+            .map_err(|error| MutationError::General(Box::new(error)))?
+            .is_ok();
+        if released {
+            tree.flush_async().await.map_err(|error| MutationError::General(Box::new(error)))?;
+        }
+        Ok(released)
+    }
+
     async fn delete_all_collections(&self) -> Result<bool, MutationError> {
         let mut any_deleted = false;
 
@@ -127,7 +177,7 @@ impl StorageEngine for SledStorageEngine {
 
             // Drop each tree
             for name in tree_names {
-                if name == "__sled__default" {
+                if name == "__sled__default" || name == ENGINE_METADATA_TREE.as_bytes() {
                     continue;
                 }
 

@@ -11,7 +11,6 @@ use axum::{
     Router,
 };
 use axum_extra::{headers, TypedHeader};
-use bincode::deserialize;
 use futures_util::StreamExt;
 use std::net::IpAddr;
 use std::{future::Future, net::SocketAddr, ops::ControlFlow, pin::Pin};
@@ -114,37 +113,42 @@ where
     info!("Websocket server connected to {}", client_ip);
 
     let (sender, mut receiver) = socket.split();
-    let mut conn = Connection::Initial(Some(sender));
+    let handshake = node.begin_peer_handshake();
+    let challenge = handshake.challenge();
+    let mut conn = Connection::Initial { sender: Some(sender), handshake: Some(handshake), outgoing_session: None };
 
-    // Immediately send server presence after connection
-    if let Err(e) = conn
-        .send(proto::Message::Presence(proto::Presence {
-            node_id: node.id,
-            durable: node.durable,
-            system_root: node.system.root(),
-            protocol_version: proto::PROTOCOL_VERSION,
-        }))
-        .await
-    {
-        debug!("Error sending presence to {client_ip}: {:?}", e);
+    // Require a live proof of key possession for this connection. The server
+    // sends its Presence only after answering the client's own challenge.
+    if let Err(e) = conn.send(proto::Message::HandshakeChallenge(challenge)).await {
+        debug!("Error sending handshake challenge to {client_ip}: {:?}", e);
         return;
     }
 
-    while let Some(msg) = receiver.next().await {
-        if let Ok(msg) = msg {
-            if process_message(msg, client_ip, &mut conn, node.clone()).await.is_break() {
+    loop {
+        tokio::select! {
+            biased;
+            _ = conn.close_requested() => {
+                debug!("Peer registration requested websocket transport close for {client_ip}");
                 break;
             }
-        } else {
-            debug!("client {client_ip} abruptly disconnected");
-            break;
+            msg = receiver.next() => {
+                let Some(msg) = msg else { break; };
+                if let Ok(msg) = msg {
+                    if process_message(msg, client_ip, &mut conn, node.clone()).await.is_break() {
+                        break;
+                    }
+                } else {
+                    debug!("client {client_ip} abruptly disconnected");
+                    break;
+                }
+            }
         }
     }
 
     // Clean up peer registration if we had registered one
-    if let Connection::Established(peer_sender) = conn {
+    if let Connection::Established { peer_sender, incoming_session, .. } = conn {
         use ankurah_core::connector::PeerSender;
-        node.deregister_peer(peer_sender.recipient_node_id());
+        node.deregister_peer_session(peer_sender.recipient_node_id(), incoming_session);
     }
 
     debug!("Websocket context {client_ip} destroyed");
@@ -165,8 +169,22 @@ where
         axum::extract::ws::Message::Binary(d) => {
             debug!(">>> {} sent {} bytes", client_ip, d.len());
 
-            if let Ok(message) = deserialize::<proto::Message>(&d) {
+            if let Ok(message) = proto::decode_message(&d) {
                 match message {
+                    proto::Message::HandshakeChallenge(challenge) => {
+                        match state {
+                            Connection::Initial { outgoing_session, .. } if outgoing_session.is_none() => {
+                                *outgoing_session = Some(challenge);
+                            }
+                            _ => {
+                                warn!("Received duplicate or out-of-order handshake challenge from {client_ip}; closing");
+                                return ControlFlow::Break(());
+                            }
+                        }
+                        if state.send(proto::Message::Presence(node.presence(challenge))).await.is_err() {
+                            return ControlFlow::Break(());
+                        }
+                    }
                     proto::Message::Presence(presence) => {
                         // Pre-check the version while we can still reply through the
                         // connection and await the flush; register_peer re-enforces
@@ -179,36 +197,68 @@ where
                             return ControlFlow::Break(());
                         }
                         match state {
-                            Connection::Initial(sender) => {
-                                if let Some(sender) = sender.take() {
+                            Connection::Initial { sender, handshake, outgoing_session } => {
+                                let Some(outgoing_session) = *outgoing_session else {
+                                    warn!("Received Presence from {client_ip} before its challenge; closing");
+                                    return ControlFlow::Break(());
+                                };
+                                if let (Some(sender), Some(handshake)) = (sender.take(), handshake.take()) {
                                     debug!("Received client presence from {}", client_ip);
+                                    let incoming_session = handshake.challenge();
 
                                     use super::sender::WebSocketClientSender;
                                     // Register peer sender for this client
-                                    let sender = WebSocketClientSender::new(presence.node_id, sender);
+                                    let (sender, close_rx) = WebSocketClientSender::new(presence.node_id, sender);
 
-                                    match node.register_peer(presence, Box::new(sender.clone())) {
-                                        Ok(()) => *state = Connection::Established(sender),
-                                        Err(rejection) => {
+                                    match node.register_peer(presence, handshake, outgoing_session, Box::new(sender.clone())) {
+                                        Ok(()) => *state = Connection::Established { peer_sender: sender, close_rx, incoming_session },
+                                        Err(proto::PresenceRefusal::IncompatibleVersion(rejection)) => {
                                             warn!("Refusing peer at {client_ip}: {rejection}");
                                             let _ = sender.send_message(proto::Message::PresenceRejected(rejection));
+                                            return ControlFlow::Break(());
+                                        }
+                                        Err(proto::PresenceRefusal::InvalidSignature(node_id)) => {
+                                            warn!("Refusing peer at {client_ip}: invalid presence signature for node {node_id}");
+                                            return ControlFlow::Break(());
+                                        }
+                                        Err(proto::PresenceRefusal::UnexpectedChallenge(node_id)) => {
+                                            warn!("Refusing peer at {client_ip}: Presence for node {node_id} answered another challenge");
+                                            return ControlFlow::Break(());
+                                        }
+                                        Err(proto::PresenceRefusal::SelfConnection(node_id)) => {
+                                            warn!("Refusing reflected/self connection for node {node_id}");
+                                            return ControlFlow::Break(());
+                                        }
+                                        Err(proto::PresenceRefusal::InvalidSystemRoot(node_id)) => {
+                                            warn!("Refusing peer at {client_ip}: invalid system-root proof for node {node_id}");
                                             return ControlFlow::Break(());
                                         }
                                     }
                                 }
                             }
-                            _ => warn!("Received presence from {} but already have a peer sender - ignoring", client_ip),
+                            _ => {
+                                warn!("Received duplicate Presence from {client_ip}; closing");
+                                return ControlFlow::Break(());
+                            }
                         }
                     }
-                    proto::Message::PeerMessage(msg) => {
-                        if let Connection::Established(_) = state {
-                            tokio::spawn(async move {
-                                if let Err(e) = node.handle_message(msg).await {
-                                    error!("Error handling message from {}: {:?}", client_ip, e);
+                    proto::Message::PeerMessage(frame) => {
+                        if let Connection::Established { peer_sender, .. } = state {
+                            use ankurah_core::connector::PeerSender;
+                            let authenticated_peer = peer_sender.recipient_node_id();
+                            let message = match node.verify_peer_message(authenticated_peer, frame) {
+                                Ok(message) => message,
+                                Err(error) => {
+                                    warn!("Rejecting authenticated peer frame from {client_ip}: {error}; closing");
+                                    return ControlFlow::Break(());
                                 }
-                            });
+                            };
+                            if let Err(e) = node.handle_verified_peer_message(message).await {
+                                error!("Error handling message from {}: {:?}", client_ip, e);
+                            }
                         } else {
-                            warn!("Received peer message from {} but not connected as a peer", client_ip);
+                            warn!("Received peer message from {client_ip} before handshake completion; closing");
+                            return ControlFlow::Break(());
                         }
                     }
                     proto::Message::PresenceRejected(rejection) => {
@@ -216,7 +266,7 @@ where
                         return ControlFlow::Break(());
                     }
                 }
-            } else if let Connection::Initial(_) = state {
+            } else if matches!(state, Connection::Initial { .. }) {
                 // A peer whose handshake we cannot read will never establish;
                 // close instead of leaving the connection dangling.
                 if proto::is_version0_presence(&d) {
@@ -226,11 +276,17 @@ where
                 }
                 return ControlFlow::Break(());
             } else {
-                error!("Failed to deserialize message from {}", client_ip);
+                // Exact decoding is a framing invariant for the entire
+                // authenticated session. Continuing after malformed or
+                // trailing bytes would let an established peer probe parser
+                // differentials without losing its authority.
+                error!("Failed to exactly decode established message from {client_ip}; closing");
+                return ControlFlow::Break(());
             }
         }
         axum::extract::ws::Message::Text(t) => {
-            debug!(">>> {client_ip} sent str: {t:?}");
+            warn!(">>> {client_ip} sent unsupported application text frame ({} bytes); closing", t.len());
+            return ControlFlow::Break(());
         }
         axum::extract::ws::Message::Close(c) => {
             if let Some(cf) = c {

@@ -54,6 +54,7 @@ impl<Projected> YrsString<Projected> {
     pub fn value(&self) -> Option<String> { self.try_value().ok().flatten() }
 
     fn try_value(&self) -> Result<Option<String>, PropertyError> {
+        self.entity.ensure_system_alive()?;
         // Map-level presence: the resolved id root wins; only an absent id root
         // falls back to a legacy name root (yrs cannot tombstone, so a cleared
         // id field may still resurrect a stale name value -- the accepted
@@ -81,6 +82,7 @@ impl<Projected> YrsString<Projected> {
         Ok(resolved)
     }
     pub fn insert(&self, index: u32, value: &str) -> Result<(), MutationError> {
+        self.entity.ensure_system_alive()?;
         if !self.entity.is_writable() {
             return Err(PropertyError::TransactionClosed.into());
         }
@@ -91,12 +93,14 @@ impl<Projected> YrsString<Projected> {
         self.backend.insert(&self.mutation_key()?, index, value)
     }
     pub fn delete(&self, index: u32, length: u32) -> Result<(), MutationError> {
+        self.entity.ensure_system_alive()?;
         if !self.entity.is_writable() {
             return Err(PropertyError::TransactionClosed.into());
         }
         self.backend.delete(&self.mutation_key()?, index, length)
     }
     pub fn overwrite(&self, start: u32, length: u32, value: &str) -> Result<(), MutationError> {
+        self.entity.ensure_system_alive()?;
         if !self.entity.is_writable() {
             return Err(PropertyError::TransactionClosed.into());
         }
@@ -106,6 +110,7 @@ impl<Projected> YrsString<Projected> {
         Ok(())
     }
     pub fn replace(&self, value: &str) -> Result<(), MutationError> {
+        self.entity.ensure_system_alive()?;
         if !self.entity.is_writable() {
             return Err(PropertyError::TransactionClosed.into());
         }

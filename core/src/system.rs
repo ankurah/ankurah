@@ -2,9 +2,12 @@ use ankurah_proto::{self as proto, Attested, CollectionId, EntityState, Event};
 use anyhow::{anyhow, Result};
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, OnceLock, RwLock,
+};
 use tokio::sync::Notify;
-use tracing::{error, warn};
+use tracing::error;
 
 use crate::collectionset::CollectionSet;
 use crate::entity::{Entity, WeakEntitySet};
@@ -15,8 +18,11 @@ use crate::policy::PolicyAgent;
 use crate::property::{Property, PropertyError};
 use crate::reactor::Reactor;
 use crate::retrieval::{LocalEventGetter, LocalStateGetter, SuspenseEvents};
-use crate::storage::{StorageCollectionWrapper, StorageEngine};
-use crate::{property::backend::LWWBackend, value::Value};
+use crate::storage::{StorageCollectionWrapper, StorageEngine, SystemRootClaim};
+use crate::{
+    property::backend::{LWWBackend, PropertyBackend},
+    value::Value,
+};
 pub const SYSTEM_COLLECTION_ID: &str = "_ankurah_system";
 /// Collections that are not mutable through ordinary transactions: the
 /// system collection and the metadata catalog (RFC section 4 in specs/model-property-metadata/rfc.md). Consulted
@@ -44,9 +50,19 @@ struct Inner<SE, PA> {
     collection_map: RwLock<BTreeMap<CollectionId, Entity>>,
     entities: WeakEntitySet,
     durable: bool,
-    root: RwLock<Option<Attested<EntityState>>>,
+    local_node_id: proto::NodeId,
+    /// Root identity, founder, and join state share one lock so two concurrent
+    /// first presences cannot both observe an empty root and become durable.
+    root: RwLock<Option<RootBinding>>,
+    /// Serializes durable root creation across the complete async persistence
+    /// path. Without this, two concurrent `create()` calls can both pass the
+    /// empty-catalog check and persist different founders/roots.
+    create_lock: tokio::sync::Mutex<()>,
     items: RwLock<Vec<Entity>>,
     loaded: OnceLock<()>,
+    /// A completed-but-failed storage warm is latched so waiters wake but all
+    /// root-sensitive operations remain fail-closed until hard reset.
+    load_error: RwLock<Option<String>>,
     loading: Notify,
     system_ready: RwLock<bool>,
     system_ready_notify: Notify,
@@ -57,7 +73,93 @@ struct Inner<SE, PA> {
     /// catalog map to be flushed alongside the state hard_reset clears,
     /// because allocated catalog ids belong to one system's allocator.
     catalog_reset_hook: RwLock<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Node-owned peer teardown, installed after Node construction. The
+    /// optional id is a Reserved root whose pending founder connection must
+    /// survive an old-system replacement long enough to be promoted.
+    peer_reset_hook: RwLock<Option<Arc<dyn Fn(Option<proto::EntityId>) + Send + Sync>>>,
+    /// Shared-storage epoch this manager loaded/created/joined against. The
+    /// actual gate and monotonic epoch live in CollectionSet's per-engine
+    /// fence, shared across independently-built Nodes using the same Arc<SE>.
+    bound_storage_epoch: AtomicU64,
+    resetting: AtomicBool,
+    destructive_resetting: AtomicBool,
     _phantom: PhantomData<PA>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RootStatus {
+    /// Loaded from an ephemeral node's cache, but not yet re-joined.
+    StoredUnjoined,
+    /// A verified first presence reserved this root before durable routing was
+    /// enabled. `needs_reset` is filled in by storage loading when reservation
+    /// wins the race with startup.
+    Reserved {
+        needs_reset: bool,
+    },
+    /// Join persistence failed and destructive cleanup owns this reservation.
+    /// New presences must not attach until cleanup completes.
+    Aborting,
+    Ready,
+}
+
+#[derive(Clone)]
+struct RootBinding {
+    proof: proto::SystemRootProof,
+    founder: proto::NodeId,
+    status: RootStatus,
+}
+
+/// Result of atomically checking and reserving a durable peer's root proof.
+pub(crate) enum RootReservation {
+    /// This peer won first join; persist the proof asynchronously.
+    StartJoin(proto::SystemRootProof),
+    /// The same root/founder was already reserved or pinned.
+    AlreadyPinned,
+    /// A different root is already reserved or pinned, or a durable receiver
+    /// cannot join another node's system.
+    Conflict,
+}
+
+/// Capability returned when an exact pending reservation is synchronously
+/// transitioned to `Aborting`. Holding the complete proof makes the later
+/// async cleanup conditional on that reservation generation.
+pub(crate) struct RootJoinAbort {
+    proof: proto::SystemRootProof,
+}
+
+/// Cancellation-safe reset marker. Drop releases the exclusive gate before
+/// publishing `resetting = false`, so a connector can never observe reset as
+/// finished while the destructive writer is still held.
+struct ResetActivity<'a> {
+    guard: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
+    resetting: &'a AtomicBool,
+}
+
+struct FlagActivity<'a>(&'a AtomicBool);
+
+impl<'a> FlagActivity<'a> {
+    fn new(flag: &'a AtomicBool) -> Self {
+        flag.store(true, Ordering::Release);
+        Self(flag)
+    }
+}
+
+impl Drop for FlagActivity<'_> {
+    fn drop(&mut self) { self.0.store(false, Ordering::Release); }
+}
+
+impl<'a> ResetActivity<'a> {
+    fn new(guard: tokio::sync::OwnedRwLockWriteGuard<()>, resetting: &'a AtomicBool) -> Self {
+        resetting.store(true, Ordering::Release);
+        Self { guard: Some(guard), resetting }
+    }
+}
+
+impl Drop for ResetActivity<'_> {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        self.resetting.store(false, Ordering::Release);
+    }
 }
 
 impl<SE, PA> SystemManager<SE, PA>
@@ -65,20 +167,34 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    pub(crate) fn new(collections: CollectionSet<SE>, entities: WeakEntitySet, reactor: Reactor, durable: bool) -> Self {
+    pub(crate) fn new(
+        collections: CollectionSet<SE>,
+        entities: WeakEntitySet,
+        reactor: Reactor,
+        durable: bool,
+        local_node_id: proto::NodeId,
+    ) -> Self {
+        let storage_epoch = collections.storage_epoch();
         let me = Self(Arc::new(Inner {
             collectionset: collections,
             entities,
             durable,
+            local_node_id,
             items: RwLock::new(Vec::new()),
             root: RwLock::new(None),
+            create_lock: tokio::sync::Mutex::new(()),
             loaded: OnceLock::new(),
+            load_error: RwLock::new(None),
             loading: Notify::new(),
             collection_map: RwLock::new(BTreeMap::new()),
             system_ready: RwLock::new(false),
             system_ready_notify: Notify::new(),
             reactor,
             catalog_reset_hook: RwLock::new(None),
+            peer_reset_hook: RwLock::new(None),
+            bound_storage_epoch: AtomicU64::new(storage_epoch),
+            resetting: AtomicBool::new(false),
+            destructive_resetting: AtomicBool::new(false),
             _phantom: PhantomData,
         }));
         {
@@ -86,13 +202,140 @@ where
             crate::task::spawn(async move {
                 if let Err(e) = me.load_system_catalog().await {
                     error!("Failed to load system catalog: {}", e);
+                    *me.0.load_error.write().unwrap() = Some(e.to_string());
+                    me.mark_loaded();
                 }
             });
         }
         me
     }
 
-    pub fn root(&self) -> Option<Attested<EntityState>> { self.0.root.read().unwrap().as_ref().map(|r| r.clone()) }
+    pub fn root(&self) -> Option<Attested<EntityState>> {
+        self.is_storage_generation_current().then(|| self.0.root.read().unwrap().as_ref().map(|root| root.proof.state.clone())).flatten()
+    }
+
+    /// The genesis-backed proof advertised in Presence. A root is exposed as
+    /// soon as it is atomically reserved; `is_system_ready` remains false until
+    /// its event and state are durable locally.
+    pub(crate) fn root_proof(&self) -> Option<proto::SystemRootProof> {
+        self.is_storage_generation_current().then(|| self.0.root.read().unwrap().as_ref().map(|root| root.proof.clone())).flatten()
+    }
+
+    /// The pinned system identity without cloning its complete state payload.
+    pub fn root_id(&self) -> Option<proto::EntityId> {
+        self.is_storage_generation_current().then(|| self.0.root.read().unwrap().as_ref().map(|root| root.proof.entity_id())).flatten()
+    }
+
+    /// The durable node identity anchored in the pinned system root.
+    pub fn founder(&self) -> Option<proto::NodeId> {
+        self.is_storage_generation_current().then(|| self.0.root.read().unwrap().as_ref().map(|root| root.founder)).flatten()
+    }
+
+    /// Verify the complete, immutable RFC-1 root proof and return the founder
+    /// encoded by its genesis. Nothing in the carried state is trusted: it must
+    /// equal the deterministic materialization of the content-addressed
+    /// genesis, including per-property provenance and the singleton head.
+    fn verify_root_proof(proof: &proto::SystemRootProof) -> Result<proto::NodeId> {
+        if !proof.state.attestations.is_empty() {
+            return Err(anyhow!("system root state must not carry attestation envelopes"));
+        }
+        let genesis = &proof.genesis;
+        genesis.validate_structure().map_err(|e| anyhow!("invalid root genesis structure: {e}"))?;
+
+        let expected_model = crate::schema::well_known_model_id(SYSTEM_COLLECTION_ID).expect("system collection has a well-known model id");
+        if genesis.model != expected_model {
+            return Err(anyhow!("root genesis uses a non-system model"));
+        }
+        if !matches!(&genesis.body, proto::EventBody::Genesis { system: None, .. }) {
+            return Err(anyhow!("system root must be a root genesis with system=None"));
+        }
+        if genesis.operations().0.len() != 1 {
+            return Err(anyhow!("system root genesis must contain only the lww backend"));
+        }
+        let lww_operations = genesis.operations().0.get("lww").ok_or_else(|| anyhow!("system root genesis has no lww operations"))?;
+
+        let backend = LWWBackend::new();
+        backend.apply_operations_with_event(lww_operations, genesis.id())?;
+        let item = proto::sys::Item::from_value(backend.get(&crate::property::PropertyKey::name("item")))?;
+        let proto::sys::Item::SysRoot { founder } = item else {
+            return Err(anyhow!("system root genesis does not contain a SysRoot record"));
+        };
+
+        let expected_state = EntityState {
+            entity_id: genesis.entity_id,
+            model: genesis.model,
+            state: proto::State {
+                state_buffers: proto::StateBuffers(BTreeMap::from([("lww".to_owned(), backend.to_state_buffer()?)])),
+                head: proto::Clock::from(vec![genesis.id()]),
+            },
+        };
+        if proof.state.payload != expected_state {
+            return Err(anyhow!("system root state is not the exact genesis materialization"));
+        }
+        Ok(founder)
+    }
+
+    /// Idempotently complete a persisted proposal. The engine-level claim
+    /// stores the full verified proof, so a loser or restart can safely finish
+    /// these exact writes after the original creator crashes.
+    async fn persist_root_proof(
+        storage: &StorageCollectionWrapper,
+        proof: &proto::SystemRootProof,
+        durable: bool,
+    ) -> Result<(), MutationError> {
+        let event_getter = LocalEventGetter::new(storage.clone(), durable);
+        let genesis: Attested<Event> = proof.genesis.clone().into();
+        event_getter.commit_event(&genesis).await?;
+        storage.set_state(proof.state.clone()).await?;
+        Ok(())
+    }
+
+    /// Validate and atomically reserve a durable peer's root before the peer is
+    /// inserted into durable routing. This is the first-join serialization
+    /// point: once one root is `Reserved`, a different root can only connect as
+    /// non-durable.
+    pub(crate) fn reserve_root_from_presence(&self, proof: &proto::SystemRootProof, claimant: proto::NodeId) -> Result<RootReservation> {
+        if !self.is_storage_generation_current() {
+            return Ok(RootReservation::Conflict);
+        }
+        let founder = Self::verify_root_proof(proof)?;
+        if founder != claimant {
+            return Err(anyhow!("root founder does not match presence node id"));
+        }
+
+        let incoming_id = proof.entity_id();
+        let mut root = self.0.root.write().unwrap();
+        let Some(existing) = root.as_mut() else {
+            if self.0.durable {
+                return Ok(RootReservation::Conflict);
+            }
+            *root = Some(RootBinding { proof: proof.clone(), founder, status: RootStatus::Reserved { needs_reset: false } });
+            return Ok(RootReservation::StartJoin(proof.clone()));
+        };
+
+        if existing.proof.entity_id() == incoming_id && existing.founder == founder {
+            return match existing.status {
+                RootStatus::StoredUnjoined if !self.0.durable => {
+                    existing.proof = proof.clone();
+                    existing.status = RootStatus::Reserved { needs_reset: false };
+                    Ok(RootReservation::StartJoin(proof.clone()))
+                }
+                RootStatus::Reserved { .. } | RootStatus::Ready => Ok(RootReservation::AlreadyPinned),
+                RootStatus::Aborting => Ok(RootReservation::Conflict),
+                RootStatus::StoredUnjoined => Ok(RootReservation::Conflict),
+            };
+        }
+
+        // An ephemeral cache is not a live pin until it re-joins. Preserve the
+        // historical ability to switch systems, but serialize the replacement
+        // synchronously so only this proof can become durable.
+        if !self.0.durable && existing.status == RootStatus::StoredUnjoined {
+            *existing = RootBinding { proof: proof.clone(), founder, status: RootStatus::Reserved { needs_reset: true } };
+            return Ok(RootReservation::StartJoin(proof.clone()));
+        }
+
+        Ok(RootReservation::Conflict)
+    }
 
     pub fn items(&self) -> Vec<Entity> { self.0.items.read().unwrap().clone() }
 
@@ -100,6 +343,9 @@ where
     /// then return collections.get to get the StorageCollectionWrapper
     pub async fn collection(&self, id: &CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
         self.wait_loaded().await;
+        if let Some(error) = self.0.load_error.read().unwrap().clone() {
+            return Err(RetrievalError::Other(format!("system catalog failed to load: {error}")));
+        }
         // TODO - update the system catalog to create an entity for this collection
 
         // Return the collection wrapper
@@ -107,12 +353,38 @@ where
     }
 
     /// Returns true if we've successfully initialized or joined a system
-    pub fn is_system_ready(&self) -> bool { *self.0.system_ready.read().unwrap() }
+    pub fn is_system_ready(&self) -> bool { self.is_storage_generation_current() && *self.0.system_ready.read().unwrap() }
+
+    pub(crate) fn is_storage_generation_current(&self) -> bool {
+        self.0.bound_storage_epoch.load(Ordering::Acquire) == self.0.collectionset.storage_epoch()
+    }
 
     /// Waits until we've successfully initialized or joined a system
     pub async fn wait_system_ready(&self) {
-        if !self.is_system_ready() {
-            self.0.system_ready_notify.notified().await;
+        loop {
+            if self.is_system_ready() || !self.is_storage_generation_current() {
+                return;
+            }
+
+            // Arm both notifications before the second check. A reset on a
+            // different Node has no access to this manager's local Notify, so
+            // the engine-shared epoch notification is what prevents a stale
+            // manager from sleeping forever.
+            let ready = self.0.system_ready_notify.notified();
+            tokio::pin!(ready);
+            ready.as_mut().enable();
+            let epoch_notify = self.0.collectionset.storage_epoch_notify();
+            let epoch_changed = epoch_notify.notified();
+            tokio::pin!(epoch_changed);
+            epoch_changed.as_mut().enable();
+
+            if self.is_system_ready() || !self.is_storage_generation_current() {
+                return;
+            }
+            tokio::select! {
+                _ = ready => {},
+                _ = epoch_changed => {},
+            }
         }
     }
 
@@ -124,6 +396,53 @@ where
         *self.0.catalog_reset_hook.write().unwrap() = Some(hook);
     }
 
+    pub(crate) fn set_peer_reset_hook(&self, hook: Arc<dyn Fn(Option<proto::EntityId>) + Send + Sync>) {
+        *self.0.peer_reset_hook.write().unwrap() = Some(hook);
+    }
+
+    pub(crate) fn is_resetting(&self) -> bool { self.0.resetting.load(Ordering::Acquire) }
+
+    pub(crate) fn is_destructive_resetting(&self) -> bool { self.0.destructive_resetting.load(Ordering::Acquire) }
+
+    /// Fence a transaction to the exact resident/system generation in which
+    /// it began. The returned guard must live across every durable write.
+    pub(crate) async fn guard_generation(
+        &self,
+        generation: &Arc<AtomicBool>,
+    ) -> Result<tokio::sync::OwnedRwLockReadGuard<()>, MutationError> {
+        let guard = self.0.collectionset.storage_read_lease().await;
+        if !self.is_storage_generation_current()
+            || !self.0.entities.is_current_generation(generation)
+            || !*self.0.system_ready.read().unwrap()
+        {
+            return Err(MutationError::SystemReset);
+        }
+        Ok(guard)
+    }
+
+    /// Fence an incoming/current-generation apply against reset. Unlike a
+    /// local transaction, the authenticated connection does not carry a
+    /// creation-time token, so readiness plus the exclusive gate is the
+    /// generation boundary.
+    pub(crate) async fn guard_current_generation(&self) -> Result<tokio::sync::OwnedRwLockReadGuard<()>, MutationError> {
+        let guard = self.0.collectionset.storage_read_lease().await;
+        if !self.is_storage_generation_current() || !*self.0.system_ready.read().unwrap() {
+            return Err(MutationError::SystemReset);
+        }
+        Ok(guard)
+    }
+
+    async fn guard_generation_allow_unready(
+        &self,
+        generation: &Arc<AtomicBool>,
+    ) -> Result<tokio::sync::OwnedRwLockReadGuard<()>, MutationError> {
+        let guard = self.0.collectionset.storage_read_lease().await;
+        if !self.is_storage_generation_current() || !self.0.entities.is_current_generation(generation) {
+            return Err(MutationError::SystemReset);
+        }
+        Ok(guard)
+    }
+
     /// Creates a new system root. This should only be called once per system by durable nodes
     /// The rest of the nodes must "join" this system.
     pub async fn create(&self) -> Result<()> {
@@ -133,41 +452,82 @@ where
 
         // Wait for local system catalog to be loaded
         self.wait_loaded().await;
-
-        {
-            let items = self.0.items.read().unwrap();
-            if !items.is_empty() {
-                return Err(anyhow!("System root already exists"));
-            }
+        if let Some(error) = self.0.load_error.read().unwrap().clone() {
+            return Err(anyhow!("system catalog failed to load: {error}"));
         }
+        let _create_guard = self.0.create_lock.lock().await;
+        let old_generation = self.0.entities.system_generation();
+        let _create_activity = ResetActivity::new(self.0.collectionset.storage_write_lease().await, &self.0.resetting);
+        if !self.is_storage_generation_current() || !self.0.entities.is_current_generation(&old_generation) {
+            return Err(MutationError::SystemReset.into());
+        }
+
+        let has_items = !self.0.items.read().unwrap().is_empty();
+        if has_items || self.0.root.read().unwrap().is_some() {
+            return Err(anyhow!("System root already exists"));
+        }
+
+        // Publishing a brand-new storage owner is a shared generation
+        // transition. Do it under the writer before constructing resident
+        // handles, so independently-built managers over this Arc<SE> become
+        // stale and only this winner binds the fresh token.
+        let (new_storage_epoch, fresh_generation) = self.0.collectionset.advance_storage_epoch();
+        self.0.bound_storage_epoch.store(new_storage_epoch, Ordering::Release);
+        self.invalidate_local_state_with_generation(true, None, Some(fresh_generation));
+        self.0.collectionset.publish_storage_epoch();
 
         // TODO - see if we can use the Model derive macro for a SysCatalogItem model rather than doing this manually
         let collection_id = CollectionId::fixed_name(SYSTEM_COLLECTION_ID);
         let storage = self.0.collectionset.get(&collection_id).await?;
 
-        let system_entity = self.0.entities.create(collection_id.clone());
+        let create_alive = Arc::new(AtomicBool::new(true));
+        let provisional = self.0.entities.create_provisional(collection_id.clone(), create_alive.clone());
+        let lww_backend = provisional.get_backend::<LWWBackend>().expect("LWW Backend should exist");
+        lww_backend
+            .set(crate::property::PropertyKey::name("item"), proto::sys::Item::SysRoot { founder: self.0.local_node_id }.into_value()?);
+        let model = crate::schema::well_known_model_id(SYSTEM_COLLECTION_ID).expect("system collection has a well-known model id");
+        let event = Event::genesis(model, None, provisional.extract_operations()?);
+        let transaction_entity = self.0.entities.create_transaction_entity(collection_id.clone(), &event, create_alive)?;
+        let system_entity = match &transaction_entity.kind {
+            crate::entity::EntityKind::Transacted { upstream, .. } => upstream.clone(),
+            crate::entity::EntityKind::Primary => return Err(anyhow!("system root creation did not produce a transaction fork")),
+        };
 
-        let lww_backend = system_entity.get_backend::<LWWBackend>().expect("LWW Backend should exist");
-        lww_backend.set(crate::property::PropertyKey::name("item"), proto::sys::Item::SysRoot.into_value()?);
+        // `snapshot_after_genesis` already contains the exact materialized
+        // genesis state while the resident primary remains empty. Persist the
+        // complete proof as the recoverable CAS proposal before any root data:
+        // a loser or restart can finish these identical writes if this task
+        // crashes at any later point.
+        let attested_state: Attested<EntityState> = transaction_entity.to_entity_state()?.into();
+        let proof = proto::SystemRootProof { genesis: event.clone(), state: attested_state };
+        Self::verify_root_proof(&proof)?;
+        match self.0.collectionset.claim_system_root(&proof).await? {
+            SystemRootClaim::Claimed => {}
+            SystemRootClaim::Existing(existing) => {
+                Self::verify_root_proof(&existing)?;
+                Self::persist_root_proof(&storage, &existing, true).await?;
+                self.0.entities.remove_if_phantom(&event.entity_id);
+                return Err(anyhow!("System root already claimed as {}", existing.entity_id()));
+            }
+        }
 
-        let event = system_entity.generate_commit_event()?.ok_or(anyhow!("Expected event"))?;
+        if let Err(error) = Self::persist_root_proof(&storage, &proof, true).await {
+            // Keep the full proof claim: unlike a bare id, it is a recoverable
+            // proposal. Clearing it could race a live writer and would make a
+            // crash between claim and persistence permanently ambiguous.
+            self.0.entities.remove_if_phantom(&event.entity_id);
+            return Err(error.into());
+        }
 
-        // Stage the event, apply, then commit
+        // The proof is durable; now advance the resident primary. The event is
+        // already stored, so lineage lookup can ground the application.
         let event_getter = LocalEventGetter::new(storage.clone(), true);
-        event_getter.stage_event(event.clone());
-
-        // Apply the creation event so LWW values are tagged with event_id before serialization.
         system_entity.apply_event(&event_getter, &event).await?;
-        let attested_event: Attested<Event> = event.clone().into();
-        event_getter.commit_event(&attested_event).await?;
-        // Now get the entity state after the head is updated
-        let attested_state: Attested<EntityState> = system_entity.to_entity_state()?.into();
-        storage.set_state(attested_state.clone()).await?;
 
         // Update our system state
         let mut items = self.0.items.write().unwrap();
         items.push(system_entity);
-        *self.0.root.write().unwrap() = Some(attested_state);
+        *self.0.root.write().unwrap() = Some(RootBinding { proof, founder: self.0.local_node_id, status: RootStatus::Ready });
 
         // Mark system as ready and notify waiters
         *self.0.system_ready.write().unwrap() = true;
@@ -176,76 +536,216 @@ where
         Ok(())
     }
 
-    /// Joins an existing system. This should only be called by ephemeral nodes.
-    pub async fn join_system(&self, state: Attested<EntityState>) -> Result<(), MutationError> {
-        // Wait for catalog to be loaded before proceeding
+    /// Persist a root that was already verified and atomically reserved by
+    /// [`Self::reserve_root_from_presence`]. The reservation remains pinned
+    /// throughout any storage reset, so a racing, different founder can never
+    /// enter durable routing during the async portion of join.
+    pub(crate) async fn finish_reserved_join(&self, proof: proto::SystemRootProof) -> Result<(), MutationError> {
         self.wait_loaded().await;
-
-        // If node is durable, fail - durable nodes should not join an existing system
         if self.0.durable {
-            warn!("Durable node attempted to join system - this is not allowed");
             return Err(MutationError::General(Box::new(std::io::Error::other("Durable nodes cannot join an existing system"))));
         }
+        Self::verify_root_proof(&proof).map_err(MutationError::from)?;
 
-        let root_state = self.root();
+        // Serialize the complete switch -- invalidation, deletion, root
+        // proof persistence, and publication. This prevents hard_reset or an
+        // old in-flight writer from interleaving between deletion and the new
+        // root becoming ready.
+        let _reset_activity = ResetActivity::new(self.0.collectionset.storage_write_lease().await, &self.0.resetting);
+        let result = async {
+            if !self.is_storage_generation_current() {
+                return Err(MutationError::SystemReset);
+            }
+            let reservation_needs_reset = {
+                let root = self.0.root.read().unwrap();
+                match root.as_ref() {
+                    Some(RootBinding { proof: reserved, status: RootStatus::Reserved { needs_reset }, .. })
+                        if reserved.entity_id() == proof.entity_id() =>
+                    {
+                        *needs_reset
+                    }
+                    _ => {
+                        return Err(MutationError::General(Box::new(std::io::Error::other(
+                            "system root reservation was lost before join",
+                        ))));
+                    }
+                }
+            };
+            let needs_reset = self.0.load_error.read().unwrap().is_some() || reservation_needs_reset;
+            let _destructive_reset = needs_reset.then(|| FlagActivity::new(&self.0.destructive_resetting));
 
-        // If we have a matching root, we're already in sync - just mark ready and return
-        if let Some(root) = root_state {
-            if root.payload.state.head == state.payload.state.head {
-                notice_info!("Found matching root - Node is part of the same system");
-                *self.0.system_ready.write().unwrap() = true;
-                self.0.system_ready_notify.notify_waiters();
+            if needs_reset {
+                tracing::info!("Resetting storage to replace mismatched reserved root");
+                self.clear_local_state_locked(false).await?;
+            }
+
+            let collection_id = CollectionId::fixed_name(SYSTEM_COLLECTION_ID);
+            let storage = self.0.collectionset.get(&collection_id).await?;
+            match self.0.collectionset.claim_system_root(&proof).await? {
+                SystemRootClaim::Claimed => {
+                    if !needs_reset {
+                        // A successful first claim establishes a new shared
+                        // storage owner just like create(). Managers that
+                        // reserved a competing root in the old empty epoch
+                        // must be stale before this writer is released.
+                        let (new_storage_epoch, fresh_generation) = self.0.collectionset.advance_storage_epoch();
+                        self.0.bound_storage_epoch.store(new_storage_epoch, Ordering::Release);
+                        self.invalidate_local_state_with_generation(false, Some(proof.entity_id()), Some(fresh_generation));
+                        self.0.collectionset.publish_storage_epoch();
+                    }
+                }
+                SystemRootClaim::Existing(existing) if existing == proof => {}
+                SystemRootClaim::Existing(existing) => {
+                    return Err(MutationError::General(Box::new(std::io::Error::other(format!(
+                        "storage is already claimed by system root {}",
+                        existing.entity_id()
+                    )))));
+                }
+            }
+            Self::persist_root_proof(&storage, &proof, false).await?;
+
+            {
+                let mut root = self.0.root.write().unwrap();
+                match root.as_mut() {
+                    Some(binding)
+                        if binding.proof.entity_id() == proof.entity_id() && matches!(binding.status, RootStatus::Reserved { .. }) =>
+                    {
+                        binding.proof = proof;
+                        binding.status = RootStatus::Ready;
+                    }
+                    _ => {
+                        return Err(MutationError::General(Box::new(std::io::Error::other("system root reservation changed during join"))));
+                    }
+                }
+            }
+            *self.0.system_ready.write().unwrap() = true;
+            self.0.system_ready_notify.notify_waiters();
+            notice_info!("Persisted verified system root and completed join");
+            Ok(())
+        }
+        .await;
+        result
+    }
+
+    /// Synchronously fence an exact pending join before any peer cleanup. New
+    /// presences see `Aborting` and cannot attach to a reservation whose async
+    /// storage cleanup is about to run.
+    pub(crate) fn begin_abort_reserved_join(&self, root_id: proto::EntityId) -> Option<RootJoinAbort> {
+        let mut root = self.0.root.write().unwrap();
+        let binding = root.as_mut()?;
+        if binding.proof.entity_id() != root_id || !matches!(binding.status, RootStatus::Reserved { .. }) {
+            return None;
+        }
+        binding.status = RootStatus::Aborting;
+        Some(RootJoinAbort { proof: binding.proof.clone() })
+    }
+
+    /// Destructively clear every artifact accepted while `abort` was the
+    /// pending root, then remove only that exact fenced reservation.
+    pub(crate) async fn finish_abort_reserved_join(&self, abort: RootJoinAbort) -> Result<(), MutationError> {
+        let _reset_activity = ResetActivity::new(self.0.collectionset.storage_write_lease().await, &self.0.resetting);
+        let _destructive_reset = FlagActivity::new(&self.0.destructive_resetting);
+        let result = async {
+            // Another Node using this exact storage engine may have reset and
+            // created a new system while this abort waited for the writer.
+            // In that case this manager may invalidate only its local caches;
+            // it must never advance the epoch or delete the new owner's rows.
+            if !self.is_storage_generation_current() {
+                self.invalidate_local_state(true, None);
                 return Ok(());
             }
-            tracing::warn!("Mismatched root state during join: local={:?}, remote={:?}", root, state.payload.state.head);
-
-            // Only reset storage if we have a root that needs to be replaced
-            tracing::info!("Resetting storage to replace mismatched root");
-            // Drop locks before reset
-            {
-                let mut root = self.0.root.write().expect("Root lock poisoned");
-                *root = None;
+            if self.0.collectionset.system_root_claim().await?.is_some_and(|claimed| claimed != abort.proof) {
+                // A different manager won and published while this abort was
+                // queued. Even on a legacy/non-advanced epoch, never erase a
+                // durable claim that does not belong to this reservation.
+                self.invalidate_local_state(true, None);
+                return Ok(());
             }
-            self.hard_reset().await.map_err(|e| MutationError::General(Box::new(std::io::Error::other(e.to_string()))))?;
+            self.clear_local_state_locked(false).await?;
+            let mut root = self.0.root.write().unwrap();
+            match root.as_ref() {
+                Some(binding) if binding.status == RootStatus::Aborting && binding.proof == abort.proof => {
+                    *root = None;
+                    Ok(())
+                }
+                _ => Err(MutationError::General(Box::new(std::io::Error::other("system root reservation changed during abort cleanup")))),
+            }
         }
-
-        let collection_id = CollectionId::fixed_name(SYSTEM_COLLECTION_ID);
-        let storage = self.0.collectionset.get(&collection_id).await?;
-
-        // Set the state
-        storage.set_state(state.clone()).await?;
-
-        // Set root and mark system as ready
-        {
-            let mut root = self.0.root.write().expect("Root lock poisoned");
-            *root = Some(state);
-        }
-        *self.0.system_ready.write().unwrap() = true;
-        self.0.system_ready_notify.notify_waiters();
-
-        Ok(())
+        .await;
+        result
     }
 
     /// Resets all storage by deleting all collections, including the system collection.
     /// This is used when an ephemeral node needs to join a system with a different root.
     /// **This is a destructive operation and should be used with extreme caution.**
-    pub async fn hard_reset(&self) -> Result<()> {
+    pub async fn hard_reset(&self) -> Result<()> { self.clear_local_state(true).await.map_err(anyhow::Error::from) }
+
+    /// Clear system-owned storage and caches. A reserved first-join root can be
+    /// preserved while the old system's storage is deleted; this is what keeps
+    /// the reservation race-free across the async reset.
+    async fn clear_local_state(&self, clear_root: bool) -> Result<(), MutationError> {
+        let _reset_activity = ResetActivity::new(self.0.collectionset.storage_write_lease().await, &self.0.resetting);
+        let _destructive_reset = FlagActivity::new(&self.0.destructive_resetting);
+        let result = self.clear_local_state_locked(clear_root).await;
+        result
+    }
+
+    /// Clear while the caller owns the reset writer. Root reservation status
+    /// decides whether one pending new-founder PeerState is preserved; old
+    /// ready peers and all other sessions are always drained.
+    async fn clear_local_state_locked(&self, clear_root: bool) -> Result<(), MutationError> {
+        let (new_storage_epoch, fresh_generation) = self.0.collectionset.advance_storage_epoch();
+        self.0.bound_storage_epoch.store(new_storage_epoch, Ordering::Release);
+        let preserved_pending_root = if clear_root {
+            None
+        } else {
+            self.0
+                .root
+                .read()
+                .unwrap()
+                .as_ref()
+                .and_then(|binding| matches!(binding.status, RootStatus::Reserved { .. }).then(|| binding.proof.entity_id()))
+        };
+
+        self.invalidate_local_state_with_generation(clear_root, preserved_pending_root, Some(fresh_generation));
+        self.0.collectionset.publish_storage_epoch();
+
         // Delete all collections from storage
         self.0.collectionset.delete_all_collections().await?;
 
-        // Reset our state
-        {
-            let mut items = self.0.items.write().unwrap();
-            items.clear();
+        Ok(())
+    }
+
+    /// Invalidate state owned solely by this manager. This contains no await
+    /// and never touches shared storage, so a stale manager can safely use it
+    /// after losing the engine epoch without erasing the succeeding system.
+    fn invalidate_local_state(&self, clear_root: bool, preserved_pending_root: Option<proto::EntityId>) {
+        self.invalidate_local_state_with_generation(clear_root, preserved_pending_root, None);
+    }
+
+    fn invalidate_local_state_with_generation(
+        &self,
+        clear_root: bool,
+        preserved_pending_root: Option<proto::EntityId>,
+        fresh_generation: Option<Arc<AtomicBool>>,
+    ) {
+        // Publish unready and invalidate all resident handles before any
+        // destructive await. A failure to delete therefore remains fail
+        // closed instead of leaving old strong handles live.
+        *self.0.system_ready.write().unwrap() = false;
+        match fresh_generation {
+            Some(generation) => self.0.entities.system_reset_to(generation),
+            None => self.0.entities.system_reset(),
         }
-        {
-            let mut root = self.0.root.write().unwrap();
-            *root = None;
+        if let Some(hook) = self.0.peer_reset_hook.read().unwrap().clone() {
+            hook(preserved_pending_root);
         }
-        {
-            let mut collection_map = self.0.collection_map.write().unwrap();
-            collection_map.clear();
+
+        self.0.items.write().unwrap().clear();
+        if clear_root {
+            *self.0.root.write().unwrap() = None;
         }
+        self.0.collection_map.write().unwrap().clear();
 
         // Flush the in-memory catalog map (RFC 5.2): allocated catalog ids
         // belong to one system, so a node re-joining a different system must
@@ -260,15 +760,11 @@ where
             hook();
         }
 
-        {
-            let mut system_ready = self.0.system_ready.write().unwrap();
-            *system_ready = false;
-        }
+        *self.0.load_error.write().unwrap() = None;
 
         // Reset the reactor state to notify subscriptions
         self.0.reactor.system_reset();
-
-        Ok(())
+        self.0.system_ready_notify.notify_waiters();
     }
 
     /// Returns true if the local system catalog is loaded
@@ -276,9 +772,20 @@ where
 
     /// Waits for the local system catalog to be loaded
     pub async fn wait_loaded(&self) {
-        if !self.is_loaded() {
-            self.0.loading.notified().await;
+        if self.is_loaded() {
+            return;
         }
+        let notified = self.0.loading.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !self.is_loaded() {
+            notified.await;
+        }
+    }
+
+    fn mark_loaded(&self) {
+        let _ = self.0.loaded.set(());
+        self.0.loading.notify_waiters();
     }
 
     async fn load_system_catalog(&self) -> Result<()> {
@@ -286,57 +793,137 @@ where
             return Err(anyhow!("System catalog already loaded"));
         }
 
+        let system_generation = self.0.entities.system_generation();
+        let _reset_guard = self.guard_generation_allow_unready(&system_generation).await?;
+
         let collection_id = CollectionId::fixed_name(SYSTEM_COLLECTION_ID);
         let storage = self.0.collectionset.get(&collection_id).await?;
 
-        let mut entities = Vec::new();
-        let mut root_state = None;
+        // A claim is a complete verified proposal, not a bare id. If the
+        // original creator crashed after CAS, finish its exact idempotent
+        // writes before scanning. Never steal or clear an absent-state claim:
+        // doing so would race a live slow writer.
+        let claimed_proof = self.0.collectionset.system_root_claim().await?;
+        if let Some(proof) = &claimed_proof {
+            Self::verify_root_proof(proof)?;
+            Self::persist_root_proof(&storage, proof, self.0.durable).await?;
+        }
+
+        let states =
+            storage.fetch_states(&ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None }).await?;
+        let mut item_states = Vec::new();
+        let mut root_states = Vec::new();
+        for state in &states {
+            let Some(buffer) = state.payload.state.state_buffers.0.get("lww") else { continue };
+            let backend = LWWBackend::from_state_buffer(buffer)?;
+            let Some(value) = backend.get(&crate::property::PropertyKey::name("item")) else { continue };
+            let item = proto::sys::Item::from_value(Some(value))?;
+            if matches!(item, proto::sys::Item::SysRoot { .. }) {
+                root_states.push(state.clone());
+            }
+            item_states.push(state.clone());
+        }
+
+        // Validate every root candidate before mutating the in-memory catalog.
+        // Multiple distinct valid roots are corruption and fail closed; the old
+        // last-wins behavior silently selected whichever scan row came last.
+        let mut valid_roots = BTreeMap::<proto::EntityId, RootBinding>::new();
+        for state in root_states {
+            let event_id = proto::EventId::from_bytes(state.payload.entity_id.to_bytes());
+            let Some(genesis) = storage.get_events(vec![event_id]).await?.into_iter().next() else {
+                error!("Ignoring persisted system root whose genesis event is missing");
+                continue;
+            };
+            let proof = proto::SystemRootProof { genesis: genesis.payload, state };
+            match Self::verify_root_proof(&proof) {
+                Ok(founder) => {
+                    valid_roots.insert(
+                        proof.entity_id(),
+                        RootBinding {
+                            proof,
+                            founder,
+                            status: if self.0.durable && founder == self.0.local_node_id {
+                                RootStatus::Ready
+                            } else {
+                                RootStatus::StoredUnjoined
+                            },
+                        },
+                    );
+                }
+                Err(error) => error!("Ignoring persisted system root without a valid self-certifying proof: {error}"),
+            }
+        }
+        if valid_roots.len() > 1 {
+            return Err(anyhow!("storage contains {} distinct valid system roots", valid_roots.len()));
+        }
+        let loaded_root = valid_roots.into_values().next();
+
+        match (&claimed_proof, &loaded_root) {
+            (Some(claimed), Some(loaded)) if claimed == &loaded.proof => {}
+            (Some(claimed), Some(loaded)) => {
+                return Err(anyhow!("system-root claim {} conflicts with stored root {}", claimed.entity_id(), loaded.proof.entity_id()));
+            }
+            (Some(claimed), None) => {
+                return Err(anyhow!("system-root claim {} could not be materialized", claimed.entity_id()));
+            }
+            (None, Some(loaded)) => match self.0.collectionset.claim_system_root(&loaded.proof).await? {
+                SystemRootClaim::Claimed => {}
+                SystemRootClaim::Existing(existing) if existing == loaded.proof => {}
+                SystemRootClaim::Existing(existing) => {
+                    return Err(anyhow!("stored root {} lost claim reconciliation to {}", loaded.proof.entity_id(), existing.entity_id()));
+                }
+            },
+            (None, None) => {}
+        }
 
         let state_getter = LocalStateGetter::new(storage.clone());
         let event_getter = LocalEventGetter::new(storage.clone(), self.0.durable);
-
-        for state in
-            storage.fetch_states(&ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None }).await?
-        {
+        let mut entities = Vec::new();
+        for state in item_states {
             let (_entity_changed, entity) = self
                 .0
                 .entities
                 .with_state(&state_getter, &event_getter, state.payload.entity_id, collection_id.clone(), state.payload.state.clone())
                 .await?;
-            let lww_backend = entity.get_backend::<LWWBackend>().expect("LWW Backend should exist");
-            if let Some(value) = lww_backend.get(&crate::property::PropertyKey::name("item")) {
-                let item = proto::sys::Item::from_value(Some(value)).expect("Invalid sys item");
+            entities.push(entity);
+        }
 
-                if let proto::sys::Item::SysRoot = &item {
-                    root_state = Some(state);
+        let mut durable_root_ready = false;
+        {
+            let mut root = self.0.root.write().expect("Root lock poisoned");
+            match root.as_mut() {
+                // A first presence may reserve while the asynchronous storage
+                // load is in flight. Never overwrite it; only tell the pending
+                // join whether replacing the loaded cache requires a reset.
+                Some(RootBinding { proof, status: RootStatus::Reserved { needs_reset }, .. }) => {
+                    *needs_reset = loaded_root.as_ref().is_some_and(|loaded| loaded.proof.entity_id() != proof.entity_id());
                 }
-                entities.push(entity);
+                Some(_) => {}
+                None => {
+                    durable_root_ready = self.0.durable
+                        && loaded_root
+                            .as_ref()
+                            .is_some_and(|binding| binding.founder == self.0.local_node_id && binding.status == RootStatus::Ready);
+                    if self.0.durable && loaded_root.as_ref().is_some_and(|binding| binding.founder != self.0.local_node_id) {
+                        error!(
+                            "Durable node key does not match the founder recorded in persisted system root; reopen with the persisted signing key"
+                        );
+                    }
+                    *root = loaded_root;
+                }
             }
         }
 
-        // Update our system state
-        {
-            let mut items = self.0.items.write().unwrap();
-            items.extend(entities);
-        }
+        self.0.items.write().unwrap().extend(entities);
 
-        // If we loaded a system root and we're a durable node, we're ready
-        let has_root = root_state.is_some();
-        {
-            let mut root = self.0.root.write().expect("Root lock poisoned");
-            *root = root_state;
-        }
-
-        // Only mark ready if we're a durable node and found a root
-        // Ephemeral nodes must explicitly join via join_system()
-        if has_root && self.0.durable {
+        // Only a durable whose persisted key matches the proven founder is
+        // ready after load. Ephemeral nodes explicitly complete first join.
+        if durable_root_ready {
             *self.0.system_ready.write().unwrap() = true;
             self.0.system_ready_notify.notify_waiters();
         }
 
-        // Set loaded state and notify waiters
-        self.0.loaded.set(()).expect("Loading flag already set");
-        self.0.loading.notify_waiters();
+        self.mark_loaded();
         Ok(())
     }
 }

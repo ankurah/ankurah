@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, HashMap};
 use ankurah_core::bench_support::{compare, topo_sort_events, AbstractCausalRelation, DEFAULT_BUDGET};
 use ankurah_core::error::RetrievalError;
 use ankurah_core::retrieval::GetEvents;
-use ankurah_proto::{Attested, Clock, EntityId, Event, EventId, OperationSet};
+use ankurah_proto::{Attested, Clock, EntityId, Event, EventBody, EventId, OperationSet};
 use async_trait::async_trait;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
@@ -63,14 +63,25 @@ impl GetEvents for MemRetriever {
 /// remain stable across runs. A `u32` seed space keeps wide/deep shapes free
 /// of collisions.
 fn event(seed: u32, parents: &[EventId]) -> Event {
-    let mut entity_id_bytes = [0u8; 16];
+    let mut entity_id_bytes = [0u8; 32];
     entity_id_bytes[0..4].copy_from_slice(&seed.to_be_bytes());
-    Event {
-        entity_id: EntityId::from_bytes(entity_id_bytes),
-        model: EntityId::from_bytes([0; 16]),
-        parent: Clock::from(parents.to_vec()),
-        operations: OperationSet(BTreeMap::new()),
-    }
+    let update_entity_id = EntityId::from_bytes(entity_id_bytes);
+    let mut model_bytes = [0u8; 32];
+    model_bytes[0] = 0xEE;
+    let model = EntityId::from_bytes(model_bytes);
+    let parent = Clock::from(parents.to_vec());
+    let operations = OperationSet(BTreeMap::new());
+    let (entity_id, body) = if parent.is_empty() {
+        let system = None;
+        let mut nonce = [0u8; 32];
+        nonce[0..4].copy_from_slice(&seed.to_be_bytes());
+        let timestamp = seed as u64;
+        let entity_id = EntityId::from(EventId::from_genesis_parts(&system, &nonce, timestamp, &operations));
+        (entity_id, EventBody::Genesis { system, nonce, timestamp, operations })
+    } else {
+        (update_entity_id, EventBody::Update { operations })
+    };
+    Event { entity_id, model, parent, body }
 }
 
 /// A generated scenario: the populated retriever plus the two clocks to
