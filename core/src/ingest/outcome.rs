@@ -36,7 +36,7 @@ pub(crate) enum SkipReason {
     /// The comparison verdict was Equal or StrictAscends: the head already
     /// incorporates this event.
     AlreadyIntegrated,
-    /// Scheduled but no longer staged when execution reached it (cap
-    /// eviction raced the plan). The sender's retry re-delivers.
+    /// Scheduled but no longer staged when execution reached it (concurrent
+    /// promotion or removal raced the plan). The sender's retry re-delivers.
     NotStaged,
 }

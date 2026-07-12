@@ -286,11 +286,11 @@ where
         let mut peer_sender: Option<WebsocketPeerSender> = None;
         let mut outgoing_rx: Option<tokio::sync::mpsc::UnboundedReceiver<proto::NodeMessage>> = None;
 
-        loop {
+        let result = loop {
             select! {
                 _ = inner.shutdown.notified() => {
                     debug!("Connection received shutdown signal");
-                    break;
+                    break Ok(());
                 }
                 msg = async {
                     match &mut outgoing_rx {
@@ -298,26 +298,26 @@ where
                         None => std::future::pending().await,
                     }
                 } => {
-                    if Self::handle_outgoing_message(&mut sink, msg).await.is_err() {
-                        break;
+                    if let Err(e) = Self::handle_outgoing_message(&mut sink, msg).await {
+                        break Err(e);
                     }
                 }
                 msg = stream.next() => {
-                    match Self::handle_incoming_message(inner, msg, &mut peer_sender, &mut outgoing_rx, &mut sink).await? {
-                        MessageResult::Continue => continue,
-                        MessageResult::Break => break,
+                    match Self::handle_incoming_message(inner, msg, &mut peer_sender, &mut outgoing_rx, &mut sink).await {
+                        Ok(MessageResult::Continue) => continue,
+                        Err(e) => break Err(e),
                     }
                 }
             }
-        }
+        };
 
-        // Cleanup
+        // Always clean up an established peer, including error exits.
         inner.connected.store(false, Ordering::Release);
         if let Some(sender) = peer_sender {
             inner.node.deregister_peer(sender.recipient_node_id());
             debug!("Deregistered peer {}", sender.recipient_node_id());
         }
-        Ok(())
+        result
     }
 
     async fn handle_outgoing_message(
@@ -390,7 +390,7 @@ where
             },
             Some(Ok(Message::Close(_))) => {
                 info!("WebSocket connection closed by server");
-                Ok(MessageResult::Break)
+                Err(anyhow::anyhow!("WebSocket connection closed by server"))
             }
             Some(Ok(Message::Ping(data))) => {
                 debug!("Received ping, sending pong");
@@ -418,7 +418,7 @@ where
             }
             None => {
                 info!("WebSocket stream closed");
-                Ok(MessageResult::Break)
+                Err(anyhow::anyhow!("WebSocket stream closed"))
             }
         }
     }
@@ -457,7 +457,6 @@ where
 #[derive(Debug)]
 enum MessageResult {
     Continue,
-    Break,
 }
 
 impl<SE, PA> Drop for WebsocketClient<SE, PA>

@@ -157,14 +157,10 @@ impl StorageEngine for SqliteStorageEngine {
 
 fn create_state_table(conn: &Connection, collection_id: &CollectionId) -> Result<(), SqliteError> {
     let table_name = collection_id.as_str();
-    // generations is the per-tip head-generation column (D2 M4, plan REV 5
-    // section K home 3): a JSON array of u32 PARALLEL to the head array
-    // (generations[i] annotates head[i]). NOT NULL because the annotation
-    // is mandatory (fresh-database ruling); a pre-M4 table lacks the column
-    // and state reads fail loudly. Reads are STRICTLY TYPED: sqlite treats
-    // an unknown double-quoted identifier as a string literal (the F2
-    // trap), so the reader parses the value as JSON and the literal string
-    // "generations" fails the parse instead of decoding silently.
+    // `generations` is a JSON array of u32 values parallel to `head`, with
+    // `generations[i]` annotating `head[i]`. The annotation is mandatory.
+    // Reads parse it as typed JSON, so an older SQLite schema cannot exploit
+    // SQLite's unknown-quoted-identifier behavior to decode a fake value.
     let query = format!(
         r#"CREATE TABLE IF NOT EXISTS "{}"(
             "id" TEXT PRIMARY KEY,
@@ -486,11 +482,8 @@ impl SqliteBucket {
     }
 }
 
-/// Reconstitute the per-tip head generations from the parallel columns (D2
-/// M4, plan REV 5 section K): the generations JSON array annotates the head
-/// array position-wise, both in Clock's sorted canonical order. Strictly
-/// typed and length-checked; a pre-M4 row yields the F2 string literal
-/// "generations" here, which fails the JSON parse loudly.
+/// Reconstitute head generations from the parallel JSON and head columns.
+/// Parsing and length checks reject incompatible schemas or malformed rows.
 fn gclock_from_parallel(head: &Clock, generations_json: &str) -> Result<GClock, SqliteError> {
     let generations: Vec<u32> = serde_json::from_str(generations_json).map_err(SqliteError::Json)?;
     if generations.len() != head.len() {
@@ -501,6 +494,14 @@ fn gclock_from_parallel(head: &Clock, generations_json: &str) -> Result<GClock, 
         )));
     }
     Ok(GClock::new(head.iter().zip(generations).map(|(tip, generation)| (generation, tip.clone())).collect::<Vec<_>>()))
+}
+
+fn ensure_event_identity(stored_id: &EventId, event: &Event) -> Result<(), RetrievalError> {
+    let actual = event.id();
+    if actual != *stored_id {
+        return Err(RetrievalError::Other(format!("event identity mismatch: stored key {stored_id}, payload recomputed to {actual}")));
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -881,13 +882,13 @@ impl StorageCollection for SqliteBucket {
                 let mut stmt = c.prepare(&query)?;
                 let params: Vec<&dyn rusqlite::ToSql> = id_strings.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
                 let rows = stmt.query_map(params.as_slice(), |row| {
-                    let _event_id: String = row.get(0)?;
+                    let event_id: String = row.get(0)?;
                     let entity_id_str: String = row.get(1)?;
                     let operations: Vec<u8> = row.get(2)?;
                     let parent_json: String = row.get(3)?;
                     let generation: u32 = row.get(4)?;
                     let attestations_blob: Vec<u8> = row.get(5)?;
-                    Ok((entity_id_str, operations, parent_json, generation, attestations_blob))
+                    Ok((event_id, entity_id_str, operations, parent_json, generation, attestations_blob))
                 })?;
                 Ok(rows.collect::<Result<Vec<_>, _>>()?)
             })
@@ -900,13 +901,16 @@ impl StorageCollection for SqliteBucket {
         let mut events = Vec::with_capacity(raw_rows.len());
         if !raw_rows.is_empty() {
             let model = self.model_id()?;
-            for (entity_id_str, operations_blob, parent_json, generation, attestations_blob) in raw_rows {
+            for (stored_id_str, entity_id_str, operations_blob, parent_json, generation, attestations_blob) in raw_rows {
+                let stored_id = EventId::from_base64(&stored_id_str).map_err(|e| RetrievalError::storage(std::io::Error::other(e)))?;
                 let entity_id = EntityId::from_base64(&entity_id_str).map_err(|e| RetrievalError::storage(std::io::Error::other(e)))?;
                 let operations: OperationSet = bincode::deserialize(&operations_blob).map_err(RetrievalError::storage)?;
                 let parent: Clock = serde_json::from_str(&parent_json).map_err(RetrievalError::storage)?;
                 let attestations: AttestationSet = bincode::deserialize(&attestations_blob).map_err(RetrievalError::storage)?;
 
-                events.push(Attested { payload: Event { model, entity_id, operations, parent, generation }, attestations });
+                let payload = Event { model, entity_id, operations, parent, generation };
+                ensure_event_identity(&stored_id, &payload)?;
+                events.push(Attested { payload, attestations });
             }
         }
         Ok(events)
@@ -941,12 +945,12 @@ impl StorageCollection for SqliteBucket {
 
                 let mut stmt = c.prepare(&query)?;
                 let rows = stmt.query_map([&entity_id_str], |row| {
-                    let _event_id: String = row.get(0)?;
+                    let event_id: String = row.get(0)?;
                     let operations: Vec<u8> = row.get(1)?;
                     let parent_json: String = row.get(2)?;
                     let generation: u32 = row.get(3)?;
                     let attestations_blob: Vec<u8> = row.get(4)?;
-                    Ok((operations, parent_json, generation, attestations_blob))
+                    Ok((event_id, operations, parent_json, generation, attestations_blob))
                 })?;
                 Ok(rows.collect::<Result<Vec<_>, _>>()?)
             })
@@ -957,12 +961,15 @@ impl StorageCollection for SqliteBucket {
         let mut events = Vec::with_capacity(raw_rows.len());
         if !raw_rows.is_empty() {
             let model = self.model_id()?;
-            for (operations_blob, parent_json, generation, attestations_blob) in raw_rows {
+            for (stored_id_str, operations_blob, parent_json, generation, attestations_blob) in raw_rows {
+                let stored_id = EventId::from_base64(&stored_id_str).map_err(|e| RetrievalError::storage(std::io::Error::other(e)))?;
                 let operations: OperationSet = bincode::deserialize(&operations_blob).map_err(RetrievalError::storage)?;
                 let parent: Clock = serde_json::from_str(&parent_json).map_err(RetrievalError::storage)?;
                 let attestations: AttestationSet = bincode::deserialize(&attestations_blob).map_err(RetrievalError::storage)?;
 
-                events.push(Attested { payload: Event { model, entity_id, operations, parent, generation }, attestations });
+                let payload = Event { model, entity_id, operations, parent, generation };
+                ensure_event_identity(&stored_id, &payload)?;
+                events.push(Attested { payload, attestations });
             }
         }
         Ok(events)
@@ -997,6 +1004,68 @@ fn post_filter_states(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct IdentityTestResolver {
+        model: EntityId,
+    }
+
+    impl PropertyResolver for IdentityTestResolver {
+        fn resolve(&self, _collection: &str, _name: &str) -> Option<EntityId> { None }
+        fn name_for(&self, _id: &EntityId) -> Option<String> { None }
+        fn model_id_for(&self, collection: &str) -> Option<EntityId> { (collection == "identity_check").then_some(self.model) }
+    }
+
+    #[test]
+    fn event_payload_must_recompute_to_the_stored_key() {
+        let honest = Event {
+            model: EntityId::from_bytes([0x11; 16]),
+            entity_id: EntityId::from_bytes([0x22; 16]),
+            operations: OperationSet(BTreeMap::new()),
+            parent: Clock::default(),
+            generation: 1,
+        };
+        let stored_id = honest.id();
+        ensure_event_identity(&stored_id, &honest).unwrap();
+
+        let doctored = Event { generation: 2, ..honest };
+        let err = ensure_event_identity(&stored_id, &doctored).unwrap_err();
+        assert!(err.to_string().contains("event identity mismatch"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn event_getters_reject_a_payload_stored_under_the_wrong_key() {
+        let engine = SqliteStorageEngine::open_in_memory().await.unwrap();
+        let model = EntityId::from_bytes([0x11; 16]);
+        let resolver: Arc<dyn PropertyResolver> = Arc::new(IdentityTestResolver { model });
+        engine.set_property_resolver(Arc::downgrade(&resolver));
+        let collection = engine.collection(&"identity_check".into()).await.unwrap();
+
+        let honest = Event {
+            model,
+            entity_id: EntityId::from_bytes([0x22; 16]),
+            operations: OperationSet(BTreeMap::new()),
+            parent: Clock::default(),
+            generation: 1,
+        };
+        let stored_id = honest.id();
+        let entity_id = honest.entity_id;
+        collection.add_event(&Attested::opt(honest, None)).await.unwrap();
+
+        let stored_id_string = stored_id.to_base64();
+        let conn = engine.pool.get().await.unwrap();
+        conn.with_connection(move |connection| {
+            connection.execute(r#"UPDATE "identity_check_event" SET "generation" = 2 WHERE "id" = ?"#, [&stored_id_string])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        drop(conn);
+
+        let err = collection.get_events(vec![stored_id.clone()]).await.unwrap_err();
+        assert!(err.to_string().contains("event identity mismatch"), "unexpected get error: {err}");
+        let err = collection.dump_entity_events(entity_id).await.unwrap_err();
+        assert!(err.to_string().contains("event identity mismatch"), "unexpected dump error: {err}");
+    }
 
     #[tokio::test]
     async fn test_open_in_memory() {

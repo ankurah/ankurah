@@ -173,6 +173,20 @@ pub async fn doctored_stored_event_generation_fails_loudly_on_read() -> Result<(
     let got = collection.get_events(vec![genesis.id()]).await;
     assert!(got.is_err(), "get_events over a non-number stored generation must fail loudly, got {got:?}");
 
+    // A different but well-typed u32 passes numeric decoding, then must fail
+    // the content-address check against the object-store primary key.
+    doctor_stored_generation(&db_name, &key, JsValue::from_f64(2.0)).await;
+    let got = collection.get_events(vec![genesis.id()]).await;
+    assert!(
+        got.as_ref().is_err_and(|e| e.to_string().contains("event identity mismatch")),
+        "get_events must reject a well-typed payload that no longer matches its key, got {got:?}"
+    );
+    let dumped = collection.dump_entity_events(entity_id).await;
+    assert!(
+        dumped.as_ref().is_err_and(|e| e.to_string().contains("event identity mismatch")),
+        "dump_entity_events must reject a well-typed payload that no longer matches its primary key, got {dumped:?}"
+    );
+
     // Restore the honest value: the row decodes again, exact (the happy
     // path is lossless and must not be collateral damage of the checks).
     doctor_stored_generation(&db_name, &key, JsValue::from_f64(1.0)).await;

@@ -18,9 +18,8 @@ impl std::fmt::Debug for EventId {
 }
 
 impl EventId {
-    /// Generate an EventID from the parts of an Event
-    /// notably, we are not including the collection in the hash because collection is getting excised from identity
-    /// The generation is inside the hashed content (266-E): two events differing only in generation are distinct events.
+    /// Hash the identity-bearing parts of an event. Model attribution is
+    /// deliberately excluded; generation is included.
     pub fn from_parts(entity_id: &EntityId, operations: &OperationSet, parent: &Clock, generation: u32) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(bincode::serialize(&entity_id).unwrap());
@@ -108,22 +107,15 @@ impl<'de> Deserialize<'de> for EventId {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Event {
-    /// The model-definition entity id this event's entity is read/mutated
-    /// under (#330). The wire carries the model ID, never a collection name:
-    /// receivers resolve it to local storage through well-known ids, the
-    /// catalog, and engine-owned mappings. Deliberately EXCLUDED from
-    /// [`EventId`] hashing, like the collection string before it.
+    /// Model-definition id used to route this event to a collection. It is
+    /// deliberately excluded from [`EventId`]; attribution is envelope-level.
     pub model: EntityId,
     pub entity_id: EntityId,
     pub operations: OperationSet,
     /// The set of concurrent events (usually only one) which is the precursor of this event
     pub parent: Clock,
-    /// The git-v1 topological level of this event: `1 + max(parent generations)`,
-    /// or `1` for a genesis event (266-A, 266-E). Stamped by the committer, carried
-    /// inside the hashed content, and verified at admission where parents are
-    /// resolvable (the equation over the whole parent set, all or nothing;
-    /// walk-time edge checks own the opportunistic per-edge detection later). A
-    /// mandatory field: there is no way to represent an event without one.
+    /// Topological level: `1 + max(parent generations)`, or `1` for genesis.
+    /// It is hashed and checked at admission wherever all parents resolve.
     pub generation: u32,
 }
 

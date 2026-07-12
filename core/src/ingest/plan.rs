@@ -30,7 +30,7 @@
 
 use std::collections::{BTreeSet, VecDeque};
 
-use ankurah_proto::{Clock, EventId};
+use ankurah_proto::{Clock, EntityId, EventId};
 
 use super::outcome::{IngestOutcome, SkipReason};
 use super::staging::StagingArea;
@@ -51,9 +51,10 @@ pub(crate) struct IngestPlan {
     /// The members that arrived in THIS delivery's batch, as opposed to
     /// closure/re-drive carryover buffered by earlier deliveries. The
     /// executor's retention sweep needs the distinction: an unresolved batch
-    /// member may leave the area (its item error drives the sender's retry),
-    /// but an unresolved carryover was acked back when it buffered, and
-    /// nobody will redeliver it.
+    /// member may leave the area after a hard failure because its item error
+    /// drives the sender's retry. An unresolved carryover stays available for
+    /// local descendant re-drive while its original sender also retains its
+    /// retry lease.
     pub batch: BTreeSet<EventId>,
     /// Members scheduled through the integrated-but-unstored backfill branch
     /// (head-contained, staged, absent from the log at plan time): the
@@ -75,9 +76,10 @@ pub(crate) struct IngestPlan {
 /// schedulable) against an entity whose current head is `head`.
 ///
 /// Contract: every id in `batch` has already been staged by intake. A batch
-/// id missing from staging (evicted between intake and planning under cap
-/// pressure) is skipped here; the sender's retry re-delivers it.
-pub(crate) async fn plan_entity<G: GetEvents + Send + Sync>(
+/// id missing from staging indicates concurrent promotion or removal and is
+/// surfaced as a retryable missing-event error.
+pub(crate) async fn plan_entity_for<G: GetEvents + Send + Sync>(
+    entity_id: EntityId,
     head: &Clock,
     batch: &[EventId],
     staging: &StagingArea,
@@ -87,11 +89,30 @@ pub(crate) async fn plan_entity<G: GetEvents + Send + Sync>(
     let mut members: BTreeSet<EventId> = BTreeSet::new();
     let mut worklist: VecDeque<EventId> = VecDeque::new();
     for id in batch {
-        if staging.contains(id) && members.insert(id.clone()) {
+        let event = staging.get(id).ok_or_else(|| crate::error::RetrievalError::EventNotFound(id.clone()))?;
+        if event.entity_id != entity_id {
+            return Err(crate::error::IngestError::Lineage(crate::error::LineageRejection::EntityMismatch {
+                event: id.clone(),
+                expected: entity_id,
+                received: event.entity_id,
+            })
+            .into());
+        }
+        if members.insert(id.clone()) {
             worklist.push_back(id.clone());
         }
     }
-    let batch_members: BTreeSet<EventId> = members.clone();
+    let batch_members: BTreeSet<EventId> = batch.iter().cloned().collect();
+
+    // A state adoption may make a previously buffered body part of the
+    // resident head without storing that body. Seed staged head tips so the
+    // integrated-but-unstored backfill path can commit them even when this is
+    // an empty-batch re-drive.
+    for id in head.as_slice() {
+        if staging.get(id).is_some_and(|event| event.entity_id == entity_id) && members.insert(id.clone()) {
+            worklist.push_back(id.clone());
+        }
+    }
     while let Some(id) = worklist.pop_front() {
         let Some(event) = staging.get(&id) else { continue };
         for parent in event.parent.as_slice() {
@@ -99,7 +120,7 @@ pub(crate) async fn plan_entity<G: GetEvents + Send + Sync>(
             // committed or in the head needs no scheduling, and a parent that
             // is simply absent is discovered (and typed NeedsEvents) at
             // execution time, where fetchability is decidable.
-            if staging.contains(parent) && members.insert(parent.clone()) {
+            if staging.get(parent).is_some_and(|parent_event| parent_event.entity_id == entity_id) && members.insert(parent.clone()) {
                 worklist.push_back(parent.clone());
             }
         }
@@ -162,6 +183,11 @@ pub(crate) async fn plan_entity<G: GetEvents + Send + Sync>(
             continue;
         }
         let Some(event) = staging.get(&candidate) else { continue };
+        if event.entity_id != entity_id {
+            // Reverse-index entries are collection-wide. A foreign child is
+            // relevant only to its own entity's future plan, never this one.
+            continue;
+        }
         let mut satisfied = true;
         for parent in event.parent.as_slice() {
             if scheduled.contains(parent) || head.contains(parent) {
@@ -217,6 +243,14 @@ pub(crate) async fn plan_entity<G: GetEvents + Send + Sync>(
             schedule.push(id);
             continue;
         }
+        // Stored ancestry is not materialized entity state. Unless this plan
+        // itself scheduled a creation first, a non-creation event over an
+        // empty resident must wait for state rather than producing a plan the
+        // entity layer will unconditionally reject.
+        if !entity_exists {
+            preresolved.push((id.clone(), IngestOutcome::NeedsState { entity: event.entity_id }));
+            continue;
+        }
         let mut missing: Vec<EventId> = Vec::new();
         for parent in event.parent.as_slice() {
             if available.contains(parent) || head.contains(parent) {
@@ -231,8 +265,6 @@ pub(crate) async fn plan_entity<G: GetEvents + Send + Sync>(
             entity_exists = true;
             available.insert(id.clone());
             schedule.push(id);
-        } else if !entity_exists {
-            preresolved.push((id.clone(), IngestOutcome::NeedsState { entity: event.entity_id }));
         } else if getter.storage_is_definitive() {
             preresolved.push((id.clone(), IngestOutcome::NeedsEvents { missing }));
         } else {
@@ -245,6 +277,30 @@ pub(crate) async fn plan_entity<G: GetEvents + Send + Sync>(
     }
 
     Ok(IngestPlan { schedule, preresolved, batch: batch_members, backfill, preverified: false })
+}
+
+/// Test convenience wrapper that infers the target from staged input.
+/// Production call sites pass the resident identity explicitly through
+/// [`plan_entity_for`].
+#[cfg(test)]
+pub(crate) async fn plan_entity<G: GetEvents + Send + Sync>(
+    head: &Clock,
+    batch: &[EventId],
+    staging: &StagingArea,
+    getter: &G,
+) -> Result<IngestPlan, MutationError> {
+    let entity_id = batch
+        .iter()
+        .find_map(|id| staging.get(id).map(|event| event.entity_id))
+        .or_else(|| head.as_slice().iter().find_map(|id| staging.get(id).map(|event| event.entity_id)))
+        .or_else(|| {
+            head.as_slice()
+                .iter()
+                .flat_map(|id| staging.staged_children_of(id))
+                .find_map(|id| staging.get(&id).map(|event| event.entity_id))
+        })
+        .ok_or(MutationError::InvalidUpdate("cannot infer entity for an empty staging plan"))?;
+    plan_entity_for(entity_id, head, batch, staging, getter).await
 }
 
 #[cfg(test)]
@@ -356,14 +412,17 @@ mod tests {
         staging.stage(e2);
         staging.stage(e1);
 
-        // Genesis is committed (in storage) rather than staged; e1 arrives in
-        // the batch; buffered e2 must re-drive off e1 with its other ancestry
-        // grounded in storage.
-        let plan = plan_entity(&Clock::from(Vec::new()), &[i1.clone()], &staging, &store(&[g.clone()])).await.unwrap();
+        // The resident has real materialized state on another tip. Genesis is
+        // committed (in storage) rather than staged; e1 arrives in the batch;
+        // buffered e2 must re-drive off e1 with its other ancestry grounded
+        // in storage. The executor remains responsible for the final causal
+        // verdict against the resident head.
+        let resident_tip = EventId::from_bytes([0xA5; 32]);
+        let plan = plan_entity(&Clock::from(vec![resident_tip]), &[i1.clone()], &staging, &store(&[g.clone()])).await.unwrap();
 
-        // Head is empty and genesis is not scheduled here, but the entity
-        // exists in storage terms; the projected-creation walk must not
-        // misclassify. e1's parent (genesis) is committed, so e1 schedules.
+        // A stored parent may satisfy ancestry only after a resident state
+        // establishes that the entity exists. An empty resident must still
+        // produce NeedsState (pinned separately below).
         assert_eq!(plan.schedule, vec![i1, i2]);
         assert!(plan.preresolved.is_empty());
     }
@@ -417,6 +476,19 @@ mod tests {
         assert_eq!(plan.preresolved, vec![(i1.clone(), IngestOutcome::NeedsState { entity })]);
         assert!(staging.contains(&i1), "needs-state event remains staged for recovery");
         let _ = g;
+    }
+
+    #[tokio::test]
+    async fn stored_parents_do_not_substitute_for_missing_entity_state() {
+        let entity = EntityId::new();
+        let ([_, e1, _], [g, i1, _]) = chain(entity);
+        let staging = StagingArea::with_default_cap();
+        staging.stage(e1);
+
+        let plan = plan_entity(&Clock::from(Vec::new()), &[i1.clone()], &staging, &store(&[g])).await.unwrap();
+
+        assert!(plan.schedule.is_empty());
+        assert_eq!(plan.preresolved, vec![(i1, IngestOutcome::NeedsState { entity })]);
     }
 
     #[tokio::test]
@@ -506,5 +578,25 @@ mod tests {
 
         assert_eq!(plan.schedule, vec![g, i1, i2]);
         assert!(plan.preresolved.is_empty());
+    }
+
+    #[tokio::test]
+    async fn descendant_redrive_never_crosses_entity_identity() {
+        let entity_a = EntityId::new();
+        let entity_b = EntityId::new();
+        let parent_a = event(entity_a, &[]);
+        let parent_id = parent_a.payload.id();
+        let child_b = event(entity_b, &[&parent_a]);
+        let staging = StagingArea::with_default_cap();
+        staging.stage(child_b.clone());
+        staging.stage(parent_a);
+
+        let plan = plan_entity_for(entity_a, &Clock::from(Vec::new()), &[parent_id.clone()], &staging, &store(&[]))
+            .await
+            .expect("entity A plan builds");
+
+        assert_eq!(plan.schedule, vec![parent_id]);
+        assert!(!plan.schedule.contains(&child_b.payload.id()), "entity B child never enters entity A's plan");
+        assert!(staging.contains(&child_b.payload.id()), "foreign child remains available for its own entity plan");
     }
 }

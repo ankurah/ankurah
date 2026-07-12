@@ -9,12 +9,12 @@ use std::{
     hash::Hash,
     ops::Deref,
     sync::{Arc, Mutex, Weak},
+    time::Duration,
 };
 use tokio::sync::oneshot;
 
 use crate::{
     action_error, action_info,
-    changes::EntityChange,
     collectionset::CollectionSet,
     connector::{PeerSender, SendError},
     context::Context,
@@ -42,16 +42,89 @@ pub struct PeerState {
     _durable: bool,
     subscription_handler: SubscriptionHandler,
     pending_requests: SafeMap<proto::RequestId, PendingRequest>,
-    pending_updates: SafeMap<proto::UpdateId, oneshot::Sender<Result<proto::NodeResponseBody, RequestError>>>,
-    /// Model-definition ids whose catalog defs were already shipped on this
-    /// connection (#330 once-per-connection descriptor shipping). A
-    /// reconnection builds a fresh `PeerState`, so the peer is re-announced.
+    pending_updates: SafeMap<proto::UpdateId, oneshot::Sender<proto::NodeUpdateAckBody>>,
+    /// Model-definition ids whose schema-bearing update was acknowledged by
+    /// this peer. Until that acknowledgement, every concurrent body repeats
+    /// the bundle so out-of-order task execution at the receiver stays safe.
+    /// A reconnection builds a fresh `PeerState` and re-announces everything.
     announced_models: std::sync::Mutex<std::collections::BTreeSet<proto::EntityId>>,
+    /// Serializes descriptor assembly with the message enqueue that carries
+    /// it, avoiding duplicate work and preserving transport order. Repeating
+    /// bundles until acknowledgement still protects receivers that dispatch
+    /// ordered messages onto concurrent tasks.
+    schema_send_lock: tokio::sync::Mutex<()>,
+    /// Closes the register-and-enqueue window against peer teardown. A task
+    /// that retained an `Arc<PeerState>` before `deregister_peer` removed it
+    /// from the map must still observe the closed state rather than adding a
+    /// waiter that teardown can no longer drain.
+    lifecycle: Mutex<PeerLifecycle>,
 }
 
 struct PendingRequest {
-    response: oneshot::Sender<Result<GuardedResponse, RequestError>>,
+    delivery: oneshot::Sender<Result<GuardedResponse, RequestError>>,
+    admitted_epoch: u64,
+    /// The request's caller owns a reset-fence read guard across the whole
+    /// request/response exchange. Response delivery must not reacquire the
+    /// fair Tokio RwLock: a queued writer between the two reads would
+    /// deadlock behind the still-held outer read guard.
+    caller_holds_reset_fence: bool,
+    /// Response admission acquires this owner's lease before schema
+    /// ingestion and delivery (absent for epoch-only callers).
     validity: Option<RequestValidity>,
+}
+
+#[derive(Default)]
+struct PeerLifecycle {
+    closed: bool,
+}
+
+/// Deterministic integration-test gate for the response/reset race. The
+/// response task rendezvous here after owning the pending waiter but before
+/// catalog ingestion or delivery; tests can then run a hard reset and release
+/// the old response into the epoch check.
+#[cfg(feature = "test-helpers")]
+#[derive(Clone)]
+pub struct ResponseDeliveryGate {
+    removed: Arc<tokio::sync::Barrier>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+/// Deterministic integration-test gate for the success-ack/reset race. The
+/// ack task parks after owning the pending waiter but before waking the update
+/// sender, allowing reset to clear connection delivery state first.
+#[cfg(feature = "test-helpers")]
+#[derive(Clone)]
+pub struct UpdateAckDeliveryGate {
+    removed: Arc<tokio::sync::Barrier>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+#[cfg(feature = "test-helpers")]
+impl UpdateAckDeliveryGate {
+    fn new() -> Self { Self { removed: Arc::new(tokio::sync::Barrier::new(2)), release: Arc::new(tokio::sync::Semaphore::new(0)) } }
+
+    pub async fn wait_until_waiter_removed(&self) { self.removed.wait().await; }
+
+    pub fn release(&self) { self.release.add_permits(1); }
+
+    async fn park(&self) {
+        self.removed.wait().await;
+        self.release.acquire().await.expect("update ack delivery gate closed").forget();
+    }
+}
+
+#[cfg(feature = "test-helpers")]
+impl ResponseDeliveryGate {
+    fn new() -> Self { Self { removed: Arc::new(tokio::sync::Barrier::new(2)), release: Arc::new(tokio::sync::Semaphore::new(0)) } }
+
+    pub async fn wait_until_waiter_removed(&self) { self.removed.wait().await; }
+
+    pub fn release(&self) { self.release.add_permits(1); }
+
+    async fn park(&self) {
+        self.removed.wait().await;
+        self.release.acquire().await.expect("response delivery gate closed").forget();
+    }
 }
 
 #[derive(Debug)]
@@ -66,6 +139,21 @@ impl GuardedResponse {
 
 impl PeerState {
     pub fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError> { self.sender.send_message(message) }
+
+    fn close(&self) {
+        let mut lifecycle = self.lifecycle.lock().unwrap();
+        lifecycle.closed = true;
+        self.pending_requests.clear();
+        self.pending_updates.clear();
+        self.announced_models.lock().unwrap().clear();
+    }
+
+    fn clear_pending_for_reset(&self) {
+        let _lifecycle = self.lifecycle.lock().unwrap();
+        self.pending_requests.clear();
+        self.pending_updates.clear();
+        self.announced_models.lock().unwrap().clear();
+    }
 }
 
 pub struct MatchArgs {
@@ -181,13 +269,21 @@ where PA: PolicyAgent
     /// Boundary consequence: re-drive is a node-held-area property, so a
     /// parent arriving through a COMMIT lane does not drain a buffered
     /// PerItem orphan; it integrates on that entity's next PerItem or
-    /// state-adoption touch, or after cap eviction and redelivery.
+    /// state-adoption touch; cap pressure rejects new admission and leaves
+    /// the sender holding its retry lease.
     /// Tightening that (a post-commit re-plan against this map) is D3
     /// lifecycle territory.
     pub(crate) staging: SafeMap<CollectionId, Arc<crate::ingest::StagingArea>>,
 
     /// Type resolver for AST preparation (temporary heuristic until Phase 3 schema)
     pub(crate) type_resolver: crate::TypeResolver,
+
+    #[cfg(feature = "test-helpers")]
+    response_delivery_gate: Mutex<Option<ResponseDeliveryGate>>,
+    #[cfg(feature = "test-helpers")]
+    update_ack_delivery_gate: Mutex<Option<UpdateAckDeliveryGate>>,
+    #[cfg(feature = "test-helpers")]
+    update_ack_processed: tokio::sync::Semaphore,
 }
 
 /// One entity's planned, policy-checked commit group: the phase-one output
@@ -256,6 +352,41 @@ where
     /// re-enable.
     pub fn set_generation_accelerations_disabled(&self, disabled: bool) { self.entities.unverified().set_accelerations_disabled(disabled); }
 
+    #[cfg(feature = "test-helpers")]
+    pub fn gate_next_response_after_waiter_removed(&self) -> ResponseDeliveryGate {
+        let gate = ResponseDeliveryGate::new();
+        *self.response_delivery_gate.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
+    #[cfg(feature = "test-helpers")]
+    pub fn gate_next_update_ack_after_waiter_removed(&self) -> UpdateAckDeliveryGate {
+        let gate = UpdateAckDeliveryGate::new();
+        *self.update_ack_delivery_gate.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
+    #[cfg(feature = "test-helpers")]
+    pub async fn wait_for_update_ack_processed_for_test(&self) {
+        self.update_ack_processed.acquire().await.expect("update ack completion probe closed").forget();
+    }
+
+    #[cfg(feature = "test-helpers")]
+    pub fn model_announced_to_peer_for_test(&self, peer: proto::EntityId, model: proto::EntityId) -> bool {
+        self.peer_connections.get(&peer).is_some_and(|connection| connection.announced_models.lock().unwrap().contains(&model))
+    }
+
+    /// TEST ONLY: declare that a connected peer already has one model's
+    /// catalog definitions. Deterministic simulation nodes preseed identical
+    /// in-memory catalog maps without creating the stored catalog entities
+    /// used by descriptor shipping, so their transport must start from this
+    /// equivalent post-announcement state.
+    #[cfg(feature = "test-helpers")]
+    pub fn assume_model_announced_to_peer_for_test(&self, peer: proto::EntityId, model: proto::EntityId) {
+        let connection = self.peer_connections.get(&peer).expect("test peer must be connected before announcing its model");
+        connection.announced_models.lock().unwrap().insert(model);
+    }
+
     fn build(engine: Arc<SE>, policy_agent: PA, durable: bool, rng: SmallRng) -> Self {
         let collections = CollectionSet::new(engine);
         let entityset: WeakEntitySet = Default::default();
@@ -285,6 +416,12 @@ where
             subscription_relay,
             staging: SafeMap::new(),
             type_resolver: crate::TypeResolver::new(),
+            #[cfg(feature = "test-helpers")]
+            response_delivery_gate: Mutex::new(None),
+            #[cfg(feature = "test-helpers")]
+            update_ack_delivery_gate: Mutex::new(None),
+            #[cfg(feature = "test-helpers")]
+            update_ack_processed: tokio::sync::Semaphore::new(0),
         }));
 
         // Set up the message sender for the subscription relay
@@ -313,6 +450,17 @@ where
             move |entity| {
                 if let Some(node) = weak.upgrade() {
                     node.stamp_resolver(entity);
+                }
+            }
+        }));
+        node.system.set_runtime_reset_hook(Arc::new({
+            let weak = node.weak();
+            move || {
+                if let Some(node) = weak.upgrade() {
+                    node.staging.clear();
+                    for connection in node.peer_connections.values() {
+                        connection.clear_pending_for_reset();
+                    }
                 }
             }
         }));
@@ -348,6 +496,8 @@ where
                 pending_requests: SafeMap::new(),
                 pending_updates: SafeMap::new(),
                 announced_models: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+                schema_send_lock: tokio::sync::Mutex::new(()),
+                lifecycle: Mutex::new(PeerLifecycle::default()),
             }),
         );
         if presence.durable {
@@ -384,6 +534,7 @@ where
         self.durable_peers.remove(&node_id);
         // Get and cleanup subscriptions before removing the peer
         if let Some(peer_state) = self.peer_connections.remove(&node_id) {
+            peer_state.close();
             action_info!(self, "unsubscribing", "subscription {} for peer {}", peer_state.subscription_handler.subscription_id(), node_id);
             // ReactorSubscription is automatically unsubscribed on drop
         }
@@ -398,32 +549,79 @@ where
     /// system/catalog ids need no defs (they are static). The defs are the
     /// stored, attested catalog entities themselves -- model, memberships,
     /// properties -- so the receiver validates and ingests them exactly like
-    /// any served state. Marks the models announced up front; a lost message
-    /// costs one reconnection's worth of re-announcement, never a wrong def.
+    /// any served state. Only an acknowledged update marks a model delivered;
+    /// concurrent updates and responses repeat the bundle until then. The
+    /// caller holds `schema_send_lock` through the eventual message enqueue.
+    /// Any incomplete bundle returns an error and callers do not send the
+    /// dependent body.
     async fn schema_states_for_models(
         &self,
         connection: &PeerState,
         models: std::collections::BTreeSet<proto::EntityId>,
-    ) -> Vec<proto::Attested<proto::EntityState>> {
+    ) -> Result<Vec<proto::Attested<proto::EntityState>>, ()> {
         let fresh: Vec<proto::EntityId> = {
-            let mut announced = connection.announced_models.lock().unwrap();
+            let announced = connection.announced_models.lock().unwrap();
             models
                 .into_iter()
                 .filter(|model| crate::schema::well_known_collection(model).is_none())
-                .filter(|model| announced.insert(*model))
+                .filter(|model| !announced.contains(model))
                 .collect()
         };
         if fresh.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        let (states, failed) = self.catalog.definition_states_for_models(&fresh).await;
-        if !failed.is_empty() {
-            let mut announced = connection.announced_models.lock().unwrap();
-            for model in failed {
-                announced.remove(&model);
+        let assembled = 'assembly: {
+            let (Ok(model_col), Ok(property_col), Ok(membership_col)) = (
+                self.collections.get(&crate::schema::model_collection()).await,
+                self.collections.get(&crate::schema::property_collection()).await,
+                self.collections.get(&crate::schema::model_property_collection()).await,
+            ) else {
+                warn!("Node({}) could not open catalog collections to ship schema defs", self.id);
+                break 'assembly Err(());
+            };
+            let mut states = Vec::new();
+            for model in &fresh {
+                let mut bundle = Vec::new();
+                match model_col.get_state(*model).await {
+                    Ok(state) => bundle.push(state),
+                    Err(e) => {
+                        warn!("Node({}) cannot ship model def {}: {}", self.id, model.to_base64_short(), e);
+                        break 'assembly Err(());
+                    }
+                }
+                for membership in self.catalog.memberships_of(model) {
+                    match property_col.get_state(membership.property).await {
+                        Ok(state) => bundle.push(state),
+                        Err(e) => {
+                            warn!(
+                                "Node({}) cannot ship property def {} for model {}: {}",
+                                self.id,
+                                membership.property.to_base64_short(),
+                                model.to_base64_short(),
+                                e
+                            );
+                            break 'assembly Err(());
+                        }
+                    }
+                    match membership_col.get_state(membership.id).await {
+                        Ok(state) => bundle.push(state),
+                        Err(e) => {
+                            warn!(
+                                "Node({}) cannot ship membership def {} for model {}: {}",
+                                self.id,
+                                membership.id.to_base64_short(),
+                                model.to_base64_short(),
+                                e
+                            );
+                            break 'assembly Err(());
+                        }
+                    }
+                }
+                states.extend(bundle);
             }
-        }
-        states
+            Ok(states)
+        };
+        assembled
     }
 
     /// Receiver side of descriptor shipping (#330): policy-validate and ingest
@@ -457,7 +655,8 @@ where
     where
         C: Iterable<PA::ContextData>,
     {
-        self.request_inner(node_id, cdata, request_body, None).await.map(|response| response.into_parts().0)
+        let request_epoch = self.entities.reset_epoch();
+        self.request_at_epoch(node_id, cdata, request_body, request_epoch).await
     }
 
     /// Send a request whose response is useful only while `validity` remains
@@ -473,15 +672,38 @@ where
     where
         C: Iterable<PA::ContextData>,
     {
-        self.request_inner(node_id, cdata, request_body, Some(validity)).await
+        let request_epoch = self.entities.reset_epoch();
+        self.request_inner(node_id, cdata, request_body, Some(validity), request_epoch).await
     }
 
+    /// Send a request only if the epoch that admitted the caller's preceding
+    /// async preparation is still current. The waiter records that same
+    /// epoch, so response delivery and any attached schema are bound to the
+    /// caller's operation rather than whichever epoch happened to exist at
+    /// enqueue time.
+    pub(crate) async fn request_at_epoch<C>(
+        &self,
+        node_id: proto::EntityId,
+        cdata: &C,
+        request_body: proto::NodeRequestBody,
+        request_epoch: u64,
+    ) -> Result<proto::NodeResponseBody, RequestError>
+    where
+        C: Iterable<PA::ContextData>,
+    {
+        self.request_inner(node_id, cdata, request_body, None, request_epoch).await.map(|response| response.into_parts().0)
+    }
+
+    /// Shared register-and-enqueue path. The optional `validity` rides the
+    /// pending waiter so response admission can acquire its lease before
+    /// schema ingestion and delivery (absent for epoch-only callers).
     async fn request_inner<C>(
         &self,
         node_id: proto::EntityId,
         cdata: &C,
         request_body: proto::NodeRequestBody,
         validity: Option<RequestValidity>,
+        request_epoch: u64,
     ) -> Result<GuardedResponse, RequestError>
     where
         C: Iterable<PA::ContextData>,
@@ -492,43 +714,181 @@ where
         let request = proto::NodeRequest { id: request_id.clone(), to: node_id, from: self.id, body: request_body };
         let auth = self.policy_agent.sign_request(self, cdata, &request)?;
 
-        // Get the peer connection
+        // Register and enqueue on one side of reset. If request preparation
+        // crossed a reset, do not send an old-system request afterward.
+        let _reset_fence = self.entities.reset_fence_read().await;
+        if self.entities.reset_epoch() != request_epoch {
+            return Err(RequestError::ConnectionLost);
+        }
         let connection = self.peer_connections.get(&node_id).ok_or(RequestError::PeerNotConnected)?;
 
-        connection.pending_requests.insert(request_id, PendingRequest { response: response_tx, validity });
-        connection.send_message(proto::NodeMessage::Request { auth, request })?;
+        {
+            let lifecycle = connection.lifecycle.lock().unwrap();
+            if lifecycle.closed {
+                return Err(RequestError::ConnectionLost);
+            }
+            connection.pending_requests.insert(
+                request_id.clone(),
+                PendingRequest { delivery: response_tx, admitted_epoch: request_epoch, caller_holds_reset_fence: false, validity },
+            );
+            if let Err(error) = connection.send_message(proto::NodeMessage::Request { auth, request }) {
+                connection.pending_requests.remove(&request_id);
+                return Err(error.into());
+            }
+        }
+        drop(_reset_fence);
 
         // Wait for response
         response_rx.await.map_err(|_| RequestError::InternalChannelClosed)?
     }
 
-    // TODO LATER: rework this to be retried in the background some number of times
+    /// Request variant for a caller that already holds the reset fence in
+    /// read mode across a larger atomic operation. It deliberately does not
+    /// reacquire the fair Tokio RwLock, which could deadlock behind a queued
+    /// reset writer while the caller still holds its outer read guard.
+    pub(crate) async fn request_fenced<C>(
+        &self,
+        node_id: proto::EntityId,
+        cdata: &C,
+        request_body: proto::NodeRequestBody,
+    ) -> Result<proto::NodeResponseBody, RequestError>
+    where
+        C: Iterable<PA::ContextData>,
+    {
+        let admitted_epoch = self.entities.reset_epoch();
+        let (response_tx, response_rx) = oneshot::channel::<Result<GuardedResponse, RequestError>>();
+        let request_id = proto::RequestId::new();
+        let request = proto::NodeRequest { id: request_id.clone(), to: node_id, from: self.id, body: request_body };
+        let auth = self.policy_agent.sign_request(self, cdata, &request)?;
+        let connection = self.peer_connections.get(&node_id).ok_or(RequestError::PeerNotConnected)?;
+        {
+            let lifecycle = connection.lifecycle.lock().unwrap();
+            if lifecycle.closed {
+                return Err(RequestError::ConnectionLost);
+            }
+            connection.pending_requests.insert(
+                request_id.clone(),
+                PendingRequest { delivery: response_tx, admitted_epoch, caller_holds_reset_fence: true, validity: None },
+            );
+            if let Err(error) = connection.send_message(proto::NodeMessage::Request { auth, request }) {
+                connection.pending_requests.remove(&request_id);
+                return Err(error.into());
+            }
+        }
+        response_rx.await.map_err(|_| RequestError::InternalChannelClosed)?.map(|response| response.into_parts().0)
+    }
+
     pub fn send_update(&self, node_id: proto::EntityId, notification: proto::NodeUpdateBody) {
-        // same as request, minus cdata and the sign_request step
         debug!("{self}.send_update({node_id:#}, {notification})");
-        let (response_tx, _response_rx) = oneshot::channel::<Result<proto::NodeResponseBody, RequestError>>();
-        let id = proto::UpdateId::new();
-
-        // Get the peer connection
-        let Some(connection) = self.peer_connections.get(&node_id) else {
-            warn!("Failed to send update to peer {}: {}", node_id, RequestError::PeerNotConnected);
-            return;
-        };
-
-        // Store the response channel
-        connection.pending_updates.insert(id.clone(), response_tx);
-
-        // Descriptor shipping (#330) needs async collection of the catalog
-        // states, and this fn is called from sync reactor callbacks, so the
-        // send moves into a task. Update order across tasks is not
-        // guaranteed, which the receiver already tolerates: wire order is
-        // untrusted (events topo-sort, snapshots compare heads).
-        let node = self.clone();
+        let weak = self.weak();
+        let send_epoch = self.entities.reset_epoch();
         crate::task::spawn(async move {
-            let schema = node.schema_states_for_models(&connection, notification.referenced_models()).await;
-            let message = proto::NodeMessage::Update(proto::NodeUpdate { id, from: node.id, to: node_id, body: notification, schema });
-            if let Err(e) = connection.send_message(message) {
-                warn!("Failed to send update to peer {}: {}", node_id, e);
+            const ACK_TIMEOUT: Duration = Duration::from_secs(15);
+            const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(5);
+
+            let mut backoff = Duration::from_millis(250);
+            loop {
+                let Some(node) = weak.upgrade() else { return };
+                let reset_fence = node.entities.reset_fence_read().await;
+                if node.entities.reset_epoch() != send_epoch {
+                    // The update belongs to the system that was reset. Never
+                    // retry its events into the successor system.
+                    return;
+                }
+                let Some(connection) = node.peer_connections.get(&node_id) else {
+                    warn!("Update peer {} is disconnected; retaining retry lease", node_id);
+                    drop(reset_fence);
+                    drop(node);
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_RETRY_BACKOFF);
+                    continue;
+                };
+                let models = notification.referenced_models();
+                let attempt = {
+                    let _schema_send = connection.schema_send_lock.lock().await;
+                    match node.schema_states_for_models(&connection, models.clone()).await {
+                        Ok(schema) => {
+                            let id = proto::UpdateId::new();
+                            let (ack_tx, ack_rx) = oneshot::channel();
+                            let lifecycle = connection.lifecycle.lock().unwrap();
+                            if lifecycle.closed {
+                                None
+                            } else {
+                                connection.pending_updates.insert(id.clone(), ack_tx);
+                                let message = proto::NodeMessage::Update(proto::NodeUpdate {
+                                    id: id.clone(),
+                                    from: node.id,
+                                    to: node_id,
+                                    body: notification.clone(),
+                                    schema,
+                                });
+                                let send_result = connection.send_message(message);
+                                if send_result.is_err() {
+                                    connection.pending_updates.remove(&id);
+                                    let mut announced = connection.announced_models.lock().unwrap();
+                                    for model in &models {
+                                        announced.remove(model);
+                                    }
+                                }
+                                Some((id, ack_rx, send_result))
+                            }
+                        }
+                        Err(()) => None,
+                    }
+                };
+                drop(reset_fence);
+
+                if let Some((id, ack_rx, send_result)) = attempt {
+                    if let Err(e) = send_result {
+                        warn!("Failed to send update to peer {}: {}; retrying", node_id, e);
+                    } else {
+                        match tokio::time::timeout(ACK_TIMEOUT, ack_rx).await {
+                            Ok(Ok(proto::NodeUpdateAckBody::Success)) => {
+                                // The ack can win its pending-map race just
+                                // before hard_reset clears connection state.
+                                // Re-enter the reset fence before publishing
+                                // the delivery fact, and bind it to both the
+                                // admitted epoch and this exact live
+                                // connection instance.
+                                let _reset_fence = node.entities.reset_fence_read().await;
+                                #[cfg(feature = "test-helpers")]
+                                node.update_ack_processed.add_permits(1);
+                                let still_live = node.peer_connections.get(&node_id).is_some_and(|live| Arc::ptr_eq(&live, &connection));
+                                if node.entities.reset_epoch() != send_epoch || !still_live {
+                                    return;
+                                }
+                                let lifecycle = connection.lifecycle.lock().unwrap();
+                                if lifecycle.closed {
+                                    return;
+                                }
+                                connection.announced_models.lock().unwrap().extend(models.iter().copied());
+                                return;
+                            }
+                            Ok(Ok(proto::NodeUpdateAckBody::RetryableError(error))) => {
+                                warn!("Peer {} applied staging backpressure; retrying update after {:?}: {}", node_id, backoff, error);
+                            }
+                            Ok(Ok(proto::NodeUpdateAckBody::Error(error))) => {
+                                warn!("Node({}) update rejected by peer {}: {}", node.id, node_id, error);
+                                return;
+                            }
+                            Ok(Err(_)) | Err(_) => {
+                                connection.pending_updates.remove(&id);
+                                let mut announced = connection.announced_models.lock().unwrap();
+                                for model in &models {
+                                    announced.remove(model);
+                                }
+                                warn!("Update {} to peer {} was not acknowledged; retrying", id, node_id);
+                            }
+                        }
+                    }
+                } else {
+                    warn!("Node({}) could not assemble a complete schema bundle for peer {}; retrying update", node.id, node_id);
+                }
+
+                drop(connection);
+                drop(node);
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(MAX_RETRY_BACKOFF);
             }
         });
     }
@@ -542,6 +902,7 @@ where
             proto::NodeMessage::Update(update) => {
                 debug!("Node({}) received update {}", self.id, update);
                 if let Some(sender) = { self.peer_connections.get(&update.from).map(|c| c.sender.cloned()) } {
+                    let update_epoch = self.entities.reset_epoch();
                     let _from = update.from;
                     let _id = update.id.clone();
                     if update.to != self.id {
@@ -599,12 +960,25 @@ where
                     // and property naming resolve. Ingest only AFTER the
                     // connection + recipient checks: a misaddressed or
                     // unsolicited envelope must not mutate our catalog map.
-                    self.ingest_schema(&update.from, &update.schema);
+                    let stale_after_reset = {
+                        let _reset_fence = self.entities.reset_fence_read().await;
+                        if self.entities.reset_epoch() != update_epoch {
+                            true
+                        } else {
+                            self.ingest_schema(&update.from, &update.schema);
+                            false
+                        }
+                    };
 
                     // TODO - validate the from node id is the one we're connected to
-                    let body = match self.handle_update(update).await {
-                        Ok(_) => proto::NodeUpdateAckBody::Success,
-                        Err(e) => proto::NodeUpdateAckBody::Error(e.to_string()),
+                    let body = if stale_after_reset {
+                        proto::NodeUpdateAckBody::Error("system reset before update admission".to_owned())
+                    } else {
+                        match self.handle_update(update, update_epoch).await {
+                            Ok(_) => proto::NodeUpdateAckBody::Success,
+                            Err(e) if e.retryable_update() => proto::NodeUpdateAckBody::RetryableError(e.to_string()),
+                            Err(e) => proto::NodeUpdateAckBody::Error(e.to_string()),
+                        }
                     };
 
                     sender.send_message(proto::NodeMessage::UpdateAck(proto::NodeUpdateAck { id, from, to, body }))?;
@@ -612,16 +986,17 @@ where
             }
             proto::NodeMessage::UpdateAck(ack) => {
                 debug!("Node({}) received ack notification {} {}", self.id, ack.id, ack.body);
-                // Drain the pending entry so the map does not leak (the send
-                // side no longer blocks on it).
                 if let Some(connection) = self.peer_connections.get(&ack.from) {
-                    connection.pending_updates.remove(&ack.id);
-                }
-                // Surface a rejected update instead of dropping it silently.
-                // Automatic retry (e.g. re-announcing the model and re-sending)
-                // is still a TODO -- see send_update.
-                if let proto::NodeUpdateAckBody::Error(e) = &ack.body {
-                    warn!("Node({}) update {} rejected by peer {}: {}", self.id, ack.id, ack.from, e);
+                    if let Some(waiter) = connection.pending_updates.remove(&ack.id) {
+                        #[cfg(feature = "test-helpers")]
+                        if let Some(gate) = {
+                            let mut slot = self.update_ack_delivery_gate.lock().unwrap();
+                            slot.take()
+                        } {
+                            gate.park().await;
+                        }
+                        let _ = waiter.send(ack.body);
+                    }
                 }
             }
             proto::NodeMessage::Request { auth, request } => {
@@ -636,29 +1011,51 @@ where
                     let sender = connection.sender.cloned();
                     let from = request.from;
                     let request_id = request.id.clone();
+                    let request_epoch = self.entities.reset_epoch();
                     if request.to != self.id {
                         warn!("{} received message from {} but is not the intended recipient", self.id, request.from);
                         return Ok(());
                     }
 
                     // Validate the request auth first, converting errors to error responses
-                    let body = match self.policy_agent.check_request(self, &auth, &request).await {
-                        Ok(cdata) => match self.handle_request(&cdata, request).await {
+                    let mut body = match self.policy_agent.check_request(self, &auth, &request).await {
+                        Ok(cdata) => match self.handle_request(&cdata, request, request_epoch).await {
                             Ok(result) => result,
                             Err(e) => proto::NodeResponseBody::Error(e.to_string()),
                         },
                         Err(e) => proto::NodeResponseBody::Error(e.to_string()),
                     };
-                    // Descriptor shipping (#330): catalog defs for any model id
-                    // this response references that the connection has not seen.
-                    let schema = self.schema_states_for_models(&connection, body.referenced_models()).await;
-                    let _result = sender.send_message(proto::NodeMessage::Response(proto::NodeResponse {
+                    // A read response computed before a reset must not be
+                    // delivered into the successor system. The fence closes
+                    // the check-to-enqueue window; mutating request handlers
+                    // already fence their own commit spans.
+                    let _reset_fence = self.entities.reset_fence_read().await;
+                    if self.entities.reset_epoch() != request_epoch {
+                        body = proto::NodeResponseBody::Error("system reset while handling request; retry".to_owned());
+                    }
+                    // Descriptor assembly and enqueue are one ordered
+                    // connection-local span, so another body cannot observe
+                    // the announcement bit before this message is queued.
+                    let models = body.referenced_models();
+                    let _schema_send = connection.schema_send_lock.lock().await;
+                    let (body, schema) = match self.schema_states_for_models(&connection, models.clone()).await {
+                        Ok(schema) => (body, schema),
+                        Err(()) => (proto::NodeResponseBody::Error("catalog schema unavailable; retry request".to_owned()), Vec::new()),
+                    };
+                    let result = sender.send_message(proto::NodeMessage::Response(proto::NodeResponse {
                         request_id,
                         from: self.id,
                         to: from,
                         body,
                         schema,
                     }));
+                    if result.is_err() {
+                        let mut announced = connection.announced_models.lock().unwrap();
+                        for model in &models {
+                            announced.remove(model);
+                        }
+                    }
+                    result?;
                 }
             }
             proto::NodeMessage::Response(response) => {
@@ -669,6 +1066,17 @@ where
                 // matches a request we actually sent, so an unsolicited or
                 // misattributed response cannot poison the catalog map.
                 if let Some(pending) = connection.pending_requests.remove(&response.request_id) {
+                    #[cfg(feature = "test-helpers")]
+                    if let Some(gate) = {
+                        let mut slot = self.response_delivery_gate.lock().unwrap();
+                        slot.take()
+                    } {
+                        gate.park().await;
+                    }
+                    // Response admission acquires the registration owner's
+                    // lease (when the request carried one) before schema
+                    // ingestion and delivery, so reset clears either before
+                    // or after the complete effect, never between them.
                     let lease = match &pending.validity {
                         Some(validity) => match validity.try_acquire() {
                             Some(lease) => lease,
@@ -682,17 +1090,46 @@ where
                         },
                         None => RequestLease::unguarded(),
                     };
-                    self.ingest_schema(&response.from, &response.schema);
-                    pending
-                        .response
-                        .send(Ok(GuardedResponse { body: response.body, lease }))
-                        .map_err(|_| anyhow!("Failed to send guarded response"))?;
+                    if pending.caller_holds_reset_fence {
+                        debug_assert_eq!(
+                            self.entities.reset_epoch(),
+                            pending.admitted_epoch,
+                            "request_fenced caller released its reset guard before response delivery"
+                        );
+                        self.ingest_schema(&response.from, &response.schema);
+                        pending
+                            .delivery
+                            .send(Ok(GuardedResponse { body: response.body, lease }))
+                            .map_err(|e| anyhow!("Failed to send response: {:?}", e))?;
+                    } else {
+                        // Removing the waiter first is intentional: reset can
+                        // now run without leaving an old-system delivery in
+                        // the map. The epoch check under a newly acquired
+                        // fence decides whether the owned response may enter
+                        // the successor system.
+                        let _reset_fence = self.entities.reset_fence_read().await;
+                        if self.entities.reset_epoch() != pending.admitted_epoch {
+                            let _ = pending.delivery.send(Err(RequestError::ConnectionLost));
+                            return Ok(());
+                        }
+                        self.ingest_schema(&response.from, &response.schema);
+                        pending
+                            .delivery
+                            .send(Ok(GuardedResponse { body: response.body, lease }))
+                            .map_err(|e| anyhow!("Failed to send response: {:?}", e))?;
+                    }
                 }
             }
             proto::NodeMessage::UnsubscribeQuery { from, query_id } => {
-                // Remove predicate from the peer's subscription
-                if let Some(peer_state) = self.peer_connections.get(&from) {
-                    peer_state.subscription_handler.remove_predicate(query_id)?;
+                // Admit the one-way mutation wholly on one side of reset.
+                // There is no response path whose epoch gate could undo a
+                // stale removal after the fact.
+                let unsubscribe_epoch = self.entities.reset_epoch();
+                let _reset_fence = self.entities.reset_fence_read().await;
+                if self.entities.reset_epoch() == unsubscribe_epoch {
+                    if let Some(peer_state) = self.peer_connections.get(&from) {
+                        peer_state.subscription_handler.remove_predicate(query_id)?;
+                    }
                 }
             }
         }
@@ -700,8 +1137,15 @@ where
     }
 
     #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(request = %request)))]
-    async fn handle_request<C>(&self, cdata: &C, request: proto::NodeRequest) -> anyhow::Result<proto::NodeResponseBody>
-    where C: Iterable<PA::ContextData> {
+    async fn handle_request<C>(
+        &self,
+        cdata: &C,
+        request: proto::NodeRequest,
+        request_epoch: u64,
+    ) -> anyhow::Result<proto::NodeResponseBody>
+    where
+        C: Iterable<PA::ContextData>,
+    {
         match request.body {
             proto::NodeRequestBody::CommitTransaction { id, events } => {
                 // Protected collections (the system collection and the metadata
@@ -718,7 +1162,7 @@ where
                 // through a direct commit_remote_transaction call, bypassing
                 // this ingress guard, so this does not block it.)
                 for event in &events {
-                    let collection_id = self.resolve_model_wait(&event.payload.model).await?;
+                    let collection_id = self.resolve_model_wait_at_epoch(&event.payload.model, request_epoch).await?;
                     if crate::schema::is_protected_collection(&collection_id) {
                         return Ok(proto::NodeResponseBody::Error(format!(
                             "collection '{}' is protected and not writable by transactions",
@@ -730,7 +1174,7 @@ where
                 // With moderate potential for duplication, while not creating message loops
                 // Doing so would be a secondary/tertiary/etc hop for this message
                 let cdata = cdata.iterable().exactly_one().map_err(|_| anyhow!("Only one cdata is permitted for CommitTransaction"))?;
-                match self.commit_remote_transaction(cdata, id.clone(), events).await {
+                match self.commit_remote_transaction_at_epoch(cdata, id.clone(), events, request_epoch).await {
                     Ok(_) => Ok(proto::NodeResponseBody::CommitComplete { id }),
                     Err(e) => Ok(proto::NodeResponseBody::Error(e.to_string())),
                 }
@@ -810,7 +1254,7 @@ where
             }
             proto::NodeRequestBody::RegisterSchema { models, properties, memberships } => {
                 let cdata = cdata.iterable().exactly_one().map_err(|_| anyhow!("Only one cdata is permitted for RegisterSchema"))?;
-                match self.execute_schema_registration(cdata, models, properties, memberships).await {
+                match self.execute_schema_registration_at_epoch(cdata, models, properties, memberships, request_epoch).await {
                     // The resolved definitions ARE the response (RFC 5.2):
                     // the requester folds them into its catalog map on ack.
                     Ok((models, properties, memberships)) => {
@@ -820,30 +1264,51 @@ where
                 }
             }
             proto::NodeRequestBody::SubscribeQuery { query_id, collection, selection, version, known_matches } => {
+                // Query preparation materializes local entities and may
+                // acquire the reset fence itself. Use pre/post admission
+                // checks rather than holding a read guard across that async
+                // work (nested fair-RwLock reads can deadlock behind a queued
+                // reset writer). A stale post-check rolls back the query
+                // mutation while fenced.
+                {
+                    let _reset_fence = self.entities.reset_fence_read().await;
+                    if self.entities.reset_epoch() != request_epoch {
+                        return Ok(proto::NodeResponseBody::Error("system reset before subscription admission; retry".to_owned()));
+                    }
+                }
                 let peer_state = self.peer_connections.get(&request.from).ok_or_else(|| anyhow!("Peer {} not connected", request.from))?;
                 // only one cdata is permitted for SubscribePredicate
                 use itertools::Itertools;
                 let cdata = cdata.iterable().exactly_one().map_err(|_| anyhow!("Only one cdata is permitted for SubscribePredicate"))?;
-                peer_state.subscription_handler.subscribe_query(self, query_id, collection, selection, cdata, version, known_matches).await
+                let result = peer_state
+                    .subscription_handler
+                    .subscribe_query(self, query_id, collection, selection, cdata, version, known_matches)
+                    .await;
+                let _reset_fence = self.entities.reset_fence_read().await;
+                if self.entities.reset_epoch() != request_epoch {
+                    let _ = peer_state.subscription_handler.remove_predicate(query_id);
+                    return Ok(proto::NodeResponseBody::Error("system reset during subscription admission; retry".to_owned()));
+                }
+                result
             }
         }
     }
 
-    async fn handle_update(&self, notification: proto::NodeUpdate) -> anyhow::Result<()> {
+    async fn handle_update(&self, notification: proto::NodeUpdate, expected_epoch: u64) -> Result<(), crate::error::ApplyError> {
         let Some(_connection) = self.peer_connections.get(&notification.from) else {
-            return Err(anyhow!("Rejected notification from unknown node {}", notification.from));
+            return Err(MutationError::InvalidUpdate("notification from unknown node").into());
         };
 
         match notification.body {
             proto::NodeUpdateBody::SubscriptionUpdate { items } => {
                 tracing::debug!("Node({}) received subscription update from peer {}", self.id, notification.from);
-                crate::node_applier::NodeApplier::apply_updates(self, &notification.from, items).await?;
+                crate::node_applier::NodeApplier::apply_updates_at_epoch(self, &notification.from, items, expected_epoch).await?;
                 Ok(())
             }
         }
     }
 
-    pub(crate) async fn relay_to_required_peers(
+    pub(crate) async fn relay_to_required_peers_fenced(
         &self,
         cdata: &PA::ContextData,
         id: proto::TransactionId,
@@ -852,7 +1317,9 @@ where
         // TODO determine how many durable peers need to respond before we can proceed. The others should continue in the background.
         // as of this writing, we only have one durable peer, so we can just await the response from "all" of them
         for peer_id in self.get_durable_peers() {
-            match self.request(peer_id, cdata, proto::NodeRequestBody::CommitTransaction { id: id.clone(), events: events.to_vec() }).await
+            match self
+                .request_fenced(peer_id, cdata, proto::NodeRequestBody::CommitTransaction { id: id.clone(), events: events.to_vec() })
+                .await
             {
                 Ok(proto::NodeResponseBody::CommitComplete { .. }) => (),
                 Ok(proto::NodeResponseBody::Error(e)) => {
@@ -901,6 +1368,34 @@ where
         }
     }
 
+    /// Epoch-bound ingress resolution. Unlike the startup-oriented ordinary
+    /// wait, this operation must not follow catalog readiness across hard
+    /// reset and accidentally resume an old request against successor
+    /// identities.
+    pub(crate) async fn resolve_model_wait_at_epoch(
+        &self,
+        model: &proto::EntityId,
+        expected_epoch: u64,
+    ) -> Result<proto::CollectionId, RetrievalError> {
+        {
+            let _reset_fence = self.entities.reset_fence_read().await;
+            if self.entities.reset_epoch() != expected_epoch {
+                return Err(RequestError::ConnectionLost.into());
+            }
+        }
+        match self.resolve_model(model) {
+            Ok(collection) => Ok(collection),
+            Err(e) => {
+                if self.durable && !self.catalog.is_catalog_ready() {
+                    self.catalog.wait_catalog_ready_at_epoch(self, expected_epoch).await?;
+                    self.resolve_model(model)
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
     /// Phase one of the Atomic commit lanes (M6 remote, M7 local): stage one
     /// entity's events into per-call staging, plan them, typed-fail anything
     /// the plan cannot resolve, and preview every scheduled event on a fork
@@ -918,12 +1413,17 @@ where
         // before.
         let getter = LocalEventGetter::with_staging(collection.clone(), self.durable, staging.clone());
 
+        let expected_model = entity.model_id()?;
         for attested in group {
-            staging.stage(attested.clone());
+            if attested.payload.entity_id != entity.id() || attested.payload.model != expected_model {
+                return Err(MutationError::InvalidEvent);
+            }
         }
+        staging.try_stage_batch(group.iter().cloned())?;
+        let scoped_getter = crate::retrieval::ScopedEventGetter::new(&getter, entity.id(), expected_model);
 
         let batch: Vec<proto::EventId> = group.iter().map(|e| e.payload.id()).collect();
-        let mut plan = crate::ingest::plan_entity(&entity.head(), &batch, &staging, &getter).await?;
+        let mut plan = crate::ingest::plan_entity_for(entity.id(), &entity.head(), &batch, &staging, &getter).await?;
 
         // NeedsState on the commit lanes fails typed, fast, and atomically;
         // the sender's retry recovers once state arrives through the
@@ -980,7 +1480,7 @@ where
                 continue;
             }
             let Some(attested) = staging.get_attested(event_id) else { continue };
-            match crate::ingest::check_generation(&getter, Some(&materialized), &attested.payload).await? {
+            match crate::ingest::check_generation(&scoped_getter, Some(&materialized), &attested.payload).await? {
                 crate::ingest::GenerationCheck::Verified => {}
                 crate::ingest::GenerationCheck::Unverifiable => {
                     tracing::warn!(event = %event_id, "commit-lane phase one could not resolve parents for generation verification; admitting unverified");
@@ -1002,14 +1502,14 @@ where
         for event_id in &plan.schedule {
             let Some(attested) = staging.get_attested(event_id) else { continue };
             let fork_before = fork.snapshot(Arc::new(AtomicBool::new(true)));
-            fork.apply_event(&getter, &attested.payload, Some(self.entities.unverified()))
+            fork.apply_event(&scoped_getter, &attested.payload, Some(self.entities.unverified()))
                 .await
                 .map_err(crate::ingest::type_comparison_error)?;
             match self.policy_agent.check_event(self, cdata, &fork_before, &fork, &attested.payload) {
                 Ok(Some(attestation)) => {
                     let mut updated = attested.clone();
                     updated.attestations.push(attestation);
-                    staging.restage(updated);
+                    staging.restage(updated)?;
                 }
                 Ok(None) => {}
                 Err(denied) => {
@@ -1028,7 +1528,24 @@ where
         id: proto::TransactionId,
         events: Vec<Attested<proto::Event>>,
     ) -> Result<(), MutationError> {
+        let expected_epoch = self.entities.reset_epoch();
+        self.commit_remote_transaction_at_epoch(cdata, id, events, expected_epoch).await
+    }
+
+    pub(crate) async fn commit_remote_transaction_at_epoch(
+        &self,
+        cdata: &PA::ContextData,
+        id: proto::TransactionId,
+        events: Vec<Attested<proto::Event>>,
+        expected_epoch: u64,
+    ) -> Result<(), MutationError> {
         debug!("{self} commiting transaction {id} with {} events", events.len());
+        {
+            let _reset_fence = self.entities.reset_fence_read().await;
+            if self.entities.reset_epoch() != expected_epoch {
+                return Err(MutationError::RetrievalError(RequestError::ConnectionLost.into()));
+            }
+        }
 
         // Group by entity, preserving first-appearance order. Cross-entity
         // order is not semantic (per-entity order comes from parent edges);
@@ -1038,7 +1555,12 @@ where
         let mut groups: Vec<(proto::EntityId, proto::EntityId, Vec<Attested<proto::Event>>)> = Vec::new();
         for event in events {
             match groups.iter_mut().find(|(eid, _, _)| *eid == event.payload.entity_id) {
-                Some((_, _, list)) => list.push(event),
+                Some((_, model, list)) => {
+                    if *model != event.payload.model {
+                        return Err(MutationError::InvalidEvent);
+                    }
+                    list.push(event);
+                }
                 None => groups.push((event.payload.entity_id, event.payload.model, vec![event])),
             }
         }
@@ -1055,7 +1577,7 @@ where
                 // INGRESS (#330): the envelope carries a model id; resolve
                 // it to the local collection (well-knowns, then catalog) or
                 // reject the transaction.
-                let collection_id = self.resolve_model_wait(model).await?;
+                let collection_id = self.resolve_model_wait_at_epoch(model, expected_epoch).await?;
                 let collection = self.collections.get(&collection_id).await?;
                 let event_getter = LocalEventGetter::new(collection.clone(), self.durable);
                 let state_getter = LocalStateGetter::new(collection);
@@ -1081,12 +1603,24 @@ where
         // Phase two: execute. Policy has passed for every event; failures
         // from here are storage-class, reported per event, not rolled back
         // (same as local commit today). The applied prefix is persisted and
-        // notified.
+        // notified. One reset-fence read covers every entity plus reactor
+        // delivery, so a queued reset cannot split a successfully committed
+        // old-epoch transaction from its notification or make the caller
+        // observe ConnectionLost after durable success.
+        let _phase_two_reset_fence = self.entities.reset_fence_read().await;
+        if self.entities.reset_epoch() != expected_epoch {
+            for entity_id in &touched {
+                self.entities.remove_if_phantom(entity_id);
+            }
+            return Err(MutationError::RetrievalError(RequestError::ConnectionLost.into()));
+        }
         let mut changes = Vec::new();
         let mut failure: Option<MutationError> = None;
         for PlannedEntityGroup { entity, staging, getter, collection, plan } in ready {
             let persist = crate::node_applier::NodePersist { node: self, collection: &collection };
-            let outcome = crate::ingest::execute_plan(plan, &entity, &self.entities, &staging, &getter, &persist).await;
+            let outcome =
+                crate::ingest::execute_plan_fenced_at_epoch(plan, &entity, &self.entities, &staging, &getter, &persist, expected_epoch)
+                    .await;
             // One change per entity carrying its applied events in
             // application order. The old per-event shape was an artifact of
             // building each change mid-loop while the head sat at that
@@ -1094,8 +1628,8 @@ where
             // constructible inside a multi-event batch (EntityChange's own
             // containment rule), which is the sanctioned shape bridges and
             // multi-event subscription items already use (V4).
-            if !outcome.applied.is_empty() {
-                changes.push(EntityChange::new(entity.clone(), outcome.applied.clone())?);
+            if let Some(change) = outcome.change {
+                changes.push(change);
             }
             if let Some(e) = outcome.failure {
                 failure = Some(e);
@@ -1330,12 +1864,13 @@ where
         ids: Vec<proto::EntityId>,
         cdata: &PA::ContextData,
     ) -> Result<(), RetrievalError> {
+        let expected_epoch = self.entities.reset_epoch();
         let peer_id = self.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
 
         match self
-            .request(peer_id, cdata, proto::NodeRequestBody::Get { collection: collection_id.clone(), ids })
+            .request_at_epoch(peer_id, cdata, proto::NodeRequestBody::Get { collection: collection_id.clone(), ids }, expected_epoch)
             .await
-            .map_err(|e| RetrievalError::Other(format!("{:?}", e)))?
+            .map_err(RetrievalError::from)?
         {
             proto::NodeResponseBody::Get(states) => {
                 let collection = self.collections.get(collection_id).await?;
@@ -1351,7 +1886,14 @@ where
                 // the head may be exactly what a buffered orphan was waiting
                 // for, and the feed's re-drive drains it from here.
                 let staging = self.staging_for(collection_id);
-                let event_getter = CachedEventGetter::with_staging(collection_id.clone(), collection.clone(), self, cdata, staging.clone());
+                let event_getter = CachedEventGetter::with_staging_at_epoch(
+                    collection_id.clone(),
+                    collection.clone(),
+                    self,
+                    cdata,
+                    staging.clone(),
+                    expected_epoch,
+                );
                 let persist = crate::node_applier::NodePersist { node: self, collection: &collection };
                 // PerItem containment (plan 2.7): one bad state must not
                 // abort the batch, and entities that already adopted and
@@ -1364,7 +1906,8 @@ where
                 for state in states {
                     let result = async {
                         self.policy_agent.validate_received_state(self, &peer_id, &state)?;
-                        let state_collection = self.resolve_model_wait(&state.payload.model).await.map_err(MutationError::from)?;
+                        let state_collection =
+                            self.resolve_model_wait_at_epoch(&state.payload.model, expected_epoch).await.map_err(MutationError::from)?;
                         if &state_collection != collection_id {
                             return Err(MutationError::from(RetrievalError::Other(format!(
                                 "Get response model {} resolves to collection '{}', expected '{}'",
@@ -1373,29 +1916,26 @@ where
                                 collection_id
                             ))));
                         }
-                        crate::ingest::apply_state_feed(
+                        crate::ingest::apply_state_feed_at_epoch(
                             &self.entities,
                             &state_getter,
                             &event_getter,
                             &staging,
                             state.payload.entity_id,
+                            state.payload.model,
                             state_collection,
                             state.payload.state.clone(),
                             &[],
                             &persist,
+                            expected_epoch,
                         )
                         .await
                     }
                     .await;
                     match result {
                         Ok(applied) => {
-                            if applied.advanced {
-                                match EntityChange::new(applied.entity, Vec::new()) {
-                                    Ok(change) => changes.push(change),
-                                    Err(e) => {
-                                        first_failure.get_or_insert(RetrievalError::Other(format!("{:?}", e)));
-                                    }
-                                }
+                            if let Some(change) = applied.change {
+                                changes.push(change);
                             }
                         }
                         Err(e) => {
@@ -1489,9 +2029,8 @@ where
         self.staging.get_or_default(collection.clone())
     }
 
-    /// (len, evictions, cap) of one collection's node-held staging area.
-    /// R6/R8 observability: buffering and cap eviction must be visible from
-    /// outside the crate.
+    /// (len, legacy-evictions, cap) of one collection's node-held staging
+    /// area. Atomic admission never evicts, so the middle value is zero.
     #[cfg(feature = "test-helpers")]
     pub fn staging_probe_for_test(&self, collection: &CollectionId) -> (usize, u64, usize) {
         let area = self.staging_for(collection);

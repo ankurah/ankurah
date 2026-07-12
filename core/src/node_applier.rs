@@ -1,7 +1,7 @@
 use crate::{
     changes::EntityChange,
     error::{ApplyError, ApplyErrorItem, MutationError},
-    ingest::{self, IngestOutcome, StagingArea},
+    ingest::{self, StagingArea},
     node::Node,
     policy::PolicyAgent,
     retrieval::{CachedEventGetter, GetState, LocalStateGetter, SuspenseEvents},
@@ -12,12 +12,9 @@ use ankurah_proto::{self as proto};
 use futures::stream::StreamExt;
 use proto::Attested;
 
-/// PersistState adapter for the ingest pipeline: attestation needs the
-/// node's PolicyAgent, so the feeder supplies persistence. Shared by the
-/// applier arms, the node's Get response lane, the remote commit lane
-/// (commit_remote_transaction phase two), and the local commit lane:
-/// every resident persist funnels through here, which is what makes this
-/// the ONE home for the persist-currency discipline (D2-6).
+/// Persistence adapter for ingest. It supplies the node's PolicyAgent for
+/// state attestation and centralizes marker-safe resident persistence for
+/// apply, Get response, remote commit, and local commit lanes.
 pub(crate) struct NodePersist<'a, SE, PA>
 where
     SE: StorageEngine + Send + Sync + 'static,
@@ -33,82 +30,35 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    /// Persist the resident's current state, ELIDING the write when the
-    /// persist-currency marker proves a completed set_state already covers
-    /// exactly the current head in the current reset epoch (D2-6,
-    /// obligations (b) and (c); the sanctioned re-introduction of the
-    /// elision ef68e081 removed, now keyed on completed-persist testimony
-    /// instead of no-op applies).
+    /// Persist the canonical resident's current state. The completed-persist
+    /// marker elides the write only when it names the resident's exact current
+    /// head in the current reset epoch.
     ///
-    /// The WHOLE span (canonical check, elision check, snapshot, engine
-    /// write, stamp) runs under the node's per-entity-id persist lock (the
-    /// M4 post-review remediation of the adversarial finding 2): engines
-    /// are blind last-writer upserts, so unserialized sibling lanes could
-    /// land their writes in the opposite order of their snapshots,
-    /// regressing the stored buffer while the marker elision made the
-    /// regression sticky. Serialized, persists of one INSTANCE are totally
-    /// ordered, the write that lands last carries the snapshot taken last
-    /// (heads never regress, so storage never regresses), a sibling
-    /// waiting its turn elides truthfully on the completed persist's
-    /// stamp, and the marker can never lead storage. The elision check
-    /// sits INSIDE the lock so it always reads the newest sibling stamp.
-    /// The lock is keyed by id rather than by instance, but id-keyed
-    /// ORDERING alone did not cover the transient two-residents-for-one-id
-    /// window (concurrency panel NOTE 4): markers are instance-local, so a
-    /// stale duplicate persisting last could still regress storage behind
-    /// the canonical head while the canonical's own marker elided the
-    /// healing write (the codex follow-up finding). The funnel therefore
-    /// also REFUSES any instance that is not the node's canonical
-    /// resident, under the same lock (the first check in the body). The
-    /// two documented raw set_state bypasses in system.rs stay outside the
-    /// lock: they never stamp, so there the marker only lags (the safe
-    /// direction).
+    /// The reset fence orders the whole operation before or after a hard
+    /// reset. Inside that fence, the per-entity persist span serializes the
+    /// canonical check, marker check, snapshot, storage write, and marker
+    /// stamp. This prevents sibling lanes from landing snapshots out of order
+    /// and prevents a stale duplicate resident from overwriting the canonical
+    /// state. The marker records the head returned by `save_state`, never a
+    /// later re-read.
     ///
-    /// The whole span also holds the RESET FENCE in read mode (M4
-    /// remediation, item 5): hard_reset takes the write half across its
-    /// epoch bump, map purge, and storage wipe, so in-flight persists
-    /// drain before the wipe and no persist span can interleave any reset
-    /// step. A funnel persist therefore cannot land dead-system bytes in
-    /// post-wipe storage, cannot stamp a current-epoch marker over storage
-    /// the wipe then erases, and cannot elide on a marker a reset just
-    /// killed. The reset epoch is captured inside the fenced span, before
-    /// the engine write, and the captured value is stamped at completion:
-    /// with the fence, every funnel persist runs strictly before or
-    /// strictly after a reset, and the epoch conjunct's remaining live job
-    /// is distrusting markers stamped BEFORE a reset on residents that
-    /// survive it through held strong references. The marker stamps the
-    /// exact head save_state serialized (returned by it), never a re-read.
-    ///
-    /// Acquisition order: fence read (node-wide, coarse) first, then the
-    /// per-entity span lock (fine); no path acquires them in the other
-    /// order or nested, and hard_reset takes no entity locks, so there is
-    /// no cycle.
+    /// Lock order is reset fence first, then the per-entity persist span.
+    /// Callers that already hold the reset fence use `persist_fenced` to avoid
+    /// recursively acquiring the fair read lock.
     async fn persist(&self, entity: &crate::entity::Entity) -> Result<(), MutationError> {
         let _fence = self.node.entities.reset_fence_read().await;
+        self.persist_fenced(entity).await
+    }
+
+    async fn persist_fenced(&self, entity: &crate::entity::Entity) -> Result<(), MutationError> {
         let span = self.node.entities.persist_span(entity.id());
         let _guard = span.lock().await;
-        // Only the node's CANONICAL resident may persist (the M4 codex
-        // follow-up remediation): the marker and the snapshot are per
-        // Entity INSTANCE, so the id-keyed ordering above cannot keep
-        // storage coherent across duplicate live instances for one id
-        // (the remove_if_phantom eviction race, concurrency panel NOTE 4).
-        // A stale instance persisting last would blindly regress storage
-        // behind the canonical head, and the canonical's instance-local
-        // marker would then elide the write that could heal it. The
-        // refusal PRECEDES the elision check so a stale instance cannot
-        // even elide truthfully on its own dead marker (an Ok here would
-        // let its caller record applied-set rows against testimony the
-        // canonical world never gave). An absent or dead map entry ALLOWS:
-        // a sole live instance persisting is coherent (a later
-        // rematerialization reads its write and heals forward; the
-        // dead-system residue on the PersistMarker doc stays a documented
-        // D3/D6 deferral). Entity equality is Arc pointer identity, and
-        // the check sits INSIDE the span lock: serialized against every
-        // sibling persist of this id, a canonical resolved here cannot
-        // have its stamp invalidated by this lane afterward (any later
-        // canonical persist queues behind this span and writes after it).
-        // The refusal is an innocent-race item failure, not a lineage
-        // rejection: the sender's redelivery lands on the canonical.
+        // Markers and snapshots belong to one Entity instance. Refuse a
+        // non-canonical live instance before consulting its marker so it
+        // cannot overwrite or claim durability for the canonical resident.
+        // An absent map entry is allowed because this is then the only live
+        // instance known to the node. A refused delivery is retryable; its
+        // redelivery resolves to the canonical resident.
         if let Some(canonical) = self.node.entities.get(&entity.id()) {
             if canonical != *entity {
                 return Err(MutationError::StaleInstancePersistRefused(entity.id()));
@@ -124,17 +74,17 @@ where
     }
 }
 
-/// Consolidates all logic for applying remote updates to a node
-/// Handles both SubscriptionUpdateItem (streaming updates) and EntityDelta (initial Fetch/QuerySubscribed)
+/// Applies streaming subscription updates and initial Fetch/QuerySubscribed
+/// deltas received from a peer.
 pub struct NodeApplier;
 
 impl NodeApplier {
-    /// Similar to commit_transaction, except that we check event attestations instead of checking write permissions
-    /// we also don't need to fan events out to peers because we're receiving them from a peer
-    pub(crate) async fn apply_updates<SE, PA>(
+    /// Apply authenticated remote updates without relaying them back to peers.
+    pub(crate) async fn apply_updates_at_epoch<SE, PA>(
         node: &Node<SE, PA>,
         from_peer_id: &proto::EntityId,
         items: Vec<proto::SubscriptionUpdateItem>,
+        expected_epoch: u64,
     ) -> Result<(), ApplyError>
     where
         SE: StorageEngine + Send + Sync + 'static,
@@ -142,8 +92,9 @@ impl NodeApplier {
     {
         tracing::debug!("received subscription update for {} items", items.len());
 
-        // In theory, if initialized_predicate is specified, we could potentially narrow it down to just the context for that predicate
-        // but this feels brittle, because failure to apply this event would affect the other contexts on this node.
+        // Validate against every context registered for this peer. Narrowing
+        // by one predicate would hide an apply failure from the peer's other
+        // active contexts on this node.
         let Some(relay) = &node.subscription_relay else {
             return Err(MutationError::InvalidUpdate("Should not be receiving updates without a subscription relay").into());
         };
@@ -161,18 +112,35 @@ impl NodeApplier {
             let entity_id = update.entity_id;
             let item_model = update.model;
             let result = async {
-                // INGRESS (#330): resolve the wire model id to the local
-                // collection (well-knowns, then catalog) or reject this item.
-                let collection_id = node.resolve_model_wait(&update.model).await?;
+                // Resolve the wire model id to a local collection through the
+                // well-known map or catalog, rejecting an unknown model (#330).
+                let collection_id = node.resolve_model_wait_at_epoch(&update.model, expected_epoch).await?;
                 let collection = node.collections.get(&collection_id).await?;
-                // Node-held staging (M8): staged-but-unapplied events
-                // survive across deliveries, which is what descendant
-                // re-drive integrates from. The getter shares the same area
-                // so BFS discovery and pipeline scheduling see one buffer.
+                // Node-held staging keeps unapplied events across deliveries.
+                // The getter shares it so lineage discovery and pipeline
+                // scheduling observe the same retained ancestors.
                 let staging = node.staging_for(&collection_id);
-                let event_getter = CachedEventGetter::with_staging(collection_id, collection.clone(), node, &cdata, staging.clone());
+                let event_getter = CachedEventGetter::with_staging_at_epoch(
+                    collection_id,
+                    collection.clone(),
+                    node,
+                    &cdata,
+                    staging.clone(),
+                    expected_epoch,
+                );
                 let state_getter = LocalStateGetter::new(collection);
-                Self::apply_update(node, from_peer_id, update, &staging, &event_getter, &state_getter, &mut changes, &mut ()).await
+                Self::apply_update(
+                    node,
+                    from_peer_id,
+                    update,
+                    &staging,
+                    &event_getter,
+                    &state_getter,
+                    &mut changes,
+                    &mut (),
+                    expected_epoch,
+                )
+                .await
             }
             .await;
             if let Err(cause) = result {
@@ -203,7 +171,8 @@ impl NodeApplier {
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
-        Self::apply_updates(node, from_peer_id, items).await
+        let expected_epoch = node.entities.reset_epoch();
+        Self::apply_updates_at_epoch(node, from_peer_id, items, expected_epoch).await
     }
 
     /// Validate each event fragment against policy and stage it for BFS
@@ -247,9 +216,7 @@ impl NodeApplier {
         // fragment.
         let mut seen = std::collections::BTreeSet::new();
         attested_events.retain(|event| seen.insert(event.payload.id()));
-        for attested_event in &attested_events {
-            staging.stage(attested_event.clone());
-        }
+        staging.try_stage_batch(attested_events.iter().cloned())?;
         Ok(attested_events)
     }
 
@@ -272,6 +239,7 @@ impl NodeApplier {
         state_getter: &S,
         changes: &mut Vec<EntityChange>,
         entities: &mut impl Pushable<crate::entity::Entity>,
+        expected_epoch: u64,
     ) -> Result<(), MutationError>
     where
         SE: StorageEngine + Send + Sync + 'static,
@@ -281,7 +249,7 @@ impl NodeApplier {
     {
         // TODO: do we actually need predicate_relevance?
         let proto::SubscriptionUpdateItem { entity_id, model, content, predicate_relevance: _, source_queries: _ } = update;
-        let collection_id = node.resolve_model_wait(&model).await?;
+        let collection_id = node.resolve_model_wait_at_epoch(&model, expected_epoch).await?;
         let collection = node.collections.get(&collection_id).await?;
 
         match content {
@@ -299,7 +267,7 @@ impl NodeApplier {
                 // a remote peer, since this shape carries no fragment.
                 let planned = async {
                     let entity = node.entities.get_retrieve_or_create(state_getter, event_getter, &collection_id, &entity_id).await?;
-                    let plan = ingest::plan_entity(&entity.head(), &batch, staging, event_getter).await?;
+                    let plan = ingest::plan_entity_for(entity.id(), &entity.head(), &batch, staging, event_getter).await?;
                     Ok::<_, MutationError>((entity, plan))
                 }
                 .await;
@@ -313,27 +281,26 @@ impl NodeApplier {
                 entities.push(entity.clone());
 
                 let persist = NodePersist { node, collection: &collection };
-                let outcome = ingest::execute_plan(plan, &entity, &node.entities, staging, event_getter, &persist).await;
+                let outcome =
+                    ingest::execute_plan_at_epoch(plan, &entity, &node.entities, staging, event_getter, &persist, expected_epoch).await;
 
                 // Anything applied before a failure is real progress; notify
                 // it. Streaming updates carry the applied events on the change.
-                if outcome.advanced() {
-                    changes.push(EntityChange::new(entity.clone(), outcome.applied.clone())?);
+                if let Some(change) = outcome.change.clone() {
+                    changes.push(change);
                 }
 
                 if let Some(failure) = outcome.failure {
                     return Err(failure);
                 }
-                // Per-item error surface, typed at M5: NeedsState is the
-                // typed empty-head lineage rejection (the event stays
-                // buffered awaiting state through any lane, but this node
-                // cannot apply it now and the ack says so). NeedsEvents is a
-                // buffered NON-error since the M8 retention flip: the event
-                // is retained in the node-held area and integrates via
-                // descendant re-drive when its parent arrives; failing the
-                // item would make the sender retry what is already safely
-                // buffered.
+                // Per-item error surface: NeedsState is the typed empty-head
+                // lineage rejection. NeedsEvents retains the event locally
+                // but remains retryable so the sender holds a lossless lease
+                // while atomic capacity admission applies backpressure.
                 if let Some(e) = outcome.needs_state_error() {
+                    return Err(e);
+                }
+                if let Some(e) = outcome.needs_events_error() {
                     return Err(e);
                 }
             }
@@ -351,16 +318,18 @@ impl NodeApplier {
                 // strict descent takes the snapshot wholesale, committing the
                 // accompanying events before the buffer persists.
                 let persist = NodePersist { node, collection: &collection };
-                let applied = match ingest::apply_state_feed(
+                let applied = match ingest::apply_state_feed_at_epoch(
                     &node.entities,
                     state_getter,
                     event_getter,
                     staging,
                     entity_id,
+                    model,
                     collection_id.clone(),
                     state.payload.state,
                     &attested_events,
                     &persist,
+                    expected_epoch,
                 )
                 .await
                 {
@@ -373,30 +342,34 @@ impl NodeApplier {
                 let entity = applied.entity.clone();
                 entities.push(applied.entity);
 
-                if applied.advanced {
-                    changes.push(EntityChange::new(entity, attested_events)?);
+                if let Some(change) = applied.change {
+                    changes.push(change);
                 } else {
                     // State not applied (divergence or older): fall back to
                     // event-by-event application through the pipeline, which
                     // handles DivergedSince by merging concurrent branches.
                     // The events are already staged; the planner orders them.
-                    let plan = match ingest::plan_entity(&entity.head(), &batch, staging, event_getter).await {
+                    let plan = match ingest::plan_entity_for(entity.id(), &entity.head(), &batch, staging, event_getter).await {
                         Ok(plan) => plan,
                         Err(e) => {
                             Self::unstage_batch(staging, &batch);
                             return Err(e);
                         }
                     };
-                    let outcome = ingest::execute_plan(plan, &entity, &node.entities, staging, event_getter, &persist).await;
+                    let outcome =
+                        ingest::execute_plan_at_epoch(plan, &entity, &node.entities, staging, event_getter, &persist, expected_epoch).await;
 
-                    if outcome.advanced() {
-                        changes.push(EntityChange::new(entity.clone(), outcome.applied.clone())?);
+                    if let Some(change) = outcome.change.clone() {
+                        changes.push(change);
                     }
                     if let Some(failure) = outcome.failure {
                         return Err(failure);
                     }
                     // Same per-item error surface as the EventOnly arm.
                     if let Some(e) = outcome.needs_state_error() {
+                        return Err(e);
+                    }
+                    if let Some(e) = outcome.needs_events_error() {
                         return Err(e);
                     }
                 }
@@ -432,13 +405,14 @@ impl NodeApplier {
     /// Apply multiple EntityDeltas in parallel with batched reactor notification
     /// Drains all ready futures per wake and calls reactor.notify_change for each batch
     /// Collects all errors and returns them at the end - caller decides whether to fail or log
-    pub(crate) async fn apply_deltas<SE, PA, E, S>(
+    pub(crate) async fn apply_deltas_at_epoch<SE, PA, E, S>(
         node: &Node<SE, PA>,
         from_peer_id: &proto::EntityId,
         deltas: Vec<proto::EntityDelta>,
         staging: &StagingArea,
         event_getter: &E,
         state_getter: &S,
+        expected_epoch: u64,
     ) -> Result<(), ApplyError>
     where
         SE: StorageEngine + Send + Sync + 'static,
@@ -450,7 +424,9 @@ impl NodeApplier {
         // if there are stragglers, they will be picked up on the next wake
         // this should in theory be deterministic for eventbridge cases where all events are immediately available
         let mut ready_chunks = ReadyChunks::new(
-            deltas.into_iter().map(|delta| Self::apply_delta(node, from_peer_id, delta, staging, event_getter, state_getter)),
+            deltas
+                .into_iter()
+                .map(|delta| Self::apply_delta(node, from_peer_id, delta, staging, event_getter, state_getter, expected_epoch)),
         );
 
         let mut all_errors = Vec::new();
@@ -489,6 +465,7 @@ impl NodeApplier {
         staging: &StagingArea,
         event_getter: &E,
         state_getter: &S,
+        expected_epoch: u64,
     ) -> Result<Option<EntityChange>, ApplyErrorItem>
     where
         SE: StorageEngine + Send + Sync + 'static,
@@ -499,7 +476,7 @@ impl NodeApplier {
         let entity_id = delta.entity_id;
         let model = delta.model;
 
-        let result = Self::apply_delta_inner(node, from_peer_id, delta, staging, event_getter, state_getter).await;
+        let result = Self::apply_delta_inner(node, from_peer_id, delta, staging, event_getter, state_getter, expected_epoch).await;
         result.map_err(|cause| ApplyErrorItem { entity_id, model, cause })
     }
 
@@ -510,6 +487,7 @@ impl NodeApplier {
         staging: &StagingArea,
         event_getter: &E,
         state_getter: &S,
+        expected_epoch: u64,
     ) -> Result<Option<EntityChange>, MutationError>
     where
         SE: StorageEngine + Send + Sync + 'static,
@@ -519,7 +497,7 @@ impl NodeApplier {
     {
         // INGRESS (#330): resolve the wire model id to the local collection
         // (well-knowns, then catalog) or reject this delta.
-        let collection_id = node.resolve_model_wait(&delta.model).await?;
+        let collection_id = node.resolve_model_wait_at_epoch(&delta.model, expected_epoch).await?;
         let collection = node.collections.get(&collection_id).await?;
 
         match delta.content {
@@ -539,16 +517,18 @@ impl NodeApplier {
                 // failure. Fresh adoption and strict descent are real
                 // changes and still notify.
                 let persist = NodePersist { node, collection: &collection };
-                let applied = ingest::apply_state_feed(
+                let applied = ingest::apply_state_feed_at_epoch(
                     &node.entities,
                     state_getter,
                     event_getter,
                     staging,
                     delta.entity_id,
+                    delta.model,
                     collection_id,
                     attested_state.payload.state,
                     &[],
                     &persist,
+                    expected_epoch,
                 )
                 .await?;
 
@@ -556,8 +536,10 @@ impl NodeApplier {
                     return Ok(None);
                 }
 
-                // Snapshots carry no events, so the change reports an empty events list.
-                Ok(Some(EntityChange::new(applied.entity, Vec::new())?))
+                // A state-only snapshot can still re-drive buffered
+                // descendants; those events belong on the one resulting
+                // change so live queries observe the final resident state.
+                Ok(applied.change)
             }
 
             proto::DeltaContent::EventBridge { events } => {
@@ -573,7 +555,7 @@ impl NodeApplier {
                 // state persistence, and phantom eviction on failure.
                 let planned = async {
                     let entity = node.entities.get_retrieve_or_create(state_getter, event_getter, &collection_id, &delta.entity_id).await?;
-                    let plan = ingest::plan_entity(&entity.head(), &batch, staging, event_getter).await?;
+                    let plan = ingest::plan_entity_for(entity.id(), &entity.head(), &batch, staging, event_getter).await?;
                     Ok::<_, MutationError>((entity, plan))
                 }
                 .await;
@@ -585,7 +567,8 @@ impl NodeApplier {
                     }
                 };
                 let persist = NodePersist { node, collection: &collection };
-                let outcome = ingest::execute_plan(plan, &entity, &node.entities, staging, event_getter, &persist).await;
+                let outcome =
+                    ingest::execute_plan_at_epoch(plan, &entity, &node.entities, staging, event_getter, &persist, expected_epoch).await;
 
                 if let Some(failure) = outcome.failure {
                     return Err(failure);
@@ -594,6 +577,9 @@ impl NodeApplier {
                 // arise on bridges (they include genesis); if it does, the
                 // typed empty-head rejection says so honestly.
                 if let Some(e) = outcome.needs_state_error() {
+                    return Err(e);
+                }
+                if let Some(e) = outcome.needs_events_error() {
                     return Err(e);
                 }
 

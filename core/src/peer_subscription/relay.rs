@@ -800,6 +800,7 @@ where
         validity: RequestValidity,
     ) -> Result<(), RetrievalError> {
         let node = self.upgrade().ok_or_else(|| RetrievalError::Other("Node has been dropped".to_string()))?;
+        let expected_epoch = node.entities.reset_epoch();
 
         // 1. Pre-fetch known_matches from local storage
         let known_matches: Vec<ankurah_proto::KnownEntity> = node
@@ -853,10 +854,25 @@ where
         // 3. Apply deltas to local node using NodeApplier
         let collection = node.collections.get(&collection_id).await?;
         let staging = node.staging_for(&collection_id);
-        let event_getter =
-            crate::retrieval::CachedEventGetter::with_staging(collection_id, collection.clone(), &node, context_data, staging.clone());
+        let event_getter = crate::retrieval::CachedEventGetter::with_staging_at_epoch(
+            collection_id,
+            collection.clone(),
+            &node,
+            context_data,
+            staging.clone(),
+            expected_epoch,
+        );
         let state_getter = crate::retrieval::LocalStateGetter::new(collection);
-        crate::node_applier::NodeApplier::apply_deltas(&node, &peer_id, deltas, &staging, &event_getter, &state_getter).await?;
+        crate::node_applier::NodeApplier::apply_deltas_at_epoch(
+            &node,
+            &peer_id,
+            deltas,
+            &staging,
+            &event_getter,
+            &state_getter,
+            expected_epoch,
+        )
+        .await?;
         drop(_request_lease);
 
         Ok(())

@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use common::Record;
+use common::{Album, Record};
 
 /// Permissive agent that denies check_event for ids in the deny set and
 /// records the (before, after) heads every check_event observed. The
@@ -166,12 +166,9 @@ fn forge_title_event(
     ankurah_tests::forge::event_with_parents(entity_id, model, proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])), parents)
 }
 
-/// R2 (D1 plan section 5): remote-commit atomicity. A policy denial mid
-/// batch must leave NOTHING durable: no committed events, no state buffer,
-/// no head advance. Red today: the per-event loop commits event 1, then
-/// propagates the denial of event 2 with `?`, leaving a committed prefix
-/// with an advanced head and no notification. The error must also carry the
-/// typed PolicyDenied class rather than a bare AccessDenied.
+/// A policy denial anywhere in a remote transaction leaves no committed
+/// events, state buffer, or resident head advance. The error retains the
+/// typed PolicyDenied class rather than collapsing to bare AccessDenied.
 #[tokio::test]
 async fn test_remote_commit_denial_leaves_nothing_durable() -> Result<()> {
     let agent = DenyingWriteAgent::new();
@@ -213,14 +210,9 @@ async fn test_remote_commit_denial_leaves_nothing_durable() -> Result<()> {
     Ok(())
 }
 
-/// R3 (D1 plan section 5): creation-rejection, the C4-19 arm. A rejected
-/// creation must leave no mutated resident entity, and the policy phase
-/// must see the creation as a PREVIEW: before-head empty, after-head at
-/// the creation event. Red today: the lane applies a creation directly to
-/// the real resident BEFORE policy runs and passes the same mutated entity
-/// as both before and after, so the agent observes a non-empty before-head
-/// and the denial strands a mutated resident until its last reference
-/// drops.
+/// C4-19: policy evaluates a remote creation on a preview. Rejection leaves
+/// no mutated resident, and the agent observes an empty before-head and the
+/// creation event in the after-head.
 #[tokio::test]
 async fn test_rejected_creation_previews_and_leaves_no_resident() -> Result<()> {
     let agent = DenyingWriteAgent::new();
@@ -261,6 +253,46 @@ async fn test_rejected_creation_previews_and_leaves_no_resident() -> Result<()> 
     if let Some(resident) = server.get_resident_entity(entity_id) {
         assert!(resident.head().is_empty(), "a denied creation must not leave a mutated resident, got {}", resident.head());
     }
+
+    Ok(())
+}
+
+/// One entity id cannot select two model routes in a remote transaction.
+/// Reject the whole request before any group reaches policy, storage, or the
+/// resident map.
+#[tokio::test]
+async fn test_remote_commit_rejects_mixed_models_for_one_entity() -> Result<()> {
+    let agent = DenyingWriteAgent::new();
+    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), agent);
+    server.system.create().await?;
+    let ctx = server.context(DEFAULT_CONTEXT)?;
+    ctx.register::<Record>().await?;
+    ctx.register::<Album>().await?;
+
+    let record_model = server.catalog.model_id_for(Record::collection().as_str()).expect("Record registered");
+    let album_model = server.catalog.model_id_for(Album::collection().as_str()).expect("Album registered");
+    let title_property = server.catalog.resolve(Record::collection().as_str(), "title").expect("Record.title registered");
+    let entity_id = proto::EntityId::new();
+    let record_event = forge_title_event(record_model, title_property, entity_id, &[], "record");
+    let album_event = forge_title_event(album_model, title_property, entity_id, &[], "album-route");
+
+    let err = server
+        .commit_remote_transaction(
+            &DEFAULT_CONTEXT,
+            proto::TransactionId::new(),
+            vec![Attested::opt(record_event, None), Attested::opt(album_event, None)],
+        )
+        .await
+        .expect_err("mixed models for one entity id must be rejected atomically");
+    assert!(matches!(err, MutationError::InvalidEvent), "expected InvalidEvent, got {err:?}");
+
+    let record_collection = server.collections.get(&Record::collection()).await?;
+    let album_collection = server.collections.get(&Album::collection()).await?;
+    assert!(record_collection.dump_entity_events(entity_id).await?.is_empty());
+    assert!(album_collection.dump_entity_events(entity_id).await?.is_empty());
+    assert!(record_collection.get_state(entity_id).await.is_err());
+    assert!(album_collection.get_state(entity_id).await.is_err());
+    assert!(server.get_resident_entity(entity_id).is_none());
 
     Ok(())
 }

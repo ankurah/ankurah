@@ -99,6 +99,21 @@ where
         properties: Vec<PropertyDescriptor>,
         memberships: Vec<MembershipDescriptor>,
     ) -> Result<RegisteredDefs, RegistrationError> {
+        let expected_epoch = self.entities.reset_epoch();
+        self.execute_schema_registration_at_epoch(cdata, models, properties, memberships, expected_epoch).await
+    }
+
+    pub(crate) async fn execute_schema_registration_at_epoch(
+        &self,
+        cdata: &PA::ContextData,
+        models: Vec<ModelDescriptor>,
+        properties: Vec<PropertyDescriptor>,
+        memberships: Vec<MembershipDescriptor>,
+        expected_epoch: u64,
+    ) -> Result<RegisteredDefs, RegistrationError> {
+        {
+            let _reset_fence = self.registration_epoch_fence(expected_epoch).await?;
+        }
         if !self.durable {
             return Err(RegistrationError::NotDurable);
         }
@@ -142,6 +157,7 @@ where
             return Err(RegistrationError::SystemNotReady);
         }
         let _registration_lease = registration_validity.try_acquire().ok_or(RegistrationError::SystemNotReady)?;
+        self.catalog.wait_catalog_ready_at_epoch(self, expected_epoch).await?;
 
         // RFC 5.1 executor discipline: the whole upsert -- lookups,
         // allocation, commit, and the synchronous map update -- serializes
@@ -177,7 +193,7 @@ where
                     plan.existing.push(id);
                     (id, name)
                 }
-                None => match self.model_lookup_checked(&m.collection).await? {
+                None => match self.model_lookup_checked(&m.collection, expected_epoch).await? {
                     Some(def) => {
                         // Display names follow the most recent registration;
                         // emit only on difference.
@@ -229,7 +245,7 @@ where
                 let c: &str = $collection;
                 match model_ids.get(c) {
                     Some(id) => *id,
-                    None => match self.model_lookup_checked(c).await? {
+                    None => match self.model_lookup_checked(c, expected_epoch).await? {
                         Some(def) => {
                             model_ids.insert(c.to_string(), def.id);
                             def.id
@@ -310,13 +326,13 @@ where
                 None => None,
             };
 
-            let current = self.property_lookup_checked(&scope, &p.name).await?;
+            let current = self.property_lookup_checked(&scope, &p.name, expected_epoch).await?;
 
             // RFC 5.8 rename-hint pre-pass, GUARDED: only when the
             // current-name lookup misses and the hinted lookup hits. The
             // hint is an ordinary name follow-up; the property keeps its id.
             let renamed = match (&current, &p.renamed_from) {
-                (None, Some(old)) => self.property_lookup_checked(&scope, old).await?,
+                (None, Some(old)) => self.property_lookup_checked(&scope, old, expected_epoch).await?,
                 _ => None,
             };
 
@@ -426,7 +442,7 @@ where
             let model_id = match model_ids.get(&ms.collection) {
                 Some(id) => *id,
                 None => self
-                    .model_lookup_checked(&ms.collection)
+                    .model_lookup_checked(&ms.collection, expected_epoch)
                     .await?
                     .map(|def| def.id)
                     .ok_or_else(|| RegistrationError::UnknownMintingCollection(ms.collection.clone()))?,
@@ -456,7 +472,7 @@ where
             }
             membership_seen.push((model_id, property_id));
 
-            let membership_id = match self.membership_lookup_checked(&model_id, &property_id).await? {
+            let membership_id = match self.membership_lookup_checked(&model_id, &property_id, expected_epoch).await? {
                 Some(def) => {
                     if def.optional != Some(ms.optional) {
                         let (_, head, head_generations) = self
@@ -504,6 +520,7 @@ where
         // nothing to gate, nothing to commit, nothing to relay -- but the
         // requester still gets the full resolved definitions.
         if plan.is_noop() {
+            let _reset_fence = self.registration_epoch_fence(expected_epoch).await?;
             return Ok((out_models, out_properties, out_memberships));
         }
 
@@ -520,11 +537,12 @@ where
 
         // The ordinary remote-commit pipeline: policy check (check_event),
         // attest, persist, apply, reactor notify.
-        self.commit_remote_transaction(cdata, TransactionId::new(), events).await?;
+        self.commit_remote_transaction_at_epoch(cdata, TransactionId::new(), events, expected_epoch).await?;
 
         // Synchronous map upsert BEFORE the allocator mutex releases: the
         // next registration in line must observe these allocations even if
         // the reactor has not delivered them yet (RFC 5.1).
+        let _reset_fence = self.registration_epoch_fence(expected_epoch).await?;
         self.catalog.upsert_registered(&out_models, &out_properties, &out_memberships);
 
         Ok((out_models, out_properties, out_memberships))
@@ -538,7 +556,19 @@ where
     /// the rest of the request (and the next one) sees it; ordinary first
     /// sightings miss both and pay one bounded fetch under the allocator
     /// mutex.
-    async fn model_lookup_checked(&self, collection: &str) -> Result<Option<super::catalog::ModelDef>, RetrievalError> {
+    async fn registration_epoch_fence(&self, expected_epoch: u64) -> Result<tokio::sync::RwLockReadGuard<'_, ()>, RetrievalError> {
+        let fence = self.entities.reset_fence_read().await;
+        if self.entities.reset_epoch() != expected_epoch {
+            return Err(crate::error::RequestError::ConnectionLost.into());
+        }
+        Ok(fence)
+    }
+
+    async fn model_lookup_checked(
+        &self,
+        collection: &str,
+        expected_epoch: u64,
+    ) -> Result<Option<super::catalog::ModelDef>, RetrievalError> {
         if let Some(def) = self.catalog.model_by_collection(collection) {
             return Ok(Some(def));
         }
@@ -550,6 +580,7 @@ where
             collection: collection.to_string(),
             name: string_field(&values, "name").unwrap_or_else(|| collection.to_string()),
         };
+        let _reset_fence = self.registration_epoch_fence(expected_epoch).await?;
         self.catalog.upsert_registered(
             &[RegisteredModel { id: def.id, collection: def.collection.clone(), name: def.name.clone() }],
             &[],
@@ -561,7 +592,12 @@ where
     /// Allocator lookup for a property by its full key (model, name,
     /// backend, value_type): map first, storage on a miss (see
     /// [`Self::model_lookup_checked`]).
-    async fn property_lookup_checked(&self, model: &EntityId, name: &str) -> Result<Option<super::catalog::PropertyDef>, RetrievalError> {
+    async fn property_lookup_checked(
+        &self,
+        model: &EntityId,
+        name: &str,
+        expected_epoch: u64,
+    ) -> Result<Option<super::catalog::PropertyDef>, RetrievalError> {
         if let Some(def) = self.catalog.property_by_name(model, name) {
             return Ok(Some(def));
         }
@@ -580,6 +616,7 @@ where
             value_type: string_field(&values, "value_type").unwrap_or_default(),
             target_model: entity_id_field(&values, "target_model"),
         };
+        let _reset_fence = self.registration_epoch_fence(expected_epoch).await?;
         self.catalog.upsert_registered(
             &[],
             &[RegisteredProperty {
@@ -601,6 +638,7 @@ where
         &self,
         model: &EntityId,
         property: &EntityId,
+        expected_epoch: u64,
     ) -> Result<Option<super::catalog::MembershipDef>, RetrievalError> {
         if let Some(def) = self.catalog.membership(model, property) {
             return Ok(Some(def));
@@ -615,6 +653,7 @@ where
         // optional (never defaulted, catalog.rs MembershipDef), and the
         // executor's diff arm emits the repairing follow-up either way.
         if let Some(optional) = optional {
+            let _reset_fence = self.registration_epoch_fence(expected_epoch).await?;
             self.catalog.upsert_registered(&[], &[], &[RegisteredMembership { id: def.id, model: *model, property: *property, optional }]);
         }
         Ok(Some(def))

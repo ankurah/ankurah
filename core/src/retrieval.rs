@@ -8,7 +8,8 @@
 use std::sync::Arc;
 
 use crate::{
-    error::{MutationError, RetrievalError},
+    entity::WeakEntitySet,
+    error::{MutationError, RequestError, RetrievalError},
     ingest::StagingArea,
     policy::PolicyAgent,
     storage::{StorageCollectionWrapper, StorageEngine},
@@ -17,6 +18,84 @@ use crate::{
 };
 use ankurah_proto::{self as proto, Attested, EntityId, Event, EventId};
 use async_trait::async_trait;
+
+fn checked_event(requested: &EventId, event: Event) -> Result<Event, RetrievalError> {
+    let actual = event.id();
+    if actual != *requested {
+        return Err(RetrievalError::Other(format!("event identity mismatch: requested {requested}, payload recomputed to {actual}")));
+    }
+    Ok(event)
+}
+
+fn validate_event_scope(event: &Event, expected_entity: EntityId, expected_model: EntityId) -> Result<(), MutationError> {
+    let event_id = event.id();
+    if event.entity_id != expected_entity {
+        return Err(crate::error::IngestError::Lineage(crate::error::LineageRejection::EntityMismatch {
+            event: event_id,
+            expected: expected_entity,
+            received: event.entity_id,
+        })
+        .into());
+    }
+    if event.model != expected_model {
+        return Err(crate::error::IngestError::Lineage(crate::error::LineageRejection::ModelMismatch {
+            event: event_id,
+            expected: expected_model,
+            received: event.model,
+        })
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_optional_scope(event: &Event, scope: Option<(EntityId, EntityId)>) -> Result<(), RetrievalError> {
+    if let Some((expected_entity, expected_model)) = scope {
+        validate_event_scope(event, expected_entity, expected_model).map_err(RetrievalError::from)?;
+    }
+    Ok(())
+}
+
+/// Validate a peer's complete response before caching any part of it. This
+/// two-pass shape matters for scoped lookups: a wrong-lineage ancestor must
+/// never be written into the requested collection before the outer comparison
+/// rejects it.
+async fn validate_and_cache_peer_events(
+    collection: &StorageCollectionWrapper,
+    requested: &EventId,
+    peer_events: Vec<Attested<Event>>,
+    scope: Option<(EntityId, EntityId)>,
+) -> Result<Event, RetrievalError> {
+    for event in &peer_events {
+        checked_event(requested, event.payload.clone())?;
+        validate_optional_scope(&event.payload, scope)?;
+    }
+
+    let first = peer_events.first().map(|event| event.payload.clone()).ok_or_else(|| RetrievalError::EventNotFound(requested.clone()))?;
+    for event in &peer_events {
+        collection.add_event(event).await?;
+    }
+    Ok(first)
+}
+
+/// Close the response-delivery-to-cache-write reset window for ordinary
+/// requests. The request itself registers under the reset fence, but it
+/// releases that guard while awaiting its response. Reacquiring here and
+/// holding through cache persistence ensures a queued reset either wipes
+/// after these writes or wins first and makes the response stale.
+async fn validate_and_cache_peer_events_at_epoch(
+    collection: &StorageCollectionWrapper,
+    requested: &EventId,
+    peer_events: Vec<Attested<Event>>,
+    scope: Option<(EntityId, EntityId)>,
+    entities: &WeakEntitySet,
+    request_epoch: u64,
+) -> Result<Event, RetrievalError> {
+    let _reset_fence = entities.reset_fence_read().await;
+    if entities.reset_epoch() != request_epoch {
+        return Err(RequestError::ConnectionLost.into());
+    }
+    validate_and_cache_peer_events(collection, requested, peer_events, scope).await
+}
 
 // ============================================================================
 // TRAITS
@@ -27,6 +106,34 @@ use async_trait::async_trait;
 pub trait GetEvents {
     /// Retrieve a single event by ID.
     async fn get_event(&self, event_id: &EventId) -> Result<Event, RetrievalError>;
+
+    /// Retrieve an event while binding every implementation-side side effect
+    /// (notably remote caching) to an expected entity/model lineage. The
+    /// default is sufficient for side-effect-free getters; caching getters
+    /// override it so validation happens before persistence.
+    async fn get_event_scoped(
+        &self,
+        event_id: &EventId,
+        expected_entity: EntityId,
+        expected_model: EntityId,
+    ) -> Result<Event, RetrievalError> {
+        let event = self.get_event(event_id).await?;
+        validate_event_scope(&event, expected_entity, expected_model).map_err(RetrievalError::from)?;
+        Ok(event)
+    }
+
+    /// Scoped lookup for a caller that already holds the node reset fence.
+    /// Side-effect-free getters can use the ordinary implementation. A
+    /// networked getter overrides this to avoid recursively acquiring
+    /// Tokio's fair RwLock behind a queued reset writer.
+    async fn get_event_scoped_fenced(
+        &self,
+        event_id: &EventId,
+        expected_entity: EntityId,
+        expected_model: EntityId,
+    ) -> Result<Event, RetrievalError> {
+        self.get_event_scoped(event_id, expected_entity, expected_model).await
+    }
 
     /// Check whether an event is in permanent storage (not staging).
     /// Used for creation-uniqueness guards where we need to know if the event
@@ -50,7 +157,7 @@ pub trait GetState {
 #[async_trait]
 pub trait SuspenseEvents: GetEvents {
     /// Stage an event for BFS discovery. `get_event` will find staged events.
-    fn stage_event(&self, event: Event);
+    fn stage_event(&self, event: Event) -> Result<(), MutationError>;
 
     /// Commit a staged event to permanent storage and remove from staging.
     async fn commit_event(&self, attested: &Attested<Event>) -> Result<(), MutationError>;
@@ -64,6 +171,92 @@ pub trait SuspenseEvents: GetEvents {
     async fn get_local_event(&self, event_id: &EventId) -> Result<Option<Event>, RetrievalError>;
 }
 
+/// Binds every lineage lookup and commit to the resident identity being
+/// mutated. Direct batch members are checked at intake; this wrapper closes
+/// the same boundary over stored or remotely fetched ancestors discovered by
+/// the comparison walk.
+pub(crate) struct ScopedEventGetter<'a, G> {
+    inner: &'a G,
+    entity: EntityId,
+    model: EntityId,
+    reset_fence_held: bool,
+}
+
+impl<'a, G> ScopedEventGetter<'a, G> {
+    pub(crate) fn new(inner: &'a G, entity: EntityId, model: EntityId) -> Self { Self { inner, entity, model, reset_fence_held: false } }
+
+    pub(crate) fn new_fenced(inner: &'a G, entity: EntityId, model: EntityId) -> Self {
+        Self { inner, entity, model, reset_fence_held: true }
+    }
+
+    fn validate(&self, event: &Event) -> Result<(), MutationError> { validate_event_scope(event, self.entity, self.model) }
+}
+
+#[async_trait]
+impl<G> GetEvents for ScopedEventGetter<'_, G>
+where G: GetEvents + Send + Sync
+{
+    async fn get_event(&self, event_id: &EventId) -> Result<Event, RetrievalError> {
+        let event = if self.reset_fence_held {
+            self.inner.get_event_scoped_fenced(event_id, self.entity, self.model).await?
+        } else {
+            self.inner.get_event_scoped(event_id, self.entity, self.model).await?
+        };
+        self.validate(&event).map_err(RetrievalError::from)?;
+        Ok(event)
+    }
+
+    async fn get_event_scoped(
+        &self,
+        event_id: &EventId,
+        expected_entity: EntityId,
+        expected_model: EntityId,
+    ) -> Result<Event, RetrievalError> {
+        let event = self.get_event(event_id).await?;
+        validate_event_scope(&event, expected_entity, expected_model).map_err(RetrievalError::from)?;
+        Ok(event)
+    }
+
+    async fn get_event_scoped_fenced(
+        &self,
+        event_id: &EventId,
+        expected_entity: EntityId,
+        expected_model: EntityId,
+    ) -> Result<Event, RetrievalError> {
+        let event = self.inner.get_event_scoped_fenced(event_id, self.entity, self.model).await?;
+        self.validate(&event).map_err(RetrievalError::from)?;
+        validate_event_scope(&event, expected_entity, expected_model).map_err(RetrievalError::from)?;
+        Ok(event)
+    }
+
+    async fn event_stored(&self, event_id: &EventId) -> Result<bool, RetrievalError> { self.inner.event_stored(event_id).await }
+
+    fn storage_is_definitive(&self) -> bool { self.inner.storage_is_definitive() }
+}
+
+#[async_trait]
+impl<G> SuspenseEvents for ScopedEventGetter<'_, G>
+where G: SuspenseEvents + Send + Sync
+{
+    fn stage_event(&self, event: Event) -> Result<(), MutationError> {
+        self.validate(&event)?;
+        self.inner.stage_event(event)
+    }
+
+    async fn commit_event(&self, attested: &Attested<Event>) -> Result<(), MutationError> {
+        self.validate(&attested.payload)?;
+        self.inner.commit_event(attested).await
+    }
+
+    async fn get_local_event(&self, event_id: &EventId) -> Result<Option<Event>, RetrievalError> {
+        let event = self.inner.get_local_event(event_id).await?;
+        if let Some(event) = &event {
+            self.validate(event).map_err(RetrievalError::from)?;
+        }
+        Ok(event)
+    }
+}
+
 // ============================================================================
 // BLANKET REFERENCE IMPLS
 // ============================================================================
@@ -71,6 +264,24 @@ pub trait SuspenseEvents: GetEvents {
 #[async_trait]
 impl<R: GetEvents + Send + Sync + ?Sized> GetEvents for &R {
     async fn get_event(&self, event_id: &EventId) -> Result<Event, RetrievalError> { (*self).get_event(event_id).await }
+
+    async fn get_event_scoped(
+        &self,
+        event_id: &EventId,
+        expected_entity: EntityId,
+        expected_model: EntityId,
+    ) -> Result<Event, RetrievalError> {
+        (*self).get_event_scoped(event_id, expected_entity, expected_model).await
+    }
+
+    async fn get_event_scoped_fenced(
+        &self,
+        event_id: &EventId,
+        expected_entity: EntityId,
+        expected_model: EntityId,
+    ) -> Result<Event, RetrievalError> {
+        (*self).get_event_scoped_fenced(event_id, expected_entity, expected_model).await
+    }
 
     async fn event_stored(&self, event_id: &EventId) -> Result<bool, RetrievalError> { (*self).event_stored(event_id).await }
 
@@ -108,7 +319,7 @@ impl LocalEventGetter {
     /// Shared staging with caller-controlled lifetime. The ingest pipeline
     /// passes the node-scoped area so staged-but-unapplied events survive
     /// across deliveries (gap replay, NeedsState/NeedsEvents buffering).
-    pub fn with_staging(collection: StorageCollectionWrapper, durable: bool, staging: Arc<StagingArea>) -> Self {
+    pub(crate) fn with_staging(collection: StorageCollectionWrapper, durable: bool, staging: Arc<StagingArea>) -> Self {
         Self { collection, durable, staging }
     }
 }
@@ -122,7 +333,10 @@ impl GetEvents for LocalEventGetter {
         }
         // Fall back to permanent storage
         let events = self.collection.get_events(vec![event_id.clone()]).await?;
-        events.into_iter().next().map(|e| e.payload).ok_or_else(|| RetrievalError::EventNotFound(event_id.clone()))
+        match events.into_iter().next() {
+            Some(event) => checked_event(event_id, event.payload),
+            None => Err(RetrievalError::EventNotFound(event_id.clone())),
+        }
     }
 
     async fn event_stored(&self, event_id: &EventId) -> Result<bool, RetrievalError> {
@@ -135,12 +349,12 @@ impl GetEvents for LocalEventGetter {
 
 #[async_trait]
 impl SuspenseEvents for LocalEventGetter {
-    fn stage_event(&self, event: Event) {
+    fn stage_event(&self, event: Event) -> Result<(), MutationError> {
         // The bare-Event form carries no attestations; that is fine for the
         // discovery-only lifetime this trait serves (attestations travel
         // separately to commit_event). Pipeline intake stages Attested
         // events directly on the shared area when retention matters.
-        self.staging.stage(Attested::opt(event, None));
+        self.staging.try_stage(Attested::opt(event, None)).map_err(Into::into)
     }
 
     async fn commit_event(&self, attested: &Attested<Event>) -> Result<(), MutationError> {
@@ -153,7 +367,10 @@ impl SuspenseEvents for LocalEventGetter {
         if let Some(event) = self.staging.get(event_id) {
             return Ok(Some(event));
         }
-        Ok(self.collection.get_events(vec![event_id.clone()]).await?.into_iter().next().map(|e| e.payload))
+        match self.collection.get_events(vec![event_id.clone()]).await?.into_iter().next() {
+            Some(event) => checked_event(event_id, event.payload).map(Some),
+            None => Ok(None),
+        }
     }
 }
 
@@ -172,6 +389,7 @@ where
     node: &'a Node<SE, PA>,
     cdata: &'a C,
     staging: Arc<StagingArea>,
+    expected_epoch: u64,
 }
 
 impl<'a, SE, PA, C> CachedEventGetter<'a, SE, PA, C>
@@ -182,18 +400,93 @@ where
 {
     /// Private per-call staging, the historical lifetime.
     pub fn new(collection_id: proto::CollectionId, collection: StorageCollectionWrapper, node: &'a Node<SE, PA>, cdata: &'a C) -> Self {
-        Self::with_staging(collection_id, collection, node, cdata, Arc::new(StagingArea::with_default_cap()))
+        let expected_epoch = node.entities.reset_epoch();
+        Self::new_at_epoch(collection_id, collection, node, cdata, expected_epoch)
     }
 
-    /// Shared staging with caller-controlled lifetime (see LocalEventGetter).
-    pub fn with_staging(
+    /// Private per-call staging bound to the epoch that admitted the owning
+    /// operation. Remote cache writes from another epoch are rejected.
+    pub(crate) fn new_at_epoch(
+        collection_id: proto::CollectionId,
+        collection: StorageCollectionWrapper,
+        node: &'a Node<SE, PA>,
+        cdata: &'a C,
+        expected_epoch: u64,
+    ) -> Self {
+        Self::with_staging_at_epoch(collection_id, collection, node, cdata, Arc::new(StagingArea::with_default_cap()), expected_epoch)
+    }
+
+    /// Shared staging bound to the epoch that admitted the owning update,
+    /// fetch, or subscription operation.
+    pub(crate) fn with_staging_at_epoch(
         collection_id: proto::CollectionId,
         collection: StorageCollectionWrapper,
         node: &'a Node<SE, PA>,
         cdata: &'a C,
         staging: Arc<StagingArea>,
+        expected_epoch: u64,
     ) -> Self {
-        Self { collection_id, collection, node, cdata, staging }
+        Self { collection_id, collection, node, cdata, staging, expected_epoch }
+    }
+
+    async fn get_event_with_scope(
+        &self,
+        event_id: &EventId,
+        scope: Option<(EntityId, EntityId)>,
+        reset_fence_held: bool,
+    ) -> Result<Event, RetrievalError> {
+        let request_epoch = self.expected_epoch;
+        if self.node.entities.reset_epoch() != request_epoch {
+            return Err(RequestError::ConnectionLost.into());
+        }
+
+        // Check staging first.
+        if let Some(event) = self.staging.get(event_id) {
+            validate_optional_scope(&event, scope)?;
+            return Ok(event);
+        }
+
+        // Try local storage.
+        let events = self.collection.get_events(vec![event_id.clone()]).await?;
+        if let Some(event) = events.into_iter().next() {
+            let event = checked_event(event_id, event.payload)?;
+            validate_optional_scope(&event, scope)?;
+            return Ok(event);
+        }
+
+        // Try a remote peer.
+        let Some(peer_id) = self.node.get_durable_peer_random() else {
+            return Err(RetrievalError::EventNotFound(event_id.clone()));
+        };
+
+        let request = proto::NodeRequestBody::GetEvents { collection: self.collection_id.clone(), event_ids: vec![event_id.clone()] };
+        let response = if reset_fence_held {
+            self.node.request_fenced(peer_id, self.cdata, request).await?
+        } else {
+            self.node.request_at_epoch(peer_id, self.cdata, request, request_epoch).await?
+        };
+
+        match response {
+            proto::NodeResponseBody::GetEvents(peer_events) => {
+                if !reset_fence_held {
+                    validate_and_cache_peer_events_at_epoch(
+                        &self.collection,
+                        event_id,
+                        peer_events,
+                        scope,
+                        &self.node.entities,
+                        request_epoch,
+                    )
+                    .await
+                } else {
+                    // request_fenced's caller owns the outer reset guard
+                    // across both the round trip and this cache write.
+                    validate_and_cache_peer_events(&self.collection, event_id, peer_events, scope).await
+                }
+            }
+            proto::NodeResponseBody::Error(e) => Err(RetrievalError::StorageError(format!("Error from peer: {}", e).into())),
+            _ => Err(RetrievalError::StorageError("Unexpected response type from peer".into())),
+        }
     }
 }
 
@@ -205,41 +498,25 @@ where
     C: Iterable<PA::ContextData> + Send + Sync + 'a,
 {
     async fn get_event(&self, event_id: &EventId) -> Result<Event, RetrievalError> {
-        // Check staging first
-        if let Some(event) = self.staging.get(event_id) {
-            return Ok(event);
-        }
+        self.get_event_with_scope(event_id, None, false).await
+    }
 
-        // Try local storage
-        let events = self.collection.get_events(vec![event_id.clone()]).await?;
-        if let Some(event) = events.into_iter().next() {
-            return Ok(event.payload);
-        }
+    async fn get_event_scoped(
+        &self,
+        event_id: &EventId,
+        expected_entity: EntityId,
+        expected_model: EntityId,
+    ) -> Result<Event, RetrievalError> {
+        self.get_event_with_scope(event_id, Some((expected_entity, expected_model)), false).await
+    }
 
-        // Try remote peer
-        let Some(peer_id) = self.node.get_durable_peer_random() else {
-            return Err(RetrievalError::EventNotFound(event_id.clone()));
-        };
-
-        match self
-            .node
-            .request(
-                peer_id,
-                self.cdata,
-                proto::NodeRequestBody::GetEvents { collection: self.collection_id.clone(), event_ids: vec![event_id.clone()] },
-            )
-            .await?
-        {
-            proto::NodeResponseBody::GetEvents(peer_events) => {
-                // Store locally for future access
-                for event in peer_events.iter() {
-                    self.collection.add_event(event).await?;
-                }
-                peer_events.into_iter().next().map(|e| e.payload).ok_or_else(|| RetrievalError::EventNotFound(event_id.clone()))
-            }
-            proto::NodeResponseBody::Error(e) => Err(RetrievalError::StorageError(format!("Error from peer: {}", e).into())),
-            _ => Err(RetrievalError::StorageError("Unexpected response type from peer".into())),
-        }
+    async fn get_event_scoped_fenced(
+        &self,
+        event_id: &EventId,
+        expected_entity: EntityId,
+        expected_model: EntityId,
+    ) -> Result<Event, RetrievalError> {
+        self.get_event_with_scope(event_id, Some((expected_entity, expected_model)), true).await
     }
 
     async fn event_stored(&self, event_id: &EventId) -> Result<bool, RetrievalError> {
@@ -255,7 +532,9 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
     C: Iterable<PA::ContextData> + Send + Sync + 'a,
 {
-    fn stage_event(&self, event: Event) { self.staging.stage(Attested::opt(event, None)); }
+    fn stage_event(&self, event: Event) -> Result<(), MutationError> {
+        self.staging.try_stage(Attested::opt(event, None)).map_err(Into::into)
+    }
 
     async fn commit_event(&self, attested: &Attested<Event>) -> Result<(), MutationError> {
         self.collection.add_event(attested).await?;
@@ -268,7 +547,10 @@ where
         if let Some(event) = self.staging.get(event_id) {
             return Ok(Some(event));
         }
-        Ok(self.collection.get_events(vec![event_id.clone()]).await?.into_iter().next().map(|e| e.payload))
+        match self.collection.get_events(vec![event_id.clone()]).await?.into_iter().next() {
+            Some(event) => checked_event(event_id, event.payload).map(Some),
+            None => Ok(None),
+        }
     }
 }
 
@@ -301,7 +583,10 @@ mod tests {
     use ankurah_proto::{AttestationSet, Attested, EntityId, EntityState, Event, EventId, OperationSet};
     use async_trait::async_trait;
     use std::collections::{BTreeMap, HashMap};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
 
     /// Minimal in-memory storage collection for testing the staging lifecycle.
     /// Only implements `add_event` and `get_events`; other methods panic or
@@ -312,6 +597,75 @@ mod tests {
 
     impl MockStorageCollection {
         fn new() -> Self { Self { events: Mutex::new(HashMap::new()) } }
+
+        fn insert_under(&self, requested: EventId, event: Event) {
+            self.events.lock().unwrap().insert(requested, Attested::opt(event, None));
+        }
+
+        fn contains(&self, event_id: &EventId) -> bool { self.events.lock().unwrap().contains_key(event_id) }
+    }
+
+    /// Exercises the same response-validation/cache helper as
+    /// CachedEventGetter without constructing a networked Node. The unscoped
+    /// method intentionally models the historical cache-first behavior; the
+    /// scoped override is the production pre-cache path.
+    struct SimulatedRemoteCacheGetter {
+        collection: StorageCollectionWrapper,
+        response: Attested<Event>,
+    }
+
+    struct FenceAwareGetter {
+        event: Event,
+        ordinary_scoped_calls: AtomicUsize,
+        fenced_scoped_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl GetEvents for FenceAwareGetter {
+        async fn get_event(&self, _event_id: &EventId) -> Result<Event, RetrievalError> {
+            panic!("scoped wrapper must not fall back to an unscoped lookup")
+        }
+
+        async fn get_event_scoped(
+            &self,
+            _event_id: &EventId,
+            _expected_entity: EntityId,
+            _expected_model: EntityId,
+        ) -> Result<Event, RetrievalError> {
+            self.ordinary_scoped_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.event.clone())
+        }
+
+        async fn get_event_scoped_fenced(
+            &self,
+            _event_id: &EventId,
+            _expected_entity: EntityId,
+            _expected_model: EntityId,
+        ) -> Result<Event, RetrievalError> {
+            self.fenced_scoped_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.event.clone())
+        }
+
+        async fn event_stored(&self, _event_id: &EventId) -> Result<bool, RetrievalError> { Ok(false) }
+    }
+
+    #[async_trait]
+    impl GetEvents for SimulatedRemoteCacheGetter {
+        async fn get_event(&self, event_id: &EventId) -> Result<Event, RetrievalError> {
+            validate_and_cache_peer_events(&self.collection, event_id, vec![self.response.clone()], None).await
+        }
+
+        async fn get_event_scoped(
+            &self,
+            event_id: &EventId,
+            expected_entity: EntityId,
+            expected_model: EntityId,
+        ) -> Result<Event, RetrievalError> {
+            validate_and_cache_peer_events(&self.collection, event_id, vec![self.response.clone()], Some((expected_entity, expected_model)))
+                .await
+        }
+
+        async fn event_stored(&self, _event_id: &EventId) -> Result<bool, RetrievalError> { Ok(false) }
     }
 
     #[async_trait]
@@ -376,7 +730,7 @@ mod tests {
         assert!(result.is_err(), "Event should not be found before staging");
 
         // Stage the event
-        getter.stage_event(event.clone());
+        getter.stage_event(event.clone()).unwrap();
 
         // After staging, get_event should find it
         let retrieved = getter.get_event(&event_id).await.expect("Staged event should be retrievable via get_event");
@@ -402,7 +756,7 @@ mod tests {
         assert!(!getter.event_stored(&event_id).await.unwrap(), "event_stored should be false before staging");
 
         // Stage the event
-        getter.stage_event(event);
+        getter.stage_event(event).unwrap();
 
         // After staging, event_stored should STILL be false
         // (staging is not permanent storage)
@@ -427,7 +781,7 @@ mod tests {
         let event_id = event.id();
 
         // Stage the event
-        getter.stage_event(event.clone());
+        getter.stage_event(event.clone()).unwrap();
 
         // Verify staged state: get_event finds it, event_stored does not
         assert!(getter.get_event(&event_id).await.is_ok(), "Staged event should be retrievable");
@@ -455,5 +809,108 @@ mod tests {
 
         let ephemeral_getter = LocalEventGetter::new(collection, false);
         assert!(!ephemeral_getter.storage_is_definitive(), "Ephemeral getter should report storage as non-definitive");
+    }
+
+    /// The executor wraps an already scoped getter after taking the reset
+    /// fence. Preserve the fenced signal through both wrappers so a cached
+    /// peer lookup reaches Node::request_fenced rather than recursively
+    /// acquiring the fair reset RwLock.
+    #[tokio::test]
+    async fn nested_scoped_lookup_preserves_the_already_fenced_path() {
+        let event = make_test_event(8, &[]);
+        let event_id = event.id();
+        let entity = event.entity_id;
+        let model = event.model;
+        let getter = FenceAwareGetter { event, ordinary_scoped_calls: AtomicUsize::new(0), fenced_scoped_calls: AtomicUsize::new(0) };
+        let inner = ScopedEventGetter::new(&getter, entity, model);
+        let outer = ScopedEventGetter::new_fenced(&inner, entity, model);
+
+        outer.get_event(&event_id).await.expect("fenced lineage lookup succeeds");
+
+        assert_eq!(getter.ordinary_scoped_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(getter.fenced_scoped_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn remote_response_from_a_dead_epoch_is_rejected_before_cache_write() {
+        let event = make_test_event(7, &[]);
+        let event_id = event.id();
+        let raw = Arc::new(MockStorageCollection::new());
+        let collection = StorageCollectionWrapper::new(raw.clone());
+        let entities = WeakEntitySet::default();
+        let request_epoch = entities.reset_epoch();
+
+        // Models the response-handler-to-caller scheduling window: delivery
+        // completed in request_epoch, then reset won before the caller could
+        // validate and populate its local cache.
+        entities.bump_reset_epoch();
+        let error = validate_and_cache_peer_events_at_epoch(
+            &collection,
+            &event_id,
+            vec![Attested::opt(event, None)],
+            None,
+            &entities,
+            request_epoch,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, RetrievalError::RequestError(RequestError::ConnectionLost)));
+        assert!(!raw.contains(&event_id), "a response from the purged epoch must not repopulate successor storage");
+    }
+
+    #[tokio::test]
+    async fn local_getters_reject_a_payload_that_does_not_match_the_requested_id() {
+        let raw = Arc::new(MockStorageCollection::new());
+        let honest = make_test_event(9, &[]);
+        let requested = honest.id();
+        let doctored = Event { generation: 7, ..honest };
+        assert_ne!(doctored.id(), requested);
+        raw.insert_under(requested.clone(), doctored);
+
+        let getter = LocalEventGetter::new(StorageCollectionWrapper::new(raw), true);
+        let err = getter.get_event(&requested).await.unwrap_err();
+        assert!(err.to_string().contains("event identity mismatch"), "unexpected error: {err}");
+
+        let err = getter.get_local_event(&requested).await.unwrap_err();
+        assert!(err.to_string().contains("event identity mismatch"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn scoped_remote_ancestors_are_rejected_before_cache_write() {
+        let expected_entity = EntityId::from_bytes([0x11; 16]);
+        let expected_model = EntityId::from_bytes([0x22; 16]);
+        let wrong_model = Event {
+            entity_id: expected_entity,
+            model: EntityId::from_bytes([0x23; 16]),
+            operations: OperationSet(BTreeMap::new()),
+            parent: proto::Clock::default(),
+            generation: 1,
+        };
+        let wrong_entity = Event {
+            entity_id: EntityId::from_bytes([0x12; 16]),
+            model: expected_model,
+            operations: OperationSet(BTreeMap::new()),
+            parent: proto::Clock::default(),
+            generation: 1,
+        };
+
+        for (kind, event, expected_message) in [("model", wrong_model, "belongs to model"), ("entity", wrong_entity, "belongs to entity")] {
+            let requested = event.id();
+            let raw = Arc::new(MockStorageCollection::new());
+            let collection = StorageCollectionWrapper::new(raw.clone());
+            let remote = SimulatedRemoteCacheGetter { collection: collection.clone(), response: Attested::opt(event, None) };
+            let scoped = ScopedEventGetter::new(&remote, expected_entity, expected_model);
+
+            let err = scoped.get_event(&requested).await.unwrap_err();
+            assert!(err.to_string().contains(expected_message), "unexpected {kind} error: {err}");
+            assert!(!raw.contains(&requested), "wrong-{kind} remote ancestor must not be cached before rejection");
+
+            let local = LocalEventGetter::new(collection, true);
+            assert!(
+                matches!(local.get_event(&requested).await, Err(RetrievalError::EventNotFound(id)) if id == requested),
+                "wrong-{kind} rejection must leave no poisoned row for subsequent local reads"
+            );
+        }
     }
 }

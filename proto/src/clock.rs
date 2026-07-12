@@ -105,44 +105,38 @@ impl std::fmt::Display for Clock {
     }
 }
 
-/// A materialized head annotated with each tip's event GENERATION (D2 plan
-/// REV 5 section K): every entry pairs one head tip's id with the generation
-/// its event payload carries, pinned from the admission-verified stamp when
-/// the tip joined the head and dropped when the tip is superseded. The head
-/// never regresses, so entries never need revision; maintenance is exact,
+/// A materialized head annotated with each tip event's generation. Every
+/// entry pairs one head tip id with the generation its payload carries. The
+/// value is pinned from the admission-verified stamp when the tip joins the
+/// head and dropped when the tip is superseded. The head never regresses, so
+/// entries never need revision; maintenance is exact,
 /// O(1) per head change, and read-free.
 ///
-/// `GClock` exists ALONGSIDE the unchanged [`Clock`] and lives in exactly
+/// `GClock` exists alongside [`Clock`] and lives in exactly
 /// three homes: (1) [`crate::State`] (and therefore the wire
 /// `StateFragment`), (2) the resident entity's in-memory state, and (3) each
 /// storage engine's persisted entity record, so rehydration reconstitutes it
-/// without reading events. `Event.parent` keeps the plain `Clock` (no
-/// id-formula change). Anywhere else, generation values may exist only as
-/// transient locals inside a comparison walk (the registry ban, REV 5
-/// section A, with this materialization as its sole carve-out).
+/// without reading events. Event identity includes generation, while
+/// `Event.parent` remains a plain `Clock`. Elsewhere, comparison code keeps
+/// generations only in transient locals.
 ///
-/// CANONICAL ENTRY ORDER (pinned by the M4 brief; serde stability and
-/// set-comparison against plain `Clock` heads require one): entries are
-/// sorted ascending by the `(u32, EventId)` tuple's DERIVED order, i.e.
-/// generation-major with EventId tiebreak, the same deterministic ordering
-/// the comparison's level drain schedules by (max eligible generation
-/// first, EventId tiebreak; core/src/event_dag/comparison.rs), and
-/// deduplicated by id (a head is a set of tips; on
-/// duplicate-id input the smallest tuple deterministically wins). The
-/// canonical order makes `max_generation` the last entry. Every construction
+/// Entries use a canonical order for stable serialization and comparison
+/// with plain `Clock` heads. They are sorted ascending by the derived
+/// `(u32, EventId)` tuple order:
+/// generation-major with EventId tiebreak. Entries are deduplicated by id
+/// because a head is a set of tips; on duplicate-id input the smallest tuple
+/// deterministically wins. The canonical order makes `max_generation` the
+/// last entry. Every construction
 /// path, deserialization of peer-supplied values included, normalizes rather
 /// than trusting input order.
 ///
-/// TRUST: entries carry their values unconditionally (stamping needs the max
-/// over all tips regardless; a wrong inherited value is rejected LOUDLY at
-/// the next durable admission that can check it, which wedges the poisoned
-/// node on that entity until a strictly descending re-adoption or resync
-/// heals the annotation); acceleration ELIGIBILITY is answered at
-/// consumption time by the node's unverified-events id set, so no per-entry
-/// flag exists here. A durable node never adopts a wire-carried entry that
-/// contradicts an event payload it holds (validated at application); an
-/// ephemeral node adopts entries inside the same trust envelope as the state
-/// itself.
+/// Entries always carry their generation because commit stamping needs the
+/// maximum over every tip. Acceleration eligibility is decided at use time by
+/// the node's unverified-event set, so entries need no eligibility flag. A
+/// durable node rejects a wire annotation that contradicts a locally held
+/// event payload; an ephemeral node accepts it within the state's trust
+/// envelope. A bad inherited value becomes a typed rejection when a durable
+/// node can compare it with the payload.
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
 #[serde(from = "Vec<(u32, EventId)>")]
 pub struct GClock(pub(crate) Vec<(u32, EventId)>);
@@ -273,9 +267,8 @@ mod tests {
         assert_eq!(head.as_slice(), &[c, e]);
     }
 
-    /// GClock's pinned canonical entry order (M4 brief): ascending by the
-    /// (u32, EventId) tuple's derived order, generation-major with EventId
-    /// tiebreak. Every construction path normalizes to it.
+    /// GClock entries are ordered by generation, then EventId. Every
+    /// construction path normalizes to this order.
     #[test]
     fn gclock_canonical_order_is_generation_major_with_id_tiebreak() {
         let shuffled = vec![(3, id(1)), (2, id(9)), (2, id(4)), (1, id(7))];

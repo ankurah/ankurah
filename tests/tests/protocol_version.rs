@@ -10,7 +10,10 @@ use ankurah_storage_sled::SledStorageEngine;
 use ankurah_websocket_client::WebsocketClient;
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+};
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
@@ -129,6 +132,126 @@ async fn server_refuses_mismatched_version() -> Result<()> {
     Ok(())
 }
 
+/// Run a server that presents the same rejected handshake on every accepted
+/// socket. The client must surface the refusal and leave the next attempt behind
+/// its one-second initial backoff rather than spinning on a clean `Break`.
+async fn assert_client_refusal_is_backed_off(
+    server_frame: Vec<u8>,
+    expected_rejection: Option<proto::PresenceRejection>,
+    error_fragment: &str,
+) -> Result<()> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let observed_rejection = Arc::new(Mutex::new(None));
+
+    let server_accepts = accepts.clone();
+    let server_rejection = observed_rejection.clone();
+    let fake_server = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            server_accepts.fetch_add(1, Ordering::SeqCst);
+            let frame = server_frame.clone();
+            let observed = server_rejection.clone();
+            tokio::spawn(async move {
+                let Ok(ws) = tokio_tungstenite::accept_async(stream).await else { return };
+                let (mut sink, mut stream) = ws.split();
+                if sink.send(WsMessage::Binary(frame.into())).await.is_err() {
+                    return;
+                }
+
+                loop {
+                    match tokio::time::timeout(Duration::from_secs(1), stream.next()).await {
+                        Ok(Some(Ok(WsMessage::Binary(data)))) => {
+                            if let Ok(proto::Message::PresenceRejected(rejection)) = bincode::deserialize::<proto::Message>(&data) {
+                                *observed.lock().unwrap() = Some(rejection);
+                            }
+                        }
+                        Ok(Some(Ok(WsMessage::Close(_)))) | Ok(Some(Err(_))) | Ok(None) | Err(_) => break,
+                        Ok(Some(Ok(_))) => {}
+                    }
+                }
+            });
+        }
+    });
+
+    let client_node = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    let client = WebsocketClient::new(client_node.clone(), &format!("ws://{}", addr)).await?;
+
+    let error = tokio::time::timeout(Duration::from_secs(2), client.wait_connected())
+        .await
+        .expect("a rejected handshake must surface an error, not wait forever")
+        .expect_err("client connected to a rejected server handshake");
+    assert!(error.to_string().contains(error_fragment), "unexpected connection error: {error}");
+
+    // INITIAL_BACKOFF is one second. Once the error is visible, a 250 ms
+    // observation window must contain no second accept.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(accepts.load(Ordering::SeqCst), 1, "rejected handshakes must not reconnect without backoff");
+
+    assert_eq!(*observed_rejection.lock().unwrap(), expected_rejection);
+
+    client.shutdown().await?;
+    fake_server.abort();
+    Ok(())
+}
+
+/// A versioned server speaking a different epoch is refused, told why, and
+/// retried only after backoff.
+#[tokio::test]
+async fn client_refuses_mismatched_server_with_backoff() -> Result<()> {
+    let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
+    let presence = proto::Presence { node_id: proto::EntityId::new(), durable: true, system_root: None, protocol_version: 999 };
+    let frame = bincode::serialize(&proto::Message::Presence(presence))?;
+    let rejection = proto::PresenceRejection { expected: proto::PROTOCOL_VERSION, received: 999 };
+
+    assert_client_refusal_is_backed_off(frame, Some(rejection), "incompatible protocol version").await
+}
+
+/// A pre-versioning server Presence cannot carry an explicit epoch, but its
+/// undecodable handshake must still surface an error and enter backoff.
+#[tokio::test]
+async fn client_refuses_version0_server_with_backoff() -> Result<()> {
+    let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
+    let mut frame = bincode::serialize(&proto::Message::Presence(presence(proto::PROTOCOL_VERSION)))?;
+    frame.truncate(frame.len() - 4);
+
+    assert_client_refusal_is_backed_off(frame, None, "pre-versioning").await
+}
+
+/// A clean close before presence is still a failed connection attempt. It
+/// must surface Error and enter the same backoff as handshake refusals.
+#[tokio::test]
+async fn client_clean_close_is_backed_off() -> Result<()> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let server_accepts = accepts.clone();
+    let fake_server = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            server_accepts.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else { return };
+                let _ = ws.close(None).await;
+            });
+        }
+    });
+
+    let client_node = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    let client = WebsocketClient::new(client_node, &format!("ws://{}", addr)).await?;
+    let error = tokio::time::timeout(Duration::from_secs(2), client.wait_connected())
+        .await
+        .expect("clean close must surface an error")
+        .expect_err("clean close cannot establish the connection");
+    assert!(error.to_string().contains("closed"), "unexpected connection error: {error}");
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(accepts.load(Ordering::SeqCst), 1, "clean closes must not reconnect without backoff");
+
+    client.shutdown().await?;
+    fake_server.abort();
+    Ok(())
+}
+
 /// A legacy browser client waits for the server Presence before sending its
 /// own. A durable v3 Presence is undecodable by that client, so it remains
 /// silent; the server must still bound the incomplete handshake.
@@ -172,65 +295,5 @@ async fn server_closes_silent_client_after_durable_presence() -> Result<()> {
     }
 
     server_task.abort();
-    Ok(())
-}
-
-/// The client side of the same handshake: a server speaking a different
-/// version is refused, told why, and never treated as connected.
-#[tokio::test]
-async fn client_refuses_mismatched_server_without_hot_loop() -> Result<()> {
-    let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-
-    // Fake server: sends a doctored Presence, records whether the client
-    // explains itself with a PresenceRejected, and keeps listening long
-    // enough to catch an immediate reconnect.
-    let fake_server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.expect("accept");
-        let ws = tokio_tungstenite::accept_async(stream).await.expect("ws accept");
-        let (mut sink, mut stream) = ws.split();
-
-        let doctored = proto::Presence { node_id: proto::EntityId::new(), durable: true, system_root: None, protocol_version: 999 };
-        sink.send(WsMessage::Binary(bincode::serialize(&proto::Message::Presence(doctored)).unwrap().into())).await.expect("send");
-
-        let mut saw_rejection = None;
-        while let Ok(Some(Ok(msg))) = tokio::time::timeout(Duration::from_secs(10), stream.next()).await {
-            match msg {
-                WsMessage::Binary(data) => {
-                    if let Ok(proto::Message::PresenceRejected(r)) = bincode::deserialize::<proto::Message>(&data) {
-                        saw_rejection = Some(r);
-                        break;
-                    }
-                }
-                WsMessage::Close(_) => break,
-                _ => {}
-            }
-        }
-
-        // INITIAL_BACKOFF is one second. A second TCP accept inside this
-        // shorter window, after the rejection has reached us, would mean a
-        // permanent refusal is hot-looping.
-        let retried_immediately = tokio::time::timeout(Duration::from_millis(500), listener.accept()).await.is_ok();
-        (saw_rejection, retried_immediately)
-    });
-
-    let client_node = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
-    let client = WebsocketClient::new(client_node.clone(), &format!("ws://{}", addr)).await?;
-
-    // The client must refuse the server, so it never reaches Connected;
-    // a timeout or a surfaced connection error are both refusal.
-    match tokio::time::timeout(Duration::from_secs(3), client.wait_connected()).await {
-        Ok(Ok(())) => panic!("client connected to an incompatible server"),
-        Ok(Err(_)) | Err(_) => {}
-    }
-
-    let (rejection, retried_immediately) = fake_server.await?;
-    let rejection = rejection.expect("client must send PresenceRejected before closing");
-    assert_eq!(rejection, proto::PresenceRejection { expected: proto::PROTOCOL_VERSION, received: 999 });
-    assert!(!retried_immediately, "client retried an incompatible server without backoff");
-
-    client.shutdown().await?;
     Ok(())
 }

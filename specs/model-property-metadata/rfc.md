@@ -910,11 +910,13 @@ receiving traffic immediately must not reject models it allocated before
 the restart; this is policy (e)'s readiness participation on the ingress
 side. Ephemeral nodes never wait: their definitions arrive inline with
 the message, so a miss is already final. Cold-catalog policy, maintainer-ruled as options c + e + d:
-(c) once per connection per model, NodeUpdate and NodeResponse attach the
+(c) NodeUpdate and NodeResponse attach the
 attested catalog entity states (model, memberships, properties) for any
 non-well-known model the payload references (`#[serde(default)] schema:
 Vec<Attested<EntityState>>`; core/src/node.rs schema_states_for_models /
-ingest_schema, tracked per peer in PeerState.announced_models); receivers
+ingest_schema). Concurrent bodies repeat the bundle until a schema-bearing
+update is acknowledged; PeerState.announced_models then enables the
+per-connection omission fast path. Receivers
 policy-validate each definition and ingest them BEFORE processing the body;
 definitions never ride inside events or state buffers. (e) Catalog warmth
 participates in readiness through the existing ensure_subscribed /

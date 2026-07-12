@@ -59,6 +59,9 @@ struct Inner<SE, PA> {
     /// finish clears catalog state after system/reactor reset, and resume
     /// re-arms durable catalog maintenance after the replacement root is ready.
     catalog_reset_hook: RwLock<Option<CatalogResetHook>>,
+    /// Node-owned volatile state that belongs to one system (staging,
+    /// descriptor announcement caches, and pending update waiters).
+    runtime_reset_hook: RwLock<Option<Arc<dyn Fn() + Send + Sync>>>,
     _phantom: PhantomData<PA>,
 }
 
@@ -92,6 +95,7 @@ where
             reset_incomplete: AtomicBool::new(false),
             reactor,
             catalog_reset_hook: RwLock::new(None),
+            runtime_reset_hook: RwLock::new(None),
             _phantom: PhantomData,
         }));
         {
@@ -149,6 +153,10 @@ where
         *self.0.catalog_reset_hook.write().unwrap() = Some(CatalogResetHook { begin, finish, resume });
     }
 
+    pub(crate) fn set_runtime_reset_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.0.runtime_reset_hook.write().unwrap() = Some(hook);
+    }
+
     /// Creates a new system root. This should only be called once per system by durable nodes
     /// The rest of the nodes must "join" this system.
     pub async fn create(&self) -> Result<()> {
@@ -185,7 +193,7 @@ where
         let event = system_entity.generate_commit_event()?.ok_or(anyhow!("Expected event"))?;
 
         // Stage the event, apply, then commit
-        event_getter.stage_event(event.clone());
+        event_getter.stage_event(event.clone())?;
 
         // Apply the creation event so LWW values are tagged with event_id before serialization.
         system_entity.apply_event(&event_getter, &event, Some(self.0.entities.unverified())).await?;
@@ -383,6 +391,14 @@ where
         let catalog_reset_hook = self.0.catalog_reset_hook.read().unwrap().clone();
         if let Some(hook) = &catalog_reset_hook {
             (hook.begin)().await;
+        }
+
+        // Flush node-owned volatile state that belongs to the dead system
+        // (staging, descriptor announcement caches, pending update waiters).
+        // Runs after the catalog drain so nothing admitted pre-reset can
+        // re-stage behind the flush.
+        if let Some(hook) = self.0.runtime_reset_hook.read().unwrap().clone() {
+            hook();
         }
 
         // Delete all collections from storage. Even a failed deletion must

@@ -10,7 +10,13 @@
 mod common;
 
 use ankurah::proto::{self, Attested};
-use ankurah::{core::property::PropertyResolver, core::storage::StorageEngine};
+use ankurah::{
+    core::storage::StorageEngine,
+    core::{
+        property::{backend::lww::LWWBackend, backend::PropertyBackend, PropertyKey, PropertyResolver},
+        value::Value,
+    },
+};
 use ankurah_storage_indexeddb_wasm::IndexedDBStorageEngine;
 use common::*;
 use std::collections::BTreeMap;
@@ -27,6 +33,19 @@ impl PropertyResolver for GClockModelResolver {
     fn resolve(&self, _collection: &str, _name: &str) -> Option<proto::EntityId> { None }
     fn name_for(&self, _id: &proto::EntityId) -> Option<String> { None }
     fn model_id_for(&self, collection: &str) -> Option<proto::EntityId> { (collection == "gclock_roundtrip").then_some(self.model) }
+}
+
+struct ReservedFieldResolver {
+    model: proto::EntityId,
+    property: proto::EntityId,
+}
+
+impl PropertyResolver for ReservedFieldResolver {
+    fn resolve(&self, collection: &str, name: &str) -> Option<proto::EntityId> {
+        (collection == "reserved_gclock" && name == "__generations").then_some(self.property)
+    }
+    fn name_for(&self, id: &proto::EntityId) -> Option<String> { (*id == self.property).then(|| "__generations".to_string()) }
+    fn model_id_for(&self, collection: &str) -> Option<proto::EntityId> { (collection == "reserved_gclock").then_some(self.model) }
 }
 
 #[wasm_bindgen_test]
@@ -59,6 +78,39 @@ pub async fn entity_head_generations_survive_indexeddb_roundtrip() -> Result<(),
         read.payload.state.head_generations, head_generations,
         "GClock pin (iii): the per-tip head generations must survive set_state + get_state rehydration, u32::MAX included"
     );
+
+    IndexedDBStorageEngine::cleanup(&db_name).await?;
+    Ok(())
+}
+
+#[wasm_bindgen_test]
+pub async fn property_named_generations_cannot_shadow_the_entity_gclock() -> Result<(), anyhow::Error> {
+    setup();
+    let db_name = format!("test_db_{}", ulid::Ulid::new());
+    let engine = IndexedDBStorageEngine::open(&db_name).await?;
+    let model = proto::EntityId::from_bytes([0xD1; 16]);
+    let property = proto::EntityId::from_bytes([0xD2; 16]);
+    let resolver: Arc<dyn PropertyResolver> = Arc::new(ReservedFieldResolver { model, property });
+    engine.set_property_resolver(Arc::downgrade(&resolver));
+    let collection = engine.collection(&"reserved_gclock".into()).await?;
+
+    let tip = proto::EventId::from_bytes([0xD3; 32]);
+    let backend = LWWBackend::new();
+    backend.set(PropertyKey::Id(property), Some(Value::String("user-value".into())));
+    let operations = backend.to_operations()?.expect("write yields operations");
+    backend.apply_operations_with_event(&operations, tip.clone())?;
+
+    let state = proto::State {
+        state_buffers: proto::StateBuffers(BTreeMap::from([("lww".to_string(), backend.to_state_buffer()?)])),
+        head: proto::Clock::from(vec![tip.clone()]),
+        head_generations: proto::GClock::from((1, tip)),
+    };
+    let entity_id = proto::EntityId::new();
+    collection.set_state(Attested::opt(proto::EntityState { entity_id, model, state: state.clone() }, None)).await?;
+
+    let read = collection.get_state(entity_id).await?;
+    assert_eq!(read.payload.state.head_generations, state.head_generations);
+    assert_eq!(read.payload.state.state_buffers, state.state_buffers);
 
     IndexedDBStorageEngine::cleanup(&db_name).await?;
     Ok(())

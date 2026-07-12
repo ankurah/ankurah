@@ -19,9 +19,10 @@ use crate::{id::EntityId, Attested, CollectionId, EntityState, State};
 ///   RegisterSchema.
 /// - 3: the model-id wire envelope (#330): Event/EntityState/EntityDelta/
 ///   SubscriptionUpdateItem carry the model-definition entity id instead of a
-///   collection name, and NodeUpdate/NodeResponse carry once-per-connection
-///   catalog schema defs. SubscriptionUpdateItem also carries the source query
-///   ids used for admission, and ORDER BY items carry stable property identities.
+///   collection name, and NodeUpdate/NodeResponse carry catalog schema defs
+///   until delivery is acknowledged for that connection. SubscriptionUpdateItem
+///   also carries the source query ids used for admission, and ORDER BY items
+///   carry stable property identities.
 /// - 4: the Phase 2 generation epoch (#266). Event and EventFragment carry a
 ///   mandatory generation inside the EventId hash, and State carries
 ///   head_generations. Wire and on-disk formats are incompatible with version

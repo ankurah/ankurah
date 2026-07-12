@@ -22,7 +22,7 @@
 //! provably contradicts locally held parents aborts the whole item;
 //! unverifiable cargo stores and records acceleration-ineligible.
 
-use ankurah_proto::{Attested, CollectionId, EntityId, Event, EventId, State};
+use ankurah_proto::{Attested, Clock, CollectionId, EntityId, Event, EventId, State};
 
 use super::executor::PersistState;
 use super::staging::StagingArea;
@@ -38,15 +38,31 @@ pub(crate) struct StateApplied {
     /// false when the incoming state was equal, older, or divergent. The
     /// advance-only notification rule rides this, as does persistence.
     pub advanced: bool,
+    /// Causally ordered events represented by the resulting change: cargo
+    /// covered by an adopted state followed by any buffered descendants the
+    /// adoption re-drove. State-only feeds usually carry only the latter.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub events: Vec<Attested<Event>>,
+    /// Notification validated while holding the entity mutation span.
+    pub change: Option<crate::changes::EntityChange>,
+}
+
+struct PreviewPersist;
+
+#[async_trait::async_trait]
+impl PersistState for PreviewPersist {
+    async fn persist(&self, _entity: &Entity) -> Result<(), MutationError> { Ok(()) }
 }
 
 /// Apply one state (plus any events that traveled with it) to one entity.
+#[cfg(test)]
 pub(crate) async fn apply_state_feed<S, E>(
     entities: &WeakEntitySet,
     state_getter: &S,
     event_getter: &E,
     staging: &StagingArea,
     entity_id: EntityId,
+    model_id: EntityId,
     collection_id: CollectionId,
     state: State,
     events_to_commit: &[Attested<Event>],
@@ -56,108 +72,213 @@ where
     S: GetState + Send + Sync,
     E: SuspenseEvents + Send + Sync,
 {
-    // The incoming state's OWN head-generation annotation is validated
-    // first, BEFORE anything adopts (plan REV 5 section K, the validation
-    // invariant): structurally on every node flavor (the annotation must
-    // cover exactly the head's tips), and against locally held event
-    // payloads on durable nodes (a durable node never adopts a
-    // wire-carried value that contradicts an event it holds). Either
-    // failure aborts the ENTIRE item typed, same containment as the cargo
-    // check below. Ephemeral nodes adopt the values inside the state's own
-    // trust envelope, so only the structural layer runs there.
-    super::verify_state_head_generations(event_getter, &state).await?;
+    let expected_epoch = entities.reset_epoch();
+    apply_state_feed_at_epoch(
+        entities,
+        state_getter,
+        event_getter,
+        staging,
+        entity_id,
+        model_id,
+        collection_id,
+        state,
+        events_to_commit,
+        persist,
+        expected_epoch,
+    )
+    .await
+}
 
-    // Cargo generations are checked BEFORE the state applies (plan REV 5
-    // section L, reversing the M2 warn-and-store arm): a claim that
-    // PROVABLY contradicts resolvable parents aborts the ENTIRE item
-    // with the typed lineage error, so nothing from the item is adopted
-    // or stored (the feeders unstage on error). The grievance is with the
-    // state that vouched for the malformed history: valid non-advancing
-    // input drops silently, verifiably INVALID input errors loudly,
-    // uniform with the streaming lane's typed rejection. This is
-    // admission rejection of malformed input, not a generation routing a
-    // verdict (the suppress-only discipline is untouched). Parents resolve
-    // from the EXISTING resident's materialized head generations first
-    // (REV 5 K: update-shaped cargo parented on the current head verifies
-    // read-free) and local payloads otherwise. UNVERIFIABLE
-    // cargo (parents not resolvable) keeps the adopted-history
-    // admission: the SNAPSHOT, not the equation, vouches for it, so it
-    // stores and records acceleration-ineligible below; fresh adoption
-    // therefore never trips the abort (no local parents, nothing
-    // provable). A storage failure from the local parent read aborts the
-    // item just as loudly (it would have failed the commit right below
-    // anyway).
-    let resident_materialization = entities.get(&entity_id).map(|resident| resident.head_generations());
-    let mut unverifiable_cargo: Vec<EventId> = Vec::new();
-    for event in events_to_commit {
-        match super::check_generation(event_getter, resident_materialization.as_ref(), &event.payload).await {
-            Ok(super::GenerationCheck::Verified) => {}
-            Ok(super::GenerationCheck::Unverifiable) => unverifiable_cargo.push(event.payload.id()),
-            Err(e) => return Err(e),
+pub(crate) async fn apply_state_feed_at_epoch<S, E>(
+    entities: &WeakEntitySet,
+    state_getter: &S,
+    event_getter: &E,
+    staging: &StagingArea,
+    entity_id: EntityId,
+    model_id: EntityId,
+    collection_id: CollectionId,
+    state: State,
+    events_to_commit: &[Attested<Event>],
+    persist: &dyn PersistState,
+    expected_epoch: u64,
+) -> Result<StateApplied, MutationError>
+where
+    S: GetState + Send + Sync,
+    E: SuspenseEvents + Send + Sync,
+{
+    let scoped_getter = crate::retrieval::ScopedEventGetter::new(event_getter, entity_id, model_id);
+    // Wire order is untrusted. This order is used both for cargo durability
+    // and for the eventual EntityChange containment check.
+    let ordered_cargo = crate::event_dag::ordering::topo_sort_events(events_to_commit.to_vec())?;
+    // Annotation and cargo validation can fetch missing lineage and cache it.
+    // Keep those reads on the admitted side of reset as well; the fenced
+    // getter routes any peer lookup through Node::request_fenced.
+    {
+        let _reset_fence = entities.reset_fence_read().await;
+        if entities.reset_epoch() != expected_epoch {
+            return Err(MutationError::InvalidUpdate("system reset during state validation"));
         }
-    }
+        let fenced_getter = crate::retrieval::ScopedEventGetter::new_fenced(event_getter, entity_id, model_id);
 
-    let (changed, entity) = entities
-        .with_state(state_getter, event_getter, entity_id, collection_id, state)
-        .await
-        .map_err(|e| super::type_comparison_error(e.into()))?;
-    let advanced = !matches!(changed, Some(false));
-    if advanced {
-        for event in events_to_commit {
-            event_getter.commit_event(event).await?;
-            // Recording only at durable admission (the M2 discipline): an
-            // unverifiable id becomes acceleration-ineligible once its
-            // commit succeeds.
-            if unverifiable_cargo.contains(&event.payload.id()) {
-                entities.unverified().insert(event.payload.id());
+        // Validate the snapshot annotation before it can become
+        // commit-stamping input on the resident.
+        super::verify_state_head_generations(&fenced_getter, &state).await?;
+
+        for event in &ordered_cargo {
+            let id = event.payload.id();
+            if event.payload.entity_id != entity_id {
+                return Err(crate::error::IngestError::Lineage(crate::error::LineageRejection::EntityMismatch {
+                    event: id,
+                    expected: entity_id,
+                    received: event.payload.entity_id,
+                })
+                .into());
+            }
+
+            // A snapshot may vouch only for cargo in its own causal history.
+            // The comparison is generation-independent; Equal or
+            // StrictDescends proves that the snapshot contains this event.
+            let comparison = crate::event_dag::comparison::compare(
+                &fenced_getter,
+                &state.head,
+                &Clock::from(vec![id.clone()]),
+                crate::event_dag::DEFAULT_BUDGET,
+            )
+            .await?;
+            match comparison.relation {
+                crate::event_dag::AbstractCausalRelation::Equal | crate::event_dag::AbstractCausalRelation::StrictDescends { .. } => {}
+                crate::event_dag::AbstractCausalRelation::BudgetExceeded { subject, other } => {
+                    return Err(crate::error::IngestError::Budget {
+                        original_budget: crate::event_dag::DEFAULT_BUDGET,
+                        subject_frontier: subject,
+                        other_frontier: other,
+                    }
+                    .into());
+                }
+                _ => {
+                    return Err(crate::error::IngestError::Lineage(crate::error::LineageRejection::EventOutsideState { event: id }).into());
+                }
             }
         }
     }
-    // Persist on every apply, advance or not. A no-op apply is not proof
-    // the buffer is current: a sibling lane may have materialized this
-    // resident an instant ago with its own persist still in flight, and the
-    // delta lanes re-read local storage to build result sets when they
-    // return (read-your-application). Persisting the resident's current
-    // state is always monotone-safe; eliding it on the APPLY VERDICT raced
-    // exactly that window. The sound elision lives inside the persist
-    // funnel (D2-6): the persist-currency marker elides only on
-    // completed-persist testimony for exactly the current head in the
-    // current epoch. Notification stays advance-only. Empty-head guard for
-    // symmetry with the executor: a phantom's empty state must not land in
-    // storage.
-    let covered_head = entity.head();
-    if !covered_head.is_empty() {
-        persist.persist(&entity).await?;
-        // The post-persist hook, insertion half (derivations section 5;
-        // REV 5 section F): a state-adoption persist proves coverage for
-        // the adopted head's own ids (and, on a no-op apply, the
-        // resident's current head ids, which the just-persisted buffer
-        // equally covers). Captured BEFORE the persist: any id covered by
-        // the resident head when the persist began is covered by every
-        // later persisted head, so a concurrent advance cannot make these
-        // rows lie. Events BELOW the adopted horizon stay out (their
-        // coverage is not enumerable here); their redelivery walks, which
-        // is cost, not correctness. A failed persist inserts nothing (the
-        // ? above returns first).
-        entity.mark_applied(covered_head.iter().cloned());
-    }
 
-    // A state adoption can be exactly the thing a buffered orphan was
-    // waiting for (268-B liveness; 2.4's post-recovery semantics are a
-    // re-plan against the staging area with an empty batch). Head-seeded
-    // re-drive schedules any staged event the new head satisfies; the
-    // common case schedules nothing and costs one reverse-index lookup per
-    // head id. Nothing here may fail the feed: the state already applied
-    // and persisted, and failing now would swallow its notification.
-    // Buffered events keep their own outcome surface from their original
-    // delivery, so re-drive trouble is logged and the events follow the
-    // retention rule.
+    // The complete state-feed span is on one side of reset and serialized
+    // against every other mutation/persist lane for this entity.
+    let (entity, advanced) = {
+        let _reset_fence = entities.reset_fence_read().await;
+        if entities.reset_epoch() != expected_epoch {
+            return Err(MutationError::InvalidUpdate("system reset during state ingest"));
+        }
+        let fenced_getter = crate::retrieval::ScopedEventGetter::new_fenced(event_getter, entity_id, model_id);
+        let mutation_span = entities.mutation_span(entity_id);
+        let _mutation_guard = mutation_span.lock().await;
+
+        let current = entities
+            .get_or_retrieve_fenced(state_getter, &fenced_getter, &collection_id, &entity_id)
+            .await
+            .map_err(|e| super::type_comparison_error(e.into()))?;
+
+        // Determine whether adoption will advance without mutating first. The
+        // mutation span keeps this verdict stable until cargo is durable and
+        // the state is applied.
+        let should_advance = if let Some(current) = &current {
+            let result =
+                crate::event_dag::comparison::compare(&fenced_getter, &state.head, &current.head(), crate::event_dag::DEFAULT_BUDGET)
+                    .await?;
+            match result.relation {
+                crate::event_dag::AbstractCausalRelation::StrictDescends { .. } => true,
+                crate::event_dag::AbstractCausalRelation::Equal
+                | crate::event_dag::AbstractCausalRelation::StrictAscends
+                | crate::event_dag::AbstractCausalRelation::DivergedSince { .. } => false,
+                crate::event_dag::AbstractCausalRelation::Disjoint { .. } => {
+                    return Err(crate::error::IngestError::Lineage(crate::error::LineageRejection::Disjoint).into());
+                }
+                crate::event_dag::AbstractCausalRelation::BudgetExceeded { subject, other } => {
+                    return Err(crate::error::IngestError::Budget {
+                        original_budget: crate::event_dag::DEFAULT_BUDGET,
+                        subject_frontier: subject,
+                        other_frontier: other,
+                    }
+                    .into());
+                }
+            }
+        } else {
+            true
+        };
+
+        let mut unverifiable_cargo: Vec<EventId> = Vec::new();
+        if should_advance {
+            let resident_materialization = current.as_ref().map(Entity::head_generations);
+            for event in &ordered_cargo {
+                match super::check_generation(&fenced_getter, resident_materialization.as_ref(), &event.payload).await {
+                    Ok(super::GenerationCheck::Verified) => {}
+                    Ok(super::GenerationCheck::Unverifiable) => unverifiable_cargo.push(event.payload.id()),
+                    Err(e) => return Err(e),
+                }
+            }
+
+            // Covered cargo becomes durable before the resident can adopt a
+            // state that references it. A failure leaves the resident
+            // untouched; the caller may safely unstage and rely on retry.
+            for event in &ordered_cargo {
+                fenced_getter.commit_event(event).await?;
+                if unverifiable_cargo.contains(&event.payload.id()) {
+                    entities.unverified().insert(event.payload.id());
+                }
+            }
+        }
+
+        let (entity, advanced) = if should_advance {
+            let (changed, entity) = entities
+                .with_state_fenced(state_getter, &fenced_getter, entity_id, collection_id.clone(), state.clone())
+                .await
+                .map_err(|e| super::type_comparison_error(e.into()))?;
+            (entity, !matches!(changed, Some(false)))
+        } else {
+            (current.expect("a non-advancing classification requires a resident"), false)
+        };
+
+        let covered_head = entity.head();
+        if !covered_head.is_empty() {
+            persist.persist_fenced(&entity).await?;
+            entity.mark_applied(covered_head.iter().cloned());
+        }
+        (entity, advanced)
+    };
+
+    // A state adoption can satisfy buffered descendants. Execute that
+    // re-drive on a detached preview first: commits happen only after each
+    // preview mutation succeeds, while a commit failure cannot advance the
+    // canonical resident to an uncommitted ghost head. Once every previewed
+    // event is durable, adopt the preview state onto the canonical entity and
+    // persist it under the normal fence and mutation span.
+    let mut change_events = if advanced { ordered_cargo } else { Vec::new() };
     if advanced {
-        match super::plan_entity(&entity.head(), &[], staging, event_getter).await {
+        match super::plan_entity_for(entity.id(), &entity.head(), &[], staging, &scoped_getter).await {
             Ok(plan) if !plan.schedule.is_empty() => {
-                let outcome = super::execute_plan(plan, &entity, entities, staging, event_getter, persist).await;
+                use std::sync::{atomic::AtomicBool, Arc};
+                let preview = entity.snapshot(Arc::new(AtomicBool::new(true)));
+                let outcome =
+                    super::execute_plan_at_epoch(plan, &preview, entities, staging, &scoped_getter, &PreviewPersist, expected_epoch).await;
                 if let Some(failure) = outcome.failure {
-                    tracing::warn!(entity_id = %entity.id(), "buffered-event re-drive after state adoption failed: {failure}");
+                    tracing::warn!(entity_id = %entity.id(), "buffered-event preview after state adoption failed: {failure}");
+                } else if !outcome.applied.is_empty() {
+                    let preview_state = preview.to_state()?;
+                    let _reset_fence = entities.reset_fence_read().await;
+                    if entities.reset_epoch() != expected_epoch {
+                        return Err(MutationError::InvalidUpdate("system reset during state re-drive"));
+                    }
+                    let mutation_span = entities.mutation_span(entity.id());
+                    let _mutation_guard = mutation_span.lock().await;
+                    let fenced_getter = crate::retrieval::ScopedEventGetter::new_fenced(event_getter, entity_id, model_id);
+                    if matches!(
+                        entity.apply_state(&fenced_getter, &preview_state, Some(entities.unverified())).await?,
+                        crate::entity::StateApplyResult::Applied
+                    ) {
+                        persist.persist_fenced(&entity).await?;
+                        entity.mark_applied(entity.head().iter().cloned());
+                        change_events.extend(outcome.applied);
+                    }
                 }
             }
             Ok(_) => {}
@@ -167,15 +288,31 @@ where
         }
     }
 
-    Ok(StateApplied { entity, advanced })
+    let change = if advanced {
+        let _reset_fence = entities.reset_fence_read().await;
+        if entities.reset_epoch() != expected_epoch {
+            return Err(MutationError::InvalidUpdate("system reset before state notification"));
+        }
+        let mutation_span = entities.mutation_span(entity.id());
+        let _mutation_guard = mutation_span.lock().await;
+        Some(
+            crate::changes::EntityChange::new(entity.clone(), change_events.clone())
+                .or_else(|_| crate::changes::EntityChange::new(entity.clone(), Vec::new()))?,
+        )
+    } else {
+        None
+    };
+
+    Ok(StateApplied { entity, advanced, events: change_events, change })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::error::{IngestError, LineageRejection};
-    use crate::ingest::testkit::{event, FailingCommitStore, NoState, NoopPersist};
+    use crate::ingest::testkit::{event, event_with_title, FailingCommitStore, NoState, NoopPersist};
     use crate::ingest::StagingArea;
+    use crate::retrieval::GetEvents;
     use ankurah_proto::EventId;
     use std::collections::BTreeMap;
 
@@ -211,7 +348,19 @@ mod tests {
         };
 
         let unverified = entities.unverified();
-        let result = apply_state_feed(&entities, &NoState, &getter, &staging, entity_id, "test".into(), lying, &[], &NoopPersist).await;
+        let result = apply_state_feed(
+            &entities,
+            &NoState,
+            &getter,
+            &staging,
+            entity_id,
+            EntityId::from_bytes([0xEE; 16]),
+            "test".into(),
+            lying,
+            &[],
+            &NoopPersist,
+        )
+        .await;
 
         match result {
             Err(MutationError::Ingest(IngestError::Lineage(LineageRejection::GenerationMismatch { claimed, expected, .. }))) => {
@@ -250,8 +399,19 @@ mod tests {
         };
 
         let unverified = entities.unverified();
-        let result =
-            apply_state_feed(&entities, &NoState, &getter, &staging, entity_id, "test".into(), mismatched, &[], &NoopPersist).await;
+        let result = apply_state_feed(
+            &entities,
+            &NoState,
+            &getter,
+            &staging,
+            entity_id,
+            EntityId::from_bytes([0xEE; 16]),
+            "test".into(),
+            mismatched,
+            &[],
+            &NoopPersist,
+        )
+        .await;
 
         match result {
             Err(MutationError::Ingest(IngestError::Lineage(LineageRejection::HeadGenerationsMismatch))) => {}
@@ -284,9 +444,20 @@ mod tests {
             head_generations: carried.clone(),
         };
 
-        let applied = apply_state_feed(&entities, &NoState, &getter, &staging, entity_id, "test".into(), state, &[], &NoopPersist)
-            .await
-            .expect("a consistent bodiless snapshot adopts cleanly on an ephemeral node");
+        let applied = apply_state_feed(
+            &entities,
+            &NoState,
+            &getter,
+            &staging,
+            entity_id,
+            EntityId::from_bytes([0xEE; 16]),
+            "test".into(),
+            state,
+            &[],
+            &NoopPersist,
+        )
+        .await
+        .expect("a consistent bodiless snapshot adopts cleanly on an ephemeral node");
         assert!(applied.advanced, "fresh adoption advances");
         assert_eq!(
             applied.entity.head_generations(),
@@ -326,10 +497,21 @@ mod tests {
             head: ankurah_proto::Clock::from(vec![h2_id.clone()]),
             head_generations: ankurah_proto::GClock::from((2, h2_id.clone())),
         };
-        let resident = apply_state_feed(&entities, &NoState, &getter, &staging, entity_id, "test".into(), adopted, &[], &NoopPersist)
-            .await
-            .expect("bodiless adoption succeeds")
-            .entity;
+        let resident = apply_state_feed(
+            &entities,
+            &NoState,
+            &getter,
+            &staging,
+            entity_id,
+            EntityId::from_bytes([0xEE; 16]),
+            "test".into(),
+            adopted,
+            &[],
+            &NoopPersist,
+        )
+        .await
+        .expect("bodiless adoption succeeds")
+        .entity;
         assert!(entities.get(&entity_id).is_some(), "precondition: the resident pre-exists the update feed");
 
         // The mis-stamped twin FIRST, while its parent h2 is the resident's
@@ -358,6 +540,7 @@ mod tests {
             &getter,
             &staging,
             entity_id,
+            EntityId::from_bytes([0xEE; 16]),
             "test".into(),
             lying_state,
             std::slice::from_ref(&lying),
@@ -398,6 +581,7 @@ mod tests {
             &getter,
             &staging,
             entity_id,
+            EntityId::from_bytes([0xEE; 16]),
             "test".into(),
             update,
             std::slice::from_ref(&h3),
@@ -413,5 +597,190 @@ mod tests {
         );
         assert!(!unverified.contains(&h3_id), "verified cargo stays acceleration-eligible (not recorded unverified)");
         assert_eq!(resident.head_generations().generation_of(&h3_id), Some(3), "the resident heads {{h3}} at its own stamp");
+    }
+
+    #[tokio::test]
+    async fn cargo_commit_failure_leaves_the_resident_unadvanced_and_body_staged() {
+        let entity_id = EntityId::new();
+        let cargo = event_with_title(entity_id, "state", &[]);
+        let cargo_id = cargo.payload.id();
+        let state = State {
+            state_buffers: ankurah_proto::StateBuffers(BTreeMap::new()),
+            head: Clock::from(vec![cargo_id.clone()]),
+            head_generations: ankurah_proto::GClock::from((1, cargo_id.clone())),
+        };
+        let entities = WeakEntitySet::default();
+        let staging = std::sync::Arc::new(StagingArea::with_default_cap());
+        staging.stage(cargo.clone());
+        let getter = FailingCommitStore::new(staging.clone(), cargo_id.clone());
+
+        let result = apply_state_feed(
+            &entities,
+            &NoState,
+            &getter,
+            &staging,
+            entity_id,
+            EntityId::from_bytes([0xEE; 16]),
+            "test".into(),
+            state,
+            std::slice::from_ref(&cargo),
+            &NoopPersist,
+        )
+        .await;
+
+        assert!(result.is_err(), "the injected cargo commit failure surfaces");
+        assert!(entities.get(&entity_id).is_none(), "state is not adopted before cargo durability");
+        assert!(staging.contains(&cargo_id), "the failed body remains available for retry");
+    }
+
+    #[tokio::test]
+    async fn unrelated_cargo_is_rejected_before_adoption_or_commit() {
+        let entity_id = EntityId::new();
+        let state_tip = event_with_title(entity_id, "state-line", &[]);
+        let cargo = event_with_title(entity_id, "foreign-line", &[]);
+        let state_tip_id = state_tip.payload.id();
+        let cargo_id = cargo.payload.id();
+        let state = State {
+            state_buffers: ankurah_proto::StateBuffers(BTreeMap::new()),
+            head: Clock::from(vec![state_tip_id.clone()]),
+            head_generations: ankurah_proto::GClock::from((1, state_tip_id)),
+        };
+        let entities = WeakEntitySet::default();
+        let staging = std::sync::Arc::new(StagingArea::with_default_cap());
+        staging.stage(state_tip);
+        staging.stage(cargo.clone());
+        let getter = FailingCommitStore::new(staging.clone(), EventId::from_bytes([0xFF; 32]));
+
+        let result = apply_state_feed(
+            &entities,
+            &NoState,
+            &getter,
+            &staging,
+            entity_id,
+            EntityId::from_bytes([0xEE; 16]),
+            "test".into(),
+            state,
+            std::slice::from_ref(&cargo),
+            &NoopPersist,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(MutationError::Ingest(IngestError::Lineage(LineageRejection::EventOutsideState { event }))) if event == cargo_id
+        ));
+        assert!(entities.get(&entity_id).is_none());
+        assert!(!getter.event_stored(&cargo_id).await.unwrap(), "unrelated cargo never reaches the log");
+    }
+
+    #[tokio::test]
+    async fn child_first_state_cargo_is_committed_and_reported_parents_first() {
+        let entity_id = EntityId::new();
+        let genesis = event_with_title(entity_id, "g", &[]);
+        let parent = event_with_title(entity_id, "p", &[&genesis]);
+        let child = event_with_title(entity_id, "c", &[&parent]);
+        let child_id = child.payload.id();
+        let state = State {
+            state_buffers: ankurah_proto::StateBuffers(BTreeMap::new()),
+            head: Clock::from(vec![child_id.clone()]),
+            head_generations: ankurah_proto::GClock::from((3, child_id)),
+        };
+        let entities = WeakEntitySet::default();
+        let staging = std::sync::Arc::new(StagingArea::with_default_cap());
+        staging.try_stage_batch([child.clone(), parent.clone(), genesis.clone()]).unwrap();
+        let getter = FailingCommitStore::new(staging.clone(), EventId::from_bytes([0xFF; 32]));
+
+        let applied = apply_state_feed(
+            &entities,
+            &NoState,
+            &getter,
+            &staging,
+            entity_id,
+            EntityId::from_bytes([0xEE; 16]),
+            "test".into(),
+            state,
+            &[child.clone(), parent.clone(), genesis.clone()],
+            &NoopPersist,
+        )
+        .await
+        .expect("covered child-first cargo applies");
+
+        let ids: Vec<_> = applied.events.iter().map(|event| event.payload.id()).collect();
+        assert_eq!(ids, vec![genesis.payload.id(), parent.payload.id(), child.payload.id()]);
+        crate::changes::EntityChange::new(applied.entity, applied.events).expect("ordered notification satisfies containment");
+    }
+
+    #[tokio::test]
+    async fn failed_re_drive_commit_does_not_expose_a_ghost_head() {
+        let entity_id = EntityId::new();
+        let parent = event_with_title(entity_id, "parent", &[]);
+        let child = event_with_title(entity_id, "child", &[&parent]);
+        let parent_id = parent.payload.id();
+        let child_id = child.payload.id();
+        let state = State {
+            state_buffers: ankurah_proto::StateBuffers(BTreeMap::new()),
+            head: Clock::from(vec![parent_id.clone()]),
+            head_generations: ankurah_proto::GClock::from((1, parent_id.clone())),
+        };
+        let entities = WeakEntitySet::default();
+        let staging = std::sync::Arc::new(StagingArea::with_default_cap());
+        staging.try_stage_batch([parent.clone(), child.clone()]).unwrap();
+        let getter = FailingCommitStore::new(staging.clone(), child_id.clone());
+
+        let applied = apply_state_feed(
+            &entities,
+            &NoState,
+            &getter,
+            &staging,
+            entity_id,
+            EntityId::from_bytes([0xEE; 16]),
+            "test".into(),
+            state,
+            std::slice::from_ref(&parent),
+            &NoopPersist,
+        )
+        .await
+        .expect("the adopted parent remains a successful state feed");
+
+        assert_eq!(applied.entity.head(), Clock::from(vec![parent_id.clone()]));
+        assert!(getter.event_stored(&parent_id).await.unwrap());
+        assert!(!getter.event_stored(&child_id).await.unwrap());
+        assert!(staging.contains(&child_id), "the failed child body stays available for its retry lease");
+        assert_eq!(applied.events.iter().map(|event| event.payload.id()).collect::<Vec<_>>(), vec![parent_id]);
+        assert!(applied.change.is_some(), "the committed parent notification remains valid");
+    }
+
+    #[tokio::test]
+    async fn adopted_staged_head_is_backfilled_even_with_an_empty_batch() {
+        let entity_id = EntityId::new();
+        let head = event_with_title(entity_id, "adopted", &[]);
+        let head_id = head.payload.id();
+        let state = State {
+            state_buffers: ankurah_proto::StateBuffers(BTreeMap::new()),
+            head: Clock::from(vec![head_id.clone()]),
+            head_generations: ankurah_proto::GClock::from((1, head_id.clone())),
+        };
+        let entities = WeakEntitySet::default();
+        let staging = std::sync::Arc::new(StagingArea::with_default_cap());
+        staging.stage(head);
+        let getter = FailingCommitStore::ephemeral(staging.clone(), EventId::from_bytes([0xFF; 32]));
+
+        apply_state_feed(
+            &entities,
+            &NoState,
+            &getter,
+            &staging,
+            entity_id,
+            EntityId::from_bytes([0xEE; 16]),
+            "test".into(),
+            state,
+            &[],
+            &NoopPersist,
+        )
+        .await
+        .expect("snapshot adopts and re-drives backfill");
+
+        assert!(getter.event_stored(&head_id).await.unwrap(), "the staged adopted head is backfilled to the log");
+        assert!(!staging.contains(&head_id));
     }
 }

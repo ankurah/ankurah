@@ -4337,11 +4337,69 @@ mod gen_corruption_immunity {
         }
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) enum SeedBand {
+        Small,
+        Large,
+        Wide,
+    }
+
+    impl SeedBand {
+        fn original_seed(self, effective_seed: u32) -> u32 {
+            match self {
+                Self::Small => effective_seed,
+                Self::Large => effective_seed.wrapping_sub(0x4000_0000),
+                Self::Wide => effective_seed.wrapping_sub(0x2000_0000),
+            }
+        }
+
+        fn count_env(self) -> &'static str {
+            match self {
+                Self::Small => "GEN_ORACLE_SEEDS",
+                Self::Large => "GEN_ORACLE_LARGE_SEEDS",
+                Self::Wide => "GEN_ORACLE_WIDE_SEEDS",
+            }
+        }
+
+        fn test_name(self) -> &'static str {
+            match self {
+                Self::Small => "randomized_corpora_are_immune_to_generation_corruption",
+                Self::Large => "randomized_large_corpora_are_immune_to_generation_corruption",
+                Self::Wide => "randomized_wide_corpora_are_immune_to_generation_corruption",
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) enum OracleRepro {
+        SeedBand(SeedBand),
+        Named(&'static str),
+    }
+
+    impl OracleRepro {
+        fn command(self, effective_seed: u32, shape: &str) -> String {
+            let test_prefix = "event_dag::tests::gen_corruption_immunity::";
+            match self {
+                Self::SeedBand(band) => format!(
+                    "GEN_ORACLE_SEED_BASE={} {}=1 GEN_ORACLE_SHAPE={shape} cargo test -p ankurah-core --lib {test_prefix}{} -- --exact --nocapture",
+                    band.original_seed(effective_seed),
+                    band.count_env(),
+                    band.test_name(),
+                ),
+                Self::Named(test_name) => {
+                    format!("cargo test -p ankurah-core --lib {test_prefix}{test_name} -- --exact --nocapture")
+                }
+            }
+        }
+    }
+
     /// The extended ORACLEFAIL artifact line (oracle brief 3.4): one line,
     /// self-contained, carrying the shape, the corruption seed, the
-    /// doctored triples, and the exact single-seed repro command.
+    /// doctored triples, and the exact repro command for the tier or named
+    /// test that generated it.
     pub(super) fn gen_artifact_line(
         dag_seed: u32,
+        repro: OracleRepro,
         shape: &str,
         corruption_seed: u32,
         subject: &[EventId],
@@ -4350,8 +4408,9 @@ mod gen_corruption_immunity {
         baseline: &Bound,
         corrupted: &Bound,
     ) -> String {
+        let command = repro.command(dag_seed, shape);
         format!(
-            "ORACLEFAIL kind=gen_corruption dag_seed={dag_seed} shape={shape} corruption_seed={corruption_seed} subject={subject:?} comparison={comparison:?} doctored={triples} baseline={baseline:?} corrupted={corrupted:?} reproduce=\"GEN_ORACLE_SEED_BASE={dag_seed} GEN_ORACLE_SEEDS=1 GEN_ORACLE_SHAPE={shape} cargo test -p ankurah-core --lib event_dag::tests::gen_corruption_immunity::randomized_corpora_are_immune_to_generation_corruption -- --exact --nocapture\""
+            "ORACLEFAIL kind=gen_corruption dag_seed={dag_seed} shape={shape} corruption_seed={corruption_seed} subject={subject:?} comparison={comparison:?} doctored={triples} baseline={baseline:?} corrupted={corrupted:?} reproduce=\"{command}\""
         )
     }
 
@@ -4361,6 +4420,7 @@ mod gen_corruption_immunity {
     /// fix-forward).
     pub(super) fn assert_bound_identical(
         dag_seed: u32,
+        repro: OracleRepro,
         shape: &str,
         corruption_seed: u32,
         subject: &[EventId],
@@ -4372,7 +4432,7 @@ mod gen_corruption_immunity {
         if baseline.bound != corrupted.bound {
             panic!(
                 "{}",
-                gen_artifact_line(dag_seed, shape, corruption_seed, subject, comparison, triples, &baseline.bound, &corrupted.bound)
+                gen_artifact_line(dag_seed, repro, shape, corruption_seed, subject, comparison, triples, &baseline.bound, &corrupted.bound)
             );
         }
     }
@@ -4841,6 +4901,7 @@ mod gen_corruption_immunity {
     /// observable: proof its bands actually contain wide joins).
     async fn drive_seed_band(
         dag_seed: u32,
+        band: SeedBand,
         n_min: usize,
         n_span: usize,
         shape_filter: &Option<String>,
@@ -4891,6 +4952,7 @@ mod gen_corruption_immunity {
                     run(lying, &corpus, &subject, &comparison, sg, cg, None, &back, &format!("shape {shape} dag_seed {dag_seed}")).await;
                 assert_bound_identical(
                     dag_seed,
+                    OracleRepro::SeedBand(band),
                     shape,
                     corruption_seed(dag_seed, shape_index),
                     &subject,
@@ -4958,7 +5020,7 @@ mod gen_corruption_immunity {
         let filter = gen_shape_filter();
         let mut free_deltas = 0usize;
         for dag_seed in base..base.saturating_add(count) {
-            free_deltas += drive_seed_band(dag_seed, 5, 6, &filter, false).await.0;
+            free_deltas += drive_seed_band(dag_seed, SeedBand::Small, 5, 6, &filter, false).await.0;
         }
         assert!(
             free_deltas > 0,
@@ -4976,7 +5038,7 @@ mod gen_corruption_immunity {
         let count = gen_large_seed_count();
         let filter = gen_shape_filter();
         for dag_seed in base..base.saturating_add(count) {
-            drive_seed_band(dag_seed.wrapping_add(0x4000_0000), 20, 21, &filter, false).await;
+            drive_seed_band(dag_seed.wrapping_add(0x4000_0000), SeedBand::Large, 20, 21, &filter, false).await;
         }
     }
 
@@ -4996,7 +5058,7 @@ mod gen_corruption_immunity {
         let filter = gen_shape_filter();
         let mut widest = 0usize;
         for dag_seed in base..base.saturating_add(count) {
-            widest = widest.max(drive_seed_band(dag_seed.wrapping_add(0x2000_0000), 24, 25, &filter, true).await.1);
+            widest = widest.max(drive_seed_band(dag_seed.wrapping_add(0x2000_0000), SeedBand::Wide, 24, 25, &filter, true).await.1);
         }
         assert!(widest >= 8, "the wide tier must actually generate wide joins (widest parent set seen: {widest}); the generator's full-tip join path cannot be engaging");
     }
@@ -5009,7 +5071,7 @@ mod gen_corruption_immunity {
     #[tokio::test]
     async fn gc_seed_41_is_immune_under_every_shape() {
         let (corpus, s, c, _c1, _m) = seed_41();
-        assert_seed_immune(&corpus, &[s], &[c], "gc_seed_41").await;
+        assert_seed_immune(&corpus, &[s], &[c], "gc_seed_41", "gc_seed_41_is_immune_under_every_shape").await;
     }
 
     /// Every shape against the 4.3 self-refutation DAG (meet {f}, where a
@@ -5017,7 +5079,7 @@ mod gen_corruption_immunity {
     #[tokio::test]
     async fn gc_seed_43_is_immune_under_every_shape() {
         let (corpus, a, b, _f) = seed_43();
-        assert_seed_immune(&corpus, &[a], &[b], "gc_seed_43").await;
+        assert_seed_immune(&corpus, &[a], &[b], "gc_seed_43", "gc_seed_43_is_immune_under_every_shape").await;
     }
 
     /// Every shape against the width-64 antichain, on all three pinned
@@ -5029,13 +5091,14 @@ mod gen_corruption_immunity {
     #[tokio::test]
     async fn gc_wide_antichain_is_immune_under_every_shape() {
         let (corpus, join, root, ca, cb) = seed_wide_antichain();
-        assert_seed_immune(&corpus, std::slice::from_ref(&join), std::slice::from_ref(&root), "gc_wide_antichain descent").await;
-        assert_seed_immune(&corpus, &[ca], &[cb], "gc_wide_antichain siblings").await;
+        let test_name = "gc_wide_antichain_is_immune_under_every_shape";
+        assert_seed_immune(&corpus, std::slice::from_ref(&join), std::slice::from_ref(&root), "gc_wide_antichain descent", test_name).await;
+        assert_seed_immune(&corpus, &[ca], &[cb], "gc_wide_antichain siblings", test_name).await;
         let antichain = wide_antichain_children(&corpus, &root);
-        assert_seed_immune(&corpus, &antichain, &[root], "gc_wide_antichain clock").await;
+        assert_seed_immune(&corpus, &antichain, &[root], "gc_wide_antichain clock", test_name).await;
     }
 
-    async fn assert_seed_immune(corpus: &Corpus, subject: &[EventId], comparison: &[EventId], name: &str) {
+    async fn assert_seed_immune(corpus: &Corpus, subject: &[EventId], comparison: &[EventId], name: &str, test_name: &'static str) {
         let (sg, cg) = Doctoring::default().operands(corpus, subject, comparison);
         let baseline =
             run(corpus.retriever.clone(), corpus, subject, comparison, sg, cg, None, &HashMap::new(), &format!("{name} baseline")).await;
@@ -5049,6 +5112,7 @@ mod gen_corruption_immunity {
             let corrupted = run(lying, corpus, subject, comparison, sg, cg, None, &back, &format!("{name} shape {shape}")).await;
             assert_bound_identical(
                 0xD2D2_0041,
+                OracleRepro::Named(test_name),
                 shape,
                 corruption_seed(0xD2D2_0041, shape_index),
                 subject,
@@ -5084,7 +5148,17 @@ mod gen_corruption_immunity {
         let (sg, cg) = doctoring.operands(&corpus, &subject, &comparison);
         let corrupted = run(lying, &corpus, &subject, &comparison, sg, cg, None, &back, "gc-sat-a corrupted").await;
 
-        assert_bound_identical(41, "gc-sat-interior", 0, &subject, &comparison, &doctoring.triples(&corpus), &baseline, &corrupted);
+        assert_bound_identical(
+            41,
+            OracleRepro::Named("gc_sat_interior_is_contained_and_detected"),
+            "gc-sat-interior",
+            0,
+            &subject,
+            &comparison,
+            &doctoring.triples(&corpus),
+            &baseline,
+            &corrupted,
+        );
         assert!(
             corrupted.stats.edge_check_violations >= 1,
             "the walk traverses the corrupt-saturated interior and must SEE it, got {}",
@@ -5118,7 +5192,17 @@ mod gen_corruption_immunity {
         let (sg, cg) = doctoring.operands(&corpus, &subject, &comparison);
         let corrupted = run(lying, &corpus, &subject, &comparison, sg, cg, None, &back, "gc-sat-b corrupted").await;
 
-        assert_bound_identical(43, "gc-sat-tips", 0, &subject, &comparison, &doctoring.triples(&corpus), &baseline, &corrupted);
+        assert_bound_identical(
+            43,
+            OracleRepro::Named("gc_sat_tips_disable_the_prechecks_without_suppressing"),
+            "gc-sat-tips",
+            0,
+            &subject,
+            &comparison,
+            &doctoring.triples(&corpus),
+            &baseline,
+            &corrupted,
+        );
         assert_eq!(
             corrupted.stats.precheck_suppressions, 0,
             "saturated operands DISABLE the precheck (266-C.iv); disabling must never read as a suppression"
@@ -5145,7 +5229,17 @@ mod gen_corruption_immunity {
             let (sg, cg) = doctoring.operands(&corpus, &[a.id()], &[g.id()]);
             let corrupted =
                 run(lying, &corpus, &[a.id()], &[g.id()], sg, cg, None, &back, &format!("gc-genesis descent claim {claim}")).await;
-            assert_bound_identical(1, "gc-genesis", claim, &[a.id()], &[g.id()], &doctoring.triples(&corpus), &baseline, &corrupted);
+            assert_bound_identical(
+                1,
+                OracleRepro::Named("gc_genesis_claims_do_not_steer_roots_or_verdicts"),
+                "gc-genesis",
+                claim,
+                &[a.id()],
+                &[g.id()],
+                &doctoring.triples(&corpus),
+                &baseline,
+                &corrupted,
+            );
         }
 
         // Disjoint shape: two independent roots.
@@ -5163,7 +5257,17 @@ mod gen_corruption_immunity {
         let (lying, back) = doctoring.retriever(&corpus);
         let (sg, cg) = doctoring.operands(&corpus, &[d1.id()], &[d2.id()]);
         let corrupted = run(lying, &corpus, &[d1.id()], &[d2.id()], sg, cg, None, &back, "gc-genesis disjoint corrupted").await;
-        assert_bound_identical(2, "gc-genesis", 0, &[d1.id()], &[d2.id()], &doctoring.triples(&corpus), &baseline, &corrupted);
+        assert_bound_identical(
+            2,
+            OracleRepro::Named("gc_genesis_claims_do_not_steer_roots_or_verdicts"),
+            "gc-genesis",
+            0,
+            &[d1.id()],
+            &[d2.id()],
+            &doctoring.triples(&corpus),
+            &baseline,
+            &corrupted,
+        );
     }
 
     /// Cross-mismatch named pin (the fold's materialization-drift shape):
@@ -5191,7 +5295,17 @@ mod gen_corruption_immunity {
         let (sg, cg) = doctoring.operands(&corpus, &subject, &comparison);
         let corrupted = run(lying, &corpus, &subject, &comparison, sg, cg, None, &back, "gc-cross corrupted").await;
 
-        assert_bound_identical(3, "gc-cross", 0, &subject, &comparison, &doctoring.triples(&corpus), &baseline, &corrupted);
+        assert_bound_identical(
+            3,
+            OracleRepro::Named("gc_cross_mismatch_between_channels_is_contained"),
+            "gc-cross",
+            0,
+            &subject,
+            &comparison,
+            &doctoring.triples(&corpus),
+            &baseline,
+            &corrupted,
+        );
         assert!(
             corrupted.stats.precheck_suppressions >= 1,
             "the corruption must BITE: the drifted operands (maxg(C)=5 > maxg(S)=3) fire P1, got {}",
@@ -5238,7 +5352,17 @@ mod gen_corruption_immunity {
     /// artifact_line_format_is_self_contained).
     #[test]
     fn gen_artifact_line_format_is_self_contained() {
-        let line = gen_artifact_line(41, "gc-deflate", 7, &[], &[], "[payload(x,2,9)]", &Bound::Equal, &Bound::StrictAscends);
+        let line = gen_artifact_line(
+            41,
+            OracleRepro::SeedBand(SeedBand::Small),
+            "gc-deflate",
+            7,
+            &[],
+            &[],
+            "[payload(x,2,9)]",
+            &Bound::Equal,
+            &Bound::StrictAscends,
+        );
         assert!(line.starts_with("ORACLEFAIL "), "must carry the ORACLEFAIL marker: {line}");
         assert!(line.contains("kind=gen_corruption"), "must self-identify the oracle: {line}");
         assert!(line.contains("dag_seed=41"), "must carry the dag seed: {line}");
@@ -5250,6 +5374,45 @@ mod gen_corruption_immunity {
             "must carry a copy-pasteable single-seed repro: {line}"
         );
         assert!(!line.contains('\n'), "must be a single line: {line}");
+    }
+
+    #[test]
+    fn gen_artifact_line_reproduces_the_originating_seed_band() {
+        let large = gen_artifact_line(
+            0x4000_0029,
+            OracleRepro::SeedBand(SeedBand::Large),
+            "gc-inflate",
+            7,
+            &[],
+            &[],
+            "[]",
+            &Bound::Equal,
+            &Bound::StrictAscends,
+        );
+        assert!(
+            large.contains(
+                "reproduce=\"GEN_ORACLE_SEED_BASE=41 GEN_ORACLE_LARGE_SEEDS=1 GEN_ORACLE_SHAPE=gc-inflate cargo test -p ankurah-core --lib event_dag::tests::gen_corruption_immunity::randomized_large_corpora_are_immune_to_generation_corruption -- --exact --nocapture\""
+            ),
+            "large-band failures must undo the seed offset and rerun the large test: {large}"
+        );
+
+        let wide = gen_artifact_line(
+            0x2000_0029,
+            OracleRepro::SeedBand(SeedBand::Wide),
+            "gc-saturate",
+            7,
+            &[],
+            &[],
+            "[]",
+            &Bound::Equal,
+            &Bound::StrictAscends,
+        );
+        assert!(
+            wide.contains(
+                "reproduce=\"GEN_ORACLE_SEED_BASE=41 GEN_ORACLE_WIDE_SEEDS=1 GEN_ORACLE_SHAPE=gc-saturate cargo test -p ankurah-core --lib event_dag::tests::gen_corruption_immunity::randomized_wide_corpora_are_immune_to_generation_corruption -- --exact --nocapture\""
+            ),
+            "wide-band failures must undo the seed offset and rerun the wide test: {wide}"
+        );
     }
 }
 

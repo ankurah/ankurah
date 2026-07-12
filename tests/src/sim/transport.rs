@@ -179,10 +179,10 @@ fn update_item_descriptor(item: &proto::SubscriptionUpdateItem) -> String {
 
 /// Sorted, joined content-derived event ids for a set of `EventFragment`s.
 /// `EventFragment` omits the event id, but it is a pure hash of
-/// `(entity_id, operations, parent)`, so we recompute it: this makes the digest
-/// faithful to the batch's actual events, not merely their count. Keying on the
-/// count alone would let two different batches for one entity share a digest and
-/// false-pass the determinism audit.
+/// `(entity_id, operations, parent, generation)`, so we recompute it. This keeps
+/// the digest faithful to the batch's actual events, not merely their count.
+/// Keying on the count alone would let two different batches for one entity
+/// share a digest and false-pass the determinism audit.
 fn fragment_ids(entity: proto::EntityId, fragments: &[proto::EventFragment]) -> String {
     let mut ids: Vec<String> =
         fragments.iter().map(|f| proto::EventId::from_parts(&entity, &f.operations, &f.parent, f.generation).to_base64_short()).collect();

@@ -69,6 +69,21 @@ impl From<MutationError> for RetrievalError {
 
 impl RetrievalError {
     pub fn storage(err: impl std::error::Error + Send + Sync + 'static) -> Self { RetrievalError::StorageError(Box::new(err)) }
+
+    pub(crate) fn retryable_update(&self) -> bool {
+        match self {
+            Self::EventNotFound(_) | Self::NoDurablePeers | Self::StorageError(_) | Self::FailedUpdate(_) => true,
+            Self::MutationError(error) => error.retryable_update(),
+            Self::ApplyError(error) => error.retryable_update(),
+            Self::RequestError(
+                RequestError::PeerNotConnected
+                | RequestError::ConnectionLost
+                | RequestError::InternalChannelClosed
+                | RequestError::SendError(_),
+            ) => true,
+            _ => false,
+        }
+    }
 }
 
 impl From<bincode::Error> for RetrievalError {
@@ -187,6 +202,19 @@ impl From<anyhow::Error> for MutationError {
     fn from(err: anyhow::Error) -> Self { MutationError::Anyhow(err) }
 }
 
+impl MutationError {
+    pub(crate) fn retryable_update(&self) -> bool {
+        match self {
+            Self::RetrievalError(error) => error.retryable_update(),
+            Self::NoDurablePeers | Self::TOCTOUAttemptsExhausted | Self::StaleInstancePersistRefused(_) | Self::UpdateFailed(_) => true,
+            Self::Ingest(IngestError::Budget { .. } | IngestError::Contention { .. } | IngestError::Storage(_)) => true,
+            Self::Ingest(IngestError::Lineage(LineageRejection::NonCreationOverEmptyHead)) => true,
+            Self::Ingest(IngestError::StagingCapacity { capacity, requested, .. }) => requested <= capacity,
+            _ => false,
+        }
+    }
+}
+
 /// The typed taxonomy at the application boundary (RFC #268 item 4).
 ///
 /// Replaces stringly `General`/`InvalidUpdate` on the ingest paths so callers
@@ -225,6 +253,10 @@ pub enum IngestError {
     /// A wire shape the pipeline recognizes but does not implement.
     #[error("unsupported: {0}")]
     Unsupported(&'static str),
+    /// Atomic staging admission refused a batch rather than evicting events
+    /// whose retry or recovery still depends on the retained body.
+    #[error("staging capacity {capacity} cannot admit {requested} new events while holding {current}")]
+    StagingCapacity { capacity: usize, current: usize, requested: usize },
 }
 
 /// Permanent lineage-shaped rejections. Every variant is a function of
@@ -241,6 +273,16 @@ pub enum LineageRejection {
     /// The batch's parent edges form a cycle (malformed or malicious input;
     /// impossible for honest content-addressed ids).
     BatchCycle,
+    /// An event entered a plan for a different entity. Staging is shared at
+    /// collection scope, so every intake and execution boundary must bind
+    /// discovered graph members back to the resident they may mutate.
+    EntityMismatch { event: EventId, expected: EntityId, received: EntityId },
+    /// An event in the lineage was decoded under a different model route.
+    ModelMismatch { event: EventId, expected: EntityId, received: EntityId },
+    /// StateAndEvent cargo was not contained in the state snapshot that
+    /// vouched for it. Covered ancestors may be committed before adoption;
+    /// unrelated or newer cargo may not be smuggled into the durable log.
+    EventOutsideState { event: EventId },
     /// A claimed generation contradicts what this node can resolve. Two
     /// emitters (D2 M4): admission verification, where an event's claim
     /// fails the equation `generation == 1 + max(parent generations)`
@@ -278,6 +320,15 @@ impl std::fmt::Display for LineageRejection {
             LineageRejection::NonCreationOverEmptyHead => write!(f, "non-creation event over an empty head"),
             LineageRejection::CreationOverNonEmptyHead => write!(f, "creation event over a non-empty head"),
             LineageRejection::BatchCycle => write!(f, "event batch contains a parent cycle"),
+            LineageRejection::EntityMismatch { event, expected, received } => {
+                write!(f, "event {event} belongs to entity {received}, expected {expected}")
+            }
+            LineageRejection::ModelMismatch { event, expected, received } => {
+                write!(f, "event {event} belongs to model {received}, expected {expected}")
+            }
+            LineageRejection::EventOutsideState { event } => {
+                write!(f, "event {event} is not contained in the accompanying state")
+            }
             LineageRejection::GenerationMismatch { event, claimed, expected } => {
                 write!(f, "generation mismatch for event {event}: claimed {claimed}, expected {expected} from its parents")
             }
@@ -347,6 +398,7 @@ impl From<RetrievalError> for MutationError {
     fn from(err: RetrievalError) -> Self {
         match err {
             RetrievalError::AccessDenied(a) => MutationError::AccessDenied(a),
+            RetrievalError::MutationError(inner) => *inner,
             _ => MutationError::RetrievalError(err),
         }
     }
@@ -357,6 +409,31 @@ impl From<AccessDenied> for RetrievalError {
 
 impl From<SubscriptionError> for RetrievalError {
     fn from(err: SubscriptionError) -> Self { RetrievalError::Anyhow(anyhow::anyhow!("Subscription error: {:?}", err)) }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    #[test]
+    fn update_retry_classification_is_typed() {
+        let missing: MutationError = RetrievalError::EventNotFound(EventId::from_bytes([0x11; 32])).into();
+        assert!(missing.retryable_update());
+
+        let fits_later: MutationError = IngestError::StagingCapacity { capacity: 10, current: 10, requested: 1 }.into();
+        assert!(fits_later.retryable_update());
+
+        let inherently_oversized: MutationError = IngestError::StagingCapacity { capacity: 10, current: 0, requested: 11 }.into();
+        assert!(!inherently_oversized.retryable_update());
+
+        let malformed: MutationError = IngestError::Lineage(LineageRejection::EntityMismatch {
+            event: EventId::from_bytes([0x22; 32]),
+            expected: EntityId::from_bytes([0x33; 16]),
+            received: EntityId::from_bytes([0x44; 16]),
+        })
+        .into();
+        assert!(!malformed.retryable_update());
+    }
 }
 
 #[derive(Error, Debug)]
@@ -435,6 +512,17 @@ impl std::error::Error for ApplyError {
             ApplyError::RetrievalError(e) => Some(e),
             ApplyError::MutationError(e) => Some(e),
             _ => None,
+        }
+    }
+}
+
+impl ApplyError {
+    pub(crate) fn retryable_update(&self) -> bool {
+        match self {
+            Self::Items(items) => items.iter().any(|item| item.cause.retryable_update()),
+            Self::RetrievalError(error) => error.retryable_update(),
+            Self::MutationError(error) => error.retryable_update(),
+            Self::CollectionNotFound(_) => false,
         }
     }
 }

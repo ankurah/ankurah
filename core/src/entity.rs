@@ -102,37 +102,20 @@ impl AppliedSet {
     pub(crate) fn len(&self) -> usize { self.order.len() }
 }
 
-/// The persist-currency marker (D2-6): testimony that a set_state of THIS
-/// resident COMPLETED for exactly `head`, with the node's reset epoch
-/// captured BEFORE that persist began. A redundant persist may be elided
-/// only when `epoch` equals the current reset epoch AND `head` equals the
-/// resident's current head. The reset fence (WeakEntitySet::reset_fence,
-/// M4 remediation item 5) keeps any funnel persist from interleaving a
-/// hard_reset's bump, purge, or wipe, so every marker is stamped strictly
-/// before or strictly after a reset; the epoch conjunct's live job is
-/// distrusting markers stamped BEFORE a reset on residents that survive
-/// the purge through held strong references. The marker may LAG storage
-/// (the raw set_state bypasses in system.rs never stamp it), which only
-/// costs a redundant monotone-safe write; it may never LEAD storage,
-/// which is why only a completed set_state stamps it, why the funnel
-/// serializes each entity's whole snapshot-write-stamp span on the node's
-/// per-id persist lock (WeakEntitySet::persist_span): unserialized lanes
-/// could land engine writes in the opposite order of their snapshots,
-/// leaving the store regressed behind the head the marker testifies to
-/// (the M4 post-review remediation of the adversarial finding 2), and why
-/// the funnel refuses to persist any instance that is not the node's
-/// canonical resident (the codex follow-up remediation): markers are
-/// instance-local, so across duplicate live instances for one id the
-/// id-keyed ordering alone could not keep a stale last write from
-/// regressing storage the canonical's own marker then elides over.
+/// Proof that a completed `set_state` stored exactly `head` for this resident
+/// in `epoch`. A write may be elided only while both the resident head and the
+/// node's current reset epoch still match the marker.
 ///
-/// KNOWN RESIDUE (dev-only reset surface): a funnel persist STARTING
-/// after a reset completes, on a dead-system resident kept alive only by
-/// held strong references, writes that resident's bytes into the
-/// successor system's storage and stamps a truthfully current marker over
-/// its own write. The marker never lies there (storage really holds what
-/// it names); the illegitimacy is the cross-system delivery itself, whose
-/// enforcement is D3/D6 scope (plan REV 5 section D).
+/// The marker may lag storage when a raw `set_state` bypass does not stamp it;
+/// that only causes a redundant write. It must never lead storage. The persist
+/// funnel therefore stamps only after a successful write, serializes the full
+/// snapshot-write-stamp span by entity id, and refuses non-canonical resident
+/// instances.
+///
+/// A resident retained solely by an external strong reference can still start
+/// a new persist after a development-only hard reset has completed. That
+/// cross-system delivery residue is tracked as G-10 in
+/// `specs/concurrency/threat-model.md`; it does not make the marker itself lie.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PersistMarker {
     pub(crate) epoch: u64,
@@ -1553,66 +1536,39 @@ mod saturation_stamp_tests {
 #[derive(Clone, Default)]
 pub struct WeakEntitySet(Arc<WeakEntitySetInner>);
 
-/// Shared interior of [`WeakEntitySet`]: the resident map plus the node's
-/// reset epoch. They live together because the SAME Arc is cloned into both
-/// `NodeInner.entities` (the persist path reaches it through the node) and
-/// `SystemManager`'s inner (hard_reset reaches it through the system
-/// manager), which is exactly the shared-reachability the epoch needs; a
-/// bare NodeInner field would be unreachable from hard_reset (REV 5 G).
+/// Shared resident and reset coordination state. The same allocation is
+/// reachable from both `NodeInner` and `SystemManager`, so persistence and
+/// hard reset observe one epoch and one set of coordination locks.
 #[derive(Default)]
 struct WeakEntitySetInner {
     entities: std::sync::RwLock<BTreeMap<EntityId, WeakEntity>>,
     bind_hook: std::sync::RwLock<Option<Box<dyn Fn(&Entity) + Send + Sync>>>,
-    /// The memory-only reset epoch (D2-6): bumped by hard_reset, captured by
-    /// the persist funnel BEFORE each set_state begins, stamped into the
-    /// persist marker at completion. Never persisted; process restart
-    /// resetting it to zero is safe because markers restart empty too (a
-    /// marker can only lag storage).
+    /// Memory-only reset epoch. Hard reset increments it, and each completed
+    /// persist stamps the value observed under the reset fence. It need not be
+    /// stored because persist markers also start empty after process restart.
     reset_epoch: AtomicU64,
-    /// Per-entity persist serialization (D2-6, the M4 post-review
-    /// remediation of the cross-lane stamp reorder): the shared persist
-    /// funnel (NodePersist::persist) holds this lock for the entity's id
-    /// across its full elision-check, snapshot, set_state, stamp span.
-    /// Every engine's set_state is a blind last-writer upsert, so without
-    /// the span lock two funnel lanes persisting one entity can commit
-    /// their writes in the opposite order of their snapshots, regressing
-    /// the stored buffer to an older head while the marker elision keeps
-    /// the regression sticky. Serialized, writes of one INSTANCE are
-    /// totally ordered, the last write carries the newest snapshot (heads
-    /// never regress), and that instance's marker can never LEAD storage.
-    ///
-    /// Keyed by EntityId at the NODE level, not by Entity instance: the
-    /// pre-existing remove_if_phantom/with_state interplay can transiently
-    /// yield two live instances for one id (concurrency panel NOTE 4), and
-    /// instance-keyed locks would silently stop serializing exactly then.
-    /// Ordering across duplicates is not sufficient on its own, though:
-    /// markers are instance-local, so a stale duplicate's last write could
-    /// still regress storage behind the canonical head (the codex
-    /// follow-up finding). The funnel therefore also REFUSES any instance
-    /// that is not the node's canonical resident, checked under this same
-    /// lock (NodePersist::persist). Entries are never removed: they are
-    /// tiny (an id, an Arc, an idle mutex), growth is bounded by distinct
-    /// entities persisted over one process lifetime, and eager cleanup
-    /// would reintroduce the two-locks-for-one-id hazard this map exists
-    /// to close.
+    /// Serializes each entity id's marker check, snapshot, storage write, and
+    /// marker stamp. Storage engines use last-writer upserts, so this ordering
+    /// prevents older snapshots from landing after newer ones. Id-based locks
+    /// also cover the transient case where two live Entity instances share an
+    /// id; the persist funnel separately rejects the non-canonical instance.
+    /// Entries live for the process lifetime so an id can never acquire two
+    /// independent locks.
     persist_locks: crate::util::safemap::SafeMap<EntityId, Arc<tokio::sync::Mutex<()>>>,
-    /// The reset fence (M4 remediation, item 5): hard_reset holds the WRITE
-    /// half across its epoch bump, purge, and storage wipe; the persist
-    /// funnel holds the READ half across each full persist span. In-flight
-    /// persists therefore DRAIN before the wipe and no new one can start
-    /// until it completes (tokio's fair RwLock queues later readers behind
-    /// a waiting writer), so a persist can never land dead-system bytes in
-    /// the successor system's storage (postgres would otherwise recreate
-    /// the state table under an in-flight set_state and durably resurrect
-    /// the dead row). The fence also closes the epoch's bump-instant
-    /// blind spots (concurrency panel finding 2): a persist span can no
-    /// longer interleave any reset step, so it cannot stamp a
-    /// current-epoch marker over storage the wipe then erases (W2) nor
-    /// elide on a pre-reset marker after the wipe (W3).
+    /// Per-entity mutation spans for ingest. A receiver holds this from the
+    /// first resident mutation through event durability and state persistence,
+    /// so no sibling lane can persist a head containing another lane's event
+    /// before that event reaches the log. Entries intentionally live for the
+    /// process lifetime, matching `persist_locks`' one-lock-per-id invariant.
+    mutation_locks: crate::util::safemap::SafeMap<EntityId, Arc<tokio::sync::Mutex<()>>>,
+    /// Orders mutations and persists against hard reset. Reset holds the write
+    /// side across the epoch increment, resident purge, and storage wipe;
+    /// participating operations hold the read side for their complete span.
+    /// Tokio's fair lock makes in-flight readers drain before the wipe and
+    /// queues later readers until reset completes.
     ///
-    /// ACQUISITION RULE: never nest fence read guards on one task (the
-    /// fair queue deadlocks a re-acquisition behind a waiting writer);
-    /// every holder acquires once at its entry point.
+    /// Do not nest read guards on one task: a fair read lock can deadlock a
+    /// re-acquisition behind a queued writer. Acquire once at the entry point.
     reset_fence: tokio::sync::RwLock<()>,
     /// The node's admitted-unverified event id set (D2-3): ids admitted
     /// WITHOUT the generation equation check (adopted-history backfill,
@@ -1670,6 +1626,10 @@ impl WeakEntitySet {
     /// `persist_locks` field doc). Funnel use only: hold it across the full
     /// elision-check, snapshot, set_state, stamp span.
     pub(crate) fn persist_span(&self, id: EntityId) -> Arc<tokio::sync::Mutex<()>> { self.0.persist_locks.get_or_default(id) }
+
+    /// Serialize the complete mutation, event-commit, and state-persist span
+    /// for one entity. Callers acquire the reset fence before this lock.
+    pub(crate) fn mutation_span(&self, id: EntityId) -> Arc<tokio::sync::Mutex<()>> { self.0.mutation_locks.get_or_default(id) }
 
     /// The reset fence, read half (see the `reset_fence` field doc): held
     /// across a whole persist span. Acquire ONCE per task entry point,
@@ -1735,6 +1695,34 @@ impl WeakEntitySet {
                 };
                 if needs_apply {
                     entity.apply_state(event_getter, &state, Some(self.unverified())).await?;
+                }
+                self.bind(&entity);
+                Ok(Some(entity))
+            }
+        }
+    }
+
+    /// `get_or_retrieve` for a caller that already holds the reset fence in
+    /// read mode. This avoids recursively acquiring Tokio's fair RwLock while
+    /// preserving the same read-then-insert materialization span.
+    pub(crate) async fn get_or_retrieve_fenced<S, E>(
+        &self,
+        state_getter: &S,
+        event_getter: &E,
+        collection_id: &CollectionId,
+        id: &EntityId,
+    ) -> Result<Option<Entity>, RetrievalError>
+    where
+        S: GetState + Send + Sync,
+        E: GetEvents + Send + Sync,
+    {
+        match self.get(id) {
+            Some(entity) => Ok(Some(entity)),
+            None => {
+                let Some(state) = state_getter.get_state(*id).await? else { return Ok(None) };
+                let (needs_apply, entity) = self.materialize_not_resident(state_getter, *id, collection_id, &state.payload.state).await?;
+                if needs_apply {
+                    entity.apply_state(event_getter, &state.payload.state, Some(self.unverified())).await?;
                 }
                 self.bind(&entity);
                 Ok(Some(entity))
@@ -1912,6 +1900,37 @@ impl WeakEntitySet {
         // incoming raw buffers, which would discard a binding attached
         // beforehand and leave an unbound (v1-emitting) backend holding
         // id-keyed entries.
+        self.bind(&entity);
+        Ok((Some(changed), entity))
+    }
+
+    /// `with_state` for a caller that already holds the reset fence in read
+    /// mode. The caller is responsible for keeping that guard alive across
+    /// the eventual persist as well as this materialization/apply step.
+    pub(crate) async fn with_state_fenced<S, E>(
+        &self,
+        state_getter: &S,
+        event_getter: &E,
+        id: EntityId,
+        collection_id: CollectionId,
+        state: State,
+    ) -> Result<(Option<bool>, Entity), RetrievalError>
+    where
+        S: GetState + Send + Sync,
+        E: GetEvents + Send + Sync,
+    {
+        let (needs_apply, entity) = match self.get(&id) {
+            Some(entity) => (true, entity),
+            None => self.materialize_not_resident(state_getter, id, &collection_id, &state).await?,
+        };
+
+        if !needs_apply {
+            self.bind(&entity);
+            return Ok((None, entity));
+        }
+
+        let result = entity.apply_state(event_getter, &state, Some(self.unverified())).await?;
+        let changed = matches!(result, StateApplyResult::Applied);
         self.bind(&entity);
         Ok((Some(changed), entity))
     }

@@ -1,42 +1,16 @@
-//! Admission verification of payload generations (plan REV 4, D2-3; plan
-//! REV 5 section K's inductive verification rule).
+//! Admission verification for event and state generation metadata.
 //!
-//! Every lane that applies an event with resolvable parents checks the
-//! stamp equation `generation == 1 + max(parent generations)` at its
-//! admission boundary (the executor loop for the PerItem arms, commit-lane
-//! phase one for the transaction lanes); genesis events (empty parent
-//! clock) must claim exactly 1 and are always verifiable. A mismatch is a
-//! typed lineage rejection, contained like any other malformed event: the
-//! stamp is deterministic given the parents, so rejection only ever fires
-//! on a buggy or malicious writer (derivations section 5b).
+//! An event with resolvable parents must satisfy
+//! `generation == 1 + max(parent generations)`; a genesis must claim 1.
+//! Mismatches are typed lineage rejections. Parent generations resolve first
+//! from the resident's verified head annotation and then from staged or stored
+//! local payloads. Verification never fetches from a peer.
 //!
-//! PARENT RESOLUTION ORDER (REV 5 section K): a parent covered by the
-//! resident's MATERIALIZED head generations resolves from the
-//! materialization with no read at all. Every materialized entry originates
-//! from an admission-verified stamp pinned when its tip joined the head, so
-//! a covered check extends the induction; head-parented arrivals, in-order
-//! bridge steps (each apply advances the materialization the next step
-//! reads), and subset-parented arrivals on multi-tip heads all verify
-//! read-free. Parents NOT covered by the tips fall back to LOCAL payload
-//! reads exactly as M2 built (staging area, then local storage, via
-//! [`SuspenseEvents::get_local_event`]): verification never fetches from a
-//! peer, and events are read wherever they are the only sound source (a
-//! self-consistent forger satisfies any equation over values it wrote, so
-//! uncovered cases must check real payloads). Parents in neither place make
-//! the admission UNVERIFIABLE, not invalid; the caller admits the event and
-//! records its id in the unverified set (adopted-history admission;
-//! eligibility is the M5 consumer). The check is all-or-nothing over the
-//! parent set: partial knowledge never rejects (D2-3 verifies "where
-//! parents are resolvable", and walk-time edge checks own the opportunistic
-//! per-edge detection later).
-//!
-//! Verification runs ONCE per admission: fork previews and canonical
-//! re-applies of an already-admitted event do not re-verify, and members of
-//! the integrated-but-unstored backfill lane (an event the resident's head
-//! already carries whose log row is missing) are never checked at all;
-//! rejecting one could never un-apply it and would wedge that entity's log
-//! repair forever (retroactive rejection of committed history is D3's
-//! jurisdiction).
+//! If any parent is unavailable from both sources, the event is admitted as
+//! unverifiable and recorded in the node's unverified set. Partial knowledge
+//! never rejects the event. Verification runs once at admission; preview
+//! applies, canonical re-applies, and integrated-but-unstored backfill do not
+//! repeat or retroactively impose it.
 
 use ankurah_proto::{Event, GClock, State};
 
@@ -97,37 +71,18 @@ pub(crate) async fn check_generation<G: SuspenseEvents + Send + Sync>(
     Ok(GenerationCheck::Verified)
 }
 
-/// Validate an incoming state's head-generation annotation at the ingress
-/// boundary, BEFORE adoption (plan REV 5 section K, the validation
-/// invariant).
+/// Validate an incoming state's head-generation annotation before adoption.
 ///
 /// Two layers:
-/// 1. STRUCTURAL, every node flavor: the annotation must cover exactly the
-///    head's tips ([`GClock::matches_head`]). A mismatched pair is
-///    malformed input (an adopted mismatch could never stamp a commit),
-///    rejected with the typed lineage error like any other malformed
-///    input.
-/// 2. PAYLOAD INSPECTION, durable nodes only (`storage_is_definitive`):
-///    a durable node never adopts a wire-carried generation uninspected
-///    (REV 5 section K). Every entry's tip event must be locally
-///    resolvable (staging, then local storage) and match that payload's
-///    generation; a contradiction OR an unresolvable tip aborts the item
-///    typed, nothing adopted (M4 remediation item 4: the earlier
-///    fall-through for unheld tips adopted an uninspectable value that
-///    would then serve as rejection ground truth against honest
-///    descendants and as commit-stamp input). No production lane delivers
-///    a wire state to a durable node today, so this arm is defensive
-///    depth; any future durable wire-state ingress (D5/D6 territory)
-///    inherits the strict posture instead of the hole. Ephemeral nodes
-///    skip this layer: they adopt inside the same trust envelope as the
-///    state itself, and an inherited lie surfaces as a loud typed
-///    rejection when their next commit relays to a durable peer holding
-///    the real payloads (a wedge until a strictly descending re-adoption
-///    heals the annotation, not silent corruption).
+/// 1. Every node requires the annotation to cover exactly the head tips via
+///    [`GClock::matches_head`].
+/// 2. A node with definitive storage also requires every tip payload to be
+///    locally resolvable and to carry the annotated generation. Missing or
+///    contradictory payloads reject the state before mutation.
 ///
-/// Engine rehydration does NOT pass through here: the persisted entity
-/// record is the node's own prior materialization (that is what makes
-/// restart read-free); this boundary exists for WIRE-carried states.
+/// Ephemeral nodes accept the annotation within the received state's trust
+/// envelope. Engine rehydration does not pass through this wire boundary;
+/// persisted records restore the node's own prior materialization directly.
 pub(crate) async fn verify_state_head_generations<G: SuspenseEvents + Send + Sync>(getter: &G, state: &State) -> Result<(), MutationError> {
     if !state.head_generations.matches_head(&state.head) {
         return Err(IngestError::Lineage(LineageRejection::HeadGenerationsMismatch).into());

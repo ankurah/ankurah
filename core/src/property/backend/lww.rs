@@ -381,13 +381,21 @@ impl PropertyBackend for LWWBackend {
         }
 
         // Add candidates from events in this layer.
-        for (event, from_to_apply) in layer.already_applied.iter().map(|e| (e, false)).chain(layer.to_apply.iter().map(|e| (e, true))) {
+        for (event_id, event, from_to_apply) in layer
+            .already_applied_with_ids()
+            .map(|(id, event)| (id, event, false))
+            .chain(layer.to_apply_with_ids().map(|(id, event)| (id, event, true)))
+        {
             if let Some(operations) = event.operations.get(&Self::property_backend_name().to_string()) {
                 for operation in operations {
                     // Both wire versions normalize to (PropertyKey, value);
                     // election below is version-agnostic.
                     for (prop, value) in decode_diff(&operation.diff)? {
-                        let candidate = Candidate { value, event_id: event.id(), from_to_apply, older_than_meet: false };
+                        // Use the id that keyed this payload in the accumulated
+                        // DAG. Recomputing from a mismatched served payload would
+                        // put provenance and tie-breaking in a different identity
+                        // space from `EventLayer::compare`.
+                        let candidate = Candidate { value, event_id: event_id.clone(), from_to_apply, older_than_meet: false };
                         if let Some(current) = winners.get_mut(&prop) {
                             if current.older_than_meet {
                                 // Stored value is below meet -- any layer candidate wins
@@ -464,7 +472,7 @@ impl PropertyBackend for LWWBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ankurah_proto::EntityId;
+    use ankurah_proto::{Clock, EntityId, Event, OperationSet};
 
     fn id(byte: u8) -> EntityId {
         let mut bytes = [0u8; 16];
@@ -657,5 +665,51 @@ mod tests {
         let ops = backend.to_operations().unwrap().expect("pending write should yield operations");
         backend.apply_operations_with_event(&ops, EventId::from_bytes([1; 32])).unwrap();
         assert_eq!(backend.get(&PropertyKey::Id(id(0x11))), Some(Value::String("alpha".into())));
+    }
+
+    #[test]
+    fn apply_layer_uses_requested_ids_when_a_served_payload_recomputes_differently() {
+        let property = id(0x11);
+        let entity = id(0x22);
+        let model = id(0x33);
+        let make_event = |value: &str| {
+            let source = LWWBackend::new();
+            source.set(PropertyKey::Id(property), Some(Value::String(value.into())));
+            let operations = source.to_operations().unwrap().expect("write yields operations");
+            Event {
+                model,
+                entity_id: entity,
+                operations: OperationSet(BTreeMap::from([("lww".to_string(), operations)])),
+                parent: Clock::default(),
+                generation: 1,
+            }
+        };
+
+        let honest_a = make_event("alpha");
+        let event_b = make_event("bravo");
+        let a_id = honest_a.id();
+        let b_id = event_b.id();
+        let authoritative_a_wins = a_id > b_id;
+
+        // Find a generation-only doctoring whose recomputed hash would reverse
+        // the honest A-vs-B tie-break. The layer must still elect in requested-id
+        // space, not in this doctored payload-id space.
+        let doctored_a = (2..10_000)
+            .find_map(|generation| {
+                let candidate = Event { generation, ..honest_a.clone() };
+                ((candidate.id() > b_id) != authoritative_a_wins).then_some(candidate)
+            })
+            .expect("the deterministic hash sample should contain a tie-break reversal");
+        assert_ne!(doctored_a.id(), a_id);
+
+        let dag = Arc::new(BTreeMap::from([(a_id.clone(), Vec::new()), (b_id.clone(), Vec::new())]));
+        let layer = EventLayer::new_with_ids(Vec::new(), vec![(a_id.clone(), doctored_a), (b_id.clone(), event_b)], dag);
+        let sink = LWWBackend::new();
+        sink.apply_layer(&layer).unwrap();
+
+        let expected_id = if authoritative_a_wins { a_id } else { b_id };
+        let expected_value = if authoritative_a_wins { "alpha" } else { "bravo" };
+        assert_eq!(sink.get(&PropertyKey::Id(property)), Some(Value::String(expected_value.into())));
+        assert_eq!(sink.get_event_id(&PropertyKey::Id(property)), Some(expected_id));
     }
 }

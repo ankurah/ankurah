@@ -125,7 +125,9 @@ impl GetEvents for FailingCommitStore {
 
 #[async_trait]
 impl SuspenseEvents for FailingCommitStore {
-    fn stage_event(&self, event: Event) { self.staging.stage(Attested::opt(event, None)); }
+    fn stage_event(&self, event: Event) -> Result<(), MutationError> {
+        self.staging.try_stage(Attested::opt(event, None)).map_err(Into::into)
+    }
     async fn commit_event(&self, attested: &Attested<Event>) -> Result<(), MutationError> {
         if attested.payload.id() == self.fail_commit_of {
             return Err(MutationError::General("injected transient commit failure".into()));

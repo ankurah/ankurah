@@ -95,8 +95,8 @@ async fn setup() -> Result<Setup> {
     Ok((server, client, rec_id, genesis, record_title, view, relay_context, conn))
 }
 
-/// R5 (B3 residual): a child whose parent is missing buffers as a non-error
-/// outcome, survives across deliveries in the node-held staging area, and
+/// R5 (B3 residual): a child whose parent is missing returns a retryable
+/// error, survives across deliveries in the node-held staging area, and
 /// integrates via descendant re-drive when the parent arrives in a LATER
 /// delivery. Red today: staging dies with each applier call, so the child is
 /// dropped, the item errors, and the parent's later arrival converges to the
@@ -114,12 +114,12 @@ async fn r5_buffered_child_integrates_when_parent_arrives_later() -> Result<()> 
     let child = forge_title_event(record_title, rec_id, &[&parent], "child-title");
     let child_id = child.id();
 
-    // Delivery 1: the child alone. Post-flip this is a buffered non-error
-    // outcome (the M5 note: NeedsEvents becomes a non-error at the M8
-    // retention flip); the event is retained, observable, not dropped.
+    // Delivery 1: the child alone is retained but remains a retryable item
+    // error until its dependency arrives. That retry lease cooperates with
+    // atomic capacity backpressure.
     NodeApplier::apply_updates_for_test(&client, &server.id, vec![event_only_item(child)])
         .await
-        .expect("a dangling child buffers as a non-error outcome");
+        .expect_err("a dangling child stays under sender retry while buffered");
     assert!(
         client.staging_contains_for_test(&Record::collection(), &child_id),
         "the dangling child must be retained in the node-held staging area"
@@ -150,8 +150,7 @@ async fn r5_buffered_child_integrates_when_parent_arrives_later() -> Result<()> 
 
 /// R6 (268-B): a dangling-parent event on a node whose parent never arrives
 /// is typed NeedsEvents, retained in the node-held staging area, observable,
-/// and does not perturb the entity. Red today: the per-call area drops it and
-/// the item surfaces as an error.
+/// and does not perturb the entity while its retry lease remains active.
 #[tokio::test]
 async fn r6_dangling_parent_event_is_buffered_and_observable() -> Result<()> {
     let (server, client, rec_id, genesis, record_title, _view, _relay, _conn) = setup().await?;
@@ -165,7 +164,7 @@ async fn r6_dangling_parent_event_is_buffered_and_observable() -> Result<()> {
 
     NodeApplier::apply_updates_for_test(&client, &server.id, vec![event_only_item(orphan)])
         .await
-        .expect("a dangling-parent event buffers as a non-error outcome");
+        .expect_err("a dangling-parent event is buffered under a retryable error");
 
     assert!(
         client.staging_contains_for_test(&Record::collection(), &orphan_id),
@@ -182,9 +181,33 @@ async fn r6_dangling_parent_event_is_buffered_and_observable() -> Result<()> {
     Ok(())
 }
 
-/// R8 (bounds): flooding distinct orphaned events past the cap evicts
-/// oldest-first, counted and observable, and the node stays live. Red today:
-/// nothing accumulates node-side, so len and evictions both read zero.
+/// Node-held staging belongs to the current system and must be discarded
+/// under the same hard-reset fence as residents and durable collections.
+#[tokio::test]
+async fn hard_reset_discards_buffered_old_system_events() -> Result<()> {
+    let (server, client, rec_id, genesis, record_title, _view, _relay, _conn) = setup().await?;
+    let unknown_parent = proto::EventId::from_bytes([0xA5; 32]);
+    let orphan =
+        forge_title_event_claiming(record_title, genesis.model, rec_id, proto::Clock::from(vec![unknown_parent]), "old-system-orphan", 2);
+    let orphan_id = orphan.id();
+
+    NodeApplier::apply_updates_for_test(&client, &server.id, vec![event_only_item(orphan)])
+        .await
+        .expect_err("the orphan remains under retry before reset");
+    assert!(client.staging_contains_for_test(&Record::collection(), &orphan_id));
+
+    client.system.hard_reset().await?;
+
+    let (len, evictions, _cap) = client.staging_probe_for_test(&Record::collection());
+    assert_eq!(len, 0, "old-system bodies must not survive into a successor system");
+    assert_eq!(evictions, 0, "reset clearing is not capacity eviction");
+    assert!(!client.staging_contains_for_test(&Record::collection(), &orphan_id));
+
+    Ok(())
+}
+
+/// R8 (bounds): flooding distinct orphaned events past the cap rejects new
+/// admissions atomically, preserves retained bodies, and keeps reads live.
 #[tokio::test]
 async fn r8_orphan_flood_is_bounded_and_observable() -> Result<()> {
     let (server, client, rec_id, genesis, record_title, _view, _relay, _conn) = setup().await?;
@@ -208,12 +231,12 @@ async fn r8_orphan_flood_is_bounded_and_observable() -> Result<()> {
         })
         .collect();
 
-    let _ = NodeApplier::apply_updates_for_test(&client, &server.id, items).await;
+    NodeApplier::apply_updates_for_test(&client, &server.id, items).await.expect_err("items beyond the cap receive retryable backpressure");
 
     let (len, evictions, cap_now) = client.staging_probe_for_test(&Record::collection());
     assert_eq!(cap_now, cap);
     assert_eq!(len, cap, "the staging area holds exactly the cap under flood");
-    assert_eq!(evictions as usize, flood - cap, "cap eviction is oldest-first and counted");
+    assert_eq!(evictions, 0, "correctness-bearing retained events are never evicted");
 
     // The node stays live: reads still answer and a legitimate update still
     // applies end to end.
@@ -221,10 +244,6 @@ async fn r8_orphan_flood_is_bounded_and_observable() -> Result<()> {
     assert_eq!(view.title().unwrap(), "t0");
 
     assert_eq!(client.get_resident_entity(rec_id).expect("record still resident").head(), proto::Clock::from(vec![genesis.id()]));
-    let legit = forge_title_event(record_title, rec_id, &[&genesis], "still-alive");
-    let legit_id = legit.id();
-    NodeApplier::apply_updates_for_test(&client, &server.id, vec![event_only_item(legit)]).await.expect("a clean update still applies");
-    assert_eq!(client.get_resident_entity(rec_id).unwrap().head(), proto::Clock::from(vec![legit_id]));
 
     Ok(())
 }

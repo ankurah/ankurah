@@ -49,6 +49,13 @@ impl SimNode {
                 Box::new(sender),
             )
             .expect("simulation peers use the current protocol version");
+
+        // build_nodes seeds the same deterministic catalog definitions into
+        // every simulator before connections are created. It deliberately
+        // bypasses stored catalog entities, so descriptor shipping cannot
+        // reconstruct a wire bundle. Mark that already-shared model as
+        // announced; production connections still require a complete bundle.
+        self.node.assume_model_announced_to_peer_for_test(peer.id(), super::model::sim_model_id());
     }
 
     /// Ingest a forged batch of events directly through the production remote

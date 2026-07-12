@@ -41,6 +41,14 @@ pub struct SledStorageCollectionInner {
 
 pub struct SledStorageCollection(SledStorageCollectionInner);
 
+fn ensure_event_identity(stored_id: &EventId, event: &Event) -> Result<(), RetrievalError> {
+    let actual = event.id();
+    if actual != *stored_id {
+        return Err(RetrievalError::Other(format!("event identity mismatch: stored key {stored_id}, payload recomputed to {actual}")));
+    }
+    Ok(())
+}
+
 impl SledStorageCollection {
     pub fn new(
         collection_id: CollectionId,
@@ -387,6 +395,7 @@ impl SledStorageCollectionInner {
             match self.database.events_tree.get(event_id.as_bytes()).map_err(SledRetrievalError::StorageError)? {
                 Some(event) => {
                     let event: Attested<Event> = bincode::deserialize(&event)?;
+                    ensure_event_identity(&event_id, &event.payload)?;
                     events.push(event);
                 }
                 None => continue,
@@ -404,8 +413,10 @@ impl SledStorageCollectionInner {
 
         // TODO: this is a full table scan. If we actually need this for more than just tests, we should index the events by entity_id
         for event_data in self.database.events_tree.iter() {
-            let (_key, data) = event_data.map_err(SledRetrievalError::StorageError)?;
+            let (key, data) = event_data.map_err(SledRetrievalError::StorageError)?;
+            let stored_id = EventId::try_from(key.to_vec())?;
             let event: Attested<Event> = bincode::deserialize(&data)?;
+            ensure_event_identity(&stored_id, &event.payload)?;
             if event.payload.entity_id == entity_id {
                 events.push(event);
             }
@@ -428,5 +439,56 @@ impl SledStorageCollectionInner {
         } else {
             Ok(true)
         }
+    }
+}
+
+#[cfg(test)]
+mod event_identity_tests {
+    use super::*;
+    use crate::engine::SledStorageEngine;
+    use ankurah_core::storage::StorageEngine;
+    use ankurah_proto::{Clock, OperationSet};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn event_payload_must_recompute_to_the_stored_key() {
+        let honest = Event {
+            model: EntityId::from_bytes([0x11; 16]),
+            entity_id: EntityId::from_bytes([0x22; 16]),
+            operations: OperationSet(BTreeMap::new()),
+            parent: Clock::default(),
+            generation: 1,
+        };
+        let stored_id = honest.id();
+        ensure_event_identity(&stored_id, &honest).unwrap();
+
+        let doctored = Event { generation: 2, ..honest };
+        let err = ensure_event_identity(&stored_id, &doctored).unwrap_err();
+        assert!(err.to_string().contains("event identity mismatch"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn event_getters_reject_a_payload_stored_under_the_wrong_key() {
+        let engine = SledStorageEngine::new_test().unwrap();
+        let collection = engine.collection(&"identity_check".into()).await.unwrap();
+        let honest = Event {
+            model: EntityId::from_bytes([0x11; 16]),
+            entity_id: EntityId::from_bytes([0x22; 16]),
+            operations: OperationSet(BTreeMap::new()),
+            parent: Clock::default(),
+            generation: 1,
+        };
+        let stored_id = honest.id();
+        let entity_id = honest.entity_id;
+        collection.add_event(&Attested::opt(honest.clone(), None)).await.unwrap();
+
+        let doctored = Attested::opt(Event { generation: 2, ..honest }, None);
+        let encoded = bincode::serialize(&doctored).unwrap();
+        engine.database.lock().unwrap().events_tree.insert(stored_id.as_bytes(), encoded).unwrap();
+
+        let err = collection.get_events(vec![stored_id.clone()]).await.unwrap_err();
+        assert!(err.to_string().contains("event identity mismatch"), "unexpected get error: {err}");
+        let err = collection.dump_entity_events(entity_id).await.unwrap_err();
+        assert!(err.to_string().contains("event identity mismatch"), "unexpected dump error: {err}");
     }
 }

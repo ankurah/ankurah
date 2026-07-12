@@ -33,13 +33,11 @@ pub fn topo_sort_events(events: Vec<Attested<Event>>) -> Result<Vec<Attested<Eve
 }
 
 /// The Kahn core over explicit (id, parent ids) pairs, considering only
-/// parent edges within the given set. DETERMINISM CONTRACT (corrected at D2
-/// M5; the red-team fold item 3 caught the older comment overclaiming
-/// input-order independence): only the queue SEED iterates in BTree order;
+/// parent edges within the given set. Only the queue seed uses BTree order;
 /// discovery appends children in the order their parents appear in the
-/// input, so ties between order-unconstrained nodes follow INPUT order. The
-/// result is deterministic for a given input SEQUENCE; callers wanting one
-/// canonical order for a given input SET must sort the input by id first
+/// input, so ties between order-unconstrained nodes follow input order. The
+/// result is deterministic for a given input sequence; callers wanting one
+/// canonical order for a given input set must sort the input by id first
 /// (`canonicalize_chain` below does exactly that).
 ///
 /// Also used by the ingest planner, which orders staged event ids without
@@ -91,9 +89,9 @@ pub(crate) fn topo_sort_ids(nodes: Vec<(EventId, Vec<EventId>)>) -> Result<Vec<E
     Ok(sorted)
 }
 
-/// Canonicalize an emitted comparison chain (D2 M5, dispositions Q2): the
-/// unique topological order of the chain SET under `topo_sort_ids` with
-/// sorted-by-id input, edges restricted to the set (drawn from the
+/// Canonicalize an emitted comparison chain as the unique topological order
+/// produced by `topo_sort_ids` from id-sorted input, with edges restricted to
+/// the set (drawn from the
 /// comparison's accumulated dag). Two emissions of the same set, however
 /// scheduled or routed (quick check vs BFS, any frontier order), produce
 /// byte-identical chains; this is what lets the immunity oracle bind the

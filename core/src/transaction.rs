@@ -27,6 +27,10 @@ pub struct Transaction {
     pub(crate) id: proto::TransactionId,
     pub(crate) entities: AppendOnlyVec<Entity>,
     pub(crate) alive: Arc<AtomicBool>,
+    /// System epoch in which this transaction fork was admitted. Local
+    /// commit rechecks it immediately and again under the phase-two reset
+    /// fence before writing any event.
+    pub(crate) reset_epoch: u64,
     /// Entity IDs that were created in this transaction via create().
     /// Used to validate that creation events (empty parent) are only for entities
     /// that were actually created in this transaction, not phantom entities.
@@ -50,11 +54,13 @@ impl Transaction {
 
 impl Transaction {
     pub(crate) fn new(dyncontext: Arc<dyn TContext + Send + Sync + 'static>) -> Self {
+        let reset_epoch = dyncontext.reset_epoch();
         Self {
             dyncontext,
             id: proto::TransactionId::new(),
             entities: AppendOnlyVec::new(),
             alive: Arc::new(AtomicBool::new(true)),
+            reset_epoch,
             created_entity_ids: std::sync::RwLock::new(std::collections::HashSet::new()),
             schemas: std::sync::RwLock::new(Vec::new()),
         }

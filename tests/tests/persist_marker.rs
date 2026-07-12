@@ -29,6 +29,44 @@ fn title_ops(title_property: proto::EntityId, title: &str) -> proto::OperationSe
     proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)]))
 }
 
+/// A transaction fork belongs to the system epoch in which it began. A hard
+/// reset purges that system; committing the held fork afterward must fail
+/// before it can recreate the old entity in successor storage.
+#[tokio::test]
+async fn transaction_begun_before_reset_cannot_commit_into_successor() -> Result<()> {
+    let engine = Arc::new(InstrumentedEngine::new(SledStorageEngine::new_test()?));
+    let instruments = engine.instruments();
+    let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
+    node.system.create().await?;
+    let ctx = node.context_async(c).await;
+
+    let trx = ctx.begin();
+    let record = trx.create(&Record { title: "old-system".to_owned(), artist: "a0".to_owned() }).await?;
+    let record_id = record.id();
+    drop(record);
+
+    node.system.hard_reset().await?;
+    let event_writes_before = instruments.add_event_attempts();
+    let result = tokio::time::timeout(Duration::from_secs(2), trx.commit())
+        .await
+        .expect("a stale transaction must reject without waiting for successor system readiness");
+
+    assert!(
+        matches!(&result, Err(ankurah::core::error::MutationError::InvalidUpdate("system reset during local transaction"))),
+        "a transaction from the purged epoch must be rejected by the epoch guard, got {result:?}"
+    );
+    assert_eq!(
+        instruments.add_event_attempts(),
+        event_writes_before,
+        "rejection must happen before any old-system event reaches successor storage"
+    );
+    assert!(
+        engine.collection(&Record::collection()).await?.get_state(record_id).await.is_err(),
+        "successor storage must contain no state for the old transaction"
+    );
+    Ok(())
+}
+
 /// R-D2-4a (plan REV 4 section 3 M4): a CURRENT no-op redelivery produces
 /// ZERO set_state calls. The resident's persist-currency marker proves a
 /// completed persist already covers exactly this head in this reset epoch,
@@ -523,6 +561,158 @@ async fn hard_reset_drains_inflight_persists_before_wiping() -> Result<()> {
         "post-reset storage must not contain the dead system's entity"
     );
     assert_eq!(node.resident_count_for_test(), 0, "and the purge ran");
+    Ok(())
+}
+
+/// REVIEW FINDING 3: the per-entity mutation span covers apply, event-log
+/// commit, and state persist as one indivisible lane. If lane A has applied
+/// E1 to the resident but is parked before add_event reaches storage, a
+/// sibling no-op lane must not persist that resident head. Otherwise the
+/// durable state names E1 before the durable event log contains E1, which
+/// is exactly the crash ordering the executor promises never to create.
+#[tokio::test]
+async fn sibling_lane_cannot_persist_an_applied_but_uncommitted_head() -> Result<()> {
+    let engine = Arc::new(InstrumentedEngine::new(SledStorageEngine::new_test()?));
+    let instruments = engine.instruments();
+    let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
+    node.system.create().await?;
+    let ctx = node.context_async(c).await;
+
+    let (rec_id, _view, genesis) = {
+        let trx = ctx.begin();
+        let rec = trx.create(&Record { title: "t0".to_owned(), artist: "a0".to_owned() }).await?;
+        let id = rec.id();
+        let view = rec.read();
+        let mut events = trx.commit_and_return_events().await?;
+        (id, view, events.remove(0))
+    };
+    let collection = engine.collection(&Record::collection()).await?;
+    let title_property = node.catalog.resolve(Record::collection().as_str(), "title").expect("Record.title registered by create");
+    let e1 = ankurah_tests::forge::event_with_parents(rec_id, genesis.model, title_ops(title_property, "t1"), &[&genesis]);
+
+    // Lane A advances the resident, then parks before its event-log write.
+    let add_baseline = instruments.add_event_attempts();
+    let state_baseline = instruments.set_state_attempts();
+    instruments.hold_next_add_event(1);
+    let lane_a = {
+        let node = node.clone();
+        let e1 = e1.clone();
+        tokio::spawn(
+            async move { node.commit_remote_transaction(&c, proto::TransactionId::new(), vec![proto::Attested::opt(e1, None)]).await },
+        )
+    };
+    instruments.wait_until_add_event_parked(1).await;
+
+    assert_eq!(instruments.add_event_attempts() - add_baseline, 1, "lane A reached exactly one event-log commit");
+    assert!(
+        node.get_resident_entity(rec_id).expect("record remains resident").head().contains(&e1.id()),
+        "precondition: E1 applied to the resident before add_event parked"
+    );
+    assert!(!collection.has_event(&e1.id()).await?, "precondition: E1 has not reached the durable event log");
+    assert!(
+        !collection.get_state(rec_id).await?.payload.state.head.contains(&e1.id()),
+        "precondition: durable state still names only committed history"
+    );
+
+    // Lane B is an already-integrated genesis redelivery. Its plan is a
+    // no-op, but its uniform persist would snapshot lane A's resident head
+    // if the mutation span did not serialize the complete apply/commit/
+    // persist sequence.
+    let mut lane_b = {
+        let node = node.clone();
+        let genesis = genesis.clone();
+        tokio::spawn(async move {
+            node.commit_remote_transaction(&c, proto::TransactionId::new(), vec![proto::Attested::opt(genesis, None)]).await
+        })
+    };
+    let b_early = tokio::time::timeout(Duration::from_millis(750), &mut lane_b).await;
+    assert!(b_early.is_err(), "a sibling lane resolved while E1 was applied but uncommitted; it must wait for lane A's full mutation span");
+    assert_eq!(
+        instruments.set_state_attempts() - state_baseline,
+        0,
+        "no state persist may reach storage while the resident head references an uncommitted event"
+    );
+    assert!(
+        !collection.get_state(rec_id).await?.payload.state.head.contains(&e1.id()),
+        "the sibling lane must not durably expose E1 before its event-log row exists"
+    );
+
+    instruments.release_held_add_events();
+    lane_a.await?.expect("lane A commits E1 and persists its state");
+    lane_b.await?.expect("lane B completes after lane A closes the gap");
+
+    assert!(collection.has_event(&e1.id()).await?, "E1 is durable when both lanes return");
+    assert!(
+        collection.get_state(rec_id).await?.payload.state.head.contains(&e1.id()),
+        "durable state may name E1 after its event-log commit completes"
+    );
+    Ok(())
+}
+
+/// REVIEW FINDING 4: hard_reset's read fence covers the full mutation span,
+/// beginning before apply and lasting through event commit and state persist.
+/// Parking add_event proves the reset waits before any set_state call exists;
+/// a fence limited to the persistence funnel would let the purge and wipe run
+/// through this earlier apply-to-commit window.
+#[tokio::test]
+async fn hard_reset_waits_for_the_apply_commit_persist_span() -> Result<()> {
+    let engine = Arc::new(InstrumentedEngine::new(SledStorageEngine::new_test()?));
+    let instruments = engine.instruments();
+    let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
+    node.system.create().await?;
+    let ctx = node.context_async(c).await;
+
+    let (rec_id, _view, genesis) = {
+        let trx = ctx.begin();
+        let rec = trx.create(&Record { title: "t0".to_owned(), artist: "a0".to_owned() }).await?;
+        let id = rec.id();
+        let view = rec.read();
+        let mut events = trx.commit_and_return_events().await?;
+        (id, view, events.remove(0))
+    };
+    let collection = engine.collection(&Record::collection()).await?;
+    let title_property = node.catalog.resolve(Record::collection().as_str(), "title").expect("Record.title registered by create");
+    let e1 = ankurah_tests::forge::event_with_parents(rec_id, genesis.model, title_ops(title_property, "t1"), &[&genesis]);
+
+    let state_baseline = instruments.set_state_attempts();
+    instruments.hold_next_add_event(1);
+    let lane = {
+        let node = node.clone();
+        let e1 = e1.clone();
+        tokio::spawn(
+            async move { node.commit_remote_transaction(&c, proto::TransactionId::new(), vec![proto::Attested::opt(e1, None)]).await },
+        )
+    };
+    instruments.wait_until_add_event_parked(1).await;
+    assert!(
+        node.get_resident_entity(rec_id).expect("record remains resident").head().contains(&e1.id()),
+        "precondition: apply completed before the event-log commit parked"
+    );
+    assert!(!collection.has_event(&e1.id()).await?, "precondition: the event-log commit is still in flight");
+    assert_eq!(
+        instruments.set_state_attempts() - state_baseline,
+        0,
+        "precondition: this is the apply-to-commit window, before persistence"
+    );
+
+    let mut reset = {
+        let node = node.clone();
+        tokio::spawn(async move { node.system.hard_reset().await })
+    };
+    let reset_early = tokio::time::timeout(Duration::from_millis(750), &mut reset).await;
+    assert!(
+        reset_early.is_err(),
+        "hard_reset resolved during an apply-to-commit gap; its fence must cover the whole mutation span, not only set_state"
+    );
+    assert!(node.get_resident_entity(rec_id).is_some(), "the reset has not purged the resident while the event commit is parked");
+    assert_eq!(instruments.set_state_attempts() - state_baseline, 0, "hard_reset is blocked before the lane even reaches set_state");
+
+    instruments.release_held_add_events();
+    lane.await?.expect("the pre-reset mutation commits and persists before the wipe");
+    reset.await??;
+
+    assert_eq!(node.resident_count_for_test(), 0, "the reset purges the drained pre-reset resident");
+    assert!(collection.get_state(rec_id).await.is_err(), "the successor store contains no pre-reset state row");
     Ok(())
 }
 

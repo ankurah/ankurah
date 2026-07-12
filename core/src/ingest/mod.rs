@@ -21,11 +21,13 @@ pub(crate) mod testkit;
 pub(crate) mod unverified;
 pub(crate) mod verify;
 
-pub(crate) use executor::{execute_plan, PersistState};
+pub(crate) use executor::{execute_plan_at_epoch, execute_plan_fenced_at_epoch, PersistState};
 pub(crate) use outcome::IngestOutcome;
-pub(crate) use plan::{plan_entity, IngestPlan};
+#[cfg(test)]
+pub(crate) use plan::plan_entity;
+pub(crate) use plan::{plan_entity_for, IngestPlan};
 pub(crate) use staging::StagingArea;
-pub(crate) use state_apply::apply_state_feed;
+pub(crate) use state_apply::apply_state_feed_at_epoch;
 pub(crate) use unverified::UnverifiedEvents;
 pub(crate) use verify::{check_generation, verify_state_head_generations, GenerationCheck};
 

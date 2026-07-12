@@ -230,7 +230,7 @@ pub struct PostgresBucket {
 }
 
 /// Fixed columns of every state table: reserved, never assignable to a property.
-const BASE_COLUMNS: [&str; 4] = ["id", "state_buffer", "head", "attestations"];
+const BASE_COLUMNS: [&str; 5] = ["id", "state_buffer", "head", "generations", "attestations"];
 
 impl PostgresBucket {
     fn state_table(&self) -> String { self.collection_id.as_str().to_string() }
@@ -435,12 +435,10 @@ impl PostgresBucket {
     }
 
     pub async fn create_state_table(&self, client: &mut tokio_postgres::Client) -> Result<(), StateError> {
-        // generations is the per-tip head-generation column (D2 M4, plan
-        // REV 5 section K home 3): a bigint array PARALLEL to the head
-        // array (generations[i] annotates head[i]; u32 stored as bigint for
-        // the same unsigned-range reason as the event table). NOT NULL
-        // because the annotation is mandatory (fresh-database ruling); a
-        // pre-M4 table lacks the column and state reads fail loudly.
+        // `generations` annotates `head` position by position. PostgreSQL
+        // stores each u32 as bigint because it has no unsigned integer type.
+        // The annotation is mandatory; an older incompatible schema fails
+        // loudly instead of fabricating generation data.
         let create_query = format!(
             r#"CREATE TABLE IF NOT EXISTS "{}"(
                 "id" character(22) PRIMARY KEY,
@@ -521,12 +519,9 @@ impl PostgresBucket {
     }
 }
 
-/// Reconstitute the per-tip head generations from the parallel arrays (D2
-/// M4, plan REV 5 section K): generations[i] annotates head[i], where the
-/// head array is stored (and re-read) in Clock's sorted canonical order.
-/// Strictly typed and length-checked: a pre-M4 row (no column, caught by
-/// the SELECT), a length mismatch, or an out-of-range value all fail
-/// loudly rather than reconstituting a wrong materialization.
+/// Reconstitute head generations from parallel arrays, where
+/// `generations[i]` annotates `head[i]`. Length mismatches and values outside
+/// the u32 range fail loudly instead of producing a wrong materialization.
 fn gclock_from_parallel(head: &Clock, generations: &[i64]) -> Result<GClock, String> {
     if generations.len() != head.len() {
         return Err(format!("generations column has {} entries for a head of {} tips", generations.len(), head.len()));
@@ -537,6 +532,18 @@ fn gclock_from_parallel(head: &Clock, generations: &[i64]) -> Result<GClock, Str
         entries.push((generation, tip.clone()));
     }
     Ok(GClock::new(entries))
+}
+
+fn checked_event_generation(stored_id: &EventId, raw: i64) -> Result<u32, RetrievalError> {
+    u32::try_from(raw).map_err(|_| RetrievalError::Other(format!("event {stored_id} has generation {raw} outside the supported u32 range")))
+}
+
+fn ensure_event_identity(stored_id: &EventId, event: &Event) -> Result<(), RetrievalError> {
+    let actual = event.id();
+    if actual != *stored_id {
+        return Err(RetrievalError::Other(format!("event identity mismatch: stored key {stored_id}, payload recomputed to {actual}")));
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -968,17 +975,18 @@ impl StorageCollection for PostgresBucket {
 
         let mut events = Vec::new();
         for row in rows {
+            let stored_id: EventId = row.try_get("id").map_err(RetrievalError::storage)?;
             let entity_id: EntityId = row.try_get("entity_id").map_err(RetrievalError::storage)?;
             let operations: OperationSet = row.try_get("operations").map_err(RetrievalError::storage)?;
             let parent: Clock = row.try_get("parent").map_err(RetrievalError::storage)?;
-            let generation: i64 = row.try_get("generation").map_err(RetrievalError::storage)?;
+            let raw_generation: i64 = row.try_get("generation").map_err(RetrievalError::storage)?;
+            let generation = checked_event_generation(&stored_id, raw_generation)?;
             let attestations_binary: Vec<u8> = row.try_get("attestations").map_err(RetrievalError::storage)?;
             let attestations: Vec<Attestation> = bincode::deserialize(&attestations_binary).map_err(RetrievalError::storage)?;
 
-            let event = Attested {
-                payload: Event { model: self.model_id()?, entity_id, operations, parent, generation: generation as u32 },
-                attestations: AttestationSet(attestations),
-            };
+            let payload = Event { model: self.model_id()?, entity_id, operations, parent, generation };
+            ensure_event_identity(&stored_id, &payload)?;
+            let event = Attested { payload, attestations: AttestationSet(attestations) };
             events.push(event);
         }
         Ok(events)
@@ -1020,18 +1028,18 @@ impl StorageCollection for PostgresBucket {
 
         let mut events = Vec::new();
         for row in rows {
-            // let event_id: EventId = row.try_get("id").map_err(|err| RetrievalError::storage(err))?;
+            let stored_id: EventId = row.try_get("id").map_err(RetrievalError::storage)?;
             let operations_binary: Vec<u8> = row.try_get("operations").map_err(RetrievalError::storage)?;
             let operations = bincode::deserialize(&operations_binary).map_err(RetrievalError::storage)?;
             let parent: Clock = row.try_get("parent").map_err(RetrievalError::storage)?;
-            let generation: i64 = row.try_get("generation").map_err(RetrievalError::storage)?;
+            let raw_generation: i64 = row.try_get("generation").map_err(RetrievalError::storage)?;
+            let generation = checked_event_generation(&stored_id, raw_generation)?;
             let attestations_binary: Vec<u8> = row.try_get("attestations").map_err(RetrievalError::storage)?;
             let attestations: Vec<Attestation> = bincode::deserialize(&attestations_binary).map_err(RetrievalError::storage)?;
 
-            events.push(Attested {
-                payload: Event { model: self.model_id()?, entity_id, operations, parent, generation: generation as u32 },
-                attestations: AttestationSet(attestations),
-            });
+            let payload = Event { model: self.model_id()?, entity_id, operations, parent, generation };
+            ensure_event_identity(&stored_id, &payload)?;
+            events.push(Attested { payload, attestations: AttestationSet(attestations) });
         }
 
         Ok(events)
@@ -1176,4 +1184,44 @@ impl ToSql for UntypedNull {
     }
 
     to_sql_checked!();
+}
+
+#[cfg(test)]
+mod event_decode_tests {
+    use super::*;
+
+    fn event(generation: u32) -> Event {
+        Event {
+            model: EntityId::from_bytes([0x11; 16]),
+            entity_id: EntityId::from_bytes([0x22; 16]),
+            operations: OperationSet(BTreeMap::new()),
+            parent: Clock::default(),
+            generation,
+        }
+    }
+
+    #[test]
+    fn event_generation_decode_is_checked() {
+        let stored_id = event(1).id();
+        assert_eq!(checked_event_generation(&stored_id, 0).unwrap(), 0);
+        assert_eq!(checked_event_generation(&stored_id, u32::MAX as i64).unwrap(), u32::MAX);
+        assert!(checked_event_generation(&stored_id, -1).is_err());
+        assert!(checked_event_generation(&stored_id, u32::MAX as i64 + 1).is_err());
+    }
+
+    #[test]
+    fn generations_column_is_reserved_from_property_assignment() {
+        assert!(BASE_COLUMNS.contains(&"generations"));
+    }
+
+    #[test]
+    fn event_payload_must_recompute_to_the_stored_key() {
+        let honest = event(1);
+        let stored_id = honest.id();
+        ensure_event_identity(&stored_id, &honest).unwrap();
+
+        let doctored = event(2);
+        let err = ensure_event_identity(&stored_id, &doctored).unwrap_err();
+        assert!(err.to_string().contains("event identity mismatch"), "unexpected error: {err}");
+    }
 }

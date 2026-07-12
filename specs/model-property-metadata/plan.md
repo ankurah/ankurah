@@ -371,10 +371,10 @@ read back "".
 
 PR #307 ships the whole epoch as PROTOCOL_VERSION = 3: LWW v2/0xA2,
 uniform PropertyKey payloads, resolved predicate Identifiers and ORDER BY
-property identities, RegisterSchema, model-id data envelopes, and
-once-per-connection schema descriptors. Durable nodes upgrade first. Protocol
-2 existed only as an intermediate branch value; no released or mergeable v2
-epoch exists.
+property identities, RegisterSchema, model-id data envelopes, and schema
+descriptors resent until acknowledged for the connection (decision 29).
+Durable nodes upgrade first. Protocol 2 existed only as an intermediate
+branch value; no released or mergeable v2 epoch exists.
 
 ## Phase C outline (engine-local; detailed after A)
 
@@ -661,12 +661,12 @@ model <-> table map half deferred with #304.
     reverse-engineered from is_entity_create + collection; the
     executor holds the answer for free at exactly the decision point.
     Refusal fails the whole registration before anything is emitted;
-    check_event still gates every emitted event underneath (defense in
-    depth) -- individually, not transactionally: a mid-batch event
-    denial leaves earlier catalog events durable (maintainer ruling
-    2026-07-06: registration need not be atomic; the allocator's
-    storage-checked lookups keep identity convergent across partials;
-    #313 tracks the transactional upgrade). The executor also requires
+    check_event still gates every emitted event underneath as defense in
+    depth. AMENDED 2026-07-07 after the D1 atomic lane landed: a
+    constituent denial aborts the batch before persistence and leaves no
+    catalog rows durable. Storage-backed allocator lookups still cover
+    crash-window partials and lazily warming engines; #313 tracks the
+    remaining system-transaction executor work. The executor also requires
     can_access_collection on every collection a request names (second
     2026-07-06 ruling: the verb-skipped no-op upsert must not serve as
     an existence oracle). Sync, matching check_event.
@@ -769,10 +769,11 @@ model <-> table map half deferred with #304.
     policy is maintainer-ruled c + e + d: (c) NodeUpdate and NodeResponse
     carry `#[serde(default)] schema: Vec<Attested<EntityState>>` -- the
     real attested catalog entity states for any non-well-known model the
-    payload references, shipped once per connection per model
-    (PeerState.announced_models), policy-validated and ingested by the
-    receiver BEFORE body processing; definitions never ride inside events
-    or state buffers. (e) Catalog warmth participates in readiness via
+    payload references. Concurrent bodies repeat the bundle until a
+    schema-bearing update is acknowledged; PeerState.announced_models then
+    enables the per-connection omission fast path. Receivers policy-validate
+    and ingest definitions BEFORE body processing; definitions never ride
+    inside events or state buffers. (e) Catalog warmth participates in readiness via
     the existing ensure_subscribed / context_async gates, and on the
     INGRESS side via resolve_model_wait: a durable node whose startup
     storage warm has not finished awaits catalog readiness once and

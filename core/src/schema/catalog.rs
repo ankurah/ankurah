@@ -754,8 +754,8 @@ where
         }
     }
 
-    /// Ingest catalog definition states shipped on a wire envelope (#330
-    /// once-per-connection descriptor shipping): parse each into its def and
+    /// Ingest catalog definition states shipped on a wire envelope (#330):
+    /// parse each into its def and
     /// upsert the in-memory map, exactly like the storage warm. Map-only -- a
     /// cache warm; the durable catalog entities still replicate through the
     /// ordinary subscription paths. States whose model id is not a well-known
@@ -896,6 +896,30 @@ where
             if self.is_catalog_ready() {
                 return true;
             }
+            notified.await;
+        }
+    }
+
+    /// Registration wait that is canceled by hard reset. The ordinary wait
+    /// intentionally follows readiness across lifecycle changes, but an
+    /// allocator operation is bound to one originating epoch: after reset it
+    /// must return instead of sleeping forever for the successor catalog or
+    /// continuing against its identities.
+    pub(crate) async fn wait_catalog_ready_at_epoch(
+        &self,
+        node: &Node<SE, PA>,
+        expected_epoch: u64,
+    ) -> Result<(), crate::error::RetrievalError> {
+        loop {
+            let notified = self.0.ready_notify.notified();
+            let reset_fence = node.entities.reset_fence_read().await;
+            if node.entities.reset_epoch() != expected_epoch {
+                return Err(crate::error::RequestError::ConnectionLost.into());
+            }
+            if self.is_catalog_ready() {
+                return Ok(());
+            }
+            drop(reset_fence);
             notified.await;
         }
     }
@@ -1310,6 +1334,7 @@ where
         if self.is_schema_ensured(schema) {
             return Ok(());
         }
+        let registration_epoch = node.entities.reset_epoch();
 
         let (models, properties, memberships) = super::registration_request(schema);
 
@@ -1321,7 +1346,16 @@ where
             // grab a post-reset fence and fold old definitions into the new
             // epoch (an ABA error).
             let _lease = initial_lease;
-            let (models, properties, memberships) = node.execute_schema_registration(cdata, models, properties, memberships).await?;
+            // Re-enter the reset fence before latching: if execution
+            // straddled a reset, the reset hook already cleared the old map
+            // and this old-system completion must not mark the successor
+            // system as registered.
+            let (models, properties, memberships) =
+                node.execute_schema_registration_at_epoch(cdata, models, properties, memberships, registration_epoch).await?;
+            let _reset_fence = node.entities.reset_fence_read().await;
+            if node.entities.reset_epoch() != registration_epoch {
+                return Err(RegistrationError::Retrieval(crate::error::RequestError::ConnectionLost.into()));
+            }
             self.mark_schema_ensured(schema, &models, &properties, &memberships)?;
             return Ok(());
         }
@@ -1359,6 +1393,14 @@ where
                         };
                         // The response is the fast path into the map (RFC
                         // 5.2): fold it in on ack so binding proceeds now.
+                        // The response-delivery epoch check protects its own
+                        // wire-schema cache warm; this second check is the
+                        // actual caller mutation boundary for the resolved
+                        // definitions and ensured latch.
+                        let _reset_fence = node.entities.reset_fence_read().await;
+                        if node.entities.reset_epoch() != registration_epoch {
+                            return Err(RegistrationError::Retrieval(crate::error::RequestError::ConnectionLost.into()));
+                        }
                         self.upsert_registered(&models, &properties, &memberships);
                         self.mark_schema_ensured(schema, &models, &properties, &memberships)?;
                         Ok(())

@@ -40,6 +40,10 @@ where
 #[async_trait]
 pub trait TContext {
     fn node_id(&self) -> proto::EntityId;
+    /// Reset epoch captured by transactions at `begin()`. The default keeps
+    /// lightweight external/test contexts source-compatible; contexts that
+    /// own resettable storage override it.
+    fn reset_epoch(&self) -> u64 { 0 }
     /// Create a brand new entity for a transaction, and add it to the WeakEntitySet
     /// Note that this does not actually persist the entity to the storage engine
     /// It merely ensures that there are no duplicate entities with the same ID (except forked entities)
@@ -77,6 +81,7 @@ pub trait TContext {
 #[async_trait]
 impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> TContext for NodeAndContext<SE, PA> {
     fn node_id(&self) -> proto::EntityId { self.node.id }
+    fn reset_epoch(&self) -> u64 { self.node.entities.reset_epoch() }
     fn create_entity(&self, collection: proto::CollectionId, trx_alive: Arc<AtomicBool>) -> Entity {
         // WeakEntitySet::create stamps the PRIMARY with the live catalog
         // resolver before this snapshot, so the transaction fork inherits it.
@@ -98,6 +103,14 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         // compare_exchange returns Err if the value was already false (already committed/rolled back).
         if trx.alive.compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire).is_err() {
             return Err(MutationError::General("Transaction already committed or rolled back".into()));
+        }
+
+        // A transaction is a fork of the system epoch in which begin() ran.
+        // Reject a visibly stale fork before registration or policy work;
+        // phase two repeats this check under the reset fence to close the
+        // admission-to-first-write race.
+        if self.node.entities.reset_epoch() != trx.reset_epoch {
+            return Err(MutationError::InvalidUpdate("system reset during local transaction"));
         }
 
         // Close the edit-only registration gap (RFC 5.2 "durable write on
@@ -191,10 +204,17 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         // the remote lane's executor phase two, while here the relay
         // barrier between event commit and state persist rules that
         // sequence out (see the executor module doc).
+        // One reset-fence span covers every event write through canonical
+        // persistence. A reset therefore drains this transaction before its
+        // wipe instead of splitting committed events from their state.
+        let _reset_fence = self.node.entities.reset_fence_read().await;
+        if self.node.entities.reset_epoch() != trx.reset_epoch {
+            return Err(MutationError::InvalidUpdate("system reset during local transaction"));
+        }
         let mut attested_events = Vec::new();
         for (_, _, event_id, group) in &planned {
             let attested =
-                group.staging.get_attested(event_id).ok_or_else(|| MutationError::General("staged event evicted mid-commit".into()))?;
+                group.staging.get_attested(event_id).ok_or_else(|| MutationError::General("staged event missing mid-commit".into()))?;
             group.getter.commit_event(&attested).await?;
             attested_events.push(attested);
         }
@@ -204,13 +224,19 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
             entity.commit_head(&attested.payload);
         }
         // Relay to peers and wait for confirmation
-        self.node.relay_to_required_peers(&self.cdata, trx_id, &attested_events).await?;
+        self.node.relay_to_required_peers_fenced(&self.cdata, trx_id, &attested_events).await?;
 
         // All peers confirmed: materialize onto the canonical entities and
         // persist state, one change per entity, one notification for the
         // transaction.
         let mut changes: Vec<EntityChange> = Vec::new();
         for ((entity, canonical, _, group), attested_event) in planned.iter().zip(&attested_events) {
+            // Serialize canonical materialization with every receive-side
+            // apply/commit/persist span. Events are already durable here, but
+            // the shared resident may otherwise contain a sibling lane's
+            // not-yet-durable head when this lane snapshots it.
+            let mutation_span = self.node.entities.mutation_span(canonical.id());
+            let _mutation_guard = mutation_span.lock().await;
             // The event is durable and no longer staged, so the getter
             // resolves it (and any concurrent history) from storage. A
             // primary entity already carries the operations; only upstream
@@ -227,7 +253,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
             // then materialize and persist); only the persist funnel is
             // shared.
             let persist = crate::node_applier::NodePersist { node: &self.node, collection: &group.collection };
-            persist.persist(canonical).await?;
+            persist.persist_fenced(canonical).await?;
             // The post-persist hook, insertion half (derivations section 5;
             // REV 5 sections E and F): the completed persist proves the
             // just-committed event covered, so a server echo redelivering
@@ -498,6 +524,7 @@ where
         collection_id: &proto::CollectionId,
         selection: ankql::ast::Selection,
     ) -> Result<Vec<crate::entity::Entity>, RetrievalError> {
+        let expected_epoch = self.node.entities.reset_epoch();
         let peer_id = self.node.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
 
         // 1. Pre-fetch known_matches from local storage
@@ -512,24 +539,38 @@ where
         let selection_clone = selection.clone();
         match self
             .node
-            .request(peer_id, &self.cdata, proto::NodeRequestBody::Fetch { collection: collection_id.clone(), selection, known_matches })
+            .request_at_epoch(
+                peer_id,
+                &self.cdata,
+                proto::NodeRequestBody::Fetch { collection: collection_id.clone(), selection, known_matches },
+                expected_epoch,
+            )
             .await?
         {
             proto::NodeResponseBody::Fetch(deltas) => {
                 let collection = self.node.collections.get(collection_id).await?;
                 let staging = self.node.staging_for(collection_id);
-                let event_getter = crate::retrieval::CachedEventGetter::with_staging(
+                let event_getter = crate::retrieval::CachedEventGetter::with_staging_at_epoch(
                     collection_id.clone(),
                     collection.clone(),
                     &self.node,
                     &self.cdata,
                     staging.clone(),
+                    expected_epoch,
                 );
                 let state_getter = crate::retrieval::LocalStateGetter::new(collection);
 
                 // 3. Apply deltas to local storage using NodeApplier
-                crate::node_applier::NodeApplier::apply_deltas(&self.node, &peer_id, deltas, &staging, &event_getter, &state_getter)
-                    .await?;
+                crate::node_applier::NodeApplier::apply_deltas_at_epoch(
+                    &self.node,
+                    &peer_id,
+                    deltas,
+                    &staging,
+                    &event_getter,
+                    &state_getter,
+                    expected_epoch,
+                )
+                .await?;
                 // ARCHITECTURAL QUESTION: Optimize in-place mutation vs re-fetching for remote-peer-assisted operations https://github.com/ankurah/ankurah/issues/145
 
                 // 4. Re-fetch entities from local storage after applying deltas

@@ -740,7 +740,7 @@ impl<G: GetEvents + Send + Sync> GetEvents for CountingGetEvents<G> {
 // zero-fetch pin dishonest.
 #[async_trait::async_trait]
 impl<G: ankurah::core::retrieval::SuspenseEvents + Send + Sync> ankurah::core::retrieval::SuspenseEvents for CountingGetEvents<G> {
-    fn stage_event(&self, event: proto::Event) { self.inner.stage_event(event) }
+    fn stage_event(&self, event: proto::Event) -> Result<(), ankurah::core::error::MutationError> { self.inner.stage_event(event) }
 
     async fn commit_event(&self, attested: &proto::Attested<proto::Event>) -> Result<(), ankurah::core::error::MutationError> {
         self.inner.commit_event(attested).await
@@ -765,6 +765,7 @@ impl<G: ankurah::core::retrieval::SuspenseEvents + Send + Sync> ankurah::core::r
 #[derive(Clone)]
 pub struct StorageInstruments {
     set_state_attempts: Arc<std::sync::atomic::AtomicUsize>,
+    add_event_attempts: Arc<std::sync::atomic::AtomicUsize>,
     /// Event reads at the STORAGE boundary (get_events calls; each call may
     /// carry several ids). The honest observable for "this flow read no
     /// event payloads" claims: the D2 M5 rehydration pin asserts the GClock
@@ -783,6 +784,12 @@ pub struct StorageInstruments {
     hold_next: Arc<std::sync::atomic::AtomicUsize>,
     held_release: Arc<tokio::sync::watch::Sender<u64>>,
     held_release_rx: tokio::sync::watch::Receiver<u64>,
+    /// Selective add_event hold (the apply-to-commit/reset-span staging):
+    /// the next `n` event commits park before reaching the inner store.
+    add_event_hold_next: Arc<std::sync::atomic::AtomicUsize>,
+    add_event_parked: Arc<std::sync::atomic::AtomicUsize>,
+    add_event_release: Arc<tokio::sync::watch::Sender<u64>>,
+    add_event_release_rx: tokio::sync::watch::Receiver<u64>,
     /// get_state EGRESS hold (the M4 materialization-porosity staging): a
     /// held get_state parks AFTER its inner read completed, result in
     /// hand, so a test can run something destructive between a storage
@@ -801,9 +808,11 @@ impl StorageInstruments {
     fn new() -> Self {
         let (tx, rx) = tokio::sync::watch::channel(true);
         let (held_tx, held_rx) = tokio::sync::watch::channel(0u64);
+        let (add_event_tx, add_event_rx) = tokio::sync::watch::channel(0u64);
         let (get_tx, get_rx) = tokio::sync::watch::channel(0u64);
         Self {
             set_state_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            add_event_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             get_events_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             gate_open: Arc::new(tx),
             gate_rx: rx,
@@ -811,6 +820,10 @@ impl StorageInstruments {
             hold_next: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             held_release: Arc::new(held_tx),
             held_release_rx: held_rx,
+            add_event_hold_next: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            add_event_parked: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            add_event_release: Arc::new(add_event_tx),
+            add_event_release_rx: add_event_rx,
             get_skip: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             get_hold: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             get_parked: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -822,6 +835,9 @@ impl StorageInstruments {
     /// Number of set_state calls OBSERVED AT ENTRY since construction
     /// (parked calls count; they were attempted).
     pub fn set_state_attempts(&self) -> usize { self.set_state_attempts.load(std::sync::atomic::Ordering::SeqCst) }
+
+    /// Number of add_event calls observed at entry since construction.
+    pub fn add_event_attempts(&self) -> usize { self.add_event_attempts.load(std::sync::atomic::Ordering::SeqCst) }
 
     /// Number of get_events calls at the storage boundary since construction.
     pub fn get_events_calls(&self) -> usize { self.get_events_calls.load(std::sync::atomic::Ordering::SeqCst) }
@@ -841,6 +857,20 @@ impl StorageInstruments {
     /// Release every set_state parked by [`hold_next`]. The global gate is
     /// untouched.
     pub fn release_held(&self) { self.held_release.send_modify(|s| *s += 1); }
+
+    /// Arm the selective event-log hold: the next `n` add_event calls park
+    /// before reaching the inner store.
+    pub fn hold_next_add_event(&self, n: usize) { self.add_event_hold_next.fetch_add(n, std::sync::atomic::Ordering::SeqCst); }
+
+    /// Release every add_event parked by [`hold_next_add_event`].
+    pub fn release_held_add_events(&self) { self.add_event_release.send_modify(|s| *s += 1); }
+
+    /// Wait until at least `n` add_event calls are parked.
+    pub async fn wait_until_add_event_parked(&self, n: usize) {
+        while self.add_event_parked.load(std::sync::atomic::Ordering::SeqCst) < n {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
 
     /// Wait until at least `n` set_state calls are parked (gate or hold).
     pub async fn wait_until_parked(&self, n: usize) {
@@ -1006,6 +1036,30 @@ impl ankurah::core::storage::StorageCollection for InstrumentedCollection {
         self.inner.fetch_states(selection).await
     }
     async fn add_event(&self, entity_event: &proto::Attested<proto::Event>) -> Result<bool, MutationError> {
+        self.instruments.add_event_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let held = loop {
+            let cur = self.instruments.add_event_hold_next.load(std::sync::atomic::Ordering::SeqCst);
+            if cur == 0 {
+                break false;
+            }
+            if self
+                .instruments
+                .add_event_hold_next
+                .compare_exchange(cur, cur - 1, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
+                .is_ok()
+            {
+                break true;
+            }
+        };
+        if held {
+            self.instruments.add_event_parked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut rx = self.instruments.add_event_release_rx.clone();
+            let seq = *rx.borrow_and_update();
+            while *rx.borrow_and_update() <= seq {
+                rx.changed().await.expect("the add_event release sender lives in StorageInstruments");
+            }
+            self.instruments.add_event_parked.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
         self.inner.add_event(entity_event).await
     }
     async fn get_events(

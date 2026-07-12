@@ -10,7 +10,7 @@ use ankurah_core::{
     selection::filter::{evaluate_predicate, Filterable},
     storage::{naming, StorageCollection},
 };
-use ankurah_proto::{self as proto, Attested, EntityId, EntityState, EventId, State};
+use ankurah_proto::{self as proto, Attested, EntityId, EntityState, Event, EventId, State};
 use async_trait::async_trait;
 use send_wrapper::SendWrapper;
 use wasm_bindgen::{JsCast, JsValue};
@@ -40,6 +40,14 @@ fn read_generation(event_obj: &Object) -> Result<u32, RetrievalError> {
     Ok(proto::wasm::decode_generation(&raw)?)
 }
 
+fn ensure_event_identity(stored_id: &EventId, event: &Event) -> Result<(), RetrievalError> {
+    let actual = event.id();
+    if actual != *stored_id {
+        return Err(RetrievalError::Other(format!("event identity mismatch: stored key {stored_id}, payload recomputed to {actual}")));
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct IndexedDBBucket {
     pub(crate) db: Database,
@@ -64,7 +72,7 @@ pub struct IndexedDBBucket {
 /// Reserved entity-object fields a property field must never shadow: the
 /// primary `id` plus the double-underscore system columns that `set_state`
 /// writes on every entity object.
-const RESERVED_FIELDS: [&str; 5] = ["id", "__collection", "__state_buffer", "__head", "__attestations"];
+const RESERVED_FIELDS: [&str; 6] = ["id", "__collection", "__state_buffer", "__head", "__generations", "__attestations"];
 
 /// Store key for a property id's field-name assignment in `collection`:
 /// `{collection}\0{id base64}`. A concatenated string key (matching the store's
@@ -369,17 +377,15 @@ impl StorageCollection for IndexedDBBucket {
 
                 let event_obj = Object::new(result);
 
-                let event = Attested {
-                    payload: ankurah_proto::Event {
-                        model: self.model_id()?,
-                        entity_id: event_obj.get(&ENTITY_ID_KEY)?,
-                        operations: event_obj.get(&OPERATIONS_KEY)?,
-                        parent: event_obj.get(&PARENT_KEY)?,
-                        generation: read_generation(&event_obj)?,
-                    },
-                    attestations: event_obj.get(&ATTESTATIONS_KEY)?,
+                let payload = ankurah_proto::Event {
+                    model: self.model_id()?,
+                    entity_id: event_obj.get(&ENTITY_ID_KEY)?,
+                    operations: event_obj.get(&OPERATIONS_KEY)?,
+                    parent: event_obj.get(&PARENT_KEY)?,
+                    generation: read_generation(&event_obj)?,
                 };
-                events.push(event);
+                ensure_event_identity(&event_id, &payload)?;
+                events.push(Attested { payload, attestations: event_obj.get(&ATTESTATIONS_KEY)? });
             }
 
             Ok(events)
@@ -427,20 +433,18 @@ impl StorageCollection for IndexedDBBucket {
                 }
 
                 let cursor = cursor_result.dyn_into::<web_sys::IdbCursorWithValue>().require("cast cursor")?;
+                let stored_id: EventId = cursor.primary_key().require("get cursor primary key")?.try_into()?;
                 let event_obj = Object::new(cursor.value().require("get cursor value")?);
 
-                let event = Attested {
-                    payload: ankurah_proto::Event {
-                        model: self.model_id()?,
-                        // id: event_obj.get(&ID_KEY)?.try_into()?,
-                        entity_id: event_obj.get(&ENTITY_ID_KEY)?,
-                        operations: event_obj.get(&OPERATIONS_KEY)?,
-                        parent: event_obj.get(&PARENT_KEY)?,
-                        generation: read_generation(&event_obj)?,
-                    },
-                    attestations: event_obj.get(&ATTESTATIONS_KEY)?,
+                let payload = ankurah_proto::Event {
+                    model: self.model_id()?,
+                    entity_id: event_obj.get(&ENTITY_ID_KEY)?,
+                    operations: event_obj.get(&OPERATIONS_KEY)?,
+                    parent: event_obj.get(&PARENT_KEY)?,
+                    generation: read_generation(&event_obj)?,
                 };
-                events.push(event);
+                ensure_event_identity(&stored_id, &payload)?;
+                events.push(Attested { payload, attestations: event_obj.get(&ATTESTATIONS_KEY)? });
 
                 cursor.continue_().require("Failed to advance cursor")?;
             }

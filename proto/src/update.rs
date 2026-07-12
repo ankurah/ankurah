@@ -6,7 +6,7 @@ use ulid::Ulid;
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct UpdateId(Ulid);
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum NodeUpdateBody {
     /// New events for a subscription
     SubscriptionUpdate { items: Vec<SubscriptionUpdateItem> },
@@ -86,10 +86,10 @@ pub struct NodeUpdate {
     pub to: EntityId,
     pub body: NodeUpdateBody,
     /// Catalog definition entities (model/property/membership states) the
-    /// receiver needs to resolve this update's model ids (#330). Shipped once
-    /// per connection per model by the sender; empty when everything was
-    /// already announced. Descriptors ride the message envelope, never inside
-    /// events or state buffers.
+    /// receiver needs to resolve this update's model ids (#330). Repeated on
+    /// concurrent bodies until a schema-bearing update is acknowledged, then
+    /// omitted for that model on the connection. Descriptors ride the message
+    /// envelope, never inside events or state buffers.
     #[serde(default)]
     pub schema: Vec<Attested<EntityState>>,
 }
@@ -103,9 +103,13 @@ pub struct NodeUpdateAck {
     pub body: NodeUpdateAckBody,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum NodeUpdateAckBody {
     Success,
+    /// The receiver retained no durable responsibility for the update, but
+    /// the same idempotent body may succeed after transient state changes.
+    RetryableError(String),
+    /// Permanent rejection. Re-sending the same body cannot make it valid.
     Error(String),
 }
 
@@ -163,6 +167,7 @@ impl std::fmt::Display for NodeUpdateAckBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             NodeUpdateAckBody::Success => write!(f, "Success"),
+            NodeUpdateAckBody::RetryableError(e) => write!(f, "Retryable error: {e}"),
             NodeUpdateAckBody::Error(e) => write!(f, "Error: {e}"),
         }
     }
