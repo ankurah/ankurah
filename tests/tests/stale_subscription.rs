@@ -71,9 +71,7 @@ impl PolicyAgent for PausingAgent {
     where
         A: Iterable<proto::AuthData> + Send + Sync,
     {
-        if matches!(request.body, proto::NodeRequestBody::SubscribeQuery { .. })
-            && self.arm_subscribe_pause.swap(false, Ordering::AcqRel)
-        {
+        if matches!(request.body, proto::NodeRequestBody::SubscribeQuery { .. }) && self.arm_subscribe_pause.swap(false, Ordering::AcqRel) {
             // Register interest BEFORE signalling entry so the release cannot
             // be lost between the two.
             let released = self.release.notified();
@@ -152,9 +150,7 @@ impl PolicyAgent for PausingAgent {
         Ok(())
     }
 
-    fn check_write(&self, _data: &Self::ContextData, _entity: &Entity, _event: Option<&proto::Event>) -> Result<(), AccessDenied> {
-        Ok(())
-    }
+    fn check_write(&self, _data: &Self::ContextData, _entity: &Entity, _event: Option<&proto::Event>) -> Result<(), AccessDenied> { Ok(()) }
 
     fn validate_causal_assertion<SE: StorageEngine>(
         &self,

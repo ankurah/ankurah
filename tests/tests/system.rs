@@ -844,9 +844,8 @@ async fn sibling_reset_wakes_pending_requests_with_typed_error() -> Result<()> {
 
     // Hold every response arriving at the sibling, so its request stays
     // pending in the old session's oneshot map.
-    let (_connection, _gate) = common::GatedConnection::new(&founder, &sibling, |message| {
-        matches!(message, proto::NodeMessage::Response(_))
-    });
+    let (_connection, _gate) =
+        common::GatedConnection::new(&founder, &sibling, |message| matches!(message, proto::NodeMessage::Response(_)));
     sibling.system.wait_system_ready().await;
     // Durable promotion runs in the register task right after the join
     // publishes readiness; give it a bounded scheduling window.
@@ -864,11 +863,7 @@ async fn sibling_reset_wakes_pending_requests_with_typed_error() -> Result<()> {
         let founder_id = founder.id;
         tokio::spawn(async move {
             sibling
-                .request(
-                    founder_id,
-                    &DEFAULT_CONTEXT,
-                    proto::NodeRequestBody::Get { collection: CollectionId::from("album"), ids: vec![] },
-                    )
+                .request(founder_id, &DEFAULT_CONTEXT, proto::NodeRequestBody::Get { collection: CollectionId::from("album"), ids: vec![] })
                 .await
         })
     };
@@ -892,10 +887,7 @@ async fn sibling_reset_wakes_pending_requests_with_typed_error() -> Result<()> {
         .await
         .expect("sibling pending request must be woken by the sibling-teardown broadcast, not a timeout")
         .expect("request task must not panic");
-    assert!(
-        matches!(outcome, Err(ankurah::error::RequestError::ConnectionLost)),
-        "expected the typed connection error, got {outcome:?}"
-    );
+    assert!(matches!(outcome, Err(ankurah::error::RequestError::ConnectionLost)), "expected the typed connection error, got {outcome:?}");
     assert!(sibling.get_durable_peers().is_empty(), "sibling durable routes must not survive a shared-engine reset");
     Ok(())
 }

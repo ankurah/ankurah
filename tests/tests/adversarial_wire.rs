@@ -163,7 +163,11 @@ fn deliver_with_schema(
 /// from that genesis, and the state is its exact materialization. Nothing
 /// about the FORMAT is rejectable, so the receiver's fill-missing-only and
 /// staleness rules are the only defenses under test.
-fn forge_catalog_proof(system: proto::EntityId, collection: &str, fields: Vec<(&str, Option<Value>)>) -> (proto::EntityId, proto::StateWithGenesis) {
+fn forge_catalog_proof(
+    system: proto::EntityId,
+    collection: &str,
+    fields: Vec<(&str, Option<Value>)>,
+) -> (proto::EntityId, proto::StateWithGenesis) {
     let backend = LWWBackend::new();
     for (name, value) in fields {
         backend.set(PropertyKey::Name(name.to_owned()), value);

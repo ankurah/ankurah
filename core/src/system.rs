@@ -348,7 +348,8 @@ where
             if self.0.durable {
                 return Ok(RootReservation::Conflict);
             }
-            *root = Some(RootBinding { proof: proof.clone(), founder, status: RootStatus::Reserved { needs_reset: false, replaces: None } });
+            *root =
+                Some(RootBinding { proof: proof.clone(), founder, status: RootStatus::Reserved { needs_reset: false, replaces: None } });
             return Ok(RootReservation::StartJoin(proof.clone()));
         };
 
@@ -945,11 +946,7 @@ where
     /// so live peer sessions are rebound rather than drained. See
     /// [`PeerSessionsReset::Rebind`].
     fn publish_first_owner_with_generation(&self, clear_root: bool, fresh_generation: Arc<AtomicBool>) {
-        self.invalidate_local_state_inner(
-            clear_root,
-            Some(fresh_generation.clone()),
-            PeerSessionsReset::Rebind { fresh_generation },
-        );
+        self.invalidate_local_state_inner(clear_root, Some(fresh_generation.clone()), PeerSessionsReset::Rebind { fresh_generation });
     }
 
     fn invalidate_local_state_inner(&self, clear_root: bool, fresh_generation: Option<Arc<AtomicBool>>, peers: PeerSessionsReset) {

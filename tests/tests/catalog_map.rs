@@ -289,7 +289,10 @@ impl StorageEngine for GatedCatalogFetchEngine {
         <SledStorageEngine as StorageEngine>::list_collections(self.inner.as_ref()).await
     }
 
-    async fn claim_system_root(&self, candidate: &proto::SystemRootProof) -> Result<ankurah::core::storage::SystemRootClaim, MutationError> {
+    async fn claim_system_root(
+        &self,
+        candidate: &proto::SystemRootProof,
+    ) -> Result<ankurah::core::storage::SystemRootClaim, MutationError> {
         <SledStorageEngine as StorageEngine>::claim_system_root(self.inner.as_ref(), candidate).await
     }
 
@@ -336,7 +339,10 @@ impl StorageEngine for GatedListEngine {
         Ok(collections)
     }
 
-    async fn claim_system_root(&self, candidate: &proto::SystemRootProof) -> Result<ankurah::core::storage::SystemRootClaim, MutationError> {
+    async fn claim_system_root(
+        &self,
+        candidate: &proto::SystemRootProof,
+    ) -> Result<ankurah::core::storage::SystemRootClaim, MutationError> {
         <SledStorageEngine as StorageEngine>::claim_system_root(self.inner.as_ref(), candidate).await
     }
 
@@ -716,8 +722,11 @@ async fn hard_reset_drains_in_flight_durable_catalog_warm() -> anyhow::Result<()
     .expect("the seed node must release the shared engine before reconstruction");
 
     let gate = Arc::new(DurableWarmGate::default());
-    let node =
-        Node::new_durable_with_signing_key(Arc::new(GatedListEngine { inner: inner.clone(), gate: gate.clone() }), PermissiveAgent::new(), persisted_key);
+    let node = Node::new_durable_with_signing_key(
+        Arc::new(GatedListEngine { inner: inner.clone(), gate: gate.clone() }),
+        PermissiveAgent::new(),
+        persisted_key,
+    );
     tokio::time::timeout(Duration::from_secs(2), gate.wait_for_first_list())
         .await
         .expect("reconstructed durable warm must reach the gated collection listing");
