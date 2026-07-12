@@ -156,6 +156,12 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
     }
 
     /// Remove a predicate from a subscription
+    /// TEST/INTROSPECTION: number of queries registered on one subscription.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn subscription_queries_len(&self, subscription_id: ReactorSubscriptionId) -> Option<usize> {
+        self.0.subscriptions.lock().unwrap().get(&subscription_id).map(|subscription| subscription.queries_len())
+    }
+
     pub fn remove_query(&self, subscription_id: ReactorSubscriptionId, query_id: proto::QueryId) -> Result<(), SubscriptionError> {
         let subscription = {
             let subscriptions = self.0.subscriptions.lock().unwrap();

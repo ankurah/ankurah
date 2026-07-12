@@ -438,6 +438,14 @@ where
 
         node
     }
+    /// TEST/INTROSPECTION: how many reactor queries the CURRENT registered
+    /// session for `node_id` carries. None when no session is registered.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn peer_subscription_query_count(&self, node_id: &proto::NodeId) -> Option<usize> {
+        let subscription_id = self.peer_connections.get(node_id).map(|state| state.subscription_handler.subscription_id())?;
+        self.reactor.subscription_queries_len(subscription_id)
+    }
+
     pub fn weak(&self) -> WeakNode<SE, PA> { WeakNode(Arc::downgrade(&self.0)) }
 
     /// Build the signed Presence every connector sends during its handshake.
