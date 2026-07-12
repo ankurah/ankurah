@@ -105,10 +105,17 @@ enum RootStatus {
     /// Loaded from an ephemeral node's cache, but not yet re-joined.
     StoredUnjoined,
     /// A verified first presence reserved this root before durable routing was
-    /// enabled. `needs_reset` is filled in by storage loading when reservation
-    /// wins the race with startup.
+    /// enabled. `needs_reset` (and the exact root the reset would replace) is
+    /// filled in by storage loading when reservation wins the race with
+    /// startup.
     Reserved {
         needs_reset: bool,
+        /// The loaded root this reservation replaces, when `needs_reset`.
+        /// Join re-validates against the storage claim under the exclusive
+        /// writer; deletion while STALE is permitted only when the claim is
+        /// exactly this recorded root (a new owner installed meanwhile must
+        /// never be erased by a queued replacement join).
+        replaces: Option<proto::EntityId>,
     },
     /// Join persistence failed and destructive cleanup owns this reservation.
     /// New presences must not attach until cleanup completes.
@@ -326,7 +333,7 @@ where
             if self.0.durable {
                 return Ok(RootReservation::Conflict);
             }
-            *root = Some(RootBinding { proof: proof.clone(), founder, status: RootStatus::Reserved { needs_reset: false } });
+            *root = Some(RootBinding { proof: proof.clone(), founder, status: RootStatus::Reserved { needs_reset: false, replaces: None } });
             return Ok(RootReservation::StartJoin(proof.clone()));
         };
 
@@ -334,7 +341,7 @@ where
             return match existing.status {
                 RootStatus::StoredUnjoined if !self.0.durable => {
                     existing.proof = proof.clone();
-                    existing.status = RootStatus::Reserved { needs_reset: false };
+                    existing.status = RootStatus::Reserved { needs_reset: false, replaces: None };
                     Ok(RootReservation::StartJoin(proof.clone()))
                 }
                 RootStatus::Reserved { .. } | RootStatus::Ready => Ok(RootReservation::AlreadyPinned),
@@ -347,7 +354,8 @@ where
         // historical ability to switch systems, but serialize the replacement
         // synchronously so only this proof can become durable.
         if !self.0.durable && existing.status == RootStatus::StoredUnjoined {
-            *existing = RootBinding { proof: proof.clone(), founder, status: RootStatus::Reserved { needs_reset: true } };
+            let replaces = Some(existing.proof.entity_id());
+            *existing = RootBinding { proof: proof.clone(), founder, status: RootStatus::Reserved { needs_reset: true, replaces } };
             return Ok(RootReservation::StartJoin(proof.clone()));
         }
 
@@ -376,17 +384,31 @@ where
         self.0.bound_storage_epoch.load(Ordering::Acquire) == self.0.collectionset.storage_epoch()
     }
 
+    /// Whether a first-join reservation (or its cleanup) is still pending.
+    /// Such a manager is MID-TRANSITION, not terminally stale: the join either
+    /// rebinds it to the current epoch and publishes readiness, or the
+    /// reservation is cleared and staleness becomes final.
+    fn has_pending_reservation(&self) -> bool {
+        matches!(
+            self.0.root.read().unwrap().as_ref().map(|binding| binding.status),
+            Some(RootStatus::Reserved { .. }) | Some(RootStatus::Aborting)
+        )
+    }
+
     /// Waits until we've successfully initialized or joined a system
     pub async fn wait_system_ready(&self) {
         loop {
-            if self.is_system_ready() || !self.is_storage_generation_current() {
+            if self.is_system_ready() || (!self.is_storage_generation_current() && !self.has_pending_reservation()) {
                 return;
             }
 
             // Arm both notifications before the second check. A reset on a
             // different Node has no access to this manager's local Notify, so
             // the engine-shared epoch notification is what prevents a stale
-            // manager from sleeping forever.
+            // manager from sleeping forever. A stale manager whose reservation
+            // is still pending keeps waiting: its queued join re-validates
+            // against storage under the exclusive writer and either rebinds
+            // this manager or clears the reservation (both notify).
             let ready = self.0.system_ready_notify.notified();
             tokio::pin!(ready);
             ready.as_mut().enable();
@@ -395,7 +417,7 @@ where
             tokio::pin!(epoch_changed);
             epoch_changed.as_mut().enable();
 
-            if self.is_system_ready() || !self.is_storage_generation_current() {
+            if self.is_system_ready() || (!self.is_storage_generation_current() && !self.has_pending_reservation()) {
                 return;
             }
             tokio::select! {
@@ -592,7 +614,7 @@ where
         // re-read still happens under the gate below.
         let advisory_needs_reset = self.0.load_error.read().unwrap().is_some()
             || self.0.root.read().unwrap().as_ref().is_some_and(|binding| {
-                binding.proof.entity_id() == proof.entity_id() && matches!(binding.status, RootStatus::Reserved { needs_reset: true })
+                binding.proof.entity_id() == proof.entity_id() && matches!(binding.status, RootStatus::Reserved { needs_reset: true, .. })
             });
         let catalog_reset_hook = self.0.catalog_reset_hook.read().unwrap().clone();
         if advisory_needs_reset {
@@ -607,16 +629,13 @@ where
         // root becoming ready.
         let _reset_activity = ResetActivity::new(self.0.collectionset.storage_write_lease().await, &self.0.resetting);
         let result = async {
-            if !self.is_storage_generation_current() {
-                return Err(MutationError::SystemReset);
-            }
-            let reservation_needs_reset = {
+            let (reservation_needs_reset, reservation_replaces) = {
                 let root = self.0.root.read().unwrap();
                 match root.as_ref() {
-                    Some(RootBinding { proof: reserved, status: RootStatus::Reserved { needs_reset }, .. })
+                    Some(RootBinding { proof: reserved, status: RootStatus::Reserved { needs_reset, replaces }, .. })
                         if reserved.entity_id() == proof.entity_id() =>
                     {
-                        *needs_reset
+                        (*needs_reset, *replaces)
                     }
                     _ => {
                         return Err(MutationError::General(Box::new(std::io::Error::other(
@@ -626,18 +645,54 @@ where
                 }
             };
             let needs_reset = self.0.load_error.read().unwrap().is_some() || reservation_needs_reset;
+
+            // The reservation is manager-local and still pinned, so staleness
+            // alone must not doom this join: a sibling manager's abort cleanup
+            // (or reset) may have advanced the shared epoch while this join
+            // waited for the writer. Storage truth decides instead. Every
+            // owner installation advances the epoch UNDER this same writer,
+            // so a claim observed while NOT stale cannot belong to a new
+            // owner; while stale, only the exact root this reservation was
+            // created to replace may be cleared.
+            let stale = !self.is_storage_generation_current();
+            let current_claim = self.0.collectionset.system_root_claim().await?;
+            let claim_allows = match &current_claim {
+                None => true,
+                Some(claim) if claim.entity_id() == proof.entity_id() => true,
+                Some(_) if needs_reset && !stale => true,
+                Some(claim) if needs_reset && reservation_replaces == Some(claim.entity_id()) => true,
+                Some(_) => false,
+            };
+            if !claim_allows {
+                return Err(MutationError::General(Box::new(std::io::Error::other(format!(
+                    "storage is already claimed by system root {}",
+                    current_claim.map(|claim| claim.entity_id().to_string()).unwrap_or_default()
+                )))));
+            }
             let _destructive_reset = needs_reset.then(|| FlagActivity::new(&self.0.destructive_resetting));
 
             if needs_reset {
                 tracing::info!("Resetting storage to replace mismatched reserved root");
                 self.clear_local_state_locked(false, catalog_reset_hook.as_ref()).await?;
+            } else if stale {
+                // Same-root fast path raced a sibling clear: rebind this
+                // manager to the current epoch (becoming the new shared
+                // owner) before persisting. Storage was cleared by whoever
+                // advanced, so there is nothing to delete here.
+                let (new_storage_epoch, fresh_generation) = self.0.collectionset.advance_storage_epoch();
+                self.0.bound_storage_epoch.store(new_storage_epoch, Ordering::Release);
+                self.invalidate_local_state_with_generation(false, Some(proof.entity_id()), Some(fresh_generation));
+                if let Some(hook) = &catalog_reset_hook {
+                    (hook.finish)();
+                }
+                self.0.collectionset.publish_storage_epoch();
             }
 
             let collection_id = CollectionId::fixed_name(SYSTEM_COLLECTION_ID);
             let storage = self.0.collectionset.get(&collection_id).await?;
             match self.0.collectionset.claim_system_root(&proof).await? {
                 SystemRootClaim::Claimed => {
-                    if !needs_reset {
+                    if !needs_reset && !stale {
                         // A successful first claim establishes a new shared
                         // storage owner just like create(). Managers that
                         // reserved a competing root in the old empty epoch
@@ -750,13 +805,24 @@ where
                 return Ok(());
             }
             self.clear_local_state_locked(false, catalog_reset_hook.as_ref()).await?;
-            let mut root = self.0.root.write().unwrap();
-            match root.as_ref() {
-                Some(binding) if binding.status == RootStatus::Aborting && binding.proof == abort.proof => {
-                    *root = None;
-                    Ok(())
+            let cleared = {
+                let mut root = self.0.root.write().unwrap();
+                match root.as_ref() {
+                    Some(binding) if binding.status == RootStatus::Aborting && binding.proof == abort.proof => {
+                        *root = None;
+                        true
+                    }
+                    _ => false,
                 }
-                _ => Err(MutationError::General(Box::new(std::io::Error::other("system root reservation changed during abort cleanup")))),
+            };
+            // Readiness waiters ride through a pending reservation even while
+            // stale; clearing it is the transition that makes their staleness
+            // final, so they must be woken here.
+            self.0.system_ready_notify.notify_waiters();
+            if cleared {
+                Ok(())
+            } else {
+                Err(MutationError::General(Box::new(std::io::Error::other("system root reservation changed during abort cleanup"))))
             }
         }
         .await;
@@ -789,10 +855,13 @@ where
             // Complete a cancelled abort's intent: its cleanup owned the
             // reservation, and nothing else will ever remove an Aborting
             // binding whose cleanup task died.
-            let mut root = self.0.root.write().unwrap();
-            if matches!(root.as_ref(), Some(binding) if binding.status == RootStatus::Aborting) {
-                *root = None;
+            {
+                let mut root = self.0.root.write().unwrap();
+                if matches!(root.as_ref(), Some(binding) if binding.status == RootStatus::Aborting) {
+                    *root = None;
+                }
             }
+            self.0.system_ready_notify.notify_waiters();
         }
         Ok(())
     }
@@ -1044,8 +1113,10 @@ where
                 // A first presence may reserve while the asynchronous storage
                 // load is in flight. Never overwrite it; only tell the pending
                 // join whether replacing the loaded cache requires a reset.
-                Some(RootBinding { proof, status: RootStatus::Reserved { needs_reset }, .. }) => {
-                    *needs_reset = loaded_root.as_ref().is_some_and(|loaded| loaded.proof.entity_id() != proof.entity_id());
+                Some(RootBinding { proof, status: RootStatus::Reserved { needs_reset, replaces }, .. }) => {
+                    let mismatched = loaded_root.as_ref().filter(|loaded| loaded.proof.entity_id() != proof.entity_id());
+                    *needs_reset = mismatched.is_some();
+                    *replaces = mismatched.map(|loaded| loaded.proof.entity_id());
                 }
                 Some(_) => {}
                 None => {
