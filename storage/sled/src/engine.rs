@@ -95,6 +95,27 @@ impl SledStorageEngine {
     }
 }
 
+/// Flush a tree's durability barrier WITHOUT `sled::Tree::flush_async`.
+///
+/// `flush_async` runs its blocking `make_stable` wait on sled 0.34's
+/// process-global IO threadpool -- the same pool that must execute the
+/// asynchronous `write_to_log` jobs the wait depends on, and whose
+/// thread-spawn accounting underflows while workers are executing tasks.
+/// Enough concurrent `flush_async` calls (across every sled database in the
+/// process) park all pool workers behind write jobs queued after them, and
+/// every sled operation in the process wedges forever. Observed repeatedly
+/// as multi-hour test-suite hangs with all `sled-io-*` threads parked in
+/// `make_stable_inner`. Running the blocking `flush()` on tokio's blocking
+/// pool keeps sled's own workers available for the short write jobs, so the
+/// wait always completes.
+async fn flush_tree(tree: sled::Tree) -> Result<(), MutationError> {
+    tokio::task::spawn_blocking(move || tree.flush())
+        .await
+        .map_err(|error| MutationError::General(Box::new(error)))?
+        .map_err(|error| MutationError::General(Box::new(error)))?;
+    Ok(())
+}
+
 #[async_trait]
 impl StorageEngine for SledStorageEngine {
     type Value = Vec<u8>;
@@ -131,7 +152,7 @@ impl StorageEngine for SledStorageEngine {
             .map_err(|error| MutationError::General(Box::new(error)))?
         {
             Ok(()) => {
-                tree.flush_async().await.map_err(|error| MutationError::General(Box::new(error)))?;
+                flush_tree(tree).await?;
                 Ok(SystemRootClaim::Claimed)
             }
             Err(conflict) => {
@@ -162,7 +183,7 @@ impl StorageEngine for SledStorageEngine {
             .map_err(|error| MutationError::General(Box::new(error)))?
             .is_ok();
         if released {
-            tree.flush_async().await.map_err(|error| MutationError::General(Box::new(error)))?;
+            flush_tree(tree).await?;
         }
         Ok(released)
     }

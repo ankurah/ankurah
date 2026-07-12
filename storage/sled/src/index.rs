@@ -316,8 +316,8 @@ mod tests {
             .iter()
             .map(|entry| {
                 let (key, _) = entry?;
-                let id_offset = key.len().checked_sub(16).ok_or_else(|| anyhow::anyhow!("index key is shorter than an entity id"))?;
-                let bytes: [u8; 16] = key[id_offset..].try_into()?;
+                let id_offset = key.len().checked_sub(32).ok_or_else(|| anyhow::anyhow!("index key is shorter than an entity id"))?;
+                let bytes: [u8; 32] = key[id_offset..].try_into()?;
                 Ok(EntityId::from_bytes(bytes))
             })
             .collect()
@@ -326,8 +326,8 @@ mod tests {
     #[test]
     fn reopened_database_rebuilds_legacy_string_collated_numeric_index() -> anyhow::Result<()> {
         let directory = tempfile::tempdir()?;
-        let price_two = EntityId::from_bytes([2; 16]);
-        let price_ten = EntityId::from_bytes([10; 16]);
+        let price_two = EntityId::from_bytes([2; 32]);
+        let price_ten = EntityId::from_bytes([10; 32]);
         let legacy_index_id;
 
         {
