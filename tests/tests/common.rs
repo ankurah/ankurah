@@ -89,6 +89,9 @@ pub struct MessageGate {
 }
 
 impl MessageGate {
+    /// Number of messages currently held by the gate.
+    pub fn held_len(&self) -> usize { self.held.lock().unwrap().len() }
+
     /// Release all currently-held messages back into the gated node, in arrival order.
     pub async fn release_held<SE, PA>(&self, node: &Node<SE, PA>)
     where

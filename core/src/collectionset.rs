@@ -37,6 +37,11 @@ struct StorageFence {
     epoch: AtomicU64,
     generation: std::sync::RwLock<Arc<std::sync::atomic::AtomicBool>>,
     epoch_changed: Arc<tokio::sync::Notify>,
+    /// Per-Node teardown callbacks, keyed by the registering CollectionSet's
+    /// identity so an advancing manager can skip its own entry (its own
+    /// teardown runs inside its invalidation, with the reservation
+    /// exemption). Entries are weak: a dropped Node just disappears.
+    participants: Mutex<Vec<(usize, Weak<dyn Fn() + Send + Sync>)>>,
 }
 
 fn shared_storage_fence<SE>(storage_engine: &Arc<SE>) -> Arc<StorageFence> {
@@ -51,6 +56,7 @@ fn shared_storage_fence<SE>(storage_engine: &Arc<SE>) -> Arc<StorageFence> {
         epoch: AtomicU64::new(0),
         generation: std::sync::RwLock::new(Arc::new(std::sync::atomic::AtomicBool::new(true))),
         epoch_changed: Arc::new(tokio::sync::Notify::new()),
+        participants: Mutex::new(Vec::new()),
     });
     registry.insert(key, Arc::downgrade(&fence));
     fence
@@ -78,6 +84,19 @@ impl<SE: StorageEngine> CollectionSet<SE> {
 
     pub(crate) fn storage_epoch_notify(&self) -> Arc<tokio::sync::Notify> { self.0.storage_fence.epoch_changed.clone() }
 
+    /// Register this Node's sibling-teardown callback. It is invoked
+    /// synchronously whenever a DIFFERENT manager sharing this engine
+    /// advances the storage epoch: the shared generation token already
+    /// fences this node's operations, but its physically open transports and
+    /// pending request oneshots would otherwise linger until a timeout that
+    /// never comes. The caller keeps the Arc alive (the fence holds a Weak).
+    pub(crate) fn set_epoch_participant(&self, callback: &Arc<dyn Fn() + Send + Sync>) {
+        let key = Arc::as_ptr(&self.0).cast::<()>() as usize;
+        let mut participants = self.0.storage_fence.participants.lock().unwrap();
+        participants.retain(|(_, existing)| existing.strong_count() > 0);
+        participants.push((key, Arc::downgrade(callback)));
+    }
+
     /// Advance only while holding the shared write lease.
     pub(crate) fn advance_storage_epoch(&self) -> (u64, Arc<std::sync::atomic::AtomicBool>) {
         let fresh_generation = {
@@ -88,6 +107,22 @@ impl<SE: StorageEngine> CollectionSet<SE> {
             fresh
         };
         let epoch = self.0.storage_fence.epoch.fetch_add(1, Ordering::AcqRel) + 1;
+
+        // Tear down every SIBLING Node sharing this engine, synchronously
+        // under the exclusive writer: close their peer transports and wake
+        // their pending request oneshots with a typed connection error. The
+        // advancing manager's own teardown runs inside its invalidation
+        // (where a pending first-join reservation may be preserved).
+        let own_key = Arc::as_ptr(&self.0).cast::<()>() as usize;
+        let callbacks: Vec<Arc<dyn Fn() + Send + Sync>> = {
+            let mut participants = self.0.storage_fence.participants.lock().unwrap();
+            participants.retain(|(_, callback)| callback.strong_count() > 0);
+            participants.iter().filter(|(key, _)| *key != own_key).filter_map(|(_, callback)| callback.upgrade()).collect()
+        };
+        for callback in callbacks {
+            callback();
+        }
+
         (epoch, fresh_generation)
     }
 

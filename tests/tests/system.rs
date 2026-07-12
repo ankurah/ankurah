@@ -781,15 +781,19 @@ async fn competing_first_joins_on_empty_shared_engine_leave_one_root() -> Result
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "setup currently hits the pre-existing album descriptor race before the reset assertion; see the Claude handoff"]
 async fn sibling_reset_immediately_invalidates_retained_handles_and_routes() -> Result<()> {
     let founder =
         Node::new_durable_with_signing_key(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new(), persisted_durable_key());
     founder.system.create().await?;
 
     let shared = Arc::new(SledStorageEngine::new_test()?);
-    let sibling = Node::new(shared.clone(), PermissiveAgent::new());
-    let resetter = Node::new(shared, PermissiveAgent::new());
+    // Construction order matters on a shared engine: each Node installs its
+    // catalog resolver into the engine's single resolver slot, and the LAST
+    // one wins. The sibling is the node writing user-model rows here, so it
+    // must be constructed last or its album writes would resolve against the
+    // resetter's cold catalog ("no model id known for collection").
+    let resetter = Node::new(shared.clone(), PermissiveAgent::new());
+    let sibling = Node::new(shared, PermissiveAgent::new());
     tokio::join!(sibling.system.wait_loaded(), resetter.system.wait_loaded());
     let _connection = LocalProcessConnection::new(&founder, &sibling).await?;
     sibling.system.wait_system_ready().await;
@@ -814,5 +818,80 @@ async fn sibling_reset_immediately_invalidates_retained_handles_and_routes() -> 
     assert!(sibling.get_durable_peers().is_empty());
     let stale_get = tokio::time::timeout(std::time::Duration::from_secs(2), sibling_context.get::<AlbumView>(id)).await?;
     assert!(stale_get.is_err());
+    Ok(())
+}
+
+/// The shared-fence participant contract: when one Node advances the shared
+/// storage epoch, SIBLING Nodes built over the exact same engine must have
+/// their transports closed and their pending request oneshots woken with a
+/// typed connection error. Without the broadcast, a sibling request whose
+/// response is still in flight would wait on a session the reset made
+/// permanently unanswerable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sibling_reset_wakes_pending_requests_with_typed_error() -> Result<()> {
+    let founder =
+        Node::new_durable_with_signing_key(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new(), persisted_durable_key());
+    founder.system.create().await?;
+
+    let shared = Arc::new(SledStorageEngine::new_test()?);
+    let resetter = Node::new(shared.clone(), PermissiveAgent::new());
+    let sibling = Node::new(shared, PermissiveAgent::new());
+    tokio::join!(sibling.system.wait_loaded(), resetter.system.wait_loaded());
+
+    // Hold every response arriving at the sibling, so its request stays
+    // pending in the old session's oneshot map.
+    let (_connection, _gate) = common::GatedConnection::new(&founder, &sibling, |message| {
+        matches!(message, proto::NodeMessage::Response(_))
+    });
+    sibling.system.wait_system_ready().await;
+    // Durable promotion runs in the register task right after the join
+    // publishes readiness; give it a bounded scheduling window.
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while sibling.get_durable_peers().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("founder must be promoted to a durable route after join");
+    assert_eq!(sibling.get_durable_peers(), vec![founder.id]);
+
+    let pending = {
+        let sibling = sibling.clone();
+        let founder_id = founder.id;
+        tokio::spawn(async move {
+            sibling
+                .request(
+                    founder_id,
+                    &DEFAULT_CONTEXT,
+                    proto::NodeRequestBody::Get { collection: CollectionId::from("album"), ids: vec![] },
+                    )
+                .await
+        })
+    };
+    // The request must be registered before the reset: wait until the
+    // founder's response is held by the gate, which proves the request was
+    // sent and its oneshot is parked in the old session's pending map.
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while _gate.held_len() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the founder's response must reach the gate before the reset");
+    assert!(!pending.is_finished(), "the gated request must still be pending before the reset");
+
+    resetter.system.hard_reset().await?;
+
+    // The sibling never initiated the reset, but its pending oneshot must be
+    // woken promptly with a typed error and its routes must be gone.
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), pending)
+        .await
+        .expect("sibling pending request must be woken by the sibling-teardown broadcast, not a timeout")
+        .expect("request task must not panic");
+    assert!(
+        matches!(outcome, Err(ankurah::error::RequestError::ConnectionLost)),
+        "expected the typed connection error, got {outcome:?}"
+    );
+    assert!(sibling.get_durable_peers().is_empty(), "sibling durable routes must not survive a shared-engine reset");
     Ok(())
 }

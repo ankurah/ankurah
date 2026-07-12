@@ -264,6 +264,12 @@ where PA: PolicyAgent
 
     /// Type resolver for AST preparation (temporary heuristic until Phase 3 schema)
     pub(crate) type_resolver: crate::TypeResolver,
+
+    /// Keeps this node's sibling-teardown callback alive in the shared
+    /// storage fence (the fence holds only a Weak). Invoked when ANOTHER
+    /// manager on the same engine advances the storage epoch; see
+    /// `CollectionSet::set_epoch_participant`.
+    _epoch_participant: std::sync::OnceLock<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl<SE, PA> Node<SE, PA>
@@ -366,6 +372,7 @@ where
             predicate_context: SafeMap::new(),
             subscription_relay,
             type_resolver: crate::TypeResolver::new(),
+            _epoch_participant: std::sync::OnceLock::new(),
         }));
 
         // Set up the message sender for the subscription relay
@@ -411,6 +418,22 @@ where
                 }
             }
         }));
+        // Sibling teardown for shared-engine resets: when a DIFFERENT Node
+        // built over this exact Arc<StorageEngine> advances the storage
+        // epoch, this node's handles are already fenced by the shared
+        // generation token, but its open transports and pending request
+        // oneshots must be closed and woken eagerly (they would otherwise
+        // wait on a session the reset made permanently unanswerable).
+        let epoch_participant: Arc<dyn Fn() + Send + Sync> = Arc::new({
+            let weak = node.weak();
+            move || {
+                if let Some(node) = weak.upgrade() {
+                    node.reset_peer_sessions(None);
+                }
+            }
+        });
+        node.collections.set_epoch_participant(&epoch_participant);
+        let _ = node.0._epoch_participant.set(epoch_participant);
         node.policy_agent.on_node_ready(node.weak());
 
         node
