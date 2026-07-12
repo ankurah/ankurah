@@ -177,15 +177,48 @@ impl NodeApplier {
             }
 
             // StateAndEvent: equivalent to old SubscriptionItem::Add
-            proto::UpdateContent::StateAndEvent(state_fragment, event_fragments) => {
+            proto::UpdateContent::StateAndEvent(proof, event_fragments) => {
+                let proto::StateWithGenesis { genesis, state } = proof;
+                let genesis = node.validate_incoming_event(from_peer_id, genesis)?;
+                let state = node.validate_incoming_state(from_peer_id, state)?;
+                let expected_genesis_id = proto::EventId::from_bytes(entity_id.to_bytes());
+
+                // StateWithGenesis is an identity proof, not merely a fetch
+                // optimization. Validate every duplicated envelope field and
+                // the self-certifying genesis shape before the proof enters
+                // staging or permanent cache. validate_incoming_event already
+                // enforces the pinned-system scope and recomputes the event id;
+                // these agreement checks bind it to this update item.
+                if !genesis.payload.is_entity_create()
+                    || !genesis.payload.parent.is_empty()
+                    || genesis.payload.id() != expected_genesis_id
+                    || genesis.payload.entity_id != entity_id
+                    || genesis.payload.model != model
+                    || state.payload.entity_id != entity_id
+                    || state.payload.model != model
+                {
+                    return Err(MutationError::InvalidUpdate("StateAndEvent carries a mismatched genesis identity proof"));
+                }
+
+                // Make the verified genesis available synchronously to state
+                // identity/lineage validation. Without this inline proof an
+                // uncached entity would issue GetEvents while the sequential
+                // transport reader is still dispatching this update, and the
+                // response could not be consumed until dispatch returned.
+                event_getter.stage_event(genesis.payload.clone());
+                node.validate_state_identity(&state.payload, event_getter).await?;
+
                 let attested_events = Self::validate_and_stage(node, from_peer_id, entity_id, model, event_fragments, event_getter)?;
                 // Sorted for the same reason as the EventOnly arm: the
                 // fallback below applies event by event.
                 let attested_events = crate::event_dag::ordering::topo_sort_events(attested_events)?;
+                // The complete item is now structurally/policy validated and
+                // causally sorted. Persist its independent identity proof
+                // before any descendant event: a crash may leave a harmless
+                // genesis-only cache, but must never leave an update whose
+                // self-certifying genesis is absent.
+                event_getter.commit_event(&genesis).await?;
 
-                let state = (entity_id, model, state_fragment.clone()).into();
-                let state = node.validate_incoming_state(from_peer_id, state)?;
-                node.validate_state_identity(&state.payload, event_getter).await?;
                 let inherited_attestations = state.attestations;
 
                 // with_state only updates the in-memory entity, it does NOT persist to storage

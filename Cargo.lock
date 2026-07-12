@@ -115,7 +115,6 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.17",
  "tracing",
- "ulid",
  "wasm-bindgen",
 ]
 
@@ -565,7 +564,6 @@ dependencies = [
  "thiserror 2.0.17",
  "tracing",
  "tracing-wasm",
- "ulid",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-test",

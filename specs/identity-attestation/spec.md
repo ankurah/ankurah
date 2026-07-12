@@ -221,6 +221,22 @@ only fills missing cache entries; it never overwrites an existing descriptor,
 so independently scheduled snapshots cannot roll mutable fields backward.
 The ordinary catalog entity stream remains the sole update path.
 
+### I.5 Streaming state identity proofs
+
+Protocol v6 uses the same `StateWithGenesis` proof for the
+`SubscriptionUpdateItem::StateAndEvent` shape. The outer update entity/model,
+the state entity/model, and the genesis entity/model must all agree; the
+genesis must have an empty parent, recompute to the outer `EntityId`, and name
+the pinned system. Receivers validate those facts before caching either half.
+
+The genesis is carried inline for correctness as well as bootstrap. Native,
+WASM, local-process, and iroh readers dispatch verified frames sequentially. If
+an uncached entity enters a predicate and state validation tries to request its
+genesis from inside that update handler, the response is queued behind the
+handler that is waiting for it. Inline genesis makes identity validation local
+and avoids that re-entrant transport deadlock without weakening the
+self-certifying entity invariant.
+
 ## Part II: Self-certifying entity identity
 
 ### II.1 EntityId = genesis EventId

@@ -1,6 +1,4 @@
-use crate::{
-    auth::Attested, data::EntityState, id::EntityId, node_id::NodeId, subscription::QueryId, EventFragment, StateFragment, StateWithGenesis,
-};
+use crate::{auth::Attested, data::EntityState, id::EntityId, node_id::NodeId, subscription::QueryId, EventFragment, StateWithGenesis};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -18,16 +16,21 @@ pub enum NodeUpdateBody {
 pub enum UpdateContent {
     /// Only events, no state (peer already has the state)
     EventOnly(Vec<EventFragment>),
-    /// Both state and events (peer needs both)
-    StateAndEvent(StateFragment, Vec<EventFragment>),
+    /// State plus the exact genesis that self-certifies its entity identity,
+    /// followed by the events which triggered this subscription update.
+    ///
+    /// Carrying genesis inline is required for sequential transports: asking
+    /// the same peer for genesis while dispatching its update would deadlock
+    /// until the update handler returned and the response could be read.
+    StateAndEvent(StateWithGenesis, Vec<EventFragment>),
 }
 
 impl UpdateContent {
-    /// Decompose into optional state and event fragments
-    pub fn into_parts(self) -> (Option<StateFragment>, Option<Vec<EventFragment>>) {
+    /// Decompose into an optional state identity proof and event fragments.
+    pub fn into_parts(self) -> (Option<StateWithGenesis>, Option<Vec<EventFragment>>) {
         match self {
             UpdateContent::EventOnly(events) => (None, Some(events)),
-            UpdateContent::StateAndEvent(state, events) => (Some(state), Some(events)),
+            UpdateContent::StateAndEvent(proof, events) => (Some(proof), Some(events)),
         }
     }
 }
@@ -59,7 +62,20 @@ impl TryFrom<SubscriptionUpdateItem> for Attested<EntityState> {
     type Error = anyhow::Error;
     fn try_from(value: SubscriptionUpdateItem) -> Result<Self, Self::Error> {
         match value.content {
-            UpdateContent::StateAndEvent(state, _) => Ok((value.entity_id, value.model, state).into()),
+            UpdateContent::StateAndEvent(proof, _) => {
+                let genesis_id = proof.genesis.payload.id();
+                if proof.genesis.payload.validate_structure().is_err()
+                    || !proof.genesis.payload.is_entity_create()
+                    || EntityId::from_bytes(genesis_id.to_bytes()) != value.entity_id
+                    || proof.genesis.payload.entity_id != value.entity_id
+                    || proof.genesis.payload.model != value.model
+                    || proof.state.payload.entity_id != value.entity_id
+                    || proof.state.payload.model != value.model
+                {
+                    return Err(anyhow::anyhow!("StateAndEvent carries a mismatched genesis identity proof"));
+                }
+                Ok(proof.state)
+            }
             UpdateContent::EventOnly(_) => Err(anyhow::anyhow!("Cannot convert event-only update to entity state")),
         }
     }
@@ -136,7 +152,7 @@ impl std::fmt::Display for SubscriptionUpdateItem {
 
         match &self.content {
             UpdateContent::EventOnly(events) => write!(f, "Events({})", events.len())?,
-            UpdateContent::StateAndEvent(state, events) => write!(f, "State+Events({}, {})", state, events.len())?,
+            UpdateContent::StateAndEvent(proof, events) => write!(f, "State+Genesis+Events({}, {})", proof.state, events.len())?,
         }
 
         if !self.predicate_relevance.is_empty() {

@@ -230,9 +230,14 @@ async fn test_websocket_bidirectional_subscription_impl() -> Result<()> {
     assert_expected_change(client_watcher.take_one_with_timeout(Duration::from_secs(30)).await, buddy_id, &[rex_id, buddy_id]);
 
     use ankurah::signals::Peek;
-    let server_pets = server_livequery.peek().iter().map(|p| p.id()).collect::<Vec<EntityId>>();
-    let client_pets = client_livequery.peek().iter().map(|p| p.id()).collect::<Vec<EntityId>>();
-    let expected_pets = vec![rex_id, buddy_id];
+    let mut server_pets = server_livequery.peek().iter().map(|p| p.id()).collect::<Vec<EntityId>>();
+    let mut client_pets = client_livequery.peek().iter().map(|p| p.id()).collect::<Vec<EntityId>>();
+    let mut expected_pets = vec![rex_id, buddy_id];
+
+    // The query has no ORDER BY, so its result order is unspecified.
+    server_pets.sort_unstable();
+    client_pets.sort_unstable();
+    expected_pets.sort_unstable();
 
     assert_eq!(server_pets, expected_pets);
     assert_eq!(client_pets, expected_pets);

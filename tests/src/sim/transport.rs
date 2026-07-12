@@ -166,12 +166,12 @@ fn update_item_descriptor(item: &proto::SubscriptionUpdateItem) -> String {
     let entity = item.entity_id;
     let kind = match &item.content {
         proto::UpdateContent::EventOnly(fragments) => format!("eventonly:{}", fragment_ids(entity, fragments)),
-        proto::UpdateContent::StateAndEvent(state, fragments) => {
+        proto::UpdateContent::StateAndEvent(proof, fragments) => {
             // The state fragment's head clock identifies the snapshot content
             // deterministically (state buffers are a BTreeMap, the head is
             // sorted), so hashing the head plus the event ids distinguishes two
             // batches that differ only in payload.
-            format!("stateandevent:head={}:{}", state.state.head.to_base64_short(), fragment_ids(entity, fragments))
+            format!("stateandevent:head={}:{}", proof.state.payload.state.head.to_base64_short(), fragment_ids(entity, fragments))
         }
     };
     format!("{}/{}", entity.to_base64_short(), kind)

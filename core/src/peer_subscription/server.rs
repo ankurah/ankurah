@@ -34,13 +34,20 @@ impl SubscriptionHandler {
             tracing::info!("SubscriptionHandler[{}] received reactor update with {} items", peer_id, update.items.len());
 
             if let Some(node) = weak_node.upgrade() {
-                tracing::debug!("SubscriptionHandler[{}] sending update to peer {}", peer_id, peer_id);
-                node.send_update(
-                    peer_id,
-                    proto::NodeUpdateBody::SubscriptionUpdate {
-                        items: update.items.into_iter().filter_map(|item| convert_item(&node, peer_id, item)).collect(),
-                    },
-                );
+                // Building a StateAndEvent update now includes loading the
+                // entity's self-certifying genesis. The signal callback is
+                // synchronous, so finish that storage work in a task before
+                // handing the complete wire body to Node::send_update.
+                crate::task::spawn(async move {
+                    let mut items = Vec::with_capacity(update.items.len());
+                    for item in update.items {
+                        if let Some(item) = convert_item(&node, peer_id, item).await {
+                            items.push(item);
+                        }
+                    }
+                    tracing::debug!("SubscriptionHandler[{}] sending update to peer {}", peer_id, peer_id);
+                    node.send_update(peer_id, proto::NodeUpdateBody::SubscriptionUpdate { items });
+                });
             }
         });
 
@@ -138,7 +145,7 @@ impl SubscriptionHandler {
 }
 
 /// Convert a single ReactorUpdateItem to a SubscriptionUpdateItem.
-fn convert_item<SE, PA>(
+async fn convert_item<SE, PA>(
     node: &Node<SE, PA>,
     peer_id: proto::NodeId,
     item: crate::reactor::ReactorUpdateItem,
@@ -162,9 +169,6 @@ where
     // Events should already be attested
     let attested_events = item.events;
 
-    // Determine content based on whether we have events
-    let content = proto::UpdateContent::StateAndEvent(attested_state.into(), attested_events.into_iter().map(|e| e.into()).collect());
-
     // Convert predicate relevance from reactor types to proto types
     let predicate_relevance = item
         .predicate_relevance
@@ -179,6 +183,39 @@ where
         })
         .collect();
 
+    let entity_id = item.entity.id();
+    let model = item.entity.model_id().ok()?;
+    let genesis_id = proto::EventId::from_bytes(entity_id.to_bytes());
+    let collection = match node.collections.get(item.entity.collection()).await {
+        Ok(collection) => collection,
+        Err(error) => {
+            warn!("Failed to open {} while proving entity {} to peer {}: {}", item.entity.collection(), entity_id, peer_id, error);
+            return None;
+        }
+    };
+    let genesis = match collection.get_events(vec![genesis_id.clone()]).await {
+        Ok(events) => events.into_iter().find(|event| event.payload.id() == genesis_id),
+        Err(error) => {
+            warn!("Failed to load genesis for entity {} for peer {}: {}", entity_id, peer_id, error);
+            return None;
+        }
+    };
+    let Some(genesis) = genesis else {
+        warn!("Cannot send state for entity {} to peer {} without its self-certifying genesis", entity_id, peer_id);
+        return None;
+    };
+    if genesis.payload.validate_structure().is_err()
+        || !genesis.payload.is_entity_create()
+        || genesis.payload.entity_id != entity_id
+        || genesis.payload.model != model
+    {
+        warn!("Refusing to send malformed genesis proof for entity {} to peer {}", entity_id, peer_id);
+        return None;
+    }
+
+    let proof = proto::StateWithGenesis { genesis, state: attested_state };
+    let content = proto::UpdateContent::StateAndEvent(proof, attested_events.into_iter().map(|e| e.into()).collect());
+
     // Create subscription update item
-    Some(proto::SubscriptionUpdateItem { entity_id: item.entity.id(), model: item.entity.model_id().ok()?, content, predicate_relevance })
+    Some(proto::SubscriptionUpdateItem { entity_id, model, content, predicate_relevance })
 }
