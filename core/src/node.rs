@@ -412,9 +412,14 @@ where
         // is durable; hard_reset preserves none.
         node.system.set_peer_reset_hook(Arc::new({
             let weak = node.weak();
-            move |preserved_pending_root| {
+            move |mode| {
                 if let Some(node) = weak.upgrade() {
-                    node.reset_peer_sessions(preserved_pending_root);
+                    match mode {
+                        crate::system::PeerSessionsReset::Drain { preserved_pending_root } => {
+                            node.reset_peer_sessions(preserved_pending_root)
+                        }
+                        crate::system::PeerSessionsReset::Rebind { fresh_generation } => node.rebind_peer_sessions(&fresh_generation),
+                    }
                 }
             }
         }));
@@ -721,6 +726,22 @@ where
         if was_durable {
             if let Some(ref relay) = self.subscription_relay {
                 relay.notify_peer_disconnected(node_id);
+            }
+        }
+    }
+
+    /// A first owner was published over previously EMPTY storage: nothing a
+    /// live session asserted has been invalidated, so instead of draining,
+    /// rebind every READY session to the fresh generation. Not-yet-ready
+    /// sessions (including the pending founder) keep their old token;
+    /// `promote_peers_for_root` re-arms them once the root is ready, exactly
+    /// as its race-loser arm already promises ("remains a valid
+    /// authenticated peer").
+    fn rebind_peer_sessions(&self, fresh_generation: &Arc<AtomicBool>) {
+        let _registry_guard = self.peer_registry_lock.lock().unwrap_or_else(|e| e.into_inner());
+        for (_, state) in self.peer_connections.to_vec() {
+            if state.ready.load(Ordering::Acquire) {
+                *state.system_generation.write().unwrap() = fresh_generation.clone();
             }
         }
     }

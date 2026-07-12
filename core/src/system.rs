@@ -78,10 +78,9 @@ struct Inner<SE, PA> {
     /// finish clears catalog state after system/reactor reset, and resume
     /// re-arms durable catalog maintenance after the replacement root is ready.
     catalog_reset_hook: RwLock<Option<CatalogResetHook>>,
-    /// Node-owned peer teardown, installed after Node construction. The
-    /// optional id is a Reserved root whose pending founder connection must
-    /// survive an old-system replacement long enough to be promoted.
-    peer_reset_hook: RwLock<Option<Arc<dyn Fn(Option<proto::EntityId>) + Send + Sync>>>,
+    /// Node-owned peer teardown/rebinding, installed after Node
+    /// construction. See [`PeerSessionsReset`] for the two modes.
+    peer_reset_hook: RwLock<Option<Arc<dyn Fn(PeerSessionsReset) + Send + Sync>>>,
     /// Shared-storage epoch this manager loaded/created/joined against. The
     /// actual gate and monotonic epoch live in CollectionSet's per-engine
     /// fence, shared across independently-built Nodes using the same Arc<SE>.
@@ -92,6 +91,22 @@ struct Inner<SE, PA> {
 }
 
 type CatalogResetFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+/// How a system transition treats this Node's registered peer sessions.
+pub(crate) enum PeerSessionsReset {
+    /// An old system is being replaced or destroyed: drain every session and
+    /// wake its pending waiters, preserving only a not-yet-ready connection
+    /// whose pending root is the newly Reserved root (the authenticated
+    /// channel that triggered the switch).
+    Drain { preserved_pending_root: Option<proto::EntityId> },
+    /// A first owner is being published over previously EMPTY storage
+    /// (create, or a first-join claim). No prior system existed, so nothing a
+    /// live session asserted has been invalidated: ready sessions are rebound
+    /// to the fresh generation in place, not-yet-ready sessions are left for
+    /// `promote_peers_for_root` to re-arm, and the pending founder keeps its
+    /// old token until promotion.
+    Rebind { fresh_generation: Arc<AtomicBool> },
+}
 
 #[derive(Clone)]
 struct CatalogResetHook {
@@ -438,7 +453,7 @@ where
         *self.0.catalog_reset_hook.write().unwrap() = Some(CatalogResetHook { begin, finish, resume });
     }
 
-    pub(crate) fn set_peer_reset_hook(&self, hook: Arc<dyn Fn(Option<proto::EntityId>) + Send + Sync>) {
+    pub(crate) fn set_peer_reset_hook(&self, hook: Arc<dyn Fn(PeerSessionsReset) + Send + Sync>) {
         *self.0.peer_reset_hook.write().unwrap() = Some(hook);
     }
 
@@ -507,13 +522,7 @@ where
         // stale and only this winner binds the fresh token.
         let (new_storage_epoch, fresh_generation) = self.0.collectionset.advance_storage_epoch();
         self.0.bound_storage_epoch.store(new_storage_epoch, Ordering::Release);
-        self.invalidate_local_state_with_generation(true, None, Some(fresh_generation));
-        // No drain is needed: the catalog cannot be warm before the system is
-        // ready, so `finish` alone flushes any name-staged residue and arms
-        // the resume that fires once this create publishes readiness.
-        if let Some(hook) = self.0.catalog_reset_hook.read().unwrap().clone() {
-            (hook.finish)();
-        }
+        self.publish_first_owner_with_generation(true, fresh_generation);
         self.0.collectionset.publish_storage_epoch();
 
         // TODO - see if we can use the Model derive macro for a SysCatalogItem model rather than doing this manually
@@ -669,10 +678,7 @@ where
                 // advanced, so there is nothing to delete here.
                 let (new_storage_epoch, fresh_generation) = self.0.collectionset.advance_storage_epoch();
                 self.0.bound_storage_epoch.store(new_storage_epoch, Ordering::Release);
-                self.invalidate_local_state_with_generation(false, Some(proof.entity_id()), Some(fresh_generation));
-                if let Some(hook) = &catalog_reset_hook {
-                    (hook.finish)();
-                }
+                self.publish_first_owner_with_generation(false, fresh_generation);
                 self.0.collectionset.publish_storage_epoch();
             }
 
@@ -687,13 +693,7 @@ where
                         // must be stale before this writer is released.
                         let (new_storage_epoch, fresh_generation) = self.0.collectionset.advance_storage_epoch();
                         self.0.bound_storage_epoch.store(new_storage_epoch, Ordering::Release);
-                        self.invalidate_local_state_with_generation(false, Some(proof.entity_id()), Some(fresh_generation));
-                        // First join from empty: the catalog was never warm,
-                        // so `finish` alone flushes staged residue and arms
-                        // the resume fired at readiness below.
-                        if let Some(hook) = self.0.catalog_reset_hook.read().unwrap().clone() {
-                            (hook.finish)();
-                        }
+                        self.publish_first_owner_with_generation(false, fresh_generation);
                         self.0.collectionset.publish_storage_epoch();
                     }
                 }
@@ -938,6 +938,21 @@ where
         preserved_pending_root: Option<proto::EntityId>,
         fresh_generation: Option<Arc<AtomicBool>>,
     ) {
+        self.invalidate_local_state_inner(clear_root, fresh_generation.clone(), PeerSessionsReset::Drain { preserved_pending_root });
+    }
+
+    /// A first-owner publication over EMPTY storage: no prior system existed,
+    /// so live peer sessions are rebound rather than drained. See
+    /// [`PeerSessionsReset::Rebind`].
+    fn publish_first_owner_with_generation(&self, clear_root: bool, fresh_generation: Arc<AtomicBool>) {
+        self.invalidate_local_state_inner(
+            clear_root,
+            Some(fresh_generation.clone()),
+            PeerSessionsReset::Rebind { fresh_generation },
+        );
+    }
+
+    fn invalidate_local_state_inner(&self, clear_root: bool, fresh_generation: Option<Arc<AtomicBool>>, peers: PeerSessionsReset) {
         // Publish unready and invalidate all resident handles before any
         // destructive await. A failure to delete therefore remains fail
         // closed instead of leaving old strong handles live.
@@ -947,7 +962,7 @@ where
             None => self.0.entities.system_reset(),
         }
         if let Some(hook) = self.0.peer_reset_hook.read().unwrap().clone() {
-            hook(preserved_pending_root);
+            hook(peers);
         }
 
         self.0.items.write().unwrap().clear();
