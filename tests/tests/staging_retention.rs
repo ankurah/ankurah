@@ -238,12 +238,45 @@ async fn r8_orphan_flood_is_bounded_and_observable() -> Result<()> {
     assert_eq!(len, cap, "the staging area holds exactly the cap under flood");
     assert_eq!(evictions, 0, "correctness-bearing retained events are never evicted");
 
-    // The node stays live: reads still answer and a legitimate update still
-    // applies end to end.
+    // The node stays live for reads: the resident answers from its own state.
     let view = ctx_c.get::<RecordView>(rec_id).await?;
     assert_eq!(view.title().unwrap(), "t0");
-
     assert_eq!(client.get_resident_entity(rec_id).expect("record still resident").head(), proto::Clock::from(vec![genesis.id()]));
+
+    // THE KNOWN LIVENESS TRADEOFF (issue #366): with cap eviction gone,
+    // retained orphans never drain, so an at-cap area refuses even an
+    // immediately applicable legitimate update. The refusal is typed and
+    // retryable (the sender keeps its lossless lease) and nothing staged is
+    // lost, but the collection's update lane stays wedged until a reset or
+    // until per-source rate limiting (#274) bounds admission. These
+    // assertions pin the refusal shape so the wedge stays visible.
+    let legit = forge_title_event(record_title, rec_id, &[&genesis], "legit-at-cap");
+    let err = NodeApplier::apply_updates_for_test(&client, &server.id, vec![event_only_item(legit)])
+        .await
+        .expect_err("an at-cap area refuses even an applicable update, typed and retryable");
+    match err {
+        ankurah::core::error::ApplyError::Items(items) => {
+            assert_eq!(items.len(), 1, "one refused item");
+            match &items[0].cause {
+                ankurah::core::error::MutationError::Ingest(ankurah::core::error::IngestError::StagingCapacity {
+                    capacity,
+                    requested,
+                    ..
+                }) => {
+                    assert!(requested <= capacity, "a single-event batch is a fits-later refusal, the retryable class");
+                }
+                other => panic!("expected the typed StagingCapacity refusal, got {other:?}"),
+            }
+        }
+        other => panic!("expected per-item errors, got {other:?}"),
+    }
+    assert_eq!(
+        client.get_resident_entity(rec_id).unwrap().head(),
+        proto::Clock::from(vec![genesis.id()]),
+        "the refused update did not apply"
+    );
+    let (len_after, evictions_after, _) = client.staging_probe_for_test(&Record::collection());
+    assert_eq!((len_after, evictions_after), (cap, 0), "the refusal neither staged nor evicted anything");
 
     Ok(())
 }
