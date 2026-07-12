@@ -71,6 +71,7 @@ pub struct PresenceClaims {
     pub durable: bool,
     pub system_root: Option<EntityId>,
     pub timestamp: u64,
+    pub protocol_version: u32,
 }
 
 impl Presence {
@@ -81,6 +82,7 @@ impl Presence {
             durable: self.durable,
             system_root: self.system_root.as_ref().map(|root| root.payload.entity_id),
             timestamp: self.timestamp,
+            protocol_version: self.protocol_version,
         }
     }
 
@@ -184,7 +186,8 @@ mod tests {
     fn presence() -> Presence {
         let key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
         let node_id = NodeId::from(key.verifying_key());
-        let claims = PresenceClaims { node_id, durable: true, system_root: None, timestamp: 1_720_000_000_000 };
+        let claims =
+            PresenceClaims { node_id, durable: true, system_root: None, timestamp: 1_720_000_000_000, protocol_version: PROTOCOL_VERSION };
         let signature: Signature = key.sign(&Presence::signable_bytes(&claims)).into();
         Presence { node_id, durable: true, system_root: None, timestamp: claims.timestamp, signature, protocol_version: PROTOCOL_VERSION }
     }
@@ -226,6 +229,10 @@ mod tests {
 
         let mut forged = p.clone();
         forged.timestamp += 1;
+        assert!(!forged.verify());
+
+        let mut forged = p.clone();
+        forged.protocol_version += 1;
         assert!(!forged.verify());
 
         // A different node id cannot claim this signature.

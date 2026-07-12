@@ -132,11 +132,12 @@ pub struct Presence {
     pub system_root: Option<Attested<EntityState>>,
     pub timestamp: u64,          // unix ms, freshness signal
     pub signature: Signature,    // by node_id's key, over PRESENCE_TAG || bincode(claims)
+    pub protocol_version: u32,
 }
 ```
 
 The signature covers a `PresenceClaims` projection (node_id, durable, the
-system root entity id if present, timestamp) under the domain tag
+system root entity id if present, timestamp, protocol version) under the domain tag
 `b"ankurah.presence.v0"`. `register_peer` (core/src/node.rs) verifies the
 signature before inserting the peer; an invalid signature rejects the
 connection. This makes node identity unforgeable at the handshake
@@ -173,6 +174,15 @@ are out of scope.
 `EntityId` becomes `[u8; 32]`, defined as the EventId of the entity's
 genesis event. There is no separate allocation step and no randomness in the
 id beyond what the genesis preimage carries.
+
+The four bootstrap model ids for the system and catalog collections are the
+single explicit exception. Those models cannot be ordinary catalog entities
+without a self-description cycle, so their ids are domain-hashed virtual
+model identities under `ankurah.well-known-model.v0`. They have the same
+256-bit collision bound as entity ids, are reserved from user creation, and
+exist only for bootstrap routing. Introducing a separate `ModelId` sum type
+would make this distinction structural, but is deferred because it would
+widen this RFC without changing the trust result.
 
 ### II.2 Event body split
 
@@ -375,8 +385,14 @@ pub struct Attestation {
 }
 
 pub enum AttestationBody {
-    EventAdmitted  { event: EventId,  claims: Vec<u8> },
-    StateAttested  { entity: EntityId, head: Clock, claims: Vec<u8> },
+    EventAdmitted  { event: EventId, model: EntityId, claims: Vec<u8> },
+    StateAttested  {
+        entity: EntityId,
+        model: EntityId,
+        head: Clock,
+        state_digest: [u8; 32],
+        claims: Vec<u8>,
+    },
 }
 ```
 
@@ -385,9 +401,17 @@ pub enum AttestationBody {
   signature valid under `attester`, and `attester` recognized (I.2/I.3).
   No connection context involved; this is what makes the artifact portable
   (multi-durable acceptance, peer-served reads, storage and replay).
-- `EventAdmitted` naming an EventId transitively pins the exact event bytes
-  (C4-01), so the attestation covers the event without signing the event.
-  Events themselves stay unsigned per R1.
+- `EventAdmitted` binds both the EventId and the model envelope used for
+  admission. The EventId pins the identity-bearing content (C4-01); model is
+  deliberately excluded from event identity because entities can be modeled
+  independently, so binding it in the attestation prevents an admitted event
+  from being relabeled under another model. Events themselves stay unsigned
+  per R1.
+- `StateAttested.state_digest` is SHA-256 over
+  `b"ankurah.state.v0" || bincode(EntityState)`. Entity, model, and head are
+  repeated in the typed body for routing and inspection; the digest binds the
+  complete state buffers. Signing only `(entity, head)` would permit state
+  substitution and is explicitly insufficient.
 - `claims` is agent-defined and opaque to core (R5). The envelope alone
   ("recognized durable D admitted event E") is the load-bearing fact.
   Attribution of the submitting user context, policy epoch, and similar
@@ -414,9 +438,10 @@ The mechanical/semantic split (core does crypto, agent does policy):
    current no-attestation behavior.
 
 2. **Validation (consume side).** Core verifies envelopes BEFORE the agent
-   hook runs: for each attestation on an incoming event/state, check
-   signature and attester recognition; invalid envelopes are stripped (and
-   counted, for observability) rather than passed through. The agent hooks
+   hook runs: for each attestation on an incoming event/state, check the body
+   variant and subject match (event id plus model, or complete state digest),
+   signature, and attester recognition. Invalid or transplanted envelopes are
+   stripped (and counted, for observability) rather than passed through. The agent hooks
    (`validate_received_event`, `validate_received_state`) then receive the
    payload with its VERIFIED attestation set and decide sufficiency:
    PermissiveAgent accepts anything (including zero attestations); a strict
@@ -516,7 +541,8 @@ conflicts with the current text, this list governs:
 ## Implementation plan (this PR)
 
 1. proto: NodeId/Signature/RequestId types, EntityId re-typing, EventBody
-   split, domain-tagged derivation, Attestation envelope, signed Presence.
+   split, domain-tagged derivation, payload-binding Attestation envelope,
+   signed Presence including protocol version.
    ed25519-dalek v2 (pure Rust, wasm-compatible), rand for nonces; sha2
    already in tree.
 2. core: Node keypair custody, presence sign/verify at register_peer,
