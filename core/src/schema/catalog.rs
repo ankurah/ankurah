@@ -34,7 +34,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, RwLock},
+    sync::{atomic::AtomicBool, Arc, RwLock},
 };
 
 use ankurah_proto::{self as proto, CollectionId, EntityId, QueryId};
@@ -1021,6 +1021,31 @@ where
         }
     }
 
+    /// Wait for catalog readiness without allowing a reset to turn an old
+    /// operation into an unbounded waiter. Reset wakes `ready_notify`; the
+    /// next exact-generation check then returns `SystemReset` even though the
+    /// new generation's catalog may remain cold until it rejoins or creates.
+    pub(crate) async fn wait_catalog_ready_in_generation(
+        &self,
+        node: &Node<SE, PA>,
+        generation: &Arc<AtomicBool>,
+    ) -> Result<(), crate::error::MutationError> {
+        loop {
+            // `notify_waiters` stores no permit, so register before checking
+            // either readiness or generation to close the lost-wakeup gap.
+            let notified = self.0.ready_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let _generation_guard = node.system.guard_generation(generation).await?;
+                if self.is_catalog_ready() {
+                    return Ok(());
+                }
+            }
+            notified.await;
+        }
+    }
+
     fn mark_ready(&self) {
         *self.0.ready.write().unwrap() = true;
         self.0.ready_notify.notify_waiters();
@@ -1257,9 +1282,32 @@ where
         cdata: &PA::ContextData,
         schema: &'static ModelSchema,
     ) -> Result<(), RegistrationError> {
+        let generation = node.entities.system_generation();
+        self.ensure_registered_in_generation(node, cdata, schema, &generation).await
+    }
+
+    /// Generation-pinned form of [`Self::ensure_registered`]. Long-lived
+    /// operations (notably transactions) must pass the token captured when
+    /// they began rather than sampling the node's current token after an
+    /// await. The registration round-trip deliberately runs without holding
+    /// the reset read lease; its response is folded and latched only after an
+    /// exact-generation lease has been reacquired.
+    pub async fn ensure_registered_in_generation(
+        &self,
+        node: &Node<SE, PA>,
+        cdata: &PA::ContextData,
+        schema: &'static ModelSchema,
+        generation: &Arc<AtomicBool>,
+    ) -> Result<(), RegistrationError> {
         let collection = schema.collection.to_string();
-        if self.is_schema_ensured(schema) {
-            return Ok(());
+        {
+            // The latch is system-local. Check it only while fenced to the
+            // operation's exact generation, otherwise an old transaction can
+            // mistake a new system's identical schema latch for its own.
+            let _generation_guard = node.system.guard_generation(generation).await?;
+            if self.is_schema_ensured(schema) {
+                return Ok(());
+            }
         }
 
         // Retain this binary-known shape for later predicate first-use
@@ -1270,8 +1318,11 @@ where
 
         if node.durable {
             // A durable node executes registration itself (no forwarding);
-            // the executor upserts the map before returning.
-            node.execute_schema_registration(cdata, models, properties, memberships).await?;
+            // the executor upserts the map before returning. Reacquire the
+            // exact-generation lease after that durable await before this
+            // caller publishes its success latch.
+            node.execute_schema_registration_in_generation(cdata, models, properties, memberships, generation).await?;
+            let _generation_guard = node.system.guard_generation(generation).await?;
             self.mark_schema_ensured(schema);
             return Ok(());
         }
@@ -1283,6 +1334,10 @@ where
                 let body = proto::NodeRequestBody::RegisterSchema { models, properties, memberships };
                 match node.request(peer, cdata, body).await {
                     Ok(proto::NodeResponseBody::SchemaRegistered { models, properties, memberships }) => {
+                        // Do not let a delayed response from the pre-reset
+                        // session repopulate the new system's map or latch.
+                        // The guard is held through both synchronous writes.
+                        let _generation_guard = node.system.guard_generation(generation).await?;
                         // The response is the fast path into the map (RFC
                         // 5.2): fold it in on ack so binding proceeds now.
                         self.upsert_registered(&models, &properties, &memberships);

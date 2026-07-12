@@ -46,6 +46,11 @@ pub struct PeerState {
     sender: Box<dyn PeerSender>,
     signing_key: SigningKey,
     incoming_session: proto::HandshakeChallenge,
+    /// Entity/system generation in which frames on this session are allowed
+    /// to dispatch. A preserved first-join session is rebound only after its
+    /// root switch completes; already-verified old frames retain the old
+    /// token and fail closed.
+    system_generation: std::sync::RwLock<Arc<AtomicBool>>,
     outgoing_session: proto::HandshakeChallenge,
     incoming_replay_window: Mutex<ReplayWindow>,
     next_outgoing_sequence: Mutex<u64>,
@@ -89,6 +94,8 @@ impl ReplayWindow {
 }
 
 impl PeerState {
+    fn generation_alive(&self) -> bool { self.system_generation.read().unwrap().load(Ordering::Acquire) }
+
     fn close_pending(&self) {
         for sender in self.pending_requests.drain_values() {
             let _ = sender.send(Err(RequestError::ConnectionLost));
@@ -107,10 +114,16 @@ impl PeerState {
     }
 
     pub fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError> {
+        if !self.generation_alive() {
+            return Err(SendError::ConnectionClosed);
+        }
         // Signing, enqueue, and sequence advancement are one serialized step.
         // Concurrent callers therefore cannot enqueue N+1 before N, and a
         // failed bounded-channel enqueue does not burn a sequence number.
         let mut next_sequence = self.next_outgoing_sequence.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.generation_alive() {
+            return Err(SendError::ConnectionClosed);
+        }
         let sequence = *next_sequence;
         let signature = self.signing_key.sign(&proto::SignedPeerMessage::signable_bytes(self.outgoing_session, sequence, &message)).into();
         self.sender.send_message(proto::SignedPeerMessage { session: self.outgoing_session, sequence, message, signature })?;
@@ -309,7 +322,7 @@ where
 
     fn build(engine: Arc<SE>, policy_agent: PA, durable: bool, rng: SmallRng, signing_key: SigningKey) -> Self {
         let collections = CollectionSet::new(engine);
-        let entityset: WeakEntitySet = Default::default();
+        let entityset = WeakEntitySet::with_system_generation(collections.storage_generation());
         let id = proto::NodeId::from(signing_key.verifying_key());
         let reactor = Reactor::new();
         notice_info!("Node {id:#} created as {}", if durable { "durable" } else { "ephemeral" });
@@ -370,6 +383,20 @@ where
                 }
             }
         }));
+        // SystemManager owns the destructive reset sequence but the Node owns
+        // connection routing. Bridge them with a weak hook so reset can drain
+        // old-system PeerStates and their pending waiters without creating an
+        // Arc cycle. A pending peer for the newly Reserved root is preserved
+        // during an automatic system replacement and promoted after its proof
+        // is durable; hard_reset preserves none.
+        node.system.set_peer_reset_hook(Arc::new({
+            let weak = node.weak();
+            move |preserved_pending_root| {
+                if let Some(node) = weak.upgrade() {
+                    node.reset_peer_sessions(preserved_pending_root);
+                }
+            }
+        }));
         node.policy_agent.on_node_ready(node.weak());
 
         node
@@ -386,7 +413,12 @@ where
     }
 
     pub fn presence(&self, challenge: proto::HandshakeChallenge) -> proto::Presence {
-        let system_root = self.system.root_proof();
+        // Never advertise a root while it is being replaced/reset. In
+        // particular, hard_reset marks the system unready before the async
+        // storage deletion reaches `root = None`; exposing the old proof in
+        // that window lets reconnecting transports re-register a stale
+        // founder on remote nodes.
+        let system_root = (self.system.is_system_ready() && !self.system.is_resetting()).then(|| self.system.root_proof()).flatten();
         let timestamp = proto::time::unix_ms_now();
         let claims = proto::PresenceClaims {
             node_id: self.id,
@@ -452,6 +484,12 @@ where
         sender: Box<dyn PeerSender>,
     ) -> Result<(), proto::PresenceRefusal> {
         action_info!(self, "register_peer", "{}", &presence);
+        let registration_generation = self.entities.system_generation();
+
+        if self.system.is_destructive_resetting() {
+            warn!("Node({}) refusing peer {} while system reset is active", self.id, presence.node_id);
+            return Err(proto::PresenceRefusal::InvalidSystemRoot(presence.node_id));
+        }
 
         if !proto::protocol_compatible(presence.protocol_version) {
             let rejection = proto::PresenceRejection { expected: proto::PROTOCOL_VERSION, received: presence.protocol_version };
@@ -483,17 +521,22 @@ where
         // its schema/application traffic before the root proof is durable can
         // contaminate a later system if persistence fails. Reconnects for the
         // same Reserved root remain pending and are promoted together.
-        let pending_root = if recognized_durable && !self.system.is_system_ready() {
-            presence.system_root.as_ref().map(proto::SystemRootProof::entity_id)
-        } else {
-            None
-        };
-        let ready = pending_root.is_none();
+        let system_ready = self.system.is_system_ready();
+        let pending_root =
+            if recognized_durable && !system_ready { presence.system_root.as_ref().map(proto::SystemRootProof::entity_id) } else { None };
+        // Once a root is Reserved but not ready, no unrelated connection may
+        // carry traffic into that join window. Keep non-winners registered but
+        // inert so concurrent handshakes retain their historical `Ok` result;
+        // successful root publication promotes them as non-durable peers.
+        // A root-less node before initial create/join remains permissive --
+        // every durable mutation path independently requires system readiness.
+        let ready = system_ready || self.system.root_id().is_none();
         let subscription_handler = SubscriptionHandler::new(presence.node_id, self);
         let new_state = Arc::new(PeerState {
             sender,
             signing_key: self.signing_key.clone(),
             incoming_session: handshake.challenge(),
+            system_generation: std::sync::RwLock::new(registration_generation.clone()),
             outgoing_session,
             incoming_replay_window: Mutex::new(ReplayWindow::default()),
             next_outgoing_sequence: Mutex::new(0),
@@ -507,10 +550,18 @@ where
         });
         {
             let _registry_guard = self.peer_registry_lock.lock().unwrap_or_else(|e| e.into_inner());
+            // Re-check under the same lock reset uses for draining. A
+            // registration that passed the optimistic check just before reset
+            // cannot publish itself behind the drain.
+            if self.system.is_destructive_resetting() || !self.entities.is_current_generation(&registration_generation) {
+                new_state.sender.close();
+                return Err(proto::PresenceRefusal::InvalidSystemRoot(presence.node_id));
+            }
             let old_state = self.peer_connections.replace(presence.node_id, new_state);
             let old_was_durable =
                 old_state.as_ref().is_some_and(|state| state.ready.load(Ordering::Acquire) && state.durable.load(Ordering::Acquire));
             if let Some(old_state) = old_state {
+                old_state.sender.close();
                 old_state.close_pending();
             }
             let new_is_durable = recognized_durable && ready;
@@ -544,7 +595,7 @@ where
                             }
                         }
                     } else {
-                        me.promote_peer_for_root(peer_id, root_id);
+                        me.promote_peers_for_root(peer_id, root_id);
                         action_info!(me, "successfully joined system");
                     }
                 });
@@ -556,18 +607,38 @@ where
         Ok(())
     }
 
-    fn promote_peer_for_root(&self, node_id: proto::NodeId, root_id: proto::EntityId) -> bool {
+    fn promote_peers_for_root(&self, node_id: proto::NodeId, root_id: proto::EntityId) -> bool {
         let _registry_guard = self.peer_registry_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(peer_state) = self.peer_connections.get(&node_id) else { return false };
-        if peer_state.pending_root != Some(root_id) || self.system.root_id() != Some(root_id) || !self.system.is_system_ready() {
+        if self.system.root_id() != Some(root_id) || !self.system.is_system_ready() {
             return false;
         }
-        peer_state.durable.store(true, Ordering::Release);
-        peer_state.ready.store(true, Ordering::Release);
-        if let Some(ref relay) = self.subscription_relay {
-            relay.notify_peer_connected(node_id);
+
+        let mut founder_promoted = false;
+        for (peer_id, peer_state) in self.peer_connections.to_vec() {
+            if peer_state.ready.load(Ordering::Acquire) {
+                continue;
+            }
+            match peer_state.pending_root {
+                Some(pending) if pending == root_id => {
+                    *peer_state.system_generation.write().unwrap() = self.entities.system_generation();
+                    peer_state.durable.store(true, Ordering::Release);
+                    peer_state.ready.store(true, Ordering::Release);
+                    founder_promoted |= peer_id == node_id;
+                    if let Some(ref relay) = self.subscription_relay {
+                        relay.notify_peer_connected(peer_id);
+                    }
+                }
+                None => {
+                    // This connection lost the first-root race. It remains a
+                    // valid authenticated peer, but never enters durable
+                    // routing for the winner's system.
+                    *peer_state.system_generation.write().unwrap() = self.entities.system_generation();
+                    peer_state.ready.store(true, Ordering::Release);
+                }
+                Some(_) => {}
+            }
         }
-        true
+        founder_promoted
     }
 
     fn deregister_peer_pending_root(&self, node_id: proto::NodeId, root_id: proto::EntityId) -> bool {
@@ -583,6 +654,7 @@ where
     #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(node_id = %node_id.to_base64_short())))]
     fn cleanup_removed_peer(&self, node_id: proto::NodeId, peer_state: Arc<PeerState>) {
         let was_durable = peer_state.ready.load(Ordering::Acquire) && peer_state.durable.load(Ordering::Acquire);
+        peer_state.sender.close();
         peer_state.close_pending();
         action_info!(self, "unsubscribing", "subscription {} for peer {}", peer_state.subscription_handler.subscription_id(), node_id);
         // ReactorSubscription is automatically unsubscribed on drop.
@@ -590,6 +662,34 @@ where
             if let Some(ref relay) = self.subscription_relay {
                 relay.notify_peer_disconnected(node_id);
             }
+        }
+    }
+
+    /// Drop every old-system connection and wake all of its pending request
+    /// and update waiters. During an automatic root replacement, keep only a
+    /// not-yet-ready connection whose pending root is the newly Reserved root;
+    /// it is the authenticated channel that triggered the switch.
+    fn reset_peer_sessions(&self, preserved_pending_root: Option<proto::EntityId>) {
+        let removed = {
+            let _registry_guard = self.peer_registry_lock.lock().unwrap_or_else(|e| e.into_inner());
+            let mut removed = Vec::new();
+            for (node_id, state) in self.peer_connections.drain() {
+                let preserve =
+                    preserved_pending_root.is_some_and(|root| state.pending_root == Some(root) && !state.ready.load(Ordering::Acquire));
+                if preserve {
+                    self.peer_connections.insert(node_id, state);
+                } else {
+                    removed.push((node_id, state));
+                }
+            }
+            #[cfg(any(test, feature = "test-helpers"))]
+            self.test_durable_peers.clear();
+            self.predicate_context.clear();
+            removed
+        };
+
+        for (node_id, state) in removed {
+            self.cleanup_removed_peer(node_id, state);
         }
     }
 
@@ -869,6 +969,11 @@ where
         if !connection.ready.load(Ordering::Acquire) {
             return Err(PeerFrameError::PeerNotReady { peer: authenticated_peer });
         }
+        // Hold the session's generation read lock through synchronous frame
+        // verification. A preserved first-join session cannot be rebound by
+        // promotion between verification and token capture.
+        let connection_generation = connection.system_generation.read().unwrap();
+        let system_generation = connection_generation.clone();
         if frame.session != connection.incoming_session {
             return Err(PeerFrameError::WrongSession { peer: authenticated_peer });
         }
@@ -881,11 +986,25 @@ where
         }
         connection.incoming_replay_window.lock().unwrap_or_else(|e| e.into_inner()).accept(authenticated_peer, frame.sequence)?;
 
-        Ok(VerifiedPeerMessage(frame.message))
+        if !self.entities.is_current_generation(&system_generation) {
+            return Err(PeerFrameError::PeerNotReady { peer: authenticated_peer });
+        }
+        drop(connection_generation);
+
+        Ok(VerifiedPeerMessage {
+            message: frame.message,
+            authenticated_peer,
+            incoming_session: connection.incoming_session,
+            system_generation,
+        })
     }
 
     pub async fn handle_verified_peer_message(&self, message: VerifiedPeerMessage) -> anyhow::Result<()> {
-        self.dispatch_message(message.0).await
+        // Revalidate immediately before dispatch, but do not hold the reset
+        // lease across arbitrary peer/policy/subscription I/O. The exact
+        // token is propagated into every downstream mutation boundary.
+        self.peer_for_dispatch(message.authenticated_peer, Some(message.incoming_session), &message.system_generation)?;
+        self.dispatch_message(message.message, message.system_generation, Some(message.incoming_session)).await
     }
 
     pub async fn handle_peer_message(&self, authenticated_peer: proto::NodeId, frame: proto::SignedPeerMessage) -> anyhow::Result<()> {
@@ -898,7 +1017,9 @@ where
     /// connectors must call [`Self::handle_peer_message`] with the identity
     /// authenticated for that connection.
     #[cfg(feature = "test-helpers")]
-    pub async fn handle_message(&self, message: proto::NodeMessage) -> anyhow::Result<()> { self.dispatch_message(message).await }
+    pub async fn handle_message(&self, message: proto::NodeMessage) -> anyhow::Result<()> {
+        self.dispatch_message(message, self.entities.system_generation(), None).await
+    }
 
     /// Sign a frame without enqueueing it. The deterministic simulator owns
     /// delivery itself, but still exercises the production session/signature/
@@ -913,47 +1034,79 @@ where
         Ok(connection.sign_message_for_delivery(message))
     }
 
+    fn peer_for_dispatch(
+        &self,
+        peer: proto::NodeId,
+        verified_session: Option<proto::HandshakeChallenge>,
+        expected_generation: &Arc<AtomicBool>,
+    ) -> Result<Arc<PeerState>, PeerFrameError> {
+        if !self.entities.is_current_generation(expected_generation) {
+            return Err(PeerFrameError::PeerNotReady { peer });
+        }
+        let _registry_guard = self.peer_registry_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let current = self.peer_connections.get(&peer).ok_or(PeerFrameError::PeerNotRegistered { peer })?;
+        if verified_session.is_some_and(|session| current.incoming_session != session) {
+            return Err(PeerFrameError::WrongSession { peer });
+        }
+        if !current.ready.load(Ordering::Acquire) {
+            return Err(PeerFrameError::PeerNotReady { peer });
+        }
+        let current_generation = current.system_generation.read().unwrap();
+        if !Arc::ptr_eq(&current_generation, expected_generation) {
+            return Err(PeerFrameError::PeerNotReady { peer });
+        }
+        drop(current_generation);
+        Ok(current)
+    }
+
     #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(message = %message)))]
-    async fn dispatch_message(&self, message: proto::NodeMessage) -> anyhow::Result<()> {
+    async fn dispatch_message(
+        &self,
+        message: proto::NodeMessage,
+        expected_generation: Arc<AtomicBool>,
+        verified_session: Option<proto::HandshakeChallenge>,
+    ) -> anyhow::Result<()> {
         match message {
             proto::NodeMessage::Update(update) => {
                 debug!("Node({}) received update {}", self.id, update);
-                if let Some(connection) = self.peer_connections.get(&update.from) {
-                    let _from = update.from;
-                    let _id = update.id.clone();
-                    if update.to != self.id {
-                        warn!("{} received message from {} but is not the intended recipient", self.id, update.from);
-                        return Ok(());
-                    }
-
-                    // take down the return address
-                    let id = update.id.clone();
-                    let to = update.from;
-                    let from = self.id;
-
-                    // Descriptor shipping (#330): warm the catalog map from the
-                    // attached defs BEFORE applying the body, so model routing
-                    // and property naming resolve. Ingest only AFTER the
-                    // connection + recipient checks: a misaddressed or
-                    // unsolicited envelope must not mutate our catalog map.
-                    let body = match self.ingest_schema(&update.from, &update.schema) {
-                        Ok(()) => match self.handle_update(update).await {
-                            Ok(_) => proto::NodeUpdateAckBody::Success,
-                            Err(e) => proto::NodeUpdateAckBody::Error(e.to_string()),
-                        },
-                        Err(error) => proto::NodeUpdateAckBody::Error(error.to_string()),
-                    };
-
-                    connection.send_message(proto::NodeMessage::UpdateAck(proto::NodeUpdateAck { id, from, to, body }))?;
+                self.peer_for_dispatch(update.from, verified_session, &expected_generation)?;
+                if update.to != self.id {
+                    warn!("{} received message from {} but is not the intended recipient", self.id, update.from);
+                    return Ok(());
                 }
+
+                // take down the return address
+                let id = update.id.clone();
+                let to = update.from;
+                let from = self.id;
+
+                // Descriptor shipping (#330): warm the catalog map from the
+                // attached defs BEFORE applying the body. Hold the exact
+                // generation lease only across this synchronous map fold;
+                // the update applier carries the token to its own bounded
+                // durable-write fences.
+                let schema_result = {
+                    let _guard = self.system.guard_generation(&expected_generation).await?;
+                    self.peer_for_dispatch(update.from, verified_session, &expected_generation)?;
+                    self.ingest_schema(&update.from, &update.schema)
+                };
+                let body = match schema_result {
+                    Ok(()) => match self.handle_update(update, &expected_generation).await {
+                        Ok(_) => proto::NodeUpdateAckBody::Success,
+                        Err(e) => proto::NodeUpdateAckBody::Error(e.to_string()),
+                    },
+                    Err(error) => proto::NodeUpdateAckBody::Error(error.to_string()),
+                };
+
+                let connection = self.peer_for_dispatch(to, verified_session, &expected_generation)?;
+                connection.send_message(proto::NodeMessage::UpdateAck(proto::NodeUpdateAck { id, from, to, body }))?;
             }
             proto::NodeMessage::UpdateAck(ack) => {
                 debug!("Node({}) received ack notification {} {}", self.id, ack.id, ack.body);
                 // Drain the pending entry so the map does not leak (the send
                 // side no longer blocks on it).
-                if let Some(connection) = self.peer_connections.get(&ack.from) {
-                    connection.pending_updates.remove(&ack.id);
-                }
+                let connection = self.peer_for_dispatch(ack.from, verified_session, &expected_generation)?;
+                connection.pending_updates.remove(&ack.id);
                 // Surface a rejected update instead of dropping it silently.
                 // Automatic retry (e.g. re-announcing the model and re-sending)
                 // is still a TODO -- see send_update.
@@ -968,63 +1121,74 @@ where
                 // I think we want timeouts to be handled by the node, not the connector,
                 // which would lend itself to spawning a task here and making this function synchronous.
 
-                // double check to make sure we have a connection to the peer based on the node id
-                if let Some(connection) = { self.peer_connections.get(&request.from) } {
-                    let from = request.from;
-                    let request_id = request.id.clone();
-                    if request.to != self.id {
-                        warn!("{} received message from {} but is not the intended recipient", self.id, request.from);
-                        return Ok(());
-                    }
-
-                    // Validate the request auth first, converting errors to error responses
-                    let body = match self.policy_agent.check_request(self, &auth, &request).await {
-                        Ok(cdata) => match self.handle_request(&cdata, request).await {
-                            Ok(result) => result,
-                            Err(e) => proto::NodeResponseBody::Error(e.to_string()),
-                        },
-                        Err(e) => proto::NodeResponseBody::Error(e.to_string()),
-                    };
-                    // Descriptor shipping (#330): catalog defs for any model id
-                    // this response references that the connection has not seen.
-                    let schema = self.schema_states_for_models(&connection, Self::models_in_response(&body)).await;
-                    let _result = connection.send_message(proto::NodeMessage::Response(proto::NodeResponse {
-                        request_id,
-                        from: self.id,
-                        to: from,
-                        body,
-                        schema,
-                    }));
+                self.peer_for_dispatch(request.from, verified_session, &expected_generation)?;
+                let from = request.from;
+                let request_id = request.id.clone();
+                if request.to != self.id {
+                    warn!("{} received message from {} but is not the intended recipient", self.id, request.from);
+                    return Ok(());
                 }
+
+                // Policy may perform arbitrary async work, so carry the
+                // expected generation through it rather than holding reset.
+                let body = match self.policy_agent.check_request(self, &auth, &request).await {
+                    Ok(cdata) => match self.handle_request(&cdata, request, &expected_generation, verified_session).await {
+                        Ok(result) => result,
+                        Err(e) => proto::NodeResponseBody::Error(e.to_string()),
+                    },
+                    Err(e) => proto::NodeResponseBody::Error(e.to_string()),
+                };
+                let connection = self.peer_for_dispatch(from, verified_session, &expected_generation)?;
+                // Descriptor shipping (#330): catalog defs for any model id
+                // this response references that the connection has not seen.
+                let schema = self.schema_states_for_models(&connection, Self::models_in_response(&body)).await;
+                let connection = self.peer_for_dispatch(from, verified_session, &expected_generation)?;
+                let _result = connection.send_message(proto::NodeMessage::Response(proto::NodeResponse {
+                    request_id,
+                    from: self.id,
+                    to: from,
+                    body,
+                    schema,
+                }));
             }
             proto::NodeMessage::Response(response) => {
                 debug!("Node {} received response {}", self.id, response);
-                let connection = self.peer_connections.get(&response.from).ok_or(RequestError::PeerNotConnected)?;
+                let connection = self.peer_for_dispatch(response.from, verified_session, &expected_generation)?;
                 // Descriptor shipping (#330): ingest attached defs before the
                 // requester consumes the body -- but only for a response that
                 // matches a request we actually sent, so an unsolicited or
                 // misattributed response cannot poison the catalog map.
                 if let Some(tx) = connection.pending_requests.remove(&response.request_id) {
-                    let body = self
-                        .ingest_schema(&response.from, &response.schema)
-                        .map(|()| response.body)
-                        .map_err(|error| RequestError::ServerError(error.to_string()));
+                    let body = {
+                        let _guard = self.system.guard_generation(&expected_generation).await?;
+                        self.peer_for_dispatch(response.from, verified_session, &expected_generation)?;
+                        self.ingest_schema(&response.from, &response.schema)
+                            .map(|()| response.body)
+                            .map_err(|error| RequestError::ServerError(error.to_string()))
+                    };
                     tx.send(body).map_err(|e| anyhow!("Failed to send response: {:?}", e))?;
                 }
             }
             proto::NodeMessage::UnsubscribeQuery { from, query_id } => {
                 // Remove predicate from the peer's subscription
-                if let Some(peer_state) = self.peer_connections.get(&from) {
-                    peer_state.subscription_handler.remove_predicate(query_id)?;
-                }
+                let peer_state = self.peer_for_dispatch(from, verified_session, &expected_generation)?;
+                peer_state.subscription_handler.remove_predicate(query_id)?;
             }
         }
         Ok(())
     }
 
     #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(request = %request)))]
-    async fn handle_request<C>(&self, cdata: &C, request: proto::NodeRequest) -> anyhow::Result<proto::NodeResponseBody>
-    where C: Iterable<PA::ContextData> {
+    async fn handle_request<C>(
+        &self,
+        cdata: &C,
+        request: proto::NodeRequest,
+        expected_generation: &Arc<AtomicBool>,
+        verified_session: Option<proto::HandshakeChallenge>,
+    ) -> anyhow::Result<proto::NodeResponseBody>
+    where
+        C: Iterable<PA::ContextData>,
+    {
         match request.body {
             proto::NodeRequestBody::CommitTransaction { id, events } => {
                 // Protected collections (the system collection and the metadata
@@ -1053,7 +1217,7 @@ where
                 // With moderate potential for duplication, while not creating message loops
                 // Doing so would be a secondary/tertiary/etc hop for this message
                 let cdata = cdata.iterable().exactly_one().map_err(|_| anyhow!("Only one cdata is permitted for CommitTransaction"))?;
-                match self.commit_remote_transaction(cdata, id.clone(), events).await {
+                match self.commit_remote_transaction_in_generation(cdata, id.clone(), events, expected_generation).await {
                     Ok(_) => Ok(proto::NodeResponseBody::CommitComplete { id }),
                     Err(e) => Ok(proto::NodeResponseBody::Error(e.to_string())),
                 }
@@ -1089,6 +1253,7 @@ where
                         deltas.push(delta);
                     }
                 }
+                let _guard = self.system.guard_generation(expected_generation).await?;
                 Ok(proto::NodeResponseBody::Fetch(deltas))
             }
             proto::NodeRequestBody::Get { collection, ids } => {
@@ -1112,6 +1277,7 @@ where
                     }
                 }
 
+                let _guard = self.system.guard_generation(expected_generation).await?;
                 Ok(proto::NodeResponseBody::Get(states))
             }
             proto::NodeRequestBody::GetEvents { collection, event_ids } => {
@@ -1129,11 +1295,12 @@ where
                     }
                 }
 
+                let _guard = self.system.guard_generation(expected_generation).await?;
                 Ok(proto::NodeResponseBody::GetEvents(events))
             }
             proto::NodeRequestBody::RegisterSchema { models, properties, memberships } => {
                 let cdata = cdata.iterable().exactly_one().map_err(|_| anyhow!("Only one cdata is permitted for RegisterSchema"))?;
-                match self.execute_schema_registration(cdata, models, properties, memberships).await {
+                match self.execute_schema_registration_in_generation(cdata, models, properties, memberships, expected_generation).await {
                     // The resolved definitions ARE the response (RFC 5.2):
                     // the requester folds them into its catalog map on ack.
                     Ok((models, properties, memberships)) => {
@@ -1143,16 +1310,30 @@ where
                 }
             }
             proto::NodeRequestBody::SubscribeQuery { query_id, collection, selection, version, known_matches } => {
-                let peer_state = self.peer_connections.get(&request.from).ok_or_else(|| anyhow!("Peer {} not connected", request.from))?;
+                let peer_state = self.peer_for_dispatch(request.from, verified_session, expected_generation)?;
                 // only one cdata is permitted for SubscribePredicate
                 use itertools::Itertools;
                 let cdata = cdata.iterable().exactly_one().map_err(|_| anyhow!("Only one cdata is permitted for SubscribePredicate"))?;
-                peer_state.subscription_handler.subscribe_query(self, query_id, collection, selection, cdata, version, known_matches).await
+                let response = peer_state
+                    .subscription_handler
+                    .subscribe_query(self, query_id.clone(), collection, selection, cdata, version, known_matches)
+                    .await;
+                match self.system.guard_generation(expected_generation).await {
+                    Ok(_guard) => Ok(response?),
+                    Err(error) => {
+                        // The exact old handler may have resumed its reactor
+                        // upsert after reset. Remove only its query; never
+                        // look the peer up again by stable NodeId, which could
+                        // target a replacement session's handler.
+                        let _ = peer_state.subscription_handler.remove_predicate(query_id);
+                        Err(error.into())
+                    }
+                }
             }
         }
     }
 
-    async fn handle_update(&self, notification: proto::NodeUpdate) -> anyhow::Result<()> {
+    async fn handle_update(&self, notification: proto::NodeUpdate, expected_generation: &Arc<AtomicBool>) -> anyhow::Result<()> {
         let Some(_connection) = self.peer_connections.get(&notification.from) else {
             return Err(anyhow!("Rejected notification from unknown node {}", notification.from));
         };
@@ -1160,7 +1341,7 @@ where
         match notification.body {
             proto::NodeUpdateBody::SubscriptionUpdate { items } => {
                 tracing::debug!("Node({}) received subscription update from peer {}", self.id, notification.from);
-                crate::node_applier::NodeApplier::apply_updates(self, &notification.from, items).await?;
+                crate::node_applier::NodeApplier::apply_updates(self, &notification.from, items, expected_generation.clone()).await?;
                 Ok(())
             }
         }
@@ -1245,8 +1426,20 @@ where
         &self,
         cdata: &PA::ContextData,
         id: proto::TransactionId,
-        mut events: Vec<Attested<proto::Event>>,
+        events: Vec<Attested<proto::Event>>,
     ) -> Result<(), MutationError> {
+        let system_generation = self.entities.system_generation();
+        self.commit_remote_transaction_in_generation(cdata, id, events, &system_generation).await
+    }
+
+    pub(crate) async fn commit_remote_transaction_in_generation(
+        &self,
+        cdata: &PA::ContextData,
+        id: proto::TransactionId,
+        mut events: Vec<Attested<proto::Event>>,
+        system_generation: &Arc<AtomicBool>,
+    ) -> Result<(), MutationError> {
+        let _system_generation_guard = self.system.guard_generation(system_generation).await?;
         debug!("{self} commiting transaction {id} with {} events", events.len());
         let mut changes = Vec::new();
 
@@ -1266,8 +1459,16 @@ where
             // When applying an event, we should only look at the local storage for the lineage
             let event_getter = LocalEventGetter::new(collection.clone(), self.durable);
             let state_getter = LocalStateGetter::new(collection.clone());
-            let entity =
-                self.entities.get_retrieve_or_create(&state_getter, &event_getter, &collection_id, &event.payload.entity_id).await?;
+            let entity = self
+                .entities
+                .get_retrieve_or_create_in_generation(
+                    &state_getter,
+                    &event_getter,
+                    &collection_id,
+                    &event.payload.entity_id,
+                    system_generation.clone(),
+                )
+                .await?;
             let admission: Result<_, MutationError> = async {
                 // Stage the event so BFS can discover it while validating on
                 // an isolated fork. In particular, a denied genesis must not
@@ -1288,7 +1489,7 @@ where
                     // Retrieval creates an empty resident placeholder when a
                     // remote genesis names a new entity. A denial must evict
                     // that placeholder as well as avoid storage mutation.
-                    self.entities.remove_if_phantom(&event.payload.entity_id);
+                    self.entities.remove_if_phantom_in_generation(&event.payload.entity_id, system_generation);
                     return Err(error);
                 }
             };
@@ -1497,6 +1698,7 @@ where
         ids: Vec<proto::EntityId>,
         cdata: &PA::ContextData,
     ) -> Result<(), RetrievalError> {
+        let system_generation = self.entities.system_generation();
         let peer_id = self.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
 
         match self
@@ -1511,6 +1713,7 @@ where
                 for state in states {
                     let state = self.validate_incoming_state(&peer_id, state)?;
                     self.validate_state_identity(&state.payload, &event_getter).await.map_err(|e| RetrievalError::Other(e.to_string()))?;
+                    let _guard = self.system.guard_generation(&system_generation).await?;
                     collection.set_state(state).await.map_err(|e| RetrievalError::Other(format!("{:?}", e)))?;
                 }
                 Ok(())
@@ -1547,7 +1750,12 @@ where
             .peer_connections
             .to_vec()
             .into_iter()
-            .filter_map(|(id, state)| (state.ready.load(Ordering::Acquire) && state.durable.load(Ordering::Acquire)).then_some(id))
+            .filter_map(|(id, state)| {
+                (state.ready.load(Ordering::Acquire)
+                    && state.durable.load(Ordering::Acquire)
+                    && state.system_generation.read().unwrap().load(Ordering::Acquire))
+                .then_some(id)
+            })
             .collect();
         #[cfg(any(test, feature = "test-helpers"))]
         peers.extend(self.test_durable_peers.to_vec());

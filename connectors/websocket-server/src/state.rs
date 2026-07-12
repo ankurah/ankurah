@@ -11,6 +11,7 @@ pub enum Connection {
     },
     Established {
         peer_sender: super::sender::WebSocketClientSender,
+        close_rx: tokio::sync::watch::Receiver<bool>,
         /// Challenge this server issued for the registration owned by this
         /// transport. Cleanup must present the same session capability.
         incoming_session: proto::HandshakeChallenge,
@@ -18,6 +19,21 @@ pub enum Connection {
 }
 
 impl Connection {
+    pub async fn close_requested(&mut self) {
+        let Connection::Established { close_rx, .. } = self else {
+            std::future::pending::<()>().await;
+            return;
+        };
+        loop {
+            if *close_rx.borrow_and_update() {
+                return;
+            }
+            if close_rx.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
     pub async fn send(&mut self, message: proto::Message) -> Result<(), SendError> {
         match self {
             Connection::Initial { sender, .. } => {

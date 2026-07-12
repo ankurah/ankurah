@@ -10,6 +10,7 @@ use crate::{
 use ankurah_proto::{self as proto};
 use futures::stream::StreamExt;
 use proto::Attested;
+use std::sync::{atomic::AtomicBool, Arc};
 
 /// Consolidates all logic for applying remote updates to a node
 /// Handles both SubscriptionUpdateItem (streaming updates) and EntityDelta (initial Fetch/QuerySubscribed)
@@ -22,11 +23,15 @@ impl NodeApplier {
         node: &Node<SE, PA>,
         from_peer_id: &proto::NodeId,
         items: Vec<proto::SubscriptionUpdateItem>,
+        system_generation: Arc<AtomicBool>,
     ) -> Result<(), ApplyError>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
+        if !node.entities.is_current_generation(&system_generation) {
+            return Err(MutationError::SystemReset.into());
+        }
         tracing::debug!("received subscription update for {} items", items.len());
 
         // In theory, if initialized_predicate is specified, we could potentially narrow it down to just the context for that predicate
@@ -54,7 +59,8 @@ impl NodeApplier {
                 let collection = node.collections.get(&collection_id).await?;
                 let event_getter = CachedEventGetter::new(collection_id, collection.clone(), node, &cdata);
                 let state_getter = LocalStateGetter::new(collection);
-                Self::apply_update(node, from_peer_id, update, &event_getter, &state_getter, &mut changes, &mut ()).await
+                Self::apply_update(node, from_peer_id, update, &event_getter, &state_getter, &mut changes, &mut (), &system_generation)
+                    .await
             }
             .await;
             if let Err(cause) = result {
@@ -63,7 +69,10 @@ impl NodeApplier {
             }
         }
 
-        node.reactor.notify_change(changes).await;
+        {
+            let _guard = node.system.guard_generation(&system_generation).await.map_err(ApplyError::from)?;
+            node.reactor.notify_change(changes).await;
+        }
 
         if !errors.is_empty() {
             return Err(ApplyError::Items(errors));
@@ -113,6 +122,7 @@ impl NodeApplier {
         state_getter: &S,
         changes: &mut Vec<EntityChange>,
         entities: &mut impl Pushable<crate::entity::Entity>,
+        system_generation: &Arc<AtomicBool>,
     ) -> Result<(), MutationError>
     where
         SE: StorageEngine + Send + Sync + 'static,
@@ -136,7 +146,10 @@ impl NodeApplier {
 
                 // We did not receive an entity fragment, so we need to retrieve it from local storage or a remote peer
                 // (assembly binds it to the id-keyed contract before we apply).
-                let entity = node.entities.get_retrieve_or_create(state_getter, event_getter, &collection_id, &entity_id).await?;
+                let entity = node
+                    .entities
+                    .get_retrieve_or_create_in_generation(state_getter, event_getter, &collection_id, &entity_id, system_generation.clone())
+                    .await?;
                 entities.push(entity.clone());
 
                 let mut applied_events = Vec::new();
@@ -151,7 +164,7 @@ impl NodeApplier {
                         }
                     };
                     if applied {
-                        if let Err(e) = event_getter.commit_event(&event).await {
+                        if let Err(e) = Self::commit_event_fenced(node, system_generation, event_getter, &event).await {
                             failure = Some(e);
                             break;
                         }
@@ -171,7 +184,7 @@ impl NodeApplier {
                     // Evict it, or the entity appears to exist with no state.
                     // Recovering by requesting state from the peer is tracked as
                     // a follow-up.
-                    node.entities.remove_if_phantom(&entity_id);
+                    node.entities.remove_if_phantom_in_generation(&entity_id, system_generation);
                     return Err(e);
                 }
             }
@@ -217,22 +230,31 @@ impl NodeApplier {
                 // before any descendant event: a crash may leave a harmless
                 // genesis-only cache, but must never leave an update whose
                 // self-certifying genesis is absent.
-                event_getter.commit_event(&genesis).await?;
+                Self::commit_event_fenced(node, system_generation, event_getter, &genesis).await?;
 
                 let inherited_attestations = state.attestations;
 
                 // with_state only updates the in-memory entity, it does NOT persist to storage
-                let (changed, entity) =
-                    node.entities.with_state(state_getter, event_getter, entity_id, collection_id.clone(), state.payload.state).await?;
+                let (changed, entity) = node
+                    .entities
+                    .with_state_in_generation(
+                        state_getter,
+                        event_getter,
+                        entity_id,
+                        collection_id.clone(),
+                        state.payload.state,
+                        system_generation.clone(),
+                    )
+                    .await?;
                 entities.push(entity.clone());
 
                 if matches!(changed, Some(true) | None) {
                     // State applied successfully (new entity or strictly descends)
                     // Commit all staged events
                     for event in &attested_events {
-                        event_getter.commit_event(event).await?;
+                        Self::commit_event_fenced(node, system_generation, event_getter, event).await?;
                     }
-                    Self::save_state(node, &entity, &collection, inherited_attestations).await?;
+                    Self::save_state(node, &entity, &collection, inherited_attestations, system_generation).await?;
                     changes.push(EntityChange::new(entity, attested_events)?);
                 } else {
                     // State not applied (divergence or older) - fall back to event-by-event application
@@ -240,12 +262,12 @@ impl NodeApplier {
                     let mut applied_events = Vec::new();
                     for event in attested_events {
                         if entity.apply_event(event_getter, &event.payload).await? {
-                            event_getter.commit_event(&event).await?;
+                            Self::commit_event_fenced(node, system_generation, event_getter, &event).await?;
                             applied_events.push(event);
                         }
                     }
                     if !applied_events.is_empty() {
-                        Self::save_state(node, &entity, &collection, inherited_attestations).await?;
+                        Self::save_state(node, &entity, &collection, inherited_attestations, system_generation).await?;
                         changes.push(EntityChange::new(entity, applied_events)?);
                     }
                 }
@@ -260,6 +282,7 @@ impl NodeApplier {
         entity: &crate::entity::Entity,
         collection_wrapper: &crate::storage::StorageCollectionWrapper,
         inherited_attestations: proto::AttestationSet,
+        system_generation: &Arc<AtomicBool>,
     ) -> Result<(), MutationError>
     where
         SE: StorageEngine + Send + Sync + 'static,
@@ -280,8 +303,24 @@ impl NodeApplier {
                 attested.attestations.push(envelope);
             }
         }
+        let _guard = node.system.guard_generation(system_generation).await?;
         collection_wrapper.set_state(attested).await?;
         Ok(())
+    }
+
+    async fn commit_event_fenced<SE, PA, E>(
+        node: &Node<SE, PA>,
+        system_generation: &Arc<AtomicBool>,
+        event_getter: &E,
+        event: &Attested<proto::Event>,
+    ) -> Result<(), MutationError>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+        E: SuspenseEvents + Send + Sync,
+    {
+        let _guard = node.system.guard_generation(system_generation).await?;
+        event_getter.commit_event(event).await
     }
 
     /// Apply multiple EntityDeltas in parallel with batched reactor notification
@@ -300,11 +339,13 @@ impl NodeApplier {
         E: SuspenseEvents + Send + Sync,
         S: GetState + Send + Sync,
     {
+        let system_generation = node.entities.system_generation();
         // do not wait for all apply_delta futures to complete - we need to apply all updates in a timely fashion
         // if there are stragglers, they will be picked up on the next wake
         // this should in theory be deterministic for eventbridge cases where all events are immediately available
-        let mut ready_chunks =
-            ReadyChunks::new(deltas.into_iter().map(|delta| Self::apply_delta(node, from_peer_id, delta, event_getter, state_getter)));
+        let mut ready_chunks = ReadyChunks::new(
+            deltas.into_iter().map(|delta| Self::apply_delta(node, from_peer_id, delta, event_getter, state_getter, &system_generation)),
+        );
 
         let mut all_errors = Vec::new();
 
@@ -322,6 +363,7 @@ impl NodeApplier {
             }
 
             if !batch.is_empty() {
+                let _guard = node.system.guard_generation(&system_generation).await.map_err(ApplyError::from)?;
                 node.reactor.notify_change(batch).await;
             }
         }
@@ -341,6 +383,7 @@ impl NodeApplier {
         delta: proto::EntityDelta,
         event_getter: &E,
         state_getter: &S,
+        system_generation: &Arc<AtomicBool>,
     ) -> Result<Option<EntityChange>, ApplyErrorItem>
     where
         SE: StorageEngine + Send + Sync + 'static,
@@ -351,7 +394,7 @@ impl NodeApplier {
         let entity_id = delta.entity_id;
         let model = delta.model;
 
-        let result = Self::apply_delta_inner(node, from_peer_id, delta, event_getter, state_getter).await;
+        let result = Self::apply_delta_inner(node, from_peer_id, delta, event_getter, state_getter, system_generation).await;
         result.map_err(|cause| ApplyErrorItem { entity_id, model, cause })
     }
 
@@ -361,6 +404,7 @@ impl NodeApplier {
         delta: proto::EntityDelta,
         event_getter: &E,
         state_getter: &S,
+        system_generation: &Arc<AtomicBool>,
     ) -> Result<Option<EntityChange>, MutationError>
     where
         SE: StorageEngine + Send + Sync + 'static,
@@ -382,11 +426,18 @@ impl NodeApplier {
 
                 let (changed, entity) = node
                     .entities
-                    .with_state(state_getter, event_getter, delta.entity_id, collection_id, attested_state.payload.state)
+                    .with_state_in_generation(
+                        state_getter,
+                        event_getter,
+                        delta.entity_id,
+                        collection_id,
+                        attested_state.payload.state,
+                        system_generation.clone(),
+                    )
                     .await?;
 
                 // Save state to storage
-                Self::save_state(node, &entity, &collection, inherited_attestations).await?;
+                Self::save_state(node, &entity, &collection, inherited_attestations, system_generation).await?;
 
                 // Only notify if the snapshot actually advanced the entity. with_state
                 // returns Some(false) when the state did not apply (the entity is
@@ -412,7 +463,16 @@ impl NodeApplier {
                 let attested_events = Self::validate_and_stage(node, from_peer_id, delta.entity_id, delta.model, events, event_getter)?;
 
                 // Get or create entity
-                let entity = node.entities.get_retrieve_or_create(state_getter, event_getter, &collection_id, &delta.entity_id).await?;
+                let entity = node
+                    .entities
+                    .get_retrieve_or_create_in_generation(
+                        state_getter,
+                        event_getter,
+                        &collection_id,
+                        &delta.entity_id,
+                        system_generation.clone(),
+                    )
+                    .await?;
 
                 // Apply events parents-first. Wire order is untrusted: applying
                 // a child before its staged parent gap-jumps the head past the
@@ -425,11 +485,11 @@ impl NodeApplier {
                     if entity.apply_event(event_getter, &event.payload).await? {
                         applied_any = true;
                     }
-                    event_getter.commit_event(&event).await?;
+                    Self::commit_event_fenced(node, system_generation, event_getter, &event).await?;
                 }
 
                 // Save updated state
-                Self::save_state(node, &entity, &collection, proto::AttestationSet::default()).await?;
+                Self::save_state(node, &entity, &collection, proto::AttestationSet::default(), system_generation).await?;
 
                 // Only notify if the bridge actually advanced the entity. If every
                 // event was already applied (apply_event returned false for all), the

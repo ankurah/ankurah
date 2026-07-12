@@ -41,9 +41,16 @@ pub trait TContext {
     fn node_id(&self) -> proto::NodeId;
     /// The pinned system root id bound into every ordinary entity genesis.
     fn system_id(&self) -> Option<proto::EntityId>;
+    /// Resident/system generation captured by a transaction at begin time.
+    fn system_generation(&self) -> Arc<AtomicBool>;
     /// Create the writable pre-identity entity used to collect initial model
     /// values. It is not inserted into the resident set.
-    fn create_provisional_entity(&self, collection: proto::CollectionId, trx_alive: Arc<AtomicBool>) -> Entity;
+    fn create_provisional_entity(
+        &self,
+        collection: proto::CollectionId,
+        trx_alive: Arc<AtomicBool>,
+        system_generation: &Arc<AtomicBool>,
+    ) -> Result<Entity, MutationError>;
     /// Insert an empty resident primary under the genesis-derived id and return
     /// the transaction snapshot materialized at the genesis head.
     fn create_transaction_entity(
@@ -51,6 +58,7 @@ pub trait TContext {
         collection: proto::CollectionId,
         genesis: &Event,
         trx_alive: Arc<AtomicBool>,
+        system_generation: &Arc<AtomicBool>,
     ) -> Result<Entity, MutationError>;
     fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied>;
     async fn get_entity(&self, id: proto::EntityId, collection: &proto::CollectionId, cached: bool) -> Result<Entity, RetrievalError>;
@@ -66,7 +74,11 @@ pub trait TContext {
     /// exact compiled shape already has a compatible canonical binding. A
     /// never-registered collection, missing field, or incompatible field
     /// fails the write.
-    async fn ensure_registered(&self, schema: &'static crate::schema::ModelSchema) -> Result<(), MutationError>;
+    async fn ensure_registered(
+        &self,
+        schema: &'static crate::schema::ModelSchema,
+        system_generation: &Arc<AtomicBool>,
+    ) -> Result<(), MutationError>;
     /// Record a binary-known compiled schema for predicate first-use
     /// registration and unknown-collection classification. Object-safe so
     /// read paths (`get`/`fetch`/`query`) and the sync `edit` path can call it
@@ -85,16 +97,23 @@ pub trait TContext {
 impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> TContext for NodeAndContext<SE, PA> {
     fn node_id(&self) -> proto::NodeId { self.node.id }
     fn system_id(&self) -> Option<proto::EntityId> { self.node.system.root_id() }
-    fn create_provisional_entity(&self, collection: proto::CollectionId, trx_alive: Arc<AtomicBool>) -> Entity {
-        self.node.entities.create_provisional(collection, trx_alive)
+    fn system_generation(&self) -> Arc<AtomicBool> { self.node.entities.system_generation() }
+    fn create_provisional_entity(
+        &self,
+        collection: proto::CollectionId,
+        trx_alive: Arc<AtomicBool>,
+        system_generation: &Arc<AtomicBool>,
+    ) -> Result<Entity, MutationError> {
+        self.node.entities.create_provisional_in_generation(collection, trx_alive, system_generation)
     }
     fn create_transaction_entity(
         &self,
         collection: proto::CollectionId,
         genesis: &Event,
         trx_alive: Arc<AtomicBool>,
+        system_generation: &Arc<AtomicBool>,
     ) -> Result<Entity, MutationError> {
-        self.node.entities.create_transaction_entity(collection, genesis, trx_alive)
+        self.node.entities.create_transaction_entity_in_generation(collection, genesis, trx_alive, system_generation)
     }
     fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied> { self.node.policy_agent.check_write(&self.cdata, entity, None) }
     async fn get_entity(&self, id: proto::EntityId, collection: &proto::CollectionId, cached: bool) -> Result<Entity, RetrievalError> {
@@ -106,6 +125,10 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     }
     async fn commit_local_trx(&self, trx: &Transaction) -> Result<Vec<Event>, MutationError> {
         use std::sync::atomic::Ordering;
+
+        if !trx.system_generation.load(Ordering::Acquire) {
+            return Err(MutationError::SystemReset);
+        }
 
         // Atomically mark transaction as no longer alive, preventing double-commit.
         // compare_exchange returns Err if the value was already false (already committed/rolled back).
@@ -124,8 +147,15 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         // has a compatible canonical binding; otherwise the commit fails.
         let schemas = trx.schemas.read().unwrap().clone();
         for schema in schemas {
-            TContext::ensure_registered(self, schema).await?;
+            TContext::ensure_registered(self, schema, &trx.system_generation).await?;
         }
+
+        // Registration may await the network, so acquire the reset fence only
+        // after it completes. The exact transaction-generation check under
+        // the read guard catches any reset that happened meanwhile; holding
+        // the guard through persistence prevents a reset/delete from racing
+        // behind a successful check.
+        let system_generation_guard = self.node.system.guard_generation(&trx.system_generation).await?;
 
         // Resolve ordinary fields' transient uncommitted Name keys to their
         // property id now the catalog is warm (the PropertyKey amendment,
@@ -237,8 +267,15 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
                 entity.commit_head(Clock::new([last.payload.id()]));
             }
         }
+        // Do not hold reset hostage to an unresponsive peer. Everything
+        // durable so far is local and will be deleted if reset wins; release
+        // the fence for network relay, then re-acquire the exact generation
+        // before any post-relay state write.
+        drop(system_generation_guard);
         // Relay to peers and wait for confirmation
         self.node.relay_to_required_peers(&self.cdata, trx_id, &attested_events).await?;
+
+        let _post_relay_generation_guard = self.node.system.guard_generation(&trx.system_generation).await?;
 
         // All peers confirmed, persist state to storage
         let mut changes: Vec<EntityChange> = Vec::new();
@@ -281,8 +318,23 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
         self.node.system.collection(id).await
     }
-    async fn ensure_registered(&self, schema: &'static crate::schema::ModelSchema) -> Result<(), MutationError> {
-        if let Err(e) = self.node.catalog.ensure_registered(&self.node, &self.cdata, schema).await {
+    async fn ensure_registered(
+        &self,
+        schema: &'static crate::schema::ModelSchema,
+        system_generation: &Arc<AtomicBool>,
+    ) -> Result<(), MutationError> {
+        let registration = self.node.catalog.ensure_registered_in_generation(&self.node, &self.cdata, schema, system_generation).await;
+        // Recheck even when the round-trip itself failed: reset tears down
+        // pending requests, and that transport error must not mask the exact
+        // transaction-generation failure or be downgraded through a new
+        // generation's compatible map.
+        let _generation_guard = self.node.system.guard_generation(system_generation).await?;
+        if let Err(e) = registration {
+            // A stale operation must never use the new generation's fully
+            // bound map as grounds to downgrade SystemReset into a warning.
+            if matches!(&e, crate::schema::registration::RegistrationError::Mutation(MutationError::SystemReset)) {
+                return Err(MutationError::SystemReset);
+            }
             // An unavailable reassertion may proceed only when this exact
             // compiled shape can already resolve every field to a compatible
             // canonical definition. Otherwise an unregistered or incompatible
@@ -309,7 +361,10 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         &self,
         schema: &'static crate::schema::ModelSchema,
     ) -> Result<(), crate::schema::registration::RegistrationError> {
-        self.node.catalog.ensure_registered(&self.node, &self.cdata, schema).await
+        let generation = self.node.entities.system_generation();
+        let registration = self.node.catalog.ensure_registered_in_generation(&self.node, &self.cdata, schema, &generation).await;
+        let _generation_guard = self.node.system.guard_generation(&generation).await?;
+        registration
     }
 }
 
@@ -442,6 +497,7 @@ where
         cached: bool,
     ) -> Result<Entity, RetrievalError> {
         debug!("Node({}).get_entity {:?}-{:?}", self.node.id, id, collection_id);
+        let generation = self.node.entities.system_generation();
 
         if !self.node.durable {
             // Fetch from peers and commit first response
@@ -455,6 +511,9 @@ where
         }
 
         if let Some(local) = self.node.entities.get(&id) {
+            if !self.node.entities.is_current_generation(&generation) {
+                return Err(RetrievalError::MutationError(Box::new(MutationError::SystemReset)));
+            }
             debug!("Node({}).get_entity found local entity - returning", self.node.id);
             let state = local.to_state()?;
             let entity_id = local.id();
@@ -466,6 +525,9 @@ where
         let collection = self.node.collections.get(collection_id).await?;
         match collection.get_state(id).await {
             Ok(entity_state) => {
+                if !self.node.entities.is_current_generation(&generation) {
+                    return Err(RetrievalError::MutationError(Box::new(MutationError::SystemReset)));
+                }
                 self.node.policy_agent.check_read(
                     &self.cdata,
                     &entity_state.payload.entity_id,
@@ -478,7 +540,14 @@ where
                 let (_changed, entity) = self
                     .node
                     .entities
-                    .with_state(&state_getter, &event_getter, id, collection_id.clone(), entity_state.payload.state)
+                    .with_state_in_generation(
+                        &state_getter,
+                        &event_getter,
+                        id,
+                        collection_id.clone(),
+                        entity_state.payload.state,
+                        generation,
+                    )
                     .await?;
                 Ok(entity)
             }
@@ -487,6 +556,7 @@ where
     }
     /// Fetch a list of entities based on a selection
     pub async fn fetch_entities(&self, collection_id: &CollectionId, mut args: MatchArgs) -> Result<Vec<Entity>, RetrievalError> {
+        let generation = self.node.entities.system_generation();
         self.node.policy_agent.can_access_collection(&self.cdata, collection_id)?;
         // Fetch raw states from storage
 
@@ -504,7 +574,7 @@ where
         args.selection = self
             .node
             .catalog
-            .resolve_selection_deferred(&self.node, Some(&self.cdata), collection_id, &args.selection)
+            .resolve_selection_deferred_in_generation(&self.node, Some(&self.cdata), collection_id, &args.selection, &generation)
             .await
             .map_err(RetrievalError::from)?;
 
@@ -514,7 +584,11 @@ where
         // TODO implement cached: true
         if !self.node.durable {
             // Fetch from peers and commit first response
-            Ok(self.fetch_from_peer(collection_id, args.selection).await?)
+            let entities = self.fetch_from_peer(collection_id, args.selection).await?;
+            if !self.node.entities.is_current_generation(&generation) {
+                return Err(RetrievalError::MutationError(Box::new(MutationError::SystemReset)));
+            }
+            Ok(entities)
         } else {
             let storage_collection = self.node.collections.get(collection_id).await?;
             let states = storage_collection.fetch_states(&args.selection).await?;
@@ -527,9 +601,19 @@ where
                 let (_, entity) = self
                     .node
                     .entities
-                    .with_state(&state_getter, &event_getter, state.payload.entity_id, collection_id.clone(), state.payload.state)
+                    .with_state_in_generation(
+                        &state_getter,
+                        &event_getter,
+                        state.payload.entity_id,
+                        collection_id.clone(),
+                        state.payload.state,
+                        generation.clone(),
+                    )
                     .await?;
                 entities.push(entity);
+            }
+            if !self.node.entities.is_current_generation(&generation) {
+                return Err(RetrievalError::MutationError(Box::new(MutationError::SystemReset)));
             }
             Ok(entities)
         }

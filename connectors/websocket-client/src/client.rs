@@ -18,7 +18,12 @@ use std::{
 };
 use strum::Display;
 use thiserror::Error;
-use tokio::{select, sync::Notify, task::JoinHandle, time::sleep};
+use tokio::{
+    select,
+    sync::{watch, Notify},
+    task::JoinHandle,
+    time::sleep,
+};
 use tokio_tungstenite::{
     connect_async_tls_with_config,
     tungstenite::{client::IntoClientRequest, protocol::WebSocketConfig, Message},
@@ -101,6 +106,62 @@ pub enum ConnectionError {
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+struct ConnectionAttempt {
+    result: Result<()>,
+    established: bool,
+    terminal: bool,
+}
+
+/// Synchronous teardown for a peer registration owned by one transport
+/// attempt. Tokio task cancellation drops locals but does not run code after
+/// the cancelled await, so explicit cleanup alone is insufficient for
+/// `WebsocketClient::drop` and competing shutdown selects.
+struct PeerSessionCleanup(Option<Box<dyn FnOnce() + Send>>);
+
+impl PeerSessionCleanup {
+    fn new(cleanup: impl FnOnce() + Send + 'static) -> Self { Self(Some(Box::new(cleanup))) }
+}
+
+impl Drop for PeerSessionCleanup {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.0.take() {
+            cleanup();
+        }
+    }
+}
+
+/// Select this attempt's retry delay and advance the accumulated backoff.
+/// A peer that completed authentication proved the endpoint was healthy, so
+/// a later disconnect starts a fresh backoff series rather than inheriting
+/// failures from before that successful session.
+fn retry_delay(backoff: &mut Duration, established: bool) -> Duration {
+    if established {
+        *backoff = INITIAL_BACKOFF;
+    }
+    let delay = *backoff;
+    *backoff = (*backoff * 2).min(MAX_BACKOFF);
+    delay
+}
+
+fn outgoing_message_or_error(msg: Option<proto::SignedPeerMessage>) -> Result<proto::SignedPeerMessage> {
+    msg.ok_or_else(|| anyhow!("registered peer's outbound websocket channel closed"))
+}
+
+async fn wait_for_sender_close(close_rx: &mut Option<watch::Receiver<bool>>) {
+    let Some(close_rx) = close_rx else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    loop {
+        if *close_rx.borrow_and_update() {
+            return;
+        }
+        if close_rx.changed().await.is_err() {
+            return;
+        }
+    }
+}
 
 struct Inner<SE, PA>
 where
@@ -234,9 +295,13 @@ where
                     info!("Websocket connection shutting down");
                     break;
                 }
-                result = Self::connect_once(&inner) => {
-                    match result {
+                attempt = Self::connect_once(&inner) => {
+                    match attempt.result {
                         Ok(()) => {
+                            if attempt.terminal {
+                                info!("Peer registration closed {}; stopping this connector", inner.server_url);
+                                break;
+                            }
                             info!("Connection to {} completed normally", inner.server_url);
                             backoff = INITIAL_BACKOFF;
                             if inner.shutdown_requested.load(Ordering::Acquire) {
@@ -245,16 +310,20 @@ where
                             }
                         }
                         Err(e) => {
+                            if inner.shutdown_requested.load(Ordering::Acquire) {
+                                info!("Connection attempt ended during shutdown: {}", e);
+                                break;
+                            }
                             error!("Connection to {} failed: {}", inner.server_url, e);
                             inner.connection_state.set(ConnectionState::Error(ConnectionError::General(e.to_string())));
                             inner.connected.store(false, Ordering::Release);
 
-                            info!("Retrying connection in {:?}", backoff);
+                            let delay = retry_delay(&mut backoff, attempt.established);
+                            info!("Retrying connection in {:?}", delay);
                             select! {
                                 _ = inner.shutdown.notified() => break,
-                                _ = sleep(backoff) => {}
+                                _ = sleep(delay) => {}
                             }
-                            backoff = (backoff * 2).min(MAX_BACKOFF);
                         }
                     }
                 }
@@ -266,7 +335,14 @@ where
     }
 
     /// Attempt a single connection
-    async fn connect_once(inner: &Arc<Inner<SE, PA>>) -> Result<()> {
+    async fn connect_once(inner: &Arc<Inner<SE, PA>>) -> ConnectionAttempt {
+        let mut established = false;
+        let mut terminal = false;
+        let result = Self::connect_once_inner(inner, &mut established, &mut terminal).await;
+        ConnectionAttempt { result, established, terminal }
+    }
+
+    async fn connect_once_inner(inner: &Arc<Inner<SE, PA>>, established: &mut bool, terminal: &mut bool) -> Result<()> {
         info!("Attempting to connect to {}", inner.server_url);
         inner.connection_state.set(ConnectionState::Connecting { url: inner.server_url.clone() });
 
@@ -287,11 +363,20 @@ where
         let mut outgoing_rx: Option<tokio::sync::mpsc::UnboundedReceiver<proto::SignedPeerMessage>> = None;
         let mut handshake = Some(handshake);
         let mut outgoing_session = None;
+        let mut sender_close_rx = None;
+        let mut session_cleanup = None;
 
         let connection_result: Result<()> = loop {
             select! {
+                biased;
                 _ = inner.shutdown.notified() => {
                     debug!("Connection received shutdown signal");
+                    break Ok(());
+                }
+                _ = wait_for_sender_close(&mut sender_close_rx) => {
+                    debug!("Peer registration requested websocket transport close");
+                    *terminal = true;
+                    let _ = tokio::time::timeout(Duration::from_millis(100), sink.send(Message::Close(None))).await;
                     break Ok(());
                 }
                 msg = async {
@@ -300,22 +385,33 @@ where
                         None => std::future::pending().await,
                     }
                 } => {
-                    if Self::handle_outgoing_message(&mut sink, msg).await.is_err() {
-                        break Ok(());
+                    if let Err(error) = Self::handle_outgoing_message(&mut sink, msg).await {
+                        break Err(error);
                     }
                 }
                 msg = stream.next() => {
-                    match Self::handle_incoming_message(
+                    let result = Self::handle_incoming_message(
                         inner,
                         msg,
                         &mut peer_sender,
                         &mut outgoing_rx,
                         &mut handshake,
                         &mut outgoing_session,
+                        &mut sender_close_rx,
                         &mut sink,
-                    ).await {
+                    ).await;
+                    if session_cleanup.is_none() {
+                        if let Some(sender) = peer_sender.as_ref() {
+                            let node = inner.node.clone();
+                            let peer_id = sender.recipient_node_id();
+                            session_cleanup = Some(PeerSessionCleanup::new(move || {
+                                let removed = node.deregister_peer_session(peer_id, incoming_session);
+                                debug!("{} peer session {}", if removed { "Deregistered" } else { "Ignored stale close for" }, peer_id);
+                            }));
+                        }
+                    }
+                    match result {
                         Ok(MessageResult::Continue) => continue,
-                        Ok(MessageResult::Break) => break Ok(()),
                         Err(error) => break Err(error),
                     }
                 }
@@ -323,11 +419,8 @@ where
         };
 
         // Cleanup
+        *established = session_cleanup.is_some();
         inner.connected.store(false, Ordering::Release);
-        if let Some(sender) = peer_sender {
-            let removed = inner.node.deregister_peer_session(sender.recipient_node_id(), incoming_session);
-            debug!("{} peer session {}", if removed { "Deregistered" } else { "Ignored stale close for" }, sender.recipient_node_id());
-        }
         connection_result
     }
 
@@ -338,15 +431,10 @@ where
         >,
         msg: Option<proto::SignedPeerMessage>,
     ) -> Result<()> {
-        if let Some(node_message) = msg {
-            let proto_message = proto::Message::PeerMessage(node_message);
-            match proto::encode_message(&proto_message) {
-                Ok(data) => {
-                    sink.send(Message::Binary(data.into())).await?;
-                }
-                Err(e) => error!("Failed to serialize outgoing message: {}", e),
-            }
-        }
+        let node_message = outgoing_message_or_error(msg)?;
+        let proto_message = proto::Message::PeerMessage(node_message);
+        let data = proto::encode_message(&proto_message)?;
+        sink.send(Message::Binary(data.into())).await?;
         Ok(())
     }
 
@@ -357,6 +445,7 @@ where
         outgoing_rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<proto::SignedPeerMessage>>,
         handshake: &mut Option<PeerHandshake>,
         outgoing_session: &mut Option<proto::HandshakeChallenge>,
+        sender_close_rx: &mut Option<watch::Receiver<bool>>,
         sink: &mut futures_util::stream::SplitSink<
             tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
             Message,
@@ -367,7 +456,7 @@ where
                 Ok(proto::Message::HandshakeChallenge(challenge)) => {
                     if outgoing_session.is_some() || peer_sender.is_some() {
                         warn!("Received duplicate or out-of-order handshake challenge from {}; closing", inner.server_url);
-                        return Ok(MessageResult::Break);
+                        return Err(anyhow!("server {} sent duplicate or out-of-order handshake challenge", inner.server_url));
                     }
                     *outgoing_session = Some(challenge);
                     let presence = proto::Message::Presence(inner.node.presence(challenge));
@@ -381,12 +470,21 @@ where
                     };
                     if peer_sender.is_some() {
                         warn!("Received out-of-order or duplicate server Presence from {}; closing", inner.server_url);
-                        return Ok(MessageResult::Break);
+                        return Err(anyhow!("server {} sent duplicate or out-of-order Presence", inner.server_url));
                     }
                     let Some(handshake) = handshake.take() else {
                         return Err(anyhow::anyhow!("refused duplicate server Presence"));
                     };
-                    match Self::handle_server_presence(inner, server_presence, handshake, outgoing_session, peer_sender, outgoing_rx).await
+                    match Self::handle_server_presence(
+                        inner,
+                        server_presence,
+                        handshake,
+                        outgoing_session,
+                        peer_sender,
+                        outgoing_rx,
+                        sender_close_rx,
+                    )
+                    .await
                     {
                         Ok(()) => Ok(MessageResult::Continue),
                         Err(proto::PresenceRefusal::IncompatibleVersion(rejection)) => {
@@ -423,12 +521,12 @@ where
                             Ok(()) => Ok(MessageResult::Continue),
                             Err(error) => {
                                 warn!("Rejecting authenticated peer frame from {}: {}; closing", inner.server_url, error);
-                                Ok(MessageResult::Break)
+                                Err(anyhow!("authenticated peer frame from {} was rejected: {}", inner.server_url, error))
                             }
                         }
                     } else {
                         warn!("Received peer message from {} before its Presence was authenticated", inner.server_url);
-                        Ok(MessageResult::Break)
+                        Err(anyhow!("server {} sent a peer frame before authenticating its Presence", inner.server_url))
                     }
                 }
                 Err(e) => {
@@ -441,13 +539,12 @@ where
                             return Err(anyhow!("failed to deserialize handshake message from {}: {}", inner.server_url, e));
                         }
                     }
-                    warn!("Failed to deserialize message: {}", e);
-                    Ok(MessageResult::Continue)
+                    Err(anyhow!("failed to exactly decode established frame from {}: {}", inner.server_url, e))
                 }
             },
             Some(Ok(Message::Close(_))) => {
                 info!("WebSocket connection closed by server");
-                Ok(MessageResult::Break)
+                Err(anyhow!("server {} closed the websocket connection", inner.server_url))
             }
             Some(Ok(Message::Ping(data))) => {
                 debug!("Received ping, sending pong");
@@ -462,12 +559,12 @@ where
                 Ok(MessageResult::Continue)
             }
             Some(Ok(Message::Text(text))) => {
-                debug!("Received unexpected text message: {}", text);
-                Ok(MessageResult::Continue)
+                warn!("Received unsupported application text frame ({} bytes) from {}; closing", text.len(), inner.server_url);
+                Err(anyhow!("server {} sent an unsupported application text frame", inner.server_url))
             }
             Some(Ok(_)) => {
-                debug!("Received other message type");
-                Ok(MessageResult::Continue)
+                warn!("Received unsupported websocket application frame from {}; closing", inner.server_url);
+                Err(anyhow!("server {} sent an unsupported websocket application frame", inner.server_url))
             }
             Some(Err(e)) => {
                 error!("WebSocket error: {}", e);
@@ -475,7 +572,7 @@ where
             }
             None => {
                 info!("WebSocket stream closed");
-                Ok(MessageResult::Break)
+                Err(anyhow!("websocket stream from {} ended unexpectedly", inner.server_url))
             }
         }
     }
@@ -487,13 +584,15 @@ where
         outgoing_session: proto::HandshakeChallenge,
         peer_sender: &mut Option<WebsocketPeerSender>,
         outgoing_rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<proto::SignedPeerMessage>>,
+        sender_close_rx: &mut Option<watch::Receiver<bool>>,
     ) -> std::result::Result<(), proto::PresenceRefusal> {
         info!("Received server presence: {}", server_presence.node_id);
 
-        let (sender, rx) = WebsocketPeerSender::new(server_presence.node_id);
+        let (sender, rx, close_rx) = WebsocketPeerSender::new(server_presence.node_id);
         inner.node.register_peer(server_presence.clone(), handshake, outgoing_session, Box::new(sender.clone()))?;
 
         *outgoing_rx = Some(rx);
+        *sender_close_rx = Some(close_rx);
         *peer_sender = Some(sender);
 
         inner.connection_state.set(ConnectionState::Connected { url: inner.server_url.to_string(), server_presence });
@@ -519,7 +618,30 @@ where
 #[derive(Debug)]
 enum MessageResult {
     Continue,
-    Break,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn established_session_starts_a_fresh_retry_series() {
+        let mut backoff = INITIAL_BACKOFF;
+        assert_eq!(retry_delay(&mut backoff, false), Duration::from_secs(1));
+        assert_eq!(retry_delay(&mut backoff, false), Duration::from_secs(2));
+        assert_eq!(retry_delay(&mut backoff, false), Duration::from_secs(4));
+
+        // Authentication resets accumulated failures, but the disconnect
+        // still observes the initial delay rather than hot-reconnecting.
+        assert_eq!(retry_delay(&mut backoff, true), INITIAL_BACKOFF);
+        assert_eq!(retry_delay(&mut backoff, false), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn closed_outbound_channel_is_a_connection_error() {
+        let error = outgoing_message_or_error(None).expect_err("closed peer channel must tear down its transport");
+        assert!(error.to_string().contains("outbound websocket channel closed"));
+    }
 }
 
 impl<SE, PA> Drop for WebsocketClient<SE, PA>

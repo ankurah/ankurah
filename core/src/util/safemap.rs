@@ -36,6 +36,8 @@ impl<K: Hash + Eq, V> SafeMap<K, V> {
 
     pub fn drain_values(&self) -> Vec<V> { self.0.write().expect("Failed to lock the map").drain().map(|(_, value)| value).collect() }
 
+    pub fn drain(&self) -> Vec<(K, V)> { self.0.write().expect("Failed to lock the map").drain().collect() }
+
     pub fn contains_key(&self, key: &K) -> bool { self.0.read().expect("Failed to lock the map").contains_key(key) }
 }
 

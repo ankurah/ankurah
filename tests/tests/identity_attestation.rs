@@ -190,6 +190,8 @@ struct NullSender {
 impl PeerSender for NullSender {
     fn send_message(&self, _message: proto::SignedPeerMessage) -> Result<(), SendError> { Ok(()) }
 
+    fn close(&self) {}
+
     fn recipient_node_id(&self) -> proto::NodeId { self.recipient }
 
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }

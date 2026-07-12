@@ -124,19 +124,29 @@ where
         return;
     }
 
-    while let Some(msg) = receiver.next().await {
-        if let Ok(msg) = msg {
-            if process_message(msg, client_ip, &mut conn, node.clone()).await.is_break() {
+    loop {
+        tokio::select! {
+            biased;
+            _ = conn.close_requested() => {
+                debug!("Peer registration requested websocket transport close for {client_ip}");
                 break;
             }
-        } else {
-            debug!("client {client_ip} abruptly disconnected");
-            break;
+            msg = receiver.next() => {
+                let Some(msg) = msg else { break; };
+                if let Ok(msg) = msg {
+                    if process_message(msg, client_ip, &mut conn, node.clone()).await.is_break() {
+                        break;
+                    }
+                } else {
+                    debug!("client {client_ip} abruptly disconnected");
+                    break;
+                }
+            }
         }
     }
 
     // Clean up peer registration if we had registered one
-    if let Connection::Established { peer_sender, incoming_session } = conn {
+    if let Connection::Established { peer_sender, incoming_session, .. } = conn {
         use ankurah_core::connector::PeerSender;
         node.deregister_peer_session(peer_sender.recipient_node_id(), incoming_session);
     }
@@ -198,10 +208,10 @@ where
 
                                     use super::sender::WebSocketClientSender;
                                     // Register peer sender for this client
-                                    let sender = WebSocketClientSender::new(presence.node_id, sender);
+                                    let (sender, close_rx) = WebSocketClientSender::new(presence.node_id, sender);
 
                                     match node.register_peer(presence, handshake, outgoing_session, Box::new(sender.clone())) {
-                                        Ok(()) => *state = Connection::Established { peer_sender: sender, incoming_session },
+                                        Ok(()) => *state = Connection::Established { peer_sender: sender, close_rx, incoming_session },
                                         Err(proto::PresenceRefusal::IncompatibleVersion(rejection)) => {
                                             warn!("Refusing peer at {client_ip}: {rejection}");
                                             let _ = sender.send_message(proto::Message::PresenceRejected(rejection));
@@ -266,11 +276,17 @@ where
                 }
                 return ControlFlow::Break(());
             } else {
-                error!("Failed to deserialize message from {}", client_ip);
+                // Exact decoding is a framing invariant for the entire
+                // authenticated session. Continuing after malformed or
+                // trailing bytes would let an established peer probe parser
+                // differentials without losing its authority.
+                error!("Failed to exactly decode established message from {client_ip}; closing");
+                return ControlFlow::Break(());
             }
         }
         axum::extract::ws::Message::Text(t) => {
-            debug!(">>> {client_ip} sent str: {t:?}");
+            warn!(">>> {client_ip} sent unsupported application text frame ({} bytes); closing", t.len());
+            return ControlFlow::Break(());
         }
         axum::extract::ws::Message::Close(c) => {
             if let Some(cf) = c {

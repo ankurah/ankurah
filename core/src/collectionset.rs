@@ -1,6 +1,9 @@
 use std::{
     collections::{btree_map::Entry, BTreeMap},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, OnceLock, Weak,
+    },
 };
 
 use ankurah_proto::{CollectionId, SystemRootProof};
@@ -20,10 +23,78 @@ impl<SE> Clone for CollectionSet<SE> {
 pub struct Inner<SE> {
     storage_engine: Arc<SE>,
     collections: RwLock<BTreeMap<CollectionId, StorageCollectionWrapper>>,
+    storage_fence: Arc<StorageFence>,
+}
+
+/// Process-wide lease shared by every Node constructed from the exact same
+/// `Arc<StorageEngine>`. A SystemManager-local lock cannot protect an engine
+/// shared by two independently-built Nodes: one node's paused load could
+/// otherwise resume after another node reset the engine and recreate old-root
+/// rows. The weak registry preserves backend generality and cannot alias a
+/// reused allocation address while the prior engine/fence is still alive.
+struct StorageFence {
+    gate: Arc<tokio::sync::RwLock<()>>,
+    epoch: AtomicU64,
+    generation: std::sync::RwLock<Arc<std::sync::atomic::AtomicBool>>,
+    epoch_changed: Arc<tokio::sync::Notify>,
+}
+
+fn shared_storage_fence<SE>(storage_engine: &Arc<SE>) -> Arc<StorageFence> {
+    static REGISTRY: OnceLock<Mutex<std::collections::HashMap<usize, Weak<StorageFence>>>> = OnceLock::new();
+    let key = Arc::as_ptr(storage_engine).cast::<()>() as usize;
+    let mut registry = REGISTRY.get_or_init(|| Mutex::new(std::collections::HashMap::new())).lock().unwrap();
+    if let Some(fence) = registry.get(&key).and_then(Weak::upgrade) {
+        return fence;
+    }
+    let fence = Arc::new(StorageFence {
+        gate: Arc::new(tokio::sync::RwLock::new(())),
+        epoch: AtomicU64::new(0),
+        generation: std::sync::RwLock::new(Arc::new(std::sync::atomic::AtomicBool::new(true))),
+        epoch_changed: Arc::new(tokio::sync::Notify::new()),
+    });
+    registry.insert(key, Arc::downgrade(&fence));
+    fence
 }
 
 impl<SE: StorageEngine> CollectionSet<SE> {
-    pub fn new(storage_engine: Arc<SE>) -> Self { Self(Arc::new(Inner { storage_engine, collections: RwLock::new(BTreeMap::new()) })) }
+    pub fn new(storage_engine: Arc<SE>) -> Self {
+        let storage_fence = shared_storage_fence(&storage_engine);
+        Self(Arc::new(Inner { storage_engine, collections: RwLock::new(BTreeMap::new()), storage_fence }))
+    }
+
+    pub(crate) fn storage_epoch(&self) -> u64 { self.0.storage_fence.epoch.load(Ordering::Acquire) }
+
+    pub(crate) fn storage_generation(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.0.storage_fence.generation.read().unwrap().clone()
+    }
+
+    pub(crate) async fn storage_read_lease(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        self.0.storage_fence.gate.clone().read_owned().await
+    }
+
+    pub(crate) async fn storage_write_lease(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        self.0.storage_fence.gate.clone().write_owned().await
+    }
+
+    pub(crate) fn storage_epoch_notify(&self) -> Arc<tokio::sync::Notify> { self.0.storage_fence.epoch_changed.clone() }
+
+    /// Advance only while holding the shared write lease.
+    pub(crate) fn advance_storage_epoch(&self) -> (u64, Arc<std::sync::atomic::AtomicBool>) {
+        let fresh_generation = {
+            let mut generation = self.0.storage_fence.generation.write().unwrap();
+            generation.store(false, Ordering::Release);
+            let fresh = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            *generation = fresh.clone();
+            fresh
+        };
+        let epoch = self.0.storage_fence.epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        (epoch, fresh_generation)
+    }
+
+    /// Publish after the resetting manager has rebound itself to the fresh
+    /// generation, so its own readiness waiter cannot mistake the brief
+    /// epoch/binding handoff for permanent sibling staleness.
+    pub(crate) fn publish_storage_epoch(&self) { self.0.storage_fence.epoch_changed.notify_waiters(); }
 
     pub async fn get(&self, id: &CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
         // The `_ankurah_` prefix is reserved for the system and catalog

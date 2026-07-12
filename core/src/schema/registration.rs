@@ -30,7 +30,10 @@
 //! pair, refuses the registration loudly. Changing a canonical type is a
 //! deliberate migration (#303), never a model-struct edit.
 
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    sync::{atomic::AtomicBool, Arc},
+};
 
 use ankurah_proto::{
     self as proto, Attested, CollectionId, EntityId, MembershipDescriptor, ModelDescriptor, PropertyDescriptor, PropertyRef,
@@ -99,6 +102,18 @@ where
         properties: Vec<PropertyDescriptor>,
         memberships: Vec<MembershipDescriptor>,
     ) -> Result<RegisteredDefs, RegistrationError> {
+        let system_generation = self.entities.system_generation();
+        self.execute_schema_registration_in_generation(cdata, models, properties, memberships, &system_generation).await
+    }
+
+    pub(crate) async fn execute_schema_registration_in_generation(
+        &self,
+        cdata: &PA::ContextData,
+        models: Vec<ModelDescriptor>,
+        properties: Vec<PropertyDescriptor>,
+        memberships: Vec<MembershipDescriptor>,
+        system_generation: &Arc<AtomicBool>,
+    ) -> Result<RegisteredDefs, RegistrationError> {
         if !self.durable {
             return Err(RegistrationError::NotDurable);
         }
@@ -135,7 +150,7 @@ where
         // storage before minting (see the *_lookup_checked helpers), so a
         // lagging or cold map (partial-commit abort skipped the fold, or a
         // lazily-warming engine, #310) can never fork identity.
-        self.catalog.wait_catalog_ready().await;
+        self.catalog.wait_catalog_ready_in_generation(self, system_generation).await?;
 
         // RFC 5.1 executor discipline: the whole upsert -- lookups,
         // allocation, commit, and the synchronous map update -- serializes
@@ -171,7 +186,7 @@ where
                     plan.existing.push(id);
                     (id, name)
                 }
-                None => match self.model_lookup_checked(&m.collection).await? {
+                None => match self.model_lookup_checked(&m.collection, system_generation).await? {
                     Some(def) => {
                         // Display names follow the most recent registration
                         // (plan decision 18); emit only on difference.
@@ -218,7 +233,7 @@ where
                 let c: &str = $collection;
                 match model_ids.get(c) {
                     Some(id) => *id,
-                    None => match self.model_lookup_checked(c).await? {
+                    None => match self.model_lookup_checked(c, system_generation).await? {
                         Some(def) => {
                             model_ids.insert(c.to_string(), def.id);
                             def.id
@@ -300,13 +315,13 @@ where
                 None => None,
             };
 
-            let current = self.property_lookup_checked(&scope, &p.name).await?;
+            let current = self.property_lookup_checked(&scope, &p.name, system_generation).await?;
 
             // RFC 5.8 rename-hint pre-pass, GUARDED: only when the
             // current-name lookup misses and the hinted lookup hits. The
             // hint is an ordinary name follow-up; the property keeps its id.
             let renamed = match (&current, &p.renamed_from) {
-                (None, Some(old)) => self.property_lookup_checked(&scope, old).await?,
+                (None, Some(old)) => self.property_lookup_checked(&scope, old, system_generation).await?,
                 _ => None,
             };
 
@@ -419,7 +434,7 @@ where
             let model_id = match model_ids.get(&ms.collection) {
                 Some(id) => *id,
                 None => self
-                    .model_lookup_checked(&ms.collection)
+                    .model_lookup_checked(&ms.collection, system_generation)
                     .await?
                     .map(|def| def.id)
                     .ok_or_else(|| RegistrationError::UnknownMintingCollection(ms.collection.clone()))?,
@@ -449,7 +464,7 @@ where
             }
             membership_seen.push((model_id, property_id));
 
-            let membership_id = match self.membership_lookup_checked(&model_id, &property_id).await? {
+            let membership_id = match self.membership_lookup_checked(&model_id, &property_id, system_generation).await? {
                 Some(def) => {
                     if def.optional != Some(ms.optional) {
                         let (_, head) = self
@@ -492,6 +507,7 @@ where
         // nothing to gate, nothing to commit, nothing to relay -- but the
         // requester still gets the full resolved definitions.
         if plan.is_noop() {
+            let _guard = self.system.guard_generation(system_generation).await?;
             return Ok((out_models, out_properties, out_memberships));
         }
 
@@ -509,11 +525,12 @@ where
 
         // The ordinary remote-commit pipeline: policy check (check_event),
         // attest, persist, apply, reactor notify.
-        self.commit_remote_transaction(cdata, TransactionId::new(), events).await?;
+        self.commit_remote_transaction_in_generation(cdata, TransactionId::new(), events, system_generation).await?;
 
         // Synchronous map upsert BEFORE the allocator mutex releases: the
         // next registration in line must observe these allocations even if
         // the reactor has not delivered them yet (RFC 5.1).
+        let _guard = self.system.guard_generation(system_generation).await?;
         self.catalog.upsert_registered(&out_models, &out_properties, &out_memberships);
 
         Ok((out_models, out_properties, out_memberships))
@@ -527,7 +544,11 @@ where
     /// is folded into the map so the rest of the request (and the next one)
     /// sees it; ordinary first sightings miss both and pay one bounded
     /// fetch under the allocator mutex.
-    async fn model_lookup_checked(&self, collection: &str) -> Result<Option<super::catalog::ModelDef>, RetrievalError> {
+    async fn model_lookup_checked(
+        &self,
+        collection: &str,
+        system_generation: &Arc<AtomicBool>,
+    ) -> Result<Option<super::catalog::ModelDef>, RegistrationError> {
         if let Some(def) = self.catalog.model_by_collection(collection) {
             return Ok(Some(def));
         }
@@ -539,6 +560,7 @@ where
             collection: collection.to_string(),
             name: string_field(&values, "name").unwrap_or_else(|| collection.to_string()),
         };
+        let _guard = self.system.guard_generation(system_generation).await?;
         self.catalog.upsert_registered(
             &[RegisteredModel { id: def.id, collection: def.collection.clone(), name: def.name.clone() }],
             &[],
@@ -550,7 +572,12 @@ where
     /// Allocator lookup for a property by its full key (model, name,
     /// backend, value_type): map first, storage on a miss (see
     /// [`Self::model_lookup_checked`]).
-    async fn property_lookup_checked(&self, model: &EntityId, name: &str) -> Result<Option<super::catalog::PropertyDef>, RetrievalError> {
+    async fn property_lookup_checked(
+        &self,
+        model: &EntityId,
+        name: &str,
+        system_generation: &Arc<AtomicBool>,
+    ) -> Result<Option<super::catalog::PropertyDef>, RegistrationError> {
         if let Some(def) = self.catalog.property_by_name(model, name) {
             return Ok(Some(def));
         }
@@ -569,6 +596,7 @@ where
             value_type: string_field(&values, "value_type").unwrap_or_default(),
             target_model: entity_id_field(&values, "target_model"),
         };
+        let _guard = self.system.guard_generation(system_generation).await?;
         self.catalog.upsert_registered(
             &[],
             &[RegisteredProperty {
@@ -590,7 +618,8 @@ where
         &self,
         model: &EntityId,
         property: &EntityId,
-    ) -> Result<Option<super::catalog::MembershipDef>, RetrievalError> {
+        system_generation: &Arc<AtomicBool>,
+    ) -> Result<Option<super::catalog::MembershipDef>, RegistrationError> {
         if let Some(def) = self.catalog.membership(model, property) {
             return Ok(Some(def));
         }
@@ -604,6 +633,7 @@ where
         // optional (never defaulted, catalog.rs MembershipDef), and the
         // executor's diff arm emits the repairing follow-up either way.
         if let Some(optional) = optional {
+            let _guard = self.system.guard_generation(system_generation).await?;
             self.catalog.upsert_registered(&[], &[], &[RegisteredMembership { id: def.id, model: *model, property: *property, optional }]);
         }
         Ok(Some(def))

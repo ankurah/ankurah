@@ -53,10 +53,14 @@ impl NodeId {
 
     /// Verify `signature` over `message` under this node's key.
     pub fn verify(&self, message: &[u8], signature: &crate::Signature) -> bool {
-        use ed25519_dalek::Verifier;
         match self.verifying_key() {
-            Ok(key) => key.verify(message, &ed25519_dalek::Signature::from_bytes(&signature.0)).is_ok(),
+            // `verify_strict` rejects both weak public keys and small-order R
+            // components. Keep the explicit key check as a local invariant:
+            // a deserialized NodeId must never authenticate as a low-order
+            // curve point, even if dalek's verification internals change.
+            Ok(key) if !key.is_weak() => key.verify_strict(message, &ed25519_dalek::Signature::from_bytes(&signature.0)).is_ok(),
             Err(_) => false,
+            Ok(_) => false,
         }
     }
 }
@@ -277,5 +281,44 @@ mod tests {
 
         // Bytes that are not a curve point verify nothing.
         assert!(!NodeId::from_bytes([0xFFu8; 32]).verify(b"hello", &sig));
+    }
+
+    #[test]
+    fn strict_verification_rejects_cross_message_small_order_forgery() {
+        use ed25519_dalek::Verifier;
+
+        // Deterministic low-order forgery: A is the Edwards identity, S=1,
+        // and R=B. The legacy/cofactored verification equation accepts this
+        // same signature for every message because [k]A is always zero.
+        let mut weak_key_bytes = [0u8; 32];
+        weak_key_bytes[0] = 1;
+        let weak_key = ed25519_dalek::VerifyingKey::from_bytes(&weak_key_bytes).expect("identity point is encoded canonically");
+        assert!(weak_key.is_weak());
+
+        let mut forged_signature_bytes = [0x66u8; 64];
+        forged_signature_bytes[0] = 0x58; // compressed Edwards basepoint R
+        forged_signature_bytes[32..].fill(0);
+        forged_signature_bytes[32] = 1; // canonical scalar S=1
+        let forged_dalek_signature = ed25519_dalek::Signature::from_bytes(&forged_signature_bytes);
+
+        let first = b"transfer 1 unit";
+        let second = b"transfer 1000000 units";
+        assert!(weak_key.verify(first, &forged_dalek_signature).is_ok(), "vector must demonstrate the legacy forgery");
+        assert!(weak_key.verify(second, &forged_dalek_signature).is_ok(), "one signature must forge a second message");
+
+        let node_id = NodeId::from_bytes(weak_key_bytes);
+        let forged_signature = Signature::from_bytes(forged_signature_bytes);
+        assert!(!node_id.verify(first, &forged_signature));
+        assert!(!node_id.verify(second, &forged_signature));
+
+        // Strict verification continues to accept ordinary deterministic
+        // keys and signatures.
+        use ed25519_dalek::Signer;
+        let normal_key = ed25519_dalek::SigningKey::from_bytes(&[0xA7; 32]);
+        let normal_node = NodeId::from(normal_key.verifying_key());
+        let normal_signature: Signature = normal_key.sign(first).into();
+        assert!(!normal_key.verifying_key().is_weak());
+        assert!(normal_node.verify(first, &normal_signature));
+        assert!(!normal_node.verify(second, &normal_signature));
     }
 }

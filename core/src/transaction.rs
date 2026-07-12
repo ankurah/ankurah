@@ -27,6 +27,10 @@ pub struct Transaction {
     pub(crate) id: proto::TransactionId,
     pub(crate) entities: AppendOnlyVec<Entity>,
     pub(crate) alive: Arc<AtomicBool>,
+    /// Exact resident/system generation in which `Context::begin` ran.
+    /// Reset flips this token before deleting storage; every transaction entry
+    /// point checks it and commit validates it again under the reset gate.
+    pub(crate) system_generation: Arc<AtomicBool>,
     /// Genesis events frozen eagerly by `create`, keyed by their derived
     /// entity id. Commit emits each before any post-create Update.
     pub(crate) genesis_events: std::sync::RwLock<std::collections::BTreeMap<EntityId, proto::Event>>,
@@ -53,14 +57,24 @@ impl Transaction {
 
 impl Transaction {
     pub(crate) fn new(dyncontext: Arc<dyn TContext + Send + Sync + 'static>) -> Self {
+        let system_generation = dyncontext.system_generation();
         Self {
             dyncontext,
             id: proto::TransactionId::new(),
             entities: AppendOnlyVec::new(),
             alive: Arc::new(AtomicBool::new(true)),
+            system_generation,
             genesis_events: std::sync::RwLock::new(std::collections::BTreeMap::new()),
             created_entity_ids: std::sync::RwLock::new(std::collections::HashSet::new()),
             schemas: std::sync::RwLock::new(Vec::new()),
+        }
+    }
+
+    fn ensure_system_generation(&self) -> Result<(), MutationError> {
+        if self.system_generation.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(MutationError::SystemReset)
         }
     }
 
@@ -77,16 +91,18 @@ impl Transaction {
     }
 
     pub async fn create<'rec, 'trx: 'rec, M: Model>(&'trx self, model: &M) -> Result<MutableBorrow<'rec, M::Mutable>, MutationError> {
+        self.ensure_system_generation()?;
         // RFC 5.2 (specs/model-property-metadata/rfc.md) model first-use: ensure M is registered BEFORE creating
         // the entity. A failed reassertion proceeds only when this exact shape
         // is already fully and compatibly bound; a never-registered, missing,
         // or incompatible field fails here.
-        self.dyncontext.ensure_registered(M::schema()).await?;
+        self.dyncontext.ensure_registered(M::schema(), &self.system_generation).await?;
+        self.ensure_system_generation()?;
 
         // Initial values are written to a provisional, writable entity which
         // is deliberately not resident: its id does not exist until these
         // operations are frozen into the genesis preimage.
-        let provisional = self.dyncontext.create_provisional_entity(M::collection(), self.alive.clone());
+        let provisional = self.dyncontext.create_provisional_entity(M::collection(), self.alive.clone(), &self.system_generation)?;
         model.initialize_new_entity(&provisional)?;
         provisional.resolve_pending_keys()?;
 
@@ -99,7 +115,8 @@ impl Transaction {
         // Insert only the derived-id primary. It remains empty until commit;
         // the returned transaction fork starts at genesis so later edits have
         // the correct parent and are extracted separately.
-        let entity = self.dyncontext.create_transaction_entity(M::collection(), &genesis, self.alive.clone())?;
+        self.ensure_system_generation()?;
+        let entity = self.dyncontext.create_transaction_entity(M::collection(), &genesis, self.alive.clone(), &self.system_generation)?;
         self.dyncontext.check_write(&entity)?;
         self.record_schema(M::schema());
 
@@ -117,13 +134,18 @@ impl Transaction {
     }
     fn get_trx_entity(&self, id: &EntityId) -> Option<&Entity> { self.entities.iter().find(|e| e.id == *id) }
     pub async fn get<'rec, 'trx: 'rec, M: Model>(&'trx self, id: &EntityId) -> Result<MutableBorrow<'rec, M::Mutable>, RetrievalError> {
+        self.ensure_system_generation()?;
         // RFC 5.2 model first-use on the mutating fetch-to-edit path.
         // Fetching does not mint identity, so a strict registration failure
         // is deferred here (warn only); commit_local_trx enforces it before
         // any write lands (plan decision 16).
-        if let Err(e) = self.dyncontext.ensure_registered(M::schema()).await {
+        if let Err(e) = self.dyncontext.ensure_registered(M::schema(), &self.system_generation).await {
             tracing::warn!("registration unavailable on fetch-to-edit for '{}'; commit will enforce: {}", M::collection(), e);
         }
+        // Registration is allowed to await a peer. Reset may have completed
+        // while it was in flight, so reject before even the transaction-local
+        // resident fast path can return an old snapshot.
+        self.ensure_system_generation()?;
         match self.get_trx_entity(id) {
             Some(entity) => {
                 self.record_schema(M::schema());
@@ -132,6 +154,7 @@ impl Transaction {
             None => {
                 // go fetch the entity from the context
                 let retrieved_entity = self.dyncontext.get_entity(*id, &M::collection(), false).await?;
+                self.ensure_system_generation()?;
                 // double check to make sure somebody didn't add the entity to the trx during the await
                 // because we're forking the entity, we need to make sure we aren't adding the same entity twice
                 if let Some(entity) = self.get_trx_entity(&retrieved_entity.id) {
@@ -148,6 +171,9 @@ impl Transaction {
         }
     }
     pub fn edit<'rec, 'trx: 'rec, M: Model>(&'trx self, entity: &Entity) -> Result<MutableBorrow<'rec, M::Mutable>, AccessDenied> {
+        if !self.system_generation.load(Ordering::Acquire) || !entity.is_system_alive() {
+            return Err(crate::property::PropertyError::SystemReset.into());
+        }
         // RFC 5.2 model first-use on the edit path. This entry is
         // SYNCHRONOUS (it is what the derive-generated `View::edit` calls, so
         // it cannot become async without touching derive and every

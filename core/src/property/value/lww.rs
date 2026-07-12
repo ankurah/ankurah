@@ -41,6 +41,7 @@ impl<T: Property> LWW<T> {
     }
 
     pub fn set(&self, value: &T) -> Result<(), PropertyError> {
+        self.entity.ensure_system_alive()?;
         if !self.entity.is_writable() {
             return Err(PropertyError::TransactionClosed);
         }
@@ -70,6 +71,7 @@ impl<T: Property> LWW<T> {
     /// defensively. Type-pair admission is REGISTRATION's job (the canonical
     /// value_type ruling): reads carry no gate.
     pub fn get(&self) -> Result<T, PropertyError> {
+        self.entity.ensure_system_alive()?;
         match self.stored_value() {
             Some(value) => {
                 let value = match crate::value::ValueType::from_property_str(T::VALUE_TYPE) {
@@ -88,6 +90,9 @@ impl<T: Property> LWW<T> {
     /// The stored value: `Some` present, `None` absent, via the generic
     /// resolved-property dispatch ([`crate::property::read_resolved`]).
     pub fn stored_value(&self) -> Option<Value> {
+        if !self.entity.is_system_alive() {
+            return None;
+        }
         match self.addressed_key() {
             PropertyKey::Id(id) => crate::property::read_resolved(self.backend.as_ref(), id, &self.property_name),
             // Unregistered or system field: read the bare name.
