@@ -1035,7 +1035,7 @@ where
     /// the deterministic simulator. It is absent from production builds;
     /// connectors must call [`Self::handle_peer_message`] with the identity
     /// authenticated for that connection.
-    #[cfg(feature = "test-helpers")]
+    #[cfg(any(test, feature = "test-helpers"))]
     pub async fn handle_message(&self, message: proto::NodeMessage) -> anyhow::Result<()> {
         self.dispatch_message(message, self.entities.system_generation(), None).await
     }
@@ -2124,6 +2124,14 @@ mod tests {
         }
 
         async fn delete_all_collections(&self) -> Result<bool, MutationError> { Ok(true) }
+
+        async fn claim_system_root(&self, _candidate: &proto::SystemRootProof) -> Result<crate::storage::SystemRootClaim, MutationError> {
+            Ok(crate::storage::SystemRootClaim::Claimed)
+        }
+
+        async fn system_root_claim(&self) -> Result<Option<proto::SystemRootProof>, RetrievalError> { Ok(None) }
+
+        async fn release_system_root_claim(&self, _expected: &proto::SystemRootProof) -> Result<bool, MutationError> { Ok(true) }
     }
 
     #[async_trait::async_trait]
@@ -2149,48 +2157,66 @@ mod tests {
 
     #[derive(Clone)]
     struct CapturingSender {
-        peer: proto::EntityId,
+        peer: proto::NodeId,
         sent: Arc<Mutex<Vec<proto::NodeMessage>>>,
     }
 
     impl PeerSender for CapturingSender {
-        fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError> {
-            self.sent.lock().unwrap().push(message);
+        fn send_message(&self, message: proto::SignedPeerMessage) -> Result<(), SendError> {
+            self.sent.lock().unwrap().push(message.message);
             Ok(())
         }
 
-        fn recipient_node_id(&self) -> proto::EntityId { self.peer }
+        fn close(&self) {}
+
+        fn recipient_node_id(&self) -> proto::NodeId { self.peer }
 
         fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
     }
 
-    fn forged_model_state(collection: &str) -> Attested<EntityState> {
+    fn forged_model_state(collection: &str) -> proto::StateWithGenesis {
         let backend = LWWBackend::new();
         backend.set(PropertyKey::Name("collection".to_owned()), Some(Value::String(collection.to_owned())));
         backend.set(PropertyKey::Name("name".to_owned()), Some(Value::String("Stale model".to_owned())));
-        let operations = backend.to_operations().unwrap().expect("catalog state has fields");
-        let event_id = proto::EventId::from_bytes([0x5A; 32]);
-        backend.apply_operations_with_event(&operations, event_id.clone()).unwrap();
-        Attested::opt(
+        let lww = backend.to_operations().unwrap().expect("catalog state has fields");
+        let model = crate::schema::well_known_model_id(crate::schema::MODEL_COLLECTION_ID).unwrap();
+        let genesis = proto::Event::genesis(
+            model,
+            Some(proto::EntityId::from_bytes([0x51; 32])),
+            proto::OperationSet(BTreeMap::from([("lww".to_owned(), lww.clone())])),
+        );
+        let event_id = genesis.id();
+        let entity_id = genesis.entity_id;
+        let backend = LWWBackend::new();
+        backend.apply_operations_with_event(&lww, event_id.clone()).unwrap();
+        let state = Attested::opt(
             EntityState {
-                entity_id: proto::EntityId::new(),
-                model: crate::schema::well_known_model_id(crate::schema::MODEL_COLLECTION_ID).unwrap(),
+                entity_id,
+                model,
                 state: proto::State {
                     state_buffers: proto::StateBuffers(BTreeMap::from([("lww".to_owned(), backend.to_state_buffer().unwrap())])),
                     head: proto::Clock::from(vec![event_id]),
                 },
             },
             None,
-        )
+        );
+        proto::StateWithGenesis { genesis: Attested::opt(genesis, None), state }
     }
 
     #[tokio::test]
     async fn invalid_request_response_is_dropped_before_schema_ingestion() {
         let node = Node::new(Arc::new(EmptyEngine), PermissiveAgent::new());
-        let peer = proto::EntityId::new();
+        // A real second node signs the presence so the production handshake
+        // verification admits the capturing transport.
+        let peer_node = Node::new(Arc::new(EmptyEngine), PermissiveAgent::new());
+        let peer = peer_node.id;
         let sent = Arc::new(Mutex::new(Vec::new()));
+        let node_handshake = node.begin_peer_handshake();
+        let peer_handshake = peer_node.begin_peer_handshake();
         node.register_peer(
-            proto::Presence { node_id: peer, durable: false, system_root: None, protocol_version: proto::PROTOCOL_VERSION },
+            peer_node.presence(node_handshake.challenge()),
+            node_handshake,
+            peer_handshake.challenge(),
             Box::new(CapturingSender { peer, sent: sent.clone() }),
         )
         .unwrap();

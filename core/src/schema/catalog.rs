@@ -1553,7 +1553,9 @@ where
 #[cfg(test)]
 mod wire_ingest_tests {
     use super::*;
+    use crate::property::backend::{LWWBackend, PropertyBackend};
     use crate::property::PropertyKey;
+    use crate::value::Value;
 
     fn id(byte: u8) -> EntityId { EntityId::from_bytes([byte; 32]) }
 

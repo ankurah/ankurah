@@ -874,7 +874,9 @@ where
 mod tests {
     use super::*;
     use crate::util::request_fence::RequestFence;
-    use ankurah_proto::NodeId;
+    use ankurah_proto::{EntityId, NodeId};
+
+    fn test_node_id(seed: u8) -> NodeId { NodeId::from(ed25519_dalek::SigningKey::from_bytes(&[seed; 32]).verifying_key()) }
     use std::sync::{Arc, Mutex};
 
     // Note: Some tests call setup_remote_subscriptions() directly to test the core
