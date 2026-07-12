@@ -13,7 +13,8 @@ what still needs scrutiny.
 The work is intentionally stacked:
 
 1. Base: `model-property-metadata` at `4911845c`.
-2. Identity substrate: `worktree-identity-substrate`.
+2. Identity substrate: `worktree-identity-substrate`, draft PR
+   <https://github.com/ankurah/ankurah/pull/359>.
 3. Iroh connector: `iroh-connector`, PR
    <https://github.com/ankurah/ankurah/pull/341>, based on the identity branch.
 
@@ -32,9 +33,10 @@ The final hardening and this handoff are later commits on the same branch. Use
 tip and complete list.
 
 The iroh branch previously merged the identity stack through `2ee3b5aa` in
-`41b5c4bb`. Its final published tip must also contain `9df93029`, `f8b3ec1c`,
-and the final hardening/handoff commits. Use the PR head, not `41b5c4bb`, as the
-review target.
+`41b5c4bb`. It merged the final identity/handoff tip in `8b823b55`, then adapted
+the Iroh connection lifecycle to the terminal core-close contract in
+`5cb89ba4`. Use the live PR head as the review target; these stable commits are
+the useful review landmarks.
 
 ## Scope actually delivered
 
@@ -207,6 +209,7 @@ Green during implementation and hardening:
 - `cargo test -p ankurah-tests --test websocket` (4/4)
 - `cargo test -p ankurah-tests --test registration_lifecycle` (10/10)
 - focused core schema tests (5/5)
+- `cargo test -p ankurah-connector-iroh --lib` (15/15 at `5cb89ba4`)
 - earlier system, identity/attestation, local subscription, and inter-node
   suites before the final shared-engine changes
 - `git diff --check` and owned-file formatting checks throughout the audit
