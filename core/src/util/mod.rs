@@ -3,6 +3,7 @@ pub mod expand_states;
 pub mod iterable;
 pub mod ivec;
 pub mod ready_chunks;
+pub(crate) mod request_fence;
 pub mod safemap;
 pub mod safeset;
 pub use iterable::Iterable;

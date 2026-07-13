@@ -37,6 +37,18 @@ on:
         description: "First dag_seed value to run (ORACLE_SEED_BASE)"
         required: false
         default: "1"
+      gen_oracle_seeds:
+        description: "Gen-corruption immunity arm: dag_seed count (GEN_ORACLE_SEEDS; each seed runs a baseline plus the full two-channel corruption matrix per pair)"
+        required: false
+        default: "25000"
+      gen_oracle_large_seeds:
+        description: "Gen-corruption immunity arm: larger-DAG (20..=40 events) seed count (GEN_ORACLE_LARGE_SEEDS)"
+        required: false
+        default: "2000"
+      gen_oracle_wide_seeds:
+        description: "Gen-corruption immunity arm: wide-frontier (full-current-tip joins, 24..=48 events) seed count (GEN_ORACLE_WIDE_SEEDS)"
+        required: false
+        default: "1000"
       shape_entities:
         description: "Event-DAG-shape tier: entities in the N-entity churn shape (SHAPE_ENTITIES)"
         required: false
@@ -89,6 +101,54 @@ jobs:
         with:
           name: oracle-failure-output
           path: oracle-output.log
+          if-no-files-found: warn
+          retention-days: 30
+
+  # The D2 M5 gen-corruption immunity arm at nightly scale: the same
+  # two-channel corruption matrix the normal test job runs at 300 seeds
+  # (core/src/event_dag/tests.rs, gen_corruption_immunity), driven to 25k
+  # seeds of randomized corpora plus 2k larger-DAG (20..=40 event) seeds
+  # plus 1k wide-frontier seeds (full-current-tip joins, 24..=48 events;
+  # the corpus class the M5 edge-check memory defect hid in).
+  # Every corrupted run must be BOUND-identical to its honest baseline
+  # (verdict, meet, immediate children, chain core, layer partition); ANY
+  # divergence is a suppress-only discipline breach and the uploaded
+  # ORACLEFAIL line (kind=gen_corruption, dag_seed, shape,
+  # corruption_seed, doctored triples, single-seed repro) is the
+  # stop-and-report artifact. Dedicated knobs so this arm scales
+  # independently of the plain oracle (each immunity seed costs roughly
+  # 8x a plain-oracle seed: a baseline plus the corruption matrix).
+  gen-corruption-immunity:
+    name: Gen-corruption immunity oracle (high-seed)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run the immunity matrix at high seed count
+        run: |
+          set -o pipefail
+          GEN_ORACLE_SEEDS="${{ github.event.inputs.gen_oracle_seeds || '25000' }}" \
+          GEN_ORACLE_LARGE_SEEDS="${{ github.event.inputs.gen_oracle_large_seeds || '2000' }}" \
+          GEN_ORACLE_WIDE_SEEDS="${{ github.event.inputs.gen_oracle_wide_seeds || '1000' }}" \
+          GEN_ORACLE_SEED_BASE="${{ github.event.inputs.oracle_seed_base || '1' }}" \
+            cargo test -p ankurah-core --lib \
+              event_dag::tests::gen_corruption_immunity \
+              -- --nocapture 2>&1 | tee gen-immunity-output.log
+        env:
+          RUST_BACKTRACE: 1
+
+      - name: Upload failure output
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gen-immunity-failure-output
+          path: gen-immunity-output.log
           if-no-files-found: warn
           retention-days: 30
 

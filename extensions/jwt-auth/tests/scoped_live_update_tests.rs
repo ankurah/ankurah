@@ -68,6 +68,13 @@ async fn ref_scope_rule_receives_live_updates() -> anyhow::Result<()> {
     node.system.create().await?;
 
     let root = node.context(JwtContext::system())?;
+    // Schema definition is the ADMIN's act (rev 4, REN 2 second ruling):
+    // the Member role carries no catalog privileges, and a query against a
+    // collection nobody registered fails loud instead of idling (pinned by
+    // unregistered_collection_query_fails_loud below). Register the
+    // collection up front so this test exercises its actual subject, the
+    // scoped LIVE delivery.
+    root.register::<ScopeItem>().await?;
     let (owner_id, other_id) = {
         let trx = root.begin();
         let owner = trx.create(&ScopeTarget { name: "owner".into() }).await?;
@@ -108,6 +115,78 @@ async fn ref_scope_rule_receives_live_updates() -> anyhow::Result<()> {
     }
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
     assert_eq!(lq.ids().len(), 1, "out-of-scope item must not appear in the scoped LiveQuery");
+
+    Ok(())
+}
+
+/// The flip side of the pre-registration above (REN 2 second ruling,
+/// 2026-07-06): a principal without catalog privileges querying a
+/// collection NOBODY has registered gets a loud, actionable error -- not a
+/// fabricated empty answer idling on a subscription that can never say
+/// anything truthful.
+#[tokio::test]
+async fn unregistered_collection_query_fails_loud() -> anyhow::Result<()> {
+    let keys = common::test_keys();
+    let agent = JwtAgent::new_ephemeral();
+    agent.update_config(serde_json::from_str::<PolicyConfig>(CONFIG_JSON)?);
+    agent.set_keys(JwtKeys::Signing(keys.clone()));
+    let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent);
+    node.system.create().await?;
+
+    let member_claims = JwtClaims {
+        sub: "member-1".into(),
+        roles: vec!["Member".into()],
+        email: "member@example.com".into(),
+        name: None,
+        custom: serde_json::Map::new(),
+    };
+    let token = keys.sign(&member_claims, Duration::from_hours(1))?;
+    let member_ctx = node.context(JwtContext::from_claims(member_claims, token))?;
+
+    // Nobody registered `scopeitem`, and the Member role may not define
+    // schema: first-use registration is refused, and the read fails loud.
+    let err = member_ctx.fetch::<ScopeItemView>("label = 'x'").await.expect_err("fetch over an unregistered collection must fail loud");
+    let msg = err.to_string();
+    assert!(msg.contains("not registered") && msg.contains("scopeitem"), "actionable error naming the collection, got: {msg}");
+
+    Ok(())
+}
+
+/// The same fail-loud contract surfaces through a LIVE QUERY (the ruling
+/// covers fetch and live query alike): the sync query() constructor
+/// succeeds -- resolution is deferred into the async init task --
+/// wait_initialized returns instead of hanging, and the loud
+/// unregistered-collection error lands in the query's error slot.
+#[tokio::test]
+async fn unregistered_collection_live_query_fails_loud() -> anyhow::Result<()> {
+    use ankurah::signals::With;
+
+    let keys = common::test_keys();
+    let agent = JwtAgent::new_ephemeral();
+    agent.update_config(serde_json::from_str::<PolicyConfig>(CONFIG_JSON)?);
+    agent.set_keys(JwtKeys::Signing(keys.clone()));
+    let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent);
+    node.system.create().await?;
+
+    let member_claims = JwtClaims {
+        sub: "member-1".into(),
+        roles: vec!["Member".into()],
+        email: "member@example.com".into(),
+        name: None,
+        custom: serde_json::Map::new(),
+    };
+    let token = keys.sign(&member_claims, Duration::from_hours(1))?;
+    let member_ctx = node.context(JwtContext::from_claims(member_claims, token))?;
+
+    let lq = member_ctx.query::<ScopeItemView>("label = 'x'")?;
+    lq.wait_initialized().await;
+
+    let msg = lq
+        .error()
+        .with(|e| e.as_ref().map(|e| e.to_string()))
+        .expect("live query over an unregistered collection must surface the loud error");
+    assert!(msg.contains("not registered") && msg.contains("scopeitem"), "actionable error naming the collection, got: {msg}");
+    assert!(lq.ids().is_empty(), "an errored live query must not fabricate results");
 
     Ok(())
 }

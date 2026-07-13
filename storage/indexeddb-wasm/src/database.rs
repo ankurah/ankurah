@@ -152,6 +152,14 @@ impl Connection {
 
                 let events_store = db.create_object_store("events").require("create events store")?;
                 events_store.create_index_with_str("by_entity_id", "__entity_id").require("create entity_id index")?;
+
+                // Engine-owned durable id-to-field map. Out-of-line string keys
+                // `{collection}\0{property id base64}` -> assigned field name.
+                // Created here alongside `entities` and `events` on the fresh
+                // database; the clean-start assumption is ratified, so no
+                // versioned migration (and thus no DB version bump) is needed
+                // for pre-existing databases.
+                db.create_object_store("property_columns").require("create property_columns store")?;
             }
             Ok(())
         })

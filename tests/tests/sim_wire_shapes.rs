@@ -66,12 +66,15 @@ fn v6_unknown_entity_item_does_not_poison_batch_or_leave_phantom() {
                     // the final states converge.
                     let head_a = w.head_of(a).unwrap();
                     let head_b = w.head_of(b).unwrap();
-                    let ev_a = model::attest(model::edit_event(a, head_a, Field::Body, "a1"));
-                    let ev_b = model::attest(model::edit_event(b, head_b, Field::Body, "b1"));
+                    // a and b are genesis (generation 1), so their edits are generation 2.
+                    let ev_a = model::attest(model::edit_event(a, head_a, Field::Body, "a1", 2));
+                    let ev_b = model::attest(model::edit_event(b, head_b, Field::Body, "b1", 2));
 
                     let unknown = w.reserve_unknown_entity();
                     let ghost_parent = proto::Clock::from(vec![proto::EventId::from_bytes([9u8; 32])]);
-                    let ev_unknown = model::attest(model::edit_event(unknown, ghost_parent, Field::Title, "ghost"));
+                    // The parent is fabricated and never local, so this event is admitted
+                    // unverified; its generation is untestable by design (2 is plausible).
+                    let ev_unknown = model::attest(model::edit_event(unknown, ghost_parent, Field::Title, "ghost", 2));
 
                     // Apply the valid edits at node 0 so it and node 1 converge.
                     w.apply_events_at(0, a, vec![ev_a.clone()]).await;
@@ -113,9 +116,10 @@ fn v4_bridge_events_arrive_child_first() {
                     // Build a two-event chain on node 0: base <- mid <- tip,
                     // writing different fields so both writes are observable.
                     let head0 = w.head_of(e).unwrap();
-                    let ev_mid = model::attest(model::edit_event(e, head0, Field::Body, "mid"));
+                    // base is genesis (generation 1): mid is 2, tip is 3.
+                    let ev_mid = model::attest(model::edit_event(e, head0, Field::Body, "mid", 2));
                     let mid_clock = proto::Clock::from(vec![ev_mid.payload.id()]);
-                    let ev_tip = model::attest(model::edit_event(e, mid_clock, Field::Title, "tip"));
+                    let ev_tip = model::attest(model::edit_event(e, mid_clock, Field::Title, "tip", 3));
 
                     // Apply both at node 0 (parent-first) so it is the source of truth.
                     w.apply_events_at(0, e, vec![ev_mid.clone(), ev_tip.clone()]).await;

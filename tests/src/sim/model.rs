@@ -1,8 +1,9 @@
 //! Deterministic entity ids and hand-forged events.
 //!
 //! The commit path (`trx.create`) mints a random ULID `EntityId`, and
-//! `EventId` is a SHA-256 over `(entity_id, operations, parent)`, so a random
-//! entity id poisons every downstream id and defeats the determinism audit.
+//! `EventId` is a SHA-256 over `(entity_id, operations, parent, generation)`,
+//! so a random entity id poisons every downstream id and defeats the
+//! determinism audit.
 //! The harness sidesteps this the way the containment tests already do
 //! (`tests/tests/update_batch_containment.rs::forge_title_event`): it
 //! constructs `proto::Event` values directly with entity ids derived from the
@@ -12,6 +13,7 @@
 //! production code, not a mock.
 
 use ankurah::core::property::backend::{lww::LWWBackend, PropertyBackend};
+use ankurah::core::property::PropertyKey;
 use ankurah::core::value::Value;
 use ankurah::proto::{self, Attested};
 use ankurah::Model;
@@ -44,6 +46,33 @@ pub fn entity_id(counter: u64) -> proto::EntityId {
 /// The `SimRecord` collection id.
 pub fn sim_collection() -> proto::CollectionId { SimRecord::collection() }
 
+/// The model-definition id the sim stamps on every forged `SimRecord` event,
+/// state, and subscription-update item (#330). The harness forges wire
+/// envelopes that bypass schema registration/relay, so ingress `resolve_model`
+/// would reject an unknown id; [`super::node::build_nodes`] seeds this exact id
+/// into every node's catalog so resolution routes it to the `SimRecord`
+/// collection. Constant and deterministic, so it is identical across every node
+/// in a run and across the two determinism-audit runs. The high bytes are
+/// non-zero, so it can never collide with a well-known model id (all-zero
+/// prefix) nor with a seed-derived entity id ([`entity_id`] fills only the low
+/// eight bytes, leaving the high bytes zero).
+pub fn sim_model_id() -> proto::EntityId { proto::EntityId::from_bytes([0x5B; 16]) }
+
+/// Fixed property-definition ids for the fields the simulator writes. Like
+/// [`sim_model_id`], these ids are identical on every node and in every audit
+/// run so forged user operations exercise the production id-keyed path.
+pub fn sim_title_property_id() -> proto::EntityId { proto::EntityId::from_bytes([0x5C; 16]) }
+
+/// The fixed property-definition id for `SimRecord::body`.
+pub fn sim_body_property_id() -> proto::EntityId { proto::EntityId::from_bytes([0x5D; 16]) }
+
+/// Fixed contract-membership ids pairing the simulator model with its two
+/// properties. They are catalog definition ids, not user entity ids.
+pub fn sim_title_membership_id() -> proto::EntityId { proto::EntityId::from_bytes([0x5E; 16]) }
+
+/// The fixed membership id pairing `SimRecord` with its `body` property.
+pub fn sim_body_membership_id() -> proto::EntityId { proto::EntityId::from_bytes([0x5F; 16]) }
+
 /// Decode the `(title, body)` LWW field values from a materialized `proto::State`
 /// as a subscriber would read them, for the C5 coherence checks that compare a
 /// recorded read against the converged truth. An unset field, or a state with no
@@ -53,11 +82,11 @@ pub fn sim_collection() -> proto::CollectionId { SimRecord::collection() }
 pub fn field_values(state: &proto::State) -> (Option<String>, Option<String>) {
     let Some(buffer) = state.state_buffers.0.get("lww") else { return (None, None) };
     let Ok(backend) = LWWBackend::from_state_buffer(buffer) else { return (None, None) };
-    let read = |name: &str| match backend.get(&name.to_string()) {
+    let read = |id| match backend.get(&PropertyKey::Id(id)) {
         Some(Value::String(s)) => Some(s),
         _ => None,
     };
-    (read("title"), read("body"))
+    (read(sim_title_property_id()), read(sim_body_property_id()))
 }
 
 /// Which LWW field a write targets.
@@ -74,12 +103,19 @@ impl Field {
             Field::Body => "body",
         }
     }
+
+    pub fn property_id(self) -> proto::EntityId {
+        match self {
+            Field::Title => sim_title_property_id(),
+            Field::Body => sim_body_property_id(),
+        }
+    }
 }
 
 /// Build the LWW `OperationSet` for setting one field to a value.
 fn lww_ops(field: Field, value: &str) -> proto::OperationSet {
     let backend = LWWBackend::new();
-    backend.set(field.name().into(), Some(Value::String(value.to_owned())));
+    backend.set(PropertyKey::Id(field.property_id()), Some(Value::String(value.to_owned())));
     let ops = backend.to_operations().unwrap().expect("a written LWW backend yields operations");
     proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)]))
 }
@@ -89,16 +125,20 @@ fn lww_ops(field: Field, value: &str) -> proto::OperationSet {
 /// state.
 pub fn genesis_event(entity: proto::EntityId, field: Field, value: &str) -> proto::Event {
     proto::Event {
-        collection: SimRecord::collection(),
+        model: sim_model_id(),
         entity_id: entity,
         operations: lww_ops(field, value),
         parent: proto::Clock::default(),
+        // A genesis event has no parents, so its generation is always 1 (266-A).
+        generation: 1,
     }
 }
 
 /// Forge a non-genesis event parented on `parent`, setting `field` to `value`.
-pub fn edit_event(entity: proto::EntityId, parent: proto::Clock, field: Field, value: &str) -> proto::Event {
-    proto::Event { collection: SimRecord::collection(), entity_id: entity, operations: lww_ops(field, value), parent }
+/// `generation` must be `1 + max(parent generations)`: forged events flow through
+/// the real ingest, whose admission verification rejects a mis-stamped generation.
+pub fn edit_event(entity: proto::EntityId, parent: proto::Clock, field: Field, value: &str, generation: u32) -> proto::Event {
+    proto::Event { model: sim_model_id(), entity_id: entity, operations: lww_ops(field, value), parent, generation }
 }
 
 /// Wrap a forged event as an unsigned `Attested<Event>`. Under `PermissiveAgent`

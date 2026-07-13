@@ -85,7 +85,9 @@ impl<E: GetEvents> EventLayers<E> {
         }
 
         let mut to_apply = Vec::new();
+        let mut to_apply_ids = Vec::new();
         let mut already_applied = Vec::new();
+        let mut already_applied_ids = Vec::new();
         let layer_frontier: Vec<EventId> = std::mem::take(&mut self.frontier).into_iter().collect();
 
         for id in &layer_frontier {
@@ -99,8 +101,10 @@ impl<E: GetEvents> EventLayers<E> {
 
             // Partition based on whether already in local head ancestry
             if self.current_head_ancestry.contains(id) {
+                already_applied_ids.push(id.clone());
                 already_applied.push(event);
             } else {
+                to_apply_ids.push(id.clone());
                 to_apply.push(event);
             }
         }
@@ -130,7 +134,7 @@ impl<E: GetEvents> EventLayers<E> {
             return Ok(None);
         }
 
-        Ok(Some(EventLayer { to_apply, already_applied, dag: Arc::clone(&self.dag) }))
+        Ok(Some(EventLayer { to_apply, to_apply_ids, already_applied, already_applied_ids, dag: Arc::clone(&self.dag) }))
     }
 }
 
@@ -150,14 +154,50 @@ impl<E: GetEvents> EventLayers<E> {
 pub struct EventLayer {
     pub(crate) already_applied: Vec<Event>,
     pub(crate) to_apply: Vec<Event>,
+    /// Requested ids that key `already_applied` in the accumulated DAG. These
+    /// normally equal `Event::id()`, but remain authoritative if a diagnostic
+    /// comparison is deliberately driven over a mismatched served payload.
+    already_applied_ids: Vec<EventId>,
+    /// Requested ids that key `to_apply` in the accumulated DAG. Backends must
+    /// use these ids for provenance and causal comparisons rather than
+    /// recomputing identity from the served payload.
+    to_apply_ids: Vec<EventId>,
     /// Shared DAG structure for causal comparison: event_id -> parent_ids.
     dag: Arc<BTreeMap<EventId, Vec<EventId>>>,
 }
 
 impl EventLayer {
     /// Create a new EventLayer with the given events and DAG structure.
+    #[cfg(test)]
     pub(crate) fn new(already_applied: Vec<Event>, to_apply: Vec<Event>, dag: Arc<BTreeMap<EventId, Vec<EventId>>>) -> Self {
-        Self { already_applied, to_apply, dag }
+        let already_applied = already_applied.into_iter().map(|event| (event.id(), event)).collect();
+        let to_apply = to_apply.into_iter().map(|event| (event.id(), event)).collect();
+        Self::new_with_ids(already_applied, to_apply, dag)
+    }
+
+    /// Create a layer from the authoritative ids used by the comparison walk.
+    /// The pair form is intentionally crate-private: production layers obtain
+    /// these ids from the frontier, while focused tests can exercise a served
+    /// payload whose recomputed id differs from its requested id.
+    #[cfg(test)]
+    pub(crate) fn new_with_ids(
+        already_applied: Vec<(EventId, Event)>,
+        to_apply: Vec<(EventId, Event)>,
+        dag: Arc<BTreeMap<EventId, Vec<EventId>>>,
+    ) -> Self {
+        let (already_applied_ids, already_applied) = already_applied.into_iter().unzip();
+        let (to_apply_ids, to_apply) = to_apply.into_iter().unzip();
+        Self { already_applied, to_apply, already_applied_ids, to_apply_ids, dag }
+    }
+
+    pub(crate) fn already_applied_with_ids(&self) -> impl Iterator<Item = (&EventId, &Event)> {
+        debug_assert_eq!(self.already_applied_ids.len(), self.already_applied.len());
+        self.already_applied_ids.iter().zip(&self.already_applied)
+    }
+
+    pub(crate) fn to_apply_with_ids(&self) -> impl Iterator<Item = (&EventId, &Event)> {
+        debug_assert_eq!(self.to_apply_ids.len(), self.to_apply.len());
+        self.to_apply_ids.iter().zip(&self.to_apply)
     }
 
     /// Check whether an event_id is present in the accumulated DAG.
@@ -198,7 +238,7 @@ mod tests {
         dag.insert(b.clone(), vec![a.clone()]);
         dag.insert(c.clone(), vec![a.clone()]);
 
-        let layer = EventLayer { to_apply: vec![], already_applied: vec![], dag: Arc::new(dag) };
+        let layer = EventLayer::new(vec![], vec![], Arc::new(dag));
 
         assert_eq!(layer.compare(&b, &a), CausalRelation::Descends);
         assert_eq!(layer.compare(&a, &b), CausalRelation::Ascends);
@@ -216,7 +256,7 @@ mod tests {
         dag.insert(a.clone(), vec![]);
         dag.insert(b.clone(), vec![a.clone()]);
 
-        let layer = EventLayer { to_apply: vec![], already_applied: vec![], dag: Arc::new(dag) };
+        let layer = EventLayer::new(vec![], vec![], Arc::new(dag));
 
         assert!(layer.dag_contains(&a));
         assert!(layer.dag_contains(&b));

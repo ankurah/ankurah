@@ -107,7 +107,8 @@ outside the DAG.
 
 ### Why lexicographic EventId comparison is safe
 
-`EventId` is a SHA-256 hash of `(entity_id, operations, parent_clock)`. The
+`EventId` is a SHA-256 hash of
+`(entity_id, operations, parent_clock, generation)`. The
 ordering of hashes has no relationship to wall-clock time, but it provides a
 **deterministic total order**: every replica comparing the same pair of
 concurrent events will pick the same winner. That is all convergence requires.

@@ -11,4 +11,8 @@ lazy_static! {
     pub static ref OPERATIONS_KEY: Property = Property::new("__operations");
     pub static ref ATTESTATIONS_KEY: Property = Property::new("__attestations");
     pub static ref PARENT_KEY: Property = Property::new("__parent");
+    pub static ref GENERATION_KEY: Property = Property::new("__generation");
+    // Entity records: the per-tip head generations (D2 M4, REV 5 section K
+    // home 3), stored self-contained as [generation, eventIdBase64] pairs.
+    pub static ref GENERATIONS_KEY: Property = Property::new("__generations");
 }

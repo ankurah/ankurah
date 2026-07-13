@@ -129,12 +129,27 @@ foundation; each item is or becomes an RFC issue.
    B3 gap-replay defense structurally, unifies partial-progress containment
    across arms, introduces the typed error taxonomy and the needs-state
    recovery outcome.
-2. **#266 indexed causality plus applied-set.** Persistent per-event
-   generation numbers, then a per-entity applied-set membership index (local,
-   derived, never trusted from the wire). Redelivery and StrictAscends become
-   O(1); gap detection becomes set difference over event ids, never a
-   generation-range test (266-B: a range proxy reproduces the crossed-linkrev
-   bug class); budget demotes to an anomaly guard.
+2. **#266 indexed causality plus applied-set (landed, PR #328).** As built:
+   every event carries a mandatory generation (1 + max over parent
+   generations, genesis exactly 1) sealed inside its content-addressed id,
+   stamped by the committer, and verified at admission with a typed
+   rejection wherever parents are locally resolvable; heads are materialized
+   with one generation per tip (GClock) on the wire, in the resident, and in
+   every engine's entity record, so stamping and covered-parent verification
+   read no event payloads. Consumption is suppress-only by design: rejection
+   prechecks and generation-first scheduling accelerate the comparison,
+   walk-time edge checks detect and demote (escalation question recorded as
+   #335), and no generation value ever routes a verdict, pinned at scale by
+   a two-channel corruption-immunity oracle; a node-level kill-switch can
+   bypass every consumer at runtime while stamping and verification stay on.
+   Redelivery is O(1) through a bounded in-memory per-resident applied-set,
+   and a persist-currency marker elides redundant persists; both are memory
+   only, never persisted, never shared. 266-B held: no generation-range test
+   anywhere (the crossed-linkrev bug class); budget remains the traversal
+   backstop, with generation distance available to #271's horizon policy
+   discussion (the D3 gate). Ships with a fresh-database requirement
+   (pre-D2 databases fail loudly on read; threat-model addendum in
+   specs/concurrency/threat-model.md section 3.8).
 3. **History lifecycle (RFC to file).** Sealed-prefix checkpoints: fold
    history below clock C into an attested snapshot, prune beneath, clamp
    traversals at C, carry a genesis attestation so Disjoint detection and
@@ -281,6 +296,14 @@ database and state management system:
 7. Federation and multi-homing (LONG_TERM_ASPIRATION bridge): peer
    discovery, cross-system attestation, roaming users; builds on the
    threat model from C4 and the replication story above.
+8. Volume test suite (recorded at the D2 close-out, in the maintainer's
+   framing): TPC-C-style cardinality and throughput workloads minus joins.
+   Concretely: 100k mostly non-concurrent edits on a single entity; 100k
+   edits across 90k entities; sustained mixed workloads. Expressly distinct
+   from the bulk-DAG-shape testing (the E-shapes scale tier) and the
+   jepsen-style simulation testing (C1/C2) the program already has: those
+   probe correctness under adversarial shapes and schedules, this probes
+   behavior at production cardinality and sustained throughput.
 
 ## Sequencing summary
 
@@ -301,8 +324,8 @@ workstream ends by updating this document's checklist.
 - [x] C6: crash/recovery fault injection
 - [ ] C7: storage engine conformance suite
 - [ ] C8 (optional): scheduler model check
-- [ ] D1: #268 scheduler pipeline
-- [ ] D2: #266 generations plus applied-set index
+- [x] D1: #268 scheduler pipeline
+- [x] D2: #266 generations plus applied-set index
 - [ ] D3: lifecycle RFC filed and implemented (checkpoints, rejection horizon)
 - [ ] D4: transactional visibility RFC filed and decided
 - [ ] D5: snapshot authority RFC filed and implemented

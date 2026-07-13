@@ -62,14 +62,26 @@ impl GetEvents for MemRetriever {
 /// parent clock. The seed only differentiates otherwise-identical events; ids
 /// remain stable across runs. A `u32` seed space keeps wide/deep shapes free
 /// of collisions.
-fn event(seed: u32, parents: &[EventId]) -> Event {
+///
+/// Parents are EVENTS, in hand at the construction site, and the generation is
+/// stamped `1 + max(parent generations)` from their payloads (genesis 1) —
+/// the commit-lane formula (D2-2). The registry ban applies to benches too:
+/// no id-to-generation side store; these stamps are the events' true
+/// topological levels because every generator derives them inductively from
+/// real parent payloads, which is what makes the shapes representative
+/// evidence for the M5 generation prechecks.
+fn event(seed: u32, parents: &[&Event]) -> Event {
     let mut entity_id_bytes = [0u8; 16];
     entity_id_bytes[0..4].copy_from_slice(&seed.to_be_bytes());
     Event {
         entity_id: EntityId::from_bytes(entity_id_bytes),
-        collection: "bench".into(),
-        parent: Clock::from(parents.to_vec()),
+        // The benchmark has no catalog, so use one deterministic model id for
+        // every event in its synthetic collection. Model ids are deliberately
+        // excluded from EventId hashing, preserving the stable DAG shapes.
+        model: EntityId::from_bytes([0xBE; 16]),
+        parent: Clock::from(parents.iter().map(|p| p.id()).collect::<Vec<_>>()),
         operations: OperationSet(BTreeMap::new()),
+        generation: Event::generation_from_parents(parents.iter().map(|p| p.generation)),
     }
 }
 
@@ -87,16 +99,20 @@ struct Scenario {
 /// not the one-step fast path, because comparison is the root not head-1).
 fn linear_deep(depth: usize) -> Scenario {
     let mut r = MemRetriever::new();
-    let mut prev: Vec<EventId> = vec![];
+    let mut prev: Option<Event> = None;
     let mut root = None;
     let mut head = None;
     for i in 0..depth {
-        let id = r.add(event(i as u32, &prev));
+        let ev = match &prev {
+            None => event(i as u32, &[]),
+            Some(p) => event(i as u32, &[p]),
+        };
+        let id = r.add(ev.clone());
         if i == 0 {
             root = Some(id.clone());
         }
-        prev = vec![id.clone()];
         head = Some(id);
+        prev = Some(ev);
     }
     Scenario {
         retriever: r,
@@ -120,16 +136,20 @@ fn diamond_chain(n: usize) -> Scenario {
         s
     };
 
-    let mut base = r.add(event(next(), &[]));
-    let mut last_a = base.clone();
-    let mut last_b = base.clone();
+    let mut base = event(next(), &[]);
+    let mut last_a = base.id();
+    let mut last_b = base.id();
+    r.add(base.clone());
 
     for _ in 0..n {
-        let a = r.add(event(next(), &[base.clone()]));
-        let b = r.add(event(next(), &[base.clone()]));
-        last_a = a.clone();
-        last_b = b.clone();
-        let join = r.add(event(next(), &[a, b]));
+        let a = event(next(), &[&base]);
+        let b = event(next(), &[&base]);
+        r.add(a.clone());
+        r.add(b.clone());
+        last_a = a.id();
+        last_b = b.id();
+        let join = event(next(), &[&a, &b]);
+        r.add(join.clone());
         base = join;
     }
 
@@ -144,13 +164,16 @@ fn diamond_chain(n: usize) -> Scenario {
 /// antichain, stressing the multi-parent frontier expansion.
 fn wide_antichain(width: usize) -> Scenario {
     let mut r = MemRetriever::new();
-    let root = r.add(event(0, &[]));
+    let root = event(0, &[]);
+    let root_id = r.add(root.clone());
     let mut children = Vec::with_capacity(width);
     for i in 0..width {
-        children.push(r.add(event(i as u32 + 1, &[root.clone()])));
+        let child = event(i as u32 + 1, &[&root]);
+        r.add(child.clone());
+        children.push(child);
     }
-    let join = r.add(event(width as u32 + 1, &children));
-    Scenario { retriever: r, subject: Clock::from(vec![join]), comparison: Clock::from(vec![root]), events: (width + 2) as u64 }
+    let join_id = r.add(event(width as u32 + 1, &children.iter().collect::<Vec<_>>()));
+    Scenario { retriever: r, subject: Clock::from(vec![join_id]), comparison: Clock::from(vec![root_id]), events: (width + 2) as u64 }
 }
 
 /// Two independent linear chains of `depth` each, sharing no root. Comparing
@@ -159,12 +182,15 @@ fn wide_antichain(width: usize) -> Scenario {
 fn disjoint(depth: usize) -> Scenario {
     let mut r = MemRetriever::new();
     let mut mk_chain = |base_seed: u32| -> EventId {
-        let mut prev: Vec<EventId> = vec![];
+        let mut prev: Option<Event> = None;
         let mut head = None;
         for i in 0..depth {
-            let id = r.add(event(base_seed + i as u32, &prev));
-            prev = vec![id.clone()];
-            head = Some(id);
+            let ev = match &prev {
+                None => event(base_seed + i as u32, &[]),
+                Some(p) => event(base_seed + i as u32, &[p]),
+            };
+            head = Some(r.add(ev.clone()));
+            prev = Some(ev);
         }
         head.expect("depth >= 1")
     };
@@ -312,11 +338,14 @@ fn bench_clock(c: &mut Criterion) {
 /// no event precedes its parent in input order: worst case for Kahn's
 /// algorithm, which must reorder the whole batch parents-first.
 fn shuffled_chain_batch(n: usize) -> Vec<Attested<Event>> {
-    let mut prev: Vec<EventId> = vec![];
+    let mut prev: Option<Event> = None;
     let mut events = Vec::with_capacity(n);
     for i in 0..n {
-        let ev = event(i as u32, &prev);
-        prev = vec![ev.id()];
+        let ev = match &prev {
+            None => event(i as u32, &[]),
+            Some(p) => event(i as u32, &[p]),
+        };
+        prev = Some(ev.clone());
         events.push(ev);
     }
     // Rotate by half so children appear before parents in the input.

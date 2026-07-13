@@ -36,7 +36,7 @@ pub struct Workload<'a> {
     /// Live subscriptions held open for the run's duration. Dropping a
     /// `LiveQuery` tears down its relay context, so scenarios that inject
     /// SubscriptionUpdates keep them alive here.
-    subscriptions: Vec<ankurah::LiveQuery<super::model::SimRecordView>>,
+    subscriptions: Vec<(usize, ankurah::LiveQuery<super::model::SimRecordView>)>,
     /// Recording subscriptions whose observed notification stream is checked for
     /// the C5 session guarantees after quiescence. Each also holds its `LiveQuery`
     /// and guard alive, so a recording subscription need not also be pushed to
@@ -55,6 +55,37 @@ impl<'a> Workload<'a> {
     /// Pick a node index uniformly from the seed (e.g. to choose an origin).
     pub fn any_node(&mut self) -> usize { self.rng.below(self.nodes.len()) }
 
+    /// The generation a child parented on `parent` must carry: `1 + max` of
+    /// the parents' PAYLOAD generations (`1` when the parent is empty). The
+    /// parent events are read back from the ORIGIN node's storage: every event
+    /// the harness parents on was committed at (or settled to) the node that
+    /// issues the edit, so its storage serves the payloads. No side map (the
+    /// M1-review registry ban), and no silent fallback: a parent the origin
+    /// does not hold is a scenario bug and panics loudly.
+    async fn child_generation(&self, origin: usize, entity: proto::EntityId, parent: &proto::Clock) -> u32 {
+        if parent.is_empty() {
+            return 1;
+        }
+        let stored = self.nodes[origin].stored_events(entity).await;
+        let generations: Vec<u32> = parent
+            .iter()
+            .map(|pid| {
+                stored
+                    .iter()
+                    .find(|e| e.payload.id() == *pid)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "parent event {pid} of entity {entity} is not stored at origin node {origin}; \
+                             scenarios must parent edits on history the origin holds"
+                        )
+                    })
+                    .payload
+                    .generation
+            })
+            .collect();
+        proto::Event::generation_from_parents(generations)
+    }
+
     /// Create a new entity at `origin` with an initial field write, propagate
     /// it to all other nodes through the scheduler, and return its id. The id
     /// is deterministic (seed-derived counter).
@@ -63,7 +94,8 @@ impl<'a> Workload<'a> {
         self.next_entity += 1;
 
         let event = model::genesis_event(id, field, value);
-        let head = proto::Clock::from(vec![event.id()]);
+        let event_id = event.id();
+        let head = proto::Clock::from(vec![event_id]);
         let attested = model::attest(event);
 
         self.commit_and_propagate(origin, id, vec![attested], &head).await;
@@ -86,8 +118,10 @@ impl<'a> Workload<'a> {
     /// multi-head shape: capture a head, let another edit advance the tracked
     /// head, then edit again from the captured (now stale) head.
     pub async fn edit_from(&mut self, origin: usize, entity: proto::EntityId, parent: proto::Clock, field: Field, value: &str) {
-        let event = model::edit_event(entity, parent, field, value);
-        let new_head = proto::Clock::from(vec![event.id()]);
+        let generation = self.child_generation(origin, entity, &parent).await;
+        let event = model::edit_event(entity, parent, field, value, generation);
+        let event_id = event.id();
+        let new_head = proto::Clock::from(vec![event_id]);
         let attested = model::attest(event);
         self.commit_and_propagate(origin, entity, vec![attested], &new_head).await;
         self.heads.insert(entity, new_head);
@@ -106,6 +140,39 @@ impl<'a> Workload<'a> {
     /// mid-workload settle are healed at its barrier, exactly as at the end.
     pub async fn settle(&mut self) { self.scheduler.run_to_quiescence(self.nodes, self.rng, self.trace).await; }
 
+    /// Create a new entity at `origin` WITHOUT propagating it: the entity
+    /// exists only where it was written, and joins the convergence universe,
+    /// so the scenario must move it to the other nodes itself (a Get, a
+    /// delivered update, a bridge). This is the setup half of every
+    /// cross-peer gap-fill shape.
+    pub async fn create_local_at(&mut self, origin: usize, field: Field, value: &str) -> proto::EntityId {
+        let id = model::entity_id(self.next_entity);
+        self.next_entity += 1;
+
+        let event = model::genesis_event(id, field, value);
+        let event_id = event.id();
+        let head = proto::Clock::from(vec![event_id]);
+        self.nodes[origin].origin_commit(vec![model::attest(event)]).await.expect("origin commit applies");
+        self.trace.record(TraceEvent::Origin { node: origin, entity: id.to_base64_short(), head: head.to_base64_short() });
+        self.created.push(id);
+        self.heads.insert(id, head);
+        id
+    }
+
+    /// Fetch an entity at `node` through the real Get request lane: this is
+    /// the cross-peer gap-fill path (get_from_peer, durable-peer selection
+    /// from the node-held seeded RNG, entity-mediated adoption of the
+    /// response, and the post-adoption re-drive of any buffered orphans).
+    /// The get must run as a spawned task because its response can only
+    /// arrive through the scheduler; the settle drives it to completion and
+    /// the join asserts the fetch succeeded.
+    pub async fn get_at(&mut self, node: usize, entity: proto::EntityId) {
+        let ctx = self.nodes[node].node.context(ankurah::policy::DEFAULT_CONTEXT).expect("context builds");
+        let handle = tokio::spawn(async move { ctx.get::<super::model::SimRecordView>(entity).await });
+        self.settle().await;
+        handle.await.expect("get task joins").expect("cross-peer get succeeds");
+    }
+
     /// Establish a live subscription on an (ephemeral) node against `predicate`,
     /// then settle so the SubscribeQuery request and its response flow. This is
     /// the precondition for injecting SubscriptionUpdates at that node: the
@@ -113,8 +180,16 @@ impl<'a> Workload<'a> {
     /// is held open for the rest of the run.
     pub async fn subscribe(&mut self, node: usize, predicate: &str) {
         let lq = self.nodes[node].subscribe(predicate).expect("subscribe registers");
-        self.subscriptions.push(lq);
+        let ready = lq.clone();
+        self.subscriptions.push((node, lq));
         self.settle().await;
+        // Durable initialization is local spawned work outside the virtual
+        // transport drain. Ephemeral initialization may instead be waiting on
+        // a deliberately dropped relay message and its real-time retry, so the
+        // deterministic scheduler barrier remains the right boundary there.
+        if self.nodes[node].durable {
+            ready.wait_initialized().await;
+        }
     }
 
     /// Establish a live subscription on `node` against `predicate` and attach a
@@ -127,10 +202,16 @@ impl<'a> Workload<'a> {
     /// determinism audit.
     pub async fn subscribe_recording(&mut self, node: usize, predicate: &str) -> usize {
         let lq = self.nodes[node].subscribe(predicate).expect("subscribe registers");
+        let ready = lq.clone();
         let recorder = super::recorder::SubscriptionRecorder::attach(node, predicate.to_owned(), lq);
         let index = self.recorders.len();
         self.recorders.push(recorder);
         self.settle().await;
+        // See `subscribe`: only durable local initialization needs this extra
+        // barrier after the virtual transport reaches quiescence.
+        if self.nodes[node].durable {
+            ready.wait_initialized().await;
+        }
         index
     }
 
@@ -178,9 +259,10 @@ impl<'a> Workload<'a> {
         let fragments: Vec<proto::EventFragment> = events.into_iter().map(|e| e.into()).collect();
         proto::SubscriptionUpdateItem {
             entity_id: entity,
-            collection: super::model::sim_collection(),
+            model: super::model::sim_model_id(),
             content: proto::UpdateContent::EventOnly(fragments),
             predicate_relevance: vec![],
+            source_queries: vec![],
         }
     }
 
@@ -193,19 +275,30 @@ impl<'a> Workload<'a> {
         let event_fragments: Vec<proto::EventFragment> = events.into_iter().map(|e| e.into()).collect();
         proto::SubscriptionUpdateItem {
             entity_id: entity,
-            collection: super::model::sim_collection(),
+            model: super::model::sim_model_id(),
             content: proto::UpdateContent::StateAndEvent(state_fragment, event_fragments),
             predicate_relevance: vec![],
+            source_queries: vec![],
         }
     }
 
     /// Wrap items into a `NodeMessage::Update` addressed from `origin` to `dst`.
-    fn subscription_update_message(&self, origin: usize, dst: usize, items: Vec<proto::SubscriptionUpdateItem>) -> proto::NodeMessage {
+    fn subscription_update_message(&self, origin: usize, dst: usize, mut items: Vec<proto::SubscriptionUpdateItem>) -> proto::NodeMessage {
+        let source_query = self
+            .subscriptions
+            .iter()
+            .rev()
+            .find_map(|(node, query)| (*node == dst).then(|| query.query_id()))
+            .expect("subscription updates require a live query on the destination");
+        for item in &mut items {
+            item.source_queries.push(source_query);
+        }
         proto::NodeMessage::Update(proto::NodeUpdate {
             id: proto::UpdateId::new(),
             from: self.nodes[origin].id(),
             to: self.nodes[dst].id(),
             body: proto::NodeUpdateBody::SubscriptionUpdate { items },
+            schema: vec![],
         })
     }
 

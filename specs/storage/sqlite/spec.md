@@ -49,7 +49,8 @@ A SQLite-based storage engine for Ankurah, providing a lightweight embedded data
 ### Event Storage
 
 1. **Event tables**: Create `{collection}_event` tables for event sourcing
-2. **Event schema**: Store event id, entity_id, operations (BLOB), parent (JSON), attestations (BLOB)
+2. **Event schema**: Store event id, entity_id, operations (BLOB), parent (JSON),
+   mandatory generation (INTEGER NOT NULL), and attestations (BLOB)
 3. **Entity index**: Index on entity_id for efficient event retrieval
 
 ## Non-Functional Requirements

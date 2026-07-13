@@ -34,7 +34,7 @@ async fn test_id_range_optimization_integration() -> Result<()> {
     // Test 1: Simple ORDER BY id ASC with LIMIT (should use optimization)
     let selection_asc = Selection {
         predicate: Predicate::True,
-        order_by: Some(vec![OrderByItem { path: PathExpr::simple("id".to_string()), direction: OrderDirection::Asc }]),
+        order_by: Some(vec![OrderByItem { path: PathExpr::simple("id".to_string()), property: None, direction: OrderDirection::Asc }]),
         limit: Some(5),
     };
 
@@ -55,7 +55,7 @@ async fn test_id_range_optimization_integration() -> Result<()> {
     // Test 2: ORDER BY id DESC (should use FullScan reverse + skip sorting)
     let selection_desc = Selection {
         predicate: Predicate::True,
-        order_by: Some(vec![OrderByItem { path: PathExpr::simple("id".to_string()), direction: OrderDirection::Desc }]),
+        order_by: Some(vec![OrderByItem { path: PathExpr::simple("id".to_string()), property: None, direction: OrderDirection::Desc }]),
         limit: Some(3),
     };
 
@@ -72,7 +72,7 @@ async fn test_id_range_optimization_integration() -> Result<()> {
     // Test 3: ORDER BY name (should require in-memory sorting, no optimization)
     let selection_name = Selection {
         predicate: Predicate::True,
-        order_by: Some(vec![OrderByItem { path: PathExpr::simple("name".to_string()), direction: OrderDirection::Asc }]),
+        order_by: Some(vec![OrderByItem { path: PathExpr::simple("name".to_string()), property: None, direction: OrderDirection::Asc }]),
         limit: Some(5),
     };
 
@@ -116,7 +116,7 @@ async fn test_id_range_with_where_clause() -> Result<()> {
             operator: ComparisonOperator::GreaterThanOrEqual,
             right: Box::new(Expr::Literal(Literal::String(start_id.to_base64()))),
         },
-        order_by: Some(vec![OrderByItem { path: PathExpr::simple("id".to_string()), direction: OrderDirection::Asc }]),
+        order_by: Some(vec![OrderByItem { path: PathExpr::simple("id".to_string()), property: None, direction: OrderDirection::Asc }]),
         limit: Some(3),
     };
 

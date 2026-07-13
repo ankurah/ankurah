@@ -3,7 +3,12 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{auth::Attested, clock::Clock, collection::CollectionId, id::EntityId, AttestationSet, DecodeError};
+use crate::{
+    auth::Attested,
+    clock::{Clock, GClock},
+    id::EntityId,
+    AttestationSet, DecodeError,
+};
 
 #[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 pub struct EventId([u8; 32]);
@@ -13,13 +18,14 @@ impl std::fmt::Debug for EventId {
 }
 
 impl EventId {
-    /// Generate an EventID from the parts of an Event
-    /// notably, we are not including the collection in the hash because collection is getting excised from identity
-    pub fn from_parts(entity_id: &EntityId, operations: &OperationSet, parent: &Clock) -> Self {
+    /// Hash the identity-bearing parts of an event. Model attribution is
+    /// deliberately excluded; generation is included.
+    pub fn from_parts(entity_id: &EntityId, operations: &OperationSet, parent: &Clock, generation: u32) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(bincode::serialize(&entity_id).unwrap());
         hasher.update(bincode::serialize(&operations).unwrap());
         hasher.update(bincode::serialize(&parent).unwrap());
+        hasher.update(bincode::serialize(&generation).unwrap());
         Self(hasher.finalize().into())
     }
     pub fn to_base64(&self) -> String {
@@ -101,34 +107,61 @@ impl<'de> Deserialize<'de> for EventId {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Event {
-    pub collection: CollectionId,
+    /// Model-definition id used to route this event to a collection. It is
+    /// deliberately excluded from [`EventId`]; attribution is envelope-level.
+    pub model: EntityId,
     pub entity_id: EntityId,
     pub operations: OperationSet,
     /// The set of concurrent events (usually only one) which is the precursor of this event
     pub parent: Clock,
+    /// Topological level: `1 + max(parent generations)`, or `1` for genesis.
+    /// It is hashed and checked at admission wherever all parents resolve.
+    pub generation: u32,
 }
 
 impl Event {
     // TODO: figure out how we actually want to signify entity creation. This is a hack for now
     pub fn is_entity_create(&self) -> bool { self.parent.is_empty() }
+
+    /// The generation an event must carry given the generations of its parents:
+    /// `1 + max(parent generations)`, or `1` for a genesis event (no parents).
+    /// Saturates at `u32::MAX` (266-C.iv); the comparison accelerations treat a
+    /// saturated value as ineligible and fall back to the plain walk (the
+    /// precheck disable path, pinned by the saturation oracle arms).
+    pub fn generation_from_parents(parent_generations: impl IntoIterator<Item = u32>) -> u32 {
+        parent_generations.into_iter().max().map_or(1, |m| m.saturating_add(1))
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct EventFragment {
     pub operations: OperationSet,
     pub parent: Clock,
+    /// See [`Event::generation`]. Carried on the wire inside the hashed content.
+    pub generation: u32,
     pub attestations: AttestationSet,
 }
 
 impl From<Attested<Event>> for EventFragment {
     fn from(attested: Attested<Event>) -> Self {
-        Self { operations: attested.payload.operations, parent: attested.payload.parent, attestations: attested.attestations }
+        Self {
+            operations: attested.payload.operations,
+            parent: attested.payload.parent,
+            generation: attested.payload.generation,
+            attestations: attested.attestations,
+        }
     }
 }
 
-impl From<(EntityId, CollectionId, EventFragment)> for Attested<Event> {
-    fn from(value: (EntityId, CollectionId, EventFragment)) -> Self {
-        let event = Event { entity_id: value.0, collection: value.1, operations: value.2.operations, parent: value.2.parent };
+impl From<(EntityId, EntityId, EventFragment)> for Attested<Event> {
+    fn from(value: (EntityId, EntityId, EventFragment)) -> Self {
+        let event = Event {
+            entity_id: value.0,
+            model: value.1,
+            operations: value.2.operations,
+            parent: value.2.parent,
+            generation: value.2.generation,
+        };
         Attested { payload: event, attestations: value.2.attestations }
     }
 }
@@ -142,15 +175,15 @@ pub struct StateFragment {
 impl From<Attested<EntityState>> for StateFragment {
     fn from(attested: Attested<EntityState>) -> Self { Self { state: attested.payload.state, attestations: attested.attestations } }
 }
-impl From<(EntityId, CollectionId, StateFragment)> for Attested<EntityState> {
-    fn from(value: (EntityId, CollectionId, StateFragment)) -> Self {
-        let entity_state = EntityState { entity_id: value.0, collection: value.1, state: value.2.state };
+impl From<(EntityId, EntityId, StateFragment)> for Attested<EntityState> {
+    fn from(value: (EntityId, EntityId, StateFragment)) -> Self {
+        let entity_state = EntityState { entity_id: value.0, model: value.1, state: value.2.state };
         Attested { payload: entity_state, attestations: value.2.attestations }
     }
 }
 
 impl Event {
-    pub fn id(&self) -> EventId { EventId::from_parts(&self.entity_id, &self.operations, &self.parent) }
+    pub fn id(&self) -> EventId { EventId::from_parts(&self.entity_id, &self.operations, &self.parent, self.generation) }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -183,7 +216,8 @@ pub struct Operation {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct EntityState {
     pub entity_id: EntityId,
-    pub collection: CollectionId,
+    /// The model-definition entity id (#330); see [`Event::model`].
+    pub model: EntityId,
     pub state: State,
 }
 
@@ -193,6 +227,14 @@ pub struct State {
     pub state_buffers: StateBuffers,
     /// The set of concurrent events (usually only one) which have been applied to the entity state above
     pub head: Clock,
+    /// Per-tip generations for `head` (D2, plan REV 5 section K): one entry
+    /// per head tip, carrying the generation the tip's event payload claims,
+    /// pinned at admission. Must annotate exactly `head`'s tips
+    /// ([`GClock::matches_head`]); a state whose annotation does not is
+    /// malformed and is rejected at the ingress boundary. This is what lets
+    /// a receiving node stamp commits and admission-verify head-parented
+    /// arrivals without retrieving any event payloads.
+    pub head_generations: GClock,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -207,9 +249,10 @@ impl std::fmt::Display for Event {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Event({} {}/{} {}{} {})",
+            "Event({} g{} {}/{} {}{} {})",
             self.id().to_base64_short(),
-            self.collection,
+            self.generation,
+            self.model.to_base64_short(),
             self.entity_id.to_base64_short(),
             if self.is_entity_create() { "(create) " } else { "" },
             self.parent.to_base64_short(),
@@ -252,7 +295,7 @@ impl std::fmt::Display for EntityState {
 }
 
 impl Attested<Event> {
-    pub fn collection(&self) -> &CollectionId { &self.payload.collection }
+    pub fn model(&self) -> EntityId { self.payload.model }
 }
 
 impl From<Event> for Attested<Event> {
@@ -264,17 +307,20 @@ impl From<EntityState> for Attested<EntityState> {
 }
 
 impl Attested<EntityState> {
-    pub fn to_parts(self) -> (EntityId, CollectionId, StateFragment) {
-        (self.payload.entity_id, self.payload.collection, StateFragment { state: self.payload.state, attestations: self.attestations })
+    pub fn to_parts(self) -> (EntityId, EntityId, StateFragment) {
+        (self.payload.entity_id, self.payload.model, StateFragment { state: self.payload.state, attestations: self.attestations })
     }
-    pub fn from_parts(entity_id: EntityId, collection: CollectionId, fragment: StateFragment) -> Self {
-        Self { payload: EntityState { entity_id, collection, state: fragment.state }, attestations: fragment.attestations }
+    pub fn from_parts(entity_id: EntityId, model: EntityId, fragment: StateFragment) -> Self {
+        Self { payload: EntityState { entity_id, model, state: fragment.state }, attestations: fragment.attestations }
     }
 }
 
 impl Attested<Event> {
-    pub fn from_parts(entity_id: EntityId, collection: CollectionId, frag: EventFragment) -> Self {
-        Self { payload: Event { entity_id, collection, operations: frag.operations, parent: frag.parent }, attestations: frag.attestations }
+    pub fn from_parts(entity_id: EntityId, model: EntityId, frag: EventFragment) -> Self {
+        Self {
+            payload: Event { entity_id, model, operations: frag.operations, parent: frag.parent, generation: frag.generation },
+            attestations: frag.attestations,
+        }
     }
 }
 
@@ -303,5 +349,21 @@ mod tests {
             [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
         );
         assert_eq!(id, bincode::deserialize(&bytes).unwrap());
+    }
+
+    /// The 266-C.iv saturation contract as ARITHMETIC (M4 remediation item
+    /// 9, test-adequacy panel MAJOR 3): the sentinel was pinned only as a
+    /// STORED value (the four engine round-trips), so replacing
+    /// saturating_add(1) with a plain + 1 passed the entire suite (no test
+    /// fed a maximal parent through the helper; release builds would wrap
+    /// to 0, inverting exactly the conservative direction the sentinel
+    /// guarantees for the M5 prechecks).
+    #[test]
+    fn generation_from_parents_saturates_at_the_sentinel() {
+        assert_eq!(Event::generation_from_parents([u32::MAX]), u32::MAX, "a saturated parent stays at the sentinel, never wraps");
+        assert_eq!(Event::generation_from_parents([u32::MAX - 1]), u32::MAX, "the last honest depth lands exactly on the sentinel");
+        assert_eq!(Event::generation_from_parents([u32::MAX, 3]), u32::MAX, "max() then saturate, order-independent");
+        assert_eq!(Event::generation_from_parents([3, u32::MAX]), u32::MAX, "max() then saturate, order-independent");
+        assert_eq!(Event::generation_from_parents([]), 1, "genesis stamps exactly 1 (266-A)");
     }
 }

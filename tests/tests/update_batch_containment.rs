@@ -1,6 +1,7 @@
 mod common;
 
 use ankurah::core::property::backend::{lww::LWWBackend, PropertyBackend};
+use ankurah::core::property::PropertyKey;
 use ankurah::core::value::Value;
 use ankurah::proto::{self, Attested};
 use ankurah::{policy::DEFAULT_CONTEXT as c, Model, Node, PermissiveAgent, View};
@@ -12,25 +13,27 @@ use std::sync::Arc;
 
 use common::{Record, RecordView};
 
-/// Forge a Record LWW event setting `title`, parented on the given clock.
-fn forge_title_event(entity_id: proto::EntityId, parent: proto::Clock, title: &str) -> proto::Event {
+/// Forge a Record LWW event setting `title`, parented on the given parent
+/// EVENTS (generation stamped from their payloads; the registry ban).
+fn forge_title_event(title_property: proto::EntityId, entity_id: proto::EntityId, parents: &[&proto::Event], title: &str) -> proto::Event {
     let backend = LWWBackend::new();
-    backend.set("title".into(), Some(Value::String(title.to_owned())));
+    backend.set(PropertyKey::Id(title_property), Some(Value::String(title.to_owned())));
     let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
-    proto::Event {
+    ankurah_tests::forge::event_with_parents(
         entity_id,
-        collection: Record::collection(),
-        operations: proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
-        parent,
-    }
+        parents.first().expect("the forged update has a creation parent").model,
+        proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
+        parents,
+    )
 }
 
-fn event_only_item(event: proto::Event) -> proto::SubscriptionUpdateItem {
+fn event_only_item(event: proto::Event, source_query: proto::QueryId) -> proto::SubscriptionUpdateItem {
     proto::SubscriptionUpdateItem {
         entity_id: event.entity_id,
-        collection: event.collection.clone(),
+        model: event.model,
         content: proto::UpdateContent::EventOnly(vec![Attested::opt(event, None).into()]),
         predicate_relevance: vec![],
+        source_queries: vec![source_query],
     }
 }
 
@@ -51,49 +54,53 @@ async fn test_event_only_multi_event_wire_order_is_untrusted() -> Result<()> {
     let ctx_s = server.context(c)?;
     let ctx_c = client.context(c)?;
 
-    let _relay_context = ctx_c.query_wait::<RecordView>("title = 'no-such-title'").await?;
+    let relay_context = ctx_c.query_wait::<RecordView>("true").await?;
 
-    let rec_id = {
+    let (rec_id, genesis) = {
         let trx = ctx_s.begin();
         let rec = trx.create(&Record { title: "t0".to_owned(), artist: "a0".to_owned() }).await?;
         let id = rec.id();
-        trx.commit().await?;
-        id
+        let mut events = trx.commit_and_return_events().await?;
+        (id, events.remove(0))
     };
     let view = ctx_c.get::<RecordView>(rec_id).await?;
     assert_eq!(view.title().unwrap(), "t0");
+    assert_eq!(view.entity().head(), proto::Clock::from(vec![genesis.id()]));
+    let record_title = server.catalog.resolve(Record::collection().as_str(), "title").expect("Record.title registered by create");
+    let record_artist = server.catalog.resolve(Record::collection().as_str(), "artist").expect("Record.artist registered by create");
 
     // Forge parent (writes artist) then child (writes title), and put the
     // CHILD first on the wire.
-    let ev_parent = forge_title_event(rec_id, view.entity().head().clone(), "ignored");
-    // rebuild parent event to write artist instead of title
     let ev_parent = {
         use ankurah::core::property::backend::{lww::LWWBackend, PropertyBackend};
+        use ankurah::core::property::PropertyKey;
         use ankurah::core::value::Value;
         let backend = LWWBackend::new();
-        backend.set("artist".into(), Some(Value::String("artist-p1".to_owned())));
+        backend.set(PropertyKey::Id(record_artist), Some(Value::String("artist-p1".to_owned())));
         let ops = backend.to_operations().unwrap().expect("ops");
-        proto::Event {
-            entity_id: rec_id,
-            collection: ev_parent.collection.clone(),
-            operations: proto::OperationSet(std::collections::BTreeMap::from([("lww".to_owned(), ops)])),
-            parent: ev_parent.parent.clone(),
-        }
+        ankurah_tests::forge::event_with_parents(
+            rec_id,
+            genesis.model,
+            proto::OperationSet(std::collections::BTreeMap::from([("lww".to_owned(), ops)])),
+            &[&genesis],
+        )
     };
-    let ev_child = forge_title_event(rec_id, proto::Clock::from(vec![ev_parent.id()]), "t-child");
+    let ev_child = forge_title_event(record_title, rec_id, &[&ev_parent], "t-child");
     let (id_parent, id_child) = (ev_parent.id(), ev_child.id());
 
     let item = proto::SubscriptionUpdateItem {
         entity_id: rec_id,
-        collection: Record::collection(),
+        model: ev_parent.model,
         content: proto::UpdateContent::EventOnly(vec![Attested::opt(ev_child, None).into(), Attested::opt(ev_parent, None).into()]),
         predicate_relevance: vec![],
+        source_queries: vec![relay_context.query_id()],
     };
     let update = proto::NodeUpdate {
         id: proto::UpdateId::new(),
         from: server.id,
         to: client.id,
         body: proto::NodeUpdateBody::SubscriptionUpdate { items: vec![item] },
+        schema: vec![],
     };
     client.handle_message(proto::NodeMessage::Update(update)).await?;
 
@@ -127,30 +134,48 @@ async fn test_event_only_unknown_entity_does_not_poison_batch() -> Result<()> {
 
     // A live subscription (to anything) establishes the relay context that
     // apply_updates requires for this peer. Held for the test's duration.
-    let _relay_context = ctx_c.query_wait::<RecordView>("title = 'no-such-title'").await?;
+    let relay_context = ctx_c.query_wait::<RecordView>("true").await?;
 
     // Two records created on the server; the client materializes them at
     // their creation heads and holds them resident.
-    let (a_id, b_id) = {
+    let (a_id, b_id, genesis_a, genesis_b) = {
         let trx = ctx_s.begin();
         let a = trx.create(&Record { title: "a0".to_owned(), artist: "artist-a".to_owned() }).await?;
         let b = trx.create(&Record { title: "b0".to_owned(), artist: "artist-b".to_owned() }).await?;
         let ids = (a.id(), b.id());
-        trx.commit().await?;
-        ids
+        let events = trx.commit_and_return_events().await?;
+        let ga = events.iter().find(|e| e.entity_id == ids.0).expect("a's creation event").clone();
+        let gb = events.iter().find(|e| e.entity_id == ids.1).expect("b's creation event").clone();
+        (ids.0, ids.1, ga, gb)
     };
     let view_a = ctx_c.get::<RecordView>(a_id).await?;
     let view_b = ctx_c.get::<RecordView>(b_id).await?;
     assert_eq!(view_a.title().unwrap(), "a0");
     assert_eq!(view_b.title().unwrap(), "b0");
+    // #330: forged events carry Record's model id, registered by the creates above.
+    let record_model = server.catalog.model_id_for(Record::collection().as_str()).expect("record registered by the creates");
+    let record_title = server.catalog.resolve(Record::collection().as_str(), "title").expect("title registered with Record");
 
     // Forge the batch: valid events for A and B (parented on their current
     // heads), and a non-creation event for an entity the client knows nothing
     // about in the middle.
-    let ev_a = forge_title_event(a_id, view_a.entity().head().clone(), "a1");
-    let ev_b = forge_title_event(b_id, view_b.entity().head().clone(), "b1");
+    let ev_a = forge_title_event(record_title, a_id, &[&genesis_a], "a1");
+    let ev_b = forge_title_event(record_title, b_id, &[&genesis_b], "b1");
     let unknown_id = proto::EntityId::new();
-    let ev_unknown = forge_title_event(unknown_id, proto::Clock::from(vec![proto::EventId::from_bytes([7u8; 32])]), "ghost");
+    // The parent id is fabricated (no true generation exists); the explicit
+    // claim of 2 is plausible and admission can never verify it.
+    let ev_unknown = {
+        let backend = LWWBackend::new();
+        backend.set(PropertyKey::Id(record_title), Some(Value::String("ghost".to_owned())));
+        let ops = backend.to_operations().unwrap().expect("ops");
+        ankurah_tests::forge::event_claiming(
+            unknown_id,
+            record_model,
+            proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
+            proto::Clock::from(vec![proto::EventId::from_bytes([7u8; 32])]),
+            2,
+        )
+    };
     let (id_ev_a, id_ev_b) = (ev_a.id(), ev_b.id());
 
     let update = proto::NodeUpdate {
@@ -158,8 +183,13 @@ async fn test_event_only_unknown_entity_does_not_poison_batch() -> Result<()> {
         from: server.id,
         to: client.id,
         body: proto::NodeUpdateBody::SubscriptionUpdate {
-            items: vec![event_only_item(ev_a), event_only_item(ev_unknown), event_only_item(ev_b)],
+            items: vec![
+                event_only_item(ev_a, relay_context.query_id()),
+                event_only_item(ev_unknown, relay_context.query_id()),
+                event_only_item(ev_b, relay_context.query_id()),
+            ],
         },
+        schema: vec![],
     };
 
     // handle_message reports per-update failures to the sender via

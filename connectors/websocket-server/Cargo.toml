@@ -1,6 +1,6 @@
 [package]
 name          = "ankurah-websocket-server"
-version       = "0.9.0"
+version       = "0.10.0"
 edition       = "2021"
 description   = "Ankurah WebSocket Server - A WebSocket server for Ankurah"
 license       = "MIT OR Apache-2.0"
@@ -14,8 +14,8 @@ instrument = []
 [dependencies]
 
 # Base dependencies
-ankurah-proto          = { path = "../../proto", version = "=0.9.0" }
-ankurah-core           = { path = "../../core", version = "=0.9.0" }
+ankurah-proto          = { path = "../../proto", version = "=0.10.0" }
+ankurah-core           = { path = "../../core", version = "=0.10.0" }
 anyhow                 = "1.0"
 bincode                = "1.3"
 serde                  = { version = "1.0.203", features = ["derive", "serde_derive"] }
@@ -26,6 +26,6 @@ forwarded-header-value = "0.1.1"
 
 axum       = { version = "0.8.3", features = ["ws"] }
 axum-extra = { version = "0.10", features = ["typed-header"] }
-tokio      = { version = "1.38", features = ["rt-multi-thread"] }
+tokio      = { version = "1.38", features = ["rt-multi-thread", "time"] }
 tower-http = { version = "0.6", features = ["trace"] }
 tower      = { version = "0.5" }

@@ -131,8 +131,8 @@ order does not matter.
 ### The ingredients of determinism
 
 1. **Lexicographic tiebreak is a total order.** EventIds are SHA-256 hashes of
-   `(entity_id, operations, parent_clock)`. The byte-level ordering is
-   consistent across all replicas.
+   `(entity_id, operations, parent_clock, generation)`. The byte-level ordering
+   is consistent across all replicas.
 
 2. **`max()` is commutative and associative.** Pairwise competition produces
    the same result regardless of evaluation order.

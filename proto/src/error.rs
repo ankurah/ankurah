@@ -6,6 +6,13 @@ pub enum DecodeError {
     InvalidUlid,
     InvalidFallback,
     InvalidFormat,
+    /// A stored generation number is not exactly a u32: NaN, infinite,
+    /// negative, fractional, or beyond u32::MAX. The indexeddb read path
+    /// must fail loudly on such a value, never coerce it (the saturating
+    /// cast silently mapped NaN and negatives to 0, truncated fractions,
+    /// and clamped overflow; D2 M4 remediation item 3, matching the
+    /// range-checked discipline of the other engine homes).
+    InvalidGeneration(f64),
     Other(anyhow::Error),
 }
 
@@ -17,6 +24,7 @@ impl std::fmt::Display for DecodeError {
             DecodeError::InvalidLength => write!(f, "Invalid Length"),
             DecodeError::InvalidUlid => write!(f, "Invalid ULID"),
             DecodeError::InvalidFallback => write!(f, "Invalid Fallback"),
+            DecodeError::InvalidGeneration(v) => write!(f, "Invalid generation: {} is not exactly a u32", v),
             DecodeError::Other(e) => write!(f, "Other: {}", e),
             DecodeError::InvalidFormat => write!(f, "Invalid Format"),
         }

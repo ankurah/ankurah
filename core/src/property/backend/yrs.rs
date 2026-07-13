@@ -5,6 +5,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use ankurah_proto::EntityId;
 use yrs::{updates::decoder::Decode, GetString, Observable, ReadTxn, StateVector, Text, Transact};
 use yrs::{Update, WriteTxn};
 
@@ -12,16 +13,41 @@ use crate::{
     error::{MutationError, StateError},
     property::{
         backend::{Operation, PropertyBackend},
-        PropertyName, Value,
+        PropertyKey, Value,
     },
 };
+
+/// The Yjs Doc root name a [`PropertyKey`] stores under. An `Id` key uses a
+/// `#`-prefixed base64 id (a leading `#` is illegal in a Rust field
+/// identifier and in a system-table property name, so it can never collide
+/// with a `Name` root); a `Name` key uses the bare name. yrs stores id-keyed
+/// like every other backend (the PropertyKey amendment on #289 superseded the
+/// earlier name-keyed-root design).
+fn root_name(key: &PropertyKey) -> String {
+    match key {
+        PropertyKey::Id(id) => format!("#{}", id.to_base64()),
+        PropertyKey::Name(name) => name.clone(),
+    }
+}
+
+/// Classify a Yjs Doc root name back to its [`PropertyKey`]: a `#`-prefixed
+/// root whose remainder decodes as an id is an `Id` key, everything else is a
+/// `Name` key.
+fn key_from_root(root: &str) -> PropertyKey {
+    if let Some(encoded) = root.strip_prefix('#') {
+        if let Ok(id) = EntityId::from_base64(encoded) {
+            return PropertyKey::Id(id);
+        }
+    }
+    PropertyKey::Name(root.to_string())
+}
 
 /// Stores one or more properties of an entity
 #[derive(Debug)]
 pub struct YrsBackend {
     pub(crate) doc: yrs::Doc,
     previous_state: Mutex<StateVector>,
-    field_broadcasts: Mutex<BTreeMap<PropertyName, ankurah_signals::broadcast::Broadcast>>,
+    field_broadcasts: Mutex<BTreeMap<PropertyKey, ankurah_signals::broadcast::Broadcast>>,
 }
 
 impl Default for YrsBackend {
@@ -35,27 +61,31 @@ impl YrsBackend {
         Self { doc, previous_state: Mutex::new(starting_state), field_broadcasts: Mutex::new(BTreeMap::new()) }
     }
 
-    pub fn get_string(&self, property_name: impl AsRef<str>) -> Option<String> {
+    pub fn get_string(&self, key: &PropertyKey) -> Option<String> {
         let txn = self.doc.transact();
-        let text = txn.get_text(property_name.as_ref()); // We only have one field in the yrs doc
+        let text = txn.get_text(root_name(key).as_str());
         text.map(|t| t.get_string(&txn))
     }
 
-    pub fn insert(&self, property_name: impl AsRef<str>, index: u32, value: &str) -> Result<(), MutationError> {
-        let text = self.doc.get_or_insert_text(property_name.as_ref()); // We only have one field in the yrs doc
+    pub fn insert(&self, key: &PropertyKey, index: u32, value: &str) -> Result<(), MutationError> {
+        let text = self.doc.get_or_insert_text(root_name(key).as_str());
         let mut ytx = self.doc.transact_mut();
         text.insert(&mut ytx, index, value);
         Ok(())
     }
 
-    pub fn delete(&self, property_name: impl AsRef<str>, index: u32, length: u32) -> Result<(), MutationError> {
-        let text = self.doc.get_or_insert_text(property_name.as_ref()); // We only have one field in the yrs doc
+    pub fn delete(&self, key: &PropertyKey, index: u32, length: u32) -> Result<(), MutationError> {
+        let text = self.doc.get_or_insert_text(root_name(key).as_str());
         let mut ytx = self.doc.transact_mut();
         text.remove_range(&mut ytx, index, length);
         Ok(())
     }
 
-    fn apply_update(&self, update: &[u8], changed_fields: &Arc<Mutex<std::collections::HashSet<String>>>) -> Result<(), MutationError> {
+    fn apply_update(
+        &self,
+        update: &[u8],
+        changed_fields: &Arc<Mutex<std::collections::HashSet<PropertyKey>>>,
+    ) -> Result<(), MutationError> {
         let mut txn = self.doc.transact_mut();
 
         // TODO: There's gotta be a better way to do this - but I don't see it at the time of this writing
@@ -64,12 +94,13 @@ impl YrsBackend {
             .lock()
             .unwrap()
             .keys()
-            .map(|b| {
+            .map(|key| {
                 let changed_fields = changed_fields.clone();
-                let b = b.to_string();
-                txn.get_or_insert_text(b.as_str()).observe(move |_, _| {
+                let key = key.clone();
+                let root = root_name(&key);
+                txn.get_or_insert_text(root.as_str()).observe(move |_, _| {
                     let mut changed_fields = changed_fields.lock().unwrap();
-                    changed_fields.insert(b.clone());
+                    changed_fields.insert(key.clone());
                 })
             })
             .collect();
@@ -81,8 +112,8 @@ impl YrsBackend {
         Ok(())
     }
 
-    fn get_property_string(&self, trx: &yrs::Transaction, property_name: &PropertyName) -> Option<Value> {
-        let value = match trx.get_text(property_name.clone()) {
+    fn get_property_string(&self, trx: &yrs::Transaction, key: &PropertyKey) -> Option<Value> {
+        let value = match trx.get_text(root_name(key).as_str()) {
             Some(text_ref) => {
                 let text = text_ref.get_string(trx);
                 Some(text)
@@ -106,25 +137,25 @@ impl PropertyBackend for YrsBackend {
         Arc::new(backend)
     }
 
-    fn properties(&self) -> Vec<String> {
+    fn properties(&self) -> Vec<PropertyKey> {
         let trx = Transact::transact(&self.doc);
         let root_refs = trx.root_refs();
-        root_refs.map(|(name, _)| name.to_owned()).collect()
+        root_refs.map(|(name, _)| key_from_root(name)).collect()
     }
 
-    fn property_value(&self, property_name: &PropertyName) -> Option<Value> {
+    fn property_value(&self, key: &PropertyKey) -> Option<Value> {
         let trx = Transact::transact(&self.doc);
-        self.get_property_string(&trx, property_name)
+        self.get_property_string(&trx, key)
     }
 
-    fn property_values(&self) -> BTreeMap<PropertyName, Option<Value>> {
+    fn property_values(&self) -> BTreeMap<PropertyKey, Option<Value>> {
         let properties = self.properties();
 
         let mut values = BTreeMap::new();
         let trx = Transact::transact(&self.doc);
-        for property_name in properties {
-            let value = self.get_property_string(&trx, &property_name);
-            values.insert(property_name, value);
+        for key in properties {
+            let value = self.get_property_string(&trx, &key);
+            values.insert(key, value);
         }
 
         values
@@ -198,14 +229,10 @@ impl PropertyBackend for YrsBackend {
         Ok(())
     }
 
-    fn listen_field(
-        &self,
-        field_name: &PropertyName,
-        listener: ankurah_signals::signal::Listener,
-    ) -> ankurah_signals::signal::ListenerGuard {
-        // Get or create the broadcast for this field
+    fn listen_field(&self, key: &PropertyKey, listener: ankurah_signals::signal::Listener) -> ankurah_signals::signal::ListenerGuard {
+        // Get or create the broadcast for this key
         let mut field_broadcasts = self.field_broadcasts.lock().expect("other thread panicked, panic here too");
-        let broadcast = field_broadcasts.entry(field_name.clone()).or_default();
+        let broadcast = field_broadcasts.entry(key.clone()).or_default();
 
         // Subscribe to the broadcast and return the guard
         broadcast.reference().listen(listener).into()
@@ -213,10 +240,10 @@ impl PropertyBackend for YrsBackend {
 }
 
 impl YrsBackend {
-    /// Get the broadcast ID for a specific field, creating the broadcast if necessary
-    pub fn field_broadcast_id(&self, field_name: &PropertyName) -> ankurah_signals::broadcast::BroadcastId {
+    /// Get the broadcast ID for a specific key, creating the broadcast if necessary
+    pub fn field_broadcast_id(&self, key: &PropertyKey) -> ankurah_signals::broadcast::BroadcastId {
         let mut field_broadcasts = self.field_broadcasts.lock().expect("other thread panicked, panic here too");
-        let broadcast = field_broadcasts.entry(field_name.clone()).or_default();
+        let broadcast = field_broadcasts.entry(key.clone()).or_default();
         broadcast.id()
     }
 }

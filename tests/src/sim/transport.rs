@@ -131,6 +131,11 @@ fn request_descriptor(body: &proto::NodeRequestBody) -> String {
         }
         proto::NodeRequestBody::Fetch { collection, .. } => format!("fetch {}", collection),
         proto::NodeRequestBody::SubscribeQuery { collection, .. } => format!("subscribe {}", collection),
+        proto::NodeRequestBody::RegisterSchema { models, properties, memberships } => {
+            let mut cols: Vec<String> = models.iter().map(|m| m.collection.to_string()).collect();
+            cols.sort();
+            format!("registerschema [{}] p{} ms{}", cols.join("+"), properties.len(), memberships.len())
+        }
     }
 }
 
@@ -145,6 +150,11 @@ fn response_descriptor(body: &proto::NodeResponseBody) -> String {
         }
         proto::NodeResponseBody::GetEvents(events) => format!("getevents {}", event_ids(events)),
         proto::NodeResponseBody::QuerySubscribed { deltas, .. } => format!("subscribed {}", deltas.len()),
+        // Counts only: allocated ids are ULIDs and would perturb the
+        // determinism digest without adding discriminating power.
+        proto::NodeResponseBody::SchemaRegistered { models, properties, memberships } => {
+            format!("schemaregistered m{} p{} ms{}", models.len(), properties.len(), memberships.len())
+        }
         proto::NodeResponseBody::Success => "success".to_string(),
         // Include the error text so two distinct rejections are distinguishable
         // in the trace (advisory path, but keeps the digest faithful).
@@ -169,13 +179,13 @@ fn update_item_descriptor(item: &proto::SubscriptionUpdateItem) -> String {
 
 /// Sorted, joined content-derived event ids for a set of `EventFragment`s.
 /// `EventFragment` omits the event id, but it is a pure hash of
-/// `(entity_id, operations, parent)`, so we recompute it: this makes the digest
-/// faithful to the batch's actual events, not merely their count. Keying on the
-/// count alone would let two different batches for one entity share a digest and
-/// false-pass the determinism audit.
+/// `(entity_id, operations, parent, generation)`, so we recompute it. This keeps
+/// the digest faithful to the batch's actual events, not merely their count.
+/// Keying on the count alone would let two different batches for one entity
+/// share a digest and false-pass the determinism audit.
 fn fragment_ids(entity: proto::EntityId, fragments: &[proto::EventFragment]) -> String {
     let mut ids: Vec<String> =
-        fragments.iter().map(|f| proto::EventId::from_parts(&entity, &f.operations, &f.parent).to_base64_short()).collect();
+        fragments.iter().map(|f| proto::EventId::from_parts(&entity, &f.operations, &f.parent, f.generation).to_base64_short()).collect();
     ids.sort();
     ids.join("+")
 }

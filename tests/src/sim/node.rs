@@ -17,7 +17,7 @@ use ankurah::{Node, PermissiveAgent};
 use ankurah_storage_sled::SledStorageEngine;
 use std::sync::Arc;
 
-use super::model::SimRecord;
+use super::model::{Field, SimRecord};
 use super::transport::{Captured, SimSender};
 use ankurah::Model;
 
@@ -38,10 +38,24 @@ impl SimNode {
     /// would, including the durable-peer bookkeeping that drives system join.
     pub fn connect_to(&self, peer: &SimNode) {
         let sender = SimSender::new(self.index, peer.id(), self.captured.clone());
-        self.node.register_peer(
-            proto::Presence { node_id: peer.id(), durable: peer.durable, system_root: peer.node.system.root() },
-            Box::new(sender),
-        );
+        self.node
+            .register_peer(
+                proto::Presence {
+                    node_id: peer.id(),
+                    durable: peer.durable,
+                    system_root: peer.node.system.root(),
+                    protocol_version: proto::PROTOCOL_VERSION,
+                },
+                Box::new(sender),
+            )
+            .expect("simulation peers use the current protocol version");
+
+        // build_nodes seeds the same deterministic catalog definitions into
+        // every simulator before connections are created. It deliberately
+        // bypasses stored catalog entities, so descriptor shipping cannot
+        // reconstruct a wire bundle. Mark that already-shared model as
+        // announced; production connections still require a complete bundle.
+        self.node.assume_model_announced_to_peer_for_test(peer.id(), super::model::sim_model_id());
     }
 
     /// Ingest a forged batch of events directly through the production remote
@@ -135,6 +149,55 @@ pub async fn build_nodes(n: usize, captured: Captured) -> anyhow::Result<Vec<Sim
     for index in 1..n {
         let node = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
         nodes.push(SimNode { index, durable: false, node, captured: captured.clone() });
+    }
+
+    // #330: forged wire envelopes carry a model-definition id, and ingress
+    // `resolve_model` rejects any id its catalog cannot route. The harness
+    // forges events/states directly (bypassing schema registration and the
+    // catalog relay), so seed every node's catalog with the `SimRecord` model,
+    // properties, and memberships at fixed ids. A direct upsert (not the
+    // durable allocator) keeps every id byte-identical across nodes and across
+    // runs; the map is only ever cleared by hard_reset, which the clean
+    // system-join here never triggers, so the seed persists for the run.
+    let sim_model = proto::RegisteredModel {
+        id: super::model::sim_model_id(),
+        collection: SimRecord::collection().as_str().to_string(),
+        name: "SimRecord".to_string(),
+    };
+    let sim_properties = [
+        proto::RegisteredProperty {
+            id: super::model::sim_title_property_id(),
+            model: sim_model.id,
+            name: "title".to_string(),
+            backend: "lww".to_string(),
+            value_type: "string".to_string(),
+            target_model: None,
+        },
+        proto::RegisteredProperty {
+            id: super::model::sim_body_property_id(),
+            model: sim_model.id,
+            name: "body".to_string(),
+            backend: "lww".to_string(),
+            value_type: "string".to_string(),
+            target_model: None,
+        },
+    ];
+    let sim_memberships = [
+        proto::RegisteredMembership {
+            id: super::model::sim_title_membership_id(),
+            model: sim_model.id,
+            property: sim_properties[0].id,
+            optional: false,
+        },
+        proto::RegisteredMembership {
+            id: super::model::sim_body_membership_id(),
+            model: sim_model.id,
+            property: sim_properties[1].id,
+            optional: false,
+        },
+    ];
+    for node in &nodes {
+        node.node.catalog.upsert_registered(std::slice::from_ref(&sim_model), &sim_properties, &sim_memberships);
     }
 
     Ok(nodes)

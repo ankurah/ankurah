@@ -35,12 +35,40 @@
 use super::{
     accumulator::{compute_ancestry_from_dag, ComparisonResult, EventAccumulator},
     frontier::Frontier,
+    ordering::canonicalize_chain,
     relation::AbstractCausalRelation,
 };
 use crate::error::RetrievalError;
+use crate::ingest::UnverifiedEvents;
 use crate::retrieval::GetEvents;
-use ankurah_proto::{Clock, EventId};
+use ankurah_proto::{Clock, EventId, GClock};
 use std::collections::{BTreeSet, HashMap};
+
+/// Generation operands and eligibility context for one comparison (D2 M5,
+/// plan D2-4). Everything here is ADVISORY acceleration input: per the
+/// 5b-ii usage discipline the values may only suppress a positive fast-path
+/// attempt or order the walk's schedule; the verdict and meet are identical
+/// for any assignment whatsoever (the gen-corruption immunity oracle pins
+/// exactly that at this seam, which is the outermost seam carrying the
+/// prechecks per dispositions Q5).
+#[derive(Default)]
+pub(crate) struct CompareOptions<'a> {
+    /// Per-tip generations of the SUBJECT clock, where materialized: the
+    /// in-hand event's own stamp on the apply_event lane, the incoming
+    /// state's carried annotation on the apply_state lane. None disables
+    /// the prechecks (never the walk).
+    pub(crate) subject_gens: Option<GClock>,
+    /// Per-tip generations of the COMPARISON clock, where materialized: the
+    /// resident's head annotation, snapshotted under the head lock together
+    /// with the head it annotates.
+    pub(crate) comparison_gens: Option<GClock>,
+    /// The node's admitted-unverified id set, consulted AT CONSUMPTION for
+    /// per-tip eligibility (D2-4: an unverified generation never feeds an
+    /// acceleration). None means no set is available and reads as empty,
+    /// the documented loss-safe degradation (unverified.rs: loss degrades
+    /// to default-eligible; suppress-only wiring caps the damage).
+    pub(crate) unverified: Option<&'a UnverifiedEvents>,
+}
 
 /// Compare two clocks to determine their causal relationship.
 ///
@@ -52,11 +80,32 @@ use std::collections::{BTreeSet, HashMap};
 ///
 /// Budget escalation: if the initial budget is exhausted, retries internally
 /// with up to 4x the initial budget before returning `BudgetExceeded`.
+///
+/// This form runs with no generation operands (prechecks disabled, schedule
+/// unkeyed); production callers use `compare_with` (the operand lanes in
+/// entity.rs, and the bridge walk threading the node's eligibility context
+/// since M6), so in a default build this wrapper's consumers are the unit
+/// tests and the bench harness (`bench_support`), hence the cfg'd dead-code
+/// allowance.
+#[cfg_attr(not(any(test, feature = "bench-internals")), allow(dead_code))]
 pub async fn compare<E: GetEvents>(
     event_getter: E,
     subject: &Clock,
     comparison: &Clock,
     budget: usize,
+) -> Result<ComparisonResult<E>, RetrievalError> {
+    compare_with(event_getter, subject, comparison, budget, CompareOptions::default()).await
+}
+
+/// `compare` with generation operands (D2 M5): identical verdict semantics,
+/// plus the suppress-only P1/P2 prechecks and eligibility-keyed scheduling
+/// where the operands allow. See `CompareOptions`.
+pub(crate) async fn compare_with<E: GetEvents>(
+    event_getter: E,
+    subject: &Clock,
+    comparison: &Clock,
+    budget: usize,
+    opts: CompareOptions<'_>,
 ) -> Result<ComparisonResult<E>, RetrievalError> {
     // Identical clocks (including two empty ones) are equal.
     if subject.as_slice() == comparison.as_slice() {
@@ -82,6 +131,38 @@ pub async fn compare<E: GetEvents>(
 
     let mut accumulator = EventAccumulator::new(event_getter);
 
+    // The M6 kill-switch (plan M6), read ONCE per comparison from the
+    // caller's eligibility context: with the switch thrown, every
+    // generation consumer below is DORMANT (the prechecks here, the
+    // schedule keying in step(), the edge checks in the accumulator) and
+    // the comparison runs exactly as it would with no generation machinery.
+    // Verdicts are identical either way: the suppress-only discipline
+    // already makes them independent of any operand ASSIGNMENT, and the
+    // kill-switch equivalence pins extend that to operand ABSENCE.
+    let accel_disabled = opts.unverified.is_some_and(|ctx| ctx.accelerations_disabled());
+    if accel_disabled {
+        accumulator.disable_edge_checks();
+    }
+
+    // P1/P2 prechecks (D2-4, derivations section 2), wired SUPPRESS-ONLY:
+    // when the eligible operands prove StrictDescends(subject over
+    // comparison) impossible, the positive fast-path attempt below is
+    // skipped and the walk decides everything. The rejection can never
+    // conclude or route a verdict: on honest operands the suppressed quick
+    // check would have found nothing (the rejection is sound), and on lying
+    // operands the walk still returns the true verdict, so a wrong value
+    // costs time, never an outcome (5b-ii; pinned by the immunity oracle).
+    // The counter is bumped per suppressed ATTEMPT, whether or not the
+    // attempt would have succeeded (write-only observability).
+    let suppress_quick_check = match (&opts.subject_gens, &opts.comparison_gens) {
+        _ if accel_disabled => false,
+        (Some(sg), Some(cg)) => super::prechecks::rejects_strict_descends(subject, sg, comparison, cg, opts.unverified),
+        _ => false,
+    };
+    if suppress_quick_check {
+        accumulator.stats.precheck_suppressions += 1;
+    }
+
     // Quick check: if every subject event sits exactly one step above the
     // comparison heads (nonempty parent set, all parents within the comparison
     // set) and every comparison head is covered by some subject event's
@@ -95,7 +176,7 @@ pub async fn compare<E: GetEvents>(
     // relevant to the parent union (a disjoint genesis root, or an event on a
     // foreign lineage) is silently vouched for by its siblings, and the BFS
     // that would detect the disjoint lineage never runs.
-    {
+    if !suppress_quick_check {
         let comparison_set: BTreeSet<EventId> = comparison.as_slice().iter().cloned().collect();
         let mut all_parents: BTreeSet<EventId> = BTreeSet::new();
         let mut applicable = true;
@@ -103,7 +184,7 @@ pub async fn compare<E: GetEvents>(
         for id in subject.as_slice() {
             match accumulator.get_event(id).await {
                 Ok(event) => {
-                    accumulator.accumulate(&event);
+                    accumulator.accumulate(id, &event);
                     let parents = event.parent.as_slice();
                     if parents.is_empty() || !parents.iter().all(|p| comparison_set.contains(p)) {
                         applicable = false;
@@ -119,8 +200,12 @@ pub async fn compare<E: GetEvents>(
         }
 
         if applicable && comparison_set.is_subset(&all_parents) {
-            // Subject's parents cover all comparison heads -> StrictDescends
-            let chain: Vec<EventId> = subject.as_slice().to_vec();
+            // Subject's parents cover all comparison heads -> StrictDescends.
+            // Canonical emission (Q2): a sorted clock over an antichain is
+            // already the canonical order, but routing it through the same
+            // canonicalizer as the BFS keeps the two emission paths
+            // byte-identical by construction rather than by coincidence.
+            let chain = canonicalize_chain(subject.as_slice().to_vec(), accumulator.dag());
             return Ok(ComparisonResult::new(AbstractCausalRelation::StrictDescends { chain }, accumulator));
         }
     }
@@ -130,7 +215,7 @@ pub async fn compare<E: GetEvents>(
     let mut current_budget = initial_budget;
 
     loop {
-        let mut comp = Comparison::new(&mut accumulator, subject, comparison, current_budget);
+        let mut comp = Comparison::new(&mut accumulator, subject, comparison, current_budget, &opts, accel_disabled);
         let relation = loop {
             if let Some(relation) = comp.step().await? {
                 break relation;
@@ -153,6 +238,17 @@ pub async fn compare<E: GetEvents>(
 /// Internal state machine for the comparison algorithm.
 struct Comparison<'a, E: GetEvents> {
     accumulator: &'a mut EventAccumulator<E>,
+
+    /// The comparison's generation operands (D2-4): schedule keys for the
+    /// level drain (initial tips read their seeds from here; interior
+    /// entries read in-hand payloads) and the eligibility context. Never a
+    /// verdict input.
+    opts: &'a CompareOptions<'a>,
+
+    /// The M6 kill-switch, resolved once by `compare_with`: when set, the
+    /// level drain skips the generation schedule keying entirely and runs
+    /// in plain id order (a pure schedule choice either way).
+    accel_disabled: bool,
 
     /// The subject clock's backward traversal.
     subject: Side,
@@ -272,11 +368,20 @@ impl NodeState {
 }
 
 impl<'a, E: GetEvents> Comparison<'a, E> {
-    fn new(accumulator: &'a mut EventAccumulator<E>, subject: &Clock, comparison: &Clock, budget: usize) -> Self {
+    fn new(
+        accumulator: &'a mut EventAccumulator<E>,
+        subject: &Clock,
+        comparison: &Clock,
+        budget: usize,
+        opts: &'a CompareOptions<'a>,
+        accel_disabled: bool,
+    ) -> Self {
         Self {
             accumulator,
             subject: Side::new(subject.as_slice().iter().cloned().collect()),
             comparison: Side::new(comparison.as_slice().iter().cloned().collect()),
+            opts,
+            accel_disabled,
             states: HashMap::new(),
             meet_candidates: BTreeSet::new(),
             any_common: false,
@@ -284,11 +389,57 @@ impl<'a, E: GetEvents> Comparison<'a, E> {
         }
     }
 
+    /// The schedule key for one frontier entry (D2-4 eligibility at
+    /// consumption): the in-hand payload's generation where the walk holds
+    /// it, else the caller's materialized tip seed (initial tips only:
+    /// interior events have no materialization); filtered by walk-time
+    /// demotion, the admitted-unverified set, and the saturation sentinel.
+    /// None means "unknown", scheduled last.
+    fn eligible_gen(&self, id: &EventId) -> Option<u32> {
+        if self.accumulator.is_demoted(id) {
+            return None;
+        }
+        if self.opts.unverified.is_some_and(|set| set.contains(id)) {
+            return None;
+        }
+        let g = self
+            .accumulator
+            .peek_generation(id)
+            .or_else(|| self.opts.subject_gens.as_ref().and_then(|sg| sg.generation_of(id)))
+            .or_else(|| self.opts.comparison_gens.as_ref().and_then(|cg| cg.generation_of(id)))?;
+        (g != u32::MAX).then_some(g)
+    }
+
     async fn step(&mut self) -> Result<Option<AbstractCausalRelation<EventId>>, RetrievalError> {
-        // Collect frontier IDs from both frontiers
-        let mut all_frontier_ids = Vec::new();
+        // Collect the level: both frontiers' entries, deduplicated (an id on
+        // both frontiers processes once; process_event handles both flags).
+        let mut all_frontier_ids: Vec<EventId> = Vec::new();
         all_frontier_ids.extend(self.subject.frontier.ids.iter().cloned());
         all_frontier_ids.extend(self.comparison.frontier.ids.iter().cloned());
+        all_frontier_ids.sort();
+        all_frontier_ids.dedup();
+
+        // In-level schedule (plan D2-4; derivations section 3): maximum
+        // eligible generation first, unknowns last, EventId ascending
+        // tiebreak (the pre-sort above plus a stable sort). A PURE schedule
+        // choice: the level's membership, every per-level set, and the
+        // check_result verdicts at level end are order-independent, so a
+        // generation value can steer only WHEN work happens, never what is
+        // concluded (5b-ii). The one order-sensitive corner is the
+        // unfetchable-both-frontiers fallback below, whose success was
+        // ALWAYS schedule luck (BTree id order before this change): with
+        // honest operands, deeper entries drain first, which can only form
+        // both-frontier co-membership for an unfetchable meet EARLIER, so
+        // the fallback fires at least as often as under id order.
+        // Kill-switch thrown (plan M6): skip the keying entirely; the
+        // pre-sort above already left the level in plain ascending id
+        // order, the exact all-unknowns schedule.
+        if !self.accel_disabled {
+            all_frontier_ids.sort_by_key(|id| match self.eligible_gen(id) {
+                Some(g) => (0u8, std::cmp::Reverse(g)),
+                None => (1u8, std::cmp::Reverse(0)),
+            });
+        }
 
         for id in &all_frontier_ids {
             // Skip events already processed (e.g. an ID that appeared in both
@@ -317,9 +468,16 @@ impl<'a, E: GetEvents> Comparison<'a, E> {
                 }
                 Err(e) => return Err(e),
             };
-            self.accumulator.accumulate(&event);
+            // R1 (dispositions Q1): bookkeeping keys on the REQUESTED id,
+            // never the served payload's recomputed id. The frontiers hold
+            // requested ids, so recomputed-id keying stalls the walk the
+            // moment storage lies; requested-id keying keeps the walk
+            // coherent over the served structure, and the D2-4 edge checks
+            // are the sanctioned detector for serve-time corruption.
+            self.accumulator.accumulate(id, &event);
             self.remaining_budget = self.remaining_budget.saturating_sub(1);
-            self.process_event(event.id(), event.parent.as_slice());
+            self.accumulator.stats.budget_decrements += 1;
+            self.process_event(id.clone(), event.parent.as_slice());
         }
 
         // Check if we have a result
@@ -439,9 +597,11 @@ impl<'a, E: GetEvents> Comparison<'a, E> {
             let frontier_grounded = self.subject.frontier.ids.iter().all(|id| comparison_ancestry.contains(id));
             if roots_grounded && frontier_grounded {
                 // Forward chain (older to newer), excluding the comparison
-                // heads themselves.
+                // heads themselves; emitted canonical (Q2) so the chain is a
+                // function of its SET, not of the schedule that visited it.
                 let chain: Vec<_> =
                     self.subject.visited.iter().rev().filter(|id| !self.comparison.original.contains(id)).cloned().collect();
+                let chain = canonicalize_chain(chain, dag);
                 return Some(AbstractCausalRelation::StrictDescends { chain });
             }
         }
@@ -507,10 +667,18 @@ impl<'a, E: GetEvents> Comparison<'a, E> {
             let meet: Vec<_> =
                 self.meet_candidates.iter().filter(|id| self.states.get(*id).map_or(0, |s| s.common_child_count) == 0).cloned().collect();
 
-            // Build forward chains from meet to tips
+            // Build forward chains from meet to tips, emitted canonical (Q2).
+            // NOTE (recorded defect, red-team fold item 2): build_forward_chain
+            // trims at the LAST-ENCOUNTERED meet member in visit order and can
+            // drop genuine divergent-region events on uneven shapes, despite
+            // relation.rs documenting these chains as full; no production
+            // consumer reads them today, the immunity oracle binds only their
+            // semantic validity (FREE-but-valid), and the defect is with the
+            // maintainer. Canonicalization orders whatever the trim retained;
+            // it cannot restore what the trim discarded.
             let meet_set: BTreeSet<_> = meet.iter().cloned().collect();
-            let subject_chain = Self::build_forward_chain(&self.subject.visited, &meet_set);
-            let other_chain = Self::build_forward_chain(&self.comparison.visited, &meet_set);
+            let subject_chain = canonicalize_chain(Self::build_forward_chain(&self.subject.visited, &meet_set), dag);
+            let other_chain = canonicalize_chain(Self::build_forward_chain(&self.comparison.visited, &meet_set), dag);
 
             // Collect immediate children of meet toward each side
             let (subject_immediate, other_immediate) = self.collect_immediate_children(&meet);

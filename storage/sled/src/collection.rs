@@ -4,9 +4,8 @@ use std::sync::atomic::AtomicBool;
 use ankql::ast::Predicate;
 use ankurah_core::indexing::KeySpec;
 use ankurah_core::{
-    entity::TemporaryEntity,
     error::{MutationError, RetrievalError},
-    storage::StorageCollection,
+    storage::{ensure_event_identity, StorageCollection},
     EntityId,
 };
 use ankurah_proto::{Attested, CollectionId, EntityState, Event, EventId, StateFragment};
@@ -33,6 +32,9 @@ pub struct SledStorageCollectionInner {
     pub collection_id: CollectionId,
     pub database: Arc<Database>,
     pub tree: sled::Tree,
+    /// The injected catalog resolver (shared with the engine): the name
+    /// source for column assignment at materialization time.
+    pub(crate) resolver: Arc<std::sync::RwLock<Option<std::sync::Weak<dyn ankurah_core::schema::CatalogResolver>>>>,
     #[cfg(debug_assertions)]
     pub prefix_guard_disabled: Arc<AtomicBool>,
 }
@@ -44,12 +46,14 @@ impl SledStorageCollection {
         collection_id: CollectionId,
         database: Arc<Database>,
         tree: sled::Tree,
+        resolver: Arc<std::sync::RwLock<Option<std::sync::Weak<dyn ankurah_core::schema::CatalogResolver>>>>,
         #[cfg(debug_assertions)] prefix_guard_disabled: Arc<AtomicBool>,
     ) -> Self {
         Self(SledStorageCollectionInner {
             collection_id,
             database,
             tree,
+            resolver,
             #[cfg(debug_assertions)]
             prefix_guard_disabled,
         })
@@ -88,6 +92,12 @@ impl StorageCollection for SledStorageCollection {
         Ok(task::spawn_blocking(move || inner.get_events_blocking(event_ids)).await??)
     }
 
+    async fn has_event(&self, event_id: &EventId) -> Result<bool, RetrievalError> {
+        let inner = self.0.clone();
+        let event_id = event_id.clone();
+        Ok(task::spawn_blocking(move || inner.has_event_blocking(&event_id)).await??)
+    }
+
     async fn dump_entity_events(&self, entity_id: EntityId) -> Result<Vec<Attested<Event>>, RetrievalError> {
         let inner = self.0.clone();
         Ok(task::spawn_blocking(move || inner.dump_entity_events_blocking(entity_id)).await??)
@@ -95,12 +105,24 @@ impl StorageCollection for SledStorageCollection {
 }
 
 impl SledStorageCollectionInner {
+    /// The model id stamped on envelopes this bucket reconstructs (#330):
+    /// well-knowns, then the injected catalog resolver.
+    fn model_id(&self) -> Result<EntityId, ankurah_core::error::RetrievalError> {
+        let resolver = self.resolver.read().unwrap().as_ref().and_then(|weak| weak.upgrade());
+        ankurah_core::storage::bucket_model_id(&self.collection_id, resolver.as_deref())
+    }
+
+    /// [`Self::model_id`] as a clonable outcome for the scan streams, which
+    /// check it only when a row actually hydrates: a scan that matches
+    /// nothing must not fail for want of a model id (cold catalog, e.g. the
+    /// ephemeral known_matches pre-fetch on a never-stored collection).
+    fn model_id_lazy(&self) -> Result<EntityId, String> { self.model_id().map_err(|e| e.to_string()) }
+
     // I think this one is done - did it myself
     fn set_state_blocking(&self, state: Attested<EntityState>) -> Result<bool, MutationError> {
-        let (entity_id, collection, sfrag) = state.to_parts();
-        if self.collection_id != collection {
-            return Err(MutationError::General(anyhow::anyhow!("Collection ID mismatch").into()));
-        }
+        // The envelope carries a model id (#330); the node resolved it to this
+        // bucket before routing, so there is no name to cross-check here.
+        let (entity_id, _model, sfrag) = state.to_parts();
 
         let binary_state = bincode::serialize(&sfrag)?;
         let id_bytes = entity_id.to_bytes();
@@ -108,14 +130,27 @@ impl SledStorageCollectionInner {
         let last = self.database.entities_tree.insert(id_bytes, binary_state.clone()).map_err(sled_error)?;
         let changed = if let Some(last_bytes) = last { last_bytes != binary_state } else { true };
 
-        // 2) Write-time materialization into collection_{collection}
-        let entity = TemporaryEntity::new(entity_id, collection, &sfrag.state)?;
-
-        // Compact property IDs and materialized list
+        // 2) Write-time materialization into collection_{collection}: each
+        // property key resolves to its assigned column name (Id keys through
+        // the durable id-to-column map, seeded from the catalog resolver;
+        // Name keys directly), and the column name feeds the compact
+        // name-to-slot table exactly as before.
+        let resolver = self.resolver.read().unwrap().as_ref().and_then(|weak| weak.upgrade());
         let mut mat: Vec<(u32, ankurah_core::value::Value)> = Vec::new();
-        for (name, opt_val) in entity.values().into_iter() {
-            if let Some(val) = opt_val {
-                mat.push((self.database.property_manager.get_property_id(&name)?, val));
+        let mut seen_columns = std::collections::HashSet::new();
+        for (backend_name, state_buffer) in sfrag.state.state_buffers.iter() {
+            let backend = ankurah_core::property::backend::backend_from_string(backend_name, Some(state_buffer))?;
+            for (key, opt_val) in backend.property_values() {
+                let column = self.database.property_manager.column_for_key(self.collection_id.as_str(), &key, resolver.as_deref())?;
+                if !seen_columns.insert(column.clone()) {
+                    // Same column from another backend of this entity: first
+                    // occurrence wins (same-collection id collisions were
+                    // deduped at column assignment and cannot land here).
+                    continue;
+                }
+                if let Some(val) = opt_val {
+                    mat.push((self.database.property_manager.get_property_id(&column)?, val));
+                }
             }
         }
 
@@ -136,7 +171,7 @@ impl SledStorageCollectionInner {
         match self.database.entities_tree.get(id.to_bytes()).map_err(sled_error)? {
             Some(ivec) => {
                 let sfrag: StateFragment = bincode::deserialize(ivec.as_ref())?;
-                let es = Attested::<EntityState>::from_parts(id, self.collection_id.clone(), sfrag);
+                let es = Attested::<EntityState>::from_parts(id, self.model_id()?, sfrag);
                 Ok(es)
             }
             None => Err(RetrievalError::EntityNotFound(id)),
@@ -158,8 +193,58 @@ impl SledStorageCollectionInner {
         // Type resolution (Literal -> Json for non-simple paths) is handled by TypeResolver
         // at the entry points (Context/Node). The selection here is already type-resolved.
 
+        // Translate into this engine's column space FIRST (ids -> assigned
+        // column names via the durable map, order-by names via the catalog
+        // resolver), so the planner's index columns, the name-to-slot lookups,
+        // and the sort comparators all address the columns writes actually
+        // created (sticky under rename, deduped under collision, synthetic
+        // under fallback).
+        let resolver = self.resolver.read().unwrap().as_ref().and_then(|weak| weak.upgrade());
+        let collection = self.collection_id.as_str();
+        let manager = &self.database.property_manager;
+
+        // Bind each ORDER BY key's canonical type while it is still in
+        // catalog/display-name space, then key that type by the physical
+        // column the planner will see. Physical names are sticky across a
+        // catalog rename and cannot themselves be resolved through the
+        // current name index.
+        let order_types: std::collections::HashMap<String, ankurah_core::value::ValueType> = selection
+            .order_by
+            .iter()
+            .flatten()
+            .filter_map(|item| {
+                let name = item.path.first();
+                if name == "id" || name.starts_with("__") {
+                    return None;
+                }
+                let resolver = resolver.as_deref()?;
+                let id = item.property.map(ankurah_proto::EntityId::from_ulid).or_else(|| resolver.resolve(collection, name))?;
+                let value_type = ankurah_core::value::ValueType::from_property_str(&resolver.canonical_value_type(&id)?)?;
+                let column = manager.column_of(collection, &id).unwrap_or_else(|| name.to_string());
+                Some((column, value_type))
+            })
+            .collect();
+        let selection = {
+            ankurah_core::storage::selection_to_column_space(collection, &selection, resolver.as_deref(), &|id| {
+                manager.column_of(collection, id)
+            })
+        };
+
+        // ORDER BY key parts collate in each property's CANONICAL value_type
+        // (the canonical value_type ruling): resolve the column name through
+        // the catalog. An unresolvable column (system collections, legacy
+        // names) keeps the historical String collation.
+        let order_type_of = |name: &str| -> Option<ankurah_core::value::ValueType> {
+            if let Some(value_type) = order_types.get(name) {
+                return Some(*value_type);
+            }
+            let resolver = resolver.as_deref()?;
+            let id = resolver.resolve(collection, name)?;
+            ankurah_core::value::ValueType::from_property_str(&resolver.canonical_value_type(&id)?)
+        };
+
         // Generate query plans and choose the first non-empty one
-        let plans = Planner::new(PlannerConfig::full_support()).plan(&selection, "id");
+        let plans = Planner::new(PlannerConfig::full_support()).plan_with_types(&selection, "id", &order_type_of);
 
         let plan = plans.into_iter().next().ok_or_else(|| RetrievalError::StorageError("No plan generated".into()))?;
 
@@ -187,6 +272,7 @@ impl SledStorageCollectionInner {
         order_by_spill: OrderByComponents,
         limit: Option<u64>,
     ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+        let model = self.model_id_lazy();
         // Debug flag for disabling equality-prefix guard (testing only)
         let prefix_guard_disabled = {
             #[cfg(debug_assertions)]
@@ -208,9 +294,7 @@ impl SledStorageCollectionInner {
         let ids = SledIndexScanner::new(&index, &bounds, scan_direction, match_type, prefix_guard_disabled)?;
 
         if remaining_predicate == Predicate::True && order_by_spill.is_satisfied() {
-            return futures::executor::block_on(
-                ids.limit(limit).entities(&self.database.entities_tree, &self.collection_id).collect_states(),
-            );
+            return futures::executor::block_on(ids.limit(limit).entities(&self.database.entities_tree, model).collect_states());
         }
 
         // Values path: ids → materialized lookup → filter/sort/topk/limit → hydrate → collect
@@ -222,32 +306,26 @@ impl SledStorageCollectionInner {
             Predicate::True => {
                 match (needs_spill, limit) {
                     // order by + limit: use partition-aware TopK
-                    (true, Some(limit)) => futures::executor::block_on(
-                        mats.top_k(order_by_spill, limit as usize).entities(e_tree, &self.collection_id).collect_states(),
-                    ),
-                    // order by only: use partition-aware sort
-                    (true, None) => {
-                        futures::executor::block_on(mats.sort_by(order_by_spill).entities(e_tree, &self.collection_id).collect_states())
+                    (true, Some(limit)) => {
+                        futures::executor::block_on(mats.top_k(order_by_spill, limit as usize).entities(e_tree, model).collect_states())
                     }
+                    // order by only: use partition-aware sort
+                    (true, None) => futures::executor::block_on(mats.sort_by(order_by_spill).entities(e_tree, model).collect_states()),
                     // limit only
-                    (false, limit) => futures::executor::block_on(mats.limit(limit).entities(e_tree, &self.collection_id).collect_states()),
+                    (false, limit) => futures::executor::block_on(mats.limit(limit).entities(e_tree, model).collect_states()),
                 }
             }
             _ => {
                 let filtered = mats.filter_predicate(&remaining_predicate);
                 match (needs_spill, limit) {
                     // filter + order by + limit: use partition-aware TopK
-                    (true, Some(limit)) => futures::executor::block_on(
-                        filtered.top_k(order_by_spill, limit as usize).entities(e_tree, &self.collection_id).collect_states(),
-                    ),
+                    (true, Some(limit)) => {
+                        futures::executor::block_on(filtered.top_k(order_by_spill, limit as usize).entities(e_tree, model).collect_states())
+                    }
                     // filter + order by: use partition-aware sort
-                    (true, None) => {
-                        futures::executor::block_on(filtered.sort_by(order_by_spill).entities(e_tree, &self.collection_id).collect_states())
-                    }
+                    (true, None) => futures::executor::block_on(filtered.sort_by(order_by_spill).entities(e_tree, model).collect_states()),
                     // filter + limit
-                    (false, limit) => {
-                        futures::executor::block_on(filtered.limit(limit).entities(e_tree, &self.collection_id).collect_states())
-                    }
+                    (false, limit) => futures::executor::block_on(filtered.limit(limit).entities(e_tree, model).collect_states()),
                 }
             }
         }
@@ -260,9 +338,10 @@ impl SledStorageCollectionInner {
         order_by_spill: OrderByComponents,
         limit: Option<u64>,
     ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+        let model = self.model_id_lazy();
         if remaining_predicate == Predicate::True && order_by_spill.is_satisfied() {
             let ids = SledCollectionKeyScanner::new(&self.tree, &bounds, scan_direction)?;
-            let states = SledEntityLookup::new(&self.database.entities_tree, &self.collection_id, ids.limit(limit));
+            let states = SledEntityLookup::new(&self.database.entities_tree, model, ids.limit(limit));
             return futures::executor::block_on(states.collect_states());
         }
 
@@ -275,17 +354,13 @@ impl SledStorageCollectionInner {
             Predicate::True => {
                 match (needs_spill, limit) {
                     // order by + limit: use partition-aware TopK
-                    (true, Some(limit)) => futures::executor::block_on(
-                        scanner.top_k(order_by_spill, limit as usize).entities(e_tree, &self.collection_id).collect_states(),
-                    ),
+                    (true, Some(limit)) => {
+                        futures::executor::block_on(scanner.top_k(order_by_spill, limit as usize).entities(e_tree, model).collect_states())
+                    }
                     // order by only: use partition-aware sort
-                    (true, None) => {
-                        futures::executor::block_on(scanner.sort_by(order_by_spill).entities(e_tree, &self.collection_id).collect_states())
-                    }
+                    (true, None) => futures::executor::block_on(scanner.sort_by(order_by_spill).entities(e_tree, model).collect_states()),
                     // limit only
-                    (false, limit) => {
-                        futures::executor::block_on(scanner.limit(limit).entities(e_tree, &self.collection_id).collect_states())
-                    }
+                    (false, limit) => futures::executor::block_on(scanner.limit(limit).entities(e_tree, model).collect_states()),
                 }
             }
             _ => {
@@ -294,17 +369,13 @@ impl SledStorageCollectionInner {
                 let filtered = futures::stream::iter(collection_items).filter_predicate(&remaining_predicate);
                 match (needs_spill, limit) {
                     // filter + order by + limit: use partition-aware TopK
-                    (true, Some(limit)) => futures::executor::block_on(
-                        filtered.top_k(order_by_spill, limit as usize).entities(e_tree, &self.collection_id).collect_states(),
-                    ),
+                    (true, Some(limit)) => {
+                        futures::executor::block_on(filtered.top_k(order_by_spill, limit as usize).entities(e_tree, model).collect_states())
+                    }
                     // filter + order by: use partition-aware sort
-                    (true, None) => {
-                        futures::executor::block_on(filtered.sort_by(order_by_spill).entities(e_tree, &self.collection_id).collect_states())
-                    }
+                    (true, None) => futures::executor::block_on(filtered.sort_by(order_by_spill).entities(e_tree, model).collect_states()),
                     // filter + limit
-                    (false, limit) => {
-                        futures::executor::block_on(filtered.limit(limit).entities(e_tree, &self.collection_id).collect_states())
-                    }
+                    (false, limit) => futures::executor::block_on(filtered.limit(limit).entities(e_tree, model).collect_states()),
                 }
             }
         }
@@ -316,6 +387,7 @@ impl SledStorageCollectionInner {
             match self.database.events_tree.get(event_id.as_bytes()).map_err(SledRetrievalError::StorageError)? {
                 Some(event) => {
                     let event: Attested<Event> = bincode::deserialize(&event)?;
+                    ensure_event_identity(&event_id, &event.payload)?;
                     events.push(event);
                 }
                 None => continue,
@@ -324,13 +396,19 @@ impl SledStorageCollectionInner {
         Ok(events)
     }
 
+    fn has_event_blocking(&self, event_id: &EventId) -> Result<bool, RetrievalError> {
+        Ok(self.database.events_tree.contains_key(event_id.as_bytes()).map_err(SledRetrievalError::StorageError)?)
+    }
+
     fn dump_entity_events_blocking(&self, entity_id: EntityId) -> Result<Vec<Attested<Event>>, RetrievalError> {
         let mut events = Vec::new();
 
         // TODO: this is a full table scan. If we actually need this for more than just tests, we should index the events by entity_id
         for event_data in self.database.events_tree.iter() {
-            let (_key, data) = event_data.map_err(SledRetrievalError::StorageError)?;
+            let (key, data) = event_data.map_err(SledRetrievalError::StorageError)?;
+            let stored_id = EventId::try_from(key.to_vec())?;
             let event: Attested<Event> = bincode::deserialize(&data)?;
+            ensure_event_identity(&stored_id, &event.payload)?;
             if event.payload.entity_id == entity_id {
                 events.push(event);
             }
@@ -353,5 +431,39 @@ impl SledStorageCollectionInner {
         } else {
             Ok(true)
         }
+    }
+}
+
+#[cfg(test)]
+mod event_identity_tests {
+    use super::*;
+    use crate::engine::SledStorageEngine;
+    use ankurah_core::storage::StorageEngine;
+    use ankurah_proto::{Clock, OperationSet};
+    use std::collections::BTreeMap;
+
+    #[tokio::test]
+    async fn event_getters_reject_a_payload_stored_under_the_wrong_key() {
+        let engine = SledStorageEngine::new_test().unwrap();
+        let collection = engine.collection(&"identity_check".into()).await.unwrap();
+        let honest = Event {
+            model: EntityId::from_bytes([0x11; 16]),
+            entity_id: EntityId::from_bytes([0x22; 16]),
+            operations: OperationSet(BTreeMap::new()),
+            parent: Clock::default(),
+            generation: 1,
+        };
+        let stored_id = honest.id();
+        let entity_id = honest.entity_id;
+        collection.add_event(&Attested::opt(honest.clone(), None)).await.unwrap();
+
+        let doctored = Attested::opt(Event { generation: 2, ..honest }, None);
+        let encoded = bincode::serialize(&doctored).unwrap();
+        engine.database.lock().unwrap().events_tree.insert(stored_id.as_bytes(), encoded).unwrap();
+
+        let err = collection.get_events(vec![stored_id.clone()]).await.unwrap_err();
+        assert!(err.to_string().contains("event identity mismatch"), "unexpected get error: {err}");
+        let err = collection.dump_entity_events(entity_id).await.unwrap_err();
+        assert!(err.to_string().contains("event identity mismatch"), "unexpected dump error: {err}");
     }
 }

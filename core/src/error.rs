@@ -69,6 +69,21 @@ impl From<MutationError> for RetrievalError {
 
 impl RetrievalError {
     pub fn storage(err: impl std::error::Error + Send + Sync + 'static) -> Self { RetrievalError::StorageError(Box::new(err)) }
+
+    pub(crate) fn retryable_update(&self) -> bool {
+        match self {
+            Self::EventNotFound(_) | Self::NoDurablePeers | Self::StorageError(_) | Self::FailedUpdate(_) => true,
+            Self::MutationError(error) => error.retryable_update(),
+            Self::ApplyError(error) => error.retryable_update(),
+            Self::RequestError(
+                RequestError::PeerNotConnected
+                | RequestError::ConnectionLost
+                | RequestError::InternalChannelClosed
+                | RequestError::SendError(_),
+            ) => true,
+            _ => false,
+        }
+    }
 }
 
 impl From<bincode::Error> for RetrievalError {
@@ -167,6 +182,16 @@ pub enum MutationError {
     Anyhow(anyhow::Error),
     #[error("TOCTOU attempts exhausted")]
     TOCTOUAttemptsExhausted,
+    #[error("ingest: {0}")]
+    Ingest(IngestError),
+    /// The persist funnel refused a non-canonical Entity instance: the id
+    /// resolves to a DIFFERENT live resident in the node's map (D2-6, the
+    /// M4 codex follow-up remediation). An innocent duplicate-instance
+    /// race, not a lineage rejection: the caller's item failure is the
+    /// heal path (the sender redelivers and the redelivery lands on the
+    /// canonical instance). Core-local; never wire-serialized.
+    #[error("persist refused: {0} resolves to a different canonical resident instance")]
+    StaleInstancePersistRefused(EntityId),
 }
 
 impl From<tokio::task::JoinError> for MutationError {
@@ -175,6 +200,150 @@ impl From<tokio::task::JoinError> for MutationError {
 
 impl From<anyhow::Error> for MutationError {
     fn from(err: anyhow::Error) -> Self { MutationError::Anyhow(err) }
+}
+
+impl MutationError {
+    pub(crate) fn retryable_update(&self) -> bool {
+        match self {
+            Self::RetrievalError(error) => error.retryable_update(),
+            Self::NoDurablePeers | Self::TOCTOUAttemptsExhausted | Self::StaleInstancePersistRefused(_) | Self::UpdateFailed(_) => true,
+            Self::Ingest(IngestError::Budget { .. } | IngestError::Contention { .. } | IngestError::Storage(_)) => true,
+            Self::Ingest(IngestError::Lineage(LineageRejection::NonCreationOverEmptyHead)) => true,
+            Self::Ingest(IngestError::StagingCapacity { capacity, requested, .. }) => requested <= capacity,
+            _ => false,
+        }
+    }
+}
+
+/// The typed taxonomy at the application boundary (RFC #268 item 4).
+///
+/// Replaces stringly `General`/`InvalidUpdate` on the ingest paths so callers
+/// and ack payloads can distinguish outcome classes without matching strings.
+/// Budget is deliberately NOT a lineage rejection: a budget-exhausted
+/// comparison is a resumable liveness anomaly carrying its frontiers, never a
+/// verdict (C4-08); two nodes of different cache depth must not disagree on
+/// rejections.
+#[derive(Error, Debug)]
+/// Several variants are forward-declared design surface (T7): `Contention`,
+/// `Storage`, `Validation`, and `Unsupported`, plus
+/// `LineageRejection::{CreationOverNonEmptyHead, BatchCycle}`, have no D1
+/// construction site by design (red-team F5: later milestones migrate onto
+/// complete types; D3's rejection horizon extends this surface).
+pub enum IngestError {
+    /// The PolicyAgent refused the event at admission or commit time.
+    #[error("policy denied: {0}")]
+    PolicyDenied(AccessDenied),
+    /// The event's lineage makes it permanently unappliable here.
+    #[error("lineage rejection: {0}")]
+    Lineage(LineageRejection),
+    /// Comparison exhausted its budget before reaching a verdict. Resumable:
+    /// the event stays uncommitted and a retry with warmer caches (or, after
+    /// D2, generation bounds) can succeed.
+    #[error("budget exhausted before verdict (budget {original_budget})")]
+    Budget { original_budget: usize, subject_frontier: BTreeSet<EventId>, other_frontier: BTreeSet<EventId> },
+    /// Head-mutation retries exhausted under concurrent writers.
+    #[error("contention: head mutation retries exhausted after {attempts}")]
+    Contention { attempts: u32 },
+    /// Durable storage failed while persisting an event or state.
+    #[error("storage: {0}")]
+    Storage(Box<dyn std::error::Error + Send + Sync + 'static>),
+    /// Structural validation of the payload failed before staging.
+    #[error("validation: {0}")]
+    Validation(Box<dyn std::error::Error + Send + Sync + 'static>),
+    /// A wire shape the pipeline recognizes but does not implement.
+    #[error("unsupported: {0}")]
+    Unsupported(&'static str),
+    /// Atomic staging admission refused a batch rather than evicting events
+    /// whose retry or recovery still depends on the retained body.
+    #[error("staging capacity {capacity} cannot admit {requested} new events while holding {current}")]
+    StagingCapacity { capacity: usize, current: usize, requested: usize },
+}
+
+/// Permanent lineage-shaped rejections. Every variant is a function of
+/// grounded graph facts, reachable only through completed exploration, never
+/// through a budget-limited walk (268-B).
+#[derive(Debug)]
+pub enum LineageRejection {
+    /// Proven different genesis events (single-root invariant violated).
+    Disjoint,
+    /// Non-creation event addressed to an entity with an empty head.
+    NonCreationOverEmptyHead,
+    /// Creation event for an entity that already has committed history.
+    CreationOverNonEmptyHead,
+    /// The batch's parent edges form a cycle (malformed or malicious input;
+    /// impossible for honest content-addressed ids).
+    BatchCycle,
+    /// An event entered a plan for a different entity. Staging is shared at
+    /// collection scope, so every intake and execution boundary must bind
+    /// discovered graph members back to the resident they may mutate.
+    EntityMismatch { event: EventId, expected: EntityId, received: EntityId },
+    /// An event in the lineage was decoded under a different model route.
+    ModelMismatch { event: EventId, expected: EntityId, received: EntityId },
+    /// StateAndEvent cargo was not contained in the state snapshot that
+    /// vouched for it. Covered ancestors may be committed before adoption;
+    /// unrelated or newer cargo may not be smuggled into the durable log.
+    EventOutsideState { event: EventId },
+    /// A claimed generation contradicts what this node can resolve. Two
+    /// emitters (D2 M4): admission verification, where an event's claim
+    /// fails the equation `generation == 1 + max(parent generations)`
+    /// against parents resolved from the resident's MATERIALIZED head
+    /// generations first (which on ephemeral nodes may be
+    /// trust-envelope-carried rather than payload-verified) and local
+    /// payload reads otherwise (genesis events must claim exactly 1); and
+    /// state-adoption validation on definitive-storage nodes, where a wire
+    /// annotation's per-tip value contradicts the locally held tip payload
+    /// (a direct value comparison). The honest value is deterministic
+    /// given the parents, so this is only ever reachable by a buggy or
+    /// malicious writer; contained like any malformed input (plan REV 4
+    /// D2-3, REV 5 section K).
+    GenerationMismatch { event: EventId, claimed: u32, expected: u32 },
+    /// A state's head-generation annotation does not cover exactly its
+    /// head's tips (same ids, each exactly once). Structurally malformed
+    /// input, rejected before adoption on every node flavor: an adopted
+    /// mismatch could never stamp a commit (D2 M4, plan REV 5 section K).
+    HeadGenerationsMismatch,
+    /// A wire state carries a head-generation annotation for a tip whose
+    /// event is not locally resolvable on this DEFINITIVE-storage node, so
+    /// the carried value cannot be inspected against a payload. Amendment
+    /// K's durable rule: a durable node never adopts a wire-carried
+    /// generation uninspected; adopted, the unvalidated value would become
+    /// rejection ground truth against honest descendants and commit-stamp
+    /// input (M4 remediation item 4). Ephemeral nodes adopt inside the
+    /// state's trust envelope and never produce this.
+    UnresolvableHeadGenerationTip { event: EventId },
+}
+
+impl std::fmt::Display for LineageRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LineageRejection::Disjoint => write!(f, "disjoint (different genesis events)"),
+            LineageRejection::NonCreationOverEmptyHead => write!(f, "non-creation event over an empty head"),
+            LineageRejection::CreationOverNonEmptyHead => write!(f, "creation event over a non-empty head"),
+            LineageRejection::BatchCycle => write!(f, "event batch contains a parent cycle"),
+            LineageRejection::EntityMismatch { event, expected, received } => {
+                write!(f, "event {event} belongs to entity {received}, expected {expected}")
+            }
+            LineageRejection::ModelMismatch { event, expected, received } => {
+                write!(f, "event {event} belongs to model {received}, expected {expected}")
+            }
+            LineageRejection::EventOutsideState { event } => {
+                write!(f, "event {event} is not contained in the accompanying state")
+            }
+            LineageRejection::GenerationMismatch { event, claimed, expected } => {
+                write!(f, "generation mismatch for event {event}: claimed {claimed}, expected {expected} from its parents")
+            }
+            LineageRejection::HeadGenerationsMismatch => {
+                write!(f, "state head_generations does not annotate exactly the state head")
+            }
+            LineageRejection::UnresolvableHeadGenerationTip { event } => {
+                write!(f, "carried head generation for tip {event} cannot be inspected: the tip's event is not locally resolvable on this definitive-storage node")
+            }
+        }
+    }
+}
+
+impl From<IngestError> for MutationError {
+    fn from(err: IngestError) -> Self { MutationError::Ingest(err) }
 }
 
 #[derive(Debug)]
@@ -229,6 +398,7 @@ impl From<RetrievalError> for MutationError {
     fn from(err: RetrievalError) -> Self {
         match err {
             RetrievalError::AccessDenied(a) => MutationError::AccessDenied(a),
+            RetrievalError::MutationError(inner) => *inner,
             _ => MutationError::RetrievalError(err),
         }
     }
@@ -241,6 +411,31 @@ impl From<SubscriptionError> for RetrievalError {
     fn from(err: SubscriptionError) -> Self { RetrievalError::Anyhow(anyhow::anyhow!("Subscription error: {:?}", err)) }
 }
 
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    #[test]
+    fn update_retry_classification_is_typed() {
+        let missing: MutationError = RetrievalError::EventNotFound(EventId::from_bytes([0x11; 32])).into();
+        assert!(missing.retryable_update());
+
+        let fits_later: MutationError = IngestError::StagingCapacity { capacity: 10, current: 10, requested: 1 }.into();
+        assert!(fits_later.retryable_update());
+
+        let inherently_oversized: MutationError = IngestError::StagingCapacity { capacity: 10, current: 0, requested: 11 }.into();
+        assert!(!inherently_oversized.retryable_update());
+
+        let malformed: MutationError = IngestError::Lineage(LineageRejection::EntityMismatch {
+            event: EventId::from_bytes([0x22; 32]),
+            expected: EntityId::from_bytes([0x33; 16]),
+            received: EntityId::from_bytes([0x44; 16]),
+        })
+        .into();
+        assert!(!malformed.retryable_update());
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum StateError {
     #[error("serialization error: {0}")]
@@ -249,6 +444,12 @@ pub enum StateError {
     DDLError(Box<dyn std::error::Error + Send + Sync + 'static>),
     #[error("DMLError: {0}")]
     DMLError(Box<dyn std::error::Error + Send + Sync + 'static>),
+    /// The wire envelope carries a model-definition id (#330) and neither the
+    /// well-known table nor the catalog can supply one for this collection.
+    /// For a locally committed user collection this means
+    /// commit-before-registration, a bug rather than a race.
+    #[error("no model id for collection '{0}'")]
+    UnknownModel(String),
 }
 
 impl From<bincode::Error> for StateError {
@@ -315,17 +516,36 @@ impl std::error::Error for ApplyError {
     }
 }
 
+impl ApplyError {
+    pub(crate) fn retryable_update(&self) -> bool {
+        match self {
+            Self::Items(items) => items.iter().any(|item| item.cause.retryable_update()),
+            Self::RetrievalError(error) => error.retryable_update(),
+            Self::MutationError(error) => error.retryable_update(),
+            Self::CollectionNotFound(_) => false,
+        }
+    }
+}
+
 /// Error applying a specific delta
 #[derive(Debug)]
 pub struct ApplyErrorItem {
     pub entity_id: EntityId,
-    pub collection: CollectionId,
+    /// The model-definition id the wire item carried (#330); the collection
+    /// may be unresolvable, which is itself one of the reportable causes.
+    pub model: EntityId,
     pub cause: MutationError,
 }
 
 impl std::fmt::Display for ApplyErrorItem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Failed to apply delta for entity {} in collection {}: {}", self.entity_id.to_base64_short(), self.collection, self.cause)
+        write!(
+            f,
+            "Failed to apply delta for entity {} of model {}: {}",
+            self.entity_id.to_base64_short(),
+            self.model.to_base64_short(),
+            self.cause
+        )
     }
 }
 

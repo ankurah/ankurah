@@ -1,8 +1,14 @@
 use crate::error::RetrievalError;
 use crate::schema::CollectionSchema;
 use crate::value::{Value, ValueType};
-use ankql::ast::{Expr, Literal, Predicate};
+use ankql::ast::{Expr, Identifier, Literal, PathExpr, Predicate};
 use anyhow::Result;
+
+/// The parse-time path a resolved Identifier is equivalent to: [name, ..subpath].
+/// Used to look up the field type via `CollectionSchema::field_type`, which is
+/// keyed on `PathExpr`. Schema lookup remains name-based, so this mirrors what
+/// the equivalent Path would resolve to.
+fn identifier_as_path(identifier: &Identifier) -> PathExpr { PathExpr { steps: identifier.path_steps() } }
 
 /// Cast all literals in a predicate based on field names using a CollectionSchema
 pub fn cast_predicate_types<S: CollectionSchema>(predicate: Predicate, schema: &S) -> Result<Predicate, RetrievalError> {
@@ -10,15 +16,26 @@ pub fn cast_predicate_types<S: CollectionSchema>(predicate: Predicate, schema: &
         Predicate::Comparison { left, operator, right } => {
             // Handle both cases: field = literal AND literal = field
             match (left.as_ref(), right.as_ref()) {
-                // Case 1: field = literal (cast literal to field type)
+                // Case 1: field = literal (cast literal to field type). A resolved
+                // Identifier behaves as the equivalent [name, ..subpath] Path here.
                 (Expr::Path(path), Expr::Literal(literal)) => {
                     let target_type = schema.field_type(path)?;
+                    let cast_literal = cast_literal_to_type(literal.clone(), target_type)?;
+                    Ok(Predicate::Comparison { left, operator, right: Box::new(cast_literal) })
+                }
+                (Expr::Identifier(identifier), Expr::Literal(literal)) => {
+                    let target_type = schema.field_type(&identifier_as_path(identifier))?;
                     let cast_literal = cast_literal_to_type(literal.clone(), target_type)?;
                     Ok(Predicate::Comparison { left, operator, right: Box::new(cast_literal) })
                 }
                 // Case 2: literal = field (cast literal to field type)
                 (Expr::Literal(literal), Expr::Path(path)) => {
                     let target_type = schema.field_type(path)?;
+                    let cast_literal = cast_literal_to_type(literal.clone(), target_type)?;
+                    Ok(Predicate::Comparison { left: Box::new(cast_literal), operator, right })
+                }
+                (Expr::Literal(literal), Expr::Identifier(identifier)) => {
+                    let target_type = schema.field_type(&identifier_as_path(identifier))?;
                     let cast_literal = cast_literal_to_type(literal.clone(), target_type)?;
                     Ok(Predicate::Comparison { left: Box::new(cast_literal), operator, right })
                 }
@@ -47,6 +64,8 @@ fn cast_expr_types<S: CollectionSchema>(expr: Expr, schema: &S) -> Result<Expr, 
     match expr {
         Expr::Literal(literal) => Ok(Expr::Literal(literal)), // Literals are cast in context
         Expr::Path(path) => Ok(Expr::Path(path)),
+        // A resolved Identifier is a property reference; pass through like Path.
+        Expr::Identifier(identifier) => Ok(Expr::Identifier(identifier)),
         Expr::Predicate(predicate) => Ok(Expr::Predicate(cast_predicate_types(predicate, schema)?)),
         Expr::InfixExpr { left, operator, right } => Ok(Expr::InfixExpr {
             left: Box::new(cast_expr_types(*left, schema)?),
