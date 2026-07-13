@@ -8,7 +8,7 @@ use ankurah_core::entity::TemporaryEntity;
 use ankurah_core::error::{MutationError, RetrievalError};
 use ankurah_core::property::backend::backend_from_string;
 use ankurah_core::selection::filter::evaluate_predicate;
-use ankurah_core::storage::{naming, StorageCollection, StorageEngine};
+use ankurah_core::storage::{ensure_event_identity, naming, StorageCollection, StorageEngine};
 use ankurah_core::{property::PropertyKey, schema::CatalogResolver};
 use ankurah_proto::{
     AttestationSet, Attested, Clock, CollectionId, EntityId, EntityState, Event, EventId, GClock, OperationSet, State, StateBuffers,
@@ -494,14 +494,6 @@ fn gclock_from_parallel(head: &Clock, generations_json: &str) -> Result<GClock, 
         )));
     }
     Ok(GClock::new(head.iter().zip(generations).map(|(tip, generation)| (generation, tip.clone())).collect::<Vec<_>>()))
-}
-
-fn ensure_event_identity(stored_id: &EventId, event: &Event) -> Result<(), RetrievalError> {
-    let actual = event.id();
-    if actual != *stored_id {
-        return Err(RetrievalError::Other(format!("event identity mismatch: stored key {stored_id}, payload recomputed to {actual}")));
-    }
-    Ok(())
 }
 
 #[async_trait]
@@ -1013,23 +1005,6 @@ mod tests {
         fn resolve(&self, _collection: &str, _name: &str) -> Option<EntityId> { None }
         fn name_for(&self, _id: &EntityId) -> Option<String> { None }
         fn model_id_for(&self, collection: &str) -> Option<EntityId> { (collection == "identity_check").then_some(self.model) }
-    }
-
-    #[test]
-    fn event_payload_must_recompute_to_the_stored_key() {
-        let honest = Event {
-            model: EntityId::from_bytes([0x11; 16]),
-            entity_id: EntityId::from_bytes([0x22; 16]),
-            operations: OperationSet(BTreeMap::new()),
-            parent: Clock::default(),
-            generation: 1,
-        };
-        let stored_id = honest.id();
-        ensure_event_identity(&stored_id, &honest).unwrap();
-
-        let doctored = Event { generation: 2, ..honest };
-        let err = ensure_event_identity(&stored_id, &doctored).unwrap_err();
-        assert!(err.to_string().contains("event identity mismatch"), "unexpected error: {err}");
     }
 
     #[tokio::test]

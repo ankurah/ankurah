@@ -8,7 +8,7 @@ use ankurah_core::{
     property::PropertyKey,
     schema::CatalogResolver,
     selection::filter::{evaluate_predicate, Filterable},
-    storage::{naming, StorageCollection},
+    storage::{ensure_event_identity, naming, StorageCollection},
 };
 use ankurah_proto::{self as proto, Attested, EntityId, EntityState, Event, EventId, State};
 use async_trait::async_trait;
@@ -38,14 +38,6 @@ fn read_generation(event_obj: &Object) -> Result<u32, RetrievalError> {
     let raw = js_sys::Reflect::get(event_obj, &GENERATION_KEY)
         .map_err(|_| RetrievalError::StorageError(anyhow::anyhow!("Failed to get generation").into()))?;
     Ok(proto::wasm::decode_generation(&raw)?)
-}
-
-fn ensure_event_identity(stored_id: &EventId, event: &Event) -> Result<(), RetrievalError> {
-    let actual = event.id();
-    if actual != *stored_id {
-        return Err(RetrievalError::Other(format!("event identity mismatch: stored key {stored_id}, payload recomputed to {actual}")));
-    }
-    Ok(())
 }
 
 #[derive(Debug)]

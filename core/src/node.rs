@@ -1,4 +1,6 @@
 use crate::selection::filter::Filterable;
+
+pub(crate) mod persist;
 use ankurah_proto::{self as proto, Attested, CollectionId};
 use anyhow::anyhow;
 
@@ -1625,7 +1627,7 @@ where
         let mut changes = Vec::new();
         let mut failure: Option<MutationError> = None;
         for PlannedEntityGroup { entity, staging, getter, collection, plan } in ready {
-            let persist = crate::node_applier::NodePersist { node: self, collection: &collection };
+            let persist = persist::NodePersist { node: self, collection: &collection };
             let outcome =
                 crate::ingest::execute_plan_fenced_at_epoch(plan, &entity, &self.entities, &staging, &getter, &persist, expected_epoch)
                     .await;
@@ -1902,7 +1904,7 @@ where
                     staging.clone(),
                     expected_epoch,
                 );
-                let persist = crate::node_applier::NodePersist { node: self, collection: &collection };
+                let persist = persist::NodePersist { node: self, collection: &collection };
                 // PerItem containment (plan 2.7): one bad state must not
                 // abort the batch, and entities that already adopted and
                 // persisted must still notify, or an established matching
@@ -2076,7 +2078,7 @@ where
     pub async fn funnel_persist_for_test(&self, entity: &crate::entity::Entity) -> Result<(), crate::error::MutationError> {
         use crate::ingest::PersistState;
         let collection = self.collections.get(entity.collection()).await?;
-        let persist = crate::node_applier::NodePersist { node: self, collection: &collection };
+        let persist = persist::NodePersist { node: self, collection: &collection };
         persist.persist(entity).await
     }
 }

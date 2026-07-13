@@ -117,3 +117,40 @@ impl std::ops::Deref for StorageCollectionWrapper {
     type Target = Arc<dyn StorageCollection>;
     fn deref(&self) -> &Self::Target { &self.0 }
 }
+
+/// Verify that a stored event row's key matches its payload's recomputed
+/// content-addressed id (the R1 read-side integrity rule). Engine-independent
+/// interpretation of the storage contract: every engine's event read path
+/// calls this before serving a payload, so a row corrupted or doctored in
+/// place surfaces as a typed error instead of poisoning lineage.
+pub fn ensure_event_identity(stored_id: &EventId, event: &Event) -> Result<(), RetrievalError> {
+    let actual = event.id();
+    if actual != *stored_id {
+        return Err(RetrievalError::Other(format!("event identity mismatch: stored key {stored_id}, payload recomputed to {actual}")));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use ankurah_proto::{Clock, EntityId, OperationSet};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn event_payload_must_recompute_to_the_stored_key() {
+        let honest = Event {
+            model: EntityId::from_bytes([0x11; 16]),
+            entity_id: EntityId::from_bytes([0x22; 16]),
+            operations: OperationSet(BTreeMap::new()),
+            parent: Clock::default(),
+            generation: 1,
+        };
+        let stored_id = honest.id();
+        ensure_event_identity(&stored_id, &honest).unwrap();
+
+        let doctored = Event { generation: 2, ..honest };
+        let err = ensure_event_identity(&stored_id, &doctored).unwrap_err();
+        assert!(err.to_string().contains("event identity mismatch"), "unexpected error: {err}");
+    }
+}

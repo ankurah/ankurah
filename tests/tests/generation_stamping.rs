@@ -1,7 +1,7 @@
 mod common;
 
 use ankurah::proto;
-use ankurah_tests::common::brute_force_depths;
+use ankurah_tests::oracles::brute_force_depths;
 use anyhow::Result;
 use common::*;
 

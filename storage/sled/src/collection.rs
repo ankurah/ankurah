@@ -5,7 +5,7 @@ use ankql::ast::Predicate;
 use ankurah_core::indexing::KeySpec;
 use ankurah_core::{
     error::{MutationError, RetrievalError},
-    storage::StorageCollection,
+    storage::{ensure_event_identity, StorageCollection},
     EntityId,
 };
 use ankurah_proto::{Attested, CollectionId, EntityState, Event, EventId, StateFragment};
@@ -40,14 +40,6 @@ pub struct SledStorageCollectionInner {
 }
 
 pub struct SledStorageCollection(SledStorageCollectionInner);
-
-fn ensure_event_identity(stored_id: &EventId, event: &Event) -> Result<(), RetrievalError> {
-    let actual = event.id();
-    if actual != *stored_id {
-        return Err(RetrievalError::Other(format!("event identity mismatch: stored key {stored_id}, payload recomputed to {actual}")));
-    }
-    Ok(())
-}
 
 impl SledStorageCollection {
     pub fn new(
@@ -449,23 +441,6 @@ mod event_identity_tests {
     use ankurah_core::storage::StorageEngine;
     use ankurah_proto::{Clock, OperationSet};
     use std::collections::BTreeMap;
-
-    #[test]
-    fn event_payload_must_recompute_to_the_stored_key() {
-        let honest = Event {
-            model: EntityId::from_bytes([0x11; 16]),
-            entity_id: EntityId::from_bytes([0x22; 16]),
-            operations: OperationSet(BTreeMap::new()),
-            parent: Clock::default(),
-            generation: 1,
-        };
-        let stored_id = honest.id();
-        ensure_event_identity(&stored_id, &honest).unwrap();
-
-        let doctored = Event { generation: 2, ..honest };
-        let err = ensure_event_identity(&stored_id, &doctored).unwrap_err();
-        assert!(err.to_string().contains("event identity mismatch"), "unexpected error: {err}");
-    }
 
     #[tokio::test]
     async fn event_getters_reject_a_payload_stored_under_the_wrong_key() {

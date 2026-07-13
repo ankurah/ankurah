@@ -12,68 +12,6 @@ use ankurah_proto::{self as proto};
 use futures::stream::StreamExt;
 use proto::Attested;
 
-/// Persistence adapter for ingest. It supplies the node's PolicyAgent for
-/// state attestation and centralizes marker-safe resident persistence for
-/// apply, Get response, remote commit, and local commit lanes.
-pub(crate) struct NodePersist<'a, SE, PA>
-where
-    SE: StorageEngine + Send + Sync + 'static,
-    PA: PolicyAgent + Send + Sync + 'static,
-{
-    pub(crate) node: &'a Node<SE, PA>,
-    pub(crate) collection: &'a crate::storage::StorageCollectionWrapper,
-}
-
-#[async_trait::async_trait]
-impl<'a, SE, PA> ingest::PersistState for NodePersist<'a, SE, PA>
-where
-    SE: StorageEngine + Send + Sync + 'static,
-    PA: PolicyAgent + Send + Sync + 'static,
-{
-    /// Persist the canonical resident's current state. The completed-persist
-    /// marker elides the write only when it names the resident's exact current
-    /// head in the current reset epoch.
-    ///
-    /// The reset fence orders the whole operation before or after a hard
-    /// reset. Inside that fence, the per-entity persist span serializes the
-    /// canonical check, marker check, snapshot, storage write, and marker
-    /// stamp. This prevents sibling lanes from landing snapshots out of order
-    /// and prevents a stale duplicate resident from overwriting the canonical
-    /// state. The marker records the head returned by `save_state`, never a
-    /// later re-read.
-    ///
-    /// Lock order is reset fence first, then the per-entity persist span.
-    /// Callers that already hold the reset fence use `persist_fenced` to avoid
-    /// recursively acquiring the fair read lock.
-    async fn persist(&self, entity: &crate::entity::Entity) -> Result<(), MutationError> {
-        let _fence = self.node.entities.reset_fence_read().await;
-        self.persist_fenced(entity).await
-    }
-
-    async fn persist_fenced(&self, entity: &crate::entity::Entity) -> Result<(), MutationError> {
-        let span = self.node.entities.persist_span(entity.id());
-        let _guard = span.lock().await;
-        // Markers and snapshots belong to one Entity instance. Refuse a
-        // non-canonical live instance before consulting its marker so it
-        // cannot overwrite or claim durability for the canonical resident.
-        // An absent map entry is allowed because this is then the only live
-        // instance known to the node. A refused delivery is retryable; its
-        // redelivery resolves to the canonical resident.
-        if let Some(canonical) = self.node.entities.get(&entity.id()) {
-            if canonical != *entity {
-                return Err(MutationError::StaleInstancePersistRefused(entity.id()));
-            }
-        }
-        let epoch = self.node.entities.reset_epoch();
-        if entity.persist_marker_current(epoch) {
-            return Ok(());
-        }
-        let persisted_head = NodeApplier::save_state(self.node, entity, self.collection).await?;
-        entity.stamp_persist_marker(epoch, persisted_head);
-        Ok(())
-    }
-}
-
 /// Applies streaming subscription updates and initial Fetch/QuerySubscribed
 /// deltas received from a peer.
 pub struct NodeApplier;
@@ -280,7 +218,7 @@ impl NodeApplier {
                 };
                 entities.push(entity.clone());
 
-                let persist = NodePersist { node, collection: &collection };
+                let persist = crate::node::persist::NodePersist { node, collection: &collection };
                 let outcome =
                     ingest::execute_plan_at_epoch(plan, &entity, &node.entities, staging, event_getter, &persist, expected_epoch).await;
 
@@ -317,7 +255,7 @@ impl NodeApplier {
                 // Fast path through the shared state-apply: fresh adoption or
                 // strict descent takes the snapshot wholesale, committing the
                 // accompanying events before the buffer persists.
-                let persist = NodePersist { node, collection: &collection };
+                let persist = crate::node::persist::NodePersist { node, collection: &collection };
                 let applied = match ingest::apply_state_feed_at_epoch(
                     &node.entities,
                     state_getter,
@@ -377,29 +315,6 @@ impl NodeApplier {
         }
 
         Ok(())
-    }
-
-    /// Serialize, attest, and persist the resident's current state.
-    /// Returns the HEAD the completed set_state wrote (the snapshot
-    /// to_state read under the entity lock, which may lag a concurrent
-    /// advance): the persist-currency marker must stamp exactly what was
-    /// persisted, never a re-read.
-    async fn save_state<SE, PA>(
-        node: &Node<SE, PA>,
-        entity: &crate::entity::Entity,
-        collection_wrapper: &crate::storage::StorageCollectionWrapper,
-    ) -> Result<proto::Clock, MutationError>
-    where
-        SE: StorageEngine + Send + Sync + 'static,
-        PA: PolicyAgent + Send + Sync + 'static,
-    {
-        let state = entity.to_state()?;
-        let persisted_head = state.head.clone();
-        let entity_state = proto::EntityState { entity_id: entity.id(), model: entity.model_id()?, state };
-        let attestation = node.policy_agent.attest_state(node, &entity_state);
-        let attested = Attested::opt(entity_state, attestation);
-        collection_wrapper.set_state(attested).await?;
-        Ok(persisted_head)
     }
 
     /// Apply multiple EntityDeltas in parallel with batched reactor notification
@@ -516,7 +431,7 @@ impl NodeApplier {
                 // race behind the intermittent server_edits_subscription
                 // failure. Fresh adoption and strict descent are real
                 // changes and still notify.
-                let persist = NodePersist { node, collection: &collection };
+                let persist = crate::node::persist::NodePersist { node, collection: &collection };
                 let applied = ingest::apply_state_feed_at_epoch(
                     &node.entities,
                     state_getter,
@@ -566,7 +481,7 @@ impl NodeApplier {
                         return Err(e);
                     }
                 };
-                let persist = NodePersist { node, collection: &collection };
+                let persist = crate::node::persist::NodePersist { node, collection: &collection };
                 let outcome =
                     ingest::execute_plan_at_epoch(plan, &entity, &node.entities, staging, event_getter, &persist, expected_epoch).await;
 

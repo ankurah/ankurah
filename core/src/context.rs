@@ -252,7 +252,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
             // keeps its own macro-order (commit, advance forks, relay, only
             // then materialize and persist); only the persist funnel is
             // shared.
-            let persist = crate::node_applier::NodePersist { node: &self.node, collection: &group.collection };
+            let persist = crate::node::persist::NodePersist { node: &self.node, collection: &group.collection };
             persist.persist_fenced(canonical).await?;
             // The post-persist hook, insertion half (derivations section 5;
             // REV 5 sections E and F): the completed persist proves the

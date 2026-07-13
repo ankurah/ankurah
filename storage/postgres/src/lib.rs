@@ -9,7 +9,7 @@ use ankurah_core::{
     error::{MutationError, RetrievalError, StateError},
     property::{backend::backend_from_string, PropertyKey},
     schema::CatalogResolver,
-    storage::{naming, StorageCollection, StorageEngine},
+    storage::{ensure_event_identity, naming, StorageCollection, StorageEngine},
 };
 use ankurah_proto::{Attestation, AttestationSet, Attested, EntityState, EventId, GClock, OperationSet, State, StateBuffers};
 
@@ -536,14 +536,6 @@ fn gclock_from_parallel(head: &Clock, generations: &[i64]) -> Result<GClock, Str
 
 fn checked_event_generation(stored_id: &EventId, raw: i64) -> Result<u32, RetrievalError> {
     u32::try_from(raw).map_err(|_| RetrievalError::Other(format!("event {stored_id} has generation {raw} outside the supported u32 range")))
-}
-
-fn ensure_event_identity(stored_id: &EventId, event: &Event) -> Result<(), RetrievalError> {
-    let actual = event.id();
-    if actual != *stored_id {
-        return Err(RetrievalError::Other(format!("event identity mismatch: stored key {stored_id}, payload recomputed to {actual}")));
-    }
-    Ok(())
 }
 
 #[async_trait]
@@ -1212,16 +1204,5 @@ mod event_decode_tests {
     #[test]
     fn generations_column_is_reserved_from_property_assignment() {
         assert!(BASE_COLUMNS.contains(&"generations"));
-    }
-
-    #[test]
-    fn event_payload_must_recompute_to_the_stored_key() {
-        let honest = event(1);
-        let stored_id = honest.id();
-        ensure_event_identity(&stored_id, &honest).unwrap();
-
-        let doctored = event(2);
-        let err = ensure_event_identity(&stored_id, &doctored).unwrap_err();
-        assert!(err.to_string().contains("event identity mismatch"), "unexpected error: {err}");
     }
 }

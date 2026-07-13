@@ -18,7 +18,7 @@ use ankurah::core::property::backend::{lww::LWWBackend, PropertyBackend};
 use ankurah::core::property::PropertyKey;
 use ankurah::policy::DEFAULT_CONTEXT as c;
 use ankurah::{proto, Mutable, Node, PermissiveAgent};
-use ankurah_tests::common::brute_force_depths;
+use ankurah_tests::oracles::brute_force_depths;
 use anyhow::Result;
 use common::*;
 use std::collections::BTreeMap;
