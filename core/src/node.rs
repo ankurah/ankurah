@@ -214,9 +214,21 @@ where
     }
     pub fn weak(&self) -> WeakNode<SE, PA> { WeakNode(Arc::downgrade(&self.0)) }
 
+    /// Register a peer connection after its Presence handshake.
+    ///
+    /// Refuses (without registering anything) when the peer's protocol
+    /// version is incompatible; the connector should relay the returned
+    /// rejection best-effort and close the connection. Enforced here, not
+    /// in connectors, so every transport inherits it.
     #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(node_id = %presence.node_id.to_base64_short(), durable = %presence.durable)))]
-    pub fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) {
+    pub fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) -> Result<(), proto::PresenceRejection> {
         action_info!(self, "register_peer", "{}", &presence);
+
+        if !proto::protocol_compatible(presence.protocol_version) {
+            let rejection = proto::PresenceRejection { expected: proto::PROTOCOL_VERSION, received: presence.protocol_version };
+            warn!("Node({}) refusing peer {}: {}", self.id, presence.node_id, rejection);
+            return Err(rejection);
+        }
 
         let subscription_handler = SubscriptionHandler::new(presence.node_id, self);
         self.peer_connections.insert(
@@ -254,6 +266,7 @@ where
             }
         }
         // TODO send hello message to the peer, including present head state for all relevant collections
+        Ok(())
     }
     #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(node_id = %node_id.to_base64_short())))]
     pub fn deregister_peer(&self, node_id: proto::EntityId) {

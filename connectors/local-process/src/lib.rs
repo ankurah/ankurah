@@ -56,13 +56,26 @@ where
 
         // we have to register the senders with the nodes
         node1.register_peer(
-            proto::Presence { node_id: node2.id, durable: node2.durable, system_root: node2.system.root() },
+            proto::Presence {
+                node_id: node2.id,
+                durable: node2.durable,
+                system_root: node2.system.root(),
+                protocol_version: proto::PROTOCOL_VERSION,
+            },
             Box::new(LocalProcessSender { sender: node2_tx, node_id: node2.id }),
-        );
-        node2.register_peer(
-            proto::Presence { node_id: node1.id, durable: node1.durable, system_root: node1.system.root() },
+        )?;
+        if let Err(rejection) = node2.register_peer(
+            proto::Presence {
+                node_id: node1.id,
+                durable: node1.durable,
+                system_root: node1.system.root(),
+                protocol_version: proto::PROTOCOL_VERSION,
+            },
             Box::new(LocalProcessSender { sender: node1_tx, node_id: node1.id }),
-        );
+        ) {
+            node1.deregister_peer(node2.id);
+            return Err(rejection.into());
+        }
 
         let receiver1_task = Self::setup_receiver(node1.clone(), node1_rx);
         let receiver2_task = Self::setup_receiver(node2.clone(), node2_rx);
