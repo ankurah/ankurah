@@ -320,7 +320,7 @@ fn parse_order_by_item(pair: Pair<grammar::Rule>) -> Result<ast::OrderByItem, Pa
     let identifier_pair = inner_pairs
         .iter()
         .find(|p| p.as_rule() == grammar::Rule::Identifier)
-        .ok_or(ParseError::InvalidPredicate("Missing column name in ORDER BY item".into()))?;
+        .ok_or(ParseError::InvalidPredicate("Missing property name in ORDER BY item".into()))?;
 
     let identifier_str = identifier_pair.as_str().trim();
 
@@ -329,7 +329,7 @@ fn parse_order_by_item(pair: Pair<grammar::Rule>) -> Result<ast::OrderByItem, Pa
         return Err(ParseError::InvalidPredicate("Dotted identifiers are not supported in ORDER BY clauses".into()));
     }
 
-    let path = ast::PathExpr::simple(identifier_str);
+    let key = ast::OrderKey::Path(ast::PathExpr::simple(identifier_str));
 
     let direction = inner_pairs
         .iter()
@@ -342,7 +342,7 @@ fn parse_order_by_item(pair: Pair<grammar::Rule>) -> Result<ast::OrderByItem, Pa
         .transpose()?
         .unwrap_or(ast::OrderDirection::Asc); // Default
 
-    Ok(ast::OrderByItem { path, direction })
+    Ok(ast::OrderByItem { key, direction })
 }
 
 #[cfg(test)]
@@ -685,7 +685,10 @@ mod tests {
         );
         assert_eq!(
             selection.order_by,
-            Some(vec![ast::OrderByItem { path: ast::PathExpr::simple("name".to_string()), direction: ast::OrderDirection::Asc }])
+            Some(vec![ast::OrderByItem {
+                key: ast::OrderKey::Path(ast::PathExpr::simple("name".to_string())),
+                direction: ast::OrderDirection::Asc,
+            }])
         );
         assert_eq!(selection.limit, None);
         Ok(())
@@ -697,7 +700,10 @@ mod tests {
         assert_eq!(selection.predicate, ast::Predicate::True);
         assert_eq!(
             selection.order_by,
-            Some(vec![ast::OrderByItem { path: ast::PathExpr::simple("created_at".to_string()), direction: ast::OrderDirection::Desc }])
+            Some(vec![ast::OrderByItem {
+                key: ast::OrderKey::Path(ast::PathExpr::simple("created_at".to_string())),
+                direction: ast::OrderDirection::Desc,
+            }])
         );
         Ok(())
     }
@@ -739,7 +745,10 @@ mod tests {
         );
         assert_eq!(
             selection.order_by,
-            Some(vec![ast::OrderByItem { path: ast::PathExpr::simple("created_at".to_string()), direction: ast::OrderDirection::Desc }])
+            Some(vec![ast::OrderByItem {
+                key: ast::OrderKey::Path(ast::PathExpr::simple("created_at".to_string())),
+                direction: ast::OrderDirection::Desc,
+            }])
         );
         assert_eq!(selection.limit, Some(5));
         Ok(())
@@ -760,7 +769,10 @@ mod tests {
         assert_eq!(selection.predicate, ast::Predicate::True);
         assert_eq!(
             selection.order_by,
-            Some(vec![ast::OrderByItem { path: ast::PathExpr::simple("score".to_string()), direction: ast::OrderDirection::Asc }])
+            Some(vec![ast::OrderByItem {
+                key: ast::OrderKey::Path(ast::PathExpr::simple("score".to_string())),
+                direction: ast::OrderDirection::Asc,
+            }])
         );
         assert_eq!(selection.limit, None);
         Ok(())
@@ -773,10 +785,16 @@ mod tests {
         assert_eq!(
             selection.order_by,
             Some(vec![
-                ast::OrderByItem { path: ast::PathExpr::simple("name".to_string()), direction: ast::OrderDirection::Asc },
-                ast::OrderByItem { path: ast::PathExpr::simple("created_at".to_string()), direction: ast::OrderDirection::Desc },
                 ast::OrderByItem {
-                    path: ast::PathExpr::simple("id".to_string()),
+                    key: ast::OrderKey::Path(ast::PathExpr::simple("name".to_string())),
+                    direction: ast::OrderDirection::Asc
+                },
+                ast::OrderByItem {
+                    key: ast::OrderKey::Path(ast::PathExpr::simple("created_at".to_string())),
+                    direction: ast::OrderDirection::Desc,
+                },
+                ast::OrderByItem {
+                    key: ast::OrderKey::Path(ast::PathExpr::simple("id".to_string())),
                     direction: ast::OrderDirection::Asc // Default
                 }
             ])
@@ -809,7 +827,10 @@ mod tests {
         );
         assert_eq!(
             selection.order_by,
-            Some(vec![ast::OrderByItem { path: ast::PathExpr::simple("name".to_string()), direction: ast::OrderDirection::Asc }])
+            Some(vec![ast::OrderByItem {
+                key: ast::OrderKey::Path(ast::PathExpr::simple("name".to_string())),
+                direction: ast::OrderDirection::Asc,
+            }])
         );
 
         Ok(())

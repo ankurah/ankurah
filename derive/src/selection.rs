@@ -305,14 +305,19 @@ fn generate_selection_code_with_replacements(
         let order_items: Vec<_> = order_by
             .iter()
             .map(|item| {
-                let steps: Vec<_> = item.path.steps.iter().map(|s| quote! { #s.to_string() }).collect();
+                // The parser only ever produces a raw `OrderKey::Path`; resolution
+                // (at query time) is what rewrites it to a resolved key.
+                let steps: Vec<_> = match &item.key {
+                    ankql::ast::OrderKey::Path(path) => path.steps.iter().map(|s| quote! { #s.to_string() }).collect(),
+                    ankql::ast::OrderKey::Property(_) => unreachable!("parser produces only raw OrderKey::Path"),
+                };
                 let direction_code = match item.direction {
                     ankql::ast::OrderDirection::Asc => quote! { ::ankql::ast::OrderDirection::Asc },
                     ankql::ast::OrderDirection::Desc => quote! { ::ankql::ast::OrderDirection::Desc },
                 };
                 quote! {
                     ::ankql::ast::OrderByItem {
-                        path: ::ankql::ast::PathExpr { steps: vec![#(#steps),*] },
+                        key: ::ankql::ast::OrderKey::Path(::ankql::ast::PathExpr { steps: vec![#(#steps),*] }),
                         direction: #direction_code,
                     }
                 }
@@ -462,6 +467,13 @@ fn generate_expr_code_with_replacements(
             quote! {
                 ::ankql::ast::Expr::ExprList(vec![#(#expr_codes),*])
             }
+        }
+        // The parser never produces a resolved PropertyPath -- it is the output of
+        // a resolution pass that runs on already-parsed ASTs, not of
+        // parse_selection, which is what feeds this codegen. This arm exists only
+        // to keep the match exhaustive.
+        ankql::ast::Expr::PropertyIdentifier(_) => {
+            panic!("selection! macro received a resolved PropertyPath; the parser only produces PathExpr")
         }
     }
 }
