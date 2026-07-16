@@ -146,6 +146,33 @@ impl CatalogMapInner {
         }
     }
 
+    pub(super) fn resolve(&self, collection: &str, name: &str) -> Option<EntityId> {
+        let model_id = self.by_collection.get(collection)?;
+        let membership_ids = self.model_memberships.get(model_id)?;
+        let mut found = None;
+        for membership_id in membership_ids {
+            let Some(membership) = self.memberships.get(membership_id) else { continue };
+            let Some(property) = self.properties.get(&membership.property) else { continue };
+            if property.name != name {
+                continue;
+            }
+            match found {
+                None => found = Some(property.id),
+                Some(first) => {
+                    tracing::warn!(
+                        "catalog map holds multiple live properties named '{}' in '{}' ({} and {}); resolving to the first",
+                        name,
+                        collection,
+                        first,
+                        property.id
+                    );
+                    break;
+                }
+            }
+        }
+        found
+    }
+
     pub(super) fn memberships_of(&self, model: &EntityId) -> Vec<MembershipDef> {
         self.model_memberships
             .get(model)

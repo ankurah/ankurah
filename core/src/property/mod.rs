@@ -10,7 +10,39 @@ pub use value::{Json, Ref, YrsString};
 
 use crate::value::Value;
 
+/// A property display name: the pre-resolution address a derive-generated
+/// accessor carries until the editable view resolves it, once, to a
+/// [`PropertyId`] (system/catalog collections have no resolver, so they stay
+/// [`PropertyId::System`] by this name).
 pub type PropertyName = String;
+
+/// The address a derive-generated accessor uses for one compiled field, before
+/// resolution.
+///
+/// Most fields are name-addressed here and are resolved to a [`PropertyId`] once
+/// at editable-view construction (`from_entity`). An explicit
+/// `#[property(id = "...")]` binding is different: the literal id is the field's
+/// identity even when its local Rust name differs from the catalog's current
+/// display name, so the accessor takes it directly without a catalog lookup.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PropertyAddress {
+    pub name: PropertyName,
+    pub explicit_id: Option<EntityId>,
+}
+
+impl PropertyAddress {
+    pub fn new(name: impl Into<PropertyName>, explicit_id: Option<EntityId>) -> Self { Self { name: name.into(), explicit_id } }
+
+    pub fn named(name: impl Into<PropertyName>) -> Self { Self::new(name, None) }
+}
+
+impl From<String> for PropertyAddress {
+    fn from(name: String) -> Self { Self::named(name) }
+}
+
+impl From<&str> for PropertyAddress {
+    fn from(name: &str) -> Self { Self::named(name) }
+}
 
 /// Read a property from ONE backend by its durable [`PropertyId`]. A backend is
 /// a dumb `PropertyId`-keyed store: the entry is authoritative, and an absent

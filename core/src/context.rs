@@ -307,7 +307,7 @@ where
             debug!("Node({}).get_entity found local entity - returning", self.node.id);
             let state = local.to_state()?;
             let entity_id = local.id();
-            self.node.policy_agent.check_read(&self.cdata, &entity_id, collection_id, &state)?;
+            self.node.policy_agent.check_read(&self.cdata, &entity_id, collection_id, &state, Some(self.node.catalog.resolver_weak()))?;
             return Ok(local);
         }
         debug!("{}.get_entity fetching from storage", self.node);
@@ -320,6 +320,7 @@ where
                     &entity_state.payload.entity_id,
                     collection_id,
                     &entity_state.payload.state,
+                    Some(self.node.catalog.resolver_weak()),
                 )?;
                 let state_getter = crate::retrieval::LocalStateGetter::new(collection.clone());
                 let event_getter = crate::retrieval::CachedEventGetter::new(collection_id.clone(), collection, &self.node, &self.cdata);
@@ -339,6 +340,21 @@ where
         // Fetch raw states from storage
 
         args.selection.predicate = self.node.policy_agent.filter_predicate(&self.cdata, collection_id, args.selection.predicate)?;
+
+        // Resolve property references against the catalog: PathExpr becomes a
+        // stable Identifier and unknown properties fail closed.
+        // Idempotent, so a selection resolved by an outer caller passes
+        // through unchanged here. A collection that neither the catalog
+        // cache nor first-use registration can resolve fails LOUD
+        // (UnregisteredCollection): a lagging replica cannot prove
+        // emptiness, and a successful registration answers empty truthfully
+        // by querying the real, entity-free collection.
+        args.selection = self
+            .node
+            .catalog
+            .resolve_selection_deferred(&self.node, Some(&self.cdata), collection_id, None, &args.selection)
+            .await
+            .map_err(RetrievalError::from)?;
 
         // Resolve types in the AST (converts literals for JSON path comparisons)
         args.selection = self.node.type_resolver.resolve_selection_types(args.selection);

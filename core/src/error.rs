@@ -49,6 +49,10 @@ pub enum RetrievalError {
     RequestError(RequestError),
     #[error("Apply error: {0}")]
     ApplyError(ApplyError),
+    /// A selection reached a storage engine unresolved. This is a caller bug,
+    /// not a data condition: see `ankql::ast::Selection::check`.
+    #[error("Unresolved selection: {0}")]
+    SelectionError(ankql::error::SelectionError),
 }
 
 impl From<RequestError> for RetrievalError {
@@ -77,6 +81,10 @@ impl From<bincode::Error> for RetrievalError {
 
 impl From<crate::selection::filter::Error> for RetrievalError {
     fn from(err: crate::selection::filter::Error) -> Self { RetrievalError::AnkqlFilter(err) }
+}
+
+impl From<ankql::error::SelectionError> for RetrievalError {
+    fn from(err: ankql::error::SelectionError) -> Self { RetrievalError::SelectionError(err) }
 }
 
 impl From<anyhow::Error> for RetrievalError {

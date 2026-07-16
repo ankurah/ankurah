@@ -51,6 +51,13 @@ impl<SE: StorageEngine> CollectionSet<SE> {
         Ok(memory_collections.keys().cloned().collect())
     }
 
+    /// Forward the catalog resolver to the engine (see
+    /// [`StorageEngine::set_catalog_resolver`]). Called once from `Node`
+    /// construction.
+    pub(crate) fn set_catalog_resolver(&self, resolver: std::sync::Weak<dyn crate::schema::CatalogResolver>) {
+        self.0.storage_engine.set_catalog_resolver(resolver);
+    }
+
     pub async fn delete_all_collections(&self) -> Result<bool, MutationError> {
         // Clear in-memory collections first
         {

@@ -17,6 +17,17 @@ pub trait StorageEngine: Send + Sync {
     async fn collection(&self, id: &CollectionId) -> Result<Arc<dyn StorageCollection>, RetrievalError>;
     // Delete all collections and their data from the storage engine
     async fn delete_all_collections(&self) -> Result<bool, MutationError>;
+
+    /// Inject the catalog resolver. Engines that maintain
+    /// human-named materialized structures (postgres/sqlite/indexeddb physical
+    /// fields, sled property slots) seed their DURABLE id-to-name maps from it at
+    /// materialization time; the maps stay engine-owned, the resolver is only
+    /// the name source. Called once from `Node` construction, after the
+    /// catalog exists -- the engine object is constructed before the node, so
+    /// this cannot be a constructor argument. Weak: the engine must not keep
+    /// the catalog (and thus the node) alive. Default no-op for engines with
+    /// no human-named structures (memory/test engines).
+    fn set_catalog_resolver(&self, resolver: std::sync::Weak<dyn crate::schema::CatalogResolver>) { let _ = resolver; }
 }
 
 #[async_trait]

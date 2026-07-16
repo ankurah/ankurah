@@ -247,6 +247,7 @@ impl PolicyAgent for JwtAgent {
         id: &proto::EntityId,
         collection: &proto::CollectionId,
         state: &proto::State,
+        resolver: Option<std::sync::Weak<dyn ankurah_core::schema::CatalogResolver>>,
     ) -> Result<(), AccessDenied>
     where
         C: Iterable<Self::ContextData>,
@@ -264,7 +265,10 @@ impl PolicyAgent for JwtAgent {
             return Ok(());
         }
 
-        let entity = TemporaryEntity::new(*id, collection.clone(), state)
+        // Scope filters are NAME-addressed (config strings) and post-epoch
+        // state is id-keyed: bind the inspection view through the node's
+        // catalog resolver or every filter reads nothing and denies.
+        let entity = TemporaryEntity::new_bound(*id, collection.clone(), state, resolver)
             .map_err(|_| AccessDenied::ByPolicy("Read scope entity state could not be evaluated"))?;
         enforce_read_scope(&guard.config, data, &entity)
     }

@@ -7,8 +7,10 @@ use crate::{
     model::View,
     property::backend::{backend_from_string, PropertyBackend},
     reactor::AbstractEntity,
+    schema::CatalogResolver,
     value::Value,
 };
+use ankql::ast::PropertyId;
 use ankurah_proto::{Clock, CollectionId, EntityId, EntityState, Event, EventId, OperationSet, State};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -77,6 +79,11 @@ pub struct EntityInner {
     pub(crate) kind: EntityKind,
     /// Broadcast for notifying Signal subscribers about entity changes
     pub(crate) broadcast: ankurah_signals::broadcast::Broadcast,
+    /// Catalog resolver stamped at assembly: lets this catalog-blind entity
+    /// resolve a display name to the property-definition id its data is
+    /// keyed under, for the sync read path. Absent for bare and temporary
+    /// entities (they read system-keyed data only).
+    resolver: std::sync::RwLock<Option<Weak<dyn CatalogResolver>>>,
 }
 
 #[derive(Debug)]
@@ -112,6 +119,53 @@ impl WeakEntity {
 /// [`Entity`] and the [`TemporaryEntity`] (which is bound only when
 /// constructed via [`TemporaryEntity::new_bound`]). Both deref here.
 impl EntityInner {
+    /// The catalog resolver stamped at assembly, if still live.
+    fn resolver(&self) -> Option<Arc<dyn CatalogResolver>> { self.resolver.read().unwrap().as_ref().and_then(|w| w.upgrade()) }
+
+    /// Stamp the catalog resolver (assembly-time). Replaces the old
+    /// backend-binding push (`Node::bind_entity`): the backend stays dumb and
+    /// the entity resolves names to ids for the sync read path.
+    pub(crate) fn set_resolver(&self, resolver: Weak<dyn CatalogResolver>) { *self.resolver.write().unwrap() = Some(resolver); }
+
+    /// Resolve a display name to the key its data is stored under, for
+    /// LENIENT (infallible) reads: the property-definition id when the
+    /// catalog knows the field, else the bare name as a
+    /// [`PropertyId::System`] (system/catalog collections, or a field not yet
+    /// registered). Evaluation has no error surface (see [`Self::read_lenient`]),
+    /// so an unresolvable name degenerates to a system-keyed read rather than
+    /// erroring; the fallible counterpart the value accessors need at
+    /// construction time is [`Self::resolve_property_id`].
+    fn resolve_key(&self, name: &str) -> PropertyId {
+        match self.resolver().and_then(|r| r.resolve(self.collection.as_str(), name)) {
+            Some(id) => PropertyId::EntityId(id.to_ulid()),
+            None => PropertyId::System { name: name.to_string() },
+        }
+    }
+
+    /// Resolve an ordinary user-model field to its durable identity, for the
+    /// value accessors (`LWW`/`YrsString`) to call ONCE at construction
+    /// (`from_entity`): a missing resolver slot is the intentional
+    /// system-keyed bare-entity case (`PropertyId::System`); once a resolver
+    /// has been stamped, failure to upgrade it or to resolve the name is a
+    /// missing/ambiguous catalog binding and surfaces as `UnknownProperty`
+    /// (the unbound-field error the accessor's `set`/`get` then returns).
+    /// Explicit-id accessors bypass this method entirely.
+    pub(crate) fn resolve_property_id(&self, name: &str) -> Result<PropertyId, crate::property::traits::PropertyError> {
+        let resolver = self.resolver.read().expect("other thread panicked, panic here too");
+        let Some(resolver) = resolver.as_ref() else {
+            return Ok(PropertyId::System { name: name.to_string() });
+        };
+        let Some(resolver) = resolver.upgrade() else {
+            return Err(crate::property::traits::PropertyError::UnknownProperty {
+                collection: self.collection.to_string(),
+                name: name.to_string(),
+            });
+        };
+        resolver.resolve(self.collection.as_str(), name).map(|id| PropertyId::EntityId(id.to_ulid())).ok_or_else(|| {
+            crate::property::traits::PropertyError::UnknownProperty { collection: self.collection.to_string(), name: name.to_string() }
+        })
+    }
+
     /// Defensive canonicalization at the read/evaluation boundary (rfc.md 5.6
     /// as amended 2026-07-10): commits canonicalize writes, but ingest is
     /// deliberately schema-blind (catalog lag), so a legacy or ill-typed
@@ -302,6 +356,7 @@ impl Entity {
             state: std::sync::RwLock::new(EntityInnerState { head: Clock::default(), backends: BTreeMap::default() }),
             kind: EntityKind::Primary,
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
+            resolver: std::sync::RwLock::new(None),
         }))
     }
 
@@ -319,6 +374,7 @@ impl Entity {
             state: std::sync::RwLock::new(EntityInnerState { head: state.head.clone(), backends }),
             kind: EntityKind::Primary,
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
+            resolver: std::sync::RwLock::new(None),
         })))
     }
 
@@ -640,6 +696,9 @@ impl Entity {
             state: std::sync::RwLock::new(EntityInnerState { head: state.head.clone(), backends: forked }),
             kind: EntityKind::Transacted { trx_alive, upstream: self.clone() },
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
+            // Carry the resolver across the fork so a transaction's read path
+            // still resolves names to ids.
+            resolver: std::sync::RwLock::new(self.resolver.read().unwrap().clone()),
         }))
     }
 

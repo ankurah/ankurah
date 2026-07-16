@@ -123,15 +123,23 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     where C: Iterable<Self::ContextData>;
 
     /// Check if a context can read an entity
-    /// If the policy agent wants to inspect the entity state, it can do so with either TemporaryEntity::new or entityset.with_state
+    /// If the policy agent wants to inspect the entity state, it can do so with either TemporaryEntity::new_bound or entityset.with_state
     /// Optimization: Consider adding a common trait implemented by Entity and TemporaryEntity returned by entityset.get_evaluation_entity that
     /// returns a real entity if resident, falling back to a temporary entity if not. (as the former case would save cycles creating/populating the backends)
+    ///
+    /// `resolver` is the node's catalog resolver: an agent that evaluates
+    /// name-addressed policy predicates against the (id-keyed) state must
+    /// bind its inspection view through it (`TemporaryEntity::new_bound`),
+    /// or every display name resolves to nothing on a post-epoch buffer and
+    /// scope predicates evaluate false. Agents that never inspect state
+    /// ignore it.
     fn check_read<C>(
         &self,
         data: &C,
         id: &proto::EntityId,
         collection: &proto::CollectionId,
         state: &proto::State,
+        resolver: Option<std::sync::Weak<dyn crate::schema::CatalogResolver>>,
     ) -> Result<(), AccessDenied>
     where
         C: Iterable<Self::ContextData>;
@@ -256,6 +264,7 @@ impl PolicyAgent for PermissiveAgent {
         _id: &proto::EntityId,
         _collection: &proto::CollectionId,
         _state: &proto::State,
+        _resolver: Option<std::sync::Weak<dyn crate::schema::CatalogResolver>>,
     ) -> Result<(), AccessDenied>
     where
         C: Iterable<Self::ContextData>,

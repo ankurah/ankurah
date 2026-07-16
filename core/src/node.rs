@@ -157,6 +157,25 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
+    /// Attach the live catalog resolver to a user entity at each assembly
+    /// path (create/load/apply). Property access can then resolve display
+    /// names to stable `PropertyId`s while backends continue to operate on
+    /// `PropertyId` alone. System and metadata-catalog entities are the
+    /// bootstrap exemption and remain name-addressed without a resolver.
+    pub(crate) fn stamp_resolver(&self, entity: &Entity) {
+        let collection = entity.collection();
+        // System + catalog collections are name-keyed (the bootstrap
+        // exemption): they need no resolver, and stamping one would be inert.
+        if collection.as_str() == crate::system::SYSTEM_COLLECTION_ID || crate::schema::is_catalog_collection(collection) {
+            return;
+        }
+        // Stamp the live catalog resolver so the entity's sync read path can
+        // resolve display names to `PropertyId`s (replacing the old id-keyed
+        // backend binding flip). The backend stays dumb; identity is carried
+        // by the `PropertyId` alone.
+        entity.set_resolver(self.catalog.resolver_weak());
+    }
+
     pub fn new(engine: Arc<SE>, policy_agent: PA) -> Self { Self::build(engine, policy_agent, false, SmallRng::from_entropy()) }
     pub fn new_durable(engine: Arc<SE>, policy_agent: PA) -> Self { Self::build(engine, policy_agent, true, SmallRng::from_entropy()) }
 
@@ -208,6 +227,25 @@ where
             }
         }
 
+        // Storage engines seed their durable id-to-name maps (table and
+        // physical-field naming) from the catalog resolver at materialization time. Injected
+        // here, not at engine construction, because the engine is built before
+        // the node/catalog exist.
+        node.collections.set_catalog_resolver(node.catalog.resolver_weak());
+        // The reactor types ORDER BY sort keys from the same catalog resolver
+        // (canonical value_type collation).
+        node.reactor.set_catalog_resolver(node.catalog.resolver_weak());
+        // Assembly-time choke point: every entity handed out by the entity
+        // set gets the catalog resolver stamped, so no assembly path can
+        // forget it and the sync read path can always resolve names to ids.
+        node.entities.set_bind_hook(Box::new({
+            let weak = node.weak();
+            move |entity| {
+                if let Some(node) = weak.upgrade() {
+                    node.stamp_resolver(entity);
+                }
+            }
+        }));
         node.policy_agent.on_node_ready(node.weak());
 
         node

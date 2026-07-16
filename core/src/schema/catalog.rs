@@ -129,6 +129,63 @@ where PA: PolicyAgent
     /// Node-taking methods (ensure_registered, ensure_subscribed).
     _pa: std::marker::PhantomData<PA>,
 }
+
+impl<SE, PA> CatalogInner<SE, PA>
+where PA: PolicyAgent
+{
+    /// Resolve a compiled alias through identities retained at registration.
+    /// This applies to ordinary and explicit fields alike: both must survive a
+    /// later display-name change. Multiple admitted declarations mapping the
+    /// same local name to different ids are ambiguous and fail closed.
+    fn resolve_property(&self, collection: &str, name: &str) -> Option<EntityId> {
+        let matching_bindings: Vec<_> = self
+            .ensured
+            .read()
+            .unwrap()
+            .get(collection)
+            .into_iter()
+            .flat_map(|bindings| bindings.iter())
+            .filter_map(|binding| binding.fields.get(name).copied().map(|property| (binding.model, property)))
+            .collect();
+        if matching_bindings.is_empty() {
+            return self.map.read().unwrap().resolve(collection, name);
+        }
+
+        let map = self.map.read().unwrap();
+        let mut candidates = BTreeSet::new();
+        for (model, property) in matching_bindings {
+            if map.membership(&model, &property).is_some() && map.properties.contains_key(&property) {
+                candidates.insert(property);
+            }
+        }
+
+        if candidates.len() != 1 {
+            tracing::warn!(
+                "ensured schemas map compiled property name '{}.{}' to {} ids; refusing ambiguous resolution",
+                collection,
+                name,
+                candidates.len()
+            );
+            return None;
+        }
+
+        candidates.iter().next().copied()
+    }
+}
+
+impl<SE, PA> crate::schema::CatalogResolver for CatalogInner<SE, PA>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    fn resolve(&self, collection: &str, name: &str) -> Option<EntityId> { self.resolve_property(collection, name) }
+    fn name_for(&self, id: &EntityId) -> Option<String> { self.map.read().unwrap().properties.get(id).map(|def| def.name.clone()) }
+    fn model_id_for(&self, collection: &str) -> Option<EntityId> { self.map.read().unwrap().by_collection.get(collection).copied() }
+    fn canonical_value_type(&self, id: &EntityId) -> Option<String> {
+        self.map.read().unwrap().properties.get(id).map(|def| def.value_type.clone())
+    }
+}
+
 impl<SE, PA> CatalogManager<SE, PA>
 where
     SE: StorageEngine + Send + Sync + 'static,
@@ -169,6 +226,26 @@ where
         }
     }
 
+    // -- public lookup API (cheap clones) -----------------------------------
+
+    /// The property addressed by `name` in `collection`: prefer retained exact
+    /// bindings for admitted ordinary or explicit fields, fail closed if those
+    /// bindings disagree, and otherwise consult the current display-name map.
+    pub fn resolve(&self, collection: &str, name: &str) -> Option<EntityId> { self.0.resolve_property(collection, name) }
+
+    /// A weak handle to this catalog as a name-to-id resolver, stamped onto
+    /// entities at assembly for the sync read path. Replaces the old
+    /// per-collection `SchemaBinding` push: identity is carried by the
+    /// [`ankql::ast::PropertyId`] itself, not by a binding injected into a
+    /// property backend.
+    pub(crate) fn resolver_weak(&self) -> std::sync::Weak<dyn crate::schema::CatalogResolver> {
+        // Downgrade to the concrete Weak first, then let the return type coerce
+        // it to the trait object (CoerceUnsized on Weak); annotating the local
+        // as the dyn type instead would wrongly force `downgrade`'s parameter.
+        let weak = Arc::downgrade(&self.0);
+        weak
+    }
+
     pub fn property_by_id(&self, id: &EntityId) -> Option<PropertyDef> { self.0.map.read().unwrap().properties.get(id).cloned() }
 
     pub fn model_by_collection(&self, collection: &str) -> Option<ModelDef> {
@@ -189,4 +266,13 @@ where
         self.0.map.read().unwrap().names_global.get(name).into_iter().flat_map(|s| s.iter().copied()).collect()
     }
 
+    /// The canonical value_type of a property-definition id, if the map knows
+    /// it (the CatalogManager-side twin of
+    /// [`crate::schema::CatalogResolver::canonical_value_type`]; rfc.md
+    /// 5.6 as amended 2026-07-10). The resolution pass casts comparison
+    /// literals to this type so predicate evaluation and the reactor's
+    /// watcher index collate in the type the backends store.
+    pub(crate) fn canonical_value_type_of(&self, id: &EntityId) -> Option<String> {
+        self.0.map.read().unwrap().properties.get(id).map(|def| def.value_type.clone())
+    }
 }
