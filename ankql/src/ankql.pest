@@ -55,7 +55,10 @@ OrderByItem = ${ Identifier ~ (WS+ ~ OrderDirection)? }
 OrderDirection = { ^"asc" | ^"desc" }
 LimitClause = ${ ^"limit" ~ WS+ ~ Unsigned }
 
-NotFlag = { ^"not" }
+// Keyword boundary guard like And/Or/True/False/Null above: without it, any
+// identifier STARTING with "not" (note, notes, notify...) lexes as a unary
+// NOT plus a mangled remainder.
+NotFlag = @{ ^"not" ~ !IDENT_CONT }
 
 EOF = { EOI | ";" }
 WS = _{ WHITESPACE }
