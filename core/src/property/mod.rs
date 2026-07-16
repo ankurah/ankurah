@@ -67,6 +67,22 @@ mod read_dispatch_tests {
     }
 }
 
+/// Collapse a backend's [`PropertyId`]-keyed values to display-name-keyed
+/// values, for the name-keyed system and catalog collections (RFC section 4
+/// bootstrap exemption), which key every field as [`PropertyId::System`].
+/// Registered `EntityId` keys, which those collections never hold, are dropped.
+pub(crate) fn name_keyed(
+    values: std::collections::BTreeMap<PropertyId, Option<Value>>,
+) -> std::collections::BTreeMap<String, Option<Value>> {
+    values
+        .into_iter()
+        .filter_map(|(key, value)| match key {
+            PropertyId::System { name } => Some((name, value)),
+            PropertyId::EntityId(_) | PropertyId::Id => None,
+        })
+        .collect()
+}
+
 pub trait Property: Sized {
     /// The NORMATIVE catalog value_type this Rust type carries on the wire: a
     /// lowercased `core::value::ValueType` variant name ("string", "i64",
