@@ -189,6 +189,8 @@ impl PropertyBackend for LWWBackend {
 
     fn entry(&self, key: &PropertyId) -> Option<Option<Value>> { LWWBackend::entry(self, key) }
 
+    fn restage(&self, key: &PropertyId, value: Option<Value>) { self.set(key.clone(), value); }
+
     fn property_backend_name() -> &'static str { "lww" }
 
     fn to_state_buffer(&self) -> Result<Vec<u8>, StateError> {
@@ -366,6 +368,15 @@ impl PropertyBackend for LWWBackend {
 
         // Subscribe to the broadcast and return the guard
         broadcast.reference().listen(listener).into()
+    }
+
+    fn uncommitted_keys(&self) -> Vec<PropertyId> {
+        self.values
+            .read()
+            .unwrap()
+            .iter()
+            .filter_map(|(key, entry)| matches!(entry, ValueEntry::Uncommitted { .. }).then(|| key.clone()))
+            .collect()
     }
 }
 

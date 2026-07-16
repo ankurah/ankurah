@@ -1,5 +1,4 @@
 mod cast;
-pub mod cast_predicate;
 mod collatable;
 #[cfg(feature = "wasm")]
 mod wasm;

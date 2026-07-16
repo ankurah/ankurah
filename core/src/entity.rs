@@ -112,6 +112,38 @@ impl WeakEntity {
 /// [`Entity`] and the [`TemporaryEntity`] (which is bound only when
 /// constructed via [`TemporaryEntity::new_bound`]). Both deref here.
 impl EntityInner {
+    /// Defensive canonicalization at the read/evaluation boundary (rfc.md 5.6
+    /// as amended 2026-07-10): commits canonicalize writes, but ingest is
+    /// deliberately schema-blind (catalog lag), so a legacy or ill-typed
+    /// payload can sit under a property id. Comparisons and the reactor's
+    /// watcher index collate canonical bytes, so an off-type value casts to
+    /// the canonical type here; a value the canonical type cannot represent
+    /// reads as NULL with a warning, never a poisoned
+    /// evaluation. No resolver, unknown id, or unknown type string: the value
+    /// passes through unchanged.
+    fn canonicalize_lenient(&self, id: &EntityId, value: Value) -> Option<Value> {
+        let Some(target) =
+            self.resolver().and_then(|r| r.canonical_value_type(id)).and_then(|s| crate::value::ValueType::from_property_str(&s))
+        else {
+            return Some(value);
+        };
+        if crate::value::ValueType::of(&value) == target {
+            return Some(value);
+        }
+        match value.cast_to(target) {
+            Ok(cast) => Some(cast),
+            Err(err) => {
+                tracing::warn!(
+                    "entity {}: value under property {} does not fit its canonical type ({}); reading as NULL",
+                    self.id,
+                    id,
+                    err
+                );
+                None
+            }
+        }
+    }
+
     /// Read `name` for evaluation and lenient consumers: resolve to a
     /// [`PropertyId`] (registered -> its id, else the system name), then scan
     /// the backends' three-way [`PropertyBackend::entry`] under that key --
@@ -190,6 +222,53 @@ impl Entity {
     pub fn collection(&self) -> &CollectionId { &self.collection }
 
     pub fn head(&self) -> Clock { self.state.read().unwrap().head.clone() }
+
+    /// Cast each staged value to its property's CANONICAL value_type (rfc.md
+    /// 5.6 as amended 2026-07-10), so backends, engines, and indexes store one
+    /// consistent type regardless of the writer's compiled type. A value the
+    /// canonical type cannot represent fails the commit here, at the writer.
+    /// Resolution itself now happens ONCE, upstream, at accessor construction
+    /// (`from_entity`): every accessor already stages under its resolved
+    /// `PropertyId`, so there is no key left to move at commit -- only this
+    /// canonicalization pass remains.
+    pub(crate) fn canonicalize_pending_values(&self) -> Result<(), crate::property::traits::PropertyError> {
+        let Some(resolver) = self.resolver() else {
+            // No resolver (a bare entity, or a system/catalog collection):
+            // nothing to canonicalize against.
+            return Ok(());
+        };
+        let state = self.state.read().expect("other thread panicked, panic here too");
+        for backend in state.backends.values() {
+            for key in backend.uncommitted_keys() {
+                // Every accessor resolves to its `PropertyId` at construction
+                // (rfc.md 5.5), so a staged key here is either a registered
+                // user field (`EntityId`, the only kind the catalog has a
+                // canonical type for) or a system field (`System`, which has
+                // no catalog entry to canonicalize against). The `id`
+                // pseudo-property is never staged.
+                let PropertyId::EntityId(ulid) = key else { continue };
+                let id = EntityId::from_ulid(ulid);
+
+                // Canonicalize the staged value through the generic trait
+                // primitives (`entry` / `restage`): a backend whose edits are
+                // not value-shaped (a text CRDT) stages nothing and restages
+                // nothing. A staged clear (tombstone) has no value to cast.
+                // An unknown canonical string (a newer fleet's type) writes
+                // as compiled: registration admitted this binary, so the
+                // types were equal.
+                if let Some(target) = resolver.canonical_value_type(&id).and_then(|c| crate::value::ValueType::from_property_str(&c)) {
+                    let staged = PropertyId::EntityId(ulid);
+                    if let Some(Some(value)) = backend.entry(&staged) {
+                        if crate::value::ValueType::of(&value) != target {
+                            let cast = value.cast_to(target)?;
+                            backend.restage(&staged, Some(cast));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 
     /// Check if this entity is writable (i.e., it's a transaction fork that's still alive)
     pub fn is_writable(&self) -> bool {

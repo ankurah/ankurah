@@ -97,6 +97,14 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
     /// Returns a subscription guard that will unsubscribe when dropped.
     fn listen_field(&self, key: &PropertyId, listener: ankurah_signals::signal::Listener) -> ankurah_signals::signal::ListenerGuard;
 
+    /// The [`PropertyId`] keys currently staged (uncommitted) in this backend,
+    /// so the commit path can canonicalize each staged value to the property's
+    /// catalog value_type before the event is generated. Names were resolved to
+    /// ids at editable-view construction, so there is nothing to re-key here.
+    /// Default empty: a backend with no value-shaped staging (a text CRDT)
+    /// stages nothing to canonicalize.
+    fn uncommitted_keys(&self) -> Vec<PropertyId> { Vec::new() }
+
     /// Three-way presence for `key`: `None` = no entry at all; `Some(None)` =
     /// an entry holding no value (a cleared tombstone: authoritative absence);
     /// `Some(Some)` = a value. This is the primitive the resolved-property read
@@ -105,6 +113,14 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
     /// projection (via [`Self::property_value`]) suits backends without
     /// tombstone semantics (e.g. text CRDTs).
     fn entry(&self, key: &PropertyId) -> Option<Option<Value>> { self.property_value(key).map(Some) }
+
+    /// Replace the STAGED (uncommitted) value under `key` -- the commit-time
+    /// canonicalization hook (rfc.md 5.6 as amended 2026-07-10): the
+    /// catalog-aware caller casts a staged value to the property's canonical
+    /// value_type and restages it here. Default no-op: a backend whose edits
+    /// are not value-shaped (a text CRDT) has its canonical type pinned by
+    /// backend equality at registration, so there is nothing to cast.
+    fn restage(&self, key: &PropertyId, value: Option<Value>) { let _ = (key, value); }
 }
 
 // This is where this gets a bit tough.
