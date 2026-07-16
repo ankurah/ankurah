@@ -96,6 +96,15 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
     /// Auto-creates the broadcast if it doesn't exist yet.
     /// Returns a subscription guard that will unsubscribe when dropped.
     fn listen_field(&self, key: &PropertyId, listener: ankurah_signals::signal::Listener) -> ankurah_signals::signal::ListenerGuard;
+
+    /// Three-way presence for `key`: `None` = no entry at all; `Some(None)` =
+    /// an entry holding no value (a cleared tombstone: authoritative absence);
+    /// `Some(Some)` = a value. This is the primitive the resolved-property read
+    /// dispatch ([`crate::property::read_by_id`]) runs on, generically -- no
+    /// caller may downcast to a concrete backend for it. The default two-way
+    /// projection (via [`Self::property_value`]) suits backends without
+    /// tombstone semantics (e.g. text CRDTs).
+    fn entry(&self, key: &PropertyId) -> Option<Option<Value>> { self.property_value(key).map(Some) }
 }
 
 // This is where this gets a bit tough.

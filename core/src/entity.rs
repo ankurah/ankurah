@@ -108,6 +108,79 @@ impl WeakEntity {
     pub fn upgrade(&self) -> Option<Entity> { self.0.upgrade().map(Entity) }
 }
 
+/// Resolver-aware read helpers shared by every EntityInner view: the resident
+/// [`Entity`] and the [`TemporaryEntity`] (which is bound only when
+/// constructed via [`TemporaryEntity::new_bound`]). Both deref here.
+impl EntityInner {
+    /// Read `name` for evaluation and lenient consumers: resolve to a
+    /// [`PropertyId`] (registered -> its id, else the system name), then scan
+    /// the backends' three-way [`PropertyBackend::entry`] under that key --
+    /// NO id-then-name fallback (a backend holds one durable key per
+    /// property, full stop). A field belongs to exactly one backend per
+    /// schema, so the first backend HOLDING AN ENTRY wins and its entry's
+    /// value is the answer: a cleared tombstone (`Some(None)`) is
+    /// authoritative absence and must shadow any value a later backend holds
+    /// under the same key, exactly like the single-backend dispatch
+    /// ([`crate::property::read_by_id`]). There is no per-backend
+    /// special-casing here (backends are addressed only through the
+    /// [`PropertyBackend`] trait).
+    fn read_lenient(&self, name: &str) -> Option<Value> {
+        let state = self.state.read().expect("other thread panicked, panic here too");
+        let key = self.resolve_key(name);
+        match &key {
+            PropertyId::EntityId(ulid) => {
+                let id = EntityId::from_ulid(*ulid);
+                state
+                    .backends
+                    .values()
+                    .find_map(|backend| backend.entry(&key))
+                    .flatten()
+                    .and_then(|value| self.canonicalize_lenient(&id, value))
+            }
+            PropertyId::System { .. } => state.backends.values().find_map(|backend| backend.entry(&key)).flatten(),
+            // `resolve_key` never produces `Id`: the `id` pseudo-property is
+            // handled by the `field == "id"` shortcut ahead of this method in
+            // the `AbstractEntity`/`Filterable` impls below.
+            PropertyId::Id => None,
+        }
+    }
+
+    /// Read a REGISTERED property's value by its stable id for resolved-identifier
+    /// predicate evaluation: the id-keyed entry scan, canonicalized at the
+    /// evaluation boundary. An unwritten id is absent (evaluates NULL); there is
+    /// NO display-name fallback. The first backend HOLDING AN ENTRY wins, so a
+    /// cleared tombstone shadows any value a later backend holds under the same
+    /// key (see [`Self::read_lenient`]). The `id` pseudo-property and
+    /// system/name-keyed fields do not come through here -- they read by name via
+    /// [`Self::read_lenient`]. Evaluation has no error surface: type admission is
+    /// registration's job (the canonical value_type ruling, 2026-07-10), and an
+    /// ill-typed stored value reads as NULL with a warning.
+    pub(crate) fn read_by_id_eval(&self, property_id: EntityId) -> Option<Value> {
+        let state = self.state.read().expect("other thread panicked, panic here too");
+        let key = PropertyId::EntityId(property_id.to_ulid());
+        state
+            .backends
+            .values()
+            .find_map(|backend| backend.entry(&key))
+            .flatten()
+            .and_then(|value| self.canonicalize_lenient(&property_id, value))
+    }
+}
+
+/// A display string for a backend key, for debug/dump consumers
+/// ([`Entity::values`], [`TemporaryEntity::values`]) ONLY -- never a storage
+/// or wire name (an engine's physical naming seeds from the catalog via
+/// `CatalogResolver::name_for`, which needs a live catalog these dump
+/// methods do not have). An id key renders as its base64 id, a system
+/// key as its name; the `id` pseudo-property never appears as a backend key.
+fn debug_key_name(key: &PropertyId) -> String {
+    match key {
+        PropertyId::Id => "id".to_string(),
+        PropertyId::EntityId(ulid) => EntityId::from_ulid(*ulid).to_base64(),
+        PropertyId::System { name } => name.clone(),
+    }
+}
+
 impl Entity {
     pub fn id(&self) -> EntityId { self.id }
 
@@ -512,17 +585,7 @@ impl Entity {
 
     pub fn values(&self) -> Vec<(String, Option<Value>)> {
         let state = self.state.read().expect("other thread panicked, panic here too");
-        state
-            .backends
-            .values()
-            .flat_map(|backend| {
-                backend
-                    .property_values()
-                    .iter()
-                    .map(|(name, value)| (name.to_string(), value.clone()))
-                    .collect::<Vec<(String, Option<Value>)>>()
-            })
-            .collect()
+        state.backends.values().flat_map(|backend| backend.property_values().into_iter().map(|(k, v)| (debug_key_name(&k), v))).collect()
     }
 }
 
@@ -536,11 +599,11 @@ impl AbstractEntity for Entity {
         if field == "id" {
             Some(crate::value::Value::EntityId(self.id))
         } else {
-            // Iterate through backends to find one that has this property
-            let state = self.state.read().expect("other thread panicked, panic here too");
-            state.backends.values().find_map(|backend| backend.property_value(&field.into()))
+            self.read_lenient(field)
         }
     }
+
+    fn value_by_id(&self, property_id: ankurah_proto::EntityId) -> Option<crate::value::Value> { self.read_by_id_eval(property_id) }
 }
 
 impl std::fmt::Display for Entity {
@@ -556,11 +619,13 @@ impl Filterable for Entity {
         if name == "id" {
             Some(Value::EntityId(self.id))
         } else {
-            // Iterate through backends to find one that has this property
-            let state = self.state.read().expect("other thread panicked, panic here too");
-            state.backends.values().find_map(|backend| backend.property_value(&name.to_owned()))
+            self.read_lenient(name)
         }
     }
+
+    /// Read a registered property by id for resolved-identifier evaluation, via
+    /// the shared [`EntityInner::read_by_id_eval`] dispatch.
+    fn value_by_id(&self, property_id: EntityId) -> Option<Value> { self.0.read_by_id_eval(property_id) }
 }
 
 impl TemporaryEntity {
@@ -583,7 +648,7 @@ impl TemporaryEntity {
     }
     pub fn values(&self) -> Vec<(String, Option<Value>)> {
         let state = self.0.state.read().expect("other thread panicked, panic here too");
-        state.backends.values().flat_map(|backend| backend.property_values()).collect()
+        state.backends.values().flat_map(|backend| backend.property_values().into_iter().map(|(k, v)| (debug_key_name(&k), v))).collect()
     }
 }
 
@@ -595,11 +660,21 @@ impl Filterable for TemporaryEntity {
         if name == "id" {
             Some(Value::EntityId(self.0.id))
         } else {
-            // Iterate through backends to find one that has this property
-            let state = self.0.state.read().expect("other thread panicked, panic here too");
-            state.backends.values().find_map(|backend| backend.property_value(&name.to_owned()))
+            // The shared lenient dispatch: with a stamped resolver
+            // (new_bound, e.g. policy scope inspection) the name resolves to
+            // its id and reads id-keyed data; unbound (the engine
+            // post-filter tier) it degenerates to the bare name-keyed scan,
+            // exactly the pre-binding behavior. Schema-blind name projection
+            // of id-keyed entries remains tracked by #312.
+            self.0.read_lenient(name)
         }
     }
+
+    /// Read a registered property by id for resolved-identifier evaluation, via
+    /// the shared [`EntityInner::read_by_id_eval`] dispatch. An unbound temporary
+    /// (no resolver) skips canonicalization: the caller-supplied resolved id is
+    /// the only schema knowledge in play.
+    fn value_by_id(&self, property_id: EntityId) -> Option<Value> { self.0.read_by_id_eval(property_id) }
 }
 
 impl std::fmt::Display for TemporaryEntity {
@@ -778,5 +853,75 @@ impl WeakEntitySet {
         let result = entity.apply_state(event_getter, &state).await?;
         let changed = matches!(result, StateApplyResult::Applied);
         Ok((Some(changed), entity))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::property::backend::LWWBackend;
+
+    fn property_key(byte: u8) -> PropertyId {
+        let mut bytes = [0u8; 16];
+        bytes[0] = byte;
+        PropertyId::EntityId(ulid::Ulid::from_bytes(bytes))
+    }
+
+    /// An entity with two backends whose BTreeMap names order `first` ahead
+    /// of `second`.
+    fn entity_with_backends(first: LWWBackend, second: LWWBackend) -> Entity {
+        let entity = Entity::create(EntityId::new(), CollectionId::fixed_name("albums"));
+        let mut state = entity.state.write().unwrap();
+        state.backends.insert("a_first".to_owned(), Arc::new(first));
+        state.backends.insert("b_second".to_owned(), Arc::new(second));
+        drop(state);
+        entity
+    }
+
+    /// The read scan selects the FIRST backend holding an entry: a cleared
+    /// tombstone (an entry holding no value) is authoritative absence and
+    /// must shadow a value a later backend holds under the same key.
+    #[test]
+    fn tombstone_in_first_backend_shadows_later_backend_value() {
+        let key = property_key(0x22);
+        let first = LWWBackend::new();
+        first.set(key.clone(), None); // a present entry with no value
+        let second = LWWBackend::new();
+        second.set(key.clone(), Some(Value::String("shadowed".into())));
+        let entity = entity_with_backends(first, second);
+
+        let PropertyId::EntityId(ulid) = key else { unreachable!() };
+        assert_eq!(entity.read_by_id_eval(EntityId::from_ulid(ulid)), None, "a tombstone entry must win over a later backend's value");
+    }
+
+    /// A backend with NO entry under the key does not stop the scan: a later
+    /// backend's entry still answers.
+    #[test]
+    fn absent_entry_falls_through_to_later_backend() {
+        let key = property_key(0x33);
+        let second = LWWBackend::new();
+        second.set(key.clone(), Some(Value::String("present".into())));
+        let entity = entity_with_backends(LWWBackend::new(), second);
+
+        let PropertyId::EntityId(ulid) = key else { unreachable!() };
+        assert_eq!(
+            entity.read_by_id_eval(EntityId::from_ulid(ulid)),
+            Some(Value::String("present".into())),
+            "an absent entry must not shadow a later backend's entry"
+        );
+    }
+
+    /// The entry-presence rule also governs the system-name branch of
+    /// read_lenient (no resolver stamped, so the name reads system-keyed).
+    #[test]
+    fn system_key_tombstone_shadows_later_backend_value() {
+        let key = PropertyId::System { name: "nickname".to_owned() };
+        let first = LWWBackend::new();
+        first.set(key.clone(), None);
+        let second = LWWBackend::new();
+        second.set(key, Some(Value::String("shadowed".into())));
+        let entity = entity_with_backends(first, second);
+
+        assert_eq!(entity.read_lenient("nickname"), None, "a system-keyed tombstone must win over a later backend's value");
     }
 }

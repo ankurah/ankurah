@@ -109,6 +109,13 @@ impl LWWBackend {
     /// primitive the generic read dispatch runs on.
     pub fn get(&self, key: &PropertyId) -> Option<Value> { self.values.read().unwrap().get(key).and_then(|e| e.value()) }
 
+    /// Presence-distinguishing read of a single key: `None` = key absent,
+    /// `Some(None)` = key present but cleared (a tombstone), `Some(Some(v))` =
+    /// a live value. This is the primitive the generic read dispatch
+    /// (`crate::property::read_by_id`, via [`PropertyBackend::entry`]) runs
+    /// on -- a distinction the `Option`-valued [`get`] cannot express.
+    pub fn entry(&self, key: &PropertyId) -> Option<Option<Value>> { self.values.read().unwrap().get(key).map(|e| e.value()) }
+
     /// The event_id that last wrote a key's value (if tracked). Raw
     /// single-key lookup, same keying as [`get`].
     pub fn get_event_id(&self, key: &PropertyId) -> Option<EventId> { self.values.read().unwrap().get(key).and_then(|e| e.event_id()) }
@@ -179,6 +186,8 @@ impl PropertyBackend for LWWBackend {
     fn property_values(&self) -> BTreeMap<PropertyId, Option<Value>> {
         self.values.read().unwrap().iter().map(|(k, v)| (k.clone(), v.value())).collect()
     }
+
+    fn entry(&self, key: &PropertyId) -> Option<Option<Value>> { LWWBackend::entry(self, key) }
 
     fn property_backend_name() -> &'static str { "lww" }
 
@@ -455,6 +464,24 @@ mod tests {
                 .unwrap();
         let err = backend.apply_operations(&[Operation { diff: bad_diff }]).unwrap_err();
         assert!(err.to_string().contains("Unknown LWW operation version"), "unexpected error: {err}");
+    }
+
+    // ---- entry(): the presence primitive the read dispatch builds on -------
+    // (The read dispatch itself lives OUTSIDE the backend; its tests are with
+    // it, `property::read_dispatch_tests`.)
+
+    #[test]
+    fn entry_distinguishes_absent_tombstone_and_value() {
+        let backend = LWWBackend::new();
+        assert_eq!(backend.entry(&sys("title")), None, "never written: absent");
+        backend.set(sys("title"), None);
+        assert_eq!(backend.entry(&sys("title")), Some(None), "cleared: present tombstone");
+        backend.set(sys("title"), Some(Value::String("v".into())));
+        assert_eq!(backend.entry(&sys("title")), Some(Some(Value::String("v".into()))));
+        // Commit state does not affect presence semantics.
+        let ops = backend.to_operations().unwrap().unwrap();
+        backend.apply_operations_with_event(&ops, EventId::from_bytes([4; 32])).unwrap();
+        assert_eq!(backend.entry(&sys("title")), Some(Some(Value::String("v".into()))));
     }
 
     // ---- election + reactivity -------------------------------------------
