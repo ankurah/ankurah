@@ -931,6 +931,101 @@ where
         self.0.ready_notify.notify_waiters();
     }
 
+    /// Begin SystemManager's reset barrier. Invalidate the generation and all
+    /// epoch owners synchronously, tear down old live queries before waiting,
+    /// then drain durable warming, ephemeral setup/local/wire application, and
+    /// schema-registration effects. Storage deletion cannot begin until this
+    /// returns.
+    async fn begin_reset(&self) {
+        let (draining_fences, ephemeral_queries, durable_sub) = {
+            let mut setup = self.0.setup_state.write().unwrap();
+            if !setup.resetting {
+                setup.resetting = true;
+                setup.generation = setup.generation.wrapping_add(1);
+            }
+            setup.ephemeral_active = false;
+            if let Some(fence) = setup.ephemeral_fence.take() {
+                fence.invalidate();
+                setup.draining_fences.push(fence);
+            }
+            if let Some(fence) = setup.durable_fence.take() {
+                fence.invalidate();
+                setup.draining_fences.push(fence);
+            }
+            if let Some(fence) = setup.registration_fence.take() {
+                fence.invalidate();
+                setup.draining_fences.push(fence);
+            }
+            let ephemeral_queries = std::mem::take(&mut *self.0.ephemeral_queries.write().unwrap());
+            let durable_sub = self.0.durable_sub.write().unwrap().take();
+            *self.0.ready.write().unwrap() = false;
+            (setup.draining_fences.clone(), ephemeral_queries, durable_sub)
+        };
+
+        // Dropping a live query synchronously removes its relay entry and
+        // schedules the peer unsubscribe. Do this before waiting so no newer
+        // response or stream is admitted merely because teardown was delayed
+        // behind an already-running response.
+        drop(ephemeral_queries);
+        drop(durable_sub);
+        self.0.setup_changed.notify_waiters();
+        self.0.ready_notify.notify_waiters();
+
+        for fence in draining_fences {
+            fence.wait_drained().await;
+        }
+    }
+
+    /// Finish SystemManager's reset only after storage, system state, and the
+    /// reactor have been cleared. This is the point where a new ephemeral
+    /// setup may claim the next generation.
+    fn finish_reset(&self) {
+        let mut setup = self.0.setup_state.write().unwrap();
+        self.0.map.write().unwrap().clear();
+        *self.0.ready.write().unwrap() = false;
+        // Allocations belong to one system and must not survive hard_reset
+        // (RFC 5.2): a node re-joining a different system must re-register
+        // everything against the new system's allocator.
+        self.0.ensured.write().unwrap().clear();
+        setup.draining_fences.clear();
+        setup.resetting = false;
+        setup.durable_resume_pending = self.0.durable;
+        // Wake any ensure_subscribed waiters so they observe the cleared
+        // latch instead of sleeping on a readiness that will never come, and
+        // cancel the detached owner so it removes its relay attempts before a
+        // held stale response can reach NodeApplier.
+        drop(setup);
+        self.0.setup_changed.notify_waiters();
+        self.0.ready_notify.notify_waiters();
+        debug!("CatalogManager reset (map cleared, not ready)");
+    }
+
+    /// Re-arm epoch-bound catalog work after `SystemManager` has published a
+    /// ready root. Every node kind gets exactly one registration fence; a
+    /// durable node also claims its one pending storage warm.
+    fn resume_after_system_ready(&self) {
+        let durable_claim = {
+            let mut setup = self.0.setup_state.write().unwrap();
+            if setup.resetting {
+                return;
+            }
+            if setup.registration_fence.is_none() {
+                setup.registration_fence = Some(RequestFence::new());
+            }
+            if !self.0.durable || !setup.durable_resume_pending {
+                return;
+            }
+            setup.durable_resume_pending = false;
+            let fence = RequestFence::new();
+            let lease = fence.try_acquire().expect("a newly-created durable warm fence must admit its owner");
+            setup.durable_fence = Some(fence);
+            (setup.generation, lease)
+        };
+        let (generation, lease) = durable_claim;
+        let me = self.clone();
+        crate::task::spawn(async move { me.run_durable_warm(generation, lease).await });
+    }
+
     // -- public lookup API (cheap clones) -----------------------------------
 
     /// The property addressed by `name` in `collection`: prefer retained exact
