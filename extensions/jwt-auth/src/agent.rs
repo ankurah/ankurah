@@ -273,14 +273,15 @@ impl PolicyAgent for JwtAgent {
         enforce_read_scope(&guard.config, data, &entity)
     }
 
-    fn check_read_event<C>(&self, data: &C, event: &Attested<proto::Event>) -> Result<(), AccessDenied>
+    fn check_read_event<C>(&self, data: &C, collection: &proto::CollectionId, event: &Attested<proto::Event>) -> Result<(), AccessDenied>
     where C: Iterable<Self::ContextData> {
+        let _ = event;
         for ctx in data.iterable() {
             if ctx.is_privileged() {
                 return Ok(());
             }
         }
-        self.can_access_collection(data, &event.payload.collection)
+        self.can_access_collection(data, collection)
     }
 
     fn check_write(&self, cdata: &Self::ContextData, entity: &Entity, _event: Option<&proto::Event>) -> Result<(), AccessDenied> {

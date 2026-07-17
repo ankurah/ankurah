@@ -530,7 +530,7 @@ where
                 // filter out any that the policy agent says we don't have access to
                 let mut events = Vec::new();
                 for event in storage_collection.get_events(event_ids).await? {
-                    match self.policy_agent.check_read_event(cdata, &event) {
+                    match self.policy_agent.check_read_event(cdata, &collection, &event) {
                         Ok(_) => events.push(event),
                         Err(AccessDenied::ByPolicy(_)) => {}
                         // TODO: we need to have a cleaner delineation between actual access denied versus processing errors
@@ -590,6 +590,38 @@ where
         Ok(())
     }
 
+    /// INGRESS resolution for the wire envelope (#330): the collection a
+    /// received model id routes to -- well-known system/catalog ids answer on
+    /// a stone-cold node, user models come from the catalog map. A miss is
+    /// rejected loudly: once descriptor shipping guarantees delivery, an
+    /// unresolvable model id is a protocol violation, and rejection (unlike
+    /// synthesizing a collection) is retryable.
+    pub(crate) fn resolve_model(&self, model: &proto::EntityId) -> Result<proto::CollectionId, RetrievalError> {
+        self.catalog.collection_for_model(model).ok_or_else(|| {
+            RetrievalError::Other(format!("unknown model id {}: no well-known or catalog entry (protocol violation?)", model.to_base64()))
+        })
+    }
+
+    /// [`Self::resolve_model`] for ingress paths on a durable node, where a
+    /// miss can mean the startup storage warm has not finished yet (a
+    /// restarted node receiving traffic immediately): await catalog
+    /// readiness once and retry before rejecting. Ephemeral nodes never
+    /// wait here -- their defs arrive inline with the message (descriptor
+    /// shipping runs before body processing), so a miss is already final.
+    pub(crate) async fn resolve_model_wait(&self, model: &proto::EntityId) -> Result<proto::CollectionId, RetrievalError> {
+        match self.resolve_model(model) {
+            Ok(collection) => Ok(collection),
+            Err(e) => {
+                if self.durable && !self.catalog.is_catalog_ready() {
+                    self.catalog.wait_catalog_ready().await;
+                    self.resolve_model(model)
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
     /// Does all the things necessary to commit a remote transaction
     pub async fn commit_remote_transaction(
         &self,
@@ -601,16 +633,16 @@ where
         let mut changes = Vec::new();
 
         for event in events.iter_mut() {
-            let collection = self.collections.get(&event.payload.collection).await?;
+            // INGRESS (#330): the envelope carries a model id; resolve it to
+            // the local collection (well-knowns, then catalog) or reject.
+            let collection_id = self.resolve_model_wait(&event.payload.model).await?;
+            let collection = self.collections.get(&collection_id).await?;
 
             // When applying an event, we should only look at the local storage for the lineage
             let event_getter = LocalEventGetter::new(collection.clone(), self.durable);
             let state_getter = LocalStateGetter::new(collection.clone());
-            let entity = self
-                .entities
-                .get_retrieve_or_create(&state_getter, &event_getter, &event.payload.collection, &event.payload.entity_id)
-                .await?;
-
+            let entity =
+                self.entities.get_retrieve_or_create(&state_getter, &event_getter, &collection_id, &event.payload.entity_id).await?;
             // Stage the event so BFS can discover it
             event_getter.stage_event(event.payload.clone());
 
@@ -642,7 +674,7 @@ where
 
             if applied {
                 let state = entity.to_state()?;
-                let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
+                let entity_state = EntityState { entity_id: entity.id(), model: entity.model_id()?, state };
                 let attestation = self.policy_agent.attest_state(self, &entity_state);
                 let attested = Attested::opt(entity_state, attestation);
                 collection.set_state(attested).await?;
@@ -670,7 +702,7 @@ where
         C: crate::util::Iterable<PA::ContextData>,
     {
         // Destructure to take ownership and avoid clones
-        let proto::Attested { payload: proto::EntityState { entity_id, collection, state }, attestations } = entity_state;
+        let proto::Attested { payload: proto::EntityState { entity_id, model, state }, attestations } = entity_state;
         let current_head = &state.head;
 
         // Entity is in known_matches - try to optimize the response
@@ -681,14 +713,17 @@ where
             }
 
             // Case 2: Heads differ → try to build EventBridge (cheaper than full state) ✓
-            match self.collect_event_bridge(storage_collection, known_head, current_head, cdata).await {
+            match self
+                .collect_event_bridge(&self.resolve_model_wait(&model).await?, storage_collection, known_head, current_head, cdata)
+                .await
+            {
                 Ok(attested_events) if !attested_events.is_empty() => {
                     // Convert Attested<Event> to EventFragments (strips entity_id and collection)
                     let event_fragments: Vec<proto::EventFragment> = attested_events.into_iter().map(|e| e.into()).collect();
 
                     return Ok(Some(proto::EntityDelta {
                         entity_id,
-                        collection,
+                        model,
                         content: proto::DeltaContent::EventBridge { events: event_fragments },
                     }));
                 }
@@ -700,13 +735,14 @@ where
 
         // Case 3: Entity not in known_matches OR bridge building failed → send full StateSnapshot ✓
         let state_fragment = proto::StateFragment { state, attestations };
-        Ok(Some(proto::EntityDelta { entity_id, collection, content: proto::DeltaContent::StateSnapshot { state: state_fragment } }))
+        Ok(Some(proto::EntityDelta { entity_id, model, content: proto::DeltaContent::StateSnapshot { state: state_fragment } }))
     }
 
     /// Collect events between known_head and current_head using event_dag comparison.
     /// Returns events needed to advance from known_head to current_head.
     pub(crate) async fn collect_event_bridge<C>(
         &self,
+        collection: &proto::CollectionId,
         storage_collection: &crate::storage::StorageCollectionWrapper,
         known_head: &proto::Clock,
         current_head: &proto::Clock,
@@ -763,7 +799,7 @@ where
                 // entirely and let the caller fall back to a state snapshot,
                 // which passes its own read check.
                 for event in &events {
-                    match self.policy_agent.check_read_event(cdata, event) {
+                    match self.policy_agent.check_read_event(cdata, collection, event) {
                         Ok(()) => {}
                         Err(AccessDenied::ByPolicy(_)) => return Ok(vec![]),
                         Err(e) => return Err(anyhow!("check_read_event failed while building event bridge: {}", e)),

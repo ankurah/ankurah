@@ -111,7 +111,8 @@ pub enum DeltaContent {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct EntityDelta {
     pub entity_id: EntityId,
-    pub collection: CollectionId,
+    /// The model-definition entity id (#330); see `Event::model` in data.rs.
+    pub model: EntityId,
     pub content: DeltaContent,
 }
 
@@ -208,7 +209,7 @@ impl std::fmt::Display for EntityDelta {
             DeltaContent::EventBridge { events } => {
                 let mut event_strs = Vec::new();
                 for event in events {
-                    let event = Attested::<Event>::from_parts(self.entity_id, self.collection.clone(), event.clone());
+                    let event = Attested::<Event>::from_parts(self.entity_id, self.model, event.clone());
                     event_strs.push(event.payload.to_string());
                 }
                 write!(f, "EntityDelta {}: EventBridge({})", self.entity_id, event_strs.join(", "))

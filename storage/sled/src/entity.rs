@@ -1,5 +1,4 @@
 use ankurah_core::selection::filter::Filterable;
-use ankurah_proto::CollectionId;
 use ankurah_storage_common::filtering::{HasEntityId, ValueSetStream};
 use ankurah_storage_common::traits::EntityIdStream;
 use futures::Stream;
@@ -9,13 +8,19 @@ use std::task::{Context, Poll};
 /// Sled-specific entity state lookup that hydrates EntityIds into full EntityStates
 pub struct SledEntityLookup<S> {
     pub entities_tree: sled::Tree,
-    pub collection_id: CollectionId,
+    /// The model id stamped on reconstructed envelopes (#330). The bucket
+    /// captures the resolution OUTCOME at stream construction and this
+    /// lookup checks it only when a row actually hydrates, so an empty
+    /// result set never demands a model id (a cold catalog must not fail a
+    /// query that returns nothing -- e.g. the ephemeral known_matches
+    /// pre-fetch against a collection this node has never stored).
+    pub model: Result<ankurah_proto::EntityId, String>,
     pub stream: S,
 }
 
 impl<S: EntityIdStream> SledEntityLookup<S> {
-    pub fn new(entities_tree: &sled::Tree, collection_id: &CollectionId, stream: S) -> Self {
-        Self { entities_tree: entities_tree.clone(), collection_id: collection_id.clone(), stream }
+    pub fn new(entities_tree: &sled::Tree, model: Result<ankurah_proto::EntityId, String>, stream: S) -> Self {
+        Self { entities_tree: entities_tree.clone(), model, stream }
     }
 }
 
@@ -49,9 +54,15 @@ impl<S: EntityIdStream> Stream for SledEntityLookup<S> {
             Err(e) => return Poll::Ready(Some(Err(ankurah_core::error::RetrievalError::StorageError(e.to_string().into())))),
         };
 
+        // A row exists, so the envelope needs its model id NOW: an
+        // unresolved model is only an error once there is something to stamp.
+        let model = match &self.model {
+            Ok(model) => *model,
+            Err(e) => return Poll::Ready(Some(Err(ankurah_core::error::RetrievalError::Other(e.clone())))),
+        };
+
         // Create Attested<EntityState> from parts
-        let attested =
-            ankurah_proto::Attested::<ankurah_proto::EntityState>::from_parts(entity_id, self.collection_id.clone(), state_fragment);
+        let attested = ankurah_proto::Attested::<ankurah_proto::EntityState>::from_parts(entity_id, model, state_fragment);
 
         Poll::Ready(Some(Ok(attested)))
     }
@@ -61,9 +72,11 @@ impl<S: EntityIdStream> Stream for SledEntityLookup<S> {
 
 /// Trait that provides a convenient `.entities()` combinator for EntityId streams
 pub trait SledEntityExt: EntityIdStream + Sized {
-    /// Hydrate EntityIds into EntityStates using the sled entities tree
-    fn entities(self, entities_tree: &sled::Tree, collection_id: &CollectionId) -> SledEntityLookup<Self> {
-        SledEntityLookup::new(entities_tree, collection_id, self)
+    /// Hydrate EntityIds into EntityStates using the sled entities tree.
+    /// `model` is the model-id resolution outcome stamped on reconstructed
+    /// envelopes (#330), checked lazily on the first hydrated row.
+    fn entities(self, entities_tree: &sled::Tree, model: Result<ankurah_proto::EntityId, String>) -> SledEntityLookup<Self> {
+        SledEntityLookup::new(entities_tree, model, self)
     }
 }
 
@@ -71,10 +84,12 @@ pub trait SledEntityExt: EntityIdStream + Sized {
 pub trait SledEntityExtFromMats: ValueSetStream + Sized
 where Self::Item: HasEntityId + Filterable
 {
-    /// Extract EntityIds and hydrate into EntityStates using the sled entities tree
-    fn entities(self, entities_tree: &sled::Tree, collection_id: &CollectionId) -> SledEntityLookup<impl EntityIdStream> {
+    /// Extract EntityIds and hydrate into EntityStates using the sled entities tree.
+    /// `model` is the model-id resolution outcome stamped on reconstructed
+    /// envelopes (#330), checked lazily on the first hydrated row.
+    fn entities(self, entities_tree: &sled::Tree, model: Result<ankurah_proto::EntityId, String>) -> SledEntityLookup<impl EntityIdStream> {
         let ids = self.extract_ids();
-        SledEntityLookup::new(entities_tree, collection_id, ids)
+        SledEntityLookup::new(entities_tree, model, ids)
     }
 }
 

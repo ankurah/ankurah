@@ -345,7 +345,17 @@ impl Entity {
 
     pub fn to_entity_state(&self) -> Result<EntityState, StateError> {
         let state = self.to_state()?;
-        Ok(EntityState { entity_id: self.id(), collection: self.collection.clone(), state })
+        Ok(EntityState { entity_id: self.id(), model: self.model_id()?, state })
+    }
+
+    /// The model-definition id stamped on this entity's wire envelopes
+    /// (#330): the well-known id for system/catalog collections, else the
+    /// stamped catalog resolver's mapping for the collection. Fails
+    /// `UnknownModel` when neither answers.
+    pub(crate) fn model_id(&self) -> Result<EntityId, StateError> {
+        crate::schema::well_known_model_id(self.collection.as_str())
+            .or_else(|| self.resolver().and_then(|r| r.model_id_for(self.collection.as_str())))
+            .ok_or_else(|| StateError::UnknownModel(self.collection.to_string()))
     }
 
     // used by the Model macro
@@ -383,6 +393,12 @@ impl Entity {
     /// using commit_head
     pub(crate) fn generate_commit_event(&self) -> Result<Option<Event>, MutationError> {
         let state = self.state.read().expect("other thread panicked, panic here too");
+        // Resolve the model id BEFORE draining backend operations:
+        // to_operations flips staged entries Uncommitted -> Pending as a side
+        // effect, so a model-id failure (resolver dropped, catalog emptied by
+        // a concurrent hard reset) after the drain would strand those
+        // operations where no retry can see them.
+        let model = self.model_id()?;
         let mut operations = BTreeMap::<String, Vec<ankurah_proto::Operation>>::new();
         for (name, backend) in &state.backends {
             if let Some(ops) = backend.to_operations()? {
@@ -394,7 +410,7 @@ impl Entity {
             Ok(None)
         } else {
             let operations = OperationSet(operations);
-            let event = Event { entity_id: self.id, collection: self.collection.clone(), operations, parent: state.head.clone() };
+            let event = Event { entity_id: self.id, model, operations, parent: state.head.clone() };
             Ok(Some(event))
         }
     }
@@ -1003,6 +1019,26 @@ mod tests {
         let mut bytes = [0u8; 16];
         bytes[0] = byte;
         PropertyId::EntityId(ulid::Ulid::from_bytes(bytes))
+    }
+
+    /// A commit whose model id cannot be resolved must fail BEFORE the
+    /// backends drain their staged operations (`to_operations` flips entries
+    /// Uncommitted -> Pending), so the staged edits remain visible to a later
+    /// retry instead of being stranded.
+    #[test]
+    fn commit_event_model_id_failure_leaves_operations_staged() {
+        // "albums" is not a well-known collection and no resolver is stamped,
+        // so model_id() fails.
+        let entity = Entity::create(EntityId::new(), CollectionId::fixed_name("albums"));
+        let key = property_key(0x11);
+        let backend = LWWBackend::new();
+        backend.set(key.clone(), Some(Value::String("staged".into())));
+        entity.state.write().unwrap().backends.insert("lww".to_owned(), Arc::new(backend));
+
+        entity.generate_commit_event().expect_err("an unresolvable model id must fail the commit event");
+
+        let state = entity.state.read().unwrap();
+        assert_eq!(state.backends["lww"].uncommitted_keys(), vec![key], "the staged operation must survive the failed commit event");
     }
 
     /// An entity with two backends whose BTreeMap names order `first` ahead

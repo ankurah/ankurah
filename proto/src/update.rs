@@ -1,4 +1,4 @@
-use crate::{auth::Attested, data::EntityState, id::EntityId, subscription::QueryId, CollectionId, EventFragment, StateFragment};
+use crate::{auth::Attested, data::EntityState, id::EntityId, subscription::QueryId, EventFragment, StateFragment};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -45,7 +45,8 @@ pub enum MembershipChange {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SubscriptionUpdateItem {
     pub entity_id: EntityId,
-    pub collection: CollectionId,
+    /// The model-definition entity id (#330); see `Event::model` in data.rs.
+    pub model: EntityId,
     pub content: UpdateContent,
     /// Which predicates this update is relevant to and how
     /// Uses PredicateId for remote subscriptions
@@ -56,7 +57,7 @@ impl TryFrom<SubscriptionUpdateItem> for Attested<EntityState> {
     type Error = anyhow::Error;
     fn try_from(value: SubscriptionUpdateItem) -> Result<Self, Self::Error> {
         match value.content {
-            UpdateContent::StateAndEvent(state, _) => Ok((value.entity_id, value.collection, state).into()),
+            UpdateContent::StateAndEvent(state, _) => Ok((value.entity_id, value.model, state).into()),
             UpdateContent::EventOnly(_) => Err(anyhow::anyhow!("Cannot convert event-only update to entity state")),
         }
     }
@@ -122,7 +123,7 @@ impl std::fmt::Display for NodeUpdateBody {
 
 impl std::fmt::Display for SubscriptionUpdateItem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}/{}: ", self.collection, self.entity_id)?;
+        write!(f, "{}/{}: ", self.model.to_base64_short(), self.entity_id)?;
 
         match &self.content {
             UpdateContent::EventOnly(events) => write!(f, "Events({})", events.len())?,

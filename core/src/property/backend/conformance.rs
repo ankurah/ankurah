@@ -86,10 +86,16 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use ankql::ast::PropertyId;
 use ankurah_proto::{Clock, EntityId, Event, EventId, Operation, OperationSet};
 
 use crate::event_dag::EventLayer;
 use crate::property::backend::PropertyBackend;
+
+/// A system-keyed [`PropertyId`] for these backend-level conformance tests:
+/// they exercise a backend directly (no catalog, no entity), so every
+/// property here is addressed by name, same as a system/catalog collection.
+fn pid(name: &str) -> PropertyId { PropertyId::System { name: name.to_string() } }
 
 /// The property backend under test, described for the conformance kit.
 ///
@@ -150,9 +156,15 @@ fn make_event(seed: u16, backend_name: &str, operations: Vec<Operation>, parents
     let mut entity_id_bytes = [0u8; 16];
     entity_id_bytes[0..2].copy_from_slice(&seed.to_be_bytes());
     let entity_id = EntityId::from_bytes(entity_id_bytes);
+    // Deterministic fake model id (#330): the conformance kit builds events by
+    // hand and applies them straight to a backend, never routing through a
+    // node's catalog; the model field is also excluded from `EventId` hashing.
+    let mut model_bytes = [0u8; 16];
+    model_bytes[0] = 0xEE;
+    let model = EntityId::from_bytes(model_bytes);
     Event {
         entity_id,
-        collection: "conformance".into(),
+        model,
         parent: Clock::from(parents.to_vec()),
         operations: OperationSet(BTreeMap::from([(backend_name.to_string(), operations)])),
     }
@@ -449,7 +461,7 @@ mod lww_conformance {
         fn stage_write(_backend: &Arc<dyn PropertyBackend>, write: &Self::Write) -> Vec<Operation> {
             // Stage on a fresh backend so to_operations returns exactly this write.
             let scratch = LWWBackend::new();
-            scratch.set(write.0.to_string(), Some(Value::String(write.1.to_string())));
+            scratch.set(pid(write.0), Some(Value::String(write.1.to_string())));
             scratch.to_operations().expect("to_operations").expect("LWW write must produce operations")
         }
 
@@ -464,7 +476,7 @@ mod lww_conformance {
             // LWW must record the writing event id so apply_layer can later resolve
             // concurrent writes by causal dominance (RFC #267).
             let lww = backend.clone().as_arc_dyn_any().downcast::<LWWBackend>().expect("backend is LWW");
-            let recorded = lww.get_event_id(&"title".to_string());
+            let recorded = lww.get_event_id(&pid("title"));
             assert_eq!(recorded.as_ref(), Some(event_id), "LWW must record the writing event id for provenance");
         }
     }
@@ -487,7 +499,7 @@ mod lww_conformance {
     /// Build an LWW event writing a single field, with the given parents.
     fn lww_write_event(seed: u16, field: &str, value: &str, parents: &[EventId]) -> Event {
         let scratch = LWWBackend::new();
-        scratch.set(field.to_string(), Some(Value::String(value.to_string())));
+        scratch.set(pid(field), Some(Value::String(value.to_string())));
         let ops = scratch.to_operations().unwrap().unwrap();
         make_event(seed, LwwAdopter::backend_name(), ops, parents)
     }
@@ -537,7 +549,7 @@ mod lww_conformance {
         backend.apply_layer(&layer).unwrap();
 
         assert_eq!(
-            backend.property_value(&field.to_string()),
+            backend.property_value(&pid(field)),
             Some(Value::String("later-write".to_string())),
             "the causally-later write must win even though the earlier event id sorts larger"
         );
@@ -570,7 +582,7 @@ mod yrs_conformance {
             // A fresh doc's diff against its empty starting state is a self-contained
             // update inserting the text; this is the wire form of one edit.
             let scratch = YrsBackend::new();
-            scratch.insert(write.0, write.1, write.2).expect("yrs insert");
+            scratch.insert(&pid(write.0), write.1, write.2).expect("yrs insert");
             scratch.to_operations().expect("to_operations").expect("yrs write must produce operations")
         }
 
@@ -662,7 +674,7 @@ mod yrs_conformance {
             let refs: Vec<&Event> = order.to_vec();
             let layer = layer_from_events(&[], &refs, &[]);
             backend.apply_layer(&layer).unwrap();
-            match backend.property_value(&"body".to_string()) {
+            match backend.property_value(&pid("body")) {
                 Some(crate::value::Value::String(s)) => s,
                 other => panic!("expected a string body, got {other:?}"),
             }

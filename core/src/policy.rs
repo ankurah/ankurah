@@ -145,7 +145,7 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
         C: Iterable<Self::ContextData>;
 
     /// Check if a context can read an event
-    fn check_read_event<C>(&self, data: &C, event: &Attested<proto::Event>) -> Result<(), AccessDenied>
+    fn check_read_event<C>(&self, data: &C, collection: &proto::CollectionId, event: &Attested<proto::Event>) -> Result<(), AccessDenied>
     where C: Iterable<Self::ContextData>;
 
     /// Check if a context can edit an entity
@@ -273,8 +273,15 @@ impl PolicyAgent for PermissiveAgent {
         Ok(())
     }
 
-    fn check_read_event<C>(&self, _data: &C, _event: &Attested<proto::Event>) -> Result<(), AccessDenied>
-    where C: Iterable<Self::ContextData> {
+    fn check_read_event<C>(
+        &self,
+        _data: &C,
+        _collection: &proto::CollectionId,
+        _event: &Attested<proto::Event>,
+    ) -> Result<(), AccessDenied>
+    where
+        C: Iterable<Self::ContextData>,
+    {
         // PermissiveAgent allows access if any context is provided
         Ok(())
     }

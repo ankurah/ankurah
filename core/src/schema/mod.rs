@@ -66,3 +66,40 @@ pub fn is_catalog_collection(id: &CollectionId) -> bool {
 pub fn is_protected_collection(id: &CollectionId) -> bool {
     id.as_str() == crate::system::SYSTEM_COLLECTION_ID || is_catalog_collection(id)
 }
+
+/// Well-known (reserved) model-definition entity ids for the system and
+/// catalog collections (#330). The wire envelope carries a model id, not a
+/// collection name, so a cold node must be able to route THESE collections'
+/// events before it holds any catalog data -- the bootstrap base case moves
+/// from static names to static ids. No catalog entity describes them (the
+/// self-description ouroboros stays forbidden); the ids exist only for
+/// routing and the protected-collections guard.
+///
+/// Reserved ids are 15 zero bytes + a one-byte ordinal. A minted
+/// `EntityId::new()` is a ULID whose leading bytes carry the current
+/// timestamp, so the all-zero prefix is unmintable and the ranges are
+/// disjoint by construction.
+const WELL_KNOWN_MODELS: &[(u8, &str)] =
+    &[(1, crate::system::SYSTEM_COLLECTION_ID), (2, MODEL_COLLECTION_ID), (3, PROPERTY_COLLECTION_ID), (4, MODEL_PROPERTY_COLLECTION_ID)];
+
+fn well_known_id(ordinal: u8) -> EntityId {
+    let mut bytes = [0u8; 16];
+    bytes[15] = ordinal;
+    EntityId::from_bytes(bytes)
+}
+
+/// The reserved model id for a system/catalog collection, if `collection` is
+/// one. User collections resolve their model id through the catalog instead.
+pub fn well_known_model_id(collection: &str) -> Option<EntityId> {
+    WELL_KNOWN_MODELS.iter().find(|(_, name)| *name == collection).map(|(ordinal, _)| well_known_id(*ordinal))
+}
+
+/// The collection a reserved model id routes to, if `id` is one. The inverse
+/// of [`well_known_model_id`].
+pub fn well_known_collection(id: &EntityId) -> Option<CollectionId> {
+    let bytes = id.to_bytes();
+    if bytes[..15] != [0u8; 15] {
+        return None;
+    }
+    WELL_KNOWN_MODELS.iter().find(|(ordinal, _)| *ordinal == bytes[15]).map(|(_, name)| CollectionId::fixed_name(name))
+}
