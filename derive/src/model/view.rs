@@ -16,7 +16,10 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
         Ok(types) => types,
         Err(e) => return e.into_compile_error(),
     };
-    let active_field_name_strs = model.active_field_name_strs();
+    let active_field_addresses = match crate::model::schema::active_field_address_tokens(model) {
+        Ok(addresses) => addresses,
+        Err(e) => return e.into_compile_error(),
+    };
 
     // WASM field getters (conditionally generated)
     #[cfg(feature = "wasm")]
@@ -178,7 +181,7 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
                     pub fn #active_field_names(&self) -> Result<#projected_field_types, ankurah::property::PropertyError> {
                         use ankurah::property::{FromActiveType, FromEntity};
                         ::ankurah::signals::CurrentObserver::track(self);
-                        let active_result = #active_field_types_turbofish::from_entity(#active_field_name_strs.into(), &self.entity);
+                        let active_result = #active_field_types_turbofish::from_entity(#active_field_addresses, &self.entity);
                         #projected_field_types_turbofish::from_active(active_result)
                     }
                 )*
