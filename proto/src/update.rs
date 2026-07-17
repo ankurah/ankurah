@@ -62,6 +62,10 @@ pub struct SubscriptionUpdateItem {
     /// Which predicates this update is relevant to and how
     /// Uses PredicateId for remote subscriptions
     pub predicate_relevance: Vec<(QueryId, MembershipChange)>,
+    /// Queries whose subscriptions caused this item to be emitted. Always
+    /// populated for subscription traffic, including ordinary updates whose
+    /// predicate membership did not change.
+    pub source_queries: Vec<QueryId>,
 }
 
 impl TryFrom<SubscriptionUpdateItem> for Attested<EntityState> {

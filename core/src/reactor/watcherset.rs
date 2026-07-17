@@ -168,20 +168,36 @@ impl WatcherSet {
         use ankql::ast::{Expr, Predicate};
         match predicate {
             Predicate::Comparison { left, operator, right } => {
-                if let (Expr::Path(path), Expr::Literal(literal)) | (Expr::Literal(literal), Expr::Path(path)) = (&**left, &**right) {
+                // Extract (property_path, literal) from either a Path or a
+                // resolved Identifier on one side and a Literal on the other.
+                // Identifier paths retain the stable property id so an active
+                // watcher survives a catalog display-name change.
+                let extracted = match (&**left, &**right) {
+                    (Expr::Path(path), Expr::Literal(literal)) | (Expr::Literal(literal), Expr::Path(path)) => {
+                        Some((PropertyPath::from_path(path), literal))
+                    }
+                    (Expr::PropertyIdentifier(identifier), Expr::Literal(literal))
+                    | (Expr::Literal(literal), Expr::PropertyIdentifier(identifier)) => {
+                        Some((PropertyPath::from_identifier(identifier), literal))
+                    }
+                    _ => None,
+                };
+                if let Some((property_path, literal)) = extracted {
                     // Use the full path for indexing.
                     // For simple paths like `name`, this is just "name".
                     // For JSON paths like `context.task_id`, this is "context.task_id".
                     // accumulate_interested_watchers will extract the value at this path.
-                    let property_path = PropertyPath::from_path(path);
                     let index = self.index_watchers.entry((collection_id.clone(), property_path)).or_default();
 
+                    // Convert the literal before indexing so thresholds and
+                    // entity values share Value's single collation domain.
+                    let value: crate::value::Value = literal.into();
                     match op {
                         WatcherOp::Add => {
-                            index.add((*literal).clone(), operator.clone(), watcher_id);
+                            index.add(value, operator.clone(), watcher_id);
                         }
                         WatcherOp::Remove => {
-                            index.remove((*literal).clone(), operator.clone(), watcher_id);
+                            index.remove(value, operator.clone(), watcher_id);
                         }
                     }
                 } else {

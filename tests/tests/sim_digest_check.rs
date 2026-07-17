@@ -20,11 +20,13 @@ fn event_only_message(entity: proto::EntityId, ev: Attested<proto::Event>) -> pr
         body: proto::NodeUpdateBody::SubscriptionUpdate {
             items: vec![proto::SubscriptionUpdateItem {
                 entity_id: entity,
-                collection: model::sim_collection(),
+                model: model::sim_model_id(),
                 content: proto::UpdateContent::EventOnly(vec![frag]),
                 predicate_relevance: vec![],
+                source_queries: vec![proto::QueryId::test(1)],
             }],
         },
+        schema: vec![],
     })
 }
 
