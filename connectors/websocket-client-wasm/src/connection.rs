@@ -157,21 +157,28 @@ impl Connection {
                     match state {
                         ConnectionState::Connected { .. } => warn!("Received duplicate server presence, ignoring"),
                         ConnectionState::Connecting { .. } => {
-                            if self
+                            // Register BEFORE publishing Connected: observers of the
+                            // state must never see a connection whose peer is not
+                            // registered (or that registration is about to refuse).
+                            if let Err(rejection) = self.node.register_peer(
+                                server_presence.clone(),
+                                Box::new(WebSocketPeerSender {
+                                    recipient_node_id: server_presence.node_id,
+                                    ws: SendWrapper::new(self.ws.clone()),
+                                }),
+                            ) {
+                                error!("Refusing server {}: {}", self.url, rejection);
+                                self.disconnect();
+                                self.set_state(ConnectionState::Error { message: rejection.to_string() });
+                                return;
+                            }
+                            if !self
                                 .set_state(ConnectionState::Connected { url: self.url.clone(), server_presence: server_presence.clone() })
                             {
-                                if let Err(rejection) = self.node.register_peer(
-                                    server_presence.clone(),
-                                    Box::new(WebSocketPeerSender {
-                                        recipient_node_id: server_presence.node_id,
-                                        ws: SendWrapper::new(self.ws.clone()),
-                                    }),
-                                ) {
-                                    error!("Refusing server {}: {}", self.url, rejection);
-                                    self.disconnect();
-                                    self.set_state(ConnectionState::Error { message: rejection.to_string() });
-                                    return;
-                                }
+                                // A concurrent close or error path claimed the state
+                                // first: roll the registration back rather than leave
+                                // a registered peer behind an unused connection.
+                                self.node.deregister_peer(server_presence.node_id);
                             }
                         }
                         _ => {

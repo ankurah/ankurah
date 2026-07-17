@@ -371,6 +371,12 @@ where
                     Err(anyhow!("server {} refused connection: {}", inner.server_url, rejection))
                 }
                 Ok(proto::Message::PeerMessage(node_msg)) => {
+                    if peer_sender.is_none() {
+                        // Application traffic before a compatible Presence:
+                        // negotiation has not admitted this server, so nothing
+                        // it says may reach the node.
+                        return Err(anyhow!("server {} sent application traffic before presence negotiation completed", inner.server_url));
+                    }
                     Self::handle_peer_message(inner, node_msg).await;
                     Ok(MessageResult::Continue)
                 }
