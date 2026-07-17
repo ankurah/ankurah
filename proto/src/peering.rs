@@ -11,18 +11,17 @@ use crate::{id::EntityId, Attested, CollectionId, EntityState, State};
 /// incompatibly (event or state encodings, request shapes, message
 /// framing).
 ///
+/// Versions number RELEASES, not development steps: one bump per published
+/// release whose wire or persisted formats changed incompatibly, regardless
+/// of how many changes that release accumulated.
+///
 /// History:
 /// - absent: 0.9.x and earlier carried no version in Presence. Such peers
 ///   are classified as version 0 (see [`is_version0_presence`]) and refused.
-/// - 1: the 0.9 wire shapes plus the versioned Presence handshake (#294).
-/// - 2: LWW diff v2 / state 0xA2, resolved predicate Identifiers, and
-///   RegisterSchema.
-/// - 3: the model-id wire envelope (#330): Event/EntityState/EntityDelta/
-///   SubscriptionUpdateItem carry the model-definition entity id instead of a
-///   collection name, and NodeUpdate/NodeResponse carry once-per-connection
-///   catalog schema defs. SubscriptionUpdateItem also carries the source query
-///   ids used for admission, and ORDER BY items carry stable property identities.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// - 1: the 0.10.0 wire (0.10.0 is not yet released to crates.io). The
+///   version field itself arrives with it (#294); 0.10.0's serialized
+///   contract is incompatible with 0.9.x.
+pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Whether a peer advertising `remote` can interoperate with this binary.
 ///
@@ -95,9 +94,9 @@ struct LegacyPresence {
     system_root: Option<Attested<LegacyEntityState>>,
 }
 
-/// The EntityState nested inside a 0.9.x durable Presence. Protocol v3
-/// replaced `collection` with `model`, so using the current EntityState here
-/// would recognize only legacy ephemeral nodes whose system_root is absent.
+/// The EntityState nested inside a 0.9.x durable Presence, pinned as its own
+/// struct so later changes to the live EntityState shape cannot silently
+/// change version-0 detection.
 #[derive(Serialize, Deserialize)]
 #[allow(dead_code)]
 struct LegacyEntityState {
