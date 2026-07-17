@@ -17,7 +17,7 @@ use ankurah::{Node, PermissiveAgent};
 use ankurah_storage_sled::SledStorageEngine;
 use std::sync::Arc;
 
-use super::model::SimRecord;
+use super::model::{Field, SimRecord};
 use super::transport::{Captured, SimSender};
 use ankurah::Model;
 
@@ -38,15 +38,17 @@ impl SimNode {
     /// would, including the durable-peer bookkeeping that drives system join.
     pub fn connect_to(&self, peer: &SimNode) {
         let sender = SimSender::new(self.index, peer.id(), self.captured.clone());
-        self.node.register_peer(
-            proto::Presence {
-                node_id: peer.id(),
-                durable: peer.durable,
-                system_root: peer.node.system.root(),
-                protocol_version: proto::PROTOCOL_VERSION,
-            },
-            Box::new(sender),
-        );
+        self.node
+            .register_peer(
+                proto::Presence {
+                    node_id: peer.id(),
+                    durable: peer.durable,
+                    system_root: peer.node.system.root(),
+                    protocol_version: proto::PROTOCOL_VERSION,
+                },
+                Box::new(sender),
+            )
+            .expect("simulation peers use the current protocol version");
     }
 
     /// Ingest a forged batch of events directly through the production remote
@@ -140,6 +142,41 @@ pub async fn build_nodes(n: usize, captured: Captured) -> anyhow::Result<Vec<Sim
     for index in 1..n {
         let node = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
         nodes.push(SimNode { index, durable: false, node, captured: captured.clone() });
+    }
+
+    // The harness forges events and states directly, bypassing schema
+    // registration and the catalog relay. Seed a complete deterministic
+    // `SimRecord` catalog on every node so ingress can route the model and the
+    // forged payloads use the same property ids that typed query registration
+    // retains. Direct upserts keep every id byte-identical across nodes and
+    // runs; hard_reset is not part of these scenarios.
+    let sim_model = proto::RegisteredModel {
+        id: super::model::sim_model_id(),
+        collection: SimRecord::collection().as_str().to_string(),
+        name: "SimRecord".to_string(),
+    };
+    let sim_properties: Vec<_> = [Field::Title, Field::Body]
+        .into_iter()
+        .map(|field| proto::RegisteredProperty {
+            id: super::model::sim_property_id(field),
+            model: sim_model.id,
+            name: field.name().to_string(),
+            backend: "lww".to_string(),
+            value_type: "string".to_string(),
+            target_model: None,
+        })
+        .collect();
+    let sim_memberships: Vec<_> = [Field::Title, Field::Body]
+        .into_iter()
+        .map(|field| proto::RegisteredMembership {
+            id: super::model::sim_membership_id(field),
+            model: sim_model.id,
+            property: super::model::sim_property_id(field),
+            optional: false,
+        })
+        .collect();
+    for node in &nodes {
+        node.node.catalog.upsert_registered(std::slice::from_ref(&sim_model), &sim_properties, &sim_memberships);
     }
 
     Ok(nodes)

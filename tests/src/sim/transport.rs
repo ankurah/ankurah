@@ -131,6 +131,11 @@ fn request_descriptor(body: &proto::NodeRequestBody) -> String {
         }
         proto::NodeRequestBody::Fetch { collection, .. } => format!("fetch {}", collection),
         proto::NodeRequestBody::SubscribeQuery { collection, .. } => format!("subscribe {}", collection),
+        proto::NodeRequestBody::RegisterSchema { models, properties, memberships } => {
+            let mut cols: Vec<String> = models.iter().map(|m| m.collection.to_string()).collect();
+            cols.sort();
+            format!("registerschema [{}] p{} ms{}", cols.join("+"), properties.len(), memberships.len())
+        }
     }
 }
 
@@ -145,6 +150,11 @@ fn response_descriptor(body: &proto::NodeResponseBody) -> String {
         }
         proto::NodeResponseBody::GetEvents(events) => format!("getevents {}", event_ids(events)),
         proto::NodeResponseBody::QuerySubscribed { deltas, .. } => format!("subscribed {}", deltas.len()),
+        // Counts only: allocated ids are ULIDs and would perturb the
+        // determinism digest without adding discriminating power.
+        proto::NodeResponseBody::SchemaRegistered { models, properties, memberships } => {
+            format!("schemaregistered m{} p{} ms{}", models.len(), properties.len(), memberships.len())
+        }
         proto::NodeResponseBody::Success => "success".to_string(),
         // Include the error text so two distinct rejections are distinguishable
         // in the trace (advisory path, but keeps the digest faithful).
