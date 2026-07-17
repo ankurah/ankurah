@@ -25,8 +25,10 @@ use crate::{
     policy::{AccessDenied, PolicyAgent},
     reactor::{AbstractEntity, Reactor},
     retrieval::{LocalEventGetter, LocalStateGetter, SuspenseEvents},
+    schema::catalog::CatalogManager,
     storage::StorageEngine,
     system::SystemManager,
+    util::request_fence::{RequestLease, RequestValidity},
     util::{safemap::SafeMap, safeset::SafeSet, Iterable},
 };
 use itertools::Itertools;
@@ -39,12 +41,46 @@ pub struct PeerState {
     sender: Box<dyn PeerSender>,
     _durable: bool,
     subscription_handler: SubscriptionHandler,
-    pending_requests: SafeMap<proto::RequestId, oneshot::Sender<Result<proto::NodeResponseBody, RequestError>>>,
+    pending_requests: SafeMap<proto::RequestId, PendingRequest>,
     pending_updates: SafeMap<proto::UpdateId, oneshot::Sender<Result<proto::NodeResponseBody, RequestError>>>,
+    /// Model-definition ids whose catalog defs were already handed to this
+    /// connection's transport (#330 once-per-connection descriptor shipping).
+    /// Marked by [`Self::mark_models_announced`] only after a successful
+    /// send. A reconnection builds a fresh `PeerState`, so the peer is
+    /// re-announced.
+    announced_models: std::sync::Mutex<std::collections::BTreeSet<proto::EntityId>>,
+}
+
+struct PendingRequest {
+    response: oneshot::Sender<Result<GuardedResponse, RequestError>>,
+    validity: Option<RequestValidity>,
+}
+
+#[derive(Debug)]
+pub(crate) struct GuardedResponse {
+    body: proto::NodeResponseBody,
+    lease: RequestLease,
+}
+
+impl GuardedResponse {
+    pub(crate) fn into_parts(self) -> (proto::NodeResponseBody, RequestLease) { (self.body, self.lease) }
 }
 
 impl PeerState {
     pub fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError> { self.sender.send_message(message) }
+
+    /// Record that catalog descriptor states for `models` were handed to this
+    /// connection's transport. Call only AFTER a successful send: marking
+    /// before the send is observable by concurrent tasks, which would then
+    /// ship schema-less messages that can overtake the descriptor-carrying
+    /// one, and a failed send would leave the models marked announced yet
+    /// never described on this connection.
+    fn mark_models_announced(&self, models: &[proto::EntityId]) {
+        if models.is_empty() {
+            return;
+        }
+        self.announced_models.lock().unwrap().extend(models.iter().copied());
+    }
 }
 
 pub struct MatchArgs {
@@ -146,6 +182,10 @@ where PA: PolicyAgent
     pub(crate) policy_agent: PA,
     pub system: SystemManager<SE, PA>,
 
+    /// The metadata catalog map (RFC section 5.2 in specs/model-property-metadata/rfc.md). Warmed from storage on
+    /// durable nodes and via the subscription relay on ephemeral nodes.
+    pub catalog: CatalogManager<SE, PA>,
+
     pub(crate) subscription_relay: Option<SubscriptionRelay<PA::ContextData, crate::livequery::WeakEntityLiveQuery>>,
 
     /// Type resolver for AST preparation (temporary heuristic until Phase 3 schema)
@@ -199,6 +239,7 @@ where
         notice_info!("Node {id:#} created as {}", if durable { "durable" } else { "ephemeral" });
 
         let system_manager = SystemManager::new(collections.clone(), entityset.clone(), reactor.clone(), durable);
+        let catalog_manager = CatalogManager::new(collections.clone(), entityset.clone(), reactor.clone(), durable);
 
         // Only ephemeral nodes relay subscriptions upstream to a durable peer.
         let subscription_relay = if durable { None } else { Some(SubscriptionRelay::new()) };
@@ -214,6 +255,7 @@ where
             durable,
             policy_agent,
             system: system_manager,
+            catalog: catalog_manager,
             predicate_context: SafeMap::new(),
             subscription_relay,
             type_resolver: crate::TypeResolver::new(),
@@ -277,6 +319,7 @@ where
                 subscription_handler,
                 pending_requests: SafeMap::new(),
                 pending_updates: SafeMap::new(),
+                announced_models: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             }),
         );
         if presence.durable {
@@ -322,6 +365,66 @@ where
             relay.notify_peer_disconnected(node_id);
         }
     }
+    /// Catalog definition states for the `models` not yet announced on
+    /// `connection` (#330 once-per-connection descriptor shipping), plus the
+    /// model ids those states describe. Well-known system/catalog ids need no
+    /// defs (they are static). The defs are the stored, attested catalog
+    /// entities themselves -- model, memberships, properties -- so the
+    /// receiver validates and ingests them exactly like any served state.
+    ///
+    /// This marks nothing announced. The caller marks the returned model ids
+    /// ([`PeerState::mark_models_announced`]) only once the message carrying
+    /// the states has been successfully handed to the transport. Marking
+    /// before the send loses data two ways: a concurrent task sees "already
+    /// announced" and ships schema-less -- possibly overtaking the
+    /// descriptor-carrying message, whose model id an ephemeral receiver then
+    /// cannot resolve, so it drops the delta -- and a FAILED send leaves the
+    /// model marked announced yet never described on this connection. The
+    /// cost of marking late is that concurrent tasks may occasionally ship
+    /// the same descriptors twice; descriptor ingest is idempotent, so a
+    /// duplicate is harmless where the old race lost data.
+    async fn schema_states_for_models(
+        &self,
+        connection: &PeerState,
+        models: std::collections::BTreeSet<proto::EntityId>,
+    ) -> (Vec<proto::Attested<proto::EntityState>>, Vec<proto::EntityId>) {
+        let fresh: Vec<proto::EntityId> = {
+            let announced = connection.announced_models.lock().unwrap();
+            models
+                .into_iter()
+                .filter(|model| crate::schema::well_known_collection(model).is_none())
+                .filter(|model| !announced.contains(model))
+                .collect()
+        };
+        if fresh.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        let (states, failed) = self.catalog.definition_states_for_models(&fresh).await;
+        let described = if failed.is_empty() { fresh } else { fresh.into_iter().filter(|model| !failed.contains(model)).collect() };
+        (states, described)
+    }
+
+    /// Receiver side of descriptor shipping (#330): policy-validate and ingest
+    /// catalog defs attached to a message envelope BEFORE its body is
+    /// processed, so model-id resolution and property naming see a warm map.
+    fn ingest_schema(&self, from: &proto::EntityId, schema: &[proto::Attested<proto::EntityState>]) {
+        if schema.is_empty() {
+            return;
+        }
+        let accepted: Vec<proto::Attested<proto::EntityState>> = schema
+            .iter()
+            .filter(|state| match self.policy_agent.validate_received_state(self, from, state) {
+                Ok(()) => true,
+                Err(e) => {
+                    warn!("Node({}) rejecting shipped schema def from {}: {}", self.id, from.to_base64_short(), e);
+                    false
+                }
+            })
+            .cloned()
+            .collect();
+        self.catalog.ingest_wire_states(&accepted);
+    }
+
     #[cfg_attr(feature = "instrument", instrument(skip_all, fields(node_id = %node_id, request_body = %request_body)))]
     pub async fn request<'a, C>(
         &self,
@@ -364,16 +467,22 @@ where
         // Store the response channel
         connection.pending_updates.insert(id.clone(), response_tx);
 
-        let notification = proto::NodeMessage::Update(proto::NodeUpdate { id, from: self.id, to: node_id, body: notification });
-
-        match connection.send_message(notification) {
-            Ok(_) => {}
-            Err(e) => {
-                warn!("Failed to send update to peer {}: {}", node_id, e);
+        // Descriptor shipping (#330) needs async collection of the catalog
+        // states, and this fn is called from sync reactor callbacks, so the
+        // send moves into a task. Update order across tasks is not
+        // guaranteed, which the receiver already tolerates: wire order is
+        // untrusted (events topo-sort, snapshots compare heads).
+        let node = self.clone();
+        crate::task::spawn(async move {
+            let (schema, described) = node.schema_states_for_models(&connection, notification.referenced_models()).await;
+            let message = proto::NodeMessage::Update(proto::NodeUpdate { id, from: node.id, to: node_id, body: notification, schema });
+            match connection.send_message(message) {
+                // Mark only after the transport accepted the message, so a
+                // failed send leaves the models eligible for re-announcement.
+                Ok(()) => connection.mark_models_announced(&described),
+                Err(e) => warn!("Failed to send update to peer {}: {}", node_id, e),
             }
-        };
-
-        // response_rx.await.map_err(|_| RequestError::InternalChannelClosed)??;
+        });
     }
 
     // TODO add a node id argument to this function rather than getting it from the message
@@ -409,10 +518,17 @@ where
             }
             proto::NodeMessage::UpdateAck(ack) => {
                 debug!("Node({}) received ack notification {} {}", self.id, ack.id, ack.body);
-                // let connection = self.peer_connections.get(&ack.from).ok_or(RequestError::PeerNotConnected)?;
-                // if let Some(tx) = connection.pending_updates.remove(&ack.id) {
-                //     tx.send(Ok(proto::NodeResponseBody::Success)).unwrap();
-                // }
+                // Drain the pending entry so the map does not leak (the send
+                // side no longer blocks on it).
+                if let Some(connection) = self.peer_connections.get(&ack.from) {
+                    connection.pending_updates.remove(&ack.id);
+                }
+                // Surface a rejected update instead of dropping it silently.
+                // Automatic retry (e.g. re-announcing the model and re-sending)
+                // is still a TODO -- see send_update.
+                if let proto::NodeUpdateAckBody::Error(e) = &ack.body {
+                    warn!("Node({}) update {} rejected by peer {}: {}", self.id, ack.id, ack.from, e);
+                }
             }
             proto::NodeMessage::Request { auth, request } => {
                 debug!("Node({}) received request {}", self.id, request);

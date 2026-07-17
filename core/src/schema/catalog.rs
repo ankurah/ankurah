@@ -191,6 +191,74 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
+    /// Stored catalog definition states needed to describe `models` on the
+    /// wire. Returns model ids whose definition could not be loaded so the
+    /// connection can make them eligible for a later announcement retry.
+    /// All-or-nothing per model: a definition whose property or membership
+    /// states cannot all be loaded ships NOTHING for that model and reports
+    /// it failed, so it is re-shipped whole later rather than latching as
+    /// announced off a partial description.
+    pub(crate) async fn definition_states_for_models(
+        &self,
+        models: &[EntityId],
+    ) -> (Vec<proto::Attested<proto::EntityState>>, Vec<EntityId>) {
+        if models.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+
+        let (Ok(model_col), Ok(property_col), Ok(membership_col)) = (
+            self.0.collectionset.get(&model_collection()).await,
+            self.0.collectionset.get(&property_collection()).await,
+            self.0.collectionset.get(&model_property_collection()).await,
+        ) else {
+            return (Vec::new(), models.to_vec());
+        };
+
+        let mut states = Vec::new();
+        let mut failed = Vec::new();
+        'models: for model in models {
+            let mut model_states = Vec::new();
+            match model_col.get_state(*model).await {
+                Ok(state) => model_states.push(state),
+                Err(error) => {
+                    warn!("Cannot load model definition {} for wire announcement: {}", model.to_base64_short(), error);
+                    failed.push(*model);
+                    continue;
+                }
+            }
+            for membership in self.memberships_of(model) {
+                match property_col.get_state(membership.property).await {
+                    Ok(state) => model_states.push(state),
+                    Err(error) => {
+                        warn!(
+                            "Cannot load property definition {} for wire announcement of model {}: {}",
+                            membership.property.to_base64_short(),
+                            model.to_base64_short(),
+                            error
+                        );
+                        failed.push(*model);
+                        continue 'models;
+                    }
+                }
+                match membership_col.get_state(membership.id).await {
+                    Ok(state) => model_states.push(state),
+                    Err(error) => {
+                        warn!(
+                            "Cannot load membership definition {} for wire announcement of model {}: {}",
+                            membership.id.to_base64_short(),
+                            model.to_base64_short(),
+                            error
+                        );
+                        failed.push(*model);
+                        continue 'models;
+                    }
+                }
+            }
+            states.append(&mut model_states);
+        }
+        (states, failed)
+    }
+
     pub(crate) fn new(collections: CollectionSet<SE>, entities: WeakEntitySet, reactor: Reactor, durable: bool) -> Self {
         Self(Arc::new(CatalogInner {
             collectionset: collections,
@@ -208,6 +276,84 @@ where
             ensured: RwLock::new(BTreeMap::new()),
             _pa: std::marker::PhantomData,
         }))
+    }
+
+    /// Ingest catalog definition states shipped on a wire envelope (#330
+    /// once-per-connection descriptor shipping): parse each into its def and
+    /// upsert the in-memory map, exactly like the storage warm. Map-only -- a
+    /// cache warm; the durable catalog entities still replicate through the
+    /// ordinary subscription paths. States whose model id is not a well-known
+    /// catalog collection are ignored (defense in depth; the sender only
+    /// ships catalog entities).
+    pub(crate) fn ingest_wire_states(&self, states: &[proto::Attested<proto::EntityState>]) {
+        if states.is_empty() {
+            return;
+        }
+        let mut map = self.0.map.write().unwrap();
+        for state in states {
+            let Some(collection) = crate::schema::well_known_collection(&state.payload.model) else { continue };
+            if !crate::schema::is_catalog_collection(&collection) {
+                continue;
+            }
+            match parse_state(&collection, state.payload.entity_id, &state.payload) {
+                Some(Entry::Model(def)) => {
+                    // The `schema` envelope field is untrusted and a wider
+                    // ingress than the durable subscription it shortcuts, so a
+                    // wire model def gets two guards beyond parse_state's shape
+                    // check:
+                    //  - it must not name a reserved collection. No legitimate
+                    //    catalog entity describes an `_ankurah_*` collection
+                    //    (the well-known ids have no catalog entity), so such a
+                    //    def could only be an attempt to route ordinary traffic
+                    //    into a protected collection.
+                    //  - an existing model id keeps its collection, and a
+                    //    collection already mapped to one id cannot be rebound
+                    //    to another. Either mutation would redirect subsequent
+                    //    body traffic through poisoned routing metadata. The
+                    //    display name remains mutable.
+                    if def.collection.starts_with(crate::schema::RESERVED_COLLECTION_PREFIX) {
+                        warn!("ignoring shipped model def {} naming reserved collection '{}'", def.id, def.collection);
+                    } else if map.models.get(&def.id).is_some_and(|existing| existing.collection != def.collection) {
+                        warn!(
+                            "ignoring shipped model def {} changing immutable collection from '{}' to '{}'",
+                            def.id,
+                            map.models.get(&def.id).map(|existing| existing.collection.as_str()).unwrap_or("<unknown>"),
+                            def.collection
+                        );
+                    } else if map.by_collection.get(&def.collection).map_or(false, |existing| *existing != def.id) {
+                        warn!("ignoring shipped model def {} rebinding collection '{}'", def.id, def.collection);
+                    } else {
+                        map.upsert_model(def);
+                    }
+                }
+                Some(Entry::Property(def)) => {
+                    // Allocation fixes a property's provenance and canonical
+                    // backend/type pair. Only its display name and reference
+                    // target are mutable metadata.
+                    if let Some(existing) = map.properties.get(&def.id) {
+                        if existing.minted_for != def.minted_for || existing.backend != def.backend || existing.value_type != def.value_type
+                        {
+                            warn!("ignoring shipped property def {} changing immutable provenance/backend/value_type", def.id);
+                            continue;
+                        }
+                    }
+                    map.upsert_property(def);
+                }
+                Some(Entry::Membership(def)) => {
+                    // A membership entity is the stable (model, property)
+                    // edge. Its optionality may change, but neither endpoint
+                    // may be rewritten by an envelope cache warm.
+                    if let Some(existing) = map.memberships.get(&def.id) {
+                        if existing.model != def.model || existing.property != def.property {
+                            warn!("ignoring shipped membership def {} changing immutable endpoints", def.id);
+                            continue;
+                        }
+                    }
+                    map.upsert_membership(def);
+                }
+                None => {}
+            }
+        }
     }
 
     /// Apply one reactor update to the map: Remove drops, everything else
@@ -252,6 +398,28 @@ where
         let map = self.0.map.read().unwrap();
         let id = map.by_collection.get(collection)?;
         map.models.get(id).cloned()
+    }
+
+    /// INGRESS resolution for the wire envelope (#330): the collection a
+    /// model-definition id routes to. Well-known (system/catalog) ids first
+    /// -- the bootstrap base case, answerable on a stone-cold node -- then
+    /// the catalog map. `None` means the model is unknown here, which after
+    /// descriptor shipping is a protocol violation the caller rejects loudly.
+    pub fn collection_for_model(&self, model: &EntityId) -> Option<CollectionId> {
+        if let Some(collection) = crate::schema::well_known_collection(model) {
+            return Some(collection);
+        }
+        let map = self.0.map.read().unwrap();
+        map.models.get(model).map(|def| CollectionId::fixed_name(&def.collection))
+    }
+
+    /// EGRESS resolution for the wire envelope (#330): the model-definition
+    /// id stamped on events/states for `collection`. Well-knowns first, then
+    /// the catalog map. `None` for an unregistered user collection -- the
+    /// commit path runs registration before event generation, so a miss
+    /// there is a bug, not a race.
+    pub fn model_id_for(&self, collection: &str) -> Option<EntityId> {
+        crate::schema::well_known_model_id(collection).or_else(|| self.0.map.read().unwrap().by_collection.get(collection).copied())
     }
 
     pub fn membership(&self, model: &EntityId, property: &EntityId) -> Option<MembershipDef> {
