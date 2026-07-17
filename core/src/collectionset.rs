@@ -36,13 +36,17 @@ impl<SE: StorageEngine> CollectionSet<SE> {
 
         let mut collections = self.0.collections.write().await;
 
-        // We might have raced with another node to create this collection
-        if let Entry::Vacant(entry) = collections.entry(id.clone()) {
-            entry.insert(collection.clone());
-        }
+        // We might have raced with another caller to create this collection.
+        // Whoever wins the map slot owns the canonical bucket and its durable
+        // address-map cache; every caller must return that shared bucket, not
+        // its own just-built duplicate, or the two buckets' caches diverge.
+        let canonical = match collections.entry(id.clone()) {
+            Entry::Vacant(entry) => entry.insert(collection).clone(),
+            Entry::Occupied(entry) => entry.get().clone(),
+        };
         drop(collections);
 
-        Ok(collection)
+        Ok(canonical)
     }
 
     pub async fn list_collections(&self) -> Result<Vec<CollectionId>, RetrievalError> {

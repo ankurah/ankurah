@@ -96,6 +96,13 @@ pub struct QueryTest {
     pub data: Json,
 }
 
+/// Regression model for #364. Values such as epoch seconds fit in an i32,
+/// but the model's declared type materializes as a PostgreSQL bigint column.
+#[derive(Model, Debug, Serialize, Deserialize, Clone)]
+pub struct TimestampedEvent {
+    pub occurred_at: i64,
+}
+
 // =============================================================================
 // POSTGRES PREDICATE CHECK
 // =============================================================================
@@ -126,6 +133,40 @@ async fn test_postgres_predicate_checks() -> Result<()> {
             assert_eq!(actual, expected, "[Postgres] case={} query='{}'", case.name, exp.query);
         }
     }
+
+    drop(container);
+    Ok(())
+}
+
+/// A small integer literal parses as `Literal::I32`; catalog resolution must
+/// widen it to the i64 property's canonical type before PostgreSQL binds the
+/// parameter. Otherwise tokio-postgres rejects the i32 parameter for the
+/// bigint column with `WrongType` (#364).
+#[tokio::test]
+async fn test_postgres_i64_field_accepts_small_integer_literal() -> Result<()> {
+    use ankql::ast::{Expr, Literal, Predicate};
+
+    let raw = ankql::parser::parse_selection("occurred_at >= 0")?;
+    assert!(
+        matches!(
+            raw.predicate,
+            Predicate::Comparison { right, .. } if matches!(right.as_ref(), Expr::Literal(Literal::I32(0)))
+        ),
+        "the regression requires a parser-narrowed i32 literal"
+    );
+
+    let (container, storage) = common::create_postgres_container().await?;
+    let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
+    node.system.create().await?;
+    let ctx = node.context_async(c).await;
+
+    let trx = ctx.begin();
+    trx.create(&TimestampedEvent { occurred_at: 1_700_000_000 }).await?;
+    trx.commit().await?;
+
+    let results: Vec<TimestampedEventView> = ctx.fetch("occurred_at >= 0").await?;
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].occurred_at()?, 1_700_000_000);
 
     drop(container);
     Ok(())

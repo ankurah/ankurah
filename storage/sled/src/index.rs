@@ -21,7 +21,7 @@ pub struct IndexRecord {
     pub id: u32,
     pub collection: String,
     pub name: String,
-    pub spec: ankurah_core::indexing::KeySpec,
+    pub spec: ankurah_core::indexing::KeySpec<String>,
     pub created_at_unix_ms: i64,
     pub build_status: BuildStatus,
 }
@@ -34,7 +34,7 @@ struct IndexInner {
     pub id: u32,
     pub collection: String,
     pub name: String,
-    pub spec: ankurah_core::indexing::KeySpec,
+    pub spec: ankurah_core::indexing::KeySpec<String>,
     pub created_at_unix_ms: i64,
     build_status: Mutex<BuildStatus>,
     pub build_lock: Mutex<()>,
@@ -75,7 +75,7 @@ impl IndexManager {
     pub fn assure_index_exists(
         &self,
         collection: &str,
-        spec: &ankurah_core::indexing::KeySpec,
+        spec: &ankurah_core::indexing::KeySpec<String>,
         db: &Db,
         property_manager: &PropertyManager,
     ) -> Result<(Index, IndexSpecMatch), RetrievalError> {
@@ -92,12 +92,15 @@ impl IndexManager {
             return Ok((existing, match_type));
         }
 
-        // Create new index
+        // Create a fresh index rather than mutating an incompatible persisted
+        // tree in place. `KeySpec::matches` includes the encoding value type,
+        // so an upgraded database with a legacy String-collated numeric index
+        // reaches this path and is backfilled under a new id. Keeping the old
+        // tree intact is safe for scans that already hold a handle to it.
         let index = {
             let id = self.next_index_id()?;
             let mut w = self.indexes.write().unwrap();
-            let index =
-                Index::new_from_spec(collection, spec.clone(), db, id, self.index_config_tree.clone(), property_manager.clone()).unwrap();
+            let index = Index::new_from_spec(collection, spec.clone(), db, id, self.index_config_tree.clone(), property_manager.clone())?;
             w.insert(id, index.clone());
             index
         };
@@ -112,7 +115,7 @@ impl Index {
     pub fn id(&self) -> u32 { self.0.id }
     pub fn collection(&self) -> &str { &self.0.collection }
     pub fn name(&self) -> &str { &self.0.name }
-    pub fn spec(&self) -> &ankurah_core::indexing::KeySpec { &self.0.spec }
+    pub fn spec(&self) -> &ankurah_core::indexing::KeySpec<String> { &self.0.spec }
     pub fn created_at_unix_ms(&self) -> i64 { self.0.created_at_unix_ms }
     /// Build the index key for an entity given a materialized property map.
     /// Returns Ok(None) if any required key part is missing and the entity should not be indexed.
@@ -129,12 +132,20 @@ impl Index {
         eid: &EntityId,
         property_map: &std::collections::BTreeMap<u32, ankurah_core::value::Value>,
     ) -> Result<Option<Vec<u8>>, IndexError> {
-        // Resolve pids using PropertyManager
+        // Resolve each keypart's physical column to its numeric slot. The slot
+        // map is keyed by durable PropertyId, so translate column -> PropertyId
+        // (through this collection's durable id-to-column map) -> slot. A column
+        // with no identity here has never been materialized: this entity is not
+        // indexed under it.
+        let column_to_id = self.0.property_manager.column_to_property_id_map(&self.0.collection)?;
         let mut pids: Vec<u32> = Vec::with_capacity(self.0.spec.keyparts.len());
         for kp in &self.0.spec.keyparts {
-            match self.0.property_manager.get_property_id(&kp.column) {
-                Ok(id) => pids.push(id),
-                Err(_e) => return Err(IndexError::PropertyNotFound(kp.column.clone())),
+            let Some(property_id) = column_to_id.get(&kp.key) else {
+                return Err(IndexError::PropertyNotFound(kp.key.clone()));
+            };
+            match self.0.property_manager.get_property_id(property_id) {
+                Ok(slot) => pids.push(slot),
+                Err(_e) => return Err(IndexError::PropertyNotFound(kp.key.clone())),
             }
         }
 
@@ -182,7 +193,7 @@ impl Index {
 
     pub fn new_from_spec(
         collection: &str,
-        spec: ankurah_core::indexing::KeySpec,
+        spec: ankurah_core::indexing::KeySpec<String>,
         db: &Db,
         id: u32,
         index_config_tree: Tree,
@@ -292,6 +303,78 @@ impl IndexManager {
                 }
                 (None, None) => {}
             }
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::Database;
+    use ankql::ast::PropertyId;
+    use ankurah_core::{
+        indexing::{IndexKeyPart, KeySpec},
+        value::{Value, ValueType},
+    };
+
+    fn entity_order(index: &Index) -> anyhow::Result<Vec<EntityId>> {
+        index
+            .tree()
+            .iter()
+            .map(|entry| {
+                let (key, _) = entry?;
+                let id_offset = key.len().checked_sub(16).ok_or_else(|| anyhow::anyhow!("index key is shorter than an entity id"))?;
+                let bytes: [u8; 16] = key[id_offset..].try_into()?;
+                Ok(EntityId::from_bytes(bytes))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reopened_database_rebuilds_legacy_string_collated_numeric_index() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let price_two = EntityId::from_bytes([2; 16]);
+        let price_ten = EntityId::from_bytes([10; 16]);
+        let legacy_index_id;
+
+        {
+            let db = sled::open(directory.path())?;
+            let database = Database::open(db.clone())?;
+            // Assign the physical column through the durable map (a system field
+            // "price" sanitizes to column "price"), and key its numeric slot by
+            // the same durable identity -- exactly the write-path pairing that
+            // the index later reverses (column -> identity -> slot).
+            let price_id = PropertyId::System { name: "price".to_string() };
+            let price_column = database.property_manager.column_for_key("product", &price_id, None)?;
+            let price_property = database.property_manager.get_property_id(&price_id)?;
+            let products = db.open_tree("collection_product")?;
+            products.insert(price_two.to_bytes(), bincode::serialize(&vec![(price_property, Value::I64(2))])?)?;
+            products.insert(price_ten.to_bytes(), bincode::serialize(&vec![(price_property, Value::I64(10))])?)?;
+
+            // This is the pre-epoch persisted shape: numeric payloads were
+            // indexed using String collation, yielding "10" before "2".
+            let legacy_spec = KeySpec::new(vec![IndexKeyPart::asc(price_column, ValueType::String)]);
+            let (legacy_index, _) =
+                database.index_manager.assure_index_exists("product", &legacy_spec, &database.db, &database.property_manager)?;
+            legacy_index_id = legacy_index.id();
+            assert_eq!(entity_order(&legacy_index)?, vec![price_ten, price_two]);
+            db.flush()?;
+        }
+
+        {
+            let db = sled::open(directory.path())?;
+            let database = Database::open(db)?;
+            assert!(database.index_manager.indexes.read().unwrap().contains_key(&legacy_index_id));
+
+            let canonical_spec = KeySpec::new(vec![IndexKeyPart::asc("price", ValueType::I64)]);
+            let (canonical_index, _) =
+                database.index_manager.assure_index_exists("product", &canonical_spec, &database.db, &database.property_manager)?;
+
+            assert_ne!(canonical_index.id(), legacy_index_id, "the legacy encoder must not be reused");
+            assert_eq!(canonical_index.spec(), &canonical_spec);
+            assert_eq!(entity_order(&canonical_index)?, vec![price_two, price_ten]);
         }
 
         Ok(())

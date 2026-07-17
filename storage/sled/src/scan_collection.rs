@@ -40,7 +40,7 @@ impl<'a> SledCollectionKeyScanner<'a> {
         // Create a primary key spec (single ascending EntityId component)
         let primary_key_spec = KeySpec {
             keyparts: vec![IndexKeyPart {
-                column: "id".to_string(),
+                key: "id".to_string(),
                 sub_path: None,
                 direction: IndexDirection::Asc,  // Primary keys are always ascending
                 value_type: ValueType::EntityId, // EntityId type
@@ -107,7 +107,7 @@ impl<'a> SledCollectionScanner<'a> {
         // Create a primary key spec (single ascending EntityId component)
         let primary_key_spec = KeySpec {
             keyparts: vec![IndexKeyPart {
-                column: "id".to_string(),
+                key: "id".to_string(),
                 sub_path: None,
                 direction: IndexDirection::Asc,  // Primary keys are always ascending
                 value_type: ValueType::EntityId, // EntityId type
@@ -157,11 +157,12 @@ impl Stream for SledCollectionScanner<'_> {
             Err(_e) => return Poll::Ready(None), // Skip errors for now - TODO: proper error handling
         };
 
-        // Convert to ProjectedEntity - store by property name (not ID)
+        // Convert to ProjectedEntity - reverse each numeric slot to its durable
+        // PropertyId so the projection is addressed by identity.
         let mut map = std::collections::BTreeMap::new();
-        for (property_id, value) in property_values {
-            if let Some(property_name) = self.property_manager.get_property_name(property_id) {
-                map.insert(property_name, value);
+        for (slot, value) in property_values {
+            if let Some(property_id) = self.property_manager.property_id_for_slot(slot) {
+                map.insert(property_id, value);
             }
         }
 
@@ -214,11 +215,12 @@ impl<S: EntityIdStream> Stream for SledCollectionLookup<S> {
             Err(_e) => return Poll::Ready(None), // Skip errors for now - TODO: proper error handling
         };
 
-        // Convert to ProjectedEntity - store by property name
+        // Convert to ProjectedEntity - reverse each numeric slot to its durable
+        // PropertyId so the projection is addressed by identity.
         let mut map = std::collections::BTreeMap::new();
-        for (property_id, value) in property_values {
-            if let Some(property_name) = self.property_manager.get_property_name(property_id) {
-                map.insert(property_name, value);
+        for (slot, value) in property_values {
+            if let Some(property_id) = self.property_manager.property_id_for_slot(slot) {
+                map.insert(property_id, value);
             }
         }
 

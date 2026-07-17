@@ -25,7 +25,7 @@ pub struct SledRangeBounds {
 /// # Arguments
 /// * `bounds` - The logical query bounds (e.g., "year >= 1969")
 /// * `key_spec` - The key specification including column order and directions
-pub fn key_bounds_to_sled_range(bounds: &KeyBounds, key_spec: &KeySpec) -> Result<SledRangeBounds, IndexError> {
+pub fn key_bounds_to_sled_range(bounds: &KeyBounds, key_spec: &KeySpec<String>) -> Result<SledRangeBounds, IndexError> {
     // Process the bounds
     let mut lower_tuple = Vec::new();
     let mut upper_tuple = Vec::new();
@@ -76,7 +76,7 @@ fn convert_to_physical_bounds(
     upper_open: bool,
     eq_prefix_len: usize,
     eq_prefix_values: Vec<Value>,
-    key_spec: &KeySpec,
+    key_spec: &KeySpec<String>,
 ) -> Result<SledRangeBounds, IndexError> {
     // Case 1: Equality bounds
     if eq_prefix_len > 0 && lower_tuple == upper_tuple && lower_tuple.len() == eq_prefix_len {
@@ -175,7 +175,7 @@ fn handle_desc_inequality(
     upper_open: bool,
     eq_prefix_len: usize,
     eq_prefix_values: Vec<Value>,
-    key_spec: &KeySpec,
+    key_spec: &KeySpec<String>,
 ) -> Result<SledRangeBounds, IndexError> {
     // DESC swaps logical lower/upper to physical upper/lower
     // x > 5 on DESC becomes scan from start to enc(5) (exclusive)
@@ -243,7 +243,7 @@ fn handle_general_bounds(
     upper_open: bool,
     eq_prefix_len: usize,
     eq_prefix_values: Vec<Value>,
-    key_spec: &KeySpec,
+    key_spec: &KeySpec<String>,
 ) -> Result<SledRangeBounds, IndexError> {
     // Standard ASC bounds or multi-component bounds
     let start = if !lower_tuple.is_empty() {
@@ -329,7 +329,7 @@ pub fn lex_successor(mut key: Vec<u8>) -> Option<Vec<u8>> {
 
 /// Type-aware encoding using KeySpec for validation and optimization
 /// Delegates to core encoding for consistency
-pub fn encode_tuple_values_with_key_spec(values: &[Value], key_spec: &KeySpec) -> Result<Vec<u8>, IndexError> {
+pub fn encode_tuple_values_with_key_spec(values: &[Value], key_spec: &KeySpec<String>) -> Result<Vec<u8>, IndexError> {
     match ankurah_core::indexing::encode_tuple_values_with_key_spec(values, key_spec) {
         Ok(bytes) => Ok(bytes),
         Err(core_err) => match core_err {

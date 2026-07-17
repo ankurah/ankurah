@@ -13,13 +13,19 @@ pub struct Database {
 
 impl Database {
     pub fn open(db: Db) -> anyhow::Result<Self> {
-        // Open trees
+        // Open trees. The two engine-owned durable maps carry the `_ankurah_`
+        // reserved prefix (matching sqlite's `_ankurah_sqlite_column_map`); sled
+        // already namespaces every user collection under `collection_`, so the
+        // prefix is belt-and-suspenders against a user-collection name clash.
         let entities_tree = db.open_tree("entities")?; // the actual entities are stored here
         let events_tree = db.open_tree("events")?; // the events are stored here
-        let property_config_tree = db.open_tree("property_config")?; // the property config is stored here
+                                                   // numeric-slot map: serialized PropertyId -> u32 slot
+        let property_config_tree = db.open_tree("_ankurah_sled_property_config")?;
+        // durable identity map: {collection}\0{serialized PropertyId} -> column name
+        let property_columns_tree = db.open_tree("_ankurah_sled_column_map")?;
         let index_config_tree = db.open_tree("index_config")?; // the index config is stored here
 
-        let property_manager = PropertyManager::open(property_config_tree)?;
+        let property_manager = PropertyManager::open(property_config_tree, property_columns_tree)?;
         let index_manager = IndexManager::open(index_config_tree, &db, property_manager.clone())?;
 
         Ok(Self { db, entities_tree, events_tree, property_manager, index_manager })

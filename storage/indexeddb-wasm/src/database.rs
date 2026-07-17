@@ -62,7 +62,7 @@ impl Database {
     pub async fn close(&self) { self.0.connection.lock().await.close(); }
 
     /// Ensure an index exists, creating it if necessary via database version upgrade
-    pub async fn assure_index_exists(&self, index_spec: &KeySpec) -> Result<(), RetrievalError> {
+    pub async fn assure_index_exists(&self, index_spec: &KeySpec<String>) -> Result<(), RetrievalError> {
         let name = index_spec.name_with("", "__");
         if self.0.index_cache.contains(&name) {
             return Ok(());
@@ -152,6 +152,14 @@ impl Connection {
 
                 let events_store = db.create_object_store("events").require("create events store")?;
                 events_store.create_index_with_str("by_entity_id", "__entity_id").require("create entity_id index")?;
+
+                // Engine-owned durable id-to-field map. Out-of-line string keys
+                // `{collection}\0{property id base64}` -> assigned field name.
+                // Created here alongside `entities` and `events` on the fresh
+                // database; the clean-start assumption is ratified, so no
+                // versioned migration (and thus no DB version bump) is needed
+                // for pre-existing databases.
+                db.create_object_store("property_columns").require("create property_columns store")?;
             }
             Ok(())
         })
@@ -159,7 +167,7 @@ impl Connection {
     }
 
     /// Open database connection with a specific index to be created
-    pub async fn open_with_index(db_name: &str, version: u32, index_spec: KeySpec) -> Result<Self, RetrievalError> {
+    pub async fn open_with_index(db_name: &str, version: u32, index_spec: KeySpec<String>) -> Result<Self, RetrievalError> {
         let index_name = index_spec.name_with("", "__");
         notice_info!("creating index {db_name}.entities.{index_name} -> {:?}", index_spec.keyparts);
 

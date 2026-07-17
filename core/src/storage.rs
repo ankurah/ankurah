@@ -26,6 +26,13 @@ pub fn bucket_model_id(
         .ok_or_else(|| RetrievalError::Other(format!("no model id known for collection '{collection}' (catalog cold?)")))
 }
 
+pub mod naming;
+// The AST->AST rewrite that used to substitute physical addressing names (a
+// now-deleted pass) is gone: the AST stays purely logical, and each engine
+// resolves a property's physical address from its own durable PropertyId-keyed
+// map at emit time (SQL builders for sqlite/postgres; the planner integration
+// for sled/idb).
+
 #[async_trait]
 pub trait StorageEngine: Send + Sync {
     type Value;
@@ -33,6 +40,15 @@ pub trait StorageEngine: Send + Sync {
     async fn collection(&self, id: &CollectionId) -> Result<Arc<dyn StorageCollection>, RetrievalError>;
     // Delete all collections and their data from the storage engine
     async fn delete_all_collections(&self) -> Result<bool, MutationError>;
+
+    /// List the collections that already have durable storage, WITHOUT
+    /// creating any. Used by the catalog manager to warm only the catalog
+    /// collections that actually exist, so a schema-less node never
+    /// materializes empty `_ankurah_*` trees. The default returns empty,
+    /// which is always safe: a caller then simply skips its existence-gated
+    /// warm (falling back to live subscription updates) rather than
+    /// misbehaving. Engines override this with their real list.
+    async fn list_collections(&self) -> Result<Vec<CollectionId>, RetrievalError> { Ok(Vec::new()) }
 
     /// Inject the catalog resolver. Engines that maintain
     /// human-named materialized structures (postgres/sqlite/indexeddb physical

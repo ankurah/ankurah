@@ -2,7 +2,9 @@
 //!
 //! Converts AnkQL predicates to SQLite-compatible SQL WHERE clauses.
 
-use ankql::ast::{ComparisonOperator, Expr, Literal, OrderByItem, OrderDirection, Predicate, Selection};
+use std::collections::BTreeMap;
+
+use ankql::ast::{ComparisonOperator, Expr, Literal, OrderByItem, OrderDirection, OrderKey, Predicate, PropertyId, Selection};
 use ankurah_core::EntityId;
 use thiserror::Error;
 
@@ -16,6 +18,8 @@ pub enum SqlGenerationError {
     UnsupportedExpression(&'static str),
     #[error("Unsupported operator: {0}")]
     UnsupportedOperator(&'static str),
+    #[error("no column assigned for property {0}: a resolved property must be translated through the engine's durable map before SQL generation (an absent property should have been folded to NULL upstream)")]
+    UnmappedProperty(String),
 }
 
 impl From<SqlGenerationError> for SqliteError {
@@ -119,6 +123,12 @@ fn can_pushdown_expr(expr: &Expr) -> bool {
     match expr {
         Expr::Literal(_) => true,
         Expr::Path(path) => !path.steps.is_empty(),
+        // A resolved identifier is pushable: it renders as its durably-assigned
+        // column (resolved through the engine's map at emit time) with an
+        // optional JSON sub-path. Any identifier that survives here addresses a
+        // materialized column, because an absent property was folded to NULL
+        // upstream (`assume_null`) before the split.
+        Expr::PropertyIdentifier(_) => true,
         Expr::ExprList(exprs) => exprs.iter().all(can_pushdown_expr),
         Expr::Predicate(_) => false,
         Expr::InfixExpr { .. } => false,
@@ -132,6 +142,13 @@ pub struct SqlBuilder {
     params: Vec<rusqlite::types::Value>,
     fields: Vec<String>,
     table_name: Option<String>,
+    /// Durable identity-to-column map for this collection (a clone of the
+    /// bucket's cache). A resolved [`Expr::PropertyIdentifier`] / [`OrderKey::Property`]
+    /// is translated to its assigned column through this map at emit time --
+    /// never by its display name -- so a rename cannot move the column a query
+    /// addresses. A raw [`Expr::Path`] carries no identity and renders its steps
+    /// verbatim (used only for unresolved test selections).
+    column_map: BTreeMap<PropertyId, String>,
 }
 
 impl Default for SqlBuilder {
@@ -139,15 +156,39 @@ impl Default for SqlBuilder {
 }
 
 impl SqlBuilder {
-    pub fn new() -> Self { Self { sql: String::new(), params: Vec::new(), fields: Vec::new(), table_name: None } }
+    pub fn new() -> Self {
+        Self { sql: String::new(), params: Vec::new(), fields: Vec::new(), table_name: None, column_map: BTreeMap::new() }
+    }
 
     pub fn with_fields<T: Into<String>>(fields: Vec<T>) -> Self {
-        Self { sql: String::new(), params: Vec::new(), fields: fields.into_iter().map(|f| f.into()).collect(), table_name: None }
+        Self {
+            sql: String::new(),
+            params: Vec::new(),
+            fields: fields.into_iter().map(|f| f.into()).collect(),
+            table_name: None,
+            column_map: BTreeMap::new(),
+        }
     }
 
     pub fn table_name(&mut self, name: impl Into<String>) -> &mut Self {
         self.table_name = Some(name.into());
         self
+    }
+
+    /// Supply this collection's durable identity-to-column map, so resolved
+    /// property references translate to their assigned columns at emit time.
+    pub fn column_map(&mut self, map: BTreeMap<PropertyId, String>) -> &mut Self {
+        self.column_map = map;
+        self
+    }
+
+    /// The durably-assigned column for a resolved property, or an
+    /// `UnmappedProperty` error. A miss is a caller bug: an absent property must
+    /// be folded to NULL (`assume_null`) before SQL generation, so anything
+    /// reaching here has a materialized column.
+    fn column_for(&self, identifier: &ankql::ast::PropertyPath) -> Result<String, SqlGenerationError> {
+        let id = identifier.id_or_systemname();
+        self.column_map.get(&id).cloned().ok_or_else(|| SqlGenerationError::UnmappedProperty(format!("{id:?}")))
     }
 
     fn push_sql(&mut self, s: &str) { self.sql.push_str(s); }
@@ -177,24 +218,18 @@ impl SqlBuilder {
         match expr {
             Expr::Placeholder => return Err(SqlGenerationError::PlaceholderFound),
             Expr::Literal(lit) => self.literal(lit),
-            Expr::Path(path) => {
-                if path.is_simple() {
-                    // Single-step path: regular column reference
-                    let escaped = path.first().replace('"', "\"\"");
-                    self.push_sql(&format!(r#""{}""#, escaped));
-                } else {
-                    // Multi-step path: JSONB traversal
-                    // SQLite's -> operator returns JSONB, but for comparisons we need to extract the value.
-                    // Use json_extract() with the full JSON path for reliable comparisons.
-                    let first = path.first().replace('"', "\"\"");
-                    // Build JSON path: $.step1.step2.step3
-                    let json_path = if path.steps.len() == 2 {
-                        format!("$.{}", path.steps[1].replace('\'', "''"))
-                    } else {
-                        format!("$.{}", path.steps.iter().skip(1).map(|s| s.replace('\'', "''")).collect::<Vec<_>>().join("."))
-                    };
-                    self.push_sql(&format!(r#"json_extract("{}", '{}')"#, first, json_path));
-                }
+            Expr::Path(path) => self.path_steps_sql(&path.steps),
+            // A resolved identifier renders as its durably-ASSIGNED column
+            // (looked up by identity in the engine's map, never by display
+            // name), followed by any JSON sub-path via json_extract(). This is
+            // where a rename stays harmless: the id addresses the same column
+            // regardless of the current name.
+            Expr::PropertyIdentifier(identifier) => {
+                let column = self.column_for(identifier)?;
+                let mut steps = Vec::with_capacity(1 + identifier.subpath.len());
+                steps.push(column);
+                steps.extend(identifier.subpath.iter().cloned());
+                self.path_steps_sql(&steps);
             }
             Expr::ExprList(exprs) => {
                 self.push_sql("(");
@@ -209,6 +244,29 @@ impl SqlBuilder {
             _ => return Err(SqlGenerationError::UnsupportedExpression("Only literal, path, and list expressions are supported")),
         }
         Ok(())
+    }
+
+    /// Emit a column reference (or JSON sub-path extraction) for a sequence of
+    /// path steps. Shared by the `Expr::Path` and `Expr::Identifier` arms so both
+    /// render identically.
+    fn path_steps_sql(&mut self, steps: &[String]) {
+        if steps.len() == 1 {
+            // Single-step path: regular column reference
+            let escaped = steps[0].replace('"', "\"\"");
+            self.push_sql(&format!(r#""{}""#, escaped));
+        } else {
+            // Multi-step path: JSONB traversal
+            // SQLite's -> operator returns JSONB, but for comparisons we need to extract the value.
+            // Use json_extract() with the full JSON path for reliable comparisons.
+            let first = steps[0].replace('"', "\"\"");
+            // Build JSON path: $.step1.step2.step3
+            let json_path = if steps.len() == 2 {
+                format!("$.{}", steps[1].replace('\'', "''"))
+            } else {
+                format!("$.{}", steps.iter().skip(1).map(|s| s.replace('\'', "''")).collect::<Vec<_>>().join("."))
+            };
+            self.push_sql(&format!(r#"json_extract("{}", '{}')"#, first, json_path));
+        }
     }
 
     fn literal(&mut self, lit: &Literal) {
@@ -315,17 +373,31 @@ impl SqlBuilder {
     }
 
     pub fn order_by_item(&mut self, order_by: &OrderByItem) -> Result<(), SqlGenerationError> {
+        // A resolved sort key translates to its assigned column through the map
+        // (like `expr()`); a raw key renders its steps verbatim. `steps` is then
+        // [column, ..subpath].
+        let steps: Vec<String> = match &order_by.key {
+            OrderKey::Property(identifier) => {
+                let column = self.column_for(identifier)?;
+                let mut steps = Vec::with_capacity(1 + identifier.subpath.len());
+                steps.push(column);
+                steps.extend(identifier.subpath.iter().cloned());
+                steps
+            }
+            OrderKey::Path(path) => path.steps.clone(),
+        };
+
         // Handle JSON paths the same way as in expr() - use -> operator for multi-step paths
-        if order_by.path.is_simple() {
+        if steps.len() == 1 {
             // Single-step path: regular column reference
-            let escaped = order_by.path.first().replace('"', "\"\"");
+            let escaped = steps[0].replace('"', "\"\"");
             self.push_sql(&format!(r#""{}""#, escaped));
         } else {
             // Multi-step path: JSONB traversal using -> operator
-            let first = order_by.path.first().replace('"', "\"\"");
+            let first = steps[0].replace('"', "\"\"");
             self.push_sql(&format!(r#""{}""#, first));
 
-            for step in order_by.path.steps.iter().skip(1) {
+            for step in steps.iter().skip(1) {
                 let escaped = step.replace('\'', "''");
                 // Use -> to keep as JSONB (not ->> which extracts as text)
                 self.push_sql(&format!("->'{}'", escaped));
@@ -413,6 +485,72 @@ mod tests {
 
         // Numeric comparison with json_extract() - SQLite handles numeric comparison correctly
         assert_eq!(sql_string, r#"json_extract("data", '$.count') > ?"#);
+    }
+
+    /// Build the WHERE clause for a single `left op 'active'` comparison
+    /// predicate, translating resolved identifiers through `column_map`.
+    fn where_for_mapped(left: ankql::ast::Expr, column_map: BTreeMap<PropertyId, String>) -> String {
+        use ankql::ast::{ComparisonOperator, Expr, Literal, Predicate};
+        let predicate = Predicate::Comparison {
+            left: Box::new(left),
+            operator: ComparisonOperator::Equal,
+            right: Box::new(Expr::Literal(Literal::String("active".to_string()))),
+        };
+        let mut sql = SqlBuilder::new();
+        sql.column_map(column_map);
+        sql.predicate(&predicate).unwrap();
+        sql.build_where_clause().0
+    }
+
+    #[test]
+    fn test_identifier_renders_assigned_column_not_display_label() {
+        use ankql::ast::{Expr, PropertyPath};
+        use ulid::Ulid;
+
+        // A resolved identifier renders its durably-ASSIGNED column, looked up by
+        // identity -- NOT its display label. Here the label ("legacy_name") differs
+        // from the assigned column ("status"), so a leak of the label would fail
+        // this assertion. This is the #374 fix in miniature: the column a query
+        // addresses tracks the identity, not the (possibly renamed) display name.
+        let id = Ulid::from_bytes([5u8; 16]);
+        let map = BTreeMap::from([(PropertyId::EntityId(id), "status".to_string())]);
+        let sql = where_for_mapped(Expr::PropertyIdentifier(PropertyPath::registered(id, "legacy_name", vec![])), map);
+
+        assert_eq!(sql, r#""status" = ?"#);
+    }
+
+    #[test]
+    fn test_identifier_json_subpath_renders_assigned_column() {
+        use ankql::ast::{Expr, PropertyPath};
+        use ulid::Ulid;
+
+        // An identifier with a JSON subpath renders json_extract() rooted at the
+        // assigned column, with the subpath as the JSON path.
+        let id = Ulid::from_bytes([6u8; 16]);
+        let map = BTreeMap::from([(PropertyId::EntityId(id), "data".to_string())]);
+        let sql = where_for_mapped(
+            Expr::PropertyIdentifier(PropertyPath::registered(id, "legacy_data", vec!["user".to_string(), "name".to_string()])),
+            map,
+        );
+
+        assert_eq!(sql, r#"json_extract("data", '$.user.name') = ?"#);
+    }
+
+    #[test]
+    fn test_identifier_unmapped_property_errors() {
+        use ankql::ast::{ComparisonOperator, Expr, Literal, Predicate, PropertyPath};
+        use ulid::Ulid;
+
+        // A resolved identifier with no map entry is a caller bug (an absent
+        // property must be folded to NULL before SQL generation): it errors
+        // rather than silently falling back to a name.
+        let predicate = Predicate::Comparison {
+            left: Box::new(Expr::PropertyIdentifier(PropertyPath::registered(Ulid::from_bytes([9u8; 16]), "ghost", vec![]))),
+            operator: ComparisonOperator::Equal,
+            right: Box::new(Expr::Literal(Literal::String("active".to_string()))),
+        };
+        let mut sql = SqlBuilder::new();
+        assert!(matches!(sql.predicate(&predicate), Err(SqlGenerationError::UnmappedProperty(_))));
     }
 
     #[test]
