@@ -41,6 +41,69 @@ impl From<AccessDenied> for wasm_bindgen::JsValue {
 
 impl AccessDenied {}
 
+/// What a RegisterSchema request will ACTUALLY do, resolved by the
+/// registration executor under the allocation mutex (RFC 5.7 in
+/// specs/model-property-metadata/rfc.md). Passed to
+/// [`PolicyAgent::check_schema_registration`]
+/// before any event is emitted, so an agent can judge real creations and
+/// metadata changes without performing its own catalog lookups:
+/// `check_request` cannot know whether a descriptor already exists, and
+/// `check_event` fires per event mid-commit. Core-side only; never
+/// crosses the wire.
+#[derive(Debug, Default)]
+pub struct RegistrationPlan {
+    /// Model entities this request will CREATE, with their would-be
+    /// allocated ids (minted, not yet committed).
+    pub creates_models: Vec<(proto::EntityId, proto::ModelDescriptor)>,
+    /// Property entities this request will CREATE, with their would-be
+    /// allocated ids. The descriptor's `minting_collection` names the
+    /// owning scope (a created or existing model in this same plan).
+    pub creates_properties: Vec<(proto::EntityId, proto::PropertyDescriptor)>,
+    /// Contract memberships this request will CREATE, fully resolved.
+    pub creates_memberships: Vec<PlannedMembership>,
+    /// Metadata follow-ups this request will write on EXISTING entities
+    /// (display-name changes including rename-hint applications, target
+    /// retargets, membership `optional` flips).
+    pub updates: Vec<PlannedUpdate>,
+    /// Definitions that resolved to existing entities with no changes:
+    /// pure no-ops, listed for context.
+    pub existing: Vec<proto::EntityId>,
+}
+
+impl RegistrationPlan {
+    /// Whether the plan writes anything at all (a re-registration of
+    /// unchanged definitions is a pure no-op and skips the policy verb).
+    pub fn is_noop(&self) -> bool {
+        self.creates_models.is_empty()
+            && self.creates_properties.is_empty()
+            && self.creates_memberships.is_empty()
+            && self.updates.is_empty()
+    }
+}
+
+/// A membership creation in a [`RegistrationPlan`], resolved to ids.
+#[derive(Debug, Clone)]
+pub struct PlannedMembership {
+    pub id: proto::EntityId,
+    pub model: proto::EntityId,
+    pub property: proto::EntityId,
+    pub optional: bool,
+}
+
+/// A metadata follow-up on an existing catalog entity, in a
+/// [`RegistrationPlan`].
+#[derive(Debug, Clone)]
+pub struct PlannedUpdate {
+    /// Which catalog collection the entity lives in.
+    pub collection: proto::CollectionId,
+    pub entity: proto::EntityId,
+    pub field: String,
+    /// The current catalog value, when one exists.
+    pub from: Option<crate::value::Value>,
+    /// The requested catalog value. `None` means the field will be cleared.
+    pub to: Option<crate::value::Value>,
+}
+
 /// PolicyAgents control access to resources, by:
 /// - signing requests which are sent to other nodes - this may come in the form of a bearer token, or a signature, or some other arbitrary method of authentication as defined by the PolicyAgent
 /// - checking access for requests. If approved, yield a ContextData
@@ -94,6 +157,30 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
         entity_after: &Entity,
         event: &proto::Event,
     ) -> Result<Option<proto::Attestation>, AccessDenied>;
+
+    /// Gate a schema registration on its resolved effect (RFC 5.7). Called by
+    /// the registration executor after its lookup
+    /// phase and before any event is emitted, still under the allocation
+    /// mutex, with the request's actual consequences: what will be created,
+    /// what will be updated, what already exists. Agents may discriminate
+    /// on the principal (`cdata`: who may define schema) or on the object
+    /// (the planned definitions themselves); both styles are first-class.
+    /// Refusal fails the whole registration before anything is emitted.
+    /// Every emitted event still passes [`Self::check_event`] afterwards,
+    /// INDIVIDUALLY: the commit batch is not transactional, so an agent
+    /// that allows the plan but denies a constituent event aborts the
+    /// remainder and leaves earlier catalog events durable (accepted by
+    /// maintainer ruling 2026-07-06; the allocator's storage-checked
+    /// lookups keep identity convergent across such partials, and #313
+    /// tracks the transactional upgrade). The default allows.
+    fn check_schema_registration<SE: StorageEngine>(
+        &self,
+        _node: &Node<SE, Self>,
+        _cdata: &Self::ContextData,
+        _plan: &RegistrationPlan,
+    ) -> Result<(), AccessDenied> {
+        Ok(())
+    }
 
     /// Validate an event attestation
     /// This could be used to validate that the event has sufficient attestation as to be trusted

@@ -19,6 +19,8 @@
 //! there is no per-call allocation and the schema is a `const`-shaped fact
 //! of the program.
 
+use ankurah_proto::{MembershipDescriptor, ModelDescriptor, PropertyDescriptor, PropertyRef};
+
 /// The compiled schema for one model: its collection binding, display name,
 /// and the ordered active (non-ephemeral) fields. Emitted as a `static` by
 /// `#[derive(Model)]`.
@@ -88,6 +90,60 @@ pub struct FieldSchema {
 impl ModelSchema {
     /// The active field whose display name is `name`, if any.
     pub fn field_by_name(&self, name: &str) -> Option<&'static FieldSchema> { self.properties.iter().find(|f| f.name == name) }
+}
+
+/// Build the language-agnostic RegisterSchema descriptor vectors for one
+/// compiled model (RFC 5.2 transport). The result is exactly what a
+/// `NodeRequestBody::RegisterSchema` carries: one [`ModelDescriptor`], one
+/// [`PropertyDescriptor`] per active field, and one [`MembershipDescriptor`]
+/// per active field.
+///
+/// Descriptors are id-FREE except for explicit bindings: ids are the
+/// executor's to allocate or resolve (RFC 5.1), so a request is portable
+/// across systems; only `#[..(id = ...)]` bindings carry a literal id, and
+/// those reference definitions that already exist.
+///
+/// Rename hints and explicit ids are respected: a field with `explicit_id`
+/// becomes a `PropertyDescriptor.explicit_id` binding and its membership
+/// references the property by `PropertyRef::Id`; otherwise the membership
+/// references it by `PropertyRef::Name` within the request (which the
+/// executor resolves to the upserted id). `optional` rides the membership,
+/// per contract.
+pub fn registration_request(schema: &ModelSchema) -> (Vec<ModelDescriptor>, Vec<PropertyDescriptor>, Vec<MembershipDescriptor>) {
+    let models = vec![ModelDescriptor {
+        collection: schema.collection.to_string(),
+        name: schema.name.to_string(),
+        explicit_id: schema.explicit_id.map(parse_explicit_id),
+    }];
+
+    let mut properties = Vec::with_capacity(schema.properties.len());
+    let mut memberships = Vec::with_capacity(schema.properties.len());
+
+    for field in schema.properties {
+        let explicit_id = field.explicit_id.map(parse_explicit_id);
+
+        properties.push(PropertyDescriptor {
+            minting_collection: schema.collection.to_string(),
+            name: field.name.to_string(),
+            renamed_from: field.renamed_from.map(|s| s.to_string()),
+            backend: field.backend.to_string(),
+            value_type: field.value_type.to_string(),
+            target_collection: field.target_collection.map(str::to_string),
+            explicit_id,
+        });
+
+        let property_ref = match explicit_id {
+            Some(id) => PropertyRef::Id(id),
+            None => PropertyRef::Name(field.name.to_string()),
+        };
+        memberships.push(MembershipDescriptor {
+            collection: schema.collection.to_string(),
+            property: property_ref,
+            optional: field.optional,
+        });
+    }
+
+    (models, properties, memberships)
 }
 
 /// Decode an explicit-id attribute value into an `EntityId`. The derive

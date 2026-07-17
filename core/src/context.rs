@@ -50,6 +50,22 @@ pub trait TContext {
     async fn commit_local_trx(&self, trx: &Transaction) -> Result<Vec<Event>, MutationError>;
     fn query(&self, collection_id: proto::CollectionId, args: MatchArgs) -> Result<EntityLiveQuery, RetrievalError>;
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError>;
+    /// RFC 5.2 (specs/model-property-metadata/rfc.md) model first-use registration, object-safe so the mutating
+    /// transaction paths (`create`/`edit`) can trigger it without the
+    /// concrete `<SE, PA>`. If no durable peer is available, use may proceed
+    /// only when the local catalog proves every model and field identity in
+    /// this exact compiled shape. Policy, executor, missing-field, and
+    /// incompatible-field failures remain strict.
+    async fn ensure_registered(&self, schema: &'static crate::schema::ModelSchema) -> Result<(), MutationError>;
+    /// RFC 5.2 STRICT registration (the eager explicit `ctx.register::<M>()`
+    /// form): propagate the error instead of swallowing it. Object-safe.
+    async fn register_strict(
+        &self,
+        schema: &'static crate::schema::ModelSchema,
+    ) -> Result<(), crate::schema::registration::RegistrationError>;
+    /// Admit the exact compiled schema for a predicate read. Kept separate
+    /// from the mutation helper so read failures do not claim a write failed.
+    async fn ensure_query_schema(&self, schema: &'static crate::schema::ModelSchema) -> Result<(), RetrievalError>;
 }
 
 #[async_trait]
@@ -74,6 +90,19 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         // compare_exchange returns Err if the value was already false (already committed/rolled back).
         if trx.alive.compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire).is_err() {
             return Err(MutationError::General("Transaction already committed or rolled back".into()));
+        }
+
+        // Close the edit-only registration gap (RFC 5.2 "durable write on
+        // first mutating use"): Transaction::edit is sync and cannot await a
+        // durable registration, so ensure-register the exact schema shapes
+        // this transaction used. Transaction scope matters: a historically
+        // failed declaration for the same collection must not poison later
+        // transactions using a compatible shape.
+        // As on create, the no-peer fallback requires a complete compatible
+        // binding for this exact declaration; every other failure is strict.
+        let schemas = trx.schemas.read().unwrap().clone();
+        for schema in schemas {
+            TContext::ensure_registered(self, schema).await?;
         }
 
         // Generate events from the transaction entities
@@ -185,6 +214,31 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
         self.node.system.collection(id).await
     }
+    async fn ensure_registered(&self, schema: &'static crate::schema::ModelSchema) -> Result<(), MutationError> {
+        self.node.catalog.ensure_schema_for_use(&self.node, &self.cdata, schema).await.map_err(|error| {
+            let message = if self.node.catalog.model_by_collection(schema.collection).is_none() {
+                format!("cannot write into unregistered collection '{}': {error}", schema.collection)
+            } else {
+                format!("cannot write using an unconfirmed schema for collection '{}': {error}", schema.collection)
+            };
+            MutationError::General(message.into())
+        })
+    }
+    async fn register_strict(
+        &self,
+        schema: &'static crate::schema::ModelSchema,
+    ) -> Result<(), crate::schema::registration::RegistrationError> {
+        self.node.catalog.ensure_registered(&self.node, &self.cdata, schema).await
+    }
+    async fn ensure_query_schema(&self, schema: &'static crate::schema::ModelSchema) -> Result<(), RetrievalError> {
+        self.node.catalog.ensure_schema_for_use(&self.node, &self.cdata, schema).await.map_err(|error| {
+            if self.node.catalog.model_by_collection(schema.collection).is_none() {
+                RetrievalError::Other(format!("collection '{}' is not registered: {error}", schema.collection))
+            } else {
+                RetrievalError::Other(error.to_string())
+            }
+        })
+    }
 }
 
 // This whole impl is conditionalized by the wasm feature flag
@@ -225,6 +279,16 @@ impl Context {
     //     Ok(result)
     // }
 
+    /// RFC 5.2 eager explicit registration (STRICT form): register `M`'s
+    /// model, properties, and memberships now, propagating any error. Automatic
+    /// mutating paths also fail a never-registered write; a failed reassertion
+    /// may proceed only when every field is already bound compatibly. Useful
+    /// before first render so predicate resolution has the ids ready. A second
+    /// call for the same compiled shape is a no-op.
+    pub async fn register<M: crate::model::Model>(&self) -> Result<(), crate::schema::registration::RegistrationError> {
+        self.0.register_strict(M::schema()).await
+    }
+
     pub async fn get<R: View>(&self, id: proto::EntityId) -> Result<R, RetrievalError> {
         let entity = self.0.get_entity(id, &R::collection(), false).await?;
         Ok(R::from_entity(entity))
@@ -240,6 +304,11 @@ impl Context {
         let args: MatchArgs = args.try_into().map_err(|e| e.into())?;
         use crate::model::Model;
         let collection_id = R::Model::collection();
+
+        // Predicate reads are schema-dependent and registration is their
+        // admission point. Ensure this exact declaration before any catalog
+        // name can resolve the selection through a different cached shape.
+        self.0.ensure_query_schema(R::Model::schema()).await?;
 
         let entities = self.0.fetch_entities(&collection_id, args).await?;
 

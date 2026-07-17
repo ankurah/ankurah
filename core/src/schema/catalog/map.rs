@@ -40,6 +40,15 @@ pub struct MembershipDef {
     pub optional: Option<bool>,
 }
 
+/// Exact durable identities admitted for one compiled model shape.
+#[derive(Debug, Clone)]
+pub(super) struct EnsuredSchemaBinding {
+    pub(super) schema: &'static ModelSchema,
+    pub(super) model: EntityId,
+    pub(super) fields: BTreeMap<&'static str, EntityId>,
+    pub(super) confirmed: bool,
+}
+
 /// Indexed in-memory view of the catalog entities.
 #[derive(Debug, Default)]
 pub(super) struct CatalogMapInner {

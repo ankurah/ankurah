@@ -434,6 +434,167 @@ where
         self.0.map.read().unwrap().names_global.get(name).into_iter().flat_map(|s| s.iter().copied()).collect()
     }
 
+    // -- registration lifecycle --------------------------------------------
+
+    // -- allocator support (RFC 5.1 executor discipline) ---------------------
+
+    /// Serialize a registration execution. The executor holds this across
+    /// its whole lookup/allocate/commit/upsert sequence.
+    pub(crate) async fn lock_allocator(&self) -> tokio::sync::MutexGuard<'_, ()> { self.0.allocator.lock().await }
+
+    /// The property lookup key (RFC 5.1 as amended 2026-07-10): (minting
+    /// model, current name). Backend and value_type left the key with the
+    /// canonical value_type ruling: a same-name registration with a different
+    /// type is a COMPATIBILITY question against the found definition, never a
+    /// second identity. Used by the executor's upsert and the rename hint
+    /// pre-pass.
+    pub fn property_by_name(&self, model: &EntityId, name: &str) -> Option<PropertyDef> {
+        let map = self.0.map.read().unwrap();
+        map.names_global.get(name)?.iter().find_map(|id| {
+            let p = map.properties.get(id)?;
+            (p.minted_for == Some(*model) && p.name == name).then(|| p.clone())
+        })
+    }
+
+    /// Derive the exact binding an already-populated catalog proves for this
+    /// compiled declaration.
+    ///
+    /// Ordinary fields use the allocator's lookup scope `(minting model,
+    /// current name)`, not any same-named membership. That distinction keeps
+    /// explicit sharing explicit. An explicit model id must itself be the
+    /// collection's live model; a compatible ordinary model must be the one
+    /// indexed by the collection. Every field then needs a live membership and
+    /// a compatible immutable backend/type pair.
+    fn compatible_binding(&self, schema: &'static ModelSchema, confirmed: bool) -> Option<EnsuredSchemaBinding> {
+        let map = self.0.map.read().unwrap();
+        let model = match schema.explicit_id {
+            Some(id) => {
+                let id = super::local::parse_explicit_id(id);
+                let def = map.models.get(&id)?;
+                if def.collection != schema.collection || map.by_collection.get(schema.collection) != Some(&id) {
+                    return None;
+                }
+                id
+            }
+            None => *map.by_collection.get(schema.collection)?,
+        };
+
+        let mut fields = BTreeMap::new();
+        for field in schema.properties {
+            let id = match field.explicit_id {
+                Some(id) => super::local::parse_explicit_id(id),
+                None => {
+                    let mut matches =
+                        map.properties.values().filter(|def| def.minted_for == Some(model) && def.name == field.name).map(|def| def.id);
+                    let id = matches.next()?;
+                    if matches.next().is_some() {
+                        return None;
+                    }
+                    id
+                }
+            };
+            if map.membership(&model, &id).is_none() {
+                return None;
+            }
+            let def = map.properties.get(&id)?;
+            if def.backend != field.backend || !super::registration::value_types_compatible(&def.value_type, field.value_type) {
+                return None;
+            }
+            fields.insert(field.name, id);
+        }
+        Some(EnsuredSchemaBinding { schema, model, fields, confirmed })
+    }
+
+    /// Build the confirmed binding from the allocator's response itself.
+    /// Registration results are the only race-free authority for the ids this
+    /// exact request resolved; reconstructing them from mutable display names
+    /// after the response could observe a concurrent rename or name reuse.
+    fn registered_binding(
+        &self,
+        schema: &'static ModelSchema,
+        models: &[proto::RegisteredModel],
+        properties: &[proto::RegisteredProperty],
+        memberships: &[proto::RegisteredMembership],
+    ) -> Option<EnsuredSchemaBinding> {
+        let model_def = models.iter().find(|model| model.collection == schema.collection)?;
+        let model = model_def.id;
+        if schema.explicit_id.is_some_and(|id| super::local::parse_explicit_id(id) != model) {
+            return None;
+        }
+
+        let mut fields = BTreeMap::new();
+        for field in schema.properties {
+            let property = match field.explicit_id {
+                Some(id) => {
+                    let id = super::local::parse_explicit_id(id);
+                    properties.iter().find(|property| property.id == id)?
+                }
+                None => properties.iter().find(|property| property.model == model && property.name == field.name)?,
+            };
+            if property.backend != field.backend
+                || !super::registration::value_types_compatible(&property.value_type, field.value_type)
+                || !memberships.iter().any(|membership| membership.model == model && membership.property == property.id)
+            {
+                return None;
+            }
+            fields.insert(field.name, property.id);
+        }
+
+        Some(EnsuredSchemaBinding { schema, model, fields, confirmed: true })
+    }
+
+    /// Record an exact binding proven from an already-compatible catalog.
+    /// This is the safe no-peer fallback when the allocator cannot be reached.
+    pub(crate) fn bind_compatible_schema(&self, schema: &'static ModelSchema) -> bool {
+        // Bind proof and publication to one ready system epoch. Reset either
+        // invalidates before admission (fail closed) or waits for this lease
+        // before clearing, so old ids cannot be stored after the clear.
+        let Some(validity) = self.registration_validity() else { return false };
+        let Some(_lease) = validity.try_acquire() else { return false };
+        let Some(binding) = self.compatible_binding(schema, false) else { return false };
+        self.store_binding(binding);
+        true
+    }
+
+    fn store_binding(&self, binding: EnsuredSchemaBinding) {
+        let mut ensured = self.0.ensured.write().unwrap();
+        let bindings = ensured.entry(binding.schema.collection.to_string()).or_default();
+        if let Some(existing) = bindings.iter_mut().find(|known| *known.schema == *binding.schema) {
+            // Confirmation belongs to the exact ids returned by the
+            // allocator. A later local proof may not replace those ids while
+            // inheriting their confirmation; only another confirmed result
+            // can replace a confirmed binding.
+            if binding.confirmed || !existing.confirmed {
+                *existing = binding;
+            }
+        } else {
+            bindings.push(binding);
+        }
+    }
+
+    /// Automatic schema use (mutation or predicate) tries the allocator first.
+    /// A policy or executor refusal is always strict. Only the explicit
+    /// no-durable-peer case may proceed from locally proven exact identities.
+    pub(crate) async fn ensure_schema_for_use(
+        &self,
+        node: &Node<SE, PA>,
+        cdata: &PA::ContextData,
+        schema: &'static ModelSchema,
+    ) -> Result<(), RegistrationError> {
+        match self.ensure_registered(node, cdata, schema).await {
+            Ok(()) => Ok(()),
+            Err(error @ RegistrationError::NoDurablePeer(_)) if self.bind_compatible_schema(schema) => {
+                tracing::warn!(
+                    "schema reassertion for fully bound collection '{}' has no durable peer; proceeding with proven canonical identities: {}",
+                    schema.collection,
+                    error
+                );
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// The canonical value_type of a property-definition id, if the map knows
     /// it (the CatalogManager-side twin of
     /// [`crate::schema::CatalogResolver::canonical_value_type`]; rfc.md
@@ -442,5 +603,169 @@ where
     /// watcher index collate in the type the backends store.
     pub(crate) fn canonical_value_type_of(&self, id: &EntityId) -> Option<String> {
         self.0.map.read().unwrap().properties.get(id).map(|def| def.value_type.clone())
+    }
+
+    /// Fold resolved definitions into the map: the executor calls this
+    /// synchronously post-commit (before releasing the allocator mutex),
+    /// and `ensure_registered` calls it with a SchemaRegistered response so
+    /// binding proceeds ahead of the catalog subscription (RFC 5.2).
+    /// Idempotent (keyed by entity id); the reactor later re-delivers the
+    /// same entities harmlessly.
+    pub fn upsert_registered(
+        &self,
+        models: &[proto::RegisteredModel],
+        properties: &[proto::RegisteredProperty],
+        memberships: &[proto::RegisteredMembership],
+    ) {
+        let mut map = self.0.map.write().unwrap();
+        for m in models {
+            map.upsert_model(ModelDef { id: m.id, collection: m.collection.clone(), name: m.name.clone() });
+        }
+        for p in properties {
+            map.upsert_property(PropertyDef {
+                id: p.id,
+                minted_for: Some(p.model),
+                name: p.name.clone(),
+                backend: p.backend.clone(),
+                value_type: p.value_type.clone(),
+                target_model: p.target_model,
+            });
+        }
+        for ms in memberships {
+            map.upsert_membership(MembershipDef { id: ms.id, model: ms.model, property: ms.property, optional: Some(ms.optional) });
+        }
+    }
+
+    /// RFC 5.2 model first-use registration ("ensure registration"). Called
+    /// on mutating paths before a write and by typed predicate reads before
+    /// name resolution. An existing schema resolves to a no-op plan, so the
+    /// common read-path case emits nothing and skips the policy verb while the
+    /// response feeds the map. Fast-returns only if this exact compiled schema
+    /// shape is already ensured in this process, then durably registers:
+    ///
+    /// - DURABLE node: execute the registration locally
+    ///   ([`Node::execute_schema_registration`], which updates the map
+    ///   itself under the allocator mutex); latch on Ok.
+    /// - EPHEMERAL node with a durable peer: forward RegisterSchema, consume
+    ///   the SchemaRegistered response into the map (binding and id-keyed
+    ///   writes proceed immediately, ahead of the catalog subscription);
+    ///   latch on Ok.
+    /// - EPHEMERAL node with NO durable peer: registration is impossible
+    ///   without the allocator, so this returns
+    ///   [`RegistrationError::NoDurablePeer`] without latching. The automatic
+    ///   caller may proceed only if the local catalog proves the exact model
+    ///   and every field's compatible canonical binding.
+    ///
+    /// Every error path returns WITHOUT latching, so a later attempt
+    /// retries.
+    pub async fn ensure_registered(
+        &self,
+        node: &Node<SE, PA>,
+        cdata: &PA::ContextData,
+        schema: &'static ModelSchema,
+    ) -> Result<(), RegistrationError> {
+        let collection = schema.collection.to_string();
+        // Snapshot and enter the epoch before consulting the latch. Checking
+        // first would allow reset to clear the latch and install a new fence
+        // between the stale boolean and our admission (an ABA false success).
+        let validity = self.registration_validity().ok_or(RegistrationError::SystemNotReady)?;
+        let initial_lease = validity.try_acquire().ok_or(RegistrationError::SystemNotReady)?;
+        if self.is_schema_ensured(schema) {
+            return Ok(());
+        }
+
+        let (models, properties, memberships) = super::registration_request(schema);
+
+        if node.durable {
+            // A durable node executes registration itself (no forwarding);
+            // the executor upserts the map before returning. Retain one
+            // outer lease across the executor and exact-schema latch. It must
+            // be snapshotted before execution: reacquiring afterward could
+            // grab a post-reset fence and fold old definitions into the new
+            // epoch (an ABA error).
+            let _lease = initial_lease;
+            let (models, properties, memberships) = node.execute_schema_registration(cdata, models, properties, memberships).await?;
+            self.mark_schema_ensured(schema, &models, &properties, &memberships)?;
+            return Ok(());
+        }
+
+        // A forwarded request may be arbitrarily slow. Do not make reset wait
+        // for the network; response admission reacquires this same old fence
+        // and rejects it before schema ingestion if reset invalidated it.
+        drop(initial_lease);
+
+        // Ephemeral: forward to a connected durable peer. There is no offline
+        // registration queue because only the durable allocator may mint ids.
+        match node.get_durable_peers().first().copied() {
+            Some(peer) => {
+                let body = proto::NodeRequestBody::RegisterSchema { models, properties, memberships };
+                if !validity.is_current() {
+                    return Err(RegistrationError::SystemNotReady);
+                }
+                match node.request_if_current(peer, cdata, body, validity).await {
+                    Ok(response) => {
+                        // Response admission acquired the registration owner
+                        // before schema ingestion. Retain that same lease
+                        // through the response-body map fold and exact-schema
+                        // latch, so reset clears either before or after the
+                        // complete effect, never between them.
+                        let (body, _lease) = response.into_parts();
+                        let proto::NodeResponseBody::SchemaRegistered { models, properties, memberships } = body else {
+                            return match body {
+                                proto::NodeResponseBody::Error(e) => {
+                                    Err(RegistrationError::Retrieval(crate::error::RetrievalError::Other(e)))
+                                }
+                                other => Err(RegistrationError::Retrieval(crate::error::RetrievalError::Other(format!(
+                                    "unexpected response to RegisterSchema: {other}"
+                                )))),
+                            };
+                        };
+                        // The response is the fast path into the map (RFC
+                        // 5.2): fold it in on ack so binding proceeds now.
+                        self.upsert_registered(&models, &properties, &memberships);
+                        self.mark_schema_ensured(schema, &models, &properties, &memberships)?;
+                        Ok(())
+                    }
+                    Err(e) => Err(RegistrationError::Retrieval(crate::error::RetrievalError::Other(format!("{e:?}")))),
+                }
+            }
+            None => Err(RegistrationError::NoDurablePeer(collection)),
+        }
+    }
+
+    /// Whether this collection's registration is latched (durably executed
+    /// or forwarded successfully) this process.
+    pub fn is_ensured(&self, collection: &str) -> bool {
+        self.0.ensured.read().unwrap().get(collection).is_some_and(|bindings| bindings.iter().any(|binding| binding.confirmed))
+    }
+
+    pub(crate) fn is_schema_ensured(&self, schema: &ModelSchema) -> bool {
+        self.0
+            .ensured
+            .read()
+            .unwrap()
+            .get(schema.collection)
+            .is_some_and(|bindings| bindings.iter().any(|known| known.confirmed && *known.schema == *schema))
+    }
+
+    pub(crate) fn has_schema_binding(&self, schema: &ModelSchema) -> bool {
+        self.0.ensured.read().unwrap().get(schema.collection).is_some_and(|bindings| bindings.iter().any(|known| *known.schema == *schema))
+    }
+
+    fn mark_schema_ensured(
+        &self,
+        schema: &'static ModelSchema,
+        models: &[proto::RegisteredModel],
+        properties: &[proto::RegisteredProperty],
+        memberships: &[proto::RegisteredMembership],
+    ) -> Result<(), RegistrationError> {
+        let binding = self.registered_binding(schema, models, properties, memberships).ok_or_else(|| {
+            RegistrationError::Retrieval(crate::error::RetrievalError::Other(format!(
+                "registration of '{}' succeeded without a complete compatible catalog binding",
+                schema.collection
+            )))
+        })?;
+        self.store_binding(binding);
+        Ok(())
     }
 }
