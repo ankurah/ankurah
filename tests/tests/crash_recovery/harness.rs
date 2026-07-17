@@ -210,6 +210,13 @@ impl<E: StorageEngine + CrashFlushable + 'static> StorageEngine for CrashStorage
     }
 
     async fn delete_all_collections(&self) -> Result<bool, MutationError> { self.inner.delete_all_collections().await }
+
+    // A wrapper must FORWARD the resolver injection: the trait default is a
+    // no-op, and swallowing it leaves the inner engine unable to stamp model
+    // ids on reconstructed envelopes (#330) or name columns from the catalog.
+    fn set_catalog_resolver(&self, resolver: std::sync::Weak<dyn ankurah::core::schema::CatalogResolver>) {
+        self.inner.set_catalog_resolver(resolver);
+    }
 }
 
 /// Wraps a storage collection, deferring to the shared engine-level counters so
@@ -416,6 +423,36 @@ pub fn fresh_sled_dir(label: &str) -> PathBuf {
 /// wrote to). Reuses the production `with_path` opener so recovery goes through
 /// the real reopen path, not a test shortcut.
 pub fn reopen_sled(dir: &Path) -> Result<SledStorageEngine> { SledStorageEngine::with_path(dir.to_path_buf()) }
+
+/// Minimal [`CatalogResolver`] for bare-engine (node-less) recovery probes:
+/// the parent reads persisted states straight off the reopened engine, and the
+/// bucket needs a model id to stamp reconstructed envelopes (#330). Maps
+/// exactly the one collection under test to the model id the child allocated
+/// (recorded in the handoff); property naming is irrelevant to these probes.
+struct HandoffModelResolver {
+    collection: String,
+    model: EntityId,
+}
+
+impl ankurah::core::schema::CatalogResolver for HandoffModelResolver {
+    fn resolve(&self, _collection: &str, _name: &str) -> Option<EntityId> { None }
+    fn name_for(&self, _id: &EntityId) -> Option<String> { None }
+    fn model_id_for(&self, collection: &str) -> Option<EntityId> { (collection == self.collection).then_some(self.model) }
+}
+
+/// Wire a [`HandoffModelResolver`] into a reopened bare engine. The caller
+/// must hold the returned `Arc` for as long as it reads through the engine
+/// (the engine keeps only a `Weak`).
+pub fn handoff_model_resolver(
+    engine: &SledStorageEngine,
+    collection: &str,
+    model: EntityId,
+) -> Arc<dyn ankurah::core::schema::CatalogResolver> {
+    let resolver: Arc<dyn ankurah::core::schema::CatalogResolver> =
+        Arc::new(HandoffModelResolver { collection: collection.to_string(), model });
+    engine.set_catalog_resolver(Arc::downgrade(&resolver));
+    resolver
+}
 
 /// Core recovery invariant: no persisted state may reference an event that is
 /// missing from storage.

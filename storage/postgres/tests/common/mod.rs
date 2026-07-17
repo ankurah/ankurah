@@ -48,7 +48,7 @@ pub async fn create_postgres_container() -> Result<(ContainerAsync<postgres::Pos
     )?;
     let pool = bb8::Pool::builder().build(manager).await?;
 
-    let storage_engine = Postgres::new(pool)?;
+    let storage_engine = Postgres::new(pool).await?;
 
     Ok((container, storage_engine))
 }

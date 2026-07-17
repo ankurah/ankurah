@@ -12,7 +12,7 @@ use ankurah_core::{
     schema::CatalogResolver,
     storage::{naming, StorageCollection, StorageEngine},
 };
-use ankurah_proto::{Attestation, AttestationSet, Attested, EntityState, EventId, OperationSet, State, StateBuffers};
+use ankurah_proto::{Attestation, AttestationSet, Attested, EntityState, EventId, OperationSet, State, StateBuffers, PROTOCOL_VERSION};
 
 use futures_util::{pin_mut, TryStreamExt};
 
@@ -34,6 +34,12 @@ pub const DEFAULT_POOL_SIZE: u32 = 15;
 /// Default connection timeout in seconds
 pub const DEFAULT_CONNECTION_TIMEOUT_SECS: u64 = 30;
 
+/// Engine-level key/value metadata for the store itself (currently just the
+/// 'protocol_version' stamp). Not a collection: it survives
+/// `delete_all_collections`, because wiping the stamp would make the store
+/// read as pre-stamp and refuse its own reopen.
+const META_TABLE: &str = "ankurah_meta";
+
 pub struct Postgres {
     pool: bb8::Pool<PostgresConnectionManager<NoTls>>,
     /// The catalog resolver, injected post-construction by `Node` (see
@@ -43,7 +49,16 @@ pub struct Postgres {
 }
 
 impl Postgres {
-    pub fn new(pool: bb8::Pool<PostgresConnectionManager<NoTls>>) -> anyhow::Result<Self> { Ok(Self { pool, resolver: Arc::new(RwLock::new(None)) }) }
+    /// Create a new storage engine with an existing pool.
+    ///
+    /// Stamps/checks the store's protocol version (see
+    /// [`Self::verify_protocol_stamp`]) so every construction path verifies
+    /// the store it is about to serve.
+    pub async fn new(pool: bb8::Pool<PostgresConnectionManager<NoTls>>) -> anyhow::Result<Self> {
+        let engine = Self { pool, resolver: Arc::new(RwLock::new(None)) };
+        engine.verify_protocol_stamp().await?;
+        Ok(engine)
+    }
 
     pub async fn open(uri: &str) -> anyhow::Result<Self> {
         let manager = PostgresConnectionManager::new_from_stringlike(uri, NoTls)?;
@@ -52,7 +67,7 @@ impl Postgres {
             .connection_timeout(Duration::from_secs(DEFAULT_CONNECTION_TIMEOUT_SECS))
             .build(manager)
             .await?;
-        Self::new(pool)
+        Self::new(pool).await
     }
 
     // TODO: newtype this to `BucketName(&str)` with a constructor that
@@ -68,6 +83,79 @@ impl Postgres {
         }
 
         true
+    }
+
+    /// Stamp or check the store's protocol version
+    /// ([`ankurah_proto::PROTOCOL_VERSION`]), run by every constructor:
+    ///
+    /// - fresh store (no stamp, no ankurah tables): write the stamp, proceed
+    /// - stamp present and equal: proceed
+    /// - stamp present and different: refuse, naming found and expected
+    /// - ankurah tables present but no stamp: refuse as a pre-stamp store
+    ///
+    /// Same spirit as the peering handshake's `protocol_compatible` refusal:
+    /// serving a store persisted by a different protocol version would
+    /// silently misread its shapes, so refuse loudly and advise a
+    /// development-database reset.
+    async fn verify_protocol_stamp(&self) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        let rows = client.query("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'", &[]).await?;
+        let tables: Vec<String> = rows.iter().map(|row| row.get("table_name")).collect();
+        let has_ankurah_tables = tables.iter().any(|t| t != META_TABLE);
+
+        let stamp: Option<String> = if tables.iter().any(|t| t == META_TABLE) {
+            client
+                .query_opt(&format!(r#"SELECT "value" FROM "{META_TABLE}" WHERE "key" = 'protocol_version'"#), &[])
+                .await?
+                .map(|row| row.get(0))
+        } else {
+            None
+        };
+
+        let expected = PROTOCOL_VERSION.to_string();
+        match stamp {
+            Some(found) if found == expected => Ok(()),
+            Some(found) => anyhow::bail!(
+                "incompatible store protocol version: found {found}, required {PROTOCOL_VERSION}; reset your development database (or migrate the store) before opening it with this binary"
+            ),
+            None if has_ankurah_tables => anyhow::bail!(
+                "store has existing ankurah tables but no protocol version stamp (pre-{PROTOCOL_VERSION} store); reset your development database (or migrate the store) before opening it with this binary"
+            ),
+            None => {
+                // Fresh store: claim the stamp, serializing concurrent first
+                // opens the same way collection DDL is serialized.
+                let lock_key = acquire_ddl_lock(&client, META_TABLE).await?;
+                let result = async {
+                    client
+                        .execute(&format!(r#"CREATE TABLE IF NOT EXISTS "{META_TABLE}" ("key" TEXT PRIMARY KEY, "value" TEXT)"#), &[])
+                        .await?;
+                    client
+                        .execute(
+                            &format!(
+                                r#"INSERT INTO "{META_TABLE}" ("key", "value") VALUES ('protocol_version', $1) ON CONFLICT ("key") DO NOTHING"#
+                            ),
+                            &[&expected],
+                        )
+                        .await?;
+                    // Re-read: if another process stamped between our scan and
+                    // our insert, the store must still match this binary.
+                    let stamped: String = client
+                        .query_one(&format!(r#"SELECT "value" FROM "{META_TABLE}" WHERE "key" = 'protocol_version'"#), &[])
+                        .await?
+                        .get(0);
+                    if stamped == expected {
+                        Ok(())
+                    } else {
+                        anyhow::bail!(
+                            "incompatible store protocol version: found {stamped}, required {PROTOCOL_VERSION}; reset your development database (or migrate the store) before opening it with this binary"
+                        )
+                    }
+                }
+                .await;
+                release_ddl_lock(&client, lock_key).await?;
+                result
+            }
+        }
     }
 }
 
@@ -173,7 +261,11 @@ impl StorageEngine for Postgres {
         "#;
 
         let rows = client.query(query, &[]).await.map_err(|err| MutationError::General(Box::new(err)))?;
-        if rows.is_empty() {
+        // The engine-level meta table is not a collection and keeps the
+        // protocol stamp across a wipe.
+        let tables: Vec<String> =
+            rows.iter().map(|row| row.get("table_name")).filter(|name: &String| name.as_str() != META_TABLE).collect();
+        if tables.is_empty() {
             return Ok(false);
         }
 
@@ -181,8 +273,7 @@ impl StorageEngine for Postgres {
         let transaction = client.transaction().await.map_err(|err| MutationError::General(Box::new(err)))?;
 
         // Drop each table
-        for row in rows {
-            let table_name: String = row.get("table_name");
+        for table_name in tables {
             let drop_query = format!(r#"DROP TABLE IF EXISTS "{}""#, table_name);
             transaction.execute(&drop_query, &[]).await.map_err(|err| MutationError::General(Box::new(err)))?;
         }
@@ -191,6 +282,30 @@ impl StorageEngine for Postgres {
         transaction.commit().await.map_err(|err| MutationError::General(Box::new(err)))?;
 
         Ok(true)
+    }
+
+    /// Non-creating collection discovery. The
+    /// trait default returns nothing, which would make a durable node warm an
+    /// empty catalog on restart. A collection's state table is named exactly
+    /// its id, paired with an `{id}_event` companion; the engine-wide
+    /// `_ankurah_postgres_column_map` map and the engine-level `ankurah_meta`
+    /// stamp table are the only others. So a table is a collection iff its
+    /// `{name}_event` companion also exists. Creates nothing.
+    async fn list_collections(&self) -> Result<Vec<CollectionId>, RetrievalError> {
+        let client = self.pool.get().await.map_err(RetrievalError::storage)?;
+        let rows = client
+            .query("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'", &[])
+            .await
+            .map_err(RetrievalError::storage)?;
+        let names: Vec<String> = rows.iter().map(|row| row.get("table_name")).collect();
+        let table_set: std::collections::HashSet<String> = names.iter().cloned().collect();
+        let collections = names
+            .into_iter()
+            .filter(|name| name.as_str() != "_ankurah_postgres_column_map" && name.as_str() != META_TABLE)
+            .filter(|name| table_set.contains(&format!("{name}_event")))
+            .map(CollectionId::from)
+            .collect();
+        Ok(collections)
     }
 }
 

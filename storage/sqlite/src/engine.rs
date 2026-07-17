@@ -13,6 +13,7 @@ use ankurah_core::selection::filter::evaluate_predicate;
 use ankurah_core::storage::{naming, StorageCollection, StorageEngine};
 use ankurah_proto::{
     AttestationSet, Attested, Clock, CollectionId, EntityId, EntityState, Event, EventId, OperationSet, State, StateBuffers,
+    PROTOCOL_VERSION,
 };
 use async_trait::async_trait;
 use rusqlite::{params_from_iter, Connection};
@@ -26,6 +27,12 @@ use crate::value::SqliteValue;
 /// Default connection pool size
 pub const DEFAULT_POOL_SIZE: u32 = 10;
 
+/// Engine-level key/value metadata for the store itself (currently just the
+/// 'protocol_version' stamp). Not a collection: it survives
+/// `delete_all_collections`, because wiping the stamp would make the store
+/// read as pre-stamp and refuse its own reopen.
+const META_TABLE: &str = "ankurah_meta";
+
 /// SQLite storage engine
 pub struct SqliteStorageEngine {
     pool: bb8::Pool<SqliteConnectionManager>,
@@ -36,14 +43,22 @@ pub struct SqliteStorageEngine {
 }
 
 impl SqliteStorageEngine {
-    /// Create a new storage engine with an existing pool
-    pub fn new(pool: bb8::Pool<SqliteConnectionManager>) -> Self { Self { pool, resolver: Arc::new(std::sync::RwLock::new(None)) } }
+    /// Create a new storage engine with an existing pool.
+    ///
+    /// Stamps/checks the store's protocol version (see
+    /// [`Self::verify_protocol_stamp`]) so every construction path verifies
+    /// the store it is about to serve.
+    pub async fn new(pool: bb8::Pool<SqliteConnectionManager>) -> anyhow::Result<Self> {
+        let engine = Self { pool, resolver: Arc::new(std::sync::RwLock::new(None)) };
+        engine.verify_protocol_stamp().await?;
+        Ok(engine)
+    }
 
     /// Open a file-based SQLite database
     pub async fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let manager = SqliteConnectionManager::file(path.as_ref());
         let pool = bb8::Pool::builder().max_size(DEFAULT_POOL_SIZE).build(manager).await?;
-        Ok(Self::new(pool))
+        Self::new(pool).await
     }
 
     /// Open an in-memory SQLite database (for testing)
@@ -51,7 +66,7 @@ impl SqliteStorageEngine {
         let manager = SqliteConnectionManager::memory();
         // For in-memory, we use a single connection to keep the database alive
         let pool = bb8::Pool::builder().max_size(1).build(manager).await?;
-        Ok(Self::new(pool))
+        Self::new(pool).await
     }
 
     /// Check if a collection name is valid
@@ -68,6 +83,65 @@ impl SqliteStorageEngine {
 
     /// Get a reference to the connection pool (for testing/diagnostics)
     pub fn pool(&self) -> &bb8::Pool<SqliteConnectionManager> { &self.pool }
+
+    /// Stamp or check the store's protocol version
+    /// ([`ankurah_proto::PROTOCOL_VERSION`]), run by every constructor:
+    ///
+    /// - fresh store (no stamp, no ankurah tables): write the stamp, proceed
+    /// - stamp present and equal: proceed
+    /// - stamp present and different: refuse, naming found and expected
+    /// - ankurah tables present but no stamp: refuse as a pre-stamp store
+    ///
+    /// Same spirit as the peering handshake's `protocol_compatible` refusal:
+    /// serving a store persisted by a different protocol version would
+    /// silently misread its shapes, so refuse loudly and advise a
+    /// development-database reset.
+    async fn verify_protocol_stamp(&self) -> Result<(), SqliteError> {
+        let conn = self.pool.get().await.map_err(|e| SqliteError::Pool(e.to_string()))?;
+        conn.with_connection(|c| {
+            let mut stmt = c.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")?;
+            let tables: Vec<String> = stmt.query_map([], |row| row.get(0))?.filter_map(|r| r.ok()).collect();
+            let has_ankurah_tables = tables.iter().any(|t| t != META_TABLE);
+
+            let stamp: Option<String> = if tables.iter().any(|t| t == META_TABLE) {
+                match c.query_row(&format!(r#"SELECT "value" FROM "{META_TABLE}" WHERE "key" = 'protocol_version'"#), [], |row| row.get(0))
+                {
+                    Ok(value) => Some(value),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                    Err(e) => return Err(SqliteError::Rusqlite(e)),
+                }
+            } else {
+                None
+            };
+
+            let expected = PROTOCOL_VERSION.to_string();
+            match stamp {
+                Some(found) if found == expected => Ok(()),
+                Some(found) => Err(SqliteError::ProtocolVersionMismatch { found, expected: PROTOCOL_VERSION }),
+                None if has_ankurah_tables => Err(SqliteError::UnstampedStore { expected: PROTOCOL_VERSION }),
+                None => {
+                    // Fresh store: claim the stamp.
+                    c.execute(&format!(r#"CREATE TABLE IF NOT EXISTS "{META_TABLE}" ("key" TEXT PRIMARY KEY, "value" TEXT)"#), [])?;
+                    c.execute(
+                        &format!(r#"INSERT OR IGNORE INTO "{META_TABLE}" ("key", "value") VALUES ('protocol_version', ?)"#),
+                        rusqlite::params![expected],
+                    )?;
+                    // Re-read: if another process stamped between our scan and
+                    // our insert, the store must still match this binary.
+                    let stamped: String =
+                        c.query_row(&format!(r#"SELECT "value" FROM "{META_TABLE}" WHERE "key" = 'protocol_version'"#), [], |row| {
+                            row.get(0)
+                        })?;
+                    if stamped == expected {
+                        Ok(())
+                    } else {
+                        Err(SqliteError::ProtocolVersionMismatch { found: stamped, expected: PROTOCOL_VERSION })
+                    }
+                }
+            }
+        })
+        .await
+    }
 }
 
 #[async_trait]
@@ -118,9 +192,11 @@ impl StorageEngine for SqliteStorageEngine {
         let conn = self.pool.get().await.map_err(|e| MutationError::General(Box::new(SqliteError::Pool(e.to_string()))))?;
 
         conn.with_connection(|c| {
-            // Get all table names
+            // Get all table names. The engine-level meta table is not a
+            // collection and keeps the protocol stamp across a wipe.
             let mut stmt = c.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")?;
-            let tables: Vec<String> = stmt.query_map([], |row| row.get(0))?.filter_map(|r| r.ok()).collect();
+            let tables: Vec<String> =
+                stmt.query_map([], |row| row.get(0))?.filter_map(|r| r.ok()).filter(|name: &String| name.as_str() != META_TABLE).collect();
 
             if tables.is_empty() {
                 return Ok(false);
@@ -134,6 +210,35 @@ impl StorageEngine for SqliteStorageEngine {
         })
         .await
         .map_err(|e| MutationError::General(Box::new(e)))
+    }
+
+    /// Non-creating collection discovery. The trait default returns nothing,
+    /// which would make a durable node warm an empty catalog on restart. A
+    /// collection's state table is named exactly its id
+    /// (`create_state_table`), paired with an `{id}_event` companion; the
+    /// engine-wide `_ankurah_sqlite_column_map`, the engine-level `ankurah_meta`
+    /// stamp table, and sqlite's own tables are the only others. So a table is
+    /// a collection iff its `{name}_event`
+    /// companion also exists -- which also disambiguates a user collection whose
+    /// id ends in `_event` from some other collection's event table. Unlike
+    /// `collection`, this creates nothing.
+    async fn list_collections(&self) -> Result<Vec<CollectionId>, RetrievalError> {
+        let conn = self.pool.get().await.map_err(|e| SqliteError::Pool(e.to_string()))?;
+        let collections = conn
+            .with_connection(|c| {
+                let mut stmt = c.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")?;
+                let names: Vec<String> = stmt.query_map([], |row| row.get(0))?.filter_map(|r| r.ok()).collect();
+                let table_set: std::collections::HashSet<String> = names.iter().cloned().collect();
+                let collections: Vec<CollectionId> = names
+                    .into_iter()
+                    .filter(|name| name.as_str() != "_ankurah_sqlite_column_map" && name.as_str() != META_TABLE)
+                    .filter(|name| table_set.contains(&format!("{name}_event")))
+                    .map(CollectionId::from)
+                    .collect();
+                Ok::<_, SqliteError>(collections)
+            })
+            .await?;
+        Ok(collections)
     }
 }
 
@@ -1011,6 +1116,30 @@ mod tests {
         let collection = engine.collection(&"test_collection".into()).await.unwrap();
         let all = ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None };
         assert!(collection.fetch_states(&all).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_collections_discovery() {
+        let engine = SqliteStorageEngine::open_in_memory().await.unwrap();
+        // Non-creating: nothing exists yet.
+        assert!(engine.list_collections().await.unwrap().is_empty());
+
+        // Opening a collection creates its state + `{id}_event` tables (and the
+        // engine-wide column-map table on first touch).
+        engine.collection(&"users".into()).await.unwrap();
+        engine.collection(&"_ankurah_model".into()).await.unwrap();
+        // A user collection whose id ends in `_event` must still be discovered
+        // (its `{id}_event` companion exists) and not be mistaken for another
+        // collection's event table.
+        engine.collection(&"click_event".into()).await.unwrap();
+
+        let mut found: Vec<String> = engine.list_collections().await.unwrap().into_iter().map(|c| c.as_str().to_string()).collect();
+        found.sort();
+        assert_eq!(found, vec!["_ankurah_model".to_string(), "click_event".to_string(), "users".to_string()]);
+        // The internal column-map table and event companions are never listed.
+        for internal in ["_ankurah_sqlite_column_map", "users_event", "_ankurah_model_event", "click_event_event"] {
+            assert!(!found.iter().any(|c| c == internal), "{internal} must not be listed as a collection");
+        }
     }
 
     #[tokio::test]
