@@ -9,7 +9,7 @@
 //! reference whose property is absent on a given entity evaluates as NULL in
 //! predicates and policy.
 //!
-//! Wired in the protocol v3 epoch at the four query ORIGIN sites --
+//! Wired in the version 1 (0.10.0) protocol epoch at the four query ORIGIN sites --
 //! context fetch, `EntityLiveQuery`, and the node-level local-fetch and
 //! remote-subscribe paths -- via [`CatalogManager::resolve_selection_deferred`];
 //! receivers pass already-resolved selections through (the pass is

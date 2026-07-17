@@ -70,7 +70,7 @@ impl Database {
         let mut connection = self.0.connection.lock().await;
 
         // A database from before the `meta` store existed carries no record at
-        // all: with ankurah data present that is a pre-v3 store (refuse before
+        // all: with ankurah data present that is a pre-versioning (0.9.x or older) store (refuse before
         // creating anything); an empty one gets the store via a versioned
         // upgrade and falls through to be recorded below.
         if !connection.db.object_store_names().contains("meta") {
@@ -91,7 +91,7 @@ impl Database {
             let found = request.result().require("protocol_version result")?;
 
             if found.is_undefined() || found.is_null() {
-                // No record. Existing ankurah data makes this a pre-v3 store;
+                // No record. Existing ankurah data makes this a pre-versioning (0.9.x or older) store;
                 // an empty database is recorded here and proceeds.
                 if has_ankurah_data(&db).await? {
                     return Err(self.protocol_version_error(None));
@@ -110,10 +110,10 @@ impl Database {
 
     /// The refusal for a protocol-version mismatch. `found` is the raw stored
     /// record; `None` means the database carries ankurah data but no record at
-    /// all (a store from before protocol v3).
+    /// all (a store from before protocol versioning).
     fn protocol_version_error(&self, found: Option<JsValue>) -> RetrievalError {
         let found = match found {
-            None => "no recorded protocol version (a store from before protocol v3)".to_string(),
+            None => "no recorded protocol version (a store from before protocol versioning)".to_string(),
             Some(value) => match value.as_f64() {
                 Some(version) => format!("protocol version {}", version),
                 None => format!("an unreadable protocol version record ({:?})", value),
