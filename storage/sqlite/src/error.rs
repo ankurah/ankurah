@@ -28,8 +28,8 @@ pub enum SqliteError {
     #[error("incompatible store protocol version: found {found}, required {expected}; reset your development database (or migrate the store) before opening it with this binary")]
     ProtocolVersionMismatch { found: String, expected: u32 },
 
-    #[error("store has existing ankurah tables but no protocol version stamp (pre-{expected} store); reset your development database (or migrate the store) before opening it with this binary")]
-    UnstampedStore { expected: u32 },
+    #[error("store has existing ankurah tables but no recorded protocol version (pre-{expected} store); reset your development database (or migrate the store) before opening it with this binary")]
+    UnversionedStore { expected: u32 },
 }
 
 impl From<SqliteError> for ankurah_core::error::RetrievalError {

@@ -28,9 +28,9 @@ use crate::value::SqliteValue;
 pub const DEFAULT_POOL_SIZE: u32 = 10;
 
 /// Engine-level key/value metadata for the store itself (currently just the
-/// 'protocol_version' stamp). Not a collection: it survives
-/// `delete_all_collections`, because wiping the stamp would make the store
-/// read as pre-stamp and refuse its own reopen.
+/// 'protocol_version' record). Not a collection: it survives
+/// `delete_all_collections`, because wiping the record would make the store
+/// read as unversioned and refuse its own reopen.
 const META_TABLE: &str = "ankurah_meta";
 
 /// SQLite storage engine
@@ -45,12 +45,12 @@ pub struct SqliteStorageEngine {
 impl SqliteStorageEngine {
     /// Create a new storage engine with an existing pool.
     ///
-    /// Stamps/checks the store's protocol version (see
-    /// [`Self::verify_protocol_stamp`]) so every construction path verifies
+    /// Records or checks the store's protocol version (see
+    /// [`Self::check_protocol_version`]) so every construction path verifies
     /// the store it is about to serve.
     pub async fn new(pool: bb8::Pool<SqliteConnectionManager>) -> anyhow::Result<Self> {
         let engine = Self { pool, resolver: Arc::new(std::sync::RwLock::new(None)) };
-        engine.verify_protocol_stamp().await?;
+        engine.check_protocol_version().await?;
         Ok(engine)
     }
 
@@ -84,26 +84,26 @@ impl SqliteStorageEngine {
     /// Get a reference to the connection pool (for testing/diagnostics)
     pub fn pool(&self) -> &bb8::Pool<SqliteConnectionManager> { &self.pool }
 
-    /// Stamp or check the store's protocol version
+    /// Record or check the store's protocol version
     /// ([`ankurah_proto::PROTOCOL_VERSION`]), run by every constructor:
     ///
-    /// - fresh store (no stamp, no ankurah tables): write the stamp, proceed
-    /// - stamp present and equal: proceed
-    /// - stamp present and different: refuse, naming found and expected
-    /// - ankurah tables present but no stamp: refuse as a pre-stamp store
+    /// - fresh store (no record, no ankurah tables): write the record, proceed
+    /// - record present and equal: proceed
+    /// - record present and different: refuse, naming found and expected
+    /// - ankurah tables present but no record: refuse as an unversioned store
     ///
     /// Same spirit as the peering handshake's `protocol_compatible` refusal:
     /// serving a store persisted by a different protocol version would
     /// silently misread its shapes, so refuse loudly and advise a
     /// development-database reset.
-    async fn verify_protocol_stamp(&self) -> Result<(), SqliteError> {
+    async fn check_protocol_version(&self) -> Result<(), SqliteError> {
         let conn = self.pool.get().await.map_err(|e| SqliteError::Pool(e.to_string()))?;
         conn.with_connection(|c| {
             let mut stmt = c.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")?;
             let tables: Vec<String> = stmt.query_map([], |row| row.get(0))?.filter_map(|r| r.ok()).collect();
             let has_ankurah_tables = tables.iter().any(|t| t != META_TABLE);
 
-            let stamp: Option<String> = if tables.iter().any(|t| t == META_TABLE) {
+            let recorded: Option<String> = if tables.iter().any(|t| t == META_TABLE) {
                 match c.query_row(&format!(r#"SELECT "value" FROM "{META_TABLE}" WHERE "key" = 'protocol_version'"#), [], |row| row.get(0))
                 {
                     Ok(value) => Some(value),
@@ -115,27 +115,27 @@ impl SqliteStorageEngine {
             };
 
             let expected = PROTOCOL_VERSION.to_string();
-            match stamp {
+            match recorded {
                 Some(found) if found == expected => Ok(()),
                 Some(found) => Err(SqliteError::ProtocolVersionMismatch { found, expected: PROTOCOL_VERSION }),
-                None if has_ankurah_tables => Err(SqliteError::UnstampedStore { expected: PROTOCOL_VERSION }),
+                None if has_ankurah_tables => Err(SqliteError::UnversionedStore { expected: PROTOCOL_VERSION }),
                 None => {
-                    // Fresh store: claim the stamp.
+                    // Fresh store: claim the record.
                     c.execute(&format!(r#"CREATE TABLE IF NOT EXISTS "{META_TABLE}" ("key" TEXT PRIMARY KEY, "value" TEXT)"#), [])?;
                     c.execute(
                         &format!(r#"INSERT OR IGNORE INTO "{META_TABLE}" ("key", "value") VALUES ('protocol_version', ?)"#),
                         rusqlite::params![expected],
                     )?;
-                    // Re-read: if another process stamped between our scan and
+                    // Re-read: if another process recorded between our scan and
                     // our insert, the store must still match this binary.
-                    let stamped: String =
+                    let reread: String =
                         c.query_row(&format!(r#"SELECT "value" FROM "{META_TABLE}" WHERE "key" = 'protocol_version'"#), [], |row| {
                             row.get(0)
                         })?;
-                    if stamped == expected {
+                    if reread == expected {
                         Ok(())
                     } else {
-                        Err(SqliteError::ProtocolVersionMismatch { found: stamped, expected: PROTOCOL_VERSION })
+                        Err(SqliteError::ProtocolVersionMismatch { found: reread, expected: PROTOCOL_VERSION })
                     }
                 }
             }
@@ -193,7 +193,7 @@ impl StorageEngine for SqliteStorageEngine {
 
         conn.with_connection(|c| {
             // Get all table names. The engine-level meta table is not a
-            // collection and keeps the protocol stamp across a wipe.
+            // collection and keeps the protocol version record across a wipe.
             let mut stmt = c.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")?;
             let tables: Vec<String> =
                 stmt.query_map([], |row| row.get(0))?.filter_map(|r| r.ok()).filter(|name: &String| name.as_str() != META_TABLE).collect();
@@ -217,7 +217,7 @@ impl StorageEngine for SqliteStorageEngine {
     /// collection's state table is named exactly its id
     /// (`create_state_table`), paired with an `{id}_event` companion; the
     /// engine-wide `_ankurah_sqlite_column_map`, the engine-level `ankurah_meta`
-    /// stamp table, and sqlite's own tables are the only others. So a table is
+    /// version table, and sqlite's own tables are the only others. So a table is
     /// a collection iff its `{name}_event`
     /// companion also exists -- which also disambiguates a user collection whose
     /// id ends in `_event` from some other collection's event table. Unlike
@@ -603,7 +603,7 @@ impl SqliteBucket {
         ))
     }
 
-    /// The model id stamped on envelopes this bucket reconstructs (#330):
+    /// The model id written on envelopes this bucket reconstructs (#330):
     /// well-knowns, then the injected catalog resolver.
     fn model_id(&self) -> Result<ankurah_proto::EntityId, RetrievalError> {
         let resolver = self.resolver.read().expect("RwLock poisoned").as_ref().and_then(|weak| weak.upgrade());

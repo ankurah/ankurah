@@ -103,7 +103,7 @@ async fn generate_creation_batch(n: usize, model: proto::EntityId) -> Result<Vec
         trx.create(&Album { name: format!("PgBatch {i}"), year: format!("20{i:02}") }).await?;
     }
     let events = trx.commit_and_return_events().await?;
-    // Restamp with the target node's model id (#330); see scenarios.rs.
+    // Rewrite the model id to the target node's (#330); see scenarios.rs.
     Ok(events
         .into_iter()
         .map(|mut event| {

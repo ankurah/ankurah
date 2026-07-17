@@ -45,7 +45,7 @@ pub fn entity_id(counter: u64) -> proto::EntityId {
 /// The `SimRecord` collection id.
 pub fn sim_collection() -> proto::CollectionId { SimRecord::collection() }
 
-/// The model-definition id the sim stamps on every forged `SimRecord` event,
+/// The model-definition id the sim writes on every forged `SimRecord` event,
 /// state, and subscription-update item (#330). The harness forges wire
 /// envelopes that bypass schema registration/relay, so ingress `resolve_model`
 /// would reject an unknown id; [`super::node::build_nodes`] seeds this exact id

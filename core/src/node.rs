@@ -202,14 +202,14 @@ where
     /// names to stable `PropertyId`s while backends continue to operate on
     /// `PropertyId` alone. System and metadata-catalog entities are the
     /// bootstrap exemption and remain name-addressed without a resolver.
-    pub(crate) fn stamp_resolver(&self, entity: &Entity) {
+    pub(crate) fn bind_resolver(&self, entity: &Entity) {
         let collection = entity.collection();
         // System + catalog collections are name-keyed (the bootstrap
-        // exemption): they need no resolver, and stamping one would be inert.
+        // exemption): they need no resolver, and binding one would be inert.
         if collection.as_str() == crate::system::SYSTEM_COLLECTION_ID || crate::schema::is_catalog_collection(collection) {
             return;
         }
-        // Stamp the live catalog resolver so the entity's sync read path can
+        // Bind the live catalog resolver so the entity's sync read path can
         // resolve display names to `PropertyId`s (replacing the old id-keyed
         // backend binding flip). The backend stays dumb; identity is carried
         // by the `PropertyId` alone.
@@ -279,13 +279,13 @@ where
         // (canonical value_type collation).
         node.reactor.set_catalog_resolver(node.catalog.resolver_weak());
         // Assembly-time choke point: every entity handed out by the entity
-        // set gets the catalog resolver stamped, so no assembly path can
+        // set gets the catalog resolver bound, so no assembly path can
         // forget it and the sync read path can always resolve names to ids.
         node.entities.set_bind_hook(Box::new({
             let weak = node.weak();
             move |entity| {
                 if let Some(node) = weak.upgrade() {
-                    node.stamp_resolver(entity);
+                    node.bind_resolver(entity);
                 }
             }
         }));

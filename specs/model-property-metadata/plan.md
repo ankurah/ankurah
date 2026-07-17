@@ -710,7 +710,7 @@ model <-> table map half deferred with #304.
     history at commit. Reads use MAP-LEVEL presence: an `Id` entry present, even
     a cleared `None` tombstone, is authoritative and never falls back to a stale
     `Name` value; only an absent id consults the bare `Name` residue. The
-    catalog-blind `Entity` carries a stamped `Weak<dyn CatalogResolver>` (the
+    catalog-blind `Entity` carries a bound `Weak<dyn CatalogResolver>` (the
     live catalog) for the sync read path, replacing the old `Node::bind_entity`
     backend flip. INVARIANT: writes are always id-keyed for a registered user
     collection; a `Name` key is emitted only for system and catalog collections
@@ -775,7 +775,7 @@ model <-> table map half deferred with #304.
     address `PropertyId::System { name }` identities, resolved like any
     other reference.
     Table creation and column creation timing are UNCHANGED (tables on
-    first need, columns on first write). Envelope stamping is LAZY: model
+    first need, columns on first write). Envelope model ids are LAZY: model
     id resolution is checked on the first hydrated row, never up front, so
     an empty scan on a cold catalog returns empty instead of erroring (the
     ephemeral known_matches pre-fetch against a never-stored collection),
@@ -823,7 +823,7 @@ model <-> table map half deferred with #304.
     generation before deleting storage, then clears reactor/catalog state
     before a replacement warm may start; queued old traffic is rejected
     without depending on unsubscribe ordering.
-    Storage engines stamp reconstructed envelopes via a shared
+    Storage engines write model ids on reconstructed envelopes via a shared
     bucket_model_id helper (well-knowns -> resolver -> loud retrieval
     error). Two policy-surface changes, both forced by the same fact (raw
     state is now id-keyed, so hooks must receive what they need to

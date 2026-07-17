@@ -61,11 +61,11 @@ async fn generate_creation_batch(n: usize, model: proto::EntityId) -> Result<Vec
         trx.create(&Album { name: format!("Batch {i}"), year: format!("20{i:02}") }).await?;
     }
     let events = trx.commit_and_return_events().await?;
-    // Restamp with the TARGET node's model id (#330): in production a sender's
+    // Rewrite the model id to the TARGET node's (#330): in production a sender's
     // binding comes from the target-system allocator (registration), so its
     // events carry an id the target resolves; the throwaway helper node
     // allocates independently. EventId excludes the model, so event ids and
-    // parent clocks are unchanged by the restamp.
+    // parent clocks are unchanged by the rewrite.
     Ok(events
         .into_iter()
         .map(|mut event| {
@@ -201,7 +201,7 @@ async fn scenario_2_mid_batch() -> Result<()> {
     assert_eq!(events.len(), S2_BATCH, "expected all batch events recorded");
 
     // Reopen and verify partial-batch durability against the invariant. The
-    // bare engine (no node) needs a model id to stamp reconstructed state
+    // bare engine (no node) needs a model id to write on reconstructed state
     // envelopes (#330); wire the one the child allocated.
     let engine = reopen_sled(&dir)?;
     let _resolver =

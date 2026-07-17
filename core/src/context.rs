@@ -77,7 +77,7 @@ pub trait TContext {
 impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> TContext for NodeAndContext<SE, PA> {
     fn node_id(&self) -> proto::EntityId { self.node.id }
     fn create_entity(&self, collection: proto::CollectionId, trx_alive: Arc<AtomicBool>) -> Entity {
-        // WeakEntitySet::create stamps the PRIMARY with the live catalog
+        // WeakEntitySet::create binds the PRIMARY to the live catalog
         // resolver before this snapshot, so the transaction fork inherits it.
         let primary_entity = self.node.entities.create(collection);
         primary_entity.snapshot(trx_alive)

@@ -1,6 +1,6 @@
-//! Protocol-version stamp semantics: a fresh store is stamped with
+//! Protocol-version record semantics: a fresh store is marked with
 //! `ankurah_proto::PROTOCOL_VERSION` on engine construction and checked on
-//! every open; a store carrying a different (or missing) stamp refuses to
+//! every open; a store carrying a different (or missing) record refuses to
 //! open, advising a development-database reset.
 
 use ankurah_core::storage::StorageEngine;
@@ -27,10 +27,10 @@ async fn fresh_pool() -> Result<(ContainerAsync<postgres::Postgres>, bb8::Pool<P
 }
 
 #[tokio::test]
-async fn fresh_store_stamps_and_reopens() -> Result<()> {
+async fn fresh_store_records_version_and_reopens() -> Result<()> {
     let (_container, pool) = fresh_pool().await?;
 
-    // A fresh store is stamped at engine construction.
+    // A fresh store records the version at engine construction.
     let engine = Postgres::new(pool.clone()).await?;
     {
         let client = pool.get().await?;
@@ -38,11 +38,11 @@ async fn fresh_store_stamps_and_reopens() -> Result<()> {
         assert_eq!(value, PROTOCOL_VERSION.to_string());
     }
 
-    // Reopening a store with the matching stamp proceeds, with or without data.
+    // Reopening a store with the matching record proceeds, with or without data.
     engine.collection(&"albums".into()).await?;
     let reopened = Postgres::new(pool.clone()).await?;
 
-    // A collection wipe preserves the stamp: the meta table is not a
+    // A collection wipe preserves the record: the meta table is not a
     // collection, and the wiped store still reopens.
     assert!(reopened.delete_all_collections().await?, "wiping existing collections reports true");
     assert!(!reopened.delete_all_collections().await?, "nothing left to wipe reports false");
@@ -51,32 +51,32 @@ async fn fresh_store_stamps_and_reopens() -> Result<()> {
 }
 
 #[tokio::test]
-async fn mismatched_or_missing_stamp_refuses() -> Result<()> {
+async fn mismatched_or_missing_version_refuses() -> Result<()> {
     let (_container, pool) = fresh_pool().await?;
 
-    // Stamp the store and give it some data.
+    // Record the version and give the store some data.
     let engine = Postgres::new(pool.clone()).await?;
     engine.collection(&"albums".into()).await?;
 
-    // Restamp the store with a different version out of band.
+    // Rewrite the stored version out of band.
     {
         let client = pool.get().await?;
         client.execute(r#"UPDATE "ankurah_meta" SET "value" = '999' WHERE "key" = 'protocol_version'"#, &[]).await?;
     }
     let err = match Postgres::new(pool.clone()).await {
-        Ok(_) => panic!("expected the mismatched stamp to refuse the open"),
+        Ok(_) => panic!("expected the mismatched version to refuse the open"),
         Err(e) => e.to_string(),
     };
     assert!(err.contains("999") && err.contains(&PROTOCOL_VERSION.to_string()), "refusal must name the found and expected versions: {err}");
 
-    // Remove the stamp while ankurah tables remain: the store now reads as a
-    // pre-stamp store.
+    // Remove the record while ankurah tables remain: the store now reads as an
+    // unversioned store.
     {
         let client = pool.get().await?;
         client.execute(r#"DROP TABLE "ankurah_meta""#, &[]).await?;
     }
     let err = match Postgres::new(pool).await {
-        Ok(_) => panic!("expected the unstamped store with existing data to refuse the open"),
+        Ok(_) => panic!("expected the unversioned store with existing data to refuse the open"),
         Err(e) => e.to_string(),
     };
     assert!(err.contains(&PROTOCOL_VERSION.to_string()), "refusal must name the expected version: {err}");

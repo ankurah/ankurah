@@ -1033,7 +1033,7 @@ where
     /// bindings disagree, and otherwise consult the current display-name map.
     pub fn resolve(&self, collection: &str, name: &str) -> Option<EntityId> { self.0.resolve_property(collection, name) }
 
-    /// A weak handle to this catalog as a name-to-id resolver, stamped onto
+    /// A weak handle to this catalog as a name-to-id resolver, bound onto
     /// entities at assembly for the sync read path. Replaces the old
     /// per-collection `SchemaBinding` push: identity is carried by the
     /// [`ankql::ast::PropertyId`] itself, not by a binding injected into a
@@ -1077,7 +1077,7 @@ where
     }
 
     /// EGRESS resolution for the wire envelope (#330): the model-definition
-    /// id stamped on events/states for `collection`. Well-knowns first, then
+    /// id carried on events/states for `collection`. Well-knowns first, then
     /// the catalog map. `None` for an unregistered user collection -- the
     /// commit path runs registration before event generation, so a miss
     /// there is a bug, not a race.

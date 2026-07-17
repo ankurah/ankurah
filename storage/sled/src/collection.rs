@@ -102,7 +102,7 @@ impl StorageCollection for SledStorageCollection {
 }
 
 impl SledStorageCollectionInner {
-    /// The model id stamped on envelopes this bucket reconstructs (#330):
+    /// The model id written on envelopes this bucket reconstructs (#330):
     /// well-knowns, then the injected catalog resolver.
     fn model_id(&self) -> Result<EntityId, ankurah_core::error::RetrievalError> {
         let resolver = self.resolver.read().unwrap().as_ref().and_then(|weak| weak.upgrade());

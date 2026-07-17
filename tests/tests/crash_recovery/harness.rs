@@ -212,7 +212,7 @@ impl<E: StorageEngine + CrashFlushable + 'static> StorageEngine for CrashStorage
     async fn delete_all_collections(&self) -> Result<bool, MutationError> { self.inner.delete_all_collections().await }
 
     // A wrapper must FORWARD the resolver injection: the trait default is a
-    // no-op, and swallowing it leaves the inner engine unable to stamp model
+    // no-op, and swallowing it leaves the inner engine unable to write model
     // ids on reconstructed envelopes (#330) or name columns from the catalog.
     fn set_catalog_resolver(&self, resolver: std::sync::Weak<dyn ankurah::core::schema::CatalogResolver>) {
         self.inner.set_catalog_resolver(resolver);
@@ -426,7 +426,7 @@ pub fn reopen_sled(dir: &Path) -> Result<SledStorageEngine> { SledStorageEngine:
 
 /// Minimal [`CatalogResolver`] for bare-engine (node-less) recovery probes:
 /// the parent reads persisted states straight off the reopened engine, and the
-/// bucket needs a model id to stamp reconstructed envelopes (#330). Maps
+/// bucket needs a model id to write on reconstructed envelopes (#330). Maps
 /// exactly the one collection under test to the model id the child allocated
 /// (recorded in the handoff); property naming is irrelevant to these probes.
 struct HandoffModelResolver {

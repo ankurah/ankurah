@@ -15,7 +15,7 @@ use web_sys::{window, IdbDatabase, IdbFactory, IdbOpenDbRequest, IdbVersionChang
 
 use crate::util::{cb_future::CBFuture, cb_race::CBRace, require::WBGRequire};
 
-/// Key of the storage protocol epoch stamp in the `meta` object store.
+/// Key of the storage protocol epoch record in the `meta` object store.
 const PROTOCOL_VERSION_KEY: &str = "protocol_version";
 
 #[derive(Debug, Clone)]
@@ -54,25 +54,25 @@ impl Database {
         Ok(database)
     }
 
-    /// Check the storage protocol epoch stamp (`meta` store, key
+    /// Check the storage protocol epoch record (`meta` store, key
     /// `protocol_version`) against [`PROTOCOL_VERSION`], once per open:
-    /// - no stamp and no existing ankurah data: write the stamp and proceed
-    ///   (a fresh database created by [`Connection::open`] was already stamped
+    /// - no record and no existing ankurah data: write the record and proceed
+    ///   (a fresh database created by [`Connection::open`] was already recorded
     ///   inside its creation upgrade; this covers databases whose creation was
-    ///   interrupted before the stamp landed);
-    /// - stamp present and equal: proceed;
-    /// - stamp present and different: refuse;
-    /// - existing ankurah data but no stamp: refuse (a store from before the
-    ///   stamp existed).
+    ///   interrupted before the record landed);
+    /// - record present and equal: proceed;
+    /// - record present and different: refuse;
+    /// - existing ankurah data but no record: refuse (a store from before the
+    ///   record existed).
     ///
     /// The refusal paths write nothing.
     async fn check_protocol_version(&self) -> Result<(), RetrievalError> {
         let mut connection = self.0.connection.lock().await;
 
-        // A database from before the `meta` store existed carries no stamp at
+        // A database from before the `meta` store existed carries no record at
         // all: with ankurah data present that is a pre-v3 store (refuse before
         // creating anything); an empty one gets the store via a versioned
-        // upgrade and falls through to be stamped below.
+        // upgrade and falls through to be recorded below.
         if !connection.db.object_store_names().contains("meta") {
             if has_ankurah_data(&connection.db).await? {
                 return Err(self.protocol_version_error(None));
@@ -91,12 +91,12 @@ impl Database {
             let found = request.result().require("protocol_version result")?;
 
             if found.is_undefined() || found.is_null() {
-                // No stamp. Existing ankurah data makes this a pre-v3 store;
-                // an empty database is stamped here and proceeds.
+                // No record. Existing ankurah data makes this a pre-v3 store;
+                // an empty database is recorded here and proceeds.
                 if has_ankurah_data(&db).await? {
                     return Err(self.protocol_version_error(None));
                 }
-                write_protocol_stamp(&db).await?;
+                write_protocol_version(&db).await?;
                 return Ok(());
             }
 
@@ -109,14 +109,14 @@ impl Database {
     }
 
     /// The refusal for a protocol-version mismatch. `found` is the raw stored
-    /// stamp; `None` means the database carries ankurah data but no stamp at
+    /// record; `None` means the database carries ankurah data but no record at
     /// all (a store from before protocol v3).
     fn protocol_version_error(&self, found: Option<JsValue>) -> RetrievalError {
         let found = match found {
-            None => "no protocol version stamp (a store from before protocol v3)".to_string(),
+            None => "no recorded protocol version (a store from before protocol v3)".to_string(),
             Some(value) => match value.as_f64() {
                 Some(version) => format!("protocol version {}", version),
-                None => format!("an unreadable protocol version stamp ({:?})", value),
+                None => format!("an unreadable protocol version record ({:?})", value),
             },
         };
         RetrievalError::StorageError(
@@ -195,7 +195,7 @@ impl Database {
 
 /// Whether any ankurah object store (beyond `meta`) already holds content:
 /// the engine-natural detection of an existing database, distinguishing a
-/// fresh store (stamp and proceed) from one predating the protocol stamp
+/// fresh store (record and proceed) from one predating the version record
 /// (refuse).
 async fn has_ankurah_data(db: &IdbDatabase) -> Result<bool, RetrievalError> {
     let db = SendWrapper::new(db);
@@ -217,10 +217,10 @@ async fn has_ankurah_data(db: &IdbDatabase) -> Result<bool, RetrievalError> {
     .await
 }
 
-/// Write the [`PROTOCOL_VERSION`] stamp into the `meta` store. Only ever
-/// called on a database with no stamp and no ankurah data; fresh databases
-/// are stamped inside their creation upgrade transaction instead.
-async fn write_protocol_stamp(db: &IdbDatabase) -> Result<(), RetrievalError> {
+/// Write the [`PROTOCOL_VERSION`] record into the `meta` store. Only ever
+/// called on a database with no record and no ankurah data; fresh databases
+/// are recorded inside their creation upgrade transaction instead.
+async fn write_protocol_version(db: &IdbDatabase) -> Result<(), RetrievalError> {
     let db = SendWrapper::new(db);
     SendWrapper::new(async move {
         let transaction =
@@ -228,7 +228,7 @@ async fn write_protocol_stamp(db: &IdbDatabase) -> Result<(), RetrievalError> {
         let store = transaction.object_store("meta").require("get meta store")?;
         let request = store
             .put_with_key(&JsValue::from(PROTOCOL_VERSION), &JsValue::from_str(PROTOCOL_VERSION_KEY))
-            .require("stamp protocol_version")?;
+            .require("record protocol_version")?;
         CBFuture::new(&request, "success", "error").await.require("await protocol_version put")?;
         CBFuture::new(&transaction, "complete", "error").await.require("complete meta write transaction")?;
         Ok(())
@@ -284,15 +284,15 @@ impl Connection {
                 // for pre-existing databases.
                 db.create_object_store("property_columns").require("create property_columns store")?;
 
-                // Storage protocol epoch stamp: `meta` carries
+                // Storage protocol epoch record: `meta` carries
                 // `protocol_version` = PROTOCOL_VERSION, written inside the
-                // creation upgrade transaction so a fresh database is stamped
-                // atomically with its stores; `Database::open` checks the stamp
+                // creation upgrade transaction so a fresh database is recorded
+                // atomically with its stores; `Database::open` checks the record
                 // on every open.
                 let meta_store = db.create_object_store("meta").require("create meta store")?;
                 meta_store
                     .put_with_key(&JsValue::from(PROTOCOL_VERSION), &JsValue::from_str(PROTOCOL_VERSION_KEY))
-                    .require("stamp protocol_version")?;
+                    .require("record protocol_version")?;
             }
             Ok(())
         })
@@ -302,8 +302,8 @@ impl Connection {
     /// Open the database at a bumped version, creating the (empty) `meta`
     /// store: the upgrade path for a database created before the store
     /// existed. Only reachable when the database holds no ankurah data -- a
-    /// data-bearing store without a stamp is refused before this runs -- and
-    /// the caller stamps `meta` right after.
+    /// data-bearing store without a record is refused before this runs -- and
+    /// the caller records the version right after.
     pub async fn open_with_meta_store(db_name: &str, version: u32) -> Result<Self, RetrievalError> {
         notice_info!("creating meta store for {db_name}");
         Self::new(db_name, Some(version), move |event: IdbVersionChangeEvent| -> Result<(), RetrievalError> {

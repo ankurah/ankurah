@@ -131,7 +131,7 @@ v3.
 - [x] Read fallback mechanics: 0xA1 and pre-0.9 buffers decode to Name
       keys; an absent resolved Id may read that legacy Name residue; the
       next save emits the current 0xA2 tagged form.
-- [x] Integration flip: Node assembly stamps a live catalog resolver;
+- [x] Integration flip: Node assembly binds a live catalog resolver;
       commit resolves ordinary staged LWW Name keys to Id and canonicalizes
       both those and already-Id explicit bindings; Yrs resolves ordinary roots
       at edit time and uses literal ids for explicit bindings. Registered user

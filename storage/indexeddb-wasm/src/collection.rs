@@ -444,7 +444,7 @@ impl StorageCollection for IndexedDBBucket {
 // }
 
 impl IndexedDBBucket {
-    /// The model id stamped on envelopes this bucket reconstructs (#330):
+    /// The model id written on envelopes this bucket reconstructs (#330):
     /// well-knowns, then the injected catalog resolver.
     fn model_id(&self) -> Result<ankurah_proto::EntityId, RetrievalError> {
         let resolver = self.resolver.read().expect("RwLock poisoned").as_ref().and_then(|weak| weak.upgrade());
@@ -452,7 +452,7 @@ impl IndexedDBBucket {
     }
 
     /// [`Self::model_id`] as a clonable outcome for the scan loop, which
-    /// checks it only when a row actually needs stamping: a scan that matches
+    /// checks it only when a row actually needs its model id: a scan that matches
     /// nothing must not fail for want of a model id (cold catalog, e.g. a
     /// fetch over persisted rows whose post-filter rejects every one).
     /// Mirrors sled's `model_id_lazy`.
@@ -730,7 +730,7 @@ impl IndexedDBBucket {
         columns: std::sync::Arc<BTreeMap<PropertyId, String>>,
     ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         // The model-id resolution OUTCOME, captured up front and checked only
-        // when a row actually needs stamping (mirrors sled's model_id_lazy):
+        // when a row actually needs its model id (mirrors sled's model_id_lazy):
         // a fetch over persisted rows whose post-filter rejects every one must
         // return empty on a cold catalog, not a model-resolution error.
         let model = self.model_id_lazy();
@@ -771,8 +771,8 @@ impl IndexedDBBucket {
                 .map_err(|e| RetrievalError::StorageError(format!("Predicate evaluation failed: {}", e).into()))?
             {
                 // This row matched, so its envelope needs the model id NOW: an
-                // unresolved model is only an error once there is something to
-                // stamp. (The loud check lives here because the hydration
+                // unresolved model is only an error once there is an envelope to
+                // fill in. (The loud check lives here because the hydration
                 // calls below swallow per-row errors.)
                 if let Err(e) = &record.model {
                     return Err(RetrievalError::Other(e.clone()));
@@ -836,9 +836,9 @@ struct IdbRecord {
     id: ankurah_proto::EntityId,
     object: Object,
     collection_id: ankurah_proto::CollectionId,
-    /// The model-id resolution OUTCOME stamped on reconstructed envelopes
+    /// The model-id resolution OUTCOME written on reconstructed envelopes
     /// (#330), captured by the bucket at scan construction and checked only
-    /// when a row actually needs stamping (mirrors sled's model_id_lazy): an
+    /// when a row actually needs its model id (mirrors sled's model_id_lazy): an
     /// empty result set never demands a model id.
     model: Result<ankurah_proto::EntityId, String>,
     /// This collection's durable identity-to-field map (snapshot), the sole
@@ -860,7 +860,7 @@ impl IdbRecord {
     }
 
     /// Get the entity state (converts from JS object on demand). This row is
-    /// being stamped, so an unresolved model id is an error here.
+    /// having its envelope built, so an unresolved model id is an error here.
     fn entity_state(&self) -> Result<Attested<EntityState>, RetrievalError> {
         let model = self.model.clone().map_err(RetrievalError::Other)?;
         js_object_to_entity_state(&self.object, model)
@@ -906,7 +906,7 @@ impl ankurah_storage_common::filtering::HasEntityId for IdbRecord {
 }
 
 /// Convert JS object to EntityState using the correct field extraction.
-/// `model` is the model id stamped on the reconstructed envelope (#330).
+/// `model` is the model id written on the reconstructed envelope (#330).
 fn js_object_to_entity_state(entity_obj: &Object, model: ankurah_proto::EntityId) -> Result<Attested<EntityState>, RetrievalError> {
     use crate::statics::{ATTESTATIONS_KEY, HEAD_KEY, ID_KEY, STATE_BUFFER_KEY};
     use ankurah_proto::{Attested, EntityId, EntityState, State};

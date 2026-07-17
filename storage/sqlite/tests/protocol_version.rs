@@ -1,6 +1,6 @@
-//! Protocol-version stamp semantics: a fresh store is stamped with
+//! Protocol-version record semantics: a fresh store is marked with
 //! `ankurah_proto::PROTOCOL_VERSION` on engine construction and checked on
-//! every open; a store carrying a different (or missing) stamp refuses to
+//! every open; a store carrying a different (or missing) record refuses to
 //! open, advising a development-database reset.
 
 use ankurah_core::storage::StorageEngine;
@@ -14,7 +14,7 @@ impl TempDb {
     fn new(name: &str) -> Self {
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("clock before epoch").as_nanos();
         let mut path = std::env::temp_dir();
-        path.push(format!("ankurah_sqlite_stamp_{name}_{}_{nanos}.db", std::process::id()));
+        path.push(format!("ankurah_sqlite_version_{name}_{}_{nanos}.db", std::process::id()));
         Self(path)
     }
 
@@ -26,16 +26,16 @@ impl Drop for TempDb {
 }
 
 #[tokio::test]
-async fn fresh_store_stamps_and_reopens() -> anyhow::Result<()> {
+async fn fresh_store_records_version_and_reopens() -> anyhow::Result<()> {
     let db = TempDb::new("fresh");
 
-    // A fresh store is stamped at engine construction.
+    // A fresh store records the version at engine construction.
     {
         let engine = SqliteStorageEngine::open(db.path()).await?;
         engine.collection(&"albums".into()).await?;
     }
 
-    // The stamp carries the running protocol version.
+    // The record carries the running protocol version.
     {
         let conn = rusqlite::Connection::open(db.path())?;
         let value: String =
@@ -43,26 +43,26 @@ async fn fresh_store_stamps_and_reopens() -> anyhow::Result<()> {
         assert_eq!(value, PROTOCOL_VERSION.to_string());
     }
 
-    // Reopening a store with the matching stamp proceeds.
+    // Reopening a store with the matching record proceeds.
     let _engine = SqliteStorageEngine::open(db.path()).await?;
     Ok(())
 }
 
 #[tokio::test]
-async fn mismatched_stamp_refuses() -> anyhow::Result<()> {
+async fn mismatched_version_refuses() -> anyhow::Result<()> {
     let db = TempDb::new("mismatch");
     {
         let _engine = SqliteStorageEngine::open(db.path()).await?;
     }
 
-    // Restamp the store with a different version out of band.
+    // Rewrite the stored version out of band.
     {
         let conn = rusqlite::Connection::open(db.path())?;
         conn.execute(r#"UPDATE "ankurah_meta" SET "value" = '999' WHERE "key" = 'protocol_version'"#, [])?;
     }
 
     let err = match SqliteStorageEngine::open(db.path()).await {
-        Ok(_) => panic!("expected the mismatched stamp to refuse the open"),
+        Ok(_) => panic!("expected the mismatched version to refuse the open"),
         Err(e) => e.to_string(),
     };
     assert!(err.contains("999") && err.contains(&PROTOCOL_VERSION.to_string()), "refusal must name the found and expected versions: {err}");
@@ -70,22 +70,22 @@ async fn mismatched_stamp_refuses() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn unstamped_store_with_data_refuses() -> anyhow::Result<()> {
-    let db = TempDb::new("unstamped");
+async fn unversioned_store_with_data_refuses() -> anyhow::Result<()> {
+    let db = TempDb::new("unversioned");
     {
         let engine = SqliteStorageEngine::open(db.path()).await?;
         engine.collection(&"albums".into()).await?;
     }
 
-    // Remove the stamp while ankurah tables remain: the store now reads as a
-    // pre-stamp store.
+    // Remove the record while ankurah tables remain: the store now reads as an
+    // unversioned store.
     {
         let conn = rusqlite::Connection::open(db.path())?;
         conn.execute(r#"DROP TABLE "ankurah_meta""#, [])?;
     }
 
     let err = match SqliteStorageEngine::open(db.path()).await {
-        Ok(_) => panic!("expected the unstamped store with existing data to refuse the open"),
+        Ok(_) => panic!("expected the unversioned store with existing data to refuse the open"),
         Err(e) => e.to_string(),
     };
     assert!(err.contains(&PROTOCOL_VERSION.to_string()), "refusal must name the expected version: {err}");
@@ -93,7 +93,7 @@ async fn unstamped_store_with_data_refuses() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn collection_wipe_preserves_the_stamp() -> anyhow::Result<()> {
+async fn collection_wipe_preserves_the_version_record() -> anyhow::Result<()> {
     let db = TempDb::new("wipe");
     {
         let engine = SqliteStorageEngine::open(db.path()).await?;
@@ -103,7 +103,7 @@ async fn collection_wipe_preserves_the_stamp() -> anyhow::Result<()> {
         assert!(!engine.delete_all_collections().await?, "nothing left to wipe reports false");
     }
 
-    // The wiped store keeps its stamp and reopens.
+    // The wiped store keeps its version record and reopens.
     let _engine = SqliteStorageEngine::open(db.path()).await?;
     Ok(())
 }

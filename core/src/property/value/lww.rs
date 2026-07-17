@@ -22,9 +22,9 @@ pub struct LWW<T: Property> {
     /// (`from_entity`) from the compiled `PropertyAddress`, via the entity's
     /// catalog resolver (rfc.md 5.5/5.6 in specs/model-property-metadata/rfc.md):
     /// an explicit `#[property(id = "...")]` binding's literal id, else the
-    /// catalog's id for `property_name`, else (no resolver stamped: a
+    /// catalog's id for `property_name`, else (no resolver bound: a
     /// system/bare/catalog entity) `property_name` itself as a
-    /// [`PropertyId::System`]. `None` only when a resolver IS stamped but does
+    /// [`PropertyId::System`]. `None` only when a resolver IS bound but does
     /// NOT know this name (an unbound field) -- `set`/`get` then surface
     /// `PropertyError::UnknownProperty`. The backend keys on this value alone
     /// and never resolves: this is the one and only resolution hop.

@@ -87,7 +87,7 @@ async fn server_rejects_create_for_existing() -> anyhow::Result<()> {
     // Try to send a create event for the same entity
     // Arguably this is a "collision" but collisions really should not happen
     let fake_create = proto::Event {
-        // #330: Album was registered by the create above, so stamp the real
+        // #330: Album was registered by the create above, so write the real
         // model id and let the duplicate-genesis guard (not model resolution)
         // reject it.
         model: server.catalog.model_id_for(Album::collection().as_str()).expect("Album registered by the create above"),

@@ -62,7 +62,7 @@ Serialized LWW state buffers begin with a one-byte version header. Versions
 are offset high (`0xA1` = version 1) because unversioned pre-0.9 buffers were
 raw bincode maps whose first byte is a small property count -- one byte
 therefore classifies any buffer with no parse-probing. Unversioned buffers
-load through a legacy fallback: their values are stamped with an all-zeros
+load through a legacy fallback: their values are marked with an all-zeros
 sentinel event id, which merge resolution treats as older-than-meet, so any
 later write to the property wins -- the same outcome true provenance would
 produce for pre-0.9's linear histories, and one every replica computes

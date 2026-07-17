@@ -8,7 +8,7 @@ use std::task::{Context, Poll};
 /// Sled-specific entity state lookup that hydrates EntityIds into full EntityStates
 pub struct SledEntityLookup<S> {
     pub entities_tree: sled::Tree,
-    /// The model id stamped on reconstructed envelopes (#330). The bucket
+    /// The model id written on reconstructed envelopes (#330). The bucket
     /// captures the resolution OUTCOME at stream construction and this
     /// lookup checks it only when a row actually hydrates, so an empty
     /// result set never demands a model id (a cold catalog must not fail a
@@ -55,7 +55,7 @@ impl<S: EntityIdStream> Stream for SledEntityLookup<S> {
         };
 
         // A row exists, so the envelope needs its model id NOW: an
-        // unresolved model is only an error once there is something to stamp.
+        // unresolved model is only an error once there is an envelope to fill in.
         let model = match &self.model {
             Ok(model) => *model,
             Err(e) => return Poll::Ready(Some(Err(ankurah_core::error::RetrievalError::Other(e.clone())))),
@@ -73,7 +73,7 @@ impl<S: EntityIdStream> Stream for SledEntityLookup<S> {
 /// Trait that provides a convenient `.entities()` combinator for EntityId streams
 pub trait SledEntityExt: EntityIdStream + Sized {
     /// Hydrate EntityIds into EntityStates using the sled entities tree.
-    /// `model` is the model-id resolution outcome stamped on reconstructed
+    /// `model` is the model-id resolution outcome written on reconstructed
     /// envelopes (#330), checked lazily on the first hydrated row.
     fn entities(self, entities_tree: &sled::Tree, model: Result<ankurah_proto::EntityId, String>) -> SledEntityLookup<Self> {
         SledEntityLookup::new(entities_tree, model, self)
@@ -85,7 +85,7 @@ pub trait SledEntityExtFromMats: ValueSetStream + Sized
 where Self::Item: HasEntityId + Filterable
 {
     /// Extract EntityIds and hydrate into EntityStates using the sled entities tree.
-    /// `model` is the model-id resolution outcome stamped on reconstructed
+    /// `model` is the model-id resolution outcome written on reconstructed
     /// envelopes (#330), checked lazily on the first hydrated row.
     fn entities(self, entities_tree: &sled::Tree, model: Result<ankurah_proto::EntityId, String>) -> SledEntityLookup<impl EntityIdStream> {
         let ids = self.extract_ids();

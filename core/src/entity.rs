@@ -79,7 +79,7 @@ pub struct EntityInner {
     pub(crate) kind: EntityKind,
     /// Broadcast for notifying Signal subscribers about entity changes
     pub(crate) broadcast: ankurah_signals::broadcast::Broadcast,
-    /// Catalog resolver stamped at assembly: lets this catalog-blind entity
+    /// Catalog resolver bound at assembly: lets this catalog-blind entity
     /// resolve a display name to the property-definition id its data is
     /// keyed under, for the sync read path. Absent for bare and temporary
     /// entities (they read system-keyed data only).
@@ -119,10 +119,10 @@ impl WeakEntity {
 /// [`Entity`] and the [`TemporaryEntity`] (which is bound only when
 /// constructed via [`TemporaryEntity::new_bound`]). Both deref here.
 impl EntityInner {
-    /// The catalog resolver stamped at assembly, if still live.
+    /// The catalog resolver bound at assembly, if still live.
     fn resolver(&self) -> Option<Arc<dyn CatalogResolver>> { self.resolver.read().unwrap().as_ref().and_then(|w| w.upgrade()) }
 
-    /// Stamp the catalog resolver (assembly-time). Replaces the old
+    /// Bind the catalog resolver (assembly-time). Replaces the old
     /// backend-binding push (`Node::bind_entity`): the backend stays dumb and
     /// the entity resolves names to ids for the sync read path.
     pub(crate) fn set_resolver(&self, resolver: Weak<dyn CatalogResolver>) { *self.resolver.write().unwrap() = Some(resolver); }
@@ -146,7 +146,7 @@ impl EntityInner {
     /// value accessors (`LWW`/`YrsString`) to call ONCE at construction
     /// (`from_entity`): a missing resolver slot is the intentional
     /// system-keyed bare-entity case (`PropertyId::System`); once a resolver
-    /// has been stamped, failure to upgrade it or to resolve the name is a
+    /// has been bound, failure to upgrade it or to resolve the name is a
     /// missing/ambiguous catalog binding and surfaces as `UnknownProperty`
     /// (the unbound-field error the accessor's `set`/`get` then returns).
     /// Explicit-id accessors bypass this method entirely.
@@ -348,9 +348,9 @@ impl Entity {
         Ok(EntityState { entity_id: self.id(), model: self.model_id()?, state })
     }
 
-    /// The model-definition id stamped on this entity's wire envelopes
+    /// The model-definition id carried on this entity's wire envelopes
     /// (#330): the well-known id for system/catalog collections, else the
-    /// stamped catalog resolver's mapping for the collection. Fails
+    /// bound catalog resolver's mapping for the collection. Fails
     /// `UnknownModel` when neither answers.
     pub(crate) fn model_id(&self) -> Result<EntityId, StateError> {
         crate::schema::well_known_model_id(self.collection.as_str())
@@ -796,7 +796,7 @@ impl TemporaryEntity {
         Self::new_bound(id, collection, state, None)
     }
 
-    /// [`Self::new`] with a catalog resolver stamped, for consumers that
+    /// [`Self::new`] with a catalog resolver bound, for consumers that
     /// evaluate NAME-addressed predicates against id-keyed state -- policy
     /// agents inspecting entity state for scope enforcement (the
     /// `PolicyAgent::check_read` resolver parameter). Without the binding, a
@@ -839,7 +839,7 @@ impl Filterable for TemporaryEntity {
         if name == "id" {
             Some(Value::EntityId(self.0.id))
         } else {
-            // The shared lenient dispatch: with a stamped resolver
+            // The shared lenient dispatch: with a bound resolver
             // (new_bound, e.g. policy scope inspection) the name resolves to
             // its id and reads id-keyed data; unbound (the engine
             // post-filter tier) it degenerates to the bare name-keyed scan,
@@ -867,7 +867,7 @@ impl std::fmt::Display for TemporaryEntity {
 ///
 /// Assembly is the single choke point for catalog-aware property access:
 /// every method that hands out an `Entity` runs the `bind_hook`, installed by
-/// `Node` to stamp its live catalog resolver. The hook is idempotent and
+/// `Node` to bind its live catalog resolver. The hook is idempotent and
 /// re-fires on resident hand-outs, so an entity assembled before the catalog
 /// warmed observes the catalog on its next access.
 #[derive(Clone, Default)]
@@ -1091,7 +1091,7 @@ mod tests {
     /// retry instead of being stranded.
     #[test]
     fn commit_event_model_id_failure_leaves_operations_staged() {
-        // "albums" is not a well-known collection and no resolver is stamped,
+        // "albums" is not a well-known collection and no resolver is bound,
         // so model_id() fails.
         let entity = Entity::create(EntityId::new(), CollectionId::fixed_name("albums"));
         let key = property_key(0x11);
@@ -1150,7 +1150,7 @@ mod tests {
     }
 
     /// The entry-presence rule also governs the system-name branch of
-    /// read_lenient (no resolver stamped, so the name reads system-keyed).
+    /// read_lenient (no resolver bound, so the name reads system-keyed).
     #[test]
     fn system_key_tombstone_shadows_later_backend_value() {
         let key = PropertyId::System { name: "nickname".to_owned() };

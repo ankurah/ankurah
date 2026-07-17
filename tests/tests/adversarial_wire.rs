@@ -151,7 +151,7 @@ struct Fixture {
     ctx_c: ankurah::Context,
     _conn: LocalProcessConnection<SledStorageEngine, PermissiveAgent, SledStorageEngine, PermissiveAgent>,
     _relay: ankurah::LiveQuery<RecordView>,
-    /// #330: Record's allocated model id, stamped on every forged event/item so
+    /// #330: Record's allocated model id, written on every forged event/item so
     /// the receiver's ingress `resolve_model` routes it to the record collection.
     record_model: proto::EntityId,
     /// Registered property-definition ids for Record's fields: post-epoch
