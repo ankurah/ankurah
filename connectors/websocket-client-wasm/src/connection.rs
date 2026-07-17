@@ -175,10 +175,21 @@ impl Connection {
                             if !self
                                 .set_state(ConnectionState::Connected { url: self.url.clone(), server_presence: server_presence.clone() })
                             {
-                                // A concurrent close or error path claimed the state
-                                // first: roll the registration back rather than leave
-                                // a registered peer behind an unused connection.
+                                // set_state writes unconditionally and returns false
+                                // only when the client is gone or no longer owns this
+                                // connection (a reconnect cycle replaced it), so
+                                // nothing observes this object's state. Tear the
+                                // orphan down: clear the state FIRST so disconnect
+                                // (here and again on Drop) cannot deregister twice,
+                                // then roll the registration back and close the
+                                // socket. A plain write, not set_state: there is no
+                                // owner left to notify.
+                                if let Ok(mut state) = self.state.write() {
+                                    *state = ConnectionState::None;
+                                }
                                 self.node.deregister_peer(server_presence.node_id);
+                                self.disconnect();
+                                return;
                             }
                         }
                         _ => {
