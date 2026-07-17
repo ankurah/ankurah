@@ -129,7 +129,7 @@ pub fn build_continuation_predicate<E: AbstractEntity>(
                     PropertyId::EntityId(id) => last_entity.value_by_id(ankurah_proto::EntityId::from_ulid(id)),
                     PropertyId::System { name } => last_entity.value(&name),
                 };
-                (value, Expr::PropertyIdentifier(identifier.clone()))
+                (value, Expr::PropertyPath(identifier.clone()))
             }
             OrderKey::Path(path) => (last_entity.value(path.first()), Expr::Path(path.clone())),
         };

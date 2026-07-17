@@ -81,7 +81,7 @@ fn generate_expr_sql(
                 buffer.push('"');
             }
         }
-        Expr::PropertyIdentifier(identifier) => {
+        Expr::PropertyPath(identifier) => {
             // Human-readable rendering only. `generate_selection_sql` backs the
             // `Display` impls for `Predicate`/`Selection`; it is NOT the query
             // path (each storage engine translates a resolved identity to its

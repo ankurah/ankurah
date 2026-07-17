@@ -58,7 +58,7 @@ impl Planner {
     ///   names) keeps the String fallback.
     /// - `column_of` (see [`ColumnOf`]) translates a resolved property identity
     ///   to this engine's physical column; a miss means the property is absent
-    ///   (no name fallback). Every resolved `Expr::PropertyIdentifier` /
+    ///   (no name fallback). Every resolved `Expr::PropertyPath` /
     ///   `OrderKey::Property` the planner touches is routed through it, so a
     ///   rename never moves the column a plan addresses.
     pub fn plan_with_types(
@@ -485,7 +485,7 @@ impl Planner {
                 // predicate (and would already have been folded to NULL upstream).
                 let field_path = match left.as_ref() {
                     Expr::Path(path) => path.steps.join("."),
-                    Expr::PropertyIdentifier(identifier) => {
+                    Expr::PropertyPath(identifier) => {
                         let column = column_of(&identifier.id_or_systemname())?;
                         std::iter::once(column).chain(identifier.subpath.iter().cloned()).collect::<Vec<_>>().join(".")
                     }
@@ -942,12 +942,12 @@ impl Planner {
             let value = match (left.as_ref(), right.as_ref()) {
                 (Expr::Path(path), Expr::Literal(literal)) if path.is_simple() && path.first() == primary_key => Value::from(literal),
                 (Expr::Literal(literal), Expr::Path(path)) if path.is_simple() && path.first() == primary_key => Value::from(literal),
-                (Expr::PropertyIdentifier(identifier), Expr::Literal(literal))
+                (Expr::PropertyPath(identifier), Expr::Literal(literal))
                     if self.identifier_is_primary_key(identifier, primary_key, column_of) =>
                 {
                     Value::from(literal)
                 }
-                (Expr::Literal(literal), Expr::PropertyIdentifier(identifier))
+                (Expr::Literal(literal), Expr::PropertyPath(identifier))
                     if self.identifier_is_primary_key(identifier, primary_key, column_of) =>
                 {
                     Value::from(literal)
@@ -1052,7 +1052,7 @@ impl Planner {
             match left.as_ref() {
                 Expr::Path(path) if path.is_simple() => path.first() == primary_key,
                 // A resolved Identifier addresses the primary key by identity.
-                Expr::PropertyIdentifier(identifier) => self.identifier_is_primary_key(identifier, primary_key, column_of),
+                Expr::PropertyPath(identifier) => self.identifier_is_primary_key(identifier, primary_key, column_of),
                 _ => false,
             }
         } else {
@@ -1078,7 +1078,7 @@ impl Planner {
                 let is_primary_key_field = match left.as_ref() {
                     Expr::Path(path) if path.is_simple() => path.first() == primary_key,
                     // A resolved Identifier addresses the primary key by identity.
-                    Expr::PropertyIdentifier(identifier) => self.identifier_is_primary_key(identifier, primary_key, column_of),
+                    Expr::PropertyPath(identifier) => self.identifier_is_primary_key(identifier, primary_key, column_of),
                     _ => false,
                 };
 
@@ -2036,7 +2036,7 @@ mod tests {
             let pk_item = OrderByItem { key: OrderKey::Property(PropertyPath::id(vec![])), direction: OrderDirection::Asc };
             let selection = Selection {
                 predicate: Predicate::Comparison {
-                    left: Box::new(Expr::PropertyIdentifier(PropertyPath::system("status", vec![]))),
+                    left: Box::new(Expr::PropertyPath(PropertyPath::system("status", vec![]))),
                     operator: ComparisonOperator::Equal,
                     right: Box::new(Expr::Literal(Literal::String("active".to_string()))),
                 },

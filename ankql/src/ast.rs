@@ -25,7 +25,7 @@ mod json_as_bytes {
 pub enum Expr {
     Literal(Literal),
     Path(PathExpr),
-    PropertyIdentifier(PropertyPath),
+    PropertyPath(PropertyPath),
     Predicate(Predicate),
     InfixExpr { left: Box<Expr>, operator: InfixOperator, right: Box<Expr> },
     ExprList(Vec<Expr>), // New variant for handling lists like (1,2,3) in IN clauses
@@ -75,34 +75,32 @@ impl std::fmt::Display for PathExpr {
 }
 
 /// A property reference resolved against the catalog: the `id`
-/// pseudo-property, a registered property's stable entity id (keeping the
-/// resolved-from name only for `Display`), or a system property's durable
-/// name -- plus any JSON sub-path into the property's value. This is the
-/// resolved counterpart of [`PathExpr`], which names a property by string
-/// alone. The parser only ever produces `PathExpr`; a `PropertyPath` appears
-/// after the resolution pass (in ankurah-core) has bound the reference.
+/// pseudo-property, a registered property's stable entity id, or a system
+/// property's durable name -- plus any JSON sub-path into the property's
+/// value. This is the resolved counterpart of [`PathExpr`], which names a
+/// property by string alone. The parser only ever produces `PathExpr`; a
+/// `PropertyPath` appears after the resolution pass (in ankurah-core) has
+/// bound the reference.
+///
+/// `label` is carried as its own field, for every arm, rather than folded
+/// into one arm of `id`'s type the way it used to be. Today a `System`
+/// label always equals its `PropertyId::System` name, and the `id`
+/// pseudo-property's label is always the literal `"id"` -- both look
+/// recoverable from `id` alone, but that is an accident of the current
+/// arms, not a rule resolution should lean on: a future path -> `PropertyId`
+/// resolution is not guaranteed a label derivable from the id after the
+/// fact, and the source label (usable only for `Display`, never a physical
+/// storage name) must survive regardless of which arm minted the id.
+/// Keeping `label` next to `id`, rather than nesting `id` inside a second
+/// enum shaped almost exactly like [`PropertyId`] just to bolt a label onto
+/// every arm, is what makes that guarantee cheap to keep.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PropertyPath {
-    inner: PropertyIdentifierInner,
+    id: PropertyId,
+    /// The input name from the unparsed AST which was resolved to this id (usable only for Display)
+    label: String,
     /// JSON sub-path into the property's value; empty for a plain reference.
     pub subpath: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-enum PropertyIdentifierInner {
-    /// The `id` pseudo-property: every entity's primary key. Resolves to
-    /// [`PropertyId::Id`], not to a catalog id or a name.
-    Id,
-    Registered {
-        /// The property's stable entity id. Held as a raw `Ulid` because ankql
-        /// cannot depend on proto's `EntityId` (same as [`Literal::EntityId`]).
-        id: Ulid,
-        /// The input name from the unparsed AST which was resolved to this id (usable only for Display)
-        label: String,
-    },
-    System {
-        name: String,
-    },
 }
 
 /// The serializable, durable address of a resolved property: a registered
@@ -120,7 +118,9 @@ enum PropertyIdentifierInner {
 pub enum PropertyId {
     /// The "id" property. each entity has one of these
     Id,
-    /// The entity id of the property registration
+    /// The entity id of the property registration. Held as a raw `Ulid`
+    /// because ankql cannot depend on proto's `EntityId` (same as
+    /// [`Literal::EntityId`]).
     EntityId(Ulid),
     /// A system-defined property, identified globally by name: the same name is
     /// the same property in every collection (a system property is an implicit
@@ -133,19 +133,20 @@ impl PropertyPath {
     /// its stable catalog id. `label` is the name that resolved to this id,
     /// retained for `Display` only (it must never seed a physical storage name).
     pub fn registered(id: Ulid, label: impl Into<String>, subpath: Vec<String>) -> Self {
-        Self { inner: PropertyIdentifierInner::Registered { id, label: label.into() }, subpath }
+        Self { id: PropertyId::EntityId(id), label: label.into(), subpath }
     }
 
     /// A resolved reference to a system/catalog property, addressed by name:
     /// the frozen bootstrap base case has no catalog entry to mint an id from.
     pub fn system(name: impl Into<String>, subpath: Vec<String>) -> Self {
-        Self { inner: PropertyIdentifierInner::System { name: name.into() }, subpath }
+        let name = name.into();
+        Self { id: PropertyId::System { name: name.clone() }, label: name, subpath }
     }
 
     /// A resolved reference to the `id` pseudo-property (every entity's primary
     /// key), addressed by its own [`PropertyId::Id`] rather than a catalog id or
     /// a name.
-    pub fn id(subpath: Vec<String>) -> Self { Self { inner: PropertyIdentifierInner::Id, subpath } }
+    pub fn id(subpath: Vec<String>) -> Self { Self { id: PropertyId::Id, label: "id".to_string(), subpath } }
 
     // pub fn path_steps(&self) -> Vec<String> {
     //     whoops, path_steps leaks name. can't do that. who's using this?
@@ -166,27 +167,17 @@ impl PropertyPath {
     /// resolved-from label), whereas the catalog (`CatalogResolver::name_for`
     /// on a registered id) gives the property's CURRENT name; the two can
     /// diverge after a rename.
-    pub fn id_or_systemname(&self) -> PropertyId {
-        match &self.inner {
-            PropertyIdentifierInner::Id => PropertyId::Id,
-            PropertyIdentifierInner::Registered { id, .. } => PropertyId::EntityId(*id),
-            PropertyIdentifierInner::System { name } => PropertyId::System { name: name.clone() },
-        }
-    }
+    pub fn id_or_systemname(&self) -> PropertyId { self.id.clone() }
 
     /// True when there is no JSON sub-path: a plain property reference.
     pub fn is_simple(&self) -> bool { self.subpath.is_empty() }
 }
 
 impl std::fmt::Display for PropertyPath {
-    /// Human-readable ONLY (never a physical storage name): the resolved-from label
-    /// (registered) or the system name, then any sub-path dotted on.
+    /// Human-readable ONLY (never a physical storage name): the resolved-from
+    /// label, then any sub-path dotted on.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.inner {
-            PropertyIdentifierInner::Id => write!(f, "id")?,
-            PropertyIdentifierInner::Registered { label, .. } => write!(f, "{}", label)?,
-            PropertyIdentifierInner::System { name } => write!(f, "{}", name)?,
-        }
+        write!(f, "{}", self.label)?;
         for step in &self.subpath {
             write!(f, ".{}", step)?;
         }
@@ -207,7 +198,7 @@ pub struct OrderByItem {
     pub direction: OrderDirection,
 }
 
-/// A sort key, mirroring `Expr::Path` vs `Expr::PropertyIdentifier`: the parser
+/// A sort key, mirroring `Expr::Path` vs `Expr::PropertyPath`: the parser
 /// produces the raw [`OrderKey::Path`] form, and the resolution pass rewrites it
 /// to [`OrderKey::Property`] -- including the `id` pseudo-property, which
 /// resolves to [`PropertyPath::id`] (carrying its own [`PropertyId::Id`]), not
@@ -382,7 +373,7 @@ impl Selection {
 /// that one property's address regardless of the subpath.
 fn expr_referenced_property(expr: &Expr) -> Option<PropertyId> {
     match expr {
-        Expr::PropertyIdentifier(identifier) => Some(identifier.id_or_systemname()),
+        Expr::PropertyPath(identifier) => Some(identifier.id_or_systemname()),
         _ => None,
     }
 }
@@ -394,7 +385,7 @@ fn expr_check(expr: &Expr) -> Result<(), SelectionError> {
     match expr {
         Expr::Path(path) => Err(SelectionError::UnresolvedPath(path.to_string())),
         Expr::Placeholder => Err(SelectionError::UnpopulatedPlaceholder),
-        Expr::PropertyIdentifier(_) | Expr::Literal(_) => Ok(()),
+        Expr::PropertyPath(_) | Expr::Literal(_) => Ok(()),
         Expr::ExprList(exprs) => exprs.iter().try_for_each(expr_check),
         Expr::Predicate(predicate) => predicate.check(),
         Expr::InfixExpr { left, operator: _, right } => {
@@ -618,7 +609,7 @@ impl Expr {
             Expr::Literal(lit) => Ok(Expr::Literal(lit)),
             Expr::Path(path) => Ok(Expr::Path(path)),
             // A resolved Identifier is a property reference, not a placeholder; pass through.
-            Expr::PropertyIdentifier(identifier) => Ok(Expr::PropertyIdentifier(identifier)),
+            Expr::PropertyPath(identifier) => Ok(Expr::PropertyPath(identifier)),
             Expr::Predicate(pred) => Ok(Expr::Predicate(pred.populate_recursive(values)?)),
             Expr::InfixExpr { left, operator, right } => Ok(Expr::InfixExpr {
                 left: Box::new(left.populate_recursive(values)?),
@@ -674,7 +665,7 @@ mod tests {
     /// `<name> = 'x'` as a RESOLVED comparison against a registered property.
     fn cmp(name: &str) -> Predicate {
         Predicate::Comparison {
-            left: Box::new(Expr::PropertyIdentifier(PropertyPath::registered(prop_id(name), name, vec![]))),
+            left: Box::new(Expr::PropertyPath(PropertyPath::registered(prop_id(name), name, vec![]))),
             operator: ComparisonOperator::Equal,
             right: Box::new(Expr::Literal(Literal::String("x".to_string()))),
         }
@@ -688,7 +679,7 @@ mod tests {
         // Any comparison against an absent property collapses to FALSE.
         assert_eq!(cmp("status").assume_null(&absent(&["status"])), Predicate::False);
         // IS NULL against an absent property is TRUE.
-        let is_null = Predicate::IsNull(Box::new(Expr::PropertyIdentifier(PropertyPath::registered(prop_id("status"), "status", vec![]))));
+        let is_null = Predicate::IsNull(Box::new(Expr::PropertyPath(PropertyPath::registered(prop_id("status"), "status", vec![]))));
         assert_eq!(is_null.assume_null(&absent(&["status"])), Predicate::True);
         // An unrelated absent property leaves the comparison intact.
         assert_eq!(cmp("role").assume_null(&absent(&["other"])), cmp("role"));
@@ -821,7 +812,7 @@ mod tests {
     fn identifier_selection(name: &str, subpath: Vec<&str>) -> Selection {
         Selection {
             predicate: Predicate::Comparison {
-                left: Box::new(Expr::PropertyIdentifier(PropertyPath::registered(
+                left: Box::new(Expr::PropertyPath(PropertyPath::registered(
                     Ulid::from_bytes([7u8; 16]),
                     name,
                     subpath.into_iter().map(|s| s.to_string()).collect(),
@@ -852,9 +843,9 @@ mod tests {
     fn check_passes_every_resolved_identity_arm() {
         // All three PropertyId arms are addressable by identity, so all three pass.
         for left in [
-            Expr::PropertyIdentifier(PropertyPath::registered(Ulid::from_bytes([7u8; 16]), "status", vec![])),
-            Expr::PropertyIdentifier(PropertyPath::system("collection", vec![])),
-            Expr::PropertyIdentifier(PropertyPath::id(vec![])),
+            Expr::PropertyPath(PropertyPath::registered(Ulid::from_bytes([7u8; 16]), "status", vec![])),
+            Expr::PropertyPath(PropertyPath::system("collection", vec![])),
+            Expr::PropertyPath(PropertyPath::id(vec![])),
         ] {
             let selection = Selection { predicate: cmp_with(left), order_by: None, limit: None };
             assert!(selection.check().is_ok());
@@ -907,7 +898,7 @@ mod tests {
 
     #[test]
     fn check_covers_order_by_not_just_the_predicate() {
-        let resolved = cmp_with(Expr::PropertyIdentifier(PropertyPath::id(vec![])));
+        let resolved = cmp_with(Expr::PropertyPath(PropertyPath::id(vec![])));
         let order_by = |key| Selection {
             predicate: resolved.clone(),
             order_by: Some(vec![OrderByItem { key, direction: OrderDirection::Asc }]),

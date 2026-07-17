@@ -98,7 +98,7 @@ fn evaluate_expr<I: Filterable>(item: &I, expr: &Expr) -> Result<ExprOutput<Valu
         // happens to equal the collection name is the PROPERTY, never a
         // qualifier. Evaluate the stable property id plus subpath; `name`
         // remains display context and the fallback key for legacy residue.
-        Expr::PropertyIdentifier(identifier) => evaluate_identifier(item, identifier),
+        Expr::PropertyPath(identifier) => evaluate_identifier(item, identifier),
         Expr::ExprList(exprs) => {
             let mut result = Vec::new();
             for expr in exprs {
@@ -110,7 +110,7 @@ fn evaluate_expr<I: Filterable>(item: &I, expr: &Expr) -> Result<ExprOutput<Valu
     }
 }
 
-/// Evaluate a RESOLVED [`PropertyIdentifier`]: read the property by its resolved
+/// Evaluate a RESOLVED [`PropertyPath`]: read the property by its resolved
 /// identity (a registered id addresses id-keyed state directly; a system name
 /// reads by name), then extract any JSON sub-path. Unlike
 /// [`evaluate_path_steps`] this does NO collection-qualifier handling -- the
@@ -156,7 +156,7 @@ fn evaluate_identifier<I: Filterable>(item: &I, identifier: &PropertyPath) -> Re
 /// Evaluate a sequence of path steps (as produced by `PathExpr::steps`)
 /// against an item. Used by the `Expr::Path` arm (unresolved paths still
 /// carry the legacy collection-qualifier ambiguity); the resolved
-/// `Expr::PropertyIdentifier` arm uses [`evaluate_identifier`] instead.
+/// `Expr::PropertyPath` arm uses [`evaluate_identifier`] instead.
 fn evaluate_path_steps<I: Filterable>(item: &I, steps: &[String]) -> Result<ExprOutput<Value>, Error> {
     // For simple paths, use the first step as the property name
     if steps.len() == 1 {
@@ -371,7 +371,7 @@ mod tests {
 
     #[test]
     fn test_identifier_evaluates_like_equivalent_path() {
-        // A predicate containing Expr::PropertyIdentifier (constructed
+        // A predicate containing Expr::PropertyPath (constructed
         // programmatically) evaluates identically to the same predicate
         // written with Expr::Path.
         use ankql::ast::{ComparisonOperator, Expr, Literal, PathExpr, Predicate, PropertyPath};
@@ -384,7 +384,7 @@ mod tests {
         // a name-keyed test item does not hold -- that path is covered by
         // `temporary_entity_post_filter_reads_id_keyed_state`).
         let id_pred = Predicate::Comparison {
-            left: Box::new(Expr::PropertyIdentifier(PropertyPath::system("name", vec![]))),
+            left: Box::new(Expr::PropertyPath(PropertyPath::system("name", vec![]))),
             operator: ComparisonOperator::Equal,
             right: Box::new(Expr::Literal(Literal::String("Alice".to_string()))),
         };
@@ -442,7 +442,7 @@ mod tests {
 
         // Resolved-Identifier predicate (the checked read path).
         let id_pred = Predicate::Comparison {
-            left: Box::new(Expr::PropertyIdentifier(PropertyPath::registered(Ulid::from_bytes(title_id.to_bytes()), "title", vec![]))),
+            left: Box::new(Expr::PropertyPath(PropertyPath::registered(Ulid::from_bytes(title_id.to_bytes()), "title", vec![]))),
             operator: ComparisonOperator::Equal,
             right: Box::new(Expr::Literal(Literal::String("alpha".to_string()))),
         };
@@ -455,7 +455,7 @@ mod tests {
 
         // A property nothing claims evaluates as NULL: comparison false, no error.
         let absent_pred = Predicate::Comparison {
-            left: Box::new(Expr::PropertyIdentifier(PropertyPath::registered(Ulid::from_bytes([8; 16]), "ghost", vec![]))),
+            left: Box::new(Expr::PropertyPath(PropertyPath::registered(Ulid::from_bytes([8; 16]), "ghost", vec![]))),
             operator: ComparisonOperator::Equal,
             right: Box::new(Expr::Literal(Literal::String("alpha".to_string()))),
         };
@@ -630,7 +630,7 @@ mod tests {
             ];
 
             let id_pred = Predicate::Comparison {
-                left: Box::new(Expr::PropertyIdentifier(PropertyPath::system("licensing", vec!["territory".to_string()]))),
+                left: Box::new(Expr::PropertyPath(PropertyPath::system("licensing", vec!["territory".to_string()]))),
                 operator: ComparisonOperator::Equal,
                 right: Box::new(Expr::Literal(Literal::String("US".to_string()))),
             };

@@ -114,11 +114,11 @@ async fn test_id_range_with_where_clause() -> Result<()> {
 
     // Query with WHERE id >= start_id ORDER BY id. Both references are to the
     // `id` pseudo-property, which resolves to `PropertyPath::id` on the predicate
-    // side (`Expr::PropertyIdentifier`) and the order side (`OrderKey::Property`),
+    // side (`Expr::PropertyPath`) and the order side (`OrderKey::Property`),
     // the resolved form the storage engine requires (`Selection::check`).
     let selection = Selection {
         predicate: Predicate::Comparison {
-            left: Box::new(Expr::PropertyIdentifier(PropertyPath::id(vec![]))),
+            left: Box::new(Expr::PropertyPath(PropertyPath::id(vec![]))),
             operator: ComparisonOperator::GreaterThanOrEqual,
             right: Box::new(Expr::Literal(Literal::String(start_id.to_base64()))),
         },

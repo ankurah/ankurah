@@ -224,7 +224,7 @@ where
     /// value_type the catalog knows and this build can parse. Subfield
     /// references and unresolved forms have no target.
     fn canonical_target(&self, expr: &Expr) -> Option<ValueType> {
-        if let Expr::PropertyIdentifier(ident) = expr {
+        if let Expr::PropertyPath(ident) = expr {
             if ident.subpath.is_empty() {
                 // Only registered properties have a catalog canonical type; a
                 // system property has none, so it has no cast target.
@@ -287,15 +287,11 @@ where
                     if steps.len() > 1 {
                         return Err(id_subpath_error(collection, path));
                     }
-                    return Ok(Expr::PropertyIdentifier(PropertyPath::id(vec![])));
+                    return Ok(Expr::PropertyPath(PropertyPath::id(vec![])));
                 }
                 // Try the first step as a property of this collection.
                 if let Some(property) = self.resolve(collection.as_str(), &steps[0]) {
-                    return Ok(Expr::PropertyIdentifier(PropertyPath::registered(
-                        property.to_ulid(),
-                        steps[0].clone(),
-                        steps[1..].to_vec(),
-                    )));
+                    return Ok(Expr::PropertyPath(PropertyPath::registered(property.to_ulid(), steps[0].clone(), steps[1..].to_vec())));
                 }
                 // Legacy collection-qualified form: strip the qualifier and
                 // resolve the remainder.
@@ -304,21 +300,17 @@ where
                         if steps.len() > 2 {
                             return Err(id_subpath_error(collection, path));
                         }
-                        return Ok(Expr::PropertyIdentifier(PropertyPath::id(vec![])));
+                        return Ok(Expr::PropertyPath(PropertyPath::id(vec![])));
                     }
                     if let Some(property) = self.resolve(collection.as_str(), &steps[1]) {
-                        return Ok(Expr::PropertyIdentifier(PropertyPath::registered(
-                            property.to_ulid(),
-                            steps[1].clone(),
-                            steps[2..].to_vec(),
-                        )));
+                        return Ok(Expr::PropertyPath(PropertyPath::registered(property.to_ulid(), steps[1].clone(), steps[2..].to_vec())));
                     }
                     return Err(PropertyError::UnknownProperty { collection: collection.to_string(), name: steps[1].clone() });
                 }
                 return Err(PropertyError::UnknownProperty { collection: collection.to_string(), name: steps[0].clone() });
             }
             // Already resolved: idempotent pass-through.
-            Expr::PropertyIdentifier(_) | Expr::Literal(_) | Expr::Placeholder => expr.clone(),
+            Expr::PropertyPath(_) | Expr::Literal(_) | Expr::Placeholder => expr.clone(),
             Expr::ExprList(exprs) => Expr::ExprList(exprs.iter().map(|e| self.resolve_expr(collection, e)).collect::<Result<Vec<_>, _>>()?),
             Expr::Predicate(p) => Expr::Predicate(self.resolve_predicate(collection, p)?),
             Expr::InfixExpr { left, operator, right } => Expr::InfixExpr {
@@ -417,7 +409,7 @@ fn systemize_expr(collection: &CollectionId, expr: &Expr) -> Result<Expr, Proper
             right: Box::new(systemize_expr(collection, right)?),
         },
         // Already an identifier, a literal, or a placeholder: unchanged.
-        Expr::PropertyIdentifier(_) | Expr::Literal(_) | Expr::Placeholder => expr.clone(),
+        Expr::PropertyPath(_) | Expr::Literal(_) | Expr::Placeholder => expr.clone(),
     })
 }
 
@@ -448,7 +440,7 @@ fn systemize_path(collection: &CollectionId, path: &PathExpr) -> Result<Expr, Pr
     if name == "id" && steps.len() > 1 {
         return Err(id_subpath_error(collection, path));
     }
-    Ok(Expr::PropertyIdentifier(system_property(name, steps[1..].to_vec())))
+    Ok(Expr::PropertyPath(system_property(name, steps[1..].to_vec())))
 }
 
 /// Sort keys systemize under the same rules as predicate references

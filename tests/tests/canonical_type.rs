@@ -115,7 +115,7 @@ fn assert_resolved_f64_comparison(selection: &ankql::ast::Selection, expected: f
     use ankql::ast::{Expr, Literal, Predicate};
     match &selection.predicate {
         Predicate::Comparison { left, right, .. } => {
-            assert!(matches!(left.as_ref(), Expr::PropertyIdentifier(_)), "property reference must be catalog-resolved: {left:?}");
+            assert!(matches!(left.as_ref(), Expr::PropertyPath(_)), "property reference must be catalog-resolved: {left:?}");
             assert!(
                 matches!(right.as_ref(), Expr::Literal(Literal::F64(value)) if *value == expected),
                 "comparison literal must be canonical f64 {expected}, got {right:?}"

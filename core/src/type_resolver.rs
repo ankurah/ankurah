@@ -91,7 +91,7 @@ impl TypeResolver {
     fn resolve_expr_type(&self, expr: &Expr) -> Option<ValueType> {
         match expr {
             Expr::Path(path) => self.resolve_path(path),
-            Expr::PropertyIdentifier(identifier) => match identifier.id_or_systemname() {
+            Expr::PropertyPath(identifier) => match identifier.id_or_systemname() {
                 // A JSON sub-path infers Json. Resolution refuses a subpath
                 // on the `id` pseudo-property (core/src/schema/resolve.rs),
                 // so this arm never sees an Id identifier; before that

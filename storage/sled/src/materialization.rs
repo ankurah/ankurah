@@ -27,7 +27,7 @@ impl Filterable for ProjectedEntity {
     }
 
     /// Read a registered property by its stable id -- the identity form a
-    /// resolved `Expr::PropertyIdentifier` evaluates through. A miss is absent
+    /// resolved `Expr::PropertyPath` evaluates through. A miss is absent
     /// (NULL); there is no fallback to a name.
     fn value_by_id(&self, property_id: EntityId) -> Option<ankurah_core::value::Value> {
         self.map.get(&PropertyId::EntityId(property_id.to_ulid())).cloned()

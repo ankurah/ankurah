@@ -893,7 +893,7 @@ impl Filterable for IdbRecord {
     }
 
     /// Read a registered property by its stable id -- the identity a resolved
-    /// `Expr::PropertyIdentifier` evaluates through. Identity -> field via the
+    /// `Expr::PropertyPath` evaluates through. Identity -> field via the
     /// durable map; a miss is absent (NULL), no name fallback.
     fn value_by_id(&self, property_id: ankurah_proto::EntityId) -> Option<ankurah_core::value::Value> {
         let field = self.columns.get(&PropertyId::EntityId(property_id.to_ulid()))?;

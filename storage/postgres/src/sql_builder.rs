@@ -180,7 +180,7 @@ fn can_pushdown_expr(expr: &Expr) -> bool {
         }
         // A resolved Identifier is pushdown-capable exactly like the equivalent
         // Path: it renders as a column (name) with optional JSONB sub-path.
-        Expr::PropertyIdentifier(_) => true,
+        Expr::PropertyPath(_) => true,
         Expr::ExprList(exprs) => exprs.iter().all(can_pushdown_expr),
         Expr::Predicate(_) => false,     // Nested predicates - not supported in SQL expressions
         Expr::InfixExpr { .. } => false, // Not yet supported
@@ -194,7 +194,7 @@ fn can_pushdown_expr(expr: &Expr) -> bool {
 fn expr_is_jsonb_path(expr: &Expr) -> bool {
     match expr {
         Expr::Path(p) => !p.is_simple(),
-        Expr::PropertyIdentifier(identifier) => !identifier.is_simple(),
+        Expr::PropertyPath(identifier) => !identifier.is_simple(),
         _ => false,
     }
 }
@@ -213,7 +213,7 @@ pub struct SqlBuilder {
     fields: Vec<String>,
     table_name: Option<String>,
     /// Durable identity-to-column map for this collection (a clone of the
-    /// bucket's cache). A resolved [`Expr::PropertyIdentifier`] / [`OrderKey::Property`]
+    /// bucket's cache). A resolved [`Expr::PropertyPath`] / [`OrderKey::Property`]
     /// is translated to its assigned column through this map at emit time --
     /// never by its display name -- so a rename cannot move the column a query
     /// addresses. A raw [`Expr::Path`] carries no identity and renders its steps
@@ -341,7 +341,7 @@ impl SqlBuilder {
             // name), followed by any JSONB sub-path via "column"->'a'->'b'. This
             // is where a rename stays harmless: the id addresses the same column
             // regardless of the current name.
-            Expr::PropertyIdentifier(identifier) => {
+            Expr::PropertyPath(identifier) => {
                 let column = self.column_for(identifier)?;
                 let mut steps = Vec::with_capacity(1 + identifier.subpath.len());
                 steps.push(column);
@@ -788,7 +788,7 @@ mod tests {
         // addresses tracks the identity, not the (possibly renamed) display name.
         let id = Ulid::from_bytes([5u8; 16]);
         let map = BTreeMap::from([(PropertyId::EntityId(id), "status".to_string())]);
-        let sql = where_for_mapped(Expr::PropertyIdentifier(PropertyPath::registered(id, "legacy_name", vec![])), map);
+        let sql = where_for_mapped(Expr::PropertyPath(PropertyPath::registered(id, "legacy_name", vec![])), map);
 
         assert_eq!(sql, r#""status" = $1"#);
     }
@@ -803,7 +803,7 @@ mod tests {
         let id = Ulid::from_bytes([6u8; 16]);
         let map = BTreeMap::from([(PropertyId::EntityId(id), "data".to_string())]);
         let sql = where_for_mapped(
-            Expr::PropertyIdentifier(PropertyPath::registered(id, "legacy_data", vec!["user".to_string(), "name".to_string()])),
+            Expr::PropertyPath(PropertyPath::registered(id, "legacy_data", vec!["user".to_string(), "name".to_string()])),
             map,
         );
 
@@ -819,7 +819,7 @@ mod tests {
         // property must be folded to NULL before SQL generation): it errors
         // rather than silently falling back to a name.
         let predicate = Predicate::Comparison {
-            left: Box::new(Expr::PropertyIdentifier(PropertyPath::registered(Ulid::from_bytes([9u8; 16]), "ghost", vec![]))),
+            left: Box::new(Expr::PropertyPath(PropertyPath::registered(Ulid::from_bytes([9u8; 16]), "ghost", vec![]))),
             operator: ComparisonOperator::Equal,
             right: Box::new(Expr::Literal(Literal::String("active".to_string()))),
         };

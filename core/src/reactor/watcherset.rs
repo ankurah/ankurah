@@ -176,8 +176,7 @@ impl WatcherSet {
                     (Expr::Path(path), Expr::Literal(literal)) | (Expr::Literal(literal), Expr::Path(path)) => {
                         Some((PropertyPath::from_path(path), literal))
                     }
-                    (Expr::PropertyIdentifier(identifier), Expr::Literal(literal))
-                    | (Expr::Literal(literal), Expr::PropertyIdentifier(identifier)) => {
+                    (Expr::PropertyPath(identifier), Expr::Literal(literal)) | (Expr::Literal(literal), Expr::PropertyPath(identifier)) => {
                         Some((PropertyPath::from_identifier(identifier), literal))
                     }
                     _ => None,

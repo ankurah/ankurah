@@ -97,7 +97,7 @@ async fn resolution_binds_names_and_fails_closed() -> anyhow::Result<()> {
     // Simple reference resolves to the allocated property id.
     let resolved = server.catalog.resolve_selection(&collection, &ankql::parser::parse_selection("name = 'x'")?).unwrap();
     match first_expr(&resolved) {
-        Expr::PropertyIdentifier(ident) => {
+        Expr::PropertyPath(ident) => {
             assert_eq!(ident.id_or_systemname(), PropertyId::EntityId(name_id.to_ulid()));
             assert_eq!(ident.to_string(), "name");
             assert!(ident.subpath.is_empty());
@@ -108,7 +108,7 @@ async fn resolution_binds_names_and_fails_closed() -> anyhow::Result<()> {
     // JSON subpath is preserved past the resolved property step.
     let resolved = server.catalog.resolve_selection(&collection, &ankql::parser::parse_selection("payload.meta.genre = 'jazz'")?).unwrap();
     match first_expr(&resolved) {
-        Expr::PropertyIdentifier(ident) => {
+        Expr::PropertyPath(ident) => {
             assert_eq!(ident.id_or_systemname(), PropertyId::EntityId(payload_id.to_ulid()));
             assert_eq!(ident.subpath, vec!["meta".to_string(), "genre".to_string()]);
         }
@@ -121,14 +121,14 @@ async fn resolution_binds_names_and_fails_closed() -> anyhow::Result<()> {
     let resolved =
         server.catalog.resolve_selection(&collection, &ankql::parser::parse_selection("id = 'AQIDBAUGBwgJCgsMDQ4PEA'")?).unwrap();
     match first_expr(&resolved) {
-        Expr::PropertyIdentifier(ident) => assert_eq!(ident.id_or_systemname(), PropertyId::Id),
+        Expr::PropertyPath(ident) => assert_eq!(ident.id_or_systemname(), PropertyId::Id),
         other => panic!("expected the id pseudo-property to resolve to PropertyId::Id, got {other:?}"),
     }
 
     // The legacy collection-qualified form normalizes away.
     let resolved = server.catalog.resolve_selection(&collection, &ankql::parser::parse_selection("album.name = 'x'")?).unwrap();
     match first_expr(&resolved) {
-        Expr::PropertyIdentifier(ident) => {
+        Expr::PropertyPath(ident) => {
             assert_eq!((ident.id_or_systemname(), ident.to_string().as_str()), (PropertyId::EntityId(name_id.to_ulid()), "name"))
         }
         other => panic!("expected Identifier, got {other:?}"),
@@ -159,7 +159,7 @@ async fn resolution_follows_renames_to_the_same_id() -> anyhow::Result<()> {
 
     let before = server.catalog.resolve_selection(&collection, &ankql::parser::parse_selection("name = 'x' ORDER BY name")?).unwrap();
     let before_id = match first_expr(&before) {
-        Expr::PropertyIdentifier(i) => match i.id_or_systemname() {
+        Expr::PropertyPath(i) => match i.id_or_systemname() {
             PropertyId::EntityId(id) => id,
             other => panic!("expected a registered property id, got {other:?}"),
         },
@@ -188,7 +188,7 @@ async fn resolution_follows_renames_to_the_same_id() -> anyhow::Result<()> {
 
     let after = server.catalog.resolve_selection(&collection, &ankql::parser::parse_selection("title = 'x'")?).unwrap();
     match first_expr(&after) {
-        Expr::PropertyIdentifier(i) => {
+        Expr::PropertyPath(i) => {
             assert_eq!(i.id_or_systemname(), PropertyId::EntityId(before_id), "rename must keep the property id")
         }
         other => panic!("expected Identifier, got {other:?}"),
@@ -312,7 +312,7 @@ async fn systemize_strips_the_collection_qualifier() -> anyhow::Result<()> {
     // Qualified predicate reference: the qualifier normalizes away.
     let resolved = server.catalog.resolve_selection(&collection, &ankql::parser::parse_selection("_ankurah_model.name = 'x'")?)?;
     match first_expr(&resolved) {
-        Expr::PropertyIdentifier(ident) => {
+        Expr::PropertyPath(ident) => {
             assert_eq!(ident.id_or_systemname(), PropertyId::System { name: "name".into() });
             assert!(ident.subpath.is_empty());
         }
@@ -322,7 +322,7 @@ async fn systemize_strips_the_collection_qualifier() -> anyhow::Result<()> {
     // Qualified reference with a JSON subpath keeps the subpath.
     let resolved = server.catalog.resolve_selection(&collection, &ankql::parser::parse_selection("_ankurah_model.name.x = 'y'")?)?;
     match first_expr(&resolved) {
-        Expr::PropertyIdentifier(ident) => {
+        Expr::PropertyPath(ident) => {
             assert_eq!(ident.id_or_systemname(), PropertyId::System { name: "name".into() });
             assert_eq!(ident.subpath, vec!["x".to_string()]);
         }
@@ -333,7 +333,7 @@ async fn systemize_strips_the_collection_qualifier() -> anyhow::Result<()> {
     // still refused through the qualified form.
     let resolved = server.catalog.resolve_selection(&collection, &ankql::parser::parse_selection("_ankurah_model.id = 'x'")?)?;
     match first_expr(&resolved) {
-        Expr::PropertyIdentifier(ident) => assert_eq!(ident.id_or_systemname(), PropertyId::Id),
+        Expr::PropertyPath(ident) => assert_eq!(ident.id_or_systemname(), PropertyId::Id),
         other => panic!("expected Identifier, got {other:?}"),
     }
     let err = server.catalog.resolve_selection(&collection, &ankql::parser::parse_selection("_ankurah_model.id.x = 'y'")?).unwrap_err();

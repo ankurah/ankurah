@@ -472,7 +472,7 @@ fn generate_expr_code_with_replacements(
         // a resolution pass that runs on already-parsed ASTs, not of
         // parse_selection, which is what feeds this codegen. This arm exists only
         // to keep the match exhaustive.
-        ankql::ast::Expr::PropertyIdentifier(_) => {
+        ankql::ast::Expr::PropertyPath(_) => {
             panic!("selection! macro received a resolved PropertyPath; the parser only produces PathExpr")
         }
     }

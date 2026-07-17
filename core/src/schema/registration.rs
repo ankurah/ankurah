@@ -803,7 +803,7 @@ fn bool_field(values: &BTreeMap<String, Option<Value>>, field: &str) -> Option<b
 
 fn field_eq(field: &str, value: ankql::ast::Literal) -> ankql::ast::Predicate {
     ankql::ast::Predicate::Comparison {
-        left: Box::new(ankql::ast::Expr::PropertyIdentifier(super::resolve::system_property(field, vec![]))),
+        left: Box::new(ankql::ast::Expr::PropertyPath(super::resolve::system_property(field, vec![]))),
         operator: ankql::ast::ComparisonOperator::Equal,
         right: Box::new(ankql::ast::Expr::Literal(value)),
     }
