@@ -1345,3 +1345,123 @@ where
         (map.models.len(), map.properties.len(), map.memberships.len())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        error::{MutationError, RetrievalError},
+        policy::PermissiveAgent,
+        storage::StorageCollection,
+    };
+
+    /// Storage whose catalog collections either serve a minimal state for any
+    /// id or fail every `get_state`, per collection.
+    struct SelectiveEngine {
+        fail: BTreeSet<CollectionId>,
+    }
+
+    struct TestCollection {
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl StorageEngine for SelectiveEngine {
+        type Value = ();
+
+        async fn collection(&self, id: &CollectionId) -> Result<Arc<dyn StorageCollection>, RetrievalError> {
+            Ok(Arc::new(TestCollection { fail: self.fail.contains(id) }))
+        }
+
+        async fn delete_all_collections(&self) -> Result<bool, MutationError> { Ok(true) }
+    }
+
+    #[async_trait::async_trait]
+    impl StorageCollection for TestCollection {
+        async fn set_state(&self, _state: proto::Attested<proto::EntityState>) -> Result<bool, MutationError> { Ok(true) }
+
+        async fn get_state(&self, id: EntityId) -> Result<proto::Attested<proto::EntityState>, RetrievalError> {
+            if self.fail {
+                return Err(RetrievalError::EntityNotFound(id));
+            }
+            Ok(proto::Attested::opt(
+                proto::EntityState {
+                    entity_id: id,
+                    model: EntityId::new(),
+                    state: proto::State { state_buffers: proto::StateBuffers(BTreeMap::new()), head: proto::Clock::default() },
+                },
+                None,
+            ))
+        }
+
+        async fn fetch_states(
+            &self,
+            _selection: &ankql::ast::Selection,
+        ) -> Result<Vec<proto::Attested<proto::EntityState>>, RetrievalError> {
+            Ok(Vec::new())
+        }
+
+        async fn add_event(&self, _event: &proto::Attested<proto::Event>) -> Result<bool, MutationError> { Ok(true) }
+
+        async fn get_events(&self, _event_ids: Vec<proto::EventId>) -> Result<Vec<proto::Attested<proto::Event>>, RetrievalError> {
+            Ok(Vec::new())
+        }
+
+        async fn dump_entity_events(&self, _id: EntityId) -> Result<Vec<proto::Attested<proto::Event>>, RetrievalError> { Ok(Vec::new()) }
+    }
+
+    fn manager_over(fail: BTreeSet<CollectionId>) -> CatalogManager<SelectiveEngine, PermissiveAgent> {
+        CatalogManager::new(CollectionSet::new(Arc::new(SelectiveEngine { fail })), WeakEntitySet::default(), Reactor::new(), true)
+    }
+
+    fn seed_membership(manager: &CatalogManager<SelectiveEngine, PermissiveAgent>, model: EntityId) {
+        manager.0.map.write().unwrap().upsert_membership(MembershipDef {
+            id: EntityId::new(),
+            model,
+            property: EntityId::new(),
+            optional: Some(false),
+        });
+    }
+
+    /// A definition whose property state cannot load must ship NOTHING for
+    /// that model and report it failed, so the connection un-marks it and a
+    /// later message re-ships the definition whole.
+    #[tokio::test]
+    async fn a_partial_definition_load_ships_nothing_and_reports_the_model() {
+        let manager = manager_over([property_collection()].into_iter().collect());
+        let model = EntityId::new();
+        seed_membership(&manager, model);
+
+        let (states, failed) = manager.definition_states_for_models(&[model]).await;
+        assert!(states.is_empty(), "a model whose property defs cannot load must ship nothing, got {} states", states.len());
+        assert_eq!(failed, vec![model], "the partially loadable model must be reported failed");
+    }
+
+    /// The happy path: model, property, and membership states all load and
+    /// ship together, and nothing is reported failed.
+    #[tokio::test]
+    async fn a_fully_loadable_definition_ships_all_three_states() {
+        let manager = manager_over(BTreeSet::new());
+        let model = EntityId::new();
+        seed_membership(&manager, model);
+
+        let (states, failed) = manager.definition_states_for_models(&[model]).await;
+        assert_eq!(states.len(), 3, "model + property + membership states ship together");
+        assert!(failed.is_empty(), "nothing failed: {failed:?}");
+    }
+
+    /// One model failing partway must not block a fully loadable model in the
+    /// same batch.
+    #[tokio::test]
+    async fn a_failed_model_does_not_block_other_models_in_the_batch() {
+        let manager = manager_over([property_collection()].into_iter().collect());
+        let broken = EntityId::new();
+        seed_membership(&manager, broken); // its property state fails to load
+        let whole = EntityId::new(); // no memberships: loads fully
+
+        let (states, failed) = manager.definition_states_for_models(&[broken, whole]).await;
+        assert_eq!(states.len(), 1, "only the fully loadable model ships");
+        assert_eq!(states[0].payload.entity_id, whole, "the shipped state is the loadable model's definition");
+        assert_eq!(failed, vec![broken], "only the partially loadable model is reported failed");
+    }
+}
