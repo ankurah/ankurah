@@ -627,13 +627,24 @@ pub async fn start_test_server() -> anyhow::Result<(Node<SledStorageEngine, Perm
             }
         });
 
-        // Wait briefly for the TcpListener::bind() call to complete
-        // If port is in use, the server task will complete immediately with an error
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-
-        // Check if the server task is still running (successful bind) or completed (failed bind)
-        if server_task.is_finished() {
-            // Server task completed immediately, which means binding failed
+        // Positive readiness: probe until the listener accepts, failing fast
+        // if the server task already exited (a failed bind). A fixed sleep can
+        // pass before a slow bind is listening, handing back a URL the suite's
+        // immediate connect then flakes on.
+        let mut listening = false;
+        for _ in 0..100 {
+            if server_task.is_finished() {
+                break;
+            }
+            if tokio::net::TcpStream::connect(&bind_addr).await.is_ok() {
+                listening = true;
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+        }
+        if !listening {
+            // Either the task exited (bind failure) or the listener never
+            // became reachable in time; retry on another port.
             tracing::warn!("Failed to bind server on port {} (attempt {})", port, attempt + 1);
             last_error = Some(anyhow::anyhow!("Port {} binding failed", port));
 

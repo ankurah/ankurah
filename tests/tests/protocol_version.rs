@@ -158,6 +158,68 @@ async fn server_closes_silent_client_after_durable_presence() -> Result<()> {
     Ok(())
 }
 
+/// Application traffic before Presence is refused: a server that skips the
+/// handshake and leads with a PeerMessage must not reach the node, and the
+/// client must drop the connection rather than continue.
+#[tokio::test]
+async fn client_refuses_peer_message_before_presence() -> Result<()> {
+    let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+
+    // Fake server: leads with application traffic instead of Presence, then
+    // watches whether the client tears the connection down.
+    let fake_server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let ws = tokio_tungstenite::accept_async(stream).await.expect("ws accept");
+        let (mut sink, mut stream) = ws.split();
+
+        let early = proto::Message::PeerMessage(proto::NodeMessage::UnsubscribeQuery {
+            from: proto::EntityId::new(),
+            query_id: proto::QueryId::new(),
+        });
+        sink.send(WsMessage::Binary(bincode::serialize(&early).unwrap().into())).await.expect("send");
+
+        // The client must close on the pre-negotiation frame instead of
+        // continuing the session. Ignore control frames; a Binary frame or a
+        // quiet open connection both mean the client continued.
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), stream.next()).await {
+                Ok(None) | Ok(Some(Ok(WsMessage::Close(_)))) | Ok(Some(Err(_))) => break true,
+                Ok(Some(Ok(WsMessage::Binary(data)))) => {
+                    // The client's own Presence (and a possible rejection
+                    // notice) are handshake chatter, not session traffic.
+                    match bincode::deserialize::<proto::Message>(&data) {
+                        Ok(proto::Message::Presence(_)) | Ok(proto::Message::PresenceRejected(_)) => continue,
+                        other => {
+                            eprintln!("client continued the session instead of closing: {other:?}");
+                            break false;
+                        }
+                    }
+                }
+                Ok(Some(Ok(_))) => continue,
+                Err(_) => {
+                    eprintln!("client left the connection open (timeout)");
+                    break false;
+                }
+            }
+        }
+    });
+
+    let client_node = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    let client = WebsocketClient::new(client_node.clone(), &format!("ws://{}", addr)).await?;
+
+    match tokio::time::timeout(Duration::from_secs(3), client.wait_connected()).await {
+        Ok(Ok(())) => panic!("client treated a pre-negotiation server as connected"),
+        Ok(Err(_)) | Err(_) => {}
+    }
+
+    assert!(fake_server.await?, "client kept the connection open after pre-negotiation application traffic");
+    client.shutdown().await?;
+    Ok(())
+}
+
 /// The client side of the same handshake: a server speaking a different
 /// version is refused, told why, and never treated as connected.
 #[tokio::test]
