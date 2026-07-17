@@ -406,7 +406,13 @@ impl Entity {
             }
         }
 
-        if operations.is_empty() {
+        // No operations on an EXISTING entity means nothing changed: no event.
+        // On a brand-new entity (empty head) it means every field is its
+        // default, which is still an entity: emit a zero-operation creation
+        // event so the entity exists, replicates, and persists (the #175
+        // degenerate case; RFC 5.4 in specs/model-property-metadata/rfc.md). EventId hashes fine over empty
+        // operations.
+        if operations.is_empty() && !state.head.is_empty() {
             Ok(None)
         } else {
             let operations = OperationSet(operations);
@@ -784,6 +790,24 @@ impl Filterable for Entity {
 
 impl TemporaryEntity {
     pub fn new(id: EntityId, collection: CollectionId, state: &State) -> Result<Self, RetrievalError> {
+        // Temporary entities parse UNBOUND by default (engine post-filter
+        // tier): no resolver, so lenient name reads see only name-keyed data,
+        // while resolved-identifier predicate reads carry their own id.
+        Self::new_bound(id, collection, state, None)
+    }
+
+    /// [`Self::new`] with a catalog resolver stamped, for consumers that
+    /// evaluate NAME-addressed predicates against id-keyed state -- policy
+    /// agents inspecting entity state for scope enforcement (the
+    /// `PolicyAgent::check_read` resolver parameter). Without the binding, a
+    /// display name resolves to nothing on a post-epoch buffer and every
+    /// scope predicate evaluates false.
+    pub fn new_bound(
+        id: EntityId,
+        collection: CollectionId,
+        state: &State,
+        resolver: Option<std::sync::Weak<dyn CatalogResolver>>,
+    ) -> Result<Self, RetrievalError> {
         // Inline from_state_buffers logic
         let mut backends = BTreeMap::new();
         for (name, state_buffer) in state.state_buffers.iter() {
@@ -798,6 +822,7 @@ impl TemporaryEntity {
             kind: EntityKind::Primary,
             // slightly annoying that we need to populate this, given that it won't be used
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
+            resolver: std::sync::RwLock::new(resolver),
         })))
     }
     pub fn values(&self) -> Vec<(String, Option<Value>)> {
@@ -838,18 +863,43 @@ impl std::fmt::Display for TemporaryEntity {
 }
 
 // TODO - Implement TOCTOU Race condition tests. Require real backend state mutations to be meaningful. punting that for now
-/// A set of entities held weakly
+/// A set of entities held weakly.
+///
+/// Assembly is the single choke point for catalog-aware property access:
+/// every method that hands out an `Entity` runs the `bind_hook`, installed by
+/// `Node` to stamp its live catalog resolver. The hook is idempotent and
+/// re-fires on resident hand-outs, so an entity assembled before the catalog
+/// warmed observes the catalog on its next access.
 #[derive(Clone, Default)]
-pub struct WeakEntitySet(Arc<std::sync::RwLock<BTreeMap<EntityId, WeakEntity>>>);
+pub struct WeakEntitySet(Arc<WeakEntitySetInner>);
+
+#[derive(Default)]
+struct WeakEntitySetInner {
+    entities: std::sync::RwLock<BTreeMap<EntityId, WeakEntity>>,
+    bind_hook: std::sync::RwLock<Option<Box<dyn Fn(&Entity) + Send + Sync>>>,
+}
+
 impl WeakEntitySet {
-    pub fn get(&self, id: &EntityId) -> Option<Entity> {
-        let entities = self.0.read().unwrap();
-        // TODO: call policy agent with cdata
-        if let Some(entity) = entities.get(id) {
-            entity.upgrade()
-        } else {
-            None
+    /// Install the assembly-time bind hook. Called once from `Node`
+    /// construction; the hook captures a `WeakNode` (no strong cycle).
+    pub(crate) fn set_bind_hook(&self, hook: Box<dyn Fn(&Entity) + Send + Sync>) { *self.0.bind_hook.write().unwrap() = Some(hook); }
+
+    /// Run the bind hook on an entity leaving the assembly boundary. Always
+    /// called OUTSIDE the entities lock (the hook takes catalog/backend
+    /// locks of its own).
+    fn bind(&self, entity: &Entity) {
+        if let Some(hook) = self.0.bind_hook.read().unwrap().as_ref() {
+            hook(entity);
         }
+    }
+
+    pub fn get(&self, id: &EntityId) -> Option<Entity> {
+        // TODO: call policy agent with cdata
+        let entity = { self.0.entities.read().unwrap().get(id).and_then(|weak| weak.upgrade()) };
+        if let Some(ref entity) = entity {
+            self.bind(entity);
+        }
+        entity
     }
 
     pub async fn get_or_retrieve<S, E>(
@@ -893,25 +943,33 @@ impl WeakEntitySet {
         match self.get_or_retrieve(state_getter, event_getter, collection_id, id).await? {
             Some(entity) => Ok(entity),
             None => {
-                let mut entities = self.0.write().unwrap();
-                // TODO: call policy agent with cdata
-                if let Some(entity) = entities.get(id) {
-                    if let Some(entity) = entity.upgrade() {
-                        return Ok(entity);
+                let entity = {
+                    let mut entities = self.0.entities.write().unwrap();
+                    // TODO: call policy agent with cdata
+                    match entities.get(id).and_then(|weak| weak.upgrade()) {
+                        Some(entity) => entity,
+                        None => {
+                            let entity = Entity::create(*id, collection_id.to_owned());
+                            entities.insert(*id, entity.weak());
+                            entity
+                        }
                     }
-                }
-                let entity = Entity::create(*id, collection_id.to_owned());
-                entities.insert(*id, entity.weak());
+                };
+                self.bind(&entity);
                 Ok(entity)
             }
         }
     }
     /// Create a brand new entity, and add it to the set
     pub fn create(&self, collection: CollectionId) -> Entity {
-        let mut entities = self.0.write().unwrap();
-        let id = EntityId::new();
-        let entity = Entity::create(id, collection);
-        entities.insert(id, entity.weak());
+        let entity = {
+            let mut entities = self.0.entities.write().unwrap();
+            let id = EntityId::new();
+            let entity = Entity::create(id, collection);
+            entities.insert(id, entity.weak());
+            entity
+        };
+        self.bind(&entity);
         entity
     }
 
@@ -921,7 +979,7 @@ impl WeakEntitySet {
     /// update that then failed to apply; leaving it resident makes the entity
     /// appear to exist with no state. Returns true if an entry was removed.
     pub fn remove_if_phantom(&self, id: &EntityId) -> bool {
-        let mut entities = self.0.write().unwrap();
+        let mut entities = self.0.entities.write().unwrap();
         if let Some(weak) = entities.get(id) {
             if let Some(entity) = weak.upgrade() {
                 if !entity.head().is_empty() {
@@ -946,7 +1004,7 @@ impl WeakEntitySet {
     /// Requires the `test-helpers` feature to be enabled.
     #[cfg(feature = "test-helpers")]
     pub fn conjure_evil_phantom(&self, id: EntityId, collection: CollectionId) -> Entity {
-        let mut entities = self.0.write().unwrap();
+        let mut entities = self.0.entities.write().unwrap();
         let entity = Entity::create(id, collection);
         entities.insert(id, entity.weak());
         entity
@@ -955,7 +1013,7 @@ impl WeakEntitySet {
     /// Get or create entity after async operations, checking for race conditions
     /// Returns (existed, entity) where existed is true if the entity was already present
     fn private_get_or_create(&self, id: EntityId, collection_id: &CollectionId, state: &State) -> Result<(bool, Entity), RetrievalError> {
-        let mut entities = self.0.write().unwrap();
+        let mut entities = self.0.entities.write().unwrap();
         if let Some(existing_weak) = entities.get(&id) {
             if let Some(existing_entity) = existing_weak.upgrade() {
                 debug!("Entity {id} was created by another thread during async work, using that one");
@@ -996,6 +1054,7 @@ impl WeakEntitySet {
                         (true, entity) => entity, // some body frontran us to create it, so we have to apply the new state
                         (false, entity) => {
                             // we just created it with the given state, so there's nothing to apply. early return
+                            self.bind(&entity);
                             return Ok((None, entity));
                         }
                     }
@@ -1006,6 +1065,11 @@ impl WeakEntitySet {
         // if we're here, we've retrieved the entity from the set and need to apply the state
         let result = entity.apply_state(event_getter, &state).await?;
         let changed = matches!(result, StateApplyResult::Applied);
+        // Bind AFTER the apply: apply_state may rebuild backends from the
+        // incoming raw buffers, which would discard a binding attached
+        // beforehand and leave an unbound (v1-emitting) backend holding
+        // id-keyed entries.
+        self.bind(&entity);
         Ok((Some(changed), entity))
     }
 }

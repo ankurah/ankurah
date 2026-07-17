@@ -77,6 +77,8 @@ pub trait TContext {
 impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> TContext for NodeAndContext<SE, PA> {
     fn node_id(&self) -> proto::EntityId { self.node.id }
     fn create_entity(&self, collection: proto::CollectionId, trx_alive: Arc<AtomicBool>) -> Entity {
+        // WeakEntitySet::create stamps the PRIMARY with the live catalog
+        // resolver before this snapshot, so the transaction fork inherits it.
         let primary_entity = self.node.entities.create(collection);
         primary_entity.snapshot(trx_alive)
     }
@@ -110,11 +112,30 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
             TContext::ensure_registered(self, schema).await?;
         }
 
+        // Cast each staged value to its property's catalog value_type now the
+        // catalog is warm (rfc.md 5.6 as amended 2026-07-10): every accessor
+        // already resolved its `PropertyId` at construction (system fields
+        // included), so there is no key left to resolve here, only values to
+        // canonicalize. The committed/wire form is always id-keyed for a
+        // registered user collection. A value the canonical type cannot
+        // represent fails this writer's commit.
+        for entity in trx.entities.iter() {
+            entity.canonicalize_pending_values()?;
+        }
+
         // Generate events from the transaction entities
         let trx_id = trx.id.clone();
         let mut entity_events = Vec::new();
         for entity in trx.entities.iter() {
             if let Some(event) = entity.generate_commit_event()? {
+                // Protected collections (system + metadata catalog) are not
+                // mutable through ordinary transactions; the catalog's only
+                // mutation path is the registration operation (RFC 4).
+                if let Some(protected) = crate::schema::well_known_collection(&event.model) {
+                    return Err(MutationError::General(
+                        format!("collection '{}' is protected and not writable by transactions", protected).into(),
+                    ));
+                }
                 // Validate creation events: if parent is empty, this is a creation event
                 // and the entity must have been created in this transaction via create()
                 if event.is_entity_create() {
@@ -154,8 +175,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
             };
 
             // Stage event and apply to fork for after state (no commit_event call here)
-            let collection_id = &event.collection;
-            let collection = self.node.collections.get(collection_id).await?;
+            let collection = self.node.collections.get(entity.collection()).await?;
             let event_getter = crate::retrieval::LocalEventGetter::new(collection, self.node.durable);
             event_getter.stage_event(event.clone());
             forked.apply_event(&event_getter, &event).await?;
@@ -168,8 +188,8 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         }
 
         // Phase 2: all events attested; persist them.
-        for (_, attested) in &entity_attested_events {
-            let collection = self.node.collections.get(&attested.payload.collection).await?;
+        for (entity, attested) in &entity_attested_events {
+            let collection = self.node.collections.get(entity.collection()).await?;
             let event_getter = crate::retrieval::LocalEventGetter::new(collection, self.node.durable);
             event_getter.commit_event(attested).await?;
         }
@@ -184,8 +204,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         // All peers confirmed, persist state to storage
         let mut changes: Vec<EntityChange> = Vec::new();
         for (entity, attested_event) in entity_attested_events {
-            let collection_id = &attested_event.payload.collection;
-            let collection = self.node.collections.get(collection_id).await?;
+            let collection = self.node.collections.get(entity.collection()).await?;
 
             // Persist canonical entity (upstream for transactional forks, entity itself for primary)
             let canonical_entity = match &entity.kind {
@@ -200,7 +219,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
 
             let state = canonical_entity.to_state()?;
 
-            let entity_state = EntityState { entity_id: canonical_entity.id(), collection: canonical_entity.collection().clone(), state };
+            let entity_state = EntityState { entity_id: canonical_entity.id(), model: canonical_entity.model_id()?, state };
             let attestation = self.node.policy_agent.attest_state(&self.node, &entity_state);
             let attested = Attested::opt(entity_state, attestation);
             collection.set_state(attested).await?;

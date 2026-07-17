@@ -1,5 +1,8 @@
 mod common;
-use ankurah::{policy::DEFAULT_CONTEXT, Model, Node, PermissiveAgent};
+use ankurah::core::property::YrsString;
+use ankurah::model::View;
+use ankurah::signals::Subscribe;
+use ankurah::{policy::DEFAULT_CONTEXT, proto, Model, Node, PermissiveAgent};
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
 use common::TestDag;
@@ -17,6 +20,36 @@ async fn setup() -> Result<ankurah::Context> {
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     node.system.create().await?;
     Ok(node.context_async(DEFAULT_CONTEXT).await)
+}
+
+/// #175: creating an entity whose every field is an empty string still
+/// produces a (zero-operation) creation event, persists to storage, and
+/// reads back "" rather than erroring Missing.
+#[tokio::test]
+async fn test_all_empty_create_persists_and_reads_back() -> Result<()> {
+    let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    node.system.create().await?;
+    let ctx = node.context_async(DEFAULT_CONTEXT).await;
+
+    let doc_id = {
+        let trx = ctx.begin();
+        let doc = trx.create(&Document { content: "".to_owned() }).await?;
+        let id = doc.id();
+        trx.commit().await?;
+        id
+    };
+
+    // The entity made it to durable storage (the degenerate #175 case
+    // produced no creation event and nothing persisted).
+    let storage = node.collections.get(&Document::collection()).await?;
+    let state = storage.get_state(doc_id).await?;
+    assert!(!state.payload.state.head.is_empty(), "creation event must exist");
+
+    // And the required string reads back as its default.
+    let doc = ctx.get::<DocumentView>(doc_id).await?;
+    assert_eq!(doc.content()?, "");
+
+    Ok(())
 }
 
 /// Test 2.1: Concurrent Text Inserts - Same Position
@@ -297,11 +330,10 @@ async fn test_yrs_convergence() -> Result<()> {
 }
 
 /// Test: Sequential text operations maintain order
-// TODO(#175): Blocked on PR #236 — Yrs does not differentiate between empty string
-// and null value. Creating an entity with content: "" produces no CRDT operations,
-// so no creation event is generated and the entity is never persisted to storage.
+// #175: an all-empty create produces a zero-operation creation event (the
+// entity exists, replicates, and persists) and required absent strings read
+// back as "" (RFC 5.4 rules; specs/model-property-metadata).
 #[tokio::test]
-#[ignore = "blocked on #236: Yrs empty-string treated as null"]
 async fn test_sequential_text_operations() -> Result<()> {
     let ctx = setup().await?;
     let mut dag = TestDag::new();
