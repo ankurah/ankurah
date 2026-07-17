@@ -445,8 +445,31 @@ mod tests {
         let selection = parse_selection(r#"note IS NULL"#).unwrap();
         assert_eq!(selection.predicate, ast::Predicate::IsNull(Box::new(ast::Expr::Path(ast::PathExpr::simple("note".to_string())))));
 
+        // Assert the complete identifier survived: a loose Comparison match
+        // would also pass on a mangled remainder.
         let selection = parse_selection(r#"notes = 1"#).unwrap();
-        assert!(matches!(selection.predicate, ast::Predicate::Comparison { .. }));
+        assert_eq!(
+            selection.predicate,
+            ast::Predicate::Comparison {
+                left: Box::new(ast::Expr::Path(ast::PathExpr::simple("notes".to_string()))),
+                operator: ast::ComparisonOperator::Equal,
+                right: Box::new(ast::Expr::Literal(ast::Literal::I32(1)))
+            }
+        );
+
+        // The identifier grammar admits hyphens and Cyrillic letters, so the
+        // boundary guard must treat them as identifier continuation too.
+        let selection = parse_selection(r#"not-field = 1"#).unwrap();
+        assert_eq!(
+            selection.predicate,
+            ast::Predicate::Comparison {
+                left: Box::new(ast::Expr::Path(ast::PathExpr::simple("not-field".to_string()))),
+                operator: ast::ComparisonOperator::Equal,
+                right: Box::new(ast::Expr::Literal(ast::Literal::I32(1)))
+            }
+        );
+        let selection = parse_selection("notа IS NULL").unwrap();
+        assert_eq!(selection.predicate, ast::Predicate::IsNull(Box::new(ast::Expr::Path(ast::PathExpr::simple("notа".to_string())))));
 
         // The bare keyword keeps working as unary NOT.
         let selection = parse_selection(r#"NOT (status = 'x')"#).unwrap();
