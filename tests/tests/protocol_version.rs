@@ -113,7 +113,7 @@ async fn server_refuses_mismatched_version() -> Result<()> {
 }
 
 /// A legacy browser client waits for the server Presence before sending its
-/// own. A durable v3 Presence is undecodable by that client, so it remains
+/// own. A durable versioned Presence is undecodable by that client, so it remains
 /// silent; the server must still bound the incomplete handshake.
 #[tokio::test(start_paused = true)]
 async fn server_closes_silent_client_after_durable_presence() -> Result<()> {
@@ -133,7 +133,7 @@ async fn server_closes_silent_client_after_durable_presence() -> Result<()> {
         }
     };
     assert!(server_presence.durable, "test server must reproduce the durable Presence shape");
-    assert!(server_presence.system_root.is_some(), "durable Presence must carry the v3 system-root state");
+    assert!(server_presence.system_root.is_some(), "durable Presence must carry the versioned system-root state");
 
     // Send nothing. Advancing beyond the production deadline keeps this test
     // deterministic and avoids adding ten seconds to the native test suite.
