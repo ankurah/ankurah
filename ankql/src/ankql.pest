@@ -63,4 +63,8 @@ NotFlag = @{ ^"not" ~ !IDENT_CONT }
 EOF = { EOI | ";" }
 WS = _{ WHITESPACE }
 WHITESPACE = _{ " " | "\t" | "\n" | "\r\n" }
-IDENT_CONT  = _{ ASCII_ALPHANUMERIC | "_" }
+// The continuation set must equal Identifier's own: IdentifierNonDigit
+// admits hyphen and Cyrillic letters, so a guard narrower than the
+// identifier grammar would let a keyword prefix mangle identifiers like
+// not-field.
+IDENT_CONT  = _{ IdentifierNonDigit | ASCII_DIGIT }
