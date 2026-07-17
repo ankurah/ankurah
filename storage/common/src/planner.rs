@@ -1,8 +1,18 @@
 use crate::{KeyBounds, predicate::ConjunctFinder, types::*};
-use ankql::ast::{ComparisonOperator, Expr, Predicate};
+use ankql::ast::{ComparisonOperator, Expr, OrderByItem, OrderKey, Predicate, PropertyId, PropertyPath};
 use ankurah_core::indexing::{IndexKeyPart, KeySpec};
 use ankurah_core::value::{Value, ValueType};
 use indexmap::IndexMap;
+
+/// Translate a resolved property identity to THIS engine's physical column, or
+/// `None` when the engine's durable map has no column for it. A miss means the
+/// property is ABSENT here; there is NO fallback to the property's name (the
+/// #374 fix). The planner threads this exactly like `order_type_of`: the caller
+/// (a storage engine) supplies it from its durable id-to-column map, and a raw
+/// unresolved `Path`/`OrderKey::Path` -- which carries no identity -- is never
+/// routed through it (its verbatim step is the column, used only by the
+/// planner's own unresolved-selection unit tests).
+type ColumnOf<'a> = &'a dyn Fn(&PropertyId) -> Option<String>;
 
 #[derive(Debug, Clone)]
 pub struct PlannerConfig {
@@ -32,21 +42,46 @@ impl Planner {
     ///
     /// Input: Selection with predicate, primary key field name
     /// Output: Vector of all viable plans (index plans + table scan fallback)
+    ///
+    /// ORDER BY key parts default to String collation; engines that know the
+    /// catalog should call [`Self::plan_with_types`] so sort keys collate in
+    /// each property's CANONICAL value_type.
     pub fn plan(&self, selection: &ankql::ast::Selection, primary_key: &str) -> Vec<Plan> {
+        self.plan_with_types(selection, primary_key, &|_| None, &|_| None)
+    }
+
+    /// [`Self::plan`] with two engine-supplied lookups:
+    /// - `order_type_of` resolves a physical column to the property's canonical
+    ///   value_type (the canonical value_type ruling), so ordered index scans
+    ///   collate numerics numerically instead of the historical hardcoded-String
+    ///   collation. `None` for a column (system collections, unresolvable legacy
+    ///   names) keeps the String fallback.
+    /// - `column_of` (see [`ColumnOf`]) translates a resolved property identity
+    ///   to this engine's physical column; a miss means the property is absent
+    ///   (no name fallback). Every resolved `Expr::PropertyIdentifier` /
+    ///   `OrderKey::Property` the planner touches is routed through it, so a
+    ///   rename never moves the column a plan addresses.
+    pub fn plan_with_types(
+        &self,
+        selection: &ankql::ast::Selection,
+        primary_key: &str,
+        order_type_of: &dyn Fn(&str) -> Option<ValueType>,
+        column_of: ColumnOf,
+    ) -> Vec<Plan> {
         let conjuncts = ConjunctFinder::find(&selection.predicate);
 
         // Separate conjuncts into equalities and inequalities, filtering out primary key predicates
-        let (equalities, inequalities) = self.categorize_conjuncts_excluding_primary_key(&conjuncts, primary_key);
+        let (equalities, inequalities) = self.categorize_conjuncts_excluding_primary_key(&conjuncts, primary_key, column_of);
 
         // Check if we should skip index generation for primary key-only queries
-        let has_primary_key_ranges = self.has_primary_key_range_predicates(&conjuncts, primary_key);
-        let has_primary_key_order_by = self.has_primary_key_order_by(&selection.order_by, primary_key);
+        let has_primary_key_ranges = self.has_primary_key_range_predicates(&conjuncts, primary_key, column_of);
+        let has_primary_key_order_by = self.has_primary_key_order_by(&selection.order_by, primary_key, column_of);
         let has_non_primary_predicates =
-            conjuncts.iter().any(|pred| !matches!(pred, Predicate::True) && !self.is_primary_key_predicate(pred, primary_key));
+            conjuncts.iter().any(|pred| !matches!(pred, Predicate::True) && !self.is_primary_key_predicate(pred, primary_key, column_of));
 
         // If we have primary key predicates/ORDER BY but NO other meaningful predicates, skip index generation
         if (has_primary_key_ranges || has_primary_key_order_by) && !has_non_primary_predicates {
-            let table_scan = self.build_table_scan_plan(&conjuncts, primary_key, &selection.order_by);
+            let table_scan = self.build_table_scan_plan(&conjuncts, primary_key, &selection.order_by, column_of);
             return vec![table_scan];
         }
 
@@ -56,15 +91,17 @@ impl Planner {
         if let Some(order_by) = &selection.order_by
             && !order_by.is_empty()
         {
-            if let Some(plan) = self.build_order_first_plan(&equalities, &inequalities, order_by, &conjuncts) {
+            if let Some(plan) =
+                self.build_order_first_plan(&equalities, &inequalities, order_by, &conjuncts, primary_key, order_type_of, column_of)
+            {
                 plans.push(plan);
             }
             // If an ORDER BY field has inequalities (covered inequality), do NOT emit INEQ-FIRST
             let covered_ineq =
-                order_by.iter().any(|item| if item.path.is_simple() { inequalities.contains_key(item.path.first()) } else { false });
+                order_by.iter().any(|item| self.order_by_column(item, column_of).is_some_and(|col| inequalities.contains_key(&col)));
             if !covered_ineq
                 && !inequalities.is_empty()
-                && let Some(plan) = self.build_ineq_first_plan(&equalities, &inequalities, order_by, &conjuncts)
+                && let Some(plan) = self.build_ineq_first_plan(&equalities, &inequalities, order_by, &conjuncts, column_of)
             {
                 plans.push(plan);
             }
@@ -73,7 +110,7 @@ impl Planner {
             let has_empty_scan = deduplicated_plans.iter().any(|plan| matches!(plan, Plan::EmptyScan));
             if !has_empty_scan {
                 let mut final_plans = deduplicated_plans;
-                let table_scan = self.build_table_scan_plan(&conjuncts, primary_key, &selection.order_by);
+                let table_scan = self.build_table_scan_plan(&conjuncts, primary_key, &selection.order_by, column_of);
                 final_plans.push(table_scan);
                 return final_plans;
             } else {
@@ -91,13 +128,14 @@ impl Planner {
                     &inequalities,
                     &conjuncts,
                     selection.order_by.as_deref(),
+                    column_of,
                 ) {
                     plans.push(plan);
                 }
             }
         } else if !equalities.is_empty() {
             // Generate equality-only plan if we have equalities but no inequalities
-            if let Some(plan) = self.generate_equality_plan(&equalities, &conjuncts) {
+            if let Some(plan) = self.generate_equality_plan(&equalities, &conjuncts, column_of) {
                 plans.push(plan);
             }
         }
@@ -109,7 +147,7 @@ impl Planner {
         let has_empty_scan = deduplicated_plans.iter().any(|plan| matches!(plan, Plan::EmptyScan));
         if !has_empty_scan {
             let mut final_plans = deduplicated_plans;
-            let table_scan = self.build_table_scan_plan(&conjuncts, primary_key, &selection.order_by);
+            let table_scan = self.build_table_scan_plan(&conjuncts, primary_key, &selection.order_by, column_of);
             final_plans.push(table_scan);
             final_plans
         } else {
@@ -117,29 +155,108 @@ impl Planner {
         }
     }
 
-    // ORDER-FIRST: [EQ …] + maximal OB prefix (capability-aware). Bounds: EQ only.
+    /// The physical column an ORDER BY item sorts on, or `None` when it does not
+    /// address a single simple column of THIS engine: a resolved property with a
+    /// JSON subpath, a resolved property absent from the durable map (a
+    /// `column_of` miss -- NO name fallback), or a raw multi-step path. A raw
+    /// simple `OrderKey::Path` carries no identity and is taken verbatim (only
+    /// unresolved-selection unit tests produce one). Mirrors the pushdown side's
+    /// `extract_comparison`, so a sort key and a predicate on the same property
+    /// resolve to the same column.
+    fn order_by_column(&self, item: &OrderByItem, column_of: ColumnOf) -> Option<String> {
+        match &item.key {
+            OrderKey::Property(identifier) => {
+                if !identifier.is_simple() {
+                    return None;
+                }
+                column_of(&identifier.id_or_systemname())
+            }
+            OrderKey::Path(path) => {
+                if !path.is_simple() {
+                    return None;
+                }
+                Some(path.first().to_string())
+            }
+        }
+    }
+
+    /// Whether a resolved identifier addresses THIS engine's primary-key column:
+    /// a bare reference (no subpath) whose identity maps to `primary_key` through
+    /// the durable map. The `id` pseudo-property maps to the primary key, so this
+    /// is how `PropertyId::Id` is recognized -- by its assigned column, never by
+    /// a literal name.
+    fn identifier_is_primary_key(&self, identifier: &PropertyPath, primary_key: &str, column_of: ColumnOf) -> bool {
+        identifier.is_simple() && column_of(&identifier.id_or_systemname()).as_deref() == Some(primary_key)
+    }
+
+    /// The ORDER BY counterpart of [`Self::identifier_is_primary_key`]: whether
+    /// a sort key addresses THIS engine's primary-key column -- a bare resolved
+    /// `id` reference (recognized through the durable map, never by literal
+    /// name) or, in unresolved unit-test selections, a raw simple `id` path
+    /// taken verbatim. This is the decision key for the primary-key ORDER BY
+    /// ruling (see [`Self::build_order_first_plan`]): such a key must NEVER
+    /// become an index keypart.
+    fn order_by_item_is_primary_key(&self, item: &OrderByItem, primary_key: &str, column_of: ColumnOf) -> bool {
+        self.order_by_column(item, column_of).as_deref() == Some(primary_key)
+    }
+
+    // ORDER-FIRST: [EQ …] + maximal OB prefix (capability-aware, primary key never keyparted). Bounds: EQ only.
     fn build_order_first_plan(
         &self,
         equalities: &[(String, Value)],
         inequalities: &IndexMap<String, Vec<(ComparisonOperator, Value)>>,
-        order_by: &[ankql::ast::OrderByItem],
+        order_by: &[OrderByItem],
         conjuncts: &[Predicate],
+        primary_key: &str,
+        order_type_of: &dyn Fn(&str) -> Option<ValueType>,
+        column_of: ColumnOf,
     ) -> Option<Plan> {
         if order_by.is_empty() {
             return None;
         }
 
+        // RULING (the F4 wedge): a primary-key ORDER BY key must NEVER become an
+        // index keypart. `PropertyId::Id` is pinned to the engine's reserved
+        // primary-key column and never enters its property-column map, so a pk
+        // keypart is unresolvable at emit time (sled's Index::build_key_from_map
+        // returns PropertyNotFound, permanently wedging the Building index).
+        //
+        // Index keys DO end with the entity id as a uniqueness suffix (sled
+        // appends the raw eid bytes after the keypart tuple; IndexedDB
+        // tie-breaks equal index keys by store primary key). ABSORBING the pk
+        // key into that suffix -- claiming the scan direction satisfies it -- is
+        // not sound on either planner-backed engine, verified at implementation
+        // time:
+        //   - sled reuses any existing index the requested spec prefix-matches
+        //     (extra keyparts interpose between our last keypart and the eid
+        //     suffix) or inverse-matches (the scan flips, flipping the suffix's
+        //     effective direction): `KeySpec::matches` +
+        //     `SledIndexScanner::effective_scan_direction`.
+        //   - IndexedDB's tie-break key is the entity id's base64url STRING,
+        //     whose lexicographic order differs from the canonical
+        //     `Value::EntityId` byte order the spill comparator uses.
+        // So the pk key -- and every ORDER BY key after it, since a scan cannot
+        // satisfy keys past an unsatisfied one -- SPILLS to the in-memory
+        // comparator, which compares entity ids canonically (byte order). Table
+        // scans still absorb a leading pk key into their scan direction
+        // (`build_table_scan_plan`): they iterate the primary-key space itself,
+        // which is never substituted.
+        let pk_split =
+            order_by.iter().position(|item| self.order_by_item_is_primary_key(item, primary_key, column_of)).unwrap_or(order_by.len());
+        let (scannable, pk_tail) = order_by.split_at(pk_split);
+
         // Keyparts: EQ prefix (using asc_path for multi-step path support)
-        let mut index_keyparts: Vec<IndexKeyPart> = equalities.iter().map(|(f, v)| IndexKeyPart::asc_path(f, ValueType::of(v))).collect();
+        let mut index_keyparts: Vec<IndexKeyPart<String>> =
+            equalities.iter().map(|(f, v)| IndexKeyPart::asc_path(f, ValueType::of(v))).collect();
 
         // Append ORDER BY fields per capability
         if self.config.supports_desc_indexes {
-            for item in order_by {
-                if item.path.is_simple() {
-                    let name = item.path.first();
+            for item in scannable {
+                if let Some(name) = self.order_by_column(item, column_of) {
+                    let vt = order_type_of(&name).unwrap_or(ValueType::String);
                     index_keyparts.push(match item.direction {
-                        ankql::ast::OrderDirection::Asc => IndexKeyPart::asc(name.to_string(), ValueType::String),
-                        ankql::ast::OrderDirection::Desc => IndexKeyPart::desc(name.to_string(), ValueType::String),
+                        ankql::ast::OrderDirection::Asc => IndexKeyPart::asc(name, vt),
+                        ankql::ast::OrderDirection::Desc => IndexKeyPart::desc(name, vt),
                     });
                 }
             }
@@ -147,11 +264,11 @@ impl Planner {
             // IndexedDB: ASC-only index parts, keep longest same-direction prefix
             let first_dir = order_by[0].direction.clone();
             let mut broke = false;
-            for item in order_by {
-                if item.path.is_simple() {
-                    let name = item.path.first();
+            for item in scannable {
+                if let Some(name) = self.order_by_column(item, column_of) {
                     if !broke && item.direction == first_dir {
-                        index_keyparts.push(IndexKeyPart::asc(name.to_string(), ValueType::String));
+                        let vt = order_type_of(&name).unwrap_or(ValueType::String);
+                        index_keyparts.push(IndexKeyPart::asc(name, vt));
                     } else {
                         broke = true;
                     }
@@ -159,14 +276,24 @@ impl Planner {
             }
         }
 
-        // Bounds: equalities + (optional) bounds on the first ORDER BY field that has inequalities
-        let applied_ineq = order_by.iter().find_map(|item| {
-            if item.path.is_simple() {
-                let name = item.path.first();
-                inequalities.get_key_value(name).map(|(k, v)| (k.as_str(), v))
-            } else {
-                None
-            }
+        // Nothing indexable: every ORDER BY key spilled at the primary key (or
+        // was unresolvable) and there is no equality prefix. An EMPTY spec
+        // prefix-matches every index (`KeySpec::matches`), so emitting it would
+        // let an engine scan an arbitrary -- possibly partial -- index. Fall
+        // through to the TableScan fallback, which scans (and orders) the
+        // primary-key space natively.
+        if index_keyparts.is_empty() {
+            return None;
+        }
+
+        // Bounds: equalities + (optional) bounds on the first ORDER BY field
+        // that has inequalities. Only scannable keys are eligible: an applied
+        // inequality is consumed from the remaining predicate on the promise
+        // that the index bounds enforce it, which requires its column to be a
+        // keypart -- never true for keys at or past the primary-key split.
+        let applied_ineq = scannable.iter().find_map(|item| {
+            let name = self.order_by_column(item, column_of)?;
+            inequalities.get_key_value(&name).map(|(k, v)| (k.as_str(), v))
         });
 
         let bounds = match applied_ineq {
@@ -178,7 +305,7 @@ impl Planner {
         }
 
         // Remaining predicate excludes the applied OB inequality if any
-        let remaining_predicate = self.calculate_remaining_predicate(conjuncts, equalities, applied_ineq.map(|(f, _)| f));
+        let remaining_predicate = self.calculate_remaining_predicate(conjuncts, equalities, applied_ineq.map(|(f, _)| f), column_of);
 
         // Scan direction
         let scan_direction = if self.config.supports_desc_indexes {
@@ -190,14 +317,17 @@ impl Planner {
             }
         };
 
-        // Build OrderByComponents: presort (satisfied by index) and spill (needs in-memory sort)
+        // Build OrderByComponents: presort (satisfied by index) and spill (needs
+        // in-memory sort). Keys from the primary-key split onward always spill
+        // (see the ruling above): they were never keyparted, so the scan cannot
+        // deliver their order.
         let order_by = if !self.config.supports_desc_indexes {
             let first_dir = order_by[0].direction.clone();
             let mut presort = Vec::new();
             let mut spill = Vec::new();
             let mut broke = false;
-            for item in order_by {
-                if item.path.is_simple() {
+            for item in scannable {
+                if self.order_by_column(item, column_of).is_some() {
                     if !broke && item.direction == first_dir {
                         presort.push(item.clone());
                     } else {
@@ -206,10 +336,12 @@ impl Planner {
                     }
                 }
             }
+            spill.extend(pk_tail.iter().cloned());
             OrderByComponents::new(presort, spill)
         } else {
-            // DESC indexes supported - entire ORDER BY satisfied by index
-            OrderByComponents::new(order_by.to_vec(), vec![])
+            // DESC indexes supported - the index satisfies every key before the
+            // primary-key split
+            OrderByComponents::new(scannable.to_vec(), pk_tail.to_vec())
         };
 
         Some(Plan::Index {
@@ -226,26 +358,24 @@ impl Planner {
         &self,
         equalities: &[(String, Value)],
         inequalities: &IndexMap<String, Vec<(ComparisonOperator, Value)>>,
-        order_by: &[ankql::ast::OrderByItem],
+        order_by: &[OrderByItem],
         conjuncts: &[Predicate],
+        column_of: ColumnOf,
     ) -> Option<Plan> {
         // Pick primary inequality: prefer first OB field with ineq, else first ineq in map order
         let primary = order_by
             .iter()
             .find_map(|item| {
-                if item.path.is_simple() {
-                    let name = item.path.first();
-                    inequalities.get_key_value(name).map(|(k, v)| (k.as_str(), v))
-                } else {
-                    None
-                }
+                let name = self.order_by_column(item, column_of)?;
+                inequalities.get_key_value(&name).map(|(k, v)| (k.as_str(), v))
             })
             .or_else(|| inequalities.iter().next().map(|(k, v)| (k.as_str(), v)))?;
 
         // Keyparts: EQ + primary INEQ (do not append ORDER BY fields; they do not satisfy global order after a range)
         // NOTE (micro-optimization): Appending OB columns after the range could help spill comparator locality,
         // but it does not change correctness and the tests expect the simpler invariant-preserving form.
-        let mut index_keyparts: Vec<IndexKeyPart> = equalities.iter().map(|(f, v)| IndexKeyPart::asc_path(f, ValueType::of(v))).collect();
+        let mut index_keyparts: Vec<IndexKeyPart<String>> =
+            equalities.iter().map(|(f, v)| IndexKeyPart::asc_path(f, ValueType::of(v))).collect();
         let primary_value = &primary.1[0].1; // Get Value from first inequality
         index_keyparts.push(IndexKeyPart::asc_path(primary.0, ValueType::of(primary_value))); // Use actual primary key value type
 
@@ -256,7 +386,7 @@ impl Planner {
         }
 
         // Remaining predicate: all inequalities except the primary one
-        let remaining_predicate = self.calculate_remaining_predicate(conjuncts, equalities, Some(primary.0));
+        let remaining_predicate = self.calculate_remaining_predicate(conjuncts, equalities, Some(primary.0), column_of);
 
         // Scan direction
         let scan_direction = if self.config.supports_desc_indexes {
@@ -277,9 +407,8 @@ impl Planner {
         let mut presort = Vec::new();
         let mut spill = Vec::new();
         for item in order_by {
-            if item.path.is_simple() {
-                let name = item.path.first();
-                if covered.contains(name) {
+            if let Some(name) = self.order_by_column(item, column_of) {
+                if covered.contains(name.as_str()) {
                     presort.push(item.clone());
                 } else {
                     spill.push(item.clone());
@@ -301,14 +430,22 @@ impl Planner {
         &self,
         conjuncts: &[Predicate],
         primary_key: &str,
+        column_of: ColumnOf,
     ) -> (Vec<(String, Value)>, IndexMap<String, Vec<(ComparisonOperator, Value)>>) {
         let mut equalities = Vec::new();
         let mut inequalities: IndexMap<String, Vec<(ComparisonOperator, Value)>> = IndexMap::new();
 
         for conjunct in conjuncts {
-            if let Some((field, op, value)) = self.extract_comparison(conjunct) {
-                // Skip primary key predicates - they'll be handled by TableScan bounds
-                if field == primary_key {
+            if let Some((field, op, value)) = self.extract_comparison(conjunct, column_of) {
+                // Skip primary-key comparisons, by BASE column: a bare `id = ?`
+                // is handled by TableScan bounds, and a subpathed `id.x = ?`
+                // stays in the remaining predicate (post-filtered). Neither may
+                // seed an index keypart: the primary key is pinned to the
+                // engine's reserved key column and never enters its
+                // property-column map, so a keypart on it (even as a subpath
+                // base) is unresolvable at emit time -- the same wedge as a pk
+                // ORDER BY keypart (see build_order_first_plan).
+                if field.split('.').next() == Some(primary_key) {
                     continue;
                 }
 
@@ -334,13 +471,24 @@ impl Planner {
     }
 
     /// Extract field path, operator, and value from a comparison predicate.
-    /// Returns the full path as a dot-separated string (e.g., "context.session_id").
-    fn extract_comparison(&self, predicate: &Predicate) -> Option<(String, ComparisonOperator, Value)> {
+    /// Returns the full path as a dot-separated string (e.g., "context.session_id"):
+    /// the physical column, dotted with any JSON subpath.
+    fn extract_comparison(&self, predicate: &Predicate, column_of: ColumnOf) -> Option<(String, ComparisonOperator, Value)> {
         match predicate {
             Predicate::Comparison { left, operator, right } => {
-                // Extract field path from left side (supports multi-step paths)
+                // Extract the physical field path from the left side (supports
+                // multi-step paths). A resolved identifier is translated to its
+                // durably-assigned column through `column_of`, then dotted with
+                // its JSON subpath -- a column-space `[column, ..subpath]` path.
+                // A `column_of` miss (absent property) yields no index constraint,
+                // NOT a name fallback: the comparison stays in the residual
+                // predicate (and would already have been folded to NULL upstream).
                 let field_path = match left.as_ref() {
                     Expr::Path(path) => path.steps.join("."),
+                    Expr::PropertyIdentifier(identifier) => {
+                        let column = column_of(&identifier.id_or_systemname())?;
+                        std::iter::once(column).chain(identifier.subpath.iter().cloned()).collect::<Vec<_>>().join(".")
+                    }
                     _ => return None,
                 };
 
@@ -364,10 +512,11 @@ impl Planner {
         inequality_field: &str,
         inequalities: &IndexMap<String, Vec<(ComparisonOperator, Value)>>,
         conjuncts: &[Predicate],
-        order_by: Option<&[ankql::ast::OrderByItem]>,
+        order_by: Option<&[OrderByItem]>,
+        column_of: ColumnOf,
     ) -> Option<Plan> {
         // Add equality fields first
-        let mut index_keyparts = Vec::new();
+        let mut index_keyparts: Vec<IndexKeyPart<String>> = Vec::new();
         for (field, value) in equalities {
             index_keyparts.push(IndexKeyPart::asc_path(field, ValueType::of(value)));
         }
@@ -392,7 +541,7 @@ impl Planner {
         };
 
         // Calculate remaining predicate (exclude this inequality field)
-        let remaining_predicate = self.calculate_remaining_predicate(conjuncts, equalities, Some(inequality_field));
+        let remaining_predicate = self.calculate_remaining_predicate(conjuncts, equalities, Some(inequality_field), column_of);
 
         // Build OrderByComponents: presort (EQ + inequality) and spill (rest)
         let order_by_spill = if let Some(order_by_items) = order_by {
@@ -401,9 +550,8 @@ impl Planner {
             let mut presort = Vec::new();
             let mut spill = Vec::new();
             for item in order_by_items {
-                if item.path.is_simple() {
-                    let name = item.path.first();
-                    if covered_fields.contains(name) {
+                if let Some(name) = self.order_by_column(item, column_of) {
+                    if covered_fields.contains(name.as_str()) {
                         presort.push(item.clone());
                     } else {
                         spill.push(item.clone());
@@ -420,9 +568,9 @@ impl Planner {
     }
 
     /// Generate plan for equality-only queries
-    fn generate_equality_plan(&self, equalities: &[(String, Value)], conjuncts: &[Predicate]) -> Option<Plan> {
+    fn generate_equality_plan(&self, equalities: &[(String, Value)], conjuncts: &[Predicate], column_of: ColumnOf) -> Option<Plan> {
         // Add all equality fields
-        let mut index_keyparts = Vec::new();
+        let mut index_keyparts: Vec<IndexKeyPart<String>> = Vec::new();
         for (field, value) in equalities {
             index_keyparts.push(IndexKeyPart::asc_path(field, ValueType::of(value)));
         }
@@ -442,7 +590,7 @@ impl Planner {
         };
 
         // Calculate remaining predicate
-        let remaining_predicate = self.calculate_remaining_predicate(conjuncts, equalities, None);
+        let remaining_predicate = self.calculate_remaining_predicate(conjuncts, equalities, None, column_of);
 
         let index_spec = KeySpec::new(index_keyparts);
         Some(Plan::Index {
@@ -461,7 +609,7 @@ impl Planner {
         &self,
         equalities: &[(String, Value)],
         inequality: Option<(&str, &Vec<(ComparisonOperator, Value)>)>,
-        index_keyparts: &[IndexKeyPart],
+        index_keyparts: &[IndexKeyPart<String>],
     ) -> Option<KeyBounds> {
         let mut keypart_bounds = Vec::new();
 
@@ -635,6 +783,7 @@ impl Planner {
         conjuncts: &[Predicate],
         consumed_equalities: &[(String, Value)],
         consumed_inequality_field: Option<&str>,
+        column_of: ColumnOf,
     ) -> Predicate {
         let mut remaining_conjuncts = Vec::new();
 
@@ -642,7 +791,7 @@ impl Planner {
             let mut consumed = false;
 
             // Check if this conjunct is consumed by equalities
-            if let Some((field, _, _)) = self.extract_comparison(conjunct) {
+            if let Some((field, _, _)) = self.extract_comparison(conjunct, column_of) {
                 // Check if it's a consumed equality
                 for (eq_field, _) in consumed_equalities {
                     if field == *eq_field {
@@ -710,9 +859,15 @@ impl Planner {
     }
 
     /// Build a table scan plan with optional entity ID range extraction
-    fn build_table_scan_plan(&self, conjuncts: &[Predicate], primary_key: &str, order_by: &Option<Vec<ankql::ast::OrderByItem>>) -> Plan {
+    fn build_table_scan_plan(
+        &self,
+        conjuncts: &[Predicate],
+        primary_key: &str,
+        order_by: &Option<Vec<OrderByItem>>,
+        column_of: ColumnOf,
+    ) -> Plan {
         // Extract entity ID range from predicates on the primary key
-        let bounds = self.extract_entity_id_range(conjuncts, primary_key);
+        let bounds = self.extract_entity_id_range(conjuncts, primary_key, column_of);
 
         // All predicates remain (no index to satisfy any)
         let remaining_predicate = conjuncts.iter().fold(ankql::ast::Predicate::True, |acc, pred| {
@@ -726,7 +881,7 @@ impl Planner {
         // Determine scan direction and ORDER BY components based on primary key ORDER BY
         let (scan_direction, order_by_spill) = if let Some(order_items) = order_by {
             if let Some(first_item) = order_items.first() {
-                if first_item.path.is_simple() && first_item.path.first() == primary_key {
+                if self.order_by_item_is_primary_key(first_item, primary_key, column_of) {
                     // Primary key ORDER BY is satisfied by scan direction
                     let direction = match first_item.direction {
                         ankql::ast::OrderDirection::Asc => ScanDirection::Forward,
@@ -753,12 +908,12 @@ impl Planner {
     }
 
     /// Extract entity ID range from predicates on the primary key field
-    fn extract_entity_id_range(&self, conjuncts: &[Predicate], primary_key: &str) -> KeyBounds {
+    fn extract_entity_id_range(&self, conjuncts: &[Predicate], primary_key: &str, column_of: ColumnOf) -> KeyBounds {
         let mut primary_key_bounds = Vec::new();
 
         // Extract all primary key constraints from conjuncts
         for predicate in conjuncts {
-            if let Some(bound) = self.extract_primary_key_bound(predicate, primary_key) {
+            if let Some(bound) = self.extract_primary_key_bound(predicate, primary_key, column_of) {
                 primary_key_bounds.push(bound);
             }
         }
@@ -778,12 +933,25 @@ impl Planner {
     }
 
     /// Extract a single primary key bound from a predicate
-    fn extract_primary_key_bound(&self, predicate: &Predicate, primary_key: &str) -> Option<KeyBoundComponent> {
+    fn extract_primary_key_bound(&self, predicate: &Predicate, primary_key: &str, column_of: ColumnOf) -> Option<KeyBoundComponent> {
         if let Predicate::Comparison { left, operator, right } = predicate {
             // Check if this is a primary key comparison
+            // A resolved Identifier addresses the primary key when its subpath is
+            // empty and its identity maps to the primary-key column, mirroring a
+            // simple Path.
             let value = match (left.as_ref(), right.as_ref()) {
                 (Expr::Path(path), Expr::Literal(literal)) if path.is_simple() && path.first() == primary_key => Value::from(literal),
                 (Expr::Literal(literal), Expr::Path(path)) if path.is_simple() && path.first() == primary_key => Value::from(literal),
+                (Expr::PropertyIdentifier(identifier), Expr::Literal(literal))
+                    if self.identifier_is_primary_key(identifier, primary_key, column_of) =>
+                {
+                    Value::from(literal)
+                }
+                (Expr::Literal(literal), Expr::PropertyIdentifier(identifier))
+                    if self.identifier_is_primary_key(identifier, primary_key, column_of) =>
+                {
+                    Value::from(literal)
+                }
                 _ => return None,
             };
 
@@ -879,10 +1047,12 @@ impl Planner {
     }
 
     /// Check if a predicate is on the primary key field
-    fn is_primary_key_predicate(&self, predicate: &Predicate, primary_key: &str) -> bool {
+    fn is_primary_key_predicate(&self, predicate: &Predicate, primary_key: &str, column_of: ColumnOf) -> bool {
         if let Predicate::Comparison { left, operator: _, right: _ } = predicate {
             match left.as_ref() {
                 Expr::Path(path) if path.is_simple() => path.first() == primary_key,
+                // A resolved Identifier addresses the primary key by identity.
+                Expr::PropertyIdentifier(identifier) => self.identifier_is_primary_key(identifier, primary_key, column_of),
                 _ => false,
             }
         } else {
@@ -891,23 +1061,24 @@ impl Planner {
     }
 
     /// Check if ORDER BY is on the primary key (should skip index generation)
-    fn has_primary_key_order_by(&self, order_by: &Option<Vec<ankql::ast::OrderByItem>>, primary_key: &str) -> bool {
+    fn has_primary_key_order_by(&self, order_by: &Option<Vec<OrderByItem>>, primary_key: &str, column_of: ColumnOf) -> bool {
         if let Some(order_items) = order_by
             && let Some(first_item) = order_items.first()
-            && first_item.path.is_simple()
         {
-            return first_item.path.first() == primary_key;
+            return self.order_by_item_is_primary_key(first_item, primary_key, column_of);
         }
         false
     }
 
     /// Check if conjuncts contain primary key range predicates that should skip index generation
-    fn has_primary_key_range_predicates(&self, conjuncts: &[Predicate], primary_key: &str) -> bool {
+    fn has_primary_key_range_predicates(&self, conjuncts: &[Predicate], primary_key: &str, column_of: ColumnOf) -> bool {
         conjuncts.iter().any(|predicate| {
             if let Predicate::Comparison { left, operator, right: _ } = predicate {
                 // Check if this is a primary key comparison with supported operators
                 let is_primary_key_field = match left.as_ref() {
                     Expr::Path(path) if path.is_simple() => path.first() == primary_key,
+                    // A resolved Identifier addresses the primary key by identity.
+                    Expr::PropertyIdentifier(identifier) => self.identifier_is_primary_key(identifier, primary_key, column_of),
                     _ => false,
                 };
 
@@ -963,15 +1134,34 @@ mod tests {
             IndexKeyPart::desc($name.to_string(), $ty)
         };
     }
+    // The planner's unit tests exercise UNRESOLVED selections (no catalog), so
+    // their ORDER BY keys are raw `OrderKey::Path`s -- exactly what the parser
+    // produces and what `column_of` leaves verbatim.
     macro_rules! oby_asc {
         ($name:expr) => {
-            ankql::ast::OrderByItem { path: ankql::ast::PathExpr::simple($name), direction: ankql::ast::OrderDirection::Asc }
+            ankql::ast::OrderByItem {
+                key: ankql::ast::OrderKey::Path(ankql::ast::PathExpr::simple($name)),
+                direction: ankql::ast::OrderDirection::Asc,
+            }
         };
     }
     macro_rules! oby_desc {
         ($name:expr) => {
-            ankql::ast::OrderByItem { path: ankql::ast::PathExpr::simple($name), direction: ankql::ast::OrderDirection::Desc }
+            ankql::ast::OrderByItem {
+                key: ankql::ast::OrderKey::Path(ankql::ast::PathExpr::simple($name)),
+                direction: ankql::ast::OrderDirection::Desc,
+            }
         };
+    }
+
+    /// The property name a test ORDER BY item sorts on. These tests build only
+    /// raw `OrderKey::Path` keys (unresolved selections), so the name is the
+    /// path's last step.
+    fn oby_prop(item: &ankql::ast::OrderByItem) -> String {
+        match &item.key {
+            ankql::ast::OrderKey::Path(path) => path.property().to_string(),
+            ankql::ast::OrderKey::Property(identifier) => identifier.to_string(),
+        }
     }
 
     use crate::{Endpoint, KeyBoundComponent, KeyBounds, KeyDatum};
@@ -1562,6 +1752,328 @@ mod tests {
                     }
                 ]
             );
+        }
+    }
+
+    // The primary-key ORDER BY ruling (the F4 wedge): a primary-key keypart must
+    // NEVER reach an index spec -- `PropertyId::Id` is pinned to the engine's
+    // reserved key column and never enters its property-column map, so such a
+    // keypart is unresolvable at emit time (sled: PropertyNotFound permanently
+    // wedges the Building index). The pk ordering is ABSORBED by scan direction
+    // on TableScans (they iterate the primary-key space itself) and SPILLED to
+    // the in-memory comparator on Index plans: absorption into the index's
+    // implicit entity-id key suffix is unsound under engine index substitution
+    // (sled prefix/inverse reuse) and IndexedDB's string-ordered tie-break (see
+    // build_order_first_plan).
+    mod primary_key_keypart_tests {
+        use super::*;
+
+        /// No plan may carry a primary-key keypart in its index spec -- bare or
+        /// as the base column of a subpath.
+        fn assert_no_pk_keypart(plans: &[Plan]) {
+            for plan in plans {
+                if let Plan::Index { index_spec, .. } = plan {
+                    assert!(
+                        !index_spec.keyparts.iter().any(|kp| kp.key == "id"),
+                        "primary-key keypart reached an index spec: {:?}",
+                        index_spec
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn eq_with_order_by_pk_full_support() {
+            let plans = plan_full_support!("__collection = 'album' ORDER BY id");
+            assert_no_pk_keypart(&plans);
+            assert_eq!(
+                plans,
+                vec![
+                    Plan::Index {
+                        index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String)]),
+                        scan_direction: ScanDirection::Forward,
+                        bounds: bounds!("__collection" => ("album"..="album")),
+                        remaining_predicate: Predicate::True,
+                        // The pk key spills: index scans never absorb it.
+                        order_by_spill: order_by_components!(spill: [oby_asc!("id")])
+                    },
+                    Plan::TableScan {
+                        bounds: KeyBounds::empty(),
+                        scan_direction: ScanDirection::Forward,
+                        remaining_predicate: selection!("__collection = 'album'").predicate,
+                        // The table scan absorbs ASC pk order into its forward
+                        // direction.
+                        order_by_spill: order_by_components!(presort: [oby_asc!("id")])
+                    }
+                ]
+            );
+        }
+
+        #[test]
+        fn eq_with_order_by_pk_indexeddb() {
+            let plans = plan!("__collection = 'album' ORDER BY id");
+            assert_no_pk_keypart(&plans);
+            assert_eq!(
+                plans,
+                vec![
+                    Plan::Index {
+                        index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String)]),
+                        scan_direction: ScanDirection::Forward,
+                        bounds: bounds!("__collection" => ("album"..="album")),
+                        remaining_predicate: Predicate::True,
+                        order_by_spill: order_by_components!(spill: [oby_asc!("id")])
+                    },
+                    Plan::TableScan {
+                        bounds: KeyBounds::empty(),
+                        scan_direction: ScanDirection::Forward,
+                        remaining_predicate: selection!("__collection = 'album'").predicate,
+                        order_by_spill: order_by_components!(presort: [oby_asc!("id")])
+                    }
+                ]
+            );
+        }
+
+        #[test]
+        fn eq_with_order_by_pk_desc_full_support() {
+            let plans = plan_full_support!("__collection = 'album' ORDER BY id DESC");
+            assert_no_pk_keypart(&plans);
+            assert_eq!(
+                plans,
+                vec![
+                    Plan::Index {
+                        index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String)]),
+                        scan_direction: ScanDirection::Forward,
+                        bounds: bounds!("__collection" => ("album"..="album")),
+                        remaining_predicate: Predicate::True,
+                        // DESC pk spills too: a forward index scan's implicit
+                        // suffix cannot be claimed in either direction.
+                        order_by_spill: order_by_components!(spill: [oby_desc!("id")])
+                    },
+                    Plan::TableScan {
+                        bounds: KeyBounds::empty(),
+                        scan_direction: ScanDirection::Reverse,
+                        remaining_predicate: selection!("__collection = 'album'").predicate,
+                        // The table scan absorbs DESC pk order by reversing.
+                        order_by_spill: order_by_components!(presort: [oby_desc!("id")])
+                    }
+                ]
+            );
+        }
+
+        #[test]
+        fn eq_with_order_by_pk_desc_indexeddb() {
+            let plans = plan!("__collection = 'album' ORDER BY id DESC");
+            assert_no_pk_keypart(&plans);
+            assert_eq!(
+                plans,
+                vec![
+                    Plan::Index {
+                        index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String)]),
+                        // IndexedDB derives scan direction from the first ORDER
+                        // BY key; harmless here since the pk key spills to a
+                        // global sort.
+                        scan_direction: ScanDirection::Reverse,
+                        bounds: bounds!("__collection" => ("album"..="album")),
+                        remaining_predicate: Predicate::True,
+                        order_by_spill: order_by_components!(spill: [oby_desc!("id")])
+                    },
+                    Plan::TableScan {
+                        bounds: KeyBounds::empty(),
+                        scan_direction: ScanDirection::Reverse,
+                        remaining_predicate: selection!("__collection = 'album'").predicate,
+                        order_by_spill: order_by_components!(presort: [oby_desc!("id")])
+                    }
+                ]
+            );
+        }
+
+        #[test]
+        fn order_by_prop_then_pk_full_support() {
+            let plans = plan_full_support!("__collection = 'album' ORDER BY name, id");
+            assert_no_pk_keypart(&plans);
+            assert_eq!(
+                plans,
+                vec![
+                    Plan::Index {
+                        // `name` is keyparted; the trailing pk key is not.
+                        index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("name", ValueType::String)]),
+                        scan_direction: ScanDirection::Forward,
+                        bounds: bounds!("__collection" => ("album"..="album")),
+                        remaining_predicate: Predicate::True,
+                        order_by_spill: order_by_components!(presort: [oby_asc!("name")], spill: [oby_asc!("id")])
+                    },
+                    Plan::TableScan {
+                        bounds: KeyBounds::empty(),
+                        scan_direction: ScanDirection::Forward,
+                        remaining_predicate: selection!("__collection = 'album'").predicate,
+                        order_by_spill: order_by_components!(spill: [oby_asc!("name"), oby_asc!("id")])
+                    }
+                ]
+            );
+        }
+
+        #[test]
+        fn order_by_prop_then_pk_indexeddb() {
+            let plans = plan!("__collection = 'album' ORDER BY name, id");
+            assert_no_pk_keypart(&plans);
+            assert_eq!(
+                plans,
+                vec![
+                    Plan::Index {
+                        index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("name", ValueType::String)]),
+                        scan_direction: ScanDirection::Forward,
+                        bounds: bounds!("__collection" => ("album"..="album")),
+                        remaining_predicate: Predicate::True,
+                        order_by_spill: order_by_components!(presort: [oby_asc!("name")], spill: [oby_asc!("id")])
+                    },
+                    Plan::TableScan {
+                        bounds: KeyBounds::empty(),
+                        scan_direction: ScanDirection::Forward,
+                        remaining_predicate: selection!("__collection = 'album'").predicate,
+                        order_by_spill: order_by_components!(spill: [oby_asc!("name"), oby_asc!("id")])
+                    }
+                ]
+            );
+        }
+
+        #[test]
+        fn order_by_pk_then_prop_stops_keyparts() {
+            // Keys AFTER the pk split never become keyparts either: a keypart
+            // there would sort ahead of the entity id and change nothing the
+            // comparator doesn't already own.
+            let plans = plan_full_support!("__collection = 'album' ORDER BY id, name");
+            assert_no_pk_keypart(&plans);
+            assert_eq!(
+                plans,
+                vec![
+                    Plan::Index {
+                        index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String)]),
+                        scan_direction: ScanDirection::Forward,
+                        bounds: bounds!("__collection" => ("album"..="album")),
+                        remaining_predicate: Predicate::True,
+                        order_by_spill: order_by_components!(spill: [oby_asc!("id"), oby_asc!("name")])
+                    },
+                    Plan::TableScan {
+                        bounds: KeyBounds::empty(),
+                        scan_direction: ScanDirection::Forward,
+                        remaining_predicate: selection!("__collection = 'album'").predicate,
+                        order_by_spill: order_by_components!(presort: [oby_asc!("id")], spill: [oby_asc!("name")])
+                    }
+                ]
+            );
+        }
+
+        #[test]
+        fn unindexable_predicate_with_order_by_pk_falls_back_to_table_scan() {
+            // No equality prefix and the only ORDER BY key is the pk: the
+            // order-first plan would have an EMPTY spec (which prefix-matches
+            // every index), so no index plan is emitted at all. Before the
+            // ruling this produced an index spec of [id] -- the wedge.
+            let plans = plan_full_support!("name != 'x' ORDER BY id");
+            assert_no_pk_keypart(&plans);
+            assert_eq!(
+                plans,
+                vec![Plan::TableScan {
+                    bounds: KeyBounds::empty(),
+                    scan_direction: ScanDirection::Forward,
+                    remaining_predicate: selection!("name != 'x'").predicate,
+                    order_by_spill: order_by_components!(presort: [oby_asc!("id")])
+                }]
+            );
+        }
+
+        #[test]
+        fn inequality_with_order_by_pk_spills_everywhere() {
+            // Both strategies (ORDER-FIRST and INEQ-FIRST) must keep the pk key
+            // out of their specs and spill it.
+            let plans = plan_full_support!("__collection = 'album' AND age > 25 ORDER BY id");
+            assert_no_pk_keypart(&plans);
+            let index_plans: Vec<_> = plans.iter().filter(|p| matches!(p, Plan::Index { .. })).collect();
+            assert_eq!(index_plans.len(), 2, "expected ORDER-FIRST and INEQ-FIRST plans: {:?}", plans);
+            for plan in &index_plans {
+                if let Plan::Index { order_by_spill, .. } = plan {
+                    assert_eq!(order_by_spill.presort, vec![], "pk ordering must not be claimed satisfied: {:?}", plan);
+                    assert_eq!(order_by_spill.spill, vec![oby_asc!("id")], "pk ordering must spill: {:?}", plan);
+                }
+            }
+        }
+
+        #[test]
+        fn subpathed_pk_equality_never_keyparted() {
+            // A comparison whose BASE column is the primary key (`id.x = 5`)
+            // must not seed a keypart either; it stays in the residual
+            // predicate.
+            let plans = plan_full_support!("__collection = 'album' AND id.x = 5");
+            assert_no_pk_keypart(&plans);
+            assert_eq!(
+                plans,
+                vec![
+                    Plan::Index {
+                        index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String)]),
+                        scan_direction: ScanDirection::Forward,
+                        bounds: bounds!("__collection" => ("album"..="album")),
+                        remaining_predicate: selection!("id.x = 5").predicate,
+                        order_by_spill: order_by_components!()
+                    },
+                    Plan::TableScan {
+                        bounds: KeyBounds::empty(),
+                        scan_direction: ScanDirection::Forward,
+                        remaining_predicate: selection!("__collection = 'album' AND id.x = 5").predicate,
+                        order_by_spill: order_by_components!()
+                    }
+                ]
+            );
+        }
+
+        /// The resolved shape that reproduced F4 at runtime: a catalog-resolved
+        /// selection whose ORDER BY key is the `id` pseudo-property
+        /// ([`ankql::ast::PropertyId::Id`]), recognized as the primary key
+        /// through the engine's `column_of` pinning -- never by literal name.
+        #[test]
+        fn resolved_pk_order_by_never_keyparted() {
+            use ankql::ast::{Expr, Literal, OrderByItem, OrderDirection, OrderKey, Predicate, PropertyId, PropertyPath, Selection};
+
+            let pk_item = OrderByItem { key: OrderKey::Property(PropertyPath::id(vec![])), direction: OrderDirection::Asc };
+            let selection = Selection {
+                predicate: Predicate::Comparison {
+                    left: Box::new(Expr::PropertyIdentifier(PropertyPath::system("status", vec![]))),
+                    operator: ComparisonOperator::Equal,
+                    right: Box::new(Expr::Literal(Literal::String("active".to_string()))),
+                },
+                order_by: Some(vec![pk_item.clone()]),
+                limit: None,
+            };
+            // The engine's durable map: `status` has an assigned column;
+            // `PropertyId::Id` answers the reserved primary-key column (the
+            // pinning) but is never itself written to the map.
+            let column_of = |pid: &PropertyId| -> Option<String> {
+                match pid {
+                    PropertyId::Id => Some("id".to_string()),
+                    PropertyId::System { name } if name == "status" => Some("c_status".to_string()),
+                    _ => None,
+                }
+            };
+            let planner = Planner::new(PlannerConfig::full_support());
+            let plans = planner.plan_with_types(&selection, "id", &|_| None, &column_of);
+
+            assert_no_pk_keypart(&plans);
+            match &plans[0] {
+                Plan::Index { index_spec, order_by_spill, .. } => {
+                    assert_eq!(index_spec.keyparts, vec![asc!("c_status", ValueType::String)]);
+                    assert_eq!(order_by_spill.presort, vec![]);
+                    assert_eq!(order_by_spill.spill, vec![pk_item.clone()]);
+                }
+                other => panic!("expected an index plan, got {:?}", other),
+            }
+            // The TableScan fallback absorbs the pk order into its direction.
+            match &plans[1] {
+                Plan::TableScan { scan_direction, order_by_spill, .. } => {
+                    assert_eq!(*scan_direction, ScanDirection::Forward);
+                    assert_eq!(order_by_spill.presort, vec![pk_item]);
+                    assert!(order_by_spill.spill.is_empty());
+                }
+                other => panic!("expected a table scan, got {:?}", other),
+            }
         }
     }
 
@@ -2639,7 +3151,7 @@ mod tests {
                 // Check that the keypart has the correct sub_path
                 assert_eq!(index_spec.keyparts.len(), 1);
                 let keypart = &index_spec.keyparts[0];
-                assert_eq!(keypart.column, "context");
+                assert_eq!(keypart.key, "context");
                 assert_eq!(keypart.sub_path, Some(vec!["session_id".to_string()]));
                 assert_eq!(keypart.full_path(), "context.session_id");
 
@@ -2663,13 +3175,13 @@ mod tests {
             if let Plan::Index { index_spec, .. } = index_plan {
                 // First keypart should be the JSON path equality
                 let first = &index_spec.keyparts[0];
-                assert_eq!(first.column, "context");
+                assert_eq!(first.key, "context");
                 assert_eq!(first.sub_path, Some(vec!["user_id".to_string()]));
 
                 // ORDER BY field should be second (simple path)
                 if index_spec.keyparts.len() > 1 {
                     let second = &index_spec.keyparts[1];
-                    assert_eq!(second.column, "created");
+                    assert_eq!(second.key, "created");
                     assert_eq!(second.sub_path, None);
                 }
             }
@@ -2686,7 +3198,7 @@ mod tests {
 
             if let Plan::Index { index_spec, .. } = index_plan {
                 let keypart = &index_spec.keyparts[0];
-                assert_eq!(keypart.column, "data");
+                assert_eq!(keypart.key, "data");
                 assert_eq!(keypart.sub_path, Some(vec!["nested".to_string(), "field".to_string()]));
                 assert_eq!(keypart.full_path(), "data.nested.field");
             }
@@ -2721,7 +3233,7 @@ mod tests {
 
             if let Plan::Index { index_spec, remaining_predicate, .. } = index_plan {
                 let keypart = &index_spec.keyparts[0];
-                assert_eq!(keypart.column, "context");
+                assert_eq!(keypart.key, "context");
                 assert_eq!(keypart.sub_path, Some(vec!["count".to_string()]));
 
                 // Inequality should be fully pushed to bounds, remaining_predicate is True
@@ -2748,7 +3260,7 @@ mod tests {
                 assert!(json_keypart.is_some(), "Should have a keypart with sub_path");
 
                 let json_kp = json_keypart.unwrap();
-                assert_eq!(json_kp.column, "context");
+                assert_eq!(json_kp.key, "context");
                 assert_eq!(json_kp.sub_path, Some(vec!["user_id".to_string()]));
 
                 // Both should be fully pushed, remaining is True
@@ -2772,12 +3284,12 @@ mod tests {
             if let Plan::Index { order_by_spill, .. } = index_plan {
                 // First column (a) is satisfied by index, remaining are spilled
                 assert_eq!(order_by_spill.presort.len(), 1);
-                assert_eq!(order_by_spill.presort[0].path.property(), "a");
+                assert_eq!(oby_prop(&order_by_spill.presort[0]), "a");
 
                 assert_eq!(order_by_spill.spill.len(), 2);
                 // Verify order: b comes before c
-                assert_eq!(order_by_spill.spill[0].path.property(), "b");
-                assert_eq!(order_by_spill.spill[1].path.property(), "c");
+                assert_eq!(oby_prop(&order_by_spill.spill[0]), "b");
+                assert_eq!(oby_prop(&order_by_spill.spill[1]), "c");
             } else {
                 panic!("Expected Index plan");
             }
@@ -2813,9 +3325,9 @@ mod tests {
             if let Plan::Index { order_by_spill, .. } = index_plan {
                 // a is presorted, b is spilled regardless of LIMIT
                 assert_eq!(order_by_spill.presort.len(), 1);
-                assert_eq!(order_by_spill.presort[0].path.property(), "a");
+                assert_eq!(oby_prop(&order_by_spill.presort[0]), "a");
                 assert_eq!(order_by_spill.spill.len(), 1);
-                assert_eq!(order_by_spill.spill[0].path.property(), "b");
+                assert_eq!(oby_prop(&order_by_spill.spill[0]), "b");
                 assert_eq!(order_by_spill.spill[0].direction, ankql::ast::OrderDirection::Desc);
             } else {
                 panic!("Expected Index plan");
@@ -2833,11 +3345,11 @@ mod tests {
                 assert!(order_by_spill.presort.is_empty());
                 assert_eq!(order_by_spill.spill.len(), 3);
                 // Verify all columns and directions
-                assert_eq!(order_by_spill.spill[0].path.property(), "x");
+                assert_eq!(oby_prop(&order_by_spill.spill[0]), "x");
                 assert_eq!(order_by_spill.spill[0].direction, ankql::ast::OrderDirection::Desc);
-                assert_eq!(order_by_spill.spill[1].path.property(), "y");
+                assert_eq!(oby_prop(&order_by_spill.spill[1]), "y");
                 assert_eq!(order_by_spill.spill[1].direction, ankql::ast::OrderDirection::Asc);
-                assert_eq!(order_by_spill.spill[2].path.property(), "z");
+                assert_eq!(oby_prop(&order_by_spill.spill[2]), "z");
                 assert_eq!(order_by_spill.spill[2].direction, ankql::ast::OrderDirection::Desc);
             } else {
                 panic!("Expected TableScan plan");
@@ -2854,7 +3366,7 @@ mod tests {
             if let Plan::Index { order_by_spill, .. } = index_plan {
                 // All ORDER BY satisfied by index
                 assert_eq!(order_by_spill.presort.len(), 1);
-                assert_eq!(order_by_spill.presort[0].path.property(), "a");
+                assert_eq!(oby_prop(&order_by_spill.presort[0]), "a");
                 assert!(order_by_spill.spill.is_empty(), "Spill should be empty when ORDER BY is fully satisfied");
             } else {
                 panic!("Expected Index plan");
@@ -2872,7 +3384,7 @@ mod tests {
             if let Plan::Index { order_by_spill, .. } = index_plan {
                 // rating ORDER BY is satisfied after equality prefix
                 assert_eq!(order_by_spill.presort.len(), 1);
-                assert_eq!(order_by_spill.presort[0].path.property(), "rating");
+                assert_eq!(oby_prop(&order_by_spill.presort[0]), "rating");
                 assert!(order_by_spill.spill.is_empty(), "No spill needed with equality prefix + ORDER BY");
             } else {
                 panic!("Expected Index plan");
