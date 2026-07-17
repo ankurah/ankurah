@@ -110,6 +110,16 @@ where SE: StorageEngine + Send + Sync + 'static {
     }
 }
 
+async fn wait_for_count(counter: &AtomicUsize, expected: usize, label: &str) -> anyhow::Result<()> {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while counter.load(Ordering::Acquire) < expected {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out waiting for {expected} {label}; observed {}", counter.load(Ordering::Acquire)))
+}
+
 // Test 1: durable node -- register schema, map resolves (collection,name) ->
 // the allocated property id; membership optional flag visible;
 // wait_catalog_ready resolves.
@@ -198,6 +208,156 @@ async fn ephemeral_map_warms_from_relay() -> anyhow::Result<()> {
     Ok(())
 }
 
+// A connected peer may accept the three catalog subscriptions but never
+// answer them. Catalog readiness is an optimization boundary, not an
+// authority boundary: one shared grace period must release context creation
+// to use the local cache, while the relay subscriptions remain alive and can
+// populate that cache if their responses arrive later.
+#[tokio::test]
+async fn ephemeral_catalog_warm_has_one_bounded_remote_deadline() -> anyhow::Result<()> {
+    let server = durable_sled_setup().await?;
+    let server_ctx = server.context_async(DEFAULT_CONTEXT).await;
+    server_ctx.register::<Album>().await?;
+
+    let client = ephemeral_sled_setup().await?;
+    let held_responses = Arc::new(AtomicUsize::new(0));
+    let (_connection, gate) = {
+        let held_responses = held_responses.clone();
+        GatedConnection::new(&server, &client, move |message| match message {
+            proto::NodeMessage::Response(response) if matches!(&response.body, proto::NodeResponseBody::QuerySubscribed { .. }) => {
+                held_responses.fetch_add(1, Ordering::AcqRel);
+                true
+            }
+            _ => false,
+        })
+    };
+    client.system.wait_system_ready().await;
+
+    tokio::time::timeout(Duration::from_secs(4), client.context_async(DEFAULT_CONTEXT))
+        .await
+        .expect("one shared catalog grace period must bound a silent connected peer");
+    assert!(client.catalog.is_catalog_ready(), "deadline fallback must make the local cache usable");
+    assert_eq!(held_responses.load(Ordering::Acquire), 3, "all three catalog subscriptions should share the same deadline");
+
+    gate.release_held(&client).await;
+    wait_resolve(&client, "album", "name").await.expect("late relay responses must still populate the retained catalog subscriptions");
+
+    Ok(())
+}
+
+// The first context caller owns only its wait, not the shared catalog setup.
+// Cancelling it after the remote requests are in flight must leave the
+// node-owned warm running so a later context can join it and complete.
+#[tokio::test]
+async fn cancelling_first_context_does_not_cancel_catalog_warm() -> anyhow::Result<()> {
+    let server = durable_sled_setup().await?;
+    let server_ctx = server.context_async(DEFAULT_CONTEXT).await;
+    server_ctx.register::<Album>().await?;
+
+    let client = ephemeral_sled_setup().await?;
+    let held_responses = Arc::new(AtomicUsize::new(0));
+    let (_connection, gate) = {
+        let held_responses = held_responses.clone();
+        GatedConnection::new(&server, &client, move |message| match message {
+            proto::NodeMessage::Response(response) if matches!(&response.body, proto::NodeResponseBody::QuerySubscribed { .. }) => {
+                held_responses.fetch_add(1, Ordering::AcqRel);
+                true
+            }
+            _ => false,
+        })
+    };
+    client.system.wait_system_ready().await;
+
+    let first_context = {
+        let client = client.clone();
+        tokio::spawn(async move { client.context_async(DEFAULT_CONTEXT).await })
+    };
+    wait_for_count(&held_responses, 3, "held catalog responses").await?;
+    first_context.abort();
+    let _ = first_context.await;
+
+    let second_context = {
+        let client = client.clone();
+        tokio::spawn(async move { client.context_async(DEFAULT_CONTEXT).await })
+    };
+    tokio::task::yield_now().await;
+    assert!(!second_context.is_finished(), "the later context should join the still-running shared warm");
+    assert_eq!(held_responses.load(Ordering::Acquire), 3, "cancellation must not launch a duplicate catalog warm");
+
+    gate.release_held(&client).await;
+    tokio::time::timeout(Duration::from_secs(2), second_context)
+        .await
+        .expect("the later context must finish when the original warm completes")
+        .expect("the later context task must not panic");
+    assert!(client.catalog.is_catalog_ready());
+    wait_resolve(&client, "album", "name").await.expect("the completed shared warm must populate the catalog");
+
+    Ok(())
+}
+
+// The manager owns its subscription guards, so their callbacks must retain it
+// weakly. Exercise both durable and ephemeral warm paths and prove the catalog
+// allocation disappears after the owning node/connection are dropped.
+#[tokio::test]
+async fn catalog_subscription_callbacks_do_not_retain_manager() -> anyhow::Result<()> {
+    let durable = durable_sled_setup().await?;
+    durable.catalog.wait_catalog_ready().await;
+    let durable_probe = durable.catalog.liveness_probe();
+    let durable_weak = durable.weak();
+    drop(durable);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while durable_probe() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("durable catalog subscription callback must not form a retain cycle");
+    assert!(durable_weak.upgrade().is_none());
+
+    let (server, client, connection) = connected_pair().await?;
+    client.context_async(DEFAULT_CONTEXT).await;
+    let ephemeral_probe = client.catalog.liveness_probe();
+    let ephemeral_weak = client.weak();
+    drop(connection);
+    drop(client);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while ephemeral_probe() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("ephemeral catalog subscription callbacks must not form a retain cycle");
+    assert!(ephemeral_weak.upgrade().is_none());
+    drop(server);
+
+    Ok(())
+}
+
+// Constructing a durable node without creating or loading a system is a valid
+// idle state. Catalog startup must not retain the managers forever while
+// waiting for readiness that may never arrive.
+#[tokio::test]
+async fn uninitialized_durable_does_not_retain_catalog_manager() -> anyhow::Result<()> {
+    let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    tokio::time::timeout(Duration::from_secs(1), node.system.wait_loaded()).await.expect("empty durable storage must finish loading");
+    assert!(!node.system.is_system_ready());
+    assert!(node.system.root().is_none());
+
+    let probe = node.catalog.liveness_probe();
+    let weak = node.weak();
+    drop(node);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while probe() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("an uninitialized durable node must not be retained by a catalog readiness task");
+    assert!(weak.upgrade().is_none());
+
+    Ok(())
+}
+
 // Test 4: ephemeral live update -- register more schema via the durable while
 // the ephemeral is connected; the ephemeral map picks it up (relay path).
 #[tokio::test]
@@ -260,6 +420,182 @@ async fn rename_updates_resolution_and_sibling_index() -> anyhow::Result<()> {
     // The global sibling index reflects the current display name.
     assert_eq!(server.catalog.siblings_by_name("title"), vec![property_id]);
     assert!(server.catalog.siblings_by_name("name").is_empty(), "old name removed from the sibling index");
+
+    Ok(())
+}
+
+// The catalog subscription is a CACHE -- an accelerator and offline
+// enabler (maintainer ruling 2026-07-06; the three catalog queries run
+// cached: true). After syncing while connected, a disconnected ephemeral
+// still resolves the collection from its map, still builds a schema
+// binding, and a cached query over the known collection initializes
+// OFFLINE from local storage instead of erroring or hanging. Uses
+// common's Album model. The raw wire registration deliberately bypasses the
+// client's registration latch while still defining the model's complete
+// compiled schema, so the later offline query has every field binding it
+// needs but no allocator confirmation to reuse.
+#[tokio::test]
+async fn ephemeral_resolves_known_collection_offline_from_cache() -> anyhow::Result<()> {
+    use ankurah::signals::With;
+
+    let (server, client, conn) = connected_pair().await?;
+    let ctx = client.context_async(DEFAULT_CONTEXT).await;
+
+    let (models, properties, memberships) = ankurah::core::schema::registration_request(Album::schema());
+    expect_registered(
+        client.request(server.id, &DEFAULT_CONTEXT, proto::NodeRequestBody::RegisterSchema { models, properties, memberships }).await?,
+    );
+    let name_id = wait_resolve(&client, "album", "name").await.expect("client map warms while connected");
+    wait_resolve(&client, "album", "year").await.expect("client map warms the complete compiled schema while connected");
+
+    drop(conn);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !client.get_durable_peers().is_empty() {
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("client still has a durable peer after disconnect");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Resolution still answers from the cached map (the binding surface was
+    // replaced by name->id resolution in the PropertyKey refactor).
+    assert_eq!(client.catalog.resolve("album", "name"), Some(name_id), "cache survives disconnect");
+    assert!(client.catalog.resolve("album", "name").is_some(), "resolution answers from the cache offline");
+
+    // A cached live query initializes offline: resolution runs against the
+    // cached catalog, activation reads local storage (empty), and the relay
+    // registration waits quietly for a reconnect.
+    let lq = ctx.query::<AlbumView>("name = 'x'")?;
+    lq.wait_initialized().await;
+    lq.error().with(|e| assert!(e.is_none(), "offline cached query must not error: {e:?}"));
+    assert!(lq.ids().is_empty(), "no local entities for a fresh cache");
+    assert!(!client.catalog.is_ensured("album"), "offline compatibility proof must not masquerade as allocator confirmation");
+
+    Ok(())
+}
+
+// A synchronous context does not start the ephemeral catalog subscription.
+// First-use registration can still initialize a typed query because its
+// response feeds the exact binding directly into the map. A later selection
+// update has no context data with which to start a policy-aware catalog warm,
+// so an unknown compiled field must fail promptly rather than waiting forever
+// on readiness that no task will establish.
+#[tokio::test]
+async fn typed_selection_update_fails_promptly_with_cold_catalog() -> anyhow::Result<()> {
+    use ankurah::signals::With;
+
+    let (_server, client, _conn) = connected_pair().await?;
+    assert!(!client.catalog.is_catalog_ready(), "the synchronous context scenario requires a cold catalog");
+    let ctx = client.context(DEFAULT_CONTEXT)?;
+
+    let lq = ctx.query_wait::<AlbumView>("name = 'x'").await?;
+    assert!(client.catalog.is_ensured("album"), "first-use registration confirms the exact compiled schema");
+    assert!(!client.catalog.is_catalog_ready(), "the registration response must not masquerade as a completed catalog warm");
+
+    let error = tokio::time::timeout(Duration::from_secs(2), lq.update_selection_wait("not_a_field = 'x'"))
+        .await
+        .expect("an unknown typed selection update must not wait for cold-catalog readiness")
+        .expect_err("the unknown property must surface from the waiter");
+    assert!(error.to_string().contains("unknown property 'not_a_field'"), "unexpected update error: {error}");
+    lq.error().with(|error| {
+        let error = error.as_ref().expect("the unknown property must remain observable on the live query");
+        assert!(error.to_string().contains("unknown property 'not_a_field'"), "unexpected update error: {error}");
+    });
+
+    Ok(())
+}
+
+// A schema-less query has no compiled binding from which a cold miss could be
+// classified. Its update path must reuse the original subscription context to
+// warm the catalog before resolving a newly introduced property reference.
+#[tokio::test]
+async fn schema_less_selection_update_warms_cold_catalog() -> anyhow::Result<()> {
+    use ankurah::signals::With;
+
+    let (server, client, _conn) = connected_pair().await?;
+    let server_ctx = server.context_async(DEFAULT_CONTEXT).await;
+    server_ctx.register::<Album>().await?;
+
+    assert!(!client.catalog.is_catalog_ready(), "the synchronous raw-query scenario requires a cold catalog");
+    let args: MatchArgs = "true".try_into()?;
+    let lq = EntityLiveQuery::new(&client, Album::collection(), args, DEFAULT_CONTEXT)?;
+    lq.wait_initialized().await;
+    assert!(!client.catalog.is_catalog_ready(), "a property-free raw selection must not masquerade as a catalog warm");
+
+    tokio::time::timeout(Duration::from_secs(5), lq.update_selection_wait("name = 'x'"))
+        .await
+        .expect("a valid schema-less update must not wait forever on a cold catalog")?;
+    assert!(client.catalog.is_catalog_ready(), "the update must warm the catalog before resolving the property");
+    assert!(client.catalog.resolve("album", "name").is_some(), "the warm must make the registered property resolvable");
+    lq.error().with(|error| assert!(error.is_none(), "the valid raw update must not error: {error:?}"));
+
+    let error = tokio::time::timeout(Duration::from_secs(2), lq.update_selection_wait("not_a_field = 'x'"))
+        .await
+        .expect("an unknown schema-less update must fail promptly after the catalog is warm")
+        .expect_err("the unknown raw property must surface from the waiter");
+    assert!(error.to_string().contains("unknown property 'not_a_field'"), "unexpected raw update error: {error}");
+    lq.error().with(|error| {
+        let error = error.as_ref().expect("the unknown raw property must remain observable on the live query");
+        assert!(error.to_string().contains("unknown property 'not_a_field'"), "unexpected raw update error: {error}");
+    });
+
+    Ok(())
+}
+
+// With no durable peer, the same catalog setup must become ready from the
+// local cache instead of waiting for a remote establishment that cannot
+// arrive. This preserves the catalog subscription's offline-enabler role.
+#[tokio::test]
+async fn ephemeral_catalog_warm_remains_offline_capable() -> anyhow::Result<()> {
+    let (_server, client, conn) = connected_pair().await?;
+    drop(conn);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !client.get_durable_peers().is_empty() {
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("client still has a durable peer after disconnect");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert!(!client.catalog.is_catalog_ready(), "no context has started the catalog warm yet");
+    tokio::time::timeout(Duration::from_secs(2), client.context_async(DEFAULT_CONTEXT))
+        .await
+        .expect("offline catalog setup must complete from the local cache");
+    assert!(client.catalog.is_catalog_ready(), "offline local-cache activation must mark the catalog ready");
+
+    Ok(())
+}
+
+// Resolution is not the only initialization failure point. A local storage
+// fetch can fail before the reactor's pre-notify hook runs; that terminal
+// error must still release waiters instead of leaving the LiveQuery pending.
+#[tokio::test]
+async fn durable_activation_error_releases_initialization_waiters() -> anyhow::Result<()> {
+    use ankurah::signals::With;
+
+    let node = durable_sled_setup().await?;
+    let collection = proto::CollectionId::from("unregistered_rows");
+    let storage = node.collections.get(&collection).await?;
+    storage
+        .set_state(proto::Attested::opt(
+            proto::EntityState { entity_id: proto::EntityId::new(), model: proto::EntityId::new(), state: proto::State::default() },
+            None,
+        ))
+        .await?;
+
+    // The raw, property-free selection resolves, then Sled's fetch fails while
+    // reconstructing the stored row because this collection has no catalog
+    // model id. That reaches the post-resolution activation-error branch.
+    let args: MatchArgs = "true".try_into()?;
+    let query = EntityLiveQuery::new(&node, collection, args, DEFAULT_CONTEXT)?;
+    tokio::time::timeout(Duration::from_secs(2), query.wait_initialized())
+        .await
+        .expect("terminal activation error must release initialization waiters");
+    query.error().with(|error| {
+        let error = error.as_ref().expect("activation error must remain observable");
+        assert!(error.to_string().contains("no model id known for collection 'unregistered_rows'"), "unexpected error: {error}");
+    });
 
     Ok(())
 }

@@ -48,7 +48,12 @@ pub trait TContext {
     fn get_resident_entity(&self, id: proto::EntityId) -> Option<Entity>;
     async fn fetch_entities(&self, collection: &proto::CollectionId, args: MatchArgs) -> Result<Vec<Entity>, RetrievalError>;
     async fn commit_local_trx(&self, trx: &Transaction) -> Result<Vec<Event>, MutationError>;
-    fn query(&self, collection_id: proto::CollectionId, args: MatchArgs) -> Result<EntityLiveQuery, RetrievalError>;
+    fn query(
+        &self,
+        collection_id: proto::CollectionId,
+        schema: &'static crate::schema::ModelSchema,
+        args: MatchArgs,
+    ) -> Result<EntityLiveQuery, RetrievalError>;
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError>;
     /// RFC 5.2 (specs/model-property-metadata/rfc.md) model first-use registration, object-safe so the mutating
     /// transaction paths (`create`/`edit`) can trigger it without the
@@ -208,8 +213,13 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
 
         Ok(attested_events.into_iter().map(|a| a.payload).collect())
     }
-    fn query(&self, collection_id: proto::CollectionId, args: MatchArgs) -> Result<EntityLiveQuery, RetrievalError> {
-        EntityLiveQuery::new(&self.node, collection_id, args, self.cdata.clone())
+    fn query(
+        &self,
+        collection_id: proto::CollectionId,
+        schema: &'static crate::schema::ModelSchema,
+        args: MatchArgs,
+    ) -> Result<EntityLiveQuery, RetrievalError> {
+        EntityLiveQuery::new_for_model(&self.node, collection_id, schema, args, self.cdata.clone())
     }
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
         self.node.system.collection(id).await
@@ -327,7 +337,7 @@ impl Context {
     where R: View {
         let args: MatchArgs = args.try_into().map_err(|e| e.into())?;
         use crate::model::Model;
-        Ok(self.0.query(R::Model::collection(), args)?.map::<R>())
+        Ok(self.0.query(R::Model::collection(), R::Model::schema(), args)?.map::<R>())
     }
 
     /// Subscribe to changes in entities matching a selection and wait for initialization
@@ -340,6 +350,12 @@ impl Context {
     {
         let livequery = self.query::<R>(args)?;
         livequery.wait_initialized().await;
+        // Initialization completing is not success: a failed resolution or
+        // activation latches an error on the query and releases the waiters.
+        // Surface it instead of handing back a dead query as Ok.
+        if let Some(error) = livequery.latched_error() {
+            return Err(error);
+        }
         Ok(livequery)
     }
     pub async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {

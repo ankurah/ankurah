@@ -55,9 +55,57 @@ use crate::{
 };
 
 use super::{model_collection, model_property_collection, property_collection, registration::RegistrationError, ModelSchema};
+
+/// A short grace period for a connected catalog relay to deliver its initial
+/// snapshots. The catalog remains a cache: expiry falls back to local state,
+/// while the live relay subscriptions stay installed and may populate the map
+/// later.
+const REMOTE_CATALOG_WARM_GRACE: Duration = Duration::from_secs(2);
+
+/// Runs a rollback closure unless a successful initialization disarms it.
+/// Keeping this guard inside the node-owned initialization task releases the
+/// first-call latch on construction failure and lets generation invalidation
+/// leave any newer claimant untouched.
+struct RollbackGuard<F: FnOnce()> {
+    rollback: Option<F>,
+}
+
+impl<F: FnOnce()> RollbackGuard<F> {
+    fn new(rollback: F) -> Self { Self { rollback: Some(rollback) } }
+    fn disarm(&mut self) { self.rollback = None; }
+}
+
+impl<F: FnOnce()> Drop for RollbackGuard<F> {
+    fn drop(&mut self) {
+        if let Some(rollback) = self.rollback.take() {
+            rollback();
+        }
+    }
+}
+
 mod map;
 use map::{apply_entry, parse_state, CatalogMapInner, EnsuredSchemaBinding, Entry};
 pub use map::{MembershipDef, ModelDef, PropertyDef};
+
+// -- gap fetcher ------------------------------------------------------------
+
+/// Catalog queries are `Predicate::True` with no LIMIT, so no gap ever
+/// forms; this fetcher is never asked to fill one.
+struct NoopGapFetcher;
+
+#[async_trait::async_trait]
+impl GapFetcher<Entity> for NoopGapFetcher {
+    async fn fetch_gap(
+        &self,
+        _collection_id: &CollectionId,
+        _selection: &ankql::ast::Selection,
+        _last_entity: Option<&Entity>,
+        _gap_size: usize,
+    ) -> Result<Vec<Entity>, crate::error::RetrievalError> {
+        Ok(Vec::new())
+    }
+}
+
 // -- manager ----------------------------------------------------------------
 
 /// The three catalog collections warmed and maintained by this manager.
@@ -128,6 +176,37 @@ where PA: PolicyAgent
     /// The manager stays generic over the node's PolicyAgent for its
     /// Node-taking methods (ensure_registered, ensure_subscribed).
     _pa: std::marker::PhantomData<PA>,
+}
+
+#[derive(Debug, Default)]
+struct CatalogSetupState {
+    generation: u64,
+    ephemeral_active: bool,
+    /// While true, `ensure_subscribed` may wait but cannot claim a new warm.
+    /// SystemManager clears it only after storage and reactor reset finish.
+    resetting: bool,
+    /// Quiescing owner fence for initial relay responses. Reset invalidates it
+    /// before storage deletion and waits for responses already admitted at
+    /// schema ingress to finish NodeApplier.
+    ephemeral_fence: Option<RequestFence>,
+    /// Quiescing owner fence for the current durable storage warm. The warm
+    /// retains one lease from before its first storage access through
+    /// subscription/readiness publication, so reset can invalidate the
+    /// generation and drain it before deleting storage.
+    durable_fence: Option<RequestFence>,
+    /// Owner fence for schema registration in the current system epoch.
+    /// It remains absent while no system is ready and is rearmed only by the
+    /// ready hook after startup or reset. Both allocator execution and
+    /// forwarded-response folding retain leases across their map effects.
+    registration_fence: Option<RequestFence>,
+    /// Invalidated owners retained until reset finishes. `hard_reset` is
+    /// cancellation-safe at the barrier: a retry while `resetting` clones and
+    /// drains the same fences instead of bypassing work whose first waiter was
+    /// canceled.
+    draining_fences: Vec<RequestFence>,
+    /// A durable hard reset drops its reactor subscription. Once the new
+    /// system root is ready, one warm must attach the current generation.
+    durable_resume_pending: bool,
 }
 
 impl<SE, PA> CatalogInner<SE, PA>
@@ -278,6 +357,429 @@ where
         }))
     }
 
+    /// Called right after the `NodeInner` Arc exists (beside
+    /// `policy_agent.on_node_ready`). It installs the hard-reset/readiness
+    /// hooks. Durable nodes arm a warm that the system-ready hook launches;
+    /// ephemeral catalog setup remains driven by `ensure_subscribed`.
+    pub(crate) fn start(&self, node: WeakNode<SE, PA>) {
+        let Some(strong) = node.upgrade() else { return };
+
+        // Install the hard-reset flush hook on the system manager so
+        // SystemManager::hard_reset can clear the catalog in-place (it does
+        // not hold the CatalogManager directly).
+        {
+            let begin_manager = self.clone();
+            let finish_manager = self.clone();
+            let resume_manager = self.clone();
+            strong.system.set_catalog_reset_hook(
+                Arc::new(move || {
+                    let manager = begin_manager.clone();
+                    Box::pin(async move { manager.begin_reset().await })
+                }),
+                Arc::new(move || finish_manager.finish_reset()),
+                Arc::new(move || resume_manager.resume_after_system_ready()),
+            );
+        }
+
+        if self.0.durable {
+            // A durable node may remain deliberately uninitialized. Do not
+            // spawn a task that owns the managers while waiting indefinitely
+            // for a system root. Instead, arm exactly one warm and let
+            // SystemManager's create/load-ready transition call the hook.
+            self.0.setup_state.write().unwrap().durable_resume_pending = true;
+        }
+
+        // Every ready system epoch gets one registration fence, on either
+        // node kind. If loading/joining won the race before hook installation,
+        // this claims the missed transition; otherwise SystemManager calls it.
+        if strong.system.is_system_ready() {
+            self.resume_after_system_ready();
+        }
+    }
+
+    /// Run one generation's durable warm and always release readiness for a
+    /// still-current generation. The system-ready hook launches both startup
+    /// and post-reset generations; no task waits indefinitely for a root.
+    async fn run_durable_warm(&self, generation: u64, _lease: RequestLease) {
+        if let Err(e) = self.warm_and_subscribe_durable(generation).await {
+            error!("CatalogManager durable warm failed: {}", e);
+            // Readiness must still latch: ingress resolution
+            // (Node::resolve_model_wait) parks on it, and a permanently
+            // un-ready catalog would turn one failed warm into a hang.
+            // With a partial map, later resolutions reject loudly instead,
+            // which is the retryable failure mode we want.
+            let setup = self.0.setup_state.read().unwrap();
+            if setup.generation == generation {
+                self.mark_ready();
+            }
+        }
+    }
+
+    /// Durable path: warm the map by scanning the catalog collections that
+    /// ALREADY exist in storage (never materializing empty ones), then
+    /// attach a policy-free, fetch-free reactor subscription so future
+    /// registrations -- executed locally or relayed from peers -- keep the map
+    /// fresh, then mark ready.
+    ///
+    /// A schema-less durable node has no catalog collections yet; it warms
+    /// nothing, subscribes without conjuring empty `_ankurah_*` trees, and is
+    /// immediately ready with an empty (correct) map. The trees appear only
+    /// when a real registration commits.
+    async fn warm_and_subscribe_durable(&self, generation: u64) -> Result<(), crate::error::RetrievalError> {
+        if self.0.setup_state.read().unwrap().generation != generation {
+            return Ok(());
+        }
+
+        // Attach the incremental reactor subscription BEFORE the storage
+        // scan, so a registration committing mid-warm is never missed: on
+        // every commit path set_state precedes notify_change, so the scan can
+        // never read anything OLDER than what the listener concurrently
+        // applied, and upserts are idempotent by entity id. Registered
+        // fetch-free (add_query_no_fetch) so watching a not-yet-existing
+        // catalog collection does not materialize it; the wildcard watcher
+        // still routes every future change (local registration or relayed
+        // catalog event) to the listener, which applies it to the map.
+        let catalog = catalog_collections();
+        let subscription = self.0.reactor.subscribe();
+        let guard = {
+            // CatalogInner retains this guard, so the callback must not retain
+            // CatalogInner in return. Otherwise durable_sub forms a permanent
+            // CatalogInner -> guard -> callback -> CatalogInner cycle.
+            let weak = Arc::downgrade(&self.0);
+            subscription.subscribe(move |update: ReactorUpdate| {
+                if let Some(inner) = weak.upgrade() {
+                    let me = CatalogManager(inner);
+                    // Serialize the generation check and map update with
+                    // reset, which takes the write side before clearing.
+                    let setup = me.0.setup_state.read().unwrap();
+                    if setup.generation == generation {
+                        me.apply_reactor_update(update);
+                    }
+                }
+            })
+        };
+
+        for collection in &catalog {
+            let resultset = EntityResultSet::empty();
+            let gap_fetcher: Arc<dyn GapFetcher<Entity>> = Arc::new(NoopGapFetcher);
+            self.0
+                .reactor
+                .add_query_no_fetch(
+                    subscription.id(),
+                    QueryId::new(),
+                    collection.clone(),
+                    ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None },
+                    resultset,
+                    gap_fetcher,
+                )
+                .map_err(|e| crate::error::RetrievalError::Other(format!("catalog add_query failed: {e}")))?;
+        }
+
+        // Now merge the storage scan into the LIVE map (never a wholesale
+        // replace, which would clobber entries the listener applied while we
+        // were scanning). Only the catalog collections that already exist are
+        // read; `get` (and thus fetch_states) would otherwise materialize
+        // empty `_ankurah_*` trees on every schema-less durable node.
+        // Propagate a listing failure rather than silently treating it as "no
+        // collections exist" (which would warm nothing and come up empty even
+        // though data is present). `start` catches this, logs it, and still
+        // latches readiness, so resolution rejects loudly instead of hanging.
+        let existing = self.0.collectionset.engine_collections().await?;
+        for collection in &catalog {
+            if !existing.contains(collection) {
+                continue;
+            }
+            let storage = self.0.collectionset.get(collection).await?;
+            let states = storage
+                .fetch_states(&ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None })
+                .await?;
+            let setup = self.0.setup_state.read().unwrap();
+            if setup.generation != generation {
+                return Ok(());
+            }
+            let mut map = self.0.map.write().unwrap();
+            for state in states {
+                if let Some(entry) = parse_state(collection, state.payload.entity_id, &state.payload) {
+                    apply_entry(&mut map, entry);
+                }
+            }
+        }
+
+        // Keep the generation read lock through publication/readiness. Reset
+        // either invalidates first (and this task drops its local guard) or
+        // runs afterward and clears the just-published state.
+        let setup = self.0.setup_state.read().unwrap();
+        if setup.generation != generation {
+            return Ok(());
+        }
+        *self.0.durable_sub.write().unwrap() = Some((subscription, guard));
+        self.mark_ready();
+        Ok(())
+    }
+
+    /// Ephemeral path: on the first call, stand up three
+    /// [`EntityLiveQuery`]s (`Predicate::True`) over the catalog
+    /// collections, feed their reactor updates into the map, wait for all
+    /// three to initialize, and mark ready. The winning caller launches that
+    /// setup as a node-owned task, then waits like every concurrent caller.
+    /// Cancelling `context_async` therefore cannot cancel the shared warm or
+    /// drop half-created remote subscriptions. A rollback guard in the task
+    /// releases the latch if construction itself fails so a later caller can
+    /// retry.
+    pub async fn ensure_subscribed(&self, cdata: PA::ContextData, node: &Node<SE, PA>) {
+        if self.0.durable {
+            return; // durable nodes warm from storage, never subscribe via relay
+        }
+
+        let mut launched_generation = None;
+        loop {
+            // `finish_reset` releases catalog locks before a replacement root
+            // is joined. Do not let a woken waiter claim that rootless gap and
+            // launch relay work against old peers; readiness is awaited with
+            // no setup lock held. A reset racing after this wait closes
+            // readiness before taking setup and invalidates any claim that
+            // won first.
+            if !node.system.is_system_ready() {
+                node.system.wait_system_ready().await;
+                continue;
+            }
+            // Enable the waiter before inspecting either readiness or the
+            // claim latch. The setup task may complete on another executor
+            // turn immediately after it is spawned.
+            let notified = self.0.ready_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_catalog_ready() {
+                return;
+            }
+            if let Some(generation) = launched_generation {
+                let setup = self.0.setup_state.read().unwrap();
+                if !setup.ephemeral_active || setup.generation != generation {
+                    // This caller's detached setup rolled its claim back or a
+                    // hard reset invalidated it. Do not immediately reclaim
+                    // and spin on a deterministic constructor failure; return
+                    // without claiming readiness and let a later call (or an
+                    // already-waiting non-claimant) retry.
+                    return;
+                }
+            }
+
+            let claimed = {
+                let mut setup = self.0.setup_state.write().unwrap();
+                if !node.system.is_system_ready() || setup.resetting || setup.ephemeral_active {
+                    None
+                } else {
+                    setup.generation = setup.generation.wrapping_add(1);
+                    setup.ephemeral_active = true;
+                    let fence = RequestFence::new();
+                    setup.ephemeral_fence = Some(fence.clone());
+                    Some((setup.generation, fence))
+                }
+            };
+            if let Some((generation, fence)) = claimed {
+                launched_generation = Some(generation);
+                let manager = self.clone();
+                let node = node.clone();
+                let cdata = cdata.clone();
+                crate::task::spawn(async move {
+                    manager.initialize_ephemeral_subscriptions(cdata, node, generation, fence).await;
+                });
+            }
+            if self.is_catalog_ready() {
+                return;
+            }
+            let (setup_active, resetting) = {
+                let setup = self.0.setup_state.read().unwrap();
+                (setup.ephemeral_active, setup.resetting)
+            };
+            if resetting {
+                notified.await;
+                continue;
+            }
+            if !setup_active {
+                // The task this caller launched failed construction. Return
+                // the context without claiming readiness; a subsequent call
+                // can retry. A concurrent non-claimant loops and becomes the
+                // next claimant, preserving first-call race behavior.
+                if launched_generation.is_some() {
+                    return;
+                }
+                continue;
+            }
+            notified.await;
+        }
+    }
+
+    async fn initialize_ephemeral_subscriptions(&self, cdata: PA::ContextData, node: Node<SE, PA>, generation: u64, fence: RequestFence) {
+        // Own the complete setup attempt, not just its local fetches and wire
+        // responses. Reset wakes the invalidation selects below, then waits
+        // for this lease so relay entries are discarded before deletion even
+        // when async selection resolution raced their registration.
+        let Some(_setup_lease) = fence.try_acquire() else { return };
+        let rollback_manager = self.clone();
+        let mut claim_guard = RollbackGuard::new(move || {
+            let mut setup = rollback_manager.0.setup_state.write().unwrap();
+            if setup.ephemeral_active && setup.generation == generation && !rollback_manager.is_catalog_ready() {
+                setup.ephemeral_active = false;
+                if let Some(fence) = setup.ephemeral_fence.take() {
+                    fence.invalidate();
+                }
+                drop(setup);
+                rollback_manager.0.ready_notify.notify_waiters();
+            }
+        });
+
+        let mut queries = Vec::with_capacity(3);
+        for collection in catalog_collections() {
+            // cached: true -- the catalog subscription is a CACHE (maintainer
+            // ruling 2026-07-06): it accelerates resolution and enables
+            // offline use; registration is the source of truth for any
+            // doubt. The cached query activates from local storage
+            // immediately (catalog entities persisted by earlier sessions),
+            // then merges the relay snapshot and live updates as they land.
+            let args = crate::node::MatchArgs {
+                selection: ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None },
+                cached: true,
+            };
+            let request_validity = RequestValidity::fenced(fence.clone());
+            let lq = match EntityLiveQuery::new_weak_node_with_request_validity(
+                &node,
+                collection.clone(),
+                args,
+                cdata.clone(),
+                request_validity,
+            ) {
+                Ok(lq) => lq,
+                Err(e) => {
+                    error!("CatalogManager ephemeral subscribe to {} failed: {}", collection, e);
+                    // The claim guard rolls the latch back and wakes waiters.
+                    return;
+                }
+            };
+            queries.push(lq);
+        }
+
+        // Cached activation makes the local catalog immediately usable
+        // offline, but it is not a remote snapshot. When a durable peer is
+        // connected, wait until each relay subscription has applied its
+        // initial response before calling the map ready; otherwise a dynamic
+        // binding could misclassify a valid property from the authority as
+        // unknown during this window. If the relay is offline or fails, keep
+        // the cache's offline-enabler semantics and proceed with local state.
+        {
+            let invalidated = self.0.setup_changed.notified();
+            tokio::pin!(invalidated);
+            invalidated.as_mut().enable();
+            if self.0.setup_state.read().unwrap().generation != generation {
+                Self::discard_ephemeral_queries(&node, &queries);
+                return;
+            }
+            let initialized = futures::future::join_all(queries.iter().map(|lq| lq.wait_initialized()));
+            tokio::pin!(initialized);
+            tokio::select! {
+                _ = &mut initialized => {}
+                _ = &mut invalidated => {
+                    Self::discard_ephemeral_queries(&node, &queries);
+                    return;
+                }
+            }
+        }
+
+        if let Some(relay) = &node.subscription_relay {
+            let remote_warm = futures::future::join_all(
+                queries
+                    .iter()
+                    .map(|lq| async { lq.wait_initial_query_ready().await && relay.wait_established_or_offline(lq.query_id()).await }),
+            );
+            tokio::pin!(remote_warm);
+            let grace = futures_timer::Delay::new(REMOTE_CATALOG_WARM_GRACE);
+            tokio::pin!(grace);
+            let invalidated = self.0.setup_changed.notified();
+            tokio::pin!(invalidated);
+            invalidated.as_mut().enable();
+            if self.0.setup_state.read().unwrap().generation != generation {
+                Self::discard_ephemeral_queries(&node, &queries);
+                return;
+            }
+            tokio::select! {
+                _ = &mut remote_warm => {}
+                _ = &mut grace => {
+                    warn!("catalog relay did not establish within {:?}; continuing from local cache", REMOTE_CATALOG_WARM_GRACE);
+                }
+                _ = &mut invalidated => {
+                    Self::discard_ephemeral_queries(&node, &queries);
+                    return;
+                }
+            }
+        }
+
+        // Serialize the final generation check and all publication with reset.
+        // If reset won, dropping `queries` tears down the obsolete relay
+        // subscriptions and the generation-aware rollback leaves any newer
+        // claimant untouched.
+        let setup = self.0.setup_state.read().unwrap();
+        if !setup.ephemeral_active || setup.generation != generation {
+            drop(setup);
+            Self::discard_ephemeral_queries(&node, &queries);
+            return;
+        }
+
+        // Install map listeners only after the current generation wins its
+        // publication fence. A stale remote response is applied through the
+        // node's global reactor and would otherwise be visible to a newer
+        // generation's listener even though the obsolete listener itself was
+        // generation-gated. Subscribing before the resultset scan closes the
+        // usual listener/scan race: an update lands either in the callback or
+        // in the resultset we seed immediately afterward (possibly both,
+        // which is an idempotent upsert).
+        let retained: Vec<_> = queries
+            .into_iter()
+            .map(|lq| {
+                // CatalogInner retains the LQ and this guard. Capture only a
+                // weak pointer so the callback cannot complete a retain cycle.
+                let weak = Arc::downgrade(&self.0);
+                let guard = lq.reactor_subscription().subscribe(move |update: ReactorUpdate| {
+                    let Some(inner) = weak.upgrade() else { return };
+                    let me = CatalogManager(inner);
+                    // Hold the generation read lock through map mutation.
+                    // Reset takes the write lock before invalidating and
+                    // clearing, so an old callback either finishes before the
+                    // clear or observes a mismatched generation afterward.
+                    let setup = me.0.setup_state.read().unwrap();
+                    if setup.ephemeral_active && setup.generation == generation {
+                        me.apply_reactor_update(update);
+                    }
+                });
+                (lq, guard)
+            })
+            .collect();
+
+        // Seed the map from the resultsets in case any Initial items predated
+        // our listener.
+        {
+            let mut map = self.0.map.write().unwrap();
+            for (lq, _) in &retained {
+                let resultset = lq.resultset();
+                let read = resultset.read();
+                for (_, entity) in read.iter_entities() {
+                    map.upsert(entity);
+                }
+            }
+        }
+
+        *self.0.ephemeral_queries.write().unwrap() = retained;
+        self.mark_ready();
+        claim_guard.disarm();
+    }
+
+    fn discard_ephemeral_queries(node: &Node<SE, PA>, queries: &[EntityLiveQuery]) {
+        if let Some(relay) = &node.subscription_relay {
+            for query in queries {
+                relay.unsubscribe_predicate(query.query_id());
+            }
+        }
+    }
+
     /// Ingest catalog definition states shipped on a wire envelope (#330
     /// once-per-connection descriptor shipping): parse each into its def and
     /// upsert the in-memory map, exactly like the storage warm. Map-only -- a
@@ -372,6 +874,63 @@ where
         }
     }
 
+    // -- readiness ----------------------------------------------------------
+
+    pub fn is_catalog_ready(&self) -> bool { *self.0.ready.read().unwrap() }
+
+    /// Whether this manager belongs to a durable node (warms from storage)
+    /// as opposed to an ephemeral one (warms by subscription). The
+    /// resolution deferral branches on this (resolve.rs).
+    pub(crate) fn is_durable(&self) -> bool { self.0.durable }
+
+    pub async fn wait_catalog_ready(&self) {
+        // `Notify::notify_waiters` wakes only waiters REGISTERED at that
+        // moment (it stores no permit), so the `Notified` future must be
+        // created BEFORE the readiness check: checking first and creating the
+        // future after would lose a `mark_ready` that lands in between and
+        // hang this waiter (and its query) forever. Loop because `reset` can
+        // flip readiness back off between the wake and our re-check.
+        loop {
+            let notified = self.0.ready_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_catalog_ready() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Snapshot the current system epoch's schema-registration owner. It is
+    /// absent before a root is ready and throughout hard reset; callers must
+    /// still acquire a lease immediately before applying epoch-bound effects.
+    pub(crate) fn registration_validity(&self) -> Option<RequestValidity> {
+        self.0.setup_state.read().unwrap().registration_fence.clone().map(RequestValidity::fenced)
+    }
+
+    /// Wait for the durable catalog warm without letting reset strand an old
+    /// allocator request. The caller acquires the validity lease after this
+    /// returns, closing the ready-to-reset race atomically at the fence.
+    pub(crate) async fn wait_catalog_ready_if_current(&self, validity: &RequestValidity) -> bool {
+        loop {
+            let notified = self.0.ready_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !validity.is_current() {
+                return false;
+            }
+            if self.is_catalog_ready() {
+                return true;
+            }
+            notified.await;
+        }
+    }
+
+    fn mark_ready(&self) {
+        *self.0.ready.write().unwrap() = true;
+        self.0.ready_notify.notify_waiters();
+    }
+
     // -- public lookup API (cheap clones) -----------------------------------
 
     /// The property addressed by `name` in `collection`: prefer retained exact
@@ -390,6 +949,15 @@ where
         // as the dyn type instead would wrongly force `downgrade`'s parameter.
         let weak = Arc::downgrade(&self.0);
         weak
+    }
+
+    /// Test-only probe for detecting catalog ownership cycles after a node is
+    /// dropped. The closure owns only a weak pointer and therefore does not
+    /// affect the lifetime it observes.
+    #[cfg(feature = "test-helpers")]
+    pub fn liveness_probe(&self) -> impl Fn() -> bool + Send + Sync + 'static {
+        let weak = Arc::downgrade(&self.0);
+        move || weak.upgrade().is_some()
     }
 
     pub fn property_by_id(&self, id: &EntityId) -> Option<PropertyDef> { self.0.map.read().unwrap().properties.get(id).cloned() }
@@ -767,5 +1335,13 @@ where
         })?;
         self.store_binding(binding);
         Ok(())
+    }
+
+    /// TEST/INTROSPECTION: number of parsed entities of each kind
+    /// (models, properties, memberships).
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn counts(&self) -> (usize, usize, usize) {
+        let map = self.0.map.read().unwrap();
+        (map.models.len(), map.properties.len(), map.memberships.len())
     }
 }

@@ -6,6 +6,32 @@ use anyhow::Result;
 use common::{Album, Pet};
 use std::sync::Arc;
 
+/// The engine's DATA collections (system + user models), sorted, with the
+/// three metadata catalog collections filtered out.
+///
+/// With A11b a create auto-registers its model, so the catalog collections
+/// (`_ankurah_model`/`_ankurah_property`/`_ankurah_model_property`) come and
+/// go alongside the data collections. Their exact presence is orthogonal to
+/// what this test verifies (system root changes and storage reset) and is
+/// timing-sensitive besides -- a later durable node instance sharing the
+/// engine warms its catalog asynchronously, which can re-materialize catalog
+/// trees just after a hard_reset. Filtering them out keeps these assertions
+/// about the data/system collections, which is the test's actual subject,
+/// and stable regardless of catalog-warm timing.
+fn data_collections(engine: &Arc<SledStorageEngine>) -> Result<Vec<CollectionId>> {
+    let mut v: Vec<CollectionId> =
+        engine.list_collections()?.into_iter().filter(|c| !ankurah::core::schema::is_catalog_collection(c)).collect();
+    v.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    Ok(v)
+}
+
+/// The given names as a sorted `Vec<CollectionId>`, matching `data_collections`.
+fn sorted_names(names: &[&str]) -> Vec<CollectionId> {
+    let mut v: Vec<CollectionId> = names.iter().map(|n| CollectionId::fixed_name(n)).collect();
+    v.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    v
+}
+
 #[tokio::test]
 async fn test_system() -> Result<()> {
     let engine = Arc::new(SledStorageEngine::new_test().unwrap());
@@ -203,12 +229,12 @@ async fn test_system_root_change_behavior() -> Result<()> {
         trx.create(&Pet { name: "Fido".into(), age: "3".to_string() }).await?;
         trx.commit().await?;
 
-        assert_eq!(
-            ephemeral_engine.list_collections()?,
-            vec![CollectionId::fixed_name("_ankurah_system"), CollectionId::fixed_name("pet")]
-        );
-
-        assert_eq!(durable_engine.list_collections()?, vec![CollectionId::fixed_name("_ankurah_system"), CollectionId::fixed_name("pet")]);
+        // Data collections (ignoring the metadata catalog): the `pet` entity
+        // lands on both nodes; the durable also EXECUTES the RFC 5.2 (specs/model-property-metadata/rfc.md)
+        // registration the ephemeral forwarded (A11b auto-assert), which
+        // additionally creates the catalog collections filtered out here.
+        assert_eq!(data_collections(&ephemeral_engine)?, sorted_names(&["_ankurah_system", "pet"]));
+        assert_eq!(data_collections(&durable_engine)?, sorted_names(&["_ankurah_system", "pet"]));
 
         initial_root
     }; // Both nodes and connection are dropped here
@@ -221,7 +247,9 @@ async fn test_system_root_change_behavior() -> Result<()> {
         // should be ready because we previously initialized a system
         assert!(durable_node.system.is_system_ready());
 
-        assert_eq!(durable_engine.list_collections()?, vec![CollectionId::fixed_name("_ankurah_system"), CollectionId::fixed_name("pet")]);
+        // Reopening the durable engine still shows the persisted `pet` data
+        // collection (catalog collections filtered out).
+        assert_eq!(data_collections(&durable_engine)?, sorted_names(&["_ankurah_system", "pet"]));
 
         // Reset storage and reinitialize
         durable_node.system.hard_reset().await?;
@@ -231,8 +259,15 @@ async fn test_system_root_change_behavior() -> Result<()> {
         assert!(!durable_node.system.is_system_ready());
 
         durable_node.system.create().await?;
+        tokio::time::timeout(std::time::Duration::from_secs(2), durable_node.catalog.wait_catalog_ready())
+            .await
+            .expect("durable catalog should rewarm promptly after recreating the system root");
+        assert!(durable_node.catalog.is_catalog_ready(), "durable catalog should rewarm after recreating the system root");
 
-        assert_eq!(durable_engine.list_collections()?, vec![CollectionId::fixed_name("_ankurah_system")]);
+        // Only the system data collection (catalog collections filtered out:
+        // a previously-constructed durable node sharing this engine may warm
+        // its catalog asynchronously and re-touch catalog trees here).
+        assert_eq!(data_collections(&durable_engine)?, sorted_names(&["_ankurah_system"]));
 
         // Verify root has changed
         let second_root = durable_node.system.root().expect("Should have new root state");
@@ -244,10 +279,9 @@ async fn test_system_root_change_behavior() -> Result<()> {
         trx.create(&Album { name: "Leonard Skynyrd".into(), year: "1973".to_string() }).await?;
         trx.commit().await?;
 
-        assert_eq!(
-            durable_engine.list_collections()?,
-            vec![CollectionId::fixed_name("_ankurah_system"), CollectionId::fixed_name("album")]
-        );
+        // A durable node executes its own registration locally (A11b); here
+        // we assert the `album` data collection (catalog collections filtered).
+        assert_eq!(data_collections(&durable_engine)?, sorted_names(&["_ankurah_system", "album"]));
 
         second_root
     }; // Drop durable node
@@ -258,19 +292,15 @@ async fn test_system_root_change_behavior() -> Result<()> {
         durable_node.system.wait_loaded().await;
         assert!(durable_node.system.is_system_ready()); // should be ready when loaded
         assert_eq!(durable_node.system.root(), Some(second_root.clone()));
-        assert_eq!(
-            durable_engine.list_collections()?,
-            vec![CollectionId::fixed_name("_ankurah_system"), CollectionId::fixed_name("album")]
-        );
+        assert_eq!(data_collections(&durable_engine)?, sorted_names(&["_ankurah_system", "album"]));
 
         let ephemeral_node = Node::new(ephemeral_engine.clone(), PermissiveAgent::new());
         ephemeral_node.system.wait_loaded().await;
         assert!(!ephemeral_node.system.is_system_ready()); // should not be ready before joining
         assert_eq!(ephemeral_node.system.root(), Some(initial_root), "Ephemeral node should have old root prior to joining");
-        assert_eq!(
-            ephemeral_engine.list_collections()?,
-            vec![CollectionId::fixed_name("_ankurah_system"), CollectionId::fixed_name("pet")]
-        );
+        // The ephemeral engine never executed a registration (it forwarded
+        // to the durable), so only `_ankurah_system` and `pet` persisted.
+        assert_eq!(data_collections(&ephemeral_engine)?, sorted_names(&["_ankurah_system", "pet"]));
 
         // Connect nodes
         let _conn = LocalProcessConnection::new(&durable_node, &ephemeral_node).await?;
@@ -280,7 +310,9 @@ async fn test_system_root_change_behavior() -> Result<()> {
 
         assert_eq!(ephemeral_node.system.root(), Some(second_root), "Ephemeral node should have new root after joining");
 
-        assert_eq!(ephemeral_engine.list_collections()?, vec![CollectionId::fixed_name("_ankurah_system")]);
+        // Joining the new system hard-resets the ephemeral (root mismatch),
+        // leaving only the system data collection (catalog filtered out).
+        assert_eq!(data_collections(&ephemeral_engine)?, sorted_names(&["_ankurah_system"]));
     }
 
     Ok(())

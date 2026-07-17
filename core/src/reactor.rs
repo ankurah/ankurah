@@ -288,6 +288,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         node: &dyn crate::node::TNodeErased<E>,
         resultset: EntityResultSet<E>,
         gap_fetcher: std::sync::Arc<dyn GapFetcher<E>>,
+        version: u32,
         pre_notify_hook: H,
     ) -> anyhow::Result<()> {
         // Get subscription reference
@@ -310,7 +311,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
             collection_id.clone(),
             selection.clone(),
             included_entities,
-            1, // version 1 for initial add
+            version,
             &mut reactor_update_items,
         )?;
 
@@ -323,12 +324,45 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         // Mark as loaded
         resultset.set_loaded(true);
 
-        // Call pre-notify hook (e.g., mark LiveQuery as initialized) with version 1
-        pre_notify_hook.pre_notify(1);
+        // A later selection can win before the first activation reaches the
+        // reactor. Publish the version that was actually activated so its
+        // initialization waiter is released.
+        pre_notify_hook.pre_notify(version);
 
         // Send the notification with collected items. We always notify because we're initializing the query.
         subscription.send_update(reactor_update_items);
 
+        Ok(())
+    }
+
+    /// Register a query and its watchers WITHOUT reading storage.
+    ///
+    /// Unlike [`add_query_and_notify`], this performs no local fetch, so it
+    /// never materializes the collection. It is for subscribers that supply
+    /// their own initial state out of band and only need the reactor to route
+    /// future `notify_change` updates -- notably the metadata catalog manager,
+    /// which must be able to watch catalog collections that do not yet exist
+    /// in storage without conjuring empty `_ankurah_*` trees. The query's
+    /// watchers (including the `Predicate::True` wildcard) are registered so
+    /// subsequent changes are delivered; no initial notification is sent.
+    pub fn add_query_no_fetch(
+        &self,
+        subscription_id: ReactorSubscriptionId,
+        query_id: proto::QueryId,
+        collection_id: proto::CollectionId,
+        selection: ankql::ast::Selection,
+        resultset: EntityResultSet<E>,
+        gap_fetcher: std::sync::Arc<dyn GapFetcher<E>>,
+    ) -> anyhow::Result<()> {
+        let subscription = {
+            let subscriptions = self.0.subscriptions.lock().unwrap();
+            subscriptions.get(&subscription_id).cloned().ok_or_else(|| anyhow::anyhow!("Subscription {:?} not found", subscription_id))?
+        };
+
+        subscription.register_query(query_id, collection_id.clone(), resultset, gap_fetcher)?;
+        // Empty included_entities: register the watchers (predicate/wildcard)
+        // without any storage read. `&mut ()` discards update items.
+        subscription.update_query(query_id, collection_id, selection, Vec::new(), 1, &mut ())?;
         Ok(())
     }
 
@@ -607,11 +641,13 @@ mod tests {
     #[async_trait::async_trait]
     impl crate::node::TNodeErased<TestEntity> for MockNode {
         fn unsubscribe_remote_predicate(&self, _query_id: proto::QueryId) {}
-        fn update_remote_query(
+        fn update_query_selection(
             &self,
             _query_id: proto::QueryId,
+            _collection_id: proto::CollectionId,
             _selection: ankql::ast::Selection,
             _version: u32,
+            _livequery: crate::livequery::WeakEntityLiveQuery,
         ) -> Result<(), anyhow::Error> {
             Ok(())
         }
@@ -623,7 +659,6 @@ mod tests {
             Ok(self.entities.clone())
         }
         fn reactor(&self) -> &Reactor<TestEntity> { panic!("MockNode::reactor() should not be called in this test") }
-        fn has_subscription_relay(&self) -> bool { false }
     }
 
     /// Test that once a predicate matches an entity, that entity continues to be watched
@@ -647,7 +682,7 @@ mod tests {
 
         // Add query using the reactor - this should send Initial notification
         reactor
-            .add_query_and_notify(rsub.id(), query_id, collection_id, selection, &mock_node, resultset, mock_gap_fetcher, ())
+            .add_query_and_notify(rsub.id(), query_id, collection_id, selection, &mock_node, resultset, mock_gap_fetcher, 1, ())
             .await
             .unwrap();
 
