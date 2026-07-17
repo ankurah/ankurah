@@ -181,7 +181,7 @@ fn encode_json_value(json: &serde_json::Value, descending: bool) -> Vec<u8> {
 
 /// Type-aware encoding using KeySpec for validation and optimization
 /// TODO: Add NULL handling later
-pub fn encode_tuple_values_with_key_spec(values: &[Value], key_spec: &KeySpec) -> Result<Vec<u8>, IndexError> {
+pub fn encode_tuple_values_with_key_spec<K>(values: &[Value], key_spec: &KeySpec<K>) -> Result<Vec<u8>, IndexError> {
     let mut out = Vec::new();
     for (i, v) in values.iter().enumerate() {
         if i >= key_spec.keyparts.len() {
@@ -217,5 +217,30 @@ mod tests {
 
         // ASC: "a" should sort before "b"
         assert!(a < b);
+    }
+
+    /// The encoder casts each component to the index's expected type before
+    /// encoding (canonical value_type ruling, 2026-07-10: one collation type
+    /// per index), so an off-type value encodes identically to its cast
+    /// image, and only a FAILED cast is a TypeMismatch.
+    #[test]
+    fn encoder_casts_to_the_expected_type() {
+        let direct = encode_component_typed(&Value::I32(5), ValueType::I32, false).unwrap();
+        // A numeric widening/narrowing casts to the same bytes.
+        let from_i64 = encode_component_typed(&Value::I64(5), ValueType::I32, false).unwrap();
+        assert_eq!(from_i64, direct, "castable off-type value must encode as its cast image");
+        // A parseable string casts too.
+        let from_str = encode_component_typed(&Value::String("5".into()), ValueType::I32, false).unwrap();
+        assert_eq!(from_str, direct);
+        // A per-value cast failure is a TypeMismatch, never mixed-type bytes.
+        assert!(matches!(
+            encode_component_typed(&Value::String("abc".into()), ValueType::I32, false),
+            Err(IndexError::TypeMismatch(ValueType::I32, ValueType::String))
+        ));
+        // An overflowing value likewise.
+        assert!(matches!(
+            encode_component_typed(&Value::I64(5_000_000_000), ValueType::I32, false),
+            Err(IndexError::TypeMismatch(ValueType::I32, ValueType::I64))
+        ));
     }
 }
