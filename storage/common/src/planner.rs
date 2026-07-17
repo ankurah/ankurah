@@ -169,7 +169,7 @@ impl Planner {
                 if !identifier.is_simple() {
                     return None;
                 }
-                column_of(&identifier.id_or_systemname())
+                column_of(&identifier.id())
             }
             OrderKey::Path(path) => {
                 if !path.is_simple() {
@@ -186,7 +186,7 @@ impl Planner {
     /// is how `PropertyId::Id` is recognized -- by its assigned column, never by
     /// a literal name.
     fn identifier_is_primary_key(&self, identifier: &PropertyPath, primary_key: &str, column_of: ColumnOf) -> bool {
-        identifier.is_simple() && column_of(&identifier.id_or_systemname()).as_deref() == Some(primary_key)
+        identifier.is_simple() && column_of(&identifier.id()).as_deref() == Some(primary_key)
     }
 
     /// The ORDER BY counterpart of [`Self::identifier_is_primary_key`]: whether
@@ -486,7 +486,7 @@ impl Planner {
                 let field_path = match left.as_ref() {
                     Expr::Path(path) => path.steps.join("."),
                     Expr::PropertyPath(identifier) => {
-                        let column = column_of(&identifier.id_or_systemname())?;
+                        let column = column_of(&identifier.id())?;
                         std::iter::once(column).chain(identifier.subpath.iter().cloned()).collect::<Vec<_>>().join(".")
                     }
                     _ => return None,
@@ -2033,7 +2033,7 @@ mod tests {
         fn resolved_pk_order_by_never_keyparted() {
             use ankql::ast::{Expr, Literal, OrderByItem, OrderDirection, OrderKey, Predicate, PropertyId, PropertyPath, Selection};
 
-            let pk_item = OrderByItem { key: OrderKey::Property(PropertyPath::id(vec![])), direction: OrderDirection::Asc };
+            let pk_item = OrderByItem { key: OrderKey::Property(PropertyPath::primary_key(vec![])), direction: OrderDirection::Asc };
             let selection = Selection {
                 predicate: Predicate::Comparison {
                     left: Box::new(Expr::PropertyPath(PropertyPath::system("status", vec![]))),

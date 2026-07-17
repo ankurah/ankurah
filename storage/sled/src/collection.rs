@@ -228,7 +228,7 @@ impl SledStorageCollectionInner {
             .flatten()
             .filter_map(|item| {
                 let OrderKey::Property(pp) = &item.key else { return None };
-                let property_id = pp.id_or_systemname();
+                let property_id = pp.id();
                 let PropertyId::EntityId(ulid) = property_id else { return None };
                 let resolver = resolver.as_deref()?;
                 let value_type =

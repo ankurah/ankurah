@@ -239,7 +239,7 @@ pub(crate) fn build_key_spec_from_selection<E: AbstractEntity>(
     for item in order_by {
         // The sort key's stable identity and its in-memory extraction path.
         let (key, property_path): (PropertyId, crate::reactor::PropertyPath) = match &item.key {
-            OrderKey::Property(identifier) => (identifier.id_or_systemname(), crate::reactor::PropertyPath::from_identifier(identifier)),
+            OrderKey::Property(identifier) => (identifier.id(), crate::reactor::PropertyPath::from_identifier(identifier)),
             // A raw (unresolved) sort key -- standalone reactors or tests that
             // never resolved -- sorts by name: key it and extract it as a system reference.
             OrderKey::Path(path) => (PropertyId::System { name: path.first().to_string() }, crate::reactor::PropertyPath::from_path(path)),

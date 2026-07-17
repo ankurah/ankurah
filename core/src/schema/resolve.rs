@@ -165,7 +165,7 @@ where
         // The `id` pseudo-property resolves to its own identity ([`PropertyId::Id`]).
         if steps[0] == "id" {
             whole_property_order(collection, path, &steps[1..])?;
-            return Ok(resolved(PropertyPath::id(vec![])));
+            return Ok(resolved(PropertyPath::primary_key(vec![])));
         }
 
         if let Some(property) = self.resolve(collection.as_str(), &steps[0]) {
@@ -177,7 +177,7 @@ where
         if steps.len() > 1 && steps[0] == collection.as_str() {
             if steps[1] == "id" {
                 whole_property_order(collection, path, &steps[2..])?;
-                return Ok(resolved(PropertyPath::id(vec![])));
+                return Ok(resolved(PropertyPath::primary_key(vec![])));
             }
             if let Some(property) = self.resolve(collection.as_str(), &steps[1]) {
                 whole_property_order(collection, path, &steps[2..])?;
@@ -228,7 +228,7 @@ where
             if ident.subpath.is_empty() {
                 // Only registered properties have a catalog canonical type; a
                 // system property has none, so it has no cast target.
-                if let ankql::ast::PropertyId::EntityId(id) = ident.id_or_systemname() {
+                if let ankql::ast::PropertyId::EntityId(id) = ident.id() {
                     return self.canonical_value_type_of(&EntityId::from_ulid(id)).and_then(|s| ValueType::from_property_str(&s));
                 }
             }
@@ -287,7 +287,7 @@ where
                     if steps.len() > 1 {
                         return Err(id_subpath_error(collection, path));
                     }
-                    return Ok(Expr::PropertyPath(PropertyPath::id(vec![])));
+                    return Ok(Expr::PropertyPath(PropertyPath::primary_key(vec![])));
                 }
                 // Try the first step as a property of this collection.
                 if let Some(property) = self.resolve(collection.as_str(), &steps[0]) {
@@ -300,7 +300,7 @@ where
                         if steps.len() > 2 {
                             return Err(id_subpath_error(collection, path));
                         }
-                        return Ok(Expr::PropertyPath(PropertyPath::id(vec![])));
+                        return Ok(Expr::PropertyPath(PropertyPath::primary_key(vec![])));
                     }
                     if let Some(property) = self.resolve(collection.as_str(), &steps[1]) {
                         return Ok(Expr::PropertyPath(PropertyPath::registered(property.to_ulid(), steps[1].clone(), steps[2..].to_vec())));
@@ -376,7 +376,7 @@ fn id_subpath_error(collection: &CollectionId, path: &PathExpr) -> PropertyError
 /// going through [`Resolver::resolve_selection`].
 pub(crate) fn system_property(name: &str, subpath: Vec<String>) -> PropertyPath {
     if name == "id" {
-        return PropertyPath::id(subpath);
+        return PropertyPath::primary_key(subpath);
     }
     PropertyPath::system(name.to_string(), subpath)
 }

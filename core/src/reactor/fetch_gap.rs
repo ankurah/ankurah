@@ -124,7 +124,7 @@ pub fn build_continuation_predicate<E: AbstractEntity>(
         // `id` pseudo-property) by name.
         let (field_value, key_expr) = match &order_item.key {
             OrderKey::Property(identifier) => {
-                let value = match identifier.id_or_systemname() {
+                let value = match identifier.id() {
                     PropertyId::Id => last_entity.value("id"),
                     PropertyId::EntityId(id) => last_entity.value_by_id(ankurah_proto::EntityId::from_ulid(id)),
                     PropertyId::System { name } => last_entity.value(&name),

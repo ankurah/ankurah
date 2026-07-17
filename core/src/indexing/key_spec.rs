@@ -35,17 +35,20 @@ pub struct IndexKeyPart<K> {
     pub collation: Option<String>, // collation name/id if relevant (optional)
 }
 
-// The string constructors and `full_path` are physical-addressing operations, so
-// they live on the engine-facing `String` instantiation only. Core builds its
-// `IndexKeyPart<PropertyId>` by struct literal from resolved identities.
-impl IndexKeyPart<String> {
-    pub fn asc<S: Into<String>>(col: S, value_type: ValueType) -> Self {
-        Self { key: col.into(), sub_path: None, direction: IndexDirection::Asc, value_type, nulls: None, collation: None }
+impl<K> IndexKeyPart<K> {
+    pub fn asc(key: impl Into<K>, value_type: ValueType) -> Self {
+        Self { key: key.into(), sub_path: None, direction: IndexDirection::Asc, value_type, nulls: None, collation: None }
     }
-    pub fn desc<S: Into<String>>(col: S, value_type: ValueType) -> Self {
-        Self { key: col.into(), sub_path: None, direction: IndexDirection::Desc, value_type, nulls: None, collation: None }
+    pub fn desc(key: impl Into<K>, value_type: ValueType) -> Self {
+        Self { key: key.into(), sub_path: None, direction: IndexDirection::Desc, value_type, nulls: None, collation: None }
     }
+}
 
+// The path-string helpers are physical-addressing operations: they split a
+// dotted name into `key` + `sub_path` or join them back, which only means
+// something for the engine-facing `String` instantiation. A resolved
+// `IndexKeyPart<PropertyId>` has no dotted-name form to parse.
+impl IndexKeyPart<String> {
     /// Create from a PathExpr (handles multi-step paths)
     pub fn from_path(path: &ankql::ast::PathExpr, direction: IndexDirection, value_type: ValueType) -> Self {
         let (key, sub_path) = if path.steps.len() == 1 {
@@ -191,8 +194,8 @@ mod tests {
 
     #[test]
     fn test_exact_match() {
-        let spec1 = KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String), IndexKeyPart::desc("b", ValueType::String)] };
-        let spec2 = KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String), IndexKeyPart::desc("b", ValueType::String)] };
+        let spec1: KeySpec<String> = KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String), IndexKeyPart::desc("b", ValueType::String)] };
+        let spec2: KeySpec<String> = KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String), IndexKeyPart::desc("b", ValueType::String)] };
 
         assert_eq!(spec1.matches(&spec2), Some(IndexSpecMatch::Match));
     }
@@ -200,8 +203,8 @@ mod tests {
     #[test]
     fn test_prefix_match() {
         // +a, -b matches +a, -b, +c
-        let query_spec = KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String), IndexKeyPart::desc("b", ValueType::String)] };
-        let index_spec = KeySpec {
+        let query_spec: KeySpec<String> = KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String), IndexKeyPart::desc("b", ValueType::String)] };
+        let index_spec: KeySpec<String> = KeySpec {
             keyparts: vec![
                 IndexKeyPart::asc("a", ValueType::String),
                 IndexKeyPart::desc("b", ValueType::String),
@@ -215,8 +218,8 @@ mod tests {
     #[test]
     fn test_inverse_exact_match() {
         // +a, -b matches -a, +b (inverse)
-        let query_spec = KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String), IndexKeyPart::desc("b", ValueType::String)] };
-        let index_spec = KeySpec { keyparts: vec![IndexKeyPart::desc("a", ValueType::String), IndexKeyPart::asc("b", ValueType::String)] };
+        let query_spec: KeySpec<String> = KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String), IndexKeyPart::desc("b", ValueType::String)] };
+        let index_spec: KeySpec<String> = KeySpec { keyparts: vec![IndexKeyPart::desc("a", ValueType::String), IndexKeyPart::asc("b", ValueType::String)] };
 
         assert_eq!(query_spec.matches(&index_spec), Some(IndexSpecMatch::Inverse));
     }
@@ -224,8 +227,8 @@ mod tests {
     #[test]
     fn test_inverse_prefix_match() {
         // +a, -b matches -a, +b, +c (inverse prefix)
-        let query_spec = KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String), IndexKeyPart::desc("b", ValueType::String)] };
-        let index_spec = KeySpec {
+        let query_spec: KeySpec<String> = KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String), IndexKeyPart::desc("b", ValueType::String)] };
+        let index_spec: KeySpec<String> = KeySpec {
             keyparts: vec![
                 IndexKeyPart::desc("a", ValueType::String),
                 IndexKeyPart::asc("b", ValueType::String),
@@ -239,10 +242,10 @@ mod tests {
     #[test]
     fn test_user_example() {
         // "+a, -b matches +a, -b, any c AND -a, +b, any c"
-        let query_spec = KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String), IndexKeyPart::desc("b", ValueType::String)] };
+        let query_spec: KeySpec<String> = KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String), IndexKeyPart::desc("b", ValueType::String)] };
 
         // Test direct match: +a, -b, +c
-        let index_spec1 = KeySpec {
+        let index_spec1: KeySpec<String> = KeySpec {
             keyparts: vec![
                 IndexKeyPart::asc("a", ValueType::String),
                 IndexKeyPart::desc("b", ValueType::String),
@@ -252,7 +255,7 @@ mod tests {
         assert_eq!(query_spec.matches(&index_spec1), Some(IndexSpecMatch::Match));
 
         // Test inverse match: -a, +b, -c
-        let index_spec2 = KeySpec {
+        let index_spec2: KeySpec<String> = KeySpec {
             keyparts: vec![
                 IndexKeyPart::desc("a", ValueType::String),
                 IndexKeyPart::asc("b", ValueType::String),
@@ -264,16 +267,16 @@ mod tests {
 
     #[test]
     fn test_no_match_different_fields() {
-        let query_spec = KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String), IndexKeyPart::desc("b", ValueType::String)] };
-        let index_spec = KeySpec { keyparts: vec![IndexKeyPart::asc("x", ValueType::String), IndexKeyPart::desc("y", ValueType::String)] };
+        let query_spec: KeySpec<String> = KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String), IndexKeyPart::desc("b", ValueType::String)] };
+        let index_spec: KeySpec<String> = KeySpec { keyparts: vec![IndexKeyPart::asc("x", ValueType::String), IndexKeyPart::desc("y", ValueType::String)] };
 
         assert_eq!(query_spec.matches(&index_spec), None);
     }
 
     #[test]
     fn test_no_match_different_value_type() {
-        let query_spec = KeySpec { keyparts: vec![IndexKeyPart::asc("price", ValueType::I64)] };
-        let string_collated_index = KeySpec { keyparts: vec![IndexKeyPart::asc("price", ValueType::String)] };
+        let query_spec: KeySpec<String> = KeySpec { keyparts: vec![IndexKeyPart::asc("price", ValueType::I64)] };
+        let string_collated_index: KeySpec<String> = KeySpec { keyparts: vec![IndexKeyPart::asc("price", ValueType::String)] };
 
         assert_eq!(query_spec.matches(&string_collated_index), None);
     }
@@ -281,8 +284,8 @@ mod tests {
     #[test]
     fn test_no_match_partial_field_overlap() {
         // +a, -b does not match +a, +b (different direction on second field)
-        let query_spec = KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String), IndexKeyPart::desc("b", ValueType::String)] };
-        let index_spec = KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String), IndexKeyPart::asc("b", ValueType::String)] };
+        let query_spec: KeySpec<String> = KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String), IndexKeyPart::desc("b", ValueType::String)] };
+        let index_spec: KeySpec<String> = KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String), IndexKeyPart::asc("b", ValueType::String)] };
 
         assert_eq!(query_spec.matches(&index_spec), None);
     }
@@ -290,22 +293,22 @@ mod tests {
     #[test]
     fn test_no_match_query_longer_than_index() {
         // +a, -b, +c cannot match +a (query is longer than index)
-        let query_spec = KeySpec {
+        let query_spec: KeySpec<String> = KeySpec {
             keyparts: vec![
                 IndexKeyPart::asc("a", ValueType::String),
                 IndexKeyPart::desc("b", ValueType::String),
                 IndexKeyPart::asc("c", ValueType::String),
             ],
         };
-        let index_spec = KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String)] };
+        let index_spec: KeySpec<String> = KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String)] };
 
         assert_eq!(query_spec.matches(&index_spec), None);
     }
 
     #[test]
     fn test_empty_specs() {
-        let empty_spec = KeySpec { keyparts: vec![] };
-        let non_empty_spec = KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String)] };
+        let empty_spec: KeySpec<String> = KeySpec { keyparts: vec![] };
+        let non_empty_spec: KeySpec<String> = KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String)] };
 
         // Empty spec matches any spec (empty prefix)
         assert_eq!(empty_spec.matches(&non_empty_spec), Some(IndexSpecMatch::Match));
@@ -317,8 +320,8 @@ mod tests {
 
     #[test]
     fn test_single_field_cases() {
-        let asc_spec = KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String)] };
-        let desc_spec = KeySpec { keyparts: vec![IndexKeyPart::desc("a", ValueType::String)] };
+        let asc_spec: KeySpec<String> = KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String)] };
+        let desc_spec: KeySpec<String> = KeySpec { keyparts: vec![IndexKeyPart::desc("a", ValueType::String)] };
 
         // Direct match
         assert_eq!(asc_spec.matches(&asc_spec), Some(IndexSpecMatch::Match));
@@ -331,7 +334,7 @@ mod tests {
     #[test]
     fn test_complex_multi_field_scenarios() {
         // Test various combinations with 3+ fields
-        let query_spec = KeySpec {
+        let query_spec: KeySpec<String> = KeySpec {
             keyparts: vec![
                 IndexKeyPart::asc("a", ValueType::String),
                 IndexKeyPart::desc("b", ValueType::String),
@@ -340,7 +343,7 @@ mod tests {
         };
 
         // Exact match with additional fields
-        let index_spec1 = KeySpec {
+        let index_spec1: KeySpec<String> = KeySpec {
             keyparts: vec![
                 IndexKeyPart::asc("a", ValueType::String),
                 IndexKeyPart::desc("b", ValueType::String),
@@ -351,7 +354,7 @@ mod tests {
         assert_eq!(query_spec.matches(&index_spec1), Some(IndexSpecMatch::Match));
 
         // Inverse match with additional fields
-        let index_spec2 = KeySpec {
+        let index_spec2: KeySpec<String> = KeySpec {
             keyparts: vec![
                 IndexKeyPart::desc("a", ValueType::String),
                 IndexKeyPart::asc("b", ValueType::String),
@@ -362,7 +365,7 @@ mod tests {
         assert_eq!(query_spec.matches(&index_spec2), Some(IndexSpecMatch::Inverse));
 
         // No match - mixed directions that don't form inverse
-        let index_spec3 = KeySpec {
+        let index_spec3: KeySpec<String> = KeySpec {
             keyparts: vec![
                 IndexKeyPart::asc("a", ValueType::String),
                 IndexKeyPart::asc("b", ValueType::String),
@@ -375,13 +378,13 @@ mod tests {
     #[test]
     fn test_helper_methods() {
         // Test IndexKeyPart helper methods
-        let asc_keypart = IndexKeyPart::asc("test", ValueType::String);
+        let asc_keypart: IndexKeyPart<String> = IndexKeyPart::asc("test", ValueType::String);
         assert_eq!(asc_keypart.key, "test");
         assert_eq!(asc_keypart.direction, IndexDirection::Asc);
         assert_eq!(asc_keypart.nulls, None);
         assert_eq!(asc_keypart.collation, None);
 
-        let desc_keypart = IndexKeyPart::desc("test", ValueType::String);
+        let desc_keypart: IndexKeyPart<String> = IndexKeyPart::desc("test", ValueType::String);
         assert_eq!(desc_keypart.key, "test");
         assert_eq!(desc_keypart.direction, IndexDirection::Desc);
         assert_eq!(desc_keypart.nulls, None);
@@ -391,7 +394,7 @@ mod tests {
     #[test]
     fn test_edge_case_behaviors() {
         // Test that matches works correctly with various edge cases
-        let spec = KeySpec {
+        let spec: KeySpec<String> = KeySpec {
             keyparts: vec![
                 IndexKeyPart::asc("a", ValueType::String),
                 IndexKeyPart::desc("b", ValueType::String),
@@ -403,7 +406,7 @@ mod tests {
         assert_eq!(spec.matches(&spec), Some(IndexSpecMatch::Match));
 
         // Empty spec matches any spec
-        let empty = KeySpec { keyparts: vec![] };
+        let empty: KeySpec<String> = KeySpec { keyparts: vec![] };
         assert_eq!(empty.matches(&spec), Some(IndexSpecMatch::Match));
     }
 }

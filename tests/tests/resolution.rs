@@ -62,7 +62,7 @@ fn first_expr(selection: &Selection) -> &Expr {
 /// `OrderByItem::property` field the `OrderKey` enum replaced.
 fn order_property_id(item: &OrderByItem) -> Option<ulid::Ulid> {
     match &item.key {
-        OrderKey::Property(identifier) => match identifier.id_or_systemname() {
+        OrderKey::Property(identifier) => match identifier.id() {
             PropertyId::EntityId(id) => Some(id),
             _ => None,
         },
@@ -98,7 +98,7 @@ async fn resolution_binds_names_and_fails_closed() -> anyhow::Result<()> {
     let resolved = server.catalog.resolve_selection(&collection, &ankql::parser::parse_selection("name = 'x'")?).unwrap();
     match first_expr(&resolved) {
         Expr::PropertyPath(ident) => {
-            assert_eq!(ident.id_or_systemname(), PropertyId::EntityId(name_id.to_ulid()));
+            assert_eq!(ident.id(), PropertyId::EntityId(name_id.to_ulid()));
             assert_eq!(ident.to_string(), "name");
             assert!(ident.subpath.is_empty());
         }
@@ -109,7 +109,7 @@ async fn resolution_binds_names_and_fails_closed() -> anyhow::Result<()> {
     let resolved = server.catalog.resolve_selection(&collection, &ankql::parser::parse_selection("payload.meta.genre = 'jazz'")?).unwrap();
     match first_expr(&resolved) {
         Expr::PropertyPath(ident) => {
-            assert_eq!(ident.id_or_systemname(), PropertyId::EntityId(payload_id.to_ulid()));
+            assert_eq!(ident.id(), PropertyId::EntityId(payload_id.to_ulid()));
             assert_eq!(ident.subpath, vec!["meta".to_string(), "genre".to_string()]);
         }
         other => panic!("expected Identifier, got {other:?}"),
@@ -121,7 +121,7 @@ async fn resolution_binds_names_and_fails_closed() -> anyhow::Result<()> {
     let resolved =
         server.catalog.resolve_selection(&collection, &ankql::parser::parse_selection("id = 'AQIDBAUGBwgJCgsMDQ4PEA'")?).unwrap();
     match first_expr(&resolved) {
-        Expr::PropertyPath(ident) => assert_eq!(ident.id_or_systemname(), PropertyId::Id),
+        Expr::PropertyPath(ident) => assert_eq!(ident.id(), PropertyId::Id),
         other => panic!("expected the id pseudo-property to resolve to PropertyId::Id, got {other:?}"),
     }
 
@@ -129,7 +129,7 @@ async fn resolution_binds_names_and_fails_closed() -> anyhow::Result<()> {
     let resolved = server.catalog.resolve_selection(&collection, &ankql::parser::parse_selection("album.name = 'x'")?).unwrap();
     match first_expr(&resolved) {
         Expr::PropertyPath(ident) => {
-            assert_eq!((ident.id_or_systemname(), ident.to_string().as_str()), (PropertyId::EntityId(name_id.to_ulid()), "name"))
+            assert_eq!((ident.id(), ident.to_string().as_str()), (PropertyId::EntityId(name_id.to_ulid()), "name"))
         }
         other => panic!("expected Identifier, got {other:?}"),
     }
@@ -159,7 +159,7 @@ async fn resolution_follows_renames_to_the_same_id() -> anyhow::Result<()> {
 
     let before = server.catalog.resolve_selection(&collection, &ankql::parser::parse_selection("name = 'x' ORDER BY name")?).unwrap();
     let before_id = match first_expr(&before) {
-        Expr::PropertyPath(i) => match i.id_or_systemname() {
+        Expr::PropertyPath(i) => match i.id() {
             PropertyId::EntityId(id) => id,
             other => panic!("expected a registered property id, got {other:?}"),
         },
@@ -189,7 +189,7 @@ async fn resolution_follows_renames_to_the_same_id() -> anyhow::Result<()> {
     let after = server.catalog.resolve_selection(&collection, &ankql::parser::parse_selection("title = 'x'")?).unwrap();
     match first_expr(&after) {
         Expr::PropertyPath(i) => {
-            assert_eq!(i.id_or_systemname(), PropertyId::EntityId(before_id), "rename must keep the property id")
+            assert_eq!(i.id(), PropertyId::EntityId(before_id), "rename must keep the property id")
         }
         other => panic!("expected Identifier, got {other:?}"),
     }
@@ -313,7 +313,7 @@ async fn systemize_strips_the_collection_qualifier() -> anyhow::Result<()> {
     let resolved = server.catalog.resolve_selection(&collection, &ankql::parser::parse_selection("_ankurah_model.name = 'x'")?)?;
     match first_expr(&resolved) {
         Expr::PropertyPath(ident) => {
-            assert_eq!(ident.id_or_systemname(), PropertyId::System { name: "name".into() });
+            assert_eq!(ident.id(), PropertyId::System { name: "name".into() });
             assert!(ident.subpath.is_empty());
         }
         other => panic!("expected Identifier, got {other:?}"),
@@ -323,7 +323,7 @@ async fn systemize_strips_the_collection_qualifier() -> anyhow::Result<()> {
     let resolved = server.catalog.resolve_selection(&collection, &ankql::parser::parse_selection("_ankurah_model.name.x = 'y'")?)?;
     match first_expr(&resolved) {
         Expr::PropertyPath(ident) => {
-            assert_eq!(ident.id_or_systemname(), PropertyId::System { name: "name".into() });
+            assert_eq!(ident.id(), PropertyId::System { name: "name".into() });
             assert_eq!(ident.subpath, vec!["x".to_string()]);
         }
         other => panic!("expected Identifier, got {other:?}"),
@@ -333,7 +333,7 @@ async fn systemize_strips_the_collection_qualifier() -> anyhow::Result<()> {
     // still refused through the qualified form.
     let resolved = server.catalog.resolve_selection(&collection, &ankql::parser::parse_selection("_ankurah_model.id = 'x'")?)?;
     match first_expr(&resolved) {
-        Expr::PropertyPath(ident) => assert_eq!(ident.id_or_systemname(), PropertyId::Id),
+        Expr::PropertyPath(ident) => assert_eq!(ident.id(), PropertyId::Id),
         other => panic!("expected Identifier, got {other:?}"),
     }
     let err = server.catalog.resolve_selection(&collection, &ankql::parser::parse_selection("_ankurah_model.id.x = 'y'")?).unwrap_err();
@@ -353,7 +353,7 @@ async fn systemize_strips_the_collection_qualifier() -> anyhow::Result<()> {
     let items = resolved.order_by.expect("order_by present");
     match &items[0].key {
         OrderKey::Property(ident) => {
-            assert_eq!(ident.id_or_systemname(), PropertyId::System { name: "name".into() });
+            assert_eq!(ident.id(), PropertyId::System { name: "name".into() });
             assert!(ident.subpath.is_empty());
         }
         other => panic!("expected resolved order key, got {other:?}"),

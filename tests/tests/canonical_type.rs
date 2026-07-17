@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 /// `OrderByItem::property` field the `OrderKey` enum replaced.
 fn order_property_id(item: &ankql::ast::OrderByItem) -> Option<ulid::Ulid> {
     match &item.key {
-        ankql::ast::OrderKey::Property(identifier) => match identifier.id_or_systemname() {
+        ankql::ast::OrderKey::Property(identifier) => match identifier.id() {
             ankql::ast::PropertyId::EntityId(id) => Some(id),
             _ => None,
         },

@@ -36,7 +36,7 @@ async fn test_id_range_optimization_integration() -> Result<()> {
     // the resolved form the storage engine requires (`Selection::check`).
     let selection_asc = Selection {
         predicate: Predicate::True,
-        order_by: Some(vec![OrderByItem { key: OrderKey::Property(PropertyPath::id(vec![])), direction: OrderDirection::Asc }]),
+        order_by: Some(vec![OrderByItem { key: OrderKey::Property(PropertyPath::primary_key(vec![])), direction: OrderDirection::Asc }]),
         limit: Some(5),
     };
 
@@ -57,7 +57,7 @@ async fn test_id_range_optimization_integration() -> Result<()> {
     // Test 2: ORDER BY id DESC (should use FullScan reverse + skip sorting)
     let selection_desc = Selection {
         predicate: Predicate::True,
-        order_by: Some(vec![OrderByItem { key: OrderKey::Property(PropertyPath::id(vec![])), direction: OrderDirection::Desc }]),
+        order_by: Some(vec![OrderByItem { key: OrderKey::Property(PropertyPath::primary_key(vec![])), direction: OrderDirection::Desc }]),
         limit: Some(3),
     };
 
@@ -118,11 +118,11 @@ async fn test_id_range_with_where_clause() -> Result<()> {
     // the resolved form the storage engine requires (`Selection::check`).
     let selection = Selection {
         predicate: Predicate::Comparison {
-            left: Box::new(Expr::PropertyPath(PropertyPath::id(vec![]))),
+            left: Box::new(Expr::PropertyPath(PropertyPath::primary_key(vec![]))),
             operator: ComparisonOperator::GreaterThanOrEqual,
             right: Box::new(Expr::Literal(Literal::String(start_id.to_base64()))),
         },
-        order_by: Some(vec![OrderByItem { key: OrderKey::Property(PropertyPath::id(vec![])), direction: OrderDirection::Asc }]),
+        order_by: Some(vec![OrderByItem { key: OrderKey::Property(PropertyPath::primary_key(vec![])), direction: OrderDirection::Asc }]),
         limit: Some(3),
     };
 

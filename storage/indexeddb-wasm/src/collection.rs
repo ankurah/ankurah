@@ -225,7 +225,7 @@ impl StorageCollection for IndexedDBBucket {
             .flatten()
             .filter_map(|item| {
                 let OrderKey::Property(pp) = &item.key else { return None };
-                let property_id = pp.id_or_systemname();
+                let property_id = pp.id();
                 let PropertyId::EntityId(ulid) = property_id else { return None };
                 let resolver = resolver.as_deref()?;
                 let value_type =
@@ -1006,7 +1006,7 @@ mod tests {
             .flatten()
             .filter_map(|item| {
                 let OrderKey::Property(pp) = &item.key else { return None };
-                let property_id = pp.id_or_systemname();
+                let property_id = pp.id();
                 let PropertyId::EntityId(ulid) = property_id else { return None };
                 let value_type = ValueType::from_property_str(&resolver.canonical_value_type(&EntityId::from_ulid(ulid))?)?;
                 let column = column_of(&property_id)?;

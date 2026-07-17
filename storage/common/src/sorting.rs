@@ -17,7 +17,7 @@ use crate::OrderByComponents;
 fn order_value<T: Filterable>(item: &T, order_item: &ankql::ast::OrderByItem) -> Option<Value> {
     use ankql::ast::{OrderKey, PropertyId};
     match &order_item.key {
-        OrderKey::Property(identifier) => match identifier.id_or_systemname() {
+        OrderKey::Property(identifier) => match identifier.id() {
             PropertyId::Id => item.value("id"),
             PropertyId::EntityId(id) => item.value_by_id(ankurah_proto::EntityId::from_ulid(id)),
             PropertyId::System { name } => item.value(&name),

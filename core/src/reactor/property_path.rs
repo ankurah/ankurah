@@ -35,7 +35,7 @@ impl PropertyPath {
     /// Create a PropertyPath from a resolved identifier: a registered id reads
     /// its id-keyed slot, a system name reads by name.
     pub fn from_identifier(identifier: &ankql::ast::PropertyPath) -> Self {
-        Self { address: PropertyPath::address_of(&identifier.id_or_systemname()), sub_path: identifier.subpath.clone() }
+        Self { address: PropertyPath::address_of(&identifier.id()), sub_path: identifier.subpath.clone() }
     }
 
     /// A simple (sub-path-free) path addressed by a resolved identity.

@@ -146,7 +146,7 @@ impl PropertyPath {
     /// A resolved reference to the `id` pseudo-property (every entity's primary
     /// key), addressed by its own [`PropertyId::Id`] rather than a catalog id or
     /// a name.
-    pub fn id(subpath: Vec<String>) -> Self { Self { id: PropertyId::Id, label: "id".to_string(), subpath } }
+    pub fn primary_key(subpath: Vec<String>) -> Self { Self { id: PropertyId::Id, label: "id".to_string(), subpath } }
 
     // pub fn path_steps(&self) -> Vec<String> {
     //     whoops, path_steps leaks name. can't do that. who's using this?
@@ -167,7 +167,7 @@ impl PropertyPath {
     /// resolved-from label), whereas the catalog (`CatalogResolver::name_for`
     /// on a registered id) gives the property's CURRENT name; the two can
     /// diverge after a rename.
-    pub fn id_or_systemname(&self) -> PropertyId { self.id.clone() }
+    pub fn id(&self) -> PropertyId { self.id.clone() }
 
     /// True when there is no JSON sub-path: a plain property reference.
     pub fn is_simple(&self) -> bool { self.subpath.is_empty() }
@@ -201,10 +201,10 @@ pub struct OrderByItem {
 /// A sort key, mirroring `Expr::Path` vs `Expr::PropertyPath`: the parser
 /// produces the raw [`OrderKey::Path`] form, and the resolution pass rewrites it
 /// to [`OrderKey::Property`] -- including the `id` pseudo-property, which
-/// resolves to [`PropertyPath::id`] (carrying its own [`PropertyId::Id`]), not
+/// resolves to [`PropertyPath::primary_key`] (carrying its own [`PropertyId::Id`]), not
 /// to a catalog id. The resolved arm keeps its name private just like
 /// [`PropertyPath`]; a storage engine keys its sort on the identifier's
-/// `id_or_systemname()`, never on a name.
+/// `id()`, never on a name.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum OrderKey {
     Path(PathExpr),
@@ -327,7 +327,7 @@ impl Selection {
                     // so it is kept; a raw `OrderKey::Path` (only the degenerate
                     // empty path survives resolution) carries no identity and is
                     // likewise kept.
-                    OrderKey::Property(identifier) => !absent.contains(&identifier.id_or_systemname()),
+                    OrderKey::Property(identifier) => !absent.contains(&identifier.id()),
                     OrderKey::Path(_) => true,
                 })
                 .cloned()
@@ -349,7 +349,7 @@ impl Selection {
         if let Some(order_by) = &self.order_by {
             for item in order_by {
                 if let OrderKey::Property(identifier) = &item.key {
-                    let id = identifier.id_or_systemname();
+                    let id = identifier.id();
                     if !properties.contains(&id) {
                         properties.push(id);
                     }
@@ -373,7 +373,7 @@ impl Selection {
 /// that one property's address regardless of the subpath.
 fn expr_referenced_property(expr: &Expr) -> Option<PropertyId> {
     match expr {
-        Expr::PropertyPath(identifier) => Some(identifier.id_or_systemname()),
+        Expr::PropertyPath(identifier) => Some(identifier.id()),
         _ => None,
     }
 }
@@ -845,7 +845,7 @@ mod tests {
         for left in [
             Expr::PropertyPath(PropertyPath::registered(Ulid::from_bytes([7u8; 16]), "status", vec![])),
             Expr::PropertyPath(PropertyPath::system("collection", vec![])),
-            Expr::PropertyPath(PropertyPath::id(vec![])),
+            Expr::PropertyPath(PropertyPath::primary_key(vec![])),
         ] {
             let selection = Selection { predicate: cmp_with(left), order_by: None, limit: None };
             assert!(selection.check().is_ok());
@@ -898,7 +898,7 @@ mod tests {
 
     #[test]
     fn check_covers_order_by_not_just_the_predicate() {
-        let resolved = cmp_with(Expr::PropertyPath(PropertyPath::id(vec![])));
+        let resolved = cmp_with(Expr::PropertyPath(PropertyPath::primary_key(vec![])));
         let order_by = |key| Selection {
             predicate: resolved.clone(),
             order_by: Some(vec![OrderByItem { key, direction: OrderDirection::Asc }]),

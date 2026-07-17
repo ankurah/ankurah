@@ -254,7 +254,7 @@ impl SqlBuilder {
     /// be folded to NULL (`assume_null`) before SQL generation, so anything
     /// reaching here has a materialized column.
     fn column_for(&self, identifier: &ankql::ast::PropertyPath) -> Result<String, SqlGenerationError> {
-        let id = identifier.id_or_systemname();
+        let id = identifier.id();
         self.column_map.get(&id).cloned().ok_or_else(|| SqlGenerationError::UnmappedProperty(format!("{id:?}")))
     }
 
@@ -383,7 +383,7 @@ impl SqlBuilder {
     }
 
     /// Emit a column reference (or JSONB sub-path traversal) for a sequence of path
-    /// steps. Shared by the `Expr::Path` and `Expr::Identifier` arms so both render
+    /// steps. Shared by the `Expr::Path` and `Expr::PropertyPath` arms so both render
     /// identically.
     fn path_steps_sql(&mut self, steps: &[String]) {
         if steps.len() == 1 {

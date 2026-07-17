@@ -121,7 +121,7 @@ fn evaluate_identifier<I: Filterable>(item: &I, identifier: &PropertyPath) -> Re
     // system property reads by name. The resolved identity fixes the property,
     // so there is no collection-qualifier ambiguity and no display-name
     // fallback for a registered id.
-    let base = match identifier.id_or_systemname() {
+    let base = match identifier.id() {
         // The `id` pseudo-property is read by its reserved name; `value` returns
         // the entity id for it.
         PropertyId::Id => item.value("id"),
