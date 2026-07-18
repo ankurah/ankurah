@@ -2,7 +2,7 @@
 //! specs/model-property-metadata/rfc.md).
 //!
 //! Resolution binds a property reference's first step against the catalog
-//! map, producing the resolved `Expr::Identifier` form and failing CLOSED
+//! map, producing the resolved `Expr::PropertyPath` form and failing CLOSED
 //! (`PropertyError::UnknownProperty`) for references nothing defines. This
 //! replaces the three inconsistent missing-property behaviors with one
 //! rule: an unresolvable reference fails at build time; a resolvable

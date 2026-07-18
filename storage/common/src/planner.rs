@@ -936,7 +936,7 @@ impl Planner {
     fn extract_primary_key_bound(&self, predicate: &Predicate, primary_key: &str, column_of: ColumnOf) -> Option<KeyBoundComponent> {
         if let Predicate::Comparison { left, operator, right } = predicate {
             // Check if this is a primary key comparison
-            // A resolved Identifier addresses the primary key when its subpath is
+            // A resolved PropertyPath addresses the primary key when its subpath is
             // empty and its identity maps to the primary-key column, mirroring a
             // simple Path.
             let value = match (left.as_ref(), right.as_ref()) {
@@ -1051,7 +1051,7 @@ impl Planner {
         if let Predicate::Comparison { left, operator: _, right: _ } = predicate {
             match left.as_ref() {
                 Expr::Path(path) if path.is_simple() => path.first() == primary_key,
-                // A resolved Identifier addresses the primary key by identity.
+                // A resolved PropertyPath addresses the primary key by identity.
                 Expr::PropertyPath(identifier) => self.identifier_is_primary_key(identifier, primary_key, column_of),
                 _ => false,
             }
@@ -1077,7 +1077,7 @@ impl Planner {
                 // Check if this is a primary key comparison with supported operators
                 let is_primary_key_field = match left.as_ref() {
                     Expr::Path(path) if path.is_simple() => path.first() == primary_key,
-                    // A resolved Identifier addresses the primary key by identity.
+                    // A resolved PropertyPath addresses the primary key by identity.
                     Expr::PropertyPath(identifier) => self.identifier_is_primary_key(identifier, primary_key, column_of),
                     _ => false,
                 };

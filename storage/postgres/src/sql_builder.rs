@@ -178,7 +178,7 @@ fn can_pushdown_expr(expr: &Expr) -> bool {
             // Json traversal (pushable) from Ref<T> traversal (not pushable).
             !path.steps.is_empty()
         }
-        // A resolved Identifier is pushdown-capable exactly like the equivalent
+        // A resolved PropertyPath is pushdown-capable exactly like the equivalent
         // Path: it renders as a column (name) with optional JSONB sub-path.
         Expr::PropertyPath(_) => true,
         Expr::ExprList(exprs) => exprs.iter().all(can_pushdown_expr),
@@ -189,7 +189,7 @@ fn can_pushdown_expr(expr: &Expr) -> bool {
 }
 
 /// Whether an expression is a multi-step JSONB traversal (a Path with a sub-path
-/// or a resolved Identifier with a non-empty subpath), which requires ::jsonb
+/// or a resolved PropertyPath with a non-empty subpath), which requires ::jsonb
 /// casting of the literal on the other side of a comparison.
 fn expr_is_jsonb_path(expr: &Expr) -> bool {
     match expr {
@@ -453,7 +453,7 @@ impl SqlBuilder {
                 // TODO: Replace path depth heuristic with schema metadata when available.
                 // We infer JSON type from !is_simple(), but with a schema registry we could
                 // look up the actual field type. See phase-3-schema.md for details.
-                // A resolved Identifier with a non-empty subpath is a JSONB traversal,
+                // A resolved PropertyPath with a non-empty subpath is a JSONB traversal,
                 // exactly like a multi-step Path.
                 let left_is_jsonb = expr_is_jsonb_path(left.as_ref());
                 let right_is_jsonb = expr_is_jsonb_path(right.as_ref());

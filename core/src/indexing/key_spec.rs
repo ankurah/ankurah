@@ -88,9 +88,6 @@ impl IndexKeyPart<String> {
 
     /// Create ascending keypart from flat path
     pub fn asc_path(path: &str, value_type: ValueType) -> Self { Self::from_flat_path(path, IndexDirection::Asc, value_type) }
-
-    /// Create descending keypart from flat path
-    pub fn desc_path(path: &str, value_type: ValueType) -> Self { Self::from_flat_path(path, IndexDirection::Desc, value_type) }
 }
 
 impl IndexDirection {
@@ -102,7 +99,9 @@ impl<K> KeySpec<K> {
 }
 
 impl KeySpec<String> {
-    /// Simple name generator similar to your existing helper.
+    /// Render a stable index name from the spec: each keypart as `path asc|desc`
+    /// (with collation/nulls extras when present), joined by `delim`, behind an
+    /// optional prefix. Engines key physical index lookup on this string.
     pub fn name_with(&self, prefix: &str, delim: &str) -> String {
         let fields: Vec<String> = self
             .keyparts

@@ -608,7 +608,7 @@ impl Expr {
             },
             Expr::Literal(lit) => Ok(Expr::Literal(lit)),
             Expr::Path(path) => Ok(Expr::Path(path)),
-            // A resolved Identifier is a property reference, not a placeholder; pass through.
+            // A resolved PropertyPath is a property reference, not a placeholder; pass through.
             Expr::PropertyPath(identifier) => Ok(Expr::PropertyPath(identifier)),
             Expr::Predicate(pred) => Ok(Expr::Predicate(pred.populate_recursive(values)?)),
             Expr::InfixExpr { left, operator, right } => Ok(Expr::InfixExpr {

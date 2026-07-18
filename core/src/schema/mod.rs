@@ -75,10 +75,15 @@ pub fn is_protected_collection(id: &CollectionId) -> bool {
 /// self-description ouroboros stays forbidden); the ids exist only for
 /// routing and the protected-collections guard.
 ///
-/// Reserved ids are 15 zero bytes + a one-byte ordinal. A minted
-/// `EntityId::new()` is a ULID whose leading bytes carry the current
-/// timestamp, so the all-zero prefix is unmintable and the ranges are
-/// disjoint by construction.
+/// Reserved ids are 15 zero bytes + a one-byte ordinal. These are valid ULID
+/// values; the guarantee is about generation, not the value space: a minted
+/// `EntityId::new()` carries the current unix-time milliseconds in its
+/// leading bytes, so no honestly generated id (in particular, no
+/// catalog-allocated model id) ever lands in the zero-prefix range. Wire
+/// deserialization will accept a crafted zero-prefix id, but that does not
+/// collide with anything: it merely names a built-in collection, and writes
+/// to those are policed by the protected-collections guard regardless of how
+/// the id was produced.
 const WELL_KNOWN_MODELS: &[(u8, &str)] =
     &[(1, crate::system::SYSTEM_COLLECTION_ID), (2, MODEL_COLLECTION_ID), (3, PROPERTY_COLLECTION_ID), (4, MODEL_PROPERTY_COLLECTION_ID)];
 
