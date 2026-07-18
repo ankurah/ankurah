@@ -164,7 +164,7 @@ fn make_event(seed: u16, backend_name: &str, operations: Vec<Operation>, parents
     let model = EntityId::from_bytes(model_bytes);
     Event {
         entity_id,
-        model,
+        model: ankurah_proto::ModelId::Entity(model),
         parent: Clock::from(parents.to_vec()),
         operations: OperationSet(BTreeMap::from([(backend_name.to_string(), operations)])),
     }

@@ -104,7 +104,7 @@ async fn register_schema_creates_catalog_entities() -> anyhow::Result<()> {
     let (models, properties, memberships) = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
     assert_eq!((models.len(), properties.len(), memberships.len()), (1, 1, 1));
     let (model_id, property_id, membership_id) = (models[0].id, properties[0].id, memberships[0].id);
-    assert_eq!(properties[0].model, model_id, "provenance scope is the request's model");
+    assert_eq!(properties[0].model, proto::ModelId::Entity(model_id), "provenance scope is the request's model");
 
     let model = catalog_values(&server, MODEL, model_id).await?;
     assert_eq!(model.get("collection"), Some(&Some(Value::String("album".into()))));
@@ -702,7 +702,7 @@ async fn explicit_model_id_binding() -> anyhow::Result<()> {
         explicit_id: None,
     };
     let bound = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, bind("album", Some(album_model), vec![genre])).await?);
-    assert_eq!(bound.1[0].model, album_model, "the property minted under the bound model id");
+    assert_eq!(bound.1[0].model, proto::ModelId::Entity(album_model), "the property minted under the bound model id");
     let values = catalog_values(&server, PROPERTY, bound.1[0].id).await?;
     assert_eq!(values.get("name"), Some(&Some(Value::String("genre".into()))));
     assert_eq!(values.get("minted_for"), Some(&Some(Value::EntityId(album_model))));
@@ -1042,8 +1042,7 @@ async fn partial_registration_retry_does_not_double_allocate() -> anyhow::Result
             on_event: Some(std::sync::Arc::new(move |event: &proto::Event| {
                 // #330: events carry a model id, not a collection name; the
                 // _ankurah_property catalog collection has a well-known one.
-                let property_model =
-                    ankurah::core::schema::well_known_model_id(PROPERTY).expect("_ankurah_property has a well-known model id");
+                let property_model = proto::ModelId::WellKnown(proto::WellKnownModel::Property);
                 if event.model == property_model && armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
                     return Err(ankurah::policy::AccessDenied::ByPolicy("property event denied once"));
                 }

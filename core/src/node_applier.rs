@@ -77,7 +77,7 @@ impl NodeApplier {
         node: &Node<SE, PA>,
         from_peer_id: &proto::EntityId,
         entity_id: proto::EntityId,
-        model: proto::EntityId,
+        model: proto::ModelId,
         event_fragments: Vec<proto::EventFragment>,
         event_getter: &E,
     ) -> Result<Vec<Attested<proto::Event>>, MutationError>

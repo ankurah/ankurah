@@ -123,12 +123,17 @@ fn lww_ops(field: Field, value: &str) -> proto::OperationSet {
 /// it as a create (`Event::is_entity_create`). `field`/`value` seed the initial
 /// state.
 pub fn genesis_event(entity: proto::EntityId, field: Field, value: &str) -> proto::Event {
-    proto::Event { model: sim_model_id(), entity_id: entity, operations: lww_ops(field, value), parent: proto::Clock::default() }
+    proto::Event {
+        model: proto::ModelId::Entity(sim_model_id()),
+        entity_id: entity,
+        operations: lww_ops(field, value),
+        parent: proto::Clock::default(),
+    }
 }
 
 /// Forge a non-genesis event parented on `parent`, setting `field` to `value`.
 pub fn edit_event(entity: proto::EntityId, parent: proto::Clock, field: Field, value: &str) -> proto::Event {
-    proto::Event { model: sim_model_id(), entity_id: entity, operations: lww_ops(field, value), parent }
+    proto::Event { model: proto::ModelId::Entity(sim_model_id()), entity_id: entity, operations: lww_ops(field, value), parent }
 }
 
 /// Wrap a forged event as an unsigned `Attested<Event>`. Under `PermissiveAgent`

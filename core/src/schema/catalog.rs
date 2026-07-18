@@ -37,7 +37,7 @@ use std::{
     time::Duration,
 };
 
-use ankurah_proto::{self as proto, CollectionId, EntityId, QueryId};
+use ankurah_proto::{self as proto, CollectionId, EntityId, ModelId, QueryId, WellKnownModel};
 use ankurah_signals::{porcelain::subscribe::SubscriptionGuard, Subscribe};
 use tokio::sync::Notify;
 use tracing::{debug, error, warn};
@@ -259,7 +259,7 @@ where
 {
     fn resolve(&self, collection: &str, name: &str) -> Option<EntityId> { self.resolve_property(collection, name) }
     fn name_for(&self, id: &EntityId) -> Option<String> { self.map.read().unwrap().properties.get(id).map(|def| def.name.clone()) }
-    fn model_id_for(&self, collection: &str) -> Option<EntityId> { self.map.read().unwrap().by_collection.get(collection).copied() }
+    fn model_id_for(&self, collection: &str) -> Option<ModelId> { self.map.read().unwrap().by_collection.get(collection).copied() }
     fn canonical_value_type(&self, id: &EntityId) -> Option<String> {
         self.map.read().unwrap().properties.get(id).map(|def| def.value_type.clone())
     }
@@ -279,8 +279,8 @@ where
     /// announced off a partial description.
     pub(crate) async fn definition_states_for_models(
         &self,
-        models: &[EntityId],
-    ) -> (Vec<proto::Attested<proto::EntityState>>, Vec<EntityId>) {
+        models: &[ModelId],
+    ) -> (Vec<proto::Attested<proto::EntityState>>, Vec<ModelId>) {
         if models.is_empty() {
             return (Vec::new(), Vec::new());
         }
@@ -296,8 +296,9 @@ where
         let mut states = Vec::new();
         let mut failed = Vec::new();
         'models: for model in models {
+            let Some(model_id) = model.entity() else { continue };
             let mut model_states = Vec::new();
-            match model_col.get_state(*model).await {
+            match model_col.get_state(model_id).await {
                 Ok(state) => model_states.push(state),
                 Err(error) => {
                     warn!("Cannot load model definition {} for wire announcement: {}", model.to_base64_short(), error);
@@ -305,7 +306,7 @@ where
                     continue;
                 }
             }
-            for membership in self.memberships_of(model) {
+            for membership in self.memberships_of(&model_id) {
                 match property_col.get_state(membership.property).await {
                     Ok(state) => model_states.push(state),
                     Err(error) => {
@@ -793,7 +794,8 @@ where
         }
         let mut map = self.0.map.write().unwrap();
         for state in states {
-            let Some(collection) = crate::schema::well_known_collection(&state.payload.model) else { continue };
+            let Some(well_known) = state.payload.model.well_known() else { continue };
+            let collection = well_known.collection_id();
             if !crate::schema::is_catalog_collection(&collection) {
                 continue;
             }
@@ -822,7 +824,7 @@ where
                             map.models.get(&def.id).map(|existing| existing.collection.as_str()).unwrap_or("<unknown>"),
                             def.collection
                         );
-                    } else if map.by_collection.get(&def.collection).map_or(false, |existing| *existing != def.id) {
+                    } else if map.by_collection.get(&def.collection).is_some_and(|existing| *existing != ModelId::Entity(def.id)) {
                         warn!("ignoring shipped model def {} rebinding collection '{}'", def.id, def.collection);
                     } else {
                         map.upsert_model(def);
@@ -1059,8 +1061,8 @@ where
 
     pub fn model_by_collection(&self, collection: &str) -> Option<ModelDef> {
         let map = self.0.map.read().unwrap();
-        let id = map.by_collection.get(collection)?;
-        map.models.get(id).cloned()
+        let id = map.by_collection.get(collection)?.entity()?;
+        map.models.get(&id).cloned()
     }
 
     /// INGRESS resolution for the wire envelope (#330): the collection a
@@ -1068,12 +1070,14 @@ where
     /// -- the bootstrap base case, answerable on a stone-cold node -- then
     /// the catalog map. `None` means the model is unknown here, which after
     /// descriptor shipping is a protocol violation the caller rejects loudly.
-    pub fn collection_for_model(&self, model: &EntityId) -> Option<CollectionId> {
-        if let Some(collection) = crate::schema::well_known_collection(model) {
-            return Some(collection);
+    pub fn collection_for_model(&self, model: &ModelId) -> Option<CollectionId> {
+        match model {
+            ModelId::WellKnown(model) => Some(model.collection_id()),
+            ModelId::Entity(id) => {
+                let map = self.0.map.read().unwrap();
+                map.models.get(id).map(|def| CollectionId::fixed_name(&def.collection))
+            }
         }
-        let map = self.0.map.read().unwrap();
-        map.models.get(model).map(|def| CollectionId::fixed_name(&def.collection))
     }
 
     /// EGRESS resolution for the wire envelope (#330): the model-definition
@@ -1081,8 +1085,10 @@ where
     /// the catalog map. `None` for an unregistered user collection -- the
     /// commit path runs registration before event generation, so a miss
     /// there is a bug, not a race.
-    pub fn model_id_for(&self, collection: &str) -> Option<EntityId> {
-        crate::schema::well_known_model_id(collection).or_else(|| self.0.map.read().unwrap().by_collection.get(collection).copied())
+    pub fn model_id_for(&self, collection: &str) -> Option<ModelId> {
+        WellKnownModel::from_collection(collection)
+            .map(ModelId::WellKnown)
+            .or_else(|| self.0.map.read().unwrap().by_collection.get(collection).copied())
     }
 
     pub fn membership(&self, model: &EntityId, property: &EntityId) -> Option<MembershipDef> {
@@ -1134,12 +1140,12 @@ where
             Some(id) => {
                 let id = super::local::parse_explicit_id(id);
                 let def = map.models.get(&id)?;
-                if def.collection != schema.collection || map.by_collection.get(schema.collection) != Some(&id) {
+                if def.collection != schema.collection || map.by_collection.get(schema.collection) != Some(&ModelId::Entity(id)) {
                     return None;
                 }
                 id
             }
-            None => *map.by_collection.get(schema.collection)?,
+            None => map.by_collection.get(schema.collection)?.entity()?,
         };
 
         let mut fields = BTreeMap::new();
@@ -1192,11 +1198,11 @@ where
                     let id = super::local::parse_explicit_id(id);
                     properties.iter().find(|property| property.id == id)?
                 }
-                None => properties.iter().find(|property| property.model == model && property.name == field.name)?,
+                None => properties.iter().find(|property| property.model == ModelId::Entity(model) && property.name == field.name)?,
             };
             if property.backend != field.backend
                 || !super::registration::value_types_compatible(&property.value_type, field.value_type)
-                || !memberships.iter().any(|membership| membership.model == model && membership.property == property.id)
+                || !memberships.iter().any(|membership| membership.model == ModelId::Entity(model) && membership.property == property.id)
             {
                 return None;
             }
@@ -1285,9 +1291,13 @@ where
             map.upsert_model(ModelDef { id: m.id, collection: m.collection.clone(), name: m.name.clone() });
         }
         for p in properties {
+            let Some(minted_for) = p.model.entity() else {
+                warn!("ignoring registered property {} with a built-in minting model", p.id);
+                continue;
+            };
             map.upsert_property(PropertyDef {
                 id: p.id,
-                minted_for: Some(p.model),
+                minted_for: Some(minted_for),
                 name: p.name.clone(),
                 backend: p.backend.clone(),
                 value_type: p.value_type.clone(),
@@ -1295,7 +1305,11 @@ where
             });
         }
         for ms in memberships {
-            map.upsert_membership(MembershipDef { id: ms.id, model: ms.model, property: ms.property, optional: Some(ms.optional) });
+            let Some(model) = ms.model.entity() else {
+                warn!("ignoring registered membership {} with a built-in model", ms.id);
+                continue;
+            };
+            map.upsert_membership(MembershipDef { id: ms.id, model, property: ms.property, optional: Some(ms.optional) });
         }
     }
 
@@ -1482,7 +1496,7 @@ mod tests {
             Ok(proto::Attested::opt(
                 proto::EntityState {
                     entity_id: id,
-                    model: EntityId::new(),
+                    model: ModelId::Entity(EntityId::new()),
                     state: proto::State { state_buffers: proto::StateBuffers(BTreeMap::new()), head: proto::Clock::default() },
                 },
                 None,
@@ -1527,6 +1541,7 @@ mod tests {
         let model = EntityId::new();
         seed_membership(&manager, model);
 
+        let model = ModelId::Entity(model);
         let (states, failed) = manager.definition_states_for_models(&[model]).await;
         assert!(states.is_empty(), "a model whose property defs cannot load must ship nothing, got {} states", states.len());
         assert_eq!(failed, vec![model], "the partially loadable model must be reported failed");
@@ -1540,7 +1555,7 @@ mod tests {
         let model = EntityId::new();
         seed_membership(&manager, model);
 
-        let (states, failed) = manager.definition_states_for_models(&[model]).await;
+        let (states, failed) = manager.definition_states_for_models(&[ModelId::Entity(model)]).await;
         assert_eq!(states.len(), 3, "model + property + membership states ship together");
         assert!(failed.is_empty(), "nothing failed: {failed:?}");
     }
@@ -1554,9 +1569,9 @@ mod tests {
         seed_membership(&manager, broken); // its property state fails to load
         let whole = EntityId::new(); // no memberships: loads fully
 
-        let (states, failed) = manager.definition_states_for_models(&[broken, whole]).await;
+        let (states, failed) = manager.definition_states_for_models(&[ModelId::Entity(broken), ModelId::Entity(whole)]).await;
         assert_eq!(states.len(), 1, "only the fully loadable model ships");
         assert_eq!(states[0].payload.entity_id, whole, "the shipped state is the loadable model's definition");
-        assert_eq!(failed, vec![broken], "only the partially loadable model is reported failed");
+        assert_eq!(failed, vec![ModelId::Entity(broken)], "only the partially loadable model is reported failed");
     }
 }

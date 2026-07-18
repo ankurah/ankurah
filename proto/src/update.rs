@@ -1,4 +1,4 @@
-use crate::{auth::Attested, data::EntityState, id::EntityId, subscription::QueryId, EventFragment, StateFragment};
+use crate::{auth::Attested, data::EntityState, id::EntityId, subscription::QueryId, EventFragment, ModelId, StateFragment};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use ulid::Ulid;
@@ -15,7 +15,7 @@ pub enum NodeUpdateBody {
 impl NodeUpdateBody {
     /// Model ids carried by entity data in this update. Senders use this to
     /// attach any catalog definitions the connection has not seen yet.
-    pub fn referenced_models(&self) -> BTreeSet<EntityId> {
+    pub fn referenced_models(&self) -> BTreeSet<ModelId> {
         match self {
             Self::SubscriptionUpdate { items } => items.iter().map(|item| item.model).collect(),
         }
@@ -56,8 +56,8 @@ pub enum MembershipChange {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SubscriptionUpdateItem {
     pub entity_id: EntityId,
-    /// The model-definition entity id (#330); see `Event::model` in data.rs.
-    pub model: EntityId,
+    /// The model address; see `Event::model` in data.rs.
+    pub model: ModelId,
     pub content: UpdateContent,
     /// Which predicates this update is relevant to and how
     /// Uses PredicateId for remote subscriptions

@@ -19,7 +19,7 @@ use common::{Record, RecordView};
 /// by the seeded id-keyed value under the anti-resurrection rule).
 fn forge_title_event(
     entity_id: proto::EntityId,
-    model: proto::EntityId,
+    model: proto::ModelId,
     title_prop: proto::EntityId,
     parent: proto::Clock,
     title: &str,

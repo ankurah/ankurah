@@ -10,7 +10,7 @@ use crate::value::Value;
 use super::comparison::compare;
 use super::relation::AbstractCausalRelation;
 use ankql::ast::PropertyId;
-use ankurah_proto::{Clock, EntityId, Event, EventId, OperationSet};
+use ankurah_proto::{Clock, EntityId, Event, EventId, ModelId, OperationSet};
 use async_trait::async_trait;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -54,10 +54,10 @@ impl GetEvents for MockRetriever {
 /// through a node's catalog, so any stable id works; the model field is also
 /// excluded from `EventId` hashing, so it never perturbs the content-hashed
 /// event ids these tests order and compare on.
-fn test_model_id() -> EntityId {
+fn test_model_id() -> ModelId {
     let mut bytes = [0u8; 16];
     bytes[0] = 0xEE;
-    EntityId::from_bytes(bytes)
+    ModelId::Entity(EntityId::from_bytes(bytes))
 }
 
 /// Create a test event with deterministic content-hashed IDs.

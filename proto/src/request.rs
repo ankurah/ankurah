@@ -5,7 +5,7 @@ use ulid::Ulid;
 
 use crate::{
     auth::Attested, clock::Clock, collection::CollectionId, data::Event, id::EntityId, subscription::QueryId, transaction::TransactionId,
-    EntityState, EventFragment, EventId, StateFragment,
+    EntityState, EventFragment, EventId, ModelId, StateFragment,
 };
 
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Serialize, Deserialize, Hash, Default)]
@@ -112,8 +112,8 @@ pub enum DeltaContent {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct EntityDelta {
     pub entity_id: EntityId,
-    /// The model-definition entity id (#330); see `Event::model` in data.rs.
-    pub model: EntityId,
+    /// The model address; see `Event::model` in data.rs.
+    pub model: ModelId,
     pub content: DeltaContent,
 }
 
@@ -245,7 +245,7 @@ pub struct RegisteredModel {
 pub struct RegisteredProperty {
     pub id: EntityId,
     /// The model in whose scope this property was minted (provenance).
-    pub model: EntityId,
+    pub model: ModelId,
     pub name: String,
     pub backend: String,
     pub value_type: String,
@@ -257,7 +257,7 @@ pub struct RegisteredProperty {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisteredMembership {
     pub id: EntityId,
-    pub model: EntityId,
+    pub model: ModelId,
     pub property: EntityId,
     pub optional: bool,
 }
@@ -305,7 +305,7 @@ pub enum NodeResponseBody {
 impl NodeResponseBody {
     /// Model ids carried by entity data in this response. Senders use this to
     /// attach any catalog definitions the connection has not seen yet.
-    pub fn referenced_models(&self) -> BTreeSet<EntityId> {
+    pub fn referenced_models(&self) -> BTreeSet<ModelId> {
         let mut models = BTreeSet::new();
         match self {
             Self::Fetch(deltas) | Self::QuerySubscribed { deltas, .. } => models.extend(deltas.iter().map(|delta| delta.model)),

@@ -446,7 +446,7 @@ impl StorageCollection for IndexedDBBucket {
 impl IndexedDBBucket {
     /// The model id written on envelopes this bucket reconstructs (#330):
     /// well-knowns, then the injected catalog resolver.
-    fn model_id(&self) -> Result<ankurah_proto::EntityId, RetrievalError> {
+    fn model_id(&self) -> Result<ankurah_proto::ModelId, RetrievalError> {
         let resolver = self.resolver.read().expect("RwLock poisoned").as_ref().and_then(|weak| weak.upgrade());
         ankurah_core::storage::bucket_model_id(&self.collection_id, resolver.as_deref())
     }
@@ -456,7 +456,7 @@ impl IndexedDBBucket {
     /// nothing must not fail for want of a model id (cold catalog, e.g. a
     /// fetch over persisted rows whose post-filter rejects every one).
     /// Mirrors sled's `model_id_lazy`.
-    fn model_id_lazy(&self) -> Result<ankurah_proto::EntityId, String> { self.model_id().map_err(|e| e.to_string()) }
+    fn model_id_lazy(&self) -> Result<ankurah_proto::ModelId, String> { self.model_id().map_err(|e| e.to_string()) }
 
     /// Hydrate `property_columns` with this collection's durable
     /// identity-to-field assignments, once per bucket. Runs BEFORE any write
@@ -840,7 +840,7 @@ struct IdbRecord {
     /// (#330), captured by the bucket at scan construction and checked only
     /// when a row actually needs its model id (mirrors sled's model_id_lazy): an
     /// empty result set never demands a model id.
-    model: Result<ankurah_proto::EntityId, String>,
+    model: Result<ankurah_proto::ModelId, String>,
     /// This collection's durable identity-to-field map (snapshot), the sole
     /// translation from a resolved property identity to the physical field the
     /// JS object carries it under.
@@ -852,7 +852,7 @@ impl IdbRecord {
     fn new(
         object: Object,
         collection_id: ankurah_proto::CollectionId,
-        model: Result<ankurah_proto::EntityId, String>,
+        model: Result<ankurah_proto::ModelId, String>,
         columns: std::sync::Arc<BTreeMap<PropertyId, String>>,
     ) -> Result<Self, RetrievalError> {
         let id: ankurah_proto::EntityId = object.get(&ID_KEY)?;
@@ -907,7 +907,7 @@ impl ankurah_storage_common::filtering::HasEntityId for IdbRecord {
 
 /// Convert JS object to EntityState using the correct field extraction.
 /// `model` is the model id written on the reconstructed envelope (#330).
-fn js_object_to_entity_state(entity_obj: &Object, model: ankurah_proto::EntityId) -> Result<Attested<EntityState>, RetrievalError> {
+fn js_object_to_entity_state(entity_obj: &Object, model: ankurah_proto::ModelId) -> Result<Attested<EntityState>, RetrievalError> {
     use crate::statics::{ATTESTATIONS_KEY, HEAD_KEY, ID_KEY, STATE_BUFFER_KEY};
     use ankurah_proto::{Attested, EntityId, EntityState, State};
 

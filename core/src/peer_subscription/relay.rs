@@ -1020,7 +1020,7 @@ mod tests {
     fn stream_item(source_queries: Vec<proto::QueryId>) -> proto::SubscriptionUpdateItem {
         proto::SubscriptionUpdateItem {
             entity_id: EntityId::new(),
-            model: EntityId::new(),
+            model: proto::ModelId::Entity(EntityId::new()),
             content: proto::UpdateContent::EventOnly(vec![]),
             predicate_relevance: vec![],
             source_queries,

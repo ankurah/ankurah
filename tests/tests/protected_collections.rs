@@ -19,10 +19,9 @@ async fn server_refuses_commits_into_protected_collections() -> anyhow::Result<(
 
     for collection in PROTECTED {
         let event = proto::Event {
-            // #330: the protected-write guard now keys on well-known model ids
-            // (`well_known_collection(&event.model)`), so the forged event must
-            // carry the collection's well-known model id for the guard to fire.
-            model: ankurah::core::schema::well_known_model_id(collection).expect("every protected collection has a well-known model id"),
+            model: proto::ModelId::WellKnown(
+                proto::WellKnownModel::from_collection(collection).expect("every protected collection is a well-known model"),
+            ),
             entity_id: EntityId::new(),
             operations: proto::OperationSet(BTreeMap::new()),
             parent: proto::Clock::default(),

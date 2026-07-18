@@ -315,8 +315,7 @@ fn membership_genesis(model: &EntityId, property: &EntityId) -> proto::Event {
     proto::Event {
         // #330: events carry a model id; the _ankurah_model_property catalog
         // collection has a well-known one.
-        model: ankurah::core::schema::well_known_model_id(ankurah::core::schema::MODEL_PROPERTY_COLLECTION_ID)
-            .expect("_ankurah_model_property has a well-known model id"),
+        model: proto::ModelId::WellKnown(proto::WellKnownModel::ModelProperty),
         entity_id: EntityId::new(),
         operations: proto::OperationSet(BTreeMap::from([("lww".to_string(), operations)])),
         parent: proto::Clock::default(),

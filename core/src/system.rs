@@ -21,7 +21,7 @@ use crate::reactor::Reactor;
 use crate::retrieval::{LocalEventGetter, LocalStateGetter, SuspenseEvents};
 use crate::storage::{StorageCollectionWrapper, StorageEngine};
 use crate::{property::backend::LWWBackend, value::Value};
-pub const SYSTEM_COLLECTION_ID: &str = "_ankurah_system";
+pub use ankurah_proto::SYSTEM_COLLECTION_ID;
 
 /// System catalog manager for storing various metadata about the system
 /// * root clock

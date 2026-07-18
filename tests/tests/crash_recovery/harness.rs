@@ -437,7 +437,9 @@ struct HandoffModelResolver {
 impl ankurah::core::schema::CatalogResolver for HandoffModelResolver {
     fn resolve(&self, _collection: &str, _name: &str) -> Option<EntityId> { None }
     fn name_for(&self, _id: &EntityId) -> Option<String> { None }
-    fn model_id_for(&self, collection: &str) -> Option<EntityId> { (collection == self.collection).then_some(self.model) }
+    fn model_id_for(&self, collection: &str) -> Option<proto::ModelId> {
+        (collection == self.collection).then_some(proto::ModelId::Entity(self.model))
+    }
 }
 
 /// Wire a [`HandoffModelResolver`] into a reopened bare engine. The caller

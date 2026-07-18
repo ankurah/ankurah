@@ -333,9 +333,9 @@ impl std::error::Error for ApplyError {
 #[derive(Debug)]
 pub struct ApplyErrorItem {
     pub entity_id: EntityId,
-    /// The model-definition id the wire item carried (#330); the collection
+    /// The model address the wire item carried (#330, #397); the collection
     /// may be unresolvable, which is itself one of the reportable causes.
-    pub model: EntityId,
+    pub model: ankurah_proto::ModelId,
     pub cause: MutationError,
 }
 

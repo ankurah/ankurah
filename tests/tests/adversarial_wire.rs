@@ -46,7 +46,7 @@ use common::{Record, RecordView};
 /// well-formed id-keyed events.
 fn forge_title_event(
     entity_id: proto::EntityId,
-    model: proto::EntityId,
+    model: proto::ModelId,
     title_prop: proto::EntityId,
     parent: proto::Clock,
     title: &str,
@@ -69,7 +69,7 @@ fn event_only_item(event: proto::Event) -> proto::SubscriptionUpdateItem {
 
 /// A single EventOnly item carrying several events (delivered in the given
 /// wire order, which the receiver must not trust).
-fn event_only_multi(entity_id: proto::EntityId, model: proto::EntityId, events: Vec<proto::Event>) -> proto::SubscriptionUpdateItem {
+fn event_only_multi(entity_id: proto::EntityId, model: proto::ModelId, events: Vec<proto::Event>) -> proto::SubscriptionUpdateItem {
     proto::SubscriptionUpdateItem {
         entity_id,
         model,
@@ -125,7 +125,8 @@ fn forge_catalog_state(collection: &str, entity_id: proto::EntityId, fields: Vec
     let operations = backend.to_operations().unwrap().expect("catalog state has fields");
     let event_id = proto::EventId::from_bytes([0x5A; 32]);
     backend.apply_operations_with_event(&operations, event_id.clone()).unwrap();
-    let model = ankurah::core::schema::well_known_model_id(collection).expect("catalog collection has a well-known model id");
+    let model =
+        proto::ModelId::WellKnown(proto::WellKnownModel::from_collection(collection).expect("catalog collection is a well-known model"));
     Attested::opt(
         proto::EntityState {
             entity_id,
@@ -153,7 +154,7 @@ struct Fixture {
     _relay: ankurah::LiveQuery<RecordView>,
     /// #330: Record's allocated model id, written on every forged event/item so
     /// the receiver's ingress `resolve_model` routes it to the record collection.
-    record_model: proto::EntityId,
+    record_model: proto::ModelId,
     /// Registered property-definition ids for Record's fields: post-epoch
     /// forgeries write id-keyed operations (see `forge_title_event`).
     record_title: proto::EntityId,
@@ -263,7 +264,11 @@ async fn schema_envelope_preserves_immutable_catalog_identity() -> Result<()> {
     let probe_item = event_only_item(probe_event);
     let model = f.client.catalog.model_by_collection("record").expect("record model warmed");
     let property = f.client.catalog.property_by_id(&f.record_title).expect("title property warmed");
-    let membership = f.client.catalog.membership(&f.record_model, &f.record_title).expect("record-title membership warmed");
+    let membership = f
+        .client
+        .catalog
+        .membership(&f.record_model.entity().expect("Record uses an allocated model"), &f.record_title)
+        .expect("record-title membership warmed");
 
     let ship = |state| {
         f.client.handle_message(deliver_with_schema(f.server.id, f.client.id, f._relay.query_id(), probe_item.clone(), vec![state]))
@@ -560,7 +565,7 @@ fn declared_cycle_is_unconstructible_content_addressing() {
     // node, so any model id works; use a fixed fabricated one.
     let model = proto::EntityId::from_bytes([0xEE; 16]);
     let title_prop = proto::EntityId::from_bytes([0xEF; 16]);
-    let mk = |title: &str, parent: proto::Clock| forge_title_event(entity, model, title_prop, parent, title);
+    let mk = |title: &str, parent: proto::Clock| forge_title_event(entity, proto::ModelId::Entity(model), title_prop, parent, title);
 
     // Start from two independent events and try to wire A.parent := [B.id()]
     // and B.parent := [A.id()]. Compute B first, then A referencing B; now A

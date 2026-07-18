@@ -52,7 +52,7 @@ async fn armed_child_node(crash: CrashPoint) -> Result<(CrashNode, Arc<CrashStor
 /// durable node. Each album is a distinct entity, so each event is a creation
 /// event (empty parent). Returned in commit order as attested events, ready to
 /// feed to `commit_remote_transaction` on the node under test.
-async fn generate_creation_batch(n: usize, model: proto::EntityId) -> Result<Vec<Attested<proto::Event>>> {
+async fn generate_creation_batch(n: usize, model: proto::ModelId) -> Result<Vec<Attested<proto::Event>>> {
     let helper = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
     helper.system.create().await?;
     let ctx = helper.context(c)?;

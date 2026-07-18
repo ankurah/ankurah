@@ -617,7 +617,7 @@ impl SqliteBucket {
 
     /// The model id written on envelopes this bucket reconstructs (#330):
     /// well-knowns, then the injected catalog resolver.
-    fn model_id(&self) -> Result<ankurah_proto::EntityId, RetrievalError> {
+    fn model_id(&self) -> Result<ankurah_proto::ModelId, RetrievalError> {
         let resolver = self.resolver.read().expect("RwLock poisoned").as_ref().and_then(|weak| weak.upgrade());
         ankurah_core::storage::bucket_model_id(&self.collection_id, resolver.as_deref())
     }

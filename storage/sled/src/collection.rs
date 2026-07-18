@@ -105,7 +105,7 @@ impl StorageCollection for SledStorageCollection {
 impl SledStorageCollectionInner {
     /// The model id written on envelopes this bucket reconstructs (#330):
     /// well-knowns, then the injected catalog resolver.
-    fn model_id(&self) -> Result<EntityId, ankurah_core::error::RetrievalError> {
+    fn model_id(&self) -> Result<ankurah_proto::ModelId, ankurah_core::error::RetrievalError> {
         let resolver = self.resolver.read().unwrap().as_ref().and_then(|weak| weak.upgrade());
         ankurah_core::storage::bucket_model_id(&self.collection_id, resolver.as_deref())
     }
@@ -114,7 +114,7 @@ impl SledStorageCollectionInner {
     /// check it only when a row actually hydrates: a scan that matches
     /// nothing must not fail for want of a model id (cold catalog, e.g. the
     /// ephemeral known_matches pre-fetch on a never-stored collection).
-    fn model_id_lazy(&self) -> Result<EntityId, String> { self.model_id().map_err(|e| e.to_string()) }
+    fn model_id_lazy(&self) -> Result<ankurah_proto::ModelId, String> { self.model_id().map_err(|e| e.to_string()) }
 
     // I think this one is done - did it myself
     fn set_state_blocking(&self, state: Attested<EntityState>) -> Result<bool, MutationError> {

@@ -159,7 +159,7 @@ pub async fn build_nodes(n: usize, captured: Captured) -> anyhow::Result<Vec<Sim
         .into_iter()
         .map(|field| proto::RegisteredProperty {
             id: super::model::sim_property_id(field),
-            model: sim_model.id,
+            model: proto::ModelId::Entity(sim_model.id),
             name: field.name().to_string(),
             backend: "lww".to_string(),
             value_type: "string".to_string(),
@@ -170,7 +170,7 @@ pub async fn build_nodes(n: usize, captured: Captured) -> anyhow::Result<Vec<Sim
         .into_iter()
         .map(|field| proto::RegisteredMembership {
             id: super::model::sim_membership_id(field),
-            model: sim_model.id,
+            model: proto::ModelId::Entity(sim_model.id),
             property: super::model::sim_property_id(field),
             optional: false,
         })

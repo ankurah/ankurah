@@ -1,4 +1,4 @@
-use ankurah_proto::EntityId;
+use ankurah_proto::{EntityId, ModelId};
 
 /// Read-only access to the durable metadata catalog.
 ///
@@ -18,9 +18,9 @@ pub trait CatalogResolver: Send + Sync {
     fn name_for(&self, id: &EntityId) -> Option<String>;
 
     /// The model-definition id for `collection`, if the catalog knows it.
-    /// Well-known system/catalog ids remain a static bootstrap concern for
-    /// callers and are not synthesized by this interface.
-    fn model_id_for(&self, collection: &str) -> Option<EntityId> {
+    /// Built-in collections are answered by the static `WellKnown` arm before
+    /// callers consult this resolver; catalog-backed models use `Entity`.
+    fn model_id_for(&self, collection: &str) -> Option<ModelId> {
         let _ = collection;
         None
     }

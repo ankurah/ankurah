@@ -302,7 +302,7 @@ where
                     let value_type = string_field(&values, "value_type").unwrap_or_else(|| p.value_type.clone());
                     out_properties.push(RegisteredProperty {
                         id,
-                        model: entity_id_field(&values, "minted_for").unwrap_or(scope),
+                        model: proto::ModelId::Entity(entity_id_field(&values, "minted_for").unwrap_or(scope)),
                         name: string_field(&values, "name").unwrap_or_else(|| p.name.clone()),
                         backend: backend.clone(),
                         value_type: value_type.clone(),
@@ -423,7 +423,7 @@ where
             property_ids.insert((p.minting_collection.clone(), p.name.clone()), (property_id, backend.clone(), value_type.clone()));
             out_properties.push(RegisteredProperty {
                 id: property_id,
-                model: scope,
+                model: proto::ModelId::Entity(scope),
                 name: p.name.clone(),
                 backend,
                 value_type,
@@ -503,7 +503,12 @@ where
                     id
                 }
             };
-            out_memberships.push(RegisteredMembership { id: membership_id, model: model_id, property: property_id, optional: ms.optional });
+            out_memberships.push(RegisteredMembership {
+                id: membership_id,
+                model: proto::ModelId::Entity(model_id),
+                property: property_id,
+                optional: ms.optional,
+            });
         }
 
         // A re-registration of unchanged definitions is a pure no-op:
@@ -591,7 +596,7 @@ where
             &[],
             &[RegisteredProperty {
                 id: def.id,
-                model: *model,
+                model: proto::ModelId::Entity(*model),
                 name: def.name.clone(),
                 backend: def.backend.clone(),
                 value_type: def.value_type.clone(),
@@ -622,7 +627,11 @@ where
         // optional (never defaulted, catalog.rs MembershipDef), and the
         // executor's diff arm emits the repairing follow-up either way.
         if let Some(optional) = optional {
-            self.catalog.upsert_registered(&[], &[], &[RegisteredMembership { id: def.id, model: *model, property: *property, optional }]);
+            self.catalog.upsert_registered(
+                &[],
+                &[],
+                &[RegisteredMembership { id: def.id, model: proto::ModelId::Entity(*model), property: *property, optional }],
+            );
         }
         Ok(Some(def))
     }
@@ -850,8 +859,9 @@ fn follow_up_patch(
     let operations = backend.to_operations().expect("LWW encoding of scalar values is infallible").expect("fields are non-empty");
     // Catalog collections have well-known model ids by construction (#330);
     // this helper is only ever called for them.
-    let model = crate::schema::well_known_model_id(collection.as_str())
-        .expect("registration events target the catalog collections, which have well-known model ids");
+    let model = proto::WellKnownModel::from_collection(collection.as_str())
+        .map(proto::ModelId::WellKnown)
+        .expect("registration events target catalog collections, which are well-known models");
     proto::Event { model, entity_id, operations: proto::OperationSet(BTreeMap::from([("lww".to_string(), operations)])), parent }
 }
 

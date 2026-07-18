@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use tracing::warn;
 
 use crate::error::{MutationError, RetrievalError};
-use ankurah_proto::{Attested, CollectionId, EntityId, EntityState, Event, EventId};
+use ankurah_proto::{Attested, CollectionId, EntityId, EntityState, Event, EventId, ModelId, WellKnownModel};
 
 pub fn state_name(name: &str) -> String { format!("{}_state", name) }
 
@@ -20,8 +20,9 @@ pub fn event_name(name: &str) -> String { format!("{}_event", name) }
 pub fn bucket_model_id(
     collection: &CollectionId,
     resolver: Option<&dyn crate::schema::CatalogResolver>,
-) -> Result<EntityId, RetrievalError> {
-    crate::schema::well_known_model_id(collection.as_str())
+) -> Result<ModelId, RetrievalError> {
+    WellKnownModel::from_collection(collection.as_str())
+        .map(ModelId::WellKnown)
         .or_else(|| resolver.and_then(|r| r.model_id_for(collection.as_str())))
         .ok_or_else(|| RetrievalError::Other(format!("no model id known for collection '{collection}' (catalog cold?)")))
 }

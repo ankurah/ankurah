@@ -131,9 +131,9 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
                 // Protected collections (system + metadata catalog) are not
                 // mutable through ordinary transactions; the catalog's only
                 // mutation path is the registration operation (RFC 4).
-                if let Some(protected) = crate::schema::well_known_collection(&event.model) {
+                if let ankurah_proto::ModelId::WellKnown(protected) = event.model {
                     return Err(MutationError::General(
-                        format!("collection '{}' is protected and not writable by transactions", protected).into(),
+                        format!("collection '{}' is protected and not writable by transactions", protected.collection_id()).into(),
                     ));
                 }
                 // Validate creation events: if parent is empty, this is a creation event

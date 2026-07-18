@@ -348,12 +348,13 @@ impl Entity {
         Ok(EntityState { entity_id: self.id(), model: self.model_id()?, state })
     }
 
-    /// The model-definition id carried on this entity's wire envelopes
-    /// (#330): the well-known id for system/catalog collections, else the
+    /// The model address carried on this entity's wire envelopes (#330,
+    /// #397): the well-known arm for system/catalog collections, else the
     /// bound catalog resolver's mapping for the collection. Fails
     /// `UnknownModel` when neither answers.
-    pub(crate) fn model_id(&self) -> Result<EntityId, StateError> {
-        crate::schema::well_known_model_id(self.collection.as_str())
+    pub(crate) fn model_id(&self) -> Result<ankurah_proto::ModelId, StateError> {
+        ankurah_proto::WellKnownModel::from_collection(self.collection.as_str())
+            .map(ankurah_proto::ModelId::WellKnown)
             .or_else(|| self.resolver().and_then(|r| r.model_id_for(self.collection.as_str())))
             .ok_or_else(|| StateError::UnknownModel(self.collection.to_string()))
     }

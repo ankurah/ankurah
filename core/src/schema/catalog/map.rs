@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use ankurah_proto::{self as proto, CollectionId, EntityId};
+use ankurah_proto::{self as proto, CollectionId, EntityId, ModelId};
 
 use crate::{
     entity::Entity,
@@ -55,7 +55,7 @@ pub(super) struct CatalogMapInner {
     pub(super) properties: BTreeMap<EntityId, PropertyDef>,
     pub(super) models: BTreeMap<EntityId, ModelDef>,
     pub(super) memberships: BTreeMap<EntityId, MembershipDef>,
-    pub(super) by_collection: BTreeMap<String, EntityId>,
+    pub(super) by_collection: BTreeMap<String, ModelId>,
     model_memberships: BTreeMap<EntityId, BTreeSet<EntityId>>,
     pub(super) names_global: BTreeMap<String, BTreeSet<EntityId>>,
 }
@@ -104,13 +104,13 @@ impl CatalogMapInner {
                 self.by_collection.remove(&old.collection);
             }
         }
-        self.by_collection.insert(def.collection.clone(), def.id);
+        self.by_collection.insert(def.collection.clone(), ModelId::Entity(def.id));
         self.models.insert(def.id, def);
     }
 
     fn remove_model(&mut self, id: &EntityId) {
         if let Some(def) = self.models.remove(id) {
-            if self.by_collection.get(&def.collection) == Some(id) {
+            if self.by_collection.get(&def.collection) == Some(&ModelId::Entity(*id)) {
                 self.by_collection.remove(&def.collection);
             }
         }
@@ -156,8 +156,8 @@ impl CatalogMapInner {
     }
 
     pub(super) fn resolve(&self, collection: &str, name: &str) -> Option<EntityId> {
-        let model_id = self.by_collection.get(collection)?;
-        let membership_ids = self.model_memberships.get(model_id)?;
+        let model_id = self.by_collection.get(collection)?.entity()?;
+        let membership_ids = self.model_memberships.get(&model_id)?;
         let mut found = None;
         for membership_id in membership_ids {
             let Some(membership) = self.memberships.get(membership_id) else { continue };

@@ -317,7 +317,12 @@ mod tests {
         model_bytes[0] = 0xEE;
         let model = EntityId::from_bytes(model_bytes);
 
-        Event { entity_id, model, parent: Clock::from(parent_ids.to_vec()), operations: OperationSet(BTreeMap::new()) }
+        Event {
+            entity_id,
+            model: ankurah_proto::ModelId::Entity(model),
+            parent: Clock::from(parent_ids.to_vec()),
+            operations: OperationSet(BTreeMap::new()),
+        }
     }
 
     // ====================================================================

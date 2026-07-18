@@ -43,12 +43,12 @@ pub struct PeerState {
     subscription_handler: SubscriptionHandler,
     pending_requests: SafeMap<proto::RequestId, PendingRequest>,
     pending_updates: SafeMap<proto::UpdateId, oneshot::Sender<Result<proto::NodeResponseBody, RequestError>>>,
-    /// Model-definition ids whose catalog defs were already handed to this
+    /// Allocated model addresses whose catalog defs were already handed to this
     /// connection's transport (#330 once-per-connection descriptor shipping).
     /// Marked by [`Self::mark_models_announced`] only after a successful
     /// send. A reconnection builds a fresh `PeerState`, so the peer is
     /// re-announced.
-    announced_models: std::sync::Mutex<std::collections::BTreeSet<proto::EntityId>>,
+    announced_models: std::sync::Mutex<std::collections::BTreeSet<proto::ModelId>>,
 }
 
 struct PendingRequest {
@@ -75,7 +75,7 @@ impl PeerState {
     /// ship schema-less messages that can overtake the descriptor-carrying
     /// one, and a failed send would leave the models marked announced yet
     /// never described on this connection.
-    fn mark_models_announced(&self, models: &[proto::EntityId]) {
+    fn mark_models_announced(&self, models: &[proto::ModelId]) {
         if models.is_empty() {
             return;
         }
@@ -387,13 +387,13 @@ where
     async fn schema_states_for_models(
         &self,
         connection: &PeerState,
-        models: std::collections::BTreeSet<proto::EntityId>,
-    ) -> (Vec<proto::Attested<proto::EntityState>>, Vec<proto::EntityId>) {
-        let fresh: Vec<proto::EntityId> = {
+        models: std::collections::BTreeSet<proto::ModelId>,
+    ) -> (Vec<proto::Attested<proto::EntityState>>, Vec<proto::ModelId>) {
+        let fresh: Vec<proto::ModelId> = {
             let announced = connection.announced_models.lock().unwrap();
             models
                 .into_iter()
-                .filter(|model| crate::schema::well_known_collection(model).is_none())
+                .filter(|model| matches!(model, proto::ModelId::Entity(_)))
                 .filter(|model| !announced.contains(model))
                 .collect()
         };
@@ -872,7 +872,7 @@ where
     /// rejected loudly: once descriptor shipping guarantees delivery, an
     /// unresolvable model id is a protocol violation, and rejection (unlike
     /// synthesizing a collection) is retryable.
-    pub(crate) fn resolve_model(&self, model: &proto::EntityId) -> Result<proto::CollectionId, RetrievalError> {
+    pub(crate) fn resolve_model(&self, model: &proto::ModelId) -> Result<proto::CollectionId, RetrievalError> {
         self.catalog.collection_for_model(model).ok_or_else(|| {
             RetrievalError::Other(format!("unknown model id {}: no well-known or catalog entry (protocol violation?)", model.to_base64()))
         })
@@ -884,7 +884,7 @@ where
     /// readiness once and retry before rejecting. Ephemeral nodes never
     /// wait here -- their defs arrive inline with the message (descriptor
     /// shipping runs before body processing), so a miss is already final.
-    pub(crate) async fn resolve_model_wait(&self, model: &proto::EntityId) -> Result<proto::CollectionId, RetrievalError> {
+    pub(crate) async fn resolve_model_wait(&self, model: &proto::ModelId) -> Result<proto::CollectionId, RetrievalError> {
         match self.resolve_model(model) {
             Ok(collection) => Ok(collection),
             Err(e) => {
@@ -1499,6 +1499,22 @@ mod tests {
         async fn dump_entity_events(&self, _id: proto::EntityId) -> Result<Vec<Attested<proto::Event>>, RetrievalError> { Ok(Vec::new()) }
     }
 
+    #[tokio::test]
+    async fn unknown_zero_prefix_ordinal_reaches_ingress_resolution() {
+        let mut bytes = [0u8; 16];
+        bytes[15] = 5;
+        let bare = proto::EntityId::from_bytes(bytes);
+        let model: proto::ModelId = bincode::deserialize(&bincode::serialize(&bare).unwrap()).unwrap();
+        assert_eq!(model, proto::ModelId::Entity(bare), "unknown ordinals stay in the entity arm");
+
+        let node = Node::new(Arc::new(EmptyEngine), PermissiveAgent::new());
+        let error = node.resolve_model(&model).expect_err("an unknown entity-arm model reaches ingress and is rejected");
+        assert!(
+            matches!(error, RetrievalError::Other(ref message) if message.contains("unknown model id")),
+            "resolution must preserve the retryable unknown-model rejection: {error}"
+        );
+    }
+
     #[derive(Clone)]
     struct CapturingSender {
         peer: proto::EntityId,
@@ -1526,7 +1542,7 @@ mod tests {
         Attested::opt(
             EntityState {
                 entity_id: proto::EntityId::new(),
-                model: crate::schema::well_known_model_id(crate::schema::MODEL_COLLECTION_ID).unwrap(),
+                model: proto::ModelId::WellKnown(proto::WellKnownModel::Model),
                 state: proto::State {
                     state_buffers: proto::StateBuffers(BTreeMap::from([("lww".to_owned(), backend.to_state_buffer().unwrap())])),
                     head: proto::Clock::from(vec![event_id]),
@@ -1646,7 +1662,7 @@ mod tests {
             Ok(Attested::opt(
                 EntityState {
                     entity_id: id,
-                    model: crate::schema::well_known_model_id(crate::schema::MODEL_COLLECTION_ID).unwrap(),
+                    model: proto::ModelId::WellKnown(proto::WellKnownModel::Model),
                     state: proto::State { state_buffers: proto::StateBuffers(BTreeMap::new()), head: proto::Clock::default() },
                 },
                 None,
@@ -1666,7 +1682,7 @@ mod tests {
         async fn dump_entity_events(&self, _id: proto::EntityId) -> Result<Vec<Attested<proto::Event>>, RetrievalError> { Ok(Vec::new()) }
     }
 
-    fn update_referencing(model: proto::EntityId) -> proto::NodeUpdateBody {
+    fn update_referencing(model: proto::ModelId) -> proto::NodeUpdateBody {
         proto::NodeUpdateBody::SubscriptionUpdate {
             items: vec![proto::SubscriptionUpdateItem {
                 entity_id: proto::EntityId::new(),
@@ -1701,7 +1717,7 @@ mod tests {
         )
         .unwrap();
         let connection = node.peer_connections.get(&peer).expect("peer registered");
-        let model = proto::EntityId::new();
+        let model = proto::ModelId::Entity(proto::EntityId::new());
 
         // A send that fails at the transport must leave the model unannounced,
         // so a later message can re-ship its descriptors.
