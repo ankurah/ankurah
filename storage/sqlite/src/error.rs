@@ -19,6 +19,9 @@ pub enum SqliteError {
     #[error("DDL error: {0}")]
     DDL(String),
 
+    #[error("corrupt durable record: {0}")]
+    CorruptRecord(String),
+
     #[error("SQL generation error: {0}")]
     SqlGeneration(String),
 

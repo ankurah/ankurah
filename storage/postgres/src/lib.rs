@@ -395,9 +395,11 @@ impl PostgresBucket {
 
     /// Load this collection's property-to-column assignments into the cache. The
     /// `property_key` column is a serialized [`PropertyId`] (JSON text, see
-    /// [`property_key_text`]); a row we cannot parse is skipped loudly rather
-    /// than poisoning the whole map. The `PropertyId::Id -> "id"` pin is seeded
-    /// last so a corrupt row can never remap the primary key.
+    /// [`property_key_text`]); a row we cannot parse refuses the collection:
+    /// a hidden assignment would let that property's next cache miss claim a
+    /// fresh column and silently split its data, so the map loads whole or
+    /// not at all. The `PropertyId::Id -> "id"` pin is seeded last so no row
+    /// can remap the primary key.
     async fn load_column_map(&self, client: &tokio_postgres::Client) -> Result<(), StateError> {
         let rows = client
             .query(
@@ -415,7 +417,10 @@ impl PostgresBucket {
                     map.insert(id, column_name);
                 }
                 Err(e) => {
-                    warn!("PostgresBucket({}): skipping corrupt property_key {:?} in column map: {}", self.collection_id, property_key, e)
+                    return Err(StateError::SerializationError(
+                        format!("corrupt property_key {:?} in the column map for collection {}: {}", property_key, self.collection_id, e)
+                            .into(),
+                    ));
                 }
             }
         }
