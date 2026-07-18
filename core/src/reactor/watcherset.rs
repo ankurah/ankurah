@@ -1,8 +1,8 @@
 use crate::reactor::candidate_changes::CandidateChanges;
 use crate::reactor::comparison_index::ComparisonIndex;
-use crate::reactor::property_path::PropertyPath;
-use crate::reactor::{AbstractEntity, ReactorSubscriptionId};
+use crate::reactor::{AbstractEntity, ExtractValue, ReactorSubscriptionId};
 use ankurah_proto as proto;
+use ankurah_proto::PropertyPath;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
@@ -173,11 +173,14 @@ impl WatcherSet {
                 // Identifier paths retain the stable property id so an active
                 // watcher survives a catalog display-name change.
                 let extracted = match (&**left, &**right) {
+                    // A raw path watches by name: the system read IS "fetch by
+                    // this name", so it lowers to a System reference (the same
+                    // lowering the sort-key spec applies).
                     (Expr::Path(path), Expr::Literal(literal)) | (Expr::Literal(literal), Expr::Path(path)) => {
-                        Some((PropertyPath::from_path(path), literal))
+                        Some((PropertyPath::system(path.first(), path.steps[1..].to_vec()), literal))
                     }
                     (Expr::PropertyPath(identifier), Expr::Literal(literal)) | (Expr::Literal(literal), Expr::PropertyPath(identifier)) => {
-                        Some((PropertyPath::from_identifier(identifier), literal))
+                        Some((identifier.clone(), literal))
                     }
                     _ => None,
                 };

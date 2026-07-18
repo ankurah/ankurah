@@ -1,7 +1,7 @@
 mod candidate_changes;
 mod comparison_index;
+mod extract;
 pub mod fetch_gap;
-mod property_path;
 mod subscription;
 mod subscription_state;
 mod update;
@@ -9,7 +9,7 @@ mod watcherset;
 
 pub(crate) use self::{
     candidate_changes::CandidateChanges,
-    property_path::PropertyPath,
+    extract::{extract_property_value, ExtractValue},
     subscription::{ReactorSubscription, ReactorSubscriptionId},
     update::{MembershipChange, ReactorUpdate, ReactorUpdateItem},
     watcherset::{WatcherChange, WatcherSet},
@@ -229,35 +229,26 @@ pub(crate) fn build_key_spec_from_selection<E: AbstractEntity>(
     resultset: &EntityResultSet<E>,
     resolver: Option<&dyn crate::schema::CatalogResolver>,
     collection: &str,
-) -> anyhow::Result<crate::resultset::ResultKeySpec> {
+) -> anyhow::Result<KeySpec<ankql::ast::PropertyId>> {
     use ankql::ast::{OrderKey, PropertyId};
     let _ = collection;
     let mut keyparts = Vec::new();
-    let mut property_paths = Vec::new();
 
     let read = resultset.read();
     for item in order_by {
-        // The sort key's stable identity, its JSON sub-path, and its in-memory
-        // extraction path. The key spec carries the sub-path too, mirroring the
-        // extraction path: two orderings that differ only by sub-path (the whole
-        // property versus one field inside it) must never produce equal key
-        // specs, or an order-by change between them would be treated as no
-        // change at all.
-        let (key, sub_path, property_path): (PropertyId, Option<Vec<String>>, crate::reactor::PropertyPath) = match &item.key {
-            OrderKey::Property(identifier) => (
-                identifier.id(),
-                (!identifier.subpath.is_empty()).then(|| identifier.subpath.clone()),
-                crate::reactor::PropertyPath::from_identifier(identifier),
-            ),
+        // The sort key's stable identity and its JSON sub-path. The key spec
+        // carries the sub-path so two orderings that differ only by sub-path
+        // (the whole property versus one field inside it) never produce equal
+        // key specs; extraction derives from the same (key, sub-path) pair,
+        // so there is no separate extraction path to keep in agreement.
+        let (key, sub_path): (PropertyId, Option<Vec<String>>) = match &item.key {
+            OrderKey::Property(identifier) => (identifier.id(), (!identifier.subpath.is_empty()).then(|| identifier.subpath.clone())),
             // A raw (unresolved) sort key -- standalone reactors or tests that
-            // never resolved -- sorts by name: key it and extract it as a system reference.
-            OrderKey::Path(path) => (
-                PropertyId::System { name: path.first().to_string() },
-                (path.steps.len() > 1).then(|| path.steps[1..].to_vec()),
-                crate::reactor::PropertyPath::from_path(path),
-            ),
+            // never resolved -- sorts by name: key it as a system reference.
+            OrderKey::Path(path) => {
+                (PropertyId::System { name: path.first().to_string() }, (path.steps.len() > 1).then(|| path.steps[1..].to_vec()))
+            }
         };
-        property_paths.push(property_path);
 
         // Collate in the property's canonical value_type when the catalog knows
         // it (registered ids); `id` is always an EntityId; otherwise sample a
@@ -270,7 +261,8 @@ pub(crate) fn build_key_spec_from_selection<E: AbstractEntity>(
             PropertyId::System { .. } => None,
         }
         .or_else(|| {
-            property_paths.last().and_then(|path| read.iter_entities().find_map(|(_, e)| path.extract_value(e).map(|v| ValueType::of(&v))))
+            let sub = sub_path.as_deref().unwrap_or(&[]);
+            read.iter_entities().find_map(|(_, e)| crate::reactor::extract_property_value(&key, sub, e).map(|v| ValueType::of(&v)))
         })
         .unwrap_or(ValueType::String);
 
@@ -282,7 +274,7 @@ pub(crate) fn build_key_spec_from_selection<E: AbstractEntity>(
         keyparts.push(IndexKeyPart { key, sub_path, direction, value_type, nulls: Some(NullsOrder::Last), collation: None });
     }
 
-    Ok(crate::resultset::ResultKeySpec::new(KeySpec { keyparts }, property_paths))
+    Ok(KeySpec { keyparts })
 }
 
 impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static> Reactor<E, Ev> {

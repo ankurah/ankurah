@@ -2,7 +2,7 @@ use crate::indexing::{encode_tuple_values_with_key_spec, KeySpec};
 use crate::{
     entity::Entity,
     model::View,
-    reactor::{AbstractEntity, PropertyPath},
+    reactor::{extract_property_value, AbstractEntity},
 };
 use ankurah_proto as proto;
 use ankurah_signals::{
@@ -74,33 +74,14 @@ struct Inner<E: AbstractEntity> {
 struct State<E: AbstractEntity> {
     order: Vec<EntityEntry<E>>,
     index: HashMap<proto::EntityId, usize>,
-    // Ordering configuration
-    key_spec: Option<ResultKeySpec>,
+    // Ordering configuration. Each keypart carries the stable property
+    // identity and its sub-path, which is also exactly what value extraction
+    // needs, so the spec is both the encoding rule and the extraction rule;
+    // identity-keyed parts keep an active query stable across display-name
+    // changes.
+    key_spec: Option<KeySpec<ankql::ast::PropertyId>>,
     limit: Option<usize>,
     gap_dirty: bool, // Set when we remove entities and go from =LIMIT to < LIMIT
-}
-
-/// Result-set ordering keeps the ordinary encoding specification together
-/// with the property addresses used to extract each component. Reactor-built
-/// paths retain catalog ids so an active query remains stable across display-
-/// name changes; standalone result sets use name-based paths.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ResultKeySpec {
-    key_spec: KeySpec<ankql::ast::PropertyId>,
-    property_paths: Vec<PropertyPath>,
-}
-
-impl ResultKeySpec {
-    pub(crate) fn new(key_spec: KeySpec<ankql::ast::PropertyId>, property_paths: Vec<PropertyPath>) -> Self {
-        assert_eq!(key_spec.keyparts.len(), property_paths.len(), "one extraction path is required per sort key component");
-        Self { key_spec, property_paths }
-    }
-
-    #[cfg(test)]
-    fn from_key_spec(key_spec: KeySpec<ankql::ast::PropertyId>) -> Self {
-        let property_paths = key_spec.keyparts.iter().map(|keypart| PropertyPath::from_key(&keypart.key)).collect();
-        Self::new(key_spec, property_paths)
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -329,12 +310,13 @@ impl<'a, E: AbstractEntity> ResultSetWrite<'a, E> {
     }
 
     /// Compute sort key for an entity using the current key spec
-    fn compute_sort_key(entity: &E, key_spec: &ResultKeySpec) -> IVec {
+    fn compute_sort_key(entity: &E, key_spec: &KeySpec<ankql::ast::PropertyId>) -> IVec {
         let mut values = Vec::new();
 
         // Extract values for each key part
-        for property_path in &key_spec.property_paths {
-            let value = property_path.extract_value(entity);
+        for keypart in &key_spec.keyparts {
+            let sub_path = keypart.sub_path.as_deref().unwrap_or(&[]);
+            let value = extract_property_value(&keypart.key, sub_path, entity);
             // TODO: Handle NULLs properly - for now we'll get encoding errors on NULLs
             // which will cause unwrap_or_default() to return empty key (sorts first)
             if let Some(v) = value {
@@ -346,7 +328,7 @@ impl<'a, E: AbstractEntity> ResultSetWrite<'a, E> {
         }
 
         // Encode the tuple - if this fails, return empty key (will sort first)
-        let encoded = encode_tuple_values_with_key_spec(&values, &key_spec.key_spec).unwrap_or_default();
+        let encoded = encode_tuple_values_with_key_spec(&values, key_spec).unwrap_or_default();
         IVec::from(encoded)
     }
 
@@ -494,16 +476,10 @@ impl<E: AbstractEntity> EntityResultSet<E> {
         st.order.last().map(|entry| entry.entity.clone())
     }
 
-    /// Configure ordering for this result set
-    #[cfg(test)]
-    pub(crate) fn order_by(&self, key_spec: Option<KeySpec<ankql::ast::PropertyId>>) {
-        self.order_by_resolved(key_spec.map(ResultKeySpec::from_key_spec));
-    }
-
-    /// Configure ordering with catalog-resolved extraction paths. The
-    /// ordinary KeySpec still owns encoding/collation; these paths only decide
-    /// which stable property supplies each component.
-    pub(crate) fn order_by_resolved(&self, key_spec: Option<ResultKeySpec>) {
+    /// Configure ordering with catalog-resolved sort keys. Each keypart's
+    /// identity + sub-path pair is both the encoding rule and the extraction
+    /// rule, so the spec alone fully determines the ordering.
+    pub(crate) fn order_by_resolved(&self, key_spec: Option<KeySpec<ankql::ast::PropertyId>>) {
         let mut st = self.0.state.lock().unwrap();
 
         // Check if the key spec actually changed
@@ -676,7 +652,7 @@ mod tests {
                 value_type: ValueType::String,
             }],
         };
-        resultset.order_by(Some(key_spec));
+        resultset.order_by_resolved(Some(key_spec));
 
         let mut write = resultset.write();
         write.add(entity2.clone());

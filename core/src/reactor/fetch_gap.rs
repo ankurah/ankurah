@@ -3,7 +3,7 @@ use crate::{
     error::RetrievalError,
     node::{MatchArgs, Node, NodeInner},
     policy::PolicyAgent,
-    reactor::AbstractEntity,
+    reactor::{AbstractEntity, ExtractValue},
     storage::StorageEngine,
     value::{Value, ValueType},
 };
@@ -118,20 +118,21 @@ pub fn build_continuation_predicate<E: AbstractEntity>(
 
     // Add ORDER BY continuation conditions
     for order_item in order_by {
-        // Read the last entity's value for this sort key, and keep the key
-        // expression to reuse as the continuation comparison's left side: a
-        // registered property reads by id, a system property or raw path (the
-        // `id` pseudo-property) by name.
+        // Read the last entity's value for this sort key (sub-path aware, so a
+        // JSON-keyed ordering reads the same component the sort encoded), and
+        // keep the key expression to reuse as the continuation comparison's
+        // left side. Sub-path values arrive as Value::Json and are skipped by
+        // the literal conversion below, like every other Json sort value.
         let (field_value, key_expr) = match &order_item.key {
-            OrderKey::Property(identifier) => {
-                let value = match identifier.id() {
-                    PropertyId::Id => last_entity.value("id"),
-                    PropertyId::EntityId(id) => last_entity.value_by_id(ankurah_proto::EntityId::from_ulid(id)),
-                    PropertyId::System { name } => last_entity.value(&name),
-                };
-                (value, Expr::PropertyPath(identifier.clone()))
-            }
-            OrderKey::Path(path) => (last_entity.value(path.first()), Expr::Path(path.clone())),
+            OrderKey::Property(identifier) => (identifier.extract_value(last_entity), Expr::PropertyPath(identifier.clone())),
+            OrderKey::Path(path) => (
+                crate::reactor::extract_property_value(
+                    &PropertyId::System { name: path.first().to_string() },
+                    &path.steps[1..],
+                    last_entity,
+                ),
+                Expr::Path(path.clone()),
+            ),
         };
         if let Some(field_value) = field_value {
             let literal = match field_value {
