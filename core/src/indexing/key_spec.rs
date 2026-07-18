@@ -194,8 +194,10 @@ mod tests {
 
     #[test]
     fn test_exact_match() {
-        let spec1: KeySpec<String> = KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String), IndexKeyPart::desc("b", ValueType::String)] };
-        let spec2: KeySpec<String> = KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String), IndexKeyPart::desc("b", ValueType::String)] };
+        let spec1: KeySpec<String> =
+            KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String), IndexKeyPart::desc("b", ValueType::String)] };
+        let spec2: KeySpec<String> =
+            KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String), IndexKeyPart::desc("b", ValueType::String)] };
 
         assert_eq!(spec1.matches(&spec2), Some(IndexSpecMatch::Match));
     }
@@ -203,7 +205,8 @@ mod tests {
     #[test]
     fn test_prefix_match() {
         // +a, -b matches +a, -b, +c
-        let query_spec: KeySpec<String> = KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String), IndexKeyPart::desc("b", ValueType::String)] };
+        let query_spec: KeySpec<String> =
+            KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String), IndexKeyPart::desc("b", ValueType::String)] };
         let index_spec: KeySpec<String> = KeySpec {
             keyparts: vec![
                 IndexKeyPart::asc("a", ValueType::String),
@@ -218,8 +221,10 @@ mod tests {
     #[test]
     fn test_inverse_exact_match() {
         // +a, -b matches -a, +b (inverse)
-        let query_spec: KeySpec<String> = KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String), IndexKeyPart::desc("b", ValueType::String)] };
-        let index_spec: KeySpec<String> = KeySpec { keyparts: vec![IndexKeyPart::desc("a", ValueType::String), IndexKeyPart::asc("b", ValueType::String)] };
+        let query_spec: KeySpec<String> =
+            KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String), IndexKeyPart::desc("b", ValueType::String)] };
+        let index_spec: KeySpec<String> =
+            KeySpec { keyparts: vec![IndexKeyPart::desc("a", ValueType::String), IndexKeyPart::asc("b", ValueType::String)] };
 
         assert_eq!(query_spec.matches(&index_spec), Some(IndexSpecMatch::Inverse));
     }
@@ -227,7 +232,8 @@ mod tests {
     #[test]
     fn test_inverse_prefix_match() {
         // +a, -b matches -a, +b, +c (inverse prefix)
-        let query_spec: KeySpec<String> = KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String), IndexKeyPart::desc("b", ValueType::String)] };
+        let query_spec: KeySpec<String> =
+            KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String), IndexKeyPart::desc("b", ValueType::String)] };
         let index_spec: KeySpec<String> = KeySpec {
             keyparts: vec![
                 IndexKeyPart::desc("a", ValueType::String),
@@ -242,7 +248,8 @@ mod tests {
     #[test]
     fn test_user_example() {
         // "+a, -b matches +a, -b, any c AND -a, +b, any c"
-        let query_spec: KeySpec<String> = KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String), IndexKeyPart::desc("b", ValueType::String)] };
+        let query_spec: KeySpec<String> =
+            KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String), IndexKeyPart::desc("b", ValueType::String)] };
 
         // Test direct match: +a, -b, +c
         let index_spec1: KeySpec<String> = KeySpec {
@@ -267,8 +274,10 @@ mod tests {
 
     #[test]
     fn test_no_match_different_fields() {
-        let query_spec: KeySpec<String> = KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String), IndexKeyPart::desc("b", ValueType::String)] };
-        let index_spec: KeySpec<String> = KeySpec { keyparts: vec![IndexKeyPart::asc("x", ValueType::String), IndexKeyPart::desc("y", ValueType::String)] };
+        let query_spec: KeySpec<String> =
+            KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String), IndexKeyPart::desc("b", ValueType::String)] };
+        let index_spec: KeySpec<String> =
+            KeySpec { keyparts: vec![IndexKeyPart::asc("x", ValueType::String), IndexKeyPart::desc("y", ValueType::String)] };
 
         assert_eq!(query_spec.matches(&index_spec), None);
     }
@@ -284,8 +293,10 @@ mod tests {
     #[test]
     fn test_no_match_partial_field_overlap() {
         // +a, -b does not match +a, +b (different direction on second field)
-        let query_spec: KeySpec<String> = KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String), IndexKeyPart::desc("b", ValueType::String)] };
-        let index_spec: KeySpec<String> = KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String), IndexKeyPart::asc("b", ValueType::String)] };
+        let query_spec: KeySpec<String> =
+            KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String), IndexKeyPart::desc("b", ValueType::String)] };
+        let index_spec: KeySpec<String> =
+            KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String), IndexKeyPart::asc("b", ValueType::String)] };
 
         assert_eq!(query_spec.matches(&index_spec), None);
     }

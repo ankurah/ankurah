@@ -10,6 +10,25 @@ use tokio::sync::Notify;
 /// A lifecycle fence for requests whose effects must finish before their
 /// owner can be reset. Invalidation rejects new leases and then waits for any
 /// effect already admitted at the owner's lifecycle boundary to finish.
+///
+/// The two halves in use:
+///
+/// ```ignore
+/// // Owner setup: response effects admit through the fence.
+/// let fence = RequestFence::new();
+/// let validity = RequestValidity::fenced(fence.clone());
+///
+/// // Response path: hold the lease across the whole effect.
+/// match validity.try_acquire() {
+///     Some(_lease) => apply_response(response), // admitted; reset waits for us
+///     None => return,                           // owner is resetting; drop it
+/// } // lease drops here: the effect is finished and reset may proceed
+///
+/// // Reset path: refuse new effects, then wait out the admitted ones.
+/// fence.invalidate();
+/// fence.wait_drained().await;
+/// wipe_state(); // nothing admitted before the wipe is still running
+/// ```
 #[derive(Clone, Debug)]
 pub(crate) struct RequestFence(Arc<RequestFenceInner>);
 
@@ -88,6 +107,16 @@ impl Drop for RequestLease {
 /// use the predicate to reject superseded attempts; reset-sensitive owners
 /// additionally attach a [`RequestFence`] so reset can quiesce effects that
 /// already passed the predicate.
+///
+/// Attempt-local predicates compose onto the owner's fence without losing it:
+///
+/// ```ignore
+/// // The owner's reset fence, narrowed to one request attempt: the response
+/// // applies only while no reset is underway AND this attempt is still the
+/// // latest one for its query (see SubscriptionRelay's request_generation).
+/// let validity = RequestValidity::fenced(owner_fence)
+///     .and(move || current_generation() == my_generation);
+/// ```
 #[derive(Clone)]
 pub(crate) struct RequestValidity {
     check: Arc<dyn Fn() -> bool + Send + Sync>,

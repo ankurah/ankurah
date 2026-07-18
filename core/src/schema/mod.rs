@@ -82,6 +82,9 @@ pub fn is_protected_collection(id: &CollectionId) -> bool {
 const WELL_KNOWN_MODELS: &[(u8, &str)] =
     &[(1, crate::system::SYSTEM_COLLECTION_ID), (2, MODEL_COLLECTION_ID), (3, PROPERTY_COLLECTION_ID), (4, MODEL_PROPERTY_COLLECTION_ID)];
 
+/// The reserved id for one [`WELL_KNOWN_MODELS`] ordinal: 15 zero bytes plus
+/// the ordinal. This is an address in model-id space with no entity behind
+/// it -- see the invariants on [`WELL_KNOWN_MODELS`] above.
 fn well_known_id(ordinal: u8) -> EntityId {
     let mut bytes = [0u8; 16];
     bytes[15] = ordinal;

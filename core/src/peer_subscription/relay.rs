@@ -51,7 +51,14 @@ pub struct RemoteQueryState<CD: ContextData, Q: RemoteQuerySubscriber> {
     pub status: Status,
     pub livequery: Q,
     /// Monotonic request attempt. Peer id + selection version are not enough
-    /// to reject a late response after disconnect/reconnect to the same peer.
+    /// to reject a late response after disconnect/reconnect to the same peer:
+    /// the reconnect re-requests the SAME selection version from the SAME
+    /// peer, so a straggler response to the pre-disconnect attempt matches on
+    /// both fields and would be applied as if it answered the new attempt.
+    /// Each attempt captures the value at send time and its validity check
+    /// requires the stored generation to still equal it, so once a newer
+    /// attempt bumps the counter, the straggler fails the check and is
+    /// dropped.
     request_generation: u64,
 }
 
