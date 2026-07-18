@@ -16,6 +16,9 @@ mod watcher;
 uniffi::setup_scaffolding!();
 
 pub use agent::{AgentState, JwtAgent};
+pub use agent_state::start_ephemeral_policy_sync;
+#[cfg(feature = "watcher")]
+pub use agent_state::start_durable_policy_watcher;
 pub use claims::{parse_claims_unverified, JwtClaims};
 pub use config::{PolicyConfig, ScopeRule, ScopeRuleOp};
 pub use context::JwtContext;

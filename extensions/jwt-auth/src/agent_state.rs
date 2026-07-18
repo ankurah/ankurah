@@ -26,8 +26,15 @@ impl<'a> std::ops::Deref for AgentStateReadGuard<'a> {
 
 /// Start durable policy watcher: spawns a background task that watches the policy file
 /// and syncs it to the node.
+///
+/// Exported so an application can **wrap** [`JwtAgent`](crate::JwtAgent) — a
+/// newtype delegating [`PolicyAgent`](ankurah_core::policy::PolicyAgent) while
+/// adding its own checks — and reuse the policy-sync machinery instead of
+/// duplicating it. Pass the inner agent's state handle
+/// ([`JwtAgent::state_handle`](crate::JwtAgent::state_handle)). Generic over
+/// any `PolicyAgent<ContextData = JwtContext>`, so it accepts the wrapper type.
 #[cfg(feature = "watcher")]
-pub(crate) fn start_durable_policy_watcher<SE, PA>(
+pub fn start_durable_policy_watcher<SE, PA>(
     node: ankurah_core::node::WeakNode<SE, PA>,
     policy_path: std::path::PathBuf,
     state_handle: Arc<RwLock<AgentState>>,
@@ -55,7 +62,13 @@ pub(crate) fn start_durable_policy_watcher<SE, PA>(
 /// Start ephemeral policy sync: creates a weak-node LiveQuery on "jwtpolicy" (so the
 /// agent does not keep its own node alive) and spawns a background task that applies
 /// policy updates from the durable node.
-pub(crate) fn start_ephemeral_policy_sync<SE, PA>(
+///
+/// Exported for the same wrapping use case as
+/// [`start_durable_policy_watcher`]: a wrapper passes the inner agent's state
+/// handle ([`JwtAgent::state_handle`](crate::JwtAgent::state_handle)) plus its
+/// own `Arc<Mutex<Option<EntityLiveQuery>>>` cell (which owns the livequery's
+/// lifetime), and gets the standard ephemeral sync without reimplementing it.
+pub fn start_ephemeral_policy_sync<SE, PA>(
     node: &Node<SE, PA>,
     state_handle: Arc<RwLock<AgentState>>,
     policy_livequery: &Arc<Mutex<Option<EntityLiveQuery>>>,
