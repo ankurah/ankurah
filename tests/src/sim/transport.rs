@@ -91,14 +91,21 @@ pub fn message_digest(message: &proto::NodeMessage) -> String {
 }
 
 /// Canonical, correlation-id-free description of a message's payload.
+///
+/// `Request`/`Response` delegate straight to `NodeRequestBody`'s /
+/// `NodeResponseBody`'s own `Display` (proto/src/request.rs) rather than
+/// hand-maintaining a second, parallel description of each variant: that
+/// duplication is exactly what used to drift whenever a variant changed.
+/// Those `Display` impls are themselves written to be correlation-id-free
+/// (no `TransactionId`/`QueryId`, which are fresh ULIDs per send) and to
+/// render id collections in sorted order, so they satisfy this function's
+/// determinism requirement directly. Only `request`/`response`'s own
+/// wrapper-level ids (`RequestId`, `UpdateId`) are skipped here, by
+/// descending into `.body` instead of formatting the wrapper.
 fn semantic_descriptor(message: &proto::NodeMessage) -> String {
     match message {
-        proto::NodeMessage::Request { request, .. } => {
-            format!("REQ {}", request_descriptor(&request.body))
-        }
-        proto::NodeMessage::Response(response) => {
-            format!("RESP {}", response_descriptor(&response.body))
-        }
+        proto::NodeMessage::Request { request, .. } => format!("REQ {}", request.body),
+        proto::NodeMessage::Response(response) => format!("RESP {}", response.body),
         proto::NodeMessage::Update(update) => {
             let proto::NodeUpdateBody::SubscriptionUpdate { items } = &update.body;
             let mut parts: Vec<String> = items.iter().map(update_item_descriptor).collect();
@@ -107,58 +114,6 @@ fn semantic_descriptor(message: &proto::NodeMessage) -> String {
         }
         proto::NodeMessage::UpdateAck(ack) => format!("ACK {}", matches!(ack.body, proto::NodeUpdateAckBody::Success)),
         proto::NodeMessage::UnsubscribeQuery { .. } => "UNSUB".to_string(),
-    }
-}
-
-fn event_ids(events: &[proto::Attested<proto::Event>]) -> String {
-    let mut ids: Vec<String> = events.iter().map(|e| e.payload.id().to_base64_short()).collect();
-    ids.sort();
-    ids.join("+")
-}
-
-fn request_descriptor(body: &proto::NodeRequestBody) -> String {
-    match body {
-        proto::NodeRequestBody::CommitTransaction { events, .. } => format!("commit {}", event_ids(events)),
-        proto::NodeRequestBody::Get { collection, ids } => {
-            let mut ss: Vec<String> = ids.iter().map(|i| i.to_base64_short()).collect();
-            ss.sort();
-            format!("get {} {}", collection, ss.join("+"))
-        }
-        proto::NodeRequestBody::GetEvents { collection, event_ids } => {
-            let mut ss: Vec<String> = event_ids.iter().map(|i| i.to_base64_short()).collect();
-            ss.sort();
-            format!("getevents {} {}", collection, ss.join("+"))
-        }
-        proto::NodeRequestBody::Fetch { collection, .. } => format!("fetch {}", collection),
-        proto::NodeRequestBody::SubscribeQuery { collection, .. } => format!("subscribe {}", collection),
-        proto::NodeRequestBody::RegisterSchema { models, properties, memberships } => {
-            let mut cols: Vec<String> = models.iter().map(|m| m.collection.to_string()).collect();
-            cols.sort();
-            format!("registerschema [{}] p{} ms{}", cols.join("+"), properties.len(), memberships.len())
-        }
-    }
-}
-
-fn response_descriptor(body: &proto::NodeResponseBody) -> String {
-    match body {
-        proto::NodeResponseBody::CommitComplete { .. } => "commitcomplete".to_string(),
-        proto::NodeResponseBody::Fetch(deltas) => format!("fetch {}", deltas.len()),
-        proto::NodeResponseBody::Get(states) => {
-            let mut ss: Vec<String> = states.iter().map(|s| s.payload.entity_id.to_base64_short()).collect();
-            ss.sort();
-            format!("get [{}]", ss.join("+"))
-        }
-        proto::NodeResponseBody::GetEvents(events) => format!("getevents {}", event_ids(events)),
-        proto::NodeResponseBody::QuerySubscribed { deltas, .. } => format!("subscribed {}", deltas.len()),
-        // Counts only: allocated ids are ULIDs and would perturb the
-        // determinism digest without adding discriminating power.
-        proto::NodeResponseBody::SchemaRegistered { models, properties, memberships } => {
-            format!("schemaregistered m{} p{} ms{}", models.len(), properties.len(), memberships.len())
-        }
-        proto::NodeResponseBody::Success => "success".to_string(),
-        // Include the error text so two distinct rejections are distinguishable
-        // in the trace (advisory path, but keeps the digest faithful).
-        proto::NodeResponseBody::Error(e) => format!("error:{e}"),
     }
 }
 
