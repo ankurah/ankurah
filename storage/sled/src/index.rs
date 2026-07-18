@@ -79,6 +79,15 @@ impl IndexManager {
         db: &Db,
         property_manager: &PropertyManager,
     ) -> Result<(Index, IndexSpecMatch), RetrievalError> {
+        // The planner never emits a primary-key keypart (the primary key is
+        // the natural tiebreak of every index scan, and materialized records
+        // do not carry it); pin that invariant where key specs enter the
+        // engine, because build_key_from_map would silently index nothing for
+        // a spec that violates it.
+        debug_assert!(
+            spec.keyparts.iter().all(|kp| kp.key != "id"),
+            "index key specs must not contain the primary-key column; the planner strips it"
+        );
         // Try existing matching index
         if let Some((_, existing, match_type)) = self.indexes.read().unwrap().iter().find_map(|(id, idx)| {
             if idx.collection() == collection {
