@@ -94,13 +94,34 @@ impl std::fmt::Display for PathExpr {
 /// Keeping `label` next to `id`, rather than nesting `id` inside a second
 /// enum shaped almost exactly like [`PropertyId`] just to bolt a label onto
 /// every arm, is what makes that guarantee cheap to keep.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PropertyPath {
     id: PropertyId,
     /// The input name from the unparsed AST which was resolved to this id (usable only for Display)
     label: String,
     /// JSON sub-path into the property's value; empty for a plain reference.
     pub subpath: Vec<String>,
+}
+
+/// Equality, ordering, and hashing are identity + sub-path ONLY: `label` is
+/// Display metadata, and two references to the same property written under
+/// different names are the SAME reference. Watcher and index keys rely on
+/// this to avoid splitting when a property is addressed pre- and post-rename.
+impl PartialEq for PropertyPath {
+    fn eq(&self, other: &Self) -> bool { self.id == other.id && self.subpath == other.subpath }
+}
+impl Eq for PropertyPath {}
+impl PartialOrd for PropertyPath {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
+}
+impl Ord for PropertyPath {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering { self.id.cmp(&other.id).then_with(|| self.subpath.cmp(&other.subpath)) }
+}
+impl std::hash::Hash for PropertyPath {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+        self.subpath.hash(state);
+    }
 }
 
 /// The serializable, durable address of a resolved property: a registered
@@ -650,6 +671,35 @@ pub enum InfixOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn property_path_equality_ignores_label() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let id = ulid::Ulid::new();
+        let written = PropertyPath::registered(id, "written_name", vec!["x".to_string()]);
+        let renamed = PropertyPath::registered(id, "renamed", vec!["x".to_string()]);
+        assert_eq!(written, renamed, "the label must not distinguish two references to one property");
+        let hash = |p: &PropertyPath| {
+            let mut h = DefaultHasher::new();
+            p.hash(&mut h);
+            h.finish()
+        };
+        assert_eq!(hash(&written), hash(&renamed), "hash must agree with equality");
+        assert_ne!(written.to_string(), renamed.to_string(), "Display still carries the written label");
+        // A different sub-path IS a different reference.
+        assert_ne!(written, PropertyPath::registered(id, "written_name", vec![]));
+    }
+
+    /// Equality ignores the label, so an equality assertion cannot catch label
+    /// loss on the wire; this pins it through Display instead.
+    #[test]
+    fn property_path_label_survives_the_wire() {
+        let p = PropertyPath::registered(ulid::Ulid::new(), "the_label", vec!["x".to_string()]);
+        let q: PropertyPath = bincode::deserialize(&bincode::serialize(&p).unwrap()).unwrap();
+        assert_eq!(p, q);
+        assert_eq!(p.to_string(), q.to_string(), "the label must survive serialization even though equality ignores it");
+    }
     use crate::parser::parse_selection;
 
     /// A deterministic property id for a name, so a test can name the identity
