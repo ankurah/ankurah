@@ -82,34 +82,25 @@ impl StorageEngine for IndexedDBStorageEngine {
     async fn delete_all_collections(&self) -> Result<bool, MutationError> {
         let db_connection = self.db.get_connection().await;
         SendWrapper::new(async move {
-            // Clear entities store
-            let entities_transaction = db_connection
-                .transaction_with_str_and_mode("entities", web_sys::IdbTransactionMode::Readwrite)
-                .require("create entities transaction")?;
-            let entities_store = entities_transaction.object_store("entities").require("get entities store")?;
-            let entities_request = entities_store.clear().require("clear entities store")?;
-            cb_future(&entities_request, "success", "error").await.require("await entities clear")?;
-            cb_future(&entities_transaction, "complete", "error").await.require("complete entities transaction")?;
-
-            // Clear events store
-            let events_transaction = db_connection
-                .transaction_with_str_and_mode("events", web_sys::IdbTransactionMode::Readwrite)
-                .require("create events transaction")?;
-            let events_store = events_transaction.object_store("events").require("get events store")?;
-            let events_request = events_store.clear().require("clear events store")?;
-            cb_future(&events_request, "success", "error").await.require("await events clear")?;
-            cb_future(&events_transaction, "complete", "error").await.require("complete events transaction")?;
-
-            // Clear property_columns store (the engine-owned durable id-to-field
-            // map). Wiping every collection must wipe its id-to-field
-            // assignments too, or a re-created collection would find stale rows.
-            let columns_transaction = db_connection
-                .transaction_with_str_and_mode("property_columns", web_sys::IdbTransactionMode::Readwrite)
-                .require("create property_columns transaction")?;
-            let columns_store = columns_transaction.object_store("property_columns").require("get property_columns store")?;
-            let columns_request = columns_store.clear().require("clear property_columns store")?;
-            cb_future(&columns_request, "success", "error").await.require("await property_columns clear")?;
-            cb_future(&columns_transaction, "complete", "error").await.require("complete property_columns transaction")?;
+            // One transaction across all three stores: a reset must not be
+            // observable half-done. Wiping every collection must wipe the
+            // engine-owned durable id-to-field map (property_columns) with it,
+            // or an interruption between per-store transactions would leave a
+            // re-created collection finding stale rows; a single transaction
+            // commits the clears together or not at all.
+            let store_names = js_sys::Array::new();
+            for name in ["entities", "events", "property_columns"] {
+                store_names.push(&name.into());
+            }
+            let transaction = db_connection
+                .transaction_with_str_sequence_and_mode(store_names.as_ref(), web_sys::IdbTransactionMode::Readwrite)
+                .require("create reset transaction")?;
+            for name in ["entities", "events", "property_columns"] {
+                let store = transaction.object_store(name).require("get store for reset")?;
+                let request = store.clear().require("clear store")?;
+                cb_future(&request, "success", "error").await.require("await store clear")?;
+            }
+            cb_future(&transaction, "complete", "error").await.require("complete reset transaction")?;
 
             // Return true since we cleared everything
             Ok(true)

@@ -195,6 +195,13 @@ impl StorageEngine for Postgres {
         if !Postgres::sane_name(collection_id.as_str()) {
             return Err(RetrievalError::InvalidBucketName);
         }
+        // The engine's own physical tables are not collections. The reserved
+        // "_ankurah_" prefix is enforced above this layer for user models, but
+        // "ankurah_meta" carries no underscore and would otherwise pass
+        // sane_name and collide with the protocol-version record table.
+        if collection_id.as_str() == META_TABLE || collection_id.as_str() == "_ankurah_postgres_column_map" {
+            return Err(RetrievalError::InvalidBucketName);
+        }
 
         let mut client = self.pool.get().await.map_err(RetrievalError::storage)?;
 
@@ -226,7 +233,13 @@ impl StorageEngine for Postgres {
         let result = async {
             bucket.create_state_table(&mut client).await?;
             bucket.create_event_table(&mut client).await?;
-            bucket.create_column_map_table(&client).await?;
+            // The map table is engine-wide, not per-collection: first opens of
+            // two DIFFERENT collections race its CREATE TABLE under their
+            // disjoint collection locks, so it takes its own fixed-key lock.
+            let map_lock = acquire_ddl_lock(&client, "_ankurah_postgres_column_map").await?;
+            let map_result = bucket.create_column_map_table(&client).await;
+            release_ddl_lock(&client, map_lock).await?;
+            map_result?;
             client
                 .execute(
                     r#"INSERT INTO "_ankurah_postgres_column_map" ("collection", "property_key", "column_name") VALUES ($1, $2, 'id')

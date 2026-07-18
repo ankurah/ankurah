@@ -152,6 +152,13 @@ impl StorageEngine for SqliteStorageEngine {
         if !Self::sane_name(collection_id.as_str()) {
             return Err(RetrievalError::InvalidBucketName);
         }
+        // The engine's own physical tables are not collections. The reserved
+        // "_ankurah_" prefix is enforced above this layer for user models, but
+        // "ankurah_meta" carries no underscore and would otherwise pass
+        // sane_name and collide with the protocol-version record table.
+        if collection_id.as_str() == META_TABLE || collection_id.as_str() == "_ankurah_sqlite_column_map" {
+            return Err(RetrievalError::InvalidBucketName);
+        }
 
         let conn = self.pool.get().await.map_err(|e| SqliteError::Pool(e.to_string()))?;
 
