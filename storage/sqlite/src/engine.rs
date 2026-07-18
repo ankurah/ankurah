@@ -4,13 +4,13 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use ankql::ast::PropertyId;
 use ankurah_core::entity::TemporaryEntity;
 use ankurah_core::error::{MutationError, RetrievalError};
 use ankurah_core::property::backend::backend_from_string;
 use ankurah_core::schema::CatalogResolver;
 use ankurah_core::selection::filter::evaluate_predicate;
 use ankurah_core::storage::{naming, StorageCollection, StorageEngine};
+use ankurah_proto::PropertyId;
 use ankurah_proto::{
     AttestationSet, Attested, Clock, CollectionId, EntityId, EntityState, Event, EventId, OperationSet, State, StateBuffers,
     PROTOCOL_VERSION,

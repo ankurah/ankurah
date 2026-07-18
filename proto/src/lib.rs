@@ -22,6 +22,12 @@ pub mod postgres;
 #[cfg(feature = "wasm")]
 pub mod wasm;
 
+/// The resolved property vocabulary is defined in ankql (the AST carries it,
+/// and ankql cannot depend on proto), but it is protocol vocabulary: resolved
+/// selections ride the wire and engines key their durable maps on it. Proto
+/// republishes it so protocol consumers name it from the protocol crate.
+pub use ankql::ast::{PropertyId, PropertyPath};
+
 pub use auth::*;
 pub use clock::*;
 pub use collection::*;

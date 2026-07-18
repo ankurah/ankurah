@@ -5,13 +5,13 @@ use std::{
     time::Duration,
 };
 
-use ankql::ast::PropertyId;
 use ankurah_core::{
     error::{MutationError, RetrievalError, StateError},
     property::backend::backend_from_string,
     schema::CatalogResolver,
     storage::{naming, StorageCollection, StorageEngine},
 };
+use ankurah_proto::PropertyId;
 use ankurah_proto::{Attestation, AttestationSet, Attested, EntityState, EventId, OperationSet, State, StateBuffers, PROTOCOL_VERSION};
 
 use futures_util::{pin_mut, TryStreamExt};

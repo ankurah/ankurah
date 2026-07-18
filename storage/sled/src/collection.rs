@@ -1,13 +1,14 @@
 #[cfg(debug_assertions)]
 use std::sync::atomic::AtomicBool;
 
-use ankql::ast::{OrderKey, Predicate, PropertyId};
+use ankql::ast::{OrderKey, Predicate};
 use ankurah_core::indexing::KeySpec;
 use ankurah_core::{
     error::{MutationError, RetrievalError},
     storage::StorageCollection,
     EntityId,
 };
+use ankurah_proto::PropertyId;
 use ankurah_proto::{Attested, CollectionId, EntityState, Event, EventId, StateFragment};
 use ankurah_storage_common::{filtering::ValueSetStream, KeyBounds, OrderByComponents, Plan, Planner, PlannerConfig, ScanDirection};
 use async_trait::async_trait;
