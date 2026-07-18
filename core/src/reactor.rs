@@ -237,12 +237,25 @@ pub(crate) fn build_key_spec_from_selection<E: AbstractEntity>(
 
     let read = resultset.read();
     for item in order_by {
-        // The sort key's stable identity and its in-memory extraction path.
-        let (key, property_path): (PropertyId, crate::reactor::PropertyPath) = match &item.key {
-            OrderKey::Property(identifier) => (identifier.id(), crate::reactor::PropertyPath::from_identifier(identifier)),
+        // The sort key's stable identity, its JSON sub-path, and its in-memory
+        // extraction path. The key spec carries the sub-path too, mirroring the
+        // extraction path: two orderings that differ only by sub-path (the whole
+        // property versus one field inside it) must never produce equal key
+        // specs, or an order-by change between them would be treated as no
+        // change at all.
+        let (key, sub_path, property_path): (PropertyId, Option<Vec<String>>, crate::reactor::PropertyPath) = match &item.key {
+            OrderKey::Property(identifier) => (
+                identifier.id(),
+                (!identifier.subpath.is_empty()).then(|| identifier.subpath.clone()),
+                crate::reactor::PropertyPath::from_identifier(identifier),
+            ),
             // A raw (unresolved) sort key -- standalone reactors or tests that
             // never resolved -- sorts by name: key it and extract it as a system reference.
-            OrderKey::Path(path) => (PropertyId::System { name: path.first().to_string() }, crate::reactor::PropertyPath::from_path(path)),
+            OrderKey::Path(path) => (
+                PropertyId::System { name: path.first().to_string() },
+                (path.steps.len() > 1).then(|| path.steps[1..].to_vec()),
+                crate::reactor::PropertyPath::from_path(path),
+            ),
         };
         property_paths.push(property_path);
 
@@ -266,7 +279,7 @@ pub(crate) fn build_key_spec_from_selection<E: AbstractEntity>(
             ankql::ast::OrderDirection::Desc => IndexDirection::Desc,
         };
 
-        keyparts.push(IndexKeyPart { key, sub_path: None, direction, value_type, nulls: Some(NullsOrder::Last), collation: None });
+        keyparts.push(IndexKeyPart { key, sub_path, direction, value_type, nulls: Some(NullsOrder::Last), collation: None });
     }
 
     Ok(crate::resultset::ResultKeySpec::new(KeySpec { keyparts }, property_paths))
