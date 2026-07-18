@@ -332,20 +332,37 @@ impl std::fmt::Display for NodeResponse {
 impl std::fmt::Display for NodeRequestBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            NodeRequestBody::CommitTransaction { id, events } => {
-                write!(f, "CommitTransaction {id} [{}]", events.iter().map(|e| format!("{}", e)).collect::<Vec<_>>().join(", "))
+            // `id` (a `TransactionId`) is a fresh ULID minted by `::new()` on
+            // every send (including on every retry of the same commit); it
+            // carries no content of its own. The sorted event ids are a
+            // content hash of (entity_id, operations, parent), so they fully
+            // and stably identify what is being committed, unlike `id`, which
+            // would make two structurally identical commits render
+            // differently. Both the simulation harness's determinism digest
+            // (tests/src/sim/transport.rs) and a human scanning logs want the
+            // latter.
+            NodeRequestBody::CommitTransaction { events, .. } => {
+                let mut ids: Vec<String> = events.iter().map(|e| e.payload.id().to_base64_short()).collect();
+                ids.sort();
+                write!(f, "CommitTransaction [{}]", ids.join(", "))
             }
             NodeRequestBody::Get { collection, ids } => {
-                write!(f, "Get {collection} {}", ids.iter().map(|id| id.to_base64_short()).collect::<Vec<_>>().join(", "))
+                let mut ids: Vec<String> = ids.iter().map(|id| id.to_base64_short()).collect();
+                ids.sort();
+                write!(f, "Get {collection} {}", ids.join(", "))
             }
             NodeRequestBody::GetEvents { collection, event_ids } => {
-                write!(f, "GetEvents {collection} {}", event_ids.iter().map(|id| id.to_base64_short()).collect::<Vec<_>>().join(", "),)
+                let mut ids: Vec<String> = event_ids.iter().map(|id| id.to_base64_short()).collect();
+                ids.sort();
+                write!(f, "GetEvents {collection} {}", ids.join(", "))
             }
             NodeRequestBody::Fetch { collection, selection: query, known_matches } => {
                 write!(f, "Fetch {collection} {query} known:{}", known_matches.len())
             }
-            NodeRequestBody::SubscribeQuery { query_id, collection, selection: query, version, known_matches } => {
-                write!(f, "Subscribe {query_id} {collection} {query} v{version} known:{}", known_matches.len())
+            // `query_id` is excluded for the same reason `CommitTransaction`'s
+            // `id` is above: a fresh per-send ULID, not content.
+            NodeRequestBody::SubscribeQuery { collection, selection: query, version, known_matches, .. } => {
+                write!(f, "Subscribe {collection} {query} v{version} known:{}", known_matches.len())
             }
             NodeRequestBody::RegisterSchema { models, properties, memberships } => {
                 write!(f, "RegisterSchema models:{} properties:{} memberships:{}", models.len(), properties.len(), memberships.len())
@@ -356,17 +373,23 @@ impl std::fmt::Display for NodeRequestBody {
 impl std::fmt::Display for NodeResponseBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            NodeResponseBody::CommitComplete { id } => write!(f, "CommitComplete {id}"),
+            // See `NodeRequestBody::CommitTransaction`: `id` is a per-send ULID.
+            NodeResponseBody::CommitComplete { .. } => write!(f, "CommitComplete"),
             NodeResponseBody::Fetch(deltas) => {
                 write!(f, "Fetch [{}]", deltas.len()) // TODO display deltas
             }
             NodeResponseBody::Get(states) => {
-                write!(f, "Get [{}]", states.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", "))
+                let mut ids: Vec<String> = states.iter().map(|s| s.payload.entity_id.to_base64_short()).collect();
+                ids.sort();
+                write!(f, "Get [{}]", ids.join(", "))
             }
             NodeResponseBody::GetEvents(events) => {
-                write!(f, "GetEvents [{}]", events.iter().map(|e| e.payload.to_string()).collect::<Vec<_>>().join(", "))
+                let mut ids: Vec<String> = events.iter().map(|e| e.payload.id().to_base64_short()).collect();
+                ids.sort();
+                write!(f, "GetEvents [{}]", ids.join(", "))
             }
-            NodeResponseBody::QuerySubscribed { query_id, deltas: initial } => write!(f, "Subscribed {query_id} initial:{}", initial.len()),
+            // See `NodeRequestBody::SubscribeQuery`: `query_id` is a per-send ULID.
+            NodeResponseBody::QuerySubscribed { deltas: initial, .. } => write!(f, "Subscribed initial:{}", initial.len()),
             NodeResponseBody::SchemaRegistered { models, properties, memberships } => {
                 write!(f, "SchemaRegistered models:{} properties:{} memberships:{}", models.len(), properties.len(), memberships.len())
             }
