@@ -69,7 +69,7 @@ async fn generate_creation_batch(n: usize, model: proto::EntityId) -> Result<Vec
     Ok(events
         .into_iter()
         .map(|mut event| {
-            event.model = model;
+            event.model = proto::ModelId::EntityId(model);
             Attested::from(event)
         })
         .collect())
@@ -168,7 +168,12 @@ async fn child_mid_batch() -> Result<()> {
     };
     let (node, _engine) = armed_child_node(crash).await?;
 
-    let model = node.catalog.model_id_for(Album::collection().as_str()).expect("Album registered in armed_child_node");
+    let model = *node
+        .catalog
+        .model_id_for(Album::collection().as_str())
+        .expect("Album registered in armed_child_node")
+        .as_entity_id()
+        .expect("Album is a catalog-allocated model");
     handoff_write("model", &model.to_base64())?;
     let events = generate_creation_batch(S2_BATCH, model).await?;
     // Record every entity id (in batch order) and the full events for re-delivery.
@@ -289,7 +294,12 @@ async fn child_mid_merge() -> Result<()> {
     handoff_write("entity", &album.to_base64())?;
     // Parent-side bare-engine probes need Album's model id to reconstruct
     // state envelopes (#330); the create above registered it.
-    let model = node.catalog.model_id_for(Album::collection().as_str()).expect("Album registered by the create");
+    let model = *node
+        .catalog
+        .model_id_for(Album::collection().as_str())
+        .expect("Album registered by the create")
+        .as_entity_id()
+        .expect("Album is a catalog-allocated model");
     handoff_write("model", &model.to_base64())?;
 
     // B: first edit (parent A). Head becomes {B}.
@@ -371,7 +381,12 @@ async fn child_entity_creation() -> Result<()> {
     };
     let (node, _engine) = armed_child_node(crash).await?;
 
-    let model = node.catalog.model_id_for(Album::collection().as_str()).expect("Album registered in armed_child_node");
+    let model = *node
+        .catalog
+        .model_id_for(Album::collection().as_str())
+        .expect("Album registered in armed_child_node")
+        .as_entity_id()
+        .expect("Album is a catalog-allocated model");
     handoff_write("model", &model.to_base64())?;
     let events = generate_creation_batch(1, model).await?;
     handoff_write("entity", &events[0].payload.entity_id.to_base64())?;

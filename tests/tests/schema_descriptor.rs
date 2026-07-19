@@ -316,7 +316,7 @@ fn catalog_lww_event(collection: &str, id: EntityId, parent: proto::Clock, field
     }
     let operations = backend.to_operations().unwrap().expect("catalog event has fields");
     proto::Event {
-        model: ankurah::core::schema::well_known_model_id(collection).expect("catalog collection has a well-known model"),
+        model: proto::ModelId::system(collection),
         entity_id: id,
         operations: proto::OperationSet(BTreeMap::from([("lww".to_string(), operations)])),
         parent,

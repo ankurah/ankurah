@@ -101,12 +101,11 @@ impl<'de> Deserialize<'de> for EventId {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Event {
-    /// The model-definition entity id this event's entity is read/mutated
-    /// under (#330). The wire carries the model ID, never a collection name:
-    /// receivers resolve it to local storage through well-known ids, the
-    /// catalog, and engine-owned mappings. Deliberately EXCLUDED from
+    /// The durable model address this event's entity is read/mutated under.
+    /// Registered models carry their real catalog entity id; built-in models
+    /// carry their system name. Deliberately EXCLUDED from
     /// [`EventId`] hashing, like the collection string before it.
-    pub model: EntityId,
+    pub model: crate::ModelId,
     pub entity_id: EntityId,
     pub operations: OperationSet,
     /// The set of concurrent events (usually only one) which is the precursor of this event
@@ -131,8 +130,8 @@ impl From<Attested<Event>> for EventFragment {
     }
 }
 
-impl From<(EntityId, EntityId, EventFragment)> for Attested<Event> {
-    fn from(value: (EntityId, EntityId, EventFragment)) -> Self {
+impl From<(EntityId, crate::ModelId, EventFragment)> for Attested<Event> {
+    fn from(value: (EntityId, crate::ModelId, EventFragment)) -> Self {
         let event = Event { entity_id: value.0, model: value.1, operations: value.2.operations, parent: value.2.parent };
         Attested { payload: event, attestations: value.2.attestations }
     }
@@ -147,8 +146,8 @@ pub struct StateFragment {
 impl From<Attested<EntityState>> for StateFragment {
     fn from(attested: Attested<EntityState>) -> Self { Self { state: attested.payload.state, attestations: attested.attestations } }
 }
-impl From<(EntityId, EntityId, StateFragment)> for Attested<EntityState> {
-    fn from(value: (EntityId, EntityId, StateFragment)) -> Self {
+impl From<(EntityId, crate::ModelId, StateFragment)> for Attested<EntityState> {
+    fn from(value: (EntityId, crate::ModelId, StateFragment)) -> Self {
         let entity_state = EntityState { entity_id: value.0, model: value.1, state: value.2.state };
         Attested { payload: entity_state, attestations: value.2.attestations }
     }
@@ -188,8 +187,8 @@ pub struct Operation {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct EntityState {
     pub entity_id: EntityId,
-    /// The model-definition entity id (#330); see [`Event::model`].
-    pub model: EntityId,
+    /// The durable model address; see [`Event::model`].
+    pub model: crate::ModelId,
     pub state: State,
 }
 
@@ -215,7 +214,7 @@ impl std::fmt::Display for Event {
             f,
             "Event({} {}/{} {}{} {})",
             self.id().to_base64_short(),
-            self.model.to_base64_short(),
+            format_args!("{:#}", self.model),
             self.entity_id.to_base64_short(),
             if self.is_entity_create() { "(create) " } else { "" },
             self.parent.to_base64_short(),
@@ -258,7 +257,7 @@ impl std::fmt::Display for EntityState {
 }
 
 impl Attested<Event> {
-    pub fn model(&self) -> EntityId { self.payload.model }
+    pub fn model(&self) -> &crate::ModelId { &self.payload.model }
 }
 
 impl From<Event> for Attested<Event> {
@@ -270,16 +269,16 @@ impl From<EntityState> for Attested<EntityState> {
 }
 
 impl Attested<EntityState> {
-    pub fn to_parts(self) -> (EntityId, EntityId, StateFragment) {
+    pub fn to_parts(self) -> (EntityId, crate::ModelId, StateFragment) {
         (self.payload.entity_id, self.payload.model, StateFragment { state: self.payload.state, attestations: self.attestations })
     }
-    pub fn from_parts(entity_id: EntityId, model: EntityId, fragment: StateFragment) -> Self {
+    pub fn from_parts(entity_id: EntityId, model: crate::ModelId, fragment: StateFragment) -> Self {
         Self { payload: EntityState { entity_id, model, state: fragment.state }, attestations: fragment.attestations }
     }
 }
 
 impl Attested<Event> {
-    pub fn from_parts(entity_id: EntityId, model: EntityId, frag: EventFragment) -> Self {
+    pub fn from_parts(entity_id: EntityId, model: crate::ModelId, frag: EventFragment) -> Self {
         Self { payload: Event { entity_id, model, operations: frag.operations, parent: frag.parent }, attestations: frag.attestations }
     }
 }
@@ -309,5 +308,16 @@ mod tests {
             [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
         );
         assert_eq!(id, bincode::deserialize(&bytes).unwrap());
+    }
+
+    #[test]
+    fn event_id_excludes_model_address_arm() {
+        let entity_id = EntityId::new();
+        let operations = OperationSet(BTreeMap::new());
+        let parent = Clock::default();
+        let allocated =
+            Event { model: crate::ModelId::EntityId(EntityId::new()), entity_id, operations: operations.clone(), parent: parent.clone() };
+        let system = Event { model: crate::ModelId::system("_ankurah_system"), entity_id, operations, parent };
+        assert_eq!(allocated.id(), system.id());
     }
 }

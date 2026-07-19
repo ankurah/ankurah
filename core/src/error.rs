@@ -257,8 +257,8 @@ pub enum StateError {
     DDLError(Box<dyn std::error::Error + Send + Sync + 'static>),
     #[error("DMLError: {0}")]
     DMLError(Box<dyn std::error::Error + Send + Sync + 'static>),
-    /// The wire envelope carries a model-definition id (#330) and neither the
-    /// well-known table nor the catalog can supply one for this collection.
+    /// Neither the built-in name mapping nor the catalog can supply a model
+    /// address for this collection.
     /// For a locally committed user collection this means
     /// commit-before-registration, a bug rather than a race.
     #[error("no model id for collection '{0}'")]
@@ -333,21 +333,15 @@ impl std::error::Error for ApplyError {
 #[derive(Debug)]
 pub struct ApplyErrorItem {
     pub entity_id: EntityId,
-    /// The model-definition id the wire item carried (#330); the collection
+    /// The model address the wire item carried; the collection
     /// may be unresolvable, which is itself one of the reportable causes.
-    pub model: EntityId,
+    pub model: ankurah_proto::ModelId,
     pub cause: MutationError,
 }
 
 impl std::fmt::Display for ApplyErrorItem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Failed to apply delta for entity {} of model {}: {}",
-            self.entity_id.to_base64_short(),
-            self.model.to_base64_short(),
-            self.cause
-        )
+        write!(f, "Failed to apply delta for entity {} of model {}: {}", self.entity_id.to_base64_short(), self.model, self.cause)
     }
 }
 

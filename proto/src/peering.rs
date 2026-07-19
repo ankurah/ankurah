@@ -146,6 +146,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn durable_presence_round_trips_named_system_model() {
+        let mut p = presence();
+        p.system_root = Some(Attested::opt(
+            EntityState { entity_id: EntityId::new(), model: crate::ModelId::system("_ankurah_system"), state: State::default() },
+            None,
+        ));
+        let bytes = bincode::serialize(&crate::Message::Presence(p.clone())).unwrap();
+        match bincode::deserialize::<crate::Message>(&bytes).unwrap() {
+            crate::Message::Presence(q) => assert_eq!(p, q),
+            other => panic!("expected Presence, got {other}"),
+        }
+    }
+
     /// With no nested system root, the pre-#294 encoding remains a strict
     /// prefix of the current one because protocol_version is last.
     #[test]

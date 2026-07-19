@@ -1040,10 +1040,8 @@ async fn partial_registration_retry_does_not_double_allocate() -> anyhow::Result
         let armed = armed.clone();
         ProbeAgent {
             on_event: Some(std::sync::Arc::new(move |event: &proto::Event| {
-                // #330: events carry a model id, not a collection name; the
-                // _ankurah_property catalog collection has a well-known one.
-                let property_model =
-                    ankurah::core::schema::well_known_model_id(PROPERTY).expect("_ankurah_property has a well-known model id");
+                // The built-in property catalog routes by its system name.
+                let property_model = proto::ModelId::system(PROPERTY);
                 if event.model == property_model && armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
                     return Err(ankurah::policy::AccessDenied::ByPolicy("property event denied once"));
                 }
@@ -1130,8 +1128,8 @@ async fn noop_probe_requires_collection_access() -> anyhow::Result<()> {
 }
 
 /// No legitimate registration names a reserved collection: the system and
-/// catalog collections have well-known ids and no catalog entities of their
-/// own, so a descriptor naming one could only route ordinary traffic into a
+/// catalog collections route by name and have no catalog model entities of
+/// their own, so a descriptor naming one could only route ordinary traffic into a
 /// protected collection. The executor refuses the reserved prefix in every
 /// position a request can name a collection -- the model itself, a
 /// property's minting or target collection, and a membership -- up front,

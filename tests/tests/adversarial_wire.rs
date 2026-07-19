@@ -54,13 +54,18 @@ fn forge_title_event(
     let backend = LWWBackend::new();
     backend.set(PropertyId::EntityId(title_prop.to_ulid()), Some(Value::String(title.to_owned())));
     let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
-    proto::Event { entity_id, model, operations: proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])), parent }
+    proto::Event {
+        entity_id,
+        model: proto::ModelId::EntityId(model),
+        operations: proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
+        parent,
+    }
 }
 
 fn event_only_item(event: proto::Event) -> proto::SubscriptionUpdateItem {
     proto::SubscriptionUpdateItem {
         entity_id: event.entity_id,
-        model: event.model,
+        model: event.model.clone(),
         content: proto::UpdateContent::EventOnly(vec![Attested::opt(event, None).into()]),
         predicate_relevance: vec![],
         source_queries: vec![],
@@ -72,7 +77,7 @@ fn event_only_item(event: proto::Event) -> proto::SubscriptionUpdateItem {
 fn event_only_multi(entity_id: proto::EntityId, model: proto::EntityId, events: Vec<proto::Event>) -> proto::SubscriptionUpdateItem {
     proto::SubscriptionUpdateItem {
         entity_id,
-        model,
+        model: proto::ModelId::EntityId(model),
         content: proto::UpdateContent::EventOnly(events.into_iter().map(|e| Attested::opt(e, None).into()).collect()),
         predicate_relevance: vec![],
         source_queries: vec![],
@@ -125,7 +130,7 @@ fn forge_catalog_state(collection: &str, entity_id: proto::EntityId, fields: Vec
     let operations = backend.to_operations().unwrap().expect("catalog state has fields");
     let event_id = proto::EventId::from_bytes([0x5A; 32]);
     backend.apply_operations_with_event(&operations, event_id.clone()).unwrap();
-    let model = ankurah::core::schema::well_known_model_id(collection).expect("catalog collection has a well-known model id");
+    let model = proto::ModelId::system(collection);
     Attested::opt(
         proto::EntityState {
             entity_id,
@@ -179,7 +184,12 @@ async fn fixture() -> Result<Fixture> {
     let _relay = ctx_c.query_wait::<RecordView>("true").await?;
     // The relay query resolves the Record predicate, which first-use-registers
     // the model (REN 2), so the durable server now holds its allocated id.
-    let record_model = server.catalog.model_id_for(Record::collection().as_str()).expect("Record registered by the relay query");
+    let record_model = *server
+        .catalog
+        .model_id_for(Record::collection().as_str())
+        .expect("Record registered by the relay query")
+        .as_entity_id()
+        .expect("Record is a catalog-allocated model");
     let record_title = server.catalog.resolve(Record::collection().as_str(), "title").expect("title registered with Record");
     let record_artist = server.catalog.resolve(Record::collection().as_str(), "artist").expect("artist registered with Record");
     Ok(Fixture { server, client, ctx_s, ctx_c, _conn, _relay, record_model, record_title, record_artist })
@@ -425,7 +435,7 @@ async fn malformed_clock_identity_is_order_independent_end_to_end() -> Result<()
         let ops = backend.to_operations().unwrap().expect("ops");
         proto::Event {
             entity_id: rec_id,
-            model: f.record_model,
+            model: proto::ModelId::EntityId(f.record_model),
             operations: proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
             parent: head0.clone(),
         }
@@ -511,7 +521,7 @@ async fn forged_extra_genesis_head_does_not_trigger_wholesale_adoption() -> Resu
         let ops = backend.to_operations().unwrap().expect("ops");
         proto::Event {
             entity_id: rec_id,
-            model: f.record_model,
+            model: proto::ModelId::EntityId(f.record_model),
             operations: proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
             parent: proto::Clock::default(),
         }

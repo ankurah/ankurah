@@ -784,8 +784,8 @@ where
     /// once-per-connection descriptor shipping): parse each into its def and
     /// upsert the in-memory map, exactly like the storage warm. Map-only -- a
     /// cache warm; the durable catalog entities still replicate through the
-    /// ordinary subscription paths. States whose model id is not a well-known
-    /// catalog collection are ignored (defense in depth; the sender only
+    /// ordinary subscription paths. States whose model address is not a named
+    /// system catalog collection are ignored (defense in depth; the sender only
     /// ships catalog entities).
     pub(crate) fn ingest_wire_states(&self, states: &[proto::Attested<proto::EntityState>]) {
         if states.is_empty() {
@@ -793,7 +793,7 @@ where
         }
         let mut map = self.0.map.write().unwrap();
         for state in states {
-            let Some(collection) = crate::schema::well_known_collection(&state.payload.model) else { continue };
+            let Some(collection) = crate::schema::system_collection(&state.payload.model) else { continue };
             if !crate::schema::is_catalog_collection(&collection) {
                 continue;
             }
@@ -805,7 +805,7 @@ where
                     // check:
                     //  - it must not name a reserved collection. No legitimate
                     //    catalog entity describes an `_ankurah_*` collection
-                    //    (the well-known ids have no catalog entity), so such a
+                    //    (built-ins route by name), so such a
                     //    def could only be an attempt to route ordinary traffic
                     //    into a protected collection.
                     //  - an existing model id keeps its collection, and a
@@ -1064,25 +1064,29 @@ where
     }
 
     /// INGRESS resolution for the wire envelope (#330): the collection a
-    /// model-definition id routes to. Well-known (system/catalog) ids first
-    /// -- the bootstrap base case, answerable on a stone-cold node -- then
-    /// the catalog map. `None` means the model is unknown here, which after
+    /// model address routes to. Named system/catalog models are the bootstrap
+    /// base case, answerable on a stone-cold node; allocated ids use the
+    /// catalog map. `None` means the model is unknown here, which after
     /// descriptor shipping is a protocol violation the caller rejects loudly.
-    pub fn collection_for_model(&self, model: &EntityId) -> Option<CollectionId> {
-        if let Some(collection) = crate::schema::well_known_collection(model) {
-            return Some(collection);
+    pub fn collection_for_model(&self, model: &proto::ModelId) -> Option<CollectionId> {
+        match model {
+            proto::ModelId::System { .. } => crate::schema::system_collection(model),
+            proto::ModelId::EntityId(id) => {
+                let map = self.0.map.read().unwrap();
+                map.models.get(id).map(|def| CollectionId::fixed_name(&def.collection))
+            }
         }
-        let map = self.0.map.read().unwrap();
-        map.models.get(model).map(|def| CollectionId::fixed_name(&def.collection))
     }
 
     /// EGRESS resolution for the wire envelope (#330): the model-definition
-    /// id carried on events/states for `collection`. Well-knowns first, then
-    /// the catalog map. `None` for an unregistered user collection -- the
+    /// address carried on events/states for `collection`. System names are the
+    /// bootstrap base case, then allocated ids come from the catalog map.
+    /// `None` for an unregistered user collection -- the
     /// commit path runs registration before event generation, so a miss
     /// there is a bug, not a race.
-    pub fn model_id_for(&self, collection: &str) -> Option<EntityId> {
-        crate::schema::well_known_model_id(collection).or_else(|| self.0.map.read().unwrap().by_collection.get(collection).copied())
+    pub fn model_id_for(&self, collection: &str) -> Option<proto::ModelId> {
+        crate::schema::system_model_id(collection)
+            .or_else(|| self.0.map.read().unwrap().by_collection.get(collection).copied().map(proto::ModelId::EntityId))
     }
 
     pub fn membership(&self, model: &EntityId, property: &EntityId) -> Option<MembershipDef> {
@@ -1482,7 +1486,7 @@ mod tests {
             Ok(proto::Attested::opt(
                 proto::EntityState {
                     entity_id: id,
-                    model: EntityId::new(),
+                    model: proto::ModelId::EntityId(EntityId::new()),
                     state: proto::State { state_buffers: proto::StateBuffers(BTreeMap::new()), head: proto::Clock::default() },
                 },
                 None,

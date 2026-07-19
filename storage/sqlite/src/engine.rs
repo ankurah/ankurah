@@ -615,9 +615,9 @@ impl SqliteBucket {
         ))
     }
 
-    /// The model id written on envelopes this bucket reconstructs (#330):
-    /// well-knowns, then the injected catalog resolver.
-    fn model_id(&self) -> Result<ankurah_proto::EntityId, RetrievalError> {
+    /// The model address written on envelopes this bucket reconstructs:
+    /// system name, then the real id from the injected catalog resolver.
+    fn model_id(&self) -> Result<ankurah_proto::ModelId, RetrievalError> {
         let resolver = self.resolver.read().expect("RwLock poisoned").as_ref().and_then(|weak| weak.upgrade());
         ankurah_core::storage::bucket_model_id(&self.collection_id, resolver.as_deref())
     }
@@ -958,7 +958,11 @@ impl StorageCollection for SqliteBucket {
                 let attestations: AttestationSet = bincode::deserialize(&attestations_blob).map_err(RetrievalError::storage)?;
 
                 results.push(Attested {
-                    payload: EntityState { entity_id: id, model, state: State { state_buffers: StateBuffers(state_buffers), head } },
+                    payload: EntityState {
+                        entity_id: id,
+                        model: model.clone(),
+                        state: State { state_buffers: StateBuffers(state_buffers), head },
+                    },
                     attestations,
                 });
             }
@@ -1048,7 +1052,7 @@ impl StorageCollection for SqliteBucket {
                 let parent: Clock = serde_json::from_str(&parent_json).map_err(RetrievalError::storage)?;
                 let attestations: AttestationSet = bincode::deserialize(&attestations_blob).map_err(RetrievalError::storage)?;
 
-                events.push(Attested { payload: Event { model, entity_id, operations, parent }, attestations });
+                events.push(Attested { payload: Event { model: model.clone(), entity_id, operations, parent }, attestations });
             }
         }
         Ok(events)
@@ -1086,7 +1090,7 @@ impl StorageCollection for SqliteBucket {
                 let parent: Clock = serde_json::from_str(&parent_json).map_err(RetrievalError::storage)?;
                 let attestations: AttestationSet = bincode::deserialize(&attestations_blob).map_err(RetrievalError::storage)?;
 
-                events.push(Attested { payload: Event { model, entity_id, operations, parent }, attestations });
+                events.push(Attested { payload: Event { model: model.clone(), entity_id, operations, parent }, attestations });
             }
         }
         Ok(events)

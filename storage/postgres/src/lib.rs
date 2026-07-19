@@ -366,9 +366,9 @@ impl PostgresBucket {
 
     pub fn event_table(&self) -> String { format!("{}_event", self.collection_id.as_str()) }
 
-    /// The model id written on envelopes this bucket reconstructs (#330):
-    /// well-knowns, then the injected catalog resolver.
-    fn model_id(&self) -> Result<EntityId, RetrievalError> {
+    /// The model address written on envelopes this bucket reconstructs:
+    /// system name, then the real id from the injected catalog resolver.
+    fn model_id(&self) -> Result<ankurah_proto::ModelId, RetrievalError> {
         let resolver = self.resolver.read().unwrap().as_ref().and_then(|weak| weak.upgrade());
         ankurah_core::storage::bucket_model_id(&self.collection_id, resolver.as_deref())
     }

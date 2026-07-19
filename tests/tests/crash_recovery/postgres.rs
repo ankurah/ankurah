@@ -93,7 +93,7 @@ async fn reopen_pg_node(uri: &str) -> Result<Node<Postgres, PermissiveAgent>> {
 
 /// Generate `n` independent album creation events on a throwaway in-memory sled
 /// node (event generation is engine-independent).
-async fn generate_creation_batch(n: usize, model: proto::EntityId) -> Result<Vec<Attested<proto::Event>>> {
+async fn generate_creation_batch(n: usize, model: proto::ModelId) -> Result<Vec<Attested<proto::Event>>> {
     use ankurah_storage_sled::SledStorageEngine;
     let helper = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
     helper.system.create().await?;
@@ -107,7 +107,7 @@ async fn generate_creation_batch(n: usize, model: proto::EntityId) -> Result<Vec
     Ok(events
         .into_iter()
         .map(|mut event| {
-            event.model = model;
+            event.model = model.clone();
             Attested::from(event)
         })
         .collect())

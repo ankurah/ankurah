@@ -112,8 +112,8 @@ pub enum DeltaContent {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct EntityDelta {
     pub entity_id: EntityId,
-    /// The model-definition entity id (#330); see `Event::model` in data.rs.
-    pub model: EntityId,
+    /// The durable model address; see `Event::model` in data.rs.
+    pub model: crate::ModelId,
     pub content: DeltaContent,
 }
 
@@ -305,12 +305,12 @@ pub enum NodeResponseBody {
 impl NodeResponseBody {
     /// Model ids carried by entity data in this response. Senders use this to
     /// attach any catalog definitions the connection has not seen yet.
-    pub fn referenced_models(&self) -> BTreeSet<EntityId> {
+    pub fn referenced_models(&self) -> BTreeSet<crate::ModelId> {
         let mut models = BTreeSet::new();
         match self {
-            Self::Fetch(deltas) | Self::QuerySubscribed { deltas, .. } => models.extend(deltas.iter().map(|delta| delta.model)),
-            Self::Get(states) => models.extend(states.iter().map(|state| state.payload.model)),
-            Self::GetEvents(events) => models.extend(events.iter().map(|event| event.payload.model)),
+            Self::Fetch(deltas) | Self::QuerySubscribed { deltas, .. } => models.extend(deltas.iter().map(|delta| delta.model.clone())),
+            Self::Get(states) => models.extend(states.iter().map(|state| state.payload.model.clone())),
+            Self::GetEvents(events) => models.extend(events.iter().map(|event| event.payload.model.clone())),
             Self::CommitComplete { .. } | Self::SchemaRegistered { .. } | Self::Success | Self::Error(_) => {}
         }
         models
@@ -383,7 +383,7 @@ impl std::fmt::Display for EntityDelta {
             DeltaContent::EventBridge { events } => {
                 let mut event_strs = Vec::new();
                 for event in events {
-                    let event = Attested::<Event>::from_parts(self.entity_id, self.model, event.clone());
+                    let event = Attested::<Event>::from_parts(self.entity_id, self.model.clone(), event.clone());
                     event_strs.push(event.payload.to_string());
                 }
                 write!(f, "EntityDelta {}: EventBridge({})", self.entity_id, event_strs.join(", "))

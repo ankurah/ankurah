@@ -348,13 +348,13 @@ impl Entity {
         Ok(EntityState { entity_id: self.id(), model: self.model_id()?, state })
     }
 
-    /// The model-definition id carried on this entity's wire envelopes
-    /// (#330): the well-known id for system/catalog collections, else the
-    /// bound catalog resolver's mapping for the collection. Fails
+    /// The durable model address carried on this entity's wire envelopes:
+    /// the name for system/catalog collections, else the real id from the
+    /// bound catalog resolver. Fails
     /// `UnknownModel` when neither answers.
-    pub(crate) fn model_id(&self) -> Result<EntityId, StateError> {
-        crate::schema::well_known_model_id(self.collection.as_str())
-            .or_else(|| self.resolver().and_then(|r| r.model_id_for(self.collection.as_str())))
+    pub(crate) fn model_id(&self) -> Result<ankurah_proto::ModelId, StateError> {
+        crate::schema::system_model_id(self.collection.as_str())
+            .or_else(|| self.resolver().and_then(|r| r.model_id_for(self.collection.as_str())).map(ankurah_proto::ModelId::EntityId))
             .ok_or_else(|| StateError::UnknownModel(self.collection.to_string()))
     }
 
@@ -1091,8 +1091,8 @@ mod tests {
     /// retry instead of being stranded.
     #[test]
     fn commit_event_model_id_failure_leaves_operations_staged() {
-        // "albums" is not a well-known collection and no resolver is bound,
-        // so model_id() fails.
+        // "albums" is not a built-in collection and no resolver is bound, so
+        // model_id() fails.
         let entity = Entity::create(EntityId::new(), CollectionId::fixed_name("albums"));
         let key = property_key(0x11);
         let backend = LWWBackend::new();

@@ -135,9 +135,9 @@ where
                 named.insert(ms.collection.as_str());
             }
             // Reserved collections are refused before policy is even asked:
-            // the catalog and system collections have well-known ids and no
-            // catalog entities of their own (see the descriptor-ingest twin
-            // of this guard in catalog.rs), so a registration naming one --
+            // the catalog and system collections route by name and have no
+            // catalog model entities of their own (see the descriptor-ingest
+            // twin of this guard in catalog.rs), so a registration naming one --
             // as a model collection, a property's minting or target
             // collection, or a membership's collection -- could only route
             // ordinary traffic into a protected collection.
@@ -848,10 +848,9 @@ fn follow_up_patch(
         backend.set(PropertyId::System { name: name.to_string() }, value);
     }
     let operations = backend.to_operations().expect("LWW encoding of scalar values is infallible").expect("fields are non-empty");
-    // Catalog collections have well-known model ids by construction (#330);
-    // this helper is only ever called for them.
-    let model = crate::schema::well_known_model_id(collection.as_str())
-        .expect("registration events target the catalog collections, which have well-known model ids");
+    // Catalog collections use their system names as model addresses; this
+    // helper is only ever called for those built-ins.
+    let model = crate::schema::system_model_id(collection.as_str()).expect("registration events target built-in catalog collections");
     proto::Event { model, entity_id, operations: proto::OperationSet(BTreeMap::from([("lww".to_string(), operations)])), parent }
 }
 

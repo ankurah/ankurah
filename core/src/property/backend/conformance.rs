@@ -156,7 +156,7 @@ fn make_event(seed: u16, backend_name: &str, operations: Vec<Operation>, parents
     let mut entity_id_bytes = [0u8; 16];
     entity_id_bytes[0..2].copy_from_slice(&seed.to_be_bytes());
     let entity_id = EntityId::from_bytes(entity_id_bytes);
-    // Deterministic fake model id (#330): the conformance kit builds events by
+    // Deterministic allocated-arm value: the conformance kit builds events by
     // hand and applies them straight to a backend, never routing through a
     // node's catalog; the model field is also excluded from `EventId` hashing.
     let mut model_bytes = [0u8; 16];
@@ -164,7 +164,7 @@ fn make_event(seed: u16, backend_name: &str, operations: Vec<Operation>, parents
     let model = EntityId::from_bytes(model_bytes);
     Event {
         entity_id,
-        model,
+        model: ankurah_proto::ModelId::EntityId(model),
         parent: Clock::from(parents.to_vec()),
         operations: OperationSet(BTreeMap::from([(backend_name.to_string(), operations)])),
     }

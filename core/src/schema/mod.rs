@@ -28,7 +28,7 @@ pub use resolver::CatalogResolver;
 use crate::property::PropertyError;
 use crate::value::ValueType;
 use ankql::ast::PathExpr;
-use ankurah_proto::{CollectionId, EntityId};
+use ankurah_proto::{CollectionId, ModelId};
 
 /// Trait for providing schema information about collections
 pub trait CollectionSchema {
@@ -67,47 +67,18 @@ pub fn is_protected_collection(id: &CollectionId) -> bool {
     id.as_str() == crate::system::SYSTEM_COLLECTION_ID || is_catalog_collection(id)
 }
 
-/// Well-known (reserved) model-definition entity ids for the system and
-/// catalog collections (#330). The wire envelope carries a model id, not a
-/// collection name, so a cold node must be able to route THESE collections'
-/// events before it holds any catalog data -- the bootstrap base case moves
-/// from static names to static ids. No catalog entity describes them (the
-/// self-description ouroboros stays forbidden); the ids exist only for
-/// routing and the protected-collections guard.
-///
-/// Reserved ids are 15 zero bytes + a one-byte ordinal. These are valid ULID
-/// values; the guarantee is about generation, not the value space: a minted
-/// `EntityId::new()` carries the current unix-time milliseconds in its
-/// leading bytes, so no honestly generated id (in particular, no
-/// catalog-allocated model id) ever lands in the zero-prefix range. Wire
-/// deserialization will accept a crafted zero-prefix id, but that does not
-/// collide with anything: it merely names a built-in collection, and writes
-/// to those are policed by the protected-collections guard regardless of how
-/// the id was produced.
-const WELL_KNOWN_MODELS: &[(u8, &str)] =
-    &[(1, crate::system::SYSTEM_COLLECTION_ID), (2, MODEL_COLLECTION_ID), (3, PROPERTY_COLLECTION_ID), (4, MODEL_PROPERTY_COLLECTION_ID)];
-
-/// The reserved id for one [`WELL_KNOWN_MODELS`] ordinal: 15 zero bytes plus
-/// the ordinal. This is an address in model-id space with no entity behind
-/// it -- see the invariants on [`WELL_KNOWN_MODELS`] above.
-fn well_known_id(ordinal: u8) -> EntityId {
-    let mut bytes = [0u8; 16];
-    bytes[15] = ordinal;
-    EntityId::from_bytes(bytes)
+/// The name-addressed model id for a built-in collection. Built-ins have no
+/// model-definition entity, so this is the catalog-bootstrap base case.
+pub fn system_model_id(collection: &str) -> Option<ModelId> {
+    let collection_id = CollectionId::fixed_name(collection);
+    is_protected_collection(&collection_id).then(|| ModelId::system(collection))
 }
 
-/// The reserved model id for a system/catalog collection, if `collection` is
-/// one. User collections resolve their model id through the catalog instead.
-pub fn well_known_model_id(collection: &str) -> Option<EntityId> {
-    WELL_KNOWN_MODELS.iter().find(|(_, name)| *name == collection).map(|(ordinal, _)| well_known_id(*ordinal))
-}
-
-/// The collection a reserved model id routes to, if `id` is one. The inverse
-/// of [`well_known_model_id`].
-pub fn well_known_collection(id: &EntityId) -> Option<CollectionId> {
-    let bytes = id.to_bytes();
-    if bytes[..15] != [0u8; 15] {
-        return None;
-    }
-    WELL_KNOWN_MODELS.iter().find(|(ordinal, _)| *ordinal == bytes[15]).map(|(_, name)| CollectionId::fixed_name(name))
+/// Validate and resolve the system-name arm of a model address. An arbitrary
+/// `System` name is untrusted wire input; only actual built-ins route without
+/// a catalog allocation.
+pub fn system_collection(model: &ModelId) -> Option<CollectionId> {
+    let ModelId::System { name } = model else { return None };
+    let collection = CollectionId::fixed_name(name);
+    is_protected_collection(&collection).then_some(collection)
 }

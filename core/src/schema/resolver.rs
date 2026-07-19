@@ -17,9 +17,9 @@ pub trait CatalogResolver: Send + Sync {
     /// Storage engines use this only to seed durable physical-name maps.
     fn name_for(&self, id: &EntityId) -> Option<String>;
 
-    /// The model-definition id for `collection`, if the catalog knows it.
-    /// Well-known system/catalog ids remain a static bootstrap concern for
-    /// callers and are not synthesized by this interface.
+    /// The real model-definition entity id for `collection`, if the catalog
+    /// knows it. Built-in name addresses are a bootstrap concern for callers
+    /// and are not synthesized by this interface.
     fn model_id_for(&self, collection: &str) -> Option<EntityId> {
         let _ = collection;
         None

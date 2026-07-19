@@ -51,10 +51,8 @@ pub fn sim_collection() -> proto::CollectionId { SimRecord::collection() }
 /// would reject an unknown id; [`super::node::build_nodes`] seeds this exact id
 /// into every node's catalog so resolution routes it to the `SimRecord`
 /// collection. Constant and deterministic, so it is identical across every node
-/// in a run and across the two determinism-audit runs. The high bytes are
-/// non-zero, so it can never collide with a well-known model id (all-zero
-/// prefix) nor with a seed-derived entity id ([`entity_id`] fills only the low
-/// eight bytes, leaving the high bytes zero).
+/// in a run and across the two determinism-audit runs. It is an actual seeded
+/// catalog entity id; the wire wraps it in `ModelId::EntityId`.
 pub fn sim_model_id() -> proto::EntityId { proto::EntityId::from_bytes([0x5B; 16]) }
 
 /// Stable catalog identity for each simulated property. The simulation
@@ -123,12 +121,17 @@ fn lww_ops(field: Field, value: &str) -> proto::OperationSet {
 /// it as a create (`Event::is_entity_create`). `field`/`value` seed the initial
 /// state.
 pub fn genesis_event(entity: proto::EntityId, field: Field, value: &str) -> proto::Event {
-    proto::Event { model: sim_model_id(), entity_id: entity, operations: lww_ops(field, value), parent: proto::Clock::default() }
+    proto::Event {
+        model: proto::ModelId::EntityId(sim_model_id()),
+        entity_id: entity,
+        operations: lww_ops(field, value),
+        parent: proto::Clock::default(),
+    }
 }
 
 /// Forge a non-genesis event parented on `parent`, setting `field` to `value`.
 pub fn edit_event(entity: proto::EntityId, parent: proto::Clock, field: Field, value: &str) -> proto::Event {
-    proto::Event { model: sim_model_id(), entity_id: entity, operations: lww_ops(field, value), parent }
+    proto::Event { model: proto::ModelId::EntityId(sim_model_id()), entity_id: entity, operations: lww_ops(field, value), parent }
 }
 
 /// Wrap a forged event as an unsigned `Attested<Event>`. Under `PermissiveAgent`

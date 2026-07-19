@@ -352,12 +352,11 @@ fn forged_model_delta(collection: &str) -> (EntityId, proto::Attested<proto::Ent
     let event_id = proto::EventId::from_bytes([0x6B; 32]);
     backend.apply_operations_with_event(&operations, event_id.clone()).unwrap();
     let entity_id = EntityId::new();
-    let model = ankurah::core::schema::well_known_model_id(ankurah::core::schema::MODEL_COLLECTION_ID)
-        .expect("model catalog has a well-known model id");
+    let model = proto::ModelId::system(ankurah::core::schema::MODEL_COLLECTION_ID);
     let state = proto::Attested::opt(
         proto::EntityState {
             entity_id,
-            model,
+            model: model.clone(),
             state: proto::State {
                 state_buffers: proto::StateBuffers(BTreeMap::from([("lww".to_owned(), backend.to_state_buffer().unwrap())])),
                 head: proto::Clock::from(vec![event_id]),
@@ -1226,7 +1225,11 @@ async fn durable_activation_error_releases_initialization_waiters() -> anyhow::R
     let storage = node.collections.get(&collection).await?;
     storage
         .set_state(proto::Attested::opt(
-            proto::EntityState { entity_id: proto::EntityId::new(), model: proto::EntityId::new(), state: proto::State::default() },
+            proto::EntityState {
+                entity_id: proto::EntityId::new(),
+                model: proto::ModelId::EntityId(proto::EntityId::new()),
+                state: proto::State::default(),
+            },
             None,
         ))
         .await?;

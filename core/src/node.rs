@@ -43,12 +43,12 @@ pub struct PeerState {
     subscription_handler: SubscriptionHandler,
     pending_requests: SafeMap<proto::RequestId, PendingRequest>,
     pending_updates: SafeMap<proto::UpdateId, oneshot::Sender<Result<proto::NodeResponseBody, RequestError>>>,
-    /// Model-definition ids whose catalog defs were already handed to this
+    /// Model addresses whose catalog defs were already handed to this
     /// connection's transport (#330 once-per-connection descriptor shipping).
     /// Marked by [`Self::mark_models_announced`] only after a successful
     /// send. A reconnection builds a fresh `PeerState`, so the peer is
     /// re-announced.
-    announced_models: std::sync::Mutex<std::collections::BTreeSet<proto::EntityId>>,
+    announced_models: std::sync::Mutex<std::collections::BTreeSet<proto::ModelId>>,
 }
 
 struct PendingRequest {
@@ -75,11 +75,11 @@ impl PeerState {
     /// ship schema-less messages that can overtake the descriptor-carrying
     /// one, and a failed send would leave the models marked announced yet
     /// never described on this connection.
-    fn mark_models_announced(&self, models: &[proto::EntityId]) {
+    fn mark_models_announced(&self, models: &[proto::ModelId]) {
         if models.is_empty() {
             return;
         }
-        self.announced_models.lock().unwrap().extend(models.iter().copied());
+        self.announced_models.lock().unwrap().extend(models.iter().cloned());
     }
 }
 
@@ -368,8 +368,8 @@ where
     }
     /// Catalog definition states for the `models` not yet announced on
     /// `connection` (#330 once-per-connection descriptor shipping), plus the
-    /// model ids those states describe. Well-known system/catalog ids need no
-    /// defs (they are static). The defs are the stored, attested catalog
+    /// model addresses those states describe. Named system/catalog models
+    /// need no defs. The defs are the stored, attested catalog
     /// entities themselves -- model, memberships, properties -- so the
     /// receiver validates and ingests them exactly like any served state.
     ///
@@ -387,21 +387,38 @@ where
     async fn schema_states_for_models(
         &self,
         connection: &PeerState,
-        models: std::collections::BTreeSet<proto::EntityId>,
-    ) -> (Vec<proto::Attested<proto::EntityState>>, Vec<proto::EntityId>) {
-        let fresh: Vec<proto::EntityId> = {
+        models: std::collections::BTreeSet<proto::ModelId>,
+    ) -> (Vec<proto::Attested<proto::EntityState>>, Vec<proto::ModelId>) {
+        let fresh: Vec<proto::ModelId> = {
             let announced = connection.announced_models.lock().unwrap();
             models
                 .into_iter()
-                .filter(|model| crate::schema::well_known_collection(model).is_none())
+                .filter(|model| matches!(model, proto::ModelId::EntityId(_)))
                 .filter(|model| !announced.contains(model))
                 .collect()
         };
         if fresh.is_empty() {
             return (Vec::new(), Vec::new());
         }
-        let (states, failed) = self.catalog.definition_states_for_models(&fresh).await;
-        let described = if failed.is_empty() { fresh } else { fresh.into_iter().filter(|model| !failed.contains(model)).collect() };
+        let allocated: Vec<proto::EntityId> = fresh
+            .iter()
+            .filter_map(|model| match model {
+                proto::ModelId::EntityId(id) => Some(*id),
+                proto::ModelId::System { .. } => None,
+            })
+            .collect();
+        let (states, failed) = self.catalog.definition_states_for_models(&allocated).await;
+        let described = if failed.is_empty() {
+            fresh
+        } else {
+            fresh
+                .into_iter()
+                .filter(|model| match model {
+                    proto::ModelId::EntityId(id) => !failed.contains(id),
+                    proto::ModelId::System { .. } => false,
+                })
+                .collect()
+        };
         (states, described)
     }
 
@@ -696,9 +713,9 @@ where
                 // regardless of the sender's software version; the catalog's
                 // only mutation path is the registration operation (RFC 4).
                 //
-                // The write target is the collection the model id RESOLVES to,
-                // not the literal id on the wire: a static well-known-id check
-                // would miss a non-reserved model id that the catalog map
+                // The write target is the collection the model address RESOLVES
+                // to, not merely its enum arm: checking only `System` would
+                // miss an allocated model address that the catalog map
                 // routes to a protected collection. Resolve every event up
                 // front so a protected target aborts the whole transaction
                 // before any event is written. (Registration writes the catalog
@@ -867,14 +884,17 @@ where
     }
 
     /// INGRESS resolution for the wire envelope (#330): the collection a
-    /// received model id routes to -- well-known system/catalog ids answer on
-    /// a stone-cold node, user models come from the catalog map. A miss is
+    /// received model address routes to -- named system/catalog models answer
+    /// on a stone-cold node, registered models come from the catalog map. A miss is
     /// rejected loudly: once descriptor shipping guarantees delivery, an
     /// unresolvable model id is a protocol violation, and rejection (unlike
     /// synthesizing a collection) is retryable.
-    pub(crate) fn resolve_model(&self, model: &proto::EntityId) -> Result<proto::CollectionId, RetrievalError> {
-        self.catalog.collection_for_model(model).ok_or_else(|| {
-            RetrievalError::Other(format!("unknown model id {}: no well-known or catalog entry (protocol violation?)", model.to_base64()))
+    pub(crate) fn resolve_model(&self, model: &proto::ModelId) -> Result<proto::CollectionId, RetrievalError> {
+        self.catalog.collection_for_model(model).ok_or_else(|| match model {
+            proto::ModelId::System { name } => RetrievalError::Other(format!("unknown system model name '{name}' (protocol violation?)")),
+            proto::ModelId::EntityId(id) => {
+                RetrievalError::Other(format!("unknown model entity id {}: no catalog entry (protocol violation?)", id.to_base64()))
+            }
         })
     }
 
@@ -884,7 +904,7 @@ where
     /// readiness once and retry before rejecting. Ephemeral nodes never
     /// wait here -- their defs arrive inline with the message (descriptor
     /// shipping runs before body processing), so a miss is already final.
-    pub(crate) async fn resolve_model_wait(&self, model: &proto::EntityId) -> Result<proto::CollectionId, RetrievalError> {
+    pub(crate) async fn resolve_model_wait(&self, model: &proto::ModelId) -> Result<proto::CollectionId, RetrievalError> {
         match self.resolve_model(model) {
             Ok(collection) => Ok(collection),
             Err(e) => {
@@ -909,8 +929,8 @@ where
         let mut changes = Vec::new();
 
         for event in events.iter_mut() {
-            // INGRESS (#330): the envelope carries a model id; resolve it to
-            // the local collection (well-knowns, then catalog) or reject.
+            // INGRESS: resolve the envelope's model address (validated system
+            // name or allocated catalog id) to a local collection or reject.
             let collection_id = self.resolve_model_wait(&event.payload.model).await?;
             let collection = self.collections.get(&collection_id).await?;
 
@@ -1526,7 +1546,7 @@ mod tests {
         Attested::opt(
             EntityState {
                 entity_id: proto::EntityId::new(),
-                model: crate::schema::well_known_model_id(crate::schema::MODEL_COLLECTION_ID).unwrap(),
+                model: proto::ModelId::system(crate::schema::MODEL_COLLECTION_ID),
                 state: proto::State {
                     state_buffers: proto::StateBuffers(BTreeMap::from([("lww".to_owned(), backend.to_state_buffer().unwrap())])),
                     head: proto::Clock::from(vec![event_id]),
@@ -1534,6 +1554,52 @@ mod tests {
             },
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn model_addresses_route_without_special_entity_patterns() {
+        let node = Node::new(Arc::new(EmptyEngine), PermissiveAgent::new());
+
+        for name in [
+            crate::system::SYSTEM_COLLECTION_ID,
+            crate::schema::MODEL_COLLECTION_ID,
+            crate::schema::PROPERTY_COLLECTION_ID,
+            crate::schema::MODEL_PROPERTY_COLLECTION_ID,
+        ] {
+            assert_eq!(node.resolve_model(&proto::ModelId::system(name)).unwrap().as_str(), name);
+        }
+
+        // A System arm is untrusted input, not permission to bypass catalog
+        // allocation. This stays invalid even after a real model entity for
+        // the same collection has been ingested.
+        let state = forged_model_state("albums");
+        let allocated = state.payload.entity_id;
+        node.catalog.ingest_wire_states(&[state]);
+        assert_eq!(
+            node.resolve_model(&proto::ModelId::EntityId(allocated)).unwrap().as_str(),
+            "albums",
+            "a registered model routes through its actual catalog entity"
+        );
+        assert!(node.resolve_model(&proto::ModelId::system("albums")).is_err());
+        assert!(node.resolve_model(&proto::ModelId::system("_ankurah_future")).is_err());
+
+        // Byte patterns formerly used as synthetic addresses have no special
+        // meaning. Every one remains an allocated-id arm and fails normally
+        // when there is no real catalog entity behind it.
+        for suffix in [0u8, 1, 2, 3, 4, 5] {
+            let mut bytes = [0u8; 16];
+            bytes[15] = suffix;
+            assert!(node.resolve_model(&proto::ModelId::EntityId(proto::EntityId::from_bytes(bytes))).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn schema_ingress_rejects_non_catalog_system_names() {
+        let node = Node::new(Arc::new(EmptyEngine), PermissiveAgent::new());
+        let mut state = forged_model_state("poisoned");
+        state.payload.model = proto::ModelId::system("albums");
+        node.catalog.ingest_wire_states(&[state]);
+        assert!(node.catalog.model_by_collection("poisoned").is_none());
     }
 
     #[tokio::test]
@@ -1646,7 +1712,7 @@ mod tests {
             Ok(Attested::opt(
                 EntityState {
                     entity_id: id,
-                    model: crate::schema::well_known_model_id(crate::schema::MODEL_COLLECTION_ID).unwrap(),
+                    model: proto::ModelId::system(crate::schema::MODEL_COLLECTION_ID),
                     state: proto::State { state_buffers: proto::StateBuffers(BTreeMap::new()), head: proto::Clock::default() },
                 },
                 None,
@@ -1670,7 +1736,7 @@ mod tests {
         proto::NodeUpdateBody::SubscriptionUpdate {
             items: vec![proto::SubscriptionUpdateItem {
                 entity_id: proto::EntityId::new(),
-                model,
+                model: proto::ModelId::EntityId(model),
                 content: proto::UpdateContent::EventOnly(Vec::new()),
                 predicate_relevance: Vec::new(),
                 source_queries: Vec::new(),
@@ -1702,13 +1768,14 @@ mod tests {
         .unwrap();
         let connection = node.peer_connections.get(&peer).expect("peer registered");
         let model = proto::EntityId::new();
+        let model_address = proto::ModelId::EntityId(model);
 
         // A send that fails at the transport must leave the model unannounced,
         // so a later message can re-ship its descriptors.
         node.send_update(peer, update_referencing(model));
         wait_for(|| attempts.load(Ordering::Acquire) >= 1).await;
         assert!(
-            !connection.announced_models.lock().unwrap().contains(&model),
+            !connection.announced_models.lock().unwrap().contains(&model_address),
             "a failed send must leave the model eligible for re-announcement"
         );
 
@@ -1722,7 +1789,7 @@ mod tests {
             let proto::NodeMessage::Update(update) = &sent[0] else { panic!("expected an update message") };
             assert!(!update.schema.is_empty(), "the first delivered update must carry the model's catalog descriptors");
         }
-        wait_for(|| connection.announced_models.lock().unwrap().contains(&model)).await;
+        wait_for(|| connection.announced_models.lock().unwrap().contains(&model_address)).await;
 
         // Already announced on this connection: later updates ship schema-less.
         node.send_update(peer, update_referencing(model));

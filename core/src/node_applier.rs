@@ -46,10 +46,10 @@ impl NodeApplier {
         let mut errors: Vec<ApplyErrorItem> = Vec::new();
         for update in items {
             let entity_id = update.entity_id;
-            let item_model = update.model;
+            let item_model = update.model.clone();
             let result = async {
-                // INGRESS (#330): resolve the wire model id to the local
-                // collection (well-knowns, then catalog) or reject this item.
+                // INGRESS: resolve the wire model address (validated system
+                // name or allocated catalog id) or reject this item.
                 let collection_id = node.resolve_model_wait(&update.model).await?;
                 let collection = node.collections.get(&collection_id).await?;
                 let event_getter = CachedEventGetter::new(collection_id, collection.clone(), node, &cdata);
@@ -58,7 +58,7 @@ impl NodeApplier {
             }
             .await;
             if let Err(cause) = result {
-                tracing::warn!("failed to apply update for model {}/{}: {}", item_model.to_base64_short(), entity_id, cause);
+                tracing::warn!("failed to apply update for model {}/{}: {}", item_model, entity_id, cause);
                 errors.push(ApplyErrorItem { entity_id, model: item_model, cause });
             }
         }
@@ -77,7 +77,7 @@ impl NodeApplier {
         node: &Node<SE, PA>,
         from_peer_id: &proto::EntityId,
         entity_id: proto::EntityId,
-        model: proto::EntityId,
+        model: proto::ModelId,
         event_fragments: Vec<proto::EventFragment>,
         event_getter: &E,
     ) -> Result<Vec<Attested<proto::Event>>, MutationError>
@@ -88,7 +88,7 @@ impl NodeApplier {
     {
         let mut attested_events = Vec::new();
         for fragment in event_fragments {
-            let attested_event: Attested<proto::Event> = (entity_id, model, fragment).into();
+            let attested_event: Attested<proto::Event> = (entity_id, model.clone(), fragment).into();
             // Relayed catalog events are trusted from the serving peer the
             // way every other served event is (RFC section 4 in
             // specs/model-property-metadata/rfc.md). The
@@ -179,7 +179,8 @@ impl NodeApplier {
 
             // StateAndEvent: equivalent to old SubscriptionItem::Add
             proto::UpdateContent::StateAndEvent(state_fragment, event_fragments) => {
-                let attested_events = Self::validate_and_stage(node, from_peer_id, entity_id, model, event_fragments, event_getter)?;
+                let attested_events =
+                    Self::validate_and_stage(node, from_peer_id, entity_id, model.clone(), event_fragments, event_getter)?;
                 // Sorted for the same reason as the EventOnly arm: the
                 // fallback below applies event by event.
                 let attested_events = crate::event_dag::ordering::topo_sort_events(attested_events)?;
@@ -303,7 +304,7 @@ impl NodeApplier {
         S: GetState + Send + Sync,
     {
         let entity_id = delta.entity_id;
-        let model = delta.model;
+        let model = delta.model.clone();
 
         let result = Self::apply_delta_inner(node, from_peer_id, delta, event_getter, state_getter).await;
         result.map_err(|cause| ApplyErrorItem { entity_id, model, cause })
@@ -322,20 +323,19 @@ impl NodeApplier {
         E: SuspenseEvents + Send + Sync,
         S: GetState + Send + Sync,
     {
-        // INGRESS (#330): resolve the wire model id to the local collection
-        // (well-knowns, then catalog) or reject this delta.
-        let collection_id = node.resolve_model_wait(&delta.model).await?;
+        // INGRESS: resolve the wire model address to the local collection or
+        // reject this delta. System-name arms are validated at this boundary.
+        let proto::EntityDelta { entity_id, model, content } = delta;
+        let collection_id = node.resolve_model_wait(&model).await?;
         let collection = node.collections.get(&collection_id).await?;
 
-        match delta.content {
+        match content {
             proto::DeltaContent::StateSnapshot { state } => {
-                let attested_state = (delta.entity_id, delta.model, state).into();
+                let attested_state = (entity_id, model, state).into();
                 node.policy_agent.validate_received_state(node, from_peer_id, &attested_state)?;
 
-                let (changed, entity) = node
-                    .entities
-                    .with_state(state_getter, event_getter, delta.entity_id, collection_id, attested_state.payload.state)
-                    .await?;
+                let (changed, entity) =
+                    node.entities.with_state(state_getter, event_getter, entity_id, collection_id, attested_state.payload.state).await?;
 
                 // Save state to storage
                 Self::save_state(node, &entity, &collection).await?;
@@ -361,10 +361,10 @@ impl NodeApplier {
             proto::DeltaContent::EventBridge { events } => {
                 // Bridge events pass the same policy gate as subscription
                 // updates; transport must not decide trust.
-                let attested_events = Self::validate_and_stage(node, from_peer_id, delta.entity_id, delta.model, events, event_getter)?;
+                let attested_events = Self::validate_and_stage(node, from_peer_id, entity_id, model, events, event_getter)?;
 
                 // Get or create entity
-                let entity = node.entities.get_retrieve_or_create(state_getter, event_getter, &collection_id, &delta.entity_id).await?;
+                let entity = node.entities.get_retrieve_or_create(state_getter, event_getter, &collection_id, &entity_id).await?;
 
                 // Apply events parents-first. Wire order is untrusted: applying
                 // a child before its staged parent gap-jumps the head past the

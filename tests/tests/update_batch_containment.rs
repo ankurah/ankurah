@@ -27,13 +27,18 @@ fn forge_title_event(
     let backend = LWWBackend::new();
     backend.set(PropertyId::EntityId(title_prop.to_ulid()), Some(Value::String(title.to_owned())));
     let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
-    proto::Event { entity_id, model, operations: proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])), parent }
+    proto::Event {
+        entity_id,
+        model: proto::ModelId::EntityId(model),
+        operations: proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
+        parent,
+    }
 }
 
 fn event_only_item(event: proto::Event, source_query: proto::QueryId) -> proto::SubscriptionUpdateItem {
     proto::SubscriptionUpdateItem {
         entity_id: event.entity_id,
-        model: event.model,
+        model: event.model.clone(),
         content: proto::UpdateContent::EventOnly(vec![Attested::opt(event, None).into()]),
         predicate_relevance: vec![],
         source_queries: vec![source_query],
@@ -69,7 +74,12 @@ async fn test_event_only_multi_event_wire_order_is_untrusted() -> Result<()> {
     let view = ctx_c.get::<RecordView>(rec_id).await?;
     assert_eq!(view.title().unwrap(), "t0");
     // #330: forged events carry Record's model id, registered by the create above.
-    let record_model = server.catalog.model_id_for(Record::collection().as_str()).expect("record registered by the create");
+    let record_model = *server
+        .catalog
+        .model_id_for(Record::collection().as_str())
+        .expect("record registered by the create")
+        .as_entity_id()
+        .expect("Record is a catalog-allocated model");
     let record_title = server.catalog.resolve(Record::collection().as_str(), "title").expect("title registered with Record");
     let record_artist = server.catalog.resolve(Record::collection().as_str(), "artist").expect("artist registered with Record");
 
@@ -96,7 +106,7 @@ async fn test_event_only_multi_event_wire_order_is_untrusted() -> Result<()> {
 
     let item = proto::SubscriptionUpdateItem {
         entity_id: rec_id,
-        model: record_model,
+        model: proto::ModelId::EntityId(record_model),
         content: proto::UpdateContent::EventOnly(vec![Attested::opt(ev_child, None).into(), Attested::opt(ev_parent, None).into()]),
         predicate_relevance: vec![],
         source_queries: vec![relay_context.query_id()],
@@ -157,7 +167,12 @@ async fn test_event_only_unknown_entity_does_not_poison_batch() -> Result<()> {
     assert_eq!(view_a.title().unwrap(), "a0");
     assert_eq!(view_b.title().unwrap(), "b0");
     // #330: forged events carry Record's model id, registered by the creates above.
-    let record_model = server.catalog.model_id_for(Record::collection().as_str()).expect("record registered by the creates");
+    let record_model = *server
+        .catalog
+        .model_id_for(Record::collection().as_str())
+        .expect("record registered by the creates")
+        .as_entity_id()
+        .expect("Record is a catalog-allocated model");
     let record_title = server.catalog.resolve(Record::collection().as_str(), "title").expect("title registered with Record");
 
     // Forge the batch: valid events for A and B (parented on their current

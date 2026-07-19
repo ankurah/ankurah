@@ -4,25 +4,25 @@ use async_trait::async_trait;
 use tracing::warn;
 
 use crate::error::{MutationError, RetrievalError};
-use ankurah_proto::{Attested, CollectionId, EntityId, EntityState, Event, EventId};
+use ankurah_proto::{Attested, CollectionId, EntityId, EntityState, Event, EventId, ModelId};
 
 pub fn state_name(name: &str) -> String { format!("{}_state", name) }
 
 pub fn event_name(name: &str) -> String { format!("{}_event", name) }
 
-/// The model-definition id a storage bucket writes on wire envelopes it
-/// reconstructs from stored fragments (#330): well-known system/catalog ids
-/// first (answerable stone-cold, which is how the catalog itself warms from
-/// storage), then the injected catalog resolver. An error means a
+/// The model address a storage bucket writes on wire envelopes it reconstructs
+/// from stored fragments: system/catalog names first (answerable stone-cold,
+/// which is how the catalog itself warms from storage), then the real model
+/// entity id from the injected catalog resolver. An error means a
 /// user-collection envelope is being reconstructed before the catalog warmed;
 /// readiness gating makes that unreachable in steady state, and failing loud
 /// beats writing a wrong id.
 pub fn bucket_model_id(
     collection: &CollectionId,
     resolver: Option<&dyn crate::schema::CatalogResolver>,
-) -> Result<EntityId, RetrievalError> {
-    crate::schema::well_known_model_id(collection.as_str())
-        .or_else(|| resolver.and_then(|r| r.model_id_for(collection.as_str())))
+) -> Result<ModelId, RetrievalError> {
+    crate::schema::system_model_id(collection.as_str())
+        .or_else(|| resolver.and_then(|r| r.model_id_for(collection.as_str())).map(ModelId::EntityId))
         .ok_or_else(|| RetrievalError::Other(format!("no model id known for collection '{collection}' (catalog cold?)")))
 }
 
@@ -98,6 +98,35 @@ pub trait StorageCollection: Send + Sync {
 
     /// Retrieve all events from the collection
     async fn dump_entity_events(&self, id: EntityId) -> Result<Vec<Attested<Event>>, RetrievalError>;
+}
+
+#[cfg(test)]
+mod model_address_tests {
+    use super::*;
+
+    struct Resolver {
+        collection: String,
+        model: EntityId,
+    }
+
+    impl crate::schema::CatalogResolver for Resolver {
+        fn resolve(&self, _collection: &str, _name: &str) -> Option<EntityId> { None }
+
+        fn name_for(&self, _id: &EntityId) -> Option<String> { None }
+
+        fn model_id_for(&self, collection: &str) -> Option<EntityId> { (collection == self.collection).then_some(self.model) }
+    }
+
+    #[test]
+    fn reconstructed_envelopes_use_names_for_builtins_and_real_ids_for_registered_models() {
+        let system = bucket_model_id(&CollectionId::fixed_name(crate::schema::MODEL_COLLECTION_ID), None).unwrap();
+        assert_eq!(system, ModelId::system(crate::schema::MODEL_COLLECTION_ID));
+
+        let allocated = EntityId::new();
+        let resolver = Resolver { collection: "albums".to_owned(), model: allocated };
+        let registered = bucket_model_id(&CollectionId::fixed_name("albums"), Some(&resolver)).unwrap();
+        assert_eq!(registered, ModelId::EntityId(allocated));
+    }
 }
 
 /// Manages the storage and state of the collection without any knowledge of the model type
