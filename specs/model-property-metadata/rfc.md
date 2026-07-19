@@ -17,7 +17,8 @@ an upsert-by-current-name RegisterSchema whose response returns the
 allocated definitions (sections 3, 4, 5.1, 5.2, 5.8). The delivered data
 plane uses the uniform `ankql::ast::PropertyId` identity (`PropertyKey` was
 retired into it on PR #307, 2026-07-15; see 5.5), LWW v2/0xA2, model-id
-envelopes, resolved query identifiers, and protocol v3. Engines refuse
+envelopes, resolved query identifiers, and the unreleased 0.10.0 protocol
+epoch (version 1). Engines refuse
 unresolved selections at the storage seam (`Selection::check`) and translate
 identities to physical columns through their private durable maps, with no
 name fallback. Schema-dependent predicate paths register
@@ -457,13 +458,13 @@ through the raw Entity/backend interface exactly as SysRoot is today
 (core/src/system.rs:124-127), never through derive(Model); deriving a Model
 for a catalog collection would be the self-description ouroboros this
 exemption exists to forbid. If we later
-want the meta-schema itself introspectable, we mint well-known property
+want the meta-schema itself introspectable, we mint explicit property
 entities for it; nothing is load-bearing on that.
 
 AMENDED (PropertyKey amendment, #289, 2026-07-07): system and catalog
 collections stay name-keyed through the `PropertyKey::Name` variant -- a data
 fact about those collections' keys, not a per-instance wire mode. The deferred
-upgrade path to hardcoded well-known constant ids for the meta-schema stays open
+upgrade path to fixed system-property names for the meta-schema stays open
 and non-load-bearing (this paragraph already records that nothing depends on
 materializing it). See plan.md decision 27. RE-KEYED by the PropertyKey
 retirement (PR #307, 2026-07-15): with `PropertyKey` retired, the variant
@@ -495,15 +496,16 @@ reserved and rejected for user-model collection ids at derive time and at
 CollectionSet::get. Because enforcement sits on the receiving durable node,
 mixed-fleet safety is a deployment ORDER (upgrade durable nodes first), not
 a simultaneous-upgrade requirement.
-AMENDED (model-id envelope amendment, #289, 2026-07-09): with collection
-names gone from the event envelope (5.5), the receiver guard keys on the
-well-known model ids (core/src/schema/mod.rs, well_known_collection) instead
-of collection strings; the protected set is unchanged.
-AMENDED (review correction, #289, 2026-07-10): keying on the wire model id's
-STATIC well-known-ness was found to be bypassable, because the actual write
-target is the collection that id RESOLVES to through the (mutable) catalog map;
-a poisoned map entry -- a non-reserved model id routed to a catalog collection
--- walked past the static check. The guard now resolves every CommitTransaction
+AMENDED (model-address correction, #397, 2026-07-18): with collection names
+gone from most event-envelope cases (5.5), built-in models are addressed by
+the explicit `ModelId::System { name }` arm. The receiver validates the name
+against the exact protected collection set; no synthetic EntityId stands in
+for a built-in.
+AMENDED (review correction, #289, 2026-07-10): keying only on the wire model
+address arm is bypassable, because the actual write target is the collection
+that address RESOLVES to through the mutable catalog map. A poisoned map entry
+-- an allocated model id routed to a catalog collection -- would walk past an
+arm-only check. The guard resolves every CommitTransaction
 event's model up front and rejects the transaction if any resolves to a
 collection accepted by `schema::is_protected_collection`, before any event is
 written (registration writes the catalog through a direct commit path that
@@ -934,23 +936,29 @@ design before release. The backend holds no binding or mode; identity is
 carried by the key and resolution belongs to catalog-aware callers. Yrs uses
 the same PropertyKey contract as every other backend.
 
-AMENDED (model-id envelope amendment, #289, 2026-07-09; implemented on PR
-#307 together with the engine column maps under Phase C below): the
-data-plane envelope drops collection names entirely. `Event`, `EntityState`,
-`EntityDelta`, and `SubscriptionUpdateItem` carry `model: EntityId` -- the
-model definition entity's id -- where they carried `collection: CollectionId`
-(proto/src/data.rs, proto/src/request.rs, proto/src/update.rs). EventId
-already excluded the collection from identity (proto/src/data.rs), so event
-ids are unchanged. Collection strings survive only in query/API surfaces and
-registration payloads, where the collection is the data (#305). The system
-and catalog collections, which have no allocated model entities, use
-WELL-KNOWN model ids -- [0u8; 15] plus an ordinal (1 = _ankurah_system,
-2 = _ankurah_model, 3 = _ankurah_property, 4 = _ankurah_model_property), a
-range no ULID mint can produce (core/src/schema/mod.rs) -- and the section-4
-protection guard keys on them. Ingress resolution (Node::resolve_model) maps
-a wire model id to its collection via well-knowns then the catalog map; an
-unknown model id is REJECTED loud (retryable), never synthesized into a
-collection. On a DURABLE node whose startup catalog warm (a storage scan)
+AMENDED (model-id envelope amendment, #289, 2026-07-09; corrected by #397,
+2026-07-18): the data-plane envelope drops a bare collection field.
+`Event`, `EntityState`, `EntityDelta`, and `SubscriptionUpdateItem` carry:
+
+```rust
+enum ModelId {
+    EntityId(EntityId),
+    System { name: String },
+}
+```
+
+A registered model uses the real entity id of its catalog definition. The
+system and catalog collections have no model-definition entities, so they use
+their durable built-in collection name. Serde encodes the enum honestly as
+distinct tagged arms. No EntityId byte pattern is reserved, classified, or
+reinterpreted as a system model. EventId already excluded the collection/model
+address from identity, so event ids are unchanged. Collection strings survive
+in query/API and registration payloads, where the collection is the data
+(#305), and in the `System` address where the name itself is the model's
+identity. Ingress resolution validates `System` names against the exact
+built-in set; arbitrary names cannot bypass catalog allocation. `EntityId`
+arms resolve through the catalog map, and an unknown address is REJECTED loud
+(retryable), never synthesized into a collection. On a DURABLE node whose startup catalog warm (a storage scan)
 has not finished, ingress resolution awaits catalog readiness once and
 retries before rejecting (resolve_model_wait) -- a restarted node
 receiving traffic immediately must not reject models it allocated before
@@ -959,7 +967,7 @@ side. Ephemeral nodes never wait: their definitions arrive inline with
 the message, so a miss is already final. Cold-catalog policy, maintainer-ruled as options c + e + d:
 (c) once per connection per model, NodeUpdate and NodeResponse attach the
 attested catalog entity states (model, memberships, properties) for any
-non-well-known model the payload references (`#[serde(default)] schema:
+`EntityId` model the payload references (`#[serde(default)] schema:
 Vec<Attested<EntityState>>`; core/src/node.rs schema_states_for_models /
 ingest_schema, tracked per peer in PeerState.announced_models); receivers
 policy-validate each definition and ingest them BEFORE processing the body;
@@ -967,7 +975,11 @@ definitions never ride inside events or state buffers. (e) Catalog warmth
 participates in readiness through the existing ensure_subscribed /
 context_async gates. (d) The engines' truncated-id fallback naming (Phase C
 amendment below) stays as a loud belt-and-suspenders net that should never
-fire. Ships as PROTOCOL_VERSION = 3 (proto/src/peering.rs).
+fire. This is an incompatible development-era wire change within the
+unreleased 0.10.0 protocol-1 epoch: versions number releases, so the constant
+does not increment. Existing protocol-1 development peers must restart
+together and development stores containing old sled event blobs must reset;
+there is deliberately no compatibility decoder for the old envelope.
 
 Streaming `SubscriptionUpdateItem`s also carry `source_queries`: the query ids
 whose result sets caused the item to be emitted, including steady-state
@@ -1002,7 +1014,7 @@ recorded in the 5.5 banner above).
   hint; the column-layering half of PR #307 removed it), and physical columns
   are derived at the engine seam from each engine's durable map alone. Fetch
   and SubscribeQuery are bincode shapes, so this was a hard wire change
-  riding the same unreleased protocol v3 epoch.
+  riding the same unreleased 0.10.0 protocol-1 epoch.
 
 Materialized storage is a separate concern. Every engine maintains a durable
 property-id to physical-column map, seeded from the injected catalog resolver
@@ -1020,7 +1032,7 @@ pre-rename assignment. Empty scans resolve the model lazily, so an absent
 row reports `EntityNotFound` rather than a cold-catalog error. The durable
 model-to-table map remains deferred with #304.
 
-These changes ship together behind protocol v3. Presence negotiation refuses
+These changes ship together behind the unreleased 0.10.0 protocol version 1. Presence negotiation refuses
 incompatible peers before registering a connection; the same epoch covers
 the model-id data envelopes, registration messages, resolved selections, and
 backend payload changes. Durable nodes upgrade first. Engine column maps are

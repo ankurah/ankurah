@@ -15,12 +15,12 @@ records the pivot work itself.
 ## 1. Phase 0: #294 protocol negotiation (folded into PR #307)
 
 DONE in the metadata epoch. The standalone PR #306 did not merge; its
-handshake work was folded into #307 and the final released epoch is protocol
-v3.
+handshake work was folded into #307 and the unreleased 0.10.0 epoch is
+protocol version 1.
 
 - [x] `protocol_version: u32` appended as the last field of `Presence`;
       compatibility isolated in one equality check. The initial handshake
-      step used version 1; the final folded metadata epoch releases as v3.
+      version 1 represents the whole unreleased 0.10.0 contract.
 - [x] `Message::PresenceRejected { expected: u32, received: u32 }`
       variant.
 - [x] Fallible `register_peer`: a decoded version mismatch refuses with
@@ -141,7 +141,7 @@ v3.
 - [x] Compatibility tests: unknown state versions are refused; legacy
       buffers decode; Name residue is preserved without substituting for an
       authoritative Id entry.
-- [x] PROTOCOL_VERSION -> 3 landed, covering LWW v2/0xA2, resolved
+- [x] PROTOCOL_VERSION 1 covers LWW v2/0xA2, resolved
       predicate Identifiers and ORDER BY property identities, RegisterSchema,
       and model-id wire envelopes.
 

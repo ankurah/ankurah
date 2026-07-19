@@ -52,7 +52,7 @@ then the macro surface.
 Delivered as part of PR #307:
 
 - `Presence` carries `protocol_version: u32` as its last field and the
-  metadata epoch exports `PROTOCOL_VERSION = 3`. Pre-versioning binaries are
+  unreleased 0.10.0 epoch exports `PROTOCOL_VERSION = 1`. Pre-versioning binaries are
   treated as version 0. An ephemeral legacy Presence is a strict prefix that
   reaches EOF at the new field; a durable legacy Presence also contains the
   old collection-bearing EntityState, so the refusal classifier parses that
@@ -375,13 +375,13 @@ read back "".
 
 ## Phase A protocol bump
 
-PR #307 ships the whole epoch as PROTOCOL_VERSION = 3: LWW v2/0xA2,
+PR #307 ships the whole unreleased 0.10.0 epoch as PROTOCOL_VERSION = 1: LWW v2/0xA2,
 uniform `PropertyId` payloads (the PropertyKey retirement, 2026-07-15, rode
 the same unreleased epoch), resolved predicate identifiers and ORDER BY
 property identities, RegisterSchema, model-id data envelopes, and
-once-per-connection schema descriptors. Durable nodes upgrade first. Protocol
-2 existed only as an intermediate branch value; no released or mergeable v2
-epoch exists.
+once-per-connection schema descriptors. Durable nodes upgrade first. Internal
+development version numbers were collapsed because protocol versions number
+releases, not commits; no version after 1 has been published.
 
 ## Phase C outline (engine-local; detailed after A)
 
@@ -432,11 +432,11 @@ model <-> table map half deferred with #304.
    Degrade contradicts rev 3's no-dual-encoding stance.
 2. **Presence field appended last** so an ephemeral old encoding is a prefix
    of the new one and detectable by EOF. Durable old encodings also carry the
-   pre-v3 nested EntityState shape and are classified by an exact mirrored
-   legacy decoder; trailing bytes distinguish versioned v1/v2 peers.
-3. **PROTOCOL_VERSION is u32; the released metadata epoch is v3.**
-   Pre-versioning binaries are implicitly version 0. Protocol 2 was an
-   intermediate branch value before model-id envelopes joined the epoch.
+   pre-versioned nested EntityState shape and are classified by an exact
+   mirrored legacy decoder; trailing bytes distinguish versioned peers.
+3. **PROTOCOL_VERSION is u32; unreleased 0.10.0 is version 1.**
+   Pre-versioning binaries are implicitly version 0. Versions number releases,
+   so incompatible development changes within 0.10.0 do not create new epochs.
 4. **One tagged PropertyKey map** in LWW diff v2/state 0xA2. ~~`Id` and
    lossless legacy `Name` residue coexist without a parallel-map shape.~~
    RETIRED with PropertyKey (PR #307, 2026-07-15): the map keys by
@@ -459,7 +459,7 @@ model <-> table map half deferred with #304.
    carry the literal id). Target-model references travel as collection
    strings, resolved executor-side.
 9. **Phase 0 folded into PR #307.** The standalone PR closed unmerged; the
-   handshake and metadata wire changes ship as one v3 epoch.
+   handshake and metadata wire changes ship as one unreleased v1 epoch.
 10. **Catalog subscriptions are policy-free on durable nodes** (the
     SystemManager precedent: the map is node infrastructure reading its
     own storage; mutation stays gated by check_event, remote access by
@@ -785,23 +785,23 @@ model <-> table map half deferred with #304.
     model <-> table half of the bidirectional-map mandate is DEFERRED with
     #304 (buckets stay collection-string-keyed until storage APIs are
     keyed by model) -- flagged for maintainer veto.
-29. **The model-id wire envelope, well-known model ids, and descriptor
-    shipping** (model-id envelope amendment, #289, 2026-07-09; implemented
-    on PR #307; PROTOCOL_VERSION = 3). Event, EntityState, EntityDelta,
-    and SubscriptionUpdateItem carry `model: EntityId` in place of
-    `collection: CollectionId`; EventId already excluded collection from
-    identity, so event ids are unchanged. Collection strings survive only
-    in query/API surfaces and registration payloads (collection is the
-    data there, #305). System and catalog collections use well-known model
-    ids ([0u8; 15] plus ordinal: 1 = _ankurah_system, 2 = _ankurah_model,
-    3 = _ankurah_property, 4 = _ankurah_model_property; unmintable ULID
-    range; core/src/schema/mod.rs); the receiver-side protection guard
-    (A6) keys on them. Ingress: Node::resolve_model maps model id ->
-    collection via well-knowns then the catalog; unknown model ids REJECT
+29. **The honest model-id wire envelope and descriptor shipping** (model-id
+    envelope amendment, #289, corrected by #397 on 2026-07-18; unreleased
+    `PROTOCOL_VERSION = 1`). Event, EntityState, EntityDelta, and
+    SubscriptionUpdateItem carry `ModelId::{EntityId(EntityId), System { name }}`
+    in place of `collection: CollectionId`; EventId already excluded collection
+    from identity, so event ids are unchanged. Registered models use the real
+    id of their catalog definition. System and catalog models have no such
+    entity and use their built-in collection name. The tagged wire arms are
+    distinct and no EntityId range has special meaning. Collection strings
+    otherwise survive only in query/API surfaces and registration payloads
+    (collection is the data there, #305). Ingress validates `System` names
+    against the exact built-in set and resolves `EntityId` through the catalog;
+    unknown model addresses REJECT
     loud and retryable, never synthesize a collection. Cold-catalog
     policy is maintainer-ruled c + e + d: (c) NodeUpdate and NodeResponse
     carry `#[serde(default)] schema: Vec<Attested<EntityState>>` -- the
-    real attested catalog entity states for any non-well-known model the
+    real attested catalog entity states for any `EntityId` model the
     payload references, shipped once per connection per model
     (PeerState.announced_models), policy-validated and ingested by the
     receiver BEFORE body processing; definitions never ride inside events
@@ -823,9 +823,13 @@ model <-> table map half deferred with #304.
     generation before deleting storage, then clears reactor/catalog state
     before a replacement warm may start; queued old traffic is rejected
     without depending on unsubscribe ordering.
-    Storage engines write model ids on reconstructed envelopes via a shared
-    bucket_model_id helper (well-knowns -> resolver -> loud retrieval
-    error). Two policy-surface changes, both forced by the same fact (raw
+    Storage engines write model addresses on reconstructed envelopes via a
+    shared bucket_model_id helper (built-in name -> resolver's real entity id
+    -> loud retrieval error). The tagged envelope is wire-incompatible with
+    older development builds; sled event blobs also contain the old envelope
+    shape and require a development-store reset. Other engines omit the model
+    from stored rows and reconstruct it from the bucket. No legacy decoder is
+    retained. Two policy-surface changes, both forced by the same fact (raw
     state is now id-keyed, so hooks must receive what they need to
     resolve): check_read_event gains a collection parameter (core
     resolves, agents keep authorizing by collection), and check_read gains
