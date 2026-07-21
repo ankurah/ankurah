@@ -149,15 +149,18 @@ async fn test_non_privileged_cannot_write_jwtpolicy() -> anyhow::Result<()> {
     let context = node.context(admin_ctx)?;
 
     let trx = context.begin();
-    let result = trx.create(&JwtPolicy { config_json: r#"{"roles":{},"collections":{}}"#.into(), public_key_pem: "fake-pem".into() }).await;
+    let result = trx
+        .create(&JwtPolicy { config_json: r#"{"roles":{},"collections":{}}"#.into(), public_key_pem: "fake-pem".into(), trust_json: None })
+        .await;
 
     assert!(result.is_err(), "Admin (non-Root) must not be able to write to the jwtpolicy collection");
 
     let root_ctx = JwtContext::system();
     let root_context = node.context(root_ctx)?;
     let trx2 = root_context.begin();
-    let root_result =
-        trx2.create(&JwtPolicy { config_json: r#"{"roles":{},"collections":{}}"#.into(), public_key_pem: "fake-pem".into() }).await;
+    let root_result = trx2
+        .create(&JwtPolicy { config_json: r#"{"roles":{},"collections":{}}"#.into(), public_key_pem: "fake-pem".into(), trust_json: None })
+        .await;
 
     assert!(root_result.is_ok(), "Root must be able to write to the jwtpolicy collection");
     trx2.commit().await?;

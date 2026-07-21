@@ -4,10 +4,10 @@
 
 The JWT auth extension provides role-based access control (RBAC) for ankurah nodes via RS256 JSON Web Tokens. It implements the `PolicyAgent` trait, intercepting all read, write, and query operations to enforce a declarative policy configuration.
 
-The extension supports two node modes:
+The extension supports two node modes and two durable trust sources:
 
-- **Durable nodes** hold signing keys and a policy config file on disk. A filesystem watcher detects changes and hot-reloads the policy without restart.
-- **Ephemeral nodes** (WASM/mobile clients) start with deny-all defaults and receive the policy and public key from the durable node via a LiveQuery on the `jwtpolicy` collection.
+- **Durable nodes** load a policy config file and either hold local signing keys or verify access tokens against an HTTPS issuer discovered through OpenID Connect. A filesystem watcher detects policy changes and hot-reloads them without restart.
+- **Ephemeral nodes** (WASM/mobile clients) start with deny-all defaults and receive the policy plus either a public key or an issuer trust descriptor from the durable node via a LiveQuery on the `jwtpolicy` collection. They do not fetch issuer JWKS.
 
 ## Permission Model
 
@@ -46,6 +46,20 @@ Tokens use RS256 with a 4096-bit RSA key pair. The claims structure:
 | Custom | (any other field) | `Map<String, Value>` | Arbitrary extra claims, captured via `#[serde(flatten)]` |
 
 Standard JWT timing claims (`iat`, `exp`, `nbf`) are handled by the `jwt_simple` library.
+
+### Trust Modes
+
+Legacy local-key mode verifies RS256 tokens against one configured public key. It expects the application-defined `JwtClaims` fields and can sign tokens when a full `SigningKeys` keypair is present.
+
+Issuer mode is native-only and requires the `issuer-http` feature for discovery and background key refresh. It accepts only tokens meeting all of these conditions:
+
+- RS256 signature, a non-empty `kid`, `typ: at+jwt`, and no `crit` header.
+- Exact configured HTTPS issuer and at least one configured audience.
+- Required `exp` and `sub` standard claims.
+- `token_use: access`.
+- A signature from the current last-good JWKS snapshot.
+
+Issuer-token `roles` are untrusted and discarded. The verifier installs policy-owned `default_roles`; `roles` and `email` may therefore be absent from the token. The default clock tolerance is 60 seconds.
 
 ### Unverified Parsing
 
@@ -149,6 +163,19 @@ let agent = JwtAgent::new_durable(keys, "path/to/policy.json")?;
 ```
 Reads and parses the policy file synchronously. Fails fast on missing/invalid file. Stores the path for the filesystem watcher.
 
+**Durable issuer resource server (native with `issuer-http`):**
+```rust
+let verifier = IssuerVerifier::discover(
+    "https://id.example/.well-known/openid-configuration",
+    "https://id.example",
+    HashSet::from(["resource-client".to_string()]),
+    vec!["user".to_string()],
+    Duration::from_secs(30 * 60),
+).await?;
+let agent = JwtAgent::new_durable_issuer(verifier, "path/to/policy.json")?;
+```
+Discovery validates the supplied discovery URL and expected issuer before network I/O, requires an exact issuer match, rejects redirects and non-success responses, validates the discovered HTTPS JWKS URL, and performs an initial JWKS fetch before returning.
+
 **Ephemeral node:**
 ```rust
 let agent = JwtAgent::new_ephemeral();
@@ -162,6 +189,8 @@ Starts with deny-all config and no keys. Policy and keys arrive via LiveQuery.
 | `SigningKeys` | Full RSA key pair. Can sign and verify JWTs. |
 | `JwtKeys::Signing(SigningKeys)` | Wraps a full key pair. |
 | `JwtKeys::VerifyOnly(RS256PublicKey)` | Public key only. Can verify but not sign. |
+| `JwtKeys::Issuer(IssuerVerifier)` | Synchronous verifier backed by an atomically replaced JWKS cache. |
+| `IssuerTrustDescriptor` | Serializable issuer, JWKS URL, required audiences/token shape, default roles, refresh TTL, and clock tolerance. |
 
 ### PolicyAgent Trait Implementation
 
@@ -169,7 +198,7 @@ Starts with deny-all config and no keys. Policy and keys arrive via LiveQuery.
 
 Called after the `Node` is fully constructed.
 
-- **Durable mode:** Spawns a `PolicyWatcher` that monitors the config file for changes using filesystem notifications (`notify` crate). The watcher runs under a `Root` context.
+- **Durable mode:** Spawns a `PolicyWatcher` that monitors the config file for changes using filesystem notifications (`notify` crate). The watcher runs under a `Root` context and publishes exactly one trust source: local public-key PEM or an issuer descriptor.
 - **Ephemeral mode:** Creates a weak-node LiveQuery (`EntityLiveQuery::new_weak_node`) on the `jwtpolicy` collection with `NoUser` context. Subscribes to changes and updates config + keys when policy entities arrive.
 
 #### `sign_request`
@@ -183,7 +212,7 @@ Serializes each `JwtContext` into `AuthData`:
 
 Deserializes `AuthData` back into `JwtContext`:
 - Empty bytes -> `NoUser`
-- Non-empty bytes -> verifies JWT signature, extracts claims -> `User`
+- Non-empty bytes -> verifies the JWT under the configured local-key or issuer trust mode, extracts normalized claims -> `User`
 
 #### `can_access_collection`
 
@@ -225,7 +254,7 @@ On a detected change:
 2. Read and parse the file as `PolicyConfig`.
 3. On parse error: log warning, keep previous valid config.
 4. On success: atomically update the in-memory `AgentState`.
-5. Upsert the `JwtPolicy` entity (collection: `jwtpolicy`) with the new config JSON and public key PEM.
+5. Upsert the `JwtPolicy` entity (collection: `jwtpolicy`) with the new config JSON and exactly one trust source: public key PEM or serialized issuer descriptor.
 
 The `JwtPolicy` entity serves as the bridge to ephemeral nodes -- changes propagate through ankurah's normal replication.
 
@@ -237,10 +266,10 @@ The `can_access_collection` method has a hardcoded carveout allowing any context
 
 When policy entities arrive or change:
 1. Parse `config_json` field as `PolicyConfig`.
-2. Parse `public_key_pem` field as an RSA public key.
-3. Atomically update the `AgentState` (config + keys) under a single write lock.
+2. Parse either `public_key_pem` as an RSA public key or `trust_json` as an `IssuerTrustDescriptor`.
+3. Atomically update the `AgentState` (config + trust material) under a single write lock. A valid descriptor makes policy ready but does not cause an ephemeral node to fetch issuer keys.
 
-After this point, the ephemeral node can verify JWTs and enforce RBAC.
+With public-key PEM, the ephemeral node can verify legacy JWTs and enforce RBAC. With descriptor-only issuer trust, it is policy-ready and can enforce local policy, but intentionally cannot verify issuer tokens because it receives no JWKS.
 
 ### JwtPolicy Model
 
@@ -251,10 +280,12 @@ pub struct JwtPolicy {
     pub config_json: String,       // Serialized PolicyConfig JSON
     #[active_type(LWW)]
     pub public_key_pem: String,    // PEM-encoded RSA public key
+    #[active_type(LWW)]
+    pub trust_json: Option<String>, // Serialized IssuerTrustDescriptor
 }
 ```
 
-Collection name: `jwtpolicy` (auto-derived from struct name). Uses Last-Writer-Wins (LWW) semantics for both fields.
+Collection name: `jwtpolicy` (auto-derived from struct name). Uses Last-Writer-Wins (LWW) semantics for all fields. The optional descriptor field keeps policy entities written by older versions readable, although adding the public Rust struct field requires downstream struct literals to initialize `trust_json`.
 
 ## Security Properties
 
@@ -265,6 +296,9 @@ Collection name: `jwtpolicy` (auto-derived from struct name). Uses Last-Writer-W
 5. **Token expiry** -- JWT expiration is enforced by the `jwt_simple` library during verification.
 6. **Atomic config updates** -- Config and keys are updated together under a single write lock, preventing inconsistent state.
 7. **Policy collection protected** -- Only `Root` contexts can write to `jwtpolicy`. Non-Root users can only read it.
+8. **Issuer transport pinned to HTTPS** -- Discovery and JWKS URLs must be HTTPS without credentials, query, or fragment. Discovery is validated before I/O, redirects are rejected, and the returned issuer must exactly match the configured issuer.
+9. **Strict access-token profile** -- Issuer mode requires RS256, `kid`, `typ: at+jwt`, configured issuer/audience, `exp`, `sub`, and `token_use: access`; token roles are never authoritative.
+10. **Bounded JWKS refresh** -- Verification never blocks on network I/O. Periodic and unknown-`kid` refreshes share one single-flight gate, unknown-`kid` refreshes have a 30-second post-refresh cooldown, HTTP operations have hard deadlines, and failed/invalid refreshes retain the last-good non-empty key snapshot.
 
 ## Crate Structure
 
@@ -277,10 +311,11 @@ extensions/jwt-auth/src/
   config.rs       -- PolicyConfig, CollectionRules, ScopeRule
   context.rs      -- JwtContext enum (User/Root/NoUser)
   error.rs        -- AuthError types
+  issuer.rs       -- Issuer descriptor, discovery, strict verification, JWKS cache
   keys.rs         -- SigningKeys, JwtKeys (sign/verify)
   model.rs        -- JwtPolicy ankurah Model (for replication)
   variables.rs    -- $jwt.* variable resolution and substitution
   watcher.rs      -- PolicyWatcher (filesystem notification, feature-gated)
 ```
 
-The `watcher` module is gated behind the `watcher` Cargo feature (not available on WASM targets).
+The `watcher` module is gated behind the `watcher` Cargo feature (not available on WASM targets). Issuer discovery and background refresh are gated behind `issuer-http` and are also unavailable on WASM targets.

@@ -41,10 +41,10 @@ impl PolicyWatcher {
         }
 
         // Read public key PEM from shared state
-        let public_key_pem = extract_public_key_pem(&shared_state);
+        let (public_key_pem, trust_json) = extract_trust_material(&shared_state)?;
 
         // Upsert the JwtPolicy entity: reuse an existing one or create a new one
-        let entity_id = upsert_entity(&context, &json_str, &public_key_pem).await?;
+        let entity_id = upsert_entity(&context, &json_str, &public_key_pem, trust_json.as_deref()).await?;
 
         let watch_entity_id = entity_id.clone();
         let watch_handle = tokio::spawn(watch_loop(path, context, watch_entity_id, shared_state));
@@ -66,16 +66,24 @@ impl Drop for PolicyWatcher {
     fn drop(&mut self) { self.watch_handle.abort(); }
 }
 
-fn extract_public_key_pem(shared_state: &Arc<RwLock<AgentState>>) -> String {
+fn extract_trust_material(shared_state: &Arc<RwLock<AgentState>>) -> Result<(String, Option<String>), anyhow::Error> {
     let guard = shared_state.read().unwrap_or_else(|e| e.into_inner());
-    match guard.keys.as_ref() {
-        Some(keys) => keys.public_key_pem().unwrap_or_default(),
-        None => String::new(),
+    if let Some(descriptor) = &guard.issuer_trust {
+        return Ok((String::new(), Some(serde_json::to_string(descriptor)?)));
     }
+    Ok(match guard.keys.as_ref() {
+        Some(keys) => (keys.public_key_pem()?, None),
+        None => (String::new(), None),
+    })
 }
 
 /// Query for an existing JwtPolicy entity and update it, or create a new one.
-async fn upsert_entity(context: &Context, json_str: &str, public_key_pem: &str) -> Result<EntityId, anyhow::Error> {
+async fn upsert_entity(
+    context: &Context,
+    json_str: &str,
+    public_key_pem: &str,
+    trust_json: Option<&str>,
+) -> Result<EntityId, anyhow::Error> {
     let existing: Vec<JwtPolicyView> = context.fetch("true").await?;
 
     if let Some(view) = existing.into_iter().next() {
@@ -84,12 +92,19 @@ async fn upsert_entity(context: &Context, json_str: &str, public_key_pem: &str) 
         let edit = view.edit(&trx)?;
         edit.config_json().set(&json_str.to_string())?;
         edit.public_key_pem().set(&public_key_pem.to_string())?;
+        edit.trust_json().set(&trust_json.map(ToString::to_string))?;
         trx.commit().await?;
         Ok(view.id())
     } else {
         // Create a new entity
         let trx = context.begin();
-        let entity = trx.create(&JwtPolicy { config_json: json_str.to_string(), public_key_pem: public_key_pem.to_string() }).await?;
+        let entity = trx
+            .create(&JwtPolicy {
+                config_json: json_str.to_string(),
+                public_key_pem: public_key_pem.to_string(),
+                trust_json: trust_json.map(ToString::to_string),
+            })
+            .await?;
         let id: EntityId = entity.id();
         trx.commit().await?;
         Ok(id)
@@ -161,30 +176,47 @@ async fn watch_loop(path: PathBuf, context: Context, entity_id: EntityId, shared
         info!("PolicyWatcher: detected valid change in {}", path.display());
 
         // Update the shared in-memory config atomically
-        let public_key_pem = {
+        let trust_material = {
             let mut guard = shared_state.write().unwrap_or_else(|e| e.into_inner());
             guard.config = new_config;
-            // Extract public key PEM while we have the lock
-            match guard.keys.as_ref() {
-                Some(keys) => keys.public_key_pem().unwrap_or_default(),
-                None => String::new(),
+            if let Some(descriptor) = &guard.issuer_trust {
+                serde_json::to_string(descriptor).map(|json| (String::new(), Some(json))).map_err(anyhow::Error::from)
+            } else {
+                match guard.keys.as_ref() {
+                    Some(keys) => keys.public_key_pem().map(|pem| (pem, None)).map_err(anyhow::Error::from),
+                    None => Ok((String::new(), None)),
+                }
+            }
+        };
+        let (public_key_pem, trust_json) = match trust_material {
+            Ok(material) => material,
+            Err(e) => {
+                warn!("PolicyWatcher: failed to export trust material: {e}");
+                continue;
             }
         };
 
         // Update the entity
-        match update_entity(&context, &entity_id, &json_str, &public_key_pem).await {
+        match update_entity(&context, &entity_id, &json_str, &public_key_pem, trust_json.as_deref()).await {
             Ok(()) => info!("PolicyWatcher: updated JwtPolicy entity {}", entity_id),
             Err(e) => warn!("PolicyWatcher: failed to update entity: {}", e),
         }
     }
 }
 
-async fn update_entity(context: &Context, entity_id: &EntityId, json_str: &str, public_key_pem: &str) -> Result<(), anyhow::Error> {
+async fn update_entity(
+    context: &Context,
+    entity_id: &EntityId,
+    json_str: &str,
+    public_key_pem: &str,
+    trust_json: Option<&str>,
+) -> Result<(), anyhow::Error> {
     let view: JwtPolicyView = context.get::<JwtPolicyView>(entity_id.clone()).await?;
     let trx = context.begin();
     let edit = view.edit(&trx)?;
     edit.config_json().set(&json_str.to_string())?;
     edit.public_key_pem().set(&public_key_pem.to_string())?;
+    edit.trust_json().set(&trust_json.map(ToString::to_string))?;
     trx.commit().await?;
     Ok(())
 }

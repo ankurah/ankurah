@@ -15,9 +15,11 @@ pub struct JwtClaims {
     pub sub: String,
 
     /// User's roles (e.g. ["Admin"], ["Dispatcher", "Technician"])
+    #[serde(default)]
     pub roles: Vec<String>,
 
     /// User's email
+    #[serde(default)]
     pub email: String,
 
     /// User's display name
