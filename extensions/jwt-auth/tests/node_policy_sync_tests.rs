@@ -19,6 +19,7 @@ pub struct Post {
 
 /// The issuer watcher publishes descriptor-only policy and makes an ephemeral
 /// agent ready without causing it to fetch issuer keys.
+#[cfg(feature = "watcher")]
 #[tokio::test]
 async fn test_ephemeral_readiness_accepts_watcher_descriptor_without_http() -> anyhow::Result<()> {
     use ankurah_connector_local_process::LocalProcessConnection;
