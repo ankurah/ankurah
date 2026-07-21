@@ -12,4 +12,10 @@ pub struct JwtPolicy {
     /// PEM-encoded public key for JWT verification
     #[active_type(LWW)]
     pub public_key_pem: String,
+
+    /// Serialized IssuerTrustDescriptor JSON. Optional so entities written by
+    /// pre-issuer versions remain readable.
+    #[active_type(LWW)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_json: Option<String>,
 }
