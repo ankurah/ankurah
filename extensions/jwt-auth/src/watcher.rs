@@ -140,7 +140,12 @@ async fn watch_loop(path: PathBuf, context: Context, entity_id: EntityId, shared
     loop {
         // Wait for any event
         match rx.recv().await {
-            Some(Ok(_event)) => {}
+            // We watch the parent directory so atomic file replacement works,
+            // but SQLite and other siblings are active there too. Ignore their
+            // notifications: publishing JwtPolicy writes SQLite, and treating
+            // that write as another policy edit creates a self-sustaining loop.
+            Some(Ok(event)) if event_targets_policy(&event, &path) => {}
+            Some(Ok(_)) => continue,
             Some(Err(e)) => {
                 warn!("PolicyWatcher: fs watcher error: {}", e);
                 continue;
@@ -204,6 +209,8 @@ async fn watch_loop(path: PathBuf, context: Context, entity_id: EntityId, shared
     }
 }
 
+fn event_targets_policy(event: &Event, policy_path: &Path) -> bool { event.paths.iter().any(|event_path| event_path == policy_path) }
+
 async fn update_entity(
     context: &Context,
     entity_id: &EntityId,
@@ -219,4 +226,21 @@ async fn update_entity(
     edit.trust_json().set(&trust_json.map(ToString::to_string))?;
     trx.commit().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::event_targets_policy;
+    use notify::{Event, EventKind};
+    use std::path::Path;
+
+    #[test]
+    fn directory_watcher_ignores_sibling_events() {
+        let policy = Path::new("/data/policy.json");
+        let sqlite_event = Event::new(EventKind::Any).add_path("/data/store.sqlite-wal".into());
+        assert!(!event_targets_policy(&sqlite_event, policy));
+
+        let policy_event = Event::new(EventKind::Any).add_path(policy.to_path_buf());
+        assert!(event_targets_policy(&policy_event, policy));
+    }
 }
