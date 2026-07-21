@@ -1,6 +1,6 @@
 use crate::agent_state::start_ephemeral_policy_sync;
 pub use crate::agent_state::{AgentState, AgentStateReadGuard};
-use crate::{JwtContext, JwtKeys, PolicyConfig, SigningKeys};
+use crate::{IssuerVerifier, JwtContext, JwtKeys, PolicyConfig, SigningKeys};
 use ankql::ast::Predicate;
 use ankurah_core::{
     entity::{Entity, TemporaryEntity},
@@ -39,7 +39,22 @@ impl JwtAgent {
         let config: PolicyConfig =
             serde_json::from_str(&json_str).map_err(|e| anyhow::anyhow!("Failed to parse policy config from {}: {}", path.display(), e))?;
         Ok(Self {
-            state: Arc::new(RwLock::new(AgentState { config, keys: Some(JwtKeys::Signing(keys)) })),
+            state: Arc::new(RwLock::new(AgentState { config, keys: Some(JwtKeys::Signing(keys)), issuer_trust: None })),
+            policy_path: Some(path.to_path_buf()),
+            policy_livequery: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    /// Create a durable agent that trusts access tokens from a discovered issuer.
+    pub fn new_durable_issuer(verifier: IssuerVerifier, policy_path: impl AsRef<Path>) -> Result<Self, anyhow::Error> {
+        let path = policy_path.as_ref();
+        let json_str =
+            std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("Failed to read policy file {}: {}", path.display(), e))?;
+        let config: PolicyConfig =
+            serde_json::from_str(&json_str).map_err(|e| anyhow::anyhow!("Failed to parse policy config from {}: {}", path.display(), e))?;
+        let issuer_trust = Some(verifier.descriptor().clone());
+        Ok(Self {
+            state: Arc::new(RwLock::new(AgentState { config, keys: Some(JwtKeys::Issuer(verifier)), issuer_trust })),
             policy_path: Some(path.to_path_buf()),
             policy_livequery: Arc::new(Mutex::new(None)),
         })
@@ -48,7 +63,7 @@ impl JwtAgent {
     /// Create a new ephemeral JwtAgent with no keys and deny-all config.
     pub fn new_ephemeral() -> Self {
         Self {
-            state: Arc::new(RwLock::new(AgentState { config: PolicyConfig::default(), keys: None })),
+            state: Arc::new(RwLock::new(AgentState { config: PolicyConfig::default(), keys: None, issuer_trust: None })),
             policy_path: None,
             policy_livequery: Arc::new(Mutex::new(None)),
         }
@@ -64,7 +79,14 @@ impl JwtAgent {
     }
 
     /// Replace the keys at runtime.
-    pub fn set_keys(&self, keys: JwtKeys) { self.state.write().unwrap_or_else(|e| e.into_inner()).keys = Some(keys); }
+    pub fn set_keys(&self, keys: JwtKeys) {
+        let mut guard = self.state.write().unwrap_or_else(|e| e.into_inner());
+        guard.issuer_trust = match &keys {
+            JwtKeys::Issuer(verifier) => Some(verifier.descriptor().clone()),
+            _ => None,
+        };
+        guard.keys = Some(keys);
+    }
 
     /// Returns a shared handle to the combined state.
     pub fn state_handle(&self) -> Arc<RwLock<AgentState>> { Arc::clone(&self.state) }
@@ -74,7 +96,7 @@ impl JwtAgent {
     /// Returns true once the agent has policy and key material.
     pub fn policy_ready(&self) -> bool {
         let guard = self.state.read().unwrap_or_else(|e| e.into_inner());
-        !guard.config.roles.is_empty() && guard.keys.is_some()
+        !guard.config.roles.is_empty() && (guard.keys.is_some() || guard.issuer_trust.is_some())
     }
 
     /// Replaces the in-memory config with a new one.

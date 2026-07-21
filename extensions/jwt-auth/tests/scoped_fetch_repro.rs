@@ -71,7 +71,7 @@ async fn enduser_scoped_cached_fetch_over_relay() -> anyhow::Result<()> {
     let root = server.context(JwtContext::system())?;
     {
         let trx = root.begin();
-        trx.create(&JwtPolicy { config_json: CONFIG_JSON.to_string(), public_key_pem: public_pem.clone() }).await?;
+        trx.create(&JwtPolicy { config_json: CONFIG_JSON.to_string(), public_key_pem: public_pem.clone(), trust_json: None }).await?;
         trx.commit().await?;
     }
 
