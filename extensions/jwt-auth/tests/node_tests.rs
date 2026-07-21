@@ -283,6 +283,47 @@ async fn test_jwt_agent_durable_ephemeral_pair() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn remote_subscription_stops_at_bearer_expiration() -> anyhow::Result<()> {
+    use ankurah_connector_local_process::LocalProcessConnection;
+
+    let keys = common::test_keys();
+    let agent = JwtAgent::new_durable(keys.clone(), blog_config_path())?;
+    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
+    let client = Node::new(Arc::new(SledStorageEngine::new_test()?), agent);
+
+    server.system.create().await?;
+    let _conn = LocalProcessConnection::new(&server, &client).await?;
+    client.system.wait_system_ready().await;
+
+    let claims = make_claims("short-lived-editor", &["Editor"], "editor@blog.com");
+    let token = keys.sign(&claims, Duration::from_secs(2))?;
+    let context = client.context(JwtContext::from_claims(claims, token))?;
+    let live = context.query::<PostView>("true")?;
+    live.wait_initialized().await;
+
+    let root = server.context(JwtContext::system())?;
+    let trx = root.begin();
+    trx.create(&Post { title: "before expiry".into(), body: "visible".into() }).await?;
+    trx.commit().await?;
+    for _ in 0..40 {
+        if live.ids().len() == 1 {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(live.ids().len(), 1, "subscription receives updates while its bearer is live");
+
+    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    let trx = root.begin();
+    trx.create(&Post { title: "after expiry".into(), body: "must be suppressed".into() }).await?;
+    trx.commit().await?;
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    assert_eq!(live.ids().len(), 1, "an open remote subscription must not outlive its bearer");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_jwt_check_request_roundtrip() -> anyhow::Result<()> {
     use ankurah_connector_local_process::LocalProcessConnection;
 

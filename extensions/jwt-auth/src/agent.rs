@@ -16,6 +16,7 @@ use ankurah_proto::{self as proto, Attested};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::SystemTime;
 use tracing::debug;
 
 /// JWT-based PolicyAgent for ankurah.
@@ -107,6 +108,19 @@ impl JwtAgent {
 impl PolicyAgent for JwtAgent {
     type ContextData = JwtContext;
 
+    fn subscription_expires_at(&self, cdata: &Self::ContextData) -> Option<SystemTime> {
+        let expires_at = cdata.expires_at()?;
+        let tolerance = self
+            .state
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .issuer_trust
+            .as_ref()
+            .map(|trust| trust.time_tolerance)
+            .unwrap_or_default();
+        expires_at.checked_add(tolerance)
+    }
+
     fn on_node_ready<SE: StorageEngine + Send + Sync + 'static>(&self, node: WeakNode<SE, Self>) {
         #[cfg(feature = "watcher")]
         if let Some(ref policy_path) = self.policy_path {
@@ -162,7 +176,11 @@ impl PolicyAgent for JwtAgent {
             let token =
                 std::str::from_utf8(&auth_data.0).map_err(|e| ValidationError::ValidationFailed(format!("Invalid UTF-8 in token: {e}")))?;
             let claims = keys.verify(token).map_err(|e| ValidationError::ValidationFailed(format!("JWT verification failed: {e}")))?;
-            contexts.push(JwtContext::from_claims(claims, token.to_string()));
+            let context = JwtContext::from_claims(claims, token.to_string());
+            if state_guard.issuer_trust.is_some() && context.expires_at().is_none() {
+                return Err(ValidationError::ValidationFailed("JWT verification succeeded without a usable expiration".into()));
+            }
+            contexts.push(context);
         }
         Ok(contexts)
     }

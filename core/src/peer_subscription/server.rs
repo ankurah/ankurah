@@ -9,6 +9,20 @@ use crate::{
     storage::StorageEngine,
 };
 use ankurah_signals::{Subscribe, SubscriptionGuard};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+    time::SystemTime,
+};
+
+#[derive(Clone, Copy)]
+struct QueryExpiry {
+    generation: u64,
+    expires_at: SystemTime,
+}
 
 /// Manages a peer's subscription to this node's reactor.
 ///
@@ -18,6 +32,8 @@ pub struct SubscriptionHandler {
     _peer_id: proto::EntityId,
     subscription: ReactorSubscription,
     _guard: SubscriptionGuard,
+    query_expiries: Arc<Mutex<HashMap<proto::QueryId, QueryExpiry>>>,
+    next_expiry_generation: Arc<AtomicU64>,
 }
 
 impl SubscriptionHandler {
@@ -28,10 +44,28 @@ impl SubscriptionHandler {
     {
         let subscription = node.reactor.subscribe();
         let weak_node = node.weak();
+        let query_expiries = Arc::new(Mutex::new(HashMap::<proto::QueryId, QueryExpiry>::new()));
+        let next_expiry_generation = Arc::new(AtomicU64::new(1));
+        let update_expiries = Arc::clone(&query_expiries);
 
         // Subscribe to changes on this subscription
         let guard = subscription.subscribe(move |update: ReactorUpdate| {
             tracing::info!("SubscriptionHandler[{}] received reactor update with {} items", peer_id, update.items.len());
+
+            // A subscription request is authenticated only once. Fail closed
+            // after the earliest credential deadline among this peer's active
+            // queries so an already-open stream cannot outlive its bearer.
+            let expired = update_expiries
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .values()
+                .map(|expiry| expiry.expires_at)
+                .min()
+                .is_some_and(|deadline| SystemTime::now() >= deadline);
+            if expired {
+                tracing::warn!("SubscriptionHandler[{}] suppressed update after credential expiry", peer_id);
+                return;
+            }
 
             if let Some(node) = weak_node.upgrade() {
                 tracing::debug!("SubscriptionHandler[{}] sending update to peer {}", peer_id, peer_id);
@@ -44,7 +78,7 @@ impl SubscriptionHandler {
             }
         });
 
-        Self { _peer_id: peer_id, subscription, _guard: guard }
+        Self { _peer_id: peer_id, subscription, _guard: guard, query_expiries, next_expiry_generation }
     }
 
     /// Get the subscription ID for this peer.
@@ -56,7 +90,41 @@ impl SubscriptionHandler {
     /// Remove a predicate from this peer's subscription.
     pub fn remove_predicate(&self, query_id: proto::QueryId) -> Result<(), SubscriptionError> {
         self.subscription.remove_predicate(query_id)?;
+        self.query_expiries.lock().unwrap_or_else(|e| e.into_inner()).remove(&query_id);
         Ok(())
+    }
+
+    fn set_query_expiry(&self, query_id: proto::QueryId, expires_at: Option<SystemTime>) {
+        let generation = self.next_expiry_generation.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut expiries = self.query_expiries.lock().unwrap_or_else(|e| e.into_inner());
+            match expires_at {
+                Some(expires_at) => {
+                    expiries.insert(query_id, QueryExpiry { generation, expires_at });
+                }
+                None => {
+                    expiries.remove(&query_id);
+                }
+            }
+        }
+
+        let Some(expires_at) = expires_at else { return };
+        let delay = expires_at.duration_since(SystemTime::now()).unwrap_or_default();
+        let subscription = self.subscription.clone();
+        let expiries = Arc::clone(&self.query_expiries);
+        crate::task::spawn(async move {
+            futures_timer::Delay::new(delay).await;
+            let should_expire = expiries
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&query_id)
+                .is_some_and(|expiry| expiry.generation == generation && SystemTime::now() >= expiry.expires_at);
+            if should_expire {
+                if subscription.remove_predicate(query_id).is_ok() {
+                    expiries.lock().unwrap_or_else(|e| e.into_inner()).remove(&query_id);
+                }
+            }
+        });
     }
 
     /// Handle a subscription request for this peer.
@@ -86,6 +154,9 @@ impl SubscriptionHandler {
             .reactor
             .upsert_query(self.subscription.id(), query_id, collection_id.clone(), selection.clone(), node, cdata, version)
             .await?;
+
+        let expires_at = node.policy_agent.subscription_expires_at(cdata);
+        self.set_query_expiry(query_id, expires_at);
 
         // TASK: Audit SubscriptionUpdate vs QuerySubscribed sequencing https://github.com/ankurah/ankurah/issues/147
 
@@ -127,6 +198,11 @@ impl SubscriptionHandler {
             if let Some(delta) = node.generate_entity_delta(&known_map, state, &storage_collection, cdata).await? {
                 deltas.push(delta);
             }
+        }
+
+        if expires_at.is_some_and(|deadline| SystemTime::now() >= deadline) {
+            self.remove_predicate(query_id)?;
+            return Err(anyhow::anyhow!("Subscription credential expired during initialization"));
         }
 
         Ok(proto::NodeResponseBody::QuerySubscribed { query_id, deltas })

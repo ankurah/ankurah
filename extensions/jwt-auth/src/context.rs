@@ -4,19 +4,23 @@ use ankurah_core::policy::AccessDenied;
 use ankurah_proto as proto;
 use async_trait::async_trait;
 use std::hash::{Hash, Hasher};
+use std::time::{Duration, SystemTime};
 
 /// The context data extracted from a validated JWT, used for all policy checks.
 /// `Root` represents a privileged system context that bypasses all RBAC checks.
 /// `NoUser` represents an unauthenticated context (e.g. for reading the policy collection).
 #[derive(Debug, Clone)]
 pub enum JwtContext {
-    User { claims: JwtClaims, token: String },
+    User { claims: JwtClaims, token: String, expires_at: Option<SystemTime> },
     Root,
     NoUser,
 }
 
 impl JwtContext {
-    pub fn from_claims(claims: JwtClaims, token: String) -> Self { JwtContext::User { claims, token } }
+    pub fn from_claims(claims: JwtClaims, token: String) -> Self {
+        let expires_at = token_expiration(&token);
+        JwtContext::User { claims, token, expires_at }
+    }
 
     pub fn system() -> Self { JwtContext::Root }
 
@@ -66,6 +70,22 @@ impl JwtContext {
             JwtContext::Root | JwtContext::NoUser => None,
         }
     }
+
+    pub fn expires_at(&self) -> Option<SystemTime> {
+        match self {
+            JwtContext::User { expires_at, .. } => *expires_at,
+            JwtContext::Root | JwtContext::NoUser => None,
+        }
+    }
+}
+
+fn token_expiration(token: &str) -> Option<SystemTime> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    let payload = token.split('.').nth(1)?;
+    let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    let seconds = claims.get("exp")?.as_u64()?;
+    SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(seconds))
 }
 
 impl PartialEq for JwtContext {

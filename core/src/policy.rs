@@ -10,6 +10,7 @@ use crate::{
 use ankql::{ast::Predicate, error::ParseError};
 use ankurah_proto::Attested;
 use async_trait::async_trait;
+use std::time::SystemTime;
 use thiserror::Error;
 use tracing::debug;
 /// The result of a policy check. Currently just Allow/Deny, but will support Trace in the future
@@ -51,6 +52,13 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     /// The context type that will be used for all resource requests.
     /// This will typically represent a user or service account.
     type ContextData: ContextData;
+
+    /// Deadline after which a remote subscription established with this
+    /// context must stop receiving updates. Policy agents backed by expiring
+    /// credentials should return the credential's accepted-through time
+    /// (including any verification tolerance). Non-expiring agents may leave
+    /// the default of `None`.
+    fn subscription_expires_at(&self, _data: &Self::ContextData) -> Option<SystemTime> { None }
 
     /// Called after the Node is fully constructed, giving the PolicyAgent a weak reference to its owning node.
     /// Use this to start background tasks (file watchers, policy subscriptions) that need the node.
