@@ -9,7 +9,11 @@ pub fn mutable_impl(model: &crate::model::description::ModelDescription) -> Toke
     // TODO - add this to the accessors
     let _active_field_visibility = model.active_field_visibility();
     let active_field_names = model.active_field_names();
-    let active_field_name_strs = model.active_field_name_strs();
+    let active_field_resolutions =
+        match crate::model::schema::active_field_resolution_tokens(model, quote! { &self.entity }, quote! { &self.model_id }) {
+            Ok(resolutions) => resolutions,
+            Err(e) => return e.into_compile_error(),
+        };
     let active_field_types = match model.active_field_types() {
         Ok(types) => types,
         Err(_) => return quote! { compile_error!("Failed to generate active field types"); },
@@ -21,16 +25,16 @@ pub fn mutable_impl(model: &crate::model::description::ModelDescription) -> Toke
 
     // FFI attributes for the struct and fields
     #[cfg(feature = "wasm")]
-    let (struct_attributes, field_attributes) = super::wasm::mutable_attributes();
+    let (struct_attributes, field_attributes) = if model.no_ffi() { (quote! {}, quote! {}) } else { super::wasm::mutable_attributes() };
 
     #[cfg(all(feature = "uniffi", not(feature = "wasm")))]
-    let (struct_attributes, field_attributes) = super::uniffi::mutable_attributes();
+    let (struct_attributes, field_attributes) = if model.no_ffi() { (quote! {}, quote! {}) } else { super::uniffi::mutable_attributes() };
 
     #[cfg(not(any(feature = "wasm", feature = "uniffi")))]
     let (struct_attributes, field_attributes) = (quote! {}, quote! {});
 
     // Generate WASM getter methods and wrapper definitions for custom types
-    let (wasm_getter_impl, wasm_custom_wrappers) = if cfg!(feature = "wasm") {
+    let (wasm_getter_impl, wasm_custom_wrappers) = if cfg!(feature = "wasm") && !model.no_ffi() {
         let getter_methods = model.mutable_wasm_getters();
         let custom_wrappers = model.custom_active_type_wrappers();
         (
@@ -55,6 +59,7 @@ pub fn mutable_impl(model: &crate::model::description::ModelDescription) -> Toke
         pub struct #mutable_name {
             #field_attributes
             pub entity: ::ankurah::entity::Entity,
+            model_id: ::ankurah::ModelId,
         }
 
         impl ::ankurah::model::Mutable for #mutable_name {
@@ -65,12 +70,15 @@ pub fn mutable_impl(model: &crate::model::description::ModelDescription) -> Toke
                 &self.entity
             }
 
-            fn new(entity: ::ankurah::entity::Entity) -> Self {
+            fn model_id(&self) -> ::ankurah::ModelId {
+                self.model_id
+            }
+
+            fn new(entity: ::ankurah::entity::Entity, model_id: ::ankurah::ModelId) -> Self {
                 use ankurah::property::FromEntity;
-                assert_eq!(entity.collection(), &Self::collection());
                 Self {
-                    // #( #active_field_names: #active_field_types_turbofish::from_entity(#active_field_name_strs.into(), &entity), )*
                     entity,
+                    model_id,
                 }
                 }
             }
@@ -83,7 +91,10 @@ pub fn mutable_impl(model: &crate::model::description::ModelDescription) -> Toke
             #(
                 pub fn #active_field_names(&self) -> #active_field_types {
                     use ankurah::property::FromEntity;
-                    #active_field_types_turbofish::from_entity(#active_field_name_strs.into(), &self.entity)
+                    #active_field_types_turbofish::from_entity(
+                        #active_field_resolutions,
+                        &self.entity,
+                    )
                 }
             )*
         }

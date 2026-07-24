@@ -65,6 +65,10 @@ async fn relay_client_cached_fetch_with_composed_scope_clauses() -> Result<()> {
         ids
     };
 
+    // `query` is synchronous and exercises pre-initialization cache behavior,
+    // so perform its asynchronous schema admission explicitly first.
+    client_ctx.model_id::<ScopeCred>().await?;
+
     // Owner-shaped two-clause predicate (this worked downstream).
     let owner_q = format!("user = '{}' AND account = '{}'", user_id.to_base64(), account_id.to_base64());
     let owner_lq = client_ctx.query::<ScopeCredView>(owner_q.as_str())?;

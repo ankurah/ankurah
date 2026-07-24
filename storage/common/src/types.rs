@@ -50,7 +50,7 @@ impl OrderByComponents {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Plan {
     Index {
-        index_spec: KeySpec,                        // key order (ASC/DESC per part)
+        index_spec: KeySpec<String>,                // key order (ASC/DESC per part), keyed by physical column
         scan_direction: ScanDirection,              // engine scan direction
         bounds: KeyBounds,                          // per-column bounds (planner IR)
         remaining_predicate: ankql::ast::Predicate, // residual quals

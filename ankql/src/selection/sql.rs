@@ -81,6 +81,15 @@ fn generate_expr_sql(
                 buffer.push('"');
             }
         }
+        Expr::PropertyPath(identifier) => {
+            // Human-readable rendering only. `generate_selection_sql` backs the
+            // `Display` impls for `Predicate`/`Selection`; it is NOT the query
+            // path (each storage engine translates a resolved identity to its
+            // own physical address in its own SQL builder). Render the
+            // identifier's display label, never a physical name.
+            use std::fmt::Write as _;
+            let _ = write!(buffer, "{}", identifier);
+        }
         Expr::ExprList(exprs) => {
             buffer.push('(');
             for (i, expr) in exprs.iter().enumerate() {
@@ -244,9 +253,9 @@ fn generate_selection_sql_inner(
 mod tests {
     use super::*;
     use crate::ast::{ComparisonOperator, Expr, PathExpr, Predicate};
+    use ankurah_core_types::Value;
     use crate::error::SqlGenerationError;
     use crate::parser::parse_selection;
-    use ankurah_core_types::Value;
     use anyhow::Result;
 
     #[test]

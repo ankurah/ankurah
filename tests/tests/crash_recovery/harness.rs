@@ -2,7 +2,7 @@
 //!
 //! Deterministic crash points beat random kills. This module provides a
 //! storage-engine wrapper that aborts the process (`std::process::abort`) the
-//! instant a configured storage operation is about to run, plus the
+//! instant a configured batch operation is about to run, plus the
 //! child-process plumbing that drives real OS-level kill and reopen cycles over
 //! a real on-disk sled directory.
 //!
@@ -33,8 +33,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use ankurah::core::error::{MutationError, RetrievalError};
-use ankurah::core::storage::{StorageCollection, StorageEngine};
-use ankurah::proto::{self, Attested, CollectionId, EntityId, EntityState, Event, EventId};
+use ankurah::core::storage::{CommitBatchOutcome, StorageEngine, StorageWriteBatch};
+use ankurah::proto::{self, Attested, EntityId, EntityState, Event, EventId};
+use ankurah::ModelId;
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -48,19 +49,18 @@ use async_trait::async_trait;
 /// on the engine (the counters live on the engine, not the collection).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrashPoint {
-    /// Abort just before the nth `add_event` (the storage call inside
-    /// `commit_event`) runs.
-    BeforeAddEvent(usize),
-    /// Abort just before the nth `set_state` runs.
-    BeforeSetState(usize),
+    /// Abort just before the nth atomic event append runs.
+    BeforeAppendEvents(usize),
+    /// Abort just before the nth atomic prepared-state batch runs.
+    BeforeCommitBatch(usize),
 }
 
 impl CrashPoint {
     /// Serialize to the wire form carried in an environment variable.
     pub fn to_env(&self) -> String {
         match self {
-            CrashPoint::BeforeAddEvent(n) => format!("add_event:{n}"),
-            CrashPoint::BeforeSetState(n) => format!("set_state:{n}"),
+            CrashPoint::BeforeAppendEvents(n) => format!("append_events:{n}"),
+            CrashPoint::BeforeCommitBatch(n) => format!("commit_batch:{n}"),
         }
     }
 
@@ -69,8 +69,8 @@ impl CrashPoint {
         let (kind, n) = s.split_once(':')?;
         let n: usize = n.parse().ok()?;
         match kind {
-            "add_event" => Some(CrashPoint::BeforeAddEvent(n)),
-            "set_state" => Some(CrashPoint::BeforeSetState(n)),
+            "append_events" => Some(CrashPoint::BeforeAppendEvents(n)),
+            "commit_batch" => Some(CrashPoint::BeforeCommitBatch(n)),
             _ => None,
         }
     }
@@ -95,8 +95,8 @@ pub const ENV_HANDOFF_FILE: &str = "ANKURAH_C6_HANDOFF";
 /// Storage engines the crash wrapper can force to durability before aborting.
 ///
 /// The wrapper must guarantee that writes completed before the crash point are
-/// actually on disk, otherwise the "crash after commit_event" scenario would be
-/// indistinguishable from "commit_event never reached disk" and the invariant
+/// actually on disk, otherwise the "crash after append_events" scenario would be
+/// indistinguishable from "append_events never reached disk" and the invariant
 /// would be untestable. For sled this is an explicit flush; a server-backed
 /// engine like postgres is durable on statement completion, so its hook is a
 /// no-op.
@@ -133,11 +133,11 @@ impl CrashFlushable for ankurah_storage_postgres::Postgres {
 struct CrashState {
     crash: Option<CrashPoint>,
     armed: AtomicBool,
-    add_event_counter: AtomicUsize,
-    set_state_counter: AtomicUsize,
+    append_events_counter: AtomicUsize,
+    commit_batch_counter: AtomicUsize,
 }
 
-/// Wraps a storage engine, counting `add_event`/`set_state` operations and
+/// Wraps a storage engine, counting `append_events`/`commit_batch` operations and
 /// aborting the process the instant the configured crash point is reached.
 pub struct CrashStorageEngine<E: StorageEngine + CrashFlushable> {
     inner: Arc<E>,
@@ -151,8 +151,8 @@ impl<E: StorageEngine + CrashFlushable + 'static> CrashStorageEngine<E> {
             state: Arc::new(CrashState {
                 crash,
                 armed: AtomicBool::new(false),
-                add_event_counter: AtomicUsize::new(0),
-                set_state_counter: AtomicUsize::new(0),
+                append_events_counter: AtomicUsize::new(0),
+                commit_batch_counter: AtomicUsize::new(0),
             }),
         }
     }
@@ -173,28 +173,28 @@ impl CrashState {
         std::process::abort();
     }
 
-    /// Called before an `add_event`. Aborts if this occurrence is the target.
-    fn check_add_event(&self, flush: &dyn CrashFlushable) {
+    /// Called before `append_events`. Aborts if this occurrence is the target.
+    fn check_append_events(&self, flush: &dyn CrashFlushable) {
         if !self.armed.load(Ordering::SeqCst) {
             return;
         }
-        let n = self.add_event_counter.fetch_add(1, Ordering::SeqCst);
-        if let Some(CrashPoint::BeforeAddEvent(target)) = self.crash {
+        let n = self.append_events_counter.fetch_add(1, Ordering::SeqCst);
+        if let Some(CrashPoint::BeforeAppendEvents(target)) = self.crash {
             if n == target {
-                self.crash_now(flush, &format!("add_event #{n}"));
+                self.crash_now(flush, &format!("append_events #{n}"));
             }
         }
     }
 
-    /// Called before a `set_state`. Aborts if this occurrence is the target.
-    fn check_set_state(&self, flush: &dyn CrashFlushable) {
+    /// Called before `commit_batch`. Aborts if this occurrence is the target.
+    fn check_commit_batch(&self, flush: &dyn CrashFlushable) {
         if !self.armed.load(Ordering::SeqCst) {
             return;
         }
-        let n = self.set_state_counter.fetch_add(1, Ordering::SeqCst);
-        if let Some(CrashPoint::BeforeSetState(target)) = self.crash {
+        let n = self.commit_batch_counter.fetch_add(1, Ordering::SeqCst);
+        if let Some(CrashPoint::BeforeCommitBatch(target)) = self.crash {
             if n == target {
-                self.crash_now(flush, &format!("set_state #{n}"));
+                self.crash_now(flush, &format!("commit_batch #{n}"));
             }
         }
     }
@@ -204,39 +204,20 @@ impl CrashState {
 impl<E: StorageEngine + CrashFlushable + 'static> StorageEngine for CrashStorageEngine<E> {
     type Value = ();
 
-    async fn collection(&self, id: &CollectionId) -> Result<Arc<dyn StorageCollection>, RetrievalError> {
-        let inner = self.inner.collection(id).await?;
-        Ok(Arc::new(CrashStorageCollection { inner, state: self.state.clone(), flush: self.inner.clone() }))
+    async fn append_events(&self, events: &[Attested<Event>]) -> Result<Vec<bool>, MutationError> {
+        self.state.check_append_events(self.inner.as_ref());
+        self.inner.append_events(events).await
     }
 
-    async fn delete_all_collections(&self) -> Result<bool, MutationError> { self.inner.delete_all_collections().await }
-}
-
-/// Wraps a storage collection, deferring to the shared engine-level counters so
-/// that crash points count operations globally (a batch spanning collections
-/// crashes at the right absolute operation).
-struct CrashStorageCollection<E: CrashFlushable> {
-    inner: Arc<dyn StorageCollection>,
-    state: Arc<CrashState>,
-    flush: Arc<E>,
-}
-
-#[async_trait]
-impl<E: CrashFlushable + Send + Sync + 'static> StorageCollection for CrashStorageCollection<E> {
-    async fn set_state(&self, state: Attested<EntityState>) -> Result<bool, MutationError> {
-        self.state.check_set_state(self.flush.as_ref());
-        self.inner.set_state(state).await
+    async fn commit_batch(&self, batch: StorageWriteBatch) -> Result<CommitBatchOutcome, MutationError> {
+        self.state.check_commit_batch(self.inner.as_ref());
+        self.inner.commit_batch(batch).await
     }
 
     async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError> { self.inner.get_state(id).await }
 
-    async fn fetch_states(&self, selection: &ankql::ast::Selection) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
-        self.inner.fetch_states(selection).await
-    }
-
-    async fn add_event(&self, event: &Attested<Event>) -> Result<bool, MutationError> {
-        self.state.check_add_event(self.flush.as_ref());
-        self.inner.add_event(event).await
+    async fn fetch_states(&self, model: &ModelId, selection: &ankql::ast::Selection) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+        self.inner.fetch_states(model, selection).await
     }
 
     async fn get_events(&self, event_ids: Vec<EventId>) -> Result<Vec<Attested<Event>>, RetrievalError> {
@@ -245,6 +226,17 @@ impl<E: CrashFlushable + Send + Sync + 'static> StorageCollection for CrashStora
 
     async fn dump_entity_events(&self, id: EntityId) -> Result<Vec<Attested<Event>>, RetrievalError> {
         self.inner.dump_entity_events(id).await
+    }
+
+    async fn delete_all(&self) -> Result<bool, MutationError> { self.inner.delete_all().await }
+
+    async fn list_materializations(&self) -> Result<Vec<ModelId>, RetrievalError> { self.inner.list_materializations().await }
+
+    // A wrapper must FORWARD the resolver injection: the trait default is a
+    // no-op, and swallowing it leaves the inner engine unable to write model
+    // ids on reconstructed envelopes (#330) or name columns from the catalog.
+    fn set_catalog_resolver(&self, resolver: std::sync::Weak<dyn ankurah::core::schema::CatalogResolver>) {
+        self.inner.set_catalog_resolver(resolver);
     }
 }
 
@@ -356,7 +348,7 @@ impl ChildOutcome {
 /// [`ChildOutcome::crashed`].
 ///
 /// `test_name` must be the fully qualified test path as `cargo test` / libtest
-/// filters it, e.g. `scenarios::child_commit_event_before_set_state`.
+/// filters it, e.g. `scenarios::child_event_append_before_state_batch`.
 pub fn spawn_crash_child(test_name: &str, sled_dir: &Path, crash: CrashPoint) -> Result<ChildOutcome> {
     let sled_dir_str = sled_dir.to_string_lossy().into_owned();
     spawn_crash_child_with(test_name, crash, &[(ENV_SLED_DIR, &sled_dir_str)])
@@ -426,9 +418,9 @@ pub fn reopen_sled(dir: &Path) -> Result<SledStorageEngine> { SledStorageEngine:
 /// events it does not have, which would make the entity unresolvable and break
 /// convergence. Orphaned events (present but unreferenced) are explicitly
 /// harmless and are NOT a violation.
-pub async fn assert_state_heads_resolvable(collection: &Arc<dyn StorageCollection>, entity_ids: &[EntityId]) -> Result<()> {
+pub async fn assert_state_heads_resolvable<E: StorageEngine + ?Sized>(engine: &E, entity_ids: &[EntityId]) -> Result<()> {
     for id in entity_ids {
-        let state = match collection.get_state(*id).await {
+        let state = match engine.get_state(*id).await {
             Ok(state) => state,
             Err(RetrievalError::EntityNotFound(_)) => continue, // no persisted state: nothing to check
             Err(e) => return Err(e.into()),
@@ -438,7 +430,7 @@ pub async fn assert_state_heads_resolvable(collection: &Arc<dyn StorageCollectio
         if head_ids.is_empty() {
             continue;
         }
-        let found = collection.get_events(head_ids.clone()).await?;
+        let found = engine.get_events(head_ids.clone()).await?;
         let found_set: std::collections::HashSet<EventId> = found.iter().map(|e| e.payload.id()).collect();
         for hid in &head_ids {
             assert!(
@@ -453,8 +445,8 @@ pub async fn assert_state_heads_resolvable(collection: &Arc<dyn StorageCollectio
 }
 
 /// Whether a given entity has any persisted state after reopen.
-pub async fn has_persisted_state(collection: &Arc<dyn StorageCollection>, id: EntityId) -> Result<bool> {
-    match collection.get_state(id).await {
+pub async fn has_persisted_state<E: StorageEngine + ?Sized>(engine: &E, id: EntityId) -> Result<bool> {
+    match engine.get_state(id).await {
         Ok(_) => Ok(true),
         Err(RetrievalError::EntityNotFound(_)) => Ok(false),
         Err(e) => Err(e.into()),
@@ -462,14 +454,14 @@ pub async fn has_persisted_state(collection: &Arc<dyn StorageCollection>, id: En
 }
 
 /// Whether a given event id is present in storage after reopen.
-pub async fn event_present(collection: &Arc<dyn StorageCollection>, id: EventId) -> Result<bool> {
-    let found = collection.get_events(vec![id.clone()]).await?;
+pub async fn event_present<E: StorageEngine + ?Sized>(engine: &E, id: EventId) -> Result<bool> {
+    let found = engine.get_events(vec![id.clone()]).await?;
     Ok(found.into_iter().any(|e| e.payload.id() == id))
 }
 
 /// Fetch a persisted state's head clock, or None if no state is persisted.
-pub async fn persisted_head(collection: &Arc<dyn StorageCollection>, id: EntityId) -> Result<Option<proto::Clock>> {
-    match collection.get_state(id).await {
+pub async fn persisted_head<E: StorageEngine + ?Sized>(engine: &E, id: EntityId) -> Result<Option<proto::Clock>> {
+    match engine.get_state(id).await {
         Ok(state) => Ok(Some(state.payload.state.head)),
         Err(RetrievalError::EntityNotFound(_)) => Ok(None),
         Err(e) => Err(e.into()),

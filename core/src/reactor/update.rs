@@ -1,5 +1,6 @@
 use crate::entity::Entity;
 use ankurah_proto::{self as proto, Attested, Event};
+use std::collections::BTreeSet;
 
 /// Describes how an entity's membership changed for a specific predicate
 #[derive(Debug, Clone, PartialEq)]
@@ -24,12 +25,18 @@ pub struct ReactorUpdate<E = Entity, Ev = Attested<Event>> {
 /// A single entity update with all relevance information
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReactorUpdateItem<E = Entity, Ev = Attested<Event>> {
+    /// Model projection through which this update was selected.
+    pub model: proto::ModelId,
     /// The entity that changed
     pub entity: E,
     /// Events that caused this update
     pub events: Vec<Ev>,
     /// Which predicates this update is relevant to (if any) and how
     pub predicate_relevance: Vec<(proto::QueryId, MembershipChange)>,
+    /// Queries whose subscriptions caused this item to be emitted. Unlike
+    /// `predicate_relevance`, this is populated even when membership did not
+    /// change, so receivers can authenticate streaming update ownership.
+    pub source_queries: BTreeSet<proto::QueryId>,
 }
 
 impl<E, Ev: Clone> ReactorUpdateItem<E, Ev> {

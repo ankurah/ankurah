@@ -9,6 +9,7 @@ use tracing::Level;
 pub use ankurah::{
     changes::{ChangeKind, ChangeSet},
     core::node::nocache,
+    core::storage::StorageEngine,
     error::MutationError,
     model::View,
     policy::DEFAULT_CONTEXT,

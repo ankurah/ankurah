@@ -1,4 +1,3 @@
-pub mod collection;
 pub mod database;
 mod dump;
 pub mod engine;
@@ -6,8 +5,9 @@ pub mod entity;
 pub mod error;
 pub mod index;
 pub mod materialization;
+mod model_store;
 pub mod planner_integration;
 pub mod property;
-pub mod scan_collection;
 pub mod scan_index;
+mod scan_model;
 pub use engine::*;

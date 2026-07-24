@@ -1,5 +1,4 @@
 use ankurah_core::selection::filter::Filterable;
-use ankurah_proto::CollectionId;
 use ankurah_storage_common::filtering::{HasEntityId, ValueSetStream};
 use ankurah_storage_common::traits::EntityIdStream;
 use futures::Stream;
@@ -9,14 +8,11 @@ use std::task::{Context, Poll};
 /// Sled-specific entity state lookup that hydrates EntityIds into full EntityStates
 pub struct SledEntityLookup<S> {
     pub entities_tree: sled::Tree,
-    pub collection_id: CollectionId,
     pub stream: S,
 }
 
 impl<S: EntityIdStream> SledEntityLookup<S> {
-    pub fn new(entities_tree: &sled::Tree, collection_id: &CollectionId, stream: S) -> Self {
-        Self { entities_tree: entities_tree.clone(), collection_id: collection_id.clone(), stream }
-    }
+    pub fn new(entities_tree: &sled::Tree, stream: S) -> Self { Self { entities_tree: entities_tree.clone(), stream } }
 }
 
 impl<S: Unpin> Unpin for SledEntityLookup<S> {}
@@ -50,8 +46,7 @@ impl<S: EntityIdStream> Stream for SledEntityLookup<S> {
         };
 
         // Create Attested<EntityState> from parts
-        let attested =
-            ankurah_proto::Attested::<ankurah_proto::EntityState>::from_parts(entity_id, self.collection_id.clone(), state_fragment);
+        let attested = ankurah_proto::Attested::<ankurah_proto::EntityState>::from_parts(entity_id, state_fragment);
 
         Poll::Ready(Some(Ok(attested)))
     }
@@ -61,20 +56,18 @@ impl<S: EntityIdStream> Stream for SledEntityLookup<S> {
 
 /// Trait that provides a convenient `.entities()` combinator for EntityId streams
 pub trait SledEntityExt: EntityIdStream + Sized {
-    /// Hydrate EntityIds into EntityStates using the sled entities tree
-    fn entities(self, entities_tree: &sled::Tree, collection_id: &CollectionId) -> SledEntityLookup<Self> {
-        SledEntityLookup::new(entities_tree, collection_id, self)
-    }
+    /// Hydrate EntityIds into EntityStates using the sled entities tree.
+    fn entities(self, entities_tree: &sled::Tree) -> SledEntityLookup<Self> { SledEntityLookup::new(entities_tree, self) }
 }
 
 /// Trait that provides a convenient `.entities()` combinator for materialized value streams
 pub trait SledEntityExtFromMats: ValueSetStream + Sized
 where Self::Item: HasEntityId + Filterable
 {
-    /// Extract EntityIds and hydrate into EntityStates using the sled entities tree
-    fn entities(self, entities_tree: &sled::Tree, collection_id: &CollectionId) -> SledEntityLookup<impl EntityIdStream> {
+    /// Extract EntityIds and hydrate into EntityStates using the sled entities tree.
+    fn entities(self, entities_tree: &sled::Tree) -> SledEntityLookup<impl EntityIdStream> {
         let ids = self.extract_ids();
-        SledEntityLookup::new(entities_tree, collection_id, ids)
+        SledEntityLookup::new(entities_tree, ids)
     }
 }
 

@@ -5,11 +5,12 @@
 
 mod common;
 
+use ankql::{NameResolutionError, NameResolver};
 use ankurah::core::selection::filter::{evaluate_predicate, Filterable};
-use ankurah::core::type_resolver::TypeResolver;
-use ankurah::core::value::Value;
+use ankurah::core::value::{Value, ValueType};
 use ankurah::property::Json;
-use ankurah::{policy::DEFAULT_CONTEXT as c, Model, Node, PermissiveAgent};
+use ankurah::proto::PropertyId;
+use ankurah::{policy::DEFAULT_CONTEXT as c, EntityId, Model, ModelId, Node, PermissiveAgent};
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -21,6 +22,22 @@ use std::sync::Arc;
 // =============================================================================
 
 const PREDICATE_CASES_JSON: &str = include_str!("../predicate_cases.json");
+fn query_test_model_id() -> ModelId { ModelId::EntityId(EntityId::from_bytes([0x31; 16])) }
+fn data_property_id() -> EntityId { EntityId::from_bytes([0x32; 16]) }
+
+struct FilterResolver;
+
+impl NameResolver for FilterResolver {
+    fn resolve_property(&self, _model: &ModelId, name: &str) -> Result<Option<PropertyId>, NameResolutionError> {
+        Ok((name == "data").then(|| PropertyId::EntityId(data_property_id())))
+    }
+
+    fn property_value_type(&self, model: &ModelId, property: &PropertyId) -> Result<ValueType, NameResolutionError> {
+        (property == &PropertyId::EntityId(data_property_id())).then_some(ValueType::Json).ok_or_else(|| {
+            NameResolutionError::ValueTypeLookup { model: *model, property: *property, message: "unknown test property".to_owned() }
+        })
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct PredicateCases {
@@ -71,16 +88,15 @@ impl MockFilterable {
 impl Filterable for MockFilterable {
     fn collection(&self) -> &str { &self.collection }
     fn value(&self, name: &str) -> Option<Value> { self.values.get(name).cloned() }
+    fn value_by_id(&self, id: EntityId) -> Option<Value> { (id == data_property_id()).then(|| self.values.get("data").cloned()).flatten() }
 }
 
 fn verify_filterable(case: &TestCase) {
-    let type_resolver = TypeResolver::new();
     for entity in &case.entities {
         let f = MockFilterable::new("QueryTest").with_json("data", entity.data.clone());
         for exp in &case.expectations {
             let sel = ankql::parser::parse_selection(&exp.query).expect("parse");
-            // Apply type resolver to convert literals for JSON path comparisons
-            let resolved_sel = type_resolver.resolve_selection_types(sel);
+            let resolved_sel = sel.resolve_names(&query_test_model_id(), &FilterResolver).expect("resolve");
             let matches = evaluate_predicate(&f, &resolved_sel.predicate).unwrap_or(false);
             let should = exp.matches.contains(&entity.label);
             assert_eq!(matches, should, "[Filterable] case={} entity={} query='{}'", case.name, entity.label, exp.query);

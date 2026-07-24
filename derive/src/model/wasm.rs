@@ -37,7 +37,7 @@ pub fn view_attributes(view_name: &Ident, mutable_name: &Ident, model_name: &Ide
                 #[wasm_bindgen(js_name = "edit")]
                 pub fn edit_wasm(&self, trx: &ankurah::transaction::Transaction) -> Result<#mutable_name, ::wasm_bindgen::JsValue> {
                     use ::ankurah::model::View;
-                    match trx.edit::<#model_name>(&self.entity) {
+                    match trx.edit::<#model_name>(&self.entity, self.model_id) {
                         Ok(mutable_borrow) => {
                             // Extract the core mutable from the borrow wrapper
                             Ok(mutable_borrow.into_core())
@@ -96,12 +96,10 @@ pub fn wasm_impl(input: &syn::DeriveInput, model: &crate::model::description::Mo
         // Generate LiveQuery wrapper (at module level for re-export)
         #livequery_wrapper
 
-        const _: () = {
-            use ::ankurah::derive_deps::{tracing::error,wasm_bindgen::prelude::*, wasm_bindgen_futures};
-
-            // Generate namespace struct with static methods
-            #namespace_class
-        };
+        // Generate namespace struct with static methods. Keep this at module
+        // scope: wasm-bindgen's impl expansion is not valid when nested in a
+        // const block.
+        #namespace_class
     }
 }
 
@@ -109,7 +107,7 @@ pub fn wasm_impl(input: &syn::DeriveInput, model: &crate::model::description::Mo
 pub fn wasm_resultset_wrapper(resultset_name: &Ident, view_name: &Ident) -> TokenStream {
     quote! {
         #[wasm_bindgen]
-        #[derive(Clone, Default)]
+        #[derive(Clone)]
         pub struct #resultset_name(::ankurah::core::resultset::ResultSet<#view_name>);
 
         #[wasm_bindgen]
@@ -157,7 +155,7 @@ pub fn wasm_changeset_wrapper(changeset_name: &Ident, view_name: &Ident, results
         impl #changeset_name {
             #[wasm_bindgen(getter)]
             pub fn resultset(&self) -> #resultset_name {
-                #resultset_name(self.0.resultset.wrap())
+                #resultset_name(self.0.resultset.clone())
             }
 
             /// Items from the initial query load (before subscription was active)
@@ -407,7 +405,7 @@ pub fn wasm_model_namespace(
 
     quote! {
         #[wasm_bindgen(typescript_custom_section)]
-        const TS_APPEND_CONTENT: &'static str = #static_methods_ts;
+        const TS_MODEL_NAMESPACE: &'static str = #static_methods_ts;
 
         // These methods are only available via wasm bindgen, so it's ok that we're inside a const block
         #[wasm_bindgen(js_name = #name, skip_typescript)]

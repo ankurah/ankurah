@@ -213,16 +213,19 @@ exactly. Head collapses back to `[D]`.
 
 ## Persistence Ordering
 
-State persistence follows a strict ordering invariant: **commit events to
-storage before persisting state** (see
+Events become durable before any canonical state can reference them (see
 [The Staging Pattern](event-dag.md#the-staging-pattern) and
-[Crash Safety](retrieval.md#crash-safety)).
+[Crash Safety](retrieval.md#crash-safety)). Event append is content-addressed
+and idempotent; canonical state, entity-model associations, and every affected
+model projection are then committed as one exact-head storage batch.
 
 This gives clean crash recovery semantics:
-- Crash after `commit_event` but before `set_state`: recovery loads the old
-  state and the event is re-applied on next delivery.
-- Crash before `commit_event`: neither event nor updated state is persisted --
-  a clean rollback.
+
+- Crash after `append_events` but before `commit_batch`: the event is durable
+  but unreferenced. Re-delivery is idempotent and can integrate it later.
+- A failed or conflicting `commit_batch` exposes none of its canonical,
+  association, projection, or index changes.
+- A successful `commit_batch` exposes all of those changes together.
 
 
 ## Key Invariants
@@ -239,9 +242,10 @@ This gives clean crash recovery semantics:
 4. **Transaction snapshot isolation.** The primary entity is not modified until
    commit phase 5.
 
-5. **Staging before comparison; commit before persistence.** Events must be
-   staged (discoverable by BFS) before `apply_event` is called. Events must be
-   committed to storage before entity state referencing them is persisted.
+5. **Staging before comparison; event append before canonical commit.** Events
+   must be staged (discoverable by BFS) before `apply_event` is called and
+   durably appended before a `commit_batch` can publish a head which references
+   them.
 
 6. **StateAndEvent divergence fallback.** When `apply_state` does not apply
    the incoming state (divergence, or the state is older than what the

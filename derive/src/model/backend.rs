@@ -126,6 +126,24 @@ impl ActiveTypeDesc {
         }
     }
 
+    /// The backend REGISTRY name ("lww" / "yrs") this active type resolves
+    /// to, as used at runtime (core/src/property/backend/mod.rs) and in the
+    /// catalog descriptors (specs/model-property-metadata/rfc.md section 4).
+    ///
+    /// The RON configs spell the backend `LWWBackend` / `YrsBackend`
+    /// (backend.rs BackendConfig::backend_name), so map those to the runtime
+    /// keys. Any future backend must extend this map; an unrecognized
+    /// backend name is a wiring bug in the RON, surfaced at derive time.
+    pub fn backend_key(&self) -> Result<&'static str, String> {
+        match self.backend_config.backend_name.as_str() {
+            "LWWBackend" => Ok("lww"),
+            "YrsBackend" => Ok("yrs"),
+            other => Err(format!(
+                "backend '{other}' has no catalog registry-name mapping; extend ActiveTypeDesc::backend_key (a spec change if it is a new backend)"
+            )),
+        }
+    }
+
     /// Determine if this type is provided by the backend or custom
     pub fn is_provided_type(&self) -> bool {
         // Check if any of the concrete types are in the provided_wrapper_types list

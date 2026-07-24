@@ -134,8 +134,11 @@ async fn complex_local_subscription() -> Result<(), Box<dyn std::error::Error + 
     jasper_edit.age().overwrite(0, 1, "6")?;
     trx.commit().await.unwrap();
 
-    // Verify both updates were received as removals
-    assert_eq!(watcher.drain(), vec![vec![(snuffy.id(), ChangeKind::Remove), (jasper.id(), ChangeKind::Remove)]]);
+    // Verify both updates were received as removals in the batch's durable
+    // EntityId order rather than transaction mutation order.
+    let mut removals = vec![(snuffy.id(), ChangeKind::Remove), (jasper.id(), ChangeKind::Remove)];
+    removals.sort_by_key(|(id, _)| *id);
+    assert_eq!(watcher.drain(), vec![removals]);
 
     // Update Rex to no longer match the query (instead of deleting)
     // This should still trigger a ChangeKind::Remove since it no longer matches

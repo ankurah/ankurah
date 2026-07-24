@@ -4,13 +4,13 @@ use ankql::ast::Predicate;
 use ankurah::core::{
     entity::Entity,
     error::ValidationError,
-    node::{Node as NodeAlias, NodeInner, WeakNode},
+    node::{Node as NodeAlias, NodeInner},
     policy::{AccessDenied, DefaultContext, PolicyAgent, DEFAULT_CONTEXT},
     storage::StorageEngine,
     util::Iterable,
 };
 use ankurah::proto::{self, Attested, EventId};
-use ankurah::{Model, Node, PermissiveAgent};
+use ankurah::{Node, PermissiveAgent};
 use ankurah_connector_local_process::LocalProcessConnection;
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
@@ -19,7 +19,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use common::{Pet, PetView};
+use common::{Album, Pet, PetView};
 
 /// Permissive agent with two observation/override points for bridge policy
 /// tests: counts validate_received_event calls, and denies check_read_event
@@ -66,6 +66,7 @@ impl PolicyAgent for BridgePolicyAgent {
         &self,
         _node: &NodeAlias<SE, Self>,
         _cdata: &Self::ContextData,
+        _model: &ankurah::ModelId,
         _entity_before: &Entity,
         _entity_after: &Entity,
         _event: &proto::Event,
@@ -77,6 +78,7 @@ impl PolicyAgent for BridgePolicyAgent {
         &self,
         _node: &NodeAlias<SE, Self>,
         _from_node: &proto::EntityId,
+        _model: &proto::ModelId,
         _event: &proto::Attested<proto::Event>,
     ) -> Result<(), AccessDenied> {
         self.validate_calls.fetch_add(1, Ordering::SeqCst);
@@ -91,17 +93,18 @@ impl PolicyAgent for BridgePolicyAgent {
         &self,
         _node: &NodeAlias<SE, Self>,
         _from_node: &proto::EntityId,
+        _model: &proto::ModelId,
         _state: &Attested<proto::EntityState>,
     ) -> Result<(), AccessDenied> {
         Ok(())
     }
 
-    fn can_access_collection<C>(&self, _data: &C, _collection: &proto::CollectionId) -> Result<(), AccessDenied>
+    fn can_access_collection<C>(&self, _data: &C, _collection: &ankurah::ModelId) -> Result<(), AccessDenied>
     where C: Iterable<Self::ContextData> {
         Ok(())
     }
 
-    fn filter_predicate<C>(&self, _data: &C, _collection: &proto::CollectionId, predicate: Predicate) -> Result<Predicate, AccessDenied>
+    fn filter_predicate<C>(&self, _data: &C, _collection: &ankurah::ModelId, predicate: Predicate) -> Result<Predicate, AccessDenied>
     where C: Iterable<Self::ContextData> {
         Ok(predicate)
     }
@@ -110,8 +113,9 @@ impl PolicyAgent for BridgePolicyAgent {
         &self,
         _data: &C,
         _id: &proto::EntityId,
-        _collection: &proto::CollectionId,
+        _collection: &ankurah::ModelId,
         _state: &proto::State,
+        _resolver: Option<std::sync::Weak<dyn ankurah::core::schema::CatalogResolver>>,
     ) -> Result<(), AccessDenied>
     where
         C: Iterable<Self::ContextData>,
@@ -119,7 +123,7 @@ impl PolicyAgent for BridgePolicyAgent {
         Ok(())
     }
 
-    fn check_read_event<C>(&self, _data: &C, event: &Attested<proto::Event>) -> Result<(), AccessDenied>
+    fn check_read_event<C>(&self, _data: &C, _collection: &ankurah::ModelId, event: &Attested<proto::Event>) -> Result<(), AccessDenied>
     where C: Iterable<Self::ContextData> {
         if self.deny_read_events.lock().unwrap().contains(&event.payload.id()) {
             return Err(AccessDenied::ByPolicy("event read denied by test agent"));
@@ -127,7 +131,15 @@ impl PolicyAgent for BridgePolicyAgent {
         Ok(())
     }
 
-    fn check_write(&self, _data: &Self::ContextData, _entity: &Entity, _event: Option<&proto::Event>) -> Result<(), AccessDenied> { Ok(()) }
+    fn check_write(
+        &self,
+        _data: &Self::ContextData,
+        _model: &ankurah::ModelId,
+        _entity: &Entity,
+        _event: Option<&proto::Event>,
+    ) -> Result<(), AccessDenied> {
+        Ok(())
+    }
 
     fn validate_causal_assertion<SE: StorageEngine>(
         &self,
@@ -242,15 +254,53 @@ async fn test_event_bridge_respects_read_policy_on_send() -> Result<()> {
     // The security property: the hidden event never reached the client, and
     // neither did the rest of the redacted window (a partial chain would
     // lose operations). The client's view of the entity is stale but honest.
-    let collection_c = ctx_c.collection(&Pet::collection()).await?;
-    let ids: HashSet<_> = collection_c.dump_entity_events(pet_id).await?.iter().map(|e| e.payload.id()).collect();
+    let ids: HashSet<_> = client.storage.dump_entity_events(pet_id).await?.iter().map(|e| e.payload.id()).collect();
     assert!(!ids.contains(&denied_id), "the read-denied event must not reach the client through any path");
     // The non-denied tip MAY reach the client: its verification attempt
     // fetches readable events through GetEvents, which applies policy per
     // event. What matters is that the hidden event stays hidden and the
     // unverifiable state is not adopted.
     let _ = open_id;
-    assert_eq!(ctx_c.get::<PetView>(pet_id).await?.age().unwrap(), "1", "client remains at its last verified state");
+    assert_eq!(initial[0].age().unwrap(), "1", "the resident view remains at its last verified state");
+
+    Ok(())
+}
+
+/// Canonical events are not partitioned by model, so a caller must not be
+/// able to retrieve an event merely by presenting its id under some other
+/// registered model. The requested model is authorization context; the
+/// entity's canonical membership is what makes that context valid.
+#[tokio::test]
+async fn get_events_does_not_cross_model_membership() -> Result<()> {
+    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    server.system.create().await?;
+    let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    let _conn = LocalProcessConnection::new(&client, &server).await?;
+    client.system.wait_system_ready().await;
+
+    let ctx = server.context(DEFAULT_CONTEXT)?;
+    let pet_event = {
+        let trx = ctx.begin();
+        trx.create(&Pet { name: "membership-bound".into(), age: "1".into() }).await?;
+        trx.commit_and_return_events().await?.into_iter().next().expect("pet genesis event")
+    };
+    {
+        let trx = ctx.begin();
+        trx.create(&Album { name: "other-model".into(), year: "2026".into() }).await?;
+        trx.commit().await?;
+    }
+
+    let album_model = server.catalog.model_id_for("album").expect("Album schema registered");
+    let response = client
+        .request(server.id, &DEFAULT_CONTEXT, proto::NodeRequestBody::GetEvents { model: album_model, event_ids: vec![pet_event.id()] })
+        .await?;
+
+    match response {
+        proto::NodeResponseBody::GetEvents { events, .. } => {
+            assert!(events.is_empty(), "a Pet event must not be disclosed through the Album model");
+        }
+        other => panic!("expected GetEvents response, got {other}"),
+    }
 
     Ok(())
 }

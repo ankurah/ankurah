@@ -33,9 +33,8 @@ async fn rt114() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let album1_id = server_album1.id();
     let album2_id = server_album2.id();
 
-    let client_collection = client_storage.collection(&"album".into()).await?;
-    assert_eq!(0, client_collection.dump_entity_events(album1_id.clone()).await?.len()); // before subscribe
-    assert_eq!(0, client_collection.dump_entity_events(album2_id.clone()).await?.len()); // before subscribe
+    assert_eq!(0, client_storage.dump_entity_events(album1_id.clone()).await?.len()); // before subscribe
+    assert_eq!(0, client_storage.dump_entity_events(album2_id.clone()).await?.len()); // before subscribe
 
     // Subscribe on the client with predicate year >= 2020
     let client_query = client_ctx.query_wait::<AlbumView>(nocache("year >= '2020'")?).await?;
@@ -43,8 +42,8 @@ async fn rt114() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     assert_eq!(client_query.peek().iter().map(|p| p.year().unwrap_or_default()).collect::<Vec<_>>(), vec!["2020", "2020"]);
 
     // actually zero events because we receive a state from ItemChange::Initial
-    assert_eq!(0, client_collection.dump_entity_events(album1_id.clone()).await?.len()); // after subscribe
-    assert_eq!(0, client_collection.dump_entity_events(album2_id.clone()).await?.len()); // after subscribe
+    assert_eq!(0, client_storage.dump_entity_events(album1_id.clone()).await?.len()); // after subscribe
+    assert_eq!(0, client_storage.dump_entity_events(album2_id.clone()).await?.len()); // after subscribe
 
     // Unsubscribe (drop the LiveQuery)
     drop(client_query);
@@ -60,8 +59,8 @@ async fn rt114() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         trx.commit().await?;
     }
 
-    assert_eq!(0, client_collection.dump_entity_events(album1_id.clone()).await?.len()); // after edits
-    assert_eq!(0, client_collection.dump_entity_events(album2_id.clone()).await?.len()); // after edits
+    assert_eq!(0, client_storage.dump_entity_events(album1_id.clone()).await?.len()); // after edits
+    assert_eq!(0, client_storage.dump_entity_events(album2_id.clone()).await?.len()); // after edits
 
     // LiveQuery refactor note: I don't think we really need this sleep, but I guess this helps differentiate between
     // the commit event not arriving (which is expected), vs merely taking some time to arrive unexpectedly
@@ -111,9 +110,8 @@ async fn rt114_b() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let album1_id = server_album1.id();
     let album2_id = server_album2.id();
 
-    let client_collection = client_storage.collection(&"album".into()).await?;
-    assert_eq!(0, client_collection.dump_entity_events(album1_id.clone()).await?.len()); // before fetch
-    assert_eq!(0, client_collection.dump_entity_events(album2_id.clone()).await?.len()); // before fetch
+    assert_eq!(0, client_storage.dump_entity_events(album1_id.clone()).await?.len()); // before fetch
+    assert_eq!(0, client_storage.dump_entity_events(album2_id.clone()).await?.len()); // before fetch
 
     // Fetch on the client with predicate year >= 2020
     let initial_fetch = client_ctx.fetch::<AlbumView>(nocache("year >= '2020'")?).await?;
@@ -121,8 +119,8 @@ async fn rt114_b() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     assert_eq!(vec!["2020", "2020"], initial_years);
 
     // actually zero events because we receive states directly
-    assert_eq!(0, client_collection.dump_entity_events(album1_id.clone()).await?.len()); // after fetch
-    assert_eq!(0, client_collection.dump_entity_events(album2_id.clone()).await?.len()); // after fetch
+    assert_eq!(0, client_storage.dump_entity_events(album1_id.clone()).await?.len()); // after fetch
+    assert_eq!(0, client_storage.dump_entity_events(album2_id.clone()).await?.len()); // after fetch
 
     // Make changes on the server while client has cached data
     // Album2: change to 2019 (no longer matches year >= 2020)
@@ -132,8 +130,8 @@ async fn rt114_b() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         trx.commit().await?;
     }
 
-    assert_eq!(0, client_collection.dump_entity_events(album1_id.clone()).await?.len()); // after edits
-    assert_eq!(0, client_collection.dump_entity_events(album2_id.clone()).await?.len()); // after edits
+    assert_eq!(0, client_storage.dump_entity_events(album1_id.clone()).await?.len()); // after edits
+    assert_eq!(0, client_storage.dump_entity_events(album2_id.clone()).await?.len()); // after edits
 
     // Fetch still needs sleeps for now unfortunately. We can probably find a better way to do this though
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;

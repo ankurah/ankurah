@@ -21,11 +21,13 @@
 //! seen is correctly rejected by the empty-head guard (the V6 semantics), and
 //! `handle_message` still returns `Ok` because the request handler turns the
 //! apply error into an error *response*. So the scheduler cannot read acceptance
-//! from the return value; instead it verifies the event landed in the
-//! receiver's storage and, if not, redelivers it in a later round. This models a
-//! transport that retries until delivery and lets any causal order converge
-//! (an edit that arrives before its create is retried until the create lands),
-//! without the scheduler ever having to understand causality itself.
+//! from the return value; instead it verifies the receiver's canonical entity
+//! head descends from the event and, if not, redelivers it in a later round.
+//! Checking only the append-only event store would be insufficient because
+//! production intentionally appends events before the entity-state CAS. This
+//! models a transport that retries until delivery and lets any causal order
+//! converge (an edit that arrives before its create is retried until the create
+//! lands), without the scheduler having to predict delivery order.
 
 use ankurah::proto;
 
@@ -46,9 +48,10 @@ struct InFlight {
     /// quiescence can still converge. This flag marks the droppable ones.
     droppable: bool,
     /// For load-bearing single-event propagation, the (entity, event) the
-    /// receiver must end up holding for the delivery to count as accepted. If
-    /// absent after delivery, the message is redelivered. `None` for advisory
-    /// traffic and for messages with no single acceptance target.
+    /// receiver's canonical state must incorporate for delivery to count as
+    /// accepted. If the current head does not descend from it, the message is
+    /// redelivered. `None` for advisory traffic and for messages with no single
+    /// acceptance target.
     accept: Option<(proto::EntityId, proto::EventId)>,
 }
 
@@ -162,7 +165,7 @@ impl Scheduler {
         let _ = nodes[item.dst].node.handle_message(clone_message(&item.message)).await;
         match &item.accept {
             None => true,
-            Some((entity, event)) => nodes[item.dst].stored_event_ids(*entity).await.contains(event),
+            Some((entity, event)) => nodes[item.dst].has_applied_event(*entity, event).await,
         }
     }
 

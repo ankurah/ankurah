@@ -1,4 +1,5 @@
 mod common;
+use ankurah::core::storage::StorageEngine;
 use ankurah::{policy::DEFAULT_CONTEXT as c, Node, PermissiveAgent};
 use anyhow::Result;
 use std::sync::Arc;
@@ -9,7 +10,8 @@ async fn add_event_postgres() -> Result<()> {
 
     let (_container, storage_engine) = common::create_postgres_container().await?;
 
-    let node = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new());
+    let storage_engine = Arc::new(storage_engine);
+    let node = Node::new_durable(storage_engine.clone(), PermissiveAgent::new());
     node.system.create().await?;
     let context = node.context(c)?;
 
@@ -31,8 +33,7 @@ async fn add_event_postgres() -> Result<()> {
     album2.name().insert(3, "o) ")?;
     trx2.commit().await?;
 
-    let albums = context.collection(&"album".into()).await?;
-    let events = albums.dump_entity_events(album_id).await?;
+    let events = storage_engine.dump_entity_events(album_id).await?;
     assert_eq!(events.len(), 3);
 
     Ok(())

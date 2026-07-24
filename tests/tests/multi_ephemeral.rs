@@ -77,8 +77,7 @@ async fn test_two_ephemeral_independent_writes() -> Result<()> {
     assert_eq!(results_e2[0].year().unwrap(), "2025");
 
     // Verify DAG structure on D
-    let collection_d = ctx_d.collection(&Album::collection()).await?;
-    let events = collection_d.dump_entity_events(album_id).await?;
+    let events = durable.storage.dump_entity_events(album_id).await?;
 
     assert_dag!(dag, events, {
         A => [],
@@ -220,8 +219,7 @@ async fn test_three_ephemeral_three_way_race() -> Result<()> {
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
 
     // Verify DAG structure on D - all three concurrent from A
-    let collection_d = ctx_d.collection(&Album::collection()).await?;
-    let events = collection_d.dump_entity_events(album_id).await?;
+    let events = durable.storage.dump_entity_events(album_id).await?;
 
     assert_dag!(dag, events, {
         A => [],

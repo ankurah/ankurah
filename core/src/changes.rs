@@ -1,8 +1,14 @@
 use crate::{entity::Entity, error::MutationError, model::View, reactor::ChangeNotification};
 use ankurah_proto::{Attested, Event};
 
+/// One canonical entity change routed through a particular model projection.
+///
+/// The entity and events themselves are model-independent. `model` records
+/// which materialized result set caused this notification so typed consumers
+/// can construct the correct [`View`].
 #[derive(Debug, Clone)]
 pub struct EntityChange {
+    model: crate::ModelId,
     entity: Entity,
     events: Vec<Attested<Event>>,
 }
@@ -15,11 +21,16 @@ impl ChangeNotification for EntityChange {
     fn into_parts(self) -> (Self::Entity, Vec<Self::Event>) { (self.entity, self.events) }
     fn entity(&self) -> &Self::Entity { &self.entity }
     fn events(&self) -> &[Self::Event] { &self.events }
+    fn model(&self) -> crate::ModelId { self.model }
 }
 
 // TODO consider a flattened version of EntityChange that includes the entity and Vec<(operations, parent, attestations)> rather than a Vec<Attested<Event>>
 impl EntityChange {
-    pub fn new(entity: Entity, events: Vec<Attested<Event>>) -> Result<Self, MutationError> {
+    /// Validate and construct a model-scoped notification.
+    ///
+    /// Every supplied event must target `entity` and belong to its current
+    /// head or to an ordered ancestor chain within this batch.
+    pub fn new(model: crate::ModelId, entity: Entity, events: Vec<Attested<Event>>) -> Result<Self, MutationError> {
         // Every event must belong to this entity and be part of its current
         // history: either a head tip, or the parent of a later event in the
         // same batch (an ancestor superseded within an ordered multi-event
@@ -38,8 +49,9 @@ impl EntityChange {
                 return Err(MutationError::InvalidEvent);
             }
         }
-        Ok(Self { entity, events })
+        Ok(Self { model, entity, events })
     }
+    /// Split the notification into its canonical entity and events.
     pub fn into_parts(self) -> (Entity, Vec<Attested<Event>>) { (self.entity, self.events) }
 }
 
@@ -80,25 +92,23 @@ where I: View
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ItemChange::Initial { item } => {
-                write!(f, "Initial {}/{}", I::collection(), item.id())
+                write!(f, "Initial {}/{}", I::model_name_hint(), item.id())
             }
             ItemChange::Add { item, .. } => {
-                write!(f, "Add {}/{}", I::collection(), item.id())
+                write!(f, "Add {}/{}", I::model_name_hint(), item.id())
             }
             ItemChange::Update { item, .. } => {
-                write!(f, "Update {}/{}", I::collection(), item.id())
+                write!(f, "Update {}/{}", I::model_name_hint(), item.id())
             }
             ItemChange::Remove { item, .. } => {
-                write!(f, "Remove {}/{}", I::collection(), item.id())
+                write!(f, "Remove {}/{}", I::model_name_hint(), item.id())
             }
         }
     }
 }
 
 impl std::fmt::Display for EntityChange {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "EntityChange {}/{}", self.entity.collection(), self.entity.id())
-    }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "EntityChange {}/{}", self.model, self.entity.id()) }
 }
 
 use crate::resultset::ResultSet;
@@ -193,19 +203,6 @@ where I: View + Clone + 'static
 
 // Note: ChangeSet<Entity> conversion removed since Entity doesn't implement View
 // and ChangeSet is no longer used by Reactor
-
-impl<I> From<ItemChange<Entity>> for ItemChange<I>
-where I: View
-{
-    fn from(change: ItemChange<Entity>) -> Self {
-        match change {
-            ItemChange::Initial { item } => ItemChange::Initial { item: I::from_entity(item) },
-            ItemChange::Add { item, events } => ItemChange::Add { item: I::from_entity(item), events },
-            ItemChange::Update { item, events } => ItemChange::Update { item: I::from_entity(item), events },
-            ItemChange::Remove { item, events } => ItemChange::Remove { item: I::from_entity(item), events },
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChangeKind {

@@ -1,6 +1,5 @@
 use crate::{JwtContext, JwtKeys, PolicyConfig};
-use ankurah_core::{livequery::EntityLiveQuery, resultset::EntityResultSet, storage::StorageEngine, Node};
-use ankurah_proto as proto;
+use ankurah_core::{livequery::EntityLiveQuery, resultset::ResultSet, storage::StorageEngine};
 use std::sync::{Arc, Mutex, RwLock};
 
 /// Combined policy config and verification keys, always updated atomically.
@@ -54,41 +53,64 @@ pub(crate) fn start_durable_policy_watcher<SE, PA>(
 
 /// Start ephemeral policy sync: creates a weak-node LiveQuery on "jwtpolicy" (so the
 /// agent does not keep its own node alive) and spawns a background task that applies
-/// policy updates from the durable node.
+/// policy updates from the durable node. Bootstrap uses [`JwtContext::NoUser`]: the
+/// local-only root context cannot be serialized to the durable peer, while the JWT
+/// policy cannot authenticate a user until this query supplies its verification key.
 pub(crate) fn start_ephemeral_policy_sync<SE, PA>(
-    node: &Node<SE, PA>,
+    node: ankurah_core::node::WeakNode<SE, PA>,
     state_handle: Arc<RwLock<AgentState>>,
-    policy_livequery: &Arc<Mutex<Option<EntityLiveQuery>>>,
+    policy_livequery: Arc<Mutex<Option<EntityLiveQuery>>>,
 ) where
     SE: StorageEngine + Send + Sync + 'static,
     PA: ankurah_core::policy::PolicyAgent<ContextData = JwtContext> + Send + Sync + 'static,
 {
-    let args: ankurah_core::node::MatchArgs = match "true".try_into() {
-        Ok(a) => a,
-        Err(e) => {
-            tracing::error!("on_node_ready: failed to parse selection: {}", e);
-            return;
-        }
-    };
-    let lq = match EntityLiveQuery::new_weak_node(node, proto::CollectionId::from("jwtpolicy"), args, JwtContext::NoUser) {
-        Ok(lq) => lq,
-        Err(e) => {
-            tracing::error!("on_node_ready: failed to create policy livequery: {}", e);
-            return;
-        }
-    };
-
-    let lq_clone = lq.clone();
-    *policy_livequery.lock().unwrap_or_else(|e| e.into_inner()) = Some(lq);
-
     ankurah_core::task::spawn(async move {
-        lq_clone.wait_initialized().await;
+        let model_id = loop {
+            let Some(strong_node) = node.upgrade() else {
+                return;
+            };
+            let context = strong_node.context_async(JwtContext::NoUser).await;
+            match context.register::<crate::JwtPolicy>().await {
+                Ok(model_id) => break model_id,
+                Err(error) => {
+                    tracing::debug!("ephemeral policy model registration is not ready yet: {error}");
+                    drop(context);
+                    drop(strong_node);
+                    futures_timer::Delay::new(std::time::Duration::from_millis(100)).await;
+                }
+            }
+        };
 
-        apply_policy_from_resultset(&lq_clone.resultset(), &state_handle);
+        let args: ankurah_core::node::MatchArgs = match "true".try_into() {
+            Ok(args) => args,
+            Err(error) => {
+                tracing::error!("on_node_ready: failed to parse selection: {error}");
+                return;
+            }
+        };
+        let Some(strong_node) = node.upgrade() else {
+            return;
+        };
+        let lq = match EntityLiveQuery::new_weak_node(&strong_node, model_id, args, JwtContext::NoUser) {
+            Ok(lq) => lq,
+            Err(error) => {
+                tracing::error!("on_node_ready: failed to create policy livequery: {error}");
+                return;
+            }
+        };
+        drop(strong_node);
+
+        let lq_clone = lq.clone();
+        *policy_livequery.lock().unwrap_or_else(|error| error.into_inner()) = Some(lq);
+        let typed_lq = lq_clone.map::<crate::JwtPolicyView>();
+        typed_lq.wait_initialized().await;
+        let resultset = typed_lq.resultset();
+
+        apply_policy_from_resultset(&resultset, &state_handle);
 
         let sh = state_handle.clone();
         use ankurah::signals::Subscribe;
-        let _guard = lq_clone.resultset().wrap::<crate::JwtPolicyView>().subscribe(move |policies: Vec<crate::JwtPolicyView>| {
+        let _guard = resultset.subscribe(move |policies: Vec<crate::JwtPolicyView>| {
             for policy in &policies {
                 apply_policy_view(policy, &sh);
             }
@@ -99,11 +121,9 @@ pub(crate) fn start_ephemeral_policy_sync<SE, PA>(
 }
 
 /// Process all JwtPolicy entities in the resultset, updating the agent's config and keys.
-fn apply_policy_from_resultset(resultset: &EntityResultSet, state: &Arc<RwLock<AgentState>>) {
-    use ankurah_core::model::View;
-    let read = resultset.read();
-    for (_, entity) in read.iter_entities() {
-        let view = crate::JwtPolicyView::from_entity(entity.clone());
+fn apply_policy_from_resultset(resultset: &ResultSet<crate::JwtPolicyView>, state: &Arc<RwLock<AgentState>>) {
+    use ankurah::signals::Peek;
+    for view in resultset.peek() {
         apply_policy_view(&view, state);
     }
 }
