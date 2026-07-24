@@ -51,8 +51,7 @@ async fn test_deeper_branch_wins() -> Result<()> {
     dag.enumerate(trx_deep2.commit_and_return_events().await?); // D
 
     // Verify DAG structure
-    let collection = ctx.collection(&Record::collection()).await?;
-    let events = collection.dump_entity_events(record_id).await?;
+    let events = node.storage.dump_entity_events(record_id).await?;
 
     // Structure:
     //       A
@@ -115,8 +114,7 @@ async fn test_sequential_writes_last_wins() -> Result<()> {
     }
 
     // Verify linear structure: A -> B -> C -> D
-    let collection = ctx.collection(&Record::collection()).await?;
-    let events = collection.dump_entity_events(record_id).await?;
+    let events = node.storage.dump_entity_events(record_id).await?;
     assert_dag!(dag, events, {
         A => [],
         B => [A],
@@ -161,8 +159,7 @@ async fn test_lexicographic_tiebreak() -> Result<()> {
     dag.enumerate(trx2.commit_and_return_events().await?); // C
 
     // Both B and C are at depth 1 from A
-    let collection = ctx.collection(&Record::collection()).await?;
-    let events = collection.dump_entity_events(record_id).await?;
+    let events = node.storage.dump_entity_events(record_id).await?;
 
     assert_dag!(dag, events, {
         A => [],
@@ -219,8 +216,7 @@ async fn test_per_property_concurrent_writes() -> Result<()> {
     dag.enumerate(trx1.commit_and_return_events().await?); // B
     dag.enumerate(trx2.commit_and_return_events().await?); // C
 
-    let collection = ctx.collection(&Record::collection()).await?;
-    let events = collection.dump_entity_events(record_id).await?;
+    let events = node.storage.dump_entity_events(record_id).await?;
 
     // Structure: diamond
     //       A
@@ -244,7 +240,7 @@ async fn test_per_property_concurrent_writes() -> Result<()> {
     record.edit(&trx)?.title().set(&"Merged-Title".to_owned())?;
     dag.enumerate(trx.commit_and_return_events().await?); // D
 
-    let events = collection.dump_entity_events(record_id).await?;
+    let events = node.storage.dump_entity_events(record_id).await?;
 
     // Final structure:
     //       A

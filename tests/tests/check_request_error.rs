@@ -76,6 +76,7 @@ impl PolicyAgent for RejectingAgent {
         &self,
         _node: &Node<SE, Self>,
         _received_from_node: &proto::EntityId,
+        _model: &proto::ModelId,
         _event: &proto::Attested<proto::Event>,
     ) -> std::result::Result<(), AccessDenied> {
         Ok(())
@@ -87,12 +88,13 @@ impl PolicyAgent for RejectingAgent {
         &self,
         _node: &Node<SE, Self>,
         _received_from_node: &proto::EntityId,
+        _model: &proto::ModelId,
         _state: &proto::Attested<proto::EntityState>,
     ) -> std::result::Result<(), AccessDenied> {
         Ok(())
     }
 
-    fn can_access_collection<C>(&self, _data: &C, _collection: &proto::CollectionId) -> std::result::Result<(), AccessDenied>
+    fn can_access_collection<C>(&self, _data: &C, _collection: &ankurah::ModelId) -> std::result::Result<(), AccessDenied>
     where C: Iterable<Self::ContextData> {
         Ok(())
     }
@@ -100,7 +102,7 @@ impl PolicyAgent for RejectingAgent {
     fn filter_predicate<C>(
         &self,
         _data: &C,
-        _collection: &proto::CollectionId,
+        _collection: &ankurah::ModelId,
         predicate: Predicate,
     ) -> std::result::Result<Predicate, AccessDenied>
     where
@@ -113,8 +115,9 @@ impl PolicyAgent for RejectingAgent {
         &self,
         _data: &C,
         _id: &proto::EntityId,
-        _collection: &proto::CollectionId,
+        _collection: &ankurah::ModelId,
         _state: &proto::State,
+        _resolver: Option<std::sync::Weak<dyn ankurah::core::schema::CatalogResolver>>,
     ) -> std::result::Result<(), AccessDenied>
     where
         C: Iterable<Self::ContextData>,
@@ -122,8 +125,15 @@ impl PolicyAgent for RejectingAgent {
         Ok(())
     }
 
-    fn check_read_event<C>(&self, _data: &C, _event: &proto::Attested<proto::Event>) -> std::result::Result<(), AccessDenied>
-    where C: Iterable<Self::ContextData> {
+    fn check_read_event<C>(
+        &self,
+        _data: &C,
+        _collection: &ankurah::ModelId,
+        _event: &proto::Attested<proto::Event>,
+    ) -> std::result::Result<(), AccessDenied>
+    where
+        C: Iterable<Self::ContextData>,
+    {
         Ok(())
     }
 
@@ -163,19 +173,21 @@ async fn check_request_error_returns_to_client() -> Result<()> {
 
     let client_ctx = client.context(DEFAULT_CONTEXT)?;
 
-    // Try to create an entity on the client - this should fail when relaying to server
-    // because the server's check_request will reject it
+    // Try to create an entity on the client. Under rev 4 the FIRST server
+    // interaction is the create's RegisterSchema (identity must be
+    // allocated before any write), so the server's check_request rejection
+    // surfaces right here as the strict unregistered-collection error --
+    // carrying the server's reason -- rather than hanging.
     let trx = client_ctx.begin();
-    trx.create(&Album { name: "Test Album".into(), year: "2024".into() }).await?;
+    let result = trx.create(&Album { name: "Test Album".into(), year: "2024".into() }).await;
 
-    // The commit should return an error (not hang!) because the server rejected the request
-    let result = trx.commit().await;
+    assert!(result.is_err(), "Create should fail when the server rejects the registration request");
 
-    assert!(result.is_err(), "Commit should fail when server rejects the request");
-
-    // Verify the error message contains our rejection reason
-    let err_msg = result.unwrap_err().to_string();
+    // Verify the error message carries our rejection reason through the
+    // strict error wrapper.
+    let err_msg = result.err().map(|e| e.to_string()).unwrap_or_default();
     assert!(err_msg.contains("rejected") || err_msg.contains("Request rejected"), "Error should indicate rejection, got: {}", err_msg);
+    assert!(err_msg.contains("unregistered collection"), "Error should name the strict rev 4 surface, got: {}", err_msg);
 
     Ok(())
 }

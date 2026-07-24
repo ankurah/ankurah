@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::Hash;
 
 use crate::collation::Collatable;
+use crate::value::{Value, ValueType};
 use ankql::ast;
 
 /// An index for a specific field and comparison operator
@@ -16,15 +17,18 @@ pub(crate) struct ComparisonIndex<T> {
     pub(crate) ne: HashMap<Vec<u8>, Vec<T>>,
     pub(crate) gt: BTreeMap<Vec<u8>, Vec<T>>,
     pub(crate) lt: BTreeMap<Vec<u8>, Vec<T>>,
+    target_type: Option<ValueType>,
 }
 
 impl<T> Default for ComparisonIndex<T> {
-    fn default() -> Self { Self { eq: HashMap::new(), ne: HashMap::new(), gt: BTreeMap::new(), lt: BTreeMap::new() } }
+    fn default() -> Self { Self { eq: HashMap::new(), ne: HashMap::new(), gt: BTreeMap::new(), lt: BTreeMap::new(), target_type: None } }
 }
 
 impl<T: Clone + Eq + Hash + Ord> ComparisonIndex<T> {
     #[allow(unused)]
     pub fn new() -> Self { Self::default() }
+
+    pub fn with_target_type(target_type: ValueType) -> Self { Self { target_type: Some(target_type), ..Self::default() } }
 
     fn for_entry<F, V>(&mut self, value: V, op: ast::ComparisonOperator, f: F)
     where
@@ -70,11 +74,13 @@ impl<T: Clone + Eq + Hash + Ord> ComparisonIndex<T> {
         }
     }
 
-    pub fn add<V: Collatable>(&mut self, value: V, op: ast::ComparisonOperator, watcher_id: T) {
+    pub fn add(&mut self, value: Value, op: ast::ComparisonOperator, watcher_id: T) {
+        let Some(value) = self.normalize(value) else { return };
         self.for_entry(value, op, |entries| entries.push(watcher_id));
     }
 
-    pub fn remove<V: Collatable>(&mut self, value: V, op: ast::ComparisonOperator, watcher_id: T) {
+    pub fn remove(&mut self, value: Value, op: ast::ComparisonOperator, watcher_id: T) {
+        let Some(value) = self.normalize(value) else { return };
         self.for_entry(value, op, |entries| {
             if let Some(pos) = entries.iter().position(|id| *id == watcher_id) {
                 entries.remove(pos);
@@ -82,7 +88,12 @@ impl<T: Clone + Eq + Hash + Ord> ComparisonIndex<T> {
         });
     }
 
-    pub fn find_matching<V: Collatable>(&self, value: V) -> std::collections::btree_set::IntoIter<T> {
+    /// Find watchers whose thresholds admit `value` after re-casting at the
+    /// entity-change boundary. If a malformed stored value cannot enter the
+    /// registered collation domain, return every watcher conservatively; the
+    /// reactor's exact predicate evaluation then decides membership.
+    pub fn find_matching(&self, value: Value) -> std::collections::btree_set::IntoIter<T> {
+        let Some(value) = self.normalize(value) else { return self.all_watchers().into_iter() };
         let mut result = BTreeSet::new();
         let bytes = value.to_bytes();
 
@@ -114,12 +125,18 @@ impl<T: Clone + Eq + Hash + Ord> ComparisonIndex<T> {
         // Should just return the BTreeSet but this sucks for test cases
         result.into_iter()
     }
+
+    fn normalize(&self, value: Value) -> Option<Value> { self.target_type.map_or(Some(value.clone()), |target| value.cast_to(target).ok()) }
+
+    fn all_watchers(&self) -> BTreeSet<T> {
+        self.eq.values().chain(self.ne.values()).chain(self.gt.values()).chain(self.lt.values()).flatten().cloned().collect()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::ComparisonIndex;
-    use crate::value::Value;
+    use crate::value::{Value, ValueType};
     use ankql::ast;
     use ankurah_proto as proto;
 
@@ -129,7 +146,7 @@ mod tests {
 
         // Less than 8 ------------------------------------------------------------
         let sub0 = proto::QueryId::test(0);
-        index.add(ast::Literal::I64(8), ast::ComparisonOperator::LessThan, sub0);
+        index.add(Value::I64(8), ast::ComparisonOperator::LessThan, sub0);
 
         // 8 should match nothing
         assert_eq!(index.find_matching(Value::I64(8)).collect::<Vec<_>>(), vec![]);
@@ -140,7 +157,7 @@ mod tests {
         let sub1 = proto::QueryId::test(1);
 
         // Greater than 20 ------------------------------------------------------------
-        index.add(ast::Literal::I64(20), ast::ComparisonOperator::GreaterThan, sub1);
+        index.add(Value::I64(20), ast::ComparisonOperator::GreaterThan, sub1);
 
         // 20 should match nothing
         assert_eq!(index.find_matching(Value::I64(20)).collect::<Vec<_>>(), vec![]);
@@ -149,13 +166,13 @@ mod tests {
         assert_eq!(index.find_matching(Value::I64(21)).collect::<Vec<_>>(), vec![sub1]);
 
         // // Add subscriptions for various numeric comparisons
-        index.add(ast::Literal::I64(5), ast::ComparisonOperator::Equal, sub0);
+        index.add(Value::I64(5), ast::ComparisonOperator::Equal, sub0);
 
         // // Test exact match (5)
         assert_eq!(index.find_matching(Value::I64(5)).collect::<Vec<_>>(), vec![sub0]);
 
         // Less than 25 ------------------------------------------------------------
-        index.add(ast::Literal::I64(25), ast::ComparisonOperator::LessThan, sub0);
+        index.add(Value::I64(25), ast::ComparisonOperator::LessThan, sub0);
 
         // 22 should match sub0 (< 25) and sub1 (> 20)
         assert_eq!(index.find_matching(Value::I64(22)).collect::<Vec<_>>(), vec![sub0, sub1]);
@@ -172,9 +189,29 @@ mod tests {
         let mut index = ComparisonIndex::<proto::QueryId>::new();
 
         let sub0 = proto::QueryId::test(0);
-        index.add(ast::Literal::I64(8), ast::ComparisonOperator::NotEqual, sub0);
+        index.add(Value::I64(8), ast::ComparisonOperator::NotEqual, sub0);
 
         assert_eq!(index.find_matching(Value::I64(8)).collect::<Vec<_>>(), vec![]);
         assert_eq!(index.find_matching(Value::I64(9)).collect::<Vec<_>>(), vec![sub0]);
+    }
+
+    #[test]
+    fn typed_index_recasts_changed_entity_values() {
+        let mut index = ComparisonIndex::with_target_type(ValueType::I64);
+        let subscription = proto::QueryId::test(0);
+        index.add(Value::I32(8), ast::ComparisonOperator::Equal, subscription);
+
+        assert_eq!(index.find_matching(Value::String("8".to_owned())).collect::<Vec<_>>(), vec![subscription]);
+    }
+
+    #[test]
+    fn uncastable_changed_value_conservatively_wakes_every_watcher() {
+        let mut index = ComparisonIndex::with_target_type(ValueType::I64);
+        let equal = proto::QueryId::test(0);
+        let not_equal = proto::QueryId::test(1);
+        index.add(Value::I64(8), ast::ComparisonOperator::Equal, equal);
+        index.add(Value::I64(8), ast::ComparisonOperator::NotEqual, not_equal);
+
+        assert_eq!(index.find_matching(Value::String("not-a-number".to_owned())).collect::<Vec<_>>(), vec![equal, not_equal]);
     }
 }

@@ -9,38 +9,35 @@ use futures::Stream;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-/// Scanner over a materialized collection tree yielding EntityId directly (for ID-only queries)
-pub struct SledCollectionKeyScanner<'a> {
-    pub tree: &'a sled::Tree,
-    pub bounds: &'a KeyBounds,
-    pub direction: ScanDirection,
-    // Iterator state
-    iter: SledCollectionIter,
+/// Scanner over a model-materialization tree yielding `EntityId` directly.
+pub struct SledMaterializationKeyScanner {
+    iter: SledMaterializationIter,
 }
 
-enum SledCollectionIter {
+enum SledMaterializationIter {
     Forward(sled::Iter),
     Reverse(std::iter::Rev<sled::Iter>),
 }
 
-impl Iterator for SledCollectionIter {
+impl Iterator for SledMaterializationIter {
     type Item = Result<(sled::IVec, sled::IVec), sled::Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
-            SledCollectionIter::Forward(iter) => iter.next(),
-            SledCollectionIter::Reverse(iter) => iter.next(),
+            SledMaterializationIter::Forward(iter) => iter.next(),
+            SledMaterializationIter::Reverse(iter) => iter.next(),
         }
     }
 }
 
-impl<'a> SledCollectionKeyScanner<'a> {
-    pub fn new(tree: &'a sled::Tree, bounds: &'a KeyBounds, direction: ScanDirection) -> Result<Self, IndexError> {
+impl SledMaterializationKeyScanner {
+    /// Create an entity-id scanner over the requested materialization range.
+    pub fn new(tree: &sled::Tree, bounds: &KeyBounds, direction: ScanDirection) -> Result<Self, IndexError> {
         // Setup iterator immediately in constructor
         // Create a primary key spec (single ascending EntityId component)
         let primary_key_spec = KeySpec {
             keyparts: vec![IndexKeyPart {
-                column: "id".to_string(),
+                key: "id".to_string(),
                 sub_path: None,
                 direction: IndexDirection::Asc,  // Primary keys are always ascending
                 value_type: ValueType::EntityId, // EntityId type
@@ -53,22 +50,22 @@ impl<'a> SledCollectionKeyScanner<'a> {
 
         let iter = match direction {
             ScanDirection::Forward => match &end_key_opt {
-                Some(end_key) => SledCollectionIter::Forward(tree.range(start_key.clone()..end_key.clone())),
-                None => SledCollectionIter::Forward(tree.range(start_key.clone()..)),
+                Some(end_key) => SledMaterializationIter::Forward(tree.range(start_key.clone()..end_key.clone())),
+                None => SledMaterializationIter::Forward(tree.range(start_key.clone()..)),
             },
             ScanDirection::Reverse => match &end_key_opt {
-                Some(end_key) => SledCollectionIter::Reverse(tree.range(start_key.clone()..end_key.clone()).rev()),
-                None => SledCollectionIter::Reverse(tree.range(start_key.clone()..).rev()),
+                Some(end_key) => SledMaterializationIter::Reverse(tree.range(start_key.clone()..end_key.clone()).rev()),
+                None => SledMaterializationIter::Reverse(tree.range(start_key.clone()..).rev()),
             },
         };
 
-        Ok(Self { tree, bounds, direction, iter })
+        Ok(Self { iter })
     }
 }
 
-impl Unpin for SledCollectionKeyScanner<'_> {}
+impl Unpin for SledMaterializationKeyScanner {}
 
-impl Stream for SledCollectionKeyScanner<'_> {
+impl Stream for SledMaterializationKeyScanner {
     type Item = Result<EntityId, RetrievalError>;
 
     fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -79,7 +76,7 @@ impl Stream for SledCollectionKeyScanner<'_> {
             None => return Poll::Ready(None),
         };
 
-        // For collection trees, the key is directly the EntityId bytes
+        // Materialization-tree keys are the raw EntityId bytes.
         match key_bytes.as_ref().try_into() {
             Ok(bytes) => Poll::Ready(Some(Ok(EntityId::from_bytes(bytes)))),
             Err(_) => Poll::Ready(None),
@@ -87,27 +84,27 @@ impl Stream for SledCollectionKeyScanner<'_> {
     }
 }
 
-/// Scanner over a materialized collection tree yielding materialized values directly
-pub struct SledCollectionScanner<'a> {
-    pub tree: &'a sled::Tree,
-    pub bounds: &'a KeyBounds,
-    pub direction: ScanDirection,
-    pub property_manager: &'a PropertyManager,
-    iter: SledCollectionIter,
+/// Scanner over a model-materialization tree yielding projected values.
+pub struct SledMaterializationScanner<'a> {
+    property_manager: &'a PropertyManager,
+    iter: SledMaterializationIter,
 }
 
-impl<'a> SledCollectionScanner<'a> {
+impl<'a> SledMaterializationScanner<'a> {
+    /// Create a projected-value scanner over the requested materialization
+    /// range.
     pub fn new(
         tree: &'a sled::Tree,
         bounds: &'a KeyBounds,
         direction: ScanDirection,
         property_manager: &'a PropertyManager,
     ) -> Result<Self, IndexError> {
-        // Setup iterator immediately in constructor (same logic as SledCollectionKeyScanner)
+        // Set up the iterator immediately, as in
+        // `SledMaterializationKeyScanner`.
         // Create a primary key spec (single ascending EntityId component)
         let primary_key_spec = KeySpec {
             keyparts: vec![IndexKeyPart {
-                column: "id".to_string(),
+                key: "id".to_string(),
                 sub_path: None,
                 direction: IndexDirection::Asc,  // Primary keys are always ascending
                 value_type: ValueType::EntityId, // EntityId type
@@ -119,22 +116,22 @@ impl<'a> SledCollectionScanner<'a> {
         let SledRangeBounds { start: start_key, end: end_key_opt, .. } = key_bounds_to_sled_range(bounds, &primary_key_spec)?;
         let iter = match direction {
             ScanDirection::Forward => match &end_key_opt {
-                Some(end_key) => SledCollectionIter::Forward(tree.range(start_key.clone()..end_key.clone())),
-                None => SledCollectionIter::Forward(tree.range(start_key.clone()..)),
+                Some(end_key) => SledMaterializationIter::Forward(tree.range(start_key.clone()..end_key.clone())),
+                None => SledMaterializationIter::Forward(tree.range(start_key.clone()..)),
             },
             ScanDirection::Reverse => match &end_key_opt {
-                Some(end_key) => SledCollectionIter::Reverse(tree.range(start_key.clone()..end_key.clone()).rev()),
-                None => SledCollectionIter::Reverse(tree.range(start_key.clone()..).rev()),
+                Some(end_key) => SledMaterializationIter::Reverse(tree.range(start_key.clone()..end_key.clone()).rev()),
+                None => SledMaterializationIter::Reverse(tree.range(start_key.clone()..).rev()),
             },
         };
 
-        Ok(Self { tree, bounds, direction, property_manager, iter })
+        Ok(Self { property_manager, iter })
     }
 }
 
-impl Unpin for SledCollectionScanner<'_> {}
+impl Unpin for SledMaterializationScanner<'_> {}
 
-impl Stream for SledCollectionScanner<'_> {
+impl Stream for SledMaterializationScanner<'_> {
     type Item = crate::materialization::ProjectedEntity;
 
     fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -157,38 +154,39 @@ impl Stream for SledCollectionScanner<'_> {
             Err(_e) => return Poll::Ready(None), // Skip errors for now - TODO: proper error handling
         };
 
-        // Convert to ProjectedEntity - store by property name (not ID)
+        // Convert to ProjectedEntity - reverse each numeric slot to its durable
+        // PropertyId so the projection is addressed by identity.
         let mut map = std::collections::BTreeMap::new();
-        for (property_id, value) in property_values {
-            if let Some(property_name) = self.property_manager.get_property_name(property_id) {
-                map.insert(property_name, value);
+        for (slot, value) in property_values {
+            if let Ok(Some(property_id)) = self.property_manager.property_for_slot(slot) {
+                map.insert(property_id, value);
             }
         }
 
-        Poll::Ready(Some(crate::materialization::ProjectedEntity {
-            id: entity_id,
-            collection: ankurah_proto::CollectionId::from("unknown"), // TODO: get from context
-            map,
-        }))
+        Poll::Ready(Some(crate::materialization::ProjectedEntity { id: entity_id, map }))
     }
 }
 
 /// Sled-specific materialized value lookup iterator (for index scans that need materialization)
-pub struct SledCollectionLookup<S> {
+pub struct SledMaterializationLookup<S> {
+    /// Materialization tree containing projected property slots.
     pub tree: sled::Tree,
+    /// Durable property-id to compact-slot registry.
     pub property_manager: PropertyManager,
+    /// Upstream entity-id stream to hydrate from the materialization.
     pub stream: S,
 }
 
-impl<S: EntityIdStream> SledCollectionLookup<S> {
+impl<S: EntityIdStream> SledMaterializationLookup<S> {
+    /// Attach projected-value lookup to an entity-id stream.
     pub fn new(tree: &sled::Tree, property_manager: &PropertyManager, stream: S) -> Self {
         Self { tree: tree.clone(), property_manager: property_manager.clone(), stream }
     }
 }
 
-impl<S: Unpin> Unpin for SledCollectionLookup<S> {}
+impl<S: Unpin> Unpin for SledMaterializationLookup<S> {}
 
-impl<S: EntityIdStream> Stream for SledCollectionLookup<S> {
+impl<S: EntityIdStream> Stream for SledMaterializationLookup<S> {
     type Item = crate::materialization::ProjectedEntity;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -200,7 +198,7 @@ impl<S: EntityIdStream> Stream for SledCollectionLookup<S> {
             Poll::Pending => return Poll::Pending,
         };
 
-        // Lookup materialized values from collection tree
+        // Look up projected values from the model materialization.
         let key = entity_id.to_bytes();
         let value_bytes = match self.tree.get(key) {
             Ok(Some(bytes)) => bytes,
@@ -214,18 +212,15 @@ impl<S: EntityIdStream> Stream for SledCollectionLookup<S> {
             Err(_e) => return Poll::Ready(None), // Skip errors for now - TODO: proper error handling
         };
 
-        // Convert to ProjectedEntity - store by property name
+        // Convert to ProjectedEntity - reverse each numeric slot to its durable
+        // PropertyId so the projection is addressed by identity.
         let mut map = std::collections::BTreeMap::new();
-        for (property_id, value) in property_values {
-            if let Some(property_name) = self.property_manager.get_property_name(property_id) {
-                map.insert(property_name, value);
+        for (slot, value) in property_values {
+            if let Ok(Some(property_id)) = self.property_manager.property_for_slot(slot) {
+                map.insert(property_id, value);
             }
         }
 
-        Poll::Ready(Some(crate::materialization::ProjectedEntity {
-            id: entity_id,
-            collection: ankurah_proto::CollectionId::from("unknown"), // TODO: get from context
-            map,
-        }))
+        Poll::Ready(Some(crate::materialization::ProjectedEntity { id: entity_id, map }))
     }
 }

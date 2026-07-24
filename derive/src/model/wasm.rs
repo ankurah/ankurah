@@ -96,12 +96,10 @@ pub fn wasm_impl(input: &syn::DeriveInput, model: &crate::model::description::Mo
         // Generate LiveQuery wrapper (at module level for re-export)
         #livequery_wrapper
 
-        const _: () = {
-            use ::ankurah::derive_deps::{tracing::error,wasm_bindgen::prelude::*, wasm_bindgen_futures};
-
-            // Generate namespace struct with static methods
-            #namespace_class
-        };
+        // Generate namespace struct with static methods. Keep this at module
+        // scope: wasm-bindgen's impl expansion is not valid when nested in a
+        // const block.
+        #namespace_class
     }
 }
 
@@ -407,7 +405,7 @@ pub fn wasm_model_namespace(
 
     quote! {
         #[wasm_bindgen(typescript_custom_section)]
-        const TS_APPEND_CONTENT: &'static str = #static_methods_ts;
+        const TS_MODEL_NAMESPACE: &'static str = #static_methods_ts;
 
         // These methods are only available via wasm bindgen, so it's ok that we're inside a const block
         #[wasm_bindgen(js_name = #name, skip_typescript)]

@@ -1,6 +1,7 @@
 use std::{collections::BTreeSet, convert::Infallible};
 
-use ankurah_proto::{CollectionId, DecodeError, EntityId, EventId};
+use crate::ModelId;
+use ankurah_proto::{DecodeError, EntityId, EventId};
 use thiserror::Error;
 
 use crate::{connector::SendError, policy::AccessDenied};
@@ -20,7 +21,7 @@ pub enum RetrievalError {
     #[error("Storage error: {0}")]
     StorageError(Box<dyn std::error::Error + Send + Sync + 'static>),
     #[error("Collection not found: {0}")]
-    CollectionNotFound(CollectionId),
+    CollectionNotFound(ModelId),
     #[error("Update failed: {0}")]
     FailedUpdate(Box<dyn std::error::Error + Send + Sync + 'static>),
     #[error("Deserialization error: {0}")]
@@ -49,6 +50,10 @@ pub enum RetrievalError {
     RequestError(RequestError),
     #[error("Apply error: {0}")]
     ApplyError(ApplyError),
+    /// A selection reached a storage engine unresolved. This is a caller bug,
+    /// not a data condition: see `ankql::ast::Selection::check`.
+    #[error("Unresolved selection: {0}")]
+    SelectionError(ankql::error::SelectionError),
 }
 
 impl From<RequestError> for RetrievalError {
@@ -77,6 +82,10 @@ impl From<bincode::Error> for RetrievalError {
 
 impl From<crate::selection::filter::Error> for RetrievalError {
     fn from(err: crate::selection::filter::Error) -> Self { RetrievalError::AnkqlFilter(err) }
+}
+
+impl From<ankql::error::SelectionError> for RetrievalError {
+    fn from(err: ankql::error::SelectionError) -> Self { RetrievalError::SelectionError(err) }
 }
 
 impl From<anyhow::Error> for RetrievalError {
@@ -249,6 +258,12 @@ pub enum StateError {
     DDLError(Box<dyn std::error::Error + Send + Sync + 'static>),
     #[error("DMLError: {0}")]
     DMLError(Box<dyn std::error::Error + Send + Sync + 'static>),
+    /// Neither the built-in name mapping nor the catalog can supply a model
+    /// address for this collection.
+    /// For a locally committed user collection this means
+    /// commit-before-registration, a bug rather than a race.
+    #[error("no model id for collection '{0}'")]
+    UnknownModel(String),
 }
 
 impl From<bincode::Error> for StateError {
@@ -283,7 +298,7 @@ pub enum ValidationError {
 #[derive(Debug)]
 pub enum ApplyError {
     Items(Vec<ApplyErrorItem>),
-    CollectionNotFound(CollectionId),
+    CollectionNotFound(ModelId),
     RetrievalError(Box<RetrievalError>),
     MutationError(Box<MutationError>),
 }
@@ -319,13 +334,15 @@ impl std::error::Error for ApplyError {
 #[derive(Debug)]
 pub struct ApplyErrorItem {
     pub entity_id: EntityId,
-    pub collection: CollectionId,
+    /// The model address the wire item carried; the collection
+    /// may be unresolvable, which is itself one of the reportable causes.
+    pub model: ankurah_proto::ModelId,
     pub cause: MutationError,
 }
 
 impl std::fmt::Display for ApplyErrorItem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Failed to apply delta for entity {} in collection {}: {}", self.entity_id.to_base64_short(), self.collection, self.cause)
+        write!(f, "Failed to apply delta for entity {} of model {}: {}", self.entity_id.to_base64_short(), self.model, self.cause)
     }
 }
 

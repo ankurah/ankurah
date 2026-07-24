@@ -219,45 +219,46 @@ accumulated DAG, never layer membership.
 
 ## The Staging Pattern
 
-An incoming event must be **discoverable by BFS** before the entity's head is
-updated to reference it. Otherwise, a concurrent traversal starting from the
-new head would encounter an unfetchable event. The staging pattern solves this
-with a four-phase lifecycle:
+An incoming event must be **discoverable by BFS** before an in-memory candidate
+head references it. Otherwise, a concurrent traversal starting from the new
+head would encounter an unfetchable event. The staging pattern participates in
+this four-phase lifecycle:
 
 ```text
-  stage_event -----> apply_event -----> commit_event -----> set_state
-  (in-memory map)   (head update)      (durable storage)   (durable state)
+  stage_event -----> compare/apply -----> append_events -----> commit_batch
+  (in-memory map)   (candidate state)    (durable history)    (CAS + projections)
 ```
 
 1. **Stage** -- Place the event in an in-memory map so that `get_event` can
    find it during BFS.
-2. **Apply** -- Compare the event against the entity head and update in-memory
-   state on success.
-3. **Commit** -- Write the event to permanent storage and remove it from the
-   staging map.
-4. **Persist state** -- Write the entity's head clock and backend buffers to
-   disk.
+2. **Compare/apply** -- Compare the event against an entity or detached
+   candidate and apply it on success.
+3. **Append** -- Write the validated, attested, content-addressed event set to
+   permanent storage through `StorageEngine::append_events`.
+4. **Commit canonical state** -- Exact-head compare-and-swap the entity while
+   atomically refreshing associations and every affected model projection.
 
 ### The ordering invariant
 
-> **Stage before head update (in memory); commit before state persist (to disk).**
+> **Stage before candidate head update; append before canonical head commit.**
 
 The first half ensures BFS reachability. The second half ensures crash safety:
 
-- Crash after commit but before state persist: recovery loads the old entity
+- Crash after append but before canonical commit: recovery loads the old entity
   state; the event is in storage but unreferenced by the head, so the next
   `apply_event` integrates it normally via BFS.
-- Crash before commit: neither event nor updated state are persisted -- a clean
-  rollback.
+- A conflicting canonical batch leaves the appended event unreferenced and
+  exposes none of the batch's state, association, or projection changes.
 
 ### Trait separation enforces the protocol
 
 The [retrieval layer](retrieval.md) splits event access into distinct traits so
 that `apply_event` (which takes [`GetEvents`](retrieval.md#why-three-traits-instead-of-one)) cannot
 accidentally stage or commit events. Only the outer caller holds
-[`SuspenseEvents`](retrieval.md#why-three-traits-instead-of-one), which adds `stage_event` and
-`commit_event`. This makes the staging protocol a compile-time guarantee rather
-than a convention.
+[`SuspenseEvents`](retrieval.md#why-three-traits-instead-of-one), which adds
+`stage_event`. Permanent append remains a separate `StorageEngine` operation,
+so the type split prevents the comparison algorithm itself from mutating
+storage.
 
 The distinction between `get_event` (union of staging + storage) and
 `event_stored` (permanent storage only) enables the

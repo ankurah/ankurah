@@ -305,14 +305,19 @@ fn generate_selection_code_with_replacements(
         let order_items: Vec<_> = order_by
             .iter()
             .map(|item| {
-                let steps: Vec<_> = item.path.steps.iter().map(|s| quote! { #s.to_string() }).collect();
+                // The parser only ever produces a raw `OrderKey::Path`; resolution
+                // (at query time) is what rewrites it to a resolved key.
+                let steps: Vec<_> = match &item.key {
+                    ankql::ast::OrderKey::Path(path) => path.steps.iter().map(|s| quote! { #s.to_string() }).collect(),
+                    ankql::ast::OrderKey::Property(_) => unreachable!("parser produces only raw OrderKey::Path"),
+                };
                 let direction_code = match item.direction {
                     ankql::ast::OrderDirection::Asc => quote! { ::ankql::ast::OrderDirection::Asc },
                     ankql::ast::OrderDirection::Desc => quote! { ::ankql::ast::OrderDirection::Desc },
                 };
                 quote! {
                     ::ankql::ast::OrderByItem {
-                        path: ::ankql::ast::PathExpr { steps: vec![#(#steps),*] },
+                        key: ::ankql::ast::OrderKey::Path(::ankql::ast::PathExpr { steps: vec![#(#steps),*] }),
                         direction: #direction_code,
                     }
                 }
@@ -463,46 +468,53 @@ fn generate_expr_code_with_replacements(
                 ::ankql::ast::Expr::ExprList(vec![#(#expr_codes),*])
             }
         }
+        // The parser never produces a resolved PropertyPath -- it is the output of
+        // a resolution pass that runs on already-parsed ASTs, not of
+        // parse_selection, which is what feeds this codegen. This arm exists only
+        // to keep the match exhaustive.
+        ankql::ast::Expr::PropertyPath(_) => {
+            panic!("selection! macro received a resolved PropertyPath; the parser only produces PathExpr")
+        }
     }
 }
 
 fn generate_literal_code_with_replacements(
-    literal: &ankql::ast::Literal,
+    literal: &ankql::ast::Value,
     _args: &[(Option<String>, String, Expr)],
     _arg_index: &mut usize,
 ) -> proc_macro2::TokenStream {
     match literal {
-        ankql::ast::Literal::String(s) => {
-            quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Literal::String(#s.to_string())) }
+        ankql::ast::Value::String(s) => {
+            quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Value::String(#s.to_string())) }
         }
-        ankql::ast::Literal::I64(i) => {
-            quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Literal::I64(#i)) }
+        ankql::ast::Value::I64(i) => {
+            quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Value::I64(#i)) }
         }
-        ankql::ast::Literal::F64(f) => {
-            quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Literal::F64(#f)) }
+        ankql::ast::Value::F64(f) => {
+            quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Value::F64(#f)) }
         }
-        ankql::ast::Literal::Bool(b) => {
-            quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Literal::Bool(#b)) }
+        ankql::ast::Value::Bool(b) => {
+            quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Value::Bool(#b)) }
         }
-        ankql::ast::Literal::I16(i) => {
-            quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Literal::I16(#i)) }
+        ankql::ast::Value::I16(i) => {
+            quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Value::I16(#i)) }
         }
-        ankql::ast::Literal::I32(i) => {
-            quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Literal::I32(#i)) }
+        ankql::ast::Value::I32(i) => {
+            quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Value::I32(#i)) }
         }
-        ankql::ast::Literal::EntityId(ulid) => {
-            let ulid_u128 = ulid.0;
-            quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Literal::EntityId(::ulid::Ulid(#ulid_u128))) }
+        ankql::ast::Value::EntityId(id) => {
+            let bytes = id.to_bytes();
+            quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Value::EntityId(::ankurah::EntityId::from_bytes([#(#bytes),*]))) }
         }
-        ankql::ast::Literal::Object(_items) => {
+        ankql::ast::Value::Object(_items) => {
             todo!("Object literals");
-            // quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Literal::Object(#items)) }
+            // quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Value::Object(#items)) }
         }
-        ankql::ast::Literal::Binary(_items) => {
+        ankql::ast::Value::Binary(_items) => {
             todo!("Binary literals");
-            // quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Literal::Binary(#items)) }
+            // quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Value::Binary(#items)) }
         }
-        ankql::ast::Literal::Json(_) => {
+        ankql::ast::Value::Json(_) => {
             // Json literals are not parsed from query syntax; created by AST preparation pass
             unreachable!("Json literals cannot appear in parsed queries")
         }

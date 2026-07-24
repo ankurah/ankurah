@@ -30,8 +30,7 @@ async fn rt106() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
     let album_id = server_album.id();
 
-    let client_collection = client_storage.collection(&"album".into()).await?;
-    assert_eq!(0, client_collection.dump_entity_events(album_id.clone()).await?.len()); // before subscribe
+    assert_eq!(0, client_storage.dump_entity_events(album_id.clone()).await?.len()); // before subscribe
 
     // Subscribe on the client
     let client_query = client_ctx.query_wait::<AlbumView>(nocache("name = 'Test Album'")?).await?;
@@ -41,7 +40,7 @@ async fn rt106() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     assert_eq!(client_query.peek().iter().map(|p| p.id()).collect::<Vec<_>>(), vec![album_id]);
 
     // actually zero events because we receive a state from ItemChange::Initial
-    assert_eq!(0, client_collection.dump_entity_events(album_id.clone()).await?.len()); // after subscribe
+    assert_eq!(0, client_storage.dump_entity_events(album_id.clone()).await?.len()); // after subscribe
 
     // Fully unsubscribe (drop the LiveQuery)
     drop(client_query);
@@ -61,7 +60,7 @@ async fn rt106() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         trx.commit().await?;
     }
 
-    assert_eq!(0, client_collection.dump_entity_events(album_id.clone()).await?.len()); // after edits
+    assert_eq!(0, client_storage.dump_entity_events(album_id.clone()).await?.len()); // after edits
 
     // Not sure what we're waiting for here exactly - for the update to NOT arrive?
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
@@ -78,8 +77,10 @@ async fn rt106() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     assert_eq!(albums.len(), 1);
     assert_eq!(albums[0].year().unwrap_or_default(), "2022");
 
-    // After resubscribe, the client should have retrieved the missing events during the lineage comparison
-    assert_eq!(2, client_collection.dump_entity_events(album_id.clone()).await?.len()); // after resubscribe
+    // The causal CAS retry compares the incoming tip with the locally stored
+    // snapshot head, so it grounds and caches the complete lineage: genesis
+    // plus both edits.
+    assert_eq!(3, client_storage.dump_entity_events(album_id.clone()).await?.len()); // after resubscribe
 
     Ok(())
 }

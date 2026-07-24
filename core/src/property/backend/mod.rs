@@ -21,7 +21,8 @@ use crate::event_dag::EventLayer;
 pub use lww::LWWBackend;
 pub use yrs::YrsBackend;
 
-use super::{PropertyName, Value};
+use super::Value;
+use ankql::ast::PropertyId;
 
 // TODO - implement a property backend value iterator so we don't have to alloc a HashMap for every call to values()
 
@@ -30,12 +31,12 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
     fn as_debug(&self) -> &dyn Debug;
     fn fork(&self) -> Arc<dyn PropertyBackend>;
 
-    fn properties(&self) -> Vec<PropertyName>;
-    fn property_value(&self, property_name: &PropertyName) -> Option<Value> {
+    fn properties(&self) -> Vec<PropertyId>;
+    fn property_value(&self, key: &PropertyId) -> Option<Value> {
         let mut map = self.property_values();
-        map.remove(property_name).flatten()
+        map.remove(key).flatten()
     }
-    fn property_values(&self) -> BTreeMap<PropertyName, Option<Value>>;
+    fn property_values(&self) -> BTreeMap<PropertyId, Option<Value>>;
 
     /// Unique property backend identifier.
     fn property_backend_name() -> &'static str
@@ -94,11 +95,32 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
     /// Listen to changes for a specific field managed by this backend.
     /// Auto-creates the broadcast if it doesn't exist yet.
     /// Returns a subscription guard that will unsubscribe when dropped.
-    fn listen_field(
-        &self,
-        field_name: &PropertyName,
-        listener: ankurah_signals::signal::Listener,
-    ) -> ankurah_signals::signal::ListenerGuard;
+    fn listen_field(&self, key: &PropertyId, listener: ankurah_signals::signal::Listener) -> ankurah_signals::signal::ListenerGuard;
+
+    /// The [`PropertyId`] keys currently staged (uncommitted) in this backend,
+    /// so the commit path can canonicalize each staged value to the property's
+    /// catalog value_type before the event is generated. Names were resolved to
+    /// ids at editable-view construction, so there is nothing to re-key here.
+    /// Default empty: a backend with no value-shaped staging (a text CRDT)
+    /// stages nothing to canonicalize.
+    fn uncommitted_keys(&self) -> Vec<PropertyId> { Vec::new() }
+
+    /// Three-way presence for `key`: `None` = no entry at all; `Some(None)` =
+    /// an entry holding no value (a cleared tombstone: authoritative absence);
+    /// `Some(Some)` = a value. This is the primitive the resolved-property read
+    /// dispatch ([`crate::property::read_by_id`]) runs on, generically -- no
+    /// caller may downcast to a concrete backend for it. The default two-way
+    /// projection (via [`Self::property_value`]) suits backends without
+    /// tombstone semantics (e.g. text CRDTs).
+    fn entry(&self, key: &PropertyId) -> Option<Option<Value>> { self.property_value(key).map(Some) }
+
+    /// Replace the STAGED (uncommitted) value under `key` -- the commit-time
+    /// canonicalization hook (rfc.md 5.6 as amended 2026-07-10): the
+    /// catalog-aware caller casts a staged value to the property's canonical
+    /// value_type and restages it here. Default no-op: a backend whose edits
+    /// are not value-shaped (a text CRDT) has its canonical type pinned by
+    /// backend equality at registration, so there is nothing to cast.
+    fn restage(&self, key: &PropertyId, value: Option<Value>) { let _ = (key, value); }
 }
 
 // This is where this gets a bit tough.
@@ -108,12 +130,12 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
 // TODO: Implement a property backend type registry rather than this hardcoded nonsense.
 /// Fire the change broadcast for each named field that has subscribers.
 pub(crate) fn notify_changed_fields<'a>(
-    field_broadcasts: &std::sync::Mutex<std::collections::BTreeMap<crate::property::PropertyName, ankurah_signals::broadcast::Broadcast>>,
-    changed: impl IntoIterator<Item = &'a crate::property::PropertyName>,
+    field_broadcasts: &std::sync::Mutex<std::collections::BTreeMap<PropertyId, ankurah_signals::broadcast::Broadcast>>,
+    changed: impl IntoIterator<Item = &'a PropertyId>,
 ) {
     let broadcasts = field_broadcasts.lock().expect("field_broadcasts lock is poisoned");
-    for field_name in changed {
-        if let Some(broadcast) = broadcasts.get(field_name) {
+    for key in changed {
+        if let Some(broadcast) = broadcasts.get(key) {
             broadcast.send(());
         }
     }

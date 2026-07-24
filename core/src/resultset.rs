@@ -1,5 +1,9 @@
 use crate::indexing::{encode_tuple_values_with_key_spec, KeySpec};
-use crate::{entity::Entity, model::View, reactor::AbstractEntity};
+use crate::{
+    entity::Entity,
+    model::View,
+    reactor::{extract_property_value, AbstractEntity},
+};
 use ankurah_proto as proto;
 use ankurah_signals::{
     broadcast::{Broadcast, BroadcastId},
@@ -70,8 +74,12 @@ struct Inner<E: AbstractEntity> {
 struct State<E: AbstractEntity> {
     order: Vec<EntityEntry<E>>,
     index: HashMap<proto::EntityId, usize>,
-    // Ordering configuration
-    key_spec: Option<KeySpec>,
+    // Ordering configuration. Each keypart carries the stable property
+    // identity and its sub-path, which is also exactly what value extraction
+    // needs, so the spec is both the encoding rule and the extraction rule;
+    // identity-keyed parts keep an active query stable across display-name
+    // changes.
+    key_spec: Option<KeySpec<ankql::ast::PropertyId>>,
     limit: Option<usize>,
     gap_dirty: bool, // Set when we remove entities and go from =LIMIT to < LIMIT
 }
@@ -302,12 +310,13 @@ impl<'a, E: AbstractEntity> ResultSetWrite<'a, E> {
     }
 
     /// Compute sort key for an entity using the current key spec
-    fn compute_sort_key(entity: &E, key_spec: &KeySpec) -> IVec {
+    fn compute_sort_key(entity: &E, key_spec: &KeySpec<ankql::ast::PropertyId>) -> IVec {
         let mut values = Vec::new();
 
         // Extract values for each key part
         for keypart in &key_spec.keyparts {
-            let value = AbstractEntity::value(entity, &keypart.column);
+            let sub_path = keypart.sub_path.as_deref().unwrap_or(&[]);
+            let value = extract_property_value(&keypart.key, sub_path, entity);
             // TODO: Handle NULLs properly - for now we'll get encoding errors on NULLs
             // which will cause unwrap_or_default() to return empty key (sorts first)
             if let Some(v) = value {
@@ -467,8 +476,10 @@ impl<E: AbstractEntity> EntityResultSet<E> {
         st.order.last().map(|entry| entry.entity.clone())
     }
 
-    /// Configure ordering for this result set
-    pub(crate) fn order_by(&self, key_spec: Option<KeySpec>) {
+    /// Configure ordering with catalog-resolved sort keys. Each keypart's
+    /// identity + sub-path pair is both the encoding rule and the extraction
+    /// rule, so the spec alone fully determines the ordering.
+    pub(crate) fn order_by_resolved(&self, key_spec: Option<KeySpec<ankql::ast::PropertyId>>) {
         let mut st = self.0.state.lock().unwrap();
 
         // Check if the key spec actually changed
@@ -561,7 +572,7 @@ mod tests {
     #[derive(Debug, Clone)]
     struct TestEntity {
         id: proto::EntityId,
-        collection: proto::CollectionId,
+        collection: crate::ModelId,
         properties: HashMap<String, Value>,
     }
 
@@ -569,12 +580,16 @@ mod tests {
         fn new(id: u8, properties: HashMap<String, Value>) -> Self {
             let mut id_bytes = [0u8; 16];
             id_bytes[15] = id;
-            Self { id: proto::EntityId::from_bytes(id_bytes), collection: proto::CollectionId::fixed_name("test"), properties }
+            Self {
+                id: proto::EntityId::from_bytes(id_bytes),
+                collection: crate::ModelId::EntityId(proto::EntityId::from_bytes([0x73; 16])),
+                properties,
+            }
         }
     }
 
     impl AbstractEntity for TestEntity {
-        fn collection(&self) -> proto::CollectionId { self.collection.clone() }
+        fn collection(&self) -> crate::ModelId { self.collection.clone() }
 
         fn id(&self) -> &proto::EntityId { &self.id }
 
@@ -633,7 +648,7 @@ mod tests {
         // Set up ordering by name
         let key_spec = KeySpec {
             keyparts: vec![IndexKeyPart {
-                column: "name".to_string(),
+                key: ankql::ast::PropertyId::System(ankql::ast::SystemProperty::Name),
                 sub_path: None,
                 direction: IndexDirection::Asc,
                 nulls: Some(NullsOrder::Last),
@@ -641,7 +656,7 @@ mod tests {
                 value_type: ValueType::String,
             }],
         };
-        resultset.order_by(Some(key_spec));
+        resultset.order_by_resolved(Some(key_spec));
 
         let mut write = resultset.write();
         write.add(entity2.clone());

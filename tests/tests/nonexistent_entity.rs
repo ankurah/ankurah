@@ -20,7 +20,8 @@ async fn local_rejects_phantom_commit() -> anyhow::Result<()> {
     let node = durable_sled_setup().await?;
     let ctx = node.context(DEFAULT_CONTEXT)?;
 
-    let phantom = AlbumView::from_entity(node.conjure_evil_phantom(EntityId::new(), Album::collection()));
+    let album_model = ctx.model_id::<Album>().await?;
+    let phantom = AlbumView::from_entity(node.conjure_evil_phantom(EntityId::new(), album_model));
     let trx = ctx.begin();
     phantom.edit(&trx)?.name().replace("inside your mind")?;
 
@@ -37,8 +38,20 @@ async fn server_rejects_update_for_nonexistent() -> anyhow::Result<()> {
         LocalProcessConnection::new(&server, &client).await?;
     client.system.wait_system_ready().await;
 
+    // #330: CommitTransaction ingress resolves the event's model id to a local
+    // collection and rejects an unknown one. Register Album on the server (a
+    // throwaway create only warms the catalog, mirroring epoch_flip.rs) so the
+    // forged event carries Album's real model id and this test keeps exercising
+    // the nonexistent-entity rejection rather than an unknown-model rejection.
+    {
+        let ctx = server.context(DEFAULT_CONTEXT)?;
+        let trx = ctx.begin();
+        trx.create(&Album { name: "warm".into(), year: "2024".into() }).await?;
+        trx.commit().await?;
+    }
+    let album_model = server.catalog.model_id_for("album").expect("Album registered by the warming create");
+
     let fake_update = proto::Event {
-        collection: Album::collection(),
         entity_id: EntityId::new(),
         operations: proto::OperationSet(BTreeMap::new()),
         parent: proto::Clock::new([proto::EventId::from_bytes([1u8; 32])]),
@@ -48,7 +61,10 @@ async fn server_rejects_update_for_nonexistent() -> anyhow::Result<()> {
         .request(
             server.id,
             &DEFAULT_CONTEXT,
-            proto::NodeRequestBody::CommitTransaction { id: proto::TransactionId::new(), events: vec![fake_update.into()] },
+            proto::NodeRequestBody::CommitTransaction {
+                id: proto::TransactionId::new(),
+                events: vec![proto::ModelContext::new(album_model, proto::Attested::opt(fake_update, None))],
+            },
         )
         .await?;
 
@@ -73,18 +89,18 @@ async fn server_rejects_create_for_existing() -> anyhow::Result<()> {
 
     // Try to send a create event for the same entity
     // Arguably this is a "collision" but collisions really should not happen
-    let fake_create = proto::Event {
-        collection: Album::collection(),
-        entity_id: existing_id,
-        operations: proto::OperationSet(BTreeMap::new()),
-        parent: proto::Clock::new([]),
-    };
+    let album_model = server.catalog.model_id_for("album").expect("Album registered by the create above");
+    let fake_create =
+        proto::Event { entity_id: existing_id, operations: proto::OperationSet(BTreeMap::new()), parent: proto::Clock::new([]) };
 
     let resp = client
         .request(
             server.id,
             &DEFAULT_CONTEXT,
-            proto::NodeRequestBody::CommitTransaction { id: proto::TransactionId::new(), events: vec![fake_create.into()] },
+            proto::NodeRequestBody::CommitTransaction {
+                id: proto::TransactionId::new(),
+                events: vec![proto::ModelContext::new(album_model, proto::Attested::opt(fake_create, None))],
+            },
         )
         .await?;
 

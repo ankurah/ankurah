@@ -2,7 +2,6 @@ mod common;
 
 use ankurah_core::policy::PolicyAgent;
 use ankurah_jwt_auth::{JwtAgent, JwtClaims, JwtContext, JwtKeys, PolicyConfig};
-use ankurah_proto::CollectionId;
 use common::make_predicate;
 use jwt_simple::prelude::Duration;
 
@@ -40,7 +39,8 @@ fn test_filter_predicate_custom_claim_variable() {
     let token = keys.sign(&claims, Duration::from_hours(1)).unwrap();
     let ctx = JwtContext::from_claims(claims, token);
     let predicate = make_predicate("status = 'active'");
-    let collection = CollectionId::from("record");
+    let models = common::policy_models(&agent, &["record"]);
+    let collection = models.id("record");
 
     let result = agent.filter_predicate(&ctx, &collection, predicate).unwrap();
 
@@ -85,7 +85,8 @@ fn test_filter_predicate_missing_claim_denied() {
     let token = keys.sign(&claims, Duration::from_hours(1)).unwrap();
     let ctx = JwtContext::from_claims(claims, token);
     let predicate = make_predicate("status = 'active'");
-    let collection = CollectionId::from("record");
+    let models = common::policy_models(&agent, &["record"]);
+    let collection = models.id("record");
 
     let result = agent.filter_predicate(&ctx, &collection, predicate);
     assert!(result.is_err(), "Missing custom claim should return AccessDenied");
@@ -128,7 +129,8 @@ fn test_filter_predicate_multiple_rules_anded() {
     let token = keys.sign(&claims, Duration::from_hours(1)).unwrap();
     let ctx = JwtContext::from_claims(claims, token);
     let predicate = make_predicate("status = 'open'");
-    let collection = CollectionId::from("job");
+    let models = common::policy_models(&agent, &["job"]);
+    let collection = models.id("job");
 
     let result = agent.filter_predicate(&ctx, &collection, predicate).unwrap();
 

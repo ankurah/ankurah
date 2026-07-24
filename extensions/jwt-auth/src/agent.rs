@@ -7,7 +7,7 @@ use ankurah_core::{
     error::ValidationError,
     livequery::EntityLiveQuery,
     node::{Node, NodeInner, WeakNode},
-    policy::{AccessDenied, PolicyAgent},
+    policy::{AccessDenied, PolicyAgent, RegistrationPlan},
     selection::filter::evaluate_predicate,
     storage::StorageEngine,
     util::Iterable,
@@ -28,6 +28,7 @@ pub struct JwtAgent {
     policy_path: Option<PathBuf>,
     /// Weak-node LiveQuery (EntityLiveQuery::new_weak_node) so the agent never keeps its own node alive
     policy_livequery: Arc<Mutex<Option<EntityLiveQuery>>>,
+    catalog_resolvers: Arc<RwLock<Vec<std::sync::Weak<dyn ankurah_core::schema::CatalogResolver>>>>,
 }
 
 impl JwtAgent {
@@ -42,6 +43,7 @@ impl JwtAgent {
             state: Arc::new(RwLock::new(AgentState { config, keys: Some(JwtKeys::Signing(keys)) })),
             policy_path: Some(path.to_path_buf()),
             policy_livequery: Arc::new(Mutex::new(None)),
+            catalog_resolvers: Arc::new(RwLock::new(Vec::new())),
         })
     }
 
@@ -51,6 +53,7 @@ impl JwtAgent {
             state: Arc::new(RwLock::new(AgentState { config: PolicyConfig::default(), keys: None })),
             policy_path: None,
             policy_livequery: Arc::new(Mutex::new(None)),
+            catalog_resolvers: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -79,6 +82,36 @@ impl JwtAgent {
 
     /// Replaces the in-memory config with a new one.
     pub fn update_config(&self, new_config: PolicyConfig) { self.state.write().unwrap_or_else(|e| e.into_inner()).config = new_config; }
+
+    /// Attach a catalog used to translate exact runtime model identities to
+    /// the human names in policy configuration. Nodes install their catalog
+    /// automatically from [`PolicyAgent::on_node_ready`]. The agent retains a
+    /// weak set rather than one replaceable slot because cloned agents share
+    /// policy state and may be attached to multiple nodes; a cold peer's
+    /// catalog must not hide a ready durable node's catalog.
+    pub fn set_catalog_resolver(&self, resolver: std::sync::Weak<dyn ankurah_core::schema::CatalogResolver>) {
+        let mut resolvers = self.catalog_resolvers.write().unwrap_or_else(|error| error.into_inner());
+        resolvers.retain(|known| known.strong_count() != 0);
+        if !resolvers.iter().any(|known| std::sync::Weak::ptr_eq(known, &resolver)) {
+            resolvers.push(resolver);
+        }
+    }
+
+    /// Policy configuration is intentionally human-name keyed. Resolve the
+    /// durable model identity through catalog metadata, then normalize the
+    /// registered model name to the extension's historical lowercase key.
+    fn policy_model_name(&self, model: &ankurah_core::ModelId) -> Result<String, AccessDenied> {
+        let resolvers = self.catalog_resolvers.read().unwrap_or_else(|error| error.into_inner());
+        if resolvers.is_empty() {
+            return Err(AccessDenied::ByPolicy("catalog resolver is unavailable for model policy lookup"));
+        }
+        resolvers
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .find_map(|resolver| resolver.model_name(model).ok())
+            .map(|name| name.to_ascii_lowercase())
+            .ok_or(AccessDenied::ByPolicy("model is unknown to the policy catalog"))
+    }
 }
 
 #[async_trait]
@@ -86,6 +119,13 @@ impl PolicyAgent for JwtAgent {
     type ContextData = JwtContext;
 
     fn on_node_ready<SE: StorageEngine + Send + Sync + 'static>(&self, node: WeakNode<SE, Self>) {
+        let Some(ready_node) = node.upgrade() else {
+            tracing::warn!("on_node_ready: node already dropped");
+            return;
+        };
+        self.set_catalog_resolver(ready_node.catalog.resolver_weak());
+        drop(ready_node);
+
         #[cfg(feature = "watcher")]
         if let Some(ref policy_path) = self.policy_path {
             crate::agent_state::start_durable_policy_watcher(node, policy_path.clone(), self.state_handle());
@@ -93,11 +133,7 @@ impl PolicyAgent for JwtAgent {
         }
 
         if self.policy_path.is_none() {
-            let Some(node) = node.upgrade() else {
-                tracing::warn!("on_node_ready: node already dropped");
-                return;
-            };
-            start_ephemeral_policy_sync(&node, self.state_handle(), &self.policy_livequery);
+            start_ephemeral_policy_sync(node, self.state_handle(), self.policy_livequery.clone());
         }
     }
 
@@ -156,27 +192,84 @@ impl PolicyAgent for JwtAgent {
         if cdata.is_privileged() {
             return Ok(None);
         }
-        if entity_after.collection().as_str() == "jwtpolicy" {
+        // Core admits writes to these protected models only through the
+        // schema-registration executor. Its resolved-plan policy check runs
+        // before this per-event check, so an authenticated caller that passed
+        // that gate may persist the catalog effects. NoUser is still denied.
+        if ankurah_core::schema::is_catalog_collection(entity_after.collection()) {
+            return if matches!(cdata, JwtContext::NoUser) {
+                Err(AccessDenied::ByPolicy("NoUser context cannot write schema metadata"))
+            } else {
+                Ok(None)
+            };
+        }
+        let model_name = self.policy_model_name(entity_after.collection())?;
+        if model_name == "jwtpolicy" {
             return Err(AccessDenied::ByPolicy("Only privileged contexts may write to jwtpolicy"));
         }
         if matches!(cdata, JwtContext::NoUser) {
             return Err(AccessDenied::ByPolicy("NoUser context cannot write events"));
         }
         let state = self.state.read().unwrap_or_else(|e| e.into_inner());
-        if !state.config.can_write_collection(cdata.roles(), entity_after.collection()) {
+        if !state.config.can_write_collection(cdata.roles(), &model_name) {
             return Err(AccessDenied::CollectionDenied(entity_after.collection().clone()));
         }
         if !entity_before.head().is_empty() {
-            enforce_write_scope(&state.config, cdata, entity_before)?;
+            enforce_write_scope(&state.config, cdata, entity_before, &model_name)?;
         }
-        enforce_write_scope(&state.config, cdata, entity_after)?;
+        enforce_write_scope(&state.config, cdata, entity_after, &model_name)?;
         Ok(None)
+    }
+
+    fn check_schema_registration<SE: StorageEngine>(
+        &self,
+        _node: &Node<SE, Self>,
+        cdata: &Self::ContextData,
+        plan: &RegistrationPlan,
+    ) -> Result<(), AccessDenied> {
+        if cdata.is_privileged() {
+            return Ok(());
+        }
+        if matches!(cdata, JwtContext::NoUser) {
+            return Err(AccessDenied::ByPolicy("NoUser context cannot define schema"));
+        }
+
+        let state = self.state.read().unwrap_or_else(|error| error.into_inner());
+        let may_write = |collection: &str| state.config.can_write_collection(cdata.roles(), collection);
+
+        if plan.creates_models.iter().any(|(_, model)| !may_write(&model.collection))
+            || plan.creates_properties.iter().any(|(_, property)| !may_write(&property.minting_collection))
+        {
+            return Err(AccessDenied::ByPolicy("schema creation requires write access to its model"));
+        }
+
+        let created_models: std::collections::BTreeMap<_, _> =
+            plan.creates_models.iter().map(|(id, model)| (*id, model.collection.as_str())).collect();
+        for membership in &plan.creates_memberships {
+            let collection = match created_models.get(&membership.model) {
+                Some(collection) => (*collection).to_owned(),
+                None => self.policy_model_name(&proto::ModelId::EntityId(membership.model))?,
+            };
+            if !may_write(&collection) {
+                return Err(AccessDenied::ByPolicy("schema membership creation requires write access to its model"));
+            }
+        }
+
+        // Renames, retargeting, and optionality changes alter existing
+        // contracts. Keep those administrative until the policy format grows
+        // a dedicated schema-migration privilege.
+        if !plan.updates.is_empty() && !state.config.roles_have_privilege(cdata.roles(), "*") {
+            return Err(AccessDenied::ByPolicy("schema metadata updates require wildcard privilege"));
+        }
+
+        Ok(())
     }
 
     fn validate_received_event<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
         _from_node: &proto::EntityId,
+        _model: &proto::ModelId,
         _event: &Attested<proto::Event>,
     ) -> Result<(), AccessDenied> {
         Ok(())
@@ -188,14 +281,27 @@ impl PolicyAgent for JwtAgent {
         &self,
         _node: &Node<SE, Self>,
         _from_node: &proto::EntityId,
+        _model: &proto::ModelId,
         _state: &Attested<proto::EntityState>,
     ) -> Result<(), AccessDenied> {
         Ok(())
     }
 
-    fn can_access_collection<C>(&self, data: &C, collection: &proto::CollectionId) -> Result<(), AccessDenied>
+    fn can_access_collection<C>(&self, data: &C, collection: &ankurah_core::ModelId) -> Result<(), AccessDenied>
     where C: Iterable<Self::ContextData> {
-        if collection.as_str() == "jwtpolicy" {
+        // Ephemeral agents must read the public metadata catalog before they
+        // can resolve the JwtPolicy model that supplies their policy and
+        // verification key. This grants no catalog mutation capability:
+        // registration events still pass through check_event, where NoUser
+        // is denied.
+        if matches!(
+            collection,
+            proto::ModelId::System(proto::SystemModel::Model | proto::SystemModel::Property | proto::SystemModel::ModelProperty)
+        ) {
+            return Ok(());
+        }
+        let model_name = self.policy_model_name(collection)?;
+        if model_name == "jwtpolicy" {
             return Ok(());
         }
         for ctx in data.iterable() {
@@ -205,14 +311,14 @@ impl PolicyAgent for JwtAgent {
         }
         let state = self.state.read().unwrap_or_else(|e| e.into_inner());
         for ctx in data.iterable() {
-            if state.config.can_access_collection(ctx.roles(), collection) {
+            if state.config.can_access_collection(ctx.roles(), &model_name) {
                 return Ok(());
             }
         }
         Err(AccessDenied::CollectionDenied(collection.clone()))
     }
 
-    fn filter_predicate<C>(&self, data: &C, collection: &proto::CollectionId, predicate: Predicate) -> Result<Predicate, AccessDenied>
+    fn filter_predicate<C>(&self, data: &C, collection: &ankurah_core::ModelId, predicate: Predicate) -> Result<Predicate, AccessDenied>
     where C: Iterable<Self::ContextData> {
         for ctx in data.iterable() {
             if ctx.is_privileged() {
@@ -220,8 +326,9 @@ impl PolicyAgent for JwtAgent {
             }
         }
 
+        let model_name = self.policy_model_name(collection)?;
         let state = self.state.read().unwrap_or_else(|e| e.into_inner());
-        if state.config.scope_rules_for_collection(collection.as_str()).is_empty() {
+        if state.config.scope_rules_for_collection(&model_name).is_empty() {
             return Ok(predicate);
         }
 
@@ -234,7 +341,7 @@ impl PolicyAgent for JwtAgent {
             .ok_or(AccessDenied::ByPolicy("No authenticated context for row filtering"))?;
 
         let mut result = predicate;
-        for filter in scoped_predicates(&state.config, collection.as_str(), claims, ScopeAccess::Read)? {
+        for filter in scoped_predicates(&state.config, &model_name, claims, ScopeAccess::Read)? {
             result = Predicate::And(Box::new(result), Box::new(filter));
         }
 
@@ -245,8 +352,9 @@ impl PolicyAgent for JwtAgent {
         &self,
         data: &C,
         id: &proto::EntityId,
-        collection: &proto::CollectionId,
+        collection: &ankurah_core::ModelId,
         state: &proto::State,
+        resolver: Option<std::sync::Weak<dyn ankurah_core::schema::CatalogResolver>>,
     ) -> Result<(), AccessDenied>
     where
         C: Iterable<Self::ContextData>,
@@ -259,38 +367,51 @@ impl PolicyAgent for JwtAgent {
             }
         }
 
+        let model_name = self.policy_model_name(collection)?;
         let guard = self.state.read().unwrap_or_else(|e| e.into_inner());
-        if guard.config.scope_rules_for_collection(collection.as_str()).is_empty() {
+        if guard.config.scope_rules_for_collection(&model_name).is_empty() {
             return Ok(());
         }
 
-        let entity = TemporaryEntity::new(*id, collection.clone(), state)
+        // Scope filters are NAME-addressed (config strings) and post-epoch
+        // state is id-keyed: bind the inspection view through the node's
+        // catalog resolver or every filter reads nothing and denies.
+        let entity = TemporaryEntity::new_bound(*id, collection.clone(), state, resolver)
             .map_err(|_| AccessDenied::ByPolicy("Read scope entity state could not be evaluated"))?;
-        enforce_read_scope(&guard.config, data, &entity)
+        enforce_read_scope(&guard.config, data, &entity, &model_name)
     }
 
-    fn check_read_event<C>(&self, data: &C, event: &Attested<proto::Event>) -> Result<(), AccessDenied>
-    where C: Iterable<Self::ContextData> {
+    fn check_read_event<C>(
+        &self,
+        data: &C,
+        collection: &ankurah_core::ModelId,
+        event: &Attested<proto::Event>,
+    ) -> Result<(), AccessDenied>
+    where
+        C: Iterable<Self::ContextData>,
+    {
+        let _ = event;
         for ctx in data.iterable() {
             if ctx.is_privileged() {
                 return Ok(());
             }
         }
-        self.can_access_collection(data, &event.payload.collection)
+        self.can_access_collection(data, collection)
     }
 
     fn check_write(&self, cdata: &Self::ContextData, entity: &Entity, _event: Option<&proto::Event>) -> Result<(), AccessDenied> {
-        if entity.collection().as_str() == "jwtpolicy" && !cdata.is_privileged() {
+        let model_name = self.policy_model_name(entity.collection())?;
+        if model_name == "jwtpolicy" && !cdata.is_privileged() {
             return Err(AccessDenied::ByPolicy("Only privileged contexts may write to jwtpolicy"));
         }
         if cdata.is_privileged() {
             return Ok(());
         }
         let state = self.state.read().unwrap_or_else(|e| e.into_inner());
-        if !state.config.can_write_collection(cdata.roles(), entity.collection()) {
+        if !state.config.can_write_collection(cdata.roles(), &model_name) {
             Err(AccessDenied::CollectionDenied(entity.collection().clone()))
         } else {
-            enforce_write_scope(&state.config, cdata, entity)
+            enforce_write_scope(&state.config, cdata, entity, &model_name)
         }
     }
 
@@ -341,12 +462,12 @@ fn scoped_predicates(
     Ok(predicates)
 }
 
-fn enforce_write_scope(config: &PolicyConfig, cdata: &JwtContext, entity: &Entity) -> Result<(), AccessDenied> {
+fn enforce_write_scope(config: &PolicyConfig, cdata: &JwtContext, entity: &Entity, model_name: &str) -> Result<(), AccessDenied> {
     let JwtContext::User { claims, .. } = cdata else {
         return Err(AccessDenied::ByPolicy("No authenticated context for write scope enforcement"));
     };
 
-    for predicate in scoped_predicates(config, entity.collection().as_str(), claims, ScopeAccess::Write)? {
+    for predicate in scoped_predicates(config, model_name, claims, ScopeAccess::Write)? {
         match evaluate_predicate(entity, &predicate) {
             Ok(true) => {}
             Ok(false) => return Err(AccessDenied::ByPolicy("Write outside permitted scope")),
@@ -357,18 +478,18 @@ fn enforce_write_scope(config: &PolicyConfig, cdata: &JwtContext, entity: &Entit
     Ok(())
 }
 
-fn enforce_read_scope<C>(config: &PolicyConfig, data: &C, entity: &TemporaryEntity) -> Result<(), AccessDenied>
+fn enforce_read_scope<C>(config: &PolicyConfig, data: &C, entity: &TemporaryEntity, model_name: &str) -> Result<(), AccessDenied>
 where C: Iterable<JwtContext> {
     for ctx in data.iterable() {
         let JwtContext::User { claims, .. } = ctx else {
             continue;
         };
-        if !config.can_access_collection(ctx.roles(), &entity.collection) {
+        if !config.can_access_collection(ctx.roles(), model_name) {
             continue;
         }
 
         let mut allowed = true;
-        for predicate in scoped_predicates(config, entity.collection.as_str(), claims, ScopeAccess::Read)? {
+        for predicate in scoped_predicates(config, model_name, claims, ScopeAccess::Read)? {
             match evaluate_predicate(entity, &predicate) {
                 Ok(true) => {}
                 Ok(false) => {

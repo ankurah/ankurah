@@ -30,6 +30,10 @@ pub struct ReactorUpdateItem<E = Entity, Ev = Attested<Event>> {
     pub events: Vec<Ev>,
     /// Which predicates this update is relevant to (if any) and how
     pub predicate_relevance: Vec<(proto::QueryId, MembershipChange)>,
+    /// Queries whose subscriptions caused this item to be emitted. Unlike
+    /// `predicate_relevance`, this is populated even when membership did not
+    /// change, so receivers can authenticate streaming update ownership.
+    pub source_queries: Vec<proto::QueryId>,
 }
 
 impl<E, Ev: Clone> ReactorUpdateItem<E, Ev> {

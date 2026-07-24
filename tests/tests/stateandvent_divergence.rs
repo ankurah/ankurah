@@ -99,8 +99,7 @@ async fn test_stateandvent_divergence_subscription() -> Result<()> {
     );
 
     // Verify DAG structure on durable
-    let collection_d = ctx_d.collection(&Record::collection()).await?;
-    let events = collection_d.dump_entity_events(record_id).await?;
+    let events = durable.storage.dump_entity_events(record_id).await?;
 
     // B and C should both have parent A (true concurrency)
     assert_dag!(dag, events, {
@@ -110,7 +109,7 @@ async fn test_stateandvent_divergence_subscription() -> Result<()> {
     });
 
     // Head should have both concurrent events
-    let state = collection_d.get_state(record_id).await?;
+    let state = durable.storage.get_state(record_id).await?;
     clock_eq!(dag, state.payload.state.head, [B, C]);
 
     Ok(())
@@ -196,8 +195,7 @@ async fn test_two_ephemeral_divergence_subscription() -> Result<()> {
     assert_eq!(final_e2.artist().unwrap(), "Artist-from-E2", "E2 should have its own artist");
 
     // Verify DAG structure
-    let collection_d = ctx_d.collection(&Record::collection()).await?;
-    let events = collection_d.dump_entity_events(record_id).await?;
+    let events = durable.storage.dump_entity_events(record_id).await?;
 
     assert_dag!(dag, events, {
         A => [],

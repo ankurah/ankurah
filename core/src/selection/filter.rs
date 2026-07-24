@@ -1,8 +1,9 @@
 //! Filter items based on a predicate. This is necessary for cases where we are scanning over a set of data
 //! which has not been pre-filtered by an index search - or to supplement/validate an index search with additional filtering.
 
+use crate::property::PropertyError;
 use crate::value::Value;
-use ankql::ast::{ComparisonOperator, Expr, Predicate};
+use ankql::ast::{ComparisonOperator, Expr, Predicate, PropertyId, PropertyPath};
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq)]
@@ -15,6 +16,16 @@ pub enum Error {
     UnsupportedExpression(&'static str),
     #[error("Unsupported operator: {0}")]
     UnsupportedOperator(&'static str),
+    /// A property read failed during evaluation. Post the canonical
+    /// value_type ruling (2026-07-10) the resolved-read dispatch itself is
+    /// infallible (absent and ill-typed both evaluate NULL); this remains
+    /// for non-dispatch read failures.
+    #[error("property read error: {0}")]
+    PropertyRead(String),
+}
+
+impl From<PropertyError> for Error {
+    fn from(e: PropertyError) -> Self { Error::PropertyRead(e.to_string()) }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -50,45 +61,44 @@ impl ExprOutput<Value> {
 pub trait Filterable {
     fn collection(&self) -> &str;
     fn value(&self, name: &str) -> Option<Value>;
+
+    /// Read a REGISTERED property by its stable id for resolved-identifier
+    /// evaluation. `Some` = present, `None` = absent (evaluated as NULL by the
+    /// caller). Evaluation has no type-error surface: the compiled/canonical
+    /// type pair is admitted at REGISTRATION (the canonical value_type ruling,
+    /// 2026-07-10), and an ill-typed stored value reads as NULL with a warning
+    /// at the entity's evaluation boundary.
+    ///
+    /// `property_id` is the resolved property-definition id the identifier
+    /// carries (RFC 5.5); it addresses id-keyed data directly, so this works on
+    /// a schema-blind `TemporaryEntity` that has no name-to-id resolver. An
+    /// unwritten id reads absent -- there is NO fallback to a display name
+    /// (system fields and the `id` pseudo-property are read by name via
+    /// [`Filterable::value`]).
+    ///
+    /// The default returns `None`, so mock/test items that hold no id-keyed
+    /// state simply read a registered property as absent. `Entity` overrides it
+    /// to route the lookup through the generic dispatch
+    /// (`crate::property::read_by_id`).
+    fn value_by_id(&self, property_id: ankurah_proto::EntityId) -> Option<Value> {
+        let _ = property_id;
+        None
+    }
 }
 
 fn evaluate_expr<I: Filterable>(item: &I, expr: &Expr) -> Result<ExprOutput<Value>, Error> {
     match expr {
         Expr::Placeholder => Err(Error::PropertyNotFound("Placeholder values must be replaced before filtering".to_string())),
         Expr::Literal(lit) => Ok(ExprOutput::Value(lit.clone().into())),
-        Expr::Path(path) => {
-            // For simple paths, use the first step as the property name
-            if path.is_simple() {
-                let name = path.first();
-                Ok(ExprOutput::Value(item.value(name).ok_or_else(|| Error::PropertyNotFound(name.to_string()))?))
-            } else {
-                // Multi-step path - could be:
-                // 1. Collection.property (legacy, check if first step matches collection)
-                // 2. property.nested.path (JSON traversal)
-
-                let first = path.first();
-
-                // First, check if it's a collection-qualified path
-                if first == item.collection() {
-                    // Treat remaining path as property access
-                    let remaining = &path.steps[1..];
-                    if remaining.len() == 1 {
-                        // Simple collection.property
-                        let name = &remaining[0];
-                        return Ok(ExprOutput::Value(item.value(name).ok_or_else(|| Error::PropertyNotFound(name.to_string()))?));
-                    }
-                    // collection.property.nested... - get property and traverse sub-path
-                    let property_name = &remaining[0];
-                    let sub_path = &remaining[1..];
-                    return evaluate_sub_path(item, property_name, sub_path);
-                }
-
-                // Not a collection qualifier - treat first step as property, rest as sub-path
-                let property_name = first;
-                let sub_path: Vec<&str> = path.steps[1..].iter().map(|s| s.as_str()).collect();
-                evaluate_sub_path(item, property_name, &sub_path)
-            }
-        }
+        Expr::Path(path) => evaluate_path_steps(item, &path.steps),
+        // A RESOLVED Identifier addresses exactly one property by its
+        // resolved-at name plus an optional JSON sub-path. It does NOT share
+        // the Path qualifier logic: the resolution pass already stripped any
+        // collection qualifier and fixed the property, so a leading step that
+        // happens to equal the collection name is the PROPERTY, never a
+        // qualifier. Evaluate the stable property id plus subpath; `name`
+        // remains display context and the fallback key for legacy residue.
+        Expr::PropertyPath(identifier) => evaluate_identifier(item, identifier),
         Expr::ExprList(exprs) => {
             let mut result = Vec::new();
             for expr in exprs {
@@ -98,6 +108,87 @@ fn evaluate_expr<I: Filterable>(item: &I, expr: &Expr) -> Result<ExprOutput<Valu
         }
         _ => Err(Error::UnsupportedExpression("Only literal, path, and list expressions are supported")),
     }
+}
+
+/// Evaluate a RESOLVED [`PropertyPath`]: read the property by its resolved
+/// identity (a registered id addresses id-keyed state directly; a system name
+/// reads by name), then extract any JSON sub-path. Unlike
+/// [`evaluate_path_steps`] this does NO collection-qualifier handling -- the
+/// resolution pass already bound the property, so a leading step equal to the
+/// collection name is the property itself, never a qualifier.
+fn evaluate_identifier<I: Filterable>(item: &I, identifier: &PropertyPath) -> Result<ExprOutput<Value>, Error> {
+    // A registered property reads its id-keyed slot directly (RFC 5.5); a
+    // system property reads by name. The resolved identity fixes the property,
+    // so there is no collection-qualifier ambiguity and no display-name
+    // fallback for a registered id.
+    let base = match identifier.id() {
+        // The `id` pseudo-property is read by its reserved name; `value` returns
+        // the entity id for it.
+        PropertyId::Id => item.value("id"),
+        PropertyId::EntityId(id) => item.value_by_id(id),
+        PropertyId::System(property) => item.value(property.as_str()),
+    };
+    if identifier.is_simple() {
+        // Bare property reference. RFC 5.4: a RESOLVED identifier that the item
+        // does not hold evaluates as NULL (IsNull matches, comparisons are
+        // false) instead of erroring PropertyNotFound -- this unifies the three
+        // historical missing-property behaviors (filter hard-error, reactor
+        // unwrap_or(false), SQL absence).
+        return Ok(match base {
+            Some(value) => ExprOutput::Value(value),
+            None => ExprOutput::None,
+        });
+    }
+    // A JSON sub-path on a resolved identifier: fetch the base property, then
+    // traverse into it. An absent base is NULL (consistent with the bare
+    // case), never PropertyNotFound.
+    let Some(base) = base else {
+        return Ok(ExprOutput::None);
+    };
+    match base.extract_at_path(&identifier.subpath) {
+        Some(value) => Ok(ExprOutput::Value(value)),
+        // Present base, but the sub-path is absent within it: NULL, matching
+        // the absent-as-NULL rule for resolved references.
+        None => Ok(ExprOutput::None),
+    }
+}
+
+/// Evaluate a sequence of path steps (as produced by `PathExpr::steps`)
+/// against an item. Used by the `Expr::Path` arm (unresolved paths still
+/// carry the legacy collection-qualifier ambiguity); the resolved
+/// `Expr::PropertyPath` arm uses [`evaluate_identifier`] instead.
+fn evaluate_path_steps<I: Filterable>(item: &I, steps: &[String]) -> Result<ExprOutput<Value>, Error> {
+    // For simple paths, use the first step as the property name
+    if steps.len() == 1 {
+        let name = steps[0].as_str();
+        return Ok(ExprOutput::Value(item.value(name).ok_or_else(|| Error::PropertyNotFound(name.to_string()))?));
+    }
+
+    // Multi-step path - could be:
+    // 1. Collection.property (legacy, check if first step matches collection)
+    // 2. property.nested.path (JSON traversal)
+
+    let first = steps[0].as_str();
+
+    // First, check if it's a collection-qualified path
+    if first == item.collection() {
+        // Treat remaining path as property access
+        let remaining = &steps[1..];
+        if remaining.len() == 1 {
+            // Simple collection.property
+            let name = &remaining[0];
+            return Ok(ExprOutput::Value(item.value(name).ok_or_else(|| Error::PropertyNotFound(name.to_string()))?));
+        }
+        // collection.property.nested... - get property and traverse sub-path
+        let property_name = &remaining[0];
+        let sub_path = &remaining[1..];
+        return evaluate_sub_path(item, property_name, sub_path);
+    }
+
+    // Not a collection qualifier - treat first step as property, rest as sub-path
+    let property_name = first;
+    let sub_path: Vec<&str> = steps[1..].iter().map(|s| s.as_str()).collect();
+    evaluate_sub_path(item, property_name, &sub_path)
 }
 
 /// Evaluate a sub-path traversal: get property value, extract nested value at path
@@ -279,6 +370,102 @@ mod tests {
     }
 
     #[test]
+    fn test_identifier_evaluates_like_equivalent_path() {
+        // A predicate containing Expr::PropertyPath (constructed
+        // programmatically) evaluates identically to the same predicate
+        // written with Expr::Path.
+        use ankql::ast::{ComparisonOperator, Expr, PathExpr, Predicate, PropertyPath, SystemProperty, Value};
+
+        let items = vec![TestItem::new("Alice", "30"), TestItem::new("Bob", "25"), TestItem::new("Charlie", "35")];
+
+        // A resolved SYSTEM identifier reads by name, so it parallels the
+        // equivalent name path (a registered id would read id-keyed state, which
+        // a name-keyed test item does not hold -- that path is covered by
+        // `temporary_entity_post_filter_reads_id_keyed_state`).
+        let id_pred = Predicate::Comparison {
+            left: Box::new(Expr::PropertyPath(PropertyPath::system(SystemProperty::Name, vec![]))),
+            operator: ComparisonOperator::Equal,
+            right: Box::new(Expr::Literal(Value::String("Alice".to_string()))),
+        };
+        // The equivalent Path predicate.
+        let path_pred = Predicate::Comparison {
+            left: Box::new(Expr::Path(PathExpr::simple("name"))),
+            operator: ComparisonOperator::Equal,
+            right: Box::new(Expr::Literal(Value::String("Alice".to_string()))),
+        };
+
+        let id_results: Vec<_> = FilterIterator::new(items.clone().into_iter(), id_pred).collect();
+        let path_results: Vec<_> = FilterIterator::new(items.into_iter(), path_pred).collect();
+
+        assert_eq!(id_results, path_results);
+        assert_eq!(
+            id_results,
+            vec![
+                FilterResult::Pass(TestItem::new("Alice", "30")),
+                FilterResult::Skip(TestItem::new("Bob", "25")),
+                FilterResult::Skip(TestItem::new("Charlie", "35")),
+            ]
+        );
+    }
+
+    /// The storage engines' post-filter shape, end to end: a RESOLVED
+    /// Identifier predicate evaluated via a schema-blind [`TemporaryEntity`]
+    /// over an id-keyed (0xA2) state buffer, exactly as
+    /// `post_filter_states` does in the sqlite/postgres engines (and as a
+    /// policy agent inspecting a raw state does). Regression guard: a
+    /// resolved-identifier predicate must read the id-keyed value here; before
+    /// threading the identifier's property id through the checked read it
+    /// evaluated as absent (NULL), silently dropping matching rows.
+    #[test]
+    fn temporary_entity_post_filter_reads_id_keyed_state() {
+        use crate::entity::TemporaryEntity;
+        use crate::property::backend::{LWWBackend, PropertyBackend};
+        use ankql::ast::{ComparisonOperator, Expr, Predicate, PropertyPath, Value};
+        use ankurah_proto as proto;
+        use std::collections::BTreeMap;
+
+        // A bound id-keyed writer, as any post-epoch user entity is.
+        let title_id = proto::EntityId::from_bytes([0x11; 16]);
+        let writer = LWWBackend::new();
+        // Build an id-keyed buffer directly: the commit path resolves user
+        // writes to id keys, so any post-epoch buffer is id-keyed (no binding).
+        writer.set(PropertyId::EntityId(title_id), Some(crate::value::Value::String("alpha".to_string())));
+        let ops = writer.to_operations().unwrap().unwrap();
+        writer.apply_operations_with_event(&ops, proto::EventId::from_bytes([3; 32])).unwrap();
+        let buffer = writer.to_state_buffer().unwrap();
+
+        let state =
+            proto::State { state_buffers: proto::StateBuffers(BTreeMap::from([("lww".to_string(), buffer)])), head: Default::default() };
+        let entity = TemporaryEntity::new(
+            proto::EntityId::from_bytes([0x77; 16]),
+            proto::ModelId::EntityId(proto::EntityId::from_bytes([0xA7; 16])),
+            &state,
+        )
+        .unwrap();
+
+        // Resolved-Identifier predicate (the checked read path).
+        let id_pred = Predicate::Comparison {
+            left: Box::new(Expr::PropertyPath(PropertyPath::registered(title_id, "title", vec![]))),
+            operator: ComparisonOperator::Equal,
+            right: Box::new(Expr::Literal(Value::String("alpha".to_string()))),
+        };
+        assert!(evaluate_predicate(&entity, &id_pred).unwrap(), "id-keyed value must be readable through its resolved id");
+
+        // (The old lenient hint-projection sub-case is gone: an UNRESOLVED path
+        // over a schema-blind TemporaryEntity cannot resolve "title" to its id,
+        // so id-keyed data is not readable by bare name -- deferred to the
+        // catalog-bound engines; dynamic schema-blind projection remains #312.)
+
+        // A property nothing claims evaluates as NULL: comparison false, no error.
+        let absent_pred = Predicate::Comparison {
+            left: Box::new(Expr::PropertyPath(PropertyPath::registered(proto::EntityId::from_bytes([8; 16]), "ghost", vec![]))),
+            operator: ComparisonOperator::Equal,
+            right: Box::new(Expr::Literal(Value::String("alpha".to_string()))),
+        };
+        assert!(!evaluate_predicate(&entity, &absent_pred).unwrap());
+    }
+
+    #[test]
     fn test_and_condition() {
         let items = vec![TestItem::new("Alice", "30"), TestItem::new("Bob", "30"), TestItem::new("Charlie", "35")];
 
@@ -364,7 +551,8 @@ mod tests {
     // JSON path traversal tests
     mod json_tests {
         use super::*;
-        use crate::type_resolver::TypeResolver;
+        use crate::{proto::PropertyId, value::ValueType, EntityId, ModelId};
+        use ankql::{NameResolutionError, NameResolver};
 
         /// Test item with a JSON property for testing nested path queries
         #[derive(Debug, Clone, PartialEq)]
@@ -389,12 +577,32 @@ mod tests {
                     _ => None,
                 }
             }
+
+            fn value_by_id(&self, property_id: ankurah_proto::EntityId) -> Option<Value> {
+                (property_id == licensing_id()).then(|| Value::Binary(self.licensing.clone()))
+            }
         }
 
-        /// Helper to parse and resolve types for JSON path queries
+        fn licensing_id() -> ankurah_proto::EntityId { ankurah_proto::EntityId::from_bytes([0x61; 16]) }
+
+        struct Resolver;
+
+        impl NameResolver for Resolver {
+            fn resolve_property(&self, _model: &ModelId, name: &str) -> Result<Option<PropertyId>, NameResolutionError> {
+                Ok((name == "licensing").then(|| PropertyId::EntityId(licensing_id())))
+            }
+
+            fn property_value_type(&self, model: &ModelId, property: &PropertyId) -> Result<ValueType, NameResolutionError> {
+                (property == &PropertyId::EntityId(licensing_id())).then_some(ValueType::Json).ok_or_else(|| {
+                    NameResolutionError::ValueTypeLookup { model: *model, property: *property, message: "unknown test property".to_owned() }
+                })
+            }
+        }
+
+        /// Helper to parse and perform AnkQL origin resolution for JSON-path queries.
         fn parse_with_types(query: &str) -> ankql::ast::Selection {
             let selection = parse_selection(query).unwrap();
-            TypeResolver::new().resolve_selection_types(selection)
+            selection.resolve_names(&ModelId::EntityId(EntityId::from_bytes([0x60; 16])), &Resolver).unwrap()
         }
 
         #[test]
@@ -430,6 +638,38 @@ mod tests {
             assert!(matches!(results[0], FilterResult::Pass(_)));
             assert!(matches!(results[1], FilterResult::Skip(_)));
             assert!(matches!(results[2], FilterResult::Pass(_)));
+        }
+
+        #[test]
+        fn test_identifier_json_subpath_evaluates_like_path() {
+            // An Identifier with a JSON subpath evaluates identically to the equivalent
+            // multi-step Path (licensing.territory = 'US'), extracting the same nested value.
+            use ankql::ast::{ComparisonOperator, Expr, PathExpr, Predicate, PropertyPath, Value};
+
+            let items = vec![
+                TrackItem::new("Track A", serde_json::json!({ "territory": "US" })),
+                TrackItem::new("Track B", serde_json::json!({ "territory": "UK" })),
+                TrackItem::new("Track C", serde_json::json!({ "territory": "US" })),
+            ];
+
+            let id_pred = Predicate::Comparison {
+                left: Box::new(Expr::PropertyPath(PropertyPath::registered(licensing_id(), "licensing", vec!["territory".to_string()]))),
+                operator: ComparisonOperator::Equal,
+                right: Box::new(Expr::Literal(Value::String("US".to_string()))),
+            };
+            let path_pred = Predicate::Comparison {
+                left: Box::new(Expr::Path(PathExpr { steps: vec!["licensing".to_string(), "territory".to_string()] })),
+                operator: ComparisonOperator::Equal,
+                right: Box::new(Expr::Literal(Value::String("US".to_string()))),
+            };
+
+            let id_results: Vec<_> = FilterIterator::new(items.clone().into_iter(), id_pred).collect();
+            let path_results: Vec<_> = FilterIterator::new(items.into_iter(), path_pred).collect();
+
+            assert_eq!(id_results, path_results);
+            assert!(matches!(id_results[0], FilterResult::Pass(_)));
+            assert!(matches!(id_results[1], FilterResult::Skip(_)));
+            assert!(matches!(id_results[2], FilterResult::Pass(_)));
         }
 
         #[test]

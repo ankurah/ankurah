@@ -7,7 +7,7 @@
 //     changes::{ChangeKind, ChangeSet},
 //     core::{context::Context, node::ContextData},
 //     policy::{AccessDenied, PolicyAgent},
-//     proto::{self, CollectionId},
+//     proto::{self, ModelId},
 //     Model, Mutable, Node, PermissiveAgent, ResultSet,
 // };
 // use ankurah_connector_local_process::LocalProcessConnection;
@@ -218,11 +218,11 @@
 //     fn check_read(&self, cdata: &MyContextData, entity: &Entity) -> Result<(), AccessDenied> { Ok(()) }
 //     fn check_write(&self, cdata: &MyContextData, entity: &Entity, event: Option<&proto::Event>) -> Result<(), AccessDenied> { Ok(()) }
 
-//     fn can_access_collection(&self, _context: &MyContextData, _collection: &CollectionId) -> Result<(), AccessDenied> { Ok(()) }
+//     fn can_access_collection(&self, _context: &MyContextData, _collection: &ModelId) -> Result<(), AccessDenied> { Ok(()) }
 //     fn filter_predicate(
 //         &self,
 //         _cdata: &MyContextData,
-//         _collection: &CollectionId,
+//         _collection: &ModelId,
 //         predicate: Predicate,
 //     ) -> Result<Predicate, AccessDenied> {
 //         Ok(predicate)
@@ -337,12 +337,12 @@
 //         Err(AccessDenied::InsufficientAttestation)
 //     }
 
-//     fn can_access_collection(&self, data: &Self::ContextData, collection: &proto::CollectionId) -> Result<(), AccessDenied>;
+//     fn can_access_collection(&self, data: &Self::ContextData, collection: &ankurah::ModelId) -> Result<(), AccessDenied>;
 
 //     fn filter_predicate(
 //         &self,
 //         cdata: &MyContextData,
-//         collection: &CollectionId,
+//         collection: &ModelId,
 //         mut predicate: Predicate,
 //     ) -> Result<Predicate, AccessDenied> {
 //         match cdata {

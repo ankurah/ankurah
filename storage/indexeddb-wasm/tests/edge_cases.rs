@@ -92,7 +92,7 @@ pub async fn test_prefix_guard_collection_boundary() -> Result<(), anyhow::Error
 
     create_books(&ctx, vec![("Book1", "2001"), ("Book2", "2002")]).await?;
 
-    // Note: With the new bounded range logic, equality-only queries on __collection
+    // Note: With the new bounded range logic, equality-only queries on __materialization
     // now create a proper upper bound (e.g., ["album"] to ["album\uFFFF"]) which prevents
     // the cursor from ever reaching the book collection. This is MORE correct than relying
     // on the prefix guard to stop at boundaries.
@@ -100,7 +100,8 @@ pub async fn test_prefix_guard_collection_boundary() -> Result<(), anyhow::Error
     // The prefix guard is still needed for inequality queries with open-ended upper bounds.
     // So this test now verifies that bounded ranges work correctly, not the guard itself.
 
-    // ORDER-FIRST plan over (__collection, name), now with bounded __collection range
+    // ORDER-FIRST plan over (__materialization, name), now with a bounded
+    // __materialization range
     // LIMIT 5 should only include album records, never book
     assert_eq!(names(&ctx.fetch("year >= '1900' ORDER BY name LIMIT 5").await?), vec!["Album1", "Album2", "Album3", "Album4", "Album5"]);
 

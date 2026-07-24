@@ -29,6 +29,21 @@ impl From<ParseError> for wasm_bindgen::JsValue {
     fn from(error: ParseError) -> Self { wasm_bindgen::JsValue::from_str(&error.to_string()) }
 }
 
+/// A selection reached a consumer that requires it to be fully resolved and
+/// populated, but it was not. Raised by [`crate::ast::Selection::check`].
+#[derive(Debug, Error)]
+pub enum SelectionError {
+    /// A property reference that never resolved to a durable identity. It
+    /// carries only a name, which a storage engine would have to guess a
+    /// column from.
+    #[error("unresolved property path `{0}`: a selection must be resolved to property ids before it is read")]
+    UnresolvedPath(String),
+    /// A placeholder that was never filled in by
+    /// [`crate::ast::Predicate::populate`], so it carries no value to compare.
+    #[error("unpopulated placeholder: a selection must be populated before it is read")]
+    UnpopulatedPlaceholder,
+}
+
 /// Custom error type for SQL generation errors
 #[derive(Debug, Error)]
 pub enum SqlGenerationError {

@@ -1,7 +1,7 @@
 mod candidate_changes;
 mod comparison_index;
+mod extract;
 pub mod fetch_gap;
-mod property_path;
 mod subscription;
 mod subscription_state;
 mod update;
@@ -9,6 +9,7 @@ mod watcherset;
 
 pub(crate) use self::{
     candidate_changes::CandidateChanges,
+    extract::{extract_property_value, ExtractValue},
     subscription::{ReactorSubscription, ReactorSubscriptionId},
     update::{MembershipChange, ReactorUpdate, ReactorUpdateItem},
     watcherset::{WatcherChange, WatcherSet},
@@ -35,9 +36,20 @@ use std::{
 
 /// Trait for entities that can be used in reactor notifications
 pub trait AbstractEntity: Clone + std::fmt::Debug {
-    fn collection(&self) -> proto::CollectionId;
+    fn collection(&self) -> crate::ModelId;
     fn id(&self) -> &proto::EntityId;
     fn value(&self, field: &str) -> Option<Value>;
+
+    /// Read a REGISTERED property by its stable id, addressing id-keyed state
+    /// directly. An unwritten id reads absent (RFC 5.4 absent-as-NULL); there is
+    /// NO fallback to a display name -- system fields and the `id`
+    /// pseudo-property are read by name via [`Self::value`]. Non-catalog test
+    /// entities that hold no id-keyed state read a registered property as absent
+    /// here; [`Entity`] overrides it with the real id-keyed read.
+    fn value_by_id(&self, property_id: proto::EntityId) -> Option<Value> {
+        let _ = property_id;
+        None
+    }
 }
 
 /// Trait for types that can be used in notify_change
@@ -72,6 +84,12 @@ struct ReactorInner<E: AbstractEntity + Filterable, Ev> {
     watcher_set: Arc<std::sync::Mutex<WatcherSet>>,
     /// Serializes notify_change invocations to ensure consistent watcher state
     notify_lock: tokio::sync::Mutex<()>,
+    /// The catalog resolver, injected post-construction by `Node` (the same
+    /// pattern as `StorageEngine::set_catalog_resolver`): ORDER BY sort keys
+    /// collate in each property's CANONICAL value_type (the canonical
+    /// value_type ruling). `None` (standalone reactors, tests) falls back to
+    /// sample-based inference.
+    catalog_resolver: std::sync::RwLock<Option<std::sync::Weak<dyn crate::schema::CatalogResolver>>>,
 }
 // don't require Clone SE or PA, because we have an Arc
 impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static> Clone for Reactor<E, Ev> {
@@ -88,13 +106,23 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
             subscriptions: Mutex::new(HashMap::new()),
             watcher_set: Arc::new(Mutex::new(WatcherSet::new())),
             notify_lock: tokio::sync::Mutex::new(()),
+            catalog_resolver: std::sync::RwLock::new(None),
         }))
+    }
+
+    /// Inject the catalog resolver (called once at Node construction, after
+    /// the catalog exists). Subscriptions created afterward type their ORDER
+    /// BY sort keys from the catalog's canonical value_type.
+    pub fn set_catalog_resolver(&self, resolver: std::sync::Weak<dyn crate::schema::CatalogResolver>) {
+        self.0.watcher_set.lock().unwrap().set_catalog_resolver(resolver.clone());
+        *self.0.catalog_resolver.write().unwrap() = Some(resolver);
     }
 
     /// Create a new subscription container
     pub fn subscribe(&self) -> ReactorSubscription<E, Ev> {
         let broadcast = ankurah_signals::broadcast::Broadcast::new();
-        let subscription = Subscription::new(broadcast.clone(), self.0.watcher_set.clone());
+        let resolver = self.0.catalog_resolver.read().unwrap().clone();
+        let subscription = Subscription::new(broadcast.clone(), self.0.watcher_set.clone(), resolver);
         let subscription_id = subscription.id();
         self.0.subscriptions.lock().unwrap().insert(subscription_id, subscription);
         ReactorSubscription(Arc::new(ReactorSubInner { subscription_id, reactor: self.clone(), broadcast }))
@@ -192,27 +220,63 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
     }
 }
 
-/// Build KeySpec from Selection's ORDER BY clause with type inference from sample entities
+/// Build KeySpec from Selection's ORDER BY clause. Sort keys collate in each
+/// property's CANONICAL value_type from the catalog (the canonical value_type
+/// ruling). A configured resolver's lookup errors are returned: silently
+/// inferring a different type can change ordering. Without a resolver
+/// (standalone reactors and tests), fall back to sampling a result-set value,
+/// then to String.
 pub(crate) fn build_key_spec_from_selection<E: AbstractEntity>(
     order_by: &[ankql::ast::OrderByItem],
     resultset: &EntityResultSet<E>,
-) -> anyhow::Result<KeySpec> {
+    resolver: Option<&dyn crate::schema::CatalogResolver>,
+) -> anyhow::Result<KeySpec<ankql::ast::PropertyId>> {
+    use ankql::ast::{OrderKey, PropertyId, SystemProperty};
     let mut keyparts = Vec::new();
 
     let read = resultset.read();
     for item in order_by {
-        // Use the property name from the path (currently only simple paths are supported in ORDER BY)
-        let column = item.path.property().to_string();
+        // The sort key's stable identity and its JSON sub-path. The key spec
+        // carries the sub-path so two orderings that differ only by sub-path
+        // (the whole property versus one field inside it) never produce equal
+        // key specs; extraction derives from the same (key, sub-path) pair,
+        // so there is no separate extraction path to keep in agreement.
+        let (key, sub_path): (PropertyId, Option<Vec<String>>) = match &item.key {
+            OrderKey::Property(identifier) => (identifier.id(), (!identifier.subpath.is_empty()).then(|| identifier.subpath.clone())),
+            // A raw (unresolved) sort key -- standalone reactors or tests that
+            // never resolved -- sorts by name: key it as a system reference.
+            OrderKey::Path(path) => {
+                let property = SystemProperty::from_name(path.first())
+                    .ok_or_else(|| anyhow::anyhow!("unresolved non-system ORDER BY property {:?}", path.first()))?;
+                (PropertyId::System(property), (path.steps.len() > 1).then(|| path.steps[1..].to_vec()))
+            }
+        };
 
-        // Infer type from first non-null value in resultset entities
-        let value_type = read.iter_entities().find_map(|(_, e)| e.value(&column).map(|v| ValueType::of(&v))).unwrap_or(ValueType::String); // TODO: Get type from system catalog instead of defaulting to String
+        // Collate in the property's canonical value_type whenever a resolver
+        // is configured; `id` is always an EntityId. Only resolver-less
+        // standalone reactors infer from the current result set.
+        let value_type = match &key {
+            PropertyId::Id => ValueType::EntityId,
+            PropertyId::EntityId(_) | PropertyId::System(_) => {
+                if let Some(resolver) = resolver {
+                    resolver.property_value_type(&key)?
+                } else {
+                    let sub = sub_path.as_deref().unwrap_or(&[]);
+                    read.iter_entities()
+                        .find_map(|(_, entity)| {
+                            crate::reactor::extract_property_value(&key, sub, entity).map(|value| ValueType::of(&value))
+                        })
+                        .unwrap_or(ValueType::String)
+                }
+            }
+        };
 
         let direction: IndexDirection = match item.direction {
             ankql::ast::OrderDirection::Asc => IndexDirection::Asc,
             ankql::ast::OrderDirection::Desc => IndexDirection::Desc,
         };
 
-        keyparts.push(IndexKeyPart { column, sub_path: None, direction, value_type, nulls: Some(NullsOrder::Last), collation: None });
+        keyparts.push(IndexKeyPart { key, sub_path, direction, value_type, nulls: Some(NullsOrder::Last), collation: None });
     }
 
     Ok(KeySpec { keyparts })
@@ -229,11 +293,12 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         &self,
         subscription_id: ReactorSubscriptionId,
         query_id: proto::QueryId,
-        collection_id: proto::CollectionId,
+        collection_id: crate::ModelId,
         selection: ankql::ast::Selection,
         node: &dyn crate::node::TNodeErased<E>,
         resultset: EntityResultSet<E>,
         gap_fetcher: std::sync::Arc<dyn GapFetcher<E>>,
+        version: u32,
         pre_notify_hook: H,
     ) -> anyhow::Result<()> {
         // Get subscription reference
@@ -256,7 +321,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
             collection_id.clone(),
             selection.clone(),
             included_entities,
-            1, // version 1 for initial add
+            version,
             &mut reactor_update_items,
         )?;
 
@@ -269,12 +334,45 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         // Mark as loaded
         resultset.set_loaded(true);
 
-        // Call pre-notify hook (e.g., mark LiveQuery as initialized) with version 1
-        pre_notify_hook.pre_notify(1);
+        // A later selection can win before the first activation reaches the
+        // reactor. Publish the version that was actually activated so its
+        // initialization waiter is released.
+        pre_notify_hook.pre_notify(version);
 
         // Send the notification with collected items. We always notify because we're initializing the query.
         subscription.send_update(reactor_update_items);
 
+        Ok(())
+    }
+
+    /// Register a query and its watchers WITHOUT reading storage.
+    ///
+    /// Unlike [`Self::add_query_and_notify`], this performs no local fetch, so it
+    /// never materializes the collection. It is for subscribers that supply
+    /// their own initial state out of band and only need the reactor to route
+    /// future `notify_change` updates -- notably the metadata catalog manager,
+    /// which must be able to watch catalog collections that do not yet exist
+    /// in storage without conjuring empty `_ankurah_*` trees. The query's
+    /// watchers (including the `Predicate::True` wildcard) are registered so
+    /// subsequent changes are delivered; no initial notification is sent.
+    pub fn add_query_no_fetch(
+        &self,
+        subscription_id: ReactorSubscriptionId,
+        query_id: proto::QueryId,
+        collection_id: crate::ModelId,
+        selection: ankql::ast::Selection,
+        resultset: EntityResultSet<E>,
+        gap_fetcher: std::sync::Arc<dyn GapFetcher<E>>,
+    ) -> anyhow::Result<()> {
+        let subscription = {
+            let subscriptions = self.0.subscriptions.lock().unwrap();
+            subscriptions.get(&subscription_id).cloned().ok_or_else(|| anyhow::anyhow!("Subscription {:?} not found", subscription_id))?
+        };
+
+        subscription.register_query(query_id, collection_id.clone(), resultset, gap_fetcher)?;
+        // Empty included_entities: register the watchers (predicate/wildcard)
+        // without any storage read. `&mut ()` discards update items.
+        subscription.update_query(query_id, collection_id, selection, Vec::new(), 1, &mut ())?;
         Ok(())
     }
 
@@ -286,7 +384,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         &self,
         subscription_id: ReactorSubscriptionId,
         query_id: proto::QueryId,
-        collection_id: proto::CollectionId,
+        collection_id: crate::ModelId,
         selection: ankql::ast::Selection,
         node: &dyn crate::node::TNodeErased<E>,
         version: u32,
@@ -397,7 +495,7 @@ impl Reactor<Entity, ankurah_proto::Attested<ankurah_proto::Event>> {
         &self,
         subscription_id: ReactorSubscriptionId,
         query_id: proto::QueryId,
-        collection_id: proto::CollectionId,
+        collection_id: crate::ModelId,
         selection: ankql::ast::Selection,
         node: &crate::node::Node<SE, PA>,
         cdata: &PA::ContextData,
@@ -456,9 +554,9 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::selection::filter::Filterable;
+    use crate::{selection::filter::Filterable, ModelId};
     use ankurah_signals::Subscribe;
-    use proto::{CollectionId, QueryId};
+    use proto::QueryId;
     use std::sync::Arc;
 
     pub fn watcher<T: Clone + Send + 'static>() -> (Box<dyn Fn(T) + Send + Sync>, Box<dyn Fn() -> Vec<T> + Send + Sync>) {
@@ -478,7 +576,7 @@ mod tests {
     #[derive(Debug, Clone)]
     struct TestEntity {
         id: proto::EntityId,
-        collection: proto::CollectionId,
+        collection: crate::ModelId,
         state: Arc<Mutex<HashMap<String, String>>>,
     }
     impl Eq for TestEntity {}
@@ -491,14 +589,15 @@ mod tests {
     #[derive(Debug, Clone, PartialEq)]
     struct TestEvent {
         id: proto::EventId,
-        collection: proto::CollectionId,
+        collection: crate::ModelId,
         changes: HashMap<String, String>,
     }
     impl TestEntity {
         fn new(name: &str, status: &str) -> Self {
             Self {
                 id: proto::EntityId::new(),
-                collection: proto::CollectionId::fixed_name("album"),
+                // Ordinary catalog entity identity used only by this fixture.
+                collection: crate::ModelId::EntityId(proto::EntityId::from_bytes([0x72; 16])),
                 state: Arc::new(Mutex::new(HashMap::from([
                     ("name".to_string(), name.to_string()),
                     ("status".to_string(), status.to_string()),
@@ -507,13 +606,13 @@ mod tests {
         }
     }
     impl Filterable for TestEntity {
-        fn collection(&self) -> &str { self.collection.as_str() }
+        fn collection(&self) -> &str { "album" }
         fn value(&self, field: &str) -> Option<crate::value::Value> {
             self.state.lock().unwrap().get(field).cloned().map(crate::value::Value::String)
         }
     }
     impl AbstractEntity for TestEntity {
-        fn collection(&self) -> proto::CollectionId { self.collection.clone() }
+        fn collection(&self) -> crate::ModelId { self.collection.clone() }
         fn id(&self) -> &proto::EntityId { &self.id }
         fn value(&self, field: &str) -> Option<crate::value::Value> {
             self.state.lock().unwrap().get(field).cloned().map(crate::value::Value::String)
@@ -535,7 +634,7 @@ mod tests {
     impl GapFetcher<TestEntity> for MockGapFetcher {
         async fn fetch_gap(
             &self,
-            _collection_id: &proto::CollectionId,
+            _collection_id: &crate::ModelId,
             _selection: &ankql::ast::Selection,
             _last_entity: Option<&TestEntity>,
             _gap_size: usize,
@@ -553,23 +652,24 @@ mod tests {
     #[async_trait::async_trait]
     impl crate::node::TNodeErased<TestEntity> for MockNode {
         fn unsubscribe_remote_predicate(&self, _query_id: proto::QueryId) {}
-        fn update_remote_query(
+        fn update_query_selection(
             &self,
             _query_id: proto::QueryId,
+            _collection_id: crate::ModelId,
             _selection: ankql::ast::Selection,
             _version: u32,
+            _livequery: crate::livequery::WeakEntityLiveQuery,
         ) -> Result<(), anyhow::Error> {
             Ok(())
         }
         async fn fetch_entities_from_local(
             &self,
-            _collection_id: &proto::CollectionId,
+            _collection_id: &crate::ModelId,
             _selection: &ankql::ast::Selection,
         ) -> Result<Vec<TestEntity>, crate::error::RetrievalError> {
             Ok(self.entities.clone())
         }
         fn reactor(&self) -> &Reactor<TestEntity> { panic!("MockNode::reactor() should not be called in this test") }
-        fn has_subscription_relay(&self) -> bool { false }
     }
 
     /// Test that once a predicate matches an entity, that entity continues to be watched
@@ -584,7 +684,7 @@ mod tests {
         let _guard = rsub.subscribe(w);
 
         let query_id = QueryId::new();
-        let collection_id = CollectionId::fixed_name("album");
+        let collection_id = ModelId::EntityId(proto::EntityId::from_bytes([0x72; 16]));
         let selection: ankql::ast::Selection = "status = 'pending'".try_into().unwrap();
         let entity1 = TestEntity::new("Test Album", "pending");
         let resultset: EntityResultSet<TestEntity> = EntityResultSet::empty();
@@ -593,7 +693,7 @@ mod tests {
 
         // Add query using the reactor - this should send Initial notification
         reactor
-            .add_query_and_notify(rsub.id(), query_id, collection_id, selection, &mock_node, resultset, mock_gap_fetcher, ())
+            .add_query_and_notify(rsub.id(), query_id, collection_id, selection, &mock_node, resultset, mock_gap_fetcher, 1, ())
             .await
             .unwrap();
 
@@ -605,6 +705,7 @@ mod tests {
                     entity: entity1.clone(),
                     events: vec![],
                     predicate_relevance: vec![(query_id, MembershipChange::Initial)],
+                    source_queries: vec![query_id],
                 }],
             }]
         );
@@ -705,5 +806,93 @@ mod tests {
         let mut sorted2 = order2.clone();
         sorted2.sort();
         assert_eq!(order2, sorted2, "emission order must be sorted by subscription id on the second run too");
+    }
+
+    /// A change's events fold into the per-entity update item exactly once,
+    /// no matter how many of the subscription's queries match the entity.
+    ///
+    /// A subscription may hold several queries whose predicates all match
+    /// the same entity (a peer's SubscriptionHandler holds every query that
+    /// peer has; two client LiveQueries on one predicate are routine). The
+    /// per-query candidate walk visits the same change once per matching
+    /// query; if each visit appends the change's events, the update item
+    /// carries every event N times for N matching queries, and receivers
+    /// that echo item events into their own change notifications report
+    /// duplicates downstream.
+    #[tokio::test]
+    async fn test_change_events_fold_once_across_matching_queries() {
+        let reactor = Reactor::<TestEntity, TestEvent>::new();
+        let rsub = reactor.subscribe();
+        let (w, check) = watcher::<ReactorUpdate<TestEntity, TestEvent>>();
+        let _guard = rsub.subscribe(w);
+
+        let collection_id = ModelId::EntityId(proto::EntityId::from_bytes([0x72; 16]));
+        let entity = TestEntity::new("Test Album", "pending");
+        let mut query_ids = Vec::new();
+
+        // Two queries on one subscription, both matching the entity.
+        for selection_str in ["status = 'pending'", "name = 'Test Album'"] {
+            let query_id = QueryId::new();
+            query_ids.push(query_id);
+            let selection: ankql::ast::Selection = selection_str.try_into().unwrap();
+            let resultset: EntityResultSet<TestEntity> = EntityResultSet::empty();
+            let mock_gap_fetcher = Arc::new(MockGapFetcher::new());
+            let mock_node = MockNode { entities: vec![entity.clone()] };
+            reactor
+                .add_query_and_notify(rsub.id(), query_id, collection_id.clone(), selection, &mock_node, resultset, mock_gap_fetcher, 1, ())
+                .await
+                .unwrap();
+        }
+        check(); // drain the two Initial notifications
+
+        // One change carrying one event.
+        let event = TestEvent { id: proto::EventId::from_bytes([7u8; 32]), collection: collection_id, changes: HashMap::new() };
+        let change = TestChange { entity: entity.clone(), events: vec![event.clone()] };
+        reactor.notify_change(vec![change]).await;
+
+        let updates = check();
+        assert_eq!(updates.len(), 1, "one batch, one update");
+        assert_eq!(updates[0].items.len(), 1, "one entity, one item");
+        assert_eq!(
+            updates[0].items[0].events,
+            vec![event],
+            "the change's events must appear once in the item, not once per matching query"
+        );
+        assert!(updates[0].items[0].predicate_relevance.is_empty(), "an unchanged match has no membership delta");
+        query_ids.sort();
+        let mut source_queries = updates[0].items[0].source_queries.clone();
+        source_queries.sort();
+        assert_eq!(source_queries, query_ids, "ordinary matching updates must retain every source query even without membership changes");
+    }
+
+    #[test]
+    fn key_spec_propagates_catalog_type_lookup_errors() {
+        struct FailingResolver;
+
+        impl crate::schema::CatalogResolver for FailingResolver {
+            fn resolve_model_property(&self, _model: &ModelId, _property_name: &str) -> anyhow::Result<Option<ankql::ast::PropertyId>> {
+                Ok(None)
+            }
+
+            fn model_properties(&self, _model: &ModelId) -> anyhow::Result<Vec<ankql::ast::PropertyId>> { Ok(Vec::new()) }
+
+            fn model_name(&self, _model: &ModelId) -> anyhow::Result<String> { Ok("test".to_owned()) }
+
+            fn property_name(&self, _id: &ankql::ast::PropertyId) -> anyhow::Result<String> { Ok("score".to_owned()) }
+
+            fn property_value_type(&self, _property: &ankql::ast::PropertyId) -> anyhow::Result<crate::value::ValueType> {
+                anyhow::bail!("catalog unavailable")
+            }
+        }
+
+        let property = proto::EntityId::from_bytes([0x91; 16]);
+        let order_by = [ankql::ast::OrderByItem {
+            key: ankql::ast::OrderKey::Property(ankql::ast::PropertyPath::registered(property, "score", vec![])),
+            direction: ankql::ast::OrderDirection::Asc,
+        }];
+        let resultset = EntityResultSet::<TestEntity>::empty();
+
+        let error = build_key_spec_from_selection(&order_by, &resultset, Some(&FailingResolver)).unwrap_err();
+        assert!(error.to_string().contains("catalog unavailable"), "{error}");
     }
 }

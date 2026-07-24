@@ -11,7 +11,7 @@ use proc_macro::TokenStream;
 use quote::quote;
 use syn::{parse_macro_input, DeriveInput};
 
-#[proc_macro_derive(Model, attributes(active_type, ephemeral, model))]
+#[proc_macro_derive(Model, attributes(active_type, ephemeral, model, property))]
 pub fn derive_model(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
 
@@ -20,6 +20,14 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
         Ok(model) => model,
         Err(e) => return e.to_compile_error().into(),
     };
+
+    // Validate schema-affecting attributes early (reserved collection
+    // prefix, explicit-id shape; RFC sections 4 and 5.9) so a bad model
+    // yields ONE actionable diagnostic instead of a cascade of downstream
+    // trait-bound errors from the other generated impls.
+    if let Err(e) = model::schema::validate_schema_attrs(&desc) {
+        return e.to_compile_error().into();
+    }
 
     let hygiene_module = quote::format_ident!("__ankurah_derive_impl_{}", to_snake_case(&desc.name().to_string()));
     let wasm_imports = if cfg!(feature = "wasm") {
@@ -36,11 +44,19 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
     let view_impl = model::view::view_impl(&desc);
     let mutable_impl = model::mutable::mutable_impl(&desc);
     #[cfg(feature = "wasm")]
-    let wasm_impl = model::wasm::wasm_impl(&input, &desc);
+    let wasm_impl = if desc.no_ffi() {
+        quote! {}
+    } else {
+        model::wasm::wasm_impl(&input, &desc)
+    };
     #[cfg(not(feature = "wasm"))]
     let wasm_impl = quote! {};
     #[cfg(all(feature = "uniffi", not(feature = "wasm")))]
-    let uniffi_impl = model::uniffi::uniffi_impl(&desc);
+    let uniffi_impl = if desc.no_ffi() {
+        quote! {}
+    } else {
+        model::uniffi::uniffi_impl(&desc)
+    };
     #[cfg(any(not(feature = "uniffi"), feature = "wasm"))]
     let uniffi_impl = quote! {};
 
@@ -135,7 +151,7 @@ pub fn selection(input: TokenStream) -> TokenStream { selection::selection_macro
 /// let results = fetch!(ctx, "status = 'active' AND {}", name).await?; // Equivalent to the above
 /// ```
 ///
-/// See [`ankurah_derive::selection!`] documentation for complete syntax details.
+/// See [`selection!`] for complete syntax details.
 #[proc_macro]
 pub fn fetch(input: TokenStream) -> TokenStream { selection::fetch_macro(input) }
 
@@ -166,7 +182,7 @@ pub fn fetch(input: TokenStream) -> TokenStream { selection::fetch_macro(input) 
 /// let handle = livequery!(ctx, callback, "status = 'active' AND {}", name).await?; // Equivalent to the above
 /// ```
 ///
-/// See [`ankurah_derive::selection!`] documentation for complete syntax details.
+/// See [`selection!`] for complete syntax details.
 #[proc_macro]
 pub fn livequery(input: TokenStream) -> TokenStream { selection::subscribe_macro(input) }
 

@@ -106,6 +106,10 @@ async fn server_edits_subscription() -> Result<()> {
     let cached_watcher = TestWatcher::changeset();
     let pred = "name = 'Rex' OR (age > 2 and age < 5)";
 
+    // `query` is deliberately synchronous and therefore requires prior schema
+    // admission; retain its pre-initialization cache behavior after doing that
+    // asynchronous work explicitly.
+    client.model_id::<Pet>().await?;
     let cached_query = client.query::<PetView>(pred)?; // Cached behavior: subscribe before remote initialization
     assert_eq!(cached_query.ids(), vec![]); // didn't wait for initialization AND the client cache is empty, so should be empty for two reasons
     let _cached_handle = cached_query.subscribe(&cached_watcher);
@@ -220,6 +224,7 @@ async fn subscription_empty_events_from_noop_delta() -> Result<()> {
 
     // Query B: start (do NOT wait). Its known_matches are empty (Rex not local
     // yet) so the server returns a StateSnapshot for Rex - which the gate parks.
+    client_ctx.model_id::<Pet>().await?;
     let query_b = client_ctx.query::<PetView>(nocache(pred)?)?;
     *gate_query_id.lock().unwrap() = Some(query_b.query_id());
 
@@ -375,6 +380,7 @@ async fn test_view_field_subscriptions_with_query_lifecycle() -> Result<()> {
 
     // Also exercise cached behavior by subscribing to a LiveQuery that uses cached initialization
     let cached_watcher = TestWatcher::changeset();
+    client.model_id::<Pet>().await?;
     let _cached_guard = client.query::<PetView>("name = 'Buddy'")?.subscribe(&cached_watcher);
 
     // This is the actual livequery, which has a predicate subscription with the server because the client node is ephemeral.
@@ -600,8 +606,7 @@ async fn test_event_bridge_uneven_diamond() -> Result<()> {
 
     // Prove the bridge (not a state snapshot fallback) served this fetch: the
     // receiver committed the bridge events to its local storage.
-    let collection_r = ctx_r.collection(&Pet::collection()).await?;
-    let events_r = collection_r.dump_entity_events(pet_id).await?;
+    let events_r = receiver.storage.dump_entity_events(pet_id).await?;
     let ids: std::collections::HashSet<_> = events_r.iter().map(|e| e.payload.id()).collect();
     for (label, id) in [("X", &id_x), ("P", &id_p), ("H1", &id_h1), ("H2", &id_h2)] {
         assert!(ids.contains(id), "receiver must hold bridge event {label}");

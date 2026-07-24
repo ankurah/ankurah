@@ -10,7 +10,8 @@ use common::*;
 /// 4. Second transaction should handle the concurrent update correctly
 #[tokio::test]
 async fn test_concurrent_transactions_same_entity() -> Result<()> {
-    let context = durable_sled_setup().await?.context_async(DEFAULT_CONTEXT).await;
+    let node = durable_sled_setup().await?;
+    let context = node.context_async(DEFAULT_CONTEXT).await;
     let mut dag = TestDag::new();
 
     // Create initial entity
@@ -54,15 +55,14 @@ async fn test_concurrent_transactions_same_entity() -> Result<()> {
     assert_eq!(final_album.year().unwrap(), "2025");
 
     // Persisted state must include both concurrent commits in its head
-    let collection = context.collection(&Album::collection()).await?;
-    let stored_state = collection.get_state(album_id).await?;
+    let stored_state = node.storage.get_state(album_id).await?;
     let persisted_head = stored_state.payload.state.head;
     let persisted_head_ids: Vec<_> = persisted_head.iter().map(|id| id.to_base64_short()).collect();
     println!("Persisted head ids: {:?}", persisted_head_ids);
     assert_eq!(persisted_head.len(), 2, "Persisted head should include both concurrent commits");
 
     // All head entries must correspond to stored events
-    let persisted_events = collection.dump_entity_events(album_id).await?;
+    let persisted_events = node.storage.dump_entity_events(album_id).await?;
     let persisted_event_ids: Vec<_> = persisted_events.iter().map(|e| e.payload.id()).collect();
     for head_id in persisted_head.iter() {
         assert!(
@@ -141,6 +141,55 @@ async fn test_many_concurrent_transactions() -> Result<()> {
     // At least the first transaction should succeed
     assert!(successes >= 1, "At least one transaction should succeed");
 
+    Ok(())
+}
+
+/// Every writer forks before any writer can commit. This forces exact-head
+/// conflicts at the storage boundary and verifies that retries true-up from
+/// the returned durable state instead of dropping a concurrent branch.
+#[tokio::test]
+async fn test_concurrent_commits_preserve_every_branch() -> Result<()> {
+    let node = durable_sled_setup().await?;
+    let context = node.context_async(DEFAULT_CONTEXT).await;
+    let album_id = {
+        let trx = context.begin();
+        let album = trx.create(&Album { name: "Counter".to_owned(), year: "genesis".to_owned() }).await?;
+        let id = album.id();
+        trx.commit().await?;
+        id
+    };
+    let album = context.get::<AlbumView>(album_id).await?;
+
+    const WRITERS: usize = 8;
+    let ready = std::sync::Arc::new(tokio::sync::Barrier::new(WRITERS));
+    let mut handles = Vec::with_capacity(WRITERS);
+    for writer in 0..WRITERS {
+        let context = context.clone();
+        let album = album.clone();
+        let ready = ready.clone();
+        handles.push(tokio::spawn(async move {
+            let trx = context.begin();
+            album.edit(&trx)?.year().replace(&format!("writer-{writer}"))?;
+            ready.wait().await;
+            trx.commit_and_return_events().await
+        }));
+    }
+
+    let mut committed_ids = Vec::with_capacity(WRITERS);
+    for handle in handles {
+        let events = handle.await??;
+        assert_eq!(events.len(), 1);
+        committed_ids.push(events[0].id());
+    }
+
+    let stored = node.storage.get_state(album_id).await?;
+    assert_eq!(stored.payload.state.head.len(), WRITERS);
+    for event_id in committed_ids {
+        assert!(
+            stored.payload.state.head.iter().any(|head| head == &event_id),
+            "every successful concurrent commit must remain in the canonical head"
+        );
+    }
     Ok(())
 }
 
