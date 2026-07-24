@@ -67,7 +67,6 @@ fn event(seed: u32, parents: &[EventId]) -> Event {
     entity_id_bytes[0..4].copy_from_slice(&seed.to_be_bytes());
     Event {
         entity_id: EntityId::from_bytes(entity_id_bytes),
-        collection: "bench".into(),
         parent: Clock::from(parents.to_vec()),
         operations: OperationSet(BTreeMap::new()),
     }

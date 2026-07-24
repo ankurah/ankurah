@@ -20,8 +20,7 @@ async fn test_single_event_entity() -> Result<()> {
     };
 
     // Verify initial state: head=[A]
-    let collection = ctx.collection(&Album::collection()).await?;
-    let state = collection.get_state(album_id).await?;
+    let state = node.storage.get_state(album_id).await?;
     clock_eq!(dag, state.payload.state.head, [A]);
 
     // The degenerate base case: a single-event entity reads back its genesis
@@ -99,8 +98,7 @@ async fn test_rapid_concurrent_transactions() -> Result<()> {
     assert!(!final_year.is_empty(), "Year should not be empty after concurrent updates");
 
     // Verify DAG is valid - no orphans, all events have valid parents
-    let collection = ctx.collection(&Album::collection()).await?;
-    let events = collection.dump_entity_events(album_id).await?;
+    let events = node.storage.dump_entity_events(album_id).await?;
 
     // All events except genesis should have parents
     for event in &events {
@@ -214,13 +212,12 @@ async fn test_multiple_merge_cycles() -> Result<()> {
     dag.enumerate(trx.commit_and_return_events().await?); // G
 
     // Verify structure
-    let collection = ctx.collection(&Album::collection()).await?;
-    let events = collection.dump_entity_events(album_id).await?;
+    let events = node.storage.dump_entity_events(album_id).await?;
 
     assert_eq!(events.len(), 7, "Should have 7 events");
 
     // Verify head is single (G)
-    let state = collection.get_state(album_id).await?;
+    let state = node.storage.get_state(album_id).await?;
     clock_eq!(dag, state.payload.state.head, [G]);
 
     // Verify DAG structure
@@ -254,8 +251,7 @@ async fn test_empty_transaction() -> Result<()> {
     };
 
     // Get event count before empty transaction
-    let collection = ctx.collection(&Album::collection()).await?;
-    let events_before = collection.dump_entity_events(album_id).await?;
+    let events_before = node.storage.dump_entity_events(album_id).await?;
     let count_before = events_before.len();
 
     // Begin transaction but don't edit anything
@@ -266,7 +262,7 @@ async fn test_empty_transaction() -> Result<()> {
     trx.commit().await?;
 
     // Event count should be the same (no new events for empty transaction)
-    let events_after = collection.dump_entity_events(album_id).await?;
+    let events_after = node.storage.dump_entity_events(album_id).await?;
     assert_eq!(events_after.len(), count_before, "Empty transaction should not create events");
 
     // State should be unchanged
@@ -309,8 +305,7 @@ async fn test_apply_state_diverged_since() -> Result<()> {
     dag.enumerate(trx2.commit_and_return_events().await?); // C
 
     // Verify DAG structure - B and C both have parent A (true concurrency)
-    let collection = ctx.collection(&Album::collection()).await?;
-    let events = collection.dump_entity_events(album_id).await?;
+    let events = node.storage.dump_entity_events(album_id).await?;
 
     assert_dag!(dag, events, {
         A => [],
@@ -319,7 +314,7 @@ async fn test_apply_state_diverged_since() -> Result<()> {
     });
 
     // Verify head has both concurrent events
-    let state = collection.get_state(album_id).await?;
+    let state = node.storage.get_state(album_id).await?;
     clock_eq!(dag, state.payload.state.head, [B, C]);
 
     // Both concurrent changes should be reflected in the final state
@@ -347,8 +342,7 @@ async fn test_apply_state_strict_ascends() -> Result<()> {
     };
 
     // Capture state at A
-    let collection = ctx.collection(&Album::collection()).await?;
-    let state_at_a = collection.get_state(album_id).await?;
+    let state_at_a = node.storage.get_state(album_id).await?;
     let old_head = state_at_a.payload.state.head.clone();
 
     // Advance: A → B → C
@@ -366,7 +360,7 @@ async fn test_apply_state_strict_ascends() -> Result<()> {
     }
 
     // Verify head has advanced
-    let state_at_c = collection.get_state(album_id).await?;
+    let state_at_c = node.storage.get_state(album_id).await?;
     let new_head = state_at_c.payload.state.head.clone();
     assert_ne!(old_head, new_head, "Head should have advanced");
 
@@ -415,8 +409,7 @@ async fn test_empty_clock_handling() -> Result<()> {
     };
 
     // Get entity and its head
-    let collection = ctx.collection(&Album::collection()).await?;
-    let state = collection.get_state(album_id).await?;
+    let state = node.storage.get_state(album_id).await?;
     let head = state.payload.state.head;
 
     // Head should not be empty after creation
@@ -451,8 +444,7 @@ async fn test_state_buffer_round_trip() -> Result<()> {
     }
 
     // Get state after B
-    let collection = ctx.collection(&Album::collection()).await?;
-    let state_after_b = collection.get_state(album_id).await?;
+    let state_after_b = node.storage.get_state(album_id).await?;
 
     // Serialize state to bytes
     let serialized = serde_json::to_vec(&state_after_b.payload.state)?;
@@ -475,7 +467,7 @@ async fn test_state_buffer_round_trip() -> Result<()> {
     }
 
     // Verify DAG structure
-    let events = collection.dump_entity_events(album_id).await?;
+    let events = node.storage.dump_entity_events(album_id).await?;
     assert_dag!(dag, events, {
         A => [],
         B => [A],
@@ -515,11 +507,8 @@ async fn test_backend_error_handling() -> Result<()> {
         id
     };
 
-    // Get the collection
-    let collection = ctx.collection(&Album::collection()).await?;
-
     // Verify that the valid entity works correctly
-    let valid_state = collection.get_state(album_id).await?;
+    let valid_state = node.storage.get_state(album_id).await?;
     assert!(!valid_state.payload.state.state_buffers.is_empty(), "Valid state should have buffers");
 
     // Verify that known backend types work
@@ -566,8 +555,7 @@ async fn test_multi_head_extend_single_tip_lww() -> Result<()> {
     dag.enumerate(trx_c.commit_and_return_events().await?); // C
 
     // Head should be [B, C]
-    let collection = ctx.collection(&Record::collection()).await?;
-    let state = collection.get_state(record_id).await?;
+    let state = node.storage.get_state(record_id).await?;
     clock_eq!(dag, state.payload.state.head, [B, C]);
 
     // Determine which of B or C has higher EventId (LWW winner)
@@ -596,7 +584,7 @@ async fn test_multi_head_extend_single_tip_lww() -> Result<()> {
 
     // Verify head is properly pruned
     // Since trx_e saw head [B, C], its event D has parent [B, C], so it should replace both
-    let state = collection.get_state(record_id).await?;
+    let state = node.storage.get_state(record_id).await?;
     // D's parent is [B, C], so D strictly descends from both - head becomes [D]
     clock_eq!(dag, state.payload.state.head, [D]);
 
@@ -663,8 +651,7 @@ async fn test_multi_head_single_tip_extension_cross_node() -> Result<()> {
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     // 4. Verify durable has multi-head [B, C]
-    let collection = ctx_d.collection(&Record::collection()).await?;
-    let state = collection.get_state(record_id).await?;
+    let state = durable.storage.get_state(record_id).await?;
     clock_eq!(dag, state.payload.state.head, [B, C]);
 
     // Determine LWW winner between B and C
@@ -703,7 +690,7 @@ async fn test_multi_head_single_tip_extension_cross_node() -> Result<()> {
     assert_eq!(final_title, "Title-D", "StrictDescends: descendant's value should win. Got: {}", final_title);
 
     // 7. Verify head is properly maintained (should be [D] since D extends [B, C])
-    let state = collection.get_state(record_id).await?;
+    let state = durable.storage.get_state(record_id).await?;
     clock_eq!(dag, state.payload.state.head, [D]);
 
     Ok(())
@@ -734,8 +721,7 @@ async fn test_redelivery_of_ancestor_event_is_noop() -> Result<()> {
         id
     };
 
-    let collection = ctx.collection(&Album::collection()).await?;
-    let state = collection.get_state(album_id).await?;
+    let state = node.storage.get_state(album_id).await?;
     clock_eq!(dag, state.payload.state.head, [A]);
 
     // Step 2: Commit event B with parent A, head=[B]
@@ -748,7 +734,7 @@ async fn test_redelivery_of_ancestor_event_is_noop() -> Result<()> {
         dag.enumerate(events_b.clone());
     }
 
-    let state = collection.get_state(album_id).await?;
+    let state = node.storage.get_state(album_id).await?;
     clock_eq!(dag, state.payload.state.head, [B]);
 
     // Step 3: Commit event C with parent B, head=[C]
@@ -759,7 +745,7 @@ async fn test_redelivery_of_ancestor_event_is_noop() -> Result<()> {
         dag.enumerate(trx.commit_and_return_events().await?); // C
     }
 
-    let state = collection.get_state(album_id).await?;
+    let state = node.storage.get_state(album_id).await?;
     clock_eq!(dag, state.payload.state.head, [C]);
 
     // Snapshot the album state before re-delivery
@@ -769,14 +755,19 @@ async fn test_redelivery_of_ancestor_event_is_noop() -> Result<()> {
 
     // Step 4: Re-deliver event B via commit_remote_transaction
     // Wrap the raw event in Attested (no attestations needed for PermissiveAgent)
-    let attested_events: Vec<ankurah::proto::Attested<ankurah::proto::Event>> =
-        events_b.into_iter().map(|e| ankurah::proto::Attested { payload: e, attestations: Default::default() }).collect();
+    let model = ctx.model_id::<Album>().await?;
+    let attested_events = events_b
+        .into_iter()
+        .map(|event| {
+            ankurah::proto::ModelContext::new(model, ankurah::proto::Attested { payload: event, attestations: Default::default() })
+        })
+        .collect();
 
     let trx_id = ankurah::proto::TransactionId::new();
     node.commit_remote_transaction(&DEFAULT_CONTEXT, trx_id, attested_events).await?;
 
     // Step 5: Assert head is still [C] — B is an ancestor of C, so re-delivery is a no-op
-    let state = collection.get_state(album_id).await?;
+    let state = node.storage.get_state(album_id).await?;
     clock_eq!(dag, state.payload.state.head, [C]);
 
     // Also verify the entity state was not corrupted
@@ -784,7 +775,7 @@ async fn test_redelivery_of_ancestor_event_is_noop() -> Result<()> {
     assert_eq!(album_after.name().unwrap(), "Name-C", "State should still be at C after re-delivery of B");
 
     // Verify DAG structure is intact
-    let events = collection.dump_entity_events(album_id).await?;
+    let events = node.storage.dump_entity_events(album_id).await?;
     assert_eq!(events.len(), 3, "Should still have exactly 3 events (A, B, C)");
     assert_dag!(dag, events, {
         A => [],

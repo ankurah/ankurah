@@ -16,16 +16,23 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
         Ok(types) => types,
         Err(e) => return e.into_compile_error(),
     };
-    let active_field_name_strs = model.active_field_name_strs();
+    let active_field_addresses = match crate::model::schema::active_field_address_tokens(model) {
+        Ok(addresses) => addresses,
+        Err(e) => return e.into_compile_error(),
+    };
 
     // WASM field getters (conditionally generated)
     #[cfg(feature = "wasm")]
     let wasm_field_getters_impl = {
-        let wasm_getters = model.wasm_getters();
-        quote! {
-            #[wasm_bindgen]
-            impl #view_name {
-                #(#wasm_getters)*
+        if model.no_ffi() {
+            quote! {}
+        } else {
+            let wasm_getters = model.wasm_getters();
+            quote! {
+                #[wasm_bindgen]
+                impl #view_name {
+                    #(#wasm_getters)*
+                }
             }
         }
     };
@@ -49,10 +56,18 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
     // Get FFI-specific attributes from the appropriate module
     // wasm takes precedence when both features are enabled
     #[cfg(feature = "wasm")]
-    let ffi_attrs = super::wasm::view_attributes(&view_name, &mutable_name, &name);
+    let ffi_attrs = if model.no_ffi() {
+        super::ViewAttributes { struct_attr: quote! {}, impl_attr: quote! {}, id_method_attr: quote! {}, extra_impl: quote! {} }
+    } else {
+        super::wasm::view_attributes(&view_name, &mutable_name, &name)
+    };
 
     #[cfg(all(feature = "uniffi", not(feature = "wasm")))]
-    let ffi_attrs = super::uniffi::view_attributes();
+    let ffi_attrs = if model.no_ffi() {
+        super::ViewAttributes { struct_attr: quote! {}, impl_attr: quote! {}, id_method_attr: quote! {}, extra_impl: quote! {} }
+    } else {
+        super::uniffi::view_attributes()
+    };
 
     #[cfg(not(any(feature = "wasm", feature = "uniffi")))]
     let ffi_attrs =
@@ -105,8 +120,6 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
                 }
 
                 fn from_entity(entity: ::ankurah::entity::Entity) -> Self {
-                    use ::ankurah::model::View;
-                    assert_eq!(&Self::collection(), entity.collection());
                     #view_name {
                         entity,
                         #(
@@ -178,7 +191,7 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
                     pub fn #active_field_names(&self) -> Result<#projected_field_types, ankurah::property::PropertyError> {
                         use ankurah::property::{FromActiveType, FromEntity};
                         ::ankurah::signals::CurrentObserver::track(self);
-                        let active_result = #active_field_types_turbofish::from_entity(#active_field_name_strs.into(), &self.entity);
+                        let active_result = #active_field_types_turbofish::from_entity(#active_field_addresses, &self.entity);
                         #projected_field_types_turbofish::from_active(active_result)
                     }
                 )*

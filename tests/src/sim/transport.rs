@@ -116,21 +116,32 @@ fn event_ids(events: &[proto::Attested<proto::Event>]) -> String {
     ids.join("+")
 }
 
+fn scoped_event_ids(events: &[proto::ModelContext<proto::Attested<proto::Event>>]) -> String {
+    let mut ids: Vec<String> = events.iter().map(|event| event.value.payload.id().to_base64_short()).collect();
+    ids.sort();
+    ids.join("+")
+}
+
 fn request_descriptor(body: &proto::NodeRequestBody) -> String {
     match body {
-        proto::NodeRequestBody::CommitTransaction { events, .. } => format!("commit {}", event_ids(events)),
-        proto::NodeRequestBody::Get { collection, ids } => {
+        proto::NodeRequestBody::CommitTransaction { events, .. } => format!("commit {}", scoped_event_ids(events)),
+        proto::NodeRequestBody::Get { model, ids } => {
             let mut ss: Vec<String> = ids.iter().map(|i| i.to_base64_short()).collect();
             ss.sort();
-            format!("get {} {}", collection, ss.join("+"))
+            format!("get {} {}", model, ss.join("+"))
         }
-        proto::NodeRequestBody::GetEvents { collection, event_ids } => {
+        proto::NodeRequestBody::GetEvents { model, event_ids } => {
             let mut ss: Vec<String> = event_ids.iter().map(|i| i.to_base64_short()).collect();
             ss.sort();
-            format!("getevents {} {}", collection, ss.join("+"))
+            format!("getevents {} {}", model, ss.join("+"))
         }
-        proto::NodeRequestBody::Fetch { collection, .. } => format!("fetch {}", collection),
-        proto::NodeRequestBody::SubscribeQuery { collection, .. } => format!("subscribe {}", collection),
+        proto::NodeRequestBody::Fetch { model, .. } => format!("fetch {}", model),
+        proto::NodeRequestBody::SubscribeQuery { model, .. } => format!("subscribe {}", model),
+        proto::NodeRequestBody::RegisterSchema { models, properties, memberships } => {
+            let mut cols: Vec<String> = models.iter().map(|m| m.collection.to_string()).collect();
+            cols.sort();
+            format!("registerschema [{}] p{} ms{}", cols.join("+"), properties.len(), memberships.len())
+        }
     }
 }
 
@@ -138,13 +149,18 @@ fn response_descriptor(body: &proto::NodeResponseBody) -> String {
     match body {
         proto::NodeResponseBody::CommitComplete { .. } => "commitcomplete".to_string(),
         proto::NodeResponseBody::Fetch(deltas) => format!("fetch {}", deltas.len()),
-        proto::NodeResponseBody::Get(states) => {
+        proto::NodeResponseBody::Get { states, .. } => {
             let mut ss: Vec<String> = states.iter().map(|s| s.payload.entity_id.to_base64_short()).collect();
             ss.sort();
             format!("get [{}]", ss.join("+"))
         }
-        proto::NodeResponseBody::GetEvents(events) => format!("getevents {}", event_ids(events)),
+        proto::NodeResponseBody::GetEvents { events, .. } => format!("getevents {}", event_ids(events)),
         proto::NodeResponseBody::QuerySubscribed { deltas, .. } => format!("subscribed {}", deltas.len()),
+        // Counts only: allocated ids are ULIDs and would perturb the
+        // determinism digest without adding discriminating power.
+        proto::NodeResponseBody::SchemaRegistered { models, properties, memberships } => {
+            format!("schemaregistered m{} p{} ms{}", models.len(), properties.len(), memberships.len())
+        }
         proto::NodeResponseBody::Success => "success".to_string(),
         // Include the error text so two distinct rejections are distinguishable
         // in the trace (advisory path, but keeps the digest faithful).

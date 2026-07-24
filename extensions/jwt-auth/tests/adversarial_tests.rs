@@ -96,7 +96,7 @@ async fn test_server_rejects_garbage_auth_data() -> anyhow::Result<()> {
         to: ankurah_proto::EntityId::new(),
         from: ankurah_proto::EntityId::new(),
         body: ankurah_proto::NodeRequestBody::Fetch {
-            collection: ankurah_proto::CollectionId::from("post"),
+            model: ankurah::ModelId::EntityId(ankurah::EntityId::new()),
             selection: "1 = 1".try_into().unwrap(),
             known_matches: vec![],
         },

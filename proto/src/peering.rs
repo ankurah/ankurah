@@ -1,7 +1,7 @@
 use bincode::Options;
 use serde::{Deserialize, Serialize};
 
-use crate::{id::EntityId, Attested, CollectionId, EntityState, State};
+use crate::{Attested, EntityId, EntityState, State};
 
 /// The wire protocol version this binary speaks.
 ///
@@ -21,7 +21,9 @@ use crate::{id::EntityId, Attested, CollectionId, EntityState, State};
 /// - 1: the 0.10.0 wire (0.10.0 is not yet released to crates.io). The
 ///   version field itself arrives with it (#294); 0.10.0's serialized
 ///   contract is incompatible with 0.9.x.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// - 2: canonical events and entity states no longer contain a model;
+///   operations that require model context carry it in their wire envelope.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Whether a peer advertising `remote` can interoperate with this binary.
 ///
@@ -101,9 +103,15 @@ struct LegacyPresence {
 #[allow(dead_code)]
 struct LegacyEntityState {
     entity_id: EntityId,
-    collection: CollectionId,
+    collection: LegacyCollectionName,
     state: State,
 }
+
+/// Mirrors the private string-newtype wire shape used by 0.9.x without
+/// retaining a live protocol collection type.
+#[derive(Serialize, Deserialize)]
+#[allow(dead_code)]
+struct LegacyCollectionName(String);
 
 /// True if `data` (an entire [`crate::Message`] frame that failed normal
 /// decoding) parses as a pre-versioning (version 0) Presence, so the
@@ -139,6 +147,17 @@ mod tests {
     #[test]
     fn presence_round_trip() {
         let p = presence();
+        let bytes = bincode::serialize(&crate::Message::Presence(p.clone())).unwrap();
+        match bincode::deserialize::<crate::Message>(&bytes).unwrap() {
+            crate::Message::Presence(q) => assert_eq!(p, q),
+            other => panic!("expected Presence, got {other}"),
+        }
+    }
+
+    #[test]
+    fn durable_presence_round_trips_named_system_model() {
+        let mut p = presence();
+        p.system_root = Some(Attested::opt(EntityState { entity_id: EntityId::new(), state: State::default() }, None));
         let bytes = bincode::serialize(&crate::Message::Presence(p.clone())).unwrap();
         match bincode::deserialize::<crate::Message>(&bytes).unwrap() {
             crate::Message::Presence(q) => assert_eq!(p, q),
@@ -190,7 +209,7 @@ mod tests {
             system_root: Some(Attested::opt(
                 LegacyEntityState {
                     entity_id: EntityId::new(),
-                    collection: CollectionId::fixed_name("_ankurah_system"),
+                    collection: LegacyCollectionName("_ankurah_system".to_owned()),
                     state: State::default(),
                 },
                 None,

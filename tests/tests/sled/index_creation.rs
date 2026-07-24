@@ -1,5 +1,6 @@
 use ankurah::core::indexing::{IndexKeyPart, KeySpec};
 use ankurah::ValueType;
+use ankurah::{EntityId, ModelId};
 use ankurah_storage_sled::SledStorageEngine;
 
 #[tokio::test]
@@ -12,21 +13,16 @@ async fn test_index_creation_and_reconnection() -> Result<(), anyhow::Error> {
 
     // Create an index spec and ensure it exists
     let index_spec = KeySpec::new(vec![IndexKeyPart::asc("name", ValueType::String)]);
-    let (index, _match_type) = engine.database.lock().unwrap().index_manager.assure_index_exists(
-        "album",
-        &index_spec,
-        &database.db,
-        &database.property_manager,
-    )?;
+    let model = ModelId::EntityId(EntityId::from_bytes([0x41; 16]));
+    let (index, _match_type) = engine.database.lock().unwrap().index_manager.assure_index_exists(&model, &index_spec, &database.db)?;
 
     // Verify metadata and tree
-    assert_eq!(index.collection(), "album");
-    let tree_name = format!("index_{}_{}", index.collection(), index.id());
+    assert_eq!(index.model_id(), &model);
+    let tree_name = format!("index_{}", index.id());
     assert!(engine.database.lock().unwrap().open_tree(&tree_name).is_ok());
 
     // Idempotent assure
-    let (index2, _match_type2) =
-        database.index_manager.assure_index_exists("album", &index_spec, &database.db, &database.property_manager)?;
+    let (index2, _match_type2) = database.index_manager.assure_index_exists(&model, &index_spec, &database.db)?;
     assert_eq!(index.id(), index2.id());
 
     // Tree count should be >= initial (cannot assert exact due to default tree)

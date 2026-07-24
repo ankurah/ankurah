@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "core-types",
     "core",
     "derive",
     "proto",
@@ -23,6 +24,7 @@ members = [
 # Use default-members to exclude wasm crates from `cargo test` - they are tested
 # separately via wasm-pack. See https://github.com/ankurah/ankurah/issues/211
 default-members = [
+    "core-types",
     "core",
     "derive",
     "proto",

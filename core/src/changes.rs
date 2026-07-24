@@ -80,16 +80,16 @@ where I: View
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ItemChange::Initial { item } => {
-                write!(f, "Initial {}/{}", I::collection(), item.id())
+                write!(f, "Initial {}/{}", I::model_name_hint(), item.id())
             }
             ItemChange::Add { item, .. } => {
-                write!(f, "Add {}/{}", I::collection(), item.id())
+                write!(f, "Add {}/{}", I::model_name_hint(), item.id())
             }
             ItemChange::Update { item, .. } => {
-                write!(f, "Update {}/{}", I::collection(), item.id())
+                write!(f, "Update {}/{}", I::model_name_hint(), item.id())
             }
             ItemChange::Remove { item, .. } => {
-                write!(f, "Remove {}/{}", I::collection(), item.id())
+                write!(f, "Remove {}/{}", I::model_name_hint(), item.id())
             }
         }
     }

@@ -16,6 +16,7 @@ wasm = [
     "js-sys",
     "send_wrapper",
     "ankql/wasm",
+    "ankurah-core-types/wasm",
     "ankurah-proto/wasm",
     "ankurah-derive",
     "futures-timer/wasm-bindgen",
@@ -33,10 +34,11 @@ bench-internals = []
 
 [dependencies]
 # Internal dependencies
-ankurah-derive  = { path = "../derive", optional = true, version = "=0.9.0" }
-ankql           = { path = "../ankql", version = "=0.9.0" }
-ankurah-proto   = { path = "../proto", version = "=0.9.0" }
-ankurah-signals = { path = "../signals", version = "=0.9.0" }
+ankurah-derive     = { path = "../derive", optional = true, version = "=0.9.0" }
+ankql              = { path = "../ankql", version = "=0.9.0" }
+ankurah-proto      = { path = "../proto", version = "=0.9.0" }
+ankurah-signals    = { path = "../signals", version = "=0.9.0" }
+ankurah-core-types = { path = "../core-types", version = "=0.9.0" }
 
 rand                 = { version = "0.8", features = ["small_rng"] }
 anyhow               = "1.0"
@@ -76,5 +78,6 @@ criterion      = { version = "0.5", features = ["async_tokio"] }
 # provides its own harness; requires the `bench-internals` feature to reach the
 # crate-internal engine via `bench_support`.
 [[bench]]
-name    = "event_dag"
-harness = false
+name              = "event_dag"
+harness           = false
+required-features = ["bench-internals"]

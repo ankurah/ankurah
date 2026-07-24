@@ -1,5 +1,6 @@
 mod common;
 
+use ankurah::core::storage::StorageEngine;
 use ankurah::error::RetrievalError;
 use ankurah::{policy::DEFAULT_CONTEXT as c, EntityId, Node, PermissiveAgent};
 use anyhow::Result;
@@ -19,18 +20,16 @@ use std::sync::Arc;
 async fn postgres_get_state_returns_entity_not_found() -> Result<()> {
     let (_container, storage_engine) = common::create_postgres_container().await?;
 
-    let node = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new());
+    let storage_engine = Arc::new(storage_engine);
+    let node = Node::new_durable(storage_engine.clone(), PermissiveAgent::new());
     node.system.create().await?;
     let context = node.context(c)?;
-
-    // Get a collection (this creates the tables)
-    let collection = context.collection(&"album".into()).await?;
 
     // Generate a random entity ID that definitely doesn't exist
     let non_existent_id = EntityId::new();
 
-    // Call get_state directly on the storage collection
-    let result = collection.get_state(non_existent_id).await;
+    // Call get_state directly on canonical storage.
+    let result = storage_engine.get_state(non_existent_id).await;
 
     // Should be EntityNotFound, NOT a generic StorageError
     match result {

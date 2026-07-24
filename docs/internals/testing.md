@@ -83,4 +83,4 @@ clock_eq!(dag, state.payload.state.head, [D]);
 
 **`apply_state` divergence path** -- The integration test creates a diverged topology but verifies that both concurrent changes are applied, rather than testing the [`apply_state`](entity-lifecycle.md#how-state-snapshots-are-applied) rejection path (`Ok(false)`) directly.
 
-**Multi-column ORDER BY** (`#[ignore]`) -- Three tests in `tests/tests/sled/multi_column_order_by.rs` are blocked on issue #210 (i64 sorted lexicographically). Unrelated to the event DAG.
+**Negative signed-integer ORDER BY** -- Issue #210 remains open because the Sled integer encoding does not yet preserve numeric order across negative and non-negative values. Positive-value multi-column ORDER BY coverage is enabled in `tests/tests/sled/multi_column_order_by.rs`. Unrelated to the event DAG.

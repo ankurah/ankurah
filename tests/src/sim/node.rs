@@ -13,11 +13,12 @@
 //! schedule.
 
 use ankurah::proto::{self, Attested};
+use ankurah::storage::StorageEngine;
 use ankurah::{Node, PermissiveAgent};
 use ankurah_storage_sled::SledStorageEngine;
 use std::sync::Arc;
 
-use super::model::SimRecord;
+use super::model::{sim_collection, Field, SimRecord};
 use super::transport::{Captured, SimSender};
 use ankurah::Model;
 
@@ -38,15 +39,17 @@ impl SimNode {
     /// would, including the durable-peer bookkeeping that drives system join.
     pub fn connect_to(&self, peer: &SimNode) {
         let sender = SimSender::new(self.index, peer.id(), self.captured.clone());
-        self.node.register_peer(
-            proto::Presence {
-                node_id: peer.id(),
-                durable: peer.durable,
-                system_root: peer.node.system.root(),
-                protocol_version: proto::PROTOCOL_VERSION,
-            },
-            Box::new(sender),
-        );
+        self.node
+            .register_peer(
+                proto::Presence {
+                    node_id: peer.id(),
+                    durable: peer.durable,
+                    system_root: peer.node.system.root(),
+                    protocol_version: proto::PROTOCOL_VERSION,
+                },
+                Box::new(sender),
+            )
+            .expect("simulation peers use the current protocol version");
     }
 
     /// Ingest a forged batch of events directly through the production remote
@@ -56,6 +59,7 @@ impl SimNode {
     /// commit_event, set_state).
     pub async fn origin_commit(&self, events: Vec<Attested<proto::Event>>) -> Result<(), ankurah::error::MutationError> {
         let txid = proto::TransactionId::new();
+        let events = events.into_iter().map(|event| proto::ModelContext::new(sim_collection(), event)).collect();
         self.node.commit_remote_transaction(&ankurah::policy::DEFAULT_CONTEXT, txid, events).await
     }
 
@@ -86,8 +90,7 @@ impl SimNode {
                 return Some(state);
             }
         }
-        let collection = self.node.collections.get(&SimRecord::collection()).await.ok()?;
-        match collection.get_state(entity).await {
+        match self.node.storage.get_state(entity).await {
             Ok(state) => Some(state.payload.state),
             Err(_) => None,
         }
@@ -96,11 +99,8 @@ impl SimNode {
     /// Every entity id this node currently holds materialized state for, in the
     /// `SimRecord` collection. A full table scan via a match-all selection.
     pub async fn known_entities(&self) -> Vec<proto::EntityId> {
-        let Ok(collection) = self.node.collections.get(&SimRecord::collection()).await else {
-            return Vec::new();
-        };
         let selection = ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None };
-        match collection.fetch_states(&selection).await {
+        match self.node.storage.fetch_states(&sim_collection(), &selection).await {
             Ok(states) => states.into_iter().map(|s| s.payload.entity_id).collect(),
             Err(_) => Vec::new(),
         }
@@ -117,10 +117,7 @@ impl SimNode {
     /// an unseen entity is correctly rejected by the empty-head guard, so
     /// propagating only the newest event would strand out-of-order receivers).
     pub async fn stored_events(&self, entity: proto::EntityId) -> Vec<Attested<proto::Event>> {
-        let Ok(collection) = self.node.collections.get(&SimRecord::collection()).await else {
-            return Vec::new();
-        };
-        collection.dump_entity_events(entity).await.unwrap_or_default()
+        self.node.storage.dump_entity_events(entity).await.unwrap_or_default()
     }
 }
 
@@ -140,6 +137,41 @@ pub async fn build_nodes(n: usize, captured: Captured) -> anyhow::Result<Vec<Sim
     for index in 1..n {
         let node = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
         nodes.push(SimNode { index, durable: false, node, captured: captured.clone() });
+    }
+
+    // The harness forges events and states directly, bypassing schema
+    // registration and the catalog relay. Seed a complete deterministic
+    // `SimRecord` catalog on every node so ingress can route the model and the
+    // forged payloads use the same property ids that typed query registration
+    // retains. Direct upserts keep every id byte-identical across nodes and
+    // runs; hard_reset is not part of these scenarios.
+    let sim_model = proto::RegisteredModel {
+        id: super::model::sim_model_id(),
+        collection: SimRecord::schema().collection.to_owned(),
+        name: "SimRecord".to_string(),
+    };
+    let sim_properties: Vec<_> = [Field::Title, Field::Body]
+        .into_iter()
+        .map(|field| proto::RegisteredProperty {
+            id: super::model::sim_property_id(field),
+            model: sim_model.id,
+            name: field.name().to_string(),
+            backend: "lww".to_string(),
+            value_type: "string".to_string(),
+            target_model: None,
+        })
+        .collect();
+    let sim_memberships: Vec<_> = [Field::Title, Field::Body]
+        .into_iter()
+        .map(|field| proto::RegisteredMembership {
+            id: super::model::sim_membership_id(field),
+            model: sim_model.id,
+            property: super::model::sim_property_id(field),
+            optional: false,
+        })
+        .collect();
+    for node in &nodes {
+        node.node.catalog.upsert_registered(std::slice::from_ref(&sim_model), &sim_properties, &sim_memberships);
     }
 
     Ok(nodes)

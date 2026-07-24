@@ -1,0 +1,33 @@
+[package]
+name          = "ankurah-core-types"
+description   = "Dependency-leaf identities and values for Ankurah"
+version       = "0.9.0"
+edition       = "2021"
+license       = "MIT OR Apache-2.0"
+documentation = "https://docs.rs/ankurah-core-types"
+homepage      = "https://github.com/ankurah/ankurah"
+repository    = "https://github.com/ankurah/ankurah"
+
+[features]
+default  = []
+wasm     = ["dep:wasm-bindgen", "dep:js-sys", "dep:serde-wasm-bindgen"]
+uniffi   = ["dep:uniffi"]
+postgres = ["dep:bytes", "dep:postgres-types"]
+
+[dependencies]
+anyhow             = "1.0"
+base64             = "0.22"
+serde              = { version = "1.0", features = ["derive"] }
+serde_json         = "1.0"
+thiserror          = "1.0"
+ulid               = { version = "1.1", features = ["serde"] }
+wasm-bindgen       = { version = "0.2.92", features = ["serde"], optional = true }
+js-sys             = { version = "0.3", optional = true }
+serde-wasm-bindgen = { version = "0.6", optional = true }
+uniffi             = { version = "0.29", optional = true }
+bytes              = { version = "1.6", optional = true }
+postgres-types     = { version = "0.2", optional = true }
+
+[dev-dependencies]
+bincode    = "1.3.3"
+serde_json = "1.0"

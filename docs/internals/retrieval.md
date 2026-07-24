@@ -31,9 +31,10 @@ The split enforces staging discipline at the type level:
 - **`GetState`** -- Entity state snapshot retrieval. Separated because state
   has different caching characteristics and is not needed by BFS.
 
-- **`SuspenseEvents`** -- Extends `GetEvents` with `stage_event` and
-  `commit_event`. Only the outermost caller (e.g., `NodeApplier`) holds
-  this; it is deliberately *not* passed into `apply_event`.
+- **`SuspenseEvents`** -- Extends `GetEvents` with `stage_event`. Only the
+  outermost caller (e.g., `NodeApplier`) holds this; it is deliberately *not*
+  passed into `apply_event`. Durable append remains an explicit
+  `StorageEngine::append_events` operation.
 
 
 ## Staging vs Permanent Storage
@@ -48,9 +49,11 @@ on incoming events: the event is staged first, then `compare` uses the
 event's own ID as the subject clock, and BFS discovers the event body
 through the staging map.
 
-**Permanent storage** is the durable backend. After `apply_event` succeeds,
-the caller commits the event -- writing it to permanent storage and removing
-it from the staging map. From this point, `event_stored` returns `true`.
+**Permanent storage** is the durable backend. After validating and attesting
+the complete logical event set, the caller appends it before attempting the
+canonical state CAS. From this point, `event_stored` returns `true`. The
+short-lived getter and its staging map are dropped when that ingress operation
+finishes.
 
 The distinction between `get_event` (union view) and `event_stored`
 (permanent-only) matters for the
@@ -84,7 +87,7 @@ historical events. `storage_is_definitive` is always `false`.
 entity state snapshots, translating "not found" into `Ok(None)`.
 
 
-## The Event Lifecycle: Stage, Apply, Commit, Persist
+## The Event Lifecycle: Stage, Apply, Append, Commit
 
 A typical flow in [`NodeApplier::apply_update`](node-architecture.md#streaming-updates-updatecontent)
 for `EventOnly` content:
@@ -94,28 +97,29 @@ for each event:
     validate(event)
     event_getter.stage_event(event)            // (1) stage
 
+events = topological_sort(events)
+storage.append_events(events)                  // (2) durable history
 entity = get_or_create(...)
 
 for each attested_event:
-    if entity.apply_event(event_getter, &event) // (2) compare + apply in memory
-        event_getter.commit_event(&attested_event) // (3) commit to disk
+    entity.apply_event(event_getter, &event)   // (3) compare + apply
 
-if any event applied:
-    save_state(entity)                         // (4) persist entity state
+commit_resident_writes(entity, events)         // (4) exact-head retry +
+                                               //     atomic projections
 ```
 
 For `StateAndEvent` content, the flow first tries
 [`apply_state`](entity-lifecycle.md#how-state-snapshots-are-applied). If the state is
-strictly newer, all staged events are committed and state is saved. If the
-state diverges, it falls back to per-event
-[`apply_event`](entity-lifecycle.md#how-events-are-applied) followed by
-`commit_event`, then saves state.
+strictly newer, the appended events and state seed enter the common canonical
+commit coordinator. If the state diverges, it falls back to per-event
+[`apply_event`](entity-lifecycle.md#how-events-are-applied), then uses that same
+coordinator.
 
 The same parent-first rule applies to every multi-event wire shape --
 `EventOnly`, `StateAndEvent`, and `EventBridge` (in `apply_delta`) alike: the
 receiver stages the whole batch upfront, topologically sorts it by in-batch
-parent edges (`event_dag/ordering.rs`), and only then applies, commits, and
-finally saves entity state. The producer also sorts what it sends, but wire
+parent edges (`event_dag/ordering.rs`), and only then applies and submits
+canonical state. The producer also sorts what it sends, but wire
 order is untrusted: applying a child before its staged parent would jump the
 head past the parent and silently drop the parent's operations.
 
@@ -125,15 +129,18 @@ head past the parent and silently drop the parent's operations.
 The ordering invariant -- commit events before persisting state -- provides
 clean recovery in every failure scenario:
 
-- **Crash after commit, before state save:** The event is in storage but the
+- **Crash after event append, before canonical commit:** The event is in storage but the
   entity state still references the old head. On recovery, the next delivery
   of the same event (or any descendant) integrates it via BFS. No data loss.
 
-- **Crash after stage, before commit:** The staging map is in-memory only
+- **Crash after stage, before append:** The staging map is in-memory only
   and lost on crash. Neither the event nor the updated state are persisted.
   Clean rollback.
 
-- **Crash after state save:** Fully consistent. Normal operation.
+- **Crash during `commit_batch`:** The canonical state, entity-model
+  associations, materializations, and indexes commit together or not at all.
+
+- **Crash after `commit_batch`:** Fully consistent. Normal operation.
 
 - **Concurrent `apply_event` on the same entity:** The
   [`try_mutate`](entity-lifecycle.md#toctou-protection) helper

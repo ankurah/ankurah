@@ -56,16 +56,12 @@ async fn test_single_node_multiple_gap_filling() -> Result<(), Box<dyn std::erro
     trx.get::<Album>(&ids[3]).await?.year().replace("1999")?;
     trx.commit().await?;
 
-    // Wait for consolidated gap filling update: 2 removes + 2 adds in one update
-    assert_eq!(
-        watcher.take_one().await,
-        vec![
-            (ids[1], ChangeKind::Remove), // 2021
-            (ids[3], ChangeKind::Remove), // 2023
-            (ids[5], ChangeKind::Add),    // 2025
-            (ids[6], ChangeKind::Add),    // 2026
-        ]
-    );
+    // Wait for consolidated gap filling update: removals use the batch's
+    // durable EntityId order; additions retain result-set order.
+    let mut expected = vec![(ids[1], ChangeKind::Remove), (ids[3], ChangeKind::Remove)];
+    expected.sort_by_key(|(id, _)| *id);
+    expected.extend([(ids[5], ChangeKind::Add), (ids[6], ChangeKind::Add)]);
+    assert_eq!(watcher.take_one().await, expected);
     assert_eq!(years(&query), vec!["2020", "2022", "2024", "2025", "2026"]);
     assert_eq!(watcher.quiesce().await, 0);
     Ok(())
@@ -127,10 +123,13 @@ async fn test_inter_node_gap_filling_desc() -> Result<(), Box<dyn std::error::Er
     trx.get::<Album>(&ids[6]).await?.year().replace("1999")?;
     trx.commit().await?;
 
-    assert_eq!(
-        watcher.take_one().await,
-        vec![(ids[4], ChangeKind::Remove), (ids[6], ChangeKind::Remove), (ids[3], ChangeKind::Add), (ids[2], ChangeKind::Add),]
-    );
+    // Batched entity writes and their resulting notifications use durable
+    // EntityId order, not the transaction's mutation order. The gap-fill
+    // additions retain result-set order.
+    let mut expected = vec![(ids[4], ChangeKind::Remove), (ids[6], ChangeKind::Remove)];
+    expected.sort_by_key(|(id, _)| *id);
+    expected.extend([(ids[3], ChangeKind::Add), (ids[2], ChangeKind::Add)]);
+    assert_eq!(watcher.take_one().await, expected);
     assert_eq!(years(&query), vec!["2027", "2025", "2023", "2022"]);
     assert_eq!(watcher.quiesce().await, 0);
     Ok(())

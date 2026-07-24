@@ -34,13 +34,11 @@ impl SubscriptionHandler {
             tracing::info!("SubscriptionHandler[{}] received reactor update with {} items", peer_id, update.items.len());
 
             if let Some(node) = weak_node.upgrade() {
-                tracing::debug!("SubscriptionHandler[{}] sending update to peer {}", peer_id, peer_id);
-                node.send_update(
-                    peer_id,
-                    proto::NodeUpdateBody::SubscriptionUpdate {
-                        items: update.items.into_iter().filter_map(|item| convert_item(&node, peer_id, item)).collect(),
-                    },
-                );
+                let items = update.items.into_iter().filter_map(|item| convert_item(&node, peer_id, item)).collect::<Vec<_>>();
+                if !items.is_empty() {
+                    tracing::debug!("SubscriptionHandler[{}] sending update to peer {}", peer_id, peer_id);
+                    node.send_update(peer_id, proto::NodeUpdateBody::SubscriptionUpdate { items });
+                }
             }
         });
 
@@ -64,7 +62,7 @@ impl SubscriptionHandler {
         &self,
         node: &Node<SE, PA>,
         query_id: proto::QueryId,
-        collection_id: proto::CollectionId,
+        collection_id: crate::ModelId,
         mut selection: ankql::ast::Selection,
         cdata: &PA::ContextData,
         version: u32,
@@ -79,8 +77,14 @@ impl SubscriptionHandler {
         }
         node.policy_agent.can_access_collection(cdata, &collection_id)?;
         selection.predicate = node.policy_agent.filter_predicate(cdata, &collection_id, selection.predicate)?;
-        let storage_collection = node.collections.get(&collection_id).await?;
 
+        // The policy filter may insert name-based references (policy agents are
+        // not catalog-aware), and engines refuse unresolved selections
+        // (`ankql::ast::Selection::check`). Resolve the merged selection here,
+        // exactly as the local query path does after its own filter pass;
+        // resolution is an idempotent pass-through for the references the
+        // requesting peer already resolved.
+        let selection = node.resolve_selection_names(Some(cdata), &collection_id, None, &selection).await?;
         // Add or update the query - idempotent, works whether query exists or not
         let matching_entities = node
             .reactor
@@ -104,7 +108,7 @@ impl SubscriptionHandler {
         let expanded_states = crate::util::expand_states::expand_states(
             initial_states,
             known_matches.iter().map(|k| k.entity_id).collect::<Vec<_>>(),
-            &storage_collection,
+            node.storage.as_ref(),
         )
         .await?;
 
@@ -119,12 +123,16 @@ impl SubscriptionHandler {
             // are evaluated against entity state, not just the predicate. Skip
             // unreadable entities silently (mirroring the Fetch/Get handlers) so one
             // out-of-scope entity doesn't fail the whole subscription.
-            if node.policy_agent.check_read(cdata, &state.payload.entity_id, &collection_id, &state.payload.state).is_err() {
+            if node
+                .policy_agent
+                .check_read(cdata, &state.payload.entity_id, &collection_id, &state.payload.state, Some(node.catalog.resolver_weak()))
+                .is_err()
+            {
                 continue;
             }
 
             // Only include delta if heads differ (None means heads are equal)
-            if let Some(delta) = node.generate_entity_delta(&known_map, state, &storage_collection, cdata).await? {
+            if let Some(delta) = node.generate_entity_delta(&collection_id, &known_map, state, cdata).await? {
                 deltas.push(delta);
             }
         }
@@ -143,6 +151,14 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
+    let mut source_queries = item.source_queries.clone();
+    source_queries.sort_unstable();
+    source_queries.dedup();
+    if source_queries.is_empty() {
+        tracing::debug!("Dropping reactor update for peer {} because no current query caused it", peer_id);
+        return None;
+    }
+
     // Convert entity to EntityState and attest it
     let entity_state = match item.entity.to_entity_state() {
         Ok(entity_state) => entity_state,
@@ -178,8 +194,9 @@ where
     // Create subscription update item
     Some(proto::SubscriptionUpdateItem {
         entity_id: item.entity.id(),
-        collection: item.entity.collection().clone(),
+        model: item.entity.model_id().ok()?,
         content,
         predicate_relevance,
+        source_queries,
     })
 }

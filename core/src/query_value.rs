@@ -33,17 +33,17 @@ impl TryFrom<QueryValue> for ankql::ast::Expr {
     type Error = ankql::error::ParseError;
 
     fn try_from(value: QueryValue) -> Result<Self, Self::Error> {
-        use ankql::ast::{Expr, Literal};
+        use ankql::ast::{Expr, Value};
 
         Ok(match value {
-            QueryValue::String(s) => Expr::Literal(Literal::String(s)),
-            QueryValue::Int(i) => Expr::Literal(Literal::I64(i)),
-            QueryValue::Float(f) => Expr::Literal(Literal::F64(f)),
-            QueryValue::Bool(b) => Expr::Literal(Literal::Bool(b)),
+            QueryValue::String(s) => Expr::Literal(Value::String(s)),
+            QueryValue::Int(i) => Expr::Literal(Value::I64(i)),
+            QueryValue::Float(f) => Expr::Literal(Value::F64(f)),
+            QueryValue::Bool(b) => Expr::Literal(Value::Bool(b)),
             QueryValue::EntityId(s) => {
                 let id = EntityId::from_base64(&s)
                     .map_err(|e| ankql::error::ParseError::InvalidPredicate(format!("Invalid EntityId: {}", e)))?;
-                Expr::Literal(Literal::EntityId(id.to_ulid()))
+                Expr::Literal(Value::EntityId(id))
             }
         })
     }

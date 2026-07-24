@@ -31,6 +31,11 @@ pub struct Transaction {
     /// Used to validate that creation events (empty parent) are only for entities
     /// that were actually created in this transaction, not phantom entities.
     pub(crate) created_entity_ids: std::sync::RwLock<std::collections::HashSet<EntityId>>,
+    /// Exact compiled schema shapes used to create, fetch, or edit entities
+    /// in this transaction. Commit reasserts only these shapes: replaying a
+    /// process-global cache would let one failed, incompatible declaration
+    /// poison unrelated later transactions for the same collection.
+    pub(crate) schemas: std::sync::RwLock<Vec<(&'static crate::schema::ModelSchema, crate::ModelId)>>,
 }
 
 #[cfg(feature = "wasm")]
@@ -51,6 +56,14 @@ impl Transaction {
             entities: AppendOnlyVec::new(),
             alive: Arc::new(AtomicBool::new(true)),
             created_entity_ids: std::sync::RwLock::new(std::collections::HashSet::new()),
+            schemas: std::sync::RwLock::new(Vec::new()),
+        }
+    }
+
+    fn record_schema(&self, schema: &'static crate::schema::ModelSchema, model_id: crate::ModelId) {
+        let mut schemas = self.schemas.write().unwrap();
+        if !schemas.iter().any(|(known_schema, known_model)| **known_schema == *schema && *known_model == model_id) {
+            schemas.push((schema, model_id));
         }
     }
 
@@ -60,9 +73,15 @@ impl Transaction {
     }
 
     pub async fn create<'rec, 'trx: 'rec, M: Model>(&'trx self, model: &M) -> Result<MutableBorrow<'rec, M::Mutable>, MutationError> {
-        let entity = self.dyncontext.create_entity(M::collection(), self.alive.clone());
-        model.initialize_new_entity(&entity);
+        // RFC 5.2 (specs/model-property-metadata/rfc.md) model first-use: ensure M is registered BEFORE creating
+        // the entity. A failed reassertion proceeds only when this exact shape
+        // is already fully and compatibly bound; a never-registered, missing,
+        // or incompatible field fails here.
+        let model_id = self.dyncontext.ensure_registered(M::schema()).await?;
+        let entity = self.dyncontext.create_entity(model_id, self.alive.clone());
+        model.initialize_new_entity(&entity)?;
         self.dyncontext.check_write(&entity)?;
+        self.record_schema(M::schema(), model_id);
 
         // Track that this entity was created in this transaction
         self.created_entity_ids.write().unwrap().insert(entity.id);
@@ -72,28 +91,46 @@ impl Transaction {
     }
     fn get_trx_entity(&self, id: &EntityId) -> Option<&Entity> { self.entities.iter().find(|e| e.id == *id) }
     pub async fn get<'rec, 'trx: 'rec, M: Model>(&'trx self, id: &EntityId) -> Result<MutableBorrow<'rec, M::Mutable>, RetrievalError> {
+        // RFC 5.2 model first-use on the mutating fetch-to-edit path.
+        let model_id = self.dyncontext.ensure_registered(M::schema()).await?;
         match self.get_trx_entity(id) {
-            Some(entity) => Ok(MutableBorrow::new(entity)),
+            Some(entity) => {
+                if entity.collection() != &model_id {
+                    return Err(RetrievalError::EntityNotFound(*id));
+                }
+                self.record_schema(M::schema(), model_id);
+                Ok(MutableBorrow::new(entity))
+            }
             None => {
                 // go fetch the entity from the context
-                let retrieved_entity = self.dyncontext.get_entity(*id, &M::collection(), false).await?;
+                let retrieved_entity = self.dyncontext.get_entity(*id, &model_id, false).await?;
                 // double check to make sure somebody didn't add the entity to the trx during the await
                 // because we're forking the entity, we need to make sure we aren't adding the same entity twice
                 if let Some(entity) = self.get_trx_entity(&retrieved_entity.id) {
                     // if this happens, I don't think we want to refresh the entity, because it's already snapshotted in the trx
                     // and we should leave it that way to honor the consistency model
+                    self.record_schema(M::schema(), model_id);
                     Ok(MutableBorrow::new(entity))
                 } else {
-                    Ok(MutableBorrow::new(self.add_entity(retrieved_entity.snapshot(self.alive.clone()))))
+                    let entity = self.add_entity(retrieved_entity.snapshot(self.alive.clone()));
+                    self.record_schema(M::schema(), model_id);
+                    Ok(MutableBorrow::new(entity))
                 }
             }
         }
     }
     pub fn edit<'rec, 'trx: 'rec, M: Model>(&'trx self, entity: &Entity) -> Result<MutableBorrow<'rec, M::Mutable>, AccessDenied> {
+        // RFC 5.2 model first-use on the edit path. This entry is
+        // SYNCHRONOUS (it is what the derive-generated `View::edit` calls, so
+        // it cannot become async without touching derive and every
+        // `.edit()?` call site). Record the exact schema on the transaction;
+        // the async commit admits it before any event is written.
         if let Some(entity) = self.get_trx_entity(&entity.id) {
+            self.record_schema(M::schema(), entity.collection().clone());
             return Ok(MutableBorrow::new(entity));
         }
         self.dyncontext.check_write(entity)?;
+        self.record_schema(M::schema(), entity.collection().clone());
 
         Ok(MutableBorrow::new(self.add_entity(entity.snapshot(self.alive.clone()))))
     }

@@ -3,9 +3,10 @@ use std::sync::{Arc, Weak};
 
 use crate::connector::PeerSender;
 use crate::{
+    ModelId,
     error::RetrievalError,
     policy::AccessResult,
-    proto::{CollectionId, Event, NodeId, State, ID},
+    proto::{Event, NodeId, State, ID},
 };
 use ankql::ast::Predicate;
 use ankurah_proto as proto;

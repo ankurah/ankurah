@@ -36,7 +36,7 @@ pub struct Workload<'a> {
     /// Live subscriptions held open for the run's duration. Dropping a
     /// `LiveQuery` tears down its relay context, so scenarios that inject
     /// SubscriptionUpdates keep them alive here.
-    subscriptions: Vec<ankurah::LiveQuery<super::model::SimRecordView>>,
+    subscriptions: Vec<(usize, ankurah::LiveQuery<super::model::SimRecordView>)>,
     /// Recording subscriptions whose observed notification stream is checked for
     /// the C5 session guarantees after quiescence. Each also holds its `LiveQuery`
     /// and guard alive, so a recording subscription need not also be pushed to
@@ -113,8 +113,16 @@ impl<'a> Workload<'a> {
     /// is held open for the rest of the run.
     pub async fn subscribe(&mut self, node: usize, predicate: &str) {
         let lq = self.nodes[node].subscribe(predicate).expect("subscribe registers");
-        self.subscriptions.push(lq);
+        let ready = lq.clone();
+        self.subscriptions.push((node, lq));
         self.settle().await;
+        // Durable initialization is local spawned work outside the virtual
+        // transport drain. Ephemeral initialization may instead be waiting on
+        // a deliberately dropped relay message and its real-time retry, so the
+        // deterministic scheduler barrier remains the right boundary there.
+        if self.nodes[node].durable {
+            ready.wait_initialized().await;
+        }
     }
 
     /// Establish a live subscription on `node` against `predicate` and attach a
@@ -127,10 +135,16 @@ impl<'a> Workload<'a> {
     /// determinism audit.
     pub async fn subscribe_recording(&mut self, node: usize, predicate: &str) -> usize {
         let lq = self.nodes[node].subscribe(predicate).expect("subscribe registers");
+        let ready = lq.clone();
         let recorder = super::recorder::SubscriptionRecorder::attach(node, predicate.to_owned(), lq);
         let index = self.recorders.len();
         self.recorders.push(recorder);
         self.settle().await;
+        // See `subscribe`: only durable local initialization needs this extra
+        // barrier after the virtual transport reaches quiescence.
+        if self.nodes[node].durable {
+            ready.wait_initialized().await;
+        }
         index
     }
 
@@ -178,9 +192,10 @@ impl<'a> Workload<'a> {
         let fragments: Vec<proto::EventFragment> = events.into_iter().map(|e| e.into()).collect();
         proto::SubscriptionUpdateItem {
             entity_id: entity,
-            collection: super::model::sim_collection(),
+            model: proto::ModelId::EntityId(super::model::sim_model_id()),
             content: proto::UpdateContent::EventOnly(fragments),
             predicate_relevance: vec![],
+            source_queries: vec![],
         }
     }
 
@@ -193,19 +208,30 @@ impl<'a> Workload<'a> {
         let event_fragments: Vec<proto::EventFragment> = events.into_iter().map(|e| e.into()).collect();
         proto::SubscriptionUpdateItem {
             entity_id: entity,
-            collection: super::model::sim_collection(),
+            model: proto::ModelId::EntityId(super::model::sim_model_id()),
             content: proto::UpdateContent::StateAndEvent(state_fragment, event_fragments),
             predicate_relevance: vec![],
+            source_queries: vec![],
         }
     }
 
     /// Wrap items into a `NodeMessage::Update` addressed from `origin` to `dst`.
-    fn subscription_update_message(&self, origin: usize, dst: usize, items: Vec<proto::SubscriptionUpdateItem>) -> proto::NodeMessage {
+    fn subscription_update_message(&self, origin: usize, dst: usize, mut items: Vec<proto::SubscriptionUpdateItem>) -> proto::NodeMessage {
+        let source_query = self
+            .subscriptions
+            .iter()
+            .rev()
+            .find_map(|(node, query)| (*node == dst).then(|| query.query_id()))
+            .expect("subscription updates require a live query on the destination");
+        for item in &mut items {
+            item.source_queries.push(source_query);
+        }
         proto::NodeMessage::Update(proto::NodeUpdate {
             id: proto::UpdateId::new(),
             from: self.nodes[origin].id(),
             to: self.nodes[dst].id(),
             body: proto::NodeUpdateBody::SubscriptionUpdate { items },
+            schema: vec![],
         })
     }
 
@@ -256,7 +282,10 @@ impl<'a> Workload<'a> {
                     id: proto::RequestId::new(),
                     to: node_ids[dst],
                     from: origin_id,
-                    body: proto::NodeRequestBody::CommitTransaction { id: proto::TransactionId::new(), events: vec![event.clone()] },
+                    body: proto::NodeRequestBody::CommitTransaction {
+                        id: proto::TransactionId::new(),
+                        events: vec![proto::ModelContext::new(model::sim_collection(), event.clone())],
+                    },
                 };
                 let message = proto::NodeMessage::Request { auth: vec![proto::AuthData(vec![])], request };
                 self.scheduler.enqueue_event(origin, dst, entity, event_id.clone(), message);

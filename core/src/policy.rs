@@ -18,7 +18,7 @@ pub enum AccessDenied {
     #[error("Access denied by policy: {0}")]
     ByPolicy(&'static str),
     #[error("Access denied by collection: {0}")]
-    CollectionDenied(proto::CollectionId),
+    CollectionDenied(crate::ModelId),
     #[error("Access denied by property error: {0}")]
     PropertyError(Box<PropertyError>),
     #[error("Access denied by parse error: {0}")]
@@ -40,6 +40,75 @@ impl From<AccessDenied> for wasm_bindgen::JsValue {
 }
 
 impl AccessDenied {}
+
+/// What a RegisterSchema request will ACTUALLY do, resolved by the
+/// registration executor under the allocation mutex (RFC 5.7 in
+/// specs/model-property-metadata/rfc.md). Passed to
+/// [`PolicyAgent::check_schema_registration`]
+/// before any event is emitted, so an agent can judge real creations and
+/// metadata changes without performing its own catalog lookups:
+/// `check_request` cannot know whether a descriptor already exists, and
+/// `check_event` fires per event mid-commit. Core-side only; never
+/// crosses the wire.
+#[derive(Debug, Default)]
+pub struct RegistrationPlan {
+    /// Model entities this request will CREATE, with their would-be
+    /// allocated ids (minted, not yet committed).
+    pub creates_models: Vec<(proto::EntityId, proto::ModelDescriptor)>,
+    /// Property entities this request will CREATE, with their would-be
+    /// allocated ids. The descriptor's `minting_collection` names the
+    /// owning scope (a created or existing model in this same plan).
+    pub creates_properties: Vec<(proto::EntityId, proto::PropertyDescriptor)>,
+    /// Contract memberships this request will CREATE, fully resolved.
+    pub creates_memberships: Vec<PlannedMembership>,
+    /// Metadata follow-ups this request will write on EXISTING entities
+    /// (display-name changes including rename-hint applications, target
+    /// retargets, membership `optional` flips).
+    pub updates: Vec<PlannedUpdate>,
+    /// Definitions that resolved to existing entities with no changes:
+    /// pure no-ops, listed for context.
+    pub existing: Vec<proto::EntityId>,
+}
+
+impl RegistrationPlan {
+    /// Whether the plan writes anything at all (a re-registration of
+    /// unchanged definitions is a pure no-op and skips the policy verb).
+    pub fn is_noop(&self) -> bool {
+        self.creates_models.is_empty()
+            && self.creates_properties.is_empty()
+            && self.creates_memberships.is_empty()
+            && self.updates.is_empty()
+    }
+}
+
+/// A membership creation in a [`RegistrationPlan`], resolved to ids.
+#[derive(Debug, Clone)]
+pub struct PlannedMembership {
+    /// The durable identity assigned to the membership entity.
+    pub id: proto::EntityId,
+    /// The model receiving the property.
+    pub model: proto::EntityId,
+    /// The property admitted to the model.
+    pub property: proto::EntityId,
+    /// Whether entities projected through the model may omit the property.
+    pub optional: bool,
+}
+
+/// A metadata follow-up on an existing catalog entity, in a
+/// [`RegistrationPlan`].
+#[derive(Debug, Clone)]
+pub struct PlannedUpdate {
+    /// Which catalog collection the entity lives in.
+    pub collection: crate::ModelId,
+    /// The durable catalog entity to update.
+    pub entity: proto::EntityId,
+    /// The system field whose metadata value changes.
+    pub field: String,
+    /// The current catalog value, when one exists.
+    pub from: Option<crate::value::Value>,
+    /// The requested catalog value. `None` means the field will be cleared.
+    pub to: Option<crate::value::Value>,
+}
 
 /// PolicyAgents control access to resources, by:
 /// - signing requests which are sent to other nodes - this may come in the form of a bearer token, or a signature, or some other arbitrary method of authentication as defined by the PolicyAgent
@@ -95,12 +164,38 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
         event: &proto::Event,
     ) -> Result<Option<proto::Attestation>, AccessDenied>;
 
-    /// Validate an event attestation
-    /// This could be used to validate that the event has sufficient attestation as to be trusted
+    /// Gate a schema registration on its resolved effect (RFC 5.7). Called by
+    /// the registration executor after its lookup
+    /// phase and before any event is emitted, still under the allocation
+    /// mutex, with the request's actual consequences: what will be created,
+    /// what will be updated, what already exists. Agents may discriminate
+    /// on the principal (`cdata`: who may define schema) or on the object
+    /// (the planned definitions themselves); both styles are first-class.
+    /// Refusal fails the whole registration before anything is emitted.
+    /// Every emitted event still passes [`Self::check_event`] afterwards,
+    /// INDIVIDUALLY: the commit batch is not transactional, so an agent
+    /// that allows the plan but denies a constituent event aborts the
+    /// remainder and leaves earlier catalog events durable (accepted by
+    /// maintainer ruling 2026-07-06; the allocator's storage-checked
+    /// lookups keep identity convergent across such partials, and #313
+    /// tracks the transactional upgrade). The default allows.
+    fn check_schema_registration<SE: StorageEngine>(
+        &self,
+        _node: &Node<SE, Self>,
+        _cdata: &Self::ContextData,
+        _plan: &RegistrationPlan,
+    ) -> Result<(), AccessDenied> {
+        Ok(())
+    }
+
+    /// Validate an event attestation under the model context through which the
+    /// event was received. Events are canonical and model-independent, so
+    /// policy must receive this context separately.
     fn validate_received_event<SE: StorageEngine>(
         &self,
         node: &Node<SE, Self>,
         received_from_node: &proto::EntityId,
+        model: &proto::ModelId,
         event: &Attested<proto::Event>,
     ) -> Result<(), AccessDenied>;
 
@@ -111,33 +206,42 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
         &self,
         node: &Node<SE, Self>,
         received_from_node: &proto::EntityId,
+        model: &proto::ModelId,
         state: &Attested<proto::EntityState>,
     ) -> Result<(), AccessDenied>;
 
     // For checking if a context can access a collection
-    fn can_access_collection<C>(&self, data: &C, collection: &proto::CollectionId) -> Result<(), AccessDenied>
+    fn can_access_collection<C>(&self, data: &C, collection: &crate::ModelId) -> Result<(), AccessDenied>
     where C: Iterable<Self::ContextData>;
 
     /// Filter a predicate based on the context data
-    fn filter_predicate<C>(&self, data: &C, collection: &proto::CollectionId, predicate: Predicate) -> Result<Predicate, AccessDenied>
+    fn filter_predicate<C>(&self, data: &C, collection: &crate::ModelId, predicate: Predicate) -> Result<Predicate, AccessDenied>
     where C: Iterable<Self::ContextData>;
 
     /// Check if a context can read an entity
-    /// If the policy agent wants to inspect the entity state, it can do so with either TemporaryEntity::new or entityset.with_state
+    /// If the policy agent wants to inspect the entity state, it can do so with either TemporaryEntity::new_bound or entityset.with_state
     /// Optimization: Consider adding a common trait implemented by Entity and TemporaryEntity returned by entityset.get_evaluation_entity that
     /// returns a real entity if resident, falling back to a temporary entity if not. (as the former case would save cycles creating/populating the backends)
+    ///
+    /// `resolver` is the node's catalog resolver: an agent that evaluates
+    /// name-addressed policy predicates against the (id-keyed) state must
+    /// bind its inspection view through it (`TemporaryEntity::new_bound`),
+    /// or every display name resolves to nothing on a post-epoch buffer and
+    /// scope predicates evaluate false. Agents that never inspect state
+    /// ignore it.
     fn check_read<C>(
         &self,
         data: &C,
         id: &proto::EntityId,
-        collection: &proto::CollectionId,
+        collection: &crate::ModelId,
         state: &proto::State,
+        resolver: Option<std::sync::Weak<dyn crate::schema::CatalogResolver>>,
     ) -> Result<(), AccessDenied>
     where
         C: Iterable<Self::ContextData>;
 
     /// Check if a context can read an event
-    fn check_read_event<C>(&self, data: &C, event: &Attested<proto::Event>) -> Result<(), AccessDenied>
+    fn check_read_event<C>(&self, data: &C, collection: &crate::ModelId, event: &Attested<proto::Event>) -> Result<(), AccessDenied>
     where C: Iterable<Self::ContextData>;
 
     /// Check if a context can edit an entity
@@ -155,7 +259,7 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     // fn check_write_event(&self, data: &Self::ContextData, entity: &Entity, event: &proto::Event) -> Result<(), AccessDenied>;
 
     // // For checking if a context can subscribe to changes
-    // fn can_subscribe(&self, data: &Self::ContextData, collection: &CollectionId, predicate: &Predicate) -> AccessResult;
+    // fn can_subscribe(&self, data: &Self::ContextData, collection: &ModelId, predicate: &Predicate) -> AccessResult;
 
     // // For checking if a context can communicate with another node
     // fn can_communicate_with_node(&self, data: &Self::ContextData, node_id: &ID) -> AccessResult;
@@ -222,6 +326,7 @@ impl PolicyAgent for PermissiveAgent {
         &self,
         _node: &Node<SE, Self>,
         _from_node: &proto::EntityId,
+        _model: &proto::ModelId,
         _event: &proto::Attested<proto::Event>,
     ) -> Result<(), AccessDenied> {
         Ok(())
@@ -237,6 +342,7 @@ impl PolicyAgent for PermissiveAgent {
         &self,
         _node: &Node<SE, Self>,
         _from_node: &proto::EntityId,
+        _model: &proto::ModelId,
         _state: &Attested<proto::EntityState>,
     ) -> Result<(), AccessDenied> {
         // This PolicyAgent does not require validation, so we return Ok
@@ -244,7 +350,7 @@ impl PolicyAgent for PermissiveAgent {
         Ok(())
     }
 
-    fn can_access_collection<C>(&self, _data: &C, _collection: &proto::CollectionId) -> Result<(), AccessDenied>
+    fn can_access_collection<C>(&self, _data: &C, _collection: &crate::ModelId) -> Result<(), AccessDenied>
     where C: Iterable<Self::ContextData> {
         // PermissiveAgent allows access if any context is provided
         Ok(())
@@ -254,8 +360,9 @@ impl PolicyAgent for PermissiveAgent {
         &self,
         _data: &C,
         _id: &proto::EntityId,
-        _collection: &proto::CollectionId,
+        _collection: &crate::ModelId,
         _state: &proto::State,
+        _resolver: Option<std::sync::Weak<dyn crate::schema::CatalogResolver>>,
     ) -> Result<(), AccessDenied>
     where
         C: Iterable<Self::ContextData>,
@@ -264,7 +371,7 @@ impl PolicyAgent for PermissiveAgent {
         Ok(())
     }
 
-    fn check_read_event<C>(&self, _data: &C, _event: &Attested<proto::Event>) -> Result<(), AccessDenied>
+    fn check_read_event<C>(&self, _data: &C, _collection: &crate::ModelId, _event: &Attested<proto::Event>) -> Result<(), AccessDenied>
     where C: Iterable<Self::ContextData> {
         // PermissiveAgent allows access if any context is provided
         Ok(())
@@ -284,7 +391,7 @@ impl PolicyAgent for PermissiveAgent {
         Ok(())
     }
 
-    fn filter_predicate<C>(&self, _data: &C, _collection: &proto::CollectionId, predicate: Predicate) -> Result<Predicate, AccessDenied>
+    fn filter_predicate<C>(&self, _data: &C, _collection: &crate::ModelId, predicate: Predicate) -> Result<Predicate, AccessDenied>
     where C: Iterable<Self::ContextData> {
         // PermissiveAgent allows access if any context is provided
         Ok(predicate)
@@ -292,11 +399,11 @@ impl PolicyAgent for PermissiveAgent {
 
     // fn can_read_entity(&self, _context: &Self::ContextData, _entity: &Entity) -> AccessResult { AccessResult::Allow }
 
-    // fn can_modify_entity(&self, _context: &Self::ContextData, _collection: &CollectionId, _id: &ID) -> AccessResult { AccessResult::Allow }
+    // fn can_modify_entity(&self, _context: &Self::ContextData, _collection: &ModelId, _id: &ID) -> AccessResult { AccessResult::Allow }
 
-    // fn can_create_in_collection(&self, _context: &Self::ContextData, _collection: &CollectionId) -> AccessResult { AccessResult::Allow }
+    // fn can_create_in_collection(&self, _context: &Self::ContextData, _collection: &ModelId) -> AccessResult { AccessResult::Allow }
 
-    // fn can_subscribe(&self, _context: &Self::ContextData, _collection: &CollectionId, _predicate: &Predicate) -> AccessResult {
+    // fn can_subscribe(&self, _context: &Self::ContextData, _collection: &ModelId, _predicate: &Predicate) -> AccessResult {
     //     AccessResult::Allow
     // }
 

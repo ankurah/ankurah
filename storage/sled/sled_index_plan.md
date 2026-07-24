@@ -1,5 +1,10 @@
 # Sled indexing and planner integration design
 
+> Historical implementation plan. Its `collection` terminology describes the
+> former model-scoped storage handle and is not the current public storage
+> contract. See `specs/storage/architecture.md` for the model-independent
+> canonical entity/event layout and model materializations adopted by PR #307.
+
 ## Goals
 
 - Single `entities` tree holds canonical `StateFragment` for all entities (graph-ready)

@@ -199,8 +199,8 @@ fn parse_atomic_expr(pair: Pair<grammar::Rule>) -> Result<ast::Expr, ParseError>
     match pair.as_rule() {
         grammar::Rule::PathExpr => parse_path_expr(pair),
         grammar::Rule::SingleQuotedString => parse_string_literal(pair),
-        grammar::Rule::True => Ok(ast::Expr::Literal(ast::Literal::Bool(true))),
-        grammar::Rule::False => Ok(ast::Expr::Literal(ast::Literal::Bool(false))),
+        grammar::Rule::True => Ok(ast::Expr::Literal(ast::Value::Bool(true))),
+        grammar::Rule::False => Ok(ast::Expr::Literal(ast::Value::Bool(false))),
         grammar::Rule::Unsigned => parse_number(pair),
         grammar::Rule::QuestionParameter => Ok(ast::Expr::Placeholder),
         grammar::Rule::ExpressionInParentheses => {
@@ -252,7 +252,7 @@ fn parse_string_literal(pair: Pair<grammar::Rule>) -> Result<ast::Expr, ParseErr
     }
     let s = &s[1..s.len() - 1];
 
-    Ok(ast::Expr::Literal(ast::Literal::String(s.to_string())))
+    Ok(ast::Expr::Literal(ast::Value::String(s.to_string())))
 }
 
 /// Parse a number literal
@@ -264,10 +264,10 @@ fn parse_number(pair: Pair<grammar::Rule>) -> Result<ast::Expr, ParseError> {
     let num = pair.as_str().trim().parse::<i64>().map_err(|e| ParseError::InvalidPredicate(format!("Failed to parse number: {}", e)))?;
 
     if num < i32::MAX as i64 && num > i32::MIN as i64 {
-        return Ok(ast::Expr::Literal(ast::Literal::I32(num as i32)));
+        return Ok(ast::Expr::Literal(ast::Value::I32(num as i32)));
     }
 
-    Ok(ast::Expr::Literal(ast::Literal::I64(num)))
+    Ok(ast::Expr::Literal(ast::Value::I64(num)))
 }
 
 /// Parse a LIMIT clause
@@ -320,7 +320,7 @@ fn parse_order_by_item(pair: Pair<grammar::Rule>) -> Result<ast::OrderByItem, Pa
     let identifier_pair = inner_pairs
         .iter()
         .find(|p| p.as_rule() == grammar::Rule::Identifier)
-        .ok_or(ParseError::InvalidPredicate("Missing column name in ORDER BY item".into()))?;
+        .ok_or(ParseError::InvalidPredicate("Missing property name in ORDER BY item".into()))?;
 
     let identifier_str = identifier_pair.as_str().trim();
 
@@ -329,7 +329,7 @@ fn parse_order_by_item(pair: Pair<grammar::Rule>) -> Result<ast::OrderByItem, Pa
         return Err(ParseError::InvalidPredicate("Dotted identifiers are not supported in ORDER BY clauses".into()));
     }
 
-    let path = ast::PathExpr::simple(identifier_str);
+    let key = ast::OrderKey::Path(ast::PathExpr::simple(identifier_str));
 
     let direction = inner_pairs
         .iter()
@@ -342,7 +342,7 @@ fn parse_order_by_item(pair: Pair<grammar::Rule>) -> Result<ast::OrderByItem, Pa
         .transpose()?
         .unwrap_or(ast::OrderDirection::Asc); // Default
 
-    Ok(ast::OrderByItem { path, direction })
+    Ok(ast::OrderByItem { key, direction })
 }
 
 #[cfg(test)]
@@ -359,7 +359,7 @@ mod tests {
                 predicate: ast::Predicate::Comparison {
                     left: Box::new(ast::Expr::Path(ast::PathExpr::simple("status".to_string()))),
                     operator: ast::ComparisonOperator::Equal,
-                    right: Box::new(ast::Expr::Literal(ast::Literal::String("active".to_string())))
+                    right: Box::new(ast::Expr::Literal(ast::Value::String("active".to_string())))
                 },
                 order_by: None,
                 limit: None,
@@ -378,12 +378,12 @@ mod tests {
                     Box::new(ast::Predicate::Comparison {
                         left: Box::new(ast::Expr::Path(ast::PathExpr::simple("user".to_string()))),
                         operator: ast::ComparisonOperator::Equal,
-                        right: Box::new(ast::Expr::Literal(ast::Literal::I32(123)))
+                        right: Box::new(ast::Expr::Literal(ast::Value::I32(123)))
                     }),
                     Box::new(ast::Predicate::Comparison {
                         left: Box::new(ast::Expr::Path(ast::PathExpr::simple("status".to_string()))),
                         operator: ast::ComparisonOperator::Equal,
-                        right: Box::new(ast::Expr::Literal(ast::Literal::String("active".to_string())))
+                        right: Box::new(ast::Expr::Literal(ast::Value::String("active".to_string())))
                     })
                 ),
                 order_by: None,
@@ -403,18 +403,18 @@ mod tests {
                     Box::new(ast::Predicate::Comparison {
                         left: Box::new(ast::Expr::Path(ast::PathExpr::simple("user".to_string()))),
                         operator: ast::ComparisonOperator::Equal,
-                        right: Box::new(ast::Expr::Literal(ast::Literal::I32(123)))
+                        right: Box::new(ast::Expr::Literal(ast::Value::I32(123)))
                     }),
                     Box::new(ast::Predicate::Comparison {
                         left: Box::new(ast::Expr::Path(ast::PathExpr::simple("user".to_string()))),
                         operator: ast::ComparisonOperator::Equal,
-                        right: Box::new(ast::Expr::Literal(ast::Literal::I32(456)))
+                        right: Box::new(ast::Expr::Literal(ast::Value::I32(456)))
                     })
                 )),
                 Box::new(ast::Predicate::Comparison {
                     left: Box::new(ast::Expr::Path(ast::PathExpr::simple("status".to_string()))),
                     operator: ast::ComparisonOperator::Equal,
-                    right: Box::new(ast::Expr::Literal(ast::Literal::String("active".to_string())))
+                    right: Box::new(ast::Expr::Literal(ast::Value::String("active".to_string())))
                 })
             )
         );
@@ -453,7 +453,7 @@ mod tests {
             ast::Predicate::Comparison {
                 left: Box::new(ast::Expr::Path(ast::PathExpr::simple("notes".to_string()))),
                 operator: ast::ComparisonOperator::Equal,
-                right: Box::new(ast::Expr::Literal(ast::Literal::I32(1)))
+                right: Box::new(ast::Expr::Literal(ast::Value::I32(1)))
             }
         );
 
@@ -465,7 +465,7 @@ mod tests {
             ast::Predicate::Comparison {
                 left: Box::new(ast::Expr::Path(ast::PathExpr::simple("not-field".to_string()))),
                 operator: ast::ComparisonOperator::Equal,
-                right: Box::new(ast::Expr::Literal(ast::Literal::I32(1)))
+                right: Box::new(ast::Expr::Literal(ast::Value::I32(1)))
             }
         );
         let selection = parse_selection("notа IS NULL").unwrap();
@@ -485,7 +485,7 @@ mod tests {
             ast::Predicate::Not(Box::new(ast::Predicate::Comparison {
                 left: Box::new(ast::Expr::Path(ast::PathExpr::simple("status".to_string()))),
                 operator: ast::ComparisonOperator::Equal,
-                right: Box::new(ast::Expr::Literal(ast::Literal::String("active".to_string())))
+                right: Box::new(ast::Expr::Literal(ast::Value::String("active".to_string())))
             }))
         );
     }
@@ -524,8 +524,8 @@ mod tests {
                 left: Box::new(ast::Expr::Path(ast::PathExpr::simple("status".to_string()))),
                 operator: ast::ComparisonOperator::In,
                 right: Box::new(ast::Expr::ExprList(vec![
-                    ast::Expr::Literal(ast::Literal::String("active".to_string())),
-                    ast::Expr::Literal(ast::Literal::String("pending".to_string())),
+                    ast::Expr::Literal(ast::Value::String("active".to_string())),
+                    ast::Expr::Literal(ast::Value::String("pending".to_string())),
                 ]))
             }
         );
@@ -541,9 +541,9 @@ mod tests {
                 left: Box::new(ast::Expr::Path(ast::PathExpr::simple("user_id".to_string()))),
                 operator: ast::ComparisonOperator::In,
                 right: Box::new(ast::Expr::ExprList(vec![
-                    ast::Expr::Literal(ast::Literal::I32(1)),
-                    ast::Expr::Literal(ast::Literal::I32(2)),
-                    ast::Expr::Literal(ast::Literal::I32(3)),
+                    ast::Expr::Literal(ast::Value::I32(1)),
+                    ast::Expr::Literal(ast::Value::I32(2)),
+                    ast::Expr::Literal(ast::Value::I32(3)),
                 ]))
             }
         );
@@ -558,7 +558,7 @@ mod tests {
             ast::Predicate::Comparison {
                 left: Box::new(ast::Expr::Path(ast::PathExpr::simple("bool_field".to_string()))),
                 operator: ast::ComparisonOperator::Equal,
-                right: Box::new(ast::Expr::Literal(ast::Literal::Bool(true)))
+                right: Box::new(ast::Expr::Literal(ast::Value::Bool(true)))
             }
         );
     }
@@ -572,7 +572,7 @@ mod tests {
             ast::Predicate::Comparison {
                 left: Box::new(ast::Expr::Path(ast::PathExpr::simple("bool_field".to_string()))),
                 operator: ast::ComparisonOperator::NotEqual,
-                right: Box::new(ast::Expr::Literal(ast::Literal::Bool(false)))
+                right: Box::new(ast::Expr::Literal(ast::Value::Bool(false)))
             }
         );
     }
@@ -584,7 +584,7 @@ mod tests {
         assert_eq!(
             selection.predicate,
             ast::Predicate::Comparison {
-                left: Box::new(ast::Expr::Literal(ast::Literal::Bool(false))),
+                left: Box::new(ast::Expr::Literal(ast::Value::Bool(false))),
                 operator: ast::ComparisonOperator::NotEqual,
                 right: Box::new(ast::Expr::Path(ast::PathExpr::simple("bool_field".to_string())))
             }
@@ -680,12 +680,15 @@ mod tests {
             ast::Predicate::Comparison {
                 left: Box::new(ast::Expr::Path(ast::PathExpr::simple("status".to_string()))),
                 operator: ast::ComparisonOperator::Equal,
-                right: Box::new(ast::Expr::Literal(ast::Literal::String("active".to_string())))
+                right: Box::new(ast::Expr::Literal(ast::Value::String("active".to_string())))
             }
         );
         assert_eq!(
             selection.order_by,
-            Some(vec![ast::OrderByItem { path: ast::PathExpr::simple("name".to_string()), direction: ast::OrderDirection::Asc }])
+            Some(vec![ast::OrderByItem {
+                key: ast::OrderKey::Path(ast::PathExpr::simple("name".to_string())),
+                direction: ast::OrderDirection::Asc,
+            }])
         );
         assert_eq!(selection.limit, None);
         Ok(())
@@ -697,7 +700,10 @@ mod tests {
         assert_eq!(selection.predicate, ast::Predicate::True);
         assert_eq!(
             selection.order_by,
-            Some(vec![ast::OrderByItem { path: ast::PathExpr::simple("created_at".to_string()), direction: ast::OrderDirection::Desc }])
+            Some(vec![ast::OrderByItem {
+                key: ast::OrderKey::Path(ast::PathExpr::simple("created_at".to_string())),
+                direction: ast::OrderDirection::Desc,
+            }])
         );
         Ok(())
     }
@@ -718,7 +724,7 @@ mod tests {
             ast::Predicate::Comparison {
                 left: Box::new(ast::Expr::Path(ast::PathExpr::simple("status".to_string()))),
                 operator: ast::ComparisonOperator::Equal,
-                right: Box::new(ast::Expr::Literal(ast::Literal::String("active".to_string())))
+                right: Box::new(ast::Expr::Literal(ast::Value::String("active".to_string())))
             }
         );
         assert_eq!(selection.order_by, None);
@@ -734,12 +740,15 @@ mod tests {
             ast::Predicate::Comparison {
                 left: Box::new(ast::Expr::Path(ast::PathExpr::simple("user_id".to_string()))),
                 operator: ast::ComparisonOperator::GreaterThan,
-                right: Box::new(ast::Expr::Literal(ast::Literal::I32(100)))
+                right: Box::new(ast::Expr::Literal(ast::Value::I32(100)))
             }
         );
         assert_eq!(
             selection.order_by,
-            Some(vec![ast::OrderByItem { path: ast::PathExpr::simple("created_at".to_string()), direction: ast::OrderDirection::Desc }])
+            Some(vec![ast::OrderByItem {
+                key: ast::OrderKey::Path(ast::PathExpr::simple("created_at".to_string())),
+                direction: ast::OrderDirection::Desc,
+            }])
         );
         assert_eq!(selection.limit, Some(5));
         Ok(())
@@ -760,7 +769,10 @@ mod tests {
         assert_eq!(selection.predicate, ast::Predicate::True);
         assert_eq!(
             selection.order_by,
-            Some(vec![ast::OrderByItem { path: ast::PathExpr::simple("score".to_string()), direction: ast::OrderDirection::Asc }])
+            Some(vec![ast::OrderByItem {
+                key: ast::OrderKey::Path(ast::PathExpr::simple("score".to_string())),
+                direction: ast::OrderDirection::Asc,
+            }])
         );
         assert_eq!(selection.limit, None);
         Ok(())
@@ -773,10 +785,16 @@ mod tests {
         assert_eq!(
             selection.order_by,
             Some(vec![
-                ast::OrderByItem { path: ast::PathExpr::simple("name".to_string()), direction: ast::OrderDirection::Asc },
-                ast::OrderByItem { path: ast::PathExpr::simple("created_at".to_string()), direction: ast::OrderDirection::Desc },
                 ast::OrderByItem {
-                    path: ast::PathExpr::simple("id".to_string()),
+                    key: ast::OrderKey::Path(ast::PathExpr::simple("name".to_string())),
+                    direction: ast::OrderDirection::Asc
+                },
+                ast::OrderByItem {
+                    key: ast::OrderKey::Path(ast::PathExpr::simple("created_at".to_string())),
+                    direction: ast::OrderDirection::Desc,
+                },
+                ast::OrderByItem {
+                    key: ast::OrderKey::Path(ast::PathExpr::simple("id".to_string())),
                     direction: ast::OrderDirection::Asc // Default
                 }
             ])
@@ -794,7 +812,7 @@ mod tests {
             ast::Predicate::Comparison {
                 left: Box::new(ast::Expr::Path(ast::PathExpr::simple("limit".to_string()))),
                 operator: ast::ComparisonOperator::Equal,
-                right: Box::new(ast::Expr::Literal(ast::Literal::I32(1)))
+                right: Box::new(ast::Expr::Literal(ast::Value::I32(1)))
             }
         );
 
@@ -804,12 +822,15 @@ mod tests {
             ast::Predicate::Comparison {
                 left: Box::new(ast::Expr::Path(ast::PathExpr::simple("order".to_string()))),
                 operator: ast::ComparisonOperator::Equal,
-                right: Box::new(ast::Expr::Literal(ast::Literal::I32(2)))
+                right: Box::new(ast::Expr::Literal(ast::Value::I32(2)))
             }
         );
         assert_eq!(
             selection.order_by,
-            Some(vec![ast::OrderByItem { path: ast::PathExpr::simple("name".to_string()), direction: ast::OrderDirection::Asc }])
+            Some(vec![ast::OrderByItem {
+                key: ast::OrderKey::Path(ast::PathExpr::simple("name".to_string())),
+                direction: ast::OrderDirection::Asc,
+            }])
         );
 
         Ok(())

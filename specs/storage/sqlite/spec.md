@@ -1,63 +1,45 @@
 # SQLite Storage Engine - Requirements
 
-## Overview
+SQLite provides Ankurah's embedded SQL storage option. It must satisfy the
+shared [`StorageEngine` contract](../architecture.md) and the following
+backend-specific requirements.
 
-A SQLite-based storage engine for Ankurah, providing a lightweight embedded database option that sits between Sled (pure KV) and Postgres (full SQL server). SQLite offers:
+## Functional requirements
 
-- Single-file database (portable, easy backup)
-- Full SQL query capabilities without external server
-- Native support on all platforms including mobile (iOS, Android)
-- WASM compatibility via sql.js or similar
+- Support persistent file databases and an isolated in-memory test database.
+- Store canonical entity states and events once, independent of models.
+- Durably retain entity-to-model associations and refresh all associated
+  materializations after a state write.
+- Maintain one query materialization per model without exposing its private
+  bucket handle through the public storage trait.
+- Push eligible AnkQL predicates and ordering into SQLite and post-filter any
+  unsupported remainder in Rust.
+- Project registered properties by durable `PropertyId`, not display label.
+- Support nested JSON predicates through SQLite JSON functions.
 
-## Motivation
+## Naming requirements
 
-- **Gap in current offerings**: Sled is pure KV (no server-side filtering), Postgres requires external server
-- **Mobile-friendly**: SQLite is the standard embedded database for mobile apps
-- **Development convenience**: No server setup, single file, easy to inspect
-- **WASM potential**: Can run in browsers via sql.js (alternative to IndexedDB)
+- Consult durable model and property name maps before consulting the catalog
+  resolver.
+- Use resolver labels only as sanitized, lowercase naming seeds.
+- Deduplicate equal labels belonging to unrelated ids.
+- Keep assigned physical names stable across reopen and catalog rename.
+- Bootstrap built-in system models without requiring a warm registered
+  catalog.
 
-## Functional Requirements
+## Reliability requirements
 
-### Core Storage Operations
+- Persist canonical state and a newly observed entity-model association in one
+  SQLite transaction.
+- Serialize materialization DDL and recheck durable assignments under the
+  lock.
+- Use WAL for file-backed databases and retain foreign-key and connection
+  health checks.
+- Never lose canonical state, events, or entity-model associations when a
+  derived materialization is rebuilt or removed.
 
-1. **Implements `StorageEngine` and `StorageCollection` traits** from `ankurah_core::storage`
-2. **File-based and in-memory modes**: Support both persistent file storage and in-memory databases (for testing)
-3. **Dynamic table creation**: Create tables per collection on demand
-4. **State persistence**: Store entity state buffers, heads (clocks), and attestations
+## Validation
 
-### Query Capabilities
-
-1. **Query pushdown**: Support AnkQL predicates converted to SQL WHERE clauses
-2. **Materialized columns**: Dynamically add columns for queryable CRDT fields
-3. **JSONB querying**: Support querying nested JSON properties via SQLite JSON functions (using `json_extract()` for path traversal and `jsonb()` function for storage, providing type-aware comparisons)
-
-### Data Format Compatibility
-
-1. **ULID storage**: TEXT (base64) matching Postgres format
-2. **State buffer**: BLOB (bincode-serialized BTreeMap)
-3. **Head/Clock**: JSON array of ULID strings
-4. **Attestations**: BLOB (bincode-serialized Vec)
-5. **JSON values**: Stored as BLOB (using SQLite JSONB format via `jsonb()` function), queried via `json_extract()` for type-aware comparisons
-
-### Performance & Reliability
-
-1. **WAL mode**: Enable Write-Ahead Logging for better concurrent read performance
-2. **Connection pooling**: Use `bb8` for async connection management
-3. **DDL locking**: Serialize schema modifications to prevent race conditions
-4. **Performance PRAGMAs**: Additional SQLite optimizations (cache_size, mmap_size, temp_store)
-
-### Event Storage
-
-1. **Event tables**: Create `{collection}_event` tables for event sourcing
-2. **Event schema**: Store event id, entity_id, operations (BLOB), parent (JSON), attestations (BLOB)
-3. **Entity index**: Index on entity_id for efficient event retrieval
-
-## Non-Functional Requirements
-
-1. **Async compatibility**: Work with tokio async runtime (via `spawn_blocking` for synchronous rusqlite)
-2. **Cross-platform**: Support all platforms where rusqlite works (desktop, mobile)
-3. **Testing**: Comprehensive unit and integration tests mirroring Postgres patterns
-
-## Out of Scope (Deferred)
-
-1. **WASM support**: Not needed for initial implementation
+Tests must cover colliding model/property labels, cross-model projection
+refresh, protocol compatibility metadata, nested JSON behavior, query
+pushdown/fallback, and reopen stability.

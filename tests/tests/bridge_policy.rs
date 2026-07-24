@@ -4,13 +4,13 @@ use ankql::ast::Predicate;
 use ankurah::core::{
     entity::Entity,
     error::ValidationError,
-    node::{Node as NodeAlias, NodeInner, WeakNode},
+    node::{Node as NodeAlias, NodeInner},
     policy::{AccessDenied, DefaultContext, PolicyAgent, DEFAULT_CONTEXT},
     storage::StorageEngine,
     util::Iterable,
 };
 use ankurah::proto::{self, Attested, EventId};
-use ankurah::{Model, Node, PermissiveAgent};
+use ankurah::{Node, PermissiveAgent};
 use ankurah_connector_local_process::LocalProcessConnection;
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
@@ -77,6 +77,7 @@ impl PolicyAgent for BridgePolicyAgent {
         &self,
         _node: &NodeAlias<SE, Self>,
         _from_node: &proto::EntityId,
+        _model: &proto::ModelId,
         _event: &proto::Attested<proto::Event>,
     ) -> Result<(), AccessDenied> {
         self.validate_calls.fetch_add(1, Ordering::SeqCst);
@@ -91,17 +92,18 @@ impl PolicyAgent for BridgePolicyAgent {
         &self,
         _node: &NodeAlias<SE, Self>,
         _from_node: &proto::EntityId,
+        _model: &proto::ModelId,
         _state: &Attested<proto::EntityState>,
     ) -> Result<(), AccessDenied> {
         Ok(())
     }
 
-    fn can_access_collection<C>(&self, _data: &C, _collection: &proto::CollectionId) -> Result<(), AccessDenied>
+    fn can_access_collection<C>(&self, _data: &C, _collection: &ankurah::ModelId) -> Result<(), AccessDenied>
     where C: Iterable<Self::ContextData> {
         Ok(())
     }
 
-    fn filter_predicate<C>(&self, _data: &C, _collection: &proto::CollectionId, predicate: Predicate) -> Result<Predicate, AccessDenied>
+    fn filter_predicate<C>(&self, _data: &C, _collection: &ankurah::ModelId, predicate: Predicate) -> Result<Predicate, AccessDenied>
     where C: Iterable<Self::ContextData> {
         Ok(predicate)
     }
@@ -110,8 +112,9 @@ impl PolicyAgent for BridgePolicyAgent {
         &self,
         _data: &C,
         _id: &proto::EntityId,
-        _collection: &proto::CollectionId,
+        _collection: &ankurah::ModelId,
         _state: &proto::State,
+        _resolver: Option<std::sync::Weak<dyn ankurah::core::schema::CatalogResolver>>,
     ) -> Result<(), AccessDenied>
     where
         C: Iterable<Self::ContextData>,
@@ -119,7 +122,7 @@ impl PolicyAgent for BridgePolicyAgent {
         Ok(())
     }
 
-    fn check_read_event<C>(&self, _data: &C, event: &Attested<proto::Event>) -> Result<(), AccessDenied>
+    fn check_read_event<C>(&self, _data: &C, _collection: &ankurah::ModelId, event: &Attested<proto::Event>) -> Result<(), AccessDenied>
     where C: Iterable<Self::ContextData> {
         if self.deny_read_events.lock().unwrap().contains(&event.payload.id()) {
             return Err(AccessDenied::ByPolicy("event read denied by test agent"));
@@ -242,15 +245,14 @@ async fn test_event_bridge_respects_read_policy_on_send() -> Result<()> {
     // The security property: the hidden event never reached the client, and
     // neither did the rest of the redacted window (a partial chain would
     // lose operations). The client's view of the entity is stale but honest.
-    let collection_c = ctx_c.collection(&Pet::collection()).await?;
-    let ids: HashSet<_> = collection_c.dump_entity_events(pet_id).await?.iter().map(|e| e.payload.id()).collect();
+    let ids: HashSet<_> = client.storage.dump_entity_events(pet_id).await?.iter().map(|e| e.payload.id()).collect();
     assert!(!ids.contains(&denied_id), "the read-denied event must not reach the client through any path");
     // The non-denied tip MAY reach the client: its verification attempt
     // fetches readable events through GetEvents, which applies policy per
     // event. What matters is that the hidden event stays hidden and the
     // unverifiable state is not adopted.
     let _ = open_id;
-    assert_eq!(ctx_c.get::<PetView>(pet_id).await?.age().unwrap(), "1", "client remains at its last verified state");
+    assert_eq!(initial[0].age().unwrap(), "1", "the resident view remains at its last verified state");
 
     Ok(())
 }

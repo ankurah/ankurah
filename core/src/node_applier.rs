@@ -5,6 +5,7 @@ use crate::{
     policy::PolicyAgent,
     retrieval::{CachedEventGetter, GetState, LocalStateGetter, SuspenseEvents},
     storage::StorageEngine,
+    storage_commit::ResidentWriteIntent,
     util::ready_chunks::ReadyChunks,
 };
 use ankurah_proto::{self as proto};
@@ -14,6 +15,11 @@ use proto::Attested;
 /// Consolidates all logic for applying remote updates to a node
 /// Handles both SubscriptionUpdateItem (streaming updates) and EntityDelta (initial Fetch/QuerySubscribed)
 pub struct NodeApplier;
+
+struct SavedState {
+    models: Vec<proto::ModelId>,
+    canonical_changed: bool,
+}
 
 impl NodeApplier {
     /// Similar to commit_transaction, except that we check event attestations instead of checking write permissions
@@ -46,17 +52,19 @@ impl NodeApplier {
         let mut errors: Vec<ApplyErrorItem> = Vec::new();
         for update in items {
             let entity_id = update.entity_id;
-            let item_collection = update.collection.clone();
+            let item_model = update.model.clone();
             let result = async {
-                let collection = node.collections.get(&update.collection).await?;
-                let event_getter = CachedEventGetter::new(update.collection.clone(), collection.clone(), node, &cdata);
-                let state_getter = LocalStateGetter::new(collection);
+                // INGRESS: resolve the wire model address (validated system
+                // name or allocated catalog id) or reject this item.
+                let collection_id = node.prepare_model_for_ingress(&update.model).await?;
+                let event_getter = CachedEventGetter::new(collection_id, node, &cdata);
+                let state_getter = LocalStateGetter::new(node.storage.clone());
                 Self::apply_update(node, from_peer_id, update, &event_getter, &state_getter, &mut changes, &mut ()).await
             }
             .await;
             if let Err(cause) = result {
-                tracing::warn!("failed to apply update for {}/{}: {}", item_collection, entity_id, cause);
-                errors.push(ApplyErrorItem { entity_id, collection: item_collection, cause });
+                tracing::warn!("failed to apply update for model {}/{}: {}", item_model, entity_id, cause);
+                errors.push(ApplyErrorItem { entity_id, model: item_model, cause });
             }
         }
 
@@ -74,7 +82,7 @@ impl NodeApplier {
         node: &Node<SE, PA>,
         from_peer_id: &proto::EntityId,
         entity_id: proto::EntityId,
-        collection_id: &proto::CollectionId,
+        model: proto::ModelId,
         event_fragments: Vec<proto::EventFragment>,
         event_getter: &E,
     ) -> Result<Vec<Attested<proto::Event>>, MutationError>
@@ -85,8 +93,18 @@ impl NodeApplier {
     {
         let mut attested_events = Vec::new();
         for fragment in event_fragments {
-            let attested_event: Attested<proto::Event> = (entity_id, collection_id.clone(), fragment).into();
-            node.policy_agent.validate_received_event(node, from_peer_id, &attested_event)?;
+            let attested_event: Attested<proto::Event> = (entity_id, fragment).into();
+            // Relayed catalog events are trusted from the serving peer the
+            // way every other served event is (RFC section 4 in
+            // specs/model-property-metadata/rfc.md). The
+            // structural write ban covers the transaction paths
+            // (CommitTransaction and local commits); this ingest path has
+            // no allocator-identity check -- in the single-allocator
+            // topology the serving durable IS the allocator, and
+            // allocator-identity enforcement for multi-peer topologies is
+            // #309's routing work. validate_received_event is the
+            // per-agent hook if a deployment wants to gate this earlier.
+            node.policy_agent.validate_received_event(node, from_peer_id, &model, &attested_event)?;
             event_getter.stage_event(attested_event.payload.clone());
             attested_events.push(attested_event);
         }
@@ -109,20 +127,21 @@ impl NodeApplier {
         S: GetState + Send + Sync,
     {
         // TODO: do we actually need predicate_relevance?
-        let proto::SubscriptionUpdateItem { entity_id, collection: collection_id, content, predicate_relevance: _ } = update;
-        let collection = node.collections.get(&collection_id).await?;
+        let proto::SubscriptionUpdateItem { entity_id, model, content, predicate_relevance: _, source_queries: _ } = update;
+        let collection_id = node.prepare_model_for_ingress(&model).await?;
 
         match content {
             // EventOnly: equivalent to old SubscriptionItem::Change
             proto::UpdateContent::EventOnly(event_fragments) => {
-                let attested_events =
-                    Self::validate_and_stage(node, from_peer_id, entity_id, &collection_id, event_fragments, event_getter)?;
+                let attested_events = Self::validate_and_stage(node, from_peer_id, entity_id, model, event_fragments, event_getter)?;
                 // Wire order is untrusted for every multi-event shape, not
                 // just bridges: a child applied before its staged parent
                 // gap-jumps the head and drops the parent's operations (V4).
                 let attested_events = crate::event_dag::ordering::topo_sort_events(attested_events)?;
+                node.storage.append_events(&attested_events).await?;
 
                 // We did not receive an entity fragment, so we need to retrieve it from local storage or a remote peer
+                // (assembly binds it to the id-keyed contract before we apply).
                 let entity = node.entities.get_retrieve_or_create(state_getter, event_getter, &collection_id, &entity_id).await?;
                 entities.push(entity.clone());
 
@@ -138,17 +157,19 @@ impl NodeApplier {
                         }
                     };
                     if applied {
-                        if let Err(e) = event_getter.commit_event(&event).await {
-                            failure = Some(e);
-                            break;
-                        }
                         applied_events.push(event);
                     }
                 }
 
                 // Anything applied before a failure is real progress; notify it.
                 if !applied_events.is_empty() {
-                    changes.push(EntityChange::new(entity.clone(), applied_events)?);
+                    let saved = Self::save_state(node, collection_id, &entity, applied_events.clone(), event_getter).await?;
+                    changes.extend(Self::changes_after_save(&entity, applied_events, saved)?);
+                } else if failure.is_none() {
+                    // Even an idempotent/older event forms the explicit
+                    // entity-model association through which it was received.
+                    let saved = Self::save_state(node, collection_id, &entity, Vec::new(), event_getter).await?;
+                    changes.extend(Self::changes_after_save(&entity, Vec::new(), saved)?);
                 }
 
                 if let Some(e) = failure {
@@ -166,13 +187,14 @@ impl NodeApplier {
             // StateAndEvent: equivalent to old SubscriptionItem::Add
             proto::UpdateContent::StateAndEvent(state_fragment, event_fragments) => {
                 let attested_events =
-                    Self::validate_and_stage(node, from_peer_id, entity_id, &collection_id, event_fragments, event_getter)?;
+                    Self::validate_and_stage(node, from_peer_id, entity_id, model.clone(), event_fragments, event_getter)?;
                 // Sorted for the same reason as the EventOnly arm: the
                 // fallback below applies event by event.
                 let attested_events = crate::event_dag::ordering::topo_sort_events(attested_events)?;
 
-                let state = (entity_id, collection_id.clone(), state_fragment.clone()).into();
-                node.policy_agent.validate_received_state(node, from_peer_id, &state)?;
+                let state = (entity_id, state_fragment.clone()).into();
+                node.policy_agent.validate_received_state(node, from_peer_id, &model, &state)?;
+                node.storage.append_events(&attested_events).await?;
 
                 // with_state only updates the in-memory entity, it does NOT persist to storage
                 let (changed, entity) =
@@ -180,27 +202,21 @@ impl NodeApplier {
                 entities.push(entity.clone());
 
                 if matches!(changed, Some(true) | None) {
-                    // State applied successfully (new entity or strictly descends)
-                    // Commit all staged events
-                    for event in &attested_events {
-                        event_getter.commit_event(event).await?;
-                    }
-                    Self::save_state(node, &entity, &collection).await?;
-                    changes.push(EntityChange::new(entity, attested_events)?);
+                    // State applied successfully (new entity or strictly
+                    // descends). Events were blindly appended before state.
+                    let saved = Self::save_state(node, collection_id, &entity, attested_events.clone(), event_getter).await?;
+                    changes.extend(Self::changes_after_save(&entity, attested_events, saved)?);
                 } else {
                     // State not applied (divergence or older) - fall back to event-by-event application
                     // This handles DivergedSince where we need to merge concurrent branches
                     let mut applied_events = Vec::new();
                     for event in attested_events {
                         if entity.apply_event(event_getter, &event.payload).await? {
-                            event_getter.commit_event(&event).await?;
                             applied_events.push(event);
                         }
                     }
-                    if !applied_events.is_empty() {
-                        Self::save_state(node, &entity, &collection).await?;
-                        changes.push(EntityChange::new(entity, applied_events)?);
-                    }
+                    let saved = Self::save_state(node, collection_id, &entity, applied_events.clone(), event_getter).await?;
+                    changes.extend(Self::changes_after_save(&entity, applied_events, saved)?);
                 }
             }
         }
@@ -208,21 +224,56 @@ impl NodeApplier {
         Ok(())
     }
 
-    async fn save_state<SE, PA>(
+    async fn save_state<SE, PA, E>(
         node: &Node<SE, PA>,
+        accessed_as: proto::ModelId,
         entity: &crate::entity::Entity,
-        collection_wrapper: &crate::storage::StorageCollectionWrapper,
-    ) -> Result<(), MutationError>
+        events: Vec<Attested<proto::Event>>,
+        event_getter: &E,
+    ) -> Result<SavedState, MutationError>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
+        E: crate::retrieval::GetEvents + Send + Sync,
     {
-        let state = entity.to_state()?;
-        let entity_state = proto::EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
-        let attestation = node.policy_agent.attest_state(node, &entity_state);
-        let attested = Attested::opt(entity_state, attestation);
-        collection_wrapper.set_state(attested).await?;
-        Ok(())
+        let result = node
+            .commit_resident_writes(
+                vec![ResidentWriteIntent::from_resident_state(entity.clone(), accessed_as, events)?],
+                None,
+                event_getter,
+            )
+            .await?;
+        let entity_result = result
+            .entities
+            .into_iter()
+            .next()
+            .ok_or_else(|| MutationError::General(format!("storage omitted commit result for entity {}", entity.id()).into()))?;
+        let models = if entity_result.canonical_changed { entity_result.materialized_as } else { entity_result.associations_added };
+        Ok(SavedState { models, canonical_changed: entity_result.canonical_changed })
+    }
+
+    /// Build reactor changes for the durable effects of a state commit.
+    ///
+    /// A canonical no-op can still add a model association, but the input
+    /// events are then historical rather than newly applied and must not be
+    /// reported as the cause of the association-only notification.
+    fn changes_after_save(
+        entity: &crate::entity::Entity,
+        events: Vec<Attested<proto::Event>>,
+        saved: SavedState,
+    ) -> Result<Vec<EntityChange>, MutationError> {
+        let events = if saved.canonical_changed { events } else { Vec::new() };
+        Self::changes_for_models(entity, events, saved.models)
+    }
+
+    /// Build one reactor change per refreshed model materialization while
+    /// sharing the entity's canonical in-memory state.
+    fn changes_for_models(
+        entity: &crate::entity::Entity,
+        events: Vec<Attested<proto::Event>>,
+        models: Vec<proto::ModelId>,
+    ) -> Result<Vec<EntityChange>, MutationError> {
+        models.into_iter().map(|model| EntityChange::new(entity.with_model_context(model), events.clone())).collect()
     }
 
     /// Apply multiple EntityDeltas in parallel with batched reactor notification
@@ -254,8 +305,7 @@ impl NodeApplier {
 
             for result in results {
                 match result {
-                    Ok(Some(change)) => batch.push(change),
-                    Ok(None) => {} // No change, continue
+                    Ok(changes) => batch.extend(changes),
                     Err(error_item) => {
                         all_errors.push(error_item);
                     }
@@ -275,14 +325,14 @@ impl NodeApplier {
     }
 
     /// Apply EntityDelta from Fetch or QuerySubscribed responses
-    /// Returns Some(EntityChange) if the delta resulted in a change, None otherwise
+    /// Returns one change per refreshed model materialization.
     async fn apply_delta<SE, PA, E, S>(
         node: &Node<SE, PA>,
         from_peer_id: &proto::EntityId,
         delta: proto::EntityDelta,
         event_getter: &E,
         state_getter: &S,
-    ) -> Result<Option<EntityChange>, ApplyErrorItem>
+    ) -> Result<Vec<EntityChange>, ApplyErrorItem>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
@@ -290,10 +340,10 @@ impl NodeApplier {
         S: GetState + Send + Sync,
     {
         let entity_id = delta.entity_id;
-        let collection = delta.collection.clone();
+        let model = delta.model.clone();
 
         let result = Self::apply_delta_inner(node, from_peer_id, delta, event_getter, state_getter).await;
-        result.map_err(|cause| ApplyErrorItem { entity_id, collection, cause })
+        result.map_err(|cause| ApplyErrorItem { entity_id, model, cause })
     }
 
     async fn apply_delta_inner<SE, PA, E, S>(
@@ -302,27 +352,28 @@ impl NodeApplier {
         delta: proto::EntityDelta,
         event_getter: &E,
         state_getter: &S,
-    ) -> Result<Option<EntityChange>, MutationError>
+    ) -> Result<Vec<EntityChange>, MutationError>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
         E: SuspenseEvents + Send + Sync,
         S: GetState + Send + Sync,
     {
-        let collection = node.collections.get(&delta.collection).await?;
+        // INGRESS: resolve the wire model address to the local collection or
+        // reject this delta. System-name arms are validated at this boundary.
+        let proto::EntityDelta { entity_id, model, content } = delta;
+        let collection_id = node.prepare_model_for_ingress(&model).await?;
 
-        match delta.content {
+        match content {
             proto::DeltaContent::StateSnapshot { state } => {
-                let attested_state = (delta.entity_id, delta.collection.clone(), state).into();
-                node.policy_agent.validate_received_state(node, from_peer_id, &attested_state)?;
+                let attested_state = (entity_id, state).into();
+                node.policy_agent.validate_received_state(node, from_peer_id, &collection_id, &attested_state)?;
 
-                let (changed, entity) = node
-                    .entities
-                    .with_state(state_getter, event_getter, delta.entity_id, delta.collection, attested_state.payload.state)
-                    .await?;
+                let (changed, entity) =
+                    node.entities.with_state(state_getter, event_getter, entity_id, collection_id, attested_state.payload.state).await?;
 
                 // Save state to storage
-                Self::save_state(node, &entity, &collection).await?;
+                let saved = Self::save_state(node, collection_id, &entity, Vec::new(), event_getter).await?;
 
                 // Only notify if the snapshot actually advanced the entity. with_state
                 // returns Some(false) when the state did not apply (the entity is
@@ -334,22 +385,21 @@ impl NodeApplier {
                 // subscription-notification race behind the intermittent
                 // server_edits_subscription failure. None (freshly created) and
                 // Some(true) (advanced) are real changes and still notify.
-                if matches!(changed, Some(false)) {
-                    return Ok(None);
+                if matches!(changed, Some(false)) && saved.models.is_empty() {
+                    return Ok(Vec::new());
                 }
 
                 // Snapshots carry no events, so the change reports an empty events list.
-                Ok(Some(EntityChange::new(entity, Vec::new())?))
+                Self::changes_after_save(&entity, Vec::new(), saved)
             }
 
             proto::DeltaContent::EventBridge { events } => {
                 // Bridge events pass the same policy gate as subscription
                 // updates; transport must not decide trust.
-                let attested_events =
-                    Self::validate_and_stage(node, from_peer_id, delta.entity_id, &delta.collection, events, event_getter)?;
+                let attested_events = Self::validate_and_stage(node, from_peer_id, entity_id, model, events, event_getter)?;
 
                 // Get or create entity
-                let entity = node.entities.get_retrieve_or_create(state_getter, event_getter, &delta.collection, &delta.entity_id).await?;
+                let entity = node.entities.get_retrieve_or_create(state_getter, event_getter, &collection_id, &entity_id).await?;
 
                 // Apply events parents-first. Wire order is untrusted: applying
                 // a child before its staged parent gap-jumps the head past the
@@ -357,16 +407,16 @@ impl NodeApplier {
                 // (V4). The producer also sorts, but receivers must not rely
                 // on sender ordering.
                 let attested_events = crate::event_dag::ordering::topo_sort_events(attested_events)?;
+                node.storage.append_events(&attested_events).await?;
                 let mut applied_any = false;
-                for event in attested_events.into_iter() {
+                for event in &attested_events {
                     if entity.apply_event(event_getter, &event.payload).await? {
                         applied_any = true;
                     }
-                    event_getter.commit_event(&event).await?;
                 }
 
                 // Save updated state
-                Self::save_state(node, &entity, &collection).await?;
+                let saved = Self::save_state(node, collection_id, &entity, attested_events, event_getter).await?;
 
                 // Only notify if the bridge actually advanced the entity. If every
                 // event was already applied (apply_event returned false for all), the
@@ -374,13 +424,13 @@ impl NodeApplier {
                 // spurious empty-events Update on other subscriptions holding this
                 // entity (see the StateSnapshot arm above). This mirrors the streaming
                 // StateAndEvent fallback, which also only notifies when events applied.
-                if !applied_any {
-                    return Ok(None);
+                if !applied_any && saved.models.is_empty() {
+                    return Ok(Vec::new());
                 }
 
                 // Bridges carry no events on the change itself; the events were applied
                 // above, so the change reports an empty events list.
-                Ok(Some(EntityChange::new(entity, Vec::new())?))
+                Self::changes_after_save(&entity, Vec::new(), saved)
             }
 
             proto::DeltaContent::StateAndRelation { .. } => Err(MutationError::InvalidUpdate("StateAndRelation not yet implemented")),

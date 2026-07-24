@@ -15,7 +15,7 @@ fn equality_bounds_use_prefix_guard_for_multi_key() -> Result<(), IndexError> {
     let key_spec = KeySpec {
         keyparts: vec![
             IndexKeyPart {
-                column: "name".to_string(),
+                key: "name".to_string(),
                 sub_path: None,
                 direction: IndexDirection::Asc,
                 value_type: ValueType::String,
@@ -23,7 +23,7 @@ fn equality_bounds_use_prefix_guard_for_multi_key() -> Result<(), IndexError> {
                 collation: None,
             },
             IndexKeyPart {
-                column: "age".to_string(),
+                key: "age".to_string(),
                 sub_path: None,
                 direction: IndexDirection::Asc,
                 value_type: ValueType::I32,
@@ -53,7 +53,7 @@ fn equality_bounds_use_tight_range_for_single_key() -> Result<(), IndexError> {
 
     let key_spec = KeySpec {
         keyparts: vec![IndexKeyPart {
-            column: "name".to_string(),
+            key: "name".to_string(),
             sub_path: None,
             direction: IndexDirection::Asc,
             value_type: ValueType::String,
@@ -82,7 +82,7 @@ fn inequality_bounds_handle_desc_correctly() -> Result<(), IndexError> {
 
     let key_spec = KeySpec {
         keyparts: vec![IndexKeyPart {
-            column: "age".to_string(),
+            key: "age".to_string(),
             sub_path: None,
             direction: IndexDirection::Desc,
             value_type: ValueType::I32,
@@ -138,7 +138,7 @@ fn desc_inequality_with_asc_equality_prefix() -> Result<(), IndexError> {
     let key_spec = KeySpec {
         keyparts: vec![
             IndexKeyPart {
-                column: "room".to_string(),
+                key: "room".to_string(),
                 sub_path: None,
                 direction: IndexDirection::Asc,
                 value_type: ValueType::String,
@@ -146,7 +146,7 @@ fn desc_inequality_with_asc_equality_prefix() -> Result<(), IndexError> {
                 collation: None,
             },
             IndexKeyPart {
-                column: "deleted".to_string(),
+                key: "deleted".to_string(),
                 sub_path: None,
                 direction: IndexDirection::Asc,
                 value_type: ValueType::Bool,
@@ -154,7 +154,7 @@ fn desc_inequality_with_asc_equality_prefix() -> Result<(), IndexError> {
                 collation: None,
             },
             IndexKeyPart {
-                column: "timestamp".to_string(),
+                key: "timestamp".to_string(),
                 sub_path: None,
                 direction: IndexDirection::Desc,
                 value_type: ValueType::I64,
@@ -214,7 +214,7 @@ fn desc_inequality_with_single_asc_prefix() -> Result<(), IndexError> {
     let key_spec = KeySpec {
         keyparts: vec![
             IndexKeyPart {
-                column: "category".to_string(),
+                key: "category".to_string(),
                 sub_path: None,
                 direction: IndexDirection::Asc,
                 value_type: ValueType::String,
@@ -222,7 +222,7 @@ fn desc_inequality_with_single_asc_prefix() -> Result<(), IndexError> {
                 collation: None,
             },
             IndexKeyPart {
-                column: "score".to_string(),
+                key: "score".to_string(),
                 sub_path: None,
                 direction: IndexDirection::Desc,
                 value_type: ValueType::I64,
@@ -270,7 +270,7 @@ fn desc_lower_bound_inequality_with_asc_prefix() -> Result<(), IndexError> {
     let key_spec = KeySpec {
         keyparts: vec![
             IndexKeyPart {
-                column: "room".to_string(),
+                key: "room".to_string(),
                 sub_path: None,
                 direction: IndexDirection::Asc,
                 value_type: ValueType::String,
@@ -278,7 +278,7 @@ fn desc_lower_bound_inequality_with_asc_prefix() -> Result<(), IndexError> {
                 collation: None,
             },
             IndexKeyPart {
-                column: "deleted".to_string(),
+                key: "deleted".to_string(),
                 sub_path: None,
                 direction: IndexDirection::Asc,
                 value_type: ValueType::Bool,
@@ -286,7 +286,7 @@ fn desc_lower_bound_inequality_with_asc_prefix() -> Result<(), IndexError> {
                 collation: None,
             },
             IndexKeyPart {
-                column: "timestamp".to_string(),
+                key: "timestamp".to_string(),
                 sub_path: None,
                 direction: IndexDirection::Desc,
                 value_type: ValueType::I64,
@@ -342,7 +342,7 @@ fn desc_range_inequality_with_asc_prefix() -> Result<(), IndexError> {
     let key_spec = KeySpec {
         keyparts: vec![
             IndexKeyPart {
-                column: "room".to_string(),
+                key: "room".to_string(),
                 sub_path: None,
                 direction: IndexDirection::Asc,
                 value_type: ValueType::String,
@@ -350,7 +350,7 @@ fn desc_range_inequality_with_asc_prefix() -> Result<(), IndexError> {
                 collation: None,
             },
             IndexKeyPart {
-                column: "deleted".to_string(),
+                key: "deleted".to_string(),
                 sub_path: None,
                 direction: IndexDirection::Asc,
                 value_type: ValueType::Bool,
@@ -358,7 +358,7 @@ fn desc_range_inequality_with_asc_prefix() -> Result<(), IndexError> {
                 collation: None,
             },
             IndexKeyPart {
-                column: "timestamp".to_string(),
+                key: "timestamp".to_string(),
                 sub_path: None,
                 direction: IndexDirection::Desc,
                 value_type: ValueType::I64,

@@ -3,7 +3,28 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{auth::Attested, clock::Clock, collection::CollectionId, id::EntityId, AttestationSet, DecodeError};
+use crate::{auth::Attested, clock::Clock, AttestationSet, DecodeError, EntityId};
+
+/// A value carried under a model usage context.
+///
+/// The model describes how the value is being accessed, authorized, or
+/// materialized. It is deliberately outside canonical entity state and event
+/// payloads, which have no intrinsic model.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct ModelContext<T> {
+    /// The model through which `value` is being used.
+    pub model: crate::ModelId,
+    /// The model-independent value.
+    pub value: T,
+}
+
+impl<T> ModelContext<T> {
+    /// Attach an explicit model usage context to `value`.
+    pub fn new(model: crate::ModelId, value: T) -> Self { Self { model, value } }
+
+    /// Split the usage context into its model and model-independent value.
+    pub fn into_parts(self) -> (crate::ModelId, T) { (self.model, self.value) }
+}
 
 #[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 pub struct EventId([u8; 32]);
@@ -13,8 +34,7 @@ impl std::fmt::Debug for EventId {
 }
 
 impl EventId {
-    /// Generate an EventID from the parts of an Event
-    /// notably, we are not including the collection in the hash because collection is getting excised from identity
+    /// Generate an event identity from its complete model-independent payload.
     pub fn from_parts(entity_id: &EntityId, operations: &OperationSet, parent: &Clock) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(bincode::serialize(&entity_id).unwrap());
@@ -99,10 +119,12 @@ impl<'de> Deserialize<'de> for EventId {
     }
 }
 
+/// A canonical, model-independent entity event.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Event {
-    pub collection: CollectionId,
+    /// The entity changed by this event.
     pub entity_id: EntityId,
+    /// Backend operations carried by the event.
     pub operations: OperationSet,
     /// The set of concurrent events (usually only one) which is the precursor of this event
     pub parent: Clock,
@@ -113,10 +135,15 @@ impl Event {
     pub fn is_entity_create(&self) -> bool { self.parent.is_empty() }
 }
 
+/// Event data with the entity identity factored out for entity-scoped wire
+/// envelopes.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct EventFragment {
+    /// Backend operations carried by the event.
     pub operations: OperationSet,
+    /// Causal parents of the event.
     pub parent: Clock,
+    /// Attestations over the complete event.
     pub attestations: AttestationSet,
 }
 
@@ -126,30 +153,35 @@ impl From<Attested<Event>> for EventFragment {
     }
 }
 
-impl From<(EntityId, CollectionId, EventFragment)> for Attested<Event> {
-    fn from(value: (EntityId, CollectionId, EventFragment)) -> Self {
-        let event = Event { entity_id: value.0, collection: value.1, operations: value.2.operations, parent: value.2.parent };
-        Attested { payload: event, attestations: value.2.attestations }
+impl From<(EntityId, EventFragment)> for Attested<Event> {
+    fn from(value: (EntityId, EventFragment)) -> Self {
+        let event = Event { entity_id: value.0, operations: value.1.operations, parent: value.1.parent };
+        Attested { payload: event, attestations: value.1.attestations }
     }
 }
 
+/// Attested state with the entity identity factored out for entity-scoped wire
+/// envelopes.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct StateFragment {
+    /// Accumulated backend state and causal head.
     pub state: State,
+    /// Attestations over the complete entity state.
     pub attestations: AttestationSet,
 }
 
 impl From<Attested<EntityState>> for StateFragment {
     fn from(attested: Attested<EntityState>) -> Self { Self { state: attested.payload.state, attestations: attested.attestations } }
 }
-impl From<(EntityId, CollectionId, StateFragment)> for Attested<EntityState> {
-    fn from(value: (EntityId, CollectionId, StateFragment)) -> Self {
-        let entity_state = EntityState { entity_id: value.0, collection: value.1, state: value.2.state };
-        Attested { payload: entity_state, attestations: value.2.attestations }
+impl From<(EntityId, StateFragment)> for Attested<EntityState> {
+    fn from(value: (EntityId, StateFragment)) -> Self {
+        let entity_state = EntityState { entity_id: value.0, state: value.1.state };
+        Attested { payload: entity_state, attestations: value.1.attestations }
     }
 }
 
 impl Event {
+    /// Derive the event identity from the complete model-independent payload.
     pub fn id(&self) -> EventId { EventId::from_parts(&self.entity_id, &self.operations, &self.parent) }
 }
 
@@ -180,10 +212,13 @@ pub struct Operation {
     pub diff: Vec<u8>,
 }
 
+/// Canonical accumulated state for one entity, independent of every model
+/// through which the entity is used.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct EntityState {
+    /// The durable entity identity.
     pub entity_id: EntityId,
-    pub collection: CollectionId,
+    /// Accumulated backend state and causal head.
     pub state: State,
 }
 
@@ -207,9 +242,8 @@ impl std::fmt::Display for Event {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Event({} {}/{} {}{} {})",
+            "Event({} {} {}{} {})",
             self.id().to_base64_short(),
-            self.collection,
             self.entity_id.to_base64_short(),
             if self.is_entity_create() { "(create) " } else { "" },
             self.parent.to_base64_short(),
@@ -251,10 +285,6 @@ impl std::fmt::Display for EntityState {
     }
 }
 
-impl Attested<Event> {
-    pub fn collection(&self) -> &CollectionId { &self.payload.collection }
-}
-
 impl From<Event> for Attested<Event> {
     fn from(val: Event) -> Self { Attested { payload: val, attestations: AttestationSet::default() } }
 }
@@ -264,17 +294,22 @@ impl From<EntityState> for Attested<EntityState> {
 }
 
 impl Attested<EntityState> {
-    pub fn to_parts(self) -> (EntityId, CollectionId, StateFragment) {
-        (self.payload.entity_id, self.payload.collection, StateFragment { state: self.payload.state, attestations: self.attestations })
+    /// Factor the entity identity out of an attested canonical state.
+    pub fn to_parts(self) -> (EntityId, StateFragment) {
+        (self.payload.entity_id, StateFragment { state: self.payload.state, attestations: self.attestations })
     }
-    pub fn from_parts(entity_id: EntityId, collection: CollectionId, fragment: StateFragment) -> Self {
-        Self { payload: EntityState { entity_id, collection, state: fragment.state }, attestations: fragment.attestations }
+    /// Reconstitute an attested canonical state from an entity identity and
+    /// state fragment.
+    pub fn from_parts(entity_id: EntityId, fragment: StateFragment) -> Self {
+        Self { payload: EntityState { entity_id, state: fragment.state }, attestations: fragment.attestations }
     }
 }
 
 impl Attested<Event> {
-    pub fn from_parts(entity_id: EntityId, collection: CollectionId, frag: EventFragment) -> Self {
-        Self { payload: Event { entity_id, collection, operations: frag.operations, parent: frag.parent }, attestations: frag.attestations }
+    /// Reconstitute an attested canonical event from an entity identity and
+    /// event fragment.
+    pub fn from_parts(entity_id: EntityId, frag: EventFragment) -> Self {
+        Self { payload: Event { entity_id, operations: frag.operations, parent: frag.parent }, attestations: frag.attestations }
     }
 }
 
@@ -303,5 +338,11 @@ mod tests {
             [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
         );
         assert_eq!(id, bincode::deserialize(&bytes).unwrap());
+    }
+
+    #[test]
+    fn event_id_is_derived_from_the_model_independent_event() {
+        let event = Event { entity_id: EntityId::new(), operations: OperationSet(BTreeMap::new()), parent: Clock::default() };
+        assert_eq!(event.id(), EventId::from_parts(&event.entity_id, &event.operations, &event.parent));
     }
 }

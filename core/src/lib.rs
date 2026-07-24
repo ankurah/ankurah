@@ -30,14 +30,13 @@ pub mod resultset;
 pub mod retrieval;
 pub mod selection;
 pub mod storage;
+mod storage_commit;
 pub mod system;
 pub mod task;
 pub mod transaction;
-pub mod type_resolver;
 pub mod util;
 pub mod value;
 
-pub mod collectionset;
 pub mod schema;
 
 #[cfg(feature = "uniffi")]
@@ -46,7 +45,6 @@ pub use model::Model;
 pub use node::Node;
 pub use property::Json;
 pub use query_value::QueryValue;
-pub use type_resolver::TypeResolver;
 
 pub use ankurah_proto as proto;
-pub use ankurah_proto::EntityId;
+pub use ankurah_proto::{EntityId, ModelId};

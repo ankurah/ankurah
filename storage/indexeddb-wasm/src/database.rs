@@ -1,6 +1,7 @@
 use crate::util::navigator_lock::NavigatorLock;
 use ankurah_core::indexing::KeySpec;
 use ankurah_core::{error::RetrievalError, notice_info, util::safeset::SafeSet};
+use ankurah_proto::PROTOCOL_VERSION;
 use anyhow::{anyhow, Result};
 use send_wrapper::SendWrapper;
 use std::sync::{
@@ -13,6 +14,9 @@ use wasm_bindgen::{prelude::*, JsCast};
 use web_sys::{window, IdbDatabase, IdbFactory, IdbOpenDbRequest, IdbVersionChangeEvent};
 
 use crate::util::{cb_future::CBFuture, cb_race::CBRace, require::WBGRequire};
+
+/// Key of the storage protocol epoch record in the `_ankurah_meta` object store.
+const PROTOCOL_VERSION_KEY: &str = "protocol_version";
 
 #[derive(Debug, Clone)]
 pub struct Database(Arc<Inner>);
@@ -40,12 +44,88 @@ impl Database {
     pub async fn open(db_name: &str) -> Result<Self, RetrievalError> {
         let connection = Connection::open(db_name).await?;
 
-        Ok(Self(Arc::new(Inner {
+        let database = Self(Arc::new(Inner {
             connection: Arc::new(tokio::sync::Mutex::new(connection)),
             db_name: db_name.to_string(),
             // _callbacks: SendWrapper::new(Vec::new()), // Callbacks are now stored in Connection
             index_cache: SafeSet::new(),
-        })))
+        }));
+        database.check_protocol_version().await?;
+        Ok(database)
+    }
+
+    /// Check the storage protocol epoch record (`_ankurah_meta` store, key
+    /// `protocol_version`) against [`PROTOCOL_VERSION`], once per open:
+    /// - no record and no existing ankurah data: write the record and proceed
+    ///   (a fresh database created by [`Connection::open`] was already recorded
+    ///   inside its creation upgrade; this covers databases whose creation was
+    ///   interrupted before the record landed);
+    /// - record present and equal: proceed;
+    /// - record present and different: refuse;
+    /// - existing ankurah data but no record: refuse (a store from before the
+    ///   record existed).
+    ///
+    /// The refusal paths write nothing.
+    async fn check_protocol_version(&self) -> Result<(), RetrievalError> {
+        let mut connection = self.0.connection.lock().await;
+
+        // A database from before the `_ankurah_meta` store existed carries no record at
+        // all: with ankurah data present that is a pre-versioning (0.9.x or older) store (refuse before
+        // creating anything); an empty one gets the store via a versioned
+        // upgrade and falls through to be recorded below.
+        if !connection.db.object_store_names().contains("_ankurah_meta") {
+            if has_ankurah_data(&connection.db).await? {
+                return Err(self.protocol_version_error(None));
+            }
+            let current_version = connection.version();
+            connection.close();
+            *connection = Connection::open_with_meta_store(&self.0.db_name, current_version + 1).await?;
+        }
+
+        let db = connection.db.clone();
+        SendWrapper::new(async move {
+            let transaction = db.transaction_with_str("_ankurah_meta").require("create meta transaction")?;
+            let store = transaction.object_store("_ankurah_meta").require("get meta store")?;
+            let request = store.get(&JsValue::from_str(PROTOCOL_VERSION_KEY)).require("get protocol_version")?;
+            CBFuture::new(&request, "success", "error").await.require("await protocol_version get")?;
+            let found = request.result().require("protocol_version result")?;
+
+            if found.is_undefined() || found.is_null() {
+                // No record. Existing ankurah data makes this a pre-versioning (0.9.x or older) store;
+                // an empty database is recorded here and proceeds.
+                if has_ankurah_data(&db).await? {
+                    return Err(self.protocol_version_error(None));
+                }
+                write_protocol_version(&db).await?;
+                return Ok(());
+            }
+
+            match found.as_f64() {
+                Some(version) if version == f64::from(PROTOCOL_VERSION) => Ok(()),
+                _ => Err(self.protocol_version_error(Some(found))),
+            }
+        })
+        .await
+    }
+
+    /// The refusal for a protocol-version mismatch. `found` is the raw stored
+    /// record; `None` means the database carries ankurah data but no record at
+    /// all (a store from before protocol versioning).
+    fn protocol_version_error(&self, found: Option<JsValue>) -> RetrievalError {
+        let found = match found {
+            None => "no recorded protocol version (a store from before protocol versioning)".to_string(),
+            Some(value) => match value.as_f64() {
+                Some(version) => format!("protocol version {}", version),
+                None => format!("an unreadable protocol version record ({:?})", value),
+            },
+        };
+        RetrievalError::StorageError(
+            format!(
+                "IndexedDB database {:?} carries {}, but this build requires protocol version {}; reset your dev database (delete the IndexedDB database, e.g. via IndexedDBStorageEngine::cleanup) to proceed",
+                self.0.db_name, found, PROTOCOL_VERSION
+            )
+            .into(),
+        )
     }
 
     /// Get a clone of the current database connection; lazily re-open if stale
@@ -62,7 +142,7 @@ impl Database {
     pub async fn close(&self) { self.0.connection.lock().await.close(); }
 
     /// Ensure an index exists, creating it if necessary via database version upgrade
-    pub async fn assure_index_exists(&self, index_spec: &KeySpec) -> Result<(), RetrievalError> {
+    pub async fn assure_index_exists(&self, index_spec: &KeySpec<String>) -> Result<(), RetrievalError> {
         let name = index_spec.name_with("", "__");
         if self.0.index_cache.contains(&name) {
             return Ok(());
@@ -113,15 +193,61 @@ impl Database {
     }
 }
 
+/// Whether any ankurah object store (beyond `_ankurah_meta`) already holds content:
+/// the engine-natural detection of an existing database, distinguishing a
+/// fresh store (record and proceed) from one predating the version record
+/// (refuse).
+async fn has_ankurah_data(db: &IdbDatabase) -> Result<bool, RetrievalError> {
+    let db = SendWrapper::new(db);
+    SendWrapper::new(async move {
+        for store_name in ["entities", "materializations", "events", "entity_models", "property_columns", "model_registrations"] {
+            if !db.object_store_names().contains(store_name) {
+                continue;
+            }
+            let transaction = db.transaction_with_str(store_name).require("create count transaction")?;
+            let store = transaction.object_store(store_name).require("get store for count")?;
+            let request = store.count().require("count store")?;
+            CBFuture::new(&request, "success", "error").await.require("await count")?;
+            if request.result().require("count result")?.as_f64().unwrap_or(0.0) > 0.0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    })
+    .await
+}
+
+/// Write the [`PROTOCOL_VERSION`] record into the `_ankurah_meta` store. Only ever
+/// called on a database with no record and no ankurah data; fresh databases
+/// are recorded inside their creation upgrade transaction instead.
+async fn write_protocol_version(db: &IdbDatabase) -> Result<(), RetrievalError> {
+    let db = SendWrapper::new(db);
+    SendWrapper::new(async move {
+        let transaction = db
+            .transaction_with_str_and_mode("_ankurah_meta", web_sys::IdbTransactionMode::Readwrite)
+            .require("create meta write transaction")?;
+        let store = transaction.object_store("_ankurah_meta").require("get meta store")?;
+        let request = store
+            .put_with_key(&JsValue::from(PROTOCOL_VERSION), &JsValue::from_str(PROTOCOL_VERSION_KEY))
+            .require("record protocol_version")?;
+        CBFuture::new(&request, "success", "error").await.require("await protocol_version put")?;
+        CBFuture::new(&transaction, "complete", "error").await.require("complete meta write transaction")?;
+        Ok(())
+    })
+    .await
+}
+
 impl Connection {
     pub fn is_stale(&self) -> bool { self.stale.load(Ordering::SeqCst) }
 
     pub fn version(&self) -> u32 { self.db.version() as u32 }
 
-    /// Check whether the `entities` store already has an index with the given name
+    /// Check whether the model-materialization store already has an index with
+    /// the given name.
     pub fn has_index(&self, index_name: &str) -> Result<bool, RetrievalError> {
-        let tx = self.db.transaction_with_str_and_mode("entities", web_sys::IdbTransactionMode::Readonly).require("get transaction")?;
-        let store = tx.object_store("entities").require("get object store")?;
+        let tx =
+            self.db.transaction_with_str_and_mode("materializations", web_sys::IdbTransactionMode::Readonly).require("get transaction")?;
+        let store = tx.object_store("materializations").require("get object store")?;
         Ok(store.index_names().contains(index_name))
     }
 
@@ -145,13 +271,56 @@ impl Connection {
 
             if let Err(_) = transaction.object_store("entities") {
                 let db: IdbDatabase = transaction.db();
-                let store = db.create_object_store("entities").require("create entities store")?;
+                db.create_object_store("entities").require("create entities store")?;
 
-                let key_path = js_sys::Array::of2(&"__collection".into(), &"id".into());
-                store.create_index_with_str_sequence("__collection__id", &key_path).require("create collection index")?;
+                let materializations = db.create_object_store("materializations").require("create materializations store")?;
+                let key_path = js_sys::Array::of2(&"__materialization".into(), &"id".into());
+                materializations
+                    .create_index_with_str_sequence("__materialization__id", &key_path)
+                    .require("create materialization index")?;
 
                 let events_store = db.create_object_store("events").require("create events store")?;
                 events_store.create_index_with_str("by_entity_id", "__entity_id").require("create entity_id index")?;
+                db.create_object_store("entity_models").require("create entity-model association store")?;
+
+                // Engine-owned durable id-to-field map. Out-of-line string keys
+                // `{serialized model id}\0{serialized property id}` -> assigned
+                // field name.
+                // Created here alongside the canonical and materialization
+                // stores on the fresh
+                // database; the clean-start assumption is ratified, so no
+                // versioned migration (and thus no DB version bump) is needed
+                // for pre-existing databases.
+                db.create_object_store("property_columns").require("create property_columns store")?;
+                db.create_object_store("model_registrations").require("create model registrations store")?;
+
+                // Storage protocol epoch record: `_ankurah_meta` carries
+                // `protocol_version` = PROTOCOL_VERSION, written inside the
+                // creation upgrade transaction so a fresh database is recorded
+                // atomically with its stores; `Database::open` checks the record
+                // on every open.
+                let meta_store = db.create_object_store("_ankurah_meta").require("create meta store")?;
+                meta_store
+                    .put_with_key(&JsValue::from(PROTOCOL_VERSION), &JsValue::from_str(PROTOCOL_VERSION_KEY))
+                    .require("record protocol_version")?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Open the database at a bumped version, creating the empty
+    /// `_ankurah_meta` store. This is the upgrade path for a database created
+    /// before the store existed. It is only reachable when the database holds
+    /// no ankurah data: a data-bearing store without a record is refused
+    /// before this runs, and the caller records the version immediately after.
+    pub async fn open_with_meta_store(db_name: &str, version: u32) -> Result<Self, RetrievalError> {
+        notice_info!("creating meta store for {db_name}");
+        Self::new(db_name, Some(version), move |event: IdbVersionChangeEvent| -> Result<(), RetrievalError> {
+            let open_request: IdbOpenDbRequest = event.target().require("get event target")?.unchecked_into();
+            let transaction = open_request.transaction().require("get upgrade transaction")?;
+            if transaction.object_store("_ankurah_meta").is_err() {
+                transaction.db().create_object_store("_ankurah_meta").require("create meta store")?;
             }
             Ok(())
         })
@@ -159,14 +328,14 @@ impl Connection {
     }
 
     /// Open database connection with a specific index to be created
-    pub async fn open_with_index(db_name: &str, version: u32, index_spec: KeySpec) -> Result<Self, RetrievalError> {
+    pub async fn open_with_index(db_name: &str, version: u32, index_spec: KeySpec<String>) -> Result<Self, RetrievalError> {
         let index_name = index_spec.name_with("", "__");
-        notice_info!("creating index {db_name}.entities.{index_name} -> {:?}", index_spec.keyparts);
+        notice_info!("creating index {db_name}.materializations.{index_name} -> {:?}", index_spec.keyparts);
 
         Self::new(db_name, Some(version), move |event: IdbVersionChangeEvent| -> Result<(), RetrievalError> {
             let open_request: IdbOpenDbRequest = event.target().require("get event target")?.unchecked_into();
             let transaction = open_request.transaction().require("get upgrade transaction")?;
-            let store = transaction.object_store("entities").require("get entities store during upgrade")?;
+            let store = transaction.object_store("materializations").require("get materializations store during upgrade")?;
             // Use full_path() to support JSON sub-paths (e.g., "context.session_id")
             let key_path: Vec<JsValue> = index_spec.keyparts.iter().map(|kp| kp.full_path().into()).collect();
             store.create_index_with_str_sequence(&index_name, &key_path.into()).require("create index")?;

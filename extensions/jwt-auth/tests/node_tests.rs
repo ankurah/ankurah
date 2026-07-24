@@ -1,8 +1,9 @@
 mod common;
 
 use ankurah::{Model, Node, Ref};
+use ankurah_core::error::MutationError;
 use ankurah_core::model::Mutable;
-use ankurah_core::policy::PolicyAgent;
+use ankurah_core::policy::{AccessDenied, PolicyAgent};
 use ankurah_jwt_auth::{JwtAgent, JwtClaims, JwtContext, JwtKeys, PolicyConfig};
 use ankurah_proto::{Clock, Event, OperationSet};
 use ankurah_storage_sled::SledStorageEngine;
@@ -63,14 +64,29 @@ async fn test_jwt_agent_reader_cannot_write_post() -> anyhow::Result<()> {
     let node = Node::new_durable(Arc::new(storage), agent);
     node.system.create().await?;
 
+    // Register through a privileged context first. Otherwise the Reader's
+    // create can fail at the schema-definition gate without ever exercising
+    // the post collection's write policy.
+    let post_model = node.context(JwtContext::system())?.register::<Post>().await?;
+
     let claims = make_claims("reader-1", &["Reader"], "reader@blog.com");
     let token = sign_token(&keys, &claims);
     let ctx = JwtContext::from_claims(claims, token);
     let context = node.context(ctx)?;
 
     let trx = context.begin();
-    let result = trx.create(&Post { title: "Sneaky Post".into(), body: "Should fail".into() }).await;
-    assert!(result.is_err(), "Reader should not be able to create a post");
+    let error = match trx.create(&Post { title: "Sneaky Post".into(), body: "Should fail".into() }).await {
+        Ok(_) => panic!("Reader should not be able to create a post"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(
+            error,
+            MutationError::AccessDenied(AccessDenied::CollectionDenied(ref collection))
+                if *collection == post_model
+        ),
+        "expected the post write-policy denial, got: {error:?}"
+    );
 
     Ok(())
 }
@@ -102,6 +118,11 @@ async fn test_write_scope_allows_matching_ref_and_denies_other_ref() -> anyhow::
     node.system.create().await?;
 
     let root = node.context(JwtContext::system())?;
+    // Schema definition is the ADMIN's act (rev 4: registration is
+    // policy-gated, and this config grants the writer role no catalog
+    // privileges): the system context registers the collection; the scoped
+    // writer below only writes data into it.
+    root.register::<ScopedRecord>().await?;
     let (allowed_account_id, denied_account_id) = {
         let trx = root.begin();
         let allowed_account = trx.create(&Account { name: "Allowed".into() }).await?;
@@ -230,7 +251,6 @@ async fn test_update_scope_requires_before_and_after_state() -> anyhow::Result<(
 
     let retag_event = Event {
         entity_id: denied_record.id(),
-        collection: denied_record.collection().clone(),
         operations: OperationSet(BTreeMap::new()),
         parent: Clock::new(denied_record.head().to_vec()),
     };
@@ -323,7 +343,8 @@ async fn test_jwtpolicy_collection_always_accessible() -> anyhow::Result<()> {
     let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path())?;
 
-    let collection = ankurah_proto::CollectionId::from("jwtpolicy");
+    let models = common::policy_models(&agent, &["jwtpolicy"]);
+    let collection = models.id("jwtpolicy");
 
     let claims = make_claims("reader-1", &["Reader"], "reader@blog.com");
     let token = sign_token(&keys, &claims);
@@ -341,7 +362,8 @@ async fn test_jwt_agent_collection_access_denied() -> anyhow::Result<()> {
     let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path())?;
 
-    let collection = ankurah_proto::CollectionId::from("post");
+    let models = common::policy_models(&agent, &["post"]);
+    let collection = models.id("post");
 
     let claims = make_claims("reader-1", &["Reader"], "reader@blog.com");
     let token = sign_token(&keys, &claims);
@@ -384,8 +406,9 @@ async fn test_root_bypasses_collection_access() -> anyhow::Result<()> {
     use ankurah_core::policy::PolicyAgent;
     let root = JwtContext::system();
 
-    let post = ankurah_proto::CollectionId::from("post");
-    let secret = ankurah_proto::CollectionId::from("secret_stuff");
+    let models = common::policy_models(&agent, &["post", "secret_stuff"]);
+    let post = models.id("post");
+    let secret = models.id("secret_stuff");
     assert!(agent.can_access_collection(&root, &post).is_ok());
     assert!(agent.can_access_collection(&root, &secret).is_ok());
 
