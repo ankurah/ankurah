@@ -40,7 +40,7 @@ use ankurah_tests::sim::{body, coherence, run_recording, FaultConfig, Field, Loc
 ///
 /// Each edit wave is drained with `settle()` before the next. A live ephemeral
 /// subscriber receives each committed change as a relayed `SubscriptionUpdate`
-/// whose outbound batching uses a real timer (`client_relay.rs` `ready_chunks`);
+/// whose outbound batching uses a real timer (`relay.rs` `ready_chunks`);
 /// piling several undrained edits into one faulted barrier lets that relay
 /// traffic accumulate against the timer and stalls the drain in wall-clock time
 /// (the same real-timer class as issue #321). Draining each wave keeps the run

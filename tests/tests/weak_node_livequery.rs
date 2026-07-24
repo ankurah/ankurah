@@ -1,8 +1,8 @@
 mod common;
 use ankurah::core::livequery::EntityLiveQuery;
 use ankurah::core::node::MatchArgs;
-use ankurah::proto::CollectionId;
 use ankurah::{policy::DEFAULT_CONTEXT, Node, PermissiveAgent};
+use ankurah::{EntityId, ModelId};
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
 use std::sync::Arc;
@@ -14,7 +14,7 @@ async fn test_weak_node_livequery_does_not_keep_node_alive() -> Result<()> {
     node.system.create().await?;
 
     // Create a LiveQuery with a weak node binding
-    let collection_id = CollectionId::fixed_name("pet");
+    let collection_id = ModelId::EntityId(EntityId::new());
     let args: MatchArgs = "true".try_into()?;
     let weak_lq = EntityLiveQuery::new_weak_node(&node, collection_id, args, DEFAULT_CONTEXT)?;
 
@@ -36,7 +36,7 @@ async fn test_weak_node_livequery_does_not_keep_node_alive() -> Result<()> {
     let weak_node = node2.weak();
 
     let args2: MatchArgs = "true".try_into()?;
-    let weak_lq2 = EntityLiveQuery::new_weak_node(&node2, CollectionId::fixed_name("pet"), args2, DEFAULT_CONTEXT)?;
+    let weak_lq2 = EntityLiveQuery::new_weak_node(&node2, ModelId::EntityId(EntityId::new()), args2, DEFAULT_CONTEXT)?;
 
     // Node should be alive while we hold it
     assert!(weak_node.upgrade().is_some(), "Node should be alive");
@@ -57,7 +57,7 @@ async fn test_entity_livequery_keeps_node_alive() -> Result<()> {
     node.system.create().await?;
 
     // Create a regular EntityLiveQuery
-    let collection_id = CollectionId::fixed_name("pet");
+    let collection_id = ModelId::EntityId(EntityId::new());
     let args: MatchArgs = "true".try_into()?;
     let lq = EntityLiveQuery::new(&node, collection_id, args, DEFAULT_CONTEXT)?;
 

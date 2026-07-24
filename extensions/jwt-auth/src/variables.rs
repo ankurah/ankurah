@@ -1,4 +1,4 @@
-use ankql::ast::{Expr, Literal, Predicate};
+use ankql::ast::{Expr, Predicate, Value};
 use ankurah_core::policy::AccessDenied;
 use ankurah_proto::EntityId;
 
@@ -24,7 +24,7 @@ fn resolve_variable<'a>(var: &str, claims: &'a JwtClaims) -> Result<String, Acce
 
 /// Convert a resolved claim value into a typed literal expression.
 ///
-/// Values that parse as base64 EntityIds become `Literal::EntityId` so that
+/// Values that parse as base64 EntityIds become `Value::EntityId` so that
 /// comparisons against Ref fields collate identically to the stored property
 /// values in the reactor's watcher index — string literals collate as text
 /// there and never match commit-time lookups (ankurah#259). Everything else
@@ -38,7 +38,7 @@ fn resolve_variable<'a>(var: &str, claims: &'a JwtClaims) -> Result<String, Acce
 fn typed_expr(value: String) -> Expr {
     match EntityId::from_base64(&value) {
         Ok(id) => Expr::from(&id),
-        Err(_) => Expr::Literal(Literal::String(value)),
+        Err(_) => Expr::Literal(Value::String(value)),
     }
 }
 
@@ -111,7 +111,7 @@ mod tests {
     }
 
     /// Extract the right-hand literal of a single comparison predicate.
-    fn rhs_literal(predicate: &Predicate) -> &Literal {
+    fn rhs_literal(predicate: &Predicate) -> &Value {
         match predicate {
             Predicate::Comparison { right, .. } => match right.as_ref() {
                 Expr::Literal(lit) => lit,
@@ -125,21 +125,21 @@ mod tests {
     fn test_substitute_jwt_sub() {
         let claims = test_claims("user123");
         let result = parse_and_substitute("author = $jwt.sub", &claims).unwrap();
-        assert_eq!(rhs_literal(&result), &Literal::String("user123".to_string()));
+        assert_eq!(rhs_literal(&result), &Value::String("user123".to_string()));
     }
 
     #[test]
     fn test_substitute_jwt_email() {
         let claims = test_claims("user123");
         let result = parse_and_substitute("contact = $jwt.email", &claims).unwrap();
-        assert_eq!(rhs_literal(&result), &Literal::String("test@example.com".to_string()));
+        assert_eq!(rhs_literal(&result), &Value::String("test@example.com".to_string()));
     }
 
     #[test]
     fn test_substitute_jwt_custom() {
         let claims = test_claims_with_custom("user123", "field_office", "NYC");
         let result = parse_and_substitute("office = $jwt.custom.field_office", &claims).unwrap();
-        assert_eq!(rhs_literal(&result), &Literal::String("NYC".to_string()));
+        assert_eq!(rhs_literal(&result), &Value::String("NYC".to_string()));
     }
 
     #[test]
@@ -160,7 +160,7 @@ mod tests {
     fn test_substitute_jwt_name() {
         let claims = test_claims("user123");
         let result = parse_and_substitute("author_name = $jwt.name", &claims).unwrap();
-        assert_eq!(rhs_literal(&result), &Literal::String("Test User".to_string()));
+        assert_eq!(rhs_literal(&result), &Value::String("Test User".to_string()));
     }
 
     #[test]
@@ -176,7 +176,7 @@ mod tests {
         // Values with hyphens, underscores, and @ are common in user IDs
         let claims = test_claims("user-123_test@example.com");
         let result = parse_and_substitute("author = $jwt.sub", &claims).unwrap();
-        assert_eq!(rhs_literal(&result), &Literal::String("user-123_test@example.com".to_string()));
+        assert_eq!(rhs_literal(&result), &Value::String("user-123_test@example.com".to_string()));
     }
 
     #[test]
@@ -186,7 +186,7 @@ mod tests {
         let payload = "'; DROP TABLE posts; --";
         let claims = test_claims(payload);
         let result = parse_and_substitute("author = $jwt.sub", &claims).unwrap();
-        assert_eq!(rhs_literal(&result), &Literal::String(payload.to_string()));
+        assert_eq!(rhs_literal(&result), &Value::String(payload.to_string()));
     }
 
     #[test]
@@ -197,7 +197,7 @@ mod tests {
         let mut claims = test_claims("user123");
         claims.name = Some("Miles O'Brien".to_string());
         let result = parse_and_substitute("author_name = $jwt.name", &claims).unwrap();
-        assert_eq!(rhs_literal(&result), &Literal::String("Miles O'Brien".to_string()));
+        assert_eq!(rhs_literal(&result), &Value::String("Miles O'Brien".to_string()));
     }
 
     #[test]
@@ -207,7 +207,7 @@ mod tests {
         let id = ankurah_proto::EntityId::new();
         let claims = test_claims(&id.to_base64());
         let result = parse_and_substitute("owner = $jwt.sub", &claims).unwrap();
-        assert_eq!(rhs_literal(&result), &Literal::EntityId(id.to_ulid()));
+        assert_eq!(rhs_literal(&result), &Value::EntityId(id));
     }
 
     #[test]
@@ -216,7 +216,7 @@ mod tests {
         // placeholder/value count mismatch must be rejected.
         let claims = test_claims("user123");
         let result = parse_and_substitute("author = $jwt.sub AND status = ?", &claims);
-        assert!(result.is_err(), "Literal placeholder in filter must fail-closed");
+        assert!(result.is_err(), "Value placeholder in filter must fail-closed");
     }
 
     #[test]

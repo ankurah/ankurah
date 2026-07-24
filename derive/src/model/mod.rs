@@ -3,6 +3,7 @@ pub(crate) mod backend_registry;
 pub(crate) mod description;
 pub(crate) mod model;
 pub(crate) mod mutable;
+pub(crate) mod schema;
 #[cfg(all(feature = "uniffi", not(feature = "wasm")))]
 pub(crate) mod uniffi;
 pub(crate) mod view;

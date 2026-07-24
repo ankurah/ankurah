@@ -12,9 +12,12 @@
 
 use std::sync::Arc;
 
-use ankurah::core::storage::StorageEngine;
-use ankurah::proto::{self, Attested};
-use ankurah::{policy::DEFAULT_CONTEXT as c, Model, Node, PermissiveAgent, View};
+use ankurah::core::{
+    property::backend::{PropertyBackend, YrsBackend},
+    storage::StorageEngine,
+};
+use ankurah::proto::{self, Attested, Membership, Operation};
+use ankurah::{policy::DEFAULT_CONTEXT as c, ModelId, Node, PermissiveAgent, View};
 use ankurah_connector_local_process::LocalProcessConnection;
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
@@ -31,31 +34,51 @@ type CrashNode = Node<CrashStorageEngine<SledStorageEngine>, PermissiveAgent>;
 /// Build a durable node on a real on-disk sled directory wrapped in the
 /// crash-injecting engine, create the system, then arm the crash hook so
 /// subsequent operation counts start from zero (bootstrap writes are excluded).
-async fn armed_child_node(crash: CrashPoint) -> Result<(CrashNode, Arc<CrashStorageEngine<SledStorageEngine>>)> {
+async fn armed_child_node(crash: CrashPoint) -> Result<(CrashNode, Arc<CrashStorageEngine<SledStorageEngine>>, ModelId)> {
     let dir = child_sled_dir().expect("child must have a sled dir");
     let sled = Arc::new(SledStorageEngine::with_path(dir)?);
     let engine = Arc::new(CrashStorageEngine::new(sled, Some(crash)));
     let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
     node.system.create().await?;
+    // Rev 4 (RFC 5.2 in specs/model-property-metadata/rfc.md): a local create auto-registers its model, and the
+    // registration executor persists the catalog entities' state first --
+    // which would consume `BeforeCommitBatch(0)` before the workload's own
+    // write. Register the scenario model as setup so the crash point counts
+    // only the workload under test.
+    let model = node.context(c)?.register::<Album>().await?;
     // Bootstrap complete: from here on, operations are the workload under test.
     engine.arm();
-    Ok((node, engine))
+    Ok((node, engine, model))
 }
 
-/// Generate `n` independent album creation events using a throwaway in-memory
-/// durable node. Each album is a distinct entity, so each event is a creation
-/// event (empty parent). Returned in commit order as attested events, ready to
-/// feed to `commit_remote_transaction` on the node under test.
-async fn generate_creation_batch(n: usize) -> Result<Vec<Attested<proto::Event>>> {
-    let helper = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
-    helper.system.create().await?;
-    let ctx = helper.context(c)?;
-    let trx = ctx.begin();
+/// Generate `n` independent Album creation events against the receiving
+/// node's registered identities without writing them to that node.
+///
+/// A throwaway node would allocate a different `ModelId` and different
+/// property ids; explicit genesis membership makes such events correctly
+/// inadmissible to this node. Constructing the opaque Yrs diff through the
+/// production backend preserves the real event shape while keeping the crash
+/// workload's first durable action inside `commit_remote_transaction`.
+fn generate_creation_batch(node: &CrashNode, model: ModelId, n: usize) -> Result<Vec<Attested<proto::Event>>> {
+    let resolver = node.catalog.resolver();
+    let name = resolver
+        .resolve_model_property(&model, "name")?
+        .ok_or_else(|| anyhow::anyhow!("Album.name is absent from the registered catalog"))?;
+    let year = resolver
+        .resolve_model_property(&model, "year")?
+        .ok_or_else(|| anyhow::anyhow!("Album.year is absent from the registered catalog"))?;
+
+    let mut events = Vec::with_capacity(n);
     for i in 0..n {
-        trx.create(&Album { name: format!("Batch {i}"), year: format!("20{i:02}") }).await?;
+        let backend = YrsBackend::new();
+        backend.insert(&name, 0, &format!("Batch {i}"))?;
+        backend.insert(&year, 0, &format!("20{i:02}"))?;
+        let operations = backend.to_operations()?.expect("non-empty Album values must produce a Yrs operation");
+        let mut operations = proto::OperationSet::from_backends(std::collections::BTreeMap::from([("yrs".to_owned(), operations)]));
+        operations.push(Operation::Membership(Membership::Add(model)));
+        events.push(Attested::from(proto::Event { entity_id: ankurah::EntityId::new(), operations, parent: proto::Clock::default() }));
     }
-    let events = trx.commit_and_return_events().await?;
-    Ok(events.into_iter().map(Attested::from).collect())
+    Ok(events)
 }
 
 /// Re-deliver a set of attested events to a node through the real ingest path
@@ -63,27 +86,28 @@ async fn generate_creation_batch(n: usize) -> Result<Vec<Attested<proto::Event>>
 /// peer that sent the batch re-sends it" for the reconvergence invariant.
 /// Generic over the storage engine so it works on both the crash-wrapped child
 /// node and the plain reopened node.
-async fn redeliver<SE>(node: &Node<SE, PermissiveAgent>, events: Vec<Attested<proto::Event>>) -> Result<()>
+async fn redeliver<SE>(node: &Node<SE, PermissiveAgent>, _model: &ModelId, events: Vec<Attested<proto::Event>>) -> Result<()>
 where SE: StorageEngine + Send + Sync + 'static {
     node.commit_remote_transaction(&c, proto::TransactionId::new(), events).await?;
     Ok(())
 }
 
 // ============================================================================
-// SCENARIO 1: crash after commit_event, before set_state
+// SCENARIO 1: crash after append_events, before commit_batch
 // ============================================================================
 
 /// Child for scenario 1. Creates one album and commits. The crash hook aborts
-/// just before the first `set_state`, i.e. after the creation event has been
-/// committed to storage but before any entity state is written. This is the
+/// just before the first `commit_batch`, after the creation event has been
+/// appended but before any entity state is written. This is the
 /// legal orphaned-event window.
 #[tokio::test]
-async fn child_commit_event_before_set_state() -> Result<()> {
+async fn child_event_append_before_state_batch() -> Result<()> {
     let Some(crash) = child_crash_point() else {
         return Ok(()); // inert when run normally in the parent binary
     };
-    let (node, _engine) = armed_child_node(crash).await?;
+    let (node, _engine, model) = armed_child_node(crash).await?;
     let ctx = node.context(c)?;
+    handoff_write("model", &model.as_entity_id().expect("Album is catalog allocated").to_base64())?;
 
     let trx = ctx.begin();
     let album = trx.create(&Album { name: "Crash One".to_owned(), year: "2001".to_owned() }).await?;
@@ -95,34 +119,33 @@ async fn child_commit_event_before_set_state() -> Result<()> {
     trx.commit().await?;
 
     // Unreachable: the crash hook must have aborted during commit.
-    panic!("scenario 1 child did not crash: set_state was not intercepted");
+    panic!("scenario 1 child did not crash: commit_batch was not intercepted");
 }
 
-/// SCENARIO 1 INVARIANT: a crash in the window after `commit_event` and before
-/// `set_state` leaves at most an orphaned event and NEVER a state that
+/// SCENARIO 1 INVARIANT: a crash after `append_events` and before
+/// `commit_batch` leaves at most an orphaned event and NEVER a state that
 /// references a missing event. After reopen, the album either has no persisted
 /// state at all (the legal outcome for this window), and whatever events are
 /// present are harmless orphans.
 #[tokio::test]
-async fn scenario_1_commit_event_before_set_state() -> Result<()> {
+async fn scenario_1_event_append_before_state_batch() -> Result<()> {
     let dir = fresh_sled_dir("s1");
-    let outcome = spawn_crash_child("scenarios::child_commit_event_before_set_state", &dir, CrashPoint::BeforeSetState(0))?;
+    let outcome = spawn_crash_child("scenarios::child_event_append_before_state_batch", &dir, CrashPoint::BeforeCommitBatch(0))?;
     assert!(outcome.crashed(), "child was expected to abort; stdout=\n{}\nstderr=\n{}", outcome.stdout, outcome.stderr);
 
     let entity_id = outcome.entity_id("entity").expect("child must record the entity id before crashing");
 
     // Reopen the surviving sled directory through the production opener.
     let engine = reopen_sled(&dir)?;
-    let collection = engine.collection(&Album::collection()).await?;
 
     // The core invariant: no persisted state references a missing event.
-    assert_state_heads_resolvable(&collection, &[entity_id]).await?;
+    assert_state_heads_resolvable(&engine, &[entity_id]).await?;
 
     // For this specific window, the state write never started, so there must be
     // no persisted state for the album at all.
     assert!(
-        !has_persisted_state(&collection, entity_id).await?,
-        "scenario 1: album state must NOT be persisted when the crash preceded set_state"
+        !has_persisted_state(&engine, entity_id).await?,
+        "scenario 1: album state must NOT be persisted when the crash preceded commit_batch"
     );
 
     cleanup(&dir);
@@ -130,48 +153,45 @@ async fn scenario_1_commit_event_before_set_state() -> Result<()> {
 }
 
 // ============================================================================
-// SCENARIO 2: mid-batch crash (some events committed, crash before the rest)
+// SCENARIO 2: multi-entity events durable, atomic state batch not started
 // ============================================================================
 
-/// Number of entities in the mid-batch. The crash targets add_event #2, so
-/// entities 0 and 1 complete fully (event + state) and entity 2 onward never
-/// begins.
+/// Number of entities in the multi-entity batch.
 const S2_BATCH: usize = 3;
-const S2_CRASH_AT: usize = 2;
 
 /// Child for scenario 2. Receives a multi-entity transaction through the real
-/// ingest path (`commit_remote_transaction`), which commits each event then
-/// writes its state, one entity at a time. The crash aborts just before the
-/// third `add_event`, so the first two entities are fully durable and the rest
-/// are absent. The full batch is handed off so the parent can re-deliver it.
+/// ingest path (`commit_remote_transaction`). Its complete event set is
+/// appended atomically, then the crash aborts before the complete prepared
+/// state batch. The full event batch is handed off so the parent can
+/// re-deliver it.
 #[tokio::test]
 async fn child_mid_batch() -> Result<()> {
     let Some(crash) = child_crash_point() else {
         return Ok(());
     };
-    let (node, _engine) = armed_child_node(crash).await?;
-
-    let events = generate_creation_batch(S2_BATCH).await?;
+    let (node, _engine, model) = armed_child_node(crash).await?;
+    let model_entity = *model.as_entity_id().expect("Album is a catalog-allocated model");
+    handoff_write("model", &model_entity.to_base64())?;
+    let events = generate_creation_batch(&node, model, S2_BATCH)?;
     // Record every entity id (in batch order) and the full events for re-delivery.
     for e in &events {
         handoff_write("entity", &e.payload.entity_id.to_base64())?;
         handoff_write_event("event", e)?;
     }
 
-    node.commit_remote_transaction(&c, proto::TransactionId::new(), events).await?;
+    node.commit_remote_transaction(&c, proto::TransactionId::new(), events.clone()).await?;
 
-    panic!("scenario 2 child did not crash: add_event #{S2_CRASH_AT} was not intercepted");
+    panic!("scenario 2 child did not crash: commit_batch was not intercepted");
 }
 
-/// SCENARIO 2 INVARIANT: a crash partway through a received batch leaves the
-/// already-committed entities intact (event present, state resolvable) and the
-/// not-yet-reached entities entirely absent, with no persisted state ever
-/// referencing an uncommitted event. After reopen, re-delivering the full batch
-/// (the sender resending) converges the node to the complete set.
+/// SCENARIO 2 INVARIANT: a crash between the atomic event append and atomic
+/// state batch leaves every event as an orphan and no entity state. No partial
+/// entity subset becomes visible. Re-delivering the full batch converges the
+/// node to the complete set.
 #[tokio::test]
 async fn scenario_2_mid_batch() -> Result<()> {
     let dir = fresh_sled_dir("s2");
-    let outcome = spawn_crash_child("scenarios::child_mid_batch", &dir, CrashPoint::BeforeAddEvent(S2_CRASH_AT))?;
+    let outcome = spawn_crash_child("scenarios::child_mid_batch", &dir, CrashPoint::BeforeCommitBatch(0))?;
     assert!(outcome.crashed(), "child was expected to abort; stdout=\n{}\nstderr=\n{}", outcome.stdout, outcome.stderr);
 
     let entity_ids =
@@ -181,25 +201,21 @@ async fn scenario_2_mid_batch() -> Result<()> {
     let events = outcome.events("event");
     assert_eq!(events.len(), S2_BATCH, "expected all batch events recorded");
 
-    // Reopen and verify partial-batch durability against the invariant.
+    // Reopen and verify event-first durability against the invariant. A bare
+    // reopened engine addresses the same materialization by the exact
+    // model identity recorded by the child.
     let engine = reopen_sled(&dir)?;
-    let collection = engine.collection(&Album::collection()).await?;
+    let model = ModelId::EntityId(outcome.entity_id("model").expect("child must record the model id"));
 
     // Global invariant: nothing persisted references a missing event.
-    assert_state_heads_resolvable(&collection, &entity_ids).await?;
+    assert_state_heads_resolvable(&engine, &entity_ids).await?;
 
-    // Entities before the crash point are fully durable; from the crash point on
-    // they are entirely absent (state AND event). The crash fired before
-    // add_event #S2_CRASH_AT, so entity index i < S2_CRASH_AT is complete.
+    // The complete event append committed, while the complete state batch did
+    // not start.
     for (i, id) in entity_ids.iter().enumerate() {
         let event_id = events[i].payload.id();
-        if i < S2_CRASH_AT {
-            assert!(has_persisted_state(&collection, *id).await?, "entity {i} committed before crash must have persisted state");
-            assert!(event_present(&collection, event_id).await?, "entity {i} committed before crash must have its event");
-        } else {
-            assert!(!has_persisted_state(&collection, *id).await?, "entity {i} at/after crash must have NO persisted state");
-            assert!(!event_present(&collection, event_id).await?, "entity {i} at/after crash must have NO event");
-        }
+        assert!(!has_persisted_state(&engine, *id).await?, "entity {i} must have no state before the atomic state batch");
+        assert!(event_present(&engine, event_id).await?, "entity {i}'s event must survive the completed atomic append");
     }
 
     // Reconvergence: reopen the node under test and re-deliver the whole batch,
@@ -207,16 +223,15 @@ async fn scenario_2_mid_batch() -> Result<()> {
     let node = Node::new_durable(Arc::new(engine), PermissiveAgent::new());
     // The system root persisted before the workload, so the reopened durable
     // node loads it and becomes ready on its own (no create/join). Awaiting a
-    // collection drives the async catalog load first.
-    let collection2 = node.system.collection(&Album::collection()).await?;
+    // Waiting for readiness drives the asynchronous persisted-system load.
     node.system.wait_system_ready().await;
     assert!(node.system.is_system_ready(), "reopened durable node must load its persisted system root");
-    redeliver(&node, events.clone()).await?;
+    redeliver(&node, &model, events.clone()).await?;
 
-    assert_state_heads_resolvable(&collection2, &entity_ids).await?;
+    assert_state_heads_resolvable(node.storage.as_ref(), &entity_ids).await?;
     for (i, id) in entity_ids.iter().enumerate() {
-        assert!(has_persisted_state(&collection2, *id).await?, "entity {i} must be present after re-delivery");
-        assert!(event_present(&collection2, events[i].payload.id()).await?, "entity {i} event must be present after re-delivery");
+        assert!(has_persisted_state(node.storage.as_ref(), *id).await?, "entity {i} must be present after re-delivery");
+        assert!(event_present(node.storage.as_ref(), events[i].payload.id()).await?, "entity {i} event must be present after re-delivery");
     }
 
     cleanup(&dir);
@@ -236,7 +251,7 @@ async fn scenario_2_mid_batch() -> Result<()> {
 ///
 /// PROBE: the archived hardening list (item 2) flags partial-layer application
 /// atomicity. The layered merge applies all layers under a single in-memory lock
-/// and then does exactly one `set_state`, so there is no storage operation
+/// and then does exactly one `commit_batch`, so there is no storage operation
 /// between layers to interrupt. This scenario asserts that property holds at the
 /// persistence boundary: after a mid-merge crash the persisted head is exactly
 /// the pre-merge head (resolvable), and C is at most an orphan event. If a
@@ -264,6 +279,10 @@ async fn child_mid_merge() -> Result<()> {
         id
     };
     handoff_write("entity", &album.to_base64())?;
+    // Parent-side bare-engine probes need Album's model id to reconstruct
+    // state envelopes (#330); the create above registered it.
+    let model = ctx.model_id::<Album>().await?;
+    handoff_write("model", &model.as_entity_id().expect("Album is a catalog-allocated model").to_base64())?;
 
     // B: first edit (parent A). Head becomes {B}.
     let a_view = ctx.get::<AlbumView>(album).await?;
@@ -279,13 +298,13 @@ async fn child_mid_merge() -> Result<()> {
 
     // C: concurrent edit, also parented on A (started from the same base as B by
     // taking a fresh transaction on the pre-B view snapshot). Committing C merges
-    // B and C. Arm the crash so the merged set_state aborts.
+    // B and C. Arm the crash so the merged commit_batch aborts.
     let t2 = ctx.begin();
     a_view.edit(&t2)?.year().overwrite(0, 4, "2099")?;
     engine.arm();
     t2.commit().await?;
 
-    panic!("scenario 3 child did not crash: merged set_state was not intercepted");
+    panic!("scenario 3 child did not crash: merged commit_batch was not intercepted");
 }
 
 /// SCENARIO 3 INVARIANT (partial-merge atomicity at the persistence boundary):
@@ -296,8 +315,8 @@ async fn child_mid_merge() -> Result<()> {
 #[tokio::test]
 async fn scenario_3_mid_merge() -> Result<()> {
     let dir = fresh_sled_dir("s3");
-    // The merge's set_state is the first armed set_state.
-    let outcome = spawn_crash_child("scenarios::child_mid_merge", &dir, CrashPoint::BeforeSetState(0))?;
+    // The merge's commit_batch is the first armed commit_batch.
+    let outcome = spawn_crash_child("scenarios::child_mid_merge", &dir, CrashPoint::BeforeCommitBatch(0))?;
     assert!(outcome.crashed(), "child was expected to abort; stdout=\n{}\nstderr=\n{}", outcome.stdout, outcome.stderr);
 
     let entity_id = outcome.entity_id("entity").expect("child must record the entity id");
@@ -305,16 +324,15 @@ async fn scenario_3_mid_merge() -> Result<()> {
     assert!(!pre_head.is_empty(), "child must record the pre-merge head");
 
     let engine = reopen_sled(&dir)?;
-    let collection = engine.collection(&Album::collection()).await?;
 
     // Invariant 1: no persisted state references a missing event.
-    assert_state_heads_resolvable(&collection, &[entity_id]).await?;
+    assert_state_heads_resolvable(&engine, &[entity_id]).await?;
 
     // Invariant 2: the persisted head is exactly the pre-merge head. A partial or
     // full merge would change the head; the crash preceded persisting the merged
     // state, so the durable head must still be the pre-merge one. This is the
     // probe result: partial-layer application never reaches storage.
-    let head = persisted_head(&collection, entity_id).await?.expect("entity state must be persisted (pre-merge state survived)");
+    let head = persisted_head(&engine, entity_id).await?.expect("entity state must be persisted (pre-merge state survived)");
     let head_set: std::collections::HashSet<_> = head.as_slice().iter().cloned().collect();
     assert_eq!(
         head_set, pre_head,
@@ -338,15 +356,16 @@ async fn child_entity_creation() -> Result<()> {
     let Some(crash) = child_crash_point() else {
         return Ok(());
     };
-    let (node, _engine) = armed_child_node(crash).await?;
-
-    let events = generate_creation_batch(1).await?;
+    let (node, _engine, model) = armed_child_node(crash).await?;
+    let model_entity = *model.as_entity_id().expect("Album is a catalog-allocated model");
+    handoff_write("model", &model_entity.to_base64())?;
+    let events = generate_creation_batch(&node, model, 1)?;
     handoff_write("entity", &events[0].payload.entity_id.to_base64())?;
     handoff_write_event("event", &events[0])?;
 
-    node.commit_remote_transaction(&c, proto::TransactionId::new(), events).await?;
+    node.commit_remote_transaction(&c, proto::TransactionId::new(), events.clone()).await?;
 
-    panic!("scenario 4 child did not crash: creation set_state was not intercepted");
+    panic!("scenario 4 child did not crash: creation commit_batch was not intercepted");
 }
 
 /// SCENARIO 4 INVARIANT: a crash after a creation event is committed but before
@@ -358,7 +377,7 @@ async fn child_entity_creation() -> Result<()> {
 #[tokio::test]
 async fn scenario_4_entity_creation() -> Result<()> {
     let dir = fresh_sled_dir("s4");
-    let outcome = spawn_crash_child("scenarios::child_entity_creation", &dir, CrashPoint::BeforeSetState(0))?;
+    let outcome = spawn_crash_child("scenarios::child_entity_creation", &dir, CrashPoint::BeforeCommitBatch(0))?;
     assert!(outcome.crashed(), "child was expected to abort; stdout=\n{}\nstderr=\n{}", outcome.stdout, outcome.stderr);
 
     let entity_id = outcome.entity_id("entity").expect("child must record the entity id");
@@ -366,25 +385,24 @@ async fn scenario_4_entity_creation() -> Result<()> {
     assert_eq!(events.len(), 1, "expected the creation event recorded");
 
     let engine = reopen_sled(&dir)?;
-    let collection = engine.collection(&Album::collection()).await?;
+    let model = ModelId::EntityId(outcome.entity_id("model").expect("child must record the model id"));
 
     // Invariant: no persisted state references a missing event. The state write
     // never started, so there must be no persisted state for the entity.
-    assert_state_heads_resolvable(&collection, &[entity_id]).await?;
+    assert_state_heads_resolvable(&engine, &[entity_id]).await?;
     assert!(
-        !has_persisted_state(&collection, entity_id).await?,
-        "scenario 4: entity state must NOT be persisted when the crash preceded set_state"
+        !has_persisted_state(&engine, entity_id).await?,
+        "scenario 4: entity state must NOT be persisted when the crash preceded commit_batch"
     );
 
     // Reconvergence via re-delivery of the identical creation event.
     let node = Node::new_durable(Arc::new(engine), PermissiveAgent::new());
-    let collection2 = node.system.collection(&Album::collection()).await?;
     node.system.wait_system_ready().await;
     assert!(node.system.is_system_ready(), "reopened durable node must be system-ready");
-    redeliver(&node, events.clone()).await?;
+    redeliver(&node, &model, events.clone()).await?;
 
-    assert_state_heads_resolvable(&collection2, &[entity_id]).await?;
-    assert!(has_persisted_state(&collection2, entity_id).await?, "entity must be present after re-delivery of the creation event");
+    assert_state_heads_resolvable(node.storage.as_ref(), &[entity_id]).await?;
+    assert!(has_persisted_state(node.storage.as_ref(), entity_id).await?, "entity must be present after re-delivery of the creation event");
 
     // Reconvergence over a live inter-node connection: a fresh ephemeral peer
     // connected to the recovered node must be able to fetch the entity, proving

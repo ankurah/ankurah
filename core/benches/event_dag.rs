@@ -65,12 +65,7 @@ impl GetEvents for MemRetriever {
 fn event(seed: u32, parents: &[EventId]) -> Event {
     let mut entity_id_bytes = [0u8; 16];
     entity_id_bytes[0..4].copy_from_slice(&seed.to_be_bytes());
-    Event {
-        entity_id: EntityId::from_bytes(entity_id_bytes),
-        collection: "bench".into(),
-        parent: Clock::from(parents.to_vec()),
-        operations: OperationSet(BTreeMap::new()),
-    }
+    Event { entity_id: EntityId::from_bytes(entity_id_bytes), parent: Clock::from(parents.to_vec()), operations: OperationSet::default() }
 }
 
 /// A generated scenario: the populated retriever plus the two clocks to

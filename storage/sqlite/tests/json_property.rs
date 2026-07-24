@@ -128,7 +128,7 @@ async fn test_json_path_query_string_equality() -> Result<()> {
     assert_eq!(uk_track.licensing().unwrap().get("territory").and_then(|v| v.as_str()), Some("UK"));
 
     // Query by JSON path
-    // The licensing column should have been created during set_state
+    // The licensing column should have been created during materialization
     // This query uses json_extract() which should work with BLOB JSONB columns
     let us_tracks: Vec<TrackView> = ctx.fetch("licensing.territory = 'US'").await?;
 

@@ -3,7 +3,6 @@ mod common;
 use ankql::ast::Predicate;
 use ankurah_core::policy::PolicyAgent;
 use ankurah_jwt_auth::{JwtAgent, JwtClaims, JwtContext, JwtKeys, PolicyConfig};
-use ankurah_proto::CollectionId;
 use common::{blog_config_path, make_predicate};
 use jwt_simple::prelude::Duration;
 
@@ -15,7 +14,8 @@ fn test_filter_predicate_privileged_bypasses() {
 
     let ctx = JwtContext::Root;
     let predicate = make_predicate("title = 'hello'");
-    let collection = CollectionId::from("post");
+    let models = common::policy_models(&agent, &["post"]);
+    let collection = models.id("post");
 
     let result = agent.filter_predicate(&ctx, &collection, predicate.clone()).unwrap();
     assert_eq!(result, predicate, "Root context should return predicate unchanged");
@@ -37,7 +37,8 @@ fn test_filter_predicate_no_scope_rules() {
     let token = keys.sign(&claims, Duration::from_hours(1)).unwrap();
     let ctx = JwtContext::from_claims(claims, token);
     let predicate = make_predicate("body = 'test'");
-    let collection = CollectionId::from("comment");
+    let models = common::policy_models(&agent, &["comment"]);
+    let collection = models.id("comment");
 
     let result = agent.filter_predicate(&ctx, &collection, predicate.clone()).unwrap();
     assert_eq!(result, predicate, "No scope rules should return predicate unchanged");
@@ -59,7 +60,8 @@ fn test_filter_predicate_applies_scope_rule() {
     let token = keys.sign(&claims, Duration::from_hours(1)).unwrap();
     let ctx = JwtContext::from_claims(claims, token);
     let predicate = make_predicate("title = 'hello'");
-    let collection = CollectionId::from("post");
+    let models = common::policy_models(&agent, &["post"]);
+    let collection = models.id("post");
 
     let result = agent.filter_predicate(&ctx, &collection, predicate).unwrap();
 
@@ -90,7 +92,8 @@ fn test_filter_predicate_unless_privilege_bypasses() {
     let token = keys.sign(&claims, Duration::from_hours(1)).unwrap();
     let ctx = JwtContext::from_claims(claims, token);
     let predicate = make_predicate("title = 'hello'");
-    let collection = CollectionId::from("post");
+    let models = common::policy_models(&agent, &["post"]);
+    let collection = models.id("post");
 
     let result = agent.filter_predicate(&ctx, &collection, predicate.clone()).unwrap();
     assert_eq!(result, predicate, "Editor should bypass the scope filter");
@@ -115,7 +118,8 @@ fn test_filter_predicate_nouser_denied() {
 
     let ctx = JwtContext::NoUser;
     let predicate = make_predicate("status = 'active'");
-    let collection = CollectionId::from("record");
+    let models = common::policy_models(&agent, &["record"]);
+    let collection = models.id("record");
 
     let result = agent.filter_predicate(&ctx, &collection, predicate);
     assert!(result.is_err(), "NoUser context with scope rules should be denied");
@@ -151,7 +155,8 @@ fn test_filter_predicate_unconditional_scope_rule() {
     let token = keys.sign(&claims, Duration::from_hours(1)).unwrap();
     let ctx = JwtContext::from_claims(claims, token);
     let predicate = make_predicate("status = 'active'");
-    let collection = CollectionId::from("record");
+    let models = common::policy_models(&agent, &["record"]);
+    let collection = models.id("record");
 
     let result = agent.filter_predicate(&ctx, &collection, predicate).unwrap();
     let display = format!("{}", result);
@@ -175,7 +180,8 @@ fn test_filter_predicate_injection_payload_is_inert() {
     let token = keys.sign(&claims, Duration::from_hours(1)).unwrap();
     let ctx = JwtContext::from_claims(claims, token);
     let predicate = make_predicate("title = 'hello'");
-    let collection = CollectionId::from("post");
+    let models = common::policy_models(&agent, &["post"]);
+    let collection = models.id("post");
 
     // Claim values are populated into the parsed AST, never spliced into the
     // filter text — the payload lands as an ordinary string literal and the

@@ -90,10 +90,10 @@ async fn test_json_property_storage_and_simple_query() -> Result<()> {
 /// 2. PostgreSQL errored: "operator does not exist: bytea -> unknown"
 /// 3. But our tests showed 0 results, not an error!
 ///
-/// The reason: `referenced_columns()` was returning the JSON path step (`territory`)
-/// instead of the actual column name (`licensing`). PostgreSQL's schema check thought
-/// `territory` didn't exist, so `assume_null()` transformed the predicate to `FALSE`,
-/// returning 0 rows without ever hitting the actual operator error.
+/// The reason: the referenced-property scan was returning the JSON path step
+/// (`territory`) instead of the property that owns it (`licensing`). PostgreSQL's schema
+/// check thought `territory` didn't exist, so the absent-property fold transformed the
+/// predicate to `FALSE`, returning 0 rows without ever hitting the actual operator error.
 ///
 /// This test is kept as documentation to show that PostgreSQL **does** error on bytea->jsonb
 /// operator mismatch - the silent failure was a different bug in our column resolution.

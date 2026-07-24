@@ -4,13 +4,13 @@ use ankql::ast::Predicate;
 use ankurah::core::{
     entity::Entity,
     error::ValidationError,
-    node::{Node as NodeInnerAlias, NodeInner, WeakNode},
+    node::{Node as NodeInnerAlias, NodeInner},
     policy::{AccessDenied, DefaultContext, PolicyAgent, DEFAULT_CONTEXT},
     storage::StorageEngine,
     util::Iterable,
 };
 use ankurah::proto::{self, Attested};
-use ankurah::{Model, Mutable, Node};
+use ankurah::Node;
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -64,11 +64,15 @@ impl PolicyAgent for DenySecondAlbumEventAgent {
         &self,
         _node: &NodeInnerAlias<SE, Self>,
         _cdata: &Self::ContextData,
+        model: &ankurah::ModelId,
         _entity_before: &Entity,
         _entity_after: &Entity,
-        event: &proto::Event,
+        _event: &proto::Event,
     ) -> Result<Option<proto::Attestation>, AccessDenied> {
-        if event.collection.as_str() == "album" && self.album_checks.fetch_add(1, Ordering::SeqCst) >= 1 {
+        // Catalog writes use System models; this workload's only ordinary
+        // model is Album, so count the exact allocated model arm without
+        // reconstructing identity from its schema label.
+        if matches!(model, ankurah::ModelId::EntityId(_)) && self.album_checks.fetch_add(1, Ordering::SeqCst) >= 1 {
             return Err(AccessDenied::ByPolicy("test agent denies the second album event"));
         }
         Ok(None)
@@ -78,6 +82,7 @@ impl PolicyAgent for DenySecondAlbumEventAgent {
         &self,
         _node: &NodeInnerAlias<SE, Self>,
         _from_node: &proto::EntityId,
+        _model: &proto::ModelId,
         _event: &proto::Attested<proto::Event>,
     ) -> Result<(), AccessDenied> {
         Ok(())
@@ -91,17 +96,18 @@ impl PolicyAgent for DenySecondAlbumEventAgent {
         &self,
         _node: &NodeInnerAlias<SE, Self>,
         _from_node: &proto::EntityId,
+        _model: &proto::ModelId,
         _state: &Attested<proto::EntityState>,
     ) -> Result<(), AccessDenied> {
         Ok(())
     }
 
-    fn can_access_collection<C>(&self, _data: &C, _collection: &proto::CollectionId) -> Result<(), AccessDenied>
+    fn can_access_collection<C>(&self, _data: &C, _collection: &ankurah::ModelId) -> Result<(), AccessDenied>
     where C: Iterable<Self::ContextData> {
         Ok(())
     }
 
-    fn filter_predicate<C>(&self, _data: &C, _collection: &proto::CollectionId, predicate: Predicate) -> Result<Predicate, AccessDenied>
+    fn filter_predicate<C>(&self, _data: &C, _collection: &ankurah::ModelId, predicate: Predicate) -> Result<Predicate, AccessDenied>
     where C: Iterable<Self::ContextData> {
         Ok(predicate)
     }
@@ -110,8 +116,9 @@ impl PolicyAgent for DenySecondAlbumEventAgent {
         &self,
         _data: &C,
         _id: &proto::EntityId,
-        _collection: &proto::CollectionId,
+        _collection: &ankurah::ModelId,
         _state: &proto::State,
+        _resolver: Option<std::sync::Weak<dyn ankurah::core::schema::CatalogResolver>>,
     ) -> Result<(), AccessDenied>
     where
         C: Iterable<Self::ContextData>,
@@ -119,12 +126,20 @@ impl PolicyAgent for DenySecondAlbumEventAgent {
         Ok(())
     }
 
-    fn check_read_event<C>(&self, _data: &C, _event: &Attested<proto::Event>) -> Result<(), AccessDenied>
+    fn check_read_event<C>(&self, _data: &C, _collection: &ankurah::ModelId, _event: &Attested<proto::Event>) -> Result<(), AccessDenied>
     where C: Iterable<Self::ContextData> {
         Ok(())
     }
 
-    fn check_write(&self, _data: &Self::ContextData, _entity: &Entity, _event: Option<&proto::Event>) -> Result<(), AccessDenied> { Ok(()) }
+    fn check_write(
+        &self,
+        _data: &Self::ContextData,
+        _model: &ankurah::ModelId,
+        _entity: &Entity,
+        _event: Option<&proto::Event>,
+    ) -> Result<(), AccessDenied> {
+        Ok(())
+    }
 
     fn validate_causal_assertion<SE: StorageEngine>(
         &self,
@@ -156,9 +171,8 @@ async fn test_multi_entity_commit_denial_leaves_nothing_durable() -> Result<()> 
     assert!(result.is_err(), "commit must fail when any event is denied, got {result:?}");
 
     // Failure atomicity: no event for EITHER entity may be durable.
-    let collection = ctx.collection(&Album::collection()).await?;
     for (label, id) in [("first", id1), ("second", id2)] {
-        let events = collection.dump_entity_events(id).await?;
+        let events = node.storage.dump_entity_events(id).await?;
         assert!(events.is_empty(), "{label} entity must have zero durable events after denied commit, found {}", events.len());
     }
 

@@ -1,7 +1,6 @@
 mod common;
 use ankurah::error::RetrievalError;
 use common::*;
-use std::collections::BTreeMap;
 
 /// context.get() with a nonexistent entity ID returns an error.
 #[tokio::test]
@@ -20,7 +19,8 @@ async fn local_rejects_phantom_commit() -> anyhow::Result<()> {
     let node = durable_sled_setup().await?;
     let ctx = node.context(DEFAULT_CONTEXT)?;
 
-    let phantom = AlbumView::from_entity(node.conjure_evil_phantom(EntityId::new(), Album::collection()));
+    let album_model = ctx.model_id::<Album>().await?;
+    let phantom = AlbumView::from_entity(node.conjure_evil_phantom(EntityId::new(), album_model), album_model);
     let trx = ctx.begin();
     phantom.edit(&trx)?.name().replace("inside your mind")?;
 
@@ -38,9 +38,8 @@ async fn server_rejects_update_for_nonexistent() -> anyhow::Result<()> {
     client.system.wait_system_ready().await;
 
     let fake_update = proto::Event {
-        collection: Album::collection(),
         entity_id: EntityId::new(),
-        operations: proto::OperationSet(BTreeMap::new()),
+        operations: proto::OperationSet::default(),
         parent: proto::Clock::new([proto::EventId::from_bytes([1u8; 32])]),
     };
 
@@ -48,7 +47,10 @@ async fn server_rejects_update_for_nonexistent() -> anyhow::Result<()> {
         .request(
             server.id,
             &DEFAULT_CONTEXT,
-            proto::NodeRequestBody::CommitTransaction { id: proto::TransactionId::new(), events: vec![fake_update.into()] },
+            proto::NodeRequestBody::CommitTransaction {
+                id: proto::TransactionId::new(),
+                events: vec![proto::Attested::opt(fake_update, None)],
+            },
         )
         .await?;
 
@@ -73,10 +75,10 @@ async fn server_rejects_create_for_existing() -> anyhow::Result<()> {
 
     // Try to send a create event for the same entity
     // Arguably this is a "collision" but collisions really should not happen
+    let album_model = server.catalog.model_id_for("album").expect("Album registered by the create above");
     let fake_create = proto::Event {
-        collection: Album::collection(),
         entity_id: existing_id,
-        operations: proto::OperationSet(BTreeMap::new()),
+        operations: proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(album_model))]),
         parent: proto::Clock::new([]),
     };
 
@@ -84,7 +86,10 @@ async fn server_rejects_create_for_existing() -> anyhow::Result<()> {
         .request(
             server.id,
             &DEFAULT_CONTEXT,
-            proto::NodeRequestBody::CommitTransaction { id: proto::TransactionId::new(), events: vec![fake_create.into()] },
+            proto::NodeRequestBody::CommitTransaction {
+                id: proto::TransactionId::new(),
+                events: vec![proto::Attested::opt(fake_create, None)],
+            },
         )
         .await?;
 

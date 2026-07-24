@@ -3,7 +3,6 @@ mod common;
 use ankurah::Model;
 use ankurah::Node;
 use ankurah_jwt_auth::{JwtAgent, JwtContext};
-use ankurah_proto::CollectionId;
 use ankurah_storage_sled::SledStorageEngine;
 use common::{blog_config_path, load_blog_config, make_claims, sign_token};
 use std::sync::Arc;
@@ -58,17 +57,18 @@ async fn test_reader_cannot_write_to_user_collection() -> anyhow::Result<()> {
     let reader_token = sign_token(&keys, &reader_claims);
     let reader_ctx = JwtContext::from_claims(reader_claims, reader_token);
 
-    let user_collection = CollectionId::from("user");
+    let models = common::policy_models(&agent, &["user"]);
+    let user_collection = models.id("user");
     let result = agent.can_access_collection(&reader_ctx, &user_collection);
     assert!(result.is_err(), "Reader must not be able to access the user collection");
 
     let config = load_blog_config();
     assert!(
-        !config.can_write_collection(&[String::from("Reader")], &user_collection),
+        !config.can_write_collection(&[String::from("Reader")], "user"),
         "Reader role must not have write access to the user collection"
     );
     assert!(
-        !config.can_access_collection(&[String::from("Reader")], &user_collection),
+        !config.can_access_collection(&[String::from("Reader")], "user"),
         "Reader role must not have any access to the user collection"
     );
 
@@ -177,11 +177,12 @@ async fn test_nouser_can_read_jwtpolicy_but_not_other_collections() -> anyhow::R
 
     let nouser = JwtContext::NoUser;
 
-    let jwtpolicy = CollectionId::from("jwtpolicy");
+    let models = common::policy_models(&agent, &["jwtpolicy", "post", "user", "comment", "tag", "secret_stuff"]);
+    let jwtpolicy = models.id("jwtpolicy");
     assert!(agent.can_access_collection(&nouser, &jwtpolicy).is_ok(), "NoUser must be able to access jwtpolicy for bootstrap");
 
     for name in &["post", "user", "comment", "tag", "secret_stuff"] {
-        let col = CollectionId::from(*name);
+        let col = models.id(name);
         assert!(agent.can_access_collection(&nouser, &col).is_err(), "NoUser must not be able to access the {} collection", name);
     }
 

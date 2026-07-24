@@ -1,9 +1,9 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{auth::Attested, clock::Clock, collection::CollectionId, id::EntityId, AttestationSet, DecodeError};
+use crate::{auth::Attested, clock::Clock, AttestationSet, DecodeError, EntityId, ModelId};
 
 #[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 pub struct EventId([u8; 32]);
@@ -13,8 +13,7 @@ impl std::fmt::Debug for EventId {
 }
 
 impl EventId {
-    /// Generate an EventID from the parts of an Event
-    /// notably, we are not including the collection in the hash because collection is getting excised from identity
+    /// Generate an event identity from its complete model-independent payload.
     pub fn from_parts(entity_id: &EntityId, operations: &OperationSet, parent: &Clock) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(bincode::serialize(&entity_id).unwrap());
@@ -99,10 +98,12 @@ impl<'de> Deserialize<'de> for EventId {
     }
 }
 
+/// A canonical, model-independent entity event.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Event {
-    pub collection: CollectionId,
+    /// The entity changed by this event.
     pub entity_id: EntityId,
+    /// Backend operations carried by the event.
     pub operations: OperationSet,
     /// The set of concurrent events (usually only one) which is the precursor of this event
     pub parent: Clock,
@@ -113,10 +114,15 @@ impl Event {
     pub fn is_entity_create(&self) -> bool { self.parent.is_empty() }
 }
 
+/// Event data with the entity identity factored out for entity-scoped wire
+/// envelopes.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct EventFragment {
+    /// Backend operations carried by the event.
     pub operations: OperationSet,
+    /// Causal parents of the event.
     pub parent: Clock,
+    /// Attestations over the complete event.
     pub attestations: AttestationSet,
 }
 
@@ -126,35 +132,42 @@ impl From<Attested<Event>> for EventFragment {
     }
 }
 
-impl From<(EntityId, CollectionId, EventFragment)> for Attested<Event> {
-    fn from(value: (EntityId, CollectionId, EventFragment)) -> Self {
-        let event = Event { entity_id: value.0, collection: value.1, operations: value.2.operations, parent: value.2.parent };
-        Attested { payload: event, attestations: value.2.attestations }
+impl From<(EntityId, EventFragment)> for Attested<Event> {
+    fn from(value: (EntityId, EventFragment)) -> Self {
+        let event = Event { entity_id: value.0, operations: value.1.operations, parent: value.1.parent };
+        Attested { payload: event, attestations: value.1.attestations }
     }
 }
 
+/// Attested state with the entity identity factored out for entity-scoped wire
+/// envelopes.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct StateFragment {
+    /// Accumulated backend state and causal head.
     pub state: State,
+    /// Attestations over the complete entity state.
     pub attestations: AttestationSet,
 }
 
 impl From<Attested<EntityState>> for StateFragment {
     fn from(attested: Attested<EntityState>) -> Self { Self { state: attested.payload.state, attestations: attested.attestations } }
 }
-impl From<(EntityId, CollectionId, StateFragment)> for Attested<EntityState> {
-    fn from(value: (EntityId, CollectionId, StateFragment)) -> Self {
-        let entity_state = EntityState { entity_id: value.0, collection: value.1, state: value.2.state };
-        Attested { payload: entity_state, attestations: value.2.attestations }
+impl From<(EntityId, StateFragment)> for Attested<EntityState> {
+    fn from(value: (EntityId, StateFragment)) -> Self {
+        let entity_state = EntityState { entity_id: value.0, state: value.1.state };
+        Attested { payload: entity_state, attestations: value.1.attestations }
     }
 }
 
 impl Event {
+    /// Derive the event identity from the complete model-independent payload.
     pub fn id(&self) -> EventId { EventId::from_parts(&self.entity_id, &self.operations, &self.parent) }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
-pub struct OperationSet(pub BTreeMap<String, Vec<Operation>>);
+/// Ordered top-level mutations that make up one event's content-addressed
+/// payload.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
+pub struct OperationSet(pub Vec<Operation>);
 
 impl std::fmt::Display for OperationSet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -163,7 +176,12 @@ impl std::fmt::Display for OperationSet {
             "OperationSet({})",
             self.0
                 .iter()
-                .map(|(backend, ops)| format!("{} => {}b", backend, ops.iter().map(|op| op.diff.len()).sum::<usize>()))
+                .map(|operation| match operation {
+                    Operation::Backend { backend, operations } => {
+                        format!("{} => {}b", backend, operations.iter().map(|operation| operation.diff.len()).sum::<usize>())
+                    }
+                    Operation::Membership(Membership::Add(model)) => format!("membership +{model}"),
+                })
                 .collect::<Vec<_>>()
                 .join(" ")
         )
@@ -171,28 +189,113 @@ impl std::fmt::Display for OperationSet {
 }
 
 impl std::ops::Deref for OperationSet {
-    type Target = BTreeMap<String, Vec<Operation>>;
+    type Target = [Operation];
     fn deref(&self) -> &Self::Target { &self.0 }
 }
 
+impl OperationSet {
+    /// Build the event-level operation sequence for backend-generated diffs.
+    ///
+    /// The input map's stable ordering gives locally generated events a
+    /// deterministic operation order.
+    pub fn from_backends(backends: BTreeMap<String, Vec<BackendOperation>>) -> Self {
+        Self(backends.into_iter().map(|(backend, operations)| Operation::Backend { backend, operations }).collect())
+    }
+
+    /// Append one event-level operation.
+    pub fn push(&mut self, operation: Operation) { self.0.push(operation); }
+
+    /// Iterate backend operation batches in event order.
+    pub fn backends(&self) -> impl Iterator<Item = (&str, &[BackendOperation])> {
+        self.0.iter().filter_map(|operation| match operation {
+            Operation::Backend { backend, operations } => Some((backend.as_str(), operations.as_slice())),
+            Operation::Membership(_) => None,
+        })
+    }
+
+    /// Iterate all backend diffs addressed to `backend`, preserving event
+    /// order even if an untrusted event contains more than one batch.
+    pub fn backend_operations<'a>(&'a self, backend: &'a str) -> impl Iterator<Item = &'a BackendOperation> {
+        self.0.iter().flat_map(move |operation| match operation {
+            Operation::Backend { backend: candidate, operations } if candidate == backend => operations.iter(),
+            Operation::Backend { .. } | Operation::Membership(_) => [].iter(),
+        })
+    }
+
+    /// Iterate explicit membership mutations in event order.
+    pub fn memberships(&self) -> impl Iterator<Item = &Membership> {
+        self.0.iter().filter_map(|operation| match operation {
+            Operation::Membership(membership) => Some(membership),
+            Operation::Backend { .. } => None,
+        })
+    }
+}
+
+/// A top-level mutation carried by an entity event.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub enum Operation {
+    /// Apply opaque diffs to one property backend.
+    Backend {
+        /// Registered property backend name.
+        backend: String,
+        /// Ordered opaque operations understood by that backend.
+        operations: Vec<BackendOperation>,
+    },
+    /// Change the entity's explicit model-backed membership state.
+    Membership(Membership),
+}
+
+/// An explicit mutation of an entity's model-backed membership state.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub enum Membership {
+    /// Add the model-backed membership.
+    ///
+    /// The current protocol permits this only in a genesis event and requires
+    /// exactly one such operation there.
+    Add(ModelId),
+}
+
+/// An opaque operation generated and interpreted by a named property backend.
 #[derive(Debug, Serialize, Deserialize, Clone, Hash, Eq, PartialEq)]
-pub struct Operation {
+pub struct BackendOperation {
+    /// Opaque diff interpreted by the selected property backend.
     pub diff: Vec<u8>,
 }
 
+/// Canonical accumulated state for one entity, independent of every model
+/// through which the entity is used.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct EntityState {
+    /// The durable entity identity.
     pub entity_id: EntityId,
-    pub collection: CollectionId,
+    /// Accumulated backend state and causal head.
     pub state: State,
 }
 
+/// Canonical accumulated backend values, model memberships, and causal head
+/// for one entity.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct State {
     /// The current accumulated state of the entity inclusive of all events up to this point
     pub state_buffers: StateBuffers,
+    /// Model-backed memberships established by this entity's causal history.
+    ///
+    /// The current protocol admits exactly one membership in the genesis
+    /// event and no later membership mutations.
+    pub memberships: BTreeSet<ModelId>,
     /// The set of concurrent events (usually only one) which have been applied to the entity state above
     pub head: Clock,
+}
+
+impl State {
+    /// Return the sole membership required by the current protocol.
+    pub fn sole_membership(&self) -> Option<ModelId> {
+        if self.memberships.len() == 1 {
+            self.memberships.iter().next().copied()
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -207,17 +310,12 @@ impl std::fmt::Display for Event {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Event({} {}/{} {}{} {})",
+            "Event({} {} {}{} {})",
             self.id().to_base64_short(),
-            self.collection,
             self.entity_id.to_base64_short(),
             if self.is_entity_create() { "(create) " } else { "" },
             self.parent.to_base64_short(),
-            self.operations
-                .iter()
-                .map(|(backend, ops)| format!("{} => {}b", backend, ops.iter().map(|op| op.diff.len()).sum::<usize>()))
-                .collect::<Vec<_>>()
-                .join(" ")
+            self.operations,
         )
     }
 }
@@ -232,8 +330,9 @@ impl std::fmt::Display for State {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "State({:#} buffers {})",
+            "State({:#} memberships [{}] buffers {})",
             self.head,
+            self.memberships.iter().map(ToString::to_string).collect::<Vec<_>>().join(","),
             self.state_buffers.iter().map(|(backend, buf)| format!("{} => {}b", backend, buf.len())).collect::<Vec<_>>().join(" ")
         )
     }
@@ -251,10 +350,6 @@ impl std::fmt::Display for EntityState {
     }
 }
 
-impl Attested<Event> {
-    pub fn collection(&self) -> &CollectionId { &self.payload.collection }
-}
-
 impl From<Event> for Attested<Event> {
     fn from(val: Event) -> Self { Attested { payload: val, attestations: AttestationSet::default() } }
 }
@@ -264,17 +359,22 @@ impl From<EntityState> for Attested<EntityState> {
 }
 
 impl Attested<EntityState> {
-    pub fn to_parts(self) -> (EntityId, CollectionId, StateFragment) {
-        (self.payload.entity_id, self.payload.collection, StateFragment { state: self.payload.state, attestations: self.attestations })
+    /// Factor the entity identity out of an attested canonical state.
+    pub fn to_parts(self) -> (EntityId, StateFragment) {
+        (self.payload.entity_id, StateFragment { state: self.payload.state, attestations: self.attestations })
     }
-    pub fn from_parts(entity_id: EntityId, collection: CollectionId, fragment: StateFragment) -> Self {
-        Self { payload: EntityState { entity_id, collection, state: fragment.state }, attestations: fragment.attestations }
+    /// Reconstitute an attested canonical state from an entity identity and
+    /// state fragment.
+    pub fn from_parts(entity_id: EntityId, fragment: StateFragment) -> Self {
+        Self { payload: EntityState { entity_id, state: fragment.state }, attestations: fragment.attestations }
     }
 }
 
 impl Attested<Event> {
-    pub fn from_parts(entity_id: EntityId, collection: CollectionId, frag: EventFragment) -> Self {
-        Self { payload: Event { entity_id, collection, operations: frag.operations, parent: frag.parent }, attestations: frag.attestations }
+    /// Reconstitute an attested canonical event from an entity identity and
+    /// event fragment.
+    pub fn from_parts(entity_id: EntityId, frag: EventFragment) -> Self {
+        Self { payload: Event { entity_id, operations: frag.operations, parent: frag.parent }, attestations: frag.attestations }
     }
 }
 
@@ -303,5 +403,11 @@ mod tests {
             [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
         );
         assert_eq!(id, bincode::deserialize(&bytes).unwrap());
+    }
+
+    #[test]
+    fn event_id_is_derived_from_the_model_independent_event() {
+        let event = Event { entity_id: EntityId::new(), operations: OperationSet::default(), parent: Clock::default() };
+        assert_eq!(event.id(), EventId::from_parts(&event.entity_id, &event.operations, &event.parent));
     }
 }

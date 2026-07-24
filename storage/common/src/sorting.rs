@@ -8,14 +8,30 @@ use std::task::{Context, Poll};
 
 use crate::OrderByComponents;
 
+/// Read an item's value for one ORDER BY key, addressed by resolved identity
+/// (never by a physical column -- the in-memory sort reads the same way the
+/// post-filter's `evaluate_identifier` does): a registered property by its id,
+/// the `id` pseudo-property and system properties by name. A raw
+/// `OrderKey::Path` (only unresolved selections produce one) reads by its last
+/// step. An absent value sorts as `None`.
+fn order_value<T: Filterable>(item: &T, order_item: &ankql::ast::OrderByItem) -> Option<Value> {
+    use ankql::ast::{OrderKey, PropertyId};
+    match &order_item.key {
+        OrderKey::Property(identifier) => match identifier.id() {
+            PropertyId::Id => item.value("id"),
+            PropertyId::EntityId(id) => item.value_by_id(id),
+            PropertyId::System(property) => item.value(property.as_str()),
+        },
+        OrderKey::Path(path) => item.value(path.property()),
+    }
+}
+
 /// Helper function to sort items by ORDER BY clauses
 fn sort_items_by_order<T: Filterable>(items: &mut [T], order_by: &[ankql::ast::OrderByItem]) {
     items.sort_by(|a, b| {
         for order_item in order_by {
-            let property_name = order_item.path.property();
-
-            let a_val = a.value(property_name);
-            let b_val = b.value(property_name);
+            let a_val = order_value(a, order_item);
+            let b_val = order_value(b, order_item);
 
             // Handle None values: None sorts before Some
             let cmp = match (a_val, b_val, &order_item.direction) {
@@ -36,7 +52,7 @@ fn sort_items_by_order<T: Filterable>(items: &mut [T], order_by: &[ankql::ast::O
 
 /// Extract partition key (presort column values) from an item
 fn extract_partition_key<T: Filterable>(item: &T, presort: &[ankql::ast::OrderByItem]) -> Vec<Option<Value>> {
-    presort.iter().map(|p| item.value(p.path.property())).collect()
+    presort.iter().map(|p| order_value(item, p)).collect()
 }
 
 /// Sorted stream with partition-aware support.
@@ -249,10 +265,8 @@ impl<T: Filterable> Ord for HeapItem<T> {
         //   - When new item > top, kick out top (it's worse than new).
         //   - Reversed comparison: smaller values are "greater" so BinaryHeap puts them at top.
         for order_item in &self.order_by {
-            let property_name = order_item.path.property();
-
-            let self_val = self.item.value(property_name);
-            let other_val = other.item.value(property_name);
+            let self_val = order_value(&self.item, order_item);
+            let other_val = order_value(&other.item, order_item);
 
             // Handle None values: None is "worst" for the heap (will be kicked out first)
             // For ASC: None is smallest, so it should be "least" (kept longer in max-heap)
@@ -451,7 +465,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ankql::ast::{OrderByItem, OrderDirection, PathExpr};
+    use ankql::ast::{OrderByItem, OrderDirection, OrderKey, PathExpr};
     use futures::StreamExt;
     use std::collections::HashMap;
 
@@ -537,7 +551,7 @@ mod tests {
         }
     }
 
-    fn oby(col: &str, dir: OrderDirection) -> OrderByItem { OrderByItem { path: PathExpr::simple(col), direction: dir } }
+    fn oby(col: &str, dir: OrderDirection) -> OrderByItem { OrderByItem { key: OrderKey::Path(PathExpr::simple(col)), direction: dir } }
 
     fn oby_asc(col: &str) -> OrderByItem { oby(col, OrderDirection::Asc) }
 

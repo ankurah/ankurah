@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 /// Policy configuration entity stored in ankurah.
 /// The collection name is auto-derived as "jwtpolicy" (struct name lowercased).
 #[derive(Model, Debug, Serialize, Deserialize)]
+#[model(no_ffi)]
 pub struct JwtPolicy {
     /// Serialized PolicyConfig JSON
     #[active_type(LWW)]

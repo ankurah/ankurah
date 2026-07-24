@@ -1,4 +1,5 @@
-use ankql::ast::{ComparisonOperator, Expr, Literal, OrderByItem, OrderDirection, PathExpr, Predicate, Selection};
+use ankql::ast::{ComparisonOperator, Expr, OrderByItem, OrderDirection, OrderKey, Predicate, PropertyPath, Selection, Value};
+use ankurah::core::storage::StorageEngine;
 use ankurah::{policy::DEFAULT_CONTEXT as c, proto::EntityId, Model, Node, PermissiveAgent};
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
@@ -32,16 +33,17 @@ async fn test_id_range_optimization_integration() -> Result<()> {
     }
 
     // Test 1: Simple ORDER BY id ASC with LIMIT (should use optimization)
+    // The `id` pseudo-property resolves to `PropertyPath::id` (its own identity),
+    // the resolved form the storage engine requires (`Selection::check`).
     let selection_asc = Selection {
         predicate: Predicate::True,
-        order_by: Some(vec![OrderByItem { path: PathExpr::simple("id".to_string()), direction: OrderDirection::Asc }]),
+        order_by: Some(vec![OrderByItem { key: OrderKey::Property(PropertyPath::primary_key(vec![])), direction: OrderDirection::Asc }]),
         limit: Some(5),
     };
 
     // Fetch results directly from storage collection to test optimization
-    let collection_id = TestEntity::collection();
-    let storage_collection = node.collections.get(&collection_id).await?;
-    let results_asc = storage_collection.fetch_states(&selection_asc).await?;
+    let collection_id = context.model_id::<TestEntity>().await?;
+    let results_asc = node.storage.fetch_states(&collection_id, &selection_asc).await?;
 
     // Should get exactly 5 results
     assert_eq!(results_asc.len(), 5, "Should return exactly 5 results due to LIMIT");
@@ -55,11 +57,11 @@ async fn test_id_range_optimization_integration() -> Result<()> {
     // Test 2: ORDER BY id DESC (should use FullScan reverse + skip sorting)
     let selection_desc = Selection {
         predicate: Predicate::True,
-        order_by: Some(vec![OrderByItem { path: PathExpr::simple("id".to_string()), direction: OrderDirection::Desc }]),
+        order_by: Some(vec![OrderByItem { key: OrderKey::Property(PropertyPath::primary_key(vec![])), direction: OrderDirection::Desc }]),
         limit: Some(3),
     };
 
-    let results_desc = storage_collection.fetch_states(&selection_desc).await?;
+    let results_desc = node.storage.fetch_states(&collection_id, &selection_desc).await?;
 
     // Validate descending results
     assert_eq!(results_desc.len(), 3, "Should return exactly 3 results due to LIMIT");
@@ -70,13 +72,14 @@ async fn test_id_range_optimization_integration() -> Result<()> {
     }
 
     // Test 3: ORDER BY name (should require in-memory sorting, no optimization)
-    let selection_name = Selection {
-        predicate: Predicate::True,
-        order_by: Some(vec![OrderByItem { path: PathExpr::simple("name".to_string()), direction: OrderDirection::Asc }]),
-        limit: Some(5),
-    };
+    // `name` is a registered model property, so it must resolve to its allocated
+    // property id, not a fabricated System identity (which would read absent and
+    // pass the test vacuously). Resolve honestly through the node's catalog, which
+    // is warm for this model after the creates above registered it.
+    let selection_name =
+        ankql::parser::parse_selection("true ORDER BY name ASC LIMIT 5")?.resolve_names(&collection_id, node.catalog.resolver())?;
 
-    let results_name = storage_collection.fetch_states(&selection_name).await?;
+    let results_name = node.storage.fetch_states(&collection_id, &selection_name).await?;
 
     // Validate name-sorted results - we just check that we get the expected count
     // The actual sorting behavior is tested in unit tests
@@ -109,20 +112,22 @@ async fn test_id_range_with_where_clause() -> Result<()> {
     entity_ids.sort();
     let start_id = entity_ids[2].clone(); // Start from the 3rd entity
 
-    // Query with WHERE id >= start_id ORDER BY id
+    // Query with WHERE id >= start_id ORDER BY id. Both references are to the
+    // `id` pseudo-property, which resolves to `PropertyPath::id` on the predicate
+    // side (`Expr::PropertyPath`) and the order side (`OrderKey::Property`),
+    // the resolved form the storage engine requires (`Selection::check`).
     let selection = Selection {
         predicate: Predicate::Comparison {
-            left: Box::new(Expr::Path(PathExpr::simple("id".to_string()))),
+            left: Box::new(Expr::PropertyPath(PropertyPath::primary_key(vec![]))),
             operator: ComparisonOperator::GreaterThanOrEqual,
-            right: Box::new(Expr::Literal(Literal::String(start_id.to_base64()))),
+            right: Box::new(Expr::Literal(Value::String(start_id.to_base64()))),
         },
-        order_by: Some(vec![OrderByItem { path: PathExpr::simple("id".to_string()), direction: OrderDirection::Asc }]),
+        order_by: Some(vec![OrderByItem { key: OrderKey::Property(PropertyPath::primary_key(vec![])), direction: OrderDirection::Asc }]),
         limit: Some(3),
     };
 
-    let collection_id = TestEntity::collection();
-    let storage_collection = node.collections.get(&collection_id).await?;
-    let results = storage_collection.fetch_states(&selection).await?;
+    let collection_id = context.model_id::<TestEntity>().await?;
+    let results = node.storage.fetch_states(&collection_id, &selection).await?;
 
     // Should get exactly 3 results
     assert_eq!(results.len(), 3, "Should return exactly 3 results due to LIMIT");

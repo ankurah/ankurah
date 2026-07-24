@@ -353,7 +353,7 @@ mod tests {
     fn test_plan_index_spec_name() {
         let plan = Plan::Index {
             index_spec: KeySpec::new(vec![
-                IndexKeyPart::asc("__collection", ValueType::String),
+                IndexKeyPart::asc("__materialization", ValueType::String),
                 IndexKeyPart::asc("age", ValueType::I32),
                 IndexKeyPart::asc("score", ValueType::I32),
             ]),
@@ -365,7 +365,7 @@ mod tests {
 
         if let Plan::Index { index_spec, .. } = plan {
             let index_name = index_spec.name_with("", "__");
-            assert_eq!(index_name, "__collection asc__age asc__score asc");
+            assert_eq!(index_name, "__materialization asc__age asc__score asc");
         }
     }
 
@@ -382,11 +382,11 @@ mod tests {
 
     #[test]
     fn test_normalize_equality_only() {
-        // Test normalization of equality-only bounds: __collection = 'album' AND age = 30
+        // Test normalization of equality-only bounds: __materialization = 'album' AND age = 30
         // With the new bounded range logic, this should create [album, 30] to [album, 31)
         let bounds = KeyBounds::new(vec![
             KeyBoundComponent {
-                column: "__collection".to_string(),
+                column: "__materialization".to_string(),
                 low: Endpoint::incl(Value::String("album".to_string())),
                 high: Endpoint::incl(Value::String("album".to_string())),
             },
@@ -407,10 +407,10 @@ mod tests {
 
     #[test]
     fn test_normalize_with_inequality() {
-        // Test normalization with inequality: __collection = 'album' AND age > 25
+        // Test normalization with inequality: __materialization = 'album' AND age > 25
         let bounds = KeyBounds::new(vec![
             KeyBoundComponent {
-                column: "__collection".to_string(),
+                column: "__materialization".to_string(),
                 low: Endpoint::incl(Value::String("album".to_string())),
                 high: Endpoint::incl(Value::String("album".to_string())),
             },
@@ -439,7 +439,7 @@ mod tests {
     fn test_plan_bounds_to_idb_range() {
         // Test the full pipeline: IndexBounds → CanonicalRange → IdbKeyRange
         let bounds = KeyBounds::new(vec![KeyBoundComponent {
-            column: "__collection".to_string(),
+            column: "__materialization".to_string(),
             low: Endpoint::incl(Value::String("album".to_string())),
             high: Endpoint::incl(Value::String("album".to_string())),
         }]);
@@ -460,7 +460,7 @@ mod tests {
         // Test the syntax generation for your exact bounds from the debug print
         let bounds = KeyBounds::new(vec![
             KeyBoundComponent {
-                column: "__collection".to_string(),
+                column: "__materialization".to_string(),
                 low: Endpoint::incl(Value::String("connectionevent".to_string())),
                 high: Endpoint::incl(Value::String("connectionevent".to_string())),
             },
@@ -497,7 +497,7 @@ mod tests {
         // Test with equality-only bounds on a single column
         // With the new bounded range logic, single equality becomes bound(["album"], ["album\uFFFF"], false, false)
         let bounds = KeyBounds::new(vec![KeyBoundComponent {
-            column: "__collection".to_string(),
+            column: "__materialization".to_string(),
             low: Endpoint::incl(Value::String("album".to_string())),
             high: Endpoint::incl(Value::String("album".to_string())),
         }]);
@@ -521,7 +521,7 @@ mod tests {
         // With the new bounded range logic, this becomes bound(["album", "2000"], ["album", "2000\uFFFF"], false, false)
         let bounds = KeyBounds::new(vec![
             KeyBoundComponent {
-                column: "__collection".to_string(),
+                column: "__materialization".to_string(),
                 low: Endpoint::incl(Value::String("album".to_string())),
                 high: Endpoint::incl(Value::String("album".to_string())),
             },

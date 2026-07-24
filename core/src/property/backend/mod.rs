@@ -1,4 +1,4 @@
-use ankurah_proto::{EventId, Operation};
+use ankurah_proto::{BackendOperation, EventId};
 use anyhow::Result;
 use std::any::Any;
 use std::fmt::Debug;
@@ -21,7 +21,8 @@ use crate::event_dag::EventLayer;
 pub use lww::LWWBackend;
 pub use yrs::YrsBackend;
 
-use super::{PropertyName, Value};
+use super::Value;
+use ankql::ast::PropertyId;
 
 // TODO - implement a property backend value iterator so we don't have to alloc a HashMap for every call to values()
 
@@ -30,12 +31,12 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
     fn as_debug(&self) -> &dyn Debug;
     fn fork(&self) -> Arc<dyn PropertyBackend>;
 
-    fn properties(&self) -> Vec<PropertyName>;
-    fn property_value(&self, property_name: &PropertyName) -> Option<Value> {
+    fn properties(&self) -> Vec<PropertyId>;
+    fn property_value(&self, key: &PropertyId) -> Option<Value> {
         let mut map = self.property_values();
-        map.remove(property_name).flatten()
+        map.remove(key).flatten()
     }
-    fn property_values(&self) -> BTreeMap<PropertyName, Option<Value>>;
+    fn property_values(&self) -> BTreeMap<PropertyId, Option<Value>>;
 
     /// Unique property backend identifier.
     fn property_backend_name() -> &'static str
@@ -48,11 +49,11 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
     where Self: Sized;
 
     /// Retrieve operations applied to this backend since the last time we called this method.
-    fn to_operations(&self) -> Result<Option<Vec<Operation>>, MutationError>;
+    fn to_operations(&self) -> Result<Option<Vec<BackendOperation>>, MutationError>;
 
     /// Apply operations without event tracking.
     /// Used when loading from state buffer (no associated event).
-    fn apply_operations(&self, operations: &[Operation]) -> Result<(), MutationError>;
+    fn apply_operations(&self, operations: &[BackendOperation]) -> Result<(), MutationError>;
 
     /// Apply operations with event tracking.
     ///
@@ -63,7 +64,7 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
     /// since CRDTs handle concurrency internally.
     ///
     /// For LWW backends, this tracks the event_id for each modified property.
-    fn apply_operations_with_event(&self, operations: &[Operation], event_id: EventId) -> Result<(), MutationError> {
+    fn apply_operations_with_event(&self, operations: &[BackendOperation], event_id: EventId) -> Result<(), MutationError> {
         // Default implementation ignores event_id (suitable for CRDTs)
         let _ = event_id;
         self.apply_operations(operations)
@@ -94,11 +95,28 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
     /// Listen to changes for a specific field managed by this backend.
     /// Auto-creates the broadcast if it doesn't exist yet.
     /// Returns a subscription guard that will unsubscribe when dropped.
-    fn listen_field(
-        &self,
-        field_name: &PropertyName,
-        listener: ankurah_signals::signal::Listener,
-    ) -> ankurah_signals::signal::ListenerGuard;
+    fn listen_field(&self, key: &PropertyId, listener: ankurah_signals::signal::Listener) -> ankurah_signals::signal::ListenerGuard;
+
+    /// The [`PropertyId`] keys currently staged (uncommitted) in this backend,
+    /// for the commit path's defensive canonical-type check. Typed accessors
+    /// already cast before staging; this catches low-level/internal writes
+    /// before event generation. Default empty: a backend with no value-shaped
+    /// staging (a text CRDT) has nothing to check.
+    fn uncommitted_keys(&self) -> Vec<PropertyId> { Vec::new() }
+
+    /// Three-way presence for `key`: `None` = no entry at all; `Some(None)` =
+    /// an entry holding no value (a cleared tombstone: authoritative absence);
+    /// `Some(Some)` = a value. This is the primitive the resolved-property read
+    /// dispatch ([`crate::property::read_by_id`]) runs on, generically -- no
+    /// caller may downcast to a concrete backend for it. The default two-way
+    /// projection (via [`Self::property_value`]) suits backends without
+    /// tombstone semantics (e.g. text CRDTs).
+    fn entry(&self, key: &PropertyId) -> Option<Option<Value>> { self.property_value(key).map(Some) }
+
+    /// Replace a staged value after the commit path's defensive canonical-type
+    /// check. Default no-op: a backend whose edits are not value-shaped (a text
+    /// CRDT) has its canonical type pinned by backend equality at registration.
+    fn restage(&self, key: &PropertyId, value: Option<Value>) { let _ = (key, value); }
 }
 
 // This is where this gets a bit tough.
@@ -108,12 +126,12 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
 // TODO: Implement a property backend type registry rather than this hardcoded nonsense.
 /// Fire the change broadcast for each named field that has subscribers.
 pub(crate) fn notify_changed_fields<'a>(
-    field_broadcasts: &std::sync::Mutex<std::collections::BTreeMap<crate::property::PropertyName, ankurah_signals::broadcast::Broadcast>>,
-    changed: impl IntoIterator<Item = &'a crate::property::PropertyName>,
+    field_broadcasts: &std::sync::Mutex<std::collections::BTreeMap<PropertyId, ankurah_signals::broadcast::Broadcast>>,
+    changed: impl IntoIterator<Item = &'a PropertyId>,
 ) {
     let broadcasts = field_broadcasts.lock().expect("field_broadcasts lock is poisoned");
-    for field_name in changed {
-        if let Some(broadcast) = broadcasts.get(field_name) {
+    for key in changed {
+        if let Some(broadcast) = broadcasts.get(key) {
             broadcast.send(());
         }
     }

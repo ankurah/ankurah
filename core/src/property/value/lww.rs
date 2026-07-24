@@ -5,9 +5,10 @@ use crate::{
     property::{
         backend::{LWWBackend, PropertyBackend},
         traits::{FromActiveType, FromEntity, PropertyError},
-        InitializeWith, Property, PropertyName, Value,
+        InitializeWith, Property, Value,
     },
 };
+use ankurah_core_types::PropertyId;
 
 use ankurah_signals::{
     signal::{Listener, ListenerGuard},
@@ -16,7 +17,11 @@ use ankurah_signals::{
 
 #[derive(Clone)]
 pub struct LWW<T: Property> {
-    pub property_name: PropertyName,
+    /// This field's durable identity, resolved by the generated view/mutable
+    /// before construction. The accessor and backend never receive a display
+    /// name.
+    pub property_id: Option<PropertyId>,
+    resolution_error: Option<String>,
     pub backend: Arc<LWWBackend>,
     pub entity: Entity,
     phantom: PhantomData<T>,
@@ -24,35 +29,96 @@ pub struct LWW<T: Property> {
 
 impl<T: Property> std::fmt::Debug for LWW<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LWW").field("property_name", &self.property_name).finish()
+        f.debug_struct("LWW").field("property_id", &self.property_id).finish()
     }
 }
 
 impl<T: Property> LWW<T> {
+    /// The resolved key, or the view-construction resolution error. `set` and
+    /// `get` (via [`Self::stored_value`]) both route through this.
+    fn resolved_id(&self) -> Result<PropertyId, PropertyError> {
+        if let Some(error) = &self.resolution_error {
+            return Err(PropertyError::RetrievalError(crate::error::RetrievalError::Other(error.clone())));
+        }
+        self.property_id
+            .ok_or_else(|| PropertyError::RetrievalError(crate::error::RetrievalError::Other("property resolution failed".to_owned())))
+    }
+
     pub fn set(&self, value: &T) -> Result<(), PropertyError> {
         if !self.entity.is_writable() {
             return Err(PropertyError::TransactionClosed);
         }
-        let value = value.into_value()?;
-        self.backend.set(self.property_name.clone(), value);
+        let pid = self.resolved_id()?;
+        let value = match value.into_value()? {
+            Some(value) => Some(self.entity.canonicalize_property_value(&pid, value)?),
+            None => None,
+        };
+        self.backend.set(pid, value);
         Ok(())
     }
 
+    /// Project the property under the RFC 5.4 (specs/model-property-metadata/rfc.md) read rules (the #175 fix):
+    ///   - present -> the value;
+    ///   - absent + REQUIRED (a defaulting value type, e.g. `String`/`i64`) ->
+    ///     the type default via [`Property::absent_default`];
+    ///   - absent + OPTIONAL (`Option<T>`) -> `None`, because the projected
+    ///     type is `Option<T>` and its `absent_default` is `None`, so the inner
+    ///     default never fires;
+    ///   - absent + no fabricable default (`EntityId`/`Ref<T>`, derived enums)
+    ///     -> `PropertyError::Missing` (or `None` under an `Option`).
+    ///
+    /// A present value is stored CANONICALLY typed (rfc.md 5.6 as amended
+    /// 2026-07-10); a compiled type drifted from the canonical one reads
+    /// through `Value::cast_to` (canonical -> compiled), and a per-value cast
+    /// failure surfaces as the fail-visible `NonCastable`, never a fabricated
+    /// default. The same hop covers a legacy or ill-typed payload
+    /// defensively. Type-pair admission is REGISTRATION's job (the canonical
+    /// value_type ruling): reads carry no gate. An unbound field (no resolved
+    /// id) surfaces `PropertyError::UnknownProperty` here too.
     pub fn get(&self) -> Result<T, PropertyError> {
-        let value = self.get_value();
-        T::from_value(value)
+        match self.stored_value()? {
+            Some(value) => {
+                let value = match crate::value::ValueType::from_property_str(T::VALUE_TYPE) {
+                    Some(target) if crate::value::ValueType::of(&value) != target => value.cast_to(target)?,
+                    _ => value,
+                };
+                T::from_value(Some(value))
+            }
+            // Absent: feed the type's required-absent default to
+            // `from_value`. `None` -> `from_value(None)` keeps today's meaning
+            // (Missing for a required scalar, None for an Option).
+            None => T::from_value(T::absent_default()),
+        }
     }
 
-    pub fn get_value(&self) -> Option<Value> { self.backend.get(&self.property_name) }
+    /// The stored value: `Some` present, `None` absent. Keys by the resolved
+    /// [`PropertyId`] alone -- no id-then-name fallback (the identity model
+    /// has exactly one durable key per property, full stop). Errors if the
+    /// field never resolved (an unbound name-addressed field).
+    pub fn stored_value(&self) -> Result<Option<Value>, PropertyError> {
+        let pid = self.resolved_id()?;
+        Ok(crate::property::read_by_id(self.backend.as_ref(), &pid))
+    }
 }
 
 impl<T: Property> FromEntity for LWW<T> {
-    fn from_entity(property_name: PropertyName, entity: &Entity) -> Self {
+    fn from_entity(property: Result<PropertyId, PropertyError>, entity: &Entity) -> Self {
         let backend = entity.get_backend::<LWWBackend>().expect("LWW Backend should exist");
-        Self { property_name, backend, entity: entity.clone(), phantom: PhantomData }
+        let (property_id, resolution_error) = match property {
+            Ok(id) => (Some(id), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        Self { property_id, resolution_error, backend, entity: entity.clone(), phantom: PhantomData }
     }
 }
 
+// One generic projection covers every LWW-backed field, because LWW's
+// projected type is OPEN (any `Property`: scalars, `Option<_>`, `Json`,
+// `Ref<T>`, derived enums), so it cannot enumerate concrete impls the way
+// `YrsString`'s closed set does. The RFC 5.4 read rules are threaded through
+// `LWW::get` -> `Property::absent_default` instead: the required-vs-optional-
+// vs-default decision is keyed on the projected type (the A10 spec, as
+// amended by the canonical value_type ruling 2026-07-10).
 impl<T: Property> FromActiveType<LWW<T>> for T {
     fn from_active(active: LWW<T>) -> Result<Self, PropertyError>
     where Self: Sized {
@@ -61,17 +127,34 @@ impl<T: Property> FromActiveType<LWW<T>> for T {
 }
 
 impl<T: Property> InitializeWith<T> for LWW<T> {
-    fn initialize_with(entity: &Entity, property_name: PropertyName, value: &T) -> Self {
-        let new = Self::from_entity(property_name, entity);
-        new.set(value).unwrap();
-        new
+    fn initialize_with(
+        entity: &Entity,
+        property: Result<PropertyId, PropertyError>,
+        value: &T,
+    ) -> Result<Self, crate::error::MutationError> {
+        let new = Self::from_entity(property, entity);
+        new.set(value)?;
+        Ok(new)
     }
 }
 
 impl<T: Property> ankurah_signals::Signal for LWW<T> {
-    fn listen(&self, listener: Listener) -> ListenerGuard { self.backend.listen_field(&self.property_name, listener) }
+    fn listen(&self, listener: Listener) -> ListenerGuard {
+        match &self.property_id {
+            Some(pid) => self.backend.listen_field(pid, listener),
+            // Unbound: Signal has no fallible surface, and there is no
+            // resolved key to listen on, so track nothing (a no-op guard).
+            // Typed reads and writes still return the resolution error.
+            None => self.entity.broadcast().reference().listen(listener).into(),
+        }
+    }
 
-    fn broadcast_id(&self) -> ankurah_signals::broadcast::BroadcastId { self.backend.field_broadcast_id(&self.property_name) }
+    fn broadcast_id(&self) -> ankurah_signals::broadcast::BroadcastId {
+        match &self.property_id {
+            Some(pid) => self.backend.field_broadcast_id(pid),
+            None => self.entity.broadcast().id(),
+        }
+    }
 }
 
 impl<T: Property> ankurah_signals::Subscribe<T> for LWW<T>

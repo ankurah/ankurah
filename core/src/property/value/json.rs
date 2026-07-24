@@ -152,6 +152,7 @@ impl wasm_bindgen::convert::FromWasmAbi for Json {
 });
 
 impl Property for Json {
+    const VALUE_TYPE: &'static str = "json";
     fn into_value(&self) -> Result<Option<Value>, PropertyError> { Ok(Some(Value::Json(self.0.clone()))) }
 
     fn from_value(value: Option<Value>) -> Result<Self, PropertyError> {
@@ -167,6 +168,11 @@ impl Property for Json {
             None => Err(PropertyError::Missing),
         }
     }
+
+    /// A required absent `Json` reads as JSON null (RFC 5.4 in specs/model-property-metadata/rfc.md rule 3): null is a
+    /// legitimate `Value::Json`, so unlike `EntityId` there IS a representable
+    /// default to return rather than erroring `Missing`.
+    fn absent_default() -> Option<Value> { Some(Value::Json(serde_json::Value::Null)) }
 }
 
 /// Macro for creating Json objects with a more ergonomic syntax.

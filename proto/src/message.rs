@@ -2,11 +2,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     auth::AuthData,
-    id::EntityId,
     peering::{Presence, PresenceRejection},
     request::{NodeRequest, NodeResponse},
     subscription::QueryId,
     update::{NodeUpdate, NodeUpdateAck},
+    EntityId,
 };
 
 #[derive(Debug, Serialize, Deserialize)]

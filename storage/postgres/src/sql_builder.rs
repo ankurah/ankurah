@@ -1,5 +1,7 @@
-use ankql::ast::{ComparisonOperator, Expr, Literal, OrderByItem, OrderDirection, Predicate, Selection};
-use ankurah_core::{error::RetrievalError, EntityId};
+use std::collections::BTreeMap;
+
+use ankql::ast::{ComparisonOperator, Expr, OrderByItem, OrderDirection, OrderKey, Predicate, PropertyId, Selection, Value};
+use ankurah_core::error::RetrievalError;
 use thiserror::Error;
 use tokio_postgres::types::ToSql;
 
@@ -13,6 +15,8 @@ pub enum SqlGenerationError {
     UnsupportedOperator(&'static str),
     #[error("SqlBuilder requires both fields and table_name to be set for complete SELECT generation, or neither for WHERE-only mode")]
     IncompleteConfiguration,
+    #[error("no column assigned for property {0}: a resolved property must be translated through the engine's durable map before SQL generation (an absent property should have been folded to NULL upstream)")]
+    UnmappedProperty(String),
 }
 
 /// Result of splitting a predicate for PostgreSQL execution.
@@ -174,6 +178,9 @@ fn can_pushdown_expr(expr: &Expr) -> bool {
             // Json traversal (pushable) from Ref<T> traversal (not pushable).
             !path.steps.is_empty()
         }
+        // A resolved PropertyPath is pushdown-capable exactly like the equivalent
+        // Path: it renders as a column (name) with optional JSONB sub-path.
+        Expr::PropertyPath(_) => true,
         Expr::ExprList(exprs) => exprs.iter().all(can_pushdown_expr),
         Expr::Predicate(_) => false,     // Nested predicates - not supported in SQL expressions
         Expr::InfixExpr { .. } => false, // Not yet supported
@@ -181,19 +188,37 @@ fn can_pushdown_expr(expr: &Expr) -> bool {
     }
 }
 
+/// Whether an expression is a multi-step JSONB traversal (a Path with a sub-path
+/// or a resolved PropertyPath with a non-empty subpath), which requires ::jsonb
+/// casting of the literal on the other side of a comparison.
+fn expr_is_jsonb_path(expr: &Expr) -> bool {
+    match expr {
+        Expr::Path(p) => !p.is_simple(),
+        Expr::PropertyPath(identifier) => !identifier.is_simple(),
+        _ => false,
+    }
+}
+
 impl From<SqlGenerationError> for RetrievalError {
     fn from(err: SqlGenerationError) -> Self { RetrievalError::StorageError(Box::new(err)) }
 }
 
-pub enum SqlExpr {
+enum SqlExpr {
     Sql(String),
     Argument(Box<dyn ToSql + Send + Sync>),
 }
 
-pub struct SqlBuilder {
+pub(crate) struct SqlBuilder {
     expressions: Vec<SqlExpr>,
     fields: Vec<String>,
     table_name: Option<String>,
+    /// Durable identity-to-column map for this materialization (a clone of the
+    /// bucket's cache). A resolved [`Expr::PropertyPath`] / [`OrderKey::Property`]
+    /// is translated to its assigned column through this map at emit time --
+    /// never by its display name -- so a rename cannot move the column a query
+    /// addresses. A raw [`Expr::Path`] carries no identity and renders its steps
+    /// verbatim (used only for unresolved test selections).
+    column_map: BTreeMap<PropertyId, String>,
 }
 
 impl Default for SqlBuilder {
@@ -201,26 +226,47 @@ impl Default for SqlBuilder {
 }
 
 impl SqlBuilder {
-    pub fn new() -> Self { Self { expressions: Vec::new(), fields: Vec::new(), table_name: None } }
+    fn new() -> Self { Self { expressions: Vec::new(), fields: Vec::new(), table_name: None, column_map: BTreeMap::new() } }
 
-    pub fn with_fields<T: Into<String>>(fields: Vec<T>) -> Self {
-        Self { expressions: Vec::new(), fields: fields.into_iter().map(|f| f.into()).collect(), table_name: None }
+    pub(crate) fn with_fields<T: Into<String>>(fields: Vec<T>) -> Self {
+        Self {
+            expressions: Vec::new(),
+            fields: fields.into_iter().map(|f| f.into()).collect(),
+            table_name: None,
+            column_map: BTreeMap::new(),
+        }
     }
 
-    pub fn table_name(&mut self, name: impl Into<String>) -> &mut Self {
+    pub(crate) fn table_name(&mut self, name: impl Into<String>) -> &mut Self {
         self.table_name = Some(name.into());
         self
     }
 
-    pub fn push(&mut self, expr: SqlExpr) { self.expressions.push(expr); }
+    /// Supply this materialization's durable identity-to-column map, so resolved
+    /// property references translate to their assigned columns at emit time.
+    pub(crate) fn column_map(&mut self, map: BTreeMap<PropertyId, String>) -> &mut Self {
+        self.column_map = map;
+        self
+    }
 
-    pub fn arg(&mut self, arg: impl ToSql + Send + Sync + 'static) {
+    /// The durably-assigned column for a resolved property, or an
+    /// `UnmappedProperty` error. A miss is a caller bug: an absent property must
+    /// be folded to NULL (`assume_null`) before SQL generation, so anything
+    /// reaching here has a materialized column.
+    fn column_for(&self, identifier: &ankql::ast::PropertyPath) -> Result<String, SqlGenerationError> {
+        let id = identifier.id();
+        self.column_map.get(&id).cloned().ok_or_else(|| SqlGenerationError::UnmappedProperty(format!("{id:?}")))
+    }
+
+    fn push(&mut self, expr: SqlExpr) { self.expressions.push(expr); }
+
+    fn arg(&mut self, arg: impl ToSql + Send + Sync + 'static) {
         self.push(SqlExpr::Argument(Box::new(arg) as Box<dyn ToSql + Send + Sync>));
     }
 
-    pub fn sql(&mut self, s: impl AsRef<str>) { self.push(SqlExpr::Sql(s.as_ref().to_owned())); }
+    fn sql(&mut self, s: impl AsRef<str>) { self.push(SqlExpr::Sql(s.as_ref().to_owned())); }
 
-    pub fn build(self) -> Result<(String, Vec<Box<dyn ToSql + Send + Sync>>), SqlGenerationError> {
+    pub(crate) fn build(self) -> Result<(String, Vec<Box<dyn ToSql + Send + Sync>>), SqlGenerationError> {
         let mut counter = 1;
         let mut where_clause = String::new();
         let mut args = Vec::new();
@@ -251,7 +297,7 @@ impl SqlBuilder {
         Ok((sql, args))
     }
 
-    pub fn build_where_clause(self) -> (String, Vec<Box<dyn ToSql + Send + Sync>>) {
+    fn build_where_clause(self) -> (String, Vec<Box<dyn ToSql + Send + Sync>>) {
         let mut counter = 1;
         let mut where_clause = String::new();
         let mut args = Vec::new();
@@ -274,39 +320,33 @@ impl SqlBuilder {
     }
 
     // --- AST flattening ---
-    pub fn expr(&mut self, expr: &Expr) -> Result<(), SqlGenerationError> {
+    fn expr(&mut self, expr: &Expr) -> Result<(), SqlGenerationError> {
         match expr {
             Expr::Placeholder => return Err(SqlGenerationError::PlaceholderFound),
             Expr::Literal(lit) => match lit {
-                Literal::String(s) => self.arg(s.to_owned()),
-                Literal::I64(int) => self.arg(*int),
-                Literal::F64(float) => self.arg(*float),
-                Literal::Bool(bool) => self.arg(*bool),
-                Literal::I16(i) => self.arg(*i),
-                Literal::I32(i) => self.arg(*i),
-                Literal::EntityId(ulid) => self.arg(EntityId::from_ulid(*ulid).to_base64()),
-                Literal::Object(bytes) => self.arg(bytes.clone()),
-                Literal::Binary(bytes) => self.arg(bytes.clone()),
-                Literal::Json(json) => self.arg(json.clone()),
+                Value::String(s) => self.arg(s.to_owned()),
+                Value::I64(int) => self.arg(*int),
+                Value::F64(float) => self.arg(*float),
+                Value::Bool(bool) => self.arg(*bool),
+                Value::I16(i) => self.arg(*i),
+                Value::I32(i) => self.arg(*i),
+                Value::EntityId(id) => self.arg(id.to_base64()),
+                Value::Object(bytes) => self.arg(bytes.clone()),
+                Value::Binary(bytes) => self.arg(bytes.clone()),
+                Value::Json(json) => self.arg(json.clone()),
             },
-            Expr::Path(path) => {
-                if path.is_simple() {
-                    // Single-step path: regular column reference "column_name"
-                    let escaped = path.first().replace('"', "\"\"");
-                    self.sql(format!(r#""{}""#, escaped));
-                } else {
-                    // Multi-step path: JSONB traversal "column"->'nested'->'path'
-                    // Use -> for ALL steps to preserve JSONB type for proper comparison semantics.
-                    // The comparison will use ::jsonb cast on literals to ensure type-aware comparison.
-                    let first = path.first().replace('"', "\"\"");
-                    self.sql(format!(r#""{}""#, first));
-
-                    for step in path.steps.iter().skip(1) {
-                        let escaped = step.replace('\'', "''");
-                        // Always use -> to keep as JSONB (not ->> which extracts as text)
-                        self.sql(format!("->'{}'", escaped));
-                    }
-                }
+            Expr::Path(path) => self.path_steps_sql(&path.steps),
+            // A resolved identifier renders as its durably-ASSIGNED column
+            // (looked up by identity in the engine's map, never by display
+            // name), followed by any JSONB sub-path via "column"->'a'->'b'. This
+            // is where a rename stays harmless: the id addresses the same column
+            // regardless of the current name.
+            Expr::PropertyPath(identifier) => {
+                let column = self.column_for(identifier)?;
+                let mut steps = Vec::with_capacity(1 + identifier.subpath.len());
+                steps.push(column);
+                steps.extend(identifier.subpath.iter().cloned());
+                self.path_steps_sql(&steps);
             }
             Expr::ExprList(exprs) => {
                 self.sql("(");
@@ -317,16 +357,16 @@ impl SqlBuilder {
                     match expr {
                         Expr::Placeholder => return Err(SqlGenerationError::PlaceholderFound),
                         Expr::Literal(lit) => match lit {
-                            Literal::String(s) => self.arg(s.to_owned()),
-                            Literal::I64(int) => self.arg(*int),
-                            Literal::F64(float) => self.arg(*float),
-                            Literal::Bool(bool) => self.arg(*bool),
-                            Literal::I16(i) => self.arg(*i),
-                            Literal::I32(i) => self.arg(*i),
-                            Literal::EntityId(ulid) => self.arg(EntityId::from_ulid(*ulid).to_base64()),
-                            Literal::Object(bytes) => self.arg(bytes.clone()),
-                            Literal::Binary(bytes) => self.arg(bytes.clone()),
-                            Literal::Json(json) => self.arg(json.clone()),
+                            Value::String(s) => self.arg(s.to_owned()),
+                            Value::I64(int) => self.arg(*int),
+                            Value::F64(float) => self.arg(*float),
+                            Value::Bool(bool) => self.arg(*bool),
+                            Value::I16(i) => self.arg(*i),
+                            Value::I32(i) => self.arg(*i),
+                            Value::EntityId(id) => self.arg(id.to_base64()),
+                            Value::Object(bytes) => self.arg(bytes.clone()),
+                            Value::Binary(bytes) => self.arg(bytes.clone()),
+                            Value::Json(json) => self.arg(json.clone()),
                         },
                         _ => {
                             return Err(SqlGenerationError::UnsupportedExpression(
@@ -342,34 +382,57 @@ impl SqlBuilder {
         Ok(())
     }
 
+    /// Emit a column reference (or JSONB sub-path traversal) for a sequence of path
+    /// steps. Shared by the `Expr::Path` and `Expr::PropertyPath` arms so both render
+    /// identically.
+    fn path_steps_sql(&mut self, steps: &[String]) {
+        if steps.len() == 1 {
+            // Single-step path: regular column reference "column_name"
+            let escaped = steps[0].replace('"', "\"\"");
+            self.sql(format!(r#""{}""#, escaped));
+        } else {
+            // Multi-step path: JSONB traversal "column"->'nested'->'path'
+            // Use -> for ALL steps to preserve JSONB type for proper comparison semantics.
+            // The comparison will use ::jsonb cast on literals to ensure type-aware comparison.
+            let first = steps[0].replace('"', "\"\"");
+            self.sql(format!(r#""{}""#, first));
+
+            for step in steps.iter().skip(1) {
+                let escaped = step.replace('\'', "''");
+                // Always use -> to keep as JSONB (not ->> which extracts as text)
+                self.sql(format!("->'{}'", escaped));
+            }
+        }
+    }
+
     /// Emit a literal expression with ::jsonb cast for proper JSONB comparison semantics.
     /// This ensures that comparisons like `"data"->'count' > '10'::jsonb` work correctly
     /// with PostgreSQL's type-aware JSONB comparison (numeric vs lexicographic).
-    pub fn expr_as_jsonb(&mut self, expr: &Expr) -> Result<(), SqlGenerationError> {
+    fn expr_as_jsonb(&mut self, expr: &Expr) -> Result<(), SqlGenerationError> {
         match expr {
             Expr::Literal(lit) => {
                 // For literals, we need to cast to jsonb
                 // PostgreSQL will compare jsonb values with proper type semantics
                 match lit {
-                    Literal::String(s) => {
+                    Value::String(s) => {
                         // String literals need to be JSON strings: '"value"'::jsonb
                         // Escape for JSON (backslash and quote) then for SQL (single quotes)
                         let json_escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
                         let sql_escaped = format!("\"{}\"", json_escaped).replace('\'', "''");
                         self.sql(format!("'{}'::jsonb", sql_escaped));
                     }
-                    Literal::I64(n) => self.sql(format!("'{}'::jsonb", n)),
-                    Literal::F64(n) => self.sql(format!("'{}'::jsonb", n)),
-                    Literal::Bool(b) => self.sql(format!("'{}'::jsonb", b)),
-                    Literal::I16(n) => self.sql(format!("'{}'::jsonb", n)),
-                    Literal::I32(n) => self.sql(format!("'{}'::jsonb", n)),
+                    Value::I64(n) => self.sql(format!("'{}'::jsonb", n)),
+                    Value::F64(n) => self.sql(format!("'{}'::jsonb", n)),
+                    Value::Bool(b) => self.sql(format!("'{}'::jsonb", b)),
+                    Value::I16(n) => self.sql(format!("'{}'::jsonb", n)),
+                    Value::I32(n) => self.sql(format!("'{}'::jsonb", n)),
                     // EntityId and binary types don't make sense as JSONB
-                    Literal::EntityId(_) | Literal::Object(_) | Literal::Binary(_) => {
+                    Value::EntityId(_) | Value::Object(_) | Value::Binary(_) => {
                         // Fall back to regular expression (will likely fail comparison, but that's correct)
                         self.expr(expr)?;
                     }
                     // JSON literal is already properly typed
-                    Literal::Json(json) => self.sql(format!("'{}'::jsonb", json)),
+                    Value::Json(json) => self.sql(format!("'{}'::jsonb", json)),
                 }
                 Ok(())
             }
@@ -378,20 +441,22 @@ impl SqlBuilder {
         }
     }
 
-    pub fn comparison_op(&mut self, op: &ComparisonOperator) -> Result<(), SqlGenerationError> {
+    fn comparison_op(&mut self, op: &ComparisonOperator) -> Result<(), SqlGenerationError> {
         self.sql(comparison_op_to_sql(op)?);
         Ok(())
     }
 
-    pub fn predicate(&mut self, predicate: &Predicate) -> Result<(), SqlGenerationError> {
+    fn predicate(&mut self, predicate: &Predicate) -> Result<(), SqlGenerationError> {
         match predicate {
             Predicate::Comparison { left, operator, right } => {
                 // Check if either side is a JSONB path (multi-step path)
                 // TODO: Replace path depth heuristic with schema metadata when available.
                 // We infer JSON type from !is_simple(), but with a schema registry we could
                 // look up the actual field type. See phase-3-schema.md for details.
-                let left_is_jsonb = matches!(left.as_ref(), Expr::Path(p) if !p.is_simple());
-                let right_is_jsonb = matches!(right.as_ref(), Expr::Path(p) if !p.is_simple());
+                // A resolved PropertyPath with a non-empty subpath is a JSONB traversal,
+                // exactly like a multi-step Path.
+                let left_is_jsonb = expr_is_jsonb_path(left.as_ref());
+                let right_is_jsonb = expr_is_jsonb_path(right.as_ref());
 
                 self.expr(left)?;
                 self.sql(" ");
@@ -442,7 +507,7 @@ impl SqlBuilder {
         Ok(())
     }
 
-    pub fn selection(&mut self, selection: &Selection) -> Result<(), SqlGenerationError> {
+    pub(crate) fn selection(&mut self, selection: &Selection) -> Result<(), SqlGenerationError> {
         // Add the predicate (WHERE clause)
         self.predicate(&selection.predicate)?;
 
@@ -466,15 +531,33 @@ impl SqlBuilder {
         Ok(())
     }
 
-    pub fn order_by_item(&mut self, order_by: &OrderByItem) -> Result<(), SqlGenerationError> {
-        // Generate the path expression
-        for (i, step) in order_by.path.steps.iter().enumerate() {
-            if i > 0 {
-                self.sql(".");
+    fn order_by_item(&mut self, order_by: &OrderByItem) -> Result<(), SqlGenerationError> {
+        // A resolved sort key translates to its assigned column through the map
+        // (like `expr()`); a raw key renders its steps verbatim. `steps` is then
+        // [column, ..subpath].
+        let steps: Vec<String> = match &order_by.key {
+            OrderKey::Property(identifier) => {
+                let column = self.column_for(identifier)?;
+                let mut steps = Vec::with_capacity(1 + identifier.subpath.len());
+                steps.push(column);
+                steps.extend(identifier.subpath.iter().cloned());
+                steps
             }
-            // Escape any existing quotes in the step by doubling them
-            let escaped_step = step.replace('"', "\"\"");
-            self.sql(format!(r#""{}""#, escaped_step));
+            OrderKey::Path(path) => path.steps.clone(),
+        };
+
+        // Single-step keys are a plain column reference; multi-step keys use the
+        // JSONB `->` traversal, matching the predicate emit path.
+        if steps.len() == 1 {
+            let escaped = steps[0].replace('"', "\"\"");
+            self.sql(format!(r#""{}""#, escaped));
+        } else {
+            let first = steps[0].replace('"', "\"\"");
+            self.sql(format!(r#""{}""#, first));
+            for step in steps.iter().skip(1) {
+                let escaped = step.replace('\'', "''");
+                self.sql(format!("->'{}'", escaped));
+            }
         }
 
         // Add the direction
@@ -504,6 +587,7 @@ fn comparison_op_to_sql(op: &ComparisonOperator) -> Result<&'static str, SqlGene
 mod tests {
     use super::*;
     use ankql::parser::parse_selection;
+    use ankurah_core::EntityId;
     use anyhow::Result;
 
     fn assert_args<'a, 'b>(args: &Vec<Box<dyn ToSql + Send + Sync>>, expected: &Vec<Box<dyn ToSql + Send + Sync>>) {
@@ -614,12 +698,12 @@ mod tests {
 
     #[test]
     fn test_selection_with_order_by() -> Result<()> {
-        use ankql::ast::{OrderByItem, OrderDirection, PathExpr, Selection};
+        use ankql::ast::{OrderByItem, OrderDirection, OrderKey, PathExpr, Selection};
 
         let base_selection = ankql::parser::parse_selection("name = 'Alice'").unwrap();
         let selection = Selection {
             predicate: base_selection.predicate,
-            order_by: Some(vec![OrderByItem { path: PathExpr::simple("created_at"), direction: OrderDirection::Desc }]),
+            order_by: Some(vec![OrderByItem { key: OrderKey::Path(PathExpr::simple("created_at")), direction: OrderDirection::Desc }]),
             limit: None,
         };
 
@@ -652,14 +736,14 @@ mod tests {
 
     #[test]
     fn test_selection_with_order_by_and_limit() -> Result<()> {
-        use ankql::ast::{OrderByItem, OrderDirection, PathExpr, Selection};
+        use ankql::ast::{OrderByItem, OrderDirection, OrderKey, PathExpr, Selection};
 
         let base_selection = ankql::parser::parse_selection("status = 'active'").unwrap();
         let selection = Selection {
             predicate: base_selection.predicate,
             order_by: Some(vec![
-                OrderByItem { path: PathExpr::simple("priority"), direction: OrderDirection::Desc },
-                OrderByItem { path: PathExpr::simple("created_at"), direction: OrderDirection::Asc },
+                OrderByItem { key: OrderKey::Path(PathExpr::simple("priority")), direction: OrderDirection::Desc },
+                OrderByItem { key: OrderKey::Path(PathExpr::simple("created_at")), direction: OrderDirection::Asc },
             ]),
             limit: Some(5),
         };
@@ -676,6 +760,69 @@ mod tests {
         let expected: Vec<Box<dyn ToSql + Send + Sync>> = vec![Box::new("active"), Box::new(5i64)];
         assert_args(&args, &expected);
         Ok(())
+    }
+
+    /// Build the WHERE clause for a single `left = 'active'` comparison
+    /// predicate, translating resolved identifiers through `column_map`.
+    fn where_for_mapped(left: Expr, column_map: BTreeMap<PropertyId, String>) -> String {
+        use ankql::ast::{ComparisonOperator, Predicate, Value};
+        let predicate = Predicate::Comparison {
+            left: Box::new(left),
+            operator: ComparisonOperator::Equal,
+            right: Box::new(Expr::Literal(Value::String("active".to_string()))),
+        };
+        let mut sql = SqlBuilder::new();
+        sql.column_map(column_map);
+        sql.predicate(&predicate).unwrap();
+        sql.build_where_clause().0
+    }
+
+    #[test]
+    fn test_identifier_renders_assigned_column_not_display_label() {
+        use ankql::ast::PropertyPath;
+
+        // A resolved identifier renders its durably-ASSIGNED column, looked up by
+        // identity -- NOT its display label. Here the label ("legacy_name") differs
+        // from the assigned column ("status"), so a leak of the label would fail
+        // this assertion. This is the #374 fix in miniature: the column a query
+        // addresses tracks the identity, not the (possibly renamed) display name.
+        let id = EntityId::from_bytes([5u8; 16]);
+        let map = BTreeMap::from([(PropertyId::EntityId(id), "status".to_string())]);
+        let sql = where_for_mapped(Expr::PropertyPath(PropertyPath::registered(id, "legacy_name", vec![])), map);
+
+        assert_eq!(sql, r#""status" = $1"#);
+    }
+
+    #[test]
+    fn test_identifier_json_subpath_renders_assigned_column() {
+        use ankql::ast::PropertyPath;
+
+        // An identifier with a JSON subpath renders the "->" traversal rooted at
+        // the durably-assigned column, with the literal cast to ::jsonb.
+        let id = EntityId::from_bytes([6u8; 16]);
+        let map = BTreeMap::from([(PropertyId::EntityId(id), "data".to_string())]);
+        let sql = where_for_mapped(
+            Expr::PropertyPath(PropertyPath::registered(id, "legacy_data", vec!["user".to_string(), "name".to_string()])),
+            map,
+        );
+
+        assert_eq!(sql, r#""data"->'user'->'name' = '"active"'::jsonb"#);
+    }
+
+    #[test]
+    fn test_identifier_unmapped_property_errors() {
+        use ankql::ast::{ComparisonOperator, Predicate, PropertyPath, Value};
+
+        // A resolved identifier with no map entry is a caller bug (an absent
+        // property must be folded to NULL before SQL generation): it errors
+        // rather than silently falling back to a name.
+        let predicate = Predicate::Comparison {
+            left: Box::new(Expr::PropertyPath(PropertyPath::registered(EntityId::from_bytes([9u8; 16]), "ghost", vec![]))),
+            operator: ComparisonOperator::Equal,
+            right: Box::new(Expr::Literal(Value::String("active".to_string()))),
+        };
+        let mut sql = SqlBuilder::new();
+        assert!(matches!(sql.predicate(&predicate), Err(SqlGenerationError::UnmappedProperty(_))));
     }
 
     // ============================================================================

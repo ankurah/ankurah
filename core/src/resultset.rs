@@ -1,5 +1,9 @@
 use crate::indexing::{encode_tuple_values_with_key_spec, KeySpec};
-use crate::{entity::Entity, model::View, reactor::AbstractEntity};
+use crate::{
+    entity::Entity,
+    model::View,
+    reactor::{extract_property_value, AbstractEntity},
+};
 use ankurah_proto as proto;
 use ankurah_signals::{
     broadcast::{Broadcast, BroadcastId},
@@ -45,9 +49,13 @@ impl From<Vec<u8>> for IVec {
 #[derive(Debug, Clone)]
 pub struct EntityResultSet<E: AbstractEntity = Entity>(Arc<Inner<E>>);
 
-/// View-typed ResultSet
+/// A typed projection over a canonical entity result set.
+///
+/// The underlying entities are model-independent; this wrapper retains the
+/// query's model so each returned item is constructed as the correct
+/// [`View`].
 #[derive(Debug)]
-pub struct ResultSet<R: View>(EntityResultSet<Entity>, std::marker::PhantomData<R>);
+pub struct ResultSet<R: View>(EntityResultSet<Entity>, crate::ModelId, std::marker::PhantomData<R>);
 
 impl<R: View> Deref for ResultSet<R> {
     type Target = EntityResultSet<Entity>;
@@ -55,7 +63,8 @@ impl<R: View> Deref for ResultSet<R> {
 }
 
 impl<R: View> ResultSet<R> {
-    pub fn by_id(&self, id: &proto::EntityId) -> Option<R> { self.0.by_id(id).map(|e| R::from_entity(e)) }
+    /// Return one matching entity projected as this result set's view type.
+    pub fn by_id(&self, id: &proto::EntityId) -> Option<R> { self.0.by_id(id).map(|entity| R::from_entity(entity, self.1)) }
 }
 
 #[derive(Debug)]
@@ -70,8 +79,12 @@ struct Inner<E: AbstractEntity> {
 struct State<E: AbstractEntity> {
     order: Vec<EntityEntry<E>>,
     index: HashMap<proto::EntityId, usize>,
-    // Ordering configuration
-    key_spec: Option<KeySpec>,
+    // Ordering configuration. Each keypart carries the stable property
+    // identity and its sub-path, which is also exactly what value extraction
+    // needs, so the spec is both the encoding rule and the extraction rule;
+    // identity-keyed parts keep an active query stable across display-name
+    // changes.
+    key_spec: Option<KeySpec<ankql::ast::PropertyId>>,
     limit: Option<usize>,
     gap_dirty: bool, // Set when we remove entities and go from =LIMIT to < LIMIT
 }
@@ -302,12 +315,13 @@ impl<'a, E: AbstractEntity> ResultSetWrite<'a, E> {
     }
 
     /// Compute sort key for an entity using the current key spec
-    fn compute_sort_key(entity: &E, key_spec: &KeySpec) -> IVec {
+    fn compute_sort_key(entity: &E, key_spec: &KeySpec<ankql::ast::PropertyId>) -> IVec {
         let mut values = Vec::new();
 
         // Extract values for each key part
         for keypart in &key_spec.keyparts {
-            let value = AbstractEntity::value(entity, &keypart.column);
+            let sub_path = keypart.sub_path.as_deref().unwrap_or(&[]);
+            let value = extract_property_value(&keypart.key, sub_path, entity);
             // TODO: Handle NULLs properly - for now we'll get encoding errors on NULLs
             // which will cause unwrap_or_default() to return empty key (sorts first)
             if let Some(v) = value {
@@ -467,8 +481,10 @@ impl<E: AbstractEntity> EntityResultSet<E> {
         st.order.last().map(|entry| entry.entity.clone())
     }
 
-    /// Configure ordering for this result set
-    pub(crate) fn order_by(&self, key_spec: Option<KeySpec>) {
+    /// Configure ordering with catalog-resolved sort keys. Each keypart's
+    /// identity + sub-path pair is both the encoding rule and the extraction
+    /// rule, so the spec alone fully determines the ordering.
+    pub(crate) fn order_by_resolved(&self, key_spec: Option<KeySpec<ankql::ast::PropertyId>>) {
         let mut st = self.0.state.lock().unwrap();
 
         // Check if the key spec actually changed
@@ -561,7 +577,6 @@ mod tests {
     #[derive(Debug, Clone)]
     struct TestEntity {
         id: proto::EntityId,
-        collection: proto::CollectionId,
         properties: HashMap<String, Value>,
     }
 
@@ -569,13 +584,11 @@ mod tests {
         fn new(id: u8, properties: HashMap<String, Value>) -> Self {
             let mut id_bytes = [0u8; 16];
             id_bytes[15] = id;
-            Self { id: proto::EntityId::from_bytes(id_bytes), collection: proto::CollectionId::fixed_name("test"), properties }
+            Self { id: proto::EntityId::from_bytes(id_bytes), properties }
         }
     }
 
     impl AbstractEntity for TestEntity {
-        fn collection(&self) -> proto::CollectionId { self.collection.clone() }
-
         fn id(&self) -> &proto::EntityId { &self.id }
 
         fn value(&self, field: &str) -> Option<Value> {
@@ -633,7 +646,7 @@ mod tests {
         // Set up ordering by name
         let key_spec = KeySpec {
             keyparts: vec![IndexKeyPart {
-                column: "name".to_string(),
+                key: ankql::ast::PropertyId::System(ankql::ast::SystemProperty::Name),
                 sub_path: None,
                 direction: IndexDirection::Asc,
                 nulls: Some(NullsOrder::Last),
@@ -641,7 +654,7 @@ mod tests {
                 value_type: ValueType::String,
             }],
         };
-        resultset.order_by(Some(key_spec));
+        resultset.order_by_resolved(Some(key_spec));
 
         let mut write = resultset.write();
         write.add(entity2.clone());
@@ -798,14 +811,7 @@ impl<E: View> ResultSet<E> {
 }
 
 impl<E: View> Clone for ResultSet<E> {
-    fn clone(&self) -> Self { Self(self.0.clone(), std::marker::PhantomData) }
-}
-
-impl<E: View> Default for ResultSet<E> {
-    fn default() -> Self {
-        let entity_resultset = EntityResultSet::empty();
-        Self(entity_resultset, std::marker::PhantomData)
-    }
+    fn clone(&self) -> Self { Self(self.0.clone(), self.1, std::marker::PhantomData) }
 }
 
 impl<E: AbstractEntity> Signal for EntityResultSet<E> {
@@ -823,12 +829,14 @@ impl<E: View + Clone + 'static> Get<Vec<E>> for ResultSet<E> {
     fn get(&self) -> Vec<E> {
         use ankurah_signals::CurrentObserver;
         CurrentObserver::track(self);
-        self.0 .0.state.lock().unwrap().order.iter().map(|e| E::from_entity(e.entity.clone())).collect()
+        self.0 .0.state.lock().unwrap().order.iter().map(|entry| E::from_entity(entry.entity.clone(), self.1)).collect()
     }
 }
 
 impl<E: View + Clone + 'static> Peek<Vec<E>> for ResultSet<E> {
-    fn peek(&self) -> Vec<E> { self.0 .0.state.lock().unwrap().order.iter().map(|e| E::from_entity(e.entity.clone())).collect() }
+    fn peek(&self) -> Vec<E> {
+        self.0 .0.state.lock().unwrap().order.iter().map(|entry| E::from_entity(entry.entity.clone(), self.1)).collect()
+    }
 }
 
 impl<E: View + Clone + 'static> Subscribe<Vec<E>> for ResultSet<E> {
@@ -837,7 +845,8 @@ impl<E: View + Clone + 'static> Subscribe<Vec<E>> for ResultSet<E> {
         let listener = listener.into_subscribe_listener();
         let me = self.clone();
         let guard: ankurah_signals::broadcast::ListenerGuard<()> = self.0 .0.broadcast.reference().listen(move |_| {
-            let entities: Vec<E> = me.0 .0.state.lock().unwrap().order.iter().map(|e| E::from_entity(e.entity.clone())).collect();
+            let entities: Vec<E> =
+                me.0 .0.state.lock().unwrap().order.iter().map(|entry| E::from_entity(entry.entity.clone(), me.1)).collect();
             listener(entities);
         });
         SubscriptionGuard::new(ListenerGuard::new(guard))
@@ -865,7 +874,7 @@ impl<E: View + Clone> Iterator for ResultSetIter<E> {
         let state = self.resultset.0 .0.state.lock().unwrap();
         if self.index < state.order.len() {
             let entity = &state.order[self.index].entity;
-            let view = E::from_entity(entity.clone());
+            let view = E::from_entity(entity.clone(), self.resultset.1);
             self.index += 1;
             Some(view)
         } else {
@@ -914,5 +923,5 @@ impl Iterator for EntityResultSetKeyIterator {
 
 // Specific implementation for EntityResultSet<Entity> to provide map method
 impl EntityResultSet<Entity> {
-    pub fn wrap<R: View>(&self) -> ResultSet<R> { ResultSet(self.clone(), std::marker::PhantomData) }
+    pub fn wrap<R: View>(&self, model: crate::ModelId) -> ResultSet<R> { ResultSet(self.clone(), model, std::marker::PhantomData) }
 }

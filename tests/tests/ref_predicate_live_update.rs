@@ -66,8 +66,9 @@ async fn typed_ref_literal_receives_live_updates() -> Result<()> {
 
     let mut selection: ankurah::ankql::ast::Selection = "room = ?".try_into()?;
     selection.predicate =
-        selection.predicate.populate([ankurah::ankql::ast::Expr::Literal(ankurah::ankql::ast::Literal::EntityId(room_a.to_ulid()))])?;
+        selection.predicate.populate([ankurah::ankql::ast::Expr::Literal(ankurah::ankql::ast::Value::EntityId(room_a))])?;
 
+    ctx.model_id::<RefPredMessage>().await?;
     let lq = ctx.query::<RefPredMessageView>(selection)?;
     lq.wait_initialized().await;
     assert_eq!(lq.ids().len(), 0, "no messages yet");
@@ -94,6 +95,7 @@ async fn string_ref_literal_receives_live_updates() -> Result<()> {
 
     let selection: ankurah::ankql::ast::Selection = format!("room = '{}'", room_a.to_base64()).as_str().try_into()?;
 
+    ctx.model_id::<RefPredMessage>().await?;
     let lq = ctx.query::<RefPredMessageView>(selection)?;
     lq.wait_initialized().await;
 

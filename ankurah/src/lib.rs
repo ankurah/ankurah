@@ -20,7 +20,7 @@
 //! ## Key Features
 //!
 //! - **Schema-First Design**: Define data models using Rust structs with an ActiveRecord-style interface - [View](Model::View)/[Mutable](Model::Mutable)
-//! - **Content-filtered pub/sub**: Subscribe to changes on a collection using a SQL-like query - [subscribe](Node::subscribe)
+//! - **Content-filtered pub/sub**: Subscribe to changes with a SQL-like query through [`Context::query`]
 //! - **Real-Time Observability**: Signal-based pattern for tracking entity changes
 //! - **Distributed Architecture**: Multi-node synchronization with event sourcing
 //! - **Flexible Storage**: Support for multiple storage backends (Sled, Postgres, TiKV)
@@ -28,12 +28,12 @@
 //!
 //! ## Core Concepts
 //!
-//! - **Model**: A struct describing fields and types for entities in a collection (data binding)
-//! - **Collection**: A group of entities of the same type (similar to a database table, and backed by a table in the postgres backend)
-//! - **Entity**: A discrete identity in a collection - Dynamic schema (similar to a schema-less database row)
+//! - **Model**: A named schema used to create, query, and project entities
+//! - **Entity**: A durable identity and canonical event-sourced state, independent of any one model
+//! - **Materialization**: A model-specific projection used for querying and indexing
 //! - **View**: A read-only representation of an entity - Typed by the model
 //! - **Mutable**: A mutable state representation of an entity - Typed by the model
-//! - **Event**: An atomic change that can be applied to an entity - used for syncrhonization and audit trail
+//! - **Event**: An atomic change applied to an entity for synchronization and audit
 //!
 //! ## Quick Start
 //!
@@ -157,6 +157,7 @@ pub use ankurah_core::{
     resultset::ResultSet,
     storage, transaction, value,
     value::{Value, ValueType},
+    ModelId,
 };
 
 #[cfg(not(target_arch = "wasm32"))]

@@ -1,0 +1,5 @@
+error: explicit id "AAAAAAAAAAAAAAAAAAAAAB" is not valid URL-safe base64: nonzero trailing bits in base64url encoding (expected 16 bytes as an EntityId, RFC 5.9)
+  --> tests/compile_fail/noncanonical_explicit_id.rs:12:16
+   |
+12 |     pub label: String,
+   |                ^^^^^^

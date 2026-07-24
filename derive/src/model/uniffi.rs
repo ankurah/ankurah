@@ -530,7 +530,7 @@ fn uniffi_changeset_wrapper(changeset_name: &Ident, view_name: &Ident, resultset
         impl #changeset_name {
             /// Get the current result set
             pub fn resultset(&self) -> #resultset_name {
-                #resultset_name(self.0.resultset.wrap())
+                #resultset_name(self.0.resultset.clone())
             }
 
             /// Items from the initial query load (before subscription was active)

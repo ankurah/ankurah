@@ -1,4 +1,3 @@
-use ankurah_proto::CollectionId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -71,14 +70,13 @@ pub struct CollectionRules {
 
 impl PolicyConfig {
     /// Check if any of the given roles can access a collection (read or write).
-    pub fn can_access_collection(&self, roles: &[String], collection: &CollectionId) -> bool {
+    pub fn can_access_collection(&self, roles: &[String], collection_name: &str) -> bool {
         for role in roles {
             if self.role_has_wildcard(role) {
                 return true;
             }
         }
 
-        let collection_name = collection.as_str();
         if let Some(rules) = self.collections.get(collection_name) {
             for role in roles {
                 let privileges = self.privileges_for_role(role);
@@ -99,14 +97,13 @@ impl PolicyConfig {
     }
 
     /// Check if any of the given roles can write to a collection.
-    pub fn can_write_collection(&self, roles: &[String], collection: &CollectionId) -> bool {
+    pub fn can_write_collection(&self, roles: &[String], collection_name: &str) -> bool {
         for role in roles {
             if self.role_has_wildcard(role) {
                 return true;
             }
         }
 
-        let collection_name = collection.as_str();
         if let Some(rules) = self.collections.get(collection_name) {
             for role in roles {
                 let privileges = self.privileges_for_role(role);
