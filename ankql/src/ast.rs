@@ -1,5 +1,6 @@
 use crate::error::ParseError;
 use crate::selection::sql::generate_selection_sql;
+use ankurah_core_types::EntityId;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -590,6 +591,14 @@ impl From<bool> for Expr {
 
 impl From<Literal> for Expr {
     fn from(lit: Literal) -> Expr { Expr::Literal(lit) }
+}
+
+impl From<EntityId> for Expr {
+    fn from(id: EntityId) -> Expr { Expr::Literal(Literal::EntityId(id.to_ulid())) }
+}
+
+impl From<&EntityId> for Expr {
+    fn from(id: &EntityId) -> Expr { Expr::Literal(Literal::EntityId(id.to_ulid())) }
 }
 
 // These create Expr::ExprList for use in IN clauses
