@@ -24,7 +24,7 @@ async fn rt106() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let server_album = {
         let trx = server_ctx.begin();
         let album = trx.create(&Album { name: "Test Album".into(), year: "2020".into() }).await?;
-        let album: AlbumView = album.read();
+        let album: AlbumView = album.read()?;
         trx.commit().await?;
         album
     };

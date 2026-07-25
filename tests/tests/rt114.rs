@@ -24,9 +24,9 @@ async fn rt114() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (server_album1, server_album2) = {
         let trx = server_ctx.begin();
         let album1 = trx.create(&Album { name: "Test Album 1".into(), year: "2020".into() }).await?;
-        let album1: AlbumView = album1.read();
+        let album1: AlbumView = album1.read()?;
         let album2 = trx.create(&Album { name: "Test Album 2".into(), year: "2020".into() }).await?;
-        let album2: AlbumView = album2.read();
+        let album2: AlbumView = album2.read()?;
         trx.commit().await?;
         (album1, album2)
     };
@@ -101,9 +101,9 @@ async fn rt114_b() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (server_album1, server_album2) = {
         let trx = server_ctx.begin();
         let album1 = trx.create(&Album { name: "Test Album 1".into(), year: "2020".into() }).await?;
-        let album1: AlbumView = album1.read();
+        let album1: AlbumView = album1.read()?;
         let album2 = trx.create(&Album { name: "Test Album 2".into(), year: "2020".into() }).await?;
-        let album2: AlbumView = album2.read();
+        let album2: AlbumView = album2.read()?;
         trx.commit().await?;
         (album1, album2)
     };

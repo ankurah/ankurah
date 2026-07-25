@@ -2,7 +2,7 @@ pub mod backend;
 pub mod traits;
 pub mod value;
 
-use ankql::ast::PropertyId;
+pub use ankurah_core_types::PropertyId;
 use ankurah_proto::EntityId;
 
 pub use traits::{FromActiveType, FromEntity, InitializeWith, PropertyError};

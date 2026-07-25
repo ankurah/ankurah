@@ -16,8 +16,10 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
         Ok(types) => types,
         Err(e) => return e.into_compile_error(),
     };
+    let active_field_count = model.active_fields().len();
+    let active_field_indices: Vec<syn::Index> = (0..active_field_count).map(syn::Index::from).collect();
     let active_field_resolutions =
-        match crate::model::schema::active_field_resolution_tokens(model, quote! { &self.entity }, quote! { &self.model_id }) {
+        match crate::model::schema::active_field_resolution_tokens(model, quote! { &entity }, quote! { &model_id }) {
             Ok(resolutions) => resolutions,
             Err(e) => return e.into_compile_error(),
         };
@@ -86,6 +88,7 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
             pub struct #view_name {
                 entity: ::ankurah::entity::Entity,
                 model_id: ::ankurah::ModelId,
+                property_ids: [::ankurah::property::PropertyId; #active_field_count],
                 #(
                     #ephemeral_field_visibility #ephemeral_field_names: #ephemeral_field_types,
                 )*
@@ -125,14 +128,16 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
                     self.model_id
                 }
 
-                fn from_entity(entity: ::ankurah::entity::Entity, model_id: ::ankurah::ModelId) -> Self {
-                    #view_name {
+                fn from_entity(entity: ::ankurah::entity::Entity, model_id: ::ankurah::ModelId) -> Result<Self, ankurah::property::PropertyError> {
+                    let property_ids = [ #( #active_field_resolutions? ),* ];
+                    Ok(#view_name {
                         entity,
                         model_id,
+                        property_ids,
                         #(
                             #ephemeral_field_names: Default::default(),
                         )*
-                    }
+                    })
                 }
             }
 
@@ -199,7 +204,7 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
                         use ankurah::property::{FromActiveType, FromEntity};
                         ::ankurah::signals::CurrentObserver::track(self);
                         let active_result = #active_field_types_turbofish::from_entity(
-                            #active_field_resolutions,
+                            self.property_ids[#active_field_indices],
                             &self.entity,
                         );
                         #projected_field_types_turbofish::from_active(active_result)

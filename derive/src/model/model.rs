@@ -49,7 +49,7 @@ pub fn model_impl(model: &crate::model::description::ModelDescription) -> TokenS
                 #(
                     #active_field_types_turbofish::initialize_with(
                         &entity,
-                        #active_field_resolutions,
+                        #active_field_resolutions?,
                         &self.#active_field_names,
                     )?;
                 )*

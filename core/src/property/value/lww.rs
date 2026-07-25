@@ -17,11 +17,7 @@ use ankurah_signals::{
 
 #[derive(Clone)]
 pub struct LWW<T: Property> {
-    /// This field's durable identity, resolved by the generated view/mutable
-    /// before construction. The accessor and backend never receive a display
-    /// name.
-    pub property_id: Option<PropertyId>,
-    resolution_error: Option<String>,
+    pub property_id: PropertyId,
     pub backend: Arc<LWWBackend>,
     pub entity: Entity,
     phantom: PhantomData<T>,
@@ -34,21 +30,11 @@ impl<T: Property> std::fmt::Debug for LWW<T> {
 }
 
 impl<T: Property> LWW<T> {
-    /// The resolved key, or the view-construction resolution error. `set` and
-    /// `get` (via [`Self::stored_value`]) both route through this.
-    fn resolved_id(&self) -> Result<PropertyId, PropertyError> {
-        if let Some(error) = &self.resolution_error {
-            return Err(PropertyError::RetrievalError(crate::error::RetrievalError::Other(error.clone())));
-        }
-        self.property_id
-            .ok_or_else(|| PropertyError::RetrievalError(crate::error::RetrievalError::Other("property resolution failed".to_owned())))
-    }
-
     pub fn set(&self, value: &T) -> Result<(), PropertyError> {
         if !self.entity.is_writable() {
             return Err(PropertyError::TransactionClosed);
         }
-        let pid = self.resolved_id()?;
+        let pid = self.property_id;
         let value = match value.into_value()? {
             Some(value) => Some(self.entity.canonicalize_property_value(&pid, value)?),
             None => None,
@@ -73,8 +59,7 @@ impl<T: Property> LWW<T> {
     /// failure surfaces as the fail-visible `NonCastable`, never a fabricated
     /// default. The same hop covers a legacy or ill-typed payload
     /// defensively. Type-pair admission is REGISTRATION's job (the canonical
-    /// value_type ruling): reads carry no gate. An unbound field (no resolved
-    /// id) surfaces `PropertyError::UnknownProperty` here too.
+    /// value_type ruling): reads carry no gate.
     pub fn get(&self) -> Result<T, PropertyError> {
         match self.stored_value()? {
             Some(value) => {
@@ -93,22 +78,17 @@ impl<T: Property> LWW<T> {
 
     /// The stored value: `Some` present, `None` absent. Keys by the resolved
     /// [`PropertyId`] alone -- no id-then-name fallback (the identity model
-    /// has exactly one durable key per property, full stop). Errors if the
-    /// field never resolved (an unbound name-addressed field).
+    /// has exactly one durable key per property, full stop).
     pub fn stored_value(&self) -> Result<Option<Value>, PropertyError> {
-        let pid = self.resolved_id()?;
+        let pid = self.property_id;
         Ok(crate::property::read_by_id(self.backend.as_ref(), &pid))
     }
 }
 
 impl<T: Property> FromEntity for LWW<T> {
-    fn from_entity(property: Result<PropertyId, PropertyError>, entity: &Entity) -> Self {
+    fn from_entity(property_id: PropertyId, entity: &Entity) -> Self {
         let backend = entity.get_backend::<LWWBackend>().expect("LWW Backend should exist");
-        let (property_id, resolution_error) = match property {
-            Ok(id) => (Some(id), None),
-            Err(error) => (None, Some(error.to_string())),
-        };
-        Self { property_id, resolution_error, backend, entity: entity.clone(), phantom: PhantomData }
+        Self { property_id, backend, entity: entity.clone(), phantom: PhantomData }
     }
 }
 
@@ -129,10 +109,10 @@ impl<T: Property> FromActiveType<LWW<T>> for T {
 impl<T: Property> InitializeWith<T> for LWW<T> {
     fn initialize_with(
         entity: &Entity,
-        property: Result<PropertyId, PropertyError>,
+        property_id: PropertyId,
         value: &T,
     ) -> Result<Self, crate::error::MutationError> {
-        let new = Self::from_entity(property, entity);
+        let new = Self::from_entity(property_id, entity);
         new.set(value)?;
         Ok(new)
     }
@@ -140,20 +120,11 @@ impl<T: Property> InitializeWith<T> for LWW<T> {
 
 impl<T: Property> ankurah_signals::Signal for LWW<T> {
     fn listen(&self, listener: Listener) -> ListenerGuard {
-        match &self.property_id {
-            Some(pid) => self.backend.listen_field(pid, listener),
-            // Unbound: Signal has no fallible surface, and there is no
-            // resolved key to listen on, so track nothing (a no-op guard).
-            // Typed reads and writes still return the resolution error.
-            None => self.entity.broadcast().reference().listen(listener).into(),
-        }
+        self.backend.listen_field(&self.property_id, listener)
     }
 
     fn broadcast_id(&self) -> ankurah_signals::broadcast::BroadcastId {
-        match &self.property_id {
-            Some(pid) => self.backend.field_broadcast_id(pid),
-            None => self.entity.broadcast().id(),
-        }
+        self.backend.field_broadcast_id(&self.property_id)
     }
 }
 

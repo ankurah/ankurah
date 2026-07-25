@@ -64,7 +64,7 @@ impl<R: View> Deref for ResultSet<R> {
 
 impl<R: View> ResultSet<R> {
     /// Return one matching entity projected as this result set's view type.
-    pub fn by_id(&self, id: &proto::EntityId) -> Option<R> { self.0.by_id(id).map(|entity| R::from_entity(entity, self.1)) }
+    pub fn by_id(&self, id: &proto::EntityId) -> Option<R> { self.0.by_id(id).map(|entity| R::from_entity(entity, self.1).expect("view fields resolve at construction; the model was admitted before this result set existed")) }
 }
 
 #[derive(Debug)]
@@ -829,13 +829,13 @@ impl<E: View + Clone + 'static> Get<Vec<E>> for ResultSet<E> {
     fn get(&self) -> Vec<E> {
         use ankurah_signals::CurrentObserver;
         CurrentObserver::track(self);
-        self.0 .0.state.lock().unwrap().order.iter().map(|entry| E::from_entity(entry.entity.clone(), self.1)).collect()
+        self.0 .0.state.lock().unwrap().order.iter().map(|entry| E::from_entity(entry.entity.clone(), self.1).expect("view fields resolve at construction; the model was admitted before this result set existed")).collect()
     }
 }
 
 impl<E: View + Clone + 'static> Peek<Vec<E>> for ResultSet<E> {
     fn peek(&self) -> Vec<E> {
-        self.0 .0.state.lock().unwrap().order.iter().map(|entry| E::from_entity(entry.entity.clone(), self.1)).collect()
+        self.0 .0.state.lock().unwrap().order.iter().map(|entry| E::from_entity(entry.entity.clone(), self.1).expect("view fields resolve at construction; the model was admitted before this result set existed")).collect()
     }
 }
 
@@ -846,7 +846,7 @@ impl<E: View + Clone + 'static> Subscribe<Vec<E>> for ResultSet<E> {
         let me = self.clone();
         let guard: ankurah_signals::broadcast::ListenerGuard<()> = self.0 .0.broadcast.reference().listen(move |_| {
             let entities: Vec<E> =
-                me.0 .0.state.lock().unwrap().order.iter().map(|entry| E::from_entity(entry.entity.clone(), me.1)).collect();
+                me.0 .0.state.lock().unwrap().order.iter().map(|entry| E::from_entity(entry.entity.clone(), me.1).expect("view fields resolve at construction; the model was admitted before this result set existed")).collect();
             listener(entities);
         });
         SubscriptionGuard::new(ListenerGuard::new(guard))
@@ -874,7 +874,7 @@ impl<E: View + Clone> Iterator for ResultSetIter<E> {
         let state = self.resultset.0 .0.state.lock().unwrap();
         if self.index < state.order.len() {
             let entity = &state.order[self.index].entity;
-            let view = E::from_entity(entity.clone(), self.resultset.1);
+            let view = E::from_entity(entity.clone(), self.resultset.1).expect("view fields resolve at construction; the model was admitted before this result set existed");
             self.index += 1;
             Some(view)
         } else {

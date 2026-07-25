@@ -104,13 +104,13 @@ async fn required_absent_i64_reads_type_default_zero() -> anyhow::Result<()> {
     // Touch the LWW backend so it exists on the entity.
     let _ = entity.get_backend::<LWWBackend>().unwrap();
 
-    let count: LWW<i64> = LWW::from_entity(Ok(PropertyId::EntityId(EntityId::new())), &entity);
+    let count: LWW<i64> = LWW::from_entity(PropertyId::EntityId(EntityId::new()), &entity);
     assert_eq!(count.get()?, 0, "absent required i64 reads the type default 0");
 
-    let title: LWW<String> = LWW::from_entity(Ok(PropertyId::EntityId(EntityId::new())), &entity);
+    let title: LWW<String> = LWW::from_entity(PropertyId::EntityId(EntityId::new()), &entity);
     assert_eq!(title.get()?, "", "absent required string reads the empty string (the #175 case)");
 
-    let flag: LWW<bool> = LWW::from_entity(Ok(PropertyId::EntityId(EntityId::new())), &entity);
+    let flag: LWW<bool> = LWW::from_entity(PropertyId::EntityId(EntityId::new()), &entity);
     assert!(!flag.get()?, "absent required bool reads false");
 
     Ok(())
@@ -130,7 +130,7 @@ async fn optional_absent_reads_none_and_is_null_matches() -> anyhow::Result<()> 
     let model = ModelId::EntityId(EntityId::new());
     let entity = Entity::create(EntityId::new(), model);
     let _ = entity.get_backend::<LWWBackend>().unwrap();
-    let opt: LWW<Option<i64>> = LWW::from_entity(Ok(PropertyId::EntityId(EntityId::new())), &entity);
+    let opt: LWW<Option<i64>> = LWW::from_entity(PropertyId::EntityId(EntityId::new()), &entity);
     assert_eq!(opt.get()?, None, "absent optional reads None");
 
     // Predicate half: through a real node so the identifier resolves. Register

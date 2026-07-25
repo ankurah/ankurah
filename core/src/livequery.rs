@@ -679,7 +679,8 @@ where R: View {
     let mut changes = Vec::new();
 
     for item in reactor_update.items {
-        let view = R::from_entity(item.entity, item.model);
+        let view = R::from_entity(item.entity, item.model)
+            .expect("view fields resolve at construction; the model was admitted before this live query existed");
 
         // Determine the change type based on predicate relevance
         // ignore the query_id, because it should only be used by LiveQuery, which entails a single-predicate subscription

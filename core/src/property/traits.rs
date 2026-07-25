@@ -14,7 +14,7 @@ use super::Value;
 pub trait InitializeWith<T> {
     /// Construct and initialize an active field under its resolved durable
     /// identity.
-    fn initialize_with(entity: &Entity, property: Result<PropertyId, PropertyError>, value: &T) -> Result<Self, MutationError>
+    fn initialize_with(entity: &Entity, property: PropertyId, value: &T) -> Result<Self, MutationError>
     where Self: Sized;
 }
 
@@ -115,7 +115,7 @@ impl From<serde_json::Error> for PropertyError {
 pub trait FromEntity {
     /// Bind an active field to an entity using the durable identity resolved
     /// by the generated view or mutable.
-    fn from_entity(property: Result<PropertyId, PropertyError>, entity: &Entity) -> Self;
+    fn from_entity(property: PropertyId, entity: &Entity) -> Self;
 }
 
 pub trait FromActiveType<A> {

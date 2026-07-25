@@ -17,9 +17,9 @@ async fn basic_local_subscription() -> Result<(), Box<dyn std::error::Error + Se
     let (two_vines, ask_that_god, ice_on_the_dune) = {
         let trx = ctx.begin();
         trx.create(&Album { name: "Walking on a Dream".into(), year: "2008".into() }).await?;
-        let ice_on_the_dune = trx.create(&Album { name: "Ice on the Dune".into(), year: "2013".into() }).await?.read();
-        let two_vines = trx.create(&Album { name: "Two Vines".into(), year: "2016".into() }).await?.read();
-        let ask_that_god = trx.create(&Album { name: "Ask That God".into(), year: "2024".into() }).await?.read();
+        let ice_on_the_dune = trx.create(&Album { name: "Ice on the Dune".into(), year: "2013".into() }).await?.read()?;
+        let two_vines = trx.create(&Album { name: "Two Vines".into(), year: "2016".into() }).await?.read()?;
+        let ask_that_god = trx.create(&Album { name: "Ask That God".into(), year: "2024".into() }).await?.read()?;
         trx.commit().await?;
 
         (two_vines, ask_that_god, ice_on_the_dune)
@@ -84,11 +84,11 @@ async fn complex_local_subscription() -> Result<(), Box<dyn std::error::Error + 
     {
         // Create some test entities
         let trx = ctx.begin();
-        rex = trx.create(&Pet { name: "Rex".to_string(), age: "1".to_string() }).await?.read();
+        rex = trx.create(&Pet { name: "Rex".to_string(), age: "1".to_string() }).await?.read()?;
 
-        snuffy = trx.create(&Pet { name: "Snuffy".to_string(), age: "2".to_string() }).await?.read();
+        snuffy = trx.create(&Pet { name: "Snuffy".to_string(), age: "2".to_string() }).await?.read()?;
 
-        jasper = trx.create(&Pet { name: "Jasper".to_string(), age: "6".to_string() }).await?.read();
+        jasper = trx.create(&Pet { name: "Jasper".to_string(), age: "6".to_string() }).await?.read()?;
 
         trx.commit().await.unwrap();
     };
@@ -164,8 +164,8 @@ async fn resultset_vs_livequery_signal_semantics() -> Result<(), Box<dyn std::er
     // Create initial entities
     let (album_a, album_b) = {
         let trx = ctx.begin();
-        let a = trx.create(&Album { name: "Album A".into(), year: "2020".into() }).await?.read();
-        let b = trx.create(&Album { name: "Album B".into(), year: "2015".into() }).await?.read();
+        let a = trx.create(&Album { name: "Album A".into(), year: "2020".into() }).await?.read()?;
+        let b = trx.create(&Album { name: "Album B".into(), year: "2015".into() }).await?.read()?;
         trx.commit().await?;
         (a, b)
     };

@@ -215,7 +215,7 @@ async fn subscription_empty_events_from_noop_delta() -> Result<()> {
     let rex = {
         let trx = server_ctx.begin();
         let rex = trx.create(&Pet { name: "Rex".to_string(), age: "1".to_string() }).await?;
-        let read = rex.read();
+        let read = rex.read()?;
         trx.commit().await?;
         read
     };

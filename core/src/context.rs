@@ -363,14 +363,14 @@ impl Context {
     pub async fn get<R: View>(&self, id: proto::EntityId) -> Result<R, RetrievalError> {
         let model_id = self.0.ensure_query_schema(R::Model::schema()).await?;
         let entity = self.0.get_entity(id, &model_id, false).await?;
-        Ok(R::from_entity(entity, model_id))
+        R::from_entity(entity, model_id).map_err(RetrievalError::from)
     }
 
     /// Get an entity, but its ok to return early if the entity is already in the local node storage
     pub async fn get_cached<R: View>(&self, id: proto::EntityId) -> Result<R, RetrievalError> {
         let model_id = self.0.ensure_query_schema(R::Model::schema()).await?;
         let entity = self.0.get_entity(id, &model_id, true).await?;
-        Ok(R::from_entity(entity, model_id))
+        R::from_entity(entity, model_id).map_err(RetrievalError::from)
     }
 
     pub async fn fetch<R: View>(&self, args: impl TryInto<MatchArgs, Error = impl Into<RetrievalError>>) -> Result<Vec<R>, RetrievalError> {
@@ -382,7 +382,7 @@ impl Context {
 
         let entities = self.0.fetch_entities(&model_id, args).await?;
 
-        Ok(entities.into_iter().map(|entity| R::from_entity(entity, model_id)).collect())
+        entities.into_iter().map(|entity| R::from_entity(entity, model_id).map_err(RetrievalError::from)).collect()
     }
 
     pub async fn fetch_one<R: View + Clone + 'static>(

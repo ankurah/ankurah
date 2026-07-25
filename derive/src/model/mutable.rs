@@ -9,8 +9,10 @@ pub fn mutable_impl(model: &crate::model::description::ModelDescription) -> Toke
     // TODO - add this to the accessors
     let _active_field_visibility = model.active_field_visibility();
     let active_field_names = model.active_field_names();
+    let active_field_count = model.active_fields().len();
+    let active_field_indices: Vec<syn::Index> = (0..active_field_count).map(syn::Index::from).collect();
     let active_field_resolutions =
-        match crate::model::schema::active_field_resolution_tokens(model, quote! { &self.entity }, quote! { &self.model_id }) {
+        match crate::model::schema::active_field_resolution_tokens(model, quote! { &entity }, quote! { &model_id }) {
             Ok(resolutions) => resolutions,
             Err(e) => return e.into_compile_error(),
         };
@@ -60,6 +62,7 @@ pub fn mutable_impl(model: &crate::model::description::ModelDescription) -> Toke
             #field_attributes
             pub entity: ::ankurah::entity::Entity,
             model_id: ::ankurah::ModelId,
+            property_ids: [::ankurah::property::PropertyId; #active_field_count],
         }
 
         impl ::ankurah::model::Mutable for #mutable_name {
@@ -74,14 +77,15 @@ pub fn mutable_impl(model: &crate::model::description::ModelDescription) -> Toke
                 self.model_id
             }
 
-            fn new(entity: ::ankurah::entity::Entity, model_id: ::ankurah::ModelId) -> Self {
-                use ankurah::property::FromEntity;
-                Self {
+            fn new(entity: ::ankurah::entity::Entity, model_id: ::ankurah::ModelId) -> Result<Self, ankurah::property::PropertyError> {
+                let property_ids = [ #( #active_field_resolutions? ),* ];
+                Ok(Self {
+                    property_ids,
                     entity,
                     model_id,
-                }
-                }
+                })
             }
+        }
 
         impl #mutable_name {
             pub fn id(&self) -> ::ankurah::proto::EntityId {
@@ -92,7 +96,7 @@ pub fn mutable_impl(model: &crate::model::description::ModelDescription) -> Toke
                 pub fn #active_field_names(&self) -> #active_field_types {
                     use ankurah::property::FromEntity;
                     #active_field_types_turbofish::from_entity(
-                        #active_field_resolutions,
+                        self.property_ids[#active_field_indices],
                         &self.entity,
                     )
                 }

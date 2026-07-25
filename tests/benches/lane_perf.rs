@@ -110,7 +110,7 @@ fn bench_single_writer_commit(c: &mut Criterion) {
                 let doc = {
                     let trx = ctx.begin();
                     let doc = trx.create(&Doc { title: "seed".into(), body: "0".into() }).await.unwrap();
-                    let read = doc.read();
+                    let read = doc.read()?;
                     trx.commit().await.unwrap();
                     read
                 };
@@ -164,7 +164,7 @@ fn bench_commit_to_subscriber_latency(c: &mut Criterion) {
                 let doc = {
                     let trx = server_ctx.begin();
                     let doc = trx.create(&Doc { title: "watched".into(), body: "0".into() }).await.unwrap();
-                    let read = doc.read();
+                    let read = doc.read()?;
                     trx.commit().await.unwrap();
                     read
                 };
@@ -259,7 +259,7 @@ fn bench_fresh_fetch_snapshot(c: &mut Criterion) {
                         let doc = {
                             let trx = server_ctx.begin();
                             let doc = trx.create(&Doc { title: "chain".into(), body: "0".into() }).await.unwrap();
-                            let read = doc.read();
+                            let read = doc.read()?;
                             trx.commit().await.unwrap();
                             read
                         };
@@ -342,7 +342,7 @@ fn bench_bridge_catchup(c: &mut Criterion) {
                         let doc = {
                             let trx = server_ctx.begin();
                             let doc = trx.create(&Doc { title: "chain".into(), body: "0".into() }).await.unwrap();
-                            let read = doc.read();
+                            let read = doc.read()?;
                             trx.commit().await.unwrap();
                             read
                         };

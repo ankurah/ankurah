@@ -93,7 +93,7 @@ impl Transaction {
         self.created_entity_ids.write().unwrap().insert(entity.id);
 
         let entity_ref = self.add_entity(entity, model_id);
-        Ok(MutableBorrow::new(entity_ref, model_id))
+        MutableBorrow::new(entity_ref, model_id).map_err(Into::into)
     }
     fn get_trx_entity(&self, id: &EntityId) -> Option<(&Entity, crate::ModelId)> {
         let entity = self.entities.iter().find(|entity| entity.id == *id)?;
@@ -108,7 +108,7 @@ impl Transaction {
                     return Err(RetrievalError::EntityNotFound(*id));
                 }
                 self.record_schema(M::schema(), model_id);
-                Ok(MutableBorrow::new(entity, model_id))
+                MutableBorrow::new(entity, model_id).map_err(Into::into)
             }
             None => {
                 // go fetch the entity from the context
@@ -122,11 +122,11 @@ impl Transaction {
                     // if this happens, I don't think we want to refresh the entity, because it's already snapshotted in the trx
                     // and we should leave it that way to honor the consistency model
                     self.record_schema(M::schema(), model_id);
-                    Ok(MutableBorrow::new(entity, model_id))
+                    MutableBorrow::new(entity, model_id).map_err(Into::into)
                 } else {
                     let entity = self.add_entity(retrieved_entity.snapshot(self.alive.clone()), model_id);
                     self.record_schema(M::schema(), model_id);
-                    Ok(MutableBorrow::new(entity, model_id))
+                    MutableBorrow::new(entity, model_id).map_err(Into::into)
                 }
             }
         }
@@ -146,12 +146,12 @@ impl Transaction {
                 return Err(AccessDenied::CollectionDenied(model));
             }
             self.record_schema(M::schema(), model);
-            return Ok(MutableBorrow::new(entity, model));
+            return MutableBorrow::new(entity, model).map_err(Into::into);
         }
         self.dyncontext.check_write(entity, &model)?;
         self.record_schema(M::schema(), model);
 
-        Ok(MutableBorrow::new(self.add_entity(entity.snapshot(self.alive.clone()), model), model))
+        MutableBorrow::new(self.add_entity(entity.snapshot(self.alive.clone()), model), model).map_err(Into::into)
     }
 
     #[must_use]

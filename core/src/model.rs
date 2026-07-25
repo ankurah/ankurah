@@ -60,7 +60,8 @@ pub trait View {
     fn entity(&self) -> &Entity;
     /// Model projection through which this view interprets the entity.
     fn model_id(&self) -> crate::ModelId;
-    fn from_entity(inner: Entity, model: crate::ModelId) -> Self;
+    fn from_entity(inner: Entity, model: crate::ModelId) -> Result<Self, PropertyError>
+    where Self: Sized;
     fn to_model(&self) -> Result<Self::Model, PropertyError>;
 }
 
@@ -72,8 +73,8 @@ pub struct MutableBorrow<'rec, T: Mutable> {
 }
 
 impl<'rec, T: Mutable> MutableBorrow<'rec, T> {
-    pub fn new(entity_ref: &'rec Entity, model: crate::ModelId) -> Self {
-        Self { mutable: T::new(entity_ref.clone(), model), _entity_ref: entity_ref }
+    pub fn new(entity_ref: &'rec Entity, model: crate::ModelId) -> Result<Self, PropertyError> {
+        Ok(Self { mutable: T::new(entity_ref.clone(), model)?, _entity_ref: entity_ref })
     }
 
     /// Extract the core mutable (for WASM usage)
@@ -100,12 +101,12 @@ pub trait Mutable {
     fn entity(&self) -> &Entity;
     /// Model projection through which this mutable interprets the entity.
     fn model_id(&self) -> crate::ModelId;
-    fn new(entity: Entity, model: crate::ModelId) -> Self
+    fn new(entity: Entity, model: crate::ModelId) -> Result<Self, PropertyError>
     where Self: Sized;
 
     fn state(&self) -> Result<State, StateError> { self.entity().to_state() }
 
-    fn read(&self) -> Self::View {
+    fn read(&self) -> Result<Self::View, PropertyError> {
         let inner = self.entity();
 
         let new_inner = match &inner.kind {
