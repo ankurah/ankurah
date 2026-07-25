@@ -3,42 +3,10 @@ use base64::write::EncoderWriter;
 use postgres_protocol::types;
 use postgres_types::{to_sql_checked, FromSql, IsNull, Kind, ToSql, Type};
 
-use crate::{Clock, DecodeError, EntityId, EventId, OperationSet};
+use crate::{Clock, DecodeError, EventId, OperationSet};
 use bytes::{BufMut, BytesMut};
 use std::error::Error;
 use std::io::Write;
-
-// EntityID implementation
-impl ToSql for EntityId {
-    fn to_sql(&self, _: &Type, out: &mut BytesMut) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
-        let mut enc = EncoderWriter::new(out.writer(), &general_purpose::URL_SAFE_NO_PAD);
-        enc.write_all(self.0.to_bytes().as_slice())?;
-        enc.finish()?;
-        Ok(IsNull::No)
-    }
-
-    fn accepts(ty: &Type) -> bool {
-        match ty.name() {
-            "character" => true,
-            "bpchar" => true,
-            _ => false,
-        }
-    }
-
-    to_sql_checked!();
-}
-
-impl<'a> FromSql<'a> for EntityId {
-    fn from_sql(_: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn Error + Sync + Send>> { Ok(EntityId::from_base64(raw)?) }
-
-    fn accepts(ty: &Type) -> bool {
-        match ty.name() {
-            "character" => true,
-            "bpchar" => true,
-            _ => false,
-        }
-    }
-}
 
 // EventID implementation
 impl ToSql for EventId {

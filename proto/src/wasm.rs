@@ -5,20 +5,7 @@ use wasm_bindgen::JsValue;
 use crate::AttestationSet;
 use crate::CollectionId;
 use crate::StateBuffers;
-use crate::{Clock, DecodeError, EntityId, EventId, OperationSet};
-
-impl TryFrom<JsValue> for EntityId {
-    type Error = DecodeError;
-
-    fn try_from(value: JsValue) -> Result<Self, Self::Error> {
-        let id_str = value.as_string().ok_or(DecodeError::NotStringValue)?;
-        EntityId::from_base64(&id_str)
-    }
-}
-
-impl From<&EntityId> for JsValue {
-    fn from(val: &EntityId) -> Self { val.to_base64().into() }
-}
+use crate::{Clock, DecodeError, EventId, OperationSet};
 
 impl TryFrom<JsValue> for EventId {
     type Error = DecodeError;
