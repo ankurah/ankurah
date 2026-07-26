@@ -157,7 +157,7 @@ pub enum RegistrationError {
     ),
 }
 
-impl<SE, PA> Node<SE, PA>
+impl<SE, PA> super::catalog::CatalogManager<SE, PA>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
@@ -166,20 +166,21 @@ where
     /// every definition by its lookup key, allocate fresh ids for misses,
     /// emit ordinary creation events and difference-only follow-ups through
     /// the policy-checked pipeline, and return the resolved definitions.
-    pub async fn execute_schema_registration(
+    pub async fn register_schema(
         &self,
         cdata: &PA::ContextData,
         models: Vec<ModelDescriptor>,
         properties: Vec<PropertyDescriptor>,
         memberships: Vec<MembershipDescriptor>,
     ) -> Result<RegisteredDefs, RegistrationError> {
-        if !self.durable {
+        let node = self.node().ok_or(RegistrationError::SystemNotReady)?;
+        if !node.durable {
             return Err(RegistrationError::NotDurable);
         }
-        if self.system.root().is_none() {
+        if node.system.root().is_none() {
             return Err(RegistrationError::SystemNotReady);
         }
-        let registration_validity = self.catalog.registration_validity().ok_or(RegistrationError::SystemNotReady)?;
+        let registration_validity = self.registration_validity().ok_or(RegistrationError::SystemNotReady)?;
         // Descriptor collection names are schema labels, not runtime model
         // identities. Validate their reserved namespace here, but never
         // manufacture a ModelId merely to run an identity-addressed policy
@@ -218,7 +219,7 @@ where
         // storage before minting (see the *_lookup_checked helpers), so a
         // lagging or cold map (partial-commit abort skipped the fold, or a
         // lazily-warming engine, #310) can never fork identity.
-        if !self.catalog.wait_catalog_ready_if_current(&registration_validity).await {
+        if !self.wait_catalog_ready_if_current(&registration_validity).await {
             return Err(RegistrationError::SystemNotReady);
         }
         let _registration_lease = registration_validity.try_acquire().ok_or(RegistrationError::SystemNotReady)?;
@@ -227,7 +228,7 @@ where
         // allocation, commit, and the synchronous map update -- serializes
         // on the allocator mutex. The reactor-fed map alone lags commit and
         // must never be raced by the next request in line.
-        let _allocator = self.catalog.lock_allocator().await;
+        let _allocator = self.lock_allocator().await;
 
         let mut plan = RegistrationPlan::default();
         // Creation events carry the FULL definition state (no frozen
@@ -585,16 +586,16 @@ where
         // upgrade). Identity survives such partials because every allocator
         // lookup double-checks storage on a map miss, so a retry converges
         // on the stored ids instead of re-minting.
-        self.policy_agent.check_schema_registration(self, cdata, &plan)?;
+        node.policy_agent.check_schema_registration(&node, cdata, &plan)?;
 
         // The ordinary remote-commit pipeline: policy check (check_event),
         // attest, persist, apply, reactor notify.
-        self.commit_remote_transaction(cdata, TransactionId::new(), events).await?;
+        node.commit_remote_transaction(cdata, TransactionId::new(), events).await?;
 
         // Synchronous map upsert BEFORE the allocator mutex releases: the
         // next registration in line must observe these allocations even if
         // the reactor has not delivered them yet (RFC 5.1).
-        self.catalog.upsert_registered(&out_models, &out_properties, &out_memberships);
+        self.upsert_registered(&out_models, &out_properties, &out_memberships);
 
         Ok((out_models, out_properties, out_memberships))
     }
@@ -608,7 +609,7 @@ where
     /// sees it; ordinary first sightings miss both and pay one bounded
     /// fetch under the allocator mutex.
     async fn model_lookup_checked(&self, label: &str) -> Result<Option<super::catalog::ModelDef>, RetrievalError> {
-        if let Some(def) = self.catalog.model_by_label(label) {
+        if let Some(def) = self.model_by_label(label) {
             return Ok(Some(def));
         }
         let Some((id, values)) = self.catalog_row_by_key(model_collection(), field_eq_str("label", label)).await? else {
@@ -619,7 +620,7 @@ where
             label: label.to_string(),
             name: string_field(&values, "name").unwrap_or_else(|| label.to_string()),
         };
-        self.catalog.upsert_registered(&[RegisteredModel { id: def.id, collection: def.label.clone(), name: def.name.clone() }], &[], &[]);
+        self.upsert_registered(&[RegisteredModel { id: def.id, collection: def.label.clone(), name: def.name.clone() }], &[], &[]);
         Ok(Some(def))
     }
 
@@ -627,7 +628,7 @@ where
     /// backend, value_type): map first, storage on a miss (see
     /// [`Self::model_lookup_checked`]).
     async fn property_lookup_checked(&self, model: &EntityId, name: &str) -> Result<Option<super::catalog::PropertyDef>, RetrievalError> {
-        if let Some(def) = self.catalog.property_by_name(model, name) {
+        if let Some(def) = self.property_by_name(model, name) {
             return Ok(Some(def));
         }
         let predicate = and(field_eq_id("minted_for", *model), field_eq_str("name", name));
@@ -645,7 +646,7 @@ where
             value_type: string_field(&values, "value_type").unwrap_or_default(),
             target_model: entity_id_field(&values, "target_model"),
         };
-        self.catalog.upsert_registered(
+        self.upsert_registered(
             &[],
             &[RegisteredProperty {
                 id: def.id,
@@ -667,7 +668,7 @@ where
         model: &EntityId,
         property: &EntityId,
     ) -> Result<Option<super::catalog::MembershipDef>, RetrievalError> {
-        if let Some(def) = self.catalog.membership(model, property) {
+        if let Some(def) = self.membership(model, property) {
             return Ok(Some(def));
         }
         let predicate = and(field_eq_id("model", *model), field_eq_id("property", *property));
@@ -680,7 +681,7 @@ where
         // optional (never defaulted, catalog.rs MembershipDef), and the
         // executor's diff arm emits the repairing follow-up either way.
         if let Some(optional) = optional {
-            self.catalog.upsert_registered(&[], &[], &[RegisteredMembership { id: def.id, model: *model, property: *property, optional }]);
+            self.upsert_registered(&[], &[], &[RegisteredMembership { id: def.id, model: *model, property: *property, optional }]);
         }
         Ok(Some(def))
     }
@@ -696,7 +697,8 @@ where
     ) -> Result<Option<(EntityId, BTreeMap<String, Option<Value>>)>, RetrievalError> {
         let selection = ankql::ast::Selection { predicate, order_by: None, limit: None };
         let mut best: Option<(EntityId, BTreeMap<String, Option<Value>>)> = None;
-        for state in self.collections.get(&catalog_collection_id(collection)).await?.fetch_states(&selection).await? {
+        let node = self.node().ok_or_else(|| RetrievalError::Other("node dropped during catalog lookup".to_owned()))?;
+        for state in node.collections.get(&catalog_collection_id(collection)).await?.fetch_states(&selection).await? {
             let id = state.payload.entity_id;
             if best.as_ref().is_some_and(|(b, _)| *b <= id) {
                 continue;
@@ -771,7 +773,8 @@ where
         id: EntityId,
         expected_model: &ModelId,
     ) -> Result<Option<(BTreeMap<String, Option<Value>>, proto::Clock)>, RetrievalError> {
-        let state = match self.collections.get(&catalog_collection_id(*expected_model)).await?.get_state(id).await {
+        let node = self.node().ok_or_else(|| RetrievalError::Other("node dropped during catalog lookup".to_owned()))?;
+        let state = match node.collections.get(&catalog_collection_id(*expected_model)).await?.get_state(id).await {
             Ok(state) => state,
             Err(RetrievalError::EntityNotFound(_)) => return Ok(None),
             Err(e) => return Err(e),

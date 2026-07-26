@@ -463,7 +463,7 @@ where
             }
             proto::NodeRequestBody::RegisterSchema { models, properties, memberships } => {
                 let cdata = cdata.iterable().exactly_one().map_err(|_| anyhow!("Only one cdata is permitted for RegisterSchema"))?;
-                match self.execute_schema_registration(cdata, models, properties, memberships).await {
+                match self.catalog.register_schema(cdata, models, properties, memberships).await {
                     // The resolved definitions ARE the response (RFC 5.2):
                     // the requester folds them into its catalog map on ack.
                     Ok((models, properties, memberships)) => {
@@ -615,8 +615,8 @@ where
             [] => return Err(MutationError::InvalidUpdate("a genesis event must add exactly one membership")),
             _ => return Err(MutationError::InvalidUpdate("a genesis event cannot add more than one membership")),
         };
-        let expected = crate::schema::system_model_id(event.collection.as_str())
-            .or_else(|| self.catalog.model_id_for(event.collection.as_str()));
+        let expected =
+            crate::schema::system_model_id(event.collection.as_str()).or_else(|| self.catalog.model_id_for(event.collection.as_str()));
         match expected {
             Some(expected) if expected == model => Ok(()),
             Some(_) => Err(MutationError::General(

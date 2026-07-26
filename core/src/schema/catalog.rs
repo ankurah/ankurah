@@ -72,6 +72,10 @@ struct CatalogInner<SE, PA>
 where PA: PolicyAgent
 {
     storage: Arc<SE>,
+    /// The owning node, installed by `start` (weak: the node owns the
+    /// manager, never the reverse). Registration executes and forwards
+    /// through it.
+    node: RwLock<Option<WeakNode<SE, PA>>>,
     durable: bool,
     /// The allocator mutex (RFC 5.1 executor discipline): the registration
     /// executor serializes every RegisterSchema execution on this lock and
@@ -209,6 +213,7 @@ where
     pub(crate) fn new(storage: Arc<SE>, durable: bool) -> Self {
         Self(Arc::new(CatalogInner {
             storage,
+            node: RwLock::new(None),
             durable,
             allocator: tokio::sync::Mutex::new(()),
             map: RwLock::new(CatalogMapInner::default()),
@@ -227,6 +232,7 @@ where
     /// ephemeral catalog setup remains driven by `ensure_subscribed`.
     pub(crate) fn start(&self, node: WeakNode<SE, PA>) {
         let Some(strong) = node.upgrade() else { return };
+        *self.0.node.write().unwrap() = Some(node);
 
         // Install the hard-reset flush hook on the system manager so
         // SystemManager::hard_reset can clear the catalog in-place (it does
@@ -324,6 +330,10 @@ where
     }
 
     // -- readiness ----------------------------------------------------------
+
+    /// The owning node, while it lives: present from `start` (called in
+    /// `Node::build`) until the node is dropped.
+    pub(crate) fn node(&self) -> Option<Node<SE, PA>> { self.0.node.read().unwrap().clone()?.upgrade() }
 
     /// Whether the catalog map is authoritative for the current system epoch.
     pub fn is_catalog_ready(&self) -> bool { *self.0.ready.read().unwrap() }
@@ -685,11 +695,10 @@ where
     /// no-durable-peer case may proceed from locally proven exact identities.
     pub(crate) async fn ensure_schema_for_use(
         &self,
-        node: &Node<SE, PA>,
         cdata: &PA::ContextData,
         schema: &'static ModelSchema,
     ) -> Result<proto::ModelId, RegistrationError> {
-        match self.ensure_registered(node, cdata, schema).await {
+        match self.ensure_registered(cdata, schema).await {
             Ok(()) => self.model_id_for_schema(schema).ok_or_else(|| {
                 RegistrationError::Retrieval(crate::error::RetrievalError::Other(format!(
                     "registration of '{}' did not retain its exact model identity",
@@ -744,6 +753,27 @@ where
         }
     }
 
+    /// TEST ONLY: seed deterministic catalog rows and admit their exact
+    /// compiled-schema binding without writing catalog entities.
+    ///
+    /// Deterministic protocol simulators forge stable entity, model, and
+    /// property identities so two runs have byte-identical traces. They cannot
+    /// use the production allocator, whose fresh ULIDs would intentionally
+    /// differ between runs. This helper keeps the compiled binding complete
+    /// (every field proven against the supplied rows) while making the
+    /// fixture's deliberate storage bypass explicit.
+    #[cfg(feature = "test-helpers")]
+    pub fn seed_registered_schema(
+        &self,
+        schema: &'static ModelSchema,
+        models: &[proto::RegisteredModel],
+        properties: &[proto::RegisteredProperty],
+        memberships: &[proto::RegisteredMembership],
+    ) -> Result<(), RegistrationError> {
+        self.upsert_registered(models, properties, memberships);
+        self.mark_schema_ensured(schema, models, properties, memberships)
+    }
+
     /// RFC 5.2 "ensure registration" (specs/model-property-metadata/rfc.md
     /// section 5.2). Called by explicit [`crate::context::Context::register`]
     /// and, through [`Self::ensure_schema_for_use`], by first-use
@@ -766,12 +796,7 @@ where
     ///
     /// Every error path returns WITHOUT latching, so a later attempt
     /// retries.
-    pub async fn ensure_registered(
-        &self,
-        node: &Node<SE, PA>,
-        cdata: &PA::ContextData,
-        schema: &'static ModelSchema,
-    ) -> Result<(), RegistrationError> {
+    pub async fn ensure_registered(&self, cdata: &PA::ContextData, schema: &'static ModelSchema) -> Result<(), RegistrationError> {
         let collection = schema.collection.to_string();
         // Snapshot and enter the epoch before consulting the latch. Checking
         // first would allow reset to clear the latch and install a new fence
@@ -784,7 +809,7 @@ where
 
         let (models, properties, memberships) = super::registration_request(schema);
 
-        if node.durable {
+        if self.0.durable {
             // A durable node executes registration itself (no forwarding);
             // the executor upserts the map before returning. Retain one
             // outer lease across the executor and exact-schema latch. It must
@@ -792,7 +817,7 @@ where
             // grab a post-reset fence and fold old definitions into the new
             // epoch (an ABA error).
             let _lease = initial_lease;
-            let (models, properties, memberships) = node.execute_schema_registration(cdata, models, properties, memberships).await?;
+            let (models, properties, memberships) = self.register_schema(cdata, models, properties, memberships).await?;
             self.mark_schema_ensured(schema, &models, &properties, &memberships)?;
             return Ok(());
         }
@@ -804,6 +829,7 @@ where
 
         // Ephemeral: forward to a connected durable peer. There is no offline
         // registration queue because only the durable allocator may mint ids.
+        let node = self.node().ok_or(RegistrationError::SystemNotReady)?;
         match node.get_durable_peers().first().copied() {
             Some(peer) => {
                 let body = proto::NodeRequestBody::RegisterSchema { models, properties, memberships };

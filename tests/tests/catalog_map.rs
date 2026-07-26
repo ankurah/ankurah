@@ -420,8 +420,7 @@ async fn hard_reset_rejects_stale_schema_registration_response() -> anyhow::Resu
     client.system.wait_system_ready().await;
 
     let old_client = client.clone();
-    let old_registration =
-        tokio::spawn(async move { old_client.catalog.ensure_registered(&old_client, &DEFAULT_CONTEXT, Album::schema()).await });
+    let old_registration = tokio::spawn(async move { old_client.catalog.ensure_registered(&DEFAULT_CONTEXT, Album::schema()).await });
     wait_for_count(&held_responses, 1, "old-epoch SchemaRegistered response").await?;
 
     // Do not cancel the request future: pending-request cleanup is response
@@ -442,8 +441,7 @@ async fn hard_reset_rejects_stale_schema_registration_response() -> anyhow::Resu
     // may populate the replacement epoch normally.
     client.system.join_system(server.system.root().expect("server root")).await?;
     let new_client = client.clone();
-    let new_registration =
-        tokio::spawn(async move { new_client.catalog.ensure_registered(&new_client, &DEFAULT_CONTEXT, Album::schema()).await });
+    let new_registration = tokio::spawn(async move { new_client.catalog.ensure_registered(&DEFAULT_CONTEXT, Album::schema()).await });
     wait_for_count(&held_responses, 2, "old and replacement SchemaRegistered responses").await?;
     gate.release_last(&client, 1).await;
     tokio::time::timeout(Duration::from_secs(1), new_registration)

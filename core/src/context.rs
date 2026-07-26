@@ -91,7 +91,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         &self,
         schema: &'static crate::schema::ModelSchema,
     ) -> Result<proto::ModelId, crate::schema::registration::RegistrationError> {
-        self.node.catalog.ensure_registered(&self.node, &self.cdata, schema).await?;
+        self.node.catalog.ensure_registered(&self.cdata, schema).await?;
         self.node.catalog.model_id_for_schema(schema).ok_or_else(|| {
             crate::schema::registration::RegistrationError::Retrieval(crate::error::RetrievalError::Other(format!(
                 "registration of '{}' did not retain its exact model identity",
@@ -101,7 +101,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     }
 
     async fn ensure_registered(&self, schema: &'static crate::schema::ModelSchema) -> Result<proto::ModelId, MutationError> {
-        self.node.catalog.ensure_schema_for_use(&self.node, &self.cdata, schema).await.map_err(|error| {
+        self.node.catalog.ensure_schema_for_use(&self.cdata, schema).await.map_err(|error| {
             let message = if self.node.catalog.model_by_label(schema.collection).is_none() {
                 format!("cannot write into unregistered collection '{}': {error}", schema.collection)
             } else {
@@ -112,7 +112,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     }
 
     async fn ensure_query_schema(&self, schema: &'static crate::schema::ModelSchema) -> Result<proto::ModelId, RetrievalError> {
-        self.node.catalog.ensure_schema_for_use(&self.node, &self.cdata, schema).await.map_err(|error| {
+        self.node.catalog.ensure_schema_for_use(&self.cdata, schema).await.map_err(|error| {
             if self.node.catalog.model_by_label(schema.collection).is_none() {
                 RetrievalError::Other(format!("collection '{}' is not registered: {error}", schema.collection))
             } else {
