@@ -40,7 +40,7 @@ async fn server_rejects_update_for_nonexistent() -> anyhow::Result<()> {
     let fake_update = proto::Event {
         collection: Album::collection(),
         entity_id: EntityId::new(),
-        operations: proto::OperationSet(BTreeMap::new()),
+        operations: proto::OperationSet::from_backends(BTreeMap::new()),
         parent: proto::Clock::new([proto::EventId::from_bytes([1u8; 32])]),
     };
 
@@ -76,7 +76,7 @@ async fn server_rejects_create_for_existing() -> anyhow::Result<()> {
     let fake_create = proto::Event {
         collection: Album::collection(),
         entity_id: existing_id,
-        operations: proto::OperationSet(BTreeMap::new()),
+        operations: proto::OperationSet::from_backends(BTreeMap::new()),
         parent: proto::Clock::new([]),
     };
 

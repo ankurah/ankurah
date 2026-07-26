@@ -43,7 +43,7 @@ fn forge_title_event(entity_id: proto::EntityId, parent: proto::Clock, title: &s
     proto::Event {
         entity_id,
         collection: Record::collection(),
-        operations: proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
+        operations: proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)])),
         parent,
     }
 }
@@ -206,7 +206,7 @@ async fn malformed_clock_identity_is_order_independent_end_to_end() -> Result<()
         proto::Event {
             entity_id: rec_id,
             collection: Record::collection(),
-            operations: proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
+            operations: proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)])),
             parent: head0.clone(),
         }
     };
@@ -292,7 +292,7 @@ async fn forged_extra_genesis_head_does_not_trigger_wholesale_adoption() -> Resu
         proto::Event {
             entity_id: rec_id,
             collection: Record::collection(),
-            operations: proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
+            operations: proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)])),
             parent: proto::Clock::default(),
         }
     };

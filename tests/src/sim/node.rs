@@ -17,7 +17,7 @@ use ankurah::{Node, PermissiveAgent};
 use ankurah_storage_sled::SledStorageEngine;
 use std::sync::Arc;
 
-use super::model::SimRecord;
+use super::model::{Field, SimRecord};
 use super::transport::{Captured, SimSender};
 use ankurah::Model;
 
@@ -140,6 +140,34 @@ pub async fn build_nodes(n: usize, captured: Captured) -> anyhow::Result<Vec<Sim
     for index in 1..n {
         let node = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
         nodes.push(SimNode { index, durable: false, node, captured: captured.clone() });
+    }
+
+    // The harness forges events and states directly, bypassing schema
+    // registration and the catalog relay. Seed and explicitly admit a complete
+    // deterministic `SimRecord` catalog on every node so commit admissibility
+    // can route each forged creation event's membership and the compiled
+    // binding is provably complete. The test-helper path keeps every id byte-identical
+    // across nodes and runs; hard_reset is not part of these scenarios.
+    let sim_model = proto::RegisteredModel {
+        id: super::model::sim_model_id(),
+        label: SimRecord::descriptor().label.to_owned(),
+        name: "SimRecord".to_string(),
+        properties: [Field::Title, Field::Body]
+            .into_iter()
+            .map(|field| proto::RegisteredProperty {
+                id: super::model::sim_property_id(field),
+                membership_id: super::model::sim_membership_id(field),
+                name: field.name().to_string(),
+                backend: "lww".to_string(),
+                value_type: "string".to_string(),
+                target_model: None,
+                minted_for: Some(super::model::sim_model_id()),
+                optional: false,
+            })
+            .collect(),
+    };
+    for node in &nodes {
+        node.node.catalog.seed_registered_schema(SimRecord::descriptor(), std::slice::from_ref(&sim_model))?;
     }
 
     Ok(nodes)
