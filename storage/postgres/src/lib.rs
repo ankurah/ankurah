@@ -467,7 +467,8 @@ impl StorageCollection for PostgresBucket {
 
     async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError> {
         // be careful with sql injection via bucket name
-        let query = format!(r#"SELECT "id", "state_buffer", "head", "attestations" FROM "{}" WHERE "id" = $1"#, self.state_table());
+        let query =
+            format!(r#"SELECT "id", "state_buffer", "memberships", "head", "attestations" FROM "{}" WHERE "id" = $1"#, self.state_table());
 
         let mut client = match self.pool.get().await {
             Ok(client) => client,
