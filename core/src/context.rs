@@ -38,8 +38,24 @@ where
 
 #[async_trait]
 pub trait TContext {
+    /// Ensure the compiled schema is registered and return the model's
+    /// durable identity: registers the model, its properties, and its
+    /// model-property memberships with the durable allocator (executed
+    /// locally on a durable node, forwarded as a RegisterSchema request on
+    /// an ephemeral one). Idempotent and latched; with no reachable peer it
+    /// may proceed only from a binding proven against locally held,
+    /// allocator-derived catalog rows. Every registration path funnels
+    /// here -- typed first use (create/fetch/get/query_wait) and the
+    /// explicit [`Context::register_model`] alike; callers convert the
+    /// typed error at their boundary (From impls into RetrievalError and
+    /// MutationError).
+    async fn ensure_registered(
+        &self,
+        schema: &'static crate::schema::ModelStructDescriptor,
+    ) -> Result<proto::ModelId, crate::schema::registration::RegistrationError>;
+
     fn node_id(&self) -> proto::EntityId;
-    /// Create a brand new entity for a transaction, and add it to the WeakEntitySet
+    /// Create a brand new entity for a transaction, and add it to the WeakEntitySet.
     /// Note that this does not actually persist the entity to the storage engine
     /// It merely ensures that there are no duplicate entities with the same ID (except forked entities)
     fn create_entity(&self, collection: proto::CollectionId, trx_alive: Arc<AtomicBool>) -> Entity;
@@ -54,6 +70,13 @@ pub trait TContext {
 
 #[async_trait]
 impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> TContext for NodeAndContext<SE, PA> {
+    async fn ensure_registered(
+        &self,
+        schema: &'static crate::schema::ModelStructDescriptor,
+    ) -> Result<proto::ModelId, crate::schema::registration::RegistrationError> {
+        self.node.catalog.ensure_schema_for_use(&self.cdata, schema).await
+    }
+
     fn node_id(&self) -> proto::EntityId { self.node.id }
     fn create_entity(&self, collection: proto::CollectionId, trx_alive: Arc<AtomicBool>) -> Entity {
         let primary_entity = self.node.entities.create(collection);
@@ -96,6 +119,9 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
                         ));
                     }
                 }
+                // Membership admissibility is a commit-path gate, mirrored on
+                // the remote funnel (commit_remote_transaction).
+                self.node.check_membership_admissibility(&event)?;
                 entity_events.push((entity.clone(), event));
             }
         }
@@ -195,6 +221,20 @@ impl Context {
     pub fn js_node_id(&self) -> proto::EntityId { self.0.node_id() }
 }
 
+// Generic methods cannot cross the wasm_bindgen boundary; they live in this
+// plain impl and remain host-and-wasm callable from Rust.
+impl Context {
+    /// Explicitly register `M`'s model, properties, and model-property
+    /// memberships with the durable allocator, propagating any error, and
+    /// return the model's allocated identity
+    ///. Useful at startup so the catalog holds `M`'s definitions
+    /// before anything else runs. A second call for the same compiled shape
+    /// is a no-op.
+    pub async fn register_model<M: crate::model::Model>(&self) -> Result<proto::ModelId, crate::schema::registration::RegistrationError> {
+        self.0.ensure_registered(M::descriptor()).await
+    }
+}
+
 // This impl may or may not have the wasm_bindgen attribute but the functions will always be defined
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
 #[cfg_attr(feature = "uniffi", uniffi::export)]
@@ -226,12 +266,18 @@ impl Context {
     // }
 
     pub async fn get<R: View>(&self, id: proto::EntityId) -> Result<R, RetrievalError> {
+        use crate::model::Model;
+        // A typed direct get is a schema-dependent use: admit the exact
+        // compiled schema (first-use registration) before decoding.
+        self.0.ensure_registered(R::Model::descriptor()).await?;
         let entity = self.0.get_entity(id, &R::collection(), false).await?;
         Ok(R::from_entity(entity))
     }
 
     /// Get an entity, but its ok to return early if the entity is already in the local node storage
     pub async fn get_cached<R: View>(&self, id: proto::EntityId) -> Result<R, RetrievalError> {
+        use crate::model::Model;
+        self.0.ensure_registered(R::Model::descriptor()).await?;
         let entity = self.0.get_entity(id, &R::collection(), true).await?;
         Ok(R::from_entity(entity))
     }
@@ -239,6 +285,11 @@ impl Context {
     pub async fn fetch<R: View>(&self, args: impl TryInto<MatchArgs, Error = impl Into<RetrievalError>>) -> Result<Vec<R>, RetrievalError> {
         let args: MatchArgs = args.try_into().map_err(|e| e.into())?;
         use crate::model::Model;
+        // Typed predicate reads register at first use, so the fetch runs
+        // against authoritative catalog rows instead of failing loud as
+        // unregistered (and offline with no peer, it fails loud instead of
+        // answering empty).
+        self.0.ensure_registered(R::Model::descriptor()).await?;
         let collection_id = R::Model::collection();
 
         let entities = self.0.fetch_entities(&collection_id, args).await?;
@@ -269,6 +320,11 @@ impl Context {
     where
         R: View,
     {
+        use crate::model::Model;
+        // The synchronous `query` cannot await first-use registration (its
+        // initialization pipeline takes that over with the
+        // propertyid-resolution PR); the awaited form registers here.
+        self.0.ensure_registered(R::Model::descriptor()).await?;
         let livequery = self.query::<R>(args)?;
         livequery.wait_initialized().await;
         Ok(livequery)

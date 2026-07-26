@@ -231,7 +231,7 @@ async fn test_update_scope_requires_before_and_after_state() -> anyhow::Result<(
     let retag_event = Event {
         entity_id: denied_record.id(),
         collection: denied_record.collection().clone(),
-        operations: OperationSet(BTreeMap::new()),
+        operations: OperationSet::from_backends(BTreeMap::new()),
         parent: Clock::new(denied_record.head().to_vec()),
     };
 

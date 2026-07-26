@@ -140,7 +140,7 @@ pub use ankurah_derive as derive;
 pub use ankurah_proto as proto;
 pub use ankurah_signals as signals;
 
-pub use proto::EntityId;
+pub use proto::{EntityId, ModelId, PropertyId};
 // Re-export commonly used types
 pub use ankurah_core::{
     changes,
