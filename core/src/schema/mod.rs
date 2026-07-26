@@ -1,20 +1,30 @@
-//! The metadata catalog (specs/model-property-metadata/rfc.md).
+//! The schema catalog: what the system knows about models and properties.
 //!
-//! ORIENTATION: one model/property/membership exists in THREE
-//! representations, one per layer, and the parallel type triplets map to
-//! them:
+//! Ankurah stores schema as DATA. Every model and every property is an
+//! ordinary entity in one of three reserved collections (`_ankurah_model`,
+//! `_ankurah_property`, `_ankurah_model_property` for the property-to-model
+//! memberships), with a durable id minted by the system's one durable
+//! allocator. Those entities replicate, persist, and survive renames like
+//! any other data, which is the point: a property's identity is its entity
+//! id, not its current display name, so renaming a field someday does not
+//! orphan the data written under it.
 //!
-//! - WIRE (a registration request): `ModelDescriptor` / `PropertyDescriptor`
-//!   / `MembershipDescriptor` (ankurah-proto). Language-agnostic, id-free
-//!   except explicit bindings; the durable executor allocates or resolves
-//!   ids for them and returns the resolved definitions
-//!   (`SchemaRegistered`).
-//! - PARSED CATALOG (the replicated entities, projected into the in-memory
-//!   map): `ModelDef` / `PropertyDef` / `MembershipDef` ([`catalog`]). The
-//!   definitive schema; keyed by the allocated entity ids.
-//! - COMPILED LOCAL (one binary's `derive(Model)` output): [`ModelSchema`] /
-//!   [`FieldSchema`] ([`local`]). A static, per-binary BINDING to the
-//!   catalog, never the definitive schema (RFC section 3).
+//! A Rust struct with `#[derive(Model)]` is not the schema; it is one
+//! binary's DECLARATION of a schema, compiled into a static
+//! ([`ModelSchema`], in [`local`]). The first time a binary uses a model --
+//! explicitly via `Context::register`, or implicitly on create/fetch -- that
+//! declaration is sent to the durable node, whose registration executor
+//! ([`registration`]) looks each piece up, allocates ids for anything new,
+//! checks that a re-declaration is compatible with what the catalog already
+//! holds, and returns the resolved ids. Two binaries with the same struct
+//! get the same ids; a binary whose declaration conflicts is refused.
+//!
+//! Each node keeps an in-memory index of the catalog entities
+//! ([`catalog::CatalogManager`]) so lookups don't touch storage: parsed into
+//! `ModelDef`/`PropertyDef`/`MembershipDef`, warmed from local storage on
+//! durable nodes and from registration responses on ephemeral ones. The
+//! wire request/response types live in ankurah-proto. The full design
+//! record is specs/model-property-metadata/rfc.md.
 
 pub mod catalog;
 pub mod local;

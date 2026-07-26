@@ -191,11 +191,12 @@ pub struct PropertyDescriptor {
     pub minting_collection: String,
     /// Current display name; part of the upsert lookup key.
     pub name: String,
-    /// Transient rename hint (RFC 5.8): the name this property carried
-    /// before a rename. Applied by the executor before lookup-or-create,
-    /// GUARDED (only when the current-name lookup misses and the old-name
-    /// lookup hits); a no-op once applied or when nothing matches.
-    /// Removable from source after every target system has seen it.
+    /// The name this property had before you renamed the field. Lets the
+    /// executor find the existing property under its old name and move it to
+    /// the new one, instead of minting a duplicate under the new name. Only
+    /// consulted when the new name misses and the old name hits, so it is
+    /// harmless to leave in place (it does nothing once applied) and safe to
+    /// delete from source once every system has seen the rename.
     pub renamed_from: Option<String>,
     /// Backend registry name, e.g. "lww", "yrs".
     pub backend: String,
