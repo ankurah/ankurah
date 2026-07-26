@@ -41,8 +41,11 @@ use tokio::sync::Notify;
 use tracing::{debug, error};
 
 use crate::{
+    entity::Entity,
     node::{Node, WeakNode},
     policy::PolicyAgent,
+    reactor::{GapFetcher, ReactorSubscription, ReactorUpdate},
+    resultset::EntityResultSet,
     storage::StorageEngine,
     util::request_fence::{RequestFence, RequestLease, RequestValidity},
 };
@@ -51,12 +54,32 @@ use super::{model_collection, model_property_collection, property_collection, re
 
 mod map;
 use map::{apply_entry, parse_state, CatalogMapInner, EnsuredSchemaBinding};
+
+pub mod rows;
 pub use map::{ModelDef, ModelPropertyMembershipDef, PropertyDef};
 
 // -- manager ----------------------------------------------------------------
 
 /// The three catalog collections warmed and maintained by this manager.
 fn catalog_collections() -> [ModelId; 3] { [model_collection(), property_collection(), model_property_collection()] }
+
+/// The catalog feed's gap fetcher. Its selections are limit-less, so the
+/// reactor never fills gaps and never calls this; it exists to satisfy the
+/// query-registration signature without borrowing a credentialed fetcher.
+struct NoopGapFetcher;
+
+#[async_trait::async_trait]
+impl GapFetcher<Entity> for NoopGapFetcher {
+    async fn fetch_gap(
+        &self,
+        _collection_id: &proto::CollectionId,
+        _selection: &ankql::ast::Selection,
+        _last_entity: Option<&Entity>,
+        _gap_size: usize,
+    ) -> Result<Vec<Entity>, crate::error::RetrievalError> {
+        Ok(Vec::new())
+    }
+}
 
 /// Maintains the in-memory catalog map for a node. Held by `Node` beside
 /// `SystemManager`; mirrors its `<SE, PA>` generics.
@@ -109,6 +132,13 @@ where PA: PolicyAgent
     /// field name, and display-name changes must not erase an established
     /// binding.
     ensured: RwLock<BTreeMap<String, Vec<EnsuredSchemaBinding>>>,
+    /// The durable map feed: a policy-free reactor subscription over the
+    /// three catalog collections (wildcard watchers; the reactor's own
+    /// initial fetch is the warm scan). Dropping either half unsubscribes,
+    /// so reset tears the feed down by clearing this and the next warm
+    /// re-establishes it. The listener holds a Weak of this inner (a strong
+    /// ref here would cycle through the guard's callback and leak).
+    durable_feed: RwLock<Option<(ReactorSubscription, ankurah_signals::SubscriptionGuard)>>,
     /// The manager stays generic over the node's PolicyAgent for its
     /// Node-taking methods (ensure_registered, ensure_subscribed).
     _pa: std::marker::PhantomData<PA>,
@@ -223,6 +253,7 @@ where
             setup_state: RwLock::new(CatalogSetupState::default()),
             setup_changed: Notify::new(),
             ensured: RwLock::new(BTreeMap::new()),
+            durable_feed: RwLock::new(None),
             _pa: std::marker::PhantomData,
         }))
     }
@@ -287,21 +318,54 @@ where
         }
     }
 
-    /// Durable path: warm the map by scanning the catalog collections, then
-    /// mark ready. Registration keeps the map fresh afterward: the executor
-    /// folds its own commits synchronously under the allocator mutex, and in
-    /// this write-only phase no other writer exists (peers forward
-    /// RegisterSchema rather than committing catalog entities directly). The
-    /// reactor-fed incremental subscription returns with the read flip.
+    /// Durable path: subscribe the map to the three catalog collections and
+    /// mark ready. The reactor subscription IS the warm: registering each
+    /// `Predicate::True` query runs the same local scan the old hand-rolled
+    /// warm did and delivers it through the listener, and every later
+    /// catalog commit (local or remote funnel; both end in `notify_change`)
+    /// arrives the same way. The executor still folds its own commits
+    /// synchronously under the allocator mutex -- the feed is asynchronous,
+    /// and consecutive registrations must observe their predecessors --
+    /// which is harmless because folds are idempotent by entity id.
     ///
-    /// A schema-less durable node has no catalog rows yet: it warms nothing
-    /// and is immediately ready with an empty (correct) map. Opening the
-    /// collections creates their empty materializations on first startup,
-    /// which is harmless and makes the catalog tables inspectable.
+    /// The subscription is policy-free by construction: `Reactor::subscribe`
+    /// and `add_query_and_notify` carry no credentials (policy lives in
+    /// EntityLiveQuery above the reactor), and the map is node
+    /// infrastructure, like `SystemManager`'s storage reads. The gap fetcher
+    /// is never invoked for a limit-less selection, so the noop is the
+    /// honest one.
+    ///
+    /// A schema-less durable node has no catalog rows yet: the fetches find
+    /// nothing and it is immediately ready with an empty (correct) map.
+    /// Opening the collections creates their empty materializations on
+    /// first startup, which is harmless and makes the catalog tables
+    /// inspectable.
     async fn warm_durable(&self, generation: u64) -> Result<(), crate::error::RetrievalError> {
         if self.0.setup_state.read().unwrap().generation != generation {
             return Ok(());
         }
+        let Some(node) = self.node() else {
+            return Err(crate::error::RetrievalError::Other("catalog warm ran without a node".to_owned()));
+        };
+
+        // Listener first, then queries: the queries' own fetches deliver the
+        // existing rows through this listener, so nothing can be missed
+        // between scan and subscribe. Gated on the warm's generation so a
+        // reset (which bumps the generation before clearing the map) mutes
+        // any straggler delivery from a torn-down feed.
+        let subscription = node.reactor.subscribe();
+        let guard = {
+            use ankurah_signals::Subscribe;
+            let weak = Arc::downgrade(&self.0);
+            subscription.subscribe(move |update: ReactorUpdate| {
+                if let Some(inner) = weak.upgrade() {
+                    let me = CatalogManager(inner);
+                    if me.0.setup_state.read().unwrap().generation == generation {
+                        me.apply_reactor_update(update);
+                    }
+                }
+            })
+        };
 
         let everything = ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None };
         for model in catalog_collections() {
@@ -309,25 +373,50 @@ where
                 ModelId::System(system) => crate::schema::system_collection_label(system),
                 ModelId::EntityId(_) => unreachable!("catalog collections are system models"),
             };
-            let states = self.0.storage.collection(&proto::CollectionId::fixed_name(label)).await?.fetch_states(&everything).await?;
-            let setup = self.0.setup_state.read().unwrap();
-            if setup.generation != generation {
-                return Ok(());
-            }
-            let mut map = self.0.map.write().unwrap();
-            for state in states {
-                if let Some(entry) = parse_state(&model, state.payload.entity_id, &state.payload) {
-                    apply_entry(&mut map, entry);
-                }
-            }
+            node.reactor
+                .add_query_and_notify(
+                    subscription.id(),
+                    proto::QueryId::new(),
+                    proto::CollectionId::fixed_name(label),
+                    everything.clone(),
+                    &node,
+                    EntityResultSet::empty(),
+                    Arc::new(NoopGapFetcher),
+                    (),
+                )
+                .await
+                .map_err(|e| crate::error::RetrievalError::Other(format!("catalog feed query failed: {e}")))?;
         }
 
         let setup = self.0.setup_state.read().unwrap();
         if setup.generation != generation {
             return Ok(());
         }
+        *self.0.durable_feed.write().unwrap() = Some((subscription, guard));
         self.mark_ready();
         Ok(())
+    }
+
+    /// Fold one reactor update into the map: the notified entities' states
+    /// through the same `parse_state`/`apply_entry` path the executor and
+    /// response folds use, keyed by each entity's collection. Idempotent by
+    /// entity id, so racing the executor's synchronous fold is harmless.
+    /// Membership removes are ignored: catalog rows never leave a
+    /// `Predicate::True` selection, and reset synthetics are muted by the
+    /// listener's generation gate.
+    fn apply_reactor_update(&self, update: ReactorUpdate) {
+        let mut map = self.0.map.write().unwrap();
+        for item in update.items {
+            let Some(model) = crate::schema::system_model_id(item.entity.collection().as_str()) else {
+                continue;
+            };
+            let Ok(state) = item.entity.to_entity_state() else {
+                continue;
+            };
+            if let Some(entry) = parse_state(&model, item.entity.id(), &state) {
+                apply_entry(&mut map, entry);
+            }
+        }
     }
 
     // -- readiness ----------------------------------------------------------
@@ -430,6 +519,9 @@ where
     /// setup may claim the next generation.
     fn finish_reset(&self) {
         let mut setup = self.0.setup_state.write().unwrap();
+        // Tear down the feed before clearing the map: dropping the handles
+        // unsubscribes, and the next generation's warm re-establishes it.
+        *self.0.durable_feed.write().unwrap() = None;
         self.0.map.write().unwrap().clear();
         *self.0.ready.write().unwrap() = false;
         // Allocations belong to one system and must not survive hard_reset

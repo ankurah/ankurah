@@ -162,6 +162,7 @@ pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
                     #(#field_tokens),*
                 ],
                 explicit_id: #model_explicit_id_tokens,
+                system: ::core::option::Option::None,
             };
             &__ANKURAH_MODEL_SCHEMA
         }
