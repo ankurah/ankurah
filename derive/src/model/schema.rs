@@ -208,13 +208,14 @@ pub(crate) fn active_field_resolution_tokens(
             let explicit_id = property_str_attr(&field.attrs, "id")?;
             let explicit_id_tokens = match explicit_id {
                 Some(id) => {
-                    let bytes = decode_base64url_no_pad(&id).map_err(|msg| syn::Error::new(field.ty.span(), msg))?;
-                    let bytes: [u8; 16] = bytes.try_into().map_err(|bytes: Vec<u8>| {
-                        syn::Error::new(
-                            field.ty.span(),
-                            format!("explicit id {id:?} decodes to {} bytes; an EntityId is exactly 16 bytes", bytes.len()),
-                        )
-                    })?;
+                    let bytes = ankurah_core_types::EntityId::from_base64(&id)
+                        .map_err(|error| {
+                            syn::Error::new(
+                                field.ty.span(),
+                                format!("explicit id {id:?} is not a valid EntityId encoding: {error} (RFC 5.9)"),
+                            )
+                        })?
+                        .to_bytes();
                     quote! { ::core::option::Option::Some(::ankurah::proto::EntityId::from_bytes([#(#bytes),*])) }
                 }
                 None => quote! { ::core::option::Option::None },
@@ -397,77 +398,12 @@ fn option_str_tokens(value: Option<&str>) -> TokenStream {
     }
 }
 
-/// Validate an explicit-id attribute value as URL-safe base64 (no padding)
-/// decoding to exactly 16 bytes (an EntityId; RFC 5.9). Hand-rolled because
-/// the derive crate has no base64 dependency and adding one for a length
-/// check is not warranted.
+/// Validate an explicit-id attribute value as a well-formed EntityId
+/// encoding (RFC 5.9), by the same parse the runtime performs.
 fn validate_explicit_id(s: &str) -> Result<(), String> {
-    let bytes = decode_base64url_no_pad(s)
-        .map_err(|e| format!("explicit id {s:?} is not valid URL-safe base64: {e} (expected 16 bytes as an EntityId, RFC 5.9)"))?;
-    if bytes.len() != 16 {
-        return Err(format!("explicit id {s:?} decodes to {} bytes; an EntityId is exactly 16 bytes (RFC 5.9)", bytes.len()));
-    }
-    Ok(())
-}
-
-/// Minimal URL-safe base64 (RFC 4648 §5, no padding) decoder. Matches
-/// `EntityId::from_base64` (proto/src/id.rs uses `URL_SAFE_NO_PAD`).
-fn decode_base64url_no_pad(s: &str) -> Result<Vec<u8>, String> {
-    fn val(c: u8) -> Result<u8, String> {
-        match c {
-            b'A'..=b'Z' => Ok(c - b'A'),
-            b'a'..=b'z' => Ok(c - b'a' + 26),
-            b'0'..=b'9' => Ok(c - b'0' + 52),
-            b'-' => Ok(62),
-            b'_' => Ok(63),
-            other => Err(format!("invalid base64url character {:?}", other as char)),
-        }
-    }
-    let s = s.as_bytes();
-    if s.contains(&b'=') {
-        return Err("padding '=' is not allowed in URL-safe no-pad base64".to_string());
-    }
-    // Valid unpadded base64 chunk lengths per 3-byte group: 4, or a final
-    // partial group of 2 (=> 1 byte) or 3 (=> 2 bytes); a remainder of 1 is
-    // impossible.
-    if s.len() % 4 == 1 {
-        return Err("invalid base64url length".to_string());
-    }
-    let mut out = Vec::with_capacity(s.len() * 3 / 4);
-    for chunk in s.chunks(4) {
-        let mut buf = [0u8; 4];
-        for (i, &c) in chunk.iter().enumerate() {
-            buf[i] = val(c)?;
-        }
-        match chunk.len() {
-            4 => {
-                out.push((buf[0] << 2) | (buf[1] >> 4));
-                out.push((buf[1] << 4) | (buf[2] >> 2));
-                out.push((buf[2] << 6) | buf[3]);
-            }
-            3 => {
-                // A 3-symbol tail carries 16 bits. The low two bits of the
-                // final symbol are padding and must be zero; accepting them
-                // would allow multiple spellings for the same byte string.
-                if buf[2] & 0b11 != 0 {
-                    return Err("nonzero trailing bits in base64url encoding".to_string());
-                }
-                out.push((buf[0] << 2) | (buf[1] >> 4));
-                out.push((buf[1] << 4) | (buf[2] >> 2));
-            }
-            2 => {
-                // A 2-symbol tail carries 8 bits. The low four bits of the
-                // final symbol are padding and must be zero for canonical
-                // RFC 4648 no-pad spelling.
-                if buf[1] & 0b1111 != 0 {
-                    return Err("nonzero trailing bits in base64url encoding".to_string());
-                }
-                out.push((buf[0] << 2) | (buf[1] >> 4));
-            }
-            _ => unreachable!("chunk length is 2..=4"),
-        }
-    }
-    Ok(out)
+    ankurah_core_types::EntityId::from_base64(s)
+        .map(|_| ())
+        .map_err(|error| format!("explicit id {s:?} is not a valid EntityId encoding: {error} (RFC 5.9)"))
 }
 
 #[cfg(test)]
@@ -475,36 +411,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn base64url_16_bytes_roundtrips() {
+    fn explicit_id_validation_matches_the_runtime_parse() {
         // 16 zero bytes -> "AAAAAAAAAAAAAAAAAAAAAA" (22 chars).
-        let s = "AAAAAAAAAAAAAAAAAAAAAA";
-        assert_eq!(decode_base64url_no_pad(s).unwrap(), vec![0u8; 16]);
-        assert!(validate_explicit_id(s).is_ok());
-    }
-
-    #[test]
-    fn base64url_rejects_wrong_length() {
-        // 22 valid chars is 16 bytes; 20 chars is fewer.
-        assert!(validate_explicit_id("AAAAAAAAAAAAAAAAAAAA").is_err());
-    }
-
-    #[test]
-    fn base64url_rejects_bad_charset_and_padding() {
-        assert!(decode_base64url_no_pad("****").is_err());
-        assert!(decode_base64url_no_pad("AA==").is_err());
-        assert!(decode_base64url_no_pad("A").is_err()); // len % 4 == 1
-    }
-
-    #[test]
-    fn base64url_rejects_noncanonical_trailing_bits() {
-        // Both pairs decode to the same zero bytes in a permissive decoder,
-        // but only the all-zero suffix has canonical unused bits.
         assert!(validate_explicit_id("AAAAAAAAAAAAAAAAAAAAAA").is_ok());
+        // 20 chars decode to fewer than 16 bytes.
+        assert!(validate_explicit_id("AAAAAAAAAAAAAAAAAAAA").is_err());
+        // Bad charset, padding, and noncanonical trailing bits all refuse.
+        assert!(validate_explicit_id("******UGBwgJCgsMDQ4PEA").is_err());
+        assert!(validate_explicit_id("AAAAAAAAAAAAAAAAAAAAA=").is_err());
         assert!(validate_explicit_id("AAAAAAAAAAAAAAAAAAAAAB").is_err());
-
-        // Exercise the three-symbol-tail rule independently as well.
-        assert_eq!(decode_base64url_no_pad("AAA").unwrap(), vec![0, 0]);
-        assert!(decode_base64url_no_pad("AAB").is_err());
     }
 
     #[test]
