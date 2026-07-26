@@ -12,22 +12,14 @@ use crate::value::Value;
 pub type PropertyName = String;
 
 pub trait Property: Sized {
-    /// The normative catalog value-type spelling for this type ("string",
-    /// "entityid", ...) that MUST equal the `Value` variant [`Self::into_value`]
-    /// actually produces (RFC 4 in specs/model-property-metadata/rfc.md mapping table).
-    ///
-    /// CONTRACT-CRITICAL: `#[derive(Model)]` reads this const (at compile
-    /// time, via the associated const) for field types outside the built-in
-    /// table, and the value is what registration declares against the
-    /// property's CANONICAL value_type: the canonical type is fixed at first
-    /// allocation and never changed by registration; a binary declaring a
-    /// different but mutually castable type registers compatibly, and a
-    /// non-castable declaration refuses registration loudly. Defaults to
-    /// "string" because the JSON-in-a-string register is the catch-all
-    /// serialization (`#[derive(Property)]` pins it explicitly); a
-    /// hand-written impl producing any other variant must override this to
-    /// match.
-    const VALUE_TYPE: &'static str = "string";
+    /// The catalog value type this Rust type serializes to: the name of the
+    /// `Value` variant [`Self::into_value`] produces ("string", "i64",
+    /// "entityid", ...). Registration records it as the property's canonical
+    /// type on first allocation and checks later declarations against it, so
+    /// it must tell the truth about the wire representation. No default:
+    /// every impl declares its own (`#[derive(Property)]` emits "string" for
+    /// its JSON-string serialization).
+    const VALUE_TYPE: &'static str;
 
     fn into_value(&self) -> Result<Option<Value>, PropertyError>;
     fn from_value(value: Option<Value>) -> Result<Self, PropertyError>;
@@ -36,6 +28,8 @@ pub trait Property: Sized {
 impl<T> Property for Option<T>
 where T: Property
 {
+    const VALUE_TYPE: &'static str = T::VALUE_TYPE;
+
     fn into_value(&self) -> Result<Option<Value>, PropertyError> {
         match self {
             Some(value) => Ok(<T as Property>::into_value(value)?),
@@ -52,8 +46,10 @@ where T: Property
 }
 
 macro_rules! into {
-    ($ty:ty => $variant:ident) => {
+    ($ty:ty => $variant:ident, $value_type:literal) => {
         impl Property for $ty {
+            const VALUE_TYPE: &'static str = $value_type;
+
             fn into_value(&self) -> Result<Option<Value>, PropertyError> { Ok(Some(Value::$variant(self.clone()))) }
             fn from_value(value: Option<Value>) -> Result<Self, PropertyError> {
                 match value {
@@ -69,16 +65,18 @@ macro_rules! into {
     };
 }
 
-into!(String => String);
-into!(i16 => I16);
-into!(i32 => I32);
-into!(i64 => I64);
-into!(f64 => F64);
-into!(bool => Bool);
-into!(EntityId => EntityId);
-into!(Vec<u8> => Binary);
+into!(String => String, "string");
+into!(i16 => I16, "i16");
+into!(i32 => I32, "i32");
+into!(i64 => I64, "i64");
+into!(f64 => F64, "f64");
+into!(bool => Bool, "bool");
+into!(EntityId => EntityId, "entityid");
+into!(Vec<u8> => Binary, "binary");
 
 impl<'a> Property for std::borrow::Cow<'a, str> {
+    const VALUE_TYPE: &'static str = "string";
+
     fn into_value(&self) -> Result<Option<Value>, PropertyError> { Ok(Some(Value::String(self.to_string()))) }
 
     fn from_value(value: Option<Value>) -> Result<Self, PropertyError> {

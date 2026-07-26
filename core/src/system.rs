@@ -356,6 +356,8 @@ where
 }
 
 impl Property for proto::sys::Item {
+    const VALUE_TYPE: &'static str = "string";
+
     fn into_value(&self) -> std::result::Result<Option<Value>, crate::property::PropertyError> {
         Ok(Some(Value::String(
             serde_json::to_string(self).map_err(|_| PropertyError::InvalidValue { value: "".to_string(), ty: "sys::Item".to_string() })?,
