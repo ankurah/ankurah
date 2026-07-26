@@ -297,7 +297,8 @@ impl Entity {
     /// Used for transaction commit. Notably this does not apply the head to the entity, which must be done
     /// using commit_head
     pub(crate) fn generate_commit_event(&self) -> Result<Option<Event>, MutationError> {
-        let mut state = self.state.write().expect("other thread panicked, panic here too");
+        let membership_operations = self.state.write().expect("other thread panicked, panic here too").memberships.to_operations();
+        let state = self.state.read().expect("other thread panicked, panic here too");
         let mut backends = BTreeMap::<String, Vec<ankurah_proto::BackendOperation>>::new();
         for (name, backend) in &state.backends {
             if let Some(ops) = backend.to_operations()? {
@@ -305,7 +306,7 @@ impl Entity {
             }
         }
         let mut operations = OperationSet::from_backends(backends);
-        for operation in state.memberships.to_operations() {
+        for operation in membership_operations {
             operations.push(operation);
         }
 
