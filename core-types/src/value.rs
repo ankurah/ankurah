@@ -203,7 +203,9 @@ impl Value {
             (Self::I64(n), ValueType::F64) => Ok(Self::F64(*n as f64)),
             (Self::F64(n), ValueType::I16) if n.is_finite() && *n >= i16::MIN as f64 && *n <= i16::MAX as f64 => Ok(Self::I16(*n as i16)),
             (Self::F64(n), ValueType::I32) if n.is_finite() && *n >= i32::MIN as f64 && *n <= i32::MAX as f64 => Ok(Self::I32(*n as i32)),
-            (Self::F64(n), ValueType::I64) if n.is_finite() && *n >= i64::MIN as f64 && *n <= i64::MAX as f64 => Ok(Self::I64(*n as i64)),
+            // i64::MAX rounds up to 2^63 as f64, so the upper bound is exclusive:
+            // 2^63 itself is out of range and must overflow, not saturate.
+            (Self::F64(n), ValueType::I64) if n.is_finite() && *n >= i64::MIN as f64 && *n < i64::MAX as f64 => Ok(Self::I64(*n as i64)),
             (Self::F64(n), ValueType::I16 | ValueType::I32 | ValueType::I64) => Err(overflow(*n, target_type)),
 
             (Self::String(s), ValueType::I16) => parse(s, target_type, Self::I16),
@@ -246,7 +248,7 @@ impl Value {
             (Self::Json(serde_json::Value::Number(n)), ValueType::I16) if n.is_i64() => {
                 i16::try_from(n.as_i64().unwrap()).map(Self::I16).map_err(|_| overflow(n, target_type))
             }
-            (Self::Json(serde_json::Value::Number(n)), ValueType::F64) => Ok(Self::F64(n.as_f64().unwrap_or(0.0))),
+            (Self::Json(serde_json::Value::Number(n)), ValueType::F64) => n.as_f64().map(Self::F64).ok_or_else(|| overflow(n, target_type)),
             (Self::Json(serde_json::Value::Bool(b)), ValueType::Bool) => Ok(Self::Bool(*b)),
 
             _ => Err(CastError::IncompatibleTypes { from: source_type, to: target_type }),
@@ -449,5 +451,14 @@ mod tests {
     fn public_parse_helpers_reject_wrong_variants_and_values() {
         assert!(matches!(Value::Bool(true).parse_as_json::<bool>(), Err(ValueParseError::InvalidVariant { given: Value::Bool(true), .. })));
         assert!(matches!(Value::String("not a number".to_owned()).parse_as_string::<i32>(), Err(ValueParseError::InvalidValue { .. })));
+    }
+
+    #[test]
+    fn f64_to_i64_boundary_overflows_instead_of_saturating() {
+        let two_pow_63 = 9_223_372_036_854_775_808.0_f64; // i64::MAX as f64 rounds up to exactly this
+        assert!(matches!(Value::F64(two_pow_63).cast_to(ValueType::I64), Err(CastError::NumericOverflow { .. })));
+        let below = 9_223_372_036_854_774_784.0_f64; // the largest f64 strictly below 2^63
+        assert_eq!(Value::F64(below).cast_to(ValueType::I64).unwrap(), Value::I64(9_223_372_036_854_774_784));
+        assert_eq!(Value::F64(i64::MIN as f64).cast_to(ValueType::I64).unwrap(), Value::I64(i64::MIN));
     }
 }
