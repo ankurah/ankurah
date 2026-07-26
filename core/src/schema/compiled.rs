@@ -19,7 +19,7 @@
 //! there is no per-call allocation and the schema is a `const`-shaped fact
 //! of the program.
 
-use ankurah_proto::{EntityId, RegisterModel, RegisterProperty};
+use ankurah_proto::{RegisterModel, RegisterProperty};
 
 /// The compiled schema for one model: its registration hints and ordered
 /// active (non-ephemeral) fields. It contains no runtime
