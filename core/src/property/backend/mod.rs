@@ -1,4 +1,4 @@
-use ankurah_proto::{EventId, Operation};
+use ankurah_proto::{BackendOperation as Operation, EventId};
 use anyhow::Result;
 use std::any::Any;
 use std::fmt::Debug;
@@ -10,7 +10,7 @@ use std::{collections::BTreeMap, sync::Arc};
 // conformance kit's cross-order determinism law without being rebuilt as a
 // provenance-tracking, idempotent op-counter (apply_layer summing deltas is
 // non-idempotent and the counter kept no per-event id to de-duplicate on).
-// See the RFC #267 conformance kit and the C3 PR body for the full rationale
+// See issue #267's conformance kit discussion for the full rationale
 // and what a future counter backend must provide.
 #[cfg(test)]
 mod conformance;

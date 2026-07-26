@@ -57,6 +57,15 @@ impl From<serde_json::Error> for PropertyError {
     fn from(e: serde_json::Error) -> Self { PropertyError::SerializeError(Box::new(e)) }
 }
 
+/// Implemented by every active type (the wrapper a model field compiles
+/// to): names the property backend that stores its data, exactly as that
+/// backend registers itself at runtime. The derive reads this const into
+/// the compiled descriptor's `backend` field, so the fact is declared by
+/// the active type itself and tabulated nowhere.
+pub trait ActiveType {
+    const BACKEND: &'static str;
+}
+
 pub trait FromEntity {
     fn from_entity(property_name: PropertyName, entity: &Entity) -> Self;
 }

@@ -68,6 +68,10 @@ impl<Projected> YrsString<Projected> {
     }
 }
 
+impl<Projected> crate::property::traits::ActiveType for YrsString<Projected> {
+    const BACKEND: &'static str = "yrs";
+}
+
 impl<Projected> FromEntity for YrsString<Projected> {
     fn from_entity(property_name: PropertyName, entity: &Entity) -> Self {
         let backend = entity.get_backend::<YrsBackend>().expect("YrsBackend should exist");

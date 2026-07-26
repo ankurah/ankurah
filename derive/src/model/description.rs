@@ -13,6 +13,9 @@ pub struct ModelDescription {
 
     // Backend manager for configuration lookup
     pub(crate) backend_registry: crate::model::backend_registry::BackendRegistry,
+
+    // Struct-level attributes, retained for #[model(...)] parsing
+    struct_attrs: Vec<syn::Attribute>,
 }
 
 impl ModelDescription {
@@ -42,11 +45,13 @@ impl ModelDescription {
         // Load backend configurations at compile time
         let backend_registry = crate::model::backend_registry::BackendRegistry::new()?;
 
-        Ok(Self { name, active_fields, ephemeral_fields, backend_registry })
+        Ok(Self { name, active_fields, ephemeral_fields, backend_registry, struct_attrs: input.attrs.clone() })
     }
 
     // Basic identifier accessors
     pub fn name(&self) -> &Ident { &self.name }
+    /// Struct-level attributes, for `#[model(id = "...")]` parsing.
+    pub fn struct_attrs(&self) -> &[syn::Attribute] { &self.struct_attrs }
     pub fn collection_str(&self) -> String { self.name.to_string().to_lowercase() }
     pub fn view_name(&self) -> Ident { format_ident!("{}View", self.name) }
     pub fn mutable_name(&self) -> Ident { format_ident!("{}Mut", self.name) }

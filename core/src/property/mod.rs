@@ -4,7 +4,7 @@ pub mod value;
 
 use ankurah_proto::EntityId;
 
-pub use traits::{FromActiveType, FromEntity, InitializeWith, PropertyError};
+pub use traits::{ActiveType, FromActiveType, FromEntity, InitializeWith, PropertyError};
 pub use value::{Json, Ref, YrsString};
 
 use crate::value::Value;
@@ -12,6 +12,15 @@ use crate::value::Value;
 pub type PropertyName = String;
 
 pub trait Property: Sized {
+    /// The catalog value type this Rust type serializes to: the name of the
+    /// `Value` variant [`Self::into_value`] produces ("string", "i64",
+    /// "entityid", ...). Registration records it as the property's canonical
+    /// type on first allocation and checks later declarations against it, so
+    /// it must tell the truth about the wire representation. No default:
+    /// every impl declares its own (`#[derive(Property)]` emits "string" for
+    /// its JSON-string serialization).
+    const VALUE_TYPE: &'static str;
+
     fn into_value(&self) -> Result<Option<Value>, PropertyError>;
     fn from_value(value: Option<Value>) -> Result<Self, PropertyError>;
 }
@@ -19,6 +28,8 @@ pub trait Property: Sized {
 impl<T> Property for Option<T>
 where T: Property
 {
+    const VALUE_TYPE: &'static str = T::VALUE_TYPE;
+
     fn into_value(&self) -> Result<Option<Value>, PropertyError> {
         match self {
             Some(value) => Ok(<T as Property>::into_value(value)?),
@@ -35,8 +46,10 @@ where T: Property
 }
 
 macro_rules! into {
-    ($ty:ty => $variant:ident) => {
+    ($ty:ty => $variant:ident, $value_type:literal) => {
         impl Property for $ty {
+            const VALUE_TYPE: &'static str = $value_type;
+
             fn into_value(&self) -> Result<Option<Value>, PropertyError> { Ok(Some(Value::$variant(self.clone()))) }
             fn from_value(value: Option<Value>) -> Result<Self, PropertyError> {
                 match value {
@@ -52,16 +65,18 @@ macro_rules! into {
     };
 }
 
-into!(String => String);
-into!(i16 => I16);
-into!(i32 => I32);
-into!(i64 => I64);
-into!(f64 => F64);
-into!(bool => Bool);
-into!(EntityId => EntityId);
-into!(Vec<u8> => Binary);
+into!(String => String, "string");
+into!(i16 => I16, "i16");
+into!(i32 => I32, "i32");
+into!(i64 => I64, "i64");
+into!(f64 => F64, "f64");
+into!(bool => Bool, "bool");
+into!(EntityId => EntityId, "entityid");
+into!(Vec<u8> => Binary, "binary");
 
 impl<'a> Property for std::borrow::Cow<'a, str> {
+    const VALUE_TYPE: &'static str = "string";
+
     fn into_value(&self) -> Result<Option<Value>, PropertyError> { Ok(Some(Value::String(self.to_string()))) }
 
     fn from_value(value: Option<Value>) -> Result<Self, PropertyError> {
@@ -75,4 +90,20 @@ impl<'a> Property for std::borrow::Cow<'a, str> {
 
 impl From<&str> for Value {
     fn from(value: &str) -> Self { Value::String(value.to_string()) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::backend::{LWWBackend, PropertyBackend, YrsBackend};
+    use super::value::{YrsString, LWW};
+    use super::ActiveType;
+
+    /// The active types' declared backend names must match the names those
+    /// backends register at runtime; a mismatch would compile descriptors
+    /// naming a backend the registry cannot construct.
+    #[test]
+    fn active_type_backend_names_match_the_registry() {
+        assert_eq!(<LWW<String> as ActiveType>::BACKEND, LWWBackend::property_backend_name());
+        assert_eq!(<YrsString<String> as ActiveType>::BACKEND, YrsBackend::property_backend_name());
+    }
 }
