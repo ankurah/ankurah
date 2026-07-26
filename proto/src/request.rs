@@ -4,7 +4,7 @@ use ulid::Ulid;
 
 use crate::{
     auth::Attested, clock::Clock, collection::CollectionId, data::Event, id::EntityId, subscription::QueryId, transaction::TransactionId,
-    EntityState, EventFragment, EventId, StateFragment,
+    EntityState, EventFragment, EventId, RegisterModel, RegisteredModel, StateFragment,
 };
 
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Serialize, Deserialize, Hash, Default)]
@@ -119,12 +119,43 @@ pub struct EntityDelta {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum NodeRequestBody {
     // Request that the Events to be committed on the remote node
-    CommitTransaction { id: TransactionId, events: Vec<Attested<Event>> },
+    CommitTransaction {
+        id: TransactionId,
+        events: Vec<Attested<Event>>,
+    },
     // Request to fetch entities matching a predicate
-    Get { collection: CollectionId, ids: Vec<EntityId> },
-    GetEvents { collection: CollectionId, event_ids: Vec<EventId> },
-    Fetch { collection: CollectionId, selection: ast::Selection, known_matches: Vec<KnownEntity> },
-    SubscribeQuery { query_id: QueryId, collection: CollectionId, selection: ast::Selection, version: u32, known_matches: Vec<KnownEntity> },
+    Get {
+        collection: CollectionId,
+        ids: Vec<EntityId>,
+    },
+    GetEvents {
+        collection: CollectionId,
+        event_ids: Vec<EventId>,
+    },
+    Fetch {
+        collection: CollectionId,
+        selection: ast::Selection,
+        known_matches: Vec<KnownEntity>,
+    },
+    SubscribeQuery {
+        query_id: QueryId,
+        collection: CollectionId,
+        selection: ast::Selection,
+        version: u32,
+        known_matches: Vec<KnownEntity>,
+    },
+    /// Register schema definitions: an UPSERT the durable node
+    /// executes under a process-local mutex. Carries everything the durable
+    /// side needs: the receiver policy-checks, looks each definition up by
+    /// its lookup key, allocates a fresh EntityId on miss, emits ordinary
+    /// events, persists, relays, and responds with
+    /// [`NodeResponseBody::SchemaRegistered`] carrying the full resolved
+    /// definitions. Idempotent as an upsert: a repeat registration finds
+    /// every key, emits zero events, and returns the same ids. The catalog
+    /// collections are not writable any other way.
+    RegisterSchema {
+        models: Vec<RegisterModel>,
+    },
 }
 
 /// A response from one node to another
@@ -139,11 +170,23 @@ pub struct NodeResponse {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum NodeResponseBody {
     // Response to CommitEvents
-    CommitComplete { id: TransactionId },
+    CommitComplete {
+        id: TransactionId,
+    },
     Fetch(Vec<EntityDelta>),
     Get(Vec<Attested<EntityState>>),
     GetEvents(Vec<Attested<Event>>),
-    QuerySubscribed { query_id: QueryId, deltas: Vec<EntityDelta> },
+    QuerySubscribed {
+        query_id: QueryId,
+        deltas: Vec<EntityDelta>,
+    },
+    /// Response to RegisterSchema: the full resolved definitions,
+    /// ids included -- allocated on this execution or already existing. The
+    /// requester upserts these into its catalog map immediately on ack, so
+    /// catalog maintenance proceeds without waiting for replication.
+    SchemaRegistered {
+        models: Vec<RegisteredModel>,
+    },
     Success,
     Error(String),
 }
@@ -178,6 +221,9 @@ impl std::fmt::Display for NodeRequestBody {
             NodeRequestBody::SubscribeQuery { query_id, collection, selection: query, version, known_matches } => {
                 write!(f, "Subscribe {query_id} {collection} {query} v{version} known:{}", known_matches.len())
             }
+            NodeRequestBody::RegisterSchema { models } => {
+                write!(f, "RegisterSchema models:{} properties:{}", models.len(), models.iter().map(|m| m.properties.len()).sum::<usize>())
+            }
         }
     }
 }
@@ -195,6 +241,14 @@ impl std::fmt::Display for NodeResponseBody {
                 write!(f, "GetEvents [{}]", events.iter().map(|e| e.payload.to_string()).collect::<Vec<_>>().join(", "))
             }
             NodeResponseBody::QuerySubscribed { query_id, deltas: initial } => write!(f, "Subscribed {query_id} initial:{}", initial.len()),
+            NodeResponseBody::SchemaRegistered { models } => {
+                write!(
+                    f,
+                    "SchemaRegistered models:{} properties:{}",
+                    models.len(),
+                    models.iter().map(|m| m.properties.len()).sum::<usize>()
+                )
+            }
             NodeResponseBody::Success => write!(f, "Success"),
             NodeResponseBody::Error(e) => write!(f, "Error: {e}"),
         }
