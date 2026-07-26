@@ -143,6 +143,10 @@ impl fmt::Debug for RequestValidity {
 }
 
 impl RequestValidity {
+    // The predicate-only constructor and `and` composition (the doc example
+    // above) are called by the request paths and subscription relay of later
+    // slices; only the fenced form has callers this phase.
+    #[allow(dead_code)]
     pub(crate) fn new(check: impl Fn() -> bool + Send + Sync + 'static) -> Self { Self { check: Arc::new(check), fence: None } }
 
     pub(crate) fn fenced(fence: RequestFence) -> Self {
@@ -152,6 +156,7 @@ impl RequestValidity {
 
     /// Compose another attempt-local predicate without losing the owner's
     /// quiescing fence.
+    #[allow(dead_code)]
     pub(crate) fn and(self, check: impl Fn() -> bool + Send + Sync + 'static) -> Self {
         let previous = self.check.clone();
         Self { check: Arc::new(move || previous() && check()), fence: self.fence }

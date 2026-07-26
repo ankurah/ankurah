@@ -159,6 +159,20 @@ impl PolicyAgent for JwtAgent {
         if entity_after.collection().as_str() == "jwtpolicy" {
             return Err(AccessDenied::ByPolicy("Only privileged contexts may write to jwtpolicy"));
         }
+        // Core admits writes to the catalog collections only through the
+        // schema-registration executor, whose resolved-plan policy check runs
+        // before this per-event check. An authenticated caller that passed
+        // that gate may persist the catalog effects of its own registration;
+        // NoUser is still denied below.
+        if ankurah_core::schema::system_model_id(entity_after.collection().as_str())
+            .is_some_and(|model| ankurah_core::schema::is_catalog_collection(&model))
+        {
+            return if matches!(cdata, JwtContext::NoUser) {
+                Err(AccessDenied::ByPolicy("NoUser context cannot write schema metadata"))
+            } else {
+                Ok(None)
+            };
+        }
         if matches!(cdata, JwtContext::NoUser) {
             return Err(AccessDenied::ByPolicy("NoUser context cannot write events"));
         }
