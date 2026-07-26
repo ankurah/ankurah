@@ -1,0 +1,5 @@
+error: collection '_ankurah_evil' uses the reserved `_ankurah_` prefix, which is reserved for system collections (specs/model-property-metadata/rfc.md section 4); rename the model
+  --> tests/compile_fail/reserved_collection_prefix.rs:11:12
+   |
+11 | pub struct _ankurah_evil {
+   |            ^^^^^^^^^^^^^
