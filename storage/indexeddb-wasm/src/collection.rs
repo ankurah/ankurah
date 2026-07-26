@@ -17,6 +17,24 @@ use crate::{
     util::{cb_future::cb_future, cb_stream::cb_stream, object::Object, require::WBGRequire},
 };
 use ankurah_storage_common::{filtering::ValueSetStream, OrderByComponents, Plan};
+
+/// Memberships cross the JS boundary as a bincode Uint8Array, like the other
+/// binary state fields; BTreeSet<ModelId> is foreign to proto, so the
+/// conversion lives here instead of on the type.
+fn memberships_to_js(memberships: &std::collections::BTreeSet<proto::ModelId>) -> Result<JsValue, MutationError> {
+    let buffer = bincode::serialize(memberships).map_err(|e| MutationError::General(Box::new(e)))?;
+    let array = js_sys::Uint8Array::new_with_length(buffer.len() as u32);
+    array.copy_from(&buffer);
+    Ok(array.into())
+}
+
+fn memberships_from_js(value: JsValue) -> Result<std::collections::BTreeSet<proto::ModelId>, RetrievalError> {
+    let array: js_sys::Uint8Array =
+        value.dyn_into().map_err(|_| RetrievalError::StorageError(anyhow::anyhow!("memberships field is not a Uint8Array").into()))?;
+    let mut buffer = vec![0; array.length() as usize];
+    array.copy_to(&mut buffer);
+    bincode::deserialize(&buffer).map_err(|e| RetrievalError::StorageError(Box::new(e)))
+}
 // Import tracing for debug macro and futures for StreamExt
 use futures::StreamExt;
 use tracing::debug;
@@ -74,6 +92,7 @@ impl StorageCollection for IndexedDBBucket {
             entity.set(&*ID_KEY, state.payload.entity_id.to_string())?;
             entity.set(&*COLLECTION_KEY, self.collection_id.as_str())?;
             entity.set(&*STATE_BUFFER_KEY, &state.payload.state.state_buffers)?;
+            entity.set(&*MEMBERSHIPS_KEY, memberships_to_js(&state.payload.state.memberships)?)?;
             entity.set(&*HEAD_KEY, &state.payload.state.head)?;
             entity.set(&*ATTESTATIONS_KEY, &state.attestations)?;
 
@@ -114,7 +133,11 @@ impl StorageCollection for IndexedDBBucket {
                 payload: EntityState {
                     entity_id: id,
                     collection: self.collection_id.clone(),
-                    state: State { state_buffers: entity.get(&STATE_BUFFER_KEY)?, head: entity.get(&HEAD_KEY)? },
+                    state: State {
+                        state_buffers: entity.get(&STATE_BUFFER_KEY)?,
+                        memberships: memberships_from_js(entity.get(&MEMBERSHIPS_KEY)?)?,
+                        head: entity.get(&HEAD_KEY)?,
+                    },
                 },
                 attestations: entity.get(&ATTESTATIONS_KEY)?,
             })
@@ -488,7 +511,7 @@ fn js_object_to_entity_state(
     entity_obj: &Object,
     collection_id: &ankurah_proto::CollectionId,
 ) -> Result<Attested<EntityState>, RetrievalError> {
-    use crate::statics::{ATTESTATIONS_KEY, HEAD_KEY, ID_KEY, STATE_BUFFER_KEY};
+    use crate::statics::{ATTESTATIONS_KEY, HEAD_KEY, ID_KEY, MEMBERSHIPS_KEY, STATE_BUFFER_KEY};
     use ankurah_proto::{Attested, EntityId, EntityState, State};
 
     // Extract the specific fields that are stored in IndexedDB using Object::get
@@ -497,7 +520,11 @@ fn js_object_to_entity_state(
     let entity_state = EntityState {
         collection: collection_id.clone(),
         entity_id: id,
-        state: State { state_buffers: entity_obj.get(&STATE_BUFFER_KEY)?, head: entity_obj.get(&HEAD_KEY)? },
+        state: State {
+            state_buffers: entity_obj.get(&STATE_BUFFER_KEY)?,
+            memberships: crate::collection::memberships_from_js(entity_obj.get(&MEMBERSHIPS_KEY)?)?,
+            head: entity_obj.get(&HEAD_KEY)?,
+        },
     };
 
     let attestations = entity_obj.get(&ATTESTATIONS_KEY)?;
