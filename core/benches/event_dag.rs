@@ -69,7 +69,7 @@ fn event(seed: u32, parents: &[EventId]) -> Event {
         entity_id: EntityId::from_bytes(entity_id_bytes),
         collection: "bench".into(),
         parent: Clock::from(parents.to_vec()),
-        operations: OperationSet(BTreeMap::new()),
+        operations: OperationSet::from_backends(BTreeMap::new()),
     }
 }
 
