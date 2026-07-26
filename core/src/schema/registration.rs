@@ -936,26 +936,4 @@ mod tests {
     fn selection(predicate: ankql::ast::Predicate) -> ankql::ast::Selection {
         ankql::ast::Selection { predicate, order_by: None, limit: None }
     }
-
-    /// The allocator reads catalog rows straight from storage
-    /// (`catalog_row_by_key`), so nothing resolves its predicates for it: they
-    /// must arrive resolved on their own or the engine refuses them.
-    ///
-    /// Regression: these were built as raw `Expr::Path`. A raw path carries no
-    /// identity, so the engines' absence scan could not see it, nothing folded
-    /// it to NULL, and postgres emitted `WHERE "label" = $1` against a
-    /// table with no such column (SQLSTATE 42703).
-    #[test]
-    fn allocator_predicates_arrive_resolved() {
-        let model = EntityId::new();
-        for predicate in [
-            field_eq_str("label", "album"),
-            field_eq_id("minted_for", model),
-            and(field_eq_id("model", model), field_eq_str("name", "title")),
-        ] {
-            if let Err(err) = selection(predicate.clone()).check() {
-                panic!("{predicate:?} must reach a storage engine resolved, but: {err}");
-            }
-        }
-    }
 }

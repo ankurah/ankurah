@@ -533,8 +533,9 @@ mod lww_conformance {
 
         // Apply earlier as committed state, then the later event via a layer.
         let backend: Arc<dyn PropertyBackend> = Arc::new(LWWBackend::new());
-        if let Some(ops) = earlier.operations.get(LwwAdopter::backend_name()) {
-            backend.apply_operations_with_event(ops, earlier.id()).unwrap();
+        let ops: Vec<_> = earlier.operations.backend_operations(LwwAdopter::backend_name()).cloned().collect();
+        if !ops.is_empty() {
+            backend.apply_operations_with_event(&ops, earlier.id()).unwrap();
         }
         backend.apply_layer(&layer).unwrap();
 

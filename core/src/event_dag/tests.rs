@@ -1266,9 +1266,9 @@ mod lww_layer_tests {
             .find(|a| a.id() > event_b.id())
             .expect("some seed yields A.id > B.id");
 
-        let lww_key = "lww".to_string();
-        let a_ops = event_a.operations.get(&lww_key).unwrap();
-        let z_ops = event_z.operations.get(&lww_key).unwrap();
+        let a_ops: Vec<_> = event_a.operations.backend_operations("lww").cloned().collect();
+        let z_ops: Vec<_> = event_z.operations.backend_operations("lww").cloned().collect();
+        let (a_ops, z_ops) = (&a_ops, &z_ops);
 
         // All layers share the same accumulated DAG {M, A, X, B}; Z is absent from it.
         let layer1 = || layer_from_refs_with_context(&[&event_a], &[&remote_mid], &[&meet, &event_b]);
