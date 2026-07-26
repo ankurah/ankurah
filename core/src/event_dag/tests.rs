@@ -1829,7 +1829,7 @@ mod phase4_duplicate_creation {
         let mut entity_id_bytes = [0u8; 16];
         entity_id_bytes[0] = 42;
         let entity_id = EntityId::from_bytes(entity_id_bytes);
-        let entity = Entity::create(entity_id, "test".into());
+        let entity = Entity::create(entity_id, "test".into(), None);
 
         let mut retriever = MockRetriever::new();
 
@@ -1860,7 +1860,7 @@ mod phase4_duplicate_creation {
         let mut entity_id_bytes = [0u8; 16];
         entity_id_bytes[0] = 42;
         let entity_id = EntityId::from_bytes(entity_id_bytes);
-        let entity = Entity::create(entity_id, "test".into());
+        let entity = Entity::create(entity_id, "test".into(), None);
 
         let mut retriever = MockRetriever::new();
 
@@ -2642,7 +2642,7 @@ mod strict_descends_gap_jump {
         let mut entity_id_bytes = [0u8; 16];
         entity_id_bytes[0] = 42;
         let entity_id = EntityId::from_bytes(entity_id_bytes);
-        let entity = Entity::create(entity_id, "test".into());
+        let entity = Entity::create(entity_id, "test".into(), None);
 
         let mut retriever = MockRetriever::new();
 
@@ -2973,7 +2973,7 @@ mod entity_change_batches {
         let mut entity_id_bytes = [0u8; 16];
         entity_id_bytes[0] = 77;
         let entity_id = EntityId::from_bytes(entity_id_bytes);
-        let entity = Entity::create(entity_id, "test".into());
+        let entity = Entity::create(entity_id, "test".into(), None);
 
         let mut retriever = MockRetriever::new();
 

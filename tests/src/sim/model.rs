@@ -44,6 +44,32 @@ pub fn entity_id(counter: u64) -> proto::EntityId {
 /// The `SimRecord` collection id.
 pub fn sim_collection() -> proto::CollectionId { SimRecord::collection() }
 
+/// The deterministic model-entity id the sim seeds into every node's catalog
+/// and asserts in every forged genesis membership. Constant, so it is
+/// identical across every node in a run and across the two
+/// determinism-audit runs.
+pub fn sim_model_id() -> proto::EntityId { proto::EntityId::from_bytes([0x5B; 16]) }
+
+/// Stable seeded catalog identity for each simulated property.
+pub fn sim_property_id(field: Field) -> proto::EntityId {
+    let mut bytes = [0x5C; 16];
+    bytes[15] = match field {
+        Field::Title => 1,
+        Field::Body => 2,
+    };
+    proto::EntityId::from_bytes(bytes)
+}
+
+/// Stable seeded membership identity for each simulated property.
+pub fn sim_membership_id(field: Field) -> proto::EntityId {
+    let mut bytes = [0x5D; 16];
+    bytes[15] = match field {
+        Field::Title => 1,
+        Field::Body => 2,
+    };
+    proto::EntityId::from_bytes(bytes)
+}
+
 /// Decode the `(title, body)` LWW field values from a materialized `proto::State`
 /// as a subscriber would read them, for the C5 coherence checks that compare a
 /// recorded read against the converged truth. An unset field, or a state with no
@@ -88,12 +114,9 @@ fn lww_ops(field: Field, value: &str) -> proto::OperationSet {
 /// it as a create (`Event::is_entity_create`). `field`/`value` seed the initial
 /// state.
 pub fn genesis_event(entity: proto::EntityId, field: Field, value: &str) -> proto::Event {
-    proto::Event {
-        collection: SimRecord::collection(),
-        entity_id: entity,
-        operations: lww_ops(field, value),
-        parent: proto::Clock::default(),
-    }
+    let mut operations = lww_ops(field, value);
+    operations.push(proto::Operation::Membership(proto::Membership::Add(ankurah::ModelId::EntityId(sim_model_id()))));
+    proto::Event { collection: SimRecord::collection(), entity_id: entity, operations, parent: proto::Clock::default() }
 }
 
 /// Forge a non-genesis event parented on `parent`, setting `field` to `value`.

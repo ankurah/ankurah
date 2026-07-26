@@ -163,15 +163,19 @@ async fn check_request_error_returns_to_client() -> Result<()> {
 
     let client_ctx = client.context(DEFAULT_CONTEXT)?;
 
-    // Try to create an entity on the client - this should fail when relaying to server
-    // because the server's check_request will reject it
+    // Try to create an entity on the client - this should fail when relaying
+    // to the server because its check_request rejects everything. First-use
+    // registration makes create the first server round trip, so the refusal
+    // may surface there; if create ever succeeds, commit must surface it.
+    // Either way the server's rejection reaches the caller instead of hanging.
     let trx = client_ctx.begin();
-    trx.create(&Album { name: "Test Album".into(), year: "2024".into() }).await?;
+    let created = trx.create(&Album { name: "Test Album".into(), year: "2024".into() }).await.map(|_| ());
+    let result = match created {
+        Err(error) => Err(error),
+        Ok(()) => trx.commit().await,
+    };
 
-    // The commit should return an error (not hang!) because the server rejected the request
-    let result = trx.commit().await;
-
-    assert!(result.is_err(), "Commit should fail when server rejects the request");
+    assert!(result.is_err(), "Create or commit should fail when server rejects the request");
 
     // Verify the error message contains our rejection reason
     let err_msg = result.unwrap_err().to_string();

@@ -31,12 +31,50 @@ type CrashNode = Node<CrashStorageEngine<SledStorageEngine>, PermissiveAgent>;
 /// Build a durable node on a real on-disk sled directory wrapped in the
 /// crash-injecting engine, create the system, then arm the crash hook so
 /// subsequent operation counts start from zero (bootstrap writes are excluded).
+/// Seed a deterministic Album catalog identity on `node` and latch the
+/// compiled binding, so every node in a scenario (the armed child, the
+/// batch-generating helper, reopened nodes) agrees on the model id the
+/// genesis membership asserts -- without spending crash-countable storage
+/// writes on registration. Registration is bootstrap here, not workload.
+fn seed_album_catalog<SE: StorageEngine + Send + Sync + 'static>(node: &Node<SE, PermissiveAgent>) -> Result<()> {
+    let model = proto::RegisteredModel {
+        id: proto::EntityId::from_bytes([0x6A; 16]),
+        collection: Album::schema().collection.to_owned(),
+        name: "Album".to_owned(),
+    };
+    let properties: Vec<_> = ["name", "year"]
+        .iter()
+        .enumerate()
+        .map(|(i, field)| proto::RegisteredProperty {
+            id: proto::EntityId::from_bytes([0x6B + i as u8; 16]),
+            model: model.id,
+            name: (*field).to_owned(),
+            backend: "yrs".to_owned(),
+            value_type: "string".to_owned(),
+            target_model: None,
+        })
+        .collect();
+    let memberships: Vec<_> = properties
+        .iter()
+        .enumerate()
+        .map(|(i, property)| proto::RegisteredMembership {
+            id: proto::EntityId::from_bytes([0x6D + i as u8; 16]),
+            model: model.id,
+            property: property.id,
+            optional: false,
+        })
+        .collect();
+    node.catalog.seed_registered_schema(Album::schema(), std::slice::from_ref(&model), &properties, &memberships)?;
+    Ok(())
+}
+
 async fn armed_child_node(crash: CrashPoint) -> Result<(CrashNode, Arc<CrashStorageEngine<SledStorageEngine>>)> {
     let dir = child_sled_dir().expect("child must have a sled dir");
     let sled = Arc::new(SledStorageEngine::with_path(dir)?);
     let engine = Arc::new(CrashStorageEngine::new(sled, Some(crash)));
     let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
     node.system.create().await?;
+    seed_album_catalog(&node)?;
     // Bootstrap complete: from here on, operations are the workload under test.
     engine.arm();
     Ok((node, engine))
@@ -49,6 +87,7 @@ async fn armed_child_node(crash: CrashPoint) -> Result<(CrashNode, Arc<CrashStor
 async fn generate_creation_batch(n: usize) -> Result<Vec<Attested<proto::Event>>> {
     let helper = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
     helper.system.create().await?;
+    seed_album_catalog(&helper)?;
     let ctx = helper.context(c)?;
     let trx = ctx.begin();
     for i in 0..n {
@@ -205,6 +244,7 @@ async fn scenario_2_mid_batch() -> Result<()> {
     // Reconvergence: reopen the node under test and re-deliver the whole batch,
     // exactly as the sending peer would on retry. Everything must converge.
     let node = Node::new_durable(Arc::new(engine), PermissiveAgent::new());
+    seed_album_catalog(&node)?;
     // The system root persisted before the workload, so the reopened durable
     // node loads it and becomes ready on its own (no create/join). Awaiting a
     // collection drives the async catalog load first.
@@ -253,6 +293,7 @@ async fn child_mid_merge() -> Result<()> {
     let engine = Arc::new(CrashStorageEngine::new(sled, Some(crash)));
     let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
     node.system.create().await?;
+    seed_album_catalog(&node)?;
     let ctx = node.context(c)?;
 
     // A: create.
@@ -378,6 +419,7 @@ async fn scenario_4_entity_creation() -> Result<()> {
 
     // Reconvergence via re-delivery of the identical creation event.
     let node = Node::new_durable(Arc::new(engine), PermissiveAgent::new());
+    seed_album_catalog(&node)?;
     let collection2 = node.system.collection(&Album::collection()).await?;
     node.system.wait_system_ready().await;
     assert!(node.system.is_system_ready(), "reopened durable node must be system-ready");
