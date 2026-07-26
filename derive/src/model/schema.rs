@@ -406,7 +406,6 @@ fn validate_explicit_id(s: &str) -> Result<(), String> {
         .map_err(|error| format!("explicit id {s:?} is not a valid EntityId encoding: {error} (RFC 5.9)"))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
