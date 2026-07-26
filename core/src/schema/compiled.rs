@@ -19,7 +19,7 @@
 //! there is no per-call allocation and the schema is a `const`-shaped fact
 //! of the program.
 
-use ankurah_proto::{MembershipDescriptor, ModelDescriptor, PropertyDescriptor, PropertyRef};
+use ankurah_proto::{EntityId, RegisterModel, RegisterProperty};
 
 /// The compiled schema for one model: its registration hints and ordered
 /// active (non-ephemeral) fields. It contains no runtime
@@ -112,38 +112,28 @@ impl ModelStructDescriptor {
 /// references the property by `PropertyRef::Id`; otherwise the membership
 /// references it by `PropertyRef::Name` within the request (which the
 /// executor resolves to the upserted id). `optional` rides the membership,
-/// per contract.
-pub fn registration_request(schema: &ModelStructDescriptor) -> (Vec<ModelDescriptor>, Vec<PropertyDescriptor>, Vec<MembershipDescriptor>) {
-    let models = vec![ModelDescriptor {
-        collection: schema.label.to_string(),
+/// Convert a compiled struct descriptor into the RegisterSchema request
+/// entry it declares: one model with its properties nested (position is the
+/// membership assertion; explicit ids ride as bindings).
+pub fn registration_request(schema: &ModelStructDescriptor) -> RegisterModel {
+    RegisterModel {
+        label: schema.label.to_string(),
         name: schema.name.to_string(),
         explicit_id: schema.explicit_id.map(parse_explicit_id),
-    }];
-
-    let mut properties = Vec::with_capacity(schema.properties.len());
-    let mut memberships = Vec::with_capacity(schema.properties.len());
-
-    for field in schema.properties {
-        let explicit_id = field.explicit_id.map(parse_explicit_id);
-
-        properties.push(PropertyDescriptor {
-            minting_collection: schema.label.to_string(),
-            name: field.name.to_string(),
-            renamed_from: field.renamed_from.map(|s| s.to_string()),
-            backend: field.backend.to_string(),
-            value_type: field.value_type.to_string(),
-            target_collection: field.target_label.map(str::to_string),
-            explicit_id,
-        });
-
-        let property_ref = match explicit_id {
-            Some(id) => PropertyRef::Id(id),
-            None => PropertyRef::Name(field.name.to_string()),
-        };
-        memberships.push(MembershipDescriptor { collection: schema.label.to_string(), property: property_ref, optional: field.optional });
+        properties: schema
+            .properties
+            .iter()
+            .map(|field| RegisterProperty {
+                name: field.name.to_string(),
+                renamed_from: field.renamed_from.map(|s| s.to_string()),
+                backend: field.backend.to_string(),
+                value_type: field.value_type.to_string(),
+                target_label: field.target_label.map(str::to_string),
+                explicit_id: field.explicit_id.map(parse_explicit_id),
+                optional: field.optional,
+            })
+            .collect(),
     }
-
-    (models, properties, memberships)
 }
 
 /// Decode an explicit-id attribute value into an `EntityId`. The derive

@@ -21,7 +21,7 @@
 //!
 //! Each node keeps an in-memory index of the catalog entities
 //! ([`catalog::CatalogManager`]) so lookups don't touch storage: parsed into
-//! `ModelDef`/`PropertyDef`/`MembershipDef`, warmed from local storage on
+//! `ModelDef`/`PropertyDef`/`ModelPropertyMembershipDef`, warmed from local storage on
 //! durable nodes and from registration responses on ephemeral ones. The
 //! wire request/response types live in ankurah-proto. The full design
 //! record is specs/model-property-metadata/rfc.md.

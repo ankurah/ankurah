@@ -461,14 +461,12 @@ where
                     Err(e) => Ok(proto::NodeResponseBody::Error(e.to_string())),
                 }
             }
-            proto::NodeRequestBody::RegisterSchema { models, properties, memberships } => {
+            proto::NodeRequestBody::RegisterSchema { models } => {
                 let cdata = cdata.iterable().exactly_one().map_err(|_| anyhow!("Only one cdata is permitted for RegisterSchema"))?;
-                match self.catalog.register_schema(cdata, models, properties, memberships).await {
-                    // The resolved definitions ARE the response (RFC 5.2):
-                    // the requester folds them into its catalog map on ack.
-                    Ok((models, properties, memberships)) => {
-                        Ok(proto::NodeResponseBody::SchemaRegistered { models, properties, memberships })
-                    }
+                match self.catalog.register_schema(cdata, models).await {
+                    // The resolved definitions ARE the response: the
+                    // requester folds them into its catalog map on ack.
+                    Ok(models) => Ok(proto::NodeResponseBody::SchemaRegistered { models }),
                     Err(e) => Ok(proto::NodeResponseBody::Error(e.to_string())),
                 }
             }

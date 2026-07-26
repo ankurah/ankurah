@@ -16,7 +16,7 @@
 mod common;
 use ankurah::core::schema::registration_request;
 use ankurah::property::{Json, Ref};
-use ankurah::proto::{self, PropertyRef};
+use ankurah::proto;
 use ankurah::value::Value;
 use ankurah::Model;
 use common::*;
@@ -162,46 +162,36 @@ fn explicit_id_attributes_reflected() {
 
 #[test]
 fn registration_request_from_schema() {
-    let (models, properties, memberships) = registration_request(DescAllTypes::descriptor());
+    let model = registration_request(DescAllTypes::descriptor());
 
-    assert_eq!(models.len(), 1);
-    assert_eq!(models[0].collection, "descalltypes");
-    assert_eq!(models[0].name, "DescAllTypes");
+    assert_eq!(model.label, "descalltypes");
+    assert_eq!(model.name, "DescAllTypes");
 
-    assert_eq!(properties.len(), 13);
-    // Spot-check the reference row: entityid plus the target model's
-    // collection, which the executor resolves to target_model (RFC 5.2).
-    let artist = properties.iter().find(|p| p.name == "artist").unwrap();
-    assert_eq!(artist.minting_collection, "descalltypes");
+    // Every active field nests as a property entry; the nesting is the
+    // membership assertion, and optionality rides the entry.
+    assert_eq!(model.properties.len(), 13);
+    let artist = model.properties.iter().find(|p| p.name == "artist").unwrap();
     assert_eq!((artist.backend.as_str(), artist.value_type.as_str()), ("lww", "entityid"));
-    assert_eq!(artist.target_collection.as_deref(), Some("descartist"));
+    assert_eq!(artist.target_label.as_deref(), Some("descartist"));
     assert_eq!(artist.explicit_id, None);
 
-    // Non-explicit memberships reference the property by name within the
-    // request; optionality rides the membership.
-    assert_eq!(memberships.len(), 13);
-    let yrs_opt = memberships.iter().find(|m| matches!(&m.property, PropertyRef::Name(n) if n == "yrs_opt")).unwrap();
+    let yrs_opt = model.properties.iter().find(|p| p.name == "yrs_opt").unwrap();
     assert!(yrs_opt.optional, "Option<String> is optional per contract");
-    let flag = memberships.iter().find(|m| matches!(&m.property, PropertyRef::Name(n) if n == "flag")).unwrap();
+    let flag = model.properties.iter().find(|p| p.name == "flag").unwrap();
     assert!(!flag.optional);
 }
 
 #[test]
 fn registration_request_honors_explicit_ids() {
-    let (_models, properties, memberships) = registration_request(DescBound::descriptor());
+    let model = registration_request(DescBound::descriptor());
+    assert_eq!(model.explicit_id, Some(proto::EntityId::from_base64(ZERO_ID_B64).unwrap()), "model explicit id preserved");
 
-    // The bound field carries its explicit id as a PropertyDescriptor
-    // binding and its membership references the property by Id, not name.
-    let label = properties.iter().find(|p| p.name == "label").unwrap();
+    // The bound field carries its explicit id; its nested position is the
+    // membership assertion, so no separate reference exists to get wrong.
+    let label = model.properties.iter().find(|p| p.name == "label").unwrap();
     assert!(label.explicit_id.is_some(), "explicit-id binding preserved");
-    let bound_id = label.explicit_id.unwrap();
-
-    let label_ms = memberships.iter().find(|m| matches!(&m.property, PropertyRef::Id(id) if *id == bound_id));
-    assert!(label_ms.is_some(), "bound field's membership references the property by id");
-
-    // The unbound field references by name.
-    let other_ms = memberships.iter().find(|m| matches!(&m.property, PropertyRef::Name(n) if n == "other"));
-    assert!(other_ms.is_some());
+    let other = model.properties.iter().find(|p| p.name == "other").unwrap();
+    assert_eq!(other.explicit_id, None, "unbound field looks up by name");
 }
 
 // -- end-to-end registration through the harness -----------------------------
@@ -233,18 +223,18 @@ async fn register_from_model_schema_end_to_end() -> anyhow::Result<()> {
 
     // The whole point: the request is built from the compiled schema, no
     // hand-written descriptors.
-    let (models, properties, memberships) = registration_request(DescAllTypes::descriptor());
-    let request = proto::NodeRequestBody::RegisterSchema { models, properties, memberships };
+    let request = proto::NodeRequestBody::RegisterSchema { models: vec![registration_request(DescAllTypes::descriptor())] };
 
-    let (reg_models, reg_properties, reg_memberships) = match client.request(server.id, &DEFAULT_CONTEXT, request).await? {
-        proto::NodeResponseBody::SchemaRegistered { models, properties, memberships } => (models, properties, memberships),
+    let reg_models = match client.request(server.id, &DEFAULT_CONTEXT, request).await? {
+        proto::NodeResponseBody::SchemaRegistered { models } => models,
         other => panic!("expected SchemaRegistered, got {other}"),
     };
 
-    // The allocator resolved the ids; index them by display name for lookup.
-    let model_id = reg_models.iter().find(|m| m.collection == "descalltypes").expect("model returned").id;
-    let artist_model_id = reg_models.iter().find(|m| m.collection == "descartist").expect("reference target model returned").id;
-    let property_ids: BTreeMap<String, EntityId> = reg_properties.iter().map(|p| (p.name.clone(), p.id)).collect();
+    // The allocator resolved the ids; the response nests them by model.
+    let registered = reg_models.iter().find(|m| m.label == "descalltypes").expect("model returned");
+    let model_id = registered.id;
+    let artist_model_id = reg_models.iter().find(|m| m.label == "descartist").expect("reference target model returned").id;
+    let property_ids: BTreeMap<String, EntityId> = registered.properties.iter().map(|p| (p.name.clone(), p.id)).collect();
 
     // The model entity exists with its collection + display name.
     let model = catalog_values(&server, MODEL, model_id).await?;
@@ -260,7 +250,7 @@ async fn register_from_model_schema_end_to_end() -> anyhow::Result<()> {
         assert_eq!(property.get("value_type"), Some(&Some(Value::String(f.value_type.into()))), "value_type for {}", f.field);
         assert_eq!(property.get("name"), Some(&Some(Value::String(f.name.into()))), "name for {}", f.field);
         assert_eq!(property.get("minted_for"), Some(&Some(Value::EntityId(model_id))), "minted_for for {}", f.field);
-        let registered = reg_properties.iter().find(|p| p.id == property_id).expect("registered property returned");
+        let registered = registered.properties.iter().find(|p| p.id == property_id).expect("registered property returned");
         match f.target_label {
             Some("descartist") => {
                 assert_eq!(registered.target_model, Some(artist_model_id), "target_model response for {}", f.field);
@@ -276,9 +266,8 @@ async fn register_from_model_schema_end_to_end() -> anyhow::Result<()> {
         }
 
         // And the (model, property) membership exists with the field's
-        // optionality, at the allocated membership id.
-        let membership_id = reg_memberships.iter().find(|m| m.property == property_id).expect("membership for property").id;
-        let membership = catalog_values(&server, MEMBERSHIP, membership_id).await?;
+        // optionality, at the membership id the nested response row carries.
+        let membership = catalog_values(&server, MEMBERSHIP, registered.membership_id).await?;
         assert_eq!(membership.get("property"), Some(&Some(Value::EntityId(property_id))), "membership property for {}", f.field);
         assert_eq!(membership.get("optional"), Some(&Some(Value::Bool(f.optional))), "membership optional for {}", f.field);
     }

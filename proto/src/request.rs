@@ -4,7 +4,7 @@ use ulid::Ulid;
 
 use crate::{
     auth::Attested, clock::Clock, collection::CollectionId, data::Event, id::EntityId, subscription::QueryId, transaction::TransactionId,
-    EntityState, EventFragment, EventId, StateFragment,
+    EntityState, EventFragment, EventId, RegisterModel, RegisteredModel, StateFragment,
 };
 
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Serialize, Deserialize, Hash, Default)]
@@ -154,128 +154,8 @@ pub enum NodeRequestBody {
     /// every key, emits zero events, and returns the same ids. The catalog
     /// collections are not writable any other way.
     RegisterSchema {
-        models: Vec<ModelDescriptor>,
-        properties: Vec<PropertyDescriptor>,
-        memberships: Vec<MembershipDescriptor>,
+        models: Vec<RegisterModel>,
     },
-}
-
-/// A model definition to register.
-///
-/// The `collection` field name is retained for source/API compatibility. Its
-/// value is the model's registration label, not a physical collection or a
-/// claim that canonical entities belong to this model.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelDescriptor {
-    /// Source-level model label and registration lookup key (RFC 5.1).
-    ///
-    /// Historical field name; canonical entities are model-independent.
-    pub collection: String,
-    /// Display name (initially the struct name); mutable metadata.
-    pub name: String,
-    /// Explicit binding (RFC 5.9): reference an EXISTING model entity
-    /// instead of looking one up by label. Never mints; hard-fails if absent
-    /// or if the bound entity's label differs. Properties and
-    /// memberships in the SAME request resolve under the bound id, so a
-    /// request touching an explicitly-bound model must include its
-    /// ModelDescriptor.
-    pub explicit_id: Option<EntityId>,
-}
-
-/// A property definition to register. Language-agnostic: `backend` and
-/// `value_type` follow the normative mapping table (RFC section 4).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PropertyDescriptor {
-    /// Label of the minting model: the lookup scope (provenance, not
-    /// ownership; RFC 5.1). Historical field name.
-    pub minting_collection: String,
-    /// Current display name; part of the upsert lookup key.
-    pub name: String,
-    /// The name this property had before you renamed the field. Lets the
-    /// executor find the existing property under its old name and move it to
-    /// the new one, instead of minting a duplicate under the new name. Only
-    /// consulted when the new name misses and the old name hits, so it is
-    /// harmless to leave in place (it does nothing once applied) and safe to
-    /// delete from source once every system has seen the rename.
-    pub renamed_from: Option<String>,
-    /// Backend registry name, e.g. "lww", "yrs".
-    pub backend: String,
-    /// Language-agnostic value type, e.g. "string", "i64".
-    pub value_type: String,
-    /// For reference-typed properties: the target model, named by its
-    /// source label (ids are the executor's to allocate or resolve; RFC 5.2).
-    /// The executor resolves this against the catalog, allocating the model
-    /// entity on miss. Mutable metadata, not identity.
-    pub target_collection: Option<String>,
-    /// Explicit binding (RFC 5.9): reference an EXISTING property entity
-    /// instead of looking one up by name. Never mints; hard-fails if absent.
-    pub explicit_id: Option<EntityId>,
-}
-
-/// How a membership names its property within a RegisterSchema request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum PropertyRef {
-    /// A property declared in this request for the same model, by current
-    /// display name.
-    Name(String),
-    /// An existing (possibly shared) property entity, by explicit id.
-    Id(EntityId),
-}
-
-/// A (model, property) contract-membership to register.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MembershipDescriptor {
-    /// The model's source label. Historical field name.
-    pub collection: String,
-    /// The property to attach, by a same-request name or durable identity.
-    pub property: PropertyRef,
-    /// PER CONTRACT: the same property may be required in one model and
-    /// optional in another.
-    pub optional: bool,
-}
-
-/// A resolved model definition, as returned by
-/// [`NodeResponseBody::SchemaRegistered`]: the allocated (or existing)
-/// entity id plus the definition state the catalog now holds.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RegisteredModel {
-    /// The model's allocated or previously registered catalog entity id.
-    pub id: EntityId,
-    /// The source-level model label used to look up this registration.
-    /// Historical field name.
-    pub collection: String,
-    /// The model's current registered display name.
-    pub name: String,
-}
-
-/// A resolved property definition (see [`RegisteredModel`]).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RegisteredProperty {
-    /// The property's allocated or previously registered catalog entity id.
-    pub id: EntityId,
-    /// The model in whose scope this property was minted (provenance).
-    pub model: EntityId,
-    /// The property's current registered display name.
-    pub name: String,
-    /// The property's canonical state-backend identifier.
-    pub backend: String,
-    /// The property's canonical logical value-type spelling.
-    pub value_type: String,
-    /// Resolved target model id for reference-typed properties.
-    pub target_model: Option<EntityId>,
-}
-
-/// A resolved contract-membership (see [`RegisteredModel`]).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RegisteredMembership {
-    /// The membership's allocated or previously registered catalog entity id.
-    pub id: EntityId,
-    /// The model participating in the membership.
-    pub model: EntityId,
-    /// The property participating in the membership.
-    pub property: EntityId,
-    /// Whether this property is optional in this model contract.
-    pub optional: bool,
 }
 
 /// A response from one node to another
@@ -306,8 +186,6 @@ pub enum NodeResponseBody {
     /// catalog maintenance proceeds without waiting for replication.
     SchemaRegistered {
         models: Vec<RegisteredModel>,
-        properties: Vec<RegisteredProperty>,
-        memberships: Vec<RegisteredMembership>,
     },
     Success,
     Error(String),
@@ -343,8 +221,8 @@ impl std::fmt::Display for NodeRequestBody {
             NodeRequestBody::SubscribeQuery { query_id, collection, selection: query, version, known_matches } => {
                 write!(f, "Subscribe {query_id} {collection} {query} v{version} known:{}", known_matches.len())
             }
-            NodeRequestBody::RegisterSchema { models, properties, memberships } => {
-                write!(f, "RegisterSchema models:{} properties:{} memberships:{}", models.len(), properties.len(), memberships.len())
+            NodeRequestBody::RegisterSchema { models } => {
+                write!(f, "RegisterSchema models:{} properties:{}", models.len(), models.iter().map(|m| m.properties.len()).sum::<usize>())
             }
         }
     }
@@ -363,8 +241,13 @@ impl std::fmt::Display for NodeResponseBody {
                 write!(f, "GetEvents [{}]", events.iter().map(|e| e.payload.to_string()).collect::<Vec<_>>().join(", "))
             }
             NodeResponseBody::QuerySubscribed { query_id, deltas: initial } => write!(f, "Subscribed {query_id} initial:{}", initial.len()),
-            NodeResponseBody::SchemaRegistered { models, properties, memberships } => {
-                write!(f, "SchemaRegistered models:{} properties:{} memberships:{}", models.len(), properties.len(), memberships.len())
+            NodeResponseBody::SchemaRegistered { models } => {
+                write!(
+                    f,
+                    "SchemaRegistered models:{} properties:{}",
+                    models.len(),
+                    models.iter().map(|m| m.properties.len()).sum::<usize>()
+                )
             }
             NodeResponseBody::Success => write!(f, "Success"),
             NodeResponseBody::Error(e) => write!(f, "Error: {e}"),

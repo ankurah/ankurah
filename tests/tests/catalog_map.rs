@@ -34,45 +34,30 @@ use tokio::sync::Notify;
 
 type TestNode = Node<SledStorageEngine, PermissiveAgent>;
 
-fn album_request() -> proto::NodeRequestBody {
-    proto::NodeRequestBody::RegisterSchema {
-        models: vec![proto::ModelDescriptor { collection: "album".into(), name: "Album".into(), explicit_id: None }],
-        properties: vec![proto::PropertyDescriptor {
-            minting_collection: "album".into(),
-            name: "name".into(),
+fn album_entry(name: &str, backend: &str, value_type: &str, optional: bool) -> proto::RegisterModel {
+    proto::RegisterModel {
+        label: "album".into(),
+        name: "Album".into(),
+        explicit_id: None,
+        properties: vec![proto::RegisterProperty {
+            name: name.into(),
             renamed_from: None,
-            backend: "yrs".into(),
-            value_type: "string".into(),
-            target_collection: None,
+            backend: backend.into(),
+            value_type: value_type.into(),
+            target_label: None,
             explicit_id: None,
-        }],
-        memberships: vec![proto::MembershipDescriptor {
-            collection: "album".into(),
-            property: proto::PropertyRef::Name("name".into()),
-            optional: false,
+            optional,
         }],
     }
 }
 
+fn album_request() -> proto::NodeRequestBody {
+    proto::NodeRequestBody::RegisterSchema { models: vec![album_entry("name", "yrs", "string", false)] }
+}
+
 /// Register a second property `year` on the album model (incremental).
 fn album_year_request() -> proto::NodeRequestBody {
-    proto::NodeRequestBody::RegisterSchema {
-        models: vec![],
-        properties: vec![proto::PropertyDescriptor {
-            minting_collection: "album".into(),
-            name: "year".into(),
-            renamed_from: None,
-            backend: "lww".into(),
-            value_type: "i64".into(),
-            target_collection: None,
-            explicit_id: None,
-        }],
-        memberships: vec![proto::MembershipDescriptor {
-            collection: "album".into(),
-            property: proto::PropertyRef::Name("year".into()),
-            optional: true,
-        }],
-    }
+    proto::NodeRequestBody::RegisterSchema { models: vec![album_entry("year", "lww", "i64", true)] }
 }
 
 async fn connected_pair(
@@ -85,11 +70,9 @@ async fn connected_pair(
 }
 
 /// Unpack a SchemaRegistered response (the resolved definitions, ids included).
-fn expect_registered(
-    resp: proto::NodeResponseBody,
-) -> (Vec<proto::RegisteredModel>, Vec<proto::RegisteredProperty>, Vec<proto::RegisteredMembership>) {
+fn expect_registered(resp: proto::NodeResponseBody) -> Vec<proto::RegisteredModel> {
     match resp {
-        proto::NodeResponseBody::SchemaRegistered { models, properties, memberships } => (models, properties, memberships),
+        proto::NodeResponseBody::SchemaRegistered { models } => models,
         other => panic!("expected SchemaRegistered, got {other}"),
     }
 }
@@ -250,8 +233,8 @@ async fn durable_map_resolves_after_registration() -> anyhow::Result<()> {
     assert!(server.catalog.is_catalog_ready());
 
     // The allocator hands back the resolved ids in the response.
-    let (models, properties, memberships) = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
-    let (model_id, property_id, membership_id) = (models[0].id, properties[0].id, memberships[0].id);
+    let models = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+    let (model_id, property_id, membership_id) = (models[0].id, models[0].properties[0].id, models[0].properties[0].membership_id);
 
     // The executor's synchronous fold resolves the display name to the
     // allocated id.
@@ -285,13 +268,13 @@ async fn durable_map_updates_incrementally() -> anyhow::Result<()> {
     let (server, client, _conn) = connected_pair().await?;
     server.catalog.wait_catalog_ready().await;
 
-    let (models, _, _) = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+    let models = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
     let model_id = models[0].id;
     wait_resolve(&server, "album", "name").await.expect("name resolves");
 
     // Second registration adds `year` -- no restart.
-    let (_, properties, _) = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_year_request()).await?);
-    let year_property_id = properties[0].id;
+    let year = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_year_request()).await?);
+    let year_property_id = year[0].properties[0].id;
     let year_id = wait_resolve(&server, "album", "year").await.expect("year resolves incrementally");
     assert_eq!(year_id, year_property_id, "the map resolves year to the allocated id");
 
@@ -546,27 +529,17 @@ async fn rename_updates_resolution_and_sibling_index() -> anyhow::Result<()> {
     let (server, client, _conn) = connected_pair().await?;
     server.catalog.wait_catalog_ready().await;
 
-    let (_, properties, _) = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
-    let property_id = properties[0].id;
+    let first = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+    let property_id = first[0].properties[0].id;
     wait_resolve(&server, "album", "name").await.expect("resolves under original name");
 
     // Rename: the renamed_from hint moves the display name to "title" WITHOUT
     // re-keying (same allocated property id).
-    let rename = proto::NodeRequestBody::RegisterSchema {
-        models: vec![],
-        properties: vec![proto::PropertyDescriptor {
-            minting_collection: "album".into(),
-            name: "title".into(),
-            renamed_from: Some("name".into()),
-            backend: "yrs".into(),
-            value_type: "string".into(),
-            target_collection: None,
-            explicit_id: None,
-        }],
-        memberships: vec![],
-    };
-    let (_, renamed, _) = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, rename).await?);
-    assert_eq!(renamed[0].id, property_id, "the hint preserves the lineage id");
+    let mut rename_entry = album_entry("title", "yrs", "string", false);
+    rename_entry.properties[0].renamed_from = Some("name".into());
+    let rename = proto::NodeRequestBody::RegisterSchema { models: vec![rename_entry] };
+    let renamed = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, rename).await?);
+    assert_eq!(renamed[0].properties[0].id, property_id, "the hint preserves the lineage id");
 
     // New display name resolves to the SAME property id; old name is gone.
     let renamed_id = wait_resolve(&server, "album", "title").await.expect("resolves under new name after rename");

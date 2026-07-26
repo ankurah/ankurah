@@ -50,7 +50,7 @@ use super::{model_collection, model_property_collection, property_collection, re
 
 mod map;
 use map::{apply_entry, parse_state, CatalogMapInner, EnsuredSchemaBinding};
-pub use map::{MembershipDef, ModelDef, PropertyDef};
+pub use map::{ModelDef, ModelPropertyMembershipDef, PropertyDef};
 
 // -- manager ----------------------------------------------------------------
 
@@ -539,12 +539,12 @@ where
     }
 
     /// Return the membership connecting `model` and `property`, if present.
-    pub fn membership(&self, model: &EntityId, property: &EntityId) -> Option<MembershipDef> {
+    pub fn membership(&self, model: &EntityId, property: &EntityId) -> Option<ModelPropertyMembershipDef> {
         self.0.map.read().unwrap().membership(model, property)
     }
 
     /// Return all property memberships currently registered for `model`.
-    pub fn memberships_of(&self, model: &EntityId) -> Vec<MembershipDef> { self.0.map.read().unwrap().memberships_of(model) }
+    pub fn memberships_of(&self, model: &EntityId) -> Vec<ModelPropertyMembershipDef> { self.0.map.read().unwrap().memberships_of(model) }
 
     /// Property ids sharing display name `name` across ALL contracts (the
     /// map's global name index, which also backs [`Self::property_by_name`]).
@@ -566,12 +566,15 @@ where
     /// type is a COMPATIBILITY question against the found definition, never a
     /// second identity. Used by the executor's upsert and the rename hint
     /// pre-pass.
+    /// The property `name` currently addresses within `model`'s membership
+    /// set. Membership is the lookup scope -- a property shared into this
+    /// model resolves here regardless of where it was minted; `minted_for`
+    /// is provenance metadata, never a matching key.
     pub fn property_by_name(&self, model: &EntityId, name: &str) -> Option<PropertyDef> {
         let map = self.0.map.read().unwrap();
-        map.names_global.get(name)?.iter().find_map(|id| {
-            let p = map.properties.get(id)?;
-            (p.minted_for == Some(*model) && p.name == name).then(|| p.clone())
-        })
+        map.memberships_of(model)
+            .into_iter()
+            .find_map(|membership| map.properties.get(&membership.property).filter(|p| p.name == name).cloned())
     }
 
     /// Build the confirmed binding from the allocator's response itself.
@@ -582,10 +585,8 @@ where
         &self,
         schema: &'static ModelStructDescriptor,
         models: &[proto::RegisteredModel],
-        properties: &[proto::RegisteredProperty],
-        memberships: &[proto::RegisteredMembership],
     ) -> Option<EnsuredSchemaBinding> {
-        let model_def = models.iter().find(|model| model.collection == schema.label)?;
+        let model_def = models.iter().find(|model| model.label == schema.label)?;
         let model = model_def.id;
         if schema.explicit_id.is_some_and(|id| super::compiled::parse_explicit_id(id) != model) {
             return None;
@@ -593,17 +594,16 @@ where
 
         let mut fields = BTreeMap::new();
         for field in schema.properties {
+            // A nested response row IS the membership; matching it proves
+            // the field is bound to this model.
             let property = match field.explicit_id {
                 Some(id) => {
                     let id = super::compiled::parse_explicit_id(id);
-                    properties.iter().find(|property| property.id == id)?
+                    model_def.properties.iter().find(|property| property.id == id)?
                 }
-                None => properties.iter().find(|property| property.model == model && property.name == field.name)?,
+                None => model_def.properties.iter().find(|property| property.name == field.name)?,
             };
-            if property.backend != field.backend
-                || !super::registration::value_types_compatible(&property.value_type, field.value_type)
-                || !memberships.iter().any(|membership| membership.model == model && membership.property == property.id)
-            {
+            if property.backend != field.backend || !super::registration::value_types_compatible(&property.value_type, field.value_type) {
                 return None;
             }
             fields.insert(field.name, property.id);
@@ -615,12 +615,11 @@ where
     /// Derive the exact binding an already-populated catalog proves for this
     /// compiled declaration.
     ///
-    /// Ordinary fields use the allocator's lookup scope `(minting model,
-    /// current name)`, not any same-named membership. That distinction keeps
-    /// explicit sharing explicit. An explicit model id must itself be the
-    /// collection's live model; a compatible ordinary model must be the one
-    /// indexed by the collection. Every field then needs a live membership and
-    /// a compatible immutable backend/type pair.
+    /// Ordinary fields resolve within the model's MEMBERSHIP SET by current
+    /// name (the same scope the allocator uses; a property shared into the
+    /// model counts, and an ambiguous name fails the proof). An explicit
+    /// model id must itself be the label's live model. Every field then
+    /// needs a compatible immutable backend/type pair.
     fn compatible_binding(&self, schema: &'static ModelStructDescriptor, confirmed: bool) -> Option<EnsuredSchemaBinding> {
         let map = self.0.map.read().unwrap();
         let model = match schema.explicit_id {
@@ -639,15 +638,7 @@ where
         for field in schema.properties {
             let id = match field.explicit_id {
                 Some(id) => super::compiled::parse_explicit_id(id),
-                None => {
-                    let mut matches =
-                        map.properties.values().filter(|def| def.minted_for == Some(model) && def.name == field.name).map(|def| def.id);
-                    let id = matches.next()?;
-                    if matches.next().is_some() {
-                        return None;
-                    }
-                    id
-                }
+                None => map.resolve(schema.label, field.name).ok().flatten()?,
             };
             if map.membership(&model, &id).is_none() {
                 return None;
@@ -728,28 +719,26 @@ where
     /// binding proceeds ahead of the catalog subscription (RFC 5.2).
     /// Idempotent (keyed by entity id); the reactor later re-delivers the
     /// same entities harmlessly.
-    pub fn upsert_registered(
-        &self,
-        models: &[proto::RegisteredModel],
-        properties: &[proto::RegisteredProperty],
-        memberships: &[proto::RegisteredMembership],
-    ) {
+    pub fn upsert_registered(&self, models: &[proto::RegisteredModel]) {
         let mut map = self.0.map.write().unwrap();
         for m in models {
-            map.upsert_model(ModelDef { id: m.id, label: m.collection.clone(), name: m.name.clone() });
-        }
-        for p in properties {
-            map.upsert_property(PropertyDef {
-                id: p.id,
-                minted_for: Some(p.model),
-                name: p.name.clone(),
-                backend: p.backend.clone(),
-                value_type: p.value_type.clone(),
-                target_model: p.target_model,
-            });
-        }
-        for ms in memberships {
-            map.upsert_membership(MembershipDef { id: ms.id, model: ms.model, property: ms.property, optional: Some(ms.optional) });
+            map.upsert_model(ModelDef { id: m.id, label: m.label.clone(), name: m.name.clone() });
+            for p in &m.properties {
+                map.upsert_property(PropertyDef {
+                    id: p.id,
+                    minted_for: p.minted_for,
+                    name: p.name.clone(),
+                    backend: p.backend.clone(),
+                    value_type: p.value_type.clone(),
+                    target_model: p.target_model,
+                });
+                map.upsert_membership(ModelPropertyMembershipDef {
+                    id: p.membership_id,
+                    model: m.id,
+                    property: p.id,
+                    optional: Some(p.optional),
+                });
+            }
         }
     }
 
@@ -767,11 +756,9 @@ where
         &self,
         schema: &'static ModelStructDescriptor,
         models: &[proto::RegisteredModel],
-        properties: &[proto::RegisteredProperty],
-        memberships: &[proto::RegisteredMembership],
     ) -> Result<(), RegistrationError> {
-        self.upsert_registered(models, properties, memberships);
-        self.mark_schema_ensured(schema, models, properties, memberships)
+        self.upsert_registered(models);
+        self.mark_schema_ensured(schema, models)
     }
 
     /// RFC 5.2 "ensure registration" (specs/model-property-metadata/rfc.md
@@ -811,7 +798,7 @@ where
             return Ok(());
         }
 
-        let (models, properties, memberships) = super::registration_request(schema);
+        let request_model = super::registration_request(schema);
 
         if self.0.durable {
             // A durable node executes registration itself (no forwarding);
@@ -821,8 +808,8 @@ where
             // grab a post-reset fence and fold old definitions into the new
             // epoch (an ABA error).
             let _lease = initial_lease;
-            let (models, properties, memberships) = self.register_schema(cdata, models, properties, memberships).await?;
-            self.mark_schema_ensured(schema, &models, &properties, &memberships)?;
+            let models = self.register_schema(cdata, vec![request_model]).await?;
+            self.mark_schema_ensured(schema, &models)?;
             return Ok(());
         }
 
@@ -836,7 +823,7 @@ where
         let node = self.node().ok_or(RegistrationError::SystemNotReady)?;
         match node.get_durable_peers().first().copied() {
             Some(peer) => {
-                let body = proto::NodeRequestBody::RegisterSchema { models, properties, memberships };
+                let body = proto::NodeRequestBody::RegisterSchema { models: vec![request_model] };
                 if !validity.is_current() {
                     return Err(RegistrationError::SystemNotReady);
                 }
@@ -849,7 +836,7 @@ where
                         if !validity.is_current() {
                             return Err(RegistrationError::SystemNotReady);
                         }
-                        let proto::NodeResponseBody::SchemaRegistered { models, properties, memberships } = body else {
+                        let proto::NodeResponseBody::SchemaRegistered { models } = body else {
                             return match body {
                                 proto::NodeResponseBody::Error(e) => {
                                     Err(RegistrationError::Retrieval(crate::error::RetrievalError::Other(e)))
@@ -861,8 +848,8 @@ where
                         };
                         // The response is the fast path into the map (RFC
                         // 5.2): fold it in on ack so binding proceeds now.
-                        self.upsert_registered(&models, &properties, &memberships);
-                        self.mark_schema_ensured(schema, &models, &properties, &memberships)?;
+                        self.upsert_registered(&models);
+                        self.mark_schema_ensured(schema, &models)?;
                         Ok(())
                     }
                     Err(e) => Err(RegistrationError::Retrieval(crate::error::RetrievalError::Other(format!("{e:?}")))),
@@ -891,10 +878,8 @@ where
         &self,
         schema: &'static ModelStructDescriptor,
         models: &[proto::RegisteredModel],
-        properties: &[proto::RegisteredProperty],
-        memberships: &[proto::RegisteredMembership],
     ) -> Result<(), RegistrationError> {
-        let binding = self.registered_binding(schema, models, properties, memberships).ok_or_else(|| {
+        let binding = self.registered_binding(schema, models).ok_or_else(|| {
             RegistrationError::Retrieval(crate::error::RetrievalError::Other(format!(
                 "registration of '{}' succeeded without a complete compatible catalog binding",
                 schema.label

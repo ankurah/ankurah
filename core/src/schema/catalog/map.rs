@@ -37,9 +37,9 @@ pub struct PropertyDef {
     pub target_model: Option<EntityId>,
 }
 
-/// A parsed contract-membership entity (`_ankurah_model_property`).
+/// A parsed model-property membership entity (`_ankurah_model_property`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MembershipDef {
+pub struct ModelPropertyMembershipDef {
     /// The catalog entity that durably identifies this membership.
     pub id: EntityId,
     /// The model participating in the membership.
@@ -65,7 +65,7 @@ pub(super) struct EnsuredSchemaBinding {
 pub(super) struct CatalogMapInner {
     pub(super) properties: BTreeMap<EntityId, PropertyDef>,
     pub(super) models: BTreeMap<EntityId, ModelDef>,
-    pub(super) memberships: BTreeMap<EntityId, MembershipDef>,
+    pub(super) memberships: BTreeMap<EntityId, ModelPropertyMembershipDef>,
     pub(super) by_label: BTreeMap<String, EntityId>,
     model_memberships: BTreeMap<EntityId, BTreeSet<EntityId>>,
     pub(super) names_global: BTreeMap<String, BTreeSet<EntityId>>,
@@ -96,15 +96,20 @@ impl CatalogMapInner {
         self.models.insert(def.id, def);
     }
 
-    pub(super) fn upsert_property(&mut self, def: PropertyDef) {
+    pub(super) fn upsert_property(&mut self, mut def: PropertyDef) {
         if let Some(old) = self.properties.get(&def.id).cloned() {
             self.deindex_property_names(&old);
+            // minted_for is provenance metadata; an upsert that does not
+            // know it must not erase what the catalog already learned.
+            if def.minted_for.is_none() {
+                def.minted_for = old.minted_for;
+            }
         }
         self.names_global.entry(def.name.clone()).or_default().insert(def.id);
         self.properties.insert(def.id, def);
     }
 
-    pub(super) fn upsert_membership(&mut self, def: MembershipDef) {
+    pub(super) fn upsert_membership(&mut self, def: ModelPropertyMembershipDef) {
         if let Some(old) = self.memberships.get(&def.id) {
             if old.model != def.model {
                 if let Some(set) = self.model_memberships.get_mut(&old.model) {
@@ -149,7 +154,7 @@ impl CatalogMapInner {
         Ok(found)
     }
 
-    pub(super) fn memberships_of(&self, model: &EntityId) -> Vec<MembershipDef> {
+    pub(super) fn memberships_of(&self, model: &EntityId) -> Vec<ModelPropertyMembershipDef> {
         self.model_memberships
             .get(model)
             .into_iter()
@@ -158,7 +163,7 @@ impl CatalogMapInner {
             .collect()
     }
 
-    pub(super) fn membership(&self, model: &EntityId, property: &EntityId) -> Option<MembershipDef> {
+    pub(super) fn membership(&self, model: &EntityId, property: &EntityId) -> Option<ModelPropertyMembershipDef> {
         self.model_memberships.get(model)?.iter().find_map(|id| {
             let membership = self.memberships.get(id)?;
             (membership.property == *property).then(|| membership.clone())
@@ -197,7 +202,7 @@ pub(super) fn parse_state(collection: &ModelId, id: EntityId, state: &proto::Ent
             target_model: get_entity_id("target_model"),
         }))
     } else if *collection == model_property_collection() {
-        Some(Entry::Membership(MembershipDef {
+        Some(Entry::Membership(ModelPropertyMembershipDef {
             id,
             model: get_entity_id("model")?,
             property: get_entity_id("property")?,
@@ -211,7 +216,7 @@ pub(super) fn parse_state(collection: &ModelId, id: EntityId, state: &proto::Ent
 pub(super) enum Entry {
     Model(ModelDef),
     Property(PropertyDef),
-    Membership(MembershipDef),
+    Membership(ModelPropertyMembershipDef),
 }
 
 pub(super) fn apply_entry(map: &mut CatalogMapInner, entry: Entry) {
@@ -248,8 +253,8 @@ mod tests {
         map.upsert_model(ModelDef { id: model, label: "report".to_owned(), name: "Report".to_owned() });
         map.upsert_property(property(first, "status"));
         map.upsert_property(property(second, "status"));
-        map.upsert_membership(MembershipDef { id: id(4), model, property: first, optional: Some(false) });
-        map.upsert_membership(MembershipDef { id: id(5), model, property: second, optional: Some(false) });
+        map.upsert_membership(ModelPropertyMembershipDef { id: id(4), model, property: first, optional: Some(false) });
+        map.upsert_membership(ModelPropertyMembershipDef { id: id(5), model, property: second, optional: Some(false) });
 
         let error = map.resolve("report", "status").unwrap_err();
         assert!(error.to_string().contains("ambiguous"), "{error}");
@@ -262,8 +267,8 @@ mod tests {
         let mut map = CatalogMapInner::default();
         map.upsert_model(ModelDef { id: model, label: "report".to_owned(), name: "Report".to_owned() });
         map.upsert_property(property(property_id, "status"));
-        map.upsert_membership(MembershipDef { id: id(3), model, property: property_id, optional: Some(false) });
-        map.upsert_membership(MembershipDef { id: id(4), model, property: property_id, optional: Some(false) });
+        map.upsert_membership(ModelPropertyMembershipDef { id: id(3), model, property: property_id, optional: Some(false) });
+        map.upsert_membership(ModelPropertyMembershipDef { id: id(4), model, property: property_id, optional: Some(false) });
 
         assert_eq!(map.resolve("report", "status").unwrap(), Some(property_id));
     }

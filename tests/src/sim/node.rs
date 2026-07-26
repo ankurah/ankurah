@@ -150,36 +150,24 @@ pub async fn build_nodes(n: usize, captured: Captured) -> anyhow::Result<Vec<Sim
     // across nodes and runs; hard_reset is not part of these scenarios.
     let sim_model = proto::RegisteredModel {
         id: super::model::sim_model_id(),
-        collection: SimRecord::descriptor().label.to_owned(),
+        label: SimRecord::descriptor().label.to_owned(),
         name: "SimRecord".to_string(),
+        properties: [Field::Title, Field::Body]
+            .into_iter()
+            .map(|field| proto::RegisteredProperty {
+                id: super::model::sim_property_id(field),
+                membership_id: super::model::sim_membership_id(field),
+                name: field.name().to_string(),
+                backend: "lww".to_string(),
+                value_type: "string".to_string(),
+                target_model: None,
+                minted_for: Some(super::model::sim_model_id()),
+                optional: false,
+            })
+            .collect(),
     };
-    let sim_properties: Vec<_> = [Field::Title, Field::Body]
-        .into_iter()
-        .map(|field| proto::RegisteredProperty {
-            id: super::model::sim_property_id(field),
-            model: sim_model.id,
-            name: field.name().to_string(),
-            backend: "lww".to_string(),
-            value_type: "string".to_string(),
-            target_model: None,
-        })
-        .collect();
-    let sim_memberships: Vec<_> = [Field::Title, Field::Body]
-        .into_iter()
-        .map(|field| proto::RegisteredMembership {
-            id: super::model::sim_membership_id(field),
-            model: sim_model.id,
-            property: super::model::sim_property_id(field),
-            optional: false,
-        })
-        .collect();
     for node in &nodes {
-        node.node.catalog.seed_registered_schema(
-            SimRecord::descriptor(),
-            std::slice::from_ref(&sim_model),
-            &sim_properties,
-            &sim_memberships,
-        )?;
+        node.node.catalog.seed_registered_schema(SimRecord::descriptor(), std::slice::from_ref(&sim_model))?;
     }
 
     Ok(nodes)

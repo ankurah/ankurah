@@ -18,6 +18,7 @@ pub mod update;
 
 #[cfg(feature = "postgres")]
 pub mod postgres;
+pub mod registration;
 
 #[cfg(feature = "wasm")]
 pub mod wasm;
@@ -32,6 +33,7 @@ pub use error::*;
 pub use id::*;
 pub use message::*;
 pub use peering::*;
+pub use registration::*;
 pub use request::*;
 pub use subscription::QueryId;
 pub use transaction::*;

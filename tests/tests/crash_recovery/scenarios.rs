@@ -37,34 +37,27 @@ type CrashNode = Node<CrashStorageEngine<SledStorageEngine>, PermissiveAgent>;
 /// genesis membership asserts -- without spending crash-countable storage
 /// writes on registration. Registration is bootstrap here, not workload.
 fn seed_album_catalog<SE: StorageEngine + Send + Sync + 'static>(node: &Node<SE, PermissiveAgent>) -> Result<()> {
+    let model_id = proto::EntityId::from_bytes([0x6A; 16]);
     let model = proto::RegisteredModel {
-        id: proto::EntityId::from_bytes([0x6A; 16]),
-        collection: Album::descriptor().label.to_owned(),
+        id: model_id,
+        label: Album::descriptor().label.to_owned(),
         name: "Album".to_owned(),
+        properties: ["name", "year"]
+            .iter()
+            .enumerate()
+            .map(|(i, field)| proto::RegisteredProperty {
+                id: proto::EntityId::from_bytes([0x6B + i as u8; 16]),
+                membership_id: proto::EntityId::from_bytes([0x6D + i as u8; 16]),
+                name: (*field).to_owned(),
+                backend: "yrs".to_owned(),
+                value_type: "string".to_owned(),
+                target_model: None,
+                minted_for: Some(model_id),
+                optional: false,
+            })
+            .collect(),
     };
-    let properties: Vec<_> = ["name", "year"]
-        .iter()
-        .enumerate()
-        .map(|(i, field)| proto::RegisteredProperty {
-            id: proto::EntityId::from_bytes([0x6B + i as u8; 16]),
-            model: model.id,
-            name: (*field).to_owned(),
-            backend: "yrs".to_owned(),
-            value_type: "string".to_owned(),
-            target_model: None,
-        })
-        .collect();
-    let memberships: Vec<_> = properties
-        .iter()
-        .enumerate()
-        .map(|(i, property)| proto::RegisteredMembership {
-            id: proto::EntityId::from_bytes([0x6D + i as u8; 16]),
-            model: model.id,
-            property: property.id,
-            optional: false,
-        })
-        .collect();
-    node.catalog.seed_registered_schema(Album::descriptor(), std::slice::from_ref(&model), &properties, &memberships)?;
+    node.catalog.seed_registered_schema(Album::descriptor(), std::slice::from_ref(&model))?;
     Ok(())
 }
 
