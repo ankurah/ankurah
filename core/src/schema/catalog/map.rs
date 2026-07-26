@@ -5,7 +5,7 @@ use ankurah_proto::{self as proto, EntityId};
 
 use crate::{
     property::backend::{LWWBackend, PropertyBackend},
-    schema::{model_collection, model_property_collection, property_collection, ModelSchema},
+    schema::{model_collection, model_property_collection, property_collection, ModelStructDescriptor},
     value::Value,
 };
 
@@ -54,7 +54,7 @@ pub struct MembershipDef {
 /// Exact durable identities admitted for one compiled model shape.
 #[derive(Debug, Clone)]
 pub(super) struct EnsuredSchemaBinding {
-    pub(super) schema: &'static ModelSchema,
+    pub(super) schema: &'static ModelStructDescriptor,
     pub(super) model: EntityId,
     pub(super) fields: BTreeMap<&'static str, EntityId>,
     pub(super) confirmed: bool,

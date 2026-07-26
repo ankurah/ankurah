@@ -39,7 +39,7 @@ type CrashNode = Node<CrashStorageEngine<SledStorageEngine>, PermissiveAgent>;
 fn seed_album_catalog<SE: StorageEngine + Send + Sync + 'static>(node: &Node<SE, PermissiveAgent>) -> Result<()> {
     let model = proto::RegisteredModel {
         id: proto::EntityId::from_bytes([0x6A; 16]),
-        collection: Album::schema().collection.to_owned(),
+        collection: Album::descriptor().label.to_owned(),
         name: "Album".to_owned(),
     };
     let properties: Vec<_> = ["name", "year"]
@@ -64,7 +64,7 @@ fn seed_album_catalog<SE: StorageEngine + Send + Sync + 'static>(node: &Node<SE,
             optional: false,
         })
         .collect();
-    node.catalog.seed_registered_schema(Album::schema(), std::slice::from_ref(&model), &properties, &memberships)?;
+    node.catalog.seed_registered_schema(Album::descriptor(), std::slice::from_ref(&model), &properties, &memberships)?;
     Ok(())
 }
 

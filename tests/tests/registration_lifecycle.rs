@@ -522,7 +522,7 @@ pub struct Review {
 #[tokio::test]
 async fn custom_property_type_declares_its_value_type() -> anyhow::Result<()> {
     // Compile-time: the schema static carries the trait-declared value_type.
-    let schema = Review::schema();
+    let schema = Review::descriptor();
     let field = schema.field_by_name("rating").expect("rating field in schema");
     assert_eq!(field.value_type, "i64", "hand impl declares its real wire type");
     assert_eq!(field.backend, "lww");

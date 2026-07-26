@@ -4,7 +4,7 @@
 //! reconciliation of the phase-3 SchemaRegistry).
 //!
 //! Rust structs are ONE binding to the catalog, not the definitive schema
-//! (RFC section 3): `#[derive(Model)]` emits a [`ModelSchema`] whose
+//! (RFC section 3): `#[derive(Model)]` emits a [`ModelStructDescriptor`] whose
 //! `(backend, value_type)` pairs come from the NORMATIVE mapping table
 //! (RFC section 4). A property's minting model and name locate its identity;
 //! registration then checks the compiled pair against the immutable canonical
@@ -15,7 +15,7 @@
 //! properties and how it builds a RegisterSchema request.
 //!
 //! These types are entirely `&'static`: the derive macro emits a `static
-//! ModelSchema` and a `Model::schema()` returning `&'static` to it, so
+//! ModelStructDescriptor` and a `Model::descriptor()` returning `&'static` to it, so
 //! there is no per-call allocation and the schema is a `const`-shaped fact
 //! of the program.
 
@@ -27,17 +27,18 @@ use ankurah_proto::{MembershipDescriptor, ModelDescriptor, PropertyDescriptor, P
 /// identity is returned by catalog admission. Emitted as a `static` by
 /// `#[derive(Model)]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ModelSchema {
-    /// The source-level usage hint sent at registration. It is not a runtime
-    /// model identity or a physical storage name. Today this is the
-    /// lowercased struct name (derive/src/model/description.rs).
-    pub collection: &'static str,
+pub struct ModelStructDescriptor {
+    /// The source-level registration label: the lookup key the allocator
+    /// files this model under. Not a runtime model identity and not a
+    /// physical storage name. Today this is the lowercased struct name
+    /// (derive/src/model/description.rs).
+    pub label: &'static str,
     /// Display name, initially the struct name (mutable catalog metadata).
     pub name: &'static str,
     /// The active fields, in declaration order. Ephemeral fields are
     /// EXCLUDED (they carry no persisted state and never enter the catalog;
     /// RFC 5.2, derive description split).
-    pub properties: &'static [FieldSchema],
+    pub properties: &'static [StructField],
     /// `#[model(id = "...")]`: bind this model to a KNOWN model entity by
     /// explicit id (RFC 5.9), bypassing label-based registration. `None` for
     /// the default label-based registration path. The value is
@@ -47,12 +48,12 @@ pub struct ModelSchema {
 
 /// The compiled schema for one active field of a model. `(backend,
 /// value_type)` are the NORMATIVE descriptor pair (RFC 4 table) checked
-/// against the property's immutable canonical pair; `target_collection`
+/// against the property's immutable canonical pair; `target_label`
 /// identifies the target of a reference-typed property; `renamed_from` is the
 /// transient rename hint (RFC 5.8); `explicit_id` is a 5.9 shared-property
 /// binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FieldSchema {
+pub struct StructField {
     /// The Rust field identifier (as declared).
     pub field: &'static str,
     /// The display name. Equals `field` (lowercased) today; catalog
@@ -78,7 +79,7 @@ pub struct FieldSchema {
     /// Registration resolves this label to the catalog model id stored as
     /// `target_model`; non-reference fields carry `None`. The field name is
     /// retained for source/API compatibility.
-    pub target_collection: Option<&'static str>,
+    pub target_label: Option<&'static str>,
     /// `true` for `Option<T>` fields. Feeds the MEMBERSHIP record's
     /// `optional`, NOT the property identity (flipping optionality must not
     /// re-key; RFC 4).
@@ -90,9 +91,9 @@ pub struct FieldSchema {
     pub explicit_id: Option<&'static str>,
 }
 
-impl ModelSchema {
+impl ModelStructDescriptor {
     /// The active field whose display name is `name`, if any.
-    pub fn field_by_name(&self, name: &str) -> Option<&'static FieldSchema> { self.properties.iter().find(|f| f.name == name) }
+    pub fn field_by_name(&self, name: &str) -> Option<&'static StructField> { self.properties.iter().find(|f| f.name == name) }
 }
 
 /// Build the language-agnostic RegisterSchema descriptor vectors for one
@@ -112,9 +113,9 @@ impl ModelSchema {
 /// references it by `PropertyRef::Name` within the request (which the
 /// executor resolves to the upserted id). `optional` rides the membership,
 /// per contract.
-pub fn registration_request(schema: &ModelSchema) -> (Vec<ModelDescriptor>, Vec<PropertyDescriptor>, Vec<MembershipDescriptor>) {
+pub fn registration_request(schema: &ModelStructDescriptor) -> (Vec<ModelDescriptor>, Vec<PropertyDescriptor>, Vec<MembershipDescriptor>) {
     let models = vec![ModelDescriptor {
-        collection: schema.collection.to_string(),
+        collection: schema.label.to_string(),
         name: schema.name.to_string(),
         explicit_id: schema.explicit_id.map(parse_explicit_id),
     }];
@@ -126,12 +127,12 @@ pub fn registration_request(schema: &ModelSchema) -> (Vec<ModelDescriptor>, Vec<
         let explicit_id = field.explicit_id.map(parse_explicit_id);
 
         properties.push(PropertyDescriptor {
-            minting_collection: schema.collection.to_string(),
+            minting_collection: schema.label.to_string(),
             name: field.name.to_string(),
             renamed_from: field.renamed_from.map(|s| s.to_string()),
             backend: field.backend.to_string(),
             value_type: field.value_type.to_string(),
-            target_collection: field.target_collection.map(str::to_string),
+            target_collection: field.target_label.map(str::to_string),
             explicit_id,
         });
 
@@ -139,11 +140,7 @@ pub fn registration_request(schema: &ModelSchema) -> (Vec<ModelDescriptor>, Vec<
             Some(id) => PropertyRef::Id(id),
             None => PropertyRef::Name(field.name.to_string()),
         };
-        memberships.push(MembershipDescriptor {
-            collection: schema.collection.to_string(),
-            property: property_ref,
-            optional: field.optional,
-        });
+        memberships.push(MembershipDescriptor { collection: schema.label.to_string(), property: property_ref, optional: field.optional });
     }
 
     (models, properties, memberships)

@@ -55,18 +55,18 @@ pub trait TContext {
     /// automatic first-use registration on mutation and typed-read paths.
     async fn register_strict(
         &self,
-        schema: &'static crate::schema::ModelSchema,
+        schema: &'static crate::schema::ModelStructDescriptor,
     ) -> Result<proto::ModelId, crate::schema::registration::RegistrationError>;
 
     /// First-use registration for a WRITE: ensure the compiled schema is
     /// registered (allocator-first; the no-peer case may proceed only from a
     /// locally proven fully compatible binding) and return the model's
     /// durable identity for the genesis membership.
-    async fn ensure_registered(&self, schema: &'static crate::schema::ModelSchema) -> Result<proto::ModelId, MutationError>;
+    async fn ensure_registered(&self, schema: &'static crate::schema::ModelStructDescriptor) -> Result<proto::ModelId, MutationError>;
 
     /// First-use registration for a typed READ (fetch/get/query): same
     /// semantics as [`Self::ensure_registered`] with read-flavored errors.
-    async fn ensure_query_schema(&self, schema: &'static crate::schema::ModelSchema) -> Result<proto::ModelId, RetrievalError>;
+    async fn ensure_query_schema(&self, schema: &'static crate::schema::ModelStructDescriptor) -> Result<proto::ModelId, RetrievalError>;
 
     fn node_id(&self) -> proto::EntityId;
     /// Create a brand new entity for a transaction, and add it to the WeakEntitySet.
@@ -89,32 +89,32 @@ pub trait TContext {
 impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> TContext for NodeAndContext<SE, PA> {
     async fn register_strict(
         &self,
-        schema: &'static crate::schema::ModelSchema,
+        schema: &'static crate::schema::ModelStructDescriptor,
     ) -> Result<proto::ModelId, crate::schema::registration::RegistrationError> {
         self.node.catalog.ensure_registered(&self.cdata, schema).await?;
         self.node.catalog.model_id_for_schema(schema).ok_or_else(|| {
             crate::schema::registration::RegistrationError::Retrieval(crate::error::RetrievalError::Other(format!(
                 "registration of '{}' did not retain its exact model identity",
-                schema.collection
+                schema.label
             )))
         })
     }
 
-    async fn ensure_registered(&self, schema: &'static crate::schema::ModelSchema) -> Result<proto::ModelId, MutationError> {
+    async fn ensure_registered(&self, schema: &'static crate::schema::ModelStructDescriptor) -> Result<proto::ModelId, MutationError> {
         self.node.catalog.ensure_schema_for_use(&self.cdata, schema).await.map_err(|error| {
-            let message = if self.node.catalog.model_by_label(schema.collection).is_none() {
-                format!("cannot write into unregistered collection '{}': {error}", schema.collection)
+            let message = if self.node.catalog.model_by_label(schema.label).is_none() {
+                format!("cannot write into unregistered collection '{}': {error}", schema.label)
             } else {
-                format!("cannot write using an unconfirmed schema for collection '{}': {error}", schema.collection)
+                format!("cannot write using an unconfirmed schema for collection '{}': {error}", schema.label)
             };
             MutationError::General(message.into())
         })
     }
 
-    async fn ensure_query_schema(&self, schema: &'static crate::schema::ModelSchema) -> Result<proto::ModelId, RetrievalError> {
+    async fn ensure_query_schema(&self, schema: &'static crate::schema::ModelStructDescriptor) -> Result<proto::ModelId, RetrievalError> {
         self.node.catalog.ensure_schema_for_use(&self.cdata, schema).await.map_err(|error| {
-            if self.node.catalog.model_by_label(schema.collection).is_none() {
-                RetrievalError::Other(format!("collection '{}' is not registered: {error}", schema.collection))
+            if self.node.catalog.model_by_label(schema.label).is_none() {
+                RetrievalError::Other(format!("collection '{}' is not registered: {error}", schema.label))
             } else {
                 RetrievalError::Other(error.to_string())
             }
@@ -276,7 +276,7 @@ impl Context {
     /// before anything else runs. A second call for the same compiled shape
     /// is a no-op.
     pub async fn register<M: crate::model::Model>(&self) -> Result<proto::ModelId, crate::schema::registration::RegistrationError> {
-        self.0.register_strict(M::schema()).await
+        self.0.register_strict(M::descriptor()).await
     }
 }
 
@@ -314,7 +314,7 @@ impl Context {
         use crate::model::Model;
         // A typed direct get is a schema-dependent use: admit the exact
         // compiled schema (first-use registration) before decoding.
-        self.0.ensure_query_schema(R::Model::schema()).await?;
+        self.0.ensure_query_schema(R::Model::descriptor()).await?;
         let entity = self.0.get_entity(id, &R::collection(), false).await?;
         Ok(R::from_entity(entity))
     }
@@ -322,7 +322,7 @@ impl Context {
     /// Get an entity, but its ok to return early if the entity is already in the local node storage
     pub async fn get_cached<R: View>(&self, id: proto::EntityId) -> Result<R, RetrievalError> {
         use crate::model::Model;
-        self.0.ensure_query_schema(R::Model::schema()).await?;
+        self.0.ensure_query_schema(R::Model::descriptor()).await?;
         let entity = self.0.get_entity(id, &R::collection(), true).await?;
         Ok(R::from_entity(entity))
     }
@@ -334,7 +334,7 @@ impl Context {
         // against authoritative catalog rows instead of failing loud as
         // unregistered (and offline with no peer, it fails loud instead of
         // answering empty).
-        self.0.ensure_query_schema(R::Model::schema()).await?;
+        self.0.ensure_query_schema(R::Model::descriptor()).await?;
         let collection_id = R::Model::collection();
 
         let entities = self.0.fetch_entities(&collection_id, args).await?;
@@ -369,7 +369,7 @@ impl Context {
         // The synchronous `query` cannot await first-use registration (its
         // initialization pipeline takes that over with the
         // propertyid-resolution PR); the awaited form registers here.
-        self.0.ensure_query_schema(R::Model::schema()).await?;
+        self.0.ensure_query_schema(R::Model::descriptor()).await?;
         let livequery = self.query::<R>(args)?;
         livequery.wait_initialized().await;
         Ok(livequery)

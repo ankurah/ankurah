@@ -1,8 +1,8 @@
 //! Compiled-schema emission for `#[derive(Model)]` (work package A11a;
 //! specs/model-property-metadata/rfc.md sections 4, 5.8, 5.9).
 //!
-//! This module generates the `static` [`ankurah::core::schema::ModelSchema`]
-//! and the `Model::schema()` method. Two facts per field are NORMATIVE.
+//! This module generates the `static` [`ankurah::core::schema::ModelStructDescriptor`]
+//! and the `Model::descriptor()` method. Two facts per field are NORMATIVE.
 //! A property's minting model and name locate its identity; registration
 //! checks these compiled facts against the immutable canonical pair (exact
 //! backend and a mutually castable value type) and refuses an incompatible
@@ -91,7 +91,7 @@ pub fn validate_schema_attrs(model: &ModelDescription) -> syn::Result<()> {
     Ok(())
 }
 
-/// Generate the `static SCHEMA: ModelSchema` + `fn schema()` for the Model
+/// Generate the `static ModelStructDescriptor` + `fn descriptor()` for the Model
 /// impl. Returns a compile error token stream if a field type cannot be
 /// mapped or an explicit-id attribute is malformed. Assumes
 /// [`validate_schema_attrs`] already ran (it re-derives the same facts, so
@@ -150,13 +150,13 @@ pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
         let explicit_id_tokens = option_str_tokens(explicit_id.as_deref());
 
         field_tokens.push(quote! {
-            ::ankurah::core::schema::FieldSchema {
+            ::ankurah::core::schema::StructField {
                 field: #field_name,
                 name: #display_name,
                 renamed_from: #renamed_from_tokens,
                 backend: #backend,
                 value_type: #value_type,
-                target_collection: #target_collection_tokens,
+                target_label: #target_collection_tokens,
                 optional: #optional,
                 explicit_id: #explicit_id_tokens,
             }
@@ -174,9 +174,9 @@ pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
     // per-call cost. Named distinctly to avoid colliding with anything in
     // the hygiene module.
     Ok(quote! {
-        fn schema() -> &'static ::ankurah::core::schema::ModelSchema {
-            static __ANKURAH_MODEL_SCHEMA: ::ankurah::core::schema::ModelSchema = ::ankurah::core::schema::ModelSchema {
-                collection: #collection,
+        fn descriptor() -> &'static ::ankurah::core::schema::ModelStructDescriptor {
+            static __ANKURAH_MODEL_SCHEMA: ::ankurah::core::schema::ModelStructDescriptor = ::ankurah::core::schema::ModelStructDescriptor {
+                label: #collection,
                 name: #name_str,
                 properties: &[
                     #(#field_tokens),*

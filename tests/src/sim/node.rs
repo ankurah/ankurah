@@ -150,7 +150,7 @@ pub async fn build_nodes(n: usize, captured: Captured) -> anyhow::Result<Vec<Sim
     // across nodes and runs; hard_reset is not part of these scenarios.
     let sim_model = proto::RegisteredModel {
         id: super::model::sim_model_id(),
-        collection: SimRecord::schema().collection.to_owned(),
+        collection: SimRecord::descriptor().label.to_owned(),
         name: "SimRecord".to_string(),
     };
     let sim_properties: Vec<_> = [Field::Title, Field::Body]
@@ -175,7 +175,7 @@ pub async fn build_nodes(n: usize, captured: Captured) -> anyhow::Result<Vec<Sim
         .collect();
     for node in &nodes {
         node.node.catalog.seed_registered_schema(
-            SimRecord::schema(),
+            SimRecord::descriptor(),
             std::slice::from_ref(&sim_model),
             &sim_properties,
             &sim_memberships,

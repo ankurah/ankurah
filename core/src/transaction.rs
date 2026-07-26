@@ -62,7 +62,7 @@ impl Transaction {
     pub async fn create<'rec, 'trx: 'rec, M: Model>(&'trx self, model: &M) -> Result<MutableBorrow<'rec, M::Mutable>, MutationError> {
         // First-use registration: the model's durable identity is the entity's
         // genesis membership, so it must exist before the entity does.
-        let model_id = self.dyncontext.ensure_registered(M::schema()).await?;
+        let model_id = self.dyncontext.ensure_registered(M::descriptor()).await?;
         let entity = self.dyncontext.create_entity(M::collection(), model_id, self.alive.clone());
         model.initialize_new_entity(&entity);
         self.dyncontext.check_write(&entity)?;

@@ -46,7 +46,7 @@ use crate::{
     util::request_fence::{RequestFence, RequestLease, RequestValidity},
 };
 
-use super::{model_collection, model_property_collection, property_collection, registration::RegistrationError, ModelSchema};
+use super::{model_collection, model_property_collection, property_collection, registration::RegistrationError, ModelStructDescriptor};
 
 mod map;
 use map::{apply_entry, parse_state, CatalogMapInner, EnsuredSchemaBinding};
@@ -527,12 +527,12 @@ where
     /// The runtime identity admitted for this exact compiled schema shape.
     /// Unlike `model_id_for`, this never performs a name lookup: the identity
     /// comes from the registration response (or a proven compatible binding).
-    pub fn model_id_for_schema(&self, schema: &ModelSchema) -> Option<proto::ModelId> {
+    pub fn model_id_for_schema(&self, schema: &ModelStructDescriptor) -> Option<proto::ModelId> {
         self.0
             .ensured
             .read()
             .unwrap()
-            .get(schema.collection)?
+            .get(schema.label)?
             .iter()
             .find(|binding| *binding.schema == *schema)
             .map(|binding| proto::ModelId::EntityId(binding.model))
@@ -580,14 +580,14 @@ where
     /// after the response could observe a concurrent rename or name reuse.
     fn registered_binding(
         &self,
-        schema: &'static ModelSchema,
+        schema: &'static ModelStructDescriptor,
         models: &[proto::RegisteredModel],
         properties: &[proto::RegisteredProperty],
         memberships: &[proto::RegisteredMembership],
     ) -> Option<EnsuredSchemaBinding> {
-        let model_def = models.iter().find(|model| model.collection == schema.collection)?;
+        let model_def = models.iter().find(|model| model.collection == schema.label)?;
         let model = model_def.id;
-        if schema.explicit_id.is_some_and(|id| super::local::parse_explicit_id(id) != model) {
+        if schema.explicit_id.is_some_and(|id| super::compiled::parse_explicit_id(id) != model) {
             return None;
         }
 
@@ -595,7 +595,7 @@ where
         for field in schema.properties {
             let property = match field.explicit_id {
                 Some(id) => {
-                    let id = super::local::parse_explicit_id(id);
+                    let id = super::compiled::parse_explicit_id(id);
                     properties.iter().find(|property| property.id == id)?
                 }
                 None => properties.iter().find(|property| property.model == model && property.name == field.name)?,
@@ -621,24 +621,24 @@ where
     /// collection's live model; a compatible ordinary model must be the one
     /// indexed by the collection. Every field then needs a live membership and
     /// a compatible immutable backend/type pair.
-    fn compatible_binding(&self, schema: &'static ModelSchema, confirmed: bool) -> Option<EnsuredSchemaBinding> {
+    fn compatible_binding(&self, schema: &'static ModelStructDescriptor, confirmed: bool) -> Option<EnsuredSchemaBinding> {
         let map = self.0.map.read().unwrap();
         let model = match schema.explicit_id {
             Some(id) => {
-                let id = super::local::parse_explicit_id(id);
+                let id = super::compiled::parse_explicit_id(id);
                 let def = map.models.get(&id)?;
-                if def.label != schema.collection || map.by_label.get(schema.collection) != Some(&id) {
+                if def.label != schema.label || map.by_label.get(schema.label) != Some(&id) {
                     return None;
                 }
                 id
             }
-            None => *map.by_label.get(schema.collection)?,
+            None => *map.by_label.get(schema.label)?,
         };
 
         let mut fields = BTreeMap::new();
         for field in schema.properties {
             let id = match field.explicit_id {
-                Some(id) => super::local::parse_explicit_id(id),
+                Some(id) => super::compiled::parse_explicit_id(id),
                 None => {
                     let mut matches =
                         map.properties.values().filter(|def| def.minted_for == Some(model) && def.name == field.name).map(|def| def.id);
@@ -663,7 +663,7 @@ where
 
     /// Record an exact binding proven from an already-compatible catalog.
     /// This is the safe no-peer fallback when the allocator cannot be reached.
-    pub(crate) fn bind_compatible_schema(&self, schema: &'static ModelSchema) -> bool {
+    pub(crate) fn bind_compatible_schema(&self, schema: &'static ModelStructDescriptor) -> bool {
         // Bind proof and publication to one ready system epoch. Reset either
         // invalidates before admission (fail closed) or waits for this lease
         // before clearing, so old ids cannot be stored after the clear.
@@ -676,7 +676,7 @@ where
 
     fn store_binding(&self, binding: EnsuredSchemaBinding) {
         let mut ensured = self.0.ensured.write().unwrap();
-        let bindings = ensured.entry(binding.schema.collection.to_string()).or_default();
+        let bindings = ensured.entry(binding.schema.label.to_string()).or_default();
         if let Some(existing) = bindings.iter_mut().find(|known| *known.schema == *binding.schema) {
             // Confirmation belongs to the exact ids returned by the
             // allocator. A later local proof may not replace those ids while
@@ -696,25 +696,25 @@ where
     pub(crate) async fn ensure_schema_for_use(
         &self,
         cdata: &PA::ContextData,
-        schema: &'static ModelSchema,
+        schema: &'static ModelStructDescriptor,
     ) -> Result<proto::ModelId, RegistrationError> {
         match self.ensure_registered(cdata, schema).await {
             Ok(()) => self.model_id_for_schema(schema).ok_or_else(|| {
                 RegistrationError::Retrieval(crate::error::RetrievalError::Other(format!(
                     "registration of '{}' did not retain its exact model identity",
-                    schema.collection
+                    schema.label
                 )))
             }),
             Err(error @ RegistrationError::NoDurablePeer(_)) if self.bind_compatible_schema(schema) => {
                 tracing::warn!(
                     "schema reassertion for fully bound collection '{}' has no durable peer; proceeding with proven canonical identities: {}",
-                    schema.collection,
+                    schema.label,
                     error
                 );
                 self.model_id_for_schema(schema).ok_or_else(|| {
                     RegistrationError::Retrieval(crate::error::RetrievalError::Other(format!(
                         "compatible binding for '{}' did not retain its exact model identity",
-                        schema.collection
+                        schema.label
                     )))
                 })
             }
@@ -765,7 +765,7 @@ where
     #[cfg(feature = "test-helpers")]
     pub fn seed_registered_schema(
         &self,
-        schema: &'static ModelSchema,
+        schema: &'static ModelStructDescriptor,
         models: &[proto::RegisteredModel],
         properties: &[proto::RegisteredProperty],
         memberships: &[proto::RegisteredMembership],
@@ -796,8 +796,12 @@ where
     ///
     /// Every error path returns WITHOUT latching, so a later attempt
     /// retries.
-    pub async fn ensure_registered(&self, cdata: &PA::ContextData, schema: &'static ModelSchema) -> Result<(), RegistrationError> {
-        let collection = schema.collection.to_string();
+    pub async fn ensure_registered(
+        &self,
+        cdata: &PA::ContextData,
+        schema: &'static ModelStructDescriptor,
+    ) -> Result<(), RegistrationError> {
+        let collection = schema.label.to_string();
         // Snapshot and enter the epoch before consulting the latch. Checking
         // first would allow reset to clear the latch and install a new fence
         // between the stale boolean and our admission (an ABA false success).
@@ -874,18 +878,18 @@ where
         self.0.ensured.read().unwrap().get(collection).is_some_and(|bindings| bindings.iter().any(|binding| binding.confirmed))
     }
 
-    pub(crate) fn is_schema_ensured(&self, schema: &ModelSchema) -> bool {
+    pub(crate) fn is_schema_ensured(&self, schema: &ModelStructDescriptor) -> bool {
         self.0
             .ensured
             .read()
             .unwrap()
-            .get(schema.collection)
+            .get(schema.label)
             .is_some_and(|bindings| bindings.iter().any(|known| known.confirmed && *known.schema == *schema))
     }
 
     fn mark_schema_ensured(
         &self,
-        schema: &'static ModelSchema,
+        schema: &'static ModelStructDescriptor,
         models: &[proto::RegisteredModel],
         properties: &[proto::RegisteredProperty],
         memberships: &[proto::RegisteredMembership],
@@ -893,7 +897,7 @@ where
         let binding = self.registered_binding(schema, models, properties, memberships).ok_or_else(|| {
             RegistrationError::Retrieval(crate::error::RetrievalError::Other(format!(
                 "registration of '{}' succeeded without a complete compatible catalog binding",
-                schema.collection
+                schema.label
             )))
         })?;
         self.store_binding(binding);

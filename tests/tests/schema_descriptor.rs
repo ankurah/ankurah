@@ -3,7 +3,7 @@
 //! NORMATIVE (backend, value_type) mapping row-by-row, the renamed_from and
 //! explicit-id attributes, ephemeral exclusion, and the RegisterSchema
 //! descriptor conversion. Ends with an end-to-end registration built from a
-//! Model::schema() and driven through the durable/ephemeral harness, sourcing
+//! Model::descriptor() and driven through the durable/ephemeral harness, sourcing
 //! the allocated ids from the SchemaRegistered response.
 //!
 //! Excised with the read flip (write-only catalog phase): the bound-property
@@ -77,8 +77,8 @@ pub struct DescAllTypes {
 /// fields are excluded.
 #[test]
 fn schema_covers_every_normative_row() {
-    let schema = DescAllTypes::schema();
-    assert_eq!(schema.collection, "descalltypes");
+    let schema = DescAllTypes::descriptor();
+    assert_eq!(schema.label, "descalltypes");
     assert_eq!(schema.name, "DescAllTypes");
     assert_eq!(schema.explicit_id, None);
 
@@ -108,7 +108,7 @@ fn schema_covers_every_normative_row() {
         assert_eq!(f.backend, *backend, "field[{i}] backend");
         assert_eq!(f.value_type, *value_type, "field[{i}] value_type");
         let target = matches!(*field, "artist" | "maybe_artist").then_some("descartist");
-        assert_eq!(f.target_collection, target, "field[{i}] reference target");
+        assert_eq!(f.target_label, target, "field[{i}] reference target");
         assert_eq!(f.optional, *optional, "field[{i}] optional");
         assert_eq!(f.renamed_from, None, "field[{i}] renamed_from");
         assert_eq!(f.explicit_id, None, "field[{i}] explicit_id");
@@ -130,7 +130,7 @@ pub struct DescRenamed {
 
 #[test]
 fn renamed_from_attribute_carries_the_hint() {
-    let schema = DescRenamed::schema();
+    let schema = DescRenamed::descriptor();
     let f = &schema.properties[0];
     assert_eq!(f.field, "headline");
     assert_eq!(f.name, "headline", "display name is the (lowercased) field name");
@@ -152,7 +152,7 @@ pub struct DescBound {
 
 #[test]
 fn explicit_id_attributes_reflected() {
-    let schema = DescBound::schema();
+    let schema = DescBound::descriptor();
     assert_eq!(schema.explicit_id, Some(ZERO_ID_B64), "model explicit id");
     assert_eq!(schema.properties[0].explicit_id, Some(ZERO_ID_B64), "property explicit id");
     assert_eq!(schema.properties[1].explicit_id, None, "unbound field has no explicit id");
@@ -162,7 +162,7 @@ fn explicit_id_attributes_reflected() {
 
 #[test]
 fn registration_request_from_schema() {
-    let (models, properties, memberships) = registration_request(DescAllTypes::schema());
+    let (models, properties, memberships) = registration_request(DescAllTypes::descriptor());
 
     assert_eq!(models.len(), 1);
     assert_eq!(models[0].collection, "descalltypes");
@@ -188,7 +188,7 @@ fn registration_request_from_schema() {
 
 #[test]
 fn registration_request_honors_explicit_ids() {
-    let (_models, properties, memberships) = registration_request(DescBound::schema());
+    let (_models, properties, memberships) = registration_request(DescBound::descriptor());
 
     // The bound field carries its explicit id as a PropertyDescriptor
     // binding and its membership references the property by Id, not name.
@@ -219,7 +219,7 @@ async fn catalog_values(
     Ok(LWWBackend::from_state_buffer(&buffer)?.property_values())
 }
 
-/// Build a RegisterSchema request from `Model::schema()` via
+/// Build a RegisterSchema request from `Model::descriptor()` via
 /// `registration_request`, send it to a schema-less durable node, and
 /// confirm the catalog holds each field at the allocator-assigned id (sourced
 /// from the SchemaRegistered response) with the normative (backend,
@@ -233,7 +233,7 @@ async fn register_from_model_schema_end_to_end() -> anyhow::Result<()> {
 
     // The whole point: the request is built from the compiled schema, no
     // hand-written descriptors.
-    let (models, properties, memberships) = registration_request(DescAllTypes::schema());
+    let (models, properties, memberships) = registration_request(DescAllTypes::descriptor());
     let request = proto::NodeRequestBody::RegisterSchema { models, properties, memberships };
 
     let (reg_models, reg_properties, reg_memberships) = match client.request(server.id, &DEFAULT_CONTEXT, request).await? {
@@ -253,7 +253,7 @@ async fn register_from_model_schema_end_to_end() -> anyhow::Result<()> {
 
     // Every active field is present as a property entity with the exact
     // normative descriptor pair the schema declared, at the allocated id.
-    for f in DescAllTypes::schema().properties {
+    for f in DescAllTypes::descriptor().properties {
         let property_id = property_ids[f.name];
         let property = catalog_values(&server, PROPERTY, property_id).await?;
         assert_eq!(property.get("backend"), Some(&Some(Value::String(f.backend.into()))), "backend for {}", f.field);
@@ -261,7 +261,7 @@ async fn register_from_model_schema_end_to_end() -> anyhow::Result<()> {
         assert_eq!(property.get("name"), Some(&Some(Value::String(f.name.into()))), "name for {}", f.field);
         assert_eq!(property.get("minted_for"), Some(&Some(Value::EntityId(model_id))), "minted_for for {}", f.field);
         let registered = reg_properties.iter().find(|p| p.id == property_id).expect("registered property returned");
-        match f.target_collection {
+        match f.target_label {
             Some("descartist") => {
                 assert_eq!(registered.target_model, Some(artist_model_id), "target_model response for {}", f.field);
                 assert_eq!(

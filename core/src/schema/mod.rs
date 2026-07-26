@@ -11,7 +11,7 @@
 //!
 //! A Rust struct with `#[derive(Model)]` is not the schema; it is one
 //! binary's DECLARATION of a schema, compiled into a static
-//! ([`ModelSchema`], in [`local`]). The first time a binary uses a model --
+//! ([`ModelStructDescriptor`], in [`compiled`]). The first time a binary uses a model --
 //! explicitly via `Context::register`, or implicitly on create/fetch -- that
 //! declaration is sent to the durable node, whose registration executor
 //! ([`registration`]) looks each piece up, allocates ids for anything new,
@@ -27,10 +27,10 @@
 //! record is specs/model-property-metadata/rfc.md.
 
 pub mod catalog;
-pub mod local;
+pub mod compiled;
 pub mod registration;
 
-pub use local::{registration_request, FieldSchema, ModelSchema};
+pub use compiled::{registration_request, ModelStructDescriptor, StructField};
 
 use ankurah_proto::{ModelId, SystemModel};
 
