@@ -20,7 +20,7 @@ fn forge_title_event(entity_id: proto::EntityId, parent: proto::Clock, title: &s
     proto::Event {
         entity_id,
         collection: Record::collection(),
-        operations: proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
+        operations: proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)])),
         parent,
     }
 }
@@ -76,7 +76,7 @@ async fn test_event_only_multi_event_wire_order_is_untrusted() -> Result<()> {
         proto::Event {
             entity_id: rec_id,
             collection: ev_parent.collection.clone(),
-            operations: proto::OperationSet(std::collections::BTreeMap::from([("lww".to_owned(), ops)])),
+            operations: proto::OperationSet::from_backends(std::collections::BTreeMap::from([("lww".to_owned(), ops)])),
             parent: ev_parent.parent.clone(),
         }
     };
