@@ -108,13 +108,15 @@ impl WeakEntity {
     pub fn upgrade(&self) -> Option<Entity> { self.0.upgrade().map(Entity) }
 }
 
-/// The genesis membership contract, enforced at event application: an event
+/// The genesis membership rule, enforced at event application: an event
 /// carries at most one Membership operation, only in a genesis event, and the
 /// model it asserts must be the same fact the event's collection field
 /// materializes. The attested event stream is the sole authority for
 /// entity-to-model membership (membership change events arrive in a later
 /// protocol revision); the collection field is its routing materialization,
 /// so a disagreement is a malformed event, refused before any state applies.
+/// (Distinct vocabulary: the catalog's CONTRACT-memberships are
+/// property-to-model records, `_ankurah_model_property`.)
 fn validate_membership_operations(event: &Event) -> Result<(), MutationError> {
     use ankurah_proto::Membership;
     let mut memberships = event.operations.memberships();

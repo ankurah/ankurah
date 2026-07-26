@@ -267,11 +267,12 @@ where
     async fn run_durable_warm(&self, generation: u64, _lease: RequestLease) {
         if let Err(e) = self.warm_durable(generation).await {
             error!("CatalogManager durable warm failed: {}", e);
-            // Readiness must still latch: ingress resolution
-            // (`Node::prepare_model_for_ingress`) parks on it, and a permanently
+            // Readiness must still latch: registration's readiness wait
+            // (`wait_catalog_ready_if_current`) parks on it, and a permanently
             // un-ready catalog would turn one failed warm into a hang.
-            // With a partial map, later resolutions reject loudly instead,
-            // which is the retryable failure mode we want.
+            // With a partial map, later registrations reject loudly on their
+            // storage double-checks instead, which is the retryable failure
+            // mode we want.
             let setup = self.0.setup_state.read().unwrap();
             if setup.generation == generation {
                 self.mark_ready();

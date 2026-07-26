@@ -2,8 +2,8 @@
 //! (specs/model-property-metadata/rfc.md section 5.2).
 //!
 //! Registration is an UPSERT: the executor looks each definition up by its
-//! lookup key (model by source label; property by (model, name); membership by
-//! (model, property)), ALLOCATES a fresh
+//! lookup key (model by source label; property by (model, name);
+//! contract-membership by (model, property)), ALLOCATES a fresh
 //! `EntityId::new()` -- a true ULID -- on miss, and emits ordinary events
 //! through the policy-checked commit pipeline. The whole execution
 //! serializes on a process-local mutex, and the executor upserts the
