@@ -9,8 +9,8 @@ use crate::{
     reactor::AbstractEntity,
     value::Value,
 };
-use ankurah_proto::{Clock, CollectionId, EntityId, EntityState, Event, EventId, OperationSet, State};
-use std::collections::BTreeMap;
+use ankurah_proto::{Clock, CollectionId, EntityId, EntityState, Event, EventId, ModelId, OperationSet, State};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use tracing::{debug, error, warn};
@@ -36,33 +36,47 @@ pub struct Entity(Arc<EntityInner>);
 /// Used only for reconstituting state to filter database results. No duplication guarantees are provided
 pub struct TemporaryEntity(Arc<EntityInner>);
 
+mod membership;
+use membership::MembershipSet;
+
 /// Combined state for atomic updates of head and backends
 #[derive(Debug)]
 struct EntityInnerState {
     head: Clock,
+    /// This entity's model memberships: applied plus staged (see [`MembershipSet`]).
+    memberships: MembershipSet,
     // TODO: remove interior mutability from backends; make mutation methods take &mut self
     backends: BTreeMap<String, Arc<dyn PropertyBackend>>,
 }
 
 impl EntityInnerState {
-    /// Apply operations from an event, tracking which event set each property.
+    /// Apply an event's operation stream, tracking which event set each
+    /// property.
     ///
-    /// This enables per-property conflict resolution when concurrent events arrive later.
-    /// For CRDT backends (like Yrs), the event_id tracking is a no-op since CRDTs
-    /// handle concurrency internally. For LWW backends, this stores the event_id
-    /// alongside each property value.
-    fn apply_operations_from_event(
-        &mut self,
-        backend_name: String,
-        operations: &[ankurah_proto::Operation],
-        event_id: EventId,
-    ) -> Result<(), MutationError> {
-        if let Some(backend) = self.backends.get(&backend_name) {
-            backend.apply_operations_with_event(operations, event_id)?;
-        } else {
-            let backend = backend_from_string(&backend_name, None)?;
-            backend.apply_operations_with_event(operations, event_id)?;
-            self.backends.insert(backend_name, backend);
+    /// Application is TOTAL over [`ankurah_proto::Operation`]: backend diffs
+    /// dispatch to their named backend (per-property conflict resolution:
+    /// the event_id tracking is a no-op for CRDT backends like Yrs, and is
+    /// stored alongside each value for LWW), and membership operations apply
+    /// into the membership set. The attested event stream is the sole
+    /// authority for entity-to-model membership, so nothing is filtered
+    /// here; admissibility (which operations may be EMITTED today) is a
+    /// commit-path concern, not an application one.
+    fn apply_operations_from_event(&mut self, operations: &ankurah_proto::OperationSet, event_id: EventId) -> Result<(), MutationError> {
+        for operation in operations.iter() {
+            match operation {
+                ankurah_proto::Operation::Backend { backend: backend_name, operations } => {
+                    if let Some(backend) = self.backends.get(backend_name.as_str()) {
+                        backend.apply_operations_with_event(operations, event_id.clone())?;
+                    } else {
+                        let backend = backend_from_string(backend_name, None)?;
+                        backend.apply_operations_with_event(operations, event_id.clone())?;
+                        self.backends.insert(backend_name.clone(), backend);
+                    }
+                }
+                ankurah_proto::Operation::Membership(ankurah_proto::Membership::Add(model)) => {
+                    self.memberships.apply(*model);
+                }
+            }
         }
         Ok(())
     }
@@ -118,6 +132,20 @@ impl Entity {
 
     pub fn head(&self) -> Clock { self.state.read().unwrap().head.clone() }
 
+    /// Durable model-backed memberships accumulated by this entity's event
+    /// history (exactly one for any created entity under the current
+    /// emission rules).
+    pub fn memberships(&self) -> BTreeSet<ModelId> { self.state.read().unwrap().memberships.applied() }
+
+    /// Whether this entity's causal history established membership in `model`.
+    pub fn has_membership(&self, model: &ModelId) -> bool { self.state.read().unwrap().memberships.is_applied(model) }
+
+    /// Stage this entity's membership in `model` to ride the next event it
+    /// records. The membership becomes canonical only when that event
+    /// applies; under the current protocol the commit funnels admit
+    /// membership operations only on an entity's first event.
+    pub fn add_membership(&self, model: ModelId) { self.state.write().unwrap().memberships.add(model); }
+
     /// Check if this entity is writable (i.e., it's a transaction fork that's still alive)
     pub fn is_writable(&self) -> bool {
         match &self.kind {
@@ -134,7 +162,7 @@ impl Entity {
             state_buffers.insert(name.clone(), state_buffer);
         }
         let state_buffers = ankurah_proto::StateBuffers(state_buffers);
-        Ok(State { state_buffers, head: state.head.clone() })
+        Ok(State { state_buffers, memberships: state.memberships.applied(), head: state.head.clone() })
     }
 
     pub fn to_entity_state(&self) -> Result<EntityState, StateError> {
@@ -142,12 +170,18 @@ impl Entity {
         Ok(EntityState { entity_id: self.id(), collection: self.collection.clone(), state })
     }
 
-    // used by the Model macro
+    /// Construct a new, writable entity with no state and no memberships.
+    /// Memberships are staged separately ([`Entity::add_membership`]) and
+    /// become canonical when an event records them.
     pub fn create(id: EntityId, collection: CollectionId) -> Self {
         Self(Arc::new(EntityInner {
             id,
             collection,
-            state: std::sync::RwLock::new(EntityInnerState { head: Clock::default(), backends: BTreeMap::default() }),
+            state: std::sync::RwLock::new(EntityInnerState {
+                head: Clock::default(),
+                memberships: MembershipSet::default(),
+                backends: BTreeMap::default(),
+            }),
             kind: EntityKind::Primary,
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
         }))
@@ -164,7 +198,11 @@ impl Entity {
         Ok(Self(Arc::new(EntityInner {
             id,
             collection,
-            state: std::sync::RwLock::new(EntityInnerState { head: state.head.clone(), backends }),
+            state: std::sync::RwLock::new(EntityInnerState {
+                head: state.head.clone(),
+                memberships: MembershipSet::from_applied(&state.memberships),
+                backends,
+            }),
             kind: EntityKind::Primary,
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
         })))
@@ -174,18 +212,33 @@ impl Entity {
     /// Used for transaction commit. Notably this does not apply the head to the entity, which must be done
     /// using commit_head
     pub(crate) fn generate_commit_event(&self) -> Result<Option<Event>, MutationError> {
+        // Drain staged memberships in a short exclusive scope, then build the
+        // event under a read lock (backends carry their own interior
+        // mutability). Holding the write lock across event generation showed
+        // up as a read-your-writes delivery failure in the deterministic sim
+        // on CI runners (isolated by A/B probe branches); the exclusive
+        // section stays minimal on the commit path.
+        let membership_operations = self.state.write().expect("other thread panicked, panic here too").memberships.to_operations();
         let state = self.state.read().expect("other thread panicked, panic here too");
-        let mut operations = BTreeMap::<String, Vec<ankurah_proto::Operation>>::new();
+        let mut backends = BTreeMap::<String, Vec<ankurah_proto::BackendOperation>>::new();
         for (name, backend) in &state.backends {
             if let Some(ops) = backend.to_operations()? {
-                operations.insert(name.clone(), ops);
+                backends.insert(name.clone(), ops);
             }
         }
+        let mut operations = OperationSet::from_backends(backends);
+        for operation in membership_operations {
+            operations.push(operation);
+        }
 
-        if operations.is_empty() {
+        // No operations on an EXISTING entity means nothing changed: no event.
+        // A brand-new entity (empty head) emits its event unconditionally:
+        // model creation stages a membership addition, so the event exists,
+        // replicates, and persists even when every field is its default (and
+        // the commit funnels refuse a first event without its membership).
+        if operations.is_empty() && !state.head.is_empty() {
             Ok(None)
         } else {
-            let operations = OperationSet(operations);
             let event = Event { entity_id: self.id, collection: self.collection.clone(), operations, parent: state.head.clone() };
             Ok(Some(event))
         }
@@ -264,9 +317,7 @@ impl Entity {
             // Re-check if head is still empty now that we hold the lock
             if state.head.is_empty() {
                 // this is the creation event for a new entity, so we simply accept it
-                for (backend_name, operations) in event.operations.iter() {
-                    state.apply_operations_from_event(backend_name.clone(), operations, event.id())?;
-                }
+                state.apply_operations_from_event(&event.operations, event.id())?;
                 state.head = event.id().into();
                 drop(state); // Release lock before broadcast
                              // Notify Signal subscribers about the change
@@ -301,9 +352,7 @@ impl Entity {
                     let new_head: Clock = event.id().into();
                     let event_id = event.id();
                     if self.try_mutate(&mut head, |state| -> Result<(), MutationError> {
-                        for (backend_name, operations) in event.operations.iter() {
-                            state.apply_operations_from_event(backend_name.clone(), operations, event_id.clone())?;
-                        }
+                        state.apply_operations_from_event(&event.operations, event_id.clone())?;
                         state.head = new_head.clone();
                         Ok(())
                     })? {
@@ -347,17 +396,23 @@ impl Entity {
 
                         // Apply layers in causal order
                         for layer in all_layers {
-                            // Check for backends that first appear in this layer's to_apply events
+                            // Check for backends that first appear in this layer's to_apply events,
+                            // and union any membership operations the layer carries (application
+                            // is total over the operation stream; backends cannot apply these).
                             for evt in &layer.to_apply {
-                                for (backend_name, _) in evt.operations.iter() {
+                                for (backend_name, _) in evt.operations.backends() {
                                     if !state.backends.contains_key(backend_name) {
                                         let backend = backend_from_string(backend_name, None)?;
                                         // Replay earlier layers for this newly-created backend
                                         for earlier in &applied_layers {
                                             backend.apply_layer(earlier)?;
                                         }
-                                        state.backends.insert(backend_name.clone(), backend);
+                                        state.backends.insert(backend_name.to_owned(), backend);
                                     }
+                                }
+                                for membership in evt.operations.memberships() {
+                                    let ankurah_proto::Membership::Add(model) = membership;
+                                    state.memberships.apply(*model);
                                 }
                             }
 
@@ -427,6 +482,7 @@ impl Entity {
                             let backend = backend_from_string(name, Some(state_buffer))?;
                             es.backends.insert(name.to_owned(), backend);
                         }
+                        es.memberships.set_applied(&state.memberships);
                         es.head = new_head;
                         Ok(())
                     })? {
@@ -485,7 +541,11 @@ impl Entity {
         Self(Arc::new(EntityInner {
             id: self.id,
             collection: self.collection.clone(),
-            state: std::sync::RwLock::new(EntityInnerState { head: state.head.clone(), backends: forked }),
+            state: std::sync::RwLock::new(EntityInnerState {
+                head: state.head.clone(),
+                memberships: state.memberships.clone(),
+                backends: forked,
+            }),
             kind: EntityKind::Transacted { trx_alive, upstream: self.clone() },
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
         }))
@@ -575,7 +635,11 @@ impl TemporaryEntity {
         Ok(Self(Arc::new(EntityInner {
             id,
             collection,
-            state: std::sync::RwLock::new(EntityInnerState { head: state.head.clone(), backends }),
+            state: std::sync::RwLock::new(EntityInnerState {
+                head: state.head.clone(),
+                memberships: MembershipSet::from_applied(&state.memberships),
+                backends,
+            }),
             kind: EntityKind::Primary,
             // slightly annoying that we need to populate this, given that it won't be used
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
@@ -677,7 +741,8 @@ impl WeakEntitySet {
             }
         }
     }
-    /// Create a brand new entity, and add it to the set
+    /// Create a brand new entity and add it to the set. Memberships are
+    /// staged separately ([`Entity::add_membership`]).
     pub fn create(&self, collection: CollectionId) -> Entity {
         let mut entities = self.0.write().unwrap();
         let id = EntityId::new();

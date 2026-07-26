@@ -1,3 +1,4 @@
+use crate::schema::catalog::CatalogManager;
 use crate::selection::filter::Filterable;
 use ankurah_proto::{self as proto, Attested, CollectionId, EntityState};
 use anyhow::anyhow;
@@ -146,6 +147,10 @@ where PA: PolicyAgent
     pub(crate) policy_agent: PA,
     pub system: SystemManager<SE, PA>,
 
+    /// The metadata catalog map (write-only in this phase: registration
+    /// maintains it; nothing resolves through it yet).
+    pub catalog: CatalogManager<SE, PA>,
+
     pub(crate) subscription_relay: Option<SubscriptionRelay<PA::ContextData, crate::livequery::WeakEntityLiveQuery>>,
 
     /// Type resolver for AST preparation (temporary heuristic until Phase 3 schema)
@@ -173,13 +178,14 @@ where
     }
 
     fn build(engine: Arc<SE>, policy_agent: PA, durable: bool, rng: SmallRng) -> Self {
-        let collections = CollectionSet::new(engine);
+        let collections = CollectionSet::new(engine.clone());
         let entityset: WeakEntitySet = Default::default();
         let id = proto::EntityId::new();
         let reactor = Reactor::new();
         notice_info!("Node {id:#} created as {}", if durable { "durable" } else { "ephemeral" });
 
         let system_manager = SystemManager::new(collections.clone(), entityset.clone(), reactor.clone(), durable);
+        let catalog = CatalogManager::new(engine, durable);
 
         // Only ephemeral nodes relay subscriptions upstream to a durable peer.
         let subscription_relay = if durable { None } else { Some(SubscriptionRelay::new()) };
@@ -195,6 +201,7 @@ where
             durable,
             policy_agent,
             system: system_manager,
+            catalog: catalog.clone(),
             predicate_context: SafeMap::new(),
             subscription_relay,
             type_resolver: crate::TypeResolver::new(),
@@ -209,6 +216,7 @@ where
         }
 
         node.policy_agent.on_node_ready(node.weak());
+        node.catalog.start(node.weak());
 
         node
     }
@@ -430,12 +438,35 @@ where
     where C: Iterable<PA::ContextData> {
         match request.body {
             proto::NodeRequestBody::CommitTransaction { id, events } => {
+                // Protected collections (the system collection and the
+                // metadata catalog) are not mutable through ordinary
+                // transactions; the catalog's only mutation path is the
+                // registration operation. Registration writes the catalog
+                // through a direct commit_remote_transaction call that
+                // bypasses this guard.
+                for event in &events {
+                    let collection = event.payload.collection.as_str();
+                    if collection.starts_with(crate::schema::RESERVED_COLLECTION_PREFIX) {
+                        return Ok(proto::NodeResponseBody::Error(format!(
+                            "collection '{collection}' is protected and not writable by transactions"
+                        )));
+                    }
+                }
                 // TODO - relay to peers in a gossipy/resource-available manner, so as to improve propagation
                 // With moderate potential for duplication, while not creating message loops
                 // Doing so would be a secondary/tertiary/etc hop for this message
                 let cdata = cdata.iterable().exactly_one().map_err(|_| anyhow!("Only one cdata is permitted for CommitTransaction"))?;
                 match self.commit_remote_transaction(cdata, id.clone(), events).await {
                     Ok(_) => Ok(proto::NodeResponseBody::CommitComplete { id }),
+                    Err(e) => Ok(proto::NodeResponseBody::Error(e.to_string())),
+                }
+            }
+            proto::NodeRequestBody::RegisterSchema { models } => {
+                let cdata = cdata.iterable().exactly_one().map_err(|_| anyhow!("Only one cdata is permitted for RegisterSchema"))?;
+                match self.catalog.register_schema(cdata, models).await {
+                    // The resolved definitions ARE the response: the
+                    // requester folds them into its catalog map on ack.
+                    Ok(models) => Ok(proto::NodeResponseBody::SchemaRegistered { models }),
                     Err(e) => Ok(proto::NodeResponseBody::Error(e.to_string())),
                 }
             }
@@ -553,6 +584,50 @@ where
     }
 
     /// Does all the things necessary to commit a remote transaction
+    /// Commit-path admissibility for membership operations: the protocol
+    /// gate beside the PolicyAgent's policy gate (`check_event`). Membership
+    /// operations are ordinary operations on any event; what is restricted
+    /// today is emission: an entity's first event must carry exactly one
+    /// Membership::Add -- asserting the same model fact the event's
+    /// collection field materializes (the built-in mapping for system
+    /// collections, the registered model for app collections) -- and no
+    /// membership mutations are admitted on later events yet. Application
+    /// (`Entity::apply_event`) is deliberately unchecked: the attested event
+    /// stream is the membership authority, and this gate controls only what
+    /// may be EMITTED into it today.
+    pub(crate) fn check_membership_admissibility(&self, event: &proto::Event) -> Result<(), MutationError> {
+        let memberships: Vec<proto::ModelId> = event
+            .operations
+            .memberships()
+            .map(|membership| match membership {
+                proto::Membership::Add(model) => *model,
+            })
+            .collect();
+        if !event.is_entity_create() {
+            return if memberships.is_empty() {
+                Ok(())
+            } else {
+                Err(MutationError::InvalidUpdate("membership changes after an entity's first event are not admissible yet"))
+            };
+        }
+        let model = match memberships.as_slice() {
+            [model] => *model,
+            [] => return Err(MutationError::InvalidUpdate("an entity's first event must add exactly one membership")),
+            _ => return Err(MutationError::InvalidUpdate("an entity's first event cannot add more than one membership")),
+        };
+        let expected =
+            crate::schema::system_model_id(event.collection.as_str()).or_else(|| self.catalog.model_id_for(event.collection.as_str()));
+        match expected {
+            Some(expected) if expected == model => Ok(()),
+            Some(_) => Err(MutationError::General(
+                format!("membership asserts model {model} but the event routes to collection '{}'", event.collection).into(),
+            )),
+            None => Err(MutationError::General(
+                format!("membership asserts model {model} but collection '{}' has no registered model", event.collection).into(),
+            )),
+        }
+    }
+
     pub async fn commit_remote_transaction(
         &self,
         cdata: &PA::ContextData,
@@ -563,6 +638,7 @@ where
         let mut changes = Vec::new();
 
         for event in events.iter_mut() {
+            self.check_membership_admissibility(&event.payload)?;
             let collection = self.collections.get(&event.payload.collection).await?;
 
             // When applying an event, we should only look at the local storage for the lineage

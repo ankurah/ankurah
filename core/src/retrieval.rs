@@ -310,7 +310,7 @@ mod tests {
         entity_id_bytes[0] = seed;
         let entity_id = EntityId::from_bytes(entity_id_bytes);
 
-        Event { entity_id, collection: "test".into(), parent: Clock::from(parent_ids.to_vec()), operations: OperationSet(BTreeMap::new()) }
+        Event { entity_id, collection: "test".into(), parent: Clock::from(parent_ids.to_vec()), operations: OperationSet::default() }
     }
 
     // ====================================================================
