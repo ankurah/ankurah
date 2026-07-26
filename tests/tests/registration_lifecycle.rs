@@ -18,10 +18,9 @@
 //!
 //! Excised with the read flip (write-only phase): first-use registration
 //! triggers (`trx.create`, predicate fetch, typed direct get) and the
-//! no-peer fallback that proceeds from a fully bound compatible schema --
-//! their entry point (`ensure_schema_for_use`) rides uncalled -- plus the
-//! relay-warmed offline scenarios and the fail-loud unregistered read.
-//! Their tests return with that wiring (successor notes in
+//! no-peer fallback that proceeds from a fully bound compatible schema,
+//! plus the relay-warmed offline scenarios and the fail-loud unregistered
+//! read. Their tests return with that wiring (successor notes in
 //! core/src/schema/catalog.rs).
 
 mod common;

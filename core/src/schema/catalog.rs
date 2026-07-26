@@ -1,84 +1,52 @@
 //! The in-memory catalog map and its maintenance
 //! (specs/model-property-metadata/rfc.md section 5.2).
 //!
-//! Every node keeps a live view of the three catalog collections
-//! (`_ankurah_model`, `_ankurah_property`, `_ankurah_model_property`) so
-//! that property references resolve locally. The map is maintained two
-//! ways, mirroring how the two node kinds already replicate:
+//! Every node keeps an in-memory view of the three catalog collections
+//! (`_ankurah_model`, `_ankurah_property`, `_ankurah_model_property`). In
+//! this write-only phase the map exists for the catalog's own maintenance
+//! (registration duplicate checks and allocation), and it fills two ways,
+//! mirroring how the two node kinds already replicate:
 //!
 //! - DURABLE nodes have the catalog in local storage. Once the system is
 //!   ready the manager warms the map by scanning the three collections
 //!   (`fetch_states` with `Predicate::True`, the same move
-//!   `SystemManager::load_system_catalog` makes for the system collection),
-//!   then keeps it fresh with a POLICY-FREE reactor subscription: the map
-//!   is node infrastructure like `SystemManager` (which reads storage with
-//!   no policy). Mutation stays gated by `check_event` in the executor and
-//!   remote access stays gated server-side, so a policy-free local read is
-//!   sound.
-//! - EPHEMERAL nodes get the catalog through the ordinary subscription
-//!   relay. The first `context`/`context_async` call drives
-//!   [`CatalogManager::ensure_subscribed`], which stands up three
-//!   [`EntityLiveQuery`]s with `Predicate::True` over the catalog
-//!   collections; their reactor updates feed the same map. Catalog
-//!   visibility on an ephemeral node therefore follows that node's user
-//!   credentials.
+//!   `SystemManager::load_system_catalog` makes for the system collection).
+//!   Afterward the registration executor folds its own commits into the map
+//!   synchronously under the allocator mutex; no other catalog writer
+//!   exists this phase. The POLICY-FREE reactor subscription that keeps the
+//!   map fresh under the read flip returns with that PR (the map is node
+//!   infrastructure like `SystemManager`, which reads storage with no
+//!   policy; mutation stays gated by `check_event` in the executor).
+//! - EPHEMERAL nodes fill their map only by folding SchemaRegistered
+//!   responses to their own forwarded registrations. The three catalog
+//!   subscriptions through the ordinary relay (and the credential-scoped
+//!   visibility they imply) return with the read flip.
 //!
 //! Catalog entities are SYSTEM MODELS (RFC section 4): they are read
-//! through the raw `Entity`/backend interface, never a `View`, because
+//! through the raw state-buffer interface, never a `View`, because
 //! deriving a `Model` for a catalog collection would be the
-//! self-description ouroboros the RFC forbids. Live entities are parsed
-//! through the `AbstractEntity::value` accessor; storage states are parsed
+//! self-description ouroboros the RFC forbids. Storage states are parsed
 //! through `LWWBackend::from_state_buffer` + `property_values`, exactly as
 //! `registration::catalog_entity_values` does.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, RwLock},
-    time::Duration,
 };
 
 use crate::ModelId;
 use ankurah_proto::{self as proto, EntityId, PropertyId, SystemProperty};
-use ankurah_signals::Subscribe;
 use tokio::sync::Notify;
 use tracing::{debug, error};
 
 use crate::{
     node::{Node, WeakNode},
     policy::PolicyAgent,
-    reactor::{AbstractEntity, Reactor},
     storage::StorageEngine,
     util::request_fence::{RequestFence, RequestLease, RequestValidity},
 };
 
 use super::{model_collection, model_property_collection, property_collection, registration::RegistrationError, ModelSchema};
-
-/// A short grace period for a connected catalog relay to deliver its initial
-/// snapshots. The catalog remains a cache: expiry falls back to local state,
-/// while the live relay subscriptions stay installed and may populate the map
-/// later.
-const REMOTE_CATALOG_WARM_GRACE: Duration = Duration::from_secs(2);
-
-/// Runs a rollback closure unless a successful initialization disarms it.
-/// Keeping this guard inside the node-owned initialization task releases the
-/// first-call latch on construction failure and lets generation invalidation
-/// leave any newer claimant untouched.
-struct RollbackGuard<F: FnOnce()> {
-    rollback: Option<F>,
-}
-
-impl<F: FnOnce()> RollbackGuard<F> {
-    fn new(rollback: F) -> Self { Self { rollback: Some(rollback) } }
-    fn disarm(&mut self) { self.rollback = None; }
-}
-
-impl<F: FnOnce()> Drop for RollbackGuard<F> {
-    fn drop(&mut self) {
-        if let Some(rollback) = self.rollback.take() {
-            rollback();
-        }
-    }
-}
 
 mod map;
 use map::{apply_entry, parse_state, CatalogMapInner, EnsuredSchemaBinding};
@@ -104,13 +72,12 @@ struct CatalogInner<SE, PA>
 where PA: PolicyAgent
 {
     storage: Arc<SE>,
-    reactor: Reactor,
     durable: bool,
     /// The allocator mutex (RFC 5.1 executor discipline): the registration
     /// executor serializes every RegisterSchema execution on this lock and
     /// upserts its allocations into the map synchronously before releasing
-    /// it, because the reactor-fed map alone lags commit and consecutive
-    /// registrations must never double-allocate.
+    /// it, so consecutive registrations observe each other and never
+    /// double-allocate.
     allocator: tokio::sync::Mutex<()>,
     map: RwLock<CatalogMapInner>,
     ready: RwLock<bool>,
@@ -215,28 +182,14 @@ where PA: PolicyAgent
     }
 }
 
-// Catalog metadata lookups. These become the CatalogResolver trait surface in
-// the propertyid-resolution PR; until then they are inherent methods used by
-// registration's own duplicate checks.
+// The name-to-id lookup behind `CatalogManager::resolve`. The wider catalog
+// metadata surface (model listing, reverse name lookups) becomes the
+// CatalogResolver trait in the propertyid-resolution PR.
 impl<SE, PA> CatalogInner<SE, PA>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    pub(crate) fn resolve_model(&self, name: &str) -> anyhow::Result<Option<proto::ModelId>> {
-        Ok(crate::schema::system_model_id(name)
-            .or_else(|| self.map.read().unwrap().by_label.get(name).copied().map(proto::ModelId::EntityId)))
-    }
-
-    pub(crate) fn model_properties_ready(&self, model: &proto::ModelId) -> bool {
-        match model {
-            proto::ModelId::System(_) => true,
-            proto::ModelId::EntityId(id) => {
-                *self.ready.read().unwrap() || self.ensured.read().unwrap().values().flatten().any(|binding| binding.model == *id)
-            }
-        }
-    }
-
     pub(crate) fn resolve_model_property(&self, model: &proto::ModelId, name: &str) -> anyhow::Result<Option<PropertyId>> {
         let proto::ModelId::EntityId(id) = model else {
             return Ok(SystemProperty::from_name(name).map(PropertyId::System));
@@ -246,64 +199,6 @@ where
         };
         Ok(self.resolve_property(*id, &label, name)?.map(PropertyId::EntityId))
     }
-
-    pub(crate) fn model_properties(&self, model: &proto::ModelId) -> anyhow::Result<Vec<PropertyId>> {
-        use proto::{SystemModel, SystemProperty};
-
-        Ok(match model {
-            proto::ModelId::EntityId(id) => {
-                if !self.model_properties_ready(model) {
-                    anyhow::bail!("catalog property memberships for model {model} are not ready");
-                }
-                self.map.read().unwrap().properties_for_model(id)
-            }
-            proto::ModelId::System(SystemModel::System) => vec![PropertyId::System(SystemProperty::Item)],
-            proto::ModelId::System(SystemModel::Model) => {
-                vec![PropertyId::System(SystemProperty::Label), PropertyId::System(SystemProperty::Name)]
-            }
-            proto::ModelId::System(SystemModel::Property) => vec![
-                PropertyId::System(SystemProperty::MintedFor),
-                PropertyId::System(SystemProperty::Name),
-                PropertyId::System(SystemProperty::Backend),
-                PropertyId::System(SystemProperty::ValueType),
-                PropertyId::System(SystemProperty::TargetModel),
-            ],
-            proto::ModelId::System(SystemModel::ModelProperty) => vec![
-                PropertyId::System(SystemProperty::Model),
-                PropertyId::System(SystemProperty::Property),
-                PropertyId::System(SystemProperty::Optional),
-            ],
-        })
-    }
-
-    pub(crate) fn model_name(&self, model: &proto::ModelId) -> anyhow::Result<String> {
-        match model {
-            proto::ModelId::EntityId(id) => self
-                .map
-                .read()
-                .unwrap()
-                .models
-                .get(id)
-                .map(|model| model.name.clone())
-                .ok_or_else(|| anyhow::anyhow!("catalog has no registered model {model}")),
-            proto::ModelId::System(system) => Ok(system.to_string()),
-        }
-    }
-
-    pub(crate) fn property_name(&self, property: &PropertyId) -> anyhow::Result<String> {
-        match property {
-            PropertyId::Id => Ok("id".to_owned()),
-            PropertyId::System(system) => Ok(system.to_string()),
-            PropertyId::EntityId(id) => self
-                .map
-                .read()
-                .unwrap()
-                .properties
-                .get(id)
-                .map(|property| property.name.clone())
-                .ok_or_else(|| anyhow::anyhow!("catalog has no registered property {id}")),
-        }
-    }
 }
 
 impl<SE, PA> CatalogManager<SE, PA>
@@ -311,10 +206,9 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    pub(crate) fn new(storage: Arc<SE>, reactor: Reactor, durable: bool) -> Self {
+    pub(crate) fn new(storage: Arc<SE>, durable: bool) -> Self {
         Self(Arc::new(CatalogInner {
             storage,
-            reactor,
             durable,
             allocator: tokio::sync::Mutex::new(()),
             map: RwLock::new(CatalogMapInner::default()),
@@ -432,11 +326,6 @@ where
 
     /// Whether the catalog map is authoritative for the current system epoch.
     pub fn is_catalog_ready(&self) -> bool { *self.0.ready.read().unwrap() }
-
-    /// Whether this manager belongs to a durable node (warms from storage)
-    /// as opposed to an ephemeral one (warms by subscription). The
-    /// resolution deferral branches on this (`node/name_resolution.rs`).
-    pub(crate) fn is_durable(&self) -> bool { self.0.durable }
 
     /// Wait until the catalog map is authoritative for the current system epoch.
     pub async fn wait_catalog_ready(&self) {
@@ -674,55 +563,6 @@ where
         })
     }
 
-    /// Derive the exact binding an already-populated catalog proves for this
-    /// compiled declaration.
-    ///
-    /// Ordinary fields use the allocator's lookup scope `(minting model,
-    /// current name)`, not any same-named membership. That distinction keeps
-    /// explicit sharing explicit. An explicit model id must itself be the
-    /// collection's live model; a compatible ordinary model must be the one
-    /// indexed by the collection. Every field then needs a live membership and
-    /// a compatible immutable backend/type pair.
-    fn compatible_binding(&self, schema: &'static ModelSchema, confirmed: bool) -> Option<EnsuredSchemaBinding> {
-        let map = self.0.map.read().unwrap();
-        let model = match schema.explicit_id {
-            Some(id) => {
-                let id = super::local::parse_explicit_id(id);
-                let def = map.models.get(&id)?;
-                if def.label != schema.collection || map.by_label.get(schema.collection) != Some(&id) {
-                    return None;
-                }
-                id
-            }
-            None => *map.by_label.get(schema.collection)?,
-        };
-
-        let mut fields = BTreeMap::new();
-        for field in schema.properties {
-            let id = match field.explicit_id {
-                Some(id) => super::local::parse_explicit_id(id),
-                None => {
-                    let mut matches =
-                        map.properties.values().filter(|def| def.minted_for == Some(model) && def.name == field.name).map(|def| def.id);
-                    let id = matches.next()?;
-                    if matches.next().is_some() {
-                        return None;
-                    }
-                    id
-                }
-            };
-            if map.membership(&model, &id).is_none() {
-                return None;
-            }
-            let def = map.properties.get(&id)?;
-            if def.backend != field.backend || !super::registration::value_types_compatible(&def.value_type, field.value_type) {
-                return None;
-            }
-            fields.insert(field.name, id);
-        }
-        Some(EnsuredSchemaBinding { schema, model, fields, confirmed })
-    }
-
     /// Build the confirmed binding from the allocator's response itself.
     /// Registration results are the only race-free authority for the ids this
     /// exact request resolved; reconstructing them from mutable display names
@@ -761,18 +601,10 @@ where
         Some(EnsuredSchemaBinding { schema, model, fields, confirmed: true })
     }
 
-    /// Record an exact binding proven from an already-compatible catalog.
-    /// This is the safe no-peer fallback when the allocator cannot be reached.
-    pub(crate) fn bind_compatible_schema(&self, schema: &'static ModelSchema) -> bool {
-        // Bind proof and publication to one ready system epoch. Reset either
-        // invalidates before admission (fail closed) or waits for this lease
-        // before clearing, so old ids cannot be stored after the clear.
-        let Some(validity) = self.registration_validity() else { return false };
-        let Some(_lease) = validity.try_acquire() else { return false };
-        let Some(binding) = self.compatible_binding(schema, false) else { return false };
-        self.store_binding(binding);
-        true
-    }
+    // Automatic first-use registration (`ensure_schema_for_use`) and the
+    // no-peer fallback that proceeds from a catalog-proven compatible binding
+    // (`bind_compatible_schema`/`compatible_binding`) return with the
+    // propertyid-resolution PR alongside their mutation/predicate triggers.
 
     fn store_binding(&self, binding: EnsuredSchemaBinding) {
         let mut ensured = self.0.ensured.write().unwrap();
@@ -781,45 +613,13 @@ where
             // Confirmation belongs to the exact ids returned by the
             // allocator. A later local proof may not replace those ids while
             // inheriting their confirmation; only another confirmed result
-            // can replace a confirmed binding.
+            // can replace a confirmed binding (the unconfirmed producer is
+            // the no-peer fallback, which returns with the resolution PR).
             if binding.confirmed || !existing.confirmed {
                 *existing = binding;
             }
         } else {
             bindings.push(binding);
-        }
-    }
-
-    /// Automatic schema use (mutation or predicate) tries the allocator first.
-    /// A policy or executor refusal is always strict. Only the explicit
-    /// no-durable-peer case may proceed from locally proven exact identities.
-    pub(crate) async fn ensure_schema_for_use(
-        &self,
-        node: &Node<SE, PA>,
-        cdata: &PA::ContextData,
-        schema: &'static ModelSchema,
-    ) -> Result<proto::ModelId, RegistrationError> {
-        match self.ensure_registered(node, cdata, schema).await {
-            Ok(()) => self.model_id_for_schema(schema).ok_or_else(|| {
-                RegistrationError::Retrieval(crate::error::RetrievalError::Other(format!(
-                    "registration of '{}' did not retain its exact model identity",
-                    schema.collection
-                )))
-            }),
-            Err(error @ RegistrationError::NoDurablePeer(_)) if self.bind_compatible_schema(schema) => {
-                tracing::warn!(
-                    "schema reassertion for fully bound collection '{}' has no durable peer; proceeding with proven canonical identities: {}",
-                    schema.collection,
-                    error
-                );
-                self.model_id_for_schema(schema).ok_or_else(|| {
-                    RegistrationError::Retrieval(crate::error::RetrievalError::Other(format!(
-                        "compatible binding for '{}' did not retain its exact model identity",
-                        schema.collection
-                    )))
-                })
-            }
-            Err(error) => Err(error),
         }
     }
 
@@ -854,47 +654,24 @@ where
         }
     }
 
-    /// TEST ONLY: seed deterministic catalog rows and admit their exact
-    /// compiled-schema binding without writing catalog entities.
-    ///
-    /// Deterministic protocol simulators forge stable entity, model, and
-    /// property identities so two runs have byte-identical traces. They cannot
-    /// use the production allocator, whose fresh ULIDs would intentionally
-    /// differ between runs. This helper preserves the production completeness
-    /// invariant—[`crate::schema::CatalogResolver::model_properties`] becomes
-    /// available only after the supplied rows prove every field in `schema`—
-    /// while making the fixture's deliberate storage bypass explicit.
-    #[cfg(feature = "test-helpers")]
-    pub fn seed_registered_schema(
-        &self,
-        schema: &'static ModelSchema,
-        models: &[proto::RegisteredModel],
-        properties: &[proto::RegisteredProperty],
-        memberships: &[proto::RegisteredMembership],
-    ) -> Result<(), RegistrationError> {
-        self.upsert_registered(models, properties, memberships);
-        self.mark_schema_ensured(schema, models, properties, memberships)
-    }
-
-    /// RFC 5.2 model first-use registration ("ensure registration"). Called
-    /// on mutating paths before a write and by typed predicate reads before
-    /// name resolution. An existing schema resolves to a no-op plan, so the
-    /// common read-path case emits nothing and skips the policy verb while the
-    /// response feeds the map. Fast-returns only if this exact compiled schema
-    /// shape is already ensured in this process, then durably registers:
+    /// RFC 5.2 "ensure registration". Called by explicit
+    /// [`crate::context::Context::register`] this phase; the automatic
+    /// mutation/predicate triggers arrive with the propertyid-resolution PR.
+    /// An existing schema resolves to a no-op plan, so re-asserting emits
+    /// nothing and skips the policy verb while the response feeds the map.
+    /// Fast-returns only if this exact compiled schema shape is already
+    /// ensured in this process, then durably registers:
     ///
     /// - DURABLE node: execute the registration locally
     ///   ([`Node::execute_schema_registration`], which updates the map
     ///   itself under the allocator mutex); latch on Ok.
-    /// - EPHEMERAL node with a durable peer: forward RegisterSchema, consume
-    ///   the SchemaRegistered response into the map (binding and id-keyed
-    ///   writes proceed immediately, ahead of the catalog subscription);
-    ///   latch on Ok.
+    /// - EPHEMERAL node with a durable peer: forward RegisterSchema and
+    ///   consume the SchemaRegistered response into the map; latch on Ok.
     /// - EPHEMERAL node with NO durable peer: registration is impossible
     ///   without the allocator, so this returns
-    ///   [`RegistrationError::NoDurablePeer`] without latching. The automatic
-    ///   caller may proceed only if the local catalog proves the exact model
-    ///   and every field's compatible canonical binding.
+    ///   [`RegistrationError::NoDurablePeer`] without latching. (The
+    ///   resolution PR's automatic caller adds a fallback that proceeds when
+    ///   the local catalog proves every field's compatible binding.)
     ///
     /// Every error path returns WITHOUT latching, so a later attempt
     /// retries.
@@ -987,10 +764,6 @@ where
             .unwrap()
             .get(schema.collection)
             .is_some_and(|bindings| bindings.iter().any(|known| known.confirmed && *known.schema == *schema))
-    }
-
-    pub(crate) fn has_schema_binding(&self, schema: &ModelSchema) -> bool {
-        self.0.ensured.read().unwrap().get(schema.collection).is_some_and(|bindings| bindings.iter().any(|known| *known.schema == *schema))
     }
 
     fn mark_schema_ensured(

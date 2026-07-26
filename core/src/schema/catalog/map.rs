@@ -1,12 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ModelId;
-use ankurah_proto::{self as proto, EntityId, PropertyId};
+use ankurah_proto::{self as proto, EntityId};
 
 use crate::{
-    entity::Entity,
     property::backend::{LWWBackend, PropertyBackend},
-    reactor::AbstractEntity,
     schema::{model_collection, model_property_collection, property_collection, ModelSchema},
     value::Value,
 };
@@ -74,17 +72,6 @@ pub(super) struct CatalogMapInner {
 }
 
 impl CatalogMapInner {
-    /// Return the durable properties currently associated with `model`.
-    pub(super) fn properties_for_model(&self, model: &EntityId) -> Vec<PropertyId> {
-        self.model_memberships
-            .get(model)
-            .into_iter()
-            .flatten()
-            .filter_map(|membership_id| self.memberships.get(membership_id))
-            .map(|membership| PropertyId::EntityId(membership.property))
-            .collect()
-    }
-
     pub(super) fn clear(&mut self) {
         self.properties.clear();
         self.models.clear();
@@ -94,32 +81,10 @@ impl CatalogMapInner {
         self.names_global.clear();
     }
 
-    pub(super) fn upsert(&mut self, collection: &ModelId, entity: &Entity) {
-        let id = *AbstractEntity::id(entity);
-        if *collection == model_collection() {
-            if let Some(def) = parse_model(entity, id) {
-                self.upsert_model(def);
-            }
-        } else if *collection == property_collection() {
-            if let Some(def) = parse_property(entity, id) {
-                self.upsert_property(def);
-            }
-        } else if *collection == model_property_collection() {
-            if let Some(def) = parse_membership(entity, id) {
-                self.upsert_membership(def);
-            }
-        }
-    }
-
-    pub(super) fn remove(&mut self, collection: &ModelId, id: &EntityId) {
-        if *collection == model_collection() {
-            self.remove_model(id);
-        } else if *collection == property_collection() {
-            self.remove_property(id);
-        } else if *collection == model_property_collection() {
-            self.remove_membership(id);
-        }
-    }
+    // The live-Entity upsert/remove surface (reactor updates parsed through
+    // AbstractEntity, including de-indexing on catalog entity removal)
+    // returns with the read flip's reactor feed; state-buffer parsing below
+    // serves the durable warm.
 
     pub(super) fn upsert_model(&mut self, def: ModelDef) {
         if let Some(old) = self.models.get(&def.id) {
@@ -131,26 +96,12 @@ impl CatalogMapInner {
         self.models.insert(def.id, def);
     }
 
-    fn remove_model(&mut self, id: &EntityId) {
-        if let Some(def) = self.models.remove(id) {
-            if self.by_label.get(&def.label) == Some(id) {
-                self.by_label.remove(&def.label);
-            }
-        }
-    }
-
     pub(super) fn upsert_property(&mut self, def: PropertyDef) {
         if let Some(old) = self.properties.get(&def.id).cloned() {
             self.deindex_property_names(&old);
         }
         self.names_global.entry(def.name.clone()).or_default().insert(def.id);
         self.properties.insert(def.id, def);
-    }
-
-    fn remove_property(&mut self, id: &EntityId) {
-        if let Some(def) = self.properties.remove(id) {
-            self.deindex_property_names(&def);
-        }
     }
 
     pub(super) fn upsert_membership(&mut self, def: MembershipDef) {
@@ -166,17 +117,6 @@ impl CatalogMapInner {
         }
         self.model_memberships.entry(def.model).or_default().insert(def.id);
         self.memberships.insert(def.id, def);
-    }
-
-    fn remove_membership(&mut self, id: &EntityId) {
-        if let Some(def) = self.memberships.remove(id) {
-            if let Some(set) = self.model_memberships.get_mut(&def.model) {
-                set.remove(id);
-                if set.is_empty() {
-                    self.model_memberships.remove(&def.model);
-                }
-            }
-        }
     }
 
     fn deindex_property_names(&mut self, def: &PropertyDef) {
@@ -224,53 +164,6 @@ impl CatalogMapInner {
             (membership.property == *property).then(|| membership.clone())
         })
     }
-}
-
-fn field_string(entity: &Entity, field: &str) -> Option<String> {
-    match AbstractEntity::value(entity, field) {
-        Some(Value::String(value)) => Some(value),
-        _ => None,
-    }
-}
-
-fn field_entity_id(entity: &Entity, field: &str) -> Option<EntityId> {
-    match AbstractEntity::value(entity, field) {
-        Some(Value::EntityId(value)) => Some(value),
-        _ => None,
-    }
-}
-
-fn field_bool(entity: &Entity, field: &str) -> Option<bool> {
-    match AbstractEntity::value(entity, field) {
-        Some(Value::Bool(value)) => Some(value),
-        _ => None,
-    }
-}
-
-fn parse_model(entity: &Entity, id: EntityId) -> Option<ModelDef> {
-    let label = field_string(entity, "label")?;
-    let name = field_string(entity, "name").unwrap_or_else(|| label.clone());
-    Some(ModelDef { id, label, name })
-}
-
-fn parse_property(entity: &Entity, id: EntityId) -> Option<PropertyDef> {
-    Some(PropertyDef {
-        id,
-        minted_for: field_entity_id(entity, "minted_for"),
-        name: field_string(entity, "name")?,
-        backend: field_string(entity, "backend")?,
-        value_type: field_string(entity, "value_type")?,
-        target_model: field_entity_id(entity, "target_model"),
-    })
-}
-
-fn parse_membership(entity: &Entity, id: EntityId) -> Option<MembershipDef> {
-    Some(MembershipDef {
-        id,
-        model: field_entity_id(entity, "model")?,
-        property: field_entity_id(entity, "property")?,
-        optional: field_bool(entity, "optional"),
-    })
 }
 
 pub(super) fn parse_state(collection: &ModelId, id: EntityId, state: &proto::EntityState) -> Option<Entry> {
