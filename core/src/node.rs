@@ -1,3 +1,4 @@
+use crate::schema::catalog::CatalogManager;
 use crate::selection::filter::Filterable;
 use ankurah_proto::{self as proto, Attested, CollectionId, EntityState};
 use anyhow::anyhow;
@@ -146,6 +147,10 @@ where PA: PolicyAgent
     pub(crate) policy_agent: PA,
     pub system: SystemManager<SE, PA>,
 
+    /// The metadata catalog map (write-only in this phase: registration
+    /// maintains it; nothing resolves through it yet).
+    pub catalog: CatalogManager<SE, PA>,
+
     pub(crate) subscription_relay: Option<SubscriptionRelay<PA::ContextData, crate::livequery::WeakEntityLiveQuery>>,
 
     /// Type resolver for AST preparation (temporary heuristic until Phase 3 schema)
@@ -173,13 +178,14 @@ where
     }
 
     fn build(engine: Arc<SE>, policy_agent: PA, durable: bool, rng: SmallRng) -> Self {
-        let collections = CollectionSet::new(engine);
+        let collections = CollectionSet::new(engine.clone());
         let entityset: WeakEntitySet = Default::default();
         let id = proto::EntityId::new();
         let reactor = Reactor::new();
         notice_info!("Node {id:#} created as {}", if durable { "durable" } else { "ephemeral" });
 
         let system_manager = SystemManager::new(collections.clone(), entityset.clone(), reactor.clone(), durable);
+        let catalog = CatalogManager::new(engine, reactor.clone(), durable);
 
         // Only ephemeral nodes relay subscriptions upstream to a durable peer.
         let subscription_relay = if durable { None } else { Some(SubscriptionRelay::new()) };
@@ -195,6 +201,7 @@ where
             durable,
             policy_agent,
             system: system_manager,
+            catalog: catalog.clone(),
             predicate_context: SafeMap::new(),
             subscription_relay,
             type_resolver: crate::TypeResolver::new(),
@@ -209,6 +216,7 @@ where
         }
 
         node.policy_agent.on_node_ready(node.weak());
+        node.catalog.start(node.weak());
 
         node
     }
@@ -436,6 +444,17 @@ where
                 let cdata = cdata.iterable().exactly_one().map_err(|_| anyhow!("Only one cdata is permitted for CommitTransaction"))?;
                 match self.commit_remote_transaction(cdata, id.clone(), events).await {
                     Ok(_) => Ok(proto::NodeResponseBody::CommitComplete { id }),
+                    Err(e) => Ok(proto::NodeResponseBody::Error(e.to_string())),
+                }
+            }
+            proto::NodeRequestBody::RegisterSchema { models, properties, memberships } => {
+                let cdata = cdata.iterable().exactly_one().map_err(|_| anyhow!("Only one cdata is permitted for RegisterSchema"))?;
+                match self.execute_schema_registration(cdata, models, properties, memberships).await {
+                    // The resolved definitions ARE the response (RFC 5.2):
+                    // the requester folds them into its catalog map on ack.
+                    Ok((models, properties, memberships)) => {
+                        Ok(proto::NodeResponseBody::SchemaRegistered { models, properties, memberships })
+                    }
                     Err(e) => Ok(proto::NodeResponseBody::Error(e.to_string())),
                 }
             }

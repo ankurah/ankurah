@@ -43,8 +43,9 @@ use crate::node::Node;
 use crate::policy::{AccessDenied, PlannedMembership, PlannedUpdate, PolicyAgent, RegistrationPlan};
 use crate::property::backend::{LWWBackend, PropertyBackend};
 use crate::storage::StorageEngine;
-use crate::value::{Value, ValueType};
+use crate::value::Value;
 use crate::ModelId;
+use ankurah_core_types::ValueType;
 
 use super::{model_collection, model_property_collection, property_collection};
 
@@ -272,7 +273,7 @@ where
                                 from: Some(Value::String(def.name.clone())),
                                 to: Some(Value::String(m.name.clone())),
                             });
-                            push(follow_up(def.id, head, vec![("name", Value::String(m.name.clone()))]));
+                            push(follow_up(model_collection(), def.id, head, vec![("name", Value::String(m.name.clone()))]));
                         } else {
                             plan.existing.push(def.id);
                         }
@@ -428,7 +429,7 @@ where
                             .catalog_entity_snapshot(def.id, &property_collection())
                             .await?
                             .ok_or_else(|| RetrievalError::Other(format!("catalog map holds property {} absent from storage", def.id)))?;
-                        push(follow_up_patch(def.id, head, fields));
+                        push(follow_up_patch(property_collection(), def.id, head, fields));
                     }
                     def.id
                 }
@@ -458,7 +459,7 @@ where
                         .catalog_entity_snapshot(def.id, &property_collection())
                         .await?
                         .ok_or_else(|| RetrievalError::Other(format!("catalog map holds property {} absent from storage", def.id)))?;
-                    push(follow_up_patch(def.id, head, fields));
+                    push(follow_up_patch(property_collection(), def.id, head, fields));
                     def.id
                 }
                 (None, None) => {
@@ -543,7 +544,7 @@ where
                             from: def.optional.map(Value::Bool),
                             to: Some(Value::Bool(ms.optional)),
                         });
-                        push(follow_up(def.id, head, vec![("optional", Value::Bool(ms.optional))]));
+                        push(follow_up(model_property_collection(), def.id, head, vec![("optional", Value::Bool(ms.optional))]));
                     } else {
                         plan.existing.push(def.id);
                     }
@@ -695,7 +696,7 @@ where
     ) -> Result<Option<(EntityId, BTreeMap<String, Option<Value>>)>, RetrievalError> {
         let selection = ankql::ast::Selection { predicate, order_by: None, limit: None };
         let mut best: Option<(EntityId, BTreeMap<String, Option<Value>>)> = None;
-        for state in self.storage.fetch_states(&collection, &selection).await? {
+        for state in self.collections.get(&catalog_collection_id(collection)).await?.fetch_states(&selection).await? {
             let id = state.payload.entity_id;
             if best.as_ref().is_some_and(|(b, _)| *b <= id) {
                 continue;
@@ -770,12 +771,15 @@ where
         id: EntityId,
         expected_model: &ModelId,
     ) -> Result<Option<(BTreeMap<String, Option<Value>>, proto::Clock)>, RetrievalError> {
-        let state = match self.storage.get_state(id).await {
+        let state = match self.collections.get(&catalog_collection_id(*expected_model)).await?.get_state(id).await {
             Ok(state) => state,
             Err(RetrievalError::EntityNotFound(_)) => return Ok(None),
             Err(e) => return Err(e),
         };
-        if !state.payload.state.memberships.contains(expected_model) {
+        // Per-collection storage already scopes the read; keep the routing
+        // check anyway so a mis-filed id reads as absent rather than as a
+        // definition of the wrong kind.
+        if state.payload.collection != catalog_collection_id(*expected_model) {
             return Ok(None);
         }
         let head = state.payload.state.head.clone();
@@ -880,11 +884,24 @@ fn entity_id_field(values: &BTreeMap<String, Option<Value>>, field: &str) -> Opt
     }
 }
 
+/// The storage collection for a catalog model: the event's routing
+/// materialization in this write-only phase, always derived from the same
+/// model the membership operation asserts.
+fn catalog_collection_id(model: ModelId) -> proto::CollectionId {
+    match model {
+        ModelId::System(system) => proto::CollectionId::fixed_name(crate::schema::system_collection_label(system)),
+        ModelId::EntityId(_) => unreachable!("catalog collections are system models"),
+    }
+}
+
 /// A creation event: full definition state, empty parent clock. Ordinary
 /// in every respect (RFC 5.1: no frozen encoder; catalog collections stay
 /// name-keyed at the backend layer permanently, the bootstrap exemption).
+/// The genesis membership operation is the authority for the entity's model;
+/// the event's collection field is the routing materialization of the same
+/// fact.
 fn creation(model: ModelId, entity_id: EntityId, fields: Vec<(&str, Value)>) -> proto::Event {
-    let mut event = follow_up(entity_id, proto::Clock::default(), fields);
+    let mut event = follow_up(model, entity_id, proto::Clock::default(), fields);
     event.operations.push(Operation::Membership(Membership::Add(model)));
     event
 }
@@ -892,19 +909,24 @@ fn creation(model: ModelId, entity_id: EntityId, fields: Vec<(&str, Value)>) -> 
 /// A follow-up event carrying changed metadata, parented at the entity's
 /// current head. It must descend the metadata it supersedes so LWW recency
 /// decides, not the concurrent tiebreak.
-fn follow_up(entity_id: EntityId, parent: proto::Clock, fields: Vec<(&str, Value)>) -> proto::Event {
-    follow_up_patch(entity_id, parent, fields.into_iter().map(|(name, value)| (name, Some(value))).collect())
+fn follow_up(model: ModelId, entity_id: EntityId, parent: proto::Clock, fields: Vec<(&str, Value)>) -> proto::Event {
+    follow_up_patch(model, entity_id, parent, fields.into_iter().map(|(name, value)| (name, Some(value))).collect())
 }
 
 /// A metadata follow-up that may clear fields as well as replace them.
-fn follow_up_patch(entity_id: EntityId, parent: proto::Clock, fields: Vec<(&str, Option<Value>)>) -> proto::Event {
+fn follow_up_patch(model: ModelId, entity_id: EntityId, parent: proto::Clock, fields: Vec<(&str, Option<Value>)>) -> proto::Event {
     let backend = LWWBackend::new();
     for (name, value) in fields {
         let property = SystemProperty::from_name(name).expect("catalog event fields are closed SystemProperty variants");
         backend.set(property.to_string(), value);
     }
     let operations = backend.to_operations().expect("LWW encoding of scalar values is infallible").expect("fields are non-empty");
-    proto::Event { entity_id, operations: OperationSet::from_backends(BTreeMap::from([("lww".to_string(), operations)])), parent }
+    proto::Event {
+        collection: catalog_collection_id(model),
+        entity_id,
+        operations: OperationSet::from_backends(BTreeMap::from([("lww".to_string(), operations)])),
+        parent,
+    }
 }
 
 #[cfg(test)]

@@ -158,6 +158,7 @@ name = "ankurah-core"
 version = "0.9.0"
 dependencies = [
  "ankql",
+ "ankurah-core-types",
  "ankurah-derive",
  "ankurah-proto",
  "ankurah-signals",

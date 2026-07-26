@@ -1,7 +1,9 @@
 use ankurah_proto::{self as proto, Attested, CollectionId, EntityState, Event};
 use anyhow::{anyhow, Result};
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::marker::PhantomData;
+use std::pin::Pin;
 use std::sync::{Arc, OnceLock, RwLock};
 use tokio::sync::Notify;
 use tracing::{error, warn};
@@ -41,8 +43,22 @@ struct Inner<SE, PA> {
     loading: Notify,
     system_ready: RwLock<bool>,
     system_ready_notify: Notify,
+    /// Reset barrier installed by `CatalogManager::start`: begin invalidates
+    /// and drains catalog effects before deletion, finish clears catalog
+    /// state after system/reactor reset, and resume re-arms durable catalog
+    /// maintenance whenever the system becomes ready.
+    catalog_reset_hook: RwLock<Option<CatalogResetHook>>,
     reactor: Reactor,
     _phantom: PhantomData<PA>,
+}
+
+type CatalogResetFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+#[derive(Clone)]
+struct CatalogResetHook {
+    begin: Arc<dyn Fn() -> CatalogResetFuture + Send + Sync>,
+    finish: Arc<dyn Fn() + Send + Sync>,
+    resume: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl<SE, PA> SystemManager<SE, PA>
@@ -62,6 +78,7 @@ where
             collection_map: RwLock::new(BTreeMap::new()),
             system_ready: RwLock::new(false),
             system_ready_notify: Notify::new(),
+            catalog_reset_hook: RwLock::new(None),
             reactor,
             _phantom: PhantomData,
         }));
@@ -92,6 +109,17 @@ where
 
     /// Returns true if we've successfully initialized or joined a system
     pub fn is_system_ready(&self) -> bool { *self.0.system_ready.read().unwrap() }
+
+    /// Install the catalog reset barrier (called by `CatalogManager::start`).
+    /// SystemManager remains the sole owner of destructive storage deletion.
+    pub(crate) fn set_catalog_reset_hook(
+        &self,
+        begin: Arc<dyn Fn() -> CatalogResetFuture + Send + Sync>,
+        finish: Arc<dyn Fn() + Send + Sync>,
+        resume: Arc<dyn Fn() + Send + Sync>,
+    ) {
+        *self.0.catalog_reset_hook.write().unwrap() = Some(CatalogResetHook { begin, finish, resume });
+    }
 
     /// Waits until we've successfully initialized or joined a system
     pub async fn wait_system_ready(&self) {
@@ -147,6 +175,9 @@ where
 
         // Mark system as ready and notify waiters
         *self.0.system_ready.write().unwrap() = true;
+        if let Some(hook) = self.0.catalog_reset_hook.read().unwrap().clone() {
+            (hook.resume)();
+        }
         self.0.system_ready_notify.notify_waiters();
 
         Ok(())
@@ -170,6 +201,9 @@ where
             if root.payload.state.head == state.payload.state.head {
                 notice_info!("Found matching root - Node is part of the same system");
                 *self.0.system_ready.write().unwrap() = true;
+                if let Some(hook) = self.0.catalog_reset_hook.read().unwrap().clone() {
+                    (hook.resume)();
+                }
                 self.0.system_ready_notify.notify_waiters();
                 return Ok(());
             }
@@ -197,6 +231,9 @@ where
             *root = Some(state);
         }
         *self.0.system_ready.write().unwrap() = true;
+        if let Some(hook) = self.0.catalog_reset_hook.read().unwrap().clone() {
+            (hook.resume)();
+        }
         self.0.system_ready_notify.notify_waiters();
 
         Ok(())
@@ -206,6 +243,13 @@ where
     /// This is used when an ephemeral node needs to join a system with a different root.
     /// **This is a destructive operation and should be used with extreme caution.**
     pub async fn hard_reset(&self) -> Result<()> {
+        // Refuse new catalog effects and wait out admitted ones before any
+        // deletion, so nothing applies across the wipe.
+        let catalog_reset_hook = self.0.catalog_reset_hook.read().unwrap().clone();
+        if let Some(hook) = &catalog_reset_hook {
+            (hook.begin)().await;
+        }
+
         // Delete all collections from storage
         self.0.collectionset.delete_all_collections().await?;
 
@@ -229,6 +273,10 @@ where
 
         // Reset the reactor state to notify subscriptions
         self.0.reactor.system_reset();
+
+        if let Some(hook) = &catalog_reset_hook {
+            (hook.finish)();
+        }
 
         Ok(())
     }
@@ -293,6 +341,9 @@ where
         // Ephemeral nodes must explicitly join via join_system()
         if has_root && self.0.durable {
             *self.0.system_ready.write().unwrap() = true;
+            if let Some(hook) = self.0.catalog_reset_hook.read().unwrap().clone() {
+                (hook.resume)();
+            }
             self.0.system_ready_notify.notify_waiters();
         }
 

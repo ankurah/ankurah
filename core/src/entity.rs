@@ -349,14 +349,14 @@ impl Entity {
                         for layer in all_layers {
                             // Check for backends that first appear in this layer's to_apply events
                             for evt in &layer.to_apply {
-                                for (backend_name, _) in evt.operations.iter() {
+                                for (backend_name, _) in evt.operations.backends() {
                                     if !state.backends.contains_key(backend_name) {
                                         let backend = backend_from_string(backend_name, None)?;
                                         // Replay earlier layers for this newly-created backend
                                         for earlier in &applied_layers {
                                             backend.apply_layer(earlier)?;
                                         }
-                                        state.backends.insert(backend_name.clone(), backend);
+                                        state.backends.insert(backend_name.to_owned(), backend);
                                     }
                                 }
                             }

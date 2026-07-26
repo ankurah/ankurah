@@ -119,12 +119,31 @@ pub struct EntityDelta {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum NodeRequestBody {
     // Request that the Events to be committed on the remote node
-    CommitTransaction { id: TransactionId, events: Vec<Attested<Event>> },
+    CommitTransaction {
+        id: TransactionId,
+        events: Vec<Attested<Event>>,
+    },
     // Request to fetch entities matching a predicate
-    Get { collection: CollectionId, ids: Vec<EntityId> },
-    GetEvents { collection: CollectionId, event_ids: Vec<EventId> },
-    Fetch { collection: CollectionId, selection: ast::Selection, known_matches: Vec<KnownEntity> },
-    SubscribeQuery { query_id: QueryId, collection: CollectionId, selection: ast::Selection, version: u32, known_matches: Vec<KnownEntity> },
+    Get {
+        collection: CollectionId,
+        ids: Vec<EntityId>,
+    },
+    GetEvents {
+        collection: CollectionId,
+        event_ids: Vec<EventId>,
+    },
+    Fetch {
+        collection: CollectionId,
+        selection: ast::Selection,
+        known_matches: Vec<KnownEntity>,
+    },
+    SubscribeQuery {
+        query_id: QueryId,
+        collection: CollectionId,
+        selection: ast::Selection,
+        version: u32,
+        known_matches: Vec<KnownEntity>,
+    },
     /// Register schema definitions (RFC 5.2): an UPSERT the durable node
     /// executes under a process-local mutex. Carries everything the durable
     /// side needs: the receiver policy-checks, looks each definition up by
@@ -134,7 +153,11 @@ pub enum NodeRequestBody {
     /// definitions. Idempotent as an upsert: a repeat registration finds
     /// every key, emits zero events, and returns the same ids. The catalog
     /// collections are not writable any other way.
-    RegisterSchema { models: Vec<ModelDescriptor>, properties: Vec<PropertyDescriptor>, memberships: Vec<MembershipDescriptor> },
+    RegisterSchema {
+        models: Vec<ModelDescriptor>,
+        properties: Vec<PropertyDescriptor>,
+        memberships: Vec<MembershipDescriptor>,
+    },
 }
 
 /// A model definition to register.
@@ -266,16 +289,25 @@ pub struct NodeResponse {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum NodeResponseBody {
     // Response to CommitEvents
-    CommitComplete { id: TransactionId },
+    CommitComplete {
+        id: TransactionId,
+    },
     Fetch(Vec<EntityDelta>),
     Get(Vec<Attested<EntityState>>),
     GetEvents(Vec<Attested<Event>>),
-    QuerySubscribed { query_id: QueryId, deltas: Vec<EntityDelta> },
+    QuerySubscribed {
+        query_id: QueryId,
+        deltas: Vec<EntityDelta>,
+    },
     /// Response to RegisterSchema (RFC 5.2): the full resolved definitions,
     /// ids included -- allocated on this execution or already existing. The
     /// requester upserts these into its catalog map immediately on ack, so
     /// catalog maintenance proceeds without waiting for replication.
-    SchemaRegistered { models: Vec<RegisteredModel>, properties: Vec<RegisteredProperty>, memberships: Vec<RegisteredMembership> },
+    SchemaRegistered {
+        models: Vec<RegisteredModel>,
+        properties: Vec<RegisteredProperty>,
+        memberships: Vec<RegisteredMembership>,
+    },
     Success,
     Error(String),
 }
