@@ -211,6 +211,13 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
 #[cfg(feature = "wasm")]
 #[wasm_bindgen]
 impl Context {
+    #[wasm_bindgen(js_name = "node_id")]
+    pub fn js_node_id(&self) -> proto::EntityId { self.0.node_id() }
+}
+
+// Generic methods cannot cross the wasm_bindgen boundary; they live in this
+// plain impl and remain host-and-wasm callable from Rust.
+impl Context {
     /// RFC 5.2 eager explicit registration (STRICT form): register `M`'s
     /// model, properties, and memberships now, propagating any error. Useful
     /// at startup so the catalog holds `M`'s definitions before anything
@@ -218,9 +225,6 @@ impl Context {
     pub async fn register<M: crate::model::Model>(&self) -> Result<proto::ModelId, crate::schema::registration::RegistrationError> {
         self.0.register_strict(M::schema()).await
     }
-
-    #[wasm_bindgen(js_name = "node_id")]
-    pub fn js_node_id(&self) -> proto::EntityId { self.0.node_id() }
 }
 
 // This impl may or may not have the wasm_bindgen attribute but the functions will always be defined
