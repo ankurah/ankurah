@@ -115,6 +115,14 @@ impl WeakEntity {
 /// entity-to-model membership (membership change events arrive in a later
 /// protocol revision); the collection field is its routing materialization,
 /// so a disagreement is a malformed event, refused before any state applies.
+///
+/// This write-only phase, only catalog entities carry the operation: their
+/// creator is the allocator and knows the ids it minted. App entities gain
+/// their genesis membership with the propertyid-resolution PR, where
+/// creation resolves the collection's registered ModelId to assert; the
+/// model==collection check then widens from the built-in mapping to the
+/// resolved one. Until that emitter exists, an op in an app collection has
+/// no legitimate author and is refused outright.
 /// (Distinct vocabulary: the catalog's CONTRACT-memberships are
 /// property-to-model records, `_ankurah_model_property`.)
 fn validate_membership_operations(event: &Event) -> Result<(), MutationError> {
