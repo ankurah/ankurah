@@ -19,12 +19,20 @@
 pub mod catalog;
 pub mod local;
 pub mod registration;
-mod resolver;
 
 pub use local::{registration_request, FieldSchema, ModelSchema};
-pub use resolver::CatalogResolver;
 
 use ankurah_proto::{ModelId, SystemModel};
+
+use crate::property::PropertyError;
+use crate::value::ValueType;
+use ankql::ast::PathExpr;
+
+/// Trait for providing schema information about collections
+pub trait CollectionSchema {
+    /// Get the ValueType for a given field path
+    fn field_type(&self, path: &PathExpr) -> Result<ValueType, PropertyError>;
+}
 
 /// The metadata catalog collections (specs/model-property-metadata/rfc.md
 /// section 4). Catalog entities are SYSTEM MODELS: raw Entity/backend
