@@ -121,6 +121,15 @@ where
         *self.0.catalog_reset_hook.write().unwrap() = Some(CatalogResetHook { begin, finish, resume });
     }
 
+    /// Re-arm epoch-bound catalog maintenance; called at every
+    /// system-becomes-ready transition (create, load, join, and the
+    /// matching-root fast path).
+    fn resume_catalog(&self) {
+        if let Some(hook) = self.0.catalog_reset_hook.read().unwrap().clone() {
+            (hook.resume)();
+        }
+    }
+
     /// Waits until we've successfully initialized or joined a system
     pub async fn wait_system_ready(&self) {
         if !self.is_system_ready() {
@@ -175,9 +184,7 @@ where
 
         // Mark system as ready and notify waiters
         *self.0.system_ready.write().unwrap() = true;
-        if let Some(hook) = self.0.catalog_reset_hook.read().unwrap().clone() {
-            (hook.resume)();
-        }
+        self.resume_catalog();
         self.0.system_ready_notify.notify_waiters();
 
         Ok(())
@@ -201,9 +208,7 @@ where
             if root.payload.state.head == state.payload.state.head {
                 notice_info!("Found matching root - Node is part of the same system");
                 *self.0.system_ready.write().unwrap() = true;
-                if let Some(hook) = self.0.catalog_reset_hook.read().unwrap().clone() {
-                    (hook.resume)();
-                }
+                self.resume_catalog();
                 self.0.system_ready_notify.notify_waiters();
                 return Ok(());
             }
@@ -231,9 +236,7 @@ where
             *root = Some(state);
         }
         *self.0.system_ready.write().unwrap() = true;
-        if let Some(hook) = self.0.catalog_reset_hook.read().unwrap().clone() {
-            (hook.resume)();
-        }
+        self.resume_catalog();
         self.0.system_ready_notify.notify_waiters();
 
         Ok(())
@@ -341,9 +344,7 @@ where
         // Ephemeral nodes must explicitly join via join_system()
         if has_root && self.0.durable {
             *self.0.system_ready.write().unwrap() = true;
-            if let Some(hook) = self.0.catalog_reset_hook.read().unwrap().clone() {
-                (hook.resume)();
-            }
+            self.resume_catalog();
             self.0.system_ready_notify.notify_waiters();
         }
 
