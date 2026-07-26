@@ -46,6 +46,10 @@ impl<T: Property> LWW<T> {
     pub fn get_value(&self) -> Option<Value> { self.backend.get(&self.property_name) }
 }
 
+impl<T: Property> crate::property::traits::ActiveType for LWW<T> {
+    const BACKEND: &'static str = "lww";
+}
+
 impl<T: Property> FromEntity for LWW<T> {
     fn from_entity(property_name: PropertyName, entity: &Entity) -> Self {
         let backend = entity.get_backend::<LWWBackend>().expect("LWW Backend should exist");

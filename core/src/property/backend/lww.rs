@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, Mutex, RwLock},
 };
 
-use ankurah_proto::{EventId, Operation};
+use ankurah_proto::{BackendOperation as Operation, EventId};
 use ankurah_signals::signal::Listener;
 use serde::{Deserialize, Serialize};
 
@@ -251,8 +251,8 @@ impl PropertyBackend for LWWBackend {
 
         // Add candidates from events in this layer.
         for (event, from_to_apply) in layer.already_applied.iter().map(|e| (e, false)).chain(layer.to_apply.iter().map(|e| (e, true))) {
-            if let Some(operations) = event.operations.get(&Self::property_backend_name().to_string()) {
-                for operation in operations {
+            {
+                for operation in event.operations.backend_operations(Self::property_backend_name()) {
                     let LWWDiff { version, data } = bincode::deserialize(&operation.diff)?;
                     match version {
                         1 => {

@@ -8,7 +8,7 @@
 //! the kit can graduate to a standalone test-support crate that external
 //! backend authors import directly.
 //!
-//! The property backend boundary (RFC ankurah#267) is a contract that any
+//! The property backend boundary is a contract that any
 //! implementation, including ones written outside this crate, must honor. This
 //! module encodes that contract as reusable property tests parameterized over a
 //! backend, so the laws run identically against every reference implementation
@@ -62,7 +62,7 @@
 //! # Constructible-state scope (`ValueEntry::Pending`)
 //!
 //! LWW carries a `ValueEntry::Pending` variant for wire-applied-but-uncommitted
-//! values. Its disposition is an open question bound to RFC ankurah#272 and the
+//! values. Its disposition is an open question bound to issue #272 and the
 //! ankurah#267 remainder, so the kit does not decide it and does not exercise it.
 //! Every law here drives backends only through their committed, event-tracked
 //! paths (`apply_operations_with_event`, `apply_layer`, `to_state_buffer`), which
@@ -86,7 +86,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use ankurah_proto::{Clock, EntityId, Event, EventId, Operation, OperationSet};
+use ankurah_proto::{BackendOperation as Operation, Clock, EntityId, Event, EventId, OperationSet};
 
 use crate::event_dag::EventLayer;
 use crate::property::backend::PropertyBackend;
@@ -154,7 +154,7 @@ fn make_event(seed: u16, backend_name: &str, operations: Vec<Operation>, parents
         entity_id,
         collection: "conformance".into(),
         parent: Clock::from(parents.to_vec()),
-        operations: OperationSet(BTreeMap::from([(backend_name.to_string(), operations)])),
+        operations: OperationSet::from_backends(BTreeMap::from([(backend_name.to_string(), operations)])),
     }
 }
 
@@ -254,7 +254,7 @@ pub(crate) fn law_operation_round_trip_across_nodes<B: ConformanceBackend>() {
 /// The split exists because provenance is where backends legitimately differ: the
 /// contract requires LWW to track the writing event (so `apply_layer` can resolve
 /// concurrent writes by causal dominance) but explicitly permits a CRDT to ignore
-/// it (RFC #267, `apply_operations_with_event` doc comment).
+/// it.
 pub(crate) fn law_provenance<B: ConformanceBackend>() {
     let write = B::linear_writes().into_iter().next().expect("linear_writes must be non-empty");
     let scratch = B::new_backend();
@@ -315,8 +315,9 @@ pub(crate) fn law_within_layer_permutation_invariance<B: ConformanceBackend>() {
     for perm in &permutations {
         let backend = B::new_backend();
         // Seed the root as committed state (the meet the layer branches from).
-        if let Some(ops) = root.operations.get(B::backend_name()) {
-            backend.apply_operations_with_event(ops, root.id()).expect("apply root");
+        let ops: Vec<_> = root.operations.backend_operations(B::backend_name()).cloned().collect();
+        if !ops.is_empty() {
+            backend.apply_operations_with_event(&ops, root.id()).expect("apply root");
         }
 
         let to_apply: Vec<&Event> = perm.iter().collect();
@@ -402,8 +403,9 @@ pub(crate) fn law_cross_order_determinism<B: ConformanceBackend>() {
 /// Apply the backend-relevant operations of `root` as committed state, so the
 /// root is the meet the subsequent layers branch from.
 fn apply_committed_root<B: ConformanceBackend>(backend: &Arc<dyn PropertyBackend>, root: &Event) {
-    if let Some(ops) = root.operations.get(B::backend_name()) {
-        backend.apply_operations_with_event(ops, root.id()).expect("apply committed root");
+    let ops: Vec<_> = root.operations.backend_operations(B::backend_name()).cloned().collect();
+    if !ops.is_empty() {
+        backend.apply_operations_with_event(&ops, root.id()).expect("apply committed root");
     }
 }
 
@@ -462,7 +464,7 @@ mod lww_conformance {
 
         fn check_provenance(backend: &Arc<dyn PropertyBackend>, event_id: &EventId) {
             // LWW must record the writing event id so apply_layer can later resolve
-            // concurrent writes by causal dominance (RFC #267).
+            // concurrent writes by causal dominance.
             let lww = backend.clone().as_arc_dyn_any().downcast::<LWWBackend>().expect("backend is LWW");
             let recorded = lww.get_event_id(&"title".to_string());
             assert_eq!(recorded.as_ref(), Some(event_id), "LWW must record the writing event id for provenance");
@@ -531,8 +533,9 @@ mod lww_conformance {
 
         // Apply earlier as committed state, then the later event via a layer.
         let backend: Arc<dyn PropertyBackend> = Arc::new(LWWBackend::new());
-        if let Some(ops) = earlier.operations.get(LwwAdopter::backend_name()) {
-            backend.apply_operations_with_event(ops, earlier.id()).unwrap();
+        let ops: Vec<_> = earlier.operations.backend_operations(LwwAdopter::backend_name()).cloned().collect();
+        if !ops.is_empty() {
+            backend.apply_operations_with_event(&ops, earlier.id()).unwrap();
         }
         backend.apply_layer(&layer).unwrap();
 
@@ -586,7 +589,7 @@ mod yrs_conformance {
         }
 
         // check_provenance: default no-op. Yrs is a CRDT and ignores the writing
-        // event id (RFC #267 permits this); it has no per-property provenance to
+        // event id; it has no per-property provenance to
         // assert.
     }
 

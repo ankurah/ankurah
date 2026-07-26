@@ -14,6 +14,12 @@ pub fn model_impl(model: &crate::model::description::ModelDescription) -> TokenS
         Err(e) => return e.into_compile_error(),
     };
 
+    // The compiled schema: static ModelStructDescriptor + fn schema().
+    let schema_method = match crate::model::schema::schema_impl(model) {
+        Ok(tokens) => tokens,
+        Err(e) => return e.into_compile_error(),
+    };
+
     // RefWrapper associated type for WASM builds
     let ref_wrapper_type = if cfg!(feature = "wasm") {
         let ref_name = format_ident!("{}Ref", name);
@@ -29,10 +35,12 @@ pub fn model_impl(model: &crate::model::description::ModelDescription) -> TokenS
             type View = #view_name;
             type Mutable = #mutable_name;
             #ref_wrapper_type
+            #schema_method
             fn collection() -> ankurah::proto::CollectionId {
                 #collection_str.into()
             }
-            fn initialize_new_entity(&self, entity: &::ankurah::entity::Entity) {
+            fn initialize_new_entity(&self, entity: &::ankurah::entity::Entity, model_id: ::ankurah::proto::ModelId) {
+                entity.add_membership(model_id);
                 use ::ankurah::property::InitializeWith;
                 #(
                     #active_field_types_turbofish::initialize_with(&entity, #active_field_name_strs.into(), &self.#active_field_names);
