@@ -50,7 +50,7 @@ fn make_test_event(seed: u8, parent_ids: &[EventId]) -> Event {
     entity_id_bytes[0] = seed;
     let entity_id = EntityId::from_bytes(entity_id_bytes);
 
-    Event { entity_id, collection: "test".into(), parent: Clock::from(parent_ids.to_vec()), operations: OperationSet(BTreeMap::new()) }
+    Event { entity_id, collection: "test".into(), parent: Clock::from(parent_ids.to_vec()), operations: OperationSet::default() }
 }
 
 /// Like make_test_event but with a two-byte seed, for tests that need a wide
@@ -59,7 +59,7 @@ fn make_test_event_u16(seed: u16, parent_ids: &[EventId]) -> Event {
     let mut entity_id_bytes = [0u8; 16];
     entity_id_bytes[0..2].copy_from_slice(&seed.to_be_bytes());
     let entity_id = EntityId::from_bytes(entity_id_bytes);
-    Event { entity_id, collection: "test".into(), parent: Clock::from(parent_ids.to_vec()), operations: OperationSet(BTreeMap::new()) }
+    Event { entity_id, collection: "test".into(), parent: Clock::from(parent_ids.to_vec()), operations: OperationSet::default() }
 }
 
 /// Create a Clock from EventIds without consuming them.
@@ -86,7 +86,7 @@ fn make_lww_event(seed: u8, properties: Vec<(&str, &str)>) -> Event {
         entity_id,
         collection: "test".into(),
         parent: Clock::default(),
-        operations: OperationSet(BTreeMap::from([("lww".to_string(), ops)])),
+        operations: OperationSet::from_backends(BTreeMap::from([("lww".to_string(), ops)])),
     }
 }
 
@@ -1345,7 +1345,7 @@ mod yrs_layer_tests {
             entity_id,
             collection: "test".into(),
             parent: Clock::default(),
-            operations: OperationSet(BTreeMap::from([("yrs".to_string(), ops)])),
+            operations: OperationSet::from_backends(BTreeMap::from([("yrs".to_string(), ops)])),
         }
     }
 
@@ -1581,7 +1581,7 @@ mod edge_case_tests {
             entity_id,
             collection: "test".into(),
             parent: Clock::default(),
-            operations: OperationSet(BTreeMap::new()), // No operations
+            operations: OperationSet::default(), // No operations
         };
 
         let already_applied: Vec<&Event> = vec![];
@@ -1647,7 +1647,7 @@ mod edge_case_tests {
             entity_id,
             collection: "test".into(),
             parent: Clock::default(),
-            operations: OperationSet(BTreeMap::from([("lww".to_string(), ops)])),
+            operations: OperationSet::from_backends(BTreeMap::from([("lww".to_string(), ops)])),
         };
 
         backend.apply_layer(&layer_from_refs_with_context(&[], &[&delete_event], &[&init_event])).unwrap();
@@ -1820,7 +1820,7 @@ mod phase4_duplicate_creation {
             entity_id,
             collection: "test".into(),
             parent: Clock::default(), // empty parent = creation event
-            operations: OperationSet(BTreeMap::from([("lww".to_string(), ops)])),
+            operations: OperationSet::from_backends(BTreeMap::from([("lww".to_string(), ops)])),
         }
     }
 
@@ -2959,7 +2959,7 @@ mod entity_change_batches {
         Event {
             entity_id,
             collection: "test".into(),
-            operations: OperationSet(BTreeMap::from([("lww".to_string(), ops)])),
+            operations: OperationSet::from_backends(BTreeMap::from([("lww".to_string(), ops)])),
             parent: Clock::from(parent_ids.to_vec()),
         }
     }

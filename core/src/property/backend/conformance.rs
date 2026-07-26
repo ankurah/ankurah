@@ -86,7 +86,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use ankurah_proto::{Clock, EntityId, Event, EventId, Operation, OperationSet};
+use ankurah_proto::{BackendOperation as Operation, Clock, EntityId, Event, EventId, OperationSet};
 
 use crate::event_dag::EventLayer;
 use crate::property::backend::PropertyBackend;
@@ -154,7 +154,7 @@ fn make_event(seed: u16, backend_name: &str, operations: Vec<Operation>, parents
         entity_id,
         collection: "conformance".into(),
         parent: Clock::from(parents.to_vec()),
-        operations: OperationSet(BTreeMap::from([(backend_name.to_string(), operations)])),
+        operations: OperationSet::from_backends(BTreeMap::from([(backend_name.to_string(), operations)])),
     }
 }
 
@@ -315,8 +315,9 @@ pub(crate) fn law_within_layer_permutation_invariance<B: ConformanceBackend>() {
     for perm in &permutations {
         let backend = B::new_backend();
         // Seed the root as committed state (the meet the layer branches from).
-        if let Some(ops) = root.operations.get(B::backend_name()) {
-            backend.apply_operations_with_event(ops, root.id()).expect("apply root");
+        let ops: Vec<_> = root.operations.backend_operations(B::backend_name()).cloned().collect();
+        if !ops.is_empty() {
+            backend.apply_operations_with_event(&ops, root.id()).expect("apply root");
         }
 
         let to_apply: Vec<&Event> = perm.iter().collect();
@@ -402,8 +403,9 @@ pub(crate) fn law_cross_order_determinism<B: ConformanceBackend>() {
 /// Apply the backend-relevant operations of `root` as committed state, so the
 /// root is the meet the subsequent layers branch from.
 fn apply_committed_root<B: ConformanceBackend>(backend: &Arc<dyn PropertyBackend>, root: &Event) {
-    if let Some(ops) = root.operations.get(B::backend_name()) {
-        backend.apply_operations_with_event(ops, root.id()).expect("apply committed root");
+    let ops: Vec<_> = root.operations.backend_operations(B::backend_name()).cloned().collect();
+    if !ops.is_empty() {
+        backend.apply_operations_with_event(&ops, root.id()).expect("apply committed root");
     }
 }
 

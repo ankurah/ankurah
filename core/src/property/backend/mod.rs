@@ -1,4 +1,4 @@
-use ankurah_proto::{EventId, Operation};
+use ankurah_proto::{BackendOperation as Operation, EventId};
 use anyhow::Result;
 use std::any::Any;
 use std::fmt::Debug;

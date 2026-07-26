@@ -54,7 +54,7 @@ impl EntityInnerState {
     fn apply_operations_from_event(
         &mut self,
         backend_name: String,
-        operations: &[ankurah_proto::Operation],
+        operations: &[ankurah_proto::BackendOperation],
         event_id: EventId,
     ) -> Result<(), MutationError> {
         if let Some(backend) = self.backends.get(&backend_name) {
@@ -175,7 +175,7 @@ impl Entity {
     /// using commit_head
     pub(crate) fn generate_commit_event(&self) -> Result<Option<Event>, MutationError> {
         let state = self.state.read().expect("other thread panicked, panic here too");
-        let mut operations = BTreeMap::<String, Vec<ankurah_proto::Operation>>::new();
+        let mut operations = BTreeMap::<String, Vec<ankurah_proto::BackendOperation>>::new();
         for (name, backend) in &state.backends {
             if let Some(ops) = backend.to_operations()? {
                 operations.insert(name.clone(), ops);
@@ -185,7 +185,7 @@ impl Entity {
         if operations.is_empty() {
             Ok(None)
         } else {
-            let operations = OperationSet(operations);
+            let operations = OperationSet::from_backends(operations);
             let event = Event { entity_id: self.id, collection: self.collection.clone(), operations, parent: state.head.clone() };
             Ok(Some(event))
         }
@@ -264,8 +264,8 @@ impl Entity {
             // Re-check if head is still empty now that we hold the lock
             if state.head.is_empty() {
                 // this is the creation event for a new entity, so we simply accept it
-                for (backend_name, operations) in event.operations.iter() {
-                    state.apply_operations_from_event(backend_name.clone(), operations, event.id())?;
+                for (backend_name, operations) in event.operations.backends() {
+                    state.apply_operations_from_event(backend_name.to_owned(), operations, event.id())?;
                 }
                 state.head = event.id().into();
                 drop(state); // Release lock before broadcast
@@ -301,8 +301,8 @@ impl Entity {
                     let new_head: Clock = event.id().into();
                     let event_id = event.id();
                     if self.try_mutate(&mut head, |state| -> Result<(), MutationError> {
-                        for (backend_name, operations) in event.operations.iter() {
-                            state.apply_operations_from_event(backend_name.clone(), operations, event_id.clone())?;
+                        for (backend_name, operations) in event.operations.backends() {
+                            state.apply_operations_from_event(backend_name.to_owned(), operations, event_id.clone())?;
                         }
                         state.head = new_head.clone();
                         Ok(())

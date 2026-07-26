@@ -49,4 +49,4 @@ pub use query_value::QueryValue;
 pub use type_resolver::TypeResolver;
 
 pub use ankurah_proto as proto;
-pub use ankurah_proto::EntityId;
+pub use ankurah_proto::{EntityId, ModelId};
