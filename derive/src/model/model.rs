@@ -39,7 +39,8 @@ pub fn model_impl(model: &crate::model::description::ModelDescription) -> TokenS
             fn collection() -> ankurah::proto::CollectionId {
                 #collection_str.into()
             }
-            fn initialize_new_entity(&self, entity: &::ankurah::entity::Entity) {
+            fn initialize_new_entity(&self, entity: &::ankurah::entity::Entity, model_id: ::ankurah::proto::ModelId) {
+                entity.add_membership(model_id);
                 use ::ankurah::property::InitializeWith;
                 #(
                     #active_field_types_turbofish::initialize_with(&entity, #active_field_name_strs.into(), &self.#active_field_names);

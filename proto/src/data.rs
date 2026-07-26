@@ -238,14 +238,14 @@ pub enum Operation {
 /// An explicit mutation of an entity's model-backed membership state: which
 /// model an ENTITY belongs to, asserted in the attested event stream (the
 /// sole authority for that fact). Distinct from the catalog's
-/// contract-memberships, which are property-to-model records
+/// model-property memberships, which are property-to-model records
 /// (`_ankurah_model_property`).
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 pub enum Membership {
     /// Add the model-backed membership.
     ///
-    /// The current protocol permits this only in a genesis event and requires
-    /// exactly one such operation there.
+    /// An ordinary operation on any event; the commit funnels currently
+    /// admit it only on an entity's first event, exactly one there.
     Add(ModelId),
 }
 
@@ -269,8 +269,8 @@ pub struct State {
     pub state_buffers: StateBuffers,
     /// Model-backed memberships established by this entity's causal history.
     ///
-    /// The current protocol admits exactly one membership in the genesis
-    /// event and no later membership mutations.
+    /// The commit funnels currently admit exactly one membership, on the
+    /// entity's first event, and no later membership mutations.
     pub memberships: BTreeSet<ModelId>,
     /// The set of concurrent events (usually only one) which have been applied to the entity state above
     pub head: Clock,

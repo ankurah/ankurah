@@ -33,9 +33,10 @@ type CrashNode = Node<CrashStorageEngine<SledStorageEngine>, PermissiveAgent>;
 /// subsequent operation counts start from zero (bootstrap writes are excluded).
 /// Seed a deterministic Album catalog identity on `node` and latch the
 /// compiled binding, so every node in a scenario (the armed child, the
-/// batch-generating helper, reopened nodes) agrees on the model id the
-/// genesis membership asserts -- without spending crash-countable storage
-/// writes on registration. Registration is bootstrap here, not workload.
+/// batch-generating helper, reopened nodes) agrees on the model id each
+/// creation event's membership asserts -- without spending crash-countable
+/// storage writes on registration. Registration is bootstrap here, not
+/// workload.
 fn seed_album_catalog<SE: StorageEngine + Send + Sync + 'static>(node: &Node<SE, PermissiveAgent>) -> Result<()> {
     let model_id = proto::EntityId::from_bytes([0x6A; 16]);
     let model = proto::RegisteredModel {

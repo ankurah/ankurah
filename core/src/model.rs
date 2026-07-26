@@ -2,7 +2,7 @@ pub mod tsify;
 
 use std::sync::Arc;
 
-use ankurah_proto::{CollectionId, EntityId, State};
+use ankurah_proto::{CollectionId, EntityId, ModelId, State};
 
 use crate::entity::Entity;
 use crate::error::StateError;
@@ -39,9 +39,11 @@ pub trait Model: Sized {
     /// `#[derive(Model)]`; there is no default, because the mapping is
     /// derived from the struct's fields.
     fn descriptor() -> &'static crate::schema::ModelStructDescriptor;
-    // TODO - this seems to be necessary, but I don't understand why
-    // Backend fields should be getting initialized on demand when the values are set
-    fn initialize_new_entity(&self, entity: &Entity);
+
+    /// Initialize a freshly created entity from this instance: stage its
+    /// membership in `model_id` (this model's registered identity) and seed
+    /// the property backends with the struct's initial field values.
+    fn initialize_new_entity(&self, entity: &Entity, model_id: ModelId);
 }
 
 /// A read only view of an Entity which offers typed accessors

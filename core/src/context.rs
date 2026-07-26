@@ -61,7 +61,7 @@ pub trait TContext {
     /// First-use registration for a WRITE: ensure the compiled schema is
     /// registered (allocator-first; the no-peer case may proceed only from a
     /// locally proven fully compatible binding) and return the model's
-    /// durable identity for the genesis membership.
+    /// durable identity for the new entity's membership.
     async fn ensure_registered(&self, schema: &'static crate::schema::ModelStructDescriptor) -> Result<proto::ModelId, MutationError>;
 
     /// First-use registration for a typed READ (fetch/get/query): same
@@ -70,12 +70,9 @@ pub trait TContext {
 
     fn node_id(&self) -> proto::EntityId;
     /// Create a brand new entity for a transaction, and add it to the WeakEntitySet.
-    /// `model` is the entity's genesis membership intent: the durable model
-    /// identity its creation event will assert with an explicit
-    /// Membership::Add operation.
     /// Note that this does not actually persist the entity to the storage engine
     /// It merely ensures that there are no duplicate entities with the same ID (except forked entities)
-    fn create_entity(&self, collection: proto::CollectionId, model: proto::ModelId, trx_alive: Arc<AtomicBool>) -> Entity;
+    fn create_entity(&self, collection: proto::CollectionId, trx_alive: Arc<AtomicBool>) -> Entity;
     fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied>;
     async fn get_entity(&self, id: proto::EntityId, collection: &proto::CollectionId, cached: bool) -> Result<Entity, RetrievalError>;
     fn get_resident_entity(&self, id: proto::EntityId) -> Option<Entity>;
@@ -122,8 +119,8 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     }
 
     fn node_id(&self) -> proto::EntityId { self.node.id }
-    fn create_entity(&self, collection: proto::CollectionId, model: proto::ModelId, trx_alive: Arc<AtomicBool>) -> Entity {
-        let primary_entity = self.node.entities.create(collection, model);
+    fn create_entity(&self, collection: proto::CollectionId, trx_alive: Arc<AtomicBool>) -> Entity {
+        let primary_entity = self.node.entities.create(collection);
         primary_entity.snapshot(trx_alive)
     }
     fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied> { self.node.policy_agent.check_write(&self.cdata, entity, None) }

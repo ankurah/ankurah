@@ -145,8 +145,8 @@ pub async fn build_nodes(n: usize, captured: Captured) -> anyhow::Result<Vec<Sim
     // The harness forges events and states directly, bypassing schema
     // registration and the catalog relay. Seed and explicitly admit a complete
     // deterministic `SimRecord` catalog on every node so commit admissibility
-    // can route the asserted genesis membership and the compiled binding is
-    // provably complete. The test-helper path keeps every id byte-identical
+    // can route each forged creation event's membership and the compiled
+    // binding is provably complete. The test-helper path keeps every id byte-identical
     // across nodes and runs; hard_reset is not part of these scenarios.
     let sim_model = proto::RegisteredModel {
         id: super::model::sim_model_id(),

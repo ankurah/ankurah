@@ -45,8 +45,8 @@ pub fn entity_id(counter: u64) -> proto::EntityId {
 pub fn sim_collection() -> proto::CollectionId { SimRecord::collection() }
 
 /// The deterministic model-entity id the sim seeds into every node's catalog
-/// and asserts in every forged genesis membership. Constant, so it is
-/// identical across every node in a run and across the two
+/// and asserts in every forged creation event's membership Add. Constant, so
+/// it is identical across every node in a run and across the two
 /// determinism-audit runs.
 pub fn sim_model_id() -> proto::EntityId { proto::EntityId::from_bytes([0x5B; 16]) }
 

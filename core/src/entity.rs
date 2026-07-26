@@ -36,17 +36,79 @@ pub struct Entity(Arc<EntityInner>);
 /// Used only for reconstituting state to filter database results. No duplication guarantees are provided
 pub struct TemporaryEntity(Arc<EntityInner>);
 
+/// The entity-to-model memberships of one entity: what the applied event
+/// stream has established, plus locally staged additions awaiting an event.
+///
+/// Dirty state mirrors the property backends: [`MembershipSet::add`] stages
+/// an addition, [`MembershipSet::to_operations`] drains staged entries into
+/// the event being generated (marking them in-flight so a later drain will
+/// not re-emit them), and event application marks entries applied. Only
+/// applied entries are canonical -- they are what persists and replicates;
+/// the rest is transaction intent that becomes real when the recording
+/// event applies. An addition is not bound to any particular event: an
+/// entity's first recorded event is simply where its initial membership
+/// happens to land.
+#[derive(Debug, Clone, Default)]
+struct MembershipSet(BTreeMap<ModelId, MembershipStatus>);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MembershipStatus {
+    /// Staged locally, not yet drained into an event.
+    Staged,
+    /// Drained into a generated event that has not yet applied.
+    InFlight,
+    /// Established by an applied event or a loaded state snapshot.
+    Applied,
+}
+
+impl MembershipSet {
+    /// Rehydrate from persisted state: every membership applied.
+    fn from_applied(applied: &BTreeSet<ModelId>) -> Self { Self(applied.iter().map(|model| (*model, MembershipStatus::Applied)).collect()) }
+
+    /// Stage an addition to ride the next generated event. A model already
+    /// staged, in flight, or applied is left as is.
+    fn add(&mut self, model: ModelId) { self.0.entry(model).or_insert(MembershipStatus::Staged); }
+
+    /// Drain staged additions into operations for an event being generated,
+    /// marking them in-flight.
+    fn to_operations(&mut self) -> Vec<ankurah_proto::Operation> {
+        self.0
+            .iter_mut()
+            .filter(|(_, status)| **status == MembershipStatus::Staged)
+            .map(|(model, status)| {
+                *status = MembershipStatus::InFlight;
+                ankurah_proto::Operation::Membership(ankurah_proto::Membership::Add(*model))
+            })
+            .collect()
+    }
+
+    /// Record a membership established by an applied event.
+    fn apply(&mut self, model: ModelId) { self.0.insert(model, MembershipStatus::Applied); }
+
+    /// Replace the applied entries with a state snapshot's, keeping staged
+    /// and in-flight intent the snapshot does not establish.
+    fn set_applied(&mut self, applied: &BTreeSet<ModelId>) {
+        self.0.retain(|_, status| *status != MembershipStatus::Applied);
+        for model in applied {
+            self.0.insert(*model, MembershipStatus::Applied);
+        }
+    }
+
+    /// The canonical applied memberships.
+    fn applied(&self) -> BTreeSet<ModelId> {
+        self.0.iter().filter(|(_, status)| **status == MembershipStatus::Applied).map(|(model, _)| *model).collect()
+    }
+
+    /// Whether the applied event stream established membership in `model`.
+    fn is_applied(&self, model: &ModelId) -> bool { self.0.get(model) == Some(&MembershipStatus::Applied) }
+}
+
 /// Combined state for atomic updates of head and backends
 #[derive(Debug)]
 struct EntityInnerState {
     head: Clock,
-    /// Model-backed memberships established by this entity's causal history.
-    memberships: BTreeSet<ModelId>,
-    /// The membership to emit in this entity's not-yet-created genesis event.
-    ///
-    /// This is transient transaction intent, not canonical state. It is
-    /// cleared when the genesis event applies.
-    pending_genesis_membership: Option<ModelId>,
+    /// This entity's model memberships: applied plus staged (see [`MembershipSet`]).
+    memberships: MembershipSet,
     // TODO: remove interior mutability from backends; make mutation methods take &mut self
     backends: BTreeMap<String, Arc<dyn PropertyBackend>>,
 }
@@ -76,10 +138,7 @@ impl EntityInnerState {
                     }
                 }
                 ankurah_proto::Operation::Membership(ankurah_proto::Membership::Add(model)) => {
-                    self.memberships.insert(*model);
-                    if self.pending_genesis_membership == Some(*model) {
-                        self.pending_genesis_membership = None;
-                    }
+                    self.memberships.apply(*model);
                 }
             }
         }
@@ -128,9 +187,9 @@ impl WeakEntity {
 }
 
 /// Persisted entity states must carry the membership their causal history
-/// established: exactly one for any created entity (the current protocol
-/// admits exactly one genesis membership and no later mutations), none for
-/// an empty-head placeholder.
+/// established: exactly one for any created entity (the commit funnels
+/// currently admit membership operations only on an entity's first event,
+/// exactly one there), none for an empty-head placeholder.
 fn validate_persisted_memberships(state: &State) -> Result<(), RetrievalError> {
     if state.head.is_empty() {
         if state.memberships.is_empty() {
@@ -158,11 +217,18 @@ impl Entity {
     pub fn head(&self) -> Clock { self.state.read().unwrap().head.clone() }
 
     /// Durable model-backed memberships accumulated by this entity's event
-    /// history (exactly one after genesis under the current protocol).
-    pub fn memberships(&self) -> BTreeSet<ModelId> { self.state.read().unwrap().memberships.clone() }
+    /// history (exactly one for any created entity under the current
+    /// emission rules).
+    pub fn memberships(&self) -> BTreeSet<ModelId> { self.state.read().unwrap().memberships.applied() }
 
     /// Whether this entity's causal history established membership in `model`.
-    pub fn has_membership(&self, model: &ModelId) -> bool { self.state.read().unwrap().memberships.contains(model) }
+    pub fn has_membership(&self, model: &ModelId) -> bool { self.state.read().unwrap().memberships.is_applied(model) }
+
+    /// Stage this entity's membership in `model` to ride the next event it
+    /// records. The membership becomes canonical only when that event
+    /// applies; under the current protocol the commit funnels admit
+    /// membership operations only on an entity's first event.
+    pub fn add_membership(&self, model: ModelId) { self.state.write().unwrap().memberships.add(model); }
 
     /// Check if this entity is writable (i.e., it's a transaction fork that's still alive)
     pub fn is_writable(&self) -> bool {
@@ -180,7 +246,7 @@ impl Entity {
             state_buffers.insert(name.clone(), state_buffer);
         }
         let state_buffers = ankurah_proto::StateBuffers(state_buffers);
-        Ok(State { state_buffers, memberships: state.memberships.clone(), head: state.head.clone() })
+        Ok(State { state_buffers, memberships: state.memberships.applied(), head: state.head.clone() })
     }
 
     pub fn to_entity_state(&self) -> Result<EntityState, StateError> {
@@ -188,19 +254,16 @@ impl Entity {
         Ok(EntityState { entity_id: self.id(), collection: self.collection.clone(), state })
     }
 
-    /// Construct a new, writable entity, optionally with a pending genesis
-    /// membership: `Some` for generated model creation (the membership enters
-    /// canonical state only when event generation emits the corresponding
-    /// explicit [`ankurah_proto::Membership::Add`] operation), `None` for
-    /// placeholders that expect their genesis to arrive as an event.
-    pub fn create(id: EntityId, collection: CollectionId, genesis_membership: Option<ModelId>) -> Self {
+    /// Construct a new, writable entity with no state and no memberships.
+    /// Memberships are staged separately ([`Entity::add_membership`]) and
+    /// become canonical when an event records them.
+    pub fn create(id: EntityId, collection: CollectionId) -> Self {
         Self(Arc::new(EntityInner {
             id,
             collection,
             state: std::sync::RwLock::new(EntityInnerState {
                 head: Clock::default(),
-                memberships: BTreeSet::default(),
-                pending_genesis_membership: genesis_membership,
+                memberships: MembershipSet::default(),
                 backends: BTreeMap::default(),
             }),
             kind: EntityKind::Primary,
@@ -222,8 +285,7 @@ impl Entity {
             collection,
             state: std::sync::RwLock::new(EntityInnerState {
                 head: state.head.clone(),
-                memberships: state.memberships.clone(),
-                pending_genesis_membership: None,
+                memberships: MembershipSet::from_applied(&state.memberships),
                 backends,
             }),
             kind: EntityKind::Primary,
@@ -235,7 +297,7 @@ impl Entity {
     /// Used for transaction commit. Notably this does not apply the head to the entity, which must be done
     /// using commit_head
     pub(crate) fn generate_commit_event(&self) -> Result<Option<Event>, MutationError> {
-        let state = self.state.read().expect("other thread panicked, panic here too");
+        let mut state = self.state.write().expect("other thread panicked, panic here too");
         let mut backends = BTreeMap::<String, Vec<ankurah_proto::BackendOperation>>::new();
         for (name, backend) in &state.backends {
             if let Some(ops) = backend.to_operations()? {
@@ -243,16 +305,15 @@ impl Entity {
             }
         }
         let mut operations = OperationSet::from_backends(backends);
-        if state.head.is_empty() {
-            let model =
-                state.pending_genesis_membership.ok_or(MutationError::InvalidUpdate("new entity is missing its genesis membership"))?;
-            operations.push(ankurah_proto::Operation::Membership(ankurah_proto::Membership::Add(model)));
+        for operation in state.memberships.to_operations() {
+            operations.push(operation);
         }
 
         // No operations on an EXISTING entity means nothing changed: no event.
-        // A brand-new entity (empty head) always carries at least its genesis
-        // membership, so every creation emits an event that exists,
-        // replicates, and persists even when every field is its default.
+        // A brand-new entity (empty head) emits its event unconditionally:
+        // model creation stages a membership addition, so the event exists,
+        // replicates, and persists even when every field is its default (and
+        // the commit funnels refuse a first event without its membership).
         if operations.is_empty() && !state.head.is_empty() {
             Ok(None)
         } else {
@@ -333,16 +394,6 @@ impl Entity {
             let mut state = self.state.write().unwrap();
             // Re-check if head is still empty now that we hold the lock
             if state.head.is_empty() {
-                // A locally staged creation intent must agree with the
-                // arriving genesis; this guards the local create flow only
-                // (replicated entities have no pending intent).
-                if let (Some(expected), Some(ankurah_proto::Membership::Add(model))) =
-                    (state.pending_genesis_membership, event.operations.memberships().next())
-                {
-                    if expected != *model {
-                        return Err(MutationError::InvalidUpdate("genesis event membership does not match creation intent"));
-                    }
-                }
                 // this is the creation event for a new entity, so we simply accept it
                 state.apply_operations_from_event(&event.operations, event.id())?;
                 state.head = event.id().into();
@@ -439,7 +490,7 @@ impl Entity {
                                 }
                                 for membership in evt.operations.memberships() {
                                     let ankurah_proto::Membership::Add(model) = membership;
-                                    state.memberships.insert(*model);
+                                    state.memberships.apply(*model);
                                 }
                             }
 
@@ -509,7 +560,7 @@ impl Entity {
                             let backend = backend_from_string(name, Some(state_buffer))?;
                             es.backends.insert(name.to_owned(), backend);
                         }
-                        es.memberships = state.memberships.clone();
+                        es.memberships.set_applied(&state.memberships);
                         es.head = new_head;
                         Ok(())
                     })? {
@@ -571,7 +622,6 @@ impl Entity {
             state: std::sync::RwLock::new(EntityInnerState {
                 head: state.head.clone(),
                 memberships: state.memberships.clone(),
-                pending_genesis_membership: state.pending_genesis_membership,
                 backends: forked,
             }),
             kind: EntityKind::Transacted { trx_alive, upstream: self.clone() },
@@ -665,8 +715,7 @@ impl TemporaryEntity {
             collection,
             state: std::sync::RwLock::new(EntityInnerState {
                 head: state.head.clone(),
-                memberships: state.memberships.clone(),
-                pending_genesis_membership: None,
+                memberships: MembershipSet::from_applied(&state.memberships),
                 backends,
             }),
             kind: EntityKind::Primary,
@@ -764,19 +813,18 @@ impl WeakEntitySet {
                         return Ok(entity);
                     }
                 }
-                let entity = Entity::create(*id, collection_id.to_owned(), None);
+                let entity = Entity::create(*id, collection_id.to_owned());
                 entities.insert(*id, entity.weak());
                 Ok(entity)
             }
         }
     }
-    /// Create a brand new entity with its pending genesis membership, and add
-    /// it to the set. The membership becomes canonical when the genesis event
-    /// emits and applies its explicit Membership::Add operation.
-    pub fn create(&self, collection: CollectionId, genesis_membership: ModelId) -> Entity {
+    /// Create a brand new entity and add it to the set. Memberships are
+    /// staged separately ([`Entity::add_membership`]).
+    pub fn create(&self, collection: CollectionId) -> Entity {
         let mut entities = self.0.write().unwrap();
         let id = EntityId::new();
-        let entity = Entity::create(id, collection, Some(genesis_membership));
+        let entity = Entity::create(id, collection);
         entities.insert(id, entity.weak());
         entity
     }
@@ -813,7 +861,7 @@ impl WeakEntitySet {
     #[cfg(feature = "test-helpers")]
     pub fn conjure_evil_phantom(&self, id: EntityId, collection: CollectionId) -> Entity {
         let mut entities = self.0.write().unwrap();
-        let entity = Entity::create(id, collection, None);
+        let entity = Entity::create(id, collection);
         entities.insert(id, entity.weak());
         entity
     }

@@ -3,7 +3,7 @@
 //!
 //! Registration is an UPSERT: the executor looks each definition up by its
 //! lookup key (model by source label; property by (model, name);
-//! contract-membership by (model, property)), ALLOCATES a fresh
+//! model-property membership by (model, property)), ALLOCATES a fresh
 //! `EntityId::new()` -- a true ULID -- on miss, and emits ordinary events
 //! through the policy-checked commit pipeline. The whole execution
 //! serializes on a process-local mutex, and the executor upserts the
@@ -951,8 +951,8 @@ fn catalog_collection_id(model: ModelId) -> proto::CollectionId {
 /// A creation event: full definition state, empty parent clock. Ordinary
 /// in every respect (RFC 5.1: no frozen encoder; catalog collections stay
 /// name-keyed at the backend layer permanently, the bootstrap exemption).
-/// The genesis membership operation is the authority for the entity's model;
-/// the event's collection field is the routing materialization of the same
+/// The membership operation is the authority for the entity's model; the
+/// event's collection field is the routing materialization of the same
 /// fact.
 fn creation(model: ModelId, entity_id: EntityId, fields: Vec<(&str, Value)>) -> proto::Event {
     let mut event = follow_up(model, entity_id, proto::Clock::default(), fields);
