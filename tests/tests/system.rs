@@ -160,6 +160,19 @@ async fn test_system_persistence_across_reconstruction() -> Result<()> {
     Ok(())
 }
 
+/// The three catalog collections the durable warm opens at startup, in
+/// sorted order for census comparisons.
+fn with_catalog(mut others: Vec<CollectionId>) -> Vec<CollectionId> {
+    others.extend(["_ankurah_model", "_ankurah_model_property", "_ankurah_property"].map(CollectionId::fixed_name));
+    others.sort();
+    others
+}
+
+fn sorted(mut v: Vec<CollectionId>) -> Vec<CollectionId> {
+    v.sort();
+    v
+}
+
 #[tokio::test]
 async fn test_system_root_change_behavior() -> Result<()> {
     // Create separate storage engines for durable and ephemeral nodes
@@ -208,7 +221,11 @@ async fn test_system_root_change_behavior() -> Result<()> {
             vec![CollectionId::fixed_name("_ankurah_system"), CollectionId::fixed_name("pet")]
         );
 
-        assert_eq!(durable_engine.list_collections()?, vec![CollectionId::fixed_name("_ankurah_system"), CollectionId::fixed_name("pet")]);
+        durable_node.catalog.wait_catalog_ready().await;
+        assert_eq!(
+            sorted(durable_engine.list_collections()?),
+            with_catalog(vec![CollectionId::fixed_name("_ankurah_system"), CollectionId::fixed_name("pet")])
+        );
 
         initial_root
     }; // Both nodes and connection are dropped here
@@ -221,7 +238,11 @@ async fn test_system_root_change_behavior() -> Result<()> {
         // should be ready because we previously initialized a system
         assert!(durable_node.system.is_system_ready());
 
-        assert_eq!(durable_engine.list_collections()?, vec![CollectionId::fixed_name("_ankurah_system"), CollectionId::fixed_name("pet")]);
+        durable_node.catalog.wait_catalog_ready().await;
+        assert_eq!(
+            sorted(durable_engine.list_collections()?),
+            with_catalog(vec![CollectionId::fixed_name("_ankurah_system"), CollectionId::fixed_name("pet")])
+        );
 
         // Reset storage and reinitialize
         durable_node.system.hard_reset().await?;
@@ -232,7 +253,8 @@ async fn test_system_root_change_behavior() -> Result<()> {
 
         durable_node.system.create().await?;
 
-        assert_eq!(durable_engine.list_collections()?, vec![CollectionId::fixed_name("_ankurah_system")]);
+        durable_node.catalog.wait_catalog_ready().await;
+        assert_eq!(sorted(durable_engine.list_collections()?), with_catalog(vec![CollectionId::fixed_name("_ankurah_system")]));
 
         // Verify root has changed
         let second_root = durable_node.system.root().expect("Should have new root state");
@@ -245,8 +267,8 @@ async fn test_system_root_change_behavior() -> Result<()> {
         trx.commit().await?;
 
         assert_eq!(
-            durable_engine.list_collections()?,
-            vec![CollectionId::fixed_name("_ankurah_system"), CollectionId::fixed_name("album")]
+            sorted(durable_engine.list_collections()?),
+            with_catalog(vec![CollectionId::fixed_name("_ankurah_system"), CollectionId::fixed_name("album")])
         );
 
         second_root
@@ -258,9 +280,10 @@ async fn test_system_root_change_behavior() -> Result<()> {
         durable_node.system.wait_loaded().await;
         assert!(durable_node.system.is_system_ready()); // should be ready when loaded
         assert_eq!(durable_node.system.root(), Some(second_root.clone()));
+        durable_node.catalog.wait_catalog_ready().await;
         assert_eq!(
-            durable_engine.list_collections()?,
-            vec![CollectionId::fixed_name("_ankurah_system"), CollectionId::fixed_name("album")]
+            sorted(durable_engine.list_collections()?),
+            with_catalog(vec![CollectionId::fixed_name("_ankurah_system"), CollectionId::fixed_name("album")])
         );
 
         let ephemeral_node = Node::new(ephemeral_engine.clone(), PermissiveAgent::new());

@@ -1,0 +1,275 @@
+//! The compiled schema `#[derive(Model)]` emits: the normative mapping,
+//! rename hints, and explicit-id bindings. Asserts the
+//! NORMATIVE (backend, value_type) mapping row-by-row, the renamed_from and
+//! explicit-id attributes, ephemeral exclusion, and the RegisterSchema
+//! descriptor conversion. Ends with an end-to-end registration built from a
+//! Model::descriptor() and driven through the durable/ephemeral harness, sourcing
+//! the allocated ids from the SchemaRegistered response.
+//!
+//! Excised with the read flip (write-only catalog phase): the bound-property
+//! half -- explicit ids driving derived accessors, query aliases, ambiguity
+//! rejection, and the offline fully-bound reassertion. Those read app
+//! entities by property id and preseed DDL-authored definitions the map
+//! only learns through the excised reactor feed; they return with the
+//! propertyid-resolution PR (successor notes in core/src/schema/catalog.rs).
+
+mod common;
+use ankurah::property::{Json, Ref};
+use ankurah::proto;
+use ankurah::value::Value;
+use ankurah::Model;
+use common::*;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+const MODEL: &str = "_ankurah_model";
+const PROPERTY: &str = "_ankurah_property";
+const MEMBERSHIP: &str = "_ankurah_model_property";
+
+// A referenced model, so Ref<T> has a target.
+#[derive(Model, Debug, Serialize, Deserialize)]
+pub struct DescArtist {
+    pub name: String,
+}
+
+/// A model exercising EVERY row of the normative mapping table, plus
+/// the attribute surfaces. Field order is meaningful: the schema preserves
+/// declaration order.
+#[derive(Model, Debug, Serialize, Deserialize)]
+pub struct DescAllTypes {
+    // String (default YrsString) -> ("yrs", "string")
+    pub yrs_name: String,
+    // Option<String> -> ("lww", "string", optional): yrs accepts only bare
+    // String (`^String$`), and a yrs text cannot represent None as distinct
+    // from "".
+    pub yrs_opt: Option<String>,
+    // #[active_type(LWW)] String -> ("lww", "string")
+    #[active_type(LWW)]
+    pub lww_str: String,
+    // LWW<i16> -> ("lww", "i16")
+    pub num_i16: i16,
+    // LWW<i32> -> ("lww", "i32")
+    pub num_i32: i32,
+    // LWW<i64> -> ("lww", "i64")
+    pub num_i64: i64,
+    // LWW<f64> -> ("lww", "f64")
+    pub num_f64: f64,
+    // LWW<bool> -> ("lww", "bool")
+    pub flag: bool,
+    // LWW<Vec<u8>> -> ("lww", "binary")
+    pub blob: Vec<u8>,
+    // LWW<Json> -> ("lww", "json")
+    pub doc: Json,
+    // Ref<T> -> ("lww", "entityid")
+    pub artist: Ref<DescArtist>,
+    // Option<i32> -> ("lww", "i32", optional)
+    pub maybe_i32: Option<i32>,
+    // Option<Ref<T>> -> ("lww", "entityid", optional)
+    pub maybe_artist: Option<Ref<DescArtist>>,
+    // An ephemeral field: EXCLUDED from the schema entirely.
+    #[model(ephemeral)]
+    pub scratch: String,
+}
+
+/// Every normative-table row is present with the exact (backend,
+/// value_type, optional) descriptor and in declaration order; ephemeral
+/// fields are excluded.
+#[test]
+fn schema_covers_every_normative_row() {
+    let schema = DescAllTypes::descriptor();
+    assert_eq!(schema.label, "descalltypes");
+    assert_eq!(schema.name, "DescAllTypes");
+    assert_eq!(schema.explicit_id, None);
+
+    // (field, name, backend, value_type, optional)
+    let expected: &[(&str, &str, &str, &str, bool)] = &[
+        ("yrs_name", "yrs_name", "yrs", "string", false),
+        // Option<String> -> lww (in-tree resolution; see field comment).
+        ("yrs_opt", "yrs_opt", "lww", "string", true),
+        ("lww_str", "lww_str", "lww", "string", false),
+        ("num_i16", "num_i16", "lww", "i16", false),
+        ("num_i32", "num_i32", "lww", "i32", false),
+        ("num_i64", "num_i64", "lww", "i64", false),
+        ("num_f64", "num_f64", "lww", "f64", false),
+        ("flag", "flag", "lww", "bool", false),
+        ("blob", "blob", "lww", "binary", false),
+        ("doc", "doc", "lww", "json", false),
+        ("artist", "artist", "lww", "entityid", false),
+        ("maybe_i32", "maybe_i32", "lww", "i32", true),
+        ("maybe_artist", "maybe_artist", "lww", "entityid", true),
+    ];
+
+    assert_eq!(schema.properties.len(), expected.len(), "ephemeral `scratch` must be excluded");
+    for (i, (field, name, backend, value_type, optional)) in expected.iter().enumerate() {
+        let f = &schema.properties[i];
+        assert_eq!(f.field, *field, "field[{i}] name");
+        assert_eq!(f.name, *name, "field[{i}] display name");
+        assert_eq!(f.backend, *backend, "field[{i}] backend");
+        assert_eq!(f.value_type, *value_type, "field[{i}] value_type");
+        let target = matches!(*field, "artist" | "maybe_artist").then_some("descartist");
+        assert_eq!(f.target_label, target, "field[{i}] reference target");
+        assert_eq!(f.optional, *optional, "field[{i}] optional");
+        assert_eq!(f.renamed_from, None, "field[{i}] renamed_from");
+        assert_eq!(f.explicit_id, None, "field[{i}] explicit_id");
+    }
+
+    // The ephemeral field is nowhere in the schema.
+    assert!(schema.field_by_name("scratch").is_none());
+}
+
+// -- renamed_from attribute --------------------------------------------------
+
+#[derive(Model, Debug, Serialize, Deserialize)]
+pub struct DescRenamed {
+    // Renamed from "name": the transient rename hint moves the lineage to the
+    // new display name (the field name, lowercased) WITHOUT re-keying.
+    #[property(renamed_from = "name")]
+    pub headline: String,
+}
+
+#[test]
+fn renamed_from_attribute_carries_the_hint() {
+    let schema = DescRenamed::descriptor();
+    let f = &schema.properties[0];
+    assert_eq!(f.field, "headline");
+    assert_eq!(f.name, "headline", "display name is the (lowercased) field name");
+    assert_eq!(f.renamed_from, Some("name"), "renamed_from carries the prior name as the rename hint");
+}
+
+// -- explicit id attributes --------------------------------------------------
+
+// 16 zero bytes as URL-safe base64 (no padding) = 22 'A's; a valid EntityId.
+const ZERO_ID_B64: &str = "AAAAAAAAAAAAAAAAAAAAAA";
+
+#[derive(Model, Debug, Serialize, Deserialize)]
+#[model(id = "AAAAAAAAAAAAAAAAAAAAAA")]
+pub struct DescBound {
+    #[property(id = "AAAAAAAAAAAAAAAAAAAAAA")]
+    pub label: String,
+    pub other: String,
+}
+
+#[test]
+fn explicit_id_attributes_reflected() {
+    let schema = DescBound::descriptor();
+    assert_eq!(schema.explicit_id, Some(ZERO_ID_B64), "model explicit id");
+    assert_eq!(schema.properties[0].explicit_id, Some(ZERO_ID_B64), "property explicit id");
+    assert_eq!(schema.properties[1].explicit_id, None, "unbound field has no explicit id");
+}
+
+// -- RegisterModel::from conversion ------------------------------------------
+
+#[test]
+fn register_model_from_schema() {
+    let model = proto::RegisterModel::from(DescAllTypes::descriptor());
+
+    assert_eq!(model.label, "descalltypes");
+    assert_eq!(model.name, "DescAllTypes");
+
+    // Every active field nests as a property entry; the nesting is the
+    // membership assertion, and optionality rides the entry.
+    assert_eq!(model.properties.len(), 13);
+    let artist = model.properties.iter().find(|p| p.name == "artist").unwrap();
+    assert_eq!((artist.backend.as_str(), artist.value_type.as_str()), ("lww", "entityid"));
+    assert_eq!(artist.target_label.as_deref(), Some("descartist"));
+    assert_eq!(artist.explicit_id, None);
+
+    let yrs_opt = model.properties.iter().find(|p| p.name == "yrs_opt").unwrap();
+    assert!(yrs_opt.optional, "Option<String> is optional per contract");
+    let flag = model.properties.iter().find(|p| p.name == "flag").unwrap();
+    assert!(!flag.optional);
+}
+
+#[test]
+fn register_model_honors_explicit_ids() {
+    let model = proto::RegisterModel::from(DescBound::descriptor());
+    assert_eq!(model.explicit_id, Some(proto::EntityId::from_base64(ZERO_ID_B64).unwrap()), "model explicit id preserved");
+
+    // The bound field carries its explicit id; its nested position is the
+    // membership assertion, so no separate reference exists to get wrong.
+    let label = model.properties.iter().find(|p| p.name == "label").unwrap();
+    assert!(label.explicit_id.is_some(), "explicit-id binding preserved");
+    let other = model.properties.iter().find(|p| p.name == "other").unwrap();
+    assert_eq!(other.explicit_id, None, "unbound field looks up by name");
+}
+
+// -- end-to-end registration through the harness -----------------------------
+
+async fn catalog_values(
+    node: &Node<SledStorageEngine, PermissiveAgent>,
+    collection: &str,
+    id: EntityId,
+) -> anyhow::Result<BTreeMap<String, Option<Value>>> {
+    use ankurah::core::property::backend::{LWWBackend, PropertyBackend};
+    let state = node.collections.get(&proto::CollectionId::fixed_name(collection)).await?.get_state(id).await?;
+    let buffer = state.payload.state.state_buffers.0.get("lww").expect("catalog entities are LWW").clone();
+    // Catalog collections are name-keyed at the backend layer (the bootstrap
+    // exemption), so the values are already keyed by their registered names.
+    Ok(LWWBackend::from_state_buffer(&buffer)?.property_values())
+}
+
+/// Build a RegisterSchema request from `Model::descriptor()` via
+/// `RegisterModel::from`, send it to a schema-less durable node, and
+/// confirm the catalog holds each field at the allocator-assigned id (sourced
+/// from the SchemaRegistered response) with the normative (backend,
+/// value_type) descriptors.
+#[tokio::test]
+async fn register_from_model_schema_end_to_end() -> anyhow::Result<()> {
+    let server = durable_sled_setup().await?;
+    let client = ephemeral_sled_setup().await?;
+    let _conn = LocalProcessConnection::new(&server, &client).await?;
+    client.system.wait_system_ready().await;
+
+    // The whole point: the request is built from the compiled schema, no
+    // hand-written descriptors.
+    let request = proto::NodeRequestBody::RegisterSchema { models: vec![proto::RegisterModel::from(DescAllTypes::descriptor())] };
+
+    let reg_models = match client.request(server.id, &DEFAULT_CONTEXT, request).await? {
+        proto::NodeResponseBody::SchemaRegistered { models } => models,
+        other => panic!("expected SchemaRegistered, got {other}"),
+    };
+
+    // The allocator resolved the ids; the response nests them by model.
+    let registered = reg_models.iter().find(|m| m.label == "descalltypes").expect("model returned");
+    let model_id = registered.id;
+    let artist_model_id = reg_models.iter().find(|m| m.label == "descartist").expect("reference target model returned").id;
+    let property_ids: BTreeMap<String, EntityId> = registered.properties.iter().map(|p| (p.name.clone(), p.id)).collect();
+
+    // The model entity exists with its collection + display name.
+    let model = catalog_values(&server, MODEL, model_id).await?;
+    assert_eq!(model.get("label"), Some(&Some(Value::String("descalltypes".into()))));
+    assert_eq!(model.get("name"), Some(&Some(Value::String("DescAllTypes".into()))));
+
+    // Every active field is present as a property entity with the exact
+    // normative descriptor pair the schema declared, at the allocated id.
+    for f in DescAllTypes::descriptor().properties {
+        let property_id = property_ids[f.name];
+        let property = catalog_values(&server, PROPERTY, property_id).await?;
+        assert_eq!(property.get("backend"), Some(&Some(Value::String(f.backend.into()))), "backend for {}", f.field);
+        assert_eq!(property.get("value_type"), Some(&Some(Value::String(f.value_type.into()))), "value_type for {}", f.field);
+        assert_eq!(property.get("name"), Some(&Some(Value::String(f.name.into()))), "name for {}", f.field);
+        assert_eq!(property.get("minted_for"), Some(&Some(Value::EntityId(model_id))), "minted_for for {}", f.field);
+        let registered = registered.properties.iter().find(|p| p.id == property_id).expect("registered property returned");
+        match f.target_label {
+            Some("descartist") => {
+                assert_eq!(registered.target_model, Some(artist_model_id), "target_model response for {}", f.field);
+                assert_eq!(
+                    property.get("target_model"),
+                    Some(&Some(Value::EntityId(artist_model_id))),
+                    "stored target_model for {}",
+                    f.field
+                );
+            }
+            None => assert_eq!(registered.target_model, None, "non-reference {} has no target", f.field),
+            Some(other) => panic!("unexpected target collection {other}"),
+        }
+
+        // And the (model, property) membership exists with the field's
+        // optionality, at the membership id the nested response row carries.
+        let membership = catalog_values(&server, MEMBERSHIP, registered.membership_id).await?;
+        assert_eq!(membership.get("property"), Some(&Some(Value::EntityId(property_id))), "membership property for {}", f.field);
+        assert_eq!(membership.get("optional"), Some(&Some(Value::Bool(f.optional))), "membership optional for {}", f.field);
+    }
+
+    Ok(())
+}

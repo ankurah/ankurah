@@ -192,7 +192,7 @@ async fn test_event_bridge_events_are_policy_validated_on_receive() -> Result<()
 /// the intended posture: staleness is the price of redaction, and the
 /// security property pinned here is that the hidden event never reaches the
 /// client through any path. (Redaction-tolerant catch-up is a phase 2
-/// design question under the snapshot-authority RFC.)
+/// design question for the snapshot-authority design.)
 #[tokio::test]
 async fn test_event_bridge_respects_read_policy_on_send() -> Result<()> {
     let server_agent = BridgePolicyAgent::new();
