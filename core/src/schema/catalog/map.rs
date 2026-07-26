@@ -154,6 +154,16 @@ impl CatalogMapInner {
     }
 
     pub(super) fn upsert_membership(&mut self, def: MembershipDef) {
+        if let Some(old) = self.memberships.get(&def.id) {
+            if old.model != def.model {
+                if let Some(set) = self.model_memberships.get_mut(&old.model) {
+                    set.remove(&def.id);
+                    if set.is_empty() {
+                        self.model_memberships.remove(&old.model);
+                    }
+                }
+            }
+        }
         self.model_memberships.entry(def.model).or_default().insert(def.id);
         self.memberships.insert(def.id, def);
     }

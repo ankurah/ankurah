@@ -39,16 +39,20 @@ struct RequestFenceInner {
     drained: Notify,
 }
 
+// The admit/invalidate handshake is a store-buffer shape: try_acquire writes
+// in_flight then reads current, while reset writes current then reads in_flight.
+// Anything weaker than SeqCst on those operations lets both sides read the stale
+// value at once, and a lease escapes past a completed drain.
 impl RequestFence {
     pub(crate) fn new() -> Self {
         Self(Arc::new(RequestFenceInner { current: AtomicBool::new(true), in_flight: AtomicUsize::new(0), drained: Notify::new() }))
     }
 
-    pub(crate) fn is_current(&self) -> bool { self.0.current.load(Ordering::Acquire) }
+    pub(crate) fn is_current(&self) -> bool { self.0.current.load(Ordering::SeqCst) }
 
     /// Stop admitting effects immediately. Callers that need a reset barrier
     /// must follow this with [`Self::wait_drained`].
-    pub(crate) fn invalidate(&self) { self.0.current.store(false, Ordering::Release); }
+    pub(crate) fn invalidate(&self) { self.0.current.store(false, Ordering::SeqCst); }
 
     pub(crate) async fn wait_drained(&self) {
         loop {
@@ -58,7 +62,7 @@ impl RequestFence {
             let drained = self.0.drained.notified();
             tokio::pin!(drained);
             drained.as_mut().enable();
-            if self.0.in_flight.load(Ordering::Acquire) == 0 {
+            if self.0.in_flight.load(Ordering::SeqCst) == 0 {
                 return;
             }
             drained.await;
@@ -69,7 +73,7 @@ impl RequestFence {
         if !self.is_current() {
             return None;
         }
-        self.0.in_flight.fetch_add(1, Ordering::AcqRel);
+        self.0.in_flight.fetch_add(1, Ordering::SeqCst);
         // Invalidation may have won between the first check and increment.
         // In that case this lease was never admitted and must not escape.
         if !self.is_current() {
