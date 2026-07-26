@@ -276,7 +276,7 @@ fn parse_membership(entity: &Entity, id: EntityId) -> Option<MembershipDef> {
 pub(super) fn parse_state(collection: &ModelId, id: EntityId, state: &proto::EntityState) -> Option<Entry> {
     let buffer = state.state.state_buffers.0.get("lww")?;
     let backend = LWWBackend::from_state_buffer(buffer).ok()?;
-    let values = crate::property::name_keyed(backend.property_values());
+    let values = backend.property_values();
     let get_string = |field: &str| match values.get(field) {
         Some(Some(Value::String(value))) => Some(value.clone()),
         _ => None,

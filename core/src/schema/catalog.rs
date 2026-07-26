@@ -38,8 +38,7 @@ use std::{
 };
 
 use crate::ModelId;
-use ankql::ast::{PropertyId, SystemProperty};
-use ankurah_proto::{self as proto, EntityId, QueryId};
+use ankurah_proto::{self as proto, EntityId, PropertyId, QueryId, SystemProperty};
 use ankurah_signals::{porcelain::subscribe::SubscriptionGuard, Subscribe};
 use tokio::sync::Notify;
 use tracing::{debug, error, warn};
@@ -98,7 +97,7 @@ struct NoopGapFetcher;
 impl GapFetcher<Entity> for NoopGapFetcher {
     async fn fetch_gap(
         &self,
-        _collection_id: &ModelId,
+        _collection_id: &proto::CollectionId,
         _selection: &ankql::ast::Selection,
         _last_entity: Option<&Entity>,
         _gap_size: usize,
@@ -244,17 +243,20 @@ where PA: PolicyAgent
     }
 }
 
-impl<SE, PA> crate::schema::CatalogResolver for CatalogInner<SE, PA>
+// Catalog metadata lookups. These become the CatalogResolver trait surface in
+// the propertyid-resolution PR; until then they are inherent methods used by
+// registration's own duplicate checks.
+impl<SE, PA> CatalogInner<SE, PA>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    fn resolve_model(&self, name: &str) -> anyhow::Result<Option<proto::ModelId>> {
+    pub(crate) fn resolve_model(&self, name: &str) -> anyhow::Result<Option<proto::ModelId>> {
         Ok(crate::schema::system_model_id(name)
             .or_else(|| self.map.read().unwrap().by_label.get(name).copied().map(proto::ModelId::EntityId)))
     }
 
-    fn model_properties_ready(&self, model: &proto::ModelId) -> bool {
+    pub(crate) fn model_properties_ready(&self, model: &proto::ModelId) -> bool {
         match model {
             proto::ModelId::System(_) => true,
             proto::ModelId::EntityId(id) => {
@@ -263,7 +265,7 @@ where
         }
     }
 
-    fn resolve_model_property(&self, model: &proto::ModelId, name: &str) -> anyhow::Result<Option<PropertyId>> {
+    pub(crate) fn resolve_model_property(&self, model: &proto::ModelId, name: &str) -> anyhow::Result<Option<PropertyId>> {
         let proto::ModelId::EntityId(id) = model else {
             return Ok(SystemProperty::from_name(name).map(PropertyId::System));
         };
@@ -273,7 +275,7 @@ where
         Ok(self.resolve_property(*id, &label, name)?.map(PropertyId::EntityId))
     }
 
-    fn model_properties(&self, model: &proto::ModelId) -> anyhow::Result<Vec<PropertyId>> {
+    pub(crate) fn model_properties(&self, model: &proto::ModelId) -> anyhow::Result<Vec<PropertyId>> {
         use proto::{SystemModel, SystemProperty};
 
         Ok(match model {
@@ -302,7 +304,7 @@ where
         })
     }
 
-    fn model_name(&self, model: &proto::ModelId) -> anyhow::Result<String> {
+    pub(crate) fn model_name(&self, model: &proto::ModelId) -> anyhow::Result<String> {
         match model {
             proto::ModelId::EntityId(id) => self
                 .map
@@ -316,7 +318,7 @@ where
         }
     }
 
-    fn property_name(&self, property: &PropertyId) -> anyhow::Result<String> {
+    pub(crate) fn property_name(&self, property: &PropertyId) -> anyhow::Result<String> {
         match property {
             PropertyId::Id => Ok("id".to_owned()),
             PropertyId::System(system) => Ok(system.to_string()),
@@ -331,7 +333,7 @@ where
         }
     }
 
-    fn property_value_type(&self, property: &PropertyId) -> anyhow::Result<crate::value::ValueType> {
+    pub(crate) fn property_value_type(&self, property: &PropertyId) -> anyhow::Result<crate::value::ValueType> {
         use crate::value::ValueType;
         let value_type = match property {
             PropertyId::Id => ValueType::EntityId,
@@ -1128,26 +1130,8 @@ where
     /// bindings for admitted ordinary or explicit fields, fail closed if those
     /// bindings disagree, and otherwise consult the current display-name map.
     pub fn resolve(&self, model: &proto::ModelId, name: &str) -> Option<PropertyId> {
-        crate::schema::CatalogResolver::resolve_model_property(self.0.as_ref(), model, name).ok().flatten()
+        self.0.resolve_model_property(model, name).ok().flatten()
     }
-
-    /// A weak handle to this catalog as a name-to-id resolver, bound onto
-    /// entities at assembly for the sync read path. Replaces the old
-    /// per-collection `SchemaBinding` push: identity is carried by the
-    /// [`ankql::ast::PropertyId`] itself, not by a binding injected into a
-    /// property backend.
-    pub fn resolver_weak(&self) -> std::sync::Weak<dyn crate::schema::CatalogResolver> {
-        // Downgrade to the concrete Weak first, then let the return type coerce
-        // it to the trait object (CoerceUnsized on Weak); annotating the local
-        // as the dyn type instead would wrongly force `downgrade`'s parameter.
-        let weak = Arc::downgrade(&self.0);
-        weak
-    }
-
-    /// Borrow the catalog's read-only metadata resolver. Query traversal lives
-    /// in AnkQL; callers pass this object to `Selection::resolve_names` rather
-    /// than routing AST operations back through `CatalogManager`.
-    pub fn resolver(&self) -> &dyn crate::schema::CatalogResolver { self.0.as_ref() }
 
     /// Test-only probe for detecting catalog ownership cycles after a node is
     /// dropped. The closure owns only a weak pointer and therefore does not

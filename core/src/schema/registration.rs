@@ -33,10 +33,9 @@
 
 use std::collections::BTreeMap;
 
-use ankql::ast::PropertyId;
 use ankurah_proto::{
     self as proto, Attested, EntityId, Membership, MembershipDescriptor, ModelDescriptor, Operation, OperationSet, PropertyDescriptor,
-    PropertyRef, RegisteredMembership, RegisteredModel, RegisteredProperty, TransactionId,
+    PropertyRef, RegisteredMembership, RegisteredModel, RegisteredProperty, SystemProperty, TransactionId,
 };
 
 use crate::error::{MutationError, RetrievalError};
@@ -704,7 +703,7 @@ where
             let Some(buffer) = state.payload.state.state_buffers.0.get("lww") else {
                 continue;
             };
-            best = Some((id, crate::property::name_keyed(LWWBackend::from_state_buffer(buffer)?.property_values())));
+            best = Some((id, LWWBackend::from_state_buffer(buffer)?.property_values()));
         }
         Ok(best)
     }
@@ -784,7 +783,7 @@ where
             return Ok(None);
         };
         let backend = LWWBackend::from_state_buffer(buffer)?;
-        Ok(Some((crate::property::name_keyed(backend.property_values()), head)))
+        Ok(Some((backend.property_values(), head)))
     }
 
     /// Values-only convenience over [`Self::catalog_entity_snapshot`].
@@ -860,19 +859,17 @@ fn bool_field(values: &BTreeMap<String, Option<Value>>, field: &str) -> Option<b
 // and mint no property-definition ids, so their fields are `System` properties,
 // named through the same `system_property` decision the systemize pass uses.
 
-fn field_eq(field: &str, value: ankql::ast::Value) -> ankql::ast::Predicate {
+fn field_eq(field: &str, value: ankql::ast::Literal) -> ankql::ast::Predicate {
     ankql::ast::Predicate::Comparison {
-        left: Box::new(ankql::ast::Expr::PropertyPath(
-            ankql::resolve::system_property(field, vec![]).expect("catalog lookup fields are closed SystemProperty variants"),
-        )),
+        left: Box::new(ankql::ast::Expr::Path(ankql::ast::PathExpr::simple(field))),
         operator: ankql::ast::ComparisonOperator::Equal,
         right: Box::new(ankql::ast::Expr::Literal(value)),
     }
 }
 
-fn field_eq_str(field: &str, value: &str) -> ankql::ast::Predicate { field_eq(field, ankql::ast::Value::String(value.to_string())) }
+fn field_eq_str(field: &str, value: &str) -> ankql::ast::Predicate { field_eq(field, ankql::ast::Literal::String(value.to_string())) }
 
-fn field_eq_id(field: &str, id: EntityId) -> ankql::ast::Predicate { field_eq(field, ankql::ast::Value::EntityId(id)) }
+fn field_eq_id(field: &str, id: EntityId) -> ankql::ast::Predicate { field_eq(field, ankql::ast::Literal::EntityId(id.to_ulid())) }
 
 fn and(a: ankql::ast::Predicate, b: ankql::ast::Predicate) -> ankql::ast::Predicate { ankql::ast::Predicate::And(Box::new(a), Box::new(b)) }
 
@@ -903,8 +900,8 @@ fn follow_up(entity_id: EntityId, parent: proto::Clock, fields: Vec<(&str, Value
 fn follow_up_patch(entity_id: EntityId, parent: proto::Clock, fields: Vec<(&str, Option<Value>)>) -> proto::Event {
     let backend = LWWBackend::new();
     for (name, value) in fields {
-        let property = ankql::ast::SystemProperty::from_name(name).expect("catalog event fields are closed SystemProperty variants");
-        backend.set(PropertyId::System(property), value);
+        let property = SystemProperty::from_name(name).expect("catalog event fields are closed SystemProperty variants");
+        backend.set(property.to_string(), value);
     }
     let operations = backend.to_operations().expect("LWW encoding of scalar values is infallible").expect("fields are non-empty");
     proto::Event { entity_id, operations: OperationSet::from_backends(BTreeMap::from([("lww".to_string(), operations)])), parent }
