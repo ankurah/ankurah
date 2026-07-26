@@ -1,6 +1,6 @@
 //! Compiled-schema emission for `#[derive(Model)]`.
 //!
-//! This module generates the `static` [`ankurah::core::schema::ModelStructDescriptor`]
+//! This module generates the `static` [`#base::schema::ModelStructDescriptor`]
 //! and the `Model::descriptor()` method. Two facts per field are NORMATIVE.
 //! A property's minting model and name locate its identity; registration
 //! checks these compiled facts against the immutable canonical pair (exact
@@ -48,7 +48,7 @@ pub fn validate_schema_attrs(model: &ModelDescription) -> syn::Result<()> {
     // model must never claim it, complementing the
     // receiver-side structural protection.
     let collection = model.collection_str();
-    if collection.starts_with("_ankurah_") {
+    if model.system().is_none() && collection.starts_with("_ankurah_") {
         return Err(syn::Error::new(
             model.name().span(),
             format!("collection '{collection}' uses the reserved `_ankurah_` prefix, which is reserved for system collections; rename the model"),
@@ -76,6 +76,7 @@ pub fn validate_schema_attrs(model: &ModelDescription) -> syn::Result<()> {
 /// [`validate_schema_attrs`] already ran (it re-derives the same facts, so
 /// it is safe to call independently).
 pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
+    let base = model.base();
     let collection = model.collection_str();
 
     let name = model.name();
@@ -100,7 +101,7 @@ pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
         // associated const, resolved inside the static initializer). The
         // derive carries no value-type vocabulary of its own.
         let inner = mapping.inner;
-        let value_type = quote! { <#inner as ::ankurah::Property>::VALUE_TYPE };
+        let value_type = quote! { <#inner as #base::property::Property>::VALUE_TYPE };
 
         // Ref<T> names its target model by source label in the registration
         // descriptor. Source model labels are the lowercased model type name
@@ -112,8 +113,8 @@ pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
         // The active type declares which backend stores it (an associated
         // const, resolved inside the static initializer). Like value_type,
         // the derive tabulates nothing.
-        let active_type = desc.rust_type()?;
-        let backend = quote! { <#active_type as ::ankurah::property::ActiveType>::BACKEND };
+        let active_type = desc.rust_type_with_context(if model.is_internal() { "local" } else { "external" })?;
+        let backend = quote! { <#active_type as #base::property::ActiveType>::BACKEND };
 
         // #[property(renamed_from = "...")]: the transient rename hint. Applied by the registration executor before lookup-or-create,
         // guarded; removable from source once every target system has seen
@@ -130,7 +131,7 @@ pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
         let explicit_id_tokens = option_str_tokens(explicit_id.as_deref());
 
         field_tokens.push(quote! {
-            ::ankurah::core::schema::StructProperty {
+            #base::schema::StructProperty {
                 field: #field_name,
                 name: #display_name,
                 renamed_from: #renamed_from_tokens,
@@ -150,19 +151,26 @@ pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
     }
     let model_explicit_id_tokens = option_str_tokens(model_explicit_id.as_deref());
 
+    // A system model pins its closed built-in identity into the descriptor;
+    // every registration path short-circuits on it.
+    let system_tokens = match model.system() {
+        Some(variant) => quote! { ::core::option::Option::Some(#base::proto::SystemModel::#variant) },
+        None => quote! { ::core::option::Option::None },
+    };
+
     // A private static so the returned reference is `&'static` with zero
     // per-call cost. Named distinctly to avoid colliding with anything in
     // the hygiene module.
     Ok(quote! {
-        fn descriptor() -> &'static ::ankurah::core::schema::ModelStructDescriptor {
-            static __ANKURAH_MODEL_SCHEMA: ::ankurah::core::schema::ModelStructDescriptor = ::ankurah::core::schema::ModelStructDescriptor {
+        fn descriptor() -> &'static #base::schema::ModelStructDescriptor {
+            static __ANKURAH_MODEL_SCHEMA: #base::schema::ModelStructDescriptor = #base::schema::ModelStructDescriptor {
                 label: #collection,
                 name: #name_str,
                 properties: &[
                     #(#field_tokens),*
                 ],
                 explicit_id: #model_explicit_id_tokens,
-                system: ::core::option::Option::None,
+                system: #system_tokens,
             };
             &__ANKURAH_MODEL_SCHEMA
         }

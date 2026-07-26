@@ -16,6 +16,17 @@ pub struct ModelDescription {
 
     // Struct-level attributes, retained for #[model(...)] parsing
     struct_attrs: Vec<syn::Attribute>,
+
+    /// `#[model(base = "...")]`: the path generated code addresses the core
+    /// crate through. Default `::ankurah::core` (the facade's re-export);
+    /// core-internal models pass `crate` so core can derive its own models.
+    base: syn::Path,
+    /// True when `base` was overridden: an internal model, which skips the
+    /// wasm/uniffi binding layers (no JS or FFI surface).
+    internal: bool,
+    /// `#[model(system = "...")]`: a built-in system model identity. Pins
+    /// the collection to the system label and short-circuits registration.
+    system: Option<Ident>,
 }
 
 impl ModelDescription {
@@ -45,14 +56,47 @@ impl ModelDescription {
         // Load backend configurations at compile time
         let backend_registry = crate::model::backend_registry::BackendRegistry::new()?;
 
-        Ok(Self { name, active_fields, ephemeral_fields, backend_registry, struct_attrs: input.attrs.clone() })
+        let base_attr = model_str_attr_on(&input.attrs, "base")?;
+        let internal = base_attr.is_some();
+        let base: syn::Path = match &base_attr {
+            Some(path) => syn::parse_str(path)
+                .map_err(|_| syn::Error::new_spanned(&name, format!("#[model(base = {path:?})] is not a valid path")))?,
+            None => syn::parse_str("::ankurah::core").expect("default base path parses"),
+        };
+        let system = match model_str_attr_on(&input.attrs, "system")? {
+            Some(variant) => match variant.as_str() {
+                "System" | "Model" | "Property" | "ModelProperty" => Some(format_ident!("{}", variant)),
+                other => return Err(syn::Error::new_spanned(
+                    &name,
+                    format!(
+                        "#[model(system = {other:?})] is not a built-in system model; expected System, Model, Property, or ModelProperty"
+                    ),
+                )),
+            },
+            None => None,
+        };
+
+        Ok(Self { name, active_fields, ephemeral_fields, backend_registry, struct_attrs: input.attrs.clone(), base, internal, system })
     }
 
     // Basic identifier accessors
     pub fn name(&self) -> &Ident { &self.name }
     /// Struct-level attributes, for `#[model(id = "...")]` parsing.
     pub fn struct_attrs(&self) -> &[syn::Attribute] { &self.struct_attrs }
-    pub fn collection_str(&self) -> String { self.name.to_string().to_lowercase() }
+    pub fn collection_str(&self) -> String {
+        match &self.system {
+            // System models live at their fixed reserved label, not a name
+            // derived from the struct.
+            Some(variant) => format!("_ankurah_{}", to_snake(&variant.to_string())),
+            None => self.name.to_string().to_lowercase(),
+        }
+    }
+    /// The path generated code reaches the core crate through.
+    pub fn base(&self) -> &syn::Path { &self.base }
+    /// True for a core-internal model: skip the wasm/uniffi binding layers.
+    pub fn is_internal(&self) -> bool { self.internal }
+    /// The built-in system identity, when this is a system model.
+    pub fn system(&self) -> Option<&Ident> { self.system.as_ref() }
     pub fn view_name(&self) -> Ident { format_ident!("{}View", self.name) }
     pub fn mutable_name(&self) -> Ident { format_ident!("{}Mut", self.name) }
 
@@ -112,7 +156,8 @@ impl ModelDescription {
         let mut results = Vec::new();
 
         for (i, desc) in descs.iter().enumerate() {
-            let rust_type = desc.rust_type().map_err(|e| {
+            let context = if self.internal { "local" } else { "external" };
+            let rust_type = desc.rust_type_with_context(context).map_err(|e| {
                 let field = &self.active_fields[i];
                 syn::Error::new_spanned(&field.ty, format!("Failed to generate Rust type: {}", e))
             })?;
@@ -393,6 +438,45 @@ fn get_model_flag(attrs: &Vec<syn::Attribute>, flag_name: &str) -> bool {
         attr.path().segments.iter().any(|seg| seg.ident == "model")
             && attr.meta.require_list().ok().and_then(|list| list.parse_args::<syn::Ident>().ok()).is_some_and(|ident| ident == flag_name)
     })
+}
+
+/// Parse `#[model(key = "value")]` off raw struct attributes (same grammar
+/// as schema.rs's model_str_attr, available before a ModelDescription
+/// exists). Bare flags and unrelated keys are skipped.
+fn model_str_attr_on(attrs: &[syn::Attribute], key: &str) -> syn::Result<Option<String>> {
+    let mut found = None;
+    for attr in attrs {
+        if !attr.path().is_ident("model") {
+            continue;
+        }
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident(key) {
+                if let Ok(value) = meta.value() {
+                    if let Ok(lit) = value.parse::<syn::LitStr>() {
+                        found = Some(lit.value());
+                    }
+                }
+            } else if meta.input.peek(syn::Token![=]) {
+                let value = meta.value()?;
+                let _: syn::Expr = value.parse()?;
+            }
+            Ok(())
+        });
+    }
+    Ok(found)
+}
+
+/// PascalCase to snake_case for system collection labels
+/// (ModelProperty -> model_property).
+fn to_snake(ident: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in ident.chars().enumerate() {
+        if c.is_uppercase() && i > 0 {
+            out.push('_');
+        }
+        out.push(c.to_ascii_lowercase());
+    }
+    out
 }
 
 fn as_turbofish(type_path: &syn::Type) -> proc_macro2::TokenStream {

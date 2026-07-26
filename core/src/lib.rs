@@ -49,4 +49,9 @@ pub use query_value::QueryValue;
 pub use type_resolver::TypeResolver;
 
 pub use ankurah_proto as proto;
+// Re-exported so derive-generated code can reach them core-relative: the
+// derive addresses everything through one base path (the facade's
+// `ankurah::core` externally, `crate` for core-internal models).
+pub use ankql;
 pub use ankurah_proto::{EntityId, ModelId};
+pub use ankurah_signals as signals;

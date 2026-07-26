@@ -17,10 +17,9 @@ wasm = [
     "send_wrapper",
     "ankql/wasm",
     "ankurah-proto/wasm",
-    "ankurah-derive",
     "futures-timer/wasm-bindgen",
 ]
-uniffi = ["dep:uniffi", "ankurah-proto/uniffi", "ankurah-derive"]
+uniffi = ["dep:uniffi", "ankurah-proto/uniffi"]
 default = []
 instrument = []
 # Enables test helper methods for adversarial testing (e.g., creating phantom entities)
@@ -33,7 +32,7 @@ bench-internals = []
 
 [dependencies]
 # Internal dependencies
-ankurah-derive     = { path = "../derive", optional = true, version = "=0.9.0" }
+ankurah-derive     = { path = "../derive", version = "=0.9.0" }
 ankql              = { path = "../ankql", version = "=0.9.0" }
 ankurah-core-types = { path = "../core-types", version = "=0.9.0" }
 ankurah-proto      = { path = "../proto", version = "=0.9.0" }
