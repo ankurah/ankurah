@@ -108,6 +108,32 @@ impl WeakEntity {
     pub fn upgrade(&self) -> Option<Entity> { self.0.upgrade().map(Entity) }
 }
 
+/// The genesis membership contract, enforced at event application: an event
+/// carries at most one Membership operation, only in a genesis event, and the
+/// model it asserts must be the same fact the event's collection field
+/// materializes. The attested event stream is the sole authority for
+/// entity-to-model membership (membership change events arrive in a later
+/// protocol revision); the collection field is its routing materialization,
+/// so a disagreement is a malformed event, refused before any state applies.
+fn validate_membership_operations(event: &Event) -> Result<(), MutationError> {
+    use ankurah_proto::Membership;
+    let mut memberships = event.operations.memberships();
+    let Some(first) = memberships.next() else { return Ok(()) };
+    if memberships.next().is_some() {
+        return Err(MutationError::General("an event carries at most one membership operation".into()));
+    }
+    if !event.is_entity_create() {
+        return Err(MutationError::General("a membership operation is permitted only in a genesis event".into()));
+    }
+    let Membership::Add(model) = first;
+    match crate::schema::system_model_id(event.collection.as_str()) {
+        Some(expected) if expected == *model => Ok(()),
+        _ => Err(MutationError::General(
+            format!("genesis membership asserts model {model} but the event routes to collection '{}'", event.collection).into(),
+        )),
+    }
+}
+
 impl Entity {
     pub fn id(&self) -> EntityId { self.id }
 
@@ -230,6 +256,7 @@ impl Entity {
     pub async fn apply_event<E>(&self, getter: &E, event: &Event) -> Result<bool, MutationError>
     where E: GetEvents + Send + Sync {
         debug!("apply_event head: {event} to {self}");
+        validate_membership_operations(event)?;
 
         // Idempotency is handled by the comparison algorithm:
         // - Event already in head -> Equal -> no-op (Ok(false))

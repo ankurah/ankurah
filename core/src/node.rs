@@ -438,6 +438,20 @@ where
     where C: Iterable<PA::ContextData> {
         match request.body {
             proto::NodeRequestBody::CommitTransaction { id, events } => {
+                // Protected collections (the system collection and the
+                // metadata catalog) are not mutable through ordinary
+                // transactions; the catalog's only mutation path is the
+                // registration operation. Registration writes the catalog
+                // through a direct commit_remote_transaction call that
+                // bypasses this guard.
+                for event in &events {
+                    let collection = event.payload.collection.as_str();
+                    if collection.starts_with(crate::schema::RESERVED_COLLECTION_PREFIX) {
+                        return Ok(proto::NodeResponseBody::Error(format!(
+                            "collection '{collection}' is protected and not writable by transactions"
+                        )));
+                    }
+                }
                 // TODO - relay to peers in a gossipy/resource-available manner, so as to improve propagation
                 // With moderate potential for duplication, while not creating message loops
                 // Doing so would be a secondary/tertiary/etc hop for this message
