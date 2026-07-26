@@ -7,21 +7,31 @@ use std::{
 };
 use tokio::sync::Notify;
 
-/// A lifecycle fence for requests whose effects must finish before their
-/// owner can be reset. Invalidation rejects new leases and then waits for any
-/// effect already admitted at the owner's lifecycle boundary to finish.
+/// A close-and-drain gate between node reset and in-flight response effects.
+///
+/// The node sends requests to peers (fetches, subscriptions, catalog warms);
+/// each response later applies effects to node state. Hard reset wipes that
+/// state, so a response mid-application must finish before the wipe, and a
+/// response arriving after the wipe belongs to the dead epoch and must never
+/// apply. Without this gate, a late response half-resurrects pre-reset data
+/// into the fresh state.
+///
+/// This is not a mutex: admitted effects run concurrently and never exclude
+/// one another. It is the async shutdown idiom, close then drain:
+/// [`Self::invalidate`] permanently refuses new leases, and
+/// [`Self::wait_drained`] completes once every admitted lease has dropped.
 ///
 /// The two halves in use:
 ///
 /// ```ignore
-/// // Owner setup: response effects admit through the fence.
+/// // Node setup: response effects admit through the fence.
 /// let fence = RequestFence::new();
 /// let validity = RequestValidity::fenced(fence.clone());
 ///
 /// // Response path: hold the lease across the whole effect.
 /// match validity.try_acquire() {
 ///     Some(_lease) => apply_response(response), // admitted; reset waits for us
-///     None => return,                           // owner is resetting; drop it
+///     None => return,                           // node is resetting; drop it
 /// } // lease drops here: the effect is finished and reset may proceed
 ///
 /// // Reset path: refuse new effects, then wait out the admitted ones.
@@ -107,18 +117,19 @@ impl Drop for RequestLease {
     }
 }
 
-/// A validity check owned by one asynchronous request attempt. Relay requests
-/// use the predicate to reject superseded attempts; reset-sensitive owners
-/// additionally attach a [`RequestFence`] so reset can quiesce effects that
-/// already passed the predicate.
+/// The "is this response still wanted" check one request attempt carries.
+/// The subscription relay uses the predicate to reject superseded attempts
+/// (a newer request for the same query has replaced this one); the node
+/// additionally attaches a [`RequestFence`] so reset can quiesce effects
+/// that already passed the predicate.
 ///
-/// Attempt-local predicates compose onto the owner's fence without losing it:
+/// Attempt-local predicates compose onto the node's fence without losing it:
 ///
 /// ```ignore
-/// // The owner's reset fence, narrowed to one request attempt: the response
+/// // The node's reset fence, narrowed to one request attempt: the response
 /// // applies only while no reset is underway AND this attempt is still the
 /// // latest one for its query (see SubscriptionRelay's request_generation).
-/// let validity = RequestValidity::fenced(owner_fence)
+/// let validity = RequestValidity::fenced(node_fence)
 ///     .and(move || current_generation() == my_generation);
 /// ```
 #[derive(Clone)]
