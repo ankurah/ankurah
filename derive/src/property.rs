@@ -9,6 +9,12 @@ pub fn derive_property_impl(input: TokenStream) -> TokenStream {
     // Generate the Property trait implementation
     let property_impl = quote! {
         impl ::ankurah::Property for #name {
+            // Pinned to match into_value below: derived Property types
+            // serialize as JSON in a string register, so their normative
+            // catalog value_type is "string" (RFC 4). A hand-written impl
+            // producing a different Value variant overrides this to match.
+            const VALUE_TYPE: &'static str = "string";
+
             fn into_value(&self) -> std::result::Result<Option<::ankurah::value::Value>, ::ankurah::property::PropertyError> {
                 let json_str = match ::ankurah::derive_deps::serde_json::to_string(self) {
                     Ok(s) => s,

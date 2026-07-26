@@ -12,6 +12,23 @@ use crate::value::Value;
 pub type PropertyName = String;
 
 pub trait Property: Sized {
+    /// The normative catalog value-type spelling for this type ("string",
+    /// "entityid", ...) that MUST equal the `Value` variant [`Self::into_value`]
+    /// actually produces (RFC 4 in specs/model-property-metadata/rfc.md mapping table).
+    ///
+    /// CONTRACT-CRITICAL: `#[derive(Model)]` reads this const (at compile
+    /// time, via the associated const) for field types outside the built-in
+    /// table, and the value is what registration declares against the
+    /// property's CANONICAL value_type: the canonical type is fixed at first
+    /// allocation and never changed by registration; a binary declaring a
+    /// different but mutually castable type registers compatibly, and a
+    /// non-castable declaration refuses registration loudly. Defaults to
+    /// "string" because the JSON-in-a-string register is the catch-all
+    /// serialization (`#[derive(Property)]` pins it explicitly); a
+    /// hand-written impl producing any other variant must override this to
+    /// match.
+    const VALUE_TYPE: &'static str = "string";
+
     fn into_value(&self) -> Result<Option<Value>, PropertyError>;
     fn from_value(value: Option<Value>) -> Result<Self, PropertyError>;
 }

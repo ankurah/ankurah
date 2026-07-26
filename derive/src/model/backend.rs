@@ -85,6 +85,20 @@ impl ActiveTypeDesc {
         Self { backend_config, value_config, concrete_types }
     }
 
+    /// The RON configs spell the backend `LWWBackend` / `YrsBackend`
+    /// (backend.rs BackendConfig::backend_name), so map those to the runtime
+    /// keys. Any future backend must extend this map; an unrecognized
+    /// backend name is a wiring bug in the RON, surfaced at derive time.
+    pub fn backend_key(&self) -> Result<&'static str, String> {
+        match self.backend_config.backend_name.as_str() {
+            "LWWBackend" => Ok("lww"),
+            "YrsBackend" => Ok("yrs"),
+            other => Err(format!(
+                "backend '{other}' has no catalog registry-name mapping; extend ActiveTypeDesc::backend_key (a spec change if it is a new backend)"
+            )),
+        }
+    }
+
     /// Get the wrapper type name for WASM bindings (just the identifier)
     pub fn wrapper_type_name(&self) -> String {
         let mut pattern = self.value_config.materialized_pattern.clone();

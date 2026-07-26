@@ -21,6 +21,14 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
         Err(e) => return e.to_compile_error().into(),
     };
 
+    // Validate schema-affecting attributes early (reserved collection
+    // prefix, explicit-id shape; RFC sections 4 and 5.9) so a bad model
+    // yields ONE actionable diagnostic instead of a cascade of downstream
+    // trait-bound errors from the other generated impls.
+    if let Err(e) = model::schema::validate_schema_attrs(&desc) {
+        return e.to_compile_error().into();
+    }
+
     let hygiene_module = quote::format_ident!("__ankurah_derive_impl_{}", to_snake_case(&desc.name().to_string()));
     let wasm_imports = if cfg!(feature = "wasm") {
         quote! {

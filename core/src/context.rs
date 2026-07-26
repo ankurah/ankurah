@@ -38,6 +38,13 @@ where
 
 #[async_trait]
 pub trait TContext {
+    /// RFC 5.2 STRICT registration (the eager explicit `ctx.register::<M>()`
+    /// form): propagate the error instead of swallowing it. Object-safe.
+    async fn register_strict(
+        &self,
+        schema: &'static crate::schema::ModelSchema,
+    ) -> Result<proto::ModelId, crate::schema::registration::RegistrationError>;
+
     fn node_id(&self) -> proto::EntityId;
     /// Create a brand new entity for a transaction, and add it to the WeakEntitySet
     /// Note that this does not actually persist the entity to the storage engine
@@ -54,6 +61,19 @@ pub trait TContext {
 
 #[async_trait]
 impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> TContext for NodeAndContext<SE, PA> {
+    async fn register_strict(
+        &self,
+        schema: &'static crate::schema::ModelSchema,
+    ) -> Result<proto::ModelId, crate::schema::registration::RegistrationError> {
+        self.node.catalog.ensure_registered(&self.node, &self.cdata, schema).await?;
+        self.node.catalog.model_id_for_schema(schema).ok_or_else(|| {
+            crate::schema::registration::RegistrationError::Retrieval(crate::error::RetrievalError::Other(format!(
+                "registration of '{}' did not retain its exact model identity",
+                schema.collection
+            )))
+        })
+    }
+
     fn node_id(&self) -> proto::EntityId { self.node.id }
     fn create_entity(&self, collection: proto::CollectionId, trx_alive: Arc<AtomicBool>) -> Entity {
         let primary_entity = self.node.entities.create(collection);
@@ -191,6 +211,14 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
 #[cfg(feature = "wasm")]
 #[wasm_bindgen]
 impl Context {
+    /// RFC 5.2 eager explicit registration (STRICT form): register `M`'s
+    /// model, properties, and memberships now, propagating any error. Useful
+    /// at startup so the catalog holds `M`'s definitions before anything
+    /// else runs. A second call for the same compiled shape is a no-op.
+    pub async fn register<M: crate::model::Model>(&self) -> Result<proto::ModelId, crate::schema::registration::RegistrationError> {
+        self.0.register_strict(M::schema()).await
+    }
+
     #[wasm_bindgen(js_name = "node_id")]
     pub fn js_node_id(&self) -> proto::EntityId { self.0.node_id() }
 }
