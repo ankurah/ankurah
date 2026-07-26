@@ -1,9 +1,10 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{auth::Attested, clock::Clock, collection::CollectionId, id::EntityId, AttestationSet, DecodeError};
+use ankurah_core_types::ModelId;
 
 #[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 pub struct EventId([u8; 32]);
@@ -153,8 +154,10 @@ impl Event {
     pub fn id(&self) -> EventId { EventId::from_parts(&self.entity_id, &self.operations, &self.parent) }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
-pub struct OperationSet(pub BTreeMap<String, Vec<Operation>>);
+/// Ordered top-level mutations that make up one event's content-addressed
+/// payload.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
+pub struct OperationSet(pub Vec<Operation>);
 
 impl std::fmt::Display for OperationSet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -163,7 +166,12 @@ impl std::fmt::Display for OperationSet {
             "OperationSet({})",
             self.0
                 .iter()
-                .map(|(backend, ops)| format!("{} => {}b", backend, ops.iter().map(|op| op.diff.len()).sum::<usize>()))
+                .map(|operation| match operation {
+                    Operation::Backend { backend, operations } => {
+                        format!("{} => {}b", backend, operations.iter().map(|operation| operation.diff.len()).sum::<usize>())
+                    }
+                    Operation::Membership(Membership::Add(model)) => format!("membership +{model}"),
+                })
                 .collect::<Vec<_>>()
                 .join(" ")
         )
@@ -171,12 +179,80 @@ impl std::fmt::Display for OperationSet {
 }
 
 impl std::ops::Deref for OperationSet {
-    type Target = BTreeMap<String, Vec<Operation>>;
+    type Target = [Operation];
     fn deref(&self) -> &Self::Target { &self.0 }
 }
 
+impl OperationSet {
+    /// Build the event-level operation sequence for backend-generated diffs.
+    ///
+    /// The input map's stable ordering gives locally generated events a
+    /// deterministic operation order.
+    pub fn from_backends(backends: BTreeMap<String, Vec<BackendOperation>>) -> Self {
+        Self(backends.into_iter().map(|(backend, operations)| Operation::Backend { backend, operations }).collect())
+    }
+
+    /// Append one event-level operation.
+    pub fn push(&mut self, operation: Operation) { self.0.push(operation); }
+
+    /// Iterate backend operation batches in event order.
+    pub fn backends(&self) -> impl Iterator<Item = (&str, &[BackendOperation])> {
+        self.0.iter().filter_map(|operation| match operation {
+            Operation::Backend { backend, operations } => Some((backend.as_str(), operations.as_slice())),
+            Operation::Membership(_) => None,
+        })
+    }
+
+    /// Iterate all backend diffs addressed to `backend`, preserving event
+    /// order even if an untrusted event contains more than one batch.
+    pub fn backend_operations<'a>(&'a self, backend: &'a str) -> impl Iterator<Item = &'a BackendOperation> {
+        self.0.iter().flat_map(move |operation| match operation {
+            Operation::Backend { backend: candidate, operations } if candidate == backend => operations.iter(),
+            Operation::Backend { .. } | Operation::Membership(_) => [].iter(),
+        })
+    }
+
+    /// Iterate explicit membership mutations in event order.
+    pub fn memberships(&self) -> impl Iterator<Item = &Membership> {
+        self.0.iter().filter_map(|operation| match operation {
+            Operation::Membership(membership) => Some(membership),
+            Operation::Backend { .. } => None,
+        })
+    }
+}
+
+/// A top-level mutation carried by an entity event.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub enum Operation {
+    /// Apply opaque diffs to one property backend.
+    Backend {
+        /// Registered property backend name.
+        backend: String,
+        /// Ordered opaque operations understood by that backend.
+        operations: Vec<BackendOperation>,
+    },
+    /// Change the entity's explicit model-backed membership state.
+    Membership(Membership),
+}
+
+/// An explicit mutation of an entity's model-backed membership state: which
+/// model an ENTITY belongs to, asserted in the attested event stream (the
+/// sole authority for that fact). Distinct from the catalog's
+/// model-property memberships, which are property-to-model records
+/// (`_ankurah_model_property`).
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub enum Membership {
+    /// Add the model-backed membership.
+    ///
+    /// An ordinary operation on any event; the commit funnels currently
+    /// admit it only on an entity's first event, exactly one there.
+    Add(ModelId),
+}
+
+/// An opaque operation generated and interpreted by a named property backend.
 #[derive(Debug, Serialize, Deserialize, Clone, Hash, Eq, PartialEq)]
-pub struct Operation {
+pub struct BackendOperation {
+    /// Opaque diff interpreted by the selected property backend.
     pub diff: Vec<u8>,
 }
 
@@ -191,6 +267,11 @@ pub struct EntityState {
 pub struct State {
     /// The current accumulated state of the entity inclusive of all events up to this point
     pub state_buffers: StateBuffers,
+    /// Model-backed memberships established by this entity's causal history.
+    ///
+    /// The commit funnels currently admit exactly one membership, on the
+    /// entity's first event, and no later membership mutations.
+    pub memberships: BTreeSet<ModelId>,
     /// The set of concurrent events (usually only one) which have been applied to the entity state above
     pub head: Clock,
 }
@@ -214,10 +295,6 @@ impl std::fmt::Display for Event {
             if self.is_entity_create() { "(create) " } else { "" },
             self.parent.to_base64_short(),
             self.operations
-                .iter()
-                .map(|(backend, ops)| format!("{} => {}b", backend, ops.iter().map(|op| op.diff.len()).sum::<usize>()))
-                .collect::<Vec<_>>()
-                .join(" ")
         )
     }
 }
@@ -303,5 +380,32 @@ mod tests {
             [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
         );
         assert_eq!(id, bincode::deserialize(&bytes).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod operation_wire_tests {
+    use super::*;
+    use ankurah_core_types::SystemModel;
+
+    /// Variant order is part of the bincode contract for event payloads:
+    /// Backend = 0, Membership = 1, and Membership::Add = 0. Payload
+    /// encodings inside the variants are pinned by ankurah-core-types' own
+    /// golden tests.
+    #[test]
+    fn operation_variant_order_is_pinned() {
+        let backend =
+            bincode::serialize(&Operation::Backend { backend: "lww".to_owned(), operations: vec![BackendOperation { diff: vec![7] }] })
+                .unwrap();
+        assert_eq!(&backend[..4], [0, 0, 0, 0], "Operation::Backend must encode as variant 0");
+
+        let membership = bincode::serialize(&Operation::Membership(Membership::Add(ModelId::System(SystemModel::Model)))).unwrap();
+        assert_eq!(&membership[..4], [1, 0, 0, 0], "Operation::Membership must encode as variant 1");
+        assert_eq!(&membership[4..8], [0, 0, 0, 0], "Membership::Add must encode as variant 0");
+
+        for bytes in [backend, membership] {
+            let round: Operation = bincode::deserialize(&bytes).unwrap();
+            assert_eq!(bincode::serialize(&round).unwrap(), bytes);
+        }
     }
 }

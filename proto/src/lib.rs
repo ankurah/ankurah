@@ -18,9 +18,12 @@ pub mod update;
 
 #[cfg(feature = "postgres")]
 pub mod postgres;
+pub mod registration;
 
 #[cfg(feature = "wasm")]
 pub mod wasm;
+
+pub use ankurah_core_types::{ModelId, PropertyId, SystemModel, SystemProperty};
 
 pub use auth::*;
 pub use clock::*;
@@ -30,6 +33,7 @@ pub use error::*;
 pub use id::*;
 pub use message::*;
 pub use peering::*;
+pub use registration::*;
 pub use request::*;
 pub use subscription::QueryId;
 pub use transaction::*;
