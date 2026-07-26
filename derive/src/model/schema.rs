@@ -188,49 +188,9 @@ pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
     })
 }
 
-/// Generate each derive-generated accessor's property-id resolution.
-///
-/// Ordinary fields resolve their compiled label through the view's model
-/// projection. An explicit binding embeds the already-validated entity id.
-/// Either way, the active property accessor receives only a `PropertyId` (or
-/// the resolution error), never a display name.
-pub(crate) fn active_field_resolution_tokens(
-    model: &ModelDescription,
-    entity: TokenStream,
-    model_id: TokenStream,
-) -> syn::Result<Vec<TokenStream>> {
-    model
-        .active_fields()
-        .iter()
-        .map(|field| {
-            let field_ident = field.ident.as_ref().expect("named field");
-            let display_name = field_ident.to_string().to_lowercase();
-            let explicit_id = property_str_attr(&field.attrs, "id")?;
-            let explicit_id_tokens = match explicit_id {
-                Some(id) => {
-                    let bytes = ankurah_core_types::EntityId::from_base64(&id)
-                        .map_err(|error| {
-                            syn::Error::new(
-                                field.ty.span(),
-                                format!("explicit id {id:?} is not a valid EntityId encoding: {error} (RFC 5.9)"),
-                            )
-                        })?
-                        .to_bytes();
-                    quote! { ::core::option::Option::Some(::ankurah::proto::EntityId::from_bytes([#(#bytes),*])) }
-                }
-                None => quote! { ::core::option::Option::None },
-            };
-            Ok(quote! {
-                ::ankurah::property::resolve_property_id(
-                    #entity,
-                    #model_id,
-                    #display_name,
-                    #explicit_id_tokens,
-                )
-            })
-        })
-        .collect()
-}
+// Accessor-side resolution (each derived accessor resolving its compiled
+// label or embedded explicit id to a PropertyId before touching a backend)
+// returns with the propertyid-resolution PR; its generator lived here.
 
 /// Map a field's original Rust type to its `(value_type, optional)` per the
 /// RFC section 4 normative table. `Option<T>` unwraps to the inner mapping
