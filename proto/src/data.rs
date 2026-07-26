@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -267,8 +267,24 @@ pub struct EntityState {
 pub struct State {
     /// The current accumulated state of the entity inclusive of all events up to this point
     pub state_buffers: StateBuffers,
+    /// Model-backed memberships established by this entity's causal history.
+    ///
+    /// The current protocol admits exactly one membership in the genesis
+    /// event and no later membership mutations.
+    pub memberships: BTreeSet<ModelId>,
     /// The set of concurrent events (usually only one) which have been applied to the entity state above
     pub head: Clock,
+}
+
+impl State {
+    /// Return the sole membership required by the current protocol.
+    pub fn sole_membership(&self) -> Option<ModelId> {
+        if self.memberships.len() == 1 {
+            self.memberships.iter().next().copied()
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]

@@ -602,10 +602,67 @@ where
         Some(EnsuredSchemaBinding { schema, model, fields, confirmed: true })
     }
 
-    // Automatic first-use registration (`ensure_schema_for_use`) and the
-    // no-peer fallback that proceeds from a catalog-proven compatible binding
-    // (`bind_compatible_schema`/`compatible_binding`) return with the
-    // propertyid-resolution PR alongside their mutation/predicate triggers.
+    /// Derive the exact binding an already-populated catalog proves for this
+    /// compiled declaration.
+    ///
+    /// Ordinary fields use the allocator's lookup scope `(minting model,
+    /// current name)`, not any same-named membership. That distinction keeps
+    /// explicit sharing explicit. An explicit model id must itself be the
+    /// collection's live model; a compatible ordinary model must be the one
+    /// indexed by the collection. Every field then needs a live membership and
+    /// a compatible immutable backend/type pair.
+    fn compatible_binding(&self, schema: &'static ModelSchema, confirmed: bool) -> Option<EnsuredSchemaBinding> {
+        let map = self.0.map.read().unwrap();
+        let model = match schema.explicit_id {
+            Some(id) => {
+                let id = super::local::parse_explicit_id(id);
+                let def = map.models.get(&id)?;
+                if def.label != schema.collection || map.by_label.get(schema.collection) != Some(&id) {
+                    return None;
+                }
+                id
+            }
+            None => *map.by_label.get(schema.collection)?,
+        };
+
+        let mut fields = BTreeMap::new();
+        for field in schema.properties {
+            let id = match field.explicit_id {
+                Some(id) => super::local::parse_explicit_id(id),
+                None => {
+                    let mut matches =
+                        map.properties.values().filter(|def| def.minted_for == Some(model) && def.name == field.name).map(|def| def.id);
+                    let id = matches.next()?;
+                    if matches.next().is_some() {
+                        return None;
+                    }
+                    id
+                }
+            };
+            if map.membership(&model, &id).is_none() {
+                return None;
+            }
+            let def = map.properties.get(&id)?;
+            if def.backend != field.backend || !super::registration::value_types_compatible(&def.value_type, field.value_type) {
+                return None;
+            }
+            fields.insert(field.name, id);
+        }
+        Some(EnsuredSchemaBinding { schema, model, fields, confirmed })
+    }
+
+    /// Record an exact binding proven from an already-compatible catalog.
+    /// This is the safe no-peer fallback when the allocator cannot be reached.
+    pub(crate) fn bind_compatible_schema(&self, schema: &'static ModelSchema) -> bool {
+        // Bind proof and publication to one ready system epoch. Reset either
+        // invalidates before admission (fail closed) or waits for this lease
+        // before clearing, so old ids cannot be stored after the clear.
+        let Some(validity) = self.registration_validity() else { return false };
+        let Some(_lease) = validity.try_acquire() else { return false };
+        let Some(binding) = self.compatible_binding(schema, false) else { return false };
+        self.store_binding(binding);
+        true
+    }
 
     fn store_binding(&self, binding: EnsuredSchemaBinding) {
         let mut ensured = self.0.ensured.write().unwrap();
@@ -614,13 +671,45 @@ where
             // Confirmation belongs to the exact ids returned by the
             // allocator. A later local proof may not replace those ids while
             // inheriting their confirmation; only another confirmed result
-            // can replace a confirmed binding (the unconfirmed producer is
-            // the no-peer fallback, which returns with the resolution PR).
+            // can replace a confirmed binding.
             if binding.confirmed || !existing.confirmed {
                 *existing = binding;
             }
         } else {
             bindings.push(binding);
+        }
+    }
+
+    /// Automatic schema use (mutation or predicate) tries the allocator first.
+    /// A policy or executor refusal is always strict. Only the explicit
+    /// no-durable-peer case may proceed from locally proven exact identities.
+    pub(crate) async fn ensure_schema_for_use(
+        &self,
+        node: &Node<SE, PA>,
+        cdata: &PA::ContextData,
+        schema: &'static ModelSchema,
+    ) -> Result<proto::ModelId, RegistrationError> {
+        match self.ensure_registered(node, cdata, schema).await {
+            Ok(()) => self.model_id_for_schema(schema).ok_or_else(|| {
+                RegistrationError::Retrieval(crate::error::RetrievalError::Other(format!(
+                    "registration of '{}' did not retain its exact model identity",
+                    schema.collection
+                )))
+            }),
+            Err(error @ RegistrationError::NoDurablePeer(_)) if self.bind_compatible_schema(schema) => {
+                tracing::warn!(
+                    "schema reassertion for fully bound collection '{}' has no durable peer; proceeding with proven canonical identities: {}",
+                    schema.collection,
+                    error
+                );
+                self.model_id_for_schema(schema).ok_or_else(|| {
+                    RegistrationError::Retrieval(crate::error::RetrievalError::Other(format!(
+                        "compatible binding for '{}' did not retain its exact model identity",
+                        schema.collection
+                    )))
+                })
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -655,13 +744,14 @@ where
         }
     }
 
-    /// RFC 5.2 "ensure registration". Called by explicit
-    /// [`crate::context::Context::register`] this phase; the automatic
-    /// mutation/predicate triggers arrive with the propertyid-resolution PR.
-    /// An existing schema resolves to a no-op plan, so re-asserting emits
-    /// nothing and skips the policy verb while the response feeds the map.
-    /// Fast-returns only if this exact compiled schema shape is already
-    /// ensured in this process, then durably registers:
+    /// RFC 5.2 "ensure registration" (specs/model-property-metadata/rfc.md
+    /// section 5.2). Called by explicit [`crate::context::Context::register`]
+    /// and, through [`Self::ensure_schema_for_use`], by first-use
+    /// registration on mutating and typed-read paths. An existing schema
+    /// resolves to a no-op plan, so re-asserting emits nothing and skips the
+    /// policy verb while the response feeds the map. Fast-returns only if
+    /// this exact compiled schema shape is already ensured in this process,
+    /// then durably registers:
     ///
     /// - DURABLE node: execute the registration locally
     ///   ([`Node::execute_schema_registration`], which updates the map
@@ -670,9 +760,9 @@ where
     ///   consume the SchemaRegistered response into the map; latch on Ok.
     /// - EPHEMERAL node with NO durable peer: registration is impossible
     ///   without the allocator, so this returns
-    ///   [`RegistrationError::NoDurablePeer`] without latching. (The
-    ///   resolution PR's automatic caller adds a fallback that proceeds when
-    ///   the local catalog proves every field's compatible binding.)
+    ///   [`RegistrationError::NoDurablePeer`] without latching. The automatic
+    ///   caller may proceed only if the local catalog proves the exact model
+    ///   and every field's compatible canonical binding.
     ///
     /// Every error path returns WITHOUT latching, so a later attempt
     /// retries.

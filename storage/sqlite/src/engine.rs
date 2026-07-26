@@ -121,6 +121,7 @@ fn create_state_table(conn: &Connection, collection_id: &CollectionId) -> Result
         r#"CREATE TABLE IF NOT EXISTS "{}"(
             "id" TEXT PRIMARY KEY,
             "state_buffer" BLOB NOT NULL,
+            "memberships" BLOB NOT NULL,
             "head" TEXT NOT NULL,
             "attestations" BLOB
         )"#,
@@ -266,6 +267,7 @@ impl StorageCollection for SqliteBucket {
         }
 
         let state_buffers = bincode::serialize(&state.payload.state.state_buffers)?;
+        let memberships_blob = bincode::serialize(&state.payload.state.memberships)?;
         let head_json = serde_json::to_string(&state.payload.state.head).map_err(|e| MutationError::General(Box::new(e)))?;
         let attestations_blob = bincode::serialize(&state.attestations)?;
         let id = state.payload.entity_id.to_base64();
@@ -298,7 +300,7 @@ impl StorageCollection for SqliteBucket {
         }
 
         // Build the UPSERT query
-        const BASE_COLUMNS: &[&str] = &["id", "state_buffer", "head", "attestations"];
+        const BASE_COLUMNS: &[&str] = &["id", "state_buffer", "memberships", "head", "attestations"];
 
         let table_name = self.state_table();
         let num_columns = BASE_COLUMNS.len() + materialized.len();
@@ -308,6 +310,7 @@ impl StorageCollection for SqliteBucket {
         let mut values: Vec<rusqlite::types::Value> = Vec::with_capacity(num_columns);
         values.push(rusqlite::types::Value::Text(id));
         values.push(rusqlite::types::Value::Blob(state_buffers));
+        values.push(rusqlite::types::Value::Blob(memberships_blob));
         values.push(rusqlite::types::Value::Text(head_json));
         values.push(rusqlite::types::Value::Blob(attestations_blob));
 
@@ -389,20 +392,23 @@ impl StorageCollection for SqliteBucket {
 
         let result = conn
             .with_connection(move |c| {
-                let query = format!(r#"SELECT "id", "state_buffer", "head", "attestations" FROM "{}" WHERE "id" = ?"#, table_name);
+                let query =
+                    format!(r#"SELECT "id", "state_buffer", "memberships", "head", "attestations" FROM "{}" WHERE "id" = ?"#, table_name);
 
                 let result = c.query_row(&query, [&id_str], |row| {
                     let _row_id: String = row.get(0)?;
                     let state_buffer: Vec<u8> = row.get(1)?;
-                    let head_json: String = row.get(2)?;
-                    let attestations_blob: Vec<u8> = row.get(3)?;
-                    Ok((state_buffer, head_json, attestations_blob))
+                    let memberships_blob: Vec<u8> = row.get(2)?;
+                    let head_json: String = row.get(3)?;
+                    let attestations_blob: Vec<u8> = row.get(4)?;
+                    Ok((state_buffer, memberships_blob, head_json, attestations_blob))
                 });
 
                 match result {
-                    Ok((state_buffer, head_json, attestations_blob)) => {
+                    Ok((state_buffer, memberships_blob, head_json, attestations_blob)) => {
                         let state_buffers: BTreeMap<String, Vec<u8>> =
                             bincode::deserialize(&state_buffer).map_err(|e| SqliteError::Serialization(e))?;
+                        let memberships = bincode::deserialize(&memberships_blob).map_err(|e| SqliteError::Serialization(e))?;
                         let head: Clock = serde_json::from_str(&head_json).map_err(|e| SqliteError::Json(e))?;
                         let attestations: AttestationSet =
                             bincode::deserialize(&attestations_blob).map_err(|e| SqliteError::Serialization(e))?;
@@ -411,7 +417,7 @@ impl StorageCollection for SqliteBucket {
                             payload: EntityState {
                                 entity_id: id,
                                 collection: collection_id,
-                                state: State { state_buffers: StateBuffers(state_buffers), head },
+                                state: State { state_buffers: StateBuffers(state_buffers), memberships, head },
                             },
                             attestations,
                         })
@@ -481,7 +487,7 @@ impl StorageCollection for SqliteBucket {
             limit: if needs_post_filter { None } else { effective_selection.limit },
         };
 
-        let mut builder = SqlBuilder::with_fields(vec!["id", "state_buffer", "head", "attestations"]);
+        let mut builder = SqlBuilder::with_fields(vec!["id", "state_buffer", "memberships", "head", "attestations"]);
         builder.table_name(self.state_table());
         builder.selection(&sql_selection).map_err(|e| SqliteError::SqlGeneration(e.to_string()))?;
 
@@ -496,14 +502,15 @@ impl StorageCollection for SqliteBucket {
                 let rows = stmt.query_map(params_from_iter(params.iter()), |row| {
                     let id_str: String = row.get(0)?;
                     let state_buffer: Vec<u8> = row.get(1)?;
-                    let head_json: String = row.get(2)?;
-                    let attestations_blob: Vec<u8> = row.get(3)?;
-                    Ok((id_str, state_buffer, head_json, attestations_blob))
+                    let memberships_blob: Vec<u8> = row.get(2)?;
+                    let head_json: String = row.get(3)?;
+                    let attestations_blob: Vec<u8> = row.get(4)?;
+                    Ok((id_str, state_buffer, memberships_blob, head_json, attestations_blob))
                 })?;
 
                 let mut results = Vec::new();
                 for row in rows {
-                    let (id_str, state_buffer, head_json, attestations_blob) = row?;
+                    let (id_str, state_buffer, memberships_blob, head_json, attestations_blob) = row?;
 
                     let id = EntityId::from_base64(&id_str).map_err(|e| {
                         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(std::io::Error::other(e)))
@@ -511,18 +518,21 @@ impl StorageCollection for SqliteBucket {
                     let state_buffers: BTreeMap<String, Vec<u8>> = bincode::deserialize(&state_buffer).map_err(|e| {
                         rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Blob, Box::new(std::io::Error::other(e)))
                     })?;
+                    let memberships = bincode::deserialize(&memberships_blob).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Blob, Box::new(std::io::Error::other(e)))
+                    })?;
                     let head: Clock = serde_json::from_str(&head_json).map_err(|e| {
-                        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(std::io::Error::other(e)))
+                        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(std::io::Error::other(e)))
                     })?;
                     let attestations: AttestationSet = bincode::deserialize(&attestations_blob).map_err(|e| {
-                        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Blob, Box::new(std::io::Error::other(e)))
+                        rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Blob, Box::new(std::io::Error::other(e)))
                     })?;
 
                     results.push(Attested {
                         payload: EntityState {
                             entity_id: id,
                             collection: collection_id.clone(),
-                            state: State { state_buffers: StateBuffers(state_buffers), head },
+                            state: State { state_buffers: StateBuffers(state_buffers), memberships, head },
                         },
                         attestations,
                     });

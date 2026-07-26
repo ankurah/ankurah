@@ -262,6 +262,7 @@ impl PostgresBucket {
             r#"CREATE TABLE IF NOT EXISTS "{}"(
                 "id" character(22) PRIMARY KEY,
                 "state_buffer" BYTEA,
+                "memberships" BYTEA,
                 "head" character(43)[],
                 "attestations" BYTEA[]
             )"#,
@@ -341,6 +342,7 @@ impl PostgresBucket {
 impl StorageCollection for PostgresBucket {
     async fn set_state(&self, state: Attested<EntityState>) -> Result<bool, MutationError> {
         let state_buffers = bincode::serialize(&state.payload.state.state_buffers)?;
+        let memberships = bincode::serialize(&state.payload.state.memberships)?;
         let attestations: Vec<Vec<u8>> = state.attestations.iter().map(bincode::serialize).collect::<Result<Vec<_>, _>>()?;
         let id = state.payload.entity_id;
 
@@ -351,10 +353,12 @@ impl StorageCollection for PostgresBucket {
 
         let mut client = self.pool.get().await.map_err(|err| MutationError::General(err.into()))?;
 
-        let mut columns: Vec<String> = vec!["id".to_owned(), "state_buffer".to_owned(), "head".to_owned(), "attestations".to_owned()];
+        let mut columns: Vec<String> =
+            vec!["id".to_owned(), "state_buffer".to_owned(), "memberships".to_owned(), "head".to_owned(), "attestations".to_owned()];
         let mut params: Vec<&(dyn ToSql + Sync)> = Vec::new();
         params.push(&id);
         params.push(&state_buffers);
+        params.push(&memberships);
         params.push(&state.payload.state.head);
         params.push(&attestations);
 
@@ -498,6 +502,8 @@ impl StorageCollection for PostgresBucket {
 
         let serialized_buffers: Vec<u8> = row.try_get("state_buffer").map_err(RetrievalError::storage)?;
         let state_buffers: BTreeMap<String, Vec<u8>> = bincode::deserialize(&serialized_buffers).map_err(RetrievalError::storage)?;
+        let membership_bytes: Vec<u8> = row.try_get("memberships").map_err(RetrievalError::storage)?;
+        let memberships = bincode::deserialize(&membership_bytes).map_err(RetrievalError::storage)?;
         let head: Clock = row.try_get("head").map_err(RetrievalError::storage)?;
         let attestation_bytes: Vec<Vec<u8>> = row.try_get("attestations").map_err(RetrievalError::storage)?;
         let attestations = attestation_bytes
@@ -510,7 +516,7 @@ impl StorageCollection for PostgresBucket {
             payload: EntityState {
                 entity_id: id,
                 collection: self.collection_id.clone(),
-                state: State { state_buffers: StateBuffers(state_buffers), head },
+                state: State { state_buffers: StateBuffers(state_buffers), memberships, head },
             },
             attestations: AttestationSet(attestations),
         })
@@ -580,7 +586,7 @@ impl StorageCollection for PostgresBucket {
         };
 
         let mut results = Vec::new();
-        let mut builder = SqlBuilder::with_fields(vec!["id", "state_buffer", "head", "attestations"]);
+        let mut builder = SqlBuilder::with_fields(vec!["id", "state_buffer", "memberships", "head", "attestations"]);
         builder.table_name(self.state_table());
         builder.selection(&sql_selection)?;
 
@@ -606,6 +612,8 @@ impl StorageCollection for PostgresBucket {
             let id: EntityId = row.try_get(0).map_err(RetrievalError::storage)?;
             let state_buffer: Vec<u8> = row.try_get(1).map_err(RetrievalError::storage)?;
             let state_buffers: BTreeMap<String, Vec<u8>> = bincode::deserialize(&state_buffer).map_err(RetrievalError::storage)?;
+            let membership_bytes: Vec<u8> = row.try_get("memberships").map_err(RetrievalError::storage)?;
+            let memberships = bincode::deserialize(&membership_bytes).map_err(RetrievalError::storage)?;
             let head: Clock = row.try_get("head").map_err(RetrievalError::storage)?;
             let attestation_bytes: Vec<Vec<u8>> = row.try_get("attestations").map_err(RetrievalError::storage)?;
             let attestations = attestation_bytes
@@ -618,7 +626,7 @@ impl StorageCollection for PostgresBucket {
                 payload: EntityState {
                     entity_id: id,
                     collection: self.collection_id.clone(),
-                    state: State { state_buffers: StateBuffers(state_buffers), head },
+                    state: State { state_buffers: StateBuffers(state_buffers), memberships, head },
                 },
                 attestations: AttestationSet(attestations),
             });

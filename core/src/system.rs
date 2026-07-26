@@ -158,7 +158,7 @@ where
         let collection_id = CollectionId::fixed_name(SYSTEM_COLLECTION_ID);
         let storage = self.0.collectionset.get(&collection_id).await?;
 
-        let system_entity = self.0.entities.create(collection_id.clone());
+        let system_entity = self.0.entities.create(collection_id.clone(), proto::ModelId::System(proto::SystemModel::System));
 
         let lww_backend = system_entity.get_backend::<LWWBackend>().expect("LWW Backend should exist");
         lww_backend.set("item".into(), proto::sys::Item::SysRoot.into_value()?);

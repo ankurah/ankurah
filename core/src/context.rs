@@ -50,21 +50,32 @@ pub trait TContext {
     /// registration protocol) -- and returns the model's allocated identity.
     ///
     /// "Strict" means every failure propagates to the caller; nothing is
-    /// swallowed and nothing falls back. Its lenient sibling -- automatic
-    /// first-use registration on mutation/query paths, with a no-peer
-    /// fallback from a locally proven binding -- arrives with the
-    /// propertyid-resolution PR; this explicit form is the only
-    /// registration entry point this phase.
+    /// swallowed and nothing falls back. The lenient siblings below
+    /// ([`Self::ensure_registered`], [`Self::ensure_query_schema`]) serve
+    /// automatic first-use registration on mutation and typed-read paths.
     async fn register_strict(
         &self,
         schema: &'static crate::schema::ModelSchema,
     ) -> Result<proto::ModelId, crate::schema::registration::RegistrationError>;
 
+    /// First-use registration for a WRITE: ensure the compiled schema is
+    /// registered (allocator-first; the no-peer case may proceed only from a
+    /// locally proven fully compatible binding) and return the model's
+    /// durable identity for the genesis membership.
+    async fn ensure_registered(&self, schema: &'static crate::schema::ModelSchema) -> Result<proto::ModelId, MutationError>;
+
+    /// First-use registration for a typed READ (fetch/get/query): same
+    /// semantics as [`Self::ensure_registered`] with read-flavored errors.
+    async fn ensure_query_schema(&self, schema: &'static crate::schema::ModelSchema) -> Result<proto::ModelId, RetrievalError>;
+
     fn node_id(&self) -> proto::EntityId;
-    /// Create a brand new entity for a transaction, and add it to the WeakEntitySet
+    /// Create a brand new entity for a transaction, and add it to the WeakEntitySet.
+    /// `model` is the entity's genesis membership intent: the durable model
+    /// identity its creation event will assert with an explicit
+    /// Membership::Add operation.
     /// Note that this does not actually persist the entity to the storage engine
     /// It merely ensures that there are no duplicate entities with the same ID (except forked entities)
-    fn create_entity(&self, collection: proto::CollectionId, trx_alive: Arc<AtomicBool>) -> Entity;
+    fn create_entity(&self, collection: proto::CollectionId, model: proto::ModelId, trx_alive: Arc<AtomicBool>) -> Entity;
     fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied>;
     async fn get_entity(&self, id: proto::EntityId, collection: &proto::CollectionId, cached: bool) -> Result<Entity, RetrievalError>;
     fn get_resident_entity(&self, id: proto::EntityId) -> Option<Entity>;
@@ -89,9 +100,30 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         })
     }
 
+    async fn ensure_registered(&self, schema: &'static crate::schema::ModelSchema) -> Result<proto::ModelId, MutationError> {
+        self.node.catalog.ensure_schema_for_use(&self.node, &self.cdata, schema).await.map_err(|error| {
+            let message = if self.node.catalog.model_by_label(schema.collection).is_none() {
+                format!("cannot write into unregistered collection '{}': {error}", schema.collection)
+            } else {
+                format!("cannot write using an unconfirmed schema for collection '{}': {error}", schema.collection)
+            };
+            MutationError::General(message.into())
+        })
+    }
+
+    async fn ensure_query_schema(&self, schema: &'static crate::schema::ModelSchema) -> Result<proto::ModelId, RetrievalError> {
+        self.node.catalog.ensure_schema_for_use(&self.node, &self.cdata, schema).await.map_err(|error| {
+            if self.node.catalog.model_by_label(schema.collection).is_none() {
+                RetrievalError::Other(format!("collection '{}' is not registered: {error}", schema.collection))
+            } else {
+                RetrievalError::Other(error.to_string())
+            }
+        })
+    }
+
     fn node_id(&self) -> proto::EntityId { self.node.id }
-    fn create_entity(&self, collection: proto::CollectionId, trx_alive: Arc<AtomicBool>) -> Entity {
-        let primary_entity = self.node.entities.create(collection);
+    fn create_entity(&self, collection: proto::CollectionId, model: proto::ModelId, trx_alive: Arc<AtomicBool>) -> Entity {
+        let primary_entity = self.node.entities.create(collection, model);
         primary_entity.snapshot(trx_alive)
     }
     fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied> { self.node.policy_agent.check_write(&self.cdata, entity, None) }
@@ -131,6 +163,9 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
                         ));
                     }
                 }
+                // Membership admissibility is a commit-path gate, mirrored on
+                // the remote funnel (commit_remote_transaction).
+                self.node.check_membership_admissibility(&event)?;
                 entity_events.push((entity.clone(), event));
             }
         }
@@ -276,12 +311,18 @@ impl Context {
     // }
 
     pub async fn get<R: View>(&self, id: proto::EntityId) -> Result<R, RetrievalError> {
+        use crate::model::Model;
+        // A typed direct get is a schema-dependent use: admit the exact
+        // compiled schema (first-use registration) before decoding.
+        self.0.ensure_query_schema(R::Model::schema()).await?;
         let entity = self.0.get_entity(id, &R::collection(), false).await?;
         Ok(R::from_entity(entity))
     }
 
     /// Get an entity, but its ok to return early if the entity is already in the local node storage
     pub async fn get_cached<R: View>(&self, id: proto::EntityId) -> Result<R, RetrievalError> {
+        use crate::model::Model;
+        self.0.ensure_query_schema(R::Model::schema()).await?;
         let entity = self.0.get_entity(id, &R::collection(), true).await?;
         Ok(R::from_entity(entity))
     }
@@ -289,6 +330,11 @@ impl Context {
     pub async fn fetch<R: View>(&self, args: impl TryInto<MatchArgs, Error = impl Into<RetrievalError>>) -> Result<Vec<R>, RetrievalError> {
         let args: MatchArgs = args.try_into().map_err(|e| e.into())?;
         use crate::model::Model;
+        // Typed predicate reads register at first use, so the fetch runs
+        // against authoritative catalog rows instead of failing loud as
+        // unregistered (and offline with no peer, it fails loud instead of
+        // answering empty).
+        self.0.ensure_query_schema(R::Model::schema()).await?;
         let collection_id = R::Model::collection();
 
         let entities = self.0.fetch_entities(&collection_id, args).await?;
@@ -319,6 +365,11 @@ impl Context {
     where
         R: View,
     {
+        use crate::model::Model;
+        // The synchronous `query` cannot await first-use registration (its
+        // initialization pipeline takes that over with the
+        // propertyid-resolution PR); the awaited form registers here.
+        self.0.ensure_query_schema(R::Model::schema()).await?;
         let livequery = self.query::<R>(args)?;
         livequery.wait_initialized().await;
         Ok(livequery)

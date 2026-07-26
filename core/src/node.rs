@@ -586,6 +586,48 @@ where
     }
 
     /// Does all the things necessary to commit a remote transaction
+    /// Commit-path admissibility for membership operations: the protocol
+    /// gate beside the PolicyAgent's policy gate (`check_event`). The
+    /// current protocol admits exactly one Membership::Add in a genesis
+    /// event -- asserting the same model fact the event's collection field
+    /// materializes (the built-in mapping for system collections, the
+    /// registered model for app collections) -- and no membership mutations
+    /// after genesis. Application (`Entity::apply_event`) is deliberately
+    /// unchecked: the attested event stream is the membership authority, and
+    /// this gate controls only what may be EMITTED into it today.
+    pub(crate) fn check_membership_admissibility(&self, event: &proto::Event) -> Result<(), MutationError> {
+        let memberships: Vec<proto::ModelId> = event
+            .operations
+            .memberships()
+            .map(|membership| match membership {
+                proto::Membership::Add(model) => *model,
+            })
+            .collect();
+        if !event.is_entity_create() {
+            return if memberships.is_empty() {
+                Ok(())
+            } else {
+                Err(MutationError::InvalidUpdate("membership changes after genesis are not admissible yet"))
+            };
+        }
+        let model = match memberships.as_slice() {
+            [model] => *model,
+            [] => return Err(MutationError::InvalidUpdate("a genesis event must add exactly one membership")),
+            _ => return Err(MutationError::InvalidUpdate("a genesis event cannot add more than one membership")),
+        };
+        let expected = crate::schema::system_model_id(event.collection.as_str())
+            .or_else(|| self.catalog.model_id_for(event.collection.as_str()));
+        match expected {
+            Some(expected) if expected == model => Ok(()),
+            Some(_) => Err(MutationError::General(
+                format!("genesis membership asserts model {model} but the event routes to collection '{}'", event.collection).into(),
+            )),
+            None => Err(MutationError::General(
+                format!("genesis membership asserts model {model} but collection '{}' has no registered model", event.collection).into(),
+            )),
+        }
+    }
+
     pub async fn commit_remote_transaction(
         &self,
         cdata: &PA::ContextData,
@@ -596,6 +638,7 @@ where
         let mut changes = Vec::new();
 
         for event in events.iter_mut() {
+            self.check_membership_admissibility(&event.payload)?;
             let collection = self.collections.get(&event.payload.collection).await?;
 
             // When applying an event, we should only look at the local storage for the lineage
