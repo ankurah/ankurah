@@ -38,8 +38,23 @@ where
 
 #[async_trait]
 pub trait TContext {
-    /// RFC 5.2 STRICT registration (the eager explicit `ctx.register::<M>()`
-    /// form): propagate the error instead of swallowing it. Object-safe.
+    /// The object-safe bridge behind [`Context::register`]. `Context` erases
+    /// the node's `<SE, PA>` generics behind `Arc<dyn TContext>`, and a dyn
+    /// trait cannot carry a generic method, so the typed `register::<M>()`
+    /// collapses to this monomorphic call with `M`'s compiled schema.
+    ///
+    /// Registers the model, its properties, and its model-property
+    /// memberships with the durable allocator -- executed locally on a
+    /// durable node, forwarded as a RegisterSchema request on an ephemeral
+    /// one (specs/model-property-metadata/rfc.md section 5.2, the
+    /// registration protocol) -- and returns the model's allocated identity.
+    ///
+    /// "Strict" means every failure propagates to the caller; nothing is
+    /// swallowed and nothing falls back. Its lenient sibling -- automatic
+    /// first-use registration on mutation/query paths, with a no-peer
+    /// fallback from a locally proven binding -- arrives with the
+    /// propertyid-resolution PR; this explicit form is the only
+    /// registration entry point this phase.
     async fn register_strict(
         &self,
         schema: &'static crate::schema::ModelSchema,
@@ -218,10 +233,13 @@ impl Context {
 // Generic methods cannot cross the wasm_bindgen boundary; they live in this
 // plain impl and remain host-and-wasm callable from Rust.
 impl Context {
-    /// RFC 5.2 eager explicit registration (STRICT form): register `M`'s
-    /// model, properties, and memberships now, propagating any error. Useful
-    /// at startup so the catalog holds `M`'s definitions before anything
-    /// else runs. A second call for the same compiled shape is a no-op.
+    /// Explicitly register `M`'s model, properties, and model-property
+    /// memberships with the durable allocator, propagating any error, and
+    /// return the model's allocated identity
+    /// (specs/model-property-metadata/rfc.md section 5.2, the registration
+    /// protocol). Useful at startup so the catalog holds `M`'s definitions
+    /// before anything else runs. A second call for the same compiled shape
+    /// is a no-op.
     pub async fn register<M: crate::model::Model>(&self) -> Result<proto::ModelId, crate::schema::registration::RegistrationError> {
         self.0.register_strict(M::schema()).await
     }
