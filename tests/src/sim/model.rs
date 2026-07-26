@@ -81,7 +81,7 @@ fn lww_ops(field: Field, value: &str) -> proto::OperationSet {
     let backend = LWWBackend::new();
     backend.set(field.name().into(), Some(Value::String(value.to_owned())));
     let ops = backend.to_operations().unwrap().expect("a written LWW backend yields operations");
-    proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)]))
+    proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)]))
 }
 
 /// Forge the genesis (creation) event for an entity: empty parent clock marks
