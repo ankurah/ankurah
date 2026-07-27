@@ -66,12 +66,14 @@ impl ModelDescription {
         let system = match model_str_attr_on(&input.attrs, "system")? {
             Some(variant) => match variant.as_str() {
                 "System" | "Model" | "Property" | "ModelProperty" => Some(format_ident!("{}", variant)),
-                other => return Err(syn::Error::new_spanned(
-                    &name,
-                    format!(
+                other => {
+                    return Err(syn::Error::new_spanned(
+                        &name,
+                        format!(
                         "#[model(system = {other:?})] is not a built-in system model; expected System, Model, Property, or ModelProperty"
                     ),
-                )),
+                    ))
+                }
             },
             None => None,
         };

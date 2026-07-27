@@ -14,10 +14,16 @@
 //!   through its `Property` impl's `VALUE_TYPE` const; the derive carries
 //!   no value-type vocabulary of its own.
 //!
-//! Attributes parsed here: `#[property(renamed_from = "...")]` (the
-//! transient rename hint) and `#[property(id = "...")]` /
-//! `#[model(id = "...")]` (explicit binding). Explicit-id values
-//! are validated at compile time as URL-safe base64 of exactly 16 bytes.
+//! Attributes parsed here, by the kind of thing each value parses as:
+//! - `#[property(renamed_from = "...")]`: a property display name (the
+//!   transient rename hint).
+//! - `#[model(id = "...")]` / `#[property(id = "...")]`: the EntityId of an
+//!   EXISTING catalog entity to bind against, verified at registration and
+//!   never minting. Built-in system identities are not catalog entities and
+//!   cannot appear here.
+//! - `#[model(system = "...")]`: a built-in SystemModel variant, parsed in
+//!   description.rs. A closed compile-time identity: never registered, and
+//!   the collection is pinned to its reserved system label.
 
 use proc_macro2::TokenStream;
 use quote::quote;
@@ -64,7 +70,12 @@ pub fn validate_schema_attrs(model: &ModelDescription) -> syn::Result<()> {
     }
 
     if let Some(id) = model_str_attr(model, "id")? {
-        validate_explicit_id(&id).map_err(|msg| syn::Error::new(model.name().span(), msg))?;
+        validate_explicit_id(&id).map_err(|msg| {
+            syn::Error::new(
+                model.name().span(),
+                format!("{msg}; #[model(id = ...)] takes the EntityId of an existing model catalog entity -- for a built-in system model use #[model(system = \"...\")]"),
+            )
+        })?;
     }
 
     Ok(())
