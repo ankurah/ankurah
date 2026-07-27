@@ -193,6 +193,35 @@ fn register_model_honors_explicit_ids() {
     assert_eq!(other.explicit_id, None, "unbound field looks up by name");
 }
 
+// -- unique ids ---------------------------------------------------------------
+
+/// The derive hashes a deterministic unique id for the struct and each
+/// active field from the DECLARING module's path and the declared names --
+/// recomputing from this module's own `module_path!()` must reproduce them
+/// exactly (which also proves no derive-internal module segment leaks into
+/// the hash input). All field ids are distinct, structs in the same module
+/// get distinct ids, and the wire conversion supplies every id as `Some`.
+#[test]
+fn unique_ids_are_derived_distinct_and_carried_on_the_wire() {
+    let schema = DescAllTypes::descriptor();
+    assert_eq!(schema.unique_id, proto::UniqueStructId::from_names(module_path!(), "DescAllTypes"));
+
+    let mut seen = std::collections::BTreeSet::new();
+    for f in schema.properties {
+        assert_eq!(f.unique_id, proto::UniqueFieldId::from_names(module_path!(), "DescAllTypes", f.field), "field id for {}", f.field);
+        assert!(seen.insert(f.unique_id), "field ids must be distinct; {} repeats one", f.field);
+    }
+
+    // Same module, different struct: distinct struct ids.
+    assert_ne!(schema.unique_id, DescArtist::descriptor().unique_id);
+
+    let model = proto::RegisterModel::from(schema);
+    assert_eq!(model.unique_id, Some(schema.unique_id), "wire model id supplied");
+    for (entry, f) in model.properties.iter().zip(schema.properties) {
+        assert_eq!(entry.unique_id, Some(f.unique_id), "wire field id for {}", f.field);
+    }
+}
+
 // -- end-to-end registration through the harness -----------------------------
 
 async fn catalog_values(

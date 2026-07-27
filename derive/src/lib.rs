@@ -61,7 +61,15 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
     #[cfg(any(not(feature = "uniffi"), feature = "wasm"))]
     let uniffi_impl = quote! {};
 
+    // The declaring module's path, captured OUTSIDE the hygiene module so
+    // the unique-id hash input carries the user's own module path, not the
+    // hygiene module's.
+    let module_path_const = desc.module_path_const();
+
     let expanded = quote! {
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals)]
+        const #module_path_const: &'static str = ::core::module_path!();
         mod #hygiene_module {
             use super::*;
             #wasm_imports

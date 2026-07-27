@@ -33,6 +33,7 @@ fn property(name: &str, renamed_from: Option<&str>, backend: &str, value_type: &
         value_type: value_type.into(),
         target_label: None,
         explicit_id: None,
+        unique_id: None,
         optional: false,
     }
 }
@@ -40,7 +41,7 @@ fn property(name: &str, renamed_from: Option<&str>, backend: &str, value_type: &
 /// One album model whose entries are the given properties (the nesting is
 /// the membership assertion).
 fn album_model(properties: Vec<proto::RegisterProperty>) -> proto::RegisterModel {
-    proto::RegisterModel { label: "album".into(), name: "Album".into(), explicit_id: None, properties }
+    proto::RegisterModel { label: "album".into(), name: "Album".into(), explicit_id: None, unique_id: None, properties }
 }
 
 fn album_request() -> proto::NodeRequestBody {
@@ -150,6 +151,44 @@ async fn registration_is_idempotent() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The wire's optional compile-time unique ids are hints the executor
+/// accepts and ignores: a request carrying them registers, and the same
+/// declaration without them resolves to the same catalog identities, so the
+/// hint participates in nothing. (Every other test in this suite sends
+/// `None`, which is the other half of the tolerance.)
+#[tokio::test]
+async fn unique_id_hints_are_accepted_and_ignored() -> anyhow::Result<()> {
+    let (server, client, _conn) = connected_pair().await?;
+
+    let hinted = proto::NodeRequestBody::RegisterSchema {
+        models: vec![proto::RegisterModel {
+            label: "album".into(),
+            name: "Album".into(),
+            explicit_id: None,
+            unique_id: Some(proto::UniqueStructId::from_names("some_app::records", "Album")),
+            properties: vec![proto::RegisterProperty {
+                name: "name".into(),
+                renamed_from: None,
+                backend: "yrs".into(),
+                value_type: "string".into(),
+                target_label: None,
+                explicit_id: None,
+                unique_id: Some(proto::UniqueFieldId::from_names("some_app::records", "Album", "name")),
+                optional: false,
+            }],
+        }],
+    };
+    let first = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, hinted).await?);
+    let (model_id, property_id) = (first[0].id, first[0].properties[0].id);
+
+    // The identical declaration WITHOUT hints lands on the same identities.
+    let second = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+    assert_eq!(second[0].id, model_id, "unique-id hints must not participate in model identity");
+    assert_eq!(second[0].properties[0].id, property_id, "unique-id hints must not participate in property identity");
+
+    Ok(())
+}
+
 /// The renamed_from hint moves the lineage to the new name
 /// WITHOUT re-keying (same property id), and no-ops once applied.
 #[tokio::test]
@@ -190,6 +229,7 @@ async fn target_model_can_be_cleared_retargeted_and_cleared_on_rename() -> anyho
             value_type: "entityid".into(),
             target_label: Some("artist".into()),
             explicit_id: None,
+            unique_id: None,
             optional: false,
         }])],
     };
@@ -205,6 +245,7 @@ async fn target_model_can_be_cleared_retargeted_and_cleared_on_rename() -> anyho
             value_type: "entityid".into(),
             target_label: None,
             explicit_id: None,
+            unique_id: None,
             optional: false,
         }])],
     };
@@ -221,6 +262,7 @@ async fn target_model_can_be_cleared_retargeted_and_cleared_on_rename() -> anyho
             value_type: "entityid".into(),
             target_label: Some("artist".into()),
             explicit_id: None,
+            unique_id: None,
             optional: false,
         }])],
     };
@@ -235,6 +277,7 @@ async fn target_model_can_be_cleared_retargeted_and_cleared_on_rename() -> anyho
             value_type: "entityid".into(),
             target_label: None,
             explicit_id: None,
+            unique_id: None,
             optional: false,
         }])],
     };
@@ -434,7 +477,13 @@ async fn model_display_name_renames_and_reverts() -> anyhow::Result<()> {
     assert_eq!(model.get("name"), Some(&Some(Value::String("Album".into()))));
 
     let rename = |name: &str| proto::NodeRequestBody::RegisterSchema {
-        models: vec![proto::RegisterModel { label: "album".into(), name: name.into(), explicit_id: None, properties: vec![] }],
+        models: vec![proto::RegisterModel {
+            label: "album".into(),
+            name: name.into(),
+            explicit_id: None,
+            unique_id: None,
+            properties: vec![],
+        }],
     };
 
     let resolved = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, rename("Discography")).await?);
@@ -465,6 +514,7 @@ async fn target_collection_resolves_and_allocates_on_miss() -> anyhow::Result<()
             value_type: "entityid".into(),
             target_label: Some("artist".into()),
             explicit_id: None,
+            unique_id: None,
             optional: false,
         }])],
     };
@@ -499,6 +549,7 @@ async fn explicit_id_binding_and_sharing() -> anyhow::Result<()> {
             label: "playlist".into(),
             name: "Playlist".into(),
             explicit_id: None,
+            unique_id: None,
             properties: vec![proto::RegisterProperty {
                 name: "name".into(),
                 renamed_from: None,
@@ -506,6 +557,7 @@ async fn explicit_id_binding_and_sharing() -> anyhow::Result<()> {
                 value_type: "string".into(),
                 target_label: None,
                 explicit_id: Some(property_id),
+                unique_id: None,
                 optional: true,
             }],
         }],
@@ -527,6 +579,7 @@ async fn explicit_id_binding_and_sharing() -> anyhow::Result<()> {
             value_type: "string".into(),
             target_label: None,
             explicit_id: Some(EntityId::new()),
+            unique_id: None,
             optional: false,
         }])],
     };
@@ -541,6 +594,7 @@ async fn explicit_id_binding_and_sharing() -> anyhow::Result<()> {
             value_type: "i64".into(),
             target_label: None,
             explicit_id: Some(property_id),
+            unique_id: None,
             optional: false,
         }])],
     };
@@ -571,6 +625,7 @@ async fn explicit_id_binding_rejects_non_catalog_entities() -> anyhow::Result<()
             value_type: "string".into(),
             target_label: None,
             explicit_id: Some(ordinary_id),
+            unique_id: None,
             optional: false,
         }])],
     };
@@ -581,6 +636,7 @@ async fn explicit_id_binding_rejects_non_catalog_entities() -> anyhow::Result<()
             label: "ordinary".into(),
             name: "Ordinary".into(),
             explicit_id: Some(ordinary_id),
+            unique_id: None,
             properties: vec![],
         }],
     };
@@ -604,6 +660,7 @@ async fn explicit_id_binding_accepts_castable_type_drift() -> anyhow::Result<()>
             label: "playlist".into(),
             name: "Playlist".into(),
             explicit_id: None,
+            unique_id: None,
             properties: vec![proto::RegisterProperty {
                 name: "year".into(),
                 renamed_from: None,
@@ -611,6 +668,7 @@ async fn explicit_id_binding_accepts_castable_type_drift() -> anyhow::Result<()>
                 value_type: "i64".into(),
                 target_label: None,
                 explicit_id: Some(property_id),
+                unique_id: None,
                 optional: false,
             }],
         }],
@@ -637,6 +695,7 @@ async fn dangling_explicit_property_refuses_before_writes() -> anyhow::Result<()
             label: "dangling".into(),
             name: "Dangling".into(),
             explicit_id: None,
+            unique_id: None,
             properties: vec![proto::RegisterProperty {
                 name: "ghost".into(),
                 renamed_from: None,
@@ -644,6 +703,7 @@ async fn dangling_explicit_property_refuses_before_writes() -> anyhow::Result<()
                 value_type: "string".into(),
                 target_label: None,
                 explicit_id: Some(missing),
+                unique_id: None,
                 optional: false,
             }],
         }],
@@ -664,7 +724,7 @@ async fn explicit_model_id_binding() -> anyhow::Result<()> {
     let album_model = first[0].id;
 
     let bind = |label: &str, explicit_id, properties| proto::NodeRequestBody::RegisterSchema {
-        models: vec![proto::RegisterModel { label: label.into(), name: label.into(), explicit_id, properties }],
+        models: vec![proto::RegisterModel { label: label.into(), name: label.into(), explicit_id, unique_id: None, properties }],
     };
 
     // Binding an id that does not exist never mints.
@@ -682,6 +742,7 @@ async fn explicit_model_id_binding() -> anyhow::Result<()> {
         value_type: "string".into(),
         target_label: None,
         explicit_id: None,
+        unique_id: None,
         optional: false,
     };
     let bound = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, bind("album", Some(album_model), vec![genre])).await?);
@@ -882,7 +943,13 @@ async fn check_schema_registration_gates_creates() -> anyhow::Result<()> {
     client.system.wait_system_ready().await;
 
     let forbidden = proto::NodeRequestBody::RegisterSchema {
-        models: vec![proto::RegisterModel { label: "forbidden".into(), name: "Forbidden".into(), explicit_id: None, properties: vec![] }],
+        models: vec![proto::RegisterModel {
+            label: "forbidden".into(),
+            name: "Forbidden".into(),
+            explicit_id: None,
+            unique_id: None,
+            properties: vec![],
+        }],
     };
     expect_error(client.request(server.id, &DEFAULT_CONTEXT, forbidden).await?, "policy");
     assert!(server.catalog.model_by_label("forbidden").is_none(), "a refused plan emits nothing");
@@ -1029,7 +1096,13 @@ async fn reserved_collection_prefix_refuses_registration() -> anyhow::Result<()>
     // under the prefix: the rule is the prefix, not an allowlist).
     for collection in ["_ankurah_model", "_ankurah_custom"] {
         let as_model = proto::NodeRequestBody::RegisterSchema {
-            models: vec![proto::RegisterModel { label: collection.into(), name: "Model".into(), explicit_id: None, properties: vec![] }],
+            models: vec![proto::RegisterModel {
+                label: collection.into(),
+                name: "Model".into(),
+                explicit_id: None,
+                unique_id: None,
+                properties: vec![],
+            }],
         };
         expect_error(client.request(server.id, &DEFAULT_CONTEXT, as_model).await?, "reserved prefix");
     }
@@ -1048,6 +1121,7 @@ async fn reserved_collection_prefix_refuses_registration() -> anyhow::Result<()>
             value_type: "entity_ref".into(),
             target_label: Some("_ankurah_model".into()),
             explicit_id: None,
+            unique_id: None,
             optional: false,
         }])],
     };

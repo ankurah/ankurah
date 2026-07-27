@@ -95,6 +95,14 @@ impl ModelDescription {
     }
     /// The path generated code reaches the core crate through.
     pub fn base(&self) -> &syn::Path { &self.base }
+    /// The per-struct hidden const holding `module_path!()` as expanded in
+    /// the USER's module. It must live outside the hygiene module (a
+    /// `module_path!()` inside it would pick up the hygiene segment, baking
+    /// a derive-internal name into the durable unique-id hash input), so
+    /// lib.rs emits it at the expansion's top level and schema.rs reads it
+    /// through `super::`. The struct name rides verbatim (not case-folded)
+    /// so distinct structs always get distinct consts.
+    pub fn module_path_const(&self) -> Ident { format_ident!("__ANKURAH_MODULE_PATH_{}", self.name) }
     /// True for a core-internal model: skip the wasm/uniffi binding layers.
     pub fn is_internal(&self) -> bool { self.internal }
     /// The built-in system identity, when this is a system model.

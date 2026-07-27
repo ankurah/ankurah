@@ -385,8 +385,13 @@ where
                         }
                         None => {
                             let id = EntityId::new();
-                            let stub =
-                                RegisterModel { label: l.to_string(), name: l.to_string(), explicit_id: None, properties: Vec::new() };
+                            let stub = RegisterModel {
+                                label: l.to_string(),
+                                name: l.to_string(),
+                                explicit_id: None,
+                                unique_id: None,
+                                properties: Vec::new(),
+                            };
                             plan.creates_models.push((id, stub));
                             push(creation(
                                 model_collection(),

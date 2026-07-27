@@ -39,6 +39,7 @@ fn album_entry(name: &str, backend: &str, value_type: &str, optional: bool) -> p
         label: "album".into(),
         name: "Album".into(),
         explicit_id: None,
+        unique_id: None,
         properties: vec![proto::RegisterProperty {
             name: name.into(),
             renamed_from: None,
@@ -46,6 +47,7 @@ fn album_entry(name: &str, backend: &str, value_type: &str, optional: bool) -> p
             value_type: value_type.into(),
             target_label: None,
             explicit_id: None,
+            unique_id: None,
             optional,
         }],
     }

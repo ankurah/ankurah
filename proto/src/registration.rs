@@ -10,6 +10,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use ankurah_core_types::{UniqueFieldId, UniqueStructId};
+
 use crate::id::EntityId;
 
 /// One model declaration within a RegisterSchema request.
@@ -26,6 +28,12 @@ pub struct RegisterModel {
     /// looking one up by label. Never mints; hard-fails if absent or if the
     /// bound entity's label differs.
     pub explicit_id: Option<EntityId>,
+    /// The declaring struct's deterministic source identity, hashed from its
+    /// names at compile time. An identity hint for future migrations: the
+    /// executor accepts and ignores it today. `None` for registrations with
+    /// no compile-time source (dynamic or non-Rust declarations); the derive
+    /// always supplies it.
+    pub unique_id: Option<UniqueStructId>,
     /// The model's properties, in declaration order. Each entry asserts a
     /// model-property membership; an entry with an explicit id references an
     /// existing (possibly shared) property and never mints.
@@ -58,6 +66,11 @@ pub struct RegisterProperty {
     /// Explicit binding: reference an EXISTING property entity instead of
     /// looking one up by name. Never mints; hard-fails if absent.
     pub explicit_id: Option<EntityId>,
+    /// The declaring field's deterministic source identity, hashed from its
+    /// names at compile time. An identity hint for future migrations: the
+    /// executor accepts and ignores it today. `None` for registrations with
+    /// no compile-time source; the derive always supplies it.
+    pub unique_id: Option<UniqueFieldId>,
     /// Whether entities of this model may omit the property. Per membership:
     /// the same property may be required in one model and optional in
     /// another.

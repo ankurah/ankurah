@@ -23,7 +23,7 @@ pub mod registration;
 #[cfg(feature = "wasm")]
 pub mod wasm;
 
-pub use ankurah_core_types::{ModelId, PropertyId, SystemModel, SystemProperty};
+pub use ankurah_core_types::{ModelId, PropertyId, SystemModel, SystemProperty, UniqueFieldId, UniqueStructId};
 
 pub use auth::*;
 pub use clock::*;

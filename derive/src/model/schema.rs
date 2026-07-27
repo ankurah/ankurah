@@ -92,6 +92,11 @@ pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
 
     let name = model.name();
     let name_str = name.to_string();
+    // The declaring module's path, captured by lib.rs in the user's module.
+    // The descriptor static lives inside the hygiene module, so it reads the
+    // const through `super::`. Unique ids hash NAMES ONLY (module path,
+    // struct, field), so they survive a change of a field's type.
+    let module_path_const = model.module_path_const();
 
     // Per-field descriptors, in declaration order (ephemeral fields already
     // excluded by ModelDescription's active/ephemeral split).
@@ -151,6 +156,7 @@ pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
                 target_label: #target_collection_tokens,
                 optional: #optional,
                 explicit_id: #explicit_id_tokens,
+                unique_id: #base::proto::UniqueFieldId::from_names(super::#module_path_const, #name_str, #field_name),
             }
         });
     }
@@ -182,6 +188,7 @@ pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
                 ],
                 explicit_id: #model_explicit_id_tokens,
                 system: #system_tokens,
+                unique_id: #base::proto::UniqueStructId::from_names(super::#module_path_const, #name_str),
             };
             &__ANKURAH_MODEL_SCHEMA
         }

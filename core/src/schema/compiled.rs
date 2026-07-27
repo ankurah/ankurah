@@ -48,6 +48,10 @@ pub struct ModelStructDescriptor {
     /// system models are pre-registered by definition and never consult
     /// the catalog they describe. `#[derive(Model)]` always emits `None`.
     pub system: Option<ankurah_core_types::SystemModel>,
+    /// The struct's deterministic source identity: a compile-time hash of
+    /// the declaring module path and struct name. Rides registration as a
+    /// migration hint; nothing resolves through it.
+    pub unique_id: ankurah_core_types::UniqueStructId,
 }
 
 /// The compiled schema for one active field of a model. `(backend,
@@ -92,6 +96,11 @@ pub struct StructProperty {
     /// default by-name registration. URL-safe base64 of a 16-byte EntityId,
     /// validated at derive time.
     pub explicit_id: Option<&'static str>,
+    /// The field's deterministic source identity: a compile-time hash of the
+    /// declaring module path, struct name, and field name. Names only, so it
+    /// survives a change of the field's type. Rides registration as a
+    /// migration hint; nothing resolves through it.
+    pub unique_id: ankurah_core_types::UniqueFieldId,
 }
 
 impl ModelStructDescriptor {
@@ -110,6 +119,7 @@ impl From<&ModelStructDescriptor> for RegisterModel {
             label: schema.label.to_string(),
             name: schema.name.to_string(),
             explicit_id: schema.explicit_id.map(parse_explicit_id),
+            unique_id: Some(schema.unique_id),
             properties: schema
                 .properties
                 .iter()
@@ -120,6 +130,7 @@ impl From<&ModelStructDescriptor> for RegisterModel {
                     value_type: field.value_type.to_string(),
                     target_label: field.target_label.map(str::to_string),
                     explicit_id: field.explicit_id.map(parse_explicit_id),
+                    unique_id: Some(field.unique_id),
                     optional: field.optional,
                 })
                 .collect(),
