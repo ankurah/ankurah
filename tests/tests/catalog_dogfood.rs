@@ -11,7 +11,7 @@ use common::*;
 use ankurah::model::Mutable as _;
 
 /// A typed create into a catalog collection travels the NORMAL entity path:
-/// first-use ensure short-circuits to the closed system identity, the
+/// first-use ensure short-circuits to the System ID, the
 /// staged membership asserts ModelId::System(Model), and commit-funnel
 /// admissibility accepts it because the collection fact matches.
 #[tokio::test]
@@ -31,7 +31,7 @@ async fn typed_create_into_catalog_collection() -> anyhow::Result<()> {
     use ankurah::model::View;
     assert!(
         fetched[0].entity().has_membership(&ankurah::proto::ModelId::System(SystemModel::Model)),
-        "the row's membership is the closed system identity"
+        "the row's membership is the System ID"
     );
     Ok(())
 }

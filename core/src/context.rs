@@ -75,8 +75,8 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         schema: &'static crate::schema::ModelStructDescriptor,
     ) -> Result<proto::ModelId, crate::schema::registration::RegistrationError> {
         // System models are pre-registered by definition: their identity is
-        // closed and compile-time, so no path here ever consults the catalog
-        // they describe.
+        // a compile-time System ID, so no path here ever consults the
+        // catalog they describe.
         if let Some(system) = schema.system {
             return Ok(proto::ModelId::System(system));
         }

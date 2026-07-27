@@ -29,12 +29,12 @@ impl fmt::Display for SystemModel {
 }
 
 /// The durable address of a model. Registered models use their real catalog
-/// entity id; built-ins use a closed logical identity, never a magic id.
+/// entity id; built-ins use a System ID, never a magic entity id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum ModelId {
     /// A user-registered model, identified by its catalog entity.
     EntityId(EntityId),
-    /// A built-in model with a closed logical identity.
+    /// A built-in model addressed by its System ID.
     System(SystemModel),
 }
 

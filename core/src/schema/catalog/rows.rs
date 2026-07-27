@@ -1,7 +1,7 @@
 //! Typed row Models for the catalog's system collections, derived like any
 //! app model. `base = "crate"` repoints the generated code at core itself
 //! (core cannot address itself through the `::ankurah` facade), and
-//! `system = "..."` pins each model's closed built-in identity: every
+//! `system = "..."` pins each model's built-in System ID: every
 //! registration path short-circuits on it, so these models never consult
 //! the catalog they describe. Expect more system tables to live here over
 //! time.

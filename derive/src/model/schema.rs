@@ -22,7 +22,7 @@
 //!   never registers a new definition. Built-in system identities are not
 //!   catalog entities and cannot appear here.
 //! - `#[model(system = "...")]`: a built-in SystemModel variant, parsed in
-//!   description.rs. A closed compile-time identity: never registered, and
+//!   description.rs. A compile-time System ID: never registered, and
 //!   the collection is pinned to its reserved system label.
 
 use proc_macro2::TokenStream;
@@ -177,7 +177,7 @@ pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
     }
     let model_explicit_id_tokens = option_str_tokens(model_explicit_id.as_deref());
 
-    // A system model pins its closed built-in identity into the descriptor;
+    // A system model pins its built-in System ID into the descriptor;
     // every registration path short-circuits on it.
     let system_tokens = match model.system() {
         Some(variant) => quote! { ::core::option::Option::Some(#base::proto::SystemModel::#variant) },

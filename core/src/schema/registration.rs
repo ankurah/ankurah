@@ -1001,7 +1001,7 @@ fn follow_up(model: ModelId, entity_id: EntityId, parent: proto::Clock, fields: 
 fn follow_up_patch(model: ModelId, entity_id: EntityId, parent: proto::Clock, fields: Vec<(&str, Option<Value>)>) -> proto::Event {
     let backend = LWWBackend::new();
     for (name, value) in fields {
-        let property = SystemProperty::from_name(name).expect("catalog event fields are closed SystemProperty variants");
+        let property = SystemProperty::from_name(name).expect("every catalog event field names a SystemProperty variant");
         backend.set(property.to_string(), value);
     }
     let operations = backend.to_operations().expect("LWW encoding of scalar values is infallible").expect("fields are non-empty");

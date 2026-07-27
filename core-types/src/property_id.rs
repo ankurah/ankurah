@@ -78,7 +78,7 @@ pub enum PropertyId {
     Id,
     /// A registered property's real catalog entity id.
     EntityId(EntityId),
-    /// A closed built-in property identity.
+    /// A built-in property addressed by its System ID.
     System(SystemProperty),
 }
 

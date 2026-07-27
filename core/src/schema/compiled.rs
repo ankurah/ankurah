@@ -42,7 +42,7 @@ pub struct ModelStructDescriptor {
     /// the default label-based registration path. The value is
     /// URL-safe base64 of a 16-byte EntityId, validated at derive time.
     pub explicit_id: Option<&'static str>,
-    /// A built-in system model's closed identity, `Some` only for the
+    /// A built-in system model's System ID, `Some` only for the
     /// catalog's own row models (core/src/schema/catalog/rows.rs). It
     /// short-circuits first-use registration to `ModelId::System(..)`:
     /// system models are pre-registered by definition and never consult
