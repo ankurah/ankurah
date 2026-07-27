@@ -19,9 +19,12 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
     };
     let active_field_name_strs = model.active_field_name_strs();
 
-    // WASM field getters (conditionally generated)
+    // WASM field getters (conditionally generated; internal models skip the
+    // wasm binding layer, matching lib.rs's gating of wasm_impl)
     #[cfg(feature = "wasm")]
-    let wasm_field_getters_impl = {
+    let wasm_field_getters_impl = if model.is_internal() {
+        quote! {}
+    } else {
         let wasm_getters = model.wasm_getters();
         quote! {
             #[wasm_bindgen]
@@ -35,7 +38,9 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
 
     // UniFFI field getters (conditionally generated - only when uniffi enabled WITHOUT wasm)
     #[cfg(all(feature = "uniffi", not(feature = "wasm")))]
-    let uniffi_field_getters_impl = {
+    let uniffi_field_getters_impl = if model.is_internal() {
+        quote! {}
+    } else {
         let uniffi_getters = model.uniffi_view_getters();
         quote! {
             #[::uniffi::export]
@@ -47,17 +52,22 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
     #[cfg(any(not(feature = "uniffi"), feature = "wasm"))]
     let uniffi_field_getters_impl = quote! {};
 
-    // Get FFI-specific attributes from the appropriate module
-    // wasm takes precedence when both features are enabled
+    let no_ffi_attrs =
+        || super::ViewAttributes { struct_attr: quote! {}, impl_attr: quote! {}, id_method_attr: quote! {}, extra_impl: quote! {} };
+
+    // Get FFI-specific attributes from the appropriate module.
+    // wasm takes precedence when both features are enabled; internal models
+    // get no FFI surface at all (their expansion has no bindgen imports and
+    // the emitted paths would name the facade crate, which internal builds
+    // cannot see).
     #[cfg(feature = "wasm")]
-    let ffi_attrs = super::wasm::view_attributes(&view_name, &mutable_name, &name);
+    let ffi_attrs = if model.is_internal() { no_ffi_attrs() } else { super::wasm::view_attributes(&view_name, &mutable_name, &name) };
 
     #[cfg(all(feature = "uniffi", not(feature = "wasm")))]
-    let ffi_attrs = super::uniffi::view_attributes();
+    let ffi_attrs = if model.is_internal() { no_ffi_attrs() } else { super::uniffi::view_attributes() };
 
     #[cfg(not(any(feature = "wasm", feature = "uniffi")))]
-    let ffi_attrs =
-        super::ViewAttributes { struct_attr: quote! {}, impl_attr: quote! {}, id_method_attr: quote! {}, extra_impl: quote! {} };
+    let ffi_attrs = no_ffi_attrs();
 
     let struct_attr = ffi_attrs.struct_attr;
     let impl_attr = ffi_attrs.impl_attr;

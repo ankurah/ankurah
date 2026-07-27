@@ -20,18 +20,22 @@ pub fn mutable_impl(model: &crate::model::description::ModelDescription) -> Toke
         Err(_) => return quote! { compile_error!("Failed to generate active field types turbofish"); },
     };
 
-    // FFI attributes for the struct and fields
+    // FFI attributes for the struct and fields. Internal models skip the
+    // wasm/uniffi binding layers entirely, matching lib.rs's gating of
+    // wasm_impl: their expansion has no bindgen imports in scope.
     #[cfg(feature = "wasm")]
-    let (struct_attributes, field_attributes) = super::wasm::mutable_attributes();
+    let (struct_attributes, field_attributes) =
+        if model.is_internal() { (quote! {}, quote! {}) } else { super::wasm::mutable_attributes() };
 
     #[cfg(all(feature = "uniffi", not(feature = "wasm")))]
-    let (struct_attributes, field_attributes) = super::uniffi::mutable_attributes();
+    let (struct_attributes, field_attributes) =
+        if model.is_internal() { (quote! {}, quote! {}) } else { super::uniffi::mutable_attributes() };
 
     #[cfg(not(any(feature = "wasm", feature = "uniffi")))]
     let (struct_attributes, field_attributes) = (quote! {}, quote! {});
 
     // Generate WASM getter methods and wrapper definitions for custom types
-    let (wasm_getter_impl, wasm_custom_wrappers) = if cfg!(feature = "wasm") {
+    let (wasm_getter_impl, wasm_custom_wrappers) = if cfg!(feature = "wasm") && !model.is_internal() {
         let getter_methods = model.mutable_wasm_getters();
         let custom_wrappers = model.custom_active_type_wrappers();
         (
