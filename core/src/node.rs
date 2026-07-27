@@ -178,14 +178,14 @@ where
     }
 
     fn build(engine: Arc<SE>, policy_agent: PA, durable: bool, rng: SmallRng) -> Self {
-        let collections = CollectionSet::new(engine.clone());
+        let collections = CollectionSet::new(engine);
         let entityset: WeakEntitySet = Default::default();
         let id = proto::EntityId::new();
         let reactor = Reactor::new();
         notice_info!("Node {id:#} created as {}", if durable { "durable" } else { "ephemeral" });
 
         let system_manager = SystemManager::new(collections.clone(), entityset.clone(), reactor.clone(), durable);
-        let catalog = CatalogManager::new(engine, durable);
+        let catalog = CatalogManager::new(durable);
 
         // Only ephemeral nodes relay subscriptions upstream to a durable peer.
         let subscription_relay = if durable { None } else { Some(SubscriptionRelay::new()) };
