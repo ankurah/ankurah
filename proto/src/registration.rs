@@ -115,3 +115,43 @@ pub struct RegisteredProperty {
     /// Whether this property is optional in the parent model.
     pub optional: bool,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The optional unique-id hints survive the serialized encoding in both
+    /// states. The in-process connection the registration suite runs over
+    /// passes structs in memory, so the encoded form is exercised here.
+    #[test]
+    fn unique_id_hints_round_trip_the_encoding() {
+        for (model_hint, field_hint) in [
+            (
+                Some(UniqueStructId::from_names("some_app::records", "Album")),
+                Some(UniqueFieldId::from_names("some_app::records", "Album", "name")),
+            ),
+            (None, None),
+        ] {
+            let model = RegisterModel {
+                label: "album".into(),
+                name: "Album".into(),
+                explicit_id: None,
+                unique_id: model_hint,
+                properties: vec![RegisterProperty {
+                    name: "name".into(),
+                    renamed_from: None,
+                    backend: "yrs".into(),
+                    value_type: "string".into(),
+                    target_label: None,
+                    explicit_id: None,
+                    unique_id: field_hint,
+                    optional: false,
+                }],
+            };
+            let decoded: RegisterModel = bincode::deserialize(&bincode::serialize(&model).unwrap()).unwrap();
+            assert_eq!(decoded.unique_id, model_hint);
+            assert_eq!(decoded.properties[0].unique_id, field_hint);
+            assert_eq!((decoded.label, decoded.name), (model.label, model.name));
+        }
+    }
+}
