@@ -450,20 +450,27 @@ fn get_model_flag(attrs: &Vec<syn::Attribute>, flag_name: &str) -> bool {
     })
 }
 
-/// Parse `#[model(key = "value")]` off raw struct attributes (same grammar
-/// as schema.rs's model_str_attr, available before a ModelDescription
-/// exists). Bare flags and unrelated keys are skipped.
-fn model_str_attr_on(attrs: &[syn::Attribute], key: &str) -> syn::Result<Option<String>> {
+/// Parse `#[model(key = "value")]` off raw struct attributes. Bare flags
+/// and unrelated keys are skipped; the requested key present with a
+/// non-string value is a hard error (silently dropping it would demote a
+/// system model to an ordinary one).
+pub(crate) fn model_str_attr_on(attrs: &[syn::Attribute], key: &str) -> syn::Result<Option<String>> {
     let mut found = None;
+    let mut bad_value: Option<syn::Error> = None;
     for attr in attrs {
         if !attr.path().is_ident("model") {
             continue;
         }
+        // Ignore walk failures from the flag form (not a name-value list);
+        // `bad_value` still surfaces a non-string value for the requested key.
         let _ = attr.parse_nested_meta(|meta| {
             if meta.path.is_ident(key) {
                 if let Ok(value) = meta.value() {
-                    if let Ok(lit) = value.parse::<syn::LitStr>() {
-                        found = Some(lit.value());
+                    match value.parse::<syn::LitStr>() {
+                        Ok(lit) => found = Some(lit.value()),
+                        Err(_) => {
+                            bad_value = Some(syn::Error::new_spanned(&meta.path, format!("#[model({key} = ...)] expects a string literal")))
+                        }
                     }
                 }
             } else if meta.input.peek(syn::Token![=]) {
@@ -473,7 +480,10 @@ fn model_str_attr_on(attrs: &[syn::Attribute], key: &str) -> syn::Result<Option<
             Ok(())
         });
     }
-    Ok(found)
+    match bad_value {
+        Some(err) => Err(err),
+        None => Ok(found),
+    }
 }
 
 /// PascalCase to snake_case for system collection labels

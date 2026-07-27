@@ -1,0 +1,5 @@
+error: #[model(system = ...)] and #[model(id = ...)] are mutually exclusive: a built-in identity is not a catalog entity
+ --> tests/compile_fail/system_and_id_are_exclusive.rs:9:12
+  |
+9 | pub struct SystemWithId {
+  |            ^^^^^^^^^^^^

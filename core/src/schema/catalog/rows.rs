@@ -1,9 +1,10 @@
 //! Typed row Models for the catalog's system collections, derived like any
 //! app model. `base = "crate"` repoints the generated code at core itself
-//! (there is no facade below the facade), and `system = "..."` pins each
-//! model's closed built-in identity: every registration path
-//! short-circuits on it, so these models never consult the catalog they
-//! describe. Expect more system tables to live here over time.
+//! (core cannot address itself through the `::ankurah` facade), and
+//! `system = "..."` pins each model's closed built-in identity: every
+//! registration path short-circuits on it, so these models never consult
+//! the catalog they describe. Expect more system tables to live here over
+//! time.
 
 use ankurah_derive::Model;
 use ankurah_proto::EntityId;
@@ -41,4 +42,24 @@ pub struct SysModelPropertyRow {
     pub model: EntityId,
     pub property: EntityId,
     pub optional: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Model;
+    use ankurah_core_types::SystemModel;
+
+    /// The derive builds each system collection label from the variant name
+    /// by convention; core declares the canonical labels as constants. The
+    /// two must agree, and each descriptor must pin its variant.
+    #[test]
+    fn row_models_match_the_canonical_system_labels() {
+        assert_eq!(SysModelRow::collection().as_str(), crate::schema::MODEL_COLLECTION_ID);
+        assert_eq!(SysPropertyRow::collection().as_str(), crate::schema::PROPERTY_COLLECTION_ID);
+        assert_eq!(SysModelPropertyRow::collection().as_str(), crate::schema::MODEL_PROPERTY_COLLECTION_ID);
+        assert_eq!(SysModelRow::descriptor().system, Some(SystemModel::Model));
+        assert_eq!(SysPropertyRow::descriptor().system, Some(SystemModel::Property));
+        assert_eq!(SysModelPropertyRow::descriptor().system, Some(SystemModel::ModelProperty));
+    }
 }

@@ -103,8 +103,12 @@ impl CatalogMapInner {
     }
 
     pub(super) fn upsert_model(&mut self, def: ModelDef) {
+        // A relabel detaches the old label only while this model still owns
+        // the index entry (another model may have claimed the label since).
         if let Some(old) = self.models.get(&def.id).filter(|old| old.label != def.label) {
-            self.by_label.remove(&old.label);
+            if self.by_label.get(&old.label) == Some(&def.id) {
+                self.by_label.remove(&old.label);
+            }
         }
         self.by_label.insert(def.label.clone(), def.id);
         self.models.insert(def.id, def);

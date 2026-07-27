@@ -46,7 +46,8 @@ pub struct ModelStructDescriptor {
     /// catalog's own row models (core/src/schema/catalog/rows.rs). It
     /// short-circuits first-use registration to `ModelId::System(..)`:
     /// system models are pre-registered by definition and never consult
-    /// the catalog they describe. `#[derive(Model)]` always emits `None`.
+    /// the catalog they describe. Only `#[model(system = "...")]` emits
+    /// `Some`; a plain derive emits `None`.
     pub system: Option<ankurah_core_types::SystemModel>,
     /// The struct's deterministic source identity: a compile-time hash of
     /// the declaring module path and struct name. Rides registration as a

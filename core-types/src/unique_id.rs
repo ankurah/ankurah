@@ -12,7 +12,8 @@
 //!
 //! The ids ride schema registration as optional hints. The server accepts
 //! and ignores them today; they exist so a future migration path can
-//! recognize a declaration across renames of everything else.
+//! recognize a declaration by its source names when everything else about
+//! it has changed.
 
 use serde::{Deserialize, Serialize};
 

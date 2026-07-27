@@ -227,8 +227,9 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         let mut map = self.0.map.write().unwrap();
         for item in update.items {
             let Some(model) = crate::schema::system_model_id(item.entity.collection().as_str()) else { continue };
-            if let Ok(state) = item.entity.to_entity_state() {
-                map.apply_state(&model, item.entity.id(), &state);
+            match item.entity.to_entity_state() {
+                Ok(state) => map.apply_state(&model, item.entity.id(), &state),
+                Err(e) => debug!("catalog feed skip {:#} {}: {e}", item.entity.id(), item.entity.collection()),
             }
         }
     }
@@ -315,9 +316,11 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     /// fresh warm from here.
     fn finish_reset(&self) {
         let mut setup = self.0.setup_state.write().unwrap();
-        // Feed teardown before map clear: dropping the handles unsubscribes,
-        // and the next generation's warm re-establishes them.
-        *self.0.durable_feed.write().unwrap() = None;
+        // Detach the feed before the map clear, but drop the handles only
+        // after the setup guard releases: dropping unsubscribes, and the
+        // listener takes a setup_state read on delivery. The next
+        // generation's warm re-establishes the feed.
+        let feed = self.0.durable_feed.write().unwrap().take();
         self.0.map.write().unwrap().clear();
         *self.0.ready.write().unwrap() = false;
         // Allocations belong to one system: a node re-joining a different
@@ -327,6 +330,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         setup.resetting = false;
         setup.durable_resume_pending = self.0.durable;
         drop(setup);
+        drop(feed);
         // Wake waiters to observe the cleared state rather than sleeping on
         // a readiness that will never come.
         self.0.ready_notify.notify_waiters();
@@ -358,7 +362,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         crate::task::spawn(async move {
             let _lease = lease;
             if let Err(e) = me.warm_durable(generation).await {
-                error!("CatalogManager durable warm failed: {}", e);
+                error!("CatalogManager durable warm failed; catalog feed absent until the next reset: {e}");
                 // Readiness must still latch even on failure: registration's
                 // wait parks on it, and one failed warm must not become a
                 // hang. Later registrations reject loudly on their storage
