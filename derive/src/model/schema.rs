@@ -2,7 +2,7 @@
 //!
 //! This module generates the `static` [`#base::schema::ModelStructDescriptor`]
 //! and the `Model::descriptor()` method. Two facts per field are NORMATIVE.
-//! A property's minting model and name locate its identity; registration
+//! A property's original model scope and name locate its identity; registration
 //! checks these compiled facts against the immutable canonical pair (exact
 //! backend and a mutually castable value type) and refuses an incompatible
 //! binding rather than registering another property identity.
@@ -18,9 +18,9 @@
 //! - `#[property(renamed_from = "...")]`: a property display name (the
 //!   transient rename hint).
 //! - `#[model(id = "...")]` / `#[property(id = "...")]`: the EntityId of an
-//!   EXISTING catalog entity to bind against, verified at registration and
-//!   never minting. Built-in system identities are not catalog entities and
-//!   cannot appear here.
+//!   EXISTING catalog entity to bind against, verified at registration; it
+//!   never registers a new definition. Built-in system identities are not
+//!   catalog entities and cannot appear here.
 //! - `#[model(system = "...")]`: a built-in SystemModel variant, parsed in
 //!   description.rs. A closed compile-time identity: never registered, and
 //!   the collection is pinned to its reserved system label.
