@@ -1,3 +1,13 @@
+//! Parses one `#[derive(Model)]` input into its model description.
+//!
+//! Here, a **model description** is the derive's validated vocabulary for a
+//! struct: its fields, generated-code base path, built-in or explicit
+//! identity, and FFI surface. [`ModelDescription`] gives the emission modules
+//! one shared interpretation of those facts; [`ModelOptions`] is the closed
+//! set of struct-level `#[model(...)]` options. This module parses and
+//! classifies input but does not emit model, view, mutable, or descriptor
+//! implementations.
+
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::{meta::ParseNestedMeta, Data, DeriveInput, Fields, Ident, LitStr, Type, Visibility};
@@ -30,10 +40,10 @@ pub struct ModelDescription {
     /// crate through. Default `::ankurah::core` (the facade's re-export);
     /// core-internal models pass `crate` so core can derive its own models.
     base: syn::Path,
-    /// Whether active-type paths should use the backend registry's local
-    /// (`crate`) substitutions. This preserves the path behavior of an
-    /// explicit `base` without conflating it with FFI generation.
-    uses_local_paths: bool,
+    /// Whether active-type paths should use the backend registry's `crate`
+    /// substitutions. Only the literal crate-relative base selects them;
+    /// an explicit external base remains external.
+    uses_crate_paths: bool,
     /// `#[model(no_ffi)]`: omit WASM and UniFFI bindings while retaining the
     /// normal Rust model, view, and mutable APIs.
     no_ffi: bool,
@@ -72,12 +82,12 @@ impl ModelDescription {
         // Load backend configurations at compile time
         let backend_registry = crate::model::backend_registry::BackendRegistry::new()?;
 
-        let uses_local_paths = options.base.is_some();
         let base: syn::Path = match &options.base {
             Some(path) => syn::parse_str(path)
                 .map_err(|_| syn::Error::new_spanned(&name, format!("#[model(base = {path:?})] is not a valid path")))?,
             None => syn::parse_str("::ankurah::core").expect("default base path parses"),
         };
+        let uses_crate_paths = base.is_ident("crate");
         let system = match options.system {
             Some(variant) => match variant.as_str() {
                 "System" | "Model" | "Property" | "ModelProperty" => Some(format_ident!("{}", variant)),
@@ -99,7 +109,7 @@ impl ModelDescription {
             ephemeral_fields,
             backend_registry,
             base,
-            uses_local_paths,
+            uses_crate_paths,
             no_ffi: options.no_ffi,
             system,
             explicit_id: options.explicit_id,
@@ -127,7 +137,7 @@ impl ModelDescription {
     /// so distinct structs always get distinct consts.
     pub fn module_path_const(&self) -> Ident { format_ident!("__ANKURAH_MODULE_PATH_{}", self.name) }
     /// Whether generated active-type paths use local backend substitutions.
-    pub fn uses_local_paths(&self) -> bool { self.uses_local_paths }
+    pub fn uses_crate_paths(&self) -> bool { self.uses_crate_paths }
     /// Whether this model deliberately omits WASM and UniFFI bindings.
     pub fn no_ffi(&self) -> bool { self.no_ffi }
     /// The built-in system identity, when this is a system model.
@@ -193,7 +203,7 @@ impl ModelDescription {
         let mut results = Vec::new();
 
         for (i, desc) in descs.iter().enumerate() {
-            let context = if self.uses_local_paths { "local" } else { "external" };
+            let context = if self.uses_crate_paths { "local" } else { "external" };
             let rust_type = desc.rust_type_with_context(context).map_err(|e| {
                 let field = &self.active_fields[i];
                 syn::Error::new_spanned(&field.ty, format!("Failed to generate Rust type: {}", e))

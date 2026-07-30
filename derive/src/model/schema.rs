@@ -142,7 +142,7 @@ pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
         // The active type declares which backend stores it (an associated
         // const, resolved inside the static initializer). Like value_type,
         // the derive tabulates nothing.
-        let active_type = desc.rust_type_with_context(if model.uses_local_paths() { "local" } else { "external" })?;
+        let active_type = desc.rust_type_with_context(if model.uses_crate_paths() { "local" } else { "external" })?;
         let backend = quote! { <#active_type as #base::property::ActiveType>::BACKEND };
 
         // #[property(renamed_from = "...")]: the transient rename hint. Applied by the registration executor before lookup-or-create,

@@ -1,17 +1,12 @@
-//! The compiled schema `#[derive(Model)]` emits: the normative mapping,
-//! rename hints, and explicit-id bindings. Asserts the
-//! NORMATIVE (backend, value_type) mapping row-by-row, the renamed_from and
-//! explicit-id attributes, ephemeral exclusion, and the RegisterSchema
-//! descriptor conversion. Ends with an end-to-end registration built from a
-//! Model::descriptor() and driven through the durable/ephemeral harness, sourcing
-//! the allocated ids from the SchemaRegistered response.
+//! The compiled schema emitted by `#[derive(Model)]`.
 //!
-//! Excised with the read flip (write-only catalog phase): the bound-property
-//! half -- explicit ids driving derived accessors, query aliases, ambiguity
-//! rejection, and the offline fully-bound reassertion. Those read app
-//! entities by property id and preseed DDL-authored definitions the map
-//! only learns through the excised reactor feed; they return with the
-//! propertyid-resolution PR (successor notes in core/src/schema/catalog.rs).
+//! Here, a **descriptor** is one binary's static model declaration: source
+//! label and name, normative backend/value-type facts, optionality, reference
+//! targets, explicit bindings, rename hints, and source-derived unique IDs.
+//! These tests verify that derive output and its `RegisterModel` conversion,
+//! including path hygiene across user modules. Durable allocation and catalog
+//! projection behavior belong to the registration and catalog suites; the
+//! end-to-end cases here only prove descriptors enter that public path intact.
 
 mod common;
 use ankurah::property::{Json, Ref};
@@ -30,6 +25,25 @@ const MEMBERSHIP: &str = "_ankurah_model_property";
 #[derive(Model, Debug, Serialize, Deserialize)]
 pub struct DescArtist {
     pub name: String,
+}
+
+/// Spelling the default generated-code base explicitly must not select the
+/// derive crate's internal `crate::...` active-type paths.
+#[derive(Model, Debug, Serialize, Deserialize)]
+#[model(base = "::ankurah::core")]
+pub struct DescExplicitDefaultBase {
+    pub name: String,
+}
+
+mod shared_user_module {
+    use super::*;
+
+    /// Exercises the derive's hidden module-path constant through its nested
+    /// hygiene module rather than deriving only at the integration-crate root.
+    #[derive(Model, Debug, Serialize, Deserialize)]
+    pub struct NestedDescriptor {
+        pub title: String,
+    }
 }
 
 /// A model exercising EVERY row of the normative mapping table, plus
@@ -220,6 +234,17 @@ fn unique_ids_are_derived_distinct_and_carried_on_the_wire() {
     for (entry, f) in model.properties.iter().zip(schema.properties) {
         assert_eq!(entry.unique_id, Some(f.unique_id), "wire field id for {}", f.field);
     }
+}
+
+#[test]
+fn explicit_default_base_and_nested_module_hygiene_compile_and_describe_the_source() {
+    let explicit_base = DescExplicitDefaultBase::descriptor();
+    assert_eq!(explicit_base.properties[0].backend, "yrs");
+
+    let nested = shared_user_module::NestedDescriptor::descriptor();
+    let declaring_module = concat!(module_path!(), "::shared_user_module");
+    assert_eq!(nested.unique_id, proto::UniqueStructId::from_names(declaring_module, "NestedDescriptor"));
+    assert_eq!(nested.properties[0].unique_id, proto::UniqueFieldId::from_names(declaring_module, "NestedDescriptor", "title"));
 }
 
 // -- end-to-end registration through the harness -----------------------------
