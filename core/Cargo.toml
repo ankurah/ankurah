@@ -68,6 +68,9 @@ lru                  = "0.12"
 base64               = { version = "0.22" }
 uniffi               = { version = "0.29", optional = true }
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
+
 [dev-dependencies]
 maplit         = "1.0"
 ankurah-derive = { path = "../derive", version = "=0.9.0" }
