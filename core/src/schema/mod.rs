@@ -66,7 +66,7 @@ pub fn is_catalog_collection(id: &ModelId) -> bool {
 
 /// Whether `id` names one of Ankurah's built-in collections. Built-ins are
 /// the only collections permitted under [`RESERVED_COLLECTION_PREFIX`] and
-/// cannot be mutated through ordinary user transactions.
+/// cannot be mutated through ordinary application transactions.
 pub fn is_protected_collection(id: &ModelId) -> bool { matches!(id, ModelId::System(_)) }
 
 /// The logical protocol model for today's built-in storage key. This mapping

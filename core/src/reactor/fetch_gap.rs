@@ -52,6 +52,24 @@ where
     pub fn new(node: &Node<SE, PA>, cdata: PA::ContextData) -> Self { Self { weak_node: Arc::downgrade(&node.0), cdata } }
 }
 
+/// Policy-free local gap fetcher for a durable SystemRoot context.
+#[derive(Clone)]
+pub(crate) struct SystemRootGapFetcher<SE, PA>
+where
+    SE: StorageEngine,
+    PA: PolicyAgent,
+{
+    weak_node: Weak<NodeInner<SE, PA>>,
+}
+
+impl<SE, PA> SystemRootGapFetcher<SE, PA>
+where
+    SE: StorageEngine,
+    PA: PolicyAgent,
+{
+    pub(crate) fn new(node: &Node<SE, PA>) -> Self { Self { weak_node: Arc::downgrade(&node.0) } }
+}
+
 #[async_trait]
 impl<SE, PA> GapFetcher<crate::entity::Entity> for QueryGapFetcher<SE, PA>
 where
@@ -73,31 +91,54 @@ where
 
         // Create a Node wrapper and NodeAndContext
         let node = Node(node_inner);
-        let node_context = NodeAndContext { node, cdata: self.cdata.clone() };
+        let node_context = NodeAndContext::new_session(node, self.cdata.clone());
 
-        // Build gap predicate if we have a last entity
-        let gap_selection = if let Some(last) = last_entity {
-            let gap_predicate = if let Some(ref order_by) = selection.order_by {
-                build_continuation_predicate(&selection.predicate, order_by, last)
-                    .map_err(|e| RetrievalError::storage(std::io::Error::other(e)))?
-            } else {
-                selection.predicate.clone()
-            };
-
-            ankql::ast::Selection { predicate: gap_predicate, order_by: selection.order_by.clone(), limit: Some(gap_size as u64) }
-        } else {
-            // No last entity, just use original selection with gap_size limit
-            ankql::ast::Selection {
-                predicate: selection.predicate.clone(),
-                order_by: selection.order_by.clone(),
-                limit: Some(gap_size as u64),
-            }
-        };
+        let gap_selection = gap_selection(selection, last_entity, gap_size)?;
 
         let match_args = MatchArgs { selection: gap_selection, cached: false };
 
         node_context.fetch_entities(collection_id, match_args).await
     }
+}
+
+#[async_trait]
+impl<SE, PA> GapFetcher<crate::entity::Entity> for SystemRootGapFetcher<SE, PA>
+where
+    SE: StorageEngine + 'static,
+    PA: PolicyAgent + 'static,
+{
+    async fn fetch_gap(
+        &self,
+        collection_id: &proto::CollectionId,
+        selection: &ankql::ast::Selection,
+        last_entity: Option<&crate::entity::Entity>,
+        gap_size: usize,
+    ) -> Result<Vec<crate::entity::Entity>, RetrievalError> {
+        let node = Node(
+            self.weak_node
+                .upgrade()
+                .ok_or_else(|| RetrievalError::storage(std::io::Error::other("Node has been dropped, cannot fill gap")))?,
+        );
+        node.fetch_entities_from_local(collection_id, &gap_selection(selection, last_entity, gap_size)?).await
+    }
+}
+
+fn gap_selection<E: AbstractEntity>(
+    selection: &ankql::ast::Selection,
+    last_entity: Option<&E>,
+    gap_size: usize,
+) -> Result<ankql::ast::Selection, RetrievalError> {
+    let predicate = if let Some(last) = last_entity {
+        if let Some(ref order_by) = selection.order_by {
+            build_continuation_predicate(&selection.predicate, order_by, last)
+                .map_err(|e| RetrievalError::storage(std::io::Error::other(e)))?
+        } else {
+            selection.predicate.clone()
+        }
+    } else {
+        selection.predicate.clone()
+    };
+    Ok(ankql::ast::Selection { predicate, order_by: selection.order_by.clone(), limit: Some(gap_size as u64) })
 }
 
 /// Build a supplemental predicate to fetch entities after the last entity in sort order

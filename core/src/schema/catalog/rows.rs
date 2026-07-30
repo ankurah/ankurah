@@ -1,13 +1,13 @@
-//! Canonical typed read shapes for the catalog's three entity collections.
+//! Canonical typed model shapes for the catalog's three entity collections.
 //!
 //! Here, a **row** means the persisted fields of one model definition,
 //! property definition, or model-property membership. These structs make
-//! catalog data available through the same generated `View` API as
-//! application data and keep that typed schema beside the raw parser it must
-//! agree with. The durable registration executor still emits raw bootstrap
-//! events, and ordinary transactions may not mutate system collections; the
-//! generated `Mutable` surface grants a Rust representation, not write
-//! authority.
+//! catalog data available through the same generated Model, View, and
+//! Mutable APIs as application data. Durable registration writes them through
+//! a local SystemRoot context; ordinary application contexts are still
+//! forbidden from mutating system collections. The generated Mutable surface
+//! provides the common mechanism, while the Context authority decides who
+//! may use it.
 //!
 //! `base = "crate"` makes generated code address core directly rather than
 //! through the `::ankurah` facade. `system = "..."` pins a built-in

@@ -10,9 +10,11 @@ use ankurah::proto::SystemModel;
 use common::*;
 use std::collections::BTreeMap;
 
-fn model_row_creation(label: &str, name: &str) -> anyhow::Result<proto::Event> {
+fn model_row_creation(label: Option<&str>, name: &str) -> anyhow::Result<proto::Event> {
     let backend = LWWBackend::new();
-    backend.set("label".into(), Some(Value::String(label.into())));
+    if let Some(label) = label {
+        backend.set("label".into(), Some(Value::String(label.into())));
+    }
     backend.set("name".into(), Some(Value::String(name.into())));
     let backend_operations = backend.to_operations()?.expect("the row has fields");
     let model = proto::ModelId::System(SystemModel::Model);
@@ -26,9 +28,9 @@ fn model_row_creation(label: &str, name: &str) -> anyhow::Result<proto::Event> {
     })
 }
 
-/// Rows the registration executor wrote as raw LWW events read back through
-/// the typed Views, field for field: one schema spelling serves both the
-/// executor's writes and typed reads.
+/// Rows the registration executor wrote through generated Models and
+/// Mutables read back through the generated Views, field for field: one
+/// schema spelling serves both writes and reads.
 #[tokio::test]
 async fn executor_rows_read_through_typed_views() -> anyhow::Result<()> {
     let node = durable_sled_setup().await?;
@@ -63,20 +65,42 @@ async fn executor_rows_read_through_typed_views() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A catalog row committed through the allocator's trusted low-level funnel,
-/// but outside `register_schema` (`upsert_registered` never sees it), appears
-/// in the map through the reactor feed. Ordinary transactions cannot take
-/// this path. `commit_remote_transaction` awaits `notify_change`, so the map
-/// is current when it returns.
+/// A test-injected catalog event committed outside `register_schema` appears
+/// in the map through the typed LiveQuery feed. This pins the important
+/// ownership boundary: the durable projection learns from catalog data, not
+/// from an executor side-channel. `commit_remote_transaction` awaits
+/// `notify_change`, so the map is current when it returns.
 #[tokio::test]
 async fn map_learns_from_the_feed_not_the_executor() -> anyhow::Result<()> {
     let node = durable_sled_setup().await?;
     node.catalog.wait_catalog_ready().await;
 
-    let event = model_row_creation("feed_only", "FeedOnly")?;
+    let event = model_row_creation(Some("feed_only"), "FeedOnly")?;
     node.commit_remote_transaction(&DEFAULT_CONTEXT, proto::TransactionId::new(), vec![proto::Attested::opt(event, None)]).await?;
 
-    let model = node.catalog.model_by_label("feed_only").expect("the reactor feed delivered the row into the map");
+    let model = node.catalog.model_by_label("feed_only").expect("the typed catalog feed delivered the row into the map");
     assert_eq!(model.name, "FeedOnly");
+    Ok(())
+}
+
+/// A malformed row is noisy but local to that row: it contributes no map
+/// entry and does not poison the subscription that delivers later valid
+/// catalog changes.
+#[tokio::test]
+async fn malformed_feed_row_is_skipped_without_stopping_the_feed() -> anyhow::Result<()> {
+    let node = durable_sled_setup().await?;
+    node.catalog.wait_catalog_ready().await;
+    let before = node.catalog.counts();
+
+    let malformed = model_row_creation(None, "MissingLabel")?;
+    node.commit_remote_transaction(&DEFAULT_CONTEXT, proto::TransactionId::new(), vec![proto::Attested::opt(malformed, None)]).await?;
+    assert_eq!(node.catalog.counts(), before, "a row missing its required label must not enter the map");
+
+    let valid = model_row_creation(Some("after_malformed"), "AfterMalformed")?;
+    node.commit_remote_transaction(&DEFAULT_CONTEXT, proto::TransactionId::new(), vec![proto::Attested::opt(valid, None)]).await?;
+
+    let model = node.catalog.model_by_label("after_malformed").expect("the feed must continue after a malformed row");
+    assert_eq!(model.name, "AfterMalformed");
+    assert_eq!(node.catalog.counts(), (before.0 + 1, before.1, before.2));
     Ok(())
 }

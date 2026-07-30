@@ -147,8 +147,9 @@ where PA: PolicyAgent
     pub(crate) policy_agent: PA,
     pub system: SystemManager<SE, PA>,
 
-    /// The metadata catalog map (write-only in this phase: registration
-    /// maintains it; nothing resolves through it yet).
+    /// The metadata catalog service. Durable nodes populate its projection
+    /// from typed SystemRoot live queries; registration and runtime schema
+    /// binding resolve through that projection.
     pub catalog: CatalogManager<SE, PA>,
 
     pub(crate) subscription_relay: Option<SubscriptionRelay<PA::ContextData, crate::livequery::WeakEntityLiveQuery>>,
@@ -462,8 +463,10 @@ where
                 }
             }
             proto::NodeRequestBody::RegisterSchema { models } => {
-                let cdata = cdata.iterable().exactly_one().map_err(|_| anyhow!("Only one cdata is permitted for RegisterSchema"))?;
-                match self.catalog.register_schema(cdata, models).await {
+                // Authentication has already admitted the request. Catalog
+                // materialization itself runs under local SystemRoot authority.
+                let _ = cdata.iterable().exactly_one().map_err(|_| anyhow!("Only one cdata is permitted for RegisterSchema"))?;
+                match self.catalog.register_schema(models).await {
                     // The resolved definitions ARE the response: the
                     // requester folds them into its catalog map on ack.
                     Ok(models) => Ok(proto::NodeResponseBody::SchemaRegistered { models }),

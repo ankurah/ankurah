@@ -1,32 +1,28 @@
-//! The durable allocator and admission transaction for `RegisterSchema`.
+//! The durable allocator for `RegisterSchema`.
 //!
 //! Here, **registration** means the durable node's complete transition from
 //! a language-neutral declaration to resolved catalog identities. The input
 //! is a set of `RegisterModel` descriptors plus current catalog state; the
-//! output is a policy-visible [`RegistrationPlan`], ordinary catalog events,
-//! and a `SchemaRegistered` tree containing every resolved id. This module
-//! owns lookup-key semantics, compatibility checks, allocation, and event
-//! construction. The per-node feed, reset epoch, compiled-binding latch, and
-//! ephemeral forwarding path belong to [`super::catalog`].
+//! output is a `SchemaRegistered` tree containing every resolved id. This
+//! module owns lookup-key semantics, compatibility checks, and allocation;
+//! it persists the resulting rows through the catalog's ordinary typed
+//! Models and Mutables under a local SystemRoot context. The per-node feed,
+//! reset epoch, compiled-binding latch, and ephemeral forwarding path belong
+//! to [`super::catalog`].
 //!
 //! Registration is an upsert: models resolve by source label, properties by
 //! current name within a model's membership set, and memberships by
 //! `(model, property)`. A miss allocates a fresh `EntityId`; a hit keeps its
 //! identity. The whole lookup/allocate/commit/fold transaction serializes on
-//! the catalog manager's allocator mutex, and resolved definitions enter the
-//! materialized catalog projection before that mutex is released. A later
-//! reactor delivery is therefore redundant rather than necessary for the
-//! next registration's correctness.
+//! the catalog manager's allocator mutex. The SystemRoot transaction notifies
+//! the typed catalog LiveQueries synchronously before commit returns, so the
+//! projection observes the new identities before the mutex is released.
 //!
-//! Policy gates the execution at two complementary boundaries:
-//! request authentication decides whether the principal may submit schema
-//! descriptors, the resolved plan -- what this request will actually create
-//! and update -- goes through `PolicyAgent::check_schema_registration` before
-//! anything is emitted, and every emitted event still passes `check_event` inside the ordinary
-//! commit pipeline. A durable node needs no model code to serve
-//! registration: the request carries language-agnostic descriptors.
-//! Idempotence is the upsert's: a repeat registration finds every key,
-//! emits zero events, and returns the same ids.
+//! Remote request authentication decides whether a principal may submit
+//! schema descriptors. Materializing an accepted request is trusted system
+//! work and therefore bypasses the application's PolicyAgent. Idempotence is
+//! the upsert's: a repeat registration finds every key, emits zero events,
+//! and returns the same ids.
 //!
 //! A property's (backend, value_type) is CANONICAL: fixed at allocation and
 //! never changed by registration. A hit
@@ -36,28 +32,21 @@
 //! pair, refuses the registration loudly. Changing a canonical type is a
 //! deliberate migration (#303), never a model-struct edit.
 //!
-//! TODO(organization): this file still co-locates the public error/plan
-//! vocabulary, the allocation algorithm, bootstrap storage reads, and raw
-//! event encoding. Keep `register_schema` as the transaction boundary, but
-//! extract those supporting nouns into focused submodules once their inputs
-//! no longer require reaching through the whole `CatalogManager`.
-
 use std::collections::BTreeMap;
 
-use ankurah_proto::{
-    self as proto, Attested, EntityId, Membership, Operation, OperationSet, RegisterModel, RegisterProperty, RegisteredModel,
-    RegisteredProperty, SystemProperty, TransactionId,
-};
+use ankurah_proto::{EntityId, RegisterModel, RegisterProperty, RegisteredModel, RegisteredProperty};
 
+use crate::context::Context;
 use crate::error::{MutationError, RetrievalError};
-use crate::policy::{AccessDenied, PolicyAgent};
-use crate::property::backend::{LWWBackend, PropertyBackend};
+use crate::model::View;
+use crate::policy::PolicyAgent;
+use crate::schema::catalog::rows::{
+    SysModelPropertyRow, SysModelPropertyRowView, SysModelRow, SysModelRowView, SysPropertyRow, SysPropertyRowView,
+};
 use crate::storage::StorageEngine;
-use crate::value::Value;
-use crate::ModelId;
 use ankurah_core_types::ValueType;
 
-use super::{model_collection, model_property_collection, property_collection};
+use ankql::ast::Selection;
 
 /// A durable schema-registration request could not be completed.
 #[derive(Debug, thiserror::Error)]
@@ -97,6 +86,10 @@ pub enum RegistrationError {
         /// The rejected source-level collection label.
         String,
     ),
+    /// SystemRoot operates only on built-in system models; it never
+    /// registers application models.
+    #[error("SystemRoot cannot register application model '{0}'")]
+    SystemRootApplicationModel(String),
     /// A membership's name reference was not declared in the same request.
     #[error("membership references property '{0}' which is not declared in this request for collection '{1}'")]
     UnresolvedPropertyRef(
@@ -151,13 +144,6 @@ pub enum RegistrationError {
         /// The value type declared by the requester.
         value_type: String,
     },
-    /// The policy agent denied the resolved registration plan.
-    #[error("registration refused by policy: {0}")]
-    PolicyDenied(
-        /// The policy agent's denial.
-        #[from]
-        AccessDenied,
-    ),
     /// Committing the catalog events failed.
     #[error(transparent)]
     Mutation(
@@ -191,87 +177,14 @@ impl From<RegistrationError> for crate::error::MutationError {
     fn from(error: RegistrationError) -> Self { crate::error::MutationError::General(Box::new(error)) }
 }
 
-/// What a RegisterSchema request will ACTUALLY do, resolved by the
-/// registration executor under the allocation mutex and handed to
-/// [`crate::policy::PolicyAgent::check_schema_registration`] before any
-/// event is emitted, so an agent can judge real creations and metadata
-/// changes without performing its own catalog lookups. Core-side only;
-/// never crosses the wire.
-#[derive(Debug, Default)]
-pub struct RegistrationPlan {
-    /// Model entities this request will CREATE, with their would-be
-    /// allocated ids (minted, not yet committed).
-    pub creates_models: Vec<(EntityId, RegisterModel)>,
-    /// Property entities this request will CREATE, with their would-be
-    /// allocated ids.
-    pub creates_properties: Vec<(EntityId, RegisterProperty)>,
-    /// Model-property memberships this request will CREATE, fully resolved.
-    pub creates_memberships: Vec<PlannedModelPropertyMembership>,
-    /// Metadata follow-ups this request will write on EXISTING entities
-    /// (display-name changes including rename-hint applications, target
-    /// retargets, membership `optional` flips).
-    pub updates: Vec<PlannedUpdate>,
-    /// Definitions that resolved to existing entities with no changes:
-    /// pure no-ops, listed for context.
-    pub existing: Vec<EntityId>,
-}
-
-impl RegistrationPlan {
-    /// Whether the plan writes anything at all (a re-registration of
-    /// unchanged definitions is a pure no-op and skips the policy verb).
-    pub fn is_noop(&self) -> bool {
-        self.creates_models.is_empty()
-            && self.creates_properties.is_empty()
-            && self.creates_memberships.is_empty()
-            && self.updates.is_empty()
-    }
-}
-
-/// A model-property membership creation in a [`RegistrationPlan`], resolved
-/// to ids.
-#[derive(Debug, Clone)]
-pub struct PlannedModelPropertyMembership {
-    /// The durable identity assigned to the membership entity.
-    pub id: EntityId,
-    /// The model receiving the property.
-    pub model: EntityId,
-    /// The property admitted to the model.
-    pub property: EntityId,
-    /// Whether entities of the model may omit the property.
-    pub optional: bool,
-}
-
-/// A metadata follow-up on an existing catalog entity, in a
-/// [`RegistrationPlan`].
-#[derive(Debug, Clone)]
-pub struct PlannedUpdate {
-    /// Which catalog collection the entity lives in.
-    pub collection: crate::ModelId,
-    /// The durable catalog entity to update.
-    pub entity: EntityId,
-    /// The system field whose metadata value changes.
-    pub field: String,
-    /// The current catalog value, when one exists.
-    pub from: Option<crate::value::Value>,
-    /// The requested catalog value. `None` means the field will be cleared.
-    pub to: Option<crate::value::Value>,
-}
-
 impl<SE, PA> super::catalog::CatalogManager<SE, PA>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    /// Execute a RegisterSchema request as the system's allocator: upsert
-    /// every model by its label and every nested property within its
-    /// model's membership set, allocate fresh ids for misses, emit ordinary
-    /// creation events and difference-only follow-ups through the
-    /// policy-checked pipeline, and return the resolved tree.
-    pub async fn register_schema(
-        &self,
-        cdata: &PA::ContextData,
-        models: Vec<RegisterModel>,
-    ) -> Result<Vec<RegisteredModel>, RegistrationError> {
+    /// Resolve and persist a RegisterSchema request through the ordinary
+    /// typed Model/Mutable transaction path under local SystemRoot authority.
+    pub async fn register_schema(&self, models: Vec<RegisterModel>) -> Result<Vec<RegisteredModel>, RegistrationError> {
         let node = self.node().ok_or(RegistrationError::SystemNotReady)?;
         if !node.durable {
             return Err(RegistrationError::NotDurable);
@@ -280,12 +193,8 @@ where
             return Err(RegistrationError::SystemNotReady);
         }
         let registration_validity = self.registration_validity().ok_or(RegistrationError::SystemNotReady)?;
-        // Labels are schema lookup keys, not runtime model identities.
-        // Reserved collections are refused before policy is even asked: the
-        // catalog and system collections route by name and have no catalog
-        // model entities of their own, so a registration naming one -- as a
-        // model label or a property's target -- could only route ordinary
-        // traffic into a protected collection.
+        // Catalog and system collections route by built-in identity and can
+        // never be declared by an application descriptor.
         {
             let mut named: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
             for m in &models {
@@ -302,78 +211,39 @@ where
                 }
             }
         }
-        // The catalog map is the executor's primary lookup source; wait for
-        // the warm so the common case looks up against a full map. The map
-        // is NOT trusted alone on a miss: every miss double-checks durable
-        // storage before minting (the *_lookup_checked helpers), so a
-        // lagging or cold map can never fork identity.
         if !self.wait_catalog_ready_if_current(&registration_validity).await {
             return Err(RegistrationError::SystemNotReady);
         }
         let _registration_lease = registration_validity.try_acquire().ok_or(RegistrationError::SystemNotReady)?;
-
-        // Executor discipline: the whole upsert -- lookups, allocation,
-        // commit, and the synchronous map update -- serializes on the
-        // allocator mutex, so consecutive registrations observe each other.
         let _allocator = self.lock_allocator().await;
+        let context = Context::new_system_root(node)?;
+        let trx = context.begin();
+        let mut changed = false;
 
-        let mut plan = RegistrationPlan::default();
-        // Creation events carry the FULL definition state; follow-ups carry
-        // only fields that differ, parented at the entity's current head so
-        // LWW recency, rather than a concurrent tiebreak, decides.
-        let mut events: Vec<Attested<proto::Event>> = Vec::new();
-        let mut push = |event: proto::Event| events.push(Attested::opt(event, None));
-
-        // -- pass 1: model shells, so nested target references and
-        //    same-request cross-references resolve ---------------------------
+        // Pass 1 resolves model shells so target-model references in pass 2
+        // can point at models declared later in the same request.
         let mut model_ids: BTreeMap<String, (EntityId, usize)> = BTreeMap::new();
         let mut out_models: Vec<RegisteredModel> = Vec::new();
         for m in &models {
-            // A duplicate label in ONE request must not re-mint: the first
-            // occurrence resolves the model; later occurrences reuse it (their
-            // property entries still attach below).
             if model_ids.contains_key(&m.label) {
                 continue;
             }
             let (model_id, resolved_name) = match m.explicit_id {
                 Some(id) => {
-                    // Explicit binding: verify, never mint, never mutate the
-                    // bound entity's fields; the catalog's display name stands.
-                    let values = self.verify_explicit_model_binding(id, m).await?;
-                    let name = string_field(&values, "name").unwrap_or_else(|| m.label.clone());
-                    plan.existing.push(id);
-                    (id, name)
+                    let def = self.verify_explicit_model_binding(&context, id, m).await?;
+                    (id, def.name)
                 }
-                None => match self.model_lookup_checked(&m.label).await? {
+                None => match self.model_lookup_checked(&context, &m.label).await? {
                     Some(def) => {
-                        // Display names follow the most recent registration;
-                        // emit only on difference.
                         if def.name != m.name {
-                            let (_, head) = self
-                                .catalog_entity_snapshot(def.id, &model_collection())
-                                .await?
-                                .ok_or_else(|| RetrievalError::Other(format!("catalog map holds model {} absent from storage", def.id)))?;
-                            plan.updates.push(PlannedUpdate {
-                                collection: model_collection(),
-                                entity: def.id,
-                                field: "name".into(),
-                                from: Some(Value::String(def.name.clone())),
-                                to: Some(Value::String(m.name.clone())),
-                            });
-                            push(follow_up(model_collection(), def.id, head, vec![("name", Value::String(m.name.clone()))]));
-                        } else {
-                            plan.existing.push(def.id);
+                            trx.get::<SysModelRow>(&def.id).await?.name().set(&m.name).map_err(MutationError::from)?;
+                            changed = true;
                         }
                         (def.id, m.name.clone())
                     }
                     None => {
-                        let id = EntityId::new();
-                        plan.creates_models.push((id, m.clone()));
-                        push(creation(
-                            model_collection(),
-                            id,
-                            vec![("label", Value::String(m.label.clone())), ("name", Value::String(m.name.clone()))],
-                        ));
+                        let id = trx.create(&SysModelRow { label: m.label.clone(), name: m.name.clone() }).await?.id();
+                        changed = true;
                         (id, m.name.clone())
                     }
                 },
@@ -382,34 +252,22 @@ where
             out_models.push(RegisteredModel { id: model_id, label: m.label.clone(), name: resolved_name, properties: Vec::new() });
         }
 
-        // Resolve a label reference to a model id, allocating a stub model
-        // on full miss (target-model references resolve executor-side).
+        // Resolve a target label, creating its catalog model shell if the
+        // target was not separately declared.
         macro_rules! resolve_model {
             ($label:expr) => {{
                 let l: &str = $label;
                 match model_ids.get(l) {
                     Some((id, _)) => *id,
-                    None => match self.model_lookup_checked(l).await? {
+                    None => match self.model_lookup_checked(&context, l).await? {
                         Some(def) => {
                             model_ids.insert(l.to_string(), (def.id, out_models.len()));
                             out_models.push(RegisteredModel { id: def.id, label: def.label, name: def.name, properties: Vec::new() });
                             def.id
                         }
                         None => {
-                            let id = EntityId::new();
-                            let stub = RegisterModel {
-                                label: l.to_string(),
-                                name: l.to_string(),
-                                explicit_id: None,
-                                unique_id: None,
-                                properties: Vec::new(),
-                            };
-                            plan.creates_models.push((id, stub));
-                            push(creation(
-                                model_collection(),
-                                id,
-                                vec![("label", Value::String(l.to_string())), ("name", Value::String(l.to_string()))],
-                            ));
+                            let id = trx.create(&SysModelRow { label: l.to_string(), name: l.to_string() }).await?.id();
+                            changed = true;
                             model_ids.insert(l.to_string(), (id, out_models.len()));
                             out_models.push(RegisteredModel { id, label: l.to_string(), name: l.to_string(), properties: Vec::new() });
                             id
@@ -419,19 +277,11 @@ where
             }};
         }
 
-        // -- pass 2: each model entry's properties. Nesting IS the
-        //    membership assertion: every entry ensures a (model, property)
-        //    membership, whether the property is minted here, found in the
-        //    model's membership set by name, or explicitly shared by id. ----
         let mut property_ids: BTreeMap<(EntityId, String), (EntityId, String, String)> = BTreeMap::new();
-        let mut membership_seen: std::collections::BTreeSet<(EntityId, EntityId)> = std::collections::BTreeSet::new();
+        let mut membership_ids: BTreeMap<(EntityId, EntityId), EntityId> = BTreeMap::new();
         for m in &models {
             let (model_id, out_index) = *model_ids.get(&m.label).expect("pass 1 resolved every model label");
             for p in &m.properties {
-                // Duplicate (model, name) in one request: the first
-                // occurrence fixes the resolution; a later duplicate
-                // coalesces onto it under the same compatibility bar as a
-                // catalog hit.
                 if let Some((_, canon_backend, canon_vt)) = property_ids.get(&(model_id, p.name.clone())) {
                     if p.backend != *canon_backend || !value_types_compatible(canon_vt, &p.value_type) {
                         return Err(RegistrationError::NonCastable {
@@ -447,55 +297,35 @@ where
                 }
 
                 if let Some(id) = p.explicit_id {
-                    // Explicit binding: verify (backend, value_type), never
-                    // mint the property; the bound entity's name and metadata
-                    // are authoritative. The nested position still asserts
-                    // THIS model's membership, which is how a property minted
-                    // elsewhere is intentionally shared.
-                    let values = self.verify_explicit_binding(id, &m.label, p).await?;
-                    plan.existing.push(id);
-                    let backend = string_field(&values, "backend").unwrap_or_else(|| p.backend.clone());
-                    let value_type = string_field(&values, "value_type").unwrap_or_else(|| p.value_type.clone());
-                    let membership_id = self.ensure_membership(&mut plan, &mut push, model_id, id, p.optional).await?;
+                    let def = self.verify_explicit_binding(&context, id, &m.label, p).await?;
+                    let backend = def.backend.clone();
+                    let value_type = def.value_type.clone();
+                    let membership_id =
+                        self.ensure_membership(&context, &trx, &mut membership_ids, &mut changed, model_id, id, p.optional).await?;
                     property_ids.insert((model_id, p.name.clone()), (id, backend.clone(), value_type.clone()));
                     out_models[out_index].properties.push(RegisteredProperty {
                         id,
                         membership_id,
-                        name: string_field(&values, "name").unwrap_or_else(|| p.name.clone()),
+                        name: if def.name.is_empty() { p.name.clone() } else { def.name },
                         backend,
                         value_type,
-                        target_model: entity_id_field(&values, "target_model"),
-                        minted_for: entity_id_field(&values, "minted_for"),
+                        target_model: def.target_model,
+                        minted_for: def.minted_for,
                         optional: p.optional,
                     });
                     continue;
                 }
 
-                // Resolve the target-model reference first so both the
-                // create and the diff paths can use it.
                 let target = match &p.target_label {
                     Some(tl) => Some(resolve_model!(tl)),
                     None => None,
                 };
 
-                // Lookup scope is the model's MEMBERSHIP SET by current name
-                // (a shared property resolves here regardless of where it
-                // was minted; minted_for is provenance, never a key), with
-                // the rename hint consulted only when the current name
-                // misses.
-                let current = self.member_property_lookup_checked(&model_id, &p.name).await?;
+                let current = self.member_property_lookup_checked(&context, &model_id, &p.name).await?;
                 let renamed = match (&current, &p.renamed_from) {
-                    (None, Some(old)) => self.member_property_lookup_checked(&model_id, old).await?,
+                    (None, Some(old)) => self.member_property_lookup_checked(&context, &model_id, old).await?,
                     _ => None,
                 };
-
-                // The canonical-type compatibility gate: a hit never mutates
-                // (backend, value_type) and never forks a second identity.
-                // Refuses loudly on a different backend or a non-castable
-                // type pair; a castable drift is admitted (the binary writes
-                // and reads through the cast) and the response carries the
-                // CANONICAL types so the requester's map holds its cast
-                // target.
                 let canonical = current.as_ref().or(renamed.as_ref()).map(|(def, _)| (def.backend.clone(), def.value_type.clone()));
                 if let Some((def, _)) = current.as_ref().or(renamed.as_ref()) {
                     check_property_compat(def, &m.label, p)?;
@@ -503,82 +333,42 @@ where
 
                 let (property_id, membership_id) = match (&current, &renamed) {
                     (Some((def, membership)), _) => {
-                        // Plain hit: name matches by construction; only the
-                        // target reference can differ.
-                        let mut fields: Vec<(&str, Option<Value>)> = Vec::new();
                         if def.target_model != target {
-                            let target_value = target.map(Value::EntityId);
-                            plan.updates.push(PlannedUpdate {
-                                collection: property_collection(),
-                                entity: def.id,
-                                field: "target_model".into(),
-                                from: def.target_model.map(Value::EntityId),
-                                to: target_value.clone(),
-                            });
-                            fields.push(("target_model", target_value));
+                            trx.get::<SysPropertyRow>(&def.id).await?.target_model().set(&target).map_err(MutationError::from)?;
+                            changed = true;
                         }
-                        if fields.is_empty() {
-                            plan.existing.push(def.id);
-                        } else {
-                            let (_, head) = self.catalog_entity_snapshot(def.id, &property_collection()).await?.ok_or_else(|| {
-                                RetrievalError::Other(format!("catalog map holds property {} absent from storage", def.id))
-                            })?;
-                            push(follow_up_patch(property_collection(), def.id, head, fields));
-                        }
-                        let membership_id = self.ensure_membership_from(&mut plan, &mut push, membership.clone(), p.optional).await?;
+                        let membership_id = self.ensure_membership_from(&trx, &mut changed, membership.clone(), p.optional).await?;
+                        membership_ids.insert((model_id, def.id), membership_id);
                         (def.id, membership_id)
                     }
                     (None, Some((def, membership))) => {
-                        // The rename hint applies: update `name` on the
-                        // existing lineage, plus any target change, in one
-                        // follow-up.
-                        let mut fields: Vec<(&str, Option<Value>)> = vec![("name", Some(Value::String(p.name.clone())))];
-                        plan.updates.push(PlannedUpdate {
-                            collection: property_collection(),
-                            entity: def.id,
-                            field: "name".into(),
-                            from: Some(Value::String(def.name.clone())),
-                            to: Some(Value::String(p.name.clone())),
-                        });
+                        let property = trx.get::<SysPropertyRow>(&def.id).await?;
+                        property.name().set(&p.name).map_err(MutationError::from)?;
                         if def.target_model != target {
-                            let target_value = target.map(Value::EntityId);
-                            plan.updates.push(PlannedUpdate {
-                                collection: property_collection(),
-                                entity: def.id,
-                                field: "target_model".into(),
-                                from: def.target_model.map(Value::EntityId),
-                                to: target_value.clone(),
-                            });
-                            fields.push(("target_model", target_value));
+                            property.target_model().set(&target).map_err(MutationError::from)?;
                         }
-                        let (_, head) = self
-                            .catalog_entity_snapshot(def.id, &property_collection())
-                            .await?
-                            .ok_or_else(|| RetrievalError::Other(format!("catalog map holds property {} absent from storage", def.id)))?;
-                        push(follow_up_patch(property_collection(), def.id, head, fields));
-                        let membership_id = self.ensure_membership_from(&mut plan, &mut push, membership.clone(), p.optional).await?;
+                        changed = true;
+                        let membership_id = self.ensure_membership_from(&trx, &mut changed, membership.clone(), p.optional).await?;
+                        membership_ids.insert((model_id, def.id), membership_id);
                         (def.id, membership_id)
                     }
                     (None, None) => {
-                        // Miss: allocate the property AND its membership. The
-                        // creation events carry the full definition state.
-                        let id = EntityId::new();
-                        plan.creates_properties.push((id, p.clone()));
-                        let mut fields: Vec<(&str, Value)> = vec![
-                            ("minted_for", Value::EntityId(model_id)),
-                            ("name", Value::String(p.name.clone())),
-                            ("backend", Value::String(p.backend.clone())),
-                            ("value_type", Value::String(p.value_type.clone())),
-                        ];
-                        if let Some(t) = target {
-                            fields.push(("target_model", Value::EntityId(t)));
-                        }
-                        push(creation(property_collection(), id, fields));
-                        let membership_id = self.ensure_membership(&mut plan, &mut push, model_id, id, p.optional).await?;
+                        let id = trx
+                            .create(&SysPropertyRow {
+                                name: p.name.clone(),
+                                backend: p.backend.clone(),
+                                value_type: p.value_type.clone(),
+                                minted_for: Some(model_id),
+                                target_model: target,
+                            })
+                            .await?
+                            .id();
+                        changed = true;
+                        let membership_id =
+                            self.ensure_membership(&context, &trx, &mut membership_ids, &mut changed, model_id, id, p.optional).await?;
                         (id, membership_id)
                     }
                 };
-                membership_seen.insert((model_id, property_id));
 
                 let (backend, value_type) = canonical.unwrap_or_else(|| (p.backend.clone(), p.value_type.clone()));
                 let minted_for = match (&current, &renamed) {
@@ -598,124 +388,67 @@ where
                 });
             }
         }
-        let _ = membership_seen;
 
-        // A re-registration of unchanged definitions is a pure no-op:
-        // nothing to gate, nothing to commit, nothing to relay -- but the
-        // requester still gets the full resolved tree.
-        if plan.is_noop() {
-            return Ok(out_models);
+        if changed {
+            trx.commit().await?;
+        } else {
+            trx.rollback();
         }
-
-        // The exists-aware policy gate judges the resolved plan before
-        // anything is emitted; refusal fails the request before any write.
-        // Underneath, check_event still gates each event individually inside
-        // the commit pipeline, and the batch is NOT transactional: a
-        // mid-batch event denial leaves the earlier catalog events durable
-        // (maintainer ruling 2026-07-06: registration does not need to be
-        // atomic; #313 tracks the transactional upgrade). Identity survives
-        // such partials because every allocator lookup double-checks storage
-        // on a map miss, so a retry converges on the stored ids instead of
-        // re-minting.
-        node.policy_agent.check_schema_registration(&node, cdata, &plan)?;
-
-        // The ordinary remote-commit pipeline: policy check (check_event),
-        // attest, persist, apply, reactor notify.
-        node.commit_remote_transaction(cdata, TransactionId::new(), events).await?;
-
-        // Synchronous map upsert BEFORE the allocator mutex releases: the
-        // next registration in line must observe these allocations even if
-        // the reactor has not delivered them yet.
-        self.upsert_registered(&out_models);
 
         Ok(out_models)
     }
 
-    /// Ensure the (model, property) membership exists with `optional`: reuse
-    /// and difference-patch a stored one, or mint. Returns the membership id.
     async fn ensure_membership(
         &self,
-        plan: &mut RegistrationPlan,
-        push: &mut impl FnMut(proto::Event),
+        context: &Context,
+        trx: &crate::transaction::Transaction,
+        request_memberships: &mut BTreeMap<(EntityId, EntityId), EntityId>,
+        changed: &mut bool,
         model: EntityId,
         property: EntityId,
         optional: bool,
     ) -> Result<EntityId, RegistrationError> {
-        match self.membership_lookup_checked(&model, &property).await? {
-            Some(def) => self.ensure_membership_from(plan, push, def, optional).await,
-            None => {
-                let id = EntityId::new();
-                plan.creates_memberships.push(PlannedModelPropertyMembership { id, model, property, optional });
-                push(creation(
-                    model_property_collection(),
-                    id,
-                    vec![("model", Value::EntityId(model)), ("property", Value::EntityId(property)), ("optional", Value::Bool(optional))],
-                ));
-                Ok(id)
-            }
+        if let Some(id) = request_memberships.get(&(model, property)) {
+            return Ok(*id);
         }
+        let id = match self.membership_lookup_checked(context, &model, &property).await? {
+            Some(def) => self.ensure_membership_from(trx, changed, def, optional).await?,
+            None => {
+                *changed = true;
+                trx.create(&SysModelPropertyRow { model, property, optional }).await?.id()
+            }
+        };
+        request_memberships.insert((model, property), id);
+        Ok(id)
     }
 
-    /// Difference-patch an already-resolved membership's `optional` flag.
     async fn ensure_membership_from(
         &self,
-        plan: &mut RegistrationPlan,
-        push: &mut impl FnMut(proto::Event),
+        trx: &crate::transaction::Transaction,
+        changed: &mut bool,
         def: super::catalog::ModelPropertyMembershipDef,
         optional: bool,
     ) -> Result<EntityId, RegistrationError> {
         if def.optional != Some(optional) {
-            let (_, head) = self
-                .catalog_entity_snapshot(def.id, &model_property_collection())
-                .await?
-                .ok_or_else(|| RetrievalError::Other(format!("catalog map holds membership {} absent from storage", def.id)))?;
-            plan.updates.push(PlannedUpdate {
-                collection: model_property_collection(),
-                entity: def.id,
-                field: "optional".into(),
-                from: def.optional.map(Value::Bool),
-                to: Some(Value::Bool(optional)),
-            });
-            push(follow_up(model_property_collection(), def.id, head, vec![("optional", Value::Bool(optional))]));
-        } else {
-            plan.existing.push(def.id);
+            trx.get::<SysModelPropertyRow>(&def.id).await?.optional().set(&optional).map_err(MutationError::from)?;
+            *changed = true;
         }
         Ok(def.id)
     }
 
-    /// Allocator lookup for a model: the catalog map first, then durable
-    /// storage on a miss. The in-memory map can lag
-    /// durable truth -- a partial-commit abort skips the post-commit fold,
-    /// and non-sled engines warm lazily (#310) -- and minting from a cold
-    /// map would fork identity for a key that already exists. A storage hit
-    /// is folded into the map so the rest of the request (and the next one)
-    /// sees it; ordinary first sightings miss both and pay one bounded
-    /// fetch under the allocator mutex.
-    async fn model_lookup_checked(&self, label: &str) -> Result<Option<super::catalog::ModelDef>, RetrievalError> {
+    async fn model_lookup_checked(&self, context: &Context, label: &str) -> Result<Option<super::catalog::ModelDef>, RetrievalError> {
         if let Some(def) = self.model_by_label(label) {
             return Ok(Some(def));
         }
-        let Some((id, values)) = self.catalog_row_by_key(model_collection(), field_eq_str("label", label)).await? else {
-            return Ok(None);
-        };
-        let def = super::catalog::ModelDef {
-            id,
-            label: label.to_string(),
-            name: string_field(&values, "name").unwrap_or_else(|| label.to_string()),
-        };
-        self.upsert_registered(&[RegisteredModel { id: def.id, label: def.label.clone(), name: def.name.clone(), properties: Vec::new() }]);
-        Ok(Some(def))
+        let mut rows =
+            context.fetch::<SysModelRowView>(Selection { predicate: field_eq_str("label", label), order_by: None, limit: None }).await?;
+        rows.sort_by_key(|row| row.id());
+        rows.first().map(model_def).transpose()
     }
 
-    /// Allocator lookup for a property by name WITHIN a model's membership
-    /// set: map first, storage on a miss (see
-    /// [`Self::model_lookup_checked`]). Membership is the scope -- a shared
-    /// property resolves regardless of where it was minted -- so the storage
-    /// path walks the model's membership rows and matches each bound
-    /// property's current name. Returns the property with the membership
-    /// that binds it.
     async fn member_property_lookup_checked(
         &self,
+        context: &Context,
         model: &EntityId,
         name: &str,
     ) -> Result<Option<(super::catalog::PropertyDef, super::catalog::ModelPropertyMembershipDef)>, RetrievalError> {
@@ -724,45 +457,27 @@ where
                 return Ok(Some((def, membership)));
             }
         }
-        let node = self.node().ok_or_else(|| RetrievalError::Other("node dropped during catalog lookup".to_owned()))?;
-        let selection = ankql::ast::Selection { predicate: field_eq_id("model", *model), order_by: None, limit: None };
-        let mut rows: Vec<proto::Attested<proto::EntityState>> =
-            node.collections.get(&catalog_collection_id(model_property_collection())).await?.fetch_states(&selection).await?;
-        // Lowest membership id first, so repeated calls are deterministic
-        // even over historical duplicates.
-        rows.sort_by_key(|state| state.payload.entity_id);
+        let mut rows = context
+            .fetch::<SysModelPropertyRowView>(Selection { predicate: field_eq_id("model", *model), order_by: None, limit: None })
+            .await?;
+        rows.sort_by_key(|row| row.id());
         for row in rows {
-            let membership_id = row.payload.entity_id;
-            let Some(buffer) = row.payload.state.state_buffers.0.get("lww") else { continue };
-            let values = LWWBackend::from_state_buffer(buffer)?.property_values();
-            let Some(property_id) = entity_id_field(&values, "property") else { continue };
-            let Some(prop_values) = self.catalog_entity_values(property_id, &property_collection()).await? else { continue };
-            if string_field(&prop_values, "name").as_deref() != Some(name) {
+            let Ok(membership) = membership_def(&row) else { continue };
+            let property = match catalog_row_by_id::<SysPropertyRowView>(context, membership.property).await? {
+                Some(row) => property_def(&row)?,
+                None => continue,
+            };
+            if property.name != name {
                 continue;
             }
-            let def = super::catalog::PropertyDef {
-                id: property_id,
-                minted_for: entity_id_field(&prop_values, "minted_for"),
-                name: name.to_string(),
-                backend: string_field(&prop_values, "backend").unwrap_or_default(),
-                value_type: string_field(&prop_values, "value_type").unwrap_or_default(),
-                target_model: entity_id_field(&prop_values, "target_model"),
-            };
-            let membership = super::catalog::ModelPropertyMembershipDef {
-                id: membership_id,
-                model: *model,
-                property: property_id,
-                optional: bool_field(&values, "optional"),
-            };
-            return Ok(Some((def, membership)));
+            return Ok(Some((property, membership)));
         }
         Ok(None)
     }
 
-    /// Allocator lookup for a membership by (model, property): map first,
-    /// storage on a miss (see [`Self::model_lookup_checked`]).
     async fn membership_lookup_checked(
         &self,
+        context: &Context,
         model: &EntityId,
         property: &EntityId,
     ) -> Result<Option<super::catalog::ModelPropertyMembershipDef>, RetrievalError> {
@@ -770,138 +485,89 @@ where
             return Ok(Some(def));
         }
         let predicate = and(field_eq_id("model", *model), field_eq_id("property", *property));
-        let Some((id, values)) = self.catalog_row_by_key(model_property_collection(), predicate).await? else {
-            return Ok(None);
-        };
-        let optional = bool_field(&values, "optional");
-        // No map fold here: memberships fold with their full registered tree
-        // (a flag-less row is TREATED as optional, never defaulted; the
-        // executor's diff arm emits the repairing follow-up either way).
-        Ok(Some(super::catalog::ModelPropertyMembershipDef { id, model: *model, property: *property, optional }))
+        let mut rows = context.fetch::<SysModelPropertyRowView>(Selection { predicate, order_by: None, limit: None }).await?;
+        rows.sort_by_key(|row| row.id());
+        rows.first().map(membership_def).transpose()
     }
 
-    /// Fetch the catalog row matching `predicate` straight from durable
-    /// storage (no map, no policy: allocator-internal, under the mutex).
-    /// Returns the lowest entity id on multiple matches so repeated calls
-    /// are deterministic even over historical duplicates.
-    async fn catalog_row_by_key(
-        &self,
-        collection: ModelId,
-        predicate: ankql::ast::Predicate,
-    ) -> Result<Option<(EntityId, BTreeMap<String, Option<Value>>)>, RetrievalError> {
-        let selection = ankql::ast::Selection { predicate, order_by: None, limit: None };
-        let mut best: Option<(EntityId, BTreeMap<String, Option<Value>>)> = None;
-        let node = self.node().ok_or_else(|| RetrievalError::Other("node dropped during catalog lookup".to_owned()))?;
-        for state in node.collections.get(&catalog_collection_id(collection)).await?.fetch_states(&selection).await? {
-            let id = state.payload.entity_id;
-            if best.as_ref().is_some_and(|(b, _)| *b <= id) {
-                continue;
-            }
-            let Some(buffer) = state.payload.state.state_buffers.0.get("lww") else {
-                continue;
-            };
-            best = Some((id, LWWBackend::from_state_buffer(buffer)?.property_values()));
-        }
-        Ok(best)
-    }
-
-    /// An explicit binding references a definition authored
-    /// elsewhere. Absence is a hard failure (cold start), and a
-    /// (backend, value_type) mismatch means the definition was retyped:
-    /// breaking for binders BY DESIGN. Returns the bound entity's current
-    /// values for response building.
     async fn verify_explicit_binding(
         &self,
+        context: &Context,
         id: EntityId,
         model_label: &str,
         p: &RegisterProperty,
-    ) -> Result<BTreeMap<String, Option<Value>>, RegistrationError> {
-        let Some(values) = self.catalog_entity_values(id, &property_collection()).await? else {
+    ) -> Result<super::catalog::PropertyDef, RegistrationError> {
+        let Some(row) = catalog_row_by_id::<SysPropertyRowView>(context, id).await? else {
             return Err(RegistrationError::ExplicitIdNotFound { property: id });
         };
-        let get_string = |field: &str| match values.get(field) {
-            Some(Some(Value::String(s))) => s.clone(),
-            _ => String::new(),
-        };
-        let (found_backend, found_value_type) = (get_string("backend"), get_string("value_type"));
-        // Same compatibility bar as the name-keyed upsert: the backend must match, and a drifted
-        // value_type is admitted only when mutually castable with the
-        // canonical one. The binding never mutates the bound definition.
-        if found_backend != p.backend || !value_types_compatible(&found_value_type, &p.value_type) {
+        let def = property_def(&row)?;
+        if def.backend != p.backend || !value_types_compatible(&def.value_type, &p.value_type) {
             return Err(RegistrationError::NonCastable {
                 collection: model_label.to_string(),
                 name: p.name.clone(),
-                found_backend,
-                found_value_type,
+                found_backend: def.backend.clone(),
+                found_value_type: def.value_type.clone(),
                 backend: p.backend.clone(),
                 value_type: p.value_type.clone(),
             });
         }
-        Ok(values)
+        Ok(def)
     }
 
-    /// An explicit model binding references a model entity
-    /// authored elsewhere. Absence is a hard failure (never mints), and a
-    /// collection mismatch means the binder points at the wrong contract.
-    /// Returns the bound entity's current values for response building.
     async fn verify_explicit_model_binding(
         &self,
+        context: &Context,
         id: EntityId,
         m: &RegisterModel,
-    ) -> Result<BTreeMap<String, Option<Value>>, RegistrationError> {
-        let Some((values, _)) = self.catalog_entity_snapshot(id, &model_collection()).await? else {
+    ) -> Result<super::catalog::ModelDef, RegistrationError> {
+        let Some(row) = catalog_row_by_id::<SysModelRowView>(context, id).await? else {
             return Err(RegistrationError::ExplicitModelIdNotFound { model: id });
         };
-        let found_label = string_field(&values, "label").unwrap_or_default();
-        if found_label != m.label {
-            return Err(RegistrationError::ExplicitModelIdMismatch { model: id, found_label, label: m.label.clone() });
+        let def = model_def(&row)?;
+        if def.label != m.label {
+            return Err(RegistrationError::ExplicitModelIdMismatch { model: id, found_label: def.label, label: m.label.clone() });
         }
-        Ok(values)
-    }
-
-    /// Read a catalog entity's LWW values and head straight from storage
-    /// (catalog entities are system models: raw backend access, never a
-    /// View). `None` when the entity does not exist yet.
-    async fn catalog_entity_snapshot(
-        &self,
-        id: EntityId,
-        expected_model: &ModelId,
-    ) -> Result<Option<(BTreeMap<String, Option<Value>>, proto::Clock)>, RetrievalError> {
-        let node = self.node().ok_or_else(|| RetrievalError::Other("node dropped during catalog lookup".to_owned()))?;
-        let state = match node.collections.get(&catalog_collection_id(*expected_model)).await?.get_state(id).await {
-            Ok(state) => state,
-            Err(RetrievalError::EntityNotFound(_)) => return Ok(None),
-            Err(e) => return Err(e),
-        };
-        // Per-collection storage already scopes the read; keep the routing
-        // check anyway so a mis-filed id reads as absent rather than as a
-        // definition of the wrong kind.
-        if state.payload.collection != catalog_collection_id(*expected_model) {
-            return Ok(None);
-        }
-        let head = state.payload.state.head.clone();
-        let Some(buffer) = state.payload.state.state_buffers.0.get("lww") else {
-            return Ok(None);
-        };
-        let backend = LWWBackend::from_state_buffer(buffer)?;
-        Ok(Some((backend.property_values(), head)))
-    }
-
-    /// Values-only convenience over [`Self::catalog_entity_snapshot`].
-    async fn catalog_entity_values(
-        &self,
-        id: EntityId,
-        expected_model: &ModelId,
-    ) -> Result<Option<BTreeMap<String, Option<Value>>>, RetrievalError> {
-        Ok(self.catalog_entity_snapshot(id, expected_model).await?.map(|(values, _)| values))
+        Ok(def)
     }
 }
 
-fn string_field(values: &BTreeMap<String, Option<Value>>, field: &str) -> Option<String> {
-    match values.get(field) {
-        Some(Some(Value::String(s))) => Some(s.clone()),
-        _ => None,
-    }
+fn row_error(kind: &str, id: EntityId, error: crate::property::PropertyError) -> RetrievalError {
+    RetrievalError::Other(format!("malformed {kind} catalog row {id}: {error}"))
+}
+
+fn model_def(row: &SysModelRowView) -> Result<super::catalog::ModelDef, RetrievalError> {
+    let label = row.label().map_err(|error| row_error("model", row.id(), error))?;
+    let name = row.name().unwrap_or_else(|_| label.clone());
+    Ok(super::catalog::ModelDef { id: row.id(), label, name })
+}
+
+fn property_def(row: &SysPropertyRowView) -> Result<super::catalog::PropertyDef, RetrievalError> {
+    Ok(super::catalog::PropertyDef {
+        id: row.id(),
+        minted_for: row.minted_for().map_err(|error| row_error("property", row.id(), error))?,
+        name: row.name().map_err(|error| row_error("property", row.id(), error))?,
+        backend: row.backend().map_err(|error| row_error("property", row.id(), error))?,
+        value_type: row.value_type().map_err(|error| row_error("property", row.id(), error))?,
+        target_model: row.target_model().map_err(|error| row_error("property", row.id(), error))?,
+    })
+}
+
+fn membership_def(row: &SysModelPropertyRowView) -> Result<super::catalog::ModelPropertyMembershipDef, RetrievalError> {
+    Ok(super::catalog::ModelPropertyMembershipDef {
+        id: row.id(),
+        model: row.model().map_err(|error| row_error("membership", row.id(), error))?,
+        property: row.property().map_err(|error| row_error("membership", row.id(), error))?,
+        optional: row.optional().ok(),
+    })
+}
+
+/// Fetch one typed catalog row by id through the collection scan rather than
+/// accepting a state solely because a storage backend has that globally
+/// unique id in another collection. Explicit bindings must prove both the id
+/// and the catalog collection they claim.
+async fn catalog_row_by_id<R: View>(context: &Context, id: EntityId) -> Result<Option<R>, RetrievalError> {
+    let rows = context.fetch::<R>(Selection { predicate: field_eq_id("id", id), order_by: None, limit: Some(1) }).await?;
+    Ok(rows.into_iter().find(|row| row.id() == id))
 }
 
 /// Whether a declared value_type is admissible against a canonical one:
@@ -942,23 +608,11 @@ fn check_property_compat(def: &super::catalog::PropertyDef, model_label: &str, p
     Ok(())
 }
 
-fn bool_field(values: &BTreeMap<String, Option<Value>>, field: &str) -> Option<bool> {
-    match values.get(field) {
-        Some(Some(Value::Bool(b))) => Some(*b),
-        _ => None,
-    }
-}
-
-// -- allocator storage-lookup predicate builders ------------------------------
+// -- allocator lookup predicate builders -------------------------------------
 //
-// These build the RESOLVED form directly. The allocator reads catalog rows
-// straight from storage (`catalog_row_by_key`), bypassing catalog-backed name
-// resolution because these lookups bootstrap the catalog that resolution
-// would read. A storage engine can only address a property by
-// identity and rejects anything else (`ankql::ast::Selection::check`), so these
-// predicates must arrive resolved on their own. Catalog collections are frozen
-// and mint no property-definition ids, so their fields are `System` properties,
-// named through the same `system_property` decision the systemize pass uses.
+// Catalog collections use built-in System properties, so these predicates
+// are already identity-resolved before they enter the normal typed Context
+// fetch path.
 
 fn field_eq(field: &str, value: ankql::ast::Literal) -> ankql::ast::Predicate {
     ankql::ast::Predicate::Comparison {
@@ -973,63 +627,3 @@ fn field_eq_str(field: &str, value: &str) -> ankql::ast::Predicate { field_eq(fi
 fn field_eq_id(field: &str, id: EntityId) -> ankql::ast::Predicate { field_eq(field, ankql::ast::Literal::EntityId(id.to_ulid())) }
 
 fn and(a: ankql::ast::Predicate, b: ankql::ast::Predicate) -> ankql::ast::Predicate { ankql::ast::Predicate::And(Box::new(a), Box::new(b)) }
-
-fn entity_id_field(values: &BTreeMap<String, Option<Value>>, field: &str) -> Option<EntityId> {
-    match values.get(field) {
-        Some(Some(Value::EntityId(id))) => Some(*id),
-        _ => None,
-    }
-}
-
-/// The storage collection for a catalog model: the event's routing
-/// materialization in this write-only phase, always derived from the same
-/// model the membership operation asserts.
-fn catalog_collection_id(model: ModelId) -> proto::CollectionId {
-    match model {
-        ModelId::System(system) => proto::CollectionId::fixed_name(crate::schema::system_collection_label(system)),
-        ModelId::EntityId(_) => unreachable!("catalog collections are system models"),
-    }
-}
-
-/// A creation event: full definition state, empty parent clock. Ordinary
-/// in every respect.
-/// The membership operation is the authority for the entity's model; the
-/// event's collection field is the routing materialization of the same
-/// fact.
-fn creation(model: ModelId, entity_id: EntityId, fields: Vec<(&str, Value)>) -> proto::Event {
-    let mut event = follow_up(model, entity_id, proto::Clock::default(), fields);
-    event.operations.push(Operation::Membership(Membership::Add(model)));
-    event
-}
-
-/// A follow-up event carrying changed metadata, parented at the entity's
-/// current head. It must descend the metadata it supersedes so LWW recency
-/// decides, not the concurrent tiebreak.
-fn follow_up(model: ModelId, entity_id: EntityId, parent: proto::Clock, fields: Vec<(&str, Value)>) -> proto::Event {
-    follow_up_patch(model, entity_id, parent, fields.into_iter().map(|(name, value)| (name, Some(value))).collect())
-}
-
-/// A metadata follow-up that may clear fields as well as replace them.
-fn follow_up_patch(model: ModelId, entity_id: EntityId, parent: proto::Clock, fields: Vec<(&str, Option<Value>)>) -> proto::Event {
-    let backend = LWWBackend::new();
-    for (name, value) in fields {
-        let property = SystemProperty::from_name(name).expect("every catalog event field names a SystemProperty variant");
-        backend.set(property.to_string(), value);
-    }
-    let operations = backend.to_operations().expect("LWW encoding of scalar values is infallible").expect("fields are non-empty");
-    proto::Event {
-        collection: catalog_collection_id(model),
-        entity_id,
-        operations: OperationSet::from_backends(BTreeMap::from([("lww".to_string(), operations)])),
-        parent,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn selection(predicate: ankql::ast::Predicate) -> ankql::ast::Selection {
-        ankql::ast::Selection { predicate, order_by: None, limit: None }
-    }
-}

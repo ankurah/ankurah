@@ -8,15 +8,15 @@
 //! `SchemaRegistered` responses; it provides cheap identity lookups and the
 //! client-side entry points that ensure a compiled descriptor is registered.
 //! Durable allocation itself lives in [`super::registration`], and the
-//! catalog's typed read shapes live in [`rows`].
+//! catalog's typed model shapes live in [`rows`].
 //!
 //! The projection fills in one of two ways:
 //!
-//! - DURABLE nodes feed it from a policy-free reactor subscription over the
-//!   three collections: the initial fetch is the warm scan, and every later
-//!   catalog commit arrives through the same listener. The map is node
-//!   infrastructure like [`crate::system::SystemManager`]; catalog mutation
-//!   remains exclusive to durable schema registration.
+//! - DURABLE nodes feed it from three ordinary typed LiveQueries opened by a
+//!   local SystemRoot context. Their initial results warm the projection and
+//!   every later catalog commit arrives through the same subscriptions. The
+//!   map is node infrastructure like [`crate::system::SystemManager`];
+//!   catalog mutation remains exclusive to durable schema registration.
 //! - EPHEMERAL nodes fold only SchemaRegistered responses to their own
 //!   forwarded registrations. They therefore know only definitions they
 //!   have registered or received in a response, not the whole system catalog.
@@ -42,12 +42,12 @@ use tokio::sync::Notify;
 use tracing::{debug, error};
 
 use crate::{
-    entity::Entity,
+    changes::ChangeSet,
+    context::Context,
     error::RetrievalError,
+    livequery::LiveQuery,
     node::{Node, WeakNode},
     policy::PolicyAgent,
-    reactor::{GapFetcher, ReactorSubscription, ReactorUpdate},
-    resultset::EntityResultSet,
     storage::StorageEngine,
     util::request_fence::{RequestFence, RequestValidity},
 };
@@ -56,6 +56,7 @@ use super::{registration::RegistrationError, ModelStructDescriptor};
 
 mod map;
 use map::CatalogMap;
+use rows::{SysModelPropertyRowView, SysModelRowView, SysPropertyRowView};
 
 pub mod rows;
 pub use map::{ModelDef, ModelPropertyMembershipDef, PropertyDef};
@@ -63,16 +64,11 @@ pub use map::{ModelDef, ModelPropertyMembershipDef, PropertyDef};
 /// A registration failure with a plain-text cause.
 fn reg_err(msg: String) -> RegistrationError { RegistrationError::Retrieval(RetrievalError::Other(msg)) }
 
-/// The catalog feed's gap fetcher: never called (limit-less selections have
-/// no gaps); it satisfies the query-registration signature without borrowing
-/// a credentialed fetcher.
-struct NoopGapFetcher;
-
-#[async_trait::async_trait]
-impl GapFetcher<Entity> for NoopGapFetcher {
-    async fn fetch_gap(&self, _: &proto::CollectionId, _: &Selection, _: Option<&Entity>, _: usize) -> Result<Vec<Entity>, RetrievalError> {
-        Ok(Vec::new())
-    }
+struct DurableCatalogFeed {
+    _models: LiveQuery<SysModelRowView>,
+    _properties: LiveQuery<SysPropertyRowView>,
+    _memberships: LiveQuery<SysModelPropertyRowView>,
+    _guards: [ankurah_signals::SubscriptionGuard; 3],
 }
 
 /// Maintains the in-memory catalog map for a node. Held by `Node` beside
@@ -108,7 +104,7 @@ struct CatalogInner<SE, PA: PolicyAgent> {
     /// tears the feed down by clearing this and the next warm re-establishes
     /// it. The listener holds a Weak of this inner (a strong ref would cycle
     /// through the guard's callback and leak).
-    durable_feed: RwLock<Option<(ReactorSubscription, ankurah_signals::SubscriptionGuard)>>,
+    durable_feed: RwLock<Option<DurableCatalogFeed>>,
     /// One-shot adversarial pauses used to pin reset interleavings without
     /// adding timing assumptions to the integration tests.
     #[cfg(feature = "test-helpers")]
@@ -146,7 +142,7 @@ struct CatalogSetupState {
     /// retried `hard_reset` drains the same fences instead of bypassing
     /// work whose first waiter was canceled.
     draining_fences: Vec<RequestFence>,
-    /// A durable hard reset drops its reactor subscription. Once the new
+    /// A durable hard reset drops its typed LiveQuery subscriptions. Once the new
     /// system root is ready, one warm must attach the current generation.
     durable_resume_pending: bool,
 }
@@ -203,46 +199,50 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         }
     }
 
-    /// Durable path: subscribe the map to the three catalog collections and
-    /// mark ready. The reactor subscription IS the warm: registering each
-    /// `Predicate::True` query runs the local scan through the listener, and
-    /// every later catalog commit (local or remote funnel) arrives the same
-    /// way. The executor still folds its own commits synchronously under the
-    /// allocator mutex (the feed is asynchronous, and consecutive
-    /// registrations must observe their predecessors); folds are idempotent
-    /// by entity id, so the overlap is harmless. The subscription carries no
-    /// credentials by construction (policy lives in EntityLiveQuery above
-    /// the reactor). A schema-less durable node finds no rows and is
-    /// immediately ready with an empty, correct map.
+    /// Durable path: use the normal typed Context/LiveQuery/View stack for
+    /// all three catalog collections. SystemRoot is the local durable-node
+    /// authority for this system data; it bypasses application policy but
+    /// otherwise exercises the same query machinery as application models.
     async fn warm_durable(&self, generation: u64, validity: RequestValidity) -> Result<(), RetrievalError> {
         if self.0.setup_state.read().unwrap().generation != generation {
             return Ok(());
         }
         let node = self.node().ok_or_else(|| RetrievalError::Other("catalog warm ran without a node".to_owned()))?;
-
-        // Listener first, then queries: the queries' own fetches deliver the
-        // existing rows through this listener, so nothing can be missed
-        // between scan and subscribe. Every delivery acquires the durable
-        // epoch fence and holds it across the complete map effect: reset
-        // either rejects a straggler or drains it before clearing the map.
-        let subscription = node.reactor.subscribe();
-        use ankurah_signals::Subscribe;
-        let weak = Arc::downgrade(&self.0);
-        let guard = subscription.subscribe(move |update: ReactorUpdate| {
-            let Some(_lease) = validity.try_acquire() else { return };
-            let Some(inner) = weak.upgrade() else { return };
-            CatalogManager(inner).apply_reactor_update(update);
-        });
-
+        let context = Context::new_system_root(node)?;
         let everything = Selection { predicate: Predicate::True, order_by: None, limit: None };
-        let (sub, noop) = (subscription.id(), Arc::new(NoopGapFetcher));
-        for label in [super::MODEL_COLLECTION_ID, super::PROPERTY_COLLECTION_ID, super::MODEL_PROPERTY_COLLECTION_ID] {
-            let (qid, cid) = (proto::QueryId::new(), proto::CollectionId::fixed_name(label));
-            node.reactor
-                .add_query_and_notify(sub, qid, cid, everything.clone(), &node, EntityResultSet::empty(), noop.clone(), ())
-                .await
-                .map_err(|e| RetrievalError::Other(format!("catalog feed query failed: {e}")))?;
-        }
+        let models = context.query::<SysModelRowView>(everything.clone())?;
+        let properties = context.query::<SysPropertyRowView>(everything.clone())?;
+        let memberships = context.query::<SysModelPropertyRowView>(everything)?;
+
+        // Subscribe before awaiting initialization so the initial View rows
+        // are observed by the same callbacks as later updates.
+        use ankurah_signals::Subscribe;
+        let model_guard = {
+            let (weak, validity) = (Arc::downgrade(&self.0), validity.clone());
+            models.subscribe(move |changes| {
+                let Some(_lease) = validity.try_acquire() else { return };
+                let Some(inner) = weak.upgrade() else { return };
+                CatalogManager(inner).apply_model_changes(changes);
+            })
+        };
+        let property_guard = {
+            let (weak, validity) = (Arc::downgrade(&self.0), validity.clone());
+            properties.subscribe(move |changes| {
+                let Some(_lease) = validity.try_acquire() else { return };
+                let Some(inner) = weak.upgrade() else { return };
+                CatalogManager(inner).apply_property_changes(changes);
+            })
+        };
+        let membership_guard = {
+            let weak = Arc::downgrade(&self.0);
+            memberships.subscribe(move |changes| {
+                let Some(_lease) = validity.try_acquire() else { return };
+                let Some(inner) = weak.upgrade() else { return };
+                CatalogManager(inner).apply_membership_changes(changes);
+            })
+        };
+
+        tokio::join!(models.wait_initialized(), properties.wait_initialized(), memberships.wait_initialized());
 
         // The held setup guard excludes a reset's generation bump (a setup
         // write) between this check and feed/readiness publication.
@@ -250,27 +250,52 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         if setup.generation != generation {
             return Ok(());
         }
-        *self.0.durable_feed.write().unwrap() = Some((subscription, guard));
+        *self.0.durable_feed.write().unwrap() = Some(DurableCatalogFeed {
+            _models: models,
+            _properties: properties,
+            _memberships: memberships,
+            _guards: [model_guard, property_guard, membership_guard],
+        });
         self.mark_ready();
         Ok(())
     }
 
-    /// Fold one reactor update into the map, keyed by entity collection.
-    /// Idempotent by entity id, so racing the executor's synchronous fold is
-    /// harmless. Membership removes are ignored: catalog rows never leave a
-    /// `Predicate::True` selection, and reset synthetics are muted by the
-    /// listener's epoch fence.
-    fn apply_reactor_update(&self, update: ReactorUpdate) {
+    fn before_feed_apply(&self) {
         #[cfg(feature = "test-helpers")]
         if let Some(hook) = self.0.next_feed_apply_hook.write().unwrap().take() {
             hook();
         }
+    }
+
+    fn apply_model_changes(&self, changes: ChangeSet<SysModelRowView>) {
+        self.before_feed_apply();
         let mut map = self.0.map.write().unwrap();
-        for item in update.items {
-            let Some(model) = crate::schema::system_model_id(item.entity.collection().as_str()) else { continue };
-            match item.entity.to_entity_state() {
-                Ok(state) => map.apply_state(&model, item.entity.id(), &state),
-                Err(e) => debug!("catalog feed skip {:#} {}: {e}", item.entity.id(), item.entity.collection()),
+        for change in changes.changes {
+            let row = change.entity();
+            if let Err(error) = map.apply_model(row) {
+                error!("catalog feed skipped malformed model row {}: {error}", row.id());
+            }
+        }
+    }
+
+    fn apply_property_changes(&self, changes: ChangeSet<SysPropertyRowView>) {
+        self.before_feed_apply();
+        let mut map = self.0.map.write().unwrap();
+        for change in changes.changes {
+            let row = change.entity();
+            if let Err(error) = map.apply_property(row) {
+                error!("catalog feed skipped malformed property row {}: {error}", row.id());
+            }
+        }
+    }
+
+    fn apply_membership_changes(&self, changes: ChangeSet<SysModelPropertyRowView>) {
+        self.before_feed_apply();
+        let mut map = self.0.map.write().unwrap();
+        for change in changes.changes {
+            let row = change.entity();
+            if let Err(error) = map.apply_membership(row) {
+                error!("catalog feed skipped malformed membership row {}: {error}", row.id());
             }
         }
     }
@@ -644,11 +669,11 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         }
     }
 
-    /// Fold resolved definitions into the map: called by the executor
-    /// synchronously post-commit (before releasing the allocator mutex) and
-    /// by `ensure_registered` with a SchemaRegistered response, so binding
-    /// proceeds ahead of the feed. Idempotent by entity id; the reactor's
-    /// later re-delivery is harmless.
+    /// Fold resolved definitions into the map on an ephemeral node after a
+    /// `SchemaRegistered` response. Ephemeral nodes do not yet subscribe to
+    /// the complete catalog, so the response is their catalog source. The
+    /// same helper seeds deterministic test fixtures; durable registration
+    /// reaches the map only through its typed LiveQueries.
     pub fn upsert_registered(&self, models: &[RegisteredModel]) {
         let mut map = self.0.map.write().unwrap();
         for m in models {
@@ -692,12 +717,13 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     /// `Context::register_model` and, via `ensure_schema_for_use`, first-use
     /// registration on mutating and typed-read paths. Fast-returns only when
     /// this exact compiled shape is already ensured in this process. DURABLE
-    /// nodes execute locally (the executor updates the map under the
-    /// allocator mutex); EPHEMERAL nodes forward RegisterSchema to a durable
-    /// peer and consume the response into the map, and with NO peer fail
+    /// nodes execute locally (the typed catalog LiveQueries update the map
+    /// synchronously before the allocator mutex is released); EPHEMERAL nodes
+    /// forward RegisterSchema to a durable peer and consume the response into
+    /// the map, and with NO peer fail
     /// with NoDurablePeer (only the durable allocator may allocate ids, so
-    /// there is no offline queue). Re-assertion resolves to a no-op plan
-    /// whose response still feeds the map. Success latches; every error path
+    /// there is no offline queue). An unchanged re-assertion performs no
+    /// transaction while its response still feeds the map. Success latches; every error path
     /// returns WITHOUT latching, so a later attempt retries.
     pub async fn ensure_registered(
         &self,
@@ -720,7 +746,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
             // snapshotted before execution: reacquiring afterward could grab
             // a post-reset fence and fold old definitions into the new epoch.
             let _lease = initial_lease;
-            let models = self.register_schema(cdata, vec![request_model]).await?;
+            let models = self.register_schema(vec![request_model]).await?;
             self.mark_schema_ensured(schema, &models)?;
             return Ok(());
         }
@@ -752,7 +778,8 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
             entered.notify_one();
             release.notified().await;
         }
-        // Fold the response in on ack so binding proceeds ahead of the feed.
+        // Ephemeral nodes have no complete catalog feed yet; the acknowledged
+        // allocation response is their source for these definitions.
         self.upsert_registered(&models);
         self.mark_schema_ensured(schema, &models)
     }

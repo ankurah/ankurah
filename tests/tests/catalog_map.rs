@@ -91,8 +91,8 @@ fn expect_registered(resp: proto::NodeResponseBody) -> Vec<proto::RegisteredMode
     }
 }
 
-/// The durable fold runs synchronously under the allocator mutex, but the
-/// forwarded-response fold lands in a separate task, so poll until the map
+/// Durable LiveQuery delivery completes synchronously inside commit, but an
+/// ephemeral response fold can land in a separate task, so poll until the map
 /// resolves the given (collection, name) or time out.
 async fn wait_resolve<SE>(node: &Node<SE, PermissiveAgent>, collection: &str, name: &str) -> Option<EntityId>
 where SE: StorageEngine + Send + Sync + 'static {
@@ -250,8 +250,8 @@ async fn durable_map_resolves_after_registration() -> anyhow::Result<()> {
     let models = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
     let (model_id, property_id, membership_id) = (models[0].id, models[0].properties[0].id, models[0].properties[0].membership_id);
 
-    // The executor's synchronous fold resolves the display name to the
-    // allocated id.
+    // The typed feed's synchronous commit delivery resolves the display name
+    // to the allocated id.
     let resolved = wait_resolve(&server, "album", "name").await.expect("catalog should resolve album.name on the durable node");
     assert_eq!(resolved, property_id, "the map resolves to the allocated property id");
 

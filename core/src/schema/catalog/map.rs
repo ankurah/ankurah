@@ -1,9 +1,9 @@
 //! The catalog's node-local materialized projection.
 //!
 //! Here, a **map** means the parsed, indexed read model derived from the
-//! catalog's three entity collections. It accepts raw catalog
-//! [`ankurah_proto::EntityState`] values or already-resolved definitions and
-//! produces identity and membership lookups for registration and runtime
+//! catalog's three entity collections. It accepts the catalog's generated
+//! typed Views or already-resolved definitions and produces identity and
+//! membership lookups for registration and runtime
 //! schema resolution. It is not catalog storage, an allocator, a feed
 //! lifecycle, or a cache of compiled Rust-schema bindings; the parent
 //! [`super::CatalogManager`] service owns those concerns.
@@ -11,23 +11,20 @@
 //! This module owns consistency between each definition table and its
 //! secondary indexes. Upserting an entity must remove stale label, name, or
 //! model-membership entries before publishing the new ones, and set-valued
-//! indexes never retain empty buckets. Parsing deliberately reads raw LWW
-//! state: using the typed catalog Views here would make catalog resolution
-//! depend on the projection it is trying to build.
+//! indexes never retain empty buckets. A malformed typed row is rejected by
+//! its accessor and contributes no definition; callers log that failure and
+//! continue processing unrelated rows.
 
 use std::{
     borrow::Borrow,
     collections::{BTreeMap, BTreeSet},
 };
 
-use ankurah_proto::{self as proto, EntityId};
+use ankurah_proto::EntityId;
 
-use crate::{
-    property::backend::{LWWBackend, PropertyBackend},
-    schema::{model_collection, model_property_collection, property_collection},
-    value::Value,
-    ModelId,
-};
+use crate::property::PropertyError;
+
+use super::rows::{SysModelPropertyRowView, SysModelRowView, SysPropertyRowView};
 
 /// A parsed model definition entity (`_ankurah_model`): the durable model
 /// identity `id`, the source-level registration lookup key `label`, and the
@@ -114,29 +111,31 @@ impl<K: Ord> EntitySetIndex<K> {
 impl CatalogMap {
     pub(super) fn clear(&mut self) { *self = Self::default(); }
 
-    /// Fold one catalog entity state into the map, keyed by its collection.
-    /// Idempotent by entity id; non-catalog collections and unparseable
-    /// states are ignored.
-    pub(super) fn apply_state(&mut self, collection: &ModelId, id: EntityId, state: &proto::EntityState) {
-        let Some(buffer) = state.state.state_buffers.0.get("lww") else { return };
-        let Ok(backend) = LWWBackend::from_state_buffer(buffer) else { return };
-        let values = backend.property_values();
-        let text = |field: &str| if let Some(Some(Value::String(v))) = values.get(field) { Some(v.clone()) } else { None };
-        let eid = |field: &str| if let Some(Some(Value::EntityId(v))) = values.get(field) { Some(*v) } else { None };
+    pub(super) fn apply_model(&mut self, row: &SysModelRowView) -> Result<(), PropertyError> {
+        self.upsert_model(ModelDef { id: row.id(), label: row.label()?, name: row.name()? });
+        Ok(())
+    }
 
-        if *collection == model_collection() {
-            let Some(label) = text("label") else { return };
-            let name = text("name").unwrap_or_else(|| label.clone());
-            self.upsert_model(ModelDef { id, label, name });
-        } else if *collection == property_collection() {
-            let (Some(name), Some(backend), Some(value_type)) = (text("name"), text("backend"), text("value_type")) else { return };
-            let (minted_for, target_model) = (eid("minted_for"), eid("target_model"));
-            self.upsert_property(PropertyDef { id, minted_for, name, backend, value_type, target_model });
-        } else if *collection == model_property_collection() {
-            let (Some(model), Some(property)) = (eid("model"), eid("property")) else { return };
-            let optional = if let Some(Some(Value::Bool(v))) = values.get("optional") { Some(*v) } else { None };
-            self.upsert_membership(ModelPropertyMembershipDef { id, model, property, optional });
-        }
+    pub(super) fn apply_property(&mut self, row: &SysPropertyRowView) -> Result<(), PropertyError> {
+        self.upsert_property(PropertyDef {
+            id: row.id(),
+            minted_for: row.minted_for()?,
+            name: row.name()?,
+            backend: row.backend()?,
+            value_type: row.value_type()?,
+            target_model: row.target_model()?,
+        });
+        Ok(())
+    }
+
+    pub(super) fn apply_membership(&mut self, row: &SysModelPropertyRowView) -> Result<(), PropertyError> {
+        self.upsert_membership(ModelPropertyMembershipDef {
+            id: row.id(),
+            model: row.model()?,
+            property: row.property()?,
+            optional: Some(row.optional()?),
+        });
+        Ok(())
     }
 
     pub(super) fn upsert_model(&mut self, def: ModelDef) {
@@ -208,7 +207,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_name_resolution_fails_closed_on_ambiguous_memberships() {
+    fn name_resolution_fails_closed_on_ambiguous_memberships() {
         let (model, first, second) = (id(1), id(2), id(3));
         let mut map = CatalogMap::default();
         map.upsert_model(ModelDef { id: model, label: "report".to_owned(), name: "Report".to_owned() });
