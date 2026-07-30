@@ -1,0 +1,5 @@
+error: #[model(no_ffi)] is a bare flag and does not take a value
+ --> tests/compile_fail/no_ffi_takes_no_value.rs:8:9
+  |
+8 | #[model(no_ffi = true)]
+  |         ^^^^^^

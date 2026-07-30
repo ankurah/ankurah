@@ -1,0 +1,5 @@
+error: #[model(system = ...)] expects a string literal
+ --> tests/compile_fail/malformed_system_attr.rs:9:9
+  |
+9 | #[model(system = Model)]
+  |         ^^^^^^

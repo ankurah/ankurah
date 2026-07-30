@@ -1,0 +1,5 @@
+error: unknown #[model(...)] option; expected `base`, `system`, `id`, or `no_ffi`
+ --> tests/compile_fail/unknown_model_option.rs:8:9
+  |
+8 | #[model(systm = "Model")]
+  |         ^^^^^

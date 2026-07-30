@@ -1,3 +1,13 @@
+//! One Ankurah node's runtime ownership and peer-message boundary.
+//!
+//! [`Node`] is the shared public handle, [`NodeInner`] owns the storage,
+//! entities, Reactor, catalog, policy adapter, system lifecycle, and peer
+//! registries, and [`WeakNode`] is the non-owning form used by background
+//! components. [`PeerState`] tracks one connected peer; [`MatchArgs`] carries a
+//! prepared query request. This file composes those services and routes local
+//! and remote operations. Context owns caller authority, the Reactor owns query
+//! matching, and the schema catalog owns model/property identity resolution.
+
 use crate::schema::catalog::CatalogManager;
 use crate::selection::filter::Filterable;
 use ankurah_proto::{self as proto, Attested, CollectionId, EntityState};
@@ -147,8 +157,9 @@ where PA: PolicyAgent
     pub(crate) policy_agent: PA,
     pub system: SystemManager<SE, PA>,
 
-    /// The metadata catalog map (write-only in this phase: registration
-    /// maintains it; nothing resolves through it yet).
+    /// The metadata catalog service. Durable nodes populate its projection
+    /// from typed SystemRoot live queries; registration and runtime schema
+    /// binding resolve through that projection.
     pub catalog: CatalogManager<SE, PA>,
 
     pub(crate) subscription_relay: Option<SubscriptionRelay<PA::ContextData, crate::livequery::WeakEntityLiveQuery>>,
@@ -178,14 +189,14 @@ where
     }
 
     fn build(engine: Arc<SE>, policy_agent: PA, durable: bool, rng: SmallRng) -> Self {
-        let collections = CollectionSet::new(engine.clone());
+        let collections = CollectionSet::new(engine);
         let entityset: WeakEntitySet = Default::default();
         let id = proto::EntityId::new();
         let reactor = Reactor::new();
         notice_info!("Node {id:#} created as {}", if durable { "durable" } else { "ephemeral" });
 
         let system_manager = SystemManager::new(collections.clone(), entityset.clone(), reactor.clone(), durable);
-        let catalog = CatalogManager::new(engine, durable);
+        let catalog = CatalogManager::new(durable);
 
         // Only ephemeral nodes relay subscriptions upstream to a durable peer.
         let subscription_relay = if durable { None } else { Some(SubscriptionRelay::new()) };
@@ -462,8 +473,10 @@ where
                 }
             }
             proto::NodeRequestBody::RegisterSchema { models } => {
-                let cdata = cdata.iterable().exactly_one().map_err(|_| anyhow!("Only one cdata is permitted for RegisterSchema"))?;
-                match self.catalog.register_schema(cdata, models).await {
+                // Authentication has already admitted the request. Catalog
+                // materialization itself runs under local SystemRoot authority.
+                let _ = cdata.iterable().exactly_one().map_err(|_| anyhow!("Only one cdata is permitted for RegisterSchema"))?;
+                match self.catalog.register_schema(models).await {
                     // The resolved definitions ARE the response: the
                     // requester folds them into its catalog map on ack.
                     Ok(models) => Ok(proto::NodeResponseBody::SchemaRegistered { models }),

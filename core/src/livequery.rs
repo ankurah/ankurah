@@ -1,3 +1,13 @@
+//! Reactive query handles over the node's local Reactor and optional peer relay.
+//!
+//! [`EntityLiveQuery`] is the type-erased subscription lifetime and activation
+//! state; [`LiveQuery`] projects its result set into a generated model View;
+//! [`WeakEntityLiveQuery`] lets relay bookkeeping refer back without retaining
+//! the query. This file owns construction, activation, selection changes,
+//! initialization, typed projection, and node-lifetime behavior. The Reactor
+//! owns match maintenance, the subscription relay owns upstream transport, and
+//! Context decides which authority may create a query.
+
 use std::{
     marker::PhantomData,
     sync::{Arc, Weak},
@@ -21,7 +31,7 @@ use crate::{
     node::{MatchArgs, NodeInner, TNodeErased},
     policy::PolicyAgent,
     reactor::{
-        fetch_gap::{GapFetcher, QueryGapFetcher},
+        fetch_gap::{GapFetcher, QueryGapFetcher, SystemRootGapFetcher},
         ReactorSubscription, ReactorUpdate,
     },
     resultset::{EntityResultSet, ResultSet},
@@ -212,15 +222,27 @@ where
 {
     node.policy_agent.can_access_collection(&cdata, &collection_id)?;
     args.selection.predicate = node.policy_agent.filter_predicate(&cdata, &collection_id, args.selection.predicate)?;
-
-    // Resolve types in the AST (converts literals for JSON path comparisons)
     args.selection = node.type_resolver.resolve_selection_types(args.selection);
+    let gap_fetcher: std::sync::Arc<dyn GapFetcher<Entity>> = std::sync::Arc::new(QueryGapFetcher::new(&node, cdata.clone()));
+    create_inner_with(node, node_ref, collection_id, args, gap_fetcher, node.subscription_relay.is_some())
+}
 
+fn create_inner_with<SE, PA>(
+    node: &Node<SE, PA>,
+    node_ref: Box<dyn NodeRef>,
+    collection_id: CollectionId,
+    args: MatchArgs,
+    gap_fetcher: std::sync::Arc<dyn GapFetcher<Entity>>,
+    has_relay: bool,
+) -> Result<(Arc<Inner>, proto::QueryId), RetrievalError>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
     let subscription = node.reactor.subscribe();
 
     let resultset = EntityResultSet::empty();
     let query_id = proto::QueryId::new();
-    let gap_fetcher: std::sync::Arc<dyn GapFetcher<Entity>> = std::sync::Arc::new(QueryGapFetcher::new(&node, cdata.clone()));
 
     let inner = Arc::new(Inner {
         query_id,
@@ -235,9 +257,6 @@ where
         collection_id: collection_id.clone(),
         gap_fetcher,
     });
-
-    // Check if this is a durable node (no relay) or ephemeral node (has relay)
-    let has_relay = node.subscription_relay.is_some();
 
     if args.cached || !has_relay {
         // Durable node: spawn initialization task directly (no remote subscription needed)
@@ -291,6 +310,28 @@ impl EntityLiveQuery {
     {
         let node_ref: Box<dyn NodeRef> = Box::new(WeakNodeRefImpl(Arc::downgrade(&node.0)));
         Self::new_with_node_ref(node, node_ref, collection_id, args, cdata)
+    }
+
+    /// A policy-free local query owned by a SystemRoot context. It is
+    /// durable-only and holds the node weakly so node-owned infrastructure
+    /// such as CatalogManager cannot form a reference cycle.
+    pub(crate) fn new_system_root_weak_node<SE, PA>(
+        node: &Node<SE, PA>,
+        collection_id: CollectionId,
+        mut args: MatchArgs,
+    ) -> Result<Self, RetrievalError>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+    {
+        if !node.durable {
+            return Err(RetrievalError::Other("a SystemRoot live query requires a durable node".to_owned()));
+        }
+        args.selection = node.type_resolver.resolve_selection_types(args.selection);
+        let node_ref: Box<dyn NodeRef> = Box::new(WeakNodeRefImpl(Arc::downgrade(&node.0)));
+        let gap_fetcher: std::sync::Arc<dyn GapFetcher<Entity>> = std::sync::Arc::new(SystemRootGapFetcher::new(node));
+        let (inner, _) = create_inner_with(node, node_ref, collection_id, args, gap_fetcher, false)?;
+        Ok(Self(inner))
     }
 
     fn new_with_node_ref<SE, PA>(

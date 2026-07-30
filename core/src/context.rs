@@ -1,3 +1,20 @@
+//! A caller-scoped interface to one node.
+//!
+//! Here, a **context** is the authority under which typed operations run on
+//! one [`crate::node::Node`]. A normal context pairs the node with one
+//! [`crate::policy::PolicyAgent::ContextData`] and applies caller policy. A
+//! **system-root context** is a core-only capability, constructible only for
+//! a durable node, that bypasses the application policy authority for the
+//! node's own system models. Both use the same fetch, live-query, model, and
+//! transaction machinery.
+//!
+//! [`Context`] is the public, generic-erased handle. [`NodeAndContext`] is
+//! the concrete implementation that retains the node and its authority,
+//! while [`TContext`] is their object-safe boundary. Local transaction admission
+//! belongs here because this is the last caller-scoped boundary before events
+//! enter the node's trusted commit pipeline; protected system collections
+//! must never cross it as ordinary application writes.
+
 use crate::retrieval::SuspenseEvents;
 use crate::{
     changes::EntityChange,
@@ -33,7 +50,15 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     pub node: Node<SE, PA>,
-    pub cdata: PA::ContextData,
+    context_type: ContextType<PA::ContextData>,
+}
+
+/// The authority behind a Context. A Session carries application context
+/// data; SystemRoot is deliberately not a session and carries no application
+/// credentials.
+enum ContextType<CD> {
+    Session(CD),
+    SystemRoot,
 }
 
 #[async_trait]
@@ -74,7 +99,18 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         &self,
         schema: &'static crate::schema::ModelStructDescriptor,
     ) -> Result<proto::ModelId, crate::schema::registration::RegistrationError> {
-        self.node.catalog.ensure_schema_for_use(&self.cdata, schema).await
+        // System models are pre-registered by definition: their identity is
+        // a compile-time System ID, so no path here ever consults the
+        // catalog they describe.
+        if let Some(system) = schema.system {
+            return Ok(proto::ModelId::System(system));
+        }
+        match &self.context_type {
+            ContextType::Session(cdata) => self.node.catalog.ensure_schema_for_use(cdata, schema).await,
+            ContextType::SystemRoot => {
+                Err(crate::schema::registration::RegistrationError::SystemRootApplicationModel(schema.label.to_owned()))
+            }
+        }
     }
 
     fn node_id(&self) -> proto::EntityId { self.node.id }
@@ -82,7 +118,12 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         let primary_entity = self.node.entities.create(collection);
         primary_entity.snapshot(trx_alive)
     }
-    fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied> { self.node.policy_agent.check_write(&self.cdata, entity, None) }
+    fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied> {
+        match &self.context_type {
+            ContextType::Session(cdata) => self.node.policy_agent.check_write(cdata, entity, None),
+            ContextType::SystemRoot => Ok(()),
+        }
+    }
     async fn get_entity(&self, id: proto::EntityId, collection: &proto::CollectionId, cached: bool) -> Result<Entity, RetrievalError> {
         self.get_entity(collection, id, cached).await
     }
@@ -91,126 +132,136 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         self.fetch_entities(collection, args).await
     }
     async fn commit_local_trx(&self, trx: &Transaction) -> Result<Vec<Event>, MutationError> {
-        use std::sync::atomic::Ordering;
-
-        // Atomically mark transaction as no longer alive, preventing double-commit.
-        // compare_exchange returns Err if the value was already false (already committed/rolled back).
-        if trx.alive.compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire).is_err() {
-            return Err(MutationError::General("Transaction already committed or rolled back".into()));
-        }
-
-        // Generate events from the transaction entities
-        let trx_id = trx.id.clone();
-        let mut entity_events = Vec::new();
-        for entity in trx.entities.iter() {
-            if let Some(event) = entity.generate_commit_event()? {
-                // Validate creation events: if parent is empty, this is a creation event
-                // and the entity must have been created in this transaction via create()
-                if event.is_entity_create() {
-                    let created_ids = trx.created_entity_ids.read().unwrap();
-                    if !created_ids.contains(&entity.id) {
-                        return Err(MutationError::General(
-                            format!(
-                                "Cannot commit phantom entity {}: entity has empty parent (creation event) \
-                             but was not created in this transaction via create()",
-                                entity.id
-                            )
-                            .into(),
-                        ));
-                    }
-                }
-                // Membership admissibility is a commit-path gate, mirrored on
-                // the remote funnel (commit_remote_transaction).
-                self.node.check_membership_admissibility(&event)?;
-                entity_events.push((entity.clone(), event));
-            }
-        }
-
-        // Now commit the events
-        let mut attested_events = Vec::new();
-        let mut entity_attested_events = Vec::new();
-
-        // Phase 1: check policy and collect attestations for EVERY event
-        // before persisting ANY of them, so a later denial leaves nothing
-        // durable (failure atomicity, V7).
-        for (entity, event) in entity_events {
-            // Create a temporary fork to apply the event for validation
-            use std::sync::atomic::AtomicBool;
-            let trx_alive = Arc::new(AtomicBool::new(true));
-            let forked = entity.snapshot(trx_alive);
-
-            // Get the canonical (upstream) entity for before state
-            let entity_before = match &entity.kind {
-                crate::entity::EntityKind::Transacted { upstream, .. } => upstream.clone(),
-                crate::entity::EntityKind::Primary => entity.clone(),
-            };
-
-            // Stage event and apply to fork for after state (no commit_event call here)
-            let collection_id = &event.collection;
-            let collection = self.node.collections.get(collection_id).await?;
-            let event_getter = crate::retrieval::LocalEventGetter::new(collection, self.node.durable);
-            event_getter.stage_event(event.clone());
-            forked.apply_event(&event_getter, &event).await?;
-
-            let attestation = self.node.policy_agent.check_event(&self.node, &self.cdata, &entity_before, &forked, &event)?;
-            let attested = Attested::opt(event.clone(), attestation);
-
-            attested_events.push(attested.clone());
-            entity_attested_events.push((entity, attested));
-        }
-
-        // Phase 2: all events attested; persist them.
-        for (_, attested) in &entity_attested_events {
-            let collection = self.node.collections.get(&attested.payload.collection).await?;
-            let event_getter = crate::retrieval::LocalEventGetter::new(collection, self.node.durable);
-            event_getter.commit_event(attested).await?;
-        }
-
-        // Update heads BEFORE relaying (makes entities visible to server echo)
-        for (entity, attested_event) in &entity_attested_events {
-            entity.commit_head(Clock::new([attested_event.payload.id()]));
-        }
-        // Relay to peers and wait for confirmation
-        self.node.relay_to_required_peers(&self.cdata, trx_id, &attested_events).await?;
-
-        // All peers confirmed, persist state to storage
-        let mut changes: Vec<EntityChange> = Vec::new();
-        for (entity, attested_event) in entity_attested_events {
-            let collection_id = &attested_event.payload.collection;
-            let collection = self.node.collections.get(collection_id).await?;
-
-            // Persist canonical entity (upstream for transactional forks, entity itself for primary)
-            let canonical_entity = match &entity.kind {
-                crate::entity::EntityKind::Transacted { upstream, .. } => {
-                    // Event is now in storage, construct fresh getter for upstream apply
-                    let event_getter = crate::retrieval::LocalEventGetter::new(collection.clone(), self.node.durable);
-                    upstream.apply_event(&event_getter, &attested_event.payload).await?;
-                    upstream.clone()
-                }
-                crate::entity::EntityKind::Primary => entity,
-            };
-
-            let state = canonical_entity.to_state()?;
-
-            let entity_state = EntityState { entity_id: canonical_entity.id(), collection: canonical_entity.collection().clone(), state };
-            let attestation = self.node.policy_agent.attest_state(&self.node, &entity_state);
-            let attested = Attested::opt(entity_state, attestation);
-            collection.set_state(attested).await?;
-
-            changes.push(EntityChange::new(canonical_entity, vec![attested_event])?);
-        }
-
-        // Notify reactor of ALL changes
-        self.node.reactor.notify_change(changes).await;
-
-        Ok(attested_events.into_iter().map(|a| a.payload).collect())
+        let authority = match &self.context_type {
+            ContextType::Session(cdata) => CommitAuthority::Session(cdata),
+            ContextType::SystemRoot => CommitAuthority::SystemRoot,
+        };
+        commit_local_transaction(&self.node, trx, authority).await
     }
     fn query(&self, collection_id: proto::CollectionId, args: MatchArgs) -> Result<EntityLiveQuery, RetrievalError> {
-        EntityLiveQuery::new(&self.node, collection_id, args, self.cdata.clone())
+        match &self.context_type {
+            ContextType::Session(cdata) => EntityLiveQuery::new(&self.node, collection_id, args, cdata.clone()),
+            ContextType::SystemRoot => EntityLiveQuery::new_system_root_weak_node(&self.node, collection_id, args),
+        }
     }
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
         self.node.system.collection(id).await
     }
+}
+
+#[derive(Clone, Copy)]
+enum CommitAuthority<'a, C> {
+    Session(&'a C),
+    SystemRoot,
+}
+
+/// Commit one ordinary typed transaction under either caller authority or
+/// the node's local system-root capability. The entity/event/storage/reactor
+/// path is shared; only application policy, protected-collection admission,
+/// state attestation, and session-authenticated relay differ.
+async fn commit_local_transaction<SE, PA>(
+    node: &Node<SE, PA>,
+    trx: &Transaction,
+    authority: CommitAuthority<'_, PA::ContextData>,
+) -> Result<Vec<Event>, MutationError>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    use std::sync::atomic::Ordering;
+
+    if trx.alive.compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return Err(MutationError::General("Transaction already committed or rolled back".into()));
+    }
+
+    let trx_id = trx.id.clone();
+    let mut entity_events = Vec::new();
+    for entity in trx.entities.iter() {
+        if let Some(event) = entity.generate_commit_event()? {
+            if matches!(authority, CommitAuthority::Session(_))
+                && event.collection.as_str().starts_with(crate::schema::RESERVED_COLLECTION_PREFIX)
+            {
+                return Err(MutationError::General(
+                    format!("collection '{}' is protected and not writable by application transactions", event.collection).into(),
+                ));
+            }
+            if event.is_entity_create() {
+                let created_ids = trx.created_entity_ids.read().unwrap();
+                if !created_ids.contains(&entity.id) {
+                    return Err(MutationError::General(
+                        format!(
+                            "Cannot commit phantom entity {}: entity has empty parent (creation event) \
+                             but was not created in this transaction via create()",
+                            entity.id
+                        )
+                        .into(),
+                    ));
+                }
+            }
+            node.check_membership_admissibility(&event)?;
+            entity_events.push((entity.clone(), event));
+        }
+    }
+
+    let mut attested_events = Vec::new();
+    let mut entity_attested_events = Vec::new();
+    for (entity, event) in entity_events {
+        let trx_alive = Arc::new(AtomicBool::new(true));
+        let forked = entity.snapshot(trx_alive);
+        let entity_before = match &entity.kind {
+            crate::entity::EntityKind::Transacted { upstream, .. } => upstream.clone(),
+            crate::entity::EntityKind::Primary => entity.clone(),
+        };
+        let collection = node.collections.get(&event.collection).await?;
+        let event_getter = crate::retrieval::LocalEventGetter::new(collection, node.durable);
+        event_getter.stage_event(event.clone());
+        forked.apply_event(&event_getter, &event).await?;
+
+        let attestation = match authority {
+            CommitAuthority::Session(cdata) => node.policy_agent.check_event(node, cdata, &entity_before, &forked, &event)?,
+            CommitAuthority::SystemRoot => None,
+        };
+        let attested = Attested::opt(event.clone(), attestation);
+        attested_events.push(attested.clone());
+        entity_attested_events.push((entity, attested));
+    }
+
+    for (_, attested) in &entity_attested_events {
+        let collection = node.collections.get(&attested.payload.collection).await?;
+        let event_getter = crate::retrieval::LocalEventGetter::new(collection, node.durable);
+        event_getter.commit_event(attested).await?;
+    }
+
+    for (entity, attested_event) in &entity_attested_events {
+        entity.commit_head(Clock::new([attested_event.payload.id()]));
+    }
+    if let CommitAuthority::Session(cdata) = authority {
+        node.relay_to_required_peers(cdata, trx_id, &attested_events).await?;
+    }
+
+    let mut changes: Vec<EntityChange> = Vec::new();
+    for (entity, attested_event) in entity_attested_events {
+        let collection = node.collections.get(&attested_event.payload.collection).await?;
+        let canonical_entity = match &entity.kind {
+            crate::entity::EntityKind::Transacted { upstream, .. } => {
+                let event_getter = crate::retrieval::LocalEventGetter::new(collection.clone(), node.durable);
+                upstream.apply_event(&event_getter, &attested_event.payload).await?;
+                upstream.clone()
+            }
+            crate::entity::EntityKind::Primary => entity,
+        };
+        let state = canonical_entity.to_state()?;
+        let entity_state = EntityState { entity_id: canonical_entity.id(), collection: canonical_entity.collection().clone(), state };
+        let attestation = match authority {
+            CommitAuthority::Session(_) => node.policy_agent.attest_state(node, &entity_state),
+            CommitAuthority::SystemRoot => None,
+        };
+        collection.set_state(Attested::opt(entity_state, attestation)).await?;
+        changes.push(EntityChange::new(canonical_entity, vec![attested_event])?);
+    }
+
+    node.reactor.notify_change(changes).await;
+    Ok(attested_events.into_iter().map(|a| a.payload).collect())
 }
 
 // This whole impl is conditionalized by the wasm feature flag
@@ -248,7 +299,22 @@ impl Context {
         node: Node<SE, PA>,
         data: PA::ContextData,
     ) -> Self {
-        Self(Arc::new(NodeAndContext { node, cdata: data }))
+        Self(Arc::new(NodeAndContext::new_session(node, data)))
+    }
+
+    /// Construct the core-only authority for a durable node's own system
+    /// models. It is crate-private and refuses ephemeral nodes, so neither an
+    /// application nor a remote request can turn ordinary credentials into
+    /// system-root authority.
+    pub(crate) fn new_system_root<SE, PA>(node: Node<SE, PA>) -> Result<Self, RetrievalError>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+    {
+        if !node.durable {
+            return Err(RetrievalError::Other("a SystemRoot context requires a durable node".to_owned()));
+        }
+        Ok(Self(Arc::new(NodeAndContext { node, context_type: ContextType::SystemRoot })))
     }
 
     pub fn node_id(&self) -> proto::EntityId { self.0.node_id() }
@@ -339,6 +405,17 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
+    pub(crate) fn new_session(node: Node<SE, PA>, cdata: PA::ContextData) -> Self {
+        Self { node, context_type: ContextType::Session(cdata) }
+    }
+
+    fn session_cdata(&self) -> Option<&PA::ContextData> {
+        match &self.context_type {
+            ContextType::Session(cdata) => Some(cdata),
+            ContextType::SystemRoot => None,
+        }
+    }
+
     /// Retrieve a single entity, either by cloning the resident Entity from the Node's WeakEntitySet or fetching from storage
     pub(crate) async fn get_entity(
         &self,
@@ -348,9 +425,23 @@ where
     ) -> Result<Entity, RetrievalError> {
         debug!("Node({}).get_entity {:?}-{:?}", self.node.id, id, collection_id);
 
+        if matches!(&self.context_type, ContextType::SystemRoot) {
+            if let Some(local) = self.node.entities.get(&id).filter(|entity| entity.collection() == collection_id) {
+                return Ok(local);
+            }
+            let collection = self.node.collections.get(collection_id).await?;
+            let state = collection.get_state(id).await?;
+            let state_getter = crate::retrieval::LocalStateGetter::new(collection.clone());
+            let event_getter = crate::retrieval::LocalEventGetter::new(collection, true);
+            let (_, entity) =
+                self.node.entities.with_state(&state_getter, &event_getter, id, collection_id.clone(), state.payload.state).await?;
+            return Ok(entity);
+        }
+        let cdata = self.session_cdata().expect("session contexts carry ContextData");
+
         if !self.node.durable {
             // Fetch from peers and commit first response
-            match self.node.get_from_peer(collection_id, vec![id], &self.cdata).await {
+            match self.node.get_from_peer(collection_id, vec![id], cdata).await {
                 Ok(_) => (),
                 Err(RetrievalError::NoDurablePeers) if cached => (),
                 Err(e) => {
@@ -359,11 +450,11 @@ where
             }
         }
 
-        if let Some(local) = self.node.entities.get(&id) {
+        if let Some(local) = self.node.entities.get(&id).filter(|entity| entity.collection() == collection_id) {
             debug!("Node({}).get_entity found local entity - returning", self.node.id);
             let state = local.to_state()?;
             let entity_id = local.id();
-            self.node.policy_agent.check_read(&self.cdata, &entity_id, collection_id, &state)?;
+            self.node.policy_agent.check_read(cdata, &entity_id, collection_id, &state)?;
             return Ok(local);
         }
         debug!("{}.get_entity fetching from storage", self.node);
@@ -371,14 +462,9 @@ where
         let collection = self.node.collections.get(collection_id).await?;
         match collection.get_state(id).await {
             Ok(entity_state) => {
-                self.node.policy_agent.check_read(
-                    &self.cdata,
-                    &entity_state.payload.entity_id,
-                    collection_id,
-                    &entity_state.payload.state,
-                )?;
+                self.node.policy_agent.check_read(cdata, &entity_state.payload.entity_id, collection_id, &entity_state.payload.state)?;
                 let state_getter = crate::retrieval::LocalStateGetter::new(collection.clone());
-                let event_getter = crate::retrieval::CachedEventGetter::new(collection_id.clone(), collection, &self.node, &self.cdata);
+                let event_getter = crate::retrieval::CachedEventGetter::new(collection_id.clone(), collection, &self.node, cdata);
                 let (_changed, entity) = self
                     .node
                     .entities
@@ -391,10 +477,15 @@ where
     }
     /// Fetch a list of entities based on a selection
     pub async fn fetch_entities(&self, collection_id: &CollectionId, mut args: MatchArgs) -> Result<Vec<Entity>, RetrievalError> {
-        self.node.policy_agent.can_access_collection(&self.cdata, collection_id)?;
+        if matches!(&self.context_type, ContextType::SystemRoot) {
+            args.selection = self.node.type_resolver.resolve_selection_types(args.selection);
+            return self.node.fetch_entities_from_local(collection_id, &args.selection).await;
+        }
+        let cdata = self.session_cdata().expect("session contexts carry ContextData");
+        self.node.policy_agent.can_access_collection(cdata, collection_id)?;
         // Fetch raw states from storage
 
-        args.selection.predicate = self.node.policy_agent.filter_predicate(&self.cdata, collection_id, args.selection.predicate)?;
+        args.selection.predicate = self.node.policy_agent.filter_predicate(cdata, collection_id, args.selection.predicate)?;
 
         // Resolve types in the AST (converts literals for JSON path comparisons)
         args.selection = self.node.type_resolver.resolve_selection_types(args.selection);
@@ -402,7 +493,7 @@ where
         // TODO implement cached: true
         if !self.node.durable {
             // Fetch from peers and commit first response
-            Ok(self.fetch_from_peer(collection_id, args.selection).await?)
+            Ok(self.fetch_from_peer(collection_id, args.selection, cdata).await?)
         } else {
             let storage_collection = self.node.collections.get(collection_id).await?;
             let states = storage_collection.fetch_states(&args.selection).await?;
@@ -410,7 +501,7 @@ where
             // Convert states to entities
             let mut entities = Vec::new();
             let state_getter = crate::retrieval::LocalStateGetter::new(storage_collection.clone());
-            let event_getter = crate::retrieval::CachedEventGetter::new(collection_id.clone(), storage_collection, &self.node, &self.cdata);
+            let event_getter = crate::retrieval::CachedEventGetter::new(collection_id.clone(), storage_collection, &self.node, cdata);
             for state in states {
                 let (_, entity) = self
                     .node
@@ -428,6 +519,7 @@ where
         &self,
         collection_id: &proto::CollectionId,
         selection: ankql::ast::Selection,
+        cdata: &PA::ContextData,
     ) -> Result<Vec<crate::entity::Entity>, RetrievalError> {
         let peer_id = self.node.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
 
@@ -443,13 +535,12 @@ where
         let selection_clone = selection.clone();
         match self
             .node
-            .request(peer_id, &self.cdata, proto::NodeRequestBody::Fetch { collection: collection_id.clone(), selection, known_matches })
+            .request(peer_id, cdata, proto::NodeRequestBody::Fetch { collection: collection_id.clone(), selection, known_matches })
             .await?
         {
             proto::NodeResponseBody::Fetch(deltas) => {
                 let collection = self.node.collections.get(collection_id).await?;
-                let event_getter =
-                    crate::retrieval::CachedEventGetter::new(collection_id.clone(), collection.clone(), &self.node, &self.cdata);
+                let event_getter = crate::retrieval::CachedEventGetter::new(collection_id.clone(), collection.clone(), &self.node, cdata);
                 let state_getter = crate::retrieval::LocalStateGetter::new(collection);
 
                 // 3. Apply deltas to local storage using NodeApplier

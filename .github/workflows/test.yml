@@ -63,6 +63,9 @@ jobs:
       - name: Add wasm32 target
         run: rustup target add wasm32-unknown-unknown
 
+      - name: Check standalone core WASM feature
+        run: cargo check -p ankurah-core --features wasm --target wasm32-unknown-unknown
+
       - name: Run WASM tests
         run: ./scripts/run-wasm-tests.sh
         env:

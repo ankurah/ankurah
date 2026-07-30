@@ -1,3 +1,12 @@
+//! Procedural-macro entry points for Ankurah's typed application surface.
+//!
+//! This crate parses model/property declarations and query macro syntax, then
+//! coordinates generators for Model, View, Mutable, FFI, and selection code.
+//! The entry points own compile-time validation, expansion hygiene, and routing
+//! to those generators. They do not implement runtime behavior or wire
+//! semantics; generated code delegates those responsibilities to
+//! `ankurah-core` and `ankurah-proto`.
+
 mod model;
 mod property;
 mod selection;
@@ -30,7 +39,8 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
     }
 
     let hygiene_module = quote::format_ident!("__ankurah_derive_impl_{}", to_snake_case(&desc.name().to_string()));
-    let wasm_imports = if cfg!(feature = "wasm") {
+    let no_ffi = desc.no_ffi();
+    let wasm_imports = if cfg!(feature = "wasm") && !no_ffi {
         quote! {
             use ::ankurah::derive_deps::wasm_bindgen::prelude::*;
             use ::ankurah::derive_deps::wasm_bindgen_futures;
@@ -44,15 +54,31 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
     let view_impl = model::view::view_impl(&desc);
     let mutable_impl = model::mutable::mutable_impl(&desc);
     #[cfg(feature = "wasm")]
-    let wasm_impl = model::wasm::wasm_impl(&input, &desc);
+    let wasm_impl = if no_ffi {
+        quote! {}
+    } else {
+        model::wasm::wasm_impl(&input, &desc)
+    };
     #[cfg(not(feature = "wasm"))]
     let wasm_impl = quote! {};
     #[cfg(all(feature = "uniffi", not(feature = "wasm")))]
-    let uniffi_impl = model::uniffi::uniffi_impl(&desc);
+    let uniffi_impl = if no_ffi {
+        quote! {}
+    } else {
+        model::uniffi::uniffi_impl(&desc)
+    };
     #[cfg(any(not(feature = "uniffi"), feature = "wasm"))]
     let uniffi_impl = quote! {};
 
+    // The declaring module's path, captured OUTSIDE the hygiene module so
+    // the unique-id hash input carries the user's own module path, not the
+    // hygiene module's.
+    let module_path_const = desc.module_path_const();
+
     let expanded = quote! {
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals)]
+        const #module_path_const: &'static str = ::core::module_path!();
         mod #hygiene_module {
             use super::*;
             #wasm_imports

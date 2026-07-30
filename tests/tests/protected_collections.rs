@@ -3,6 +3,7 @@
 //! prefix is reserved.
 
 mod common;
+use ankurah::core::schema::catalog::rows::SysModelRow;
 use common::*;
 
 const PROTECTED: [&str; 4] = ["_ankurah_system", "_ankurah_model", "_ankurah_property", "_ankurah_model_property"];
@@ -42,14 +43,21 @@ async fn server_refuses_commits_into_protected_collections() -> anyhow::Result<(
     Ok(())
 }
 
-// NOTE: the local-transaction path into a protected collection (the
-// `commit_local_trx` guard, core/src/context.rs) is no longer reachable
-// through the public API: a user model whose collection carries the
-// reserved `_ankurah_` prefix is now REFUSED at derive time, so a struct
-// like `_ankurah_model` cannot be defined at all. That compile-time
-// rejection is exercised by the trybuild fixture
-// `tests/tests/compile_fail/reserved_collection_prefix.rs`
-// (see `derive_compile_fail.rs`). The runtime `commit_local_trx` guard
-// remains in place as structural defense-in-depth; the receiver-side guard
-// for all four protected collections is exercised by
-// `server_refuses_commits_into_protected_collections` above.
+/// The built-in typed catalog rows are public for typed reads, but their
+/// system identity must not turn an ordinary local transaction into a second
+/// registration path.
+#[tokio::test]
+async fn local_transaction_refuses_typed_catalog_write() -> anyhow::Result<()> {
+    let node = durable_sled_setup().await?;
+    let context = node.context(DEFAULT_CONTEXT)?;
+
+    let transaction = context.begin();
+    transaction.create(&SysModelRow { label: "blocked".into(), name: "Blocked".into() }).await?;
+    let error = transaction.commit().await.expect_err("ordinary catalog mutation must be rejected");
+    let message = error.to_string();
+    assert!(message.contains("protected"), "unexpected refusal: {message}");
+    assert!(message.contains("_ankurah_model"), "refusal should identify the collection: {message}");
+    assert!(node.catalog.model_by_label("blocked").is_none(), "rejected row must not reach the catalog map");
+
+    Ok(())
+}

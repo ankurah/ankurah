@@ -10,6 +10,7 @@ mod entity_id;
 mod error;
 mod model_id;
 mod property_id;
+mod unique_id;
 mod value;
 mod value_type;
 
@@ -17,5 +18,6 @@ pub use entity_id::EntityId;
 pub use error::{DecodeError, IdParseError};
 pub use model_id::{ModelId, SystemModel};
 pub use property_id::{PropertyId, SystemProperty};
+pub use unique_id::{UniqueFieldId, UniqueStructId};
 pub use value::{CastError, Value, ValueParseError};
 pub use value_type::ValueType;

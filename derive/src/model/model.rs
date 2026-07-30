@@ -1,8 +1,18 @@
+//! Generation of the derived Model trait implementation.
+//!
+//! [`model_impl`] connects one parsed model description to its generated View
+//! and Mutable types, compiled schema descriptor, collection identity, and
+//! new-entity field initialization. It also emits the minimal internal Ref
+//! wrapper required by a WASM build when FFI generation is disabled. Attribute
+//! parsing and validation belong to neighboring description/schema modules;
+//! View, Mutable, and language-binding surfaces have their own generators.
+
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
 /// Generate the Model trait implementation
 pub fn model_impl(model: &crate::model::description::ModelDescription) -> TokenStream {
+    let base = model.base();
     let name = model.name();
     let view_name = model.view_name();
     let mutable_name = model.mutable_name();
@@ -20,28 +30,44 @@ pub fn model_impl(model: &crate::model::description::ModelDescription) -> TokenS
         Err(e) => return e.into_compile_error(),
     };
 
-    // RefWrapper associated type for WASM builds
+    // RefWrapper associated type for WASM builds. Models marked `no_ffi`
+    // skip the wasm binding layer, so they get a plain newtype satisfying the
+    // associated-type bound with no bindgen surface.
+    let ref_name = format_ident!("{}Ref", name);
     let ref_wrapper_type = if cfg!(feature = "wasm") {
-        let ref_name = format_ident!("{}Ref", name);
         quote! {
             type RefWrapper = #ref_name;
         }
     } else {
         quote! {}
     };
+    let internal_ref_wrapper = if cfg!(feature = "wasm") && model.no_ffi() {
+        quote! {
+            pub struct #ref_name(#base::property::Ref<#name>);
+            impl From<#base::property::Ref<#name>> for #ref_name {
+                fn from(r: #base::property::Ref<#name>) -> Self { Self(r) }
+            }
+            impl From<#ref_name> for #base::property::Ref<#name> {
+                fn from(w: #ref_name) -> Self { w.0 }
+            }
+        }
+    } else {
+        quote! {}
+    };
 
     quote! {
-        impl ::ankurah::model::Model for #name {
+        #internal_ref_wrapper
+        impl #base::model::Model for #name {
             type View = #view_name;
             type Mutable = #mutable_name;
             #ref_wrapper_type
             #schema_method
-            fn collection() -> ankurah::proto::CollectionId {
+            fn collection() -> #base::proto::CollectionId {
                 #collection_str.into()
             }
-            fn initialize_new_entity(&self, entity: &::ankurah::entity::Entity, model_id: ::ankurah::proto::ModelId) {
+            fn initialize_new_entity(&self, entity: &#base::entity::Entity, model_id: #base::proto::ModelId) {
                 entity.add_membership(model_id);
-                use ::ankurah::property::InitializeWith;
+                use #base::property::InitializeWith;
                 #(
                     #active_field_types_turbofish::initialize_with(&entity, #active_field_name_strs.into(), &self.#active_field_names);
                 )*

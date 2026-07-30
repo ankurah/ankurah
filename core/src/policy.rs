@@ -1,3 +1,13 @@
+//! The application-defined authorization, authentication, and attestation seam.
+//!
+//! [`PolicyAgent`] is the contract a node calls to sign and validate requests,
+//! filter reads, authorize writes, and attest or validate replicated data.
+//! [`ContextData`] is its application credential value, [`AccessDenied`] is the
+//! common refusal, and [`PermissiveAgent`] is the allow-all implementation used
+//! where no application policy is required. This module does not create
+//! Context authority: the Context layer owns Session versus local SystemRoot,
+//! and SystemRoot deliberately bypasses this application-policy seam.
+
 use crate::util::Iterable;
 use crate::{
     entity::Entity,
@@ -40,11 +50,6 @@ impl From<AccessDenied> for wasm_bindgen::JsValue {
 }
 
 impl AccessDenied {}
-
-// The registration plan vocabulary (RegistrationPlan and friends) lives
-// with its builder in crate::schema::registration and is re-exported here
-// because it is part of this trait's surface.
-pub use crate::schema::registration::{PlannedModelPropertyMembership, PlannedUpdate, RegistrationPlan};
 
 /// PolicyAgents control access to resources, by:
 /// - signing requests which are sent to other nodes - this may come in the form of a bearer token, or a signature, or some other arbitrary method of authentication as defined by the PolicyAgent
@@ -91,30 +96,6 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     /// or you could just return None if you don't want to attest to the event
     /// entity_before: Entity state before the event is applied
     /// entity_after: Entity state after the event has been applied (allows inspection of resulting state)
-    /// Gate a schema registration on its resolved effect. Called by
-    /// the registration executor after its lookup
-    /// phase and before any event is emitted, still under the allocation
-    /// mutex, with the request's actual consequences: what will be created,
-    /// what will be updated, what already exists. Agents may discriminate
-    /// on the principal (`cdata`: who may define schema) or on the object
-    /// (the planned definitions themselves); both styles are first-class.
-    /// Refusal fails the whole registration before anything is emitted.
-    /// Every emitted event still passes [`Self::check_event`] afterwards,
-    /// INDIVIDUALLY: the commit batch is not transactional, so an agent
-    /// that allows the plan but denies a constituent event aborts the
-    /// remainder and leaves earlier catalog events durable (accepted by
-    /// maintainer ruling 2026-07-06; the allocator's storage-checked
-    /// lookups keep identity convergent across such partials, and #313
-    /// tracks the transactional upgrade). The default allows.
-    fn check_schema_registration<SE: StorageEngine>(
-        &self,
-        _node: &Node<SE, Self>,
-        _cdata: &Self::ContextData,
-        _plan: &RegistrationPlan,
-    ) -> Result<(), AccessDenied> {
-        Ok(())
-    }
-
     fn check_event<SE: StorageEngine>(
         &self,
         node: &Node<SE, Self>,

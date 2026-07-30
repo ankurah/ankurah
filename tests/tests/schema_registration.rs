@@ -6,8 +6,9 @@
 //! repeats are pure no-ops, rename hints move lineages without re-keying,
 //! retypes never fork (a castable declaration reuses the identity against
 //! the CANONICAL value_type, a non-castable one refuses; as
-//! amended 2026-07-10), and the exists-aware policy verb gates actual
-//! creations.
+//! amended 2026-07-10). Request authentication admits registration RPCs;
+//! accepted catalog materialization runs as local SystemRoot work rather
+//! than application-policy work.
 
 mod common;
 use ankurah::core::property::backend::{LWWBackend, PropertyBackend};
@@ -21,10 +22,6 @@ const MEMBERSHIP: &str = "_ankurah_model_property";
 
 type TestNode = Node<SledStorageEngine, PermissiveAgent>;
 
-fn catalog_model(collection: &str) -> ankurah::ModelId {
-    ankurah::core::schema::system_model_id(collection).expect("catalog helper only accepts built-in collection labels")
-}
-
 fn property(name: &str, renamed_from: Option<&str>, backend: &str, value_type: &str) -> proto::RegisterProperty {
     proto::RegisterProperty {
         name: name.into(),
@@ -33,6 +30,7 @@ fn property(name: &str, renamed_from: Option<&str>, backend: &str, value_type: &
         value_type: value_type.into(),
         target_label: None,
         explicit_id: None,
+        unique_id: None,
         optional: false,
     }
 }
@@ -40,7 +38,7 @@ fn property(name: &str, renamed_from: Option<&str>, backend: &str, value_type: &
 /// One album model whose entries are the given properties (the nesting is
 /// the membership assertion).
 fn album_model(properties: Vec<proto::RegisterProperty>) -> proto::RegisterModel {
-    proto::RegisterModel { label: "album".into(), name: "Album".into(), explicit_id: None, properties }
+    proto::RegisterModel { label: "album".into(), name: "Album".into(), explicit_id: None, unique_id: None, properties }
 }
 
 fn album_request() -> proto::NodeRequestBody {
@@ -150,6 +148,44 @@ async fn registration_is_idempotent() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The wire's optional compile-time unique ids are hints the executor
+/// accepts and ignores: a request carrying them registers, and the same
+/// declaration without them resolves to the same catalog identities, so the
+/// hint participates in nothing. (Every other test in this suite sends
+/// `None`, which is the other half of the tolerance.)
+#[tokio::test]
+async fn unique_id_hints_are_accepted_and_ignored() -> anyhow::Result<()> {
+    let (server, client, _conn) = connected_pair().await?;
+
+    let hinted = proto::NodeRequestBody::RegisterSchema {
+        models: vec![proto::RegisterModel {
+            label: "album".into(),
+            name: "Album".into(),
+            explicit_id: None,
+            unique_id: Some(proto::UniqueStructId::from_names("some_app::records", "Album")),
+            properties: vec![proto::RegisterProperty {
+                name: "name".into(),
+                renamed_from: None,
+                backend: "yrs".into(),
+                value_type: "string".into(),
+                target_label: None,
+                explicit_id: None,
+                unique_id: Some(proto::UniqueFieldId::from_names("some_app::records", "Album", "name")),
+                optional: false,
+            }],
+        }],
+    };
+    let first = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, hinted).await?);
+    let (model_id, property_id) = (first[0].id, first[0].properties[0].id);
+
+    // The identical declaration WITHOUT hints lands on the same identities.
+    let second = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+    assert_eq!(second[0].id, model_id, "unique-id hints must not participate in model identity");
+    assert_eq!(second[0].properties[0].id, property_id, "unique-id hints must not participate in property identity");
+
+    Ok(())
+}
+
 /// The renamed_from hint moves the lineage to the new name
 /// WITHOUT re-keying (same property id), and no-ops once applied.
 #[tokio::test]
@@ -190,6 +226,7 @@ async fn target_model_can_be_cleared_retargeted_and_cleared_on_rename() -> anyho
             value_type: "entityid".into(),
             target_label: Some("artist".into()),
             explicit_id: None,
+            unique_id: None,
             optional: false,
         }])],
     };
@@ -205,6 +242,7 @@ async fn target_model_can_be_cleared_retargeted_and_cleared_on_rename() -> anyho
             value_type: "entityid".into(),
             target_label: None,
             explicit_id: None,
+            unique_id: None,
             optional: false,
         }])],
     };
@@ -221,6 +259,7 @@ async fn target_model_can_be_cleared_retargeted_and_cleared_on_rename() -> anyho
             value_type: "entityid".into(),
             target_label: Some("artist".into()),
             explicit_id: None,
+            unique_id: None,
             optional: false,
         }])],
     };
@@ -235,6 +274,7 @@ async fn target_model_can_be_cleared_retargeted_and_cleared_on_rename() -> anyho
             value_type: "entityid".into(),
             target_label: None,
             explicit_id: None,
+            unique_id: None,
             optional: false,
         }])],
     };
@@ -434,7 +474,13 @@ async fn model_display_name_renames_and_reverts() -> anyhow::Result<()> {
     assert_eq!(model.get("name"), Some(&Some(Value::String("Album".into()))));
 
     let rename = |name: &str| proto::NodeRequestBody::RegisterSchema {
-        models: vec![proto::RegisterModel { label: "album".into(), name: name.into(), explicit_id: None, properties: vec![] }],
+        models: vec![proto::RegisterModel {
+            label: "album".into(),
+            name: name.into(),
+            explicit_id: None,
+            unique_id: None,
+            properties: vec![],
+        }],
     };
 
     let resolved = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, rename("Discography")).await?);
@@ -465,6 +511,7 @@ async fn target_collection_resolves_and_allocates_on_miss() -> anyhow::Result<()
             value_type: "entityid".into(),
             target_label: Some("artist".into()),
             explicit_id: None,
+            unique_id: None,
             optional: false,
         }])],
     };
@@ -499,6 +546,7 @@ async fn explicit_id_binding_and_sharing() -> anyhow::Result<()> {
             label: "playlist".into(),
             name: "Playlist".into(),
             explicit_id: None,
+            unique_id: None,
             properties: vec![proto::RegisterProperty {
                 name: "name".into(),
                 renamed_from: None,
@@ -506,6 +554,7 @@ async fn explicit_id_binding_and_sharing() -> anyhow::Result<()> {
                 value_type: "string".into(),
                 target_label: None,
                 explicit_id: Some(property_id),
+                unique_id: None,
                 optional: true,
             }],
         }],
@@ -527,6 +576,7 @@ async fn explicit_id_binding_and_sharing() -> anyhow::Result<()> {
             value_type: "string".into(),
             target_label: None,
             explicit_id: Some(EntityId::new()),
+            unique_id: None,
             optional: false,
         }])],
     };
@@ -541,6 +591,7 @@ async fn explicit_id_binding_and_sharing() -> anyhow::Result<()> {
             value_type: "i64".into(),
             target_label: None,
             explicit_id: Some(property_id),
+            unique_id: None,
             optional: false,
         }])],
     };
@@ -571,6 +622,7 @@ async fn explicit_id_binding_rejects_non_catalog_entities() -> anyhow::Result<()
             value_type: "string".into(),
             target_label: None,
             explicit_id: Some(ordinary_id),
+            unique_id: None,
             optional: false,
         }])],
     };
@@ -581,6 +633,7 @@ async fn explicit_id_binding_rejects_non_catalog_entities() -> anyhow::Result<()
             label: "ordinary".into(),
             name: "Ordinary".into(),
             explicit_id: Some(ordinary_id),
+            unique_id: None,
             properties: vec![],
         }],
     };
@@ -604,6 +657,7 @@ async fn explicit_id_binding_accepts_castable_type_drift() -> anyhow::Result<()>
             label: "playlist".into(),
             name: "Playlist".into(),
             explicit_id: None,
+            unique_id: None,
             properties: vec![proto::RegisterProperty {
                 name: "year".into(),
                 renamed_from: None,
@@ -611,6 +665,7 @@ async fn explicit_id_binding_accepts_castable_type_drift() -> anyhow::Result<()>
                 value_type: "i64".into(),
                 target_label: None,
                 explicit_id: Some(property_id),
+                unique_id: None,
                 optional: false,
             }],
         }],
@@ -627,7 +682,7 @@ async fn explicit_id_binding_accepts_castable_type_drift() -> anyhow::Result<()>
 /// A dangling membership is unrepresentable under nesting (there is no
 /// membership item to point at nothing), so the surviving refusal is the
 /// explicit property binding: an unknown id rejects the whole request
-/// before any of its planned creations commit.
+/// before any staged creation commits.
 #[tokio::test]
 async fn dangling_explicit_property_refuses_before_writes() -> anyhow::Result<()> {
     let (server, client, _conn) = connected_pair().await?;
@@ -637,6 +692,7 @@ async fn dangling_explicit_property_refuses_before_writes() -> anyhow::Result<()
             label: "dangling".into(),
             name: "Dangling".into(),
             explicit_id: None,
+            unique_id: None,
             properties: vec![proto::RegisterProperty {
                 name: "ghost".into(),
                 renamed_from: None,
@@ -644,13 +700,14 @@ async fn dangling_explicit_property_refuses_before_writes() -> anyhow::Result<()
                 value_type: "string".into(),
                 target_label: None,
                 explicit_id: Some(missing),
+                unique_id: None,
                 optional: false,
             }],
         }],
     };
 
     expect_error(client.request(server.id, &DEFAULT_CONTEXT, request).await?, "does not exist");
-    assert_eq!(server.catalog.model_id_for("dangling"), None, "planned model creation must not commit on refusal");
+    assert_eq!(server.catalog.model_id_for("dangling"), None, "staged model creation must not commit on refusal");
 
     Ok(())
 }
@@ -664,7 +721,7 @@ async fn explicit_model_id_binding() -> anyhow::Result<()> {
     let album_model = first[0].id;
 
     let bind = |label: &str, explicit_id, properties| proto::NodeRequestBody::RegisterSchema {
-        models: vec![proto::RegisterModel { label: label.into(), name: label.into(), explicit_id, properties }],
+        models: vec![proto::RegisterModel { label: label.into(), name: label.into(), explicit_id, unique_id: None, properties }],
     };
 
     // Binding an id that does not exist never mints.
@@ -682,6 +739,7 @@ async fn explicit_model_id_binding() -> anyhow::Result<()> {
         value_type: "string".into(),
         target_label: None,
         explicit_id: None,
+        unique_id: None,
         optional: false,
     };
     let bound = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, bind("album", Some(album_model), vec![genre])).await?);
@@ -703,21 +761,27 @@ async fn ephemeral_node_refuses_execution() -> anyhow::Result<()> {
     Ok(())
 }
 
-// -- the exists-aware policy verb ---------------
+// -- the SystemRoot policy boundary ---------------
 
-/// One configurable PermissiveAgent clone driving every policy-verb test in
-/// this file. It is permissive everywhere except the customization points the
-/// tests exercise: a schema plan gate, a per-event gate, a collection-access
-/// gate, and an optional name-keyed catalog filter. A `Default` instance is
-/// fully permissive -- the inert client side.
+/// A PolicyAgent that can turn every application-policy touch of a catalog
+/// collection into a counted denial. SystemRoot catalog work must never call
+/// any of these hooks; a `Default` instance remains fully permissive for the
+/// inert client side.
 #[derive(Clone, Default)]
 struct ProbeAgent {
-    on_schema_registration:
-        Option<std::sync::Arc<dyn Fn(&ankurah::policy::RegistrationPlan) -> Result<(), ankurah::policy::AccessDenied> + Send + Sync>>,
-    on_event:
-        Option<std::sync::Arc<dyn Fn(&proto::CollectionId, &proto::Event) -> Result<(), ankurah::policy::AccessDenied> + Send + Sync>>,
-    on_collection_access: Option<std::sync::Arc<dyn Fn(&proto::CollectionId) -> Result<(), ankurah::policy::AccessDenied> + Send + Sync>>,
-    filter_catalog_properties: bool,
+    catalog_policy_calls: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+impl ProbeAgent {
+    fn reject_catalog_policy_call(&self, collection: &proto::CollectionId) -> Result<(), ankurah::policy::AccessDenied> {
+        if collection.as_str().starts_with(ankurah::core::schema::RESERVED_COLLECTION_PREFIX) {
+            if let Some(calls) = &self.catalog_policy_calls {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return Err(ankurah::policy::AccessDenied::ByPolicy("catalog infrastructure must bypass application policy"));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -756,22 +820,8 @@ impl ankurah::policy::PolicyAgent for ProbeAgent {
         _entity_after: &ankurah::core::entity::Entity,
         event: &proto::Event,
     ) -> Result<Option<proto::Attestation>, ankurah::policy::AccessDenied> {
-        if let Some(hook) = &self.on_event {
-            hook(&event.collection, event)?;
-        }
+        self.reject_catalog_policy_call(&event.collection)?;
         Ok(None)
-    }
-
-    fn check_schema_registration<SE: ankurah::core::storage::StorageEngine>(
-        &self,
-        _node: &Node<SE, Self>,
-        _cdata: &Self::ContextData,
-        plan: &ankurah::policy::RegistrationPlan,
-    ) -> Result<(), ankurah::policy::AccessDenied> {
-        if let Some(hook) = &self.on_schema_registration {
-            hook(plan)?;
-        }
-        Ok(())
     }
 
     fn validate_received_event<SE: ankurah::core::storage::StorageEngine>(
@@ -786,8 +836,13 @@ impl ankurah::policy::PolicyAgent for ProbeAgent {
     fn attest_state<SE: ankurah::core::storage::StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _state: &proto::EntityState,
+        state: &proto::EntityState,
     ) -> Option<proto::Attestation> {
+        if state.collection.as_str().starts_with(ankurah::core::schema::RESERVED_COLLECTION_PREFIX) {
+            if let Some(calls) = &self.catalog_policy_calls {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
         None
     }
 
@@ -802,10 +857,7 @@ impl ankurah::policy::PolicyAgent for ProbeAgent {
 
     fn can_access_collection<C>(&self, _data: &C, collection: &proto::CollectionId) -> Result<(), ankurah::policy::AccessDenied>
     where C: ankurah::core::util::Iterable<Self::ContextData> {
-        if let Some(hook) = &self.on_collection_access {
-            hook(collection)?;
-        }
-        Ok(())
+        self.reject_catalog_policy_call(collection)
     }
 
     fn filter_predicate<C>(
@@ -817,10 +869,7 @@ impl ankurah::policy::PolicyAgent for ProbeAgent {
     where
         C: ankurah::core::util::Iterable<Self::ContextData>,
     {
-        if self.filter_catalog_properties && collection.as_str() == ankurah::core::schema::PROPERTY_COLLECTION_ID {
-            let name_filter = ankql::parser::parse_selection("name != '__never__'").expect("static catalog policy filter parses").predicate;
-            return Ok(ankql::ast::Predicate::And(Box::new(predicate), Box::new(name_filter)));
-        }
+        self.reject_catalog_policy_call(collection)?;
         Ok(predicate)
     }
 
@@ -828,13 +877,13 @@ impl ankurah::policy::PolicyAgent for ProbeAgent {
         &self,
         _data: &C,
         _id: &proto::EntityId,
-        _collection: &proto::CollectionId,
+        collection: &proto::CollectionId,
         _state: &proto::State,
     ) -> Result<(), ankurah::policy::AccessDenied>
     where
         C: ankurah::core::util::Iterable<Self::ContextData>,
     {
-        Ok(())
+        self.reject_catalog_policy_call(collection)
     }
 
     fn check_read_event<C>(&self, _data: &C, _event: &proto::Attested<proto::Event>) -> Result<(), ankurah::policy::AccessDenied>
@@ -845,10 +894,10 @@ impl ankurah::policy::PolicyAgent for ProbeAgent {
     fn check_write(
         &self,
         _context: &Self::ContextData,
-        _entity: &ankurah::core::entity::Entity,
+        entity: &ankurah::core::entity::Entity,
         _event: Option<&proto::Event>,
     ) -> Result<(), ankurah::policy::AccessDenied> {
-        Ok(())
+        self.reject_catalog_policy_call(entity.collection())
     }
 
     fn validate_causal_assertion<SE: ankurah::core::storage::StorageEngine>(
@@ -861,71 +910,31 @@ impl ankurah::policy::PolicyAgent for ProbeAgent {
     }
 }
 
-/// The exists-aware gate: a plan that would CREATE a forbidden definition
-/// is refused BEFORE anything is emitted (no catalog entities appear), and
-/// an unrelated registration on the same node passes.
+/// Catalog warming, typed lookups, `Mutable` writes, commit validation, and
+/// state publication all run under SystemRoot. The application PolicyAgent
+/// is still the request-authentication boundary, but is never consulted for
+/// those local catalog operations.
 #[tokio::test]
-async fn check_schema_registration_gates_creates() -> anyhow::Result<()> {
-    let deny_forbidden = ProbeAgent {
-        on_schema_registration: Some(std::sync::Arc::new(|plan: &ankurah::policy::RegistrationPlan| {
-            if plan.creates_models.iter().any(|(_, m)| m.label == "forbidden") {
-                return Err(ankurah::policy::AccessDenied::ByPolicy("schema definition for 'forbidden' is not writable"));
-            }
-            Ok(())
-        })),
-        ..Default::default()
-    };
-    let server = Node::new_durable(std::sync::Arc::new(SledStorageEngine::new_test().unwrap()), deny_forbidden.clone());
-    server.system.create().await?;
-    let client = Node::new(std::sync::Arc::new(SledStorageEngine::new_test().unwrap()), deny_forbidden);
-    let _conn = LocalProcessConnection::new(&server, &client).await?;
-    client.system.wait_system_ready().await;
-
-    let forbidden = proto::NodeRequestBody::RegisterSchema {
-        models: vec![proto::RegisterModel { label: "forbidden".into(), name: "Forbidden".into(), explicit_id: None, properties: vec![] }],
-    };
-    expect_error(client.request(server.id, &DEFAULT_CONTEXT, forbidden).await?, "policy");
-    assert!(server.catalog.model_by_label("forbidden").is_none(), "a refused plan emits nothing");
-
-    // An unrelated collection passes the same gate.
-    expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
-    assert!(server.catalog.model_by_label("album").is_some());
-
-    Ok(())
-}
-
-/// The policy verb fires once for a plan with effects and is SKIPPED for a
-/// pure no-op re-registration (REN 2 second ruling: predicate-resolution
-/// paths lean on the upsert's idempotence, so a no-op registration must not consult the
-/// agent -- zero events, zero policy calls, full definitions returned).
-#[tokio::test]
-async fn policy_verb_skipped_on_noop_reregistration() -> anyhow::Result<()> {
+async fn system_root_catalog_work_bypasses_application_policy() -> anyhow::Result<()> {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    let count = std::sync::Arc::new(AtomicUsize::new(0));
-    let counting = {
-        let count = count.clone();
-        ProbeAgent {
-            on_schema_registration: Some(std::sync::Arc::new(move |_plan: &ankurah::policy::RegistrationPlan| {
-                count.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            })),
-            ..Default::default()
-        }
-    };
-    let server = Node::new_durable(std::sync::Arc::new(SledStorageEngine::new_test().unwrap()), counting.clone());
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let server = Node::new_durable(
+        std::sync::Arc::new(SledStorageEngine::new_test().unwrap()),
+        ProbeAgent { catalog_policy_calls: Some(calls.clone()) },
+    );
     server.system.create().await?;
-    let client = Node::new(std::sync::Arc::new(SledStorageEngine::new_test().unwrap()), counting);
+    let client = Node::new(std::sync::Arc::new(SledStorageEngine::new_test().unwrap()), ProbeAgent::default());
     let _conn = LocalProcessConnection::new(&server, &client).await?;
     client.system.wait_system_ready().await;
 
-    let models1 = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
-    assert_eq!(count.load(Ordering::SeqCst), 1, "a plan with creates consults the agent exactly once");
-
-    let models2 = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
-    assert_eq!(count.load(Ordering::SeqCst), 1, "a pure no-op re-registration skips the policy verb");
-    assert_eq!(models1[0].id, models2[0].id, "the skipped no-op still returns the same ids");
-    assert_eq!(models1[0].properties[0].id, models2[0].properties[0].id, "the skipped no-op still returns the same ids");
+    let models = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0].properties.len(), 1);
+    assert_eq!(count_rows(&server, MODEL).await?, 1);
+    assert_eq!(count_rows(&server, PROPERTY).await?, 1);
+    assert_eq!(count_rows(&server, MEMBERSHIP).await?, 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "SystemRoot catalog work must not touch application policy");
 
     Ok(())
 }
@@ -938,8 +947,8 @@ where PA: ankurah::policy::PolicyAgent + Send + Sync + 'static {
 }
 
 /// Duplicate descriptors inside ONE request must coalesce onto a single
-/// allocation (the in-flight tables are consulted before the catalog map,
-/// which only learns this request's ids at the post-commit fold).
+/// allocation (the request-local tables are consulted before the catalog
+/// LiveQueries learn this request's ids from the commit).
 #[tokio::test]
 async fn duplicate_descriptors_in_one_request_do_not_double_allocate() -> anyhow::Result<()> {
     let (server, client, _conn) = connected_pair().await?;
@@ -961,65 +970,13 @@ async fn duplicate_descriptors_in_one_request_do_not_double_allocate() -> anyhow
     Ok(())
 }
 
-/// The interim commit contract (accepted by maintainer ruling 2026-07-06;
-/// #313 tracks the transactional upgrade): the commit batch is not
-/// transactional, so a mid-batch policy denial aborts the REMAINDER while
-/// earlier catalog events stay durable. The allocator's storage-checked
-/// lookups keep identity convergent across such partials: the retry finds
-/// the existing model row instead of double-allocating, and completes the
-/// property and membership. Batch atomicity returns with the StorageEngine
-/// PR, and this test's first phase tightens with it.
-#[tokio::test]
-async fn registration_policy_denial_aborts_the_remainder_and_heals_on_retry() -> anyhow::Result<()> {
-    let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let deny_property_once = {
-        let armed = armed.clone();
-        ProbeAgent {
-            on_event: Some(std::sync::Arc::new(move |collection: &proto::CollectionId, _event: &proto::Event| {
-                // The built-in property catalog routes by its system name.
-                if collection.as_str() == ankurah::core::schema::PROPERTY_COLLECTION_ID
-                    && armed.swap(false, std::sync::atomic::Ordering::SeqCst)
-                {
-                    return Err(ankurah::policy::AccessDenied::ByPolicy("property event denied once"));
-                }
-                Ok(())
-            })),
-            ..Default::default()
-        }
-    };
-    let server = Node::new_durable(std::sync::Arc::new(SledStorageEngine::new_test().unwrap()), deny_property_once);
-    server.system.create().await?;
-    let client = Node::new(std::sync::Arc::new(SledStorageEngine::new_test().unwrap()), ProbeAgent::default());
-    let _conn = LocalProcessConnection::new(&server, &client).await?;
-    client.system.wait_system_ready().await;
-
-    // First attempt: the model event commits, then the property event is
-    // denied mid-batch, aborting the remainder. The model row stays durable
-    // (the interim non-transactional contract).
-    expect_error(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?, "denied");
-    assert_eq!(count_rows(&server, MODEL).await?, 1, "the already-committed model row stays durable");
-    assert_eq!(count_rows(&server, PROPERTY).await?, 0, "the denied property event must not be durable");
-    assert_eq!(count_rows(&server, MEMBERSHIP).await?, 0, "the aborted remainder leaves no membership row");
-
-    // Retry (agent now allows): the existing model is found, not re-minted,
-    // and the property and membership complete.
-    let models = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
-    assert_eq!(count_rows(&server, MODEL).await?, 1, "the retry reuses the existing model row, no double allocation");
-    assert_eq!(count_rows(&server, PROPERTY).await?, 1, "the retry completes the property");
-    assert_eq!(count_rows(&server, MEMBERSHIP).await?, 1, "and the membership");
-    assert_eq!(models.len(), 1);
-    assert_eq!(models[0].properties.len(), 1);
-
-    Ok(())
-}
-
 /// No legitimate registration names a reserved collection: the system and
 /// catalog collections route by name and have no catalog model entities of
 /// their own, so a descriptor naming one could only route ordinary traffic into a
 /// protected collection. The executor refuses the reserved prefix in every
 /// position a request can name a collection -- the model itself, a
 /// property's minting or target collection, and a membership -- up front,
-/// before policy, lookups, or writes (the executor-side twin of the
+/// before lookups or writes (the executor-side twin of the
 /// descriptor-ingest guard in catalog.rs).
 #[tokio::test]
 async fn reserved_collection_prefix_refuses_registration() -> anyhow::Result<()> {
@@ -1029,7 +986,13 @@ async fn reserved_collection_prefix_refuses_registration() -> anyhow::Result<()>
     // under the prefix: the rule is the prefix, not an allowlist).
     for collection in ["_ankurah_model", "_ankurah_custom"] {
         let as_model = proto::NodeRequestBody::RegisterSchema {
-            models: vec![proto::RegisterModel { label: collection.into(), name: "Model".into(), explicit_id: None, properties: vec![] }],
+            models: vec![proto::RegisterModel {
+                label: collection.into(),
+                name: "Model".into(),
+                explicit_id: None,
+                unique_id: None,
+                properties: vec![],
+            }],
         };
         expect_error(client.request(server.id, &DEFAULT_CONTEXT, as_model).await?, "reserved prefix");
     }
@@ -1048,6 +1011,7 @@ async fn reserved_collection_prefix_refuses_registration() -> anyhow::Result<()>
             value_type: "entity_ref".into(),
             target_label: Some("_ankurah_model".into()),
             explicit_id: None,
+            unique_id: None,
             optional: false,
         }])],
     };
@@ -1057,7 +1021,7 @@ async fn reserved_collection_prefix_refuses_registration() -> anyhow::Result<()>
     // nesting is the membership, so there is no separate collection field to
     // abuse.
 
-    // The refusals happened before the plan committed anything: the catalog
+    // The refusals happened before the transaction committed anything: the catalog
     // holds no model or property rows (not even the "album" rider).
     assert_eq!(count_rows(&server, MODEL).await?, 0, "no model row survives a refused request");
     assert_eq!(count_rows(&server, PROPERTY).await?, 0, "no property row survives a refused request");

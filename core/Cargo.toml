@@ -10,6 +10,7 @@ repository    = "https://github.com/ankurah/ankurah"
 
 [features]
 wasm = [
+    "ankurah-derive/wasm",
     "wasm-bindgen",
     "wasm-bindgen-futures",
     "serde-wasm-bindgen",
@@ -17,10 +18,9 @@ wasm = [
     "send_wrapper",
     "ankql/wasm",
     "ankurah-proto/wasm",
-    "ankurah-derive",
     "futures-timer/wasm-bindgen",
 ]
-uniffi = ["dep:uniffi", "ankurah-proto/uniffi", "ankurah-derive"]
+uniffi = ["dep:uniffi", "ankurah-proto/uniffi"]
 default = []
 instrument = []
 # Enables test helper methods for adversarial testing (e.g., creating phantom entities)
@@ -33,7 +33,7 @@ bench-internals = []
 
 [dependencies]
 # Internal dependencies
-ankurah-derive     = { path = "../derive", optional = true, version = "=0.9.0" }
+ankurah-derive     = { path = "../derive", version = "=0.9.0" }
 ankql              = { path = "../ankql", version = "=0.9.0" }
 ankurah-core-types = { path = "../core-types", version = "=0.9.0" }
 ankurah-proto      = { path = "../proto", version = "=0.9.0" }
@@ -67,6 +67,9 @@ indexmap             = "2.0"
 lru                  = "0.12"
 base64               = { version = "0.22" }
 uniffi               = { version = "0.29", optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
 
 [dev-dependencies]
 maplit         = "1.0"
