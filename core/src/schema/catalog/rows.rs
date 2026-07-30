@@ -1,17 +1,28 @@
-//! Typed row Models for the catalog's system collections, derived like any
-//! app model. `base = "crate"` repoints the generated code at core itself
-//! (core cannot address itself through the `::ankurah` facade), and
-//! `system = "..."` pins each model's built-in System ID: every
-//! registration path short-circuits on it, so these models never consult
-//! the catalog they describe. Expect more system tables to live here over
-//! time.
+//! Canonical typed read shapes for the catalog's three entity collections.
+//!
+//! Here, a **row** means the persisted fields of one model definition,
+//! property definition, or model-property membership. These structs make
+//! catalog data available through the same generated `View` API as
+//! application data and keep that typed schema beside the raw parser it must
+//! agree with. The durable registration executor still emits raw bootstrap
+//! events, and ordinary transactions may not mutate system collections; the
+//! generated `Mutable` surface grants a Rust representation, not write
+//! authority.
+//!
+//! `base = "crate"` makes generated code address core directly rather than
+//! through the `::ankurah` facade. `system = "..."` pins a built-in
+//! [`ankurah_proto::SystemModel`] identity, so first use never tries to
+//! register the catalog row through the catalog it describes. `no_ffi`
+//! deliberately omits WASM and UniFFI bindings for these private catalog
+//! implementation types; choosing an alternate `base` does not itself alter
+//! a model's FFI surface.
 
 use ankurah_derive::Model;
 use ankurah_proto::EntityId;
 
 /// One `_ankurah_model` row: a registered model definition.
 #[derive(Model, Debug, Clone)]
-#[model(base = "crate", system = "Model")]
+#[model(base = "crate", system = "Model", no_ffi)]
 pub struct SysModelRow {
     #[active_type(LWW)]
     pub label: String,
@@ -23,7 +34,7 @@ pub struct SysModelRow {
 /// `minted_for` and `target_model` are optional in the data (folds preserve
 /// absent provenance; only reference properties have targets).
 #[derive(Model, Debug, Clone)]
-#[model(base = "crate", system = "Property")]
+#[model(base = "crate", system = "Property", no_ffi)]
 pub struct SysPropertyRow {
     #[active_type(LWW)]
     pub name: String,
@@ -37,7 +48,7 @@ pub struct SysPropertyRow {
 
 /// One `_ankurah_model_property` row: a property's membership in a model.
 #[derive(Model, Debug, Clone)]
-#[model(base = "crate", system = "ModelProperty")]
+#[model(base = "crate", system = "ModelProperty", no_ffi)]
 pub struct SysModelPropertyRow {
     pub model: EntityId,
     pub property: EntityId,

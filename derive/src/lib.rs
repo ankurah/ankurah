@@ -30,8 +30,8 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
     }
 
     let hygiene_module = quote::format_ident!("__ankurah_derive_impl_{}", to_snake_case(&desc.name().to_string()));
-    let internal = desc.is_internal();
-    let wasm_imports = if cfg!(feature = "wasm") && !internal {
+    let no_ffi = desc.no_ffi();
+    let wasm_imports = if cfg!(feature = "wasm") && !no_ffi {
         quote! {
             use ::ankurah::derive_deps::wasm_bindgen::prelude::*;
             use ::ankurah::derive_deps::wasm_bindgen_futures;
@@ -45,7 +45,7 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
     let view_impl = model::view::view_impl(&desc);
     let mutable_impl = model::mutable::mutable_impl(&desc);
     #[cfg(feature = "wasm")]
-    let wasm_impl = if internal {
+    let wasm_impl = if no_ffi {
         quote! {}
     } else {
         model::wasm::wasm_impl(&input, &desc)
@@ -53,7 +53,7 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
     #[cfg(not(feature = "wasm"))]
     let wasm_impl = quote! {};
     #[cfg(all(feature = "uniffi", not(feature = "wasm")))]
-    let uniffi_impl = if internal {
+    let uniffi_impl = if no_ffi {
         quote! {}
     } else {
         model::uniffi::uniffi_impl(&desc)

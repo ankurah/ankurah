@@ -1,21 +1,24 @@
-//! The local compiled schema: the derive macro's static description of a
-//! model and its properties.
+//! Static model declarations emitted into one compiled binary.
 //!
-//! Rust structs are ONE binding to the catalog, not the definitive schema
-//!: `#[derive(Model)]` emits a [`ModelStructDescriptor`] whose
-//! `(backend, value_type)` pairs come from the NORMATIVE mapping table
-//!. A property's minting model and name locate its identity;
-//! registration then checks the compiled pair against the immutable canonical
-//! pair (exact backend and a mutually castable value type), refusing an
-//! incompatible binding rather than minting another identity. The catalog
-//! entities themselves remain the definitive schema; ids exist only there and
-//! in registration responses. This type is how a compiled binary names its
-//! properties and how it builds a RegisterSchema request.
+//! Here, **compiled schema** means a program's source-level claim about one
+//! model, not the system's authoritative schema. `#[derive(Model)]` turns
+//! Rust names, field types, and model attributes into a static
+//! [`ModelStructDescriptor`]; this module turns that descriptor into a
+//! language-neutral `RegisterModel` request. It owns no catalog lookup,
+//! allocation, or per-system binding state.
 //!
-//! These types are entirely `&'static`: the derive macro emits a `static
-//! ModelStructDescriptor` and a `Model::descriptor()` returning `&'static` to it, so
-//! there is no per-call allocation and the schema is a `const`-shaped fact
-//! of the program.
+//! Ordinary property identity is located by current name inside the model's
+//! membership set; `minted_for` is provenance, not part of that key.
+//! Registration then checks the descriptor's `(backend, value_type)` against
+//! the durable property's canonical pair and refuses an incompatible
+//! declaration rather than minting a second identity. Explicit ids pin known
+//! catalog entities, while source-derived unique ids are migration hints only
+//! and never resolve a property today.
+//!
+//! Descriptor data is entirely `&'static`: the derive emits one static value
+//! and `Model::descriptor()` returns it by reference. Catalog entity ids enter
+//! only through explicit pins or a registration response, never through this
+//! module's ordinary derived declarations.
 
 use ankurah_proto::{RegisterModel, RegisterProperty};
 

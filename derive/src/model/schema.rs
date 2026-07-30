@@ -1,6 +1,6 @@
 //! Compiled-schema emission for `#[derive(Model)]`.
 //!
-//! This module generates the `static` [`#base::schema::ModelStructDescriptor`]
+//! This module generates the static `ModelStructDescriptor`
 //! and the `Model::descriptor()` method. Two facts per field are NORMATIVE.
 //! A property's original model scope and name locate its identity; registration
 //! checks these compiled facts against the immutable canonical pair (exact
@@ -24,6 +24,10 @@
 //! - `#[model(system = "...")]`: a built-in SystemModel variant, parsed in
 //!   description.rs. A compile-time System ID: never registered, and
 //!   the collection is pinned to its reserved system label.
+//! - `#[model(base = "...")]`: the path through which generated Rust code
+//!   addresses core. This is independent of FFI generation.
+//! - `#[model(no_ffi)]`: omit WASM and UniFFI surfaces for this model while
+//!   retaining its normal Rust model, view, and mutable APIs.
 
 use proc_macro2::TokenStream;
 use quote::quote;
@@ -71,14 +75,14 @@ pub fn validate_schema_attrs(model: &ModelDescription) -> syn::Result<()> {
 
     // A system model's identity is built in; it cannot also bind a catalog
     // entity id.
-    if model.system().is_some() && model_str_attr(model, "id")?.is_some() {
+    if model.system().is_some() && model.explicit_id().is_some() {
         return Err(syn::Error::new(
             model.name().span(),
             "#[model(system = ...)] and #[model(id = ...)] are mutually exclusive: a built-in identity is not a catalog entity",
         ));
     }
 
-    if let Some(id) = model_str_attr(model, "id")? {
+    if let Some(id) = model.explicit_id() {
         validate_explicit_id(&id).map_err(|msg| {
             syn::Error::new(
                 model.name().span(),
@@ -138,7 +142,7 @@ pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
         // The active type declares which backend stores it (an associated
         // const, resolved inside the static initializer). Like value_type,
         // the derive tabulates nothing.
-        let active_type = desc.rust_type_with_context(if model.is_internal() { "local" } else { "external" })?;
+        let active_type = desc.rust_type_with_context(if model.uses_local_paths() { "local" } else { "external" })?;
         let backend = quote! { <#active_type as #base::property::ActiveType>::BACKEND };
 
         // #[property(renamed_from = "...")]: the transient rename hint. Applied by the registration executor before lookup-or-create,
@@ -171,11 +175,11 @@ pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
     }
 
     // #[model(id = "...")]: explicit binding to a known model entity.
-    let model_explicit_id = model_str_attr(model, "id")?;
-    if let Some(ref id) = model_explicit_id {
+    let model_explicit_id = model.explicit_id();
+    if let Some(id) = model_explicit_id {
         validate_explicit_id(id).map_err(|msg| syn::Error::new(name.span(), msg))?;
     }
-    let model_explicit_id_tokens = option_str_tokens(model_explicit_id.as_deref());
+    let model_explicit_id_tokens = option_str_tokens(model_explicit_id);
 
     // A system model pins its built-in System ID into the descriptor;
     // every registration path short-circuits on it.
@@ -286,13 +290,6 @@ fn property_str_attr(attrs: &[syn::Attribute], key: &str) -> syn::Result<Option<
         })?;
     }
     Ok(found)
-}
-
-/// Parse a `#[model(key = "value")]` string attribute off the struct.
-/// Coexists with the flag form `#[model(ephemeral)]`-style parsing
-/// (get_model_flag); a non-string value for `key` is a hard error.
-fn model_str_attr(model: &ModelDescription, key: &str) -> syn::Result<Option<String>> {
-    crate::model::description::model_str_attr_on(model.struct_attrs(), key)
 }
 
 /// Emit `Some("...")` or `None` for an `Option<&'static str>` field.

@@ -1,0 +1,5 @@
+error: unknown field #[model(...)] option; expected `ephemeral`
+ --> tests/compile_fail/unknown_field_model_option.rs:9:13
+  |
+9 |     #[model(ephemral)]
+  |             ^^^^^^^^

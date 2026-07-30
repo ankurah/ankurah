@@ -1,32 +1,28 @@
-//! The catalog map in its write-only phase.
+//! Integration tests for the per-node schema-catalog service.
 //!
-//! A durable node warms its in-memory catalog map from the three catalog
-//! collections at startup and keeps it fresh by folding its own registrations
-//! synchronously under the allocator mutex; an ephemeral node fills its map
-//! only by folding SchemaRegistered responses. These tests drive
-//! RegisterSchema over the wire (the same schema-less-durable harness as
-//! schema_registration.rs), assert the map resolves to the ids the allocator
-//! handed back, and pin the reset barrier that keeps hard_reset from deleting
-//! storage under an in-flight warm.
-//!
-//! Excised with the read flip (write-only phase): the reactor-fed durable
-//! subscription, the ephemeral relay warm and its generation/deadline/
-//! cancellation semantics, wire-state ingestion with the stale-generation
-//! admission fence, live-query resolution against the map, and resolver
-//! behavior for unwarmed catalogs. Their tests return with that machinery
-//! (successor notes in core/src/schema/catalog.rs).
+//! Here, the **catalog map** is the node-local materialized projection owned
+//! by `CatalogManager`, and the **catalog lifecycle** is its warm, feed,
+//! registration fold, and reset epoch. These tests drive those boundaries
+//! through real durable and ephemeral nodes: they verify allocated ids enter
+//! the projection, reactor updates maintain it, and hard reset either rejects
+//! or drains every old-epoch effect before clearing storage and bindings.
+//! Pure parsing and secondary-index invariants remain unit tests beside the
+//! projection in `core/src/schema/catalog/map.rs`.
 
 mod common;
 use ankurah::core::error::{MutationError, RetrievalError};
+use ankurah::core::property::backend::{LWWBackend, PropertyBackend};
 use ankurah::core::schema::{MODEL_COLLECTION_ID, MODEL_PROPERTY_COLLECTION_ID, PROPERTY_COLLECTION_ID};
 use ankurah::core::storage::{StorageCollection, StorageEngine};
+use ankurah::core::value::Value;
 use ankurah::PropertyId;
 use async_trait::async_trait;
 use common::*;
 use std::{
+    collections::BTreeMap,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc,
+        Arc, Barrier,
     },
     time::Duration,
 };
@@ -60,6 +56,22 @@ fn album_request() -> proto::NodeRequestBody {
 /// Register a second property `year` on the album model (incremental).
 fn album_year_request() -> proto::NodeRequestBody {
     proto::NodeRequestBody::RegisterSchema { models: vec![album_entry("year", "lww", "i64", true)] }
+}
+
+fn model_row_creation(label: &str, name: &str) -> anyhow::Result<proto::Event> {
+    let backend = LWWBackend::new();
+    backend.set("label".into(), Some(Value::String(label.into())));
+    backend.set("name".into(), Some(Value::String(name.into())));
+    let backend_operations = backend.to_operations()?.expect("the row has fields");
+    let model = proto::ModelId::System(proto::SystemModel::Model);
+    let mut operations = proto::OperationSet::from_backends(BTreeMap::from([("lww".into(), backend_operations)]));
+    operations.push(proto::Operation::Membership(proto::Membership::Add(model)));
+    Ok(proto::Event {
+        collection: proto::CollectionId::fixed_name(MODEL_COLLECTION_ID),
+        entity_id: EntityId::new(),
+        operations,
+        parent: proto::Clock::default(),
+    })
 }
 
 async fn connected_pair(
@@ -380,6 +392,63 @@ async fn hard_reset_drains_in_flight_durable_catalog_warm() -> anyhow::Result<()
     Ok(())
 }
 
+// An admitted feed callback is an old-epoch effect even after it has sampled
+// the current generation. Reset must drain the callback before clearing the
+// map so it cannot resume afterward and resurrect the delivered row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hard_reset_drains_admitted_catalog_feed_update() -> anyhow::Result<()> {
+    let node = durable_sled_setup().await?;
+    node.catalog.wait_catalog_ready().await;
+
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    node.catalog.hook_next_feed_apply({
+        let entered = entered.clone();
+        let release = release.clone();
+        move || {
+            entered.wait();
+            release.wait();
+        }
+    });
+
+    let event = model_row_creation("old_feed", "OldFeed")?;
+    let commit_node = node.clone();
+    let commit = tokio::spawn(async move {
+        commit_node.commit_remote_transaction(&DEFAULT_CONTEXT, proto::TransactionId::new(), vec![proto::Attested::opt(event, None)]).await
+    });
+    let entered_wait = entered.clone();
+    tokio::time::timeout(Duration::from_secs(1), tokio::task::spawn_blocking(move || entered_wait.wait()))
+        .await
+        .expect("feed callback must reach the post-admission pause")
+        .expect("barrier waiter must not panic");
+
+    let reset_node = node.clone();
+    let reset = tokio::spawn(async move { reset_node.system.hard_reset().await });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while node.catalog.registration_epoch_is_current() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("reset must invalidate the epoch before waiting for the feed callback");
+    assert!(!reset.is_finished(), "reset must drain the admitted feed callback before clearing");
+
+    let release_wait = release.clone();
+    tokio::task::spawn_blocking(move || release_wait.wait()).await.expect("release barrier must not panic");
+    tokio::time::timeout(Duration::from_secs(1), commit)
+        .await
+        .expect("feed-producing commit must finish after release")
+        .expect("commit task must not panic")?;
+    tokio::time::timeout(Duration::from_secs(1), reset)
+        .await
+        .expect("reset must finish after the callback drains")
+        .expect("reset task must not panic")?;
+
+    assert_eq!(node.catalog.counts(), (0, 0, 0), "old feed delivery must not survive reset");
+    assert!(node.catalog.model_by_label("old_feed").is_none());
+    Ok(())
+}
+
 // Forwarded registration may remain pending while reset clears the system.
 // Its old response must be rejected at schema ingress, never folded or
 // latched into either the cleared epoch or a replacement epoch.
@@ -436,6 +505,53 @@ async fn hard_reset_rejects_stale_schema_registration_response() -> anyhow::Resu
     assert!(client.catalog.is_ensured("album"));
     assert!(wait_resolve(&client, "album", "name").await.is_some());
 
+    Ok(())
+}
+
+// A response admitted before reset may fold, but reset must wait until both
+// the map update and ensured latch are complete and then clear them together.
+// This pins the former check-then-fold TOCTOU directly.
+#[tokio::test]
+async fn hard_reset_drains_admitted_schema_registration_fold() -> anyhow::Result<()> {
+    let server = durable_sled_setup().await?;
+    let client = ephemeral_sled_setup().await?;
+    let _connection = LocalProcessConnection::new(&server, &client).await?;
+    client.system.wait_system_ready().await;
+
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    client.catalog.pause_next_registration_fold(entered.clone(), release.clone());
+
+    let registration_client = client.clone();
+    let registration =
+        tokio::spawn(async move { registration_client.catalog.ensure_registered(&DEFAULT_CONTEXT, Album::descriptor()).await });
+    tokio::time::timeout(Duration::from_secs(1), entered.notified())
+        .await
+        .expect("registration response must pause after acquiring its fold lease");
+
+    let reset_client = client.clone();
+    let reset = tokio::spawn(async move { reset_client.system.hard_reset().await });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while client.catalog.registration_epoch_is_current() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("reset must invalidate the epoch before waiting for the fold");
+    assert!(!reset.is_finished(), "reset must drain the admitted response fold before clearing");
+
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(1), registration)
+        .await
+        .expect("registration must finish after the fold is released")
+        .expect("registration task must not panic")?;
+    tokio::time::timeout(Duration::from_secs(1), reset)
+        .await
+        .expect("reset must finish after the fold lease drains")
+        .expect("reset task must not panic")?;
+
+    assert_eq!(client.catalog.counts(), (0, 0, 0), "admitted old-epoch fold must be cleared by reset");
+    assert!(!client.catalog.is_ensured("album"), "old-epoch ensured latch must be cleared by reset");
     Ok(())
 }
 

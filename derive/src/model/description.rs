@@ -1,6 +1,18 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use syn::{Data, DeriveInput, Fields, Ident, Type, Visibility};
+use syn::{meta::ParseNestedMeta, Data, DeriveInput, Fields, Ident, LitStr, Type, Visibility};
+
+/// The complete struct-level `#[model(...)]` vocabulary.
+///
+/// Parsing it once keeps unknown, duplicate, and malformed options from being
+/// silently ignored by independent lookups later in expansion.
+#[derive(Default)]
+struct ModelOptions {
+    base: Option<String>,
+    system: Option<String>,
+    explicit_id: Option<String>,
+    no_ffi: bool,
+}
 
 /// Encapsulates all the parsed information about a model and provides clean accessors
 pub struct ModelDescription {
@@ -14,25 +26,29 @@ pub struct ModelDescription {
     // Backend manager for configuration lookup
     pub(crate) backend_registry: crate::model::backend_registry::BackendRegistry,
 
-    // Struct-level attributes, retained for #[model(...)] parsing
-    struct_attrs: Vec<syn::Attribute>,
-
     /// `#[model(base = "...")]`: the path generated code addresses the core
     /// crate through. Default `::ankurah::core` (the facade's re-export);
     /// core-internal models pass `crate` so core can derive its own models.
     base: syn::Path,
-    /// True when `base` was overridden: an internal model, which skips the
-    /// wasm/uniffi binding layers (no JS or FFI surface).
-    internal: bool,
+    /// Whether active-type paths should use the backend registry's local
+    /// (`crate`) substitutions. This preserves the path behavior of an
+    /// explicit `base` without conflating it with FFI generation.
+    uses_local_paths: bool,
+    /// `#[model(no_ffi)]`: omit WASM and UniFFI bindings while retaining the
+    /// normal Rust model, view, and mutable APIs.
+    no_ffi: bool,
     /// `#[model(system = "...")]`: a built-in system model identity. Pins
     /// the collection to the system label and short-circuits registration.
     system: Option<Ident>,
+    /// `#[model(id = "...")]`: an explicit durable catalog model identity.
+    explicit_id: Option<String>,
 }
 
 impl ModelDescription {
     /// Parse a DeriveInput and create a ModelDescription
     pub fn parse(input: &DeriveInput) -> syn::Result<Self> {
         let name = input.ident.clone();
+        let options = parse_model_options(&input.attrs)?;
 
         let fields = match &input.data {
             Data::Struct(data) => match &data.fields {
@@ -46,7 +62,7 @@ impl ModelDescription {
         let mut active_fields = Vec::new();
         let mut ephemeral_fields = Vec::new();
         for field in fields.into_iter() {
-            if get_model_flag(&field.attrs, "ephemeral") {
+            if field_is_ephemeral(&field.attrs)? {
                 ephemeral_fields.push(field);
             } else {
                 active_fields.push(field);
@@ -56,14 +72,13 @@ impl ModelDescription {
         // Load backend configurations at compile time
         let backend_registry = crate::model::backend_registry::BackendRegistry::new()?;
 
-        let base_attr = model_str_attr_on(&input.attrs, "base")?;
-        let internal = base_attr.is_some();
-        let base: syn::Path = match &base_attr {
+        let uses_local_paths = options.base.is_some();
+        let base: syn::Path = match &options.base {
             Some(path) => syn::parse_str(path)
                 .map_err(|_| syn::Error::new_spanned(&name, format!("#[model(base = {path:?})] is not a valid path")))?,
             None => syn::parse_str("::ankurah::core").expect("default base path parses"),
         };
-        let system = match model_str_attr_on(&input.attrs, "system")? {
+        let system = match options.system {
             Some(variant) => match variant.as_str() {
                 "System" | "Model" | "Property" | "ModelProperty" => Some(format_ident!("{}", variant)),
                 other => {
@@ -78,13 +93,21 @@ impl ModelDescription {
             None => None,
         };
 
-        Ok(Self { name, active_fields, ephemeral_fields, backend_registry, struct_attrs: input.attrs.clone(), base, internal, system })
+        Ok(Self {
+            name,
+            active_fields,
+            ephemeral_fields,
+            backend_registry,
+            base,
+            uses_local_paths,
+            no_ffi: options.no_ffi,
+            system,
+            explicit_id: options.explicit_id,
+        })
     }
 
     // Basic identifier accessors
     pub fn name(&self) -> &Ident { &self.name }
-    /// Struct-level attributes, for `#[model(id = "...")]` parsing.
-    pub fn struct_attrs(&self) -> &[syn::Attribute] { &self.struct_attrs }
     pub fn collection_str(&self) -> String {
         match &self.system {
             // System models live at their fixed reserved label, not a name
@@ -103,10 +126,14 @@ impl ModelDescription {
     /// through `super::`. The struct name rides verbatim (not case-folded)
     /// so distinct structs always get distinct consts.
     pub fn module_path_const(&self) -> Ident { format_ident!("__ANKURAH_MODULE_PATH_{}", self.name) }
-    /// True for a core-internal model: skip the wasm/uniffi binding layers.
-    pub fn is_internal(&self) -> bool { self.internal }
+    /// Whether generated active-type paths use local backend substitutions.
+    pub fn uses_local_paths(&self) -> bool { self.uses_local_paths }
+    /// Whether this model deliberately omits WASM and UniFFI bindings.
+    pub fn no_ffi(&self) -> bool { self.no_ffi }
     /// The built-in system identity, when this is a system model.
     pub fn system(&self) -> Option<&Ident> { self.system.as_ref() }
+    /// The explicit durable catalog model identity, when supplied.
+    pub fn explicit_id(&self) -> Option<&str> { self.explicit_id.as_deref() }
     pub fn view_name(&self) -> Ident { format_ident!("{}View", self.name) }
     pub fn mutable_name(&self) -> Ident { format_ident!("{}Mut", self.name) }
 
@@ -166,7 +193,7 @@ impl ModelDescription {
         let mut results = Vec::new();
 
         for (i, desc) in descs.iter().enumerate() {
-            let context = if self.internal { "local" } else { "external" };
+            let context = if self.uses_local_paths { "local" } else { "external" };
             let rust_type = desc.rust_type_with_context(context).map_err(|e| {
                 let field = &self.active_fields[i];
                 syn::Error::new_spanned(&field.ty, format!("Failed to generate Rust type: {}", e))
@@ -443,47 +470,83 @@ impl ModelDescription {
     }
 }
 
-fn get_model_flag(attrs: &Vec<syn::Attribute>, flag_name: &str) -> bool {
-    attrs.iter().any(|attr| {
-        attr.path().segments.iter().any(|seg| seg.ident == "model")
-            && attr.meta.require_list().ok().and_then(|list| list.parse_args::<syn::Ident>().ok()).is_some_and(|ident| ident == flag_name)
-    })
-}
-
-/// Parse `#[model(key = "value")]` off raw struct attributes. Bare flags
-/// and unrelated keys are skipped; the requested key present with a
-/// non-string value is a hard error (silently dropping it would demote a
-/// system model to an ordinary one).
-pub(crate) fn model_str_attr_on(attrs: &[syn::Attribute], key: &str) -> syn::Result<Option<String>> {
-    let mut found = None;
-    let mut bad_value: Option<syn::Error> = None;
+/// Parse every struct-level `#[model(...)]` option using one closed
+/// vocabulary. A typo must not silently change the generated model's schema,
+/// identity, path base, or FFI surface.
+fn parse_model_options(attrs: &[syn::Attribute]) -> syn::Result<ModelOptions> {
+    let mut options = ModelOptions::default();
     for attr in attrs {
         if !attr.path().is_ident("model") {
             continue;
         }
-        // Ignore walk failures from the flag form (not a name-value list);
-        // `bad_value` still surfaces a non-string value for the requested key.
-        let _ = attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident(key) {
-                if let Ok(value) = meta.value() {
-                    match value.parse::<syn::LitStr>() {
-                        Ok(lit) => found = Some(lit.value()),
-                        Err(_) => {
-                            bad_value = Some(syn::Error::new_spanned(&meta.path, format!("#[model({key} = ...)] expects a string literal")))
-                        }
-                    }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("base") {
+                let value = model_string_value(&meta, "base")?;
+                set_model_option(&mut options.base, value, &meta, "base")
+            } else if meta.path.is_ident("system") {
+                let value = model_string_value(&meta, "system")?;
+                set_model_option(&mut options.system, value, &meta, "system")
+            } else if meta.path.is_ident("id") {
+                let value = model_string_value(&meta, "id")?;
+                set_model_option(&mut options.explicit_id, value, &meta, "id")
+            } else if meta.path.is_ident("no_ffi") {
+                if options.no_ffi {
+                    return Err(meta.error("duplicate #[model(no_ffi)] option"));
                 }
-            } else if meta.input.peek(syn::Token![=]) {
-                let value = meta.value()?;
-                let _: syn::Expr = value.parse()?;
+                if !meta.input.is_empty() {
+                    return Err(meta.error("#[model(no_ffi)] is a bare flag and does not take a value"));
+                }
+                options.no_ffi = true;
+                Ok(())
+            } else {
+                Err(meta.error("unknown #[model(...)] option; expected `base`, `system`, `id`, or `no_ffi`"))
             }
+        })?;
+    }
+    Ok(options)
+}
+
+fn model_string_value(meta: &ParseNestedMeta<'_>, key: &str) -> syn::Result<String> {
+    if !meta.input.peek(syn::Token![=]) {
+        return Err(meta.error(format!("#[model({key} = ...)] expects a string literal")));
+    }
+    let value = meta.value()?;
+    let literal = value
+        .parse::<LitStr>()
+        .map_err(|_| syn::Error::new_spanned(&meta.path, format!("#[model({key} = ...)] expects a string literal")))?;
+    Ok(literal.value())
+}
+
+fn set_model_option(slot: &mut Option<String>, value: String, meta: &ParseNestedMeta<'_>, key: &str) -> syn::Result<()> {
+    if slot.replace(value).is_some() {
+        return Err(meta.error(format!("duplicate #[model({key} = ...)] option")));
+    }
+    Ok(())
+}
+
+/// Field-level `#[model(...)]` has its own closed vocabulary. At present the
+/// only field option is the bare `ephemeral` flag.
+fn field_is_ephemeral(attrs: &[syn::Attribute]) -> syn::Result<bool> {
+    let mut ephemeral = false;
+    for attr in attrs {
+        if !attr.path().is_ident("model") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if !meta.path.is_ident("ephemeral") {
+                return Err(meta.error("unknown field #[model(...)] option; expected `ephemeral`"));
+            }
+            if ephemeral {
+                return Err(meta.error("duplicate #[model(ephemeral)] option"));
+            }
+            if !meta.input.is_empty() {
+                return Err(meta.error("#[model(ephemeral)] is a bare flag and does not take a value"));
+            }
+            ephemeral = true;
             Ok(())
-        });
+        })?;
     }
-    match bad_value {
-        Some(err) => Err(err),
-        None => Ok(found),
-    }
+    Ok(ephemeral)
 }
 
 /// PascalCase to snake_case for system collection labels

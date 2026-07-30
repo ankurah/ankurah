@@ -1,39 +1,29 @@
-//! The three catalog collections accessed through ordinary typed Models
+//! The three catalog collections read through ordinary typed Views
 //! (core/src/schema/catalog/rows.rs) whose identity is a compile-time
 //! SystemModel. No registration, no catalog lookup, no raw state-buffer
-//! parsing.
+//! parsing on the typed read side.
 
 mod common;
-use ankurah::core::schema::catalog::rows::{SysModelPropertyRowView, SysModelRow, SysModelRowView, SysPropertyRowView};
+use ankurah::core::schema::catalog::rows::{SysModelPropertyRowView, SysModelRowView, SysPropertyRowView};
+use ankurah::core::{property::backend::LWWBackend, property::backend::PropertyBackend, value::Value};
 use ankurah::proto::SystemModel;
 use common::*;
+use std::collections::BTreeMap;
 
-use ankurah::model::Mutable as _;
-
-/// A typed create into a catalog collection travels the NORMAL entity path:
-/// first-use ensure short-circuits to the System ID, the
-/// staged membership asserts ModelId::System(Model), and commit-funnel
-/// admissibility accepts it because the collection fact matches.
-#[tokio::test]
-async fn typed_create_into_catalog_collection() -> anyhow::Result<()> {
-    let node = durable_sled_setup().await?;
-    let ctx = node.context(DEFAULT_CONTEXT)?;
-
-    let trx = ctx.begin();
-    let row = trx.create(&SysModelRow { label: "typed_row".into(), name: "TypedRow".into() }).await?;
-    let id = row.id();
-    trx.commit().await?;
-
-    let fetched = ctx.fetch::<SysModelRowView>("label = 'typed_row'").await?;
-    assert_eq!(fetched.len(), 1, "typed fetch finds the typed create");
-    assert_eq!(fetched[0].id(), id);
-    assert_eq!(fetched[0].name()?, "TypedRow");
-    use ankurah::model::View;
-    assert!(
-        fetched[0].entity().has_membership(&ankurah::proto::ModelId::System(SystemModel::Model)),
-        "the row's membership is the System ID"
-    );
-    Ok(())
+fn model_row_creation(label: &str, name: &str) -> anyhow::Result<proto::Event> {
+    let backend = LWWBackend::new();
+    backend.set("label".into(), Some(Value::String(label.into())));
+    backend.set("name".into(), Some(Value::String(name.into())));
+    let backend_operations = backend.to_operations()?.expect("the row has fields");
+    let model = proto::ModelId::System(SystemModel::Model);
+    let mut operations = proto::OperationSet::from_backends(BTreeMap::from([("lww".into(), backend_operations)]));
+    operations.push(proto::Operation::Membership(proto::Membership::Add(model)));
+    Ok(proto::Event {
+        collection: proto::CollectionId::fixed_name(ankurah::core::schema::MODEL_COLLECTION_ID),
+        entity_id: EntityId::new(),
+        operations,
+        parent: proto::Clock::default(),
+    })
 }
 
 /// Rows the registration executor wrote as raw LWW events read back through
@@ -73,20 +63,18 @@ async fn executor_rows_read_through_typed_views() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A catalog row committed OUTSIDE the registration executor (a typed
-/// create; `upsert_registered` never sees it) appears in the in-memory
-/// catalog map, delivered by the policy-free reactor subscription.
-/// `commit` awaits `notify_change`, and the feed listener folds inline on
-/// the broadcast, so the map is current when commit returns.
+/// A catalog row committed through the allocator's trusted low-level funnel,
+/// but outside `register_schema` (`upsert_registered` never sees it), appears
+/// in the map through the reactor feed. Ordinary transactions cannot take
+/// this path. `commit_remote_transaction` awaits `notify_change`, so the map
+/// is current when it returns.
 #[tokio::test]
 async fn map_learns_from_the_feed_not_the_executor() -> anyhow::Result<()> {
     let node = durable_sled_setup().await?;
-    let ctx = node.context(DEFAULT_CONTEXT)?;
     node.catalog.wait_catalog_ready().await;
 
-    let trx = ctx.begin();
-    trx.create(&SysModelRow { label: "feed_only".into(), name: "FeedOnly".into() }).await?;
-    trx.commit().await?;
+    let event = model_row_creation("feed_only", "FeedOnly")?;
+    node.commit_remote_transaction(&DEFAULT_CONTEXT, proto::TransactionId::new(), vec![proto::Attested::opt(event, None)]).await?;
 
     let model = node.catalog.model_by_label("feed_only").expect("the reactor feed delivered the row into the map");
     assert_eq!(model.name, "FeedOnly");

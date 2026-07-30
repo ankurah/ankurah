@@ -1,6 +1,6 @@
 //! Compile-fail coverage for the `#[derive(Model)]` schema attributes:
 //! the reserved collection prefix, the explicit-id shape, and the system
-//! attribute's grammar. trybuild compiles each fixture as its own crate
+//! attribute grammar, including rejection of unknown model options. trybuild compiles each fixture as its own crate
 //! and asserts it fails with the pinned diagnostic in the matching
 //! `.stderr`.
 //!
@@ -18,6 +18,9 @@ fn derive_model_rejections() {
     t.compile_fail("tests/compile_fail/invalid_explicit_id.rs");
     t.compile_fail("tests/compile_fail/noncanonical_explicit_id.rs");
     t.compile_fail("tests/compile_fail/malformed_system_attr.rs");
+    t.compile_fail("tests/compile_fail/unknown_model_option.rs");
+    t.compile_fail("tests/compile_fail/unknown_field_model_option.rs");
+    t.compile_fail("tests/compile_fail/no_ffi_takes_no_value.rs");
     t.compile_fail("tests/compile_fail/system_and_id_are_exclusive.rs");
     t.compile_fail("tests/compile_fail/model_id_signposts_system.rs");
 }

@@ -10,6 +10,7 @@ repository    = "https://github.com/ankurah/ankurah"
 
 [features]
 wasm = [
+    "ankurah-derive/wasm",
     "wasm-bindgen",
     "wasm-bindgen-futures",
     "serde-wasm-bindgen",

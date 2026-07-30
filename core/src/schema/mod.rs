@@ -1,30 +1,27 @@
-//! The schema catalog: what the system knows about models and properties.
+//! The boundary between source-level model declarations and a system's
+//! durable model and property identities.
 //!
-//! Ankurah stores schema as DATA. Every model and every property is an
-//! ordinary entity in one of three reserved collections (`_ankurah_model`,
-//! `_ankurah_property`, `_ankurah_model_property` for the property-to-model
-//! memberships), with a durable id minted by the system's one durable
-//! allocator. Those entities replicate, persist, and survive renames like
-//! any other data, which is the point: a property's identity is its entity
-//! id, not its current display name, so renaming a field someday does not
-//! orphan the data written under it.
+//! Here, **schema** means the facts needed to translate model and property
+//! names and Rust field types into stable identities and value types. The
+//! durable facts are data: application model definitions, property
+//! definitions, and model-property memberships are entities in three
+//! reserved collections. Their entity ids survive renames, so stored data is
+//! addressed by identity rather than by its current source spelling.
 //!
-//! A Rust struct with `#[derive(Model)]` is not the schema; it is one
-//! binary's DECLARATION of a schema, compiled into a static
-//! ([`ModelStructDescriptor`], in [`compiled`]). The first time a binary uses a model --
-//! explicitly via `Context::register`, or implicitly on create/fetch -- that
-//! declaration is sent to the durable node, whose registration executor
-//! ([`registration`]) looks each piece up, allocates ids for anything new,
-//! checks that a re-declaration is compatible with what the catalog already
-//! holds, and returns the resolved ids. Two binaries with the same struct
-//! get the same ids; a binary whose declaration conflicts is refused.
+//! [`compiled`] is one binary's static declaration of those facts;
+//! [`registration`] is the durable allocator operation that reconciles a
+//! declaration with catalog data; [`catalog`] is each node's runtime service
+//! and materialized projection of the resulting definitions. The first use
+//! of a derived model, or an explicit `Context::register_model`, sends its
+//! [`ModelStructDescriptor`] through that path. Compatible declarations
+//! receive the same ids and incompatible declarations fail.
 //!
-//! Each node keeps an in-memory index of the catalog entities
-//! ([`catalog::CatalogManager`]) so lookups don't touch storage: parsed into
-//! `ModelDef`/`PropertyDef`/`ModelPropertyMembershipDef`, warmed from local storage on
-//! durable nodes and from registration responses on ephemeral ones. The
-//! wire request/response types live in ankurah-proto. The full design
-//! record lives with the design documents for this subsystem.
+//! This module root owns vocabulary shared by those three stages: the closed
+//! mapping between built-in [`SystemModel`]
+//! identities and their current collection labels, protection of the
+//! `_ankurah_` namespace, and [`CollectionSchema`], the minimal field-type
+//! interface used when query literals must be cast. Wire request and response
+//! types remain in `ankurah-proto`.
 
 pub mod catalog;
 pub mod compiled;
@@ -44,10 +41,10 @@ pub trait CollectionSchema {
     fn field_type(&self, path: &PathExpr) -> Result<ValueType, PropertyError>;
 }
 
-/// The metadata catalog collections. Catalog entities are SYSTEM MODELS: raw Entity/backend
-/// access only, like SysRoot; deriving a Model for one of these is the
-/// self-description ouroboros: the catalog must never need itself to
-/// describe itself.
+/// The metadata catalog collections. Their typed row models are SYSTEM
+/// MODELS: compile-time identities whose derives never consult the catalog
+/// they describe. Ordinary transactions may read them through typed Views,
+/// but only schema registration may mutate them.
 pub const MODEL_COLLECTION_ID: &str = "_ankurah_model";
 pub const PROPERTY_COLLECTION_ID: &str = "_ankurah_property";
 pub const MODEL_PROPERTY_COLLECTION_ID: &str = "_ankurah_model_property";

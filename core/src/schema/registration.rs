@@ -1,16 +1,22 @@
-//! The durable-side executor for the RegisterSchema protocol operation
-//!.
+//! The durable allocator and admission transaction for `RegisterSchema`.
 //!
-//! Registration is an UPSERT: the executor looks each definition up by its
-//! lookup key (model by source label; property by (model, name);
-//! model-property membership by (model, property)), ALLOCATES a fresh
-//! `EntityId::new()` -- a true ULID -- on miss, and emits ordinary events
-//! through the policy-checked commit pipeline. The whole execution
-//! serializes on a process-local mutex, and the executor upserts the
-//! resolved definitions into the catalog map synchronously after commit,
-//! BEFORE releasing that mutex, so consecutive registrations can never
-//! race the reactor-fed map into double-allocation. The resolved definitions are returned to the requester via
-//! `NodeResponseBody::SchemaRegistered`.
+//! Here, **registration** means the durable node's complete transition from
+//! a language-neutral declaration to resolved catalog identities. The input
+//! is a set of `RegisterModel` descriptors plus current catalog state; the
+//! output is a policy-visible [`RegistrationPlan`], ordinary catalog events,
+//! and a `SchemaRegistered` tree containing every resolved id. This module
+//! owns lookup-key semantics, compatibility checks, allocation, and event
+//! construction. The per-node feed, reset epoch, compiled-binding latch, and
+//! ephemeral forwarding path belong to [`super::catalog`].
+//!
+//! Registration is an upsert: models resolve by source label, properties by
+//! current name within a model's membership set, and memberships by
+//! `(model, property)`. A miss allocates a fresh `EntityId`; a hit keeps its
+//! identity. The whole lookup/allocate/commit/fold transaction serializes on
+//! the catalog manager's allocator mutex, and resolved definitions enter the
+//! materialized catalog projection before that mutex is released. A later
+//! reactor delivery is therefore redundant rather than necessary for the
+//! next registration's correctness.
 //!
 //! Policy gates the execution at two complementary boundaries:
 //! request authentication decides whether the principal may submit schema
@@ -29,6 +35,12 @@
 //! and reads through the cast); a different backend, or a non-castable type
 //! pair, refuses the registration loudly. Changing a canonical type is a
 //! deliberate migration (#303), never a model-struct edit.
+//!
+//! TODO(organization): this file still co-locates the public error/plan
+//! vocabulary, the allocation algorithm, bootstrap storage reads, and raw
+//! event encoding. Keep `register_schema` as the transaction boundary, but
+//! extract those supporting nouns into focused submodules once their inputs
+//! no longer require reaching through the whole `CatalogManager`.
 
 use std::collections::BTreeMap;
 

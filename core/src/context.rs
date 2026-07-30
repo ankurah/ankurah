@@ -1,3 +1,19 @@
+//! A caller-scoped interface to one node.
+//!
+//! Here, a **context** means a [`crate::node::Node`] paired with the
+//! [`crate::policy::PolicyAgent::ContextData`] that must accompany every
+//! operation on behalf of one caller. It accepts typed fetch, live-query,
+//! entity-creation, and transaction requests; it ensures the relevant
+//! compiled schema is bound to this system, applies caller-specific policy,
+//! and delegates storage and replication to the node.
+//!
+//! [`Context`] is the public, generic-erased handle. [`NodeAndContext`] is
+//! the concrete implementation that retains the node and context data, while
+//! [`TContext`] is their object-safe boundary. Local transaction admission
+//! belongs here because this is the last caller-scoped boundary before events
+//! enter the node's trusted commit pipeline; protected system collections
+//! must never cross it as ordinary user writes.
+
 use crate::retrieval::SuspenseEvents;
 use crate::{
     changes::EntityChange,
@@ -110,6 +126,12 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         let mut entity_events = Vec::new();
         for entity in trx.entities.iter() {
             if let Some(event) = entity.generate_commit_event()? {
+                let collection = event.collection.as_str();
+                if collection.starts_with(crate::schema::RESERVED_COLLECTION_PREFIX) {
+                    return Err(MutationError::General(
+                        format!("collection '{collection}' is protected and not writable by transactions").into(),
+                    ));
+                }
                 // Validate creation events: if parent is empty, this is a creation event
                 // and the entity must have been created in this transaction via create()
                 if event.is_entity_create() {

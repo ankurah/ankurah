@@ -21,8 +21,8 @@ pub fn model_impl(model: &crate::model::description::ModelDescription) -> TokenS
         Err(e) => return e.into_compile_error(),
     };
 
-    // RefWrapper associated type for WASM builds. Internal models skip the
-    // wasm binding layer, so they get a plain newtype satisfying the
+    // RefWrapper associated type for WASM builds. Models marked `no_ffi`
+    // skip the wasm binding layer, so they get a plain newtype satisfying the
     // associated-type bound with no bindgen surface.
     let ref_name = format_ident!("{}Ref", name);
     let ref_wrapper_type = if cfg!(feature = "wasm") {
@@ -32,7 +32,7 @@ pub fn model_impl(model: &crate::model::description::ModelDescription) -> TokenS
     } else {
         quote! {}
     };
-    let internal_ref_wrapper = if cfg!(feature = "wasm") && model.is_internal() {
+    let internal_ref_wrapper = if cfg!(feature = "wasm") && model.no_ffi() {
         quote! {
             pub struct #ref_name(#base::property::Ref<#name>);
             impl From<#base::property::Ref<#name>> for #ref_name {

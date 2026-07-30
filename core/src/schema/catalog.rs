@@ -1,21 +1,37 @@
-//! The in-memory catalog map and its maintenance.
+//! The per-node schema-catalog service.
 //!
-//! Every node keeps an in-memory view of the three catalog collections
-//! (`_ankurah_model`, `_ankurah_property`, `_ankurah_model_property`). In
-//! this write-only phase the map serves the catalog's own maintenance
-//! (registration duplicate checks and allocation), filling one of two ways:
+//! Here, the **catalog** is the runtime service that connects durable schema
+//! facts to one node's schema users. [`CatalogManager`] owns a materialized
+//! map projection, the exact bindings between compiled Rust descriptors
+//! and this system's allocated ids, and the readiness/reset epoch that makes
+//! both safe to consult. It accepts catalog entity updates and
+//! `SchemaRegistered` responses; it provides cheap identity lookups and the
+//! client-side entry points that ensure a compiled descriptor is registered.
+//! Durable allocation itself lives in [`super::registration`], and the
+//! catalog's typed read shapes live in [`rows`].
+//!
+//! The projection fills in one of two ways:
 //!
 //! - DURABLE nodes feed it from a policy-free reactor subscription over the
 //!   three collections: the initial fetch is the warm scan, and every later
 //!   catalog commit arrives through the same listener. The map is node
-//!   infrastructure like `SystemManager`; mutation stays gated by
-//!   `check_event` in the executor.
+//!   infrastructure like [`crate::system::SystemManager`]; catalog mutation
+//!   remains exclusive to durable schema registration.
 //! - EPHEMERAL nodes fold only SchemaRegistered responses to their own
-//!   forwarded registrations; relayed catalog subscriptions (and the
-//!   credential-scoped visibility they imply) return with the read flip.
+//!   forwarded registrations. They therefore know only definitions they
+//!   have registered or received in a response, not the whole system catalog.
 //!
-//! The map parses raw state buffers, never typed Views: resolving the
-//! catalog's own rows through catalog resolution would be circular.
+//! Reset is the service's main cross-cutting invariant. Each feed callback,
+//! warm, registration execution, and admitted response fold holds an epoch
+//! lease across its complete effect. Reset invalidates admission, drains
+//! those leases, and only then clears the projection and compiled bindings;
+//! an old-system effect can therefore neither survive nor resurrect state.
+//!
+//! TODO(organization): this file still co-locates two separable parts of the
+//! service: projection feed/reset lifecycle and compiled-binding/registration
+//! forwarding. They share one epoch today, so a safe extraction should first
+//! make that epoch owner an explicit boundary rather than mechanically split
+//! this `CatalogManager` impl.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
@@ -39,7 +55,7 @@ use crate::{
 use super::{registration::RegistrationError, ModelStructDescriptor};
 
 mod map;
-use map::{CatalogMapInner, EnsuredSchemaBinding};
+use map::CatalogMap;
 
 pub mod rows;
 pub use map::{ModelDef, ModelPropertyMembershipDef, PropertyDef};
@@ -77,7 +93,7 @@ struct CatalogInner<SE, PA: PolicyAgent> {
     /// lock and upserts its allocations before releasing it, so consecutive
     /// registrations observe each other and never double-allocate.
     allocator: tokio::sync::Mutex<()>,
-    map: RwLock<CatalogMapInner>,
+    map: RwLock<CatalogMap>,
     ready: RwLock<bool>,
     ready_notify: Notify,
     /// Warm generation and epoch fences: reset invalidates the generation
@@ -93,6 +109,23 @@ struct CatalogInner<SE, PA: PolicyAgent> {
     /// it. The listener holds a Weak of this inner (a strong ref would cycle
     /// through the guard's callback and leak).
     durable_feed: RwLock<Option<(ReactorSubscription, ankurah_signals::SubscriptionGuard)>>,
+    /// One-shot adversarial pauses used to pin reset interleavings without
+    /// adding timing assumptions to the integration tests.
+    #[cfg(feature = "test-helpers")]
+    next_registration_fold_pause: RwLock<Option<(Arc<Notify>, Arc<Notify>)>>,
+    #[cfg(feature = "test-helpers")]
+    next_feed_apply_hook: RwLock<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+/// One process-local proof that a compiled model shape resolves to a durable
+/// model identity in the current system. Field identities are re-derived
+/// from the descriptor and catalog projection when needed; `confirmed`
+/// records whether the allocator itself returned this binding.
+#[derive(Debug, Clone)]
+struct EnsuredSchemaBinding {
+    schema: &'static ModelStructDescriptor,
+    model: EntityId,
+    confirmed: bool,
 }
 
 #[derive(Debug, Default)]
@@ -101,9 +134,9 @@ struct CatalogSetupState {
     /// While true, no new warm may be claimed. SystemManager clears it only
     /// after storage and reactor reset finish.
     resetting: bool,
-    /// Quiescing owner fence for the current durable warm: one lease held
-    /// from before its first storage access through readiness publication,
-    /// so reset can invalidate and drain it before deleting storage.
+    /// Quiescing owner fence for the current durable feed: warming holds one
+    /// lease from its first storage access through readiness publication,
+    /// and every later callback holds another across its map effect.
     durable_fence: Option<RequestFence>,
     /// Owner fence for schema registration in the current system epoch:
     /// absent until a root is ready, rearmed only by the ready hook. Both
@@ -124,12 +157,16 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
             node: RwLock::new(None),
             durable,
             allocator: tokio::sync::Mutex::new(()),
-            map: RwLock::new(CatalogMapInner::default()),
+            map: RwLock::new(CatalogMap::default()),
             ready: RwLock::new(false),
             ready_notify: Notify::new(),
             setup_state: RwLock::new(CatalogSetupState::default()),
             ensured: RwLock::new(BTreeMap::new()),
             durable_feed: RwLock::new(None),
+            #[cfg(feature = "test-helpers")]
+            next_registration_fold_pause: RwLock::new(None),
+            #[cfg(feature = "test-helpers")]
+            next_feed_apply_hook: RwLock::new(None),
         }))
     }
 
@@ -177,7 +214,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     /// credentials by construction (policy lives in EntityLiveQuery above
     /// the reactor). A schema-less durable node finds no rows and is
     /// immediately ready with an empty, correct map.
-    async fn warm_durable(&self, generation: u64) -> Result<(), RetrievalError> {
+    async fn warm_durable(&self, generation: u64, validity: RequestValidity) -> Result<(), RetrievalError> {
         if self.0.setup_state.read().unwrap().generation != generation {
             return Ok(());
         }
@@ -185,16 +222,16 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
 
         // Listener first, then queries: the queries' own fetches deliver the
         // existing rows through this listener, so nothing can be missed
-        // between scan and subscribe. Gated on the warm's generation so a
-        // reset (which bumps the generation before clearing the map) mutes
-        // any straggler delivery from a torn-down feed.
+        // between scan and subscribe. Every delivery acquires the durable
+        // epoch fence and holds it across the complete map effect: reset
+        // either rejects a straggler or drains it before clearing the map.
         let subscription = node.reactor.subscribe();
         use ankurah_signals::Subscribe;
         let weak = Arc::downgrade(&self.0);
         let guard = subscription.subscribe(move |update: ReactorUpdate| {
-            if let Some(inner) = weak.upgrade().filter(|inner| inner.setup_state.read().unwrap().generation == generation) {
-                CatalogManager(inner).apply_reactor_update(update);
-            }
+            let Some(_lease) = validity.try_acquire() else { return };
+            let Some(inner) = weak.upgrade() else { return };
+            CatalogManager(inner).apply_reactor_update(update);
         });
 
         let everything = Selection { predicate: Predicate::True, order_by: None, limit: None };
@@ -222,8 +259,12 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     /// Idempotent by entity id, so racing the executor's synchronous fold is
     /// harmless. Membership removes are ignored: catalog rows never leave a
     /// `Predicate::True` selection, and reset synthetics are muted by the
-    /// listener's generation gate.
+    /// listener's epoch fence.
     fn apply_reactor_update(&self, update: ReactorUpdate) {
+        #[cfg(feature = "test-helpers")]
+        if let Some(hook) = self.0.next_feed_apply_hook.write().unwrap().take() {
+            hook();
+        }
         let mut map = self.0.map.write().unwrap();
         for item in update.items {
             let Some(model) = crate::schema::system_model_id(item.entity.collection().as_str()) else { continue };
@@ -316,10 +357,10 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     /// fresh warm from here.
     fn finish_reset(&self) {
         let mut setup = self.0.setup_state.write().unwrap();
-        // Detach the feed before the map clear, but drop the handles only
-        // after the setup guard releases: dropping unsubscribes, and the
-        // listener takes a setup_state read on delivery. The next
-        // generation's warm re-establishes the feed.
+        // Detach the drained feed before the map clear, but drop its handles
+        // after the setup guard releases so unsubscribe teardown never runs
+        // under catalog setup synchronization. The next generation's warm
+        // re-establishes the feed.
         let feed = self.0.durable_feed.write().unwrap().take();
         self.0.map.write().unwrap().clear();
         *self.0.ready.write().unwrap() = false;
@@ -341,7 +382,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     /// ready root. Every node kind gets exactly one registration fence; a
     /// durable node also claims its one pending storage warm.
     fn resume_after_system_ready(&self) {
-        let (generation, lease) = {
+        let (generation, lease, validity) = {
             let mut setup = self.0.setup_state.write().unwrap();
             if setup.resetting {
                 return;
@@ -355,13 +396,14 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
             setup.durable_resume_pending = false;
             let fence = RequestFence::new();
             let lease = fence.try_acquire().expect("a newly-created durable warm fence must admit its owner");
+            let validity = RequestValidity::fenced(fence.clone());
             setup.durable_fence = Some(fence);
-            (setup.generation, lease)
+            (setup.generation, lease, validity)
         };
         let me = self.clone();
         crate::task::spawn(async move {
             let _lease = lease;
-            if let Err(e) = me.warm_durable(generation).await {
+            if let Err(e) = me.warm_durable(generation, validity).await {
                 error!("CatalogManager durable warm failed; catalog feed absent until the next reset: {e}");
                 // Readiness must still latch even on failure: registration's
                 // wait parks on it, and one failed warm must not become a
@@ -412,6 +454,25 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         move || weak.upgrade().is_some()
     }
 
+    /// TEST ONLY: pause the next admitted registration response after it has
+    /// acquired its reset lease and before it folds any catalog state.
+    #[cfg(feature = "test-helpers")]
+    pub fn pause_next_registration_fold(&self, entered: Arc<Notify>, release: Arc<Notify>) {
+        *self.0.next_registration_fold_pause.write().unwrap() = Some((entered, release));
+    }
+
+    /// TEST ONLY: run `hook` in the next admitted durable feed callback after
+    /// it has acquired its reset lease and before it folds the update.
+    #[cfg(feature = "test-helpers")]
+    pub fn hook_next_feed_apply(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self.0.next_feed_apply_hook.write().unwrap() = Some(Arc::new(hook));
+    }
+
+    /// TEST ONLY: whether the current system epoch is still admitting schema
+    /// registration effects. Reset removes this owner before awaiting drains.
+    #[cfg(feature = "test-helpers")]
+    pub fn registration_epoch_is_current(&self) -> bool { self.registration_validity().is_some_and(|validity| validity.is_current()) }
+
     /// Return the current catalog definition for a durable property identity.
     pub fn property_by_id(&self, id: &EntityId) -> Option<PropertyDef> { self.0.map.read().unwrap().properties.get(id).cloned() }
 
@@ -447,9 +508,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
 
     /// Property ids sharing display name `name` across ALL contracts (the
     /// map's global name index, which also backs [`Self::property_by_name`]).
-    pub fn siblings_by_name(&self, name: &str) -> Vec<EntityId> {
-        self.0.map.read().unwrap().names_global.get(name).into_iter().flat_map(|s| s.iter().copied()).collect()
-    }
+    pub fn siblings_by_name(&self, name: &str) -> Vec<EntityId> { self.0.map.read().unwrap().siblings_by_name(name) }
 
     // -- registration lifecycle --------------------------------------------
 
@@ -529,6 +588,21 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     }
 
     fn store_binding(&self, binding: EnsuredSchemaBinding) {
+        // TODO(schema-binding-telemetry): Extend the compiled/wire
+        // declaration with identity metadata, then emit a best-effort
+        // asynchronous observation whenever this gate accepts a binding.
+        // `CARGO_PKG_NAME` and `CARGO_PKG_VERSION`, expanded by the derive,
+        // reliably identify the crate declaring the model; final application
+        // name and source revision are not reliably available there and
+        // should be supplied by the application/runtime when practical.
+        // Record those identities with the source UniqueStructId/
+        // UniqueFieldId values, resolved durable ModelId/PropertyId values,
+        // current labels, match basis, and binding source. This must never
+        // delay or reject schema use. Operators need the observations to
+        // distinguish applications or builds whose identical-looking
+        // declarations require different treatment, audit deployed label
+        // dependencies before migrations, and prepare Unique-ID fallback
+        // mappings for affected builds.
         let mut ensured = self.0.ensured.write().unwrap();
         let bindings = ensured.entry(binding.schema.label.to_string()).or_default();
         match bindings.iter_mut().find(|known| *known.schema == *binding.schema) {
@@ -663,15 +737,21 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         still_current()?;
         let request = proto::NodeRequestBody::RegisterSchema { models: vec![request_model] };
         let response = node.request(peer, cdata, request).await.map_err(|e| reg_err(format!("{e:?}")))?;
-        // The response applies only while still wanted: recheck before
-        // folding so reset clears before or after the complete effect,
-        // never between.
-        still_current()?;
+        // A lease, not a sample: reset drains admitted effects before
+        // clearing and rejects responses that arrive after invalidation.
+        let _fold_lease = validity.try_acquire().ok_or(RegistrationError::SystemNotReady)?;
         let models = match response {
             proto::NodeResponseBody::SchemaRegistered { models } => models,
             proto::NodeResponseBody::Error(e) => return Err(reg_err(e)),
             other => return Err(reg_err(format!("unexpected response to RegisterSchema: {other}"))),
         };
+        #[cfg(feature = "test-helpers")]
+        let fold_pause = self.0.next_registration_fold_pause.write().unwrap().take();
+        #[cfg(feature = "test-helpers")]
+        if let Some((entered, release)) = fold_pause {
+            entered.notify_one();
+            release.notified().await;
+        }
         // Fold the response in on ack so binding proceeds ahead of the feed.
         self.upsert_registered(&models);
         self.mark_schema_ensured(schema, &models)
