@@ -1,3 +1,12 @@
+//! Generation of the derived Model trait implementation.
+//!
+//! [`model_impl`] connects one parsed model description to its generated View
+//! and Mutable types, compiled schema descriptor, collection identity, and
+//! new-entity field initialization. It also emits the minimal internal Ref
+//! wrapper required by a WASM build when FFI generation is disabled. Attribute
+//! parsing and validation belong to neighboring description/schema modules;
+//! View, Mutable, and language-binding surfaces have their own generators.
+
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 

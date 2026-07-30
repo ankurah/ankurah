@@ -1,3 +1,13 @@
+//! One Ankurah node's runtime ownership and peer-message boundary.
+//!
+//! [`Node`] is the shared public handle, [`NodeInner`] owns the storage,
+//! entities, Reactor, catalog, policy adapter, system lifecycle, and peer
+//! registries, and [`WeakNode`] is the non-owning form used by background
+//! components. [`PeerState`] tracks one connected peer; [`MatchArgs`] carries a
+//! prepared query request. This file composes those services and routes local
+//! and remote operations. Context owns caller authority, the Reactor owns query
+//! matching, and the schema catalog owns model/property identity resolution.
+
 use crate::schema::catalog::CatalogManager;
 use crate::selection::filter::Filterable;
 use ankurah_proto::{self as proto, Attested, CollectionId, EntityState};

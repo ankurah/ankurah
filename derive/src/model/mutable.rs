@@ -1,3 +1,11 @@
+//! Generation of a model's typed transactional Mutable projection.
+//!
+//! [`mutable_impl`] emits the Mutable wrapper around an Entity, its typed active
+//! property accessors, identity conversion, and optional WASM/UniFFI attributes
+//! and wrapper types. The generated object exposes staged transaction state; it
+//! does not own commit, authorization, or property-backend semantics. Model
+//! metadata and View generation remain in their neighboring generator modules.
+
 use proc_macro2::TokenStream;
 use quote::quote;
 

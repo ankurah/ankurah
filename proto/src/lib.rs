@@ -1,3 +1,12 @@
+//! Serialized vocabulary exchanged between Ankurah nodes and storage layers.
+//!
+//! This crate gathers identities, clocks, entities, events, requests,
+//! responses, subscription updates, schema registration declarations, and
+//! attestations into one protocol surface, re-exporting their canonical types
+//! from this module root. It owns data shape and encoding compatibility, not
+//! transport, authorization, catalog allocation, or runtime application of the
+//! messages; those responsibilities live in connectors and `ankurah-core`.
+
 #[cfg(feature = "uniffi")]
 uniffi::setup_scaffolding!();
 

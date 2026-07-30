@@ -1,3 +1,11 @@
+//! Generation of a model's typed read-only View projection.
+//!
+//! [`view_impl`] emits the View wrapper around an Entity, typed field accessors,
+//! signal/subscription integration, edit and Ref conveniences, and optional
+//! WASM/UniFFI exposure. The generated View interprets live entity state; it
+//! does not own query execution, mutation commit, or property-backend behavior.
+//! Model metadata and Mutable generation remain in their neighboring modules.
+
 use proc_macro2::TokenStream;
 use quote::quote;
 

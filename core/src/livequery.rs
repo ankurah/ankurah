@@ -1,3 +1,13 @@
+//! Reactive query handles over the node's local Reactor and optional peer relay.
+//!
+//! [`EntityLiveQuery`] is the type-erased subscription lifetime and activation
+//! state; [`LiveQuery`] projects its result set into a generated model View;
+//! [`WeakEntityLiveQuery`] lets relay bookkeeping refer back without retaining
+//! the query. This file owns construction, activation, selection changes,
+//! initialization, typed projection, and node-lifetime behavior. The Reactor
+//! owns match maintenance, the subscription relay owns upstream transport, and
+//! Context decides which authority may create a query.
+
 use std::{
     marker::PhantomData,
     sync::{Arc, Weak},

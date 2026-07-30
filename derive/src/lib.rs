@@ -1,3 +1,12 @@
+//! Procedural-macro entry points for Ankurah's typed application surface.
+//!
+//! This crate parses model/property declarations and query macro syntax, then
+//! coordinates generators for Model, View, Mutable, FFI, and selection code.
+//! The entry points own compile-time validation, expansion hygiene, and routing
+//! to those generators. They do not implement runtime behavior or wire
+//! semantics; generated code delegates those responsibilities to
+//! `ankurah-core` and `ankurah-proto`.
+
 mod model;
 mod property;
 mod selection;

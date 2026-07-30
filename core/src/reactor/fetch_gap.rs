@@ -1,3 +1,13 @@
+//! Backfill support for limited reactive result sets.
+//!
+//! A [`GapFetcher`] supplies rows when an ordered, limited LiveQuery loses a
+//! member and needs to refill its window. [`QueryGapFetcher`] performs that
+//! fetch under a session credential; [`SystemRootGapFetcher`] is the
+//! crate-private durable system equivalent. This file also owns construction
+//! of the continuation selection after the current last row. The Reactor owns
+//! result-set membership and query lifecycle; ordinary fetch execution and
+//! authorization remain in the node/context path.
+
 use crate::{
     context::NodeAndContext,
     error::RetrievalError,

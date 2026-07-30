@@ -1,3 +1,13 @@
+//! Logical property identities shared across Ankurah's runtime and wire layers.
+//!
+//! A [`PropertyId`] addresses stored values independently of a field's current
+//! source label: registered properties use their catalog entity id, built-in
+//! fields use [`SystemProperty`], and [`PropertyId::Id`] names the entity-id
+//! pseudo-property. This file owns those value types, their stable serialized
+//! shape, and their exact text encoding. Resolving model-local names belongs to
+//! the schema catalog; choosing physical column or CRDT-root names belongs to
+//! storage backends.
+
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;

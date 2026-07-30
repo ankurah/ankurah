@@ -1,3 +1,13 @@
+//! The application-defined authorization, authentication, and attestation seam.
+//!
+//! [`PolicyAgent`] is the contract a node calls to sign and validate requests,
+//! filter reads, authorize writes, and attest or validate replicated data.
+//! [`ContextData`] is its application credential value, [`AccessDenied`] is the
+//! common refusal, and [`PermissiveAgent`] is the allow-all implementation used
+//! where no application policy is required. This module does not create
+//! Context authority: the Context layer owns Session versus local SystemRoot,
+//! and SystemRoot deliberately bypasses this application-policy seam.
+
 use crate::util::Iterable;
 use crate::{
     entity::Entity,

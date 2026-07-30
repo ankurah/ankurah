@@ -1,3 +1,12 @@
+//! Logical model identities shared across Ankurah's runtime and wire layers.
+//!
+//! A [`ModelId`] is the durable address carried by entities and operations:
+//! application models use the entity id of their catalog definition, while a
+//! [`SystemModel`] names one of the closed built-in bootstrap models. This file
+//! owns those value types, their stable serialized shape, and their textual
+//! representation. Resolving source labels to model ids belongs to the schema
+//! catalog; mapping an id to physical storage belongs to the storage layer.
+
 use serde::{Deserialize, Serialize};
 use std::fmt;
 

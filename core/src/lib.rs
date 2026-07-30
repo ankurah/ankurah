@@ -1,3 +1,12 @@
+//! The runtime core of an Ankurah node.
+//!
+//! This crate assembles the node, contexts, entities, transactions, reactive
+//! queries, schema catalog, policy boundary, and storage interfaces, then
+//! re-exports the small vocabulary needed by applications and derive-generated
+//! code. The module root owns that public assembly and feature-gated surface;
+//! each child module owns its mechanism. Serialized protocol types live in
+//! `ankurah-proto`, while procedural code generation lives in `ankurah-derive`.
+
 pub mod changes;
 pub mod collation;
 pub mod connector;
