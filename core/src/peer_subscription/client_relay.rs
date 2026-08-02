@@ -38,7 +38,10 @@ pub struct Content<CD: ContextData> {
     pub query_id: proto::QueryId,
     pub collection_id: CollectionId,
     pub selection: ankql::ast::Selection,
-    pub context_data: CD,
+    /// The live credential source; every send reads its then-current
+    /// values, so a reconnect re-registration after a refresh carries the
+    /// fresh ones. A set-backed query sends every live credential.
+    pub sessions: crate::session::Sessions<CD>,
     pub version: u32,
 }
 
@@ -129,7 +132,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         query_id: proto::QueryId,
         collection_id: CollectionId,
         selection: ankql::ast::Selection,
-        context_data: CD,
+        sessions: crate::session::Sessions<CD>,
         version: u32,
         livequery: Q,
     ) {
@@ -138,7 +141,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
             self.inner.subscriptions.lock().expect("poisoned lock").insert(
                 query_id,
                 RemoteQueryState {
-                    content: Arc::new(Content { collection_id, selection, context_data, query_id, version }),
+                    content: Arc::new(Content { collection_id, selection, sessions, query_id, version }),
                     status: Status::PendingRemote,
                     livequery,
                 },
@@ -162,7 +165,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                     state.content = Arc::new(Content {
                         collection_id: old_content.collection_id.clone(),
                         selection: selection.clone(),
-                        context_data: old_content.context_data.clone(),
+                        sessions: old_content.sessions.clone(),
                         query_id: old_content.query_id,
                         version,
                     });
@@ -171,7 +174,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                         Status::Established(peer_id, _old_version) => {
                             // Update to new version, mark as requested for this peer
                             state.status = Status::Requested(peer_id, version);
-                            Some((peer_id, state.content.collection_id.clone(), state.content.context_data.clone()))
+                            Some((peer_id, state.content.collection_id.clone(), state.content.sessions.clone()))
                             // Return the peer_id to send update to
                         }
                         _ => {
@@ -186,8 +189,8 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         };
 
         match update {
-            Some((peer_id, collection_id, context_data)) => {
-                self.update_query_on_peer(peer_id, query_id, collection_id, selection, version, context_data);
+            Some((peer_id, collection_id, sessions)) => {
+                self.update_query_on_peer(peer_id, query_id, collection_id, selection, version, sessions);
             }
             None => {
                 // Not established yet - use setup_remote_subscriptions for initial setup
@@ -205,7 +208,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         collection_id: CollectionId,
         selection: ankql::ast::Selection,
         version: u32,
-        context_data: CD,
+        sessions: crate::session::Sessions<CD>,
     ) {
         let me = self.clone();
         crate::task::spawn(async move {
@@ -215,8 +218,9 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                     me.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner()).get(&query_id).map(|state| state.livequery.clone())
                 };
 
-                // Send the updated predicate to the peer
-                match node.remote_subscribe(peer_id, query_id, collection_id, selection, &context_data, version).await {
+                // Send the updated predicate to the peer, under the
+                // credentials current at send time.
+                match node.remote_subscribe(peer_id, query_id, collection_id, selection, sessions.snapshot(), version).await {
                     Ok(()) => {
                         // Deltas applied successfully, now activate the livequery
                         if let Some(lq) = livequery {
@@ -323,7 +327,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
             match &state.status {
                 Status::Established(established_peer, _) | Status::Requested(established_peer, _) => {
                     if established_peer == peer_id {
-                        contexts.insert(state.content.context_data.clone());
+                        contexts.extend(state.content.sessions.snapshot());
                     }
                 }
                 _ => {}
@@ -384,7 +388,8 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
     async fn attempt_subscribe(self, node: Arc<dyn TNode<CD>>, target_peer: proto::EntityId, content: Arc<Content<CD>>) {
         let query_id = content.query_id;
         let predicate = content.selection.clone();
-        let context_data = content.context_data.clone();
+        // Credentials read at send time from the live source.
+        let cdatas = content.sessions.snapshot();
         let version = content.version;
 
         // Get the livequery for error handling
@@ -392,7 +397,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
             { self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner()).get(&query_id).map(|state| state.livequery.clone()) };
 
         // Call remote_subscribe which fetches known matches, subscribes, applies deltas, and stores events
-        match node.remote_subscribe(target_peer, query_id, content.collection_id.clone(), predicate, &context_data, version).await {
+        match node.remote_subscribe(target_peer, query_id, content.collection_id.clone(), predicate, cdatas, version).await {
             Ok(()) => {
                 // Deltas applied successfully, now activate the livequery
                 // The livequery handles its own errors internally
@@ -487,7 +492,7 @@ pub trait TNode<CD: ContextData>: Send + Sync {
         query_id: proto::QueryId,
         collection_id: CollectionId,
         selection: ankql::ast::Selection,
-        context_data: &CD,
+        context_data: Vec<CD>,
         version: u32,
     ) -> Result<(), RetrievalError>;
 
@@ -509,7 +514,7 @@ where
         query_id: proto::QueryId,
         collection_id: CollectionId,
         selection: ankql::ast::Selection,
-        context_data: &PA::ContextData,
+        context_data: Vec<PA::ContextData>,
         version: u32,
     ) -> Result<(), RetrievalError> {
         let node = self.upgrade().ok_or_else(|| RetrievalError::Other("Node has been dropped".to_string()))?;
@@ -526,7 +531,7 @@ where
         let deltas = match node
             .request(
                 peer_id,
-                context_data,
+                &context_data,
                 ankurah_proto::NodeRequestBody::SubscribeQuery {
                     query_id,
                     collection: collection_id.clone(),
@@ -551,7 +556,7 @@ where
         );
         // 3. Apply deltas to local node using NodeApplier
         let collection = node.collections.get(&collection_id).await?;
-        let event_getter = crate::retrieval::CachedEventGetter::new(collection_id, collection.clone(), &node, context_data);
+        let event_getter = crate::retrieval::CachedEventGetter::new(collection_id, collection.clone(), &node, &context_data);
         let state_getter = crate::retrieval::LocalStateGetter::new(collection);
         crate::node_applier::NodeApplier::apply_deltas(&node, &peer_id, deltas, &event_getter, &state_getter).await?;
 
@@ -622,7 +627,7 @@ mod tests {
             query_id: proto::QueryId,
             collection_id: CollectionId,
             selection: ankql::ast::Selection,
-            _context_data: &CD,
+            _context_data: Vec<CD>,
             _version: u32,
         ) -> Result<(), RetrievalError> {
             self.sent_requests.lock().unwrap().push((peer_id, query_id, collection_id.clone(), selection.clone()));
@@ -690,7 +695,14 @@ mod tests {
         relay.notify_peer_connected(peer_id);
 
         // Notify of new subscription
-        relay.subscribe_query(query_id, collection_id.clone(), predicate.clone(), collection_id.clone(), 0, MockLiveQuery);
+        relay.subscribe_query(
+            query_id,
+            collection_id.clone(),
+            predicate.clone(),
+            crate::session::Session::detached(collection_id.clone()).into(),
+            0,
+            MockLiveQuery,
+        );
 
         // Check initial state - subscription should immediately go to Requested state since peer is connected
         assert!(matches!(relay.get_status(query_id), Some(Status::Requested(_, _))));
@@ -725,7 +737,14 @@ mod tests {
         relay.notify_peer_connected(peer_id);
 
         // Setup established subscription by going through the full flow
-        relay.subscribe_query(query_id, collection_id.clone(), predicate, collection_id.clone(), 0, MockLiveQuery);
+        relay.subscribe_query(
+            query_id,
+            collection_id.clone(),
+            predicate,
+            crate::session::Session::detached(collection_id.clone()).into(),
+            0,
+            MockLiveQuery,
+        );
 
         // Give async task time to complete
         futures_timer::Delay::new(std::time::Duration::from_millis(10)).await;
@@ -751,7 +770,14 @@ mod tests {
         let peer_id = EntityId::new();
 
         // Add pending subscription (no peers connected yet)
-        relay.subscribe_query(query_id, collection_id.clone(), predicate.clone(), collection_id.clone(), 0, MockLiveQuery);
+        relay.subscribe_query(
+            query_id,
+            collection_id.clone(),
+            predicate.clone(),
+            crate::session::Session::detached(collection_id.clone()).into(),
+            0,
+            MockLiveQuery,
+        );
         assert!(matches!(relay.get_status(query_id), Some(Status::PendingRemote)));
 
         // Clear any previous requests
@@ -786,7 +812,14 @@ mod tests {
 
         // Connect peer and add subscription (should succeed initially)
         relay.notify_peer_connected(peer_id);
-        relay.subscribe_query(query_id, collection_id.clone(), predicate.clone(), collection_id.clone(), 0, MockLiveQuery);
+        relay.subscribe_query(
+            query_id,
+            collection_id.clone(),
+            predicate.clone(),
+            crate::session::Session::detached(collection_id.clone()).into(),
+            0,
+            MockLiveQuery,
+        );
 
         // Give async task time to complete
         futures_timer::Delay::new(std::time::Duration::from_millis(10)).await;
@@ -832,8 +865,22 @@ mod tests {
         let peer_id = EntityId::new();
 
         // Add subscriptions
-        relay.subscribe_query(retryable_query_id, collection_id.clone(), predicate.clone(), collection_id.clone(), 0, MockLiveQuery);
-        relay.subscribe_query(non_retryable_query_id, collection_id.clone(), predicate.clone(), collection_id.clone(), 0, MockLiveQuery);
+        relay.subscribe_query(
+            retryable_query_id,
+            collection_id.clone(),
+            predicate.clone(),
+            crate::session::Session::detached(collection_id.clone()).into(),
+            0,
+            MockLiveQuery,
+        );
+        relay.subscribe_query(
+            non_retryable_query_id,
+            collection_id.clone(),
+            predicate.clone(),
+            crate::session::Session::detached(collection_id.clone()).into(),
+            0,
+            MockLiveQuery,
+        );
 
         // Manually set different failure types - retryable goes back to pending, non-retryable stays failed
         {
@@ -877,7 +924,14 @@ mod tests {
 
         // Connect peer and setup established subscription
         relay.notify_peer_connected(peer_id);
-        relay.subscribe_query(query_id, collection_id.clone(), predicate, collection_id.clone(), 0, MockLiveQuery);
+        relay.subscribe_query(
+            query_id,
+            collection_id.clone(),
+            predicate,
+            crate::session::Session::detached(collection_id.clone()).into(),
+            0,
+            MockLiveQuery,
+        );
 
         // Give async task time to complete
         futures_timer::Delay::new(std::time::Duration::from_millis(10)).await;
@@ -914,7 +968,14 @@ mod tests {
         let peer_id = EntityId::new();
 
         // Test setup without message sender - should not crash
-        relay.subscribe_query(query_id, collection_id.clone(), predicate.clone(), collection_id.clone(), 0, MockLiveQuery);
+        relay.subscribe_query(
+            query_id,
+            collection_id.clone(),
+            predicate.clone(),
+            crate::session::Session::detached(collection_id.clone()).into(),
+            0,
+            MockLiveQuery,
+        );
         futures_timer::Delay::new(std::time::Duration::from_millis(10)).await;
 
         // Should still be pending since no sender
@@ -950,7 +1011,14 @@ mod tests {
         let predicate = create_test_selection();
 
         // Add subscription but don't establish it
-        relay.subscribe_query(query_id, collection_id.clone(), predicate, collection_id.clone(), 0, MockLiveQuery);
+        relay.subscribe_query(
+            query_id,
+            collection_id.clone(),
+            predicate,
+            crate::session::Session::detached(collection_id.clone()).into(),
+            0,
+            MockLiveQuery,
+        );
         assert!(matches!(relay.get_status(query_id), Some(Status::PendingRemote)));
 
         // Unsubscribe from pending subscription

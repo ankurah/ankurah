@@ -1,12 +1,13 @@
 use crate::error::AuthError;
 use serde::{Deserialize, Serialize};
+use std::hash::{Hash, Hasher};
 
 /// JWT claims carried in every token issued by the auth system.
 ///
 /// Note: `sub` is stored in the standard JWT `subject` field (not in custom claims)
 /// to avoid serde conflicts with `jwt_simple`'s `#[serde(flatten)]` on custom claims.
 /// The `sub` field here is populated by `SigningKeys::verify()` from the standard claim.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct JwtClaims {
     /// User entity ID (ankurah EntityId serialized as string).
     /// When signing, this is placed in the standard JWT `sub` claim.
@@ -28,6 +29,85 @@ pub struct JwtClaims {
     /// Captures any JSON fields not explicitly defined above.
     #[serde(flatten)]
     pub custom: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Total equality is honest: `serde_json` cannot represent NaN or
+/// infinity (parsing rejects them and `Number::from_f64` refuses them),
+/// so the reflexivity hole in `Value`'s `PartialEq` is unreachable.
+impl Eq for JwtClaims {}
+
+/// Full-value hash agreeing with `Eq` (the `ContextData` contract).
+/// `serde_json::Value` implements no `Hash`, so the `custom` map is
+/// hashed by a recursive walk — objects in sorted key order, because
+/// map equality is order-independent.
+impl Hash for JwtClaims {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.sub.hash(state);
+        self.roles.hash(state);
+        self.email.hash(state);
+        self.name.hash(state);
+        self.custom.len().hash(state);
+        let mut keys: Vec<&String> = self.custom.keys().collect();
+        keys.sort();
+        for key in keys {
+            key.hash(state);
+            hash_json_value(&self.custom[key], state);
+        }
+    }
+}
+
+/// Hash a JSON value such that values equal under `serde_json`'s own
+/// `PartialEq` hash equal: arm-tagged, arrays in order, objects in
+/// sorted key order. Numbers hash by their canonical arm (unsigned,
+/// signed, then float bits), mirroring `serde_json::Number` equality,
+/// which never compares across arms.
+fn hash_json_value<H: Hasher>(value: &serde_json::Value, state: &mut H) {
+    use serde_json::Value;
+    match value {
+        Value::Null => 0u8.hash(state),
+        Value::Bool(b) => {
+            1u8.hash(state);
+            b.hash(state);
+        }
+        Value::Number(n) => {
+            2u8.hash(state);
+            if let Some(u) = n.as_u64() {
+                0u8.hash(state);
+                u.hash(state);
+            } else if let Some(i) = n.as_i64() {
+                1u8.hash(state);
+                i.hash(state);
+            } else {
+                // serde_json number equality is IEEE (-0.0 == 0.0), so
+                // the hash must not split zero by sign bit.
+                2u8.hash(state);
+                let float = n.as_f64().expect("a serde_json Number is one of u64/i64/f64");
+                let float = if float == 0.0 { 0.0 } else { float };
+                float.to_bits().hash(state);
+            }
+        }
+        Value::String(s) => {
+            3u8.hash(state);
+            s.hash(state);
+        }
+        Value::Array(items) => {
+            4u8.hash(state);
+            items.len().hash(state);
+            for item in items {
+                hash_json_value(item, state);
+            }
+        }
+        Value::Object(map) => {
+            5u8.hash(state);
+            map.len().hash(state);
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            for key in keys {
+                key.hash(state);
+                hash_json_value(&map[key], state);
+            }
+        }
+    }
 }
 
 /// Parse a JWT token without verifying the signature.

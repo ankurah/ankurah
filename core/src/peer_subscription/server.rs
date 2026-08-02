@@ -66,7 +66,7 @@ impl SubscriptionHandler {
         query_id: proto::QueryId,
         collection_id: proto::CollectionId,
         mut selection: ankql::ast::Selection,
-        cdata: &PA::ContextData,
+        cdata: &Vec<PA::ContextData>,
         version: u32,
         known_matches: Vec<proto::KnownEntity>,
     ) -> anyhow::Result<proto::NodeResponseBody>
@@ -77,8 +77,29 @@ impl SubscriptionHandler {
         if version == 0 {
             return Err(anyhow::anyhow!("Invalid version 0 for subscription"));
         }
-        node.policy_agent.can_access_collection(cdata, &collection_id)?;
-        selection.predicate = node.policy_agent.filter_predicate(cdata, &collection_id, selection.predicate)?;
+        // A failed validation removes any STANDING registration for this
+        // query before erroring: re-subscribes re-validate under the
+        // peer's current credentials, and a credential that lost access
+        // must not leave the previous registration streaming under the
+        // grant it replaced — the server-side half of the claw-back. The
+        // removal is floored on this request's version so a DELAYED older
+        // request that now fails validation cannot tear down the live
+        // newer registration that superseded it. (Idempotent; first-time
+        // subscribes have nothing to remove. A tombstone preventing an
+        // older request from re-REGISTERING after removal is follow-up
+        // work: https://github.com/ankurah/ankurah/issues/429)
+        let validated = node
+            .policy_agent
+            .can_access_collection(cdata, &collection_id)
+            .and_then(|()| node.policy_agent.filter_predicate(cdata, &collection_id, selection.predicate.clone()));
+        let filtered = match validated {
+            Ok(filtered) => filtered,
+            Err(denied) => {
+                let _ = self.subscription.remove_predicate_at_or_below(query_id, version);
+                return Err(denied.into());
+            }
+        };
+        selection.predicate = filtered;
         let storage_collection = node.collections.get(&collection_id).await?;
 
         // Add or update the query - idempotent, works whether query exists or not

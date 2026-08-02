@@ -140,15 +140,43 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
 
         // Remove the query from the subscription
         let query_state = subscription.remove_query(query_id).ok_or(SubscriptionError::PredicateNotFound)?;
+        self.cleanup_removed_query(subscription_id, query_id, &query_state);
+        Ok(())
+    }
 
+    /// [`Self::remove_query`] behind a version floor: removes only a
+    /// registration at or below `version`, so a stale request's failure
+    /// cannot tear down its newer successor. Absence and a newer
+    /// registration are both quiet no-ops.
+    pub fn remove_query_at_or_below(
+        &self,
+        subscription_id: ReactorSubscriptionId,
+        query_id: proto::QueryId,
+        version: u32,
+    ) -> Result<(), SubscriptionError> {
+        let subscription = {
+            let subscriptions = self.0.subscriptions.lock().unwrap();
+            subscriptions.get(&subscription_id).cloned().ok_or(SubscriptionError::SubscriptionNotFound)?
+        };
+        if let Some(query_state) = subscription.remove_query_at_or_below(query_id, version) {
+            self.cleanup_removed_query(subscription_id, query_id, &query_state);
+        }
+        Ok(())
+    }
+
+    /// Watcher teardown shared by the removal paths.
+    fn cleanup_removed_query(
+        &self,
+        subscription_id: ReactorSubscriptionId,
+        query_id: proto::QueryId,
+        query_state: &subscription_state::QueryState<E>,
+    ) {
         // Remove from watchers (only if selection was set)
         if let Some(selection) = &query_state.selection {
             let mut watcher_set = self.0.watcher_set.lock().unwrap();
             let watcher_id = (subscription_id, query_id);
             watcher_set.recurse_predicate_watchers(&query_state.collection_id, &selection.predicate, watcher_id, WatcherOp::Remove);
         }
-
-        Ok(())
     }
 
     /// Add entity subscriptions to a subscription
@@ -400,7 +428,7 @@ impl Reactor<Entity, ankurah_proto::Attested<ankurah_proto::Event>> {
         collection_id: proto::CollectionId,
         selection: ankql::ast::Selection,
         node: &crate::node::Node<SE, PA>,
-        cdata: &PA::ContextData,
+        cdatas: &[PA::ContextData],
         version: u32,
     ) -> anyhow::Result<Vec<Entity>>
     where
@@ -414,9 +442,11 @@ impl Reactor<Entity, ankurah_proto::Attested<ankurah_proto::Event>> {
 
         let included_entities = node.fetch_entities_from_local(&collection_id, &selection).await?;
 
-        // Upsert query - register if new or get existing resultset
-        // Gap fetcher is only created if query doesn't exist yet
-        let resultset = subscription.upsert_query(query_id, collection_id.clone(), node, cdata);
+        // Upsert query - register if new or get existing resultset.
+        // Re-subscribes for the same query id arrive with freshly
+        // validated credentials; the stored gap fetcher's session is
+        // refreshed in place so later gap fills read under the latest one.
+        let resultset = subscription.upsert_query(query_id, collection_id.clone(), node, cdatas, version);
 
         // Update query - watcher management is handled internally
         let mut all_entities =

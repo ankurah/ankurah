@@ -70,7 +70,12 @@ pub(crate) fn start_ephemeral_policy_sync<SE, PA>(
             return;
         }
     };
-    let lq = match EntityLiveQuery::new_weak_node(node, proto::CollectionId::from("jwtpolicy"), args, JwtContext::NoUser) {
+    let lq = match EntityLiveQuery::new_weak_node(
+        node,
+        proto::CollectionId::from("jwtpolicy"),
+        args,
+        ankurah_core::session::Session::detached(JwtContext::NoUser),
+    ) {
         Ok(lq) => lq,
         Err(e) => {
             tracing::error!("on_node_ready: failed to create policy livequery: {}", e);
