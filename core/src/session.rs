@@ -4,9 +4,8 @@
 //! A Session wraps the current ContextData in a signal, so a long-lived
 //! handle's credential can change (a token refresh, a re-login) without
 //! rebuilding the Context or the livequeries under it: holders keep the
-//! session and read the current value at use time, and change
-//! subscribers hear each effective update (the liveness PR's relay
-//! re-permissions remote subscriptions on it).
+//! session and read the current value at use time, and subscribers (the
+//! relay) react to a change by re-permissioning remote subscriptions.
 //! The SessionSet tracks the node's live sessions, undeduplicated: two
 //! sessions whose credentials compare equal today are still independent
 //! and may diverge tomorrow, so any deduplication happens at the point of
@@ -241,6 +240,20 @@ impl<CD: ContextData> Sessions<CD> {
             Self::Held(holder) => holder.0.set.current(),
         }
     }
+
+    /// Subscribe to credential changes; the listener receives the new
+    /// current credentials. For a set, membership changes fire too.
+    pub fn subscribe_changes<F>(&self, listener: F) -> SubscriptionGuard
+    where F: IntoSubscribeListener<Vec<CD>> {
+        match self {
+            Self::One(session) => {
+                let listener = listener.into_subscribe_listener();
+                session.subscribe_changes(move |cdata: CD| listener(vec![cdata]))
+            }
+            Self::Set(set) => set.subscribe(listener),
+            Self::Held(holder) => holder.0.set.subscribe(listener),
+        }
+    }
 }
 
 impl<CD: ContextData> From<Arc<Session<CD>>> for Sessions<CD> {
@@ -463,6 +476,30 @@ mod tests {
         drop(b);
         assert_eq!(fired.lock().unwrap().last(), Some(&Vec::new()));
         assert_eq!(fired.lock().unwrap().len(), count + 1, "exactly the final cull fired");
+    }
+
+    /// A `Sessions` source unifies the two credential shapes: One
+    /// snapshots a vec of one and forwards its session's updates; Set
+    /// snapshots the union.
+    #[test]
+    fn sessions_source_unifies_one_and_set() {
+        let set: SessionSet<TestCd> = SessionSet::new();
+        let session = set.register(TestCd { subject: 1, token: 1 });
+
+        let one: Sessions<TestCd> = session.clone().into();
+        assert_eq!(one.snapshot(), vec![TestCd { subject: 1, token: 1 }]);
+
+        let many: Sessions<TestCd> = set.clone().into();
+        let _b = set.register(TestCd { subject: 2, token: 2 });
+        assert_eq!(many.snapshot().len(), 2, "a Set source snapshots every live credential");
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let _guard = one.subscribe_changes(move |current: Vec<TestCd>| {
+            sink.lock().unwrap().push(current.len());
+        });
+        session.update(TestCd { subject: 1, token: 9 });
+        assert_eq!(seen.lock().unwrap().as_slice(), &[1], "a One source forwards its session's update as a vec of one");
     }
 
     /// Peek reads the union without tracking; the porcelain and the

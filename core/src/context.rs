@@ -85,9 +85,8 @@ pub trait TContext {
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError>;
     /// Replace this context's credential (type-erased across the trait
     /// object; [`Context::update_cdata`] is the typed surface). Holders of
-    /// the session observe the new value on their next operation. STANDING
-    /// queries keep their creation-time derivation; the liveness PR wires
-    /// re-permission.
+    /// the session observe the new value on their next operation, and the
+    /// relay re-permissions this context's remote subscriptions.
     fn update_cdata(&self, new: Box<dyn std::any::Any + Send>) -> Result<(), UpdateCdataError>;
 }
 
@@ -301,12 +300,11 @@ impl Context {
 
     /// Replace this context's credential in place: a token refresh or a
     /// re-login. Livequeries and pending operations keep running; each
-    /// holder reads the new value on its next operation, so commits,
-    /// fetches, and NEW queries run under the refreshed credential.
-    /// STANDING queries keep their creation-time derivation until the
-    /// liveness PR wires re-permission. Errors when `new` is not this
-    /// node's ContextData type, or through the system context (whose
-    /// member sessions update via their own contexts).
+    /// holder reads the new value on its next operation, and the relay
+    /// re-permissions this context's remote subscriptions with it. Errors
+    /// when `new` is not this node's ContextData type, or through the
+    /// system context (whose member sessions update via their own
+    /// contexts).
     pub fn update_cdata<CD: crate::node::ContextData>(&self, new: CD) -> Result<(), UpdateCdataError> { self.0.update_cdata(Box::new(new)) }
 
     pub fn node_id(&self) -> proto::EntityId { self.0.node_id() }

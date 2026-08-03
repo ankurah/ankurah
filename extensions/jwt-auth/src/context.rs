@@ -10,7 +10,7 @@ use ankurah_proto as proto;
 /// Equality and hash are full-value — claims and token — because
 /// `ContextData`'s contract is operational identity and `Session` update
 /// delivery gates on it: a token refresh compares unequal and
-/// propagates; an identical update is a no-op.
+/// re-permissions; an identical update is a no-op.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum JwtContext {
     User { claims: JwtClaims, token: String },

@@ -405,14 +405,6 @@ impl<E: AbstractEntity> EntityResultSet<E> {
         self.0.loaded.load(Ordering::Relaxed)
     }
 
-    pub fn clear(&self) {
-        let mut st = self.0.state.lock().unwrap();
-        st.order.clear();
-        st.index.clear();
-        drop(st);
-        self.0.broadcast.send(());
-    }
-
     /// Get an iterator over entity IDs without cloning entities
     pub fn keys(&self) -> EntityResultSetKeyIterator {
         // TODO make a signal trait for tracked keys
@@ -421,6 +413,12 @@ impl<E: AbstractEntity> EntityResultSet<E> {
         let keys: Vec<proto::EntityId> = st.order.iter().map(|e| *e.entity.id()).collect();
         EntityResultSetKeyIterator::new(keys)
     }
+
+    /// Handle identity: whether two EntityResultSet values share one
+    /// underlying instance. The deferred-write and gap-fill liveness
+    /// gates require it because (query id, version) alone is reusable
+    /// across registration incarnations of the same query.
+    pub(crate) fn same_instance(&self, other: &Self) -> bool { std::sync::Arc::ptr_eq(&self.0, &other.0) }
 
     /// Check if an entity with the given ID exists
     pub fn contains_key(&self, id: &proto::EntityId) -> bool {
@@ -448,6 +446,11 @@ impl<E: AbstractEntity> EntityResultSet<E> {
         let st = self.0.state.lock().unwrap();
         st.gap_dirty
     }
+
+    /// Re-arm gap filling: a fill that was extracted (clearing the flag)
+    /// but then dropped by the liveness gate re-marks, so the query's
+    /// CURRENT version re-extracts instead of staying short forever.
+    pub(crate) fn mark_gap_dirty(&self) { self.0.state.lock().unwrap_or_else(|e| e.into_inner()).gap_dirty = true; }
 
     /// Clear the gap_dirty flag (called after gap filling is complete)
     pub(crate) fn clear_gap_dirty(&self) {
@@ -510,8 +513,10 @@ impl<E: AbstractEntity> EntityResultSet<E> {
             st.index.insert(id, i);
         }
 
-        drop(st);
-        self.0.broadcast.send(());
+        // No broadcast here: the sole production caller (update_query)
+        // runs this under the reactor's state lock, where subscriber
+        // callbacks must not fire, and its enclosing write transaction
+        // always broadcasts at the end of the same update.
     }
 
     /// Set the limit for this result set
@@ -526,11 +531,9 @@ impl<E: AbstractEntity> EntityResultSet<E> {
         st.limit = limit;
 
         // Apply the new limit by truncating if necessary
-        let mut entities_removed = false;
         if let Some(limit) = limit {
             if st.order.len() > limit {
                 st.order.truncate(limit);
-                entities_removed = true;
 
                 // Rebuild index after truncation
                 st.index.clear();
@@ -541,12 +544,8 @@ impl<E: AbstractEntity> EntityResultSet<E> {
             }
         }
 
-        drop(st);
-
-        // Only broadcast if entities were actually removed
-        if entities_removed {
-            self.0.broadcast.send(());
-        }
+        // No broadcast even when a truncation removed entities: see
+        // order_by — the enclosing write transaction broadcasts.
     }
 }
 

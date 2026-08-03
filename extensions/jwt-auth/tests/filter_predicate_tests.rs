@@ -190,3 +190,104 @@ fn test_filter_predicate_injection_payload_is_inert() {
         other => panic!("Expected AND predicate, got: {:?}", other),
     }
 }
+
+/// Multiple authenticated contexts see the UNION of their scoped slices:
+/// the effective filter is the OR of each context's narrowed predicate,
+/// never just the first context's.
+#[test]
+fn test_filter_predicate_unions_across_contexts() {
+    let config_json = r#"{
+        "roles": { "Worker": ["view_records"] },
+        "collections": {
+            "record": {
+                "read": "view_records",
+                "write": "manage_records",
+                "scope": [{ "filter": "owner = $jwt.sub" }]
+            }
+        }
+    }"#;
+    let config: PolicyConfig = serde_json::from_str(config_json).unwrap();
+
+    let keys = common::test_keys();
+    let agent = JwtAgent::new_ephemeral();
+    agent.update_config(config);
+    agent.set_keys(JwtKeys::Signing(keys.clone()));
+
+    let make_ctx = |sub: &str| {
+        let claims = JwtClaims {
+            sub: sub.into(),
+            roles: vec!["Worker".into()],
+            email: format!("{sub}@co.com"),
+            name: None,
+            custom: serde_json::Map::new(),
+        };
+        let token = keys.sign(&claims, Duration::from_hours(1)).unwrap();
+        JwtContext::from_claims(claims, token)
+    };
+
+    let contexts = vec![make_ctx("worker-1"), make_ctx("worker-2")];
+    let predicate = make_predicate("status = 'active'");
+    let collection = CollectionId::from("record");
+
+    let result = agent.filter_predicate(&contexts, &collection, predicate).unwrap();
+
+    match &result {
+        Predicate::Or(first, second) => {
+            let first = format!("{}", first);
+            let second = format!("{}", second);
+            assert!(first.contains("worker-1") && first.contains("active"), "first narrowing: {}", first);
+            assert!(second.contains("worker-2") && second.contains("active"), "second narrowing: {}", second);
+        }
+        other => panic!("Expected OR of per-context narrowings, got: {:?}", other),
+    }
+}
+
+/// The union is over AUTHORIZED contexts only: an authenticated context
+/// whose roles lack the collection's read privilege contributes no
+/// branch (its scoped slice would expose rows no authorized credential
+/// could read), and a set with no authorized context is denied outright.
+#[test]
+fn test_filter_predicate_excludes_unauthorized_contexts() {
+    let config_json = r#"{
+        "roles": { "Worker": ["view_records"], "Guest": ["view_lobby"] },
+        "collections": {
+            "record": {
+                "read": "view_records",
+                "write": "manage_records",
+                "scope": [{ "filter": "owner = $jwt.sub" }]
+            }
+        }
+    }"#;
+    let config: PolicyConfig = serde_json::from_str(config_json).unwrap();
+
+    let keys = common::test_keys();
+    let agent = JwtAgent::new_ephemeral();
+    agent.update_config(config);
+    agent.set_keys(JwtKeys::Signing(keys.clone()));
+
+    let make_ctx = |sub: &str, role: &str| {
+        let claims = JwtClaims {
+            sub: sub.into(),
+            roles: vec![role.into()],
+            email: format!("{sub}@co.com"),
+            name: None,
+            custom: serde_json::Map::new(),
+        };
+        let token = keys.sign(&claims, Duration::from_hours(1)).unwrap();
+        JwtContext::from_claims(claims, token)
+    };
+
+    let alice = make_ctx("alice-authorized", "Worker");
+    let bob = make_ctx("bob-unauthorized", "Guest");
+    let predicate = make_predicate("status = 'active'");
+    let collection = CollectionId::from("record");
+
+    let result = agent.filter_predicate(&vec![alice, bob.clone()], &collection, predicate.clone()).unwrap();
+    let display = format!("{}", result);
+    assert!(matches!(result, Predicate::And(..)), "one authorized context degenerates to its single narrowing, got: {}", display);
+    assert!(display.contains("alice-authorized"), "the authorized context's scope must be present in: {}", display);
+    assert!(!display.contains("bob-unauthorized"), "the unauthorized context must contribute no branch to: {}", display);
+
+    let denied = agent.filter_predicate(&vec![bob], &collection, predicate);
+    assert!(denied.is_err(), "a set with no authorized context is denied, got: {:?}", denied);
+}
