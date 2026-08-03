@@ -138,7 +138,7 @@ where PA: PolicyAgent
     rng: Mutex<SmallRng>,
 
     /// The node's live credential sessions, one per ordinary Context
-    /// (a set-backed context reads this whole set instead), culled by
+    /// (the system context reads this whole set instead), culled by
     /// RAII when the last holder drops.
     pub sessions: crate::session::SessionSet<PA::ContextData>,
 
@@ -857,6 +857,13 @@ where
         self.system.wait_system_ready().await;
         Context::new(Node::clone(self), data)
     }
+
+    /// The context system queries read through: credentialed by the node's
+    /// whole live SessionSet, so reads run under the union of active
+    /// credentials and re-permission as sessions come, go, and refresh.
+    /// Not a user surface; write operations refuse through it.
+    #[allow(dead_code)] // First consumer is the catalog manager (next PR).
+    pub(crate) fn system_context(&self) -> Context { Context::new_system(Node::clone(self)) }
 
     pub(crate) async fn get_from_peer(
         &self,

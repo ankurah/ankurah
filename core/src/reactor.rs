@@ -4,6 +4,7 @@ pub mod fetch_gap;
 mod property_path;
 mod subscription;
 mod subscription_state;
+pub(crate) use subscription_state::QueryAlreadyRegistered;
 mod update;
 mod watcherset;
 
@@ -176,6 +177,12 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
             let mut watcher_set = self.0.watcher_set.lock().unwrap();
             let watcher_id = (subscription_id, query_id);
             watcher_set.recurse_predicate_watchers(&query_state.collection_id, &selection.predicate, watcher_id, WatcherOp::Remove);
+            // The per-entity watchers are keyed by (subscription, query)
+            // and must leave with the query: left behind, they keep
+            // routing those entities here after removal and merge into a
+            // re-added query's watcher set.
+            let entity_ids: Vec<ankurah_proto::EntityId> = query_state.resultset.keys().collect();
+            watcher_set.cleanup_removed_predicate_watchers(subscription_id, query_id, &entity_ids);
         }
     }
 
@@ -253,6 +260,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
     /// Add a query and send initialization notification (for local subscriptions)
     /// Collects ReactorUpdateItems and sends them
     /// pre_notify_hook is called before sending notification (e.g., to mark LiveQuery initialized)
+    #[allow(clippy::too_many_arguments)]
     pub async fn add_query_and_notify<H: PreNotifyHook>(
         &self,
         subscription_id: ReactorSubscriptionId,
@@ -262,6 +270,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         node: &dyn crate::node::TNodeErased<E>,
         resultset: EntityResultSet<E>,
         gap_fetcher: std::sync::Arc<dyn GapFetcher<E>>,
+        version: u32,
         pre_notify_hook: H,
     ) -> anyhow::Result<()> {
         // Get subscription reference
@@ -284,7 +293,9 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
             collection_id.clone(),
             selection.clone(),
             included_entities,
-            1, // version 1 for initial add
+            // A first activation is not always version 1: a query healing
+            // from Denied re-enters here at its current version.
+            version,
             &mut reactor_update_items,
         )?;
 
@@ -297,8 +308,8 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         // Mark as loaded
         resultset.set_loaded(true);
 
-        // Call pre-notify hook (e.g., mark LiveQuery as initialized) with version 1
-        pre_notify_hook.pre_notify(1);
+        // Call pre-notify hook (e.g., mark LiveQuery as initialized)
+        pre_notify_hook.pre_notify(version);
 
         // Send the notification with collected items. We always notify because we're initializing the query.
         subscription.send_update(reactor_update_items);
@@ -408,8 +419,12 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
             watcher_set.clear_entity_watchers();
         }
 
-        let subscriptions = self.0.subscriptions.lock().unwrap();
-        for subscription in subscriptions.values() {
+        // Collect the handles and release the GLOBAL mutex before any
+        // per-subscription reset runs: resets broadcast (resultset clears
+        // and ReactorUpdates), and a subscriber that synchronously revokes
+        // a credential re-enters remove_query, which needs this mutex.
+        let subscriptions: Vec<_> = self.0.subscriptions.lock().unwrap().values().cloned().collect();
+        for subscription in subscriptions {
             subscription.system_reset();
         }
     }
@@ -623,7 +638,7 @@ mod tests {
 
         // Add query using the reactor - this should send Initial notification
         reactor
-            .add_query_and_notify(rsub.id(), query_id, collection_id, selection, &mock_node, resultset, mock_gap_fetcher, ())
+            .add_query_and_notify(rsub.id(), query_id, collection_id, selection, &mock_node, resultset, mock_gap_fetcher, 1, ())
             .await
             .unwrap();
 
@@ -735,5 +750,81 @@ mod tests {
         let mut sorted2 = order2.clone();
         sorted2.sort();
         assert_eq!(order2, sorted2, "emission order must be sorted by subscription id on the second run too");
+    }
+
+    /// A deferred ADD whose query is superseded mid-batch is RE-DECIDED
+    /// against the superseding selection, not discarded. The superseding
+    /// update_query only re-adds entities its caller fetched BEFORE
+    /// taking the state lock, so an entity that persisted after that
+    /// fetch is re-decided by nobody else: discarding it here would
+    /// leave a row matching the current selection silently missing until
+    /// the entity next changes. The listener performs the supersede
+    /// re-entrantly from the FIRST deferred write's broadcast, with an
+    /// empty included_entities standing in for the pre-batch fetch,
+    /// which is exactly that interleave.
+    #[tokio::test]
+    async fn superseded_deferred_add_is_redecided_not_discarded() {
+        use ankurah_signals::Signal;
+
+        let reactor = Reactor::<TestEntity, TestEvent>::new();
+        let rsub = reactor.subscribe();
+
+        let query_id = QueryId::new();
+        let collection_id = CollectionId::fixed_name("album");
+        let selection: ankql::ast::Selection = "status = 'pending'".try_into().unwrap();
+        let resultset: EntityResultSet<TestEntity> = EntityResultSet::empty();
+        let mock_gap_fetcher = Arc::new(MockGapFetcher::new());
+        let empty_node = MockNode { entities: vec![] };
+
+        reactor
+            .add_query_and_notify(
+                rsub.id(),
+                query_id,
+                collection_id.clone(),
+                selection,
+                &empty_node,
+                resultset.clone(),
+                mock_gap_fetcher,
+                1,
+                (),
+            )
+            .await
+            .unwrap();
+
+        // The internal subscription handle, so the listener can run the
+        // superseding update_query synchronously from inside dispatch.
+        let subscription = reactor.0.subscriptions.lock().unwrap().get(&rsub.id()).cloned().unwrap();
+
+        let superseded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _listener_guard = {
+            let superseded = superseded.clone();
+            let collection_id = collection_id.clone();
+            resultset.listen(Arc::new(move |_| {
+                if !superseded.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    // Same membership, new text: an ordinary re-permission
+                    // mints a version without changing what matches.
+                    let v2: ankql::ast::Selection = "status = 'pending' AND name != 'nope'".try_into().unwrap();
+                    subscription
+                        .update_query(query_id, collection_id.clone(), v2, vec![], 2, &mut Vec::new())
+                        .expect("re-entrant supersede must not fail");
+                }
+            }))
+        };
+
+        // One batch, two matching entities: two deferred adds. The first
+        // add's broadcast supersedes to version 2; the second add must be
+        // re-decided against version 2's selection, not dropped.
+        let e1 = TestEntity::new("first", "pending");
+        let e2 = TestEntity::new("second", "pending");
+        reactor
+            .notify_change(vec![TestChange { entity: e1.clone(), events: vec![] }, TestChange { entity: e2.clone(), events: vec![] }])
+            .await;
+
+        assert!(superseded.load(std::sync::atomic::Ordering::SeqCst), "the first write's broadcast must have superseded the query");
+        let mut ids: Vec<proto::EntityId> = resultset.keys().collect();
+        ids.sort();
+        let mut expected = vec![e1.id, e2.id];
+        expected.sort();
+        assert_eq!(ids, expected, "both batch entities belong to the superseding selection's resultset");
     }
 }

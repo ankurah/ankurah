@@ -155,6 +155,9 @@ impl WatcherSet {
         for entity_id in removed_entities {
             if let Some(entity_watcher) = self.entity_watchers.get_mut(entity_id) {
                 entity_watcher.remove(&EntityWatcherId::Predicate(subscription_id, query_id));
+                if entity_watcher.is_empty() {
+                    self.entity_watchers.remove(entity_id);
+                }
             }
         }
     }

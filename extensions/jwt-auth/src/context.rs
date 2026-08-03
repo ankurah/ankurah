@@ -2,6 +2,7 @@ use crate::claims::JwtClaims;
 use ankurah_core::node::ContextData;
 use ankurah_core::policy::AccessDenied;
 use ankurah_proto as proto;
+use async_trait::async_trait;
 
 /// The context data extracted from a validated JWT, used for all policy checks.
 /// `Root` represents a privileged system context that bypasses all RBAC checks.
@@ -10,7 +11,7 @@ use ankurah_proto as proto;
 /// Equality and hash are full-value — claims and token — because
 /// `ContextData`'s contract is operational identity and `Session` update
 /// delivery gates on it: a token refresh compares unequal and
-/// propagates; an identical update is a no-op.
+/// re-permissions; an identical update is a no-op.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum JwtContext {
     User { claims: JwtClaims, token: String },
@@ -71,4 +72,5 @@ impl JwtContext {
     }
 }
 
+#[async_trait]
 impl ContextData for JwtContext {}

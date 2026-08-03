@@ -4,9 +4,8 @@
 //! A Session wraps the current ContextData in a signal, so a long-lived
 //! handle's credential can change (a token refresh, a re-login) without
 //! rebuilding the Context or the livequeries under it: holders keep the
-//! session and read the current value at use time, and change
-//! subscribers hear each effective update (the liveness PR's relay
-//! re-permissions remote subscriptions on it).
+//! session and read the current value at use time, and subscribers (the
+//! relay) react to a change by re-permissioning remote subscriptions.
 //! The SessionSet tracks the node's live sessions, undeduplicated: two
 //! sessions whose credentials compare equal today are still independent
 //! and may diverge tomorrow, so any deduplication happens at the point of
@@ -40,12 +39,20 @@ pub trait ContextData: Send + Sync + Clone + std::hash::Hash + Eq + 'static {}
 
 /// One live credential: the value a single principal acts under,
 /// replaceable in place. An ordinary context registers exactly one in
-/// the node's [`SessionSet`]; a set-backed context reads through the
+/// the node's [`SessionSet`]; the system context reads through the
 /// whole set instead. Queries and their machinery (livequeries, gap
 /// fetchers, the relay) hold their context's [`Sessions`] source and
 /// read its current value once per operation.
 pub struct Session<CD: ContextData> {
     current: Mut<CD>,
+    /// Needed to close the TOCTOU between deriving state from a credential
+    /// snapshot and subscribing to its changes (the livequery constructor
+    /// re-checks it once its listener is live). Value comparison cannot
+    /// serve as that re-check: a change-and-revert inside the window (a
+    /// re-login to another user and back) leaves the value equal to the
+    /// snapshot while an in-window send may have shipped the interloper.
+    /// Bumped before the value stores, once per effective update.
+    generation: std::sync::atomic::AtomicU64,
     /// The owning [`SessionSet`] slot, absent for detached sessions.
     registry: Option<(Weak<SessionSetInner<CD>>, u64)>,
 }
@@ -54,7 +61,9 @@ impl<CD: ContextData> Session<CD> {
     /// A session outside any SessionSet: infrastructure credentials (and
     /// server-side per-query holders) that must not participate in the
     /// node's active-session enumeration.
-    pub fn detached(cdata: CD) -> Arc<Self> { Arc::new(Self { current: Mut::new(cdata), registry: None }) }
+    pub fn detached(cdata: CD) -> Arc<Self> {
+        Arc::new(Self { current: Mut::new(cdata), generation: std::sync::atomic::AtomicU64::new(0), registry: None })
+    }
 
     /// A snapshot of the current credential. Take one per logical
     /// operation, so a mid-operation update cannot mix credentials. (Named
@@ -63,8 +72,8 @@ impl<CD: ContextData> Session<CD> {
     pub fn snapshot(&self) -> CD { self.current.value() }
 
     /// Replace the credential. A value comparing equal to the current one
-    /// is a complete no-op, no store and no notification: `Eq` is
-    /// operational identity per [`ContextData`], so
+    /// is a complete no-op — no store, no generation bump, no
+    /// notification: `Eq` is operational identity per [`ContextData`], so
     /// equal means nothing observable changed and there is nothing to
     /// re-permission. A token refresh carries a new token, compares
     /// unequal, and notifies holders and change subscribers.
@@ -77,8 +86,17 @@ impl<CD: ContextData> Session<CD> {
         if self.current.value() == cdata {
             return;
         }
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        if let Some((registry, _)) = &self.registry {
+            if let Some(registry) = registry.upgrade() {
+                registry.generation.fetch_add(1, Ordering::SeqCst);
+            }
+        }
         self.current.set(cdata);
     }
+
+    /// The effective-update count; see the field doc for the TOCTOU it closes.
+    pub fn generation(&self) -> u64 { self.generation.load(Ordering::SeqCst) }
 
     /// Subscribe to credential changes; the listener receives each new
     /// value. Dropping the guard unsubscribes.
@@ -121,6 +139,7 @@ impl<CD: ContextData> Session<CD> {
     pub(crate) fn revoke(&self) {
         if let Some((registry, slot)) = &self.registry {
             if let Some(registry) = registry.upgrade() {
+                registry.generation.fetch_add(1, Ordering::SeqCst);
                 if registry.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(slot).is_some() {
                     // Fire outside the lock: subscribers read the set back.
                     registry.changed.send(());
@@ -156,6 +175,11 @@ struct SessionSetInner<CD: ContextData> {
     /// Fires on any membership change (register, cull) and on any live
     /// member's value change (each slot forwards its session's signal).
     changed: Broadcast<()>,
+    /// Composite update count, bumped BEFORE the change it counts becomes
+    /// observable (registrations, culls, and member updates alike), so the
+    /// snapshot-then-subscribe re-check ([`Session::generation`]) works
+    /// over the whole set.
+    generation: AtomicU64,
 }
 
 struct SessionSlot<CD: ContextData> {
@@ -167,13 +191,20 @@ struct SessionSlot<CD: ContextData> {
 
 impl<CD: ContextData> SessionSet<CD> {
     pub fn new() -> Self {
-        Self(Arc::new(SessionSetInner { sessions: Mutex::new(HashMap::new()), next_slot: AtomicU64::new(0), changed: Broadcast::new() }))
+        Self(Arc::new(SessionSetInner {
+            sessions: Mutex::new(HashMap::new()),
+            next_slot: AtomicU64::new(0),
+            changed: Broadcast::new(),
+            generation: AtomicU64::new(0),
+        }))
     }
 
     /// Register a new live session holding `cdata`.
     pub fn register(&self, cdata: CD) -> Arc<Session<CD>> {
+        self.0.generation.fetch_add(1, Ordering::SeqCst);
         let slot = self.0.next_slot.fetch_add(1, Ordering::Relaxed);
-        let session = Arc::new(Session { current: Mut::new(cdata), registry: Some((Arc::downgrade(&self.0), slot)) });
+        let session =
+            Arc::new(Session { current: Mut::new(cdata), generation: AtomicU64::new(0), registry: Some((Arc::downgrade(&self.0), slot)) });
         let forward = {
             let changed = self.0.changed.clone();
             session.subscribe_changes(move |_new: CD| changed.send(()))
@@ -198,14 +229,20 @@ impl<CD: ContextData> SessionSet<CD> {
 
     /// The current credential of every live session, in slot order.
     pub fn current(&self) -> Vec<CD> { self.sessions().iter().map(|session| session.snapshot()).collect() }
+
+    /// The composite update count; see [`Session::generation`] for the
+    /// TOCTOU it closes. Moves on registrations, culls, and member
+    /// updates alike.
+    pub fn generation(&self) -> u64 { self.0.generation.load(Ordering::SeqCst) }
 }
 
 /// The credential source behind a query: exactly one session (an ordinary
 /// context's query), the node's whole live set (a system query), or a
 /// held set the query's server side replaces wholesale on re-validated
 /// subscribes. Sends snapshot the CURRENT credentials; subscribers fire
-/// on any change. Only `One` can write: the other arms act as no
-/// single principal.
+/// on any change, and the composite generation closes the same
+/// snapshot-then-subscribe TOCTOU as [`Session::generation`]. Only `One`
+/// can write: the other arms act as no single principal.
 pub enum Sessions<CD: ContextData> {
     One(Arc<Session<CD>>),
     Set(SessionSet<CD>),
@@ -239,6 +276,30 @@ impl<CD: ContextData> Sessions<CD> {
             Self::One(session) => vec![session.snapshot()],
             Self::Set(set) => set.current(),
             Self::Held(holder) => holder.0.set.current(),
+        }
+    }
+
+    /// Subscribe to credential changes; the listener receives the new
+    /// current credentials. For a set, membership changes fire too.
+    pub fn subscribe_changes<F>(&self, listener: F) -> SubscriptionGuard
+    where F: IntoSubscribeListener<Vec<CD>> {
+        match self {
+            Self::One(session) => {
+                let listener = listener.into_subscribe_listener();
+                session.subscribe_changes(move |cdata: CD| listener(vec![cdata]))
+            }
+            Self::Set(set) => set.subscribe(listener),
+            Self::Held(holder) => holder.0.set.subscribe(listener),
+        }
+    }
+
+    /// The update count; see [`Session::generation`] for the TOCTOU it
+    /// closes.
+    pub fn generation(&self) -> u64 {
+        match self {
+            Self::One(session) => session.generation(),
+            Self::Set(set) => set.generation(),
+            Self::Held(holder) => holder.0.set.generation(),
         }
     }
 }
@@ -335,6 +396,10 @@ impl<CD: ContextData> Subscribe<Vec<CD>> for SessionSet<CD> {
     }
 }
 
+impl<CD: ContextData> Default for SessionSet<CD> {
+    fn default() -> Self { Self::new() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -406,7 +471,7 @@ mod tests {
 
     /// A token refresh — same subject, new token — is a real change: it
     /// compares unequal and fires the subscriber. An identical update is
-    /// a complete no-op: no notification.
+    /// a complete no-op: no notification, no generation bump.
     #[test]
     fn refresh_notifies_and_identical_update_is_a_noop() {
         let session = Session::detached(TestCd { subject: 1, token: 1 });
@@ -421,8 +486,10 @@ mod tests {
         session.update(refreshed);
         assert_eq!(seen.lock().unwrap().as_slice(), &[2], "the refresh fires the subscriber");
 
+        let before = session.generation();
         session.update(TestCd { subject: 1, token: 2 });
         assert_eq!(seen.lock().unwrap().as_slice(), &[2], "an identical update does not notify");
+        assert_eq!(session.generation(), before, "an identical update does not bump the generation");
         assert_eq!(session.snapshot().token, 2, "the stored value is unchanged");
     }
 
@@ -432,6 +499,21 @@ mod tests {
         let set: SessionSet<TestCd> = SessionSet::new();
         let _infra = Session::detached(TestCd { subject: 1, token: 0 });
         assert!(set.sessions().is_empty());
+    }
+
+    /// The generation bumps once per effective update and not for gated
+    /// no-ops: the snapshot-then-subscribe re-check must see exactly the
+    /// updates that changed something.
+    #[test]
+    fn generation_counts_every_effective_update() {
+        let session = Session::detached(TestCd { subject: 1, token: 1 });
+        let before = session.generation();
+        session.update(TestCd { subject: 1, token: 2 });
+        assert_eq!(session.generation(), before + 1, "a refresh bumps");
+        session.update(TestCd { subject: 2, token: 3 });
+        assert_eq!(session.generation(), before + 2);
+        session.update(TestCd { subject: 2, token: 3 });
+        assert_eq!(session.generation(), before + 2, "an identical update does not bump");
     }
 
     /// The set is a signal over the union of current credentials: it
@@ -463,6 +545,48 @@ mod tests {
         drop(b);
         assert_eq!(fired.lock().unwrap().last(), Some(&Vec::new()));
         assert_eq!(fired.lock().unwrap().len(), count + 1, "exactly the final cull fired");
+    }
+
+    /// The set's composite generation moves on registrations, culls, and
+    /// member updates alike, closing the construction window for
+    /// set-backed consumers the way [`Session::generation`] does for
+    /// single-session ones.
+    #[test]
+    fn set_generation_counts_every_change() {
+        let set: SessionSet<TestCd> = SessionSet::new();
+        let after_new = set.generation();
+        let a = set.register(TestCd { subject: 1, token: 0 });
+        assert!(set.generation() > after_new, "a registration bumps");
+        let after_register = set.generation();
+        a.update(TestCd { subject: 1, token: 1 });
+        assert!(set.generation() > after_register, "a member update bumps the set too");
+        let after_update = set.generation();
+        drop(a);
+        assert!(set.generation() > after_update, "a cull bumps");
+    }
+
+    /// A `Sessions` source unifies the two credential shapes: One
+    /// snapshots a vec of one and forwards its session's updates; Set
+    /// snapshots the union.
+    #[test]
+    fn sessions_source_unifies_one_and_set() {
+        let set: SessionSet<TestCd> = SessionSet::new();
+        let session = set.register(TestCd { subject: 1, token: 1 });
+
+        let one: Sessions<TestCd> = session.clone().into();
+        assert_eq!(one.snapshot(), vec![TestCd { subject: 1, token: 1 }]);
+
+        let many: Sessions<TestCd> = set.clone().into();
+        let _b = set.register(TestCd { subject: 2, token: 2 });
+        assert_eq!(many.snapshot().len(), 2, "a Set source snapshots every live credential");
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let _guard = one.subscribe_changes(move |current: Vec<TestCd>| {
+            sink.lock().unwrap().push(current.len());
+        });
+        session.update(TestCd { subject: 1, token: 9 });
+        assert_eq!(seen.lock().unwrap().as_slice(), &[1], "a One source forwards its session's update as a vec of one");
     }
 
     /// Peek reads the union without tracking; the porcelain and the

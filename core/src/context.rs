@@ -85,9 +85,8 @@ pub trait TContext {
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError>;
     /// Replace this context's credential (type-erased across the trait
     /// object; [`Context::update_cdata`] is the typed surface). Holders of
-    /// the session observe the new value on their next operation. STANDING
-    /// queries keep their creation-time derivation; the liveness PR wires
-    /// re-permission.
+    /// the session observe the new value on their next operation, and the
+    /// relay re-permissions this context's remote subscriptions.
     fn update_cdata(&self, new: Box<dyn std::any::Any + Send>) -> Result<(), UpdateCdataError>;
 }
 
@@ -299,14 +298,25 @@ impl Context {
         Self(Arc::new(NodeAndContext { node, sessions: session.into() }))
     }
 
+    /// A context reading under the union of the node's live credentials,
+    /// reactively (the credential source is the node's whole SessionSet).
+    /// For system queries such as the catalog manager's; not a user
+    /// surface. Write operations, registration, and update_cdata refuse
+    /// through it, because they act as one principal.
+    pub(crate) fn new_system<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static>(
+        node: Node<SE, PA>,
+    ) -> Self {
+        let sessions = crate::session::Sessions::Set(node.sessions.clone());
+        Self(Arc::new(NodeAndContext { node, sessions }))
+    }
+
     /// Replace this context's credential in place: a token refresh or a
     /// re-login. Livequeries and pending operations keep running; each
-    /// holder reads the new value on its next operation, so commits,
-    /// fetches, and NEW queries run under the refreshed credential.
-    /// STANDING queries keep their creation-time derivation until the
-    /// liveness PR wires re-permission. Errors when `new` is not this
-    /// node's ContextData type, or through the system context (whose
-    /// member sessions update via their own contexts).
+    /// holder reads the new value on its next operation, and the relay
+    /// re-permissions this context's remote subscriptions with it. Errors
+    /// when `new` is not this node's ContextData type, or through the
+    /// system context (whose member sessions update via their own
+    /// contexts).
     pub fn update_cdata<CD: crate::node::ContextData>(&self, new: CD) -> Result<(), UpdateCdataError> { self.0.update_cdata(Box::new(new)) }
 
     pub fn node_id(&self) -> proto::EntityId { self.0.node_id() }
@@ -397,9 +407,9 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    /// The single credential write paths require. Set- and holder-backed
-    /// contexts refuse: commits, registration, and event attestation act
-    /// as one principal, and a union has no single principal to act as.
+    /// The single credential write paths require. The system context
+    /// refuses: commits, registration, and event attestation act as one
+    /// principal, and the union has no single principal to act as.
     fn write_credential(&self) -> Result<PA::ContextData, AccessDenied> {
         match &self.sessions {
             crate::session::Sessions::One(session) => Ok(session.snapshot()),
@@ -434,7 +444,7 @@ where
             debug!("Node({}).get_entity found local entity - returning", self.node.id);
             let state = local.to_state()?;
             let entity_id = local.id();
-            self.node.policy_agent.check_read(&self.sessions.snapshot(), &entity_id, collection_id, &state)?;
+            self.node.policy_agent.check_read(&cdata, &entity_id, collection_id, &state)?;
             return Ok(local);
         }
         debug!("{}.get_entity fetching from storage", self.node);
@@ -442,12 +452,7 @@ where
         let collection = self.node.collections.get(collection_id).await?;
         match collection.get_state(id).await {
             Ok(entity_state) => {
-                self.node.policy_agent.check_read(
-                    &self.sessions.snapshot(),
-                    &entity_state.payload.entity_id,
-                    collection_id,
-                    &entity_state.payload.state,
-                )?;
+                self.node.policy_agent.check_read(&cdata, &entity_state.payload.entity_id, collection_id, &entity_state.payload.state)?;
                 let state_getter = crate::retrieval::LocalStateGetter::new(collection.clone());
                 let event_getter = crate::retrieval::CachedEventGetter::new(collection_id.clone(), collection, &self.node, &cdata);
                 let (_changed, entity) = self
@@ -462,13 +467,11 @@ where
     }
     /// Fetch a list of entities based on a selection
     pub async fn fetch_entities(&self, collection_id: &CollectionId, mut args: MatchArgs) -> Result<Vec<Entity>, RetrievalError> {
-        self.node.policy_agent.can_access_collection(&self.sessions.snapshot(), collection_id)?;
+        let cdata = self.sessions.snapshot();
+        self.node.policy_agent.can_access_collection(&cdata, collection_id)?;
         // Fetch raw states from storage
 
-        args.selection.predicate =
-            self.node.policy_agent.filter_predicate(&self.sessions.snapshot(), collection_id, args.selection.predicate)?;
-
-        let cdata = self.sessions.snapshot();
+        args.selection.predicate = self.node.policy_agent.filter_predicate(&cdata, collection_id, args.selection.predicate)?;
 
         // Resolve types in the AST (converts literals for JSON path comparisons)
         args.selection = self.node.type_resolver.resolve_selection_types(args.selection);

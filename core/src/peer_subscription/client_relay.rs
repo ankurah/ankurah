@@ -19,18 +19,37 @@ pub trait RemoteQuerySubscriber: Clone + Send + Sync + 'static {
     /// Handles marking initialization as complete and setting last_error on failure
     async fn subscription_established(&self, version: u32);
 
-    /// Set the last error for this subscription
-    fn set_last_error(&self, error: RetrievalError);
+    /// Latch a relay-leg error, floored on the same report sequence as
+    /// the status transition it accompanies: a superseded failure's late
+    /// latch must not overwrite a newer attempt's recovery.
+    fn set_last_error(&self, seq: u64, error: RetrievalError);
+
+    /// Report a remote-leg transition; the livequery folds it into its
+    /// public status signal. `seq` is drawn under the relay's lock at the
+    /// transition and floors delivery: reports dispatch outside the lock,
+    /// so a delayed older report must never overwrite a newer one.
+    fn remote_status(&self, seq: u64, status: crate::livequery::RemoteStatus);
 }
 
 #[derive(Debug, Clone)]
 pub enum Status {
     PendingRemote,
-    Requested(proto::EntityId, u32),     // peer_id, version
-    Established(proto::EntityId, u32),   // peer_id, version
-    PendingUpdate(proto::EntityId, u32), // peer_id, version
+    Requested(proto::EntityId, u32),   // peer_id, version
+    Established(proto::EntityId, u32), // peer_id, version
     /// Non-retryable
     Failed,
+}
+
+/// The public projection of a [`Status`] transition, for the derivable
+/// arms; `Failed` carries no error here, so its reports are built where
+/// the error is in hand (`handle_error`).
+fn projected(status: &Status) -> Option<crate::livequery::RemoteStatus> {
+    match status {
+        Status::PendingRemote => Some(crate::livequery::RemoteStatus::Pending),
+        Status::Requested(_, version) => Some(crate::livequery::RemoteStatus::Requested { version: *version }),
+        Status::Established(_, version) => Some(crate::livequery::RemoteStatus::Established { version: *version }),
+        Status::Failed => None,
+    }
 }
 
 #[derive(Debug)]
@@ -49,6 +68,32 @@ pub struct RemoteQueryState<CD: ContextData, Q: RemoteQuerySubscriber> {
     pub content: Arc<Content<CD>>,
     pub status: Status,
     pub livequery: Q,
+    /// Monotonic stamp for status reports, drawn under the subscriptions
+    /// lock at each transition; the livequery floors on it.
+    pub report_seq: u64,
+    /// Monotonic per-entry attempt id, bumped under the lock every time
+    /// a send is dispatched. `(peer, version)` alone is REUSABLE (a
+    /// reconnect of the same peer re-sends the same version), so reports
+    /// must also match the attempt that produced them or two attempts
+    /// alias and a dead one can resolve its successor's state.
+    pub attempt: u64,
+}
+
+impl<CD: ContextData, Q: RemoteQuerySubscriber> RemoteQueryState<CD, Q> {
+    /// Stamp the CURRENT status for reporting: bump the sequence under
+    /// the lock and project. Dispatch the returned report after the lock
+    /// is released.
+    fn stamp(&mut self) -> Option<(u64, crate::livequery::RemoteStatus, Q)> {
+        let report = projected(&self.status)?;
+        self.report_seq += 1;
+        Some((self.report_seq, report, self.livequery.clone()))
+    }
+
+    /// Stamp with an explicit report (the non-derivable Failed arms).
+    fn stamp_with(&mut self, report: crate::livequery::RemoteStatus) -> (u64, crate::livequery::RemoteStatus, Q) {
+        self.report_seq += 1;
+        (self.report_seq, report, self.livequery.clone())
+    }
 }
 
 struct SubscriptionRelayInner<CD: ContextData, Q: RemoteQuerySubscriber> {
@@ -137,15 +182,20 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         livequery: Q,
     ) {
         debug!("SubscriptionRelay.subscribe_predicate() - New predicate {} needs remote registration", query_id);
-        {
-            self.inner.subscriptions.lock().expect("poisoned lock").insert(
-                query_id,
-                RemoteQueryState {
-                    content: Arc::new(Content { collection_id, selection, sessions, query_id, version }),
-                    status: Status::PendingRemote,
-                    livequery,
-                },
-            );
+        let stamped = {
+            let mut state = RemoteQueryState {
+                content: Arc::new(Content { collection_id, selection, sessions, query_id, version }),
+                status: Status::PendingRemote,
+                livequery,
+                report_seq: 0,
+                attempt: 0,
+            };
+            let stamped = state.stamp();
+            self.inner.subscriptions.lock().expect("poisoned lock").insert(query_id, state);
+            stamped
+        };
+        if let Some((seq, report, livequery)) = stamped {
+            livequery.remote_status(seq, report);
         }
 
         // Immediately attempt setup with available peers
@@ -160,6 +210,15 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
             let mut subscriptions = self.inner.subscriptions.lock().expect("poisoned lock");
             match subscriptions.get_mut(&query_id) {
                 Some(state) => {
+                    // Racing reissues dispatch unordered after minting under
+                    // the livequery's lock. A stale write here would be
+                    // re-sent verbatim by the next reconnect or retry, so
+                    // the stored content gets the same floor the completion
+                    // transitions and the server upsert enforce.
+                    if version < state.content.version {
+                        debug!("Ignoring stale update_query for {} (version {} < {})", query_id, version, state.content.version);
+                        return Ok(());
+                    }
                     // Update the content with new predicate and version
                     let old_content = &state.content;
                     state.content = Arc::new(Content {
@@ -173,14 +232,18 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                     match state.status {
                         Status::Established(peer_id, _old_version) => {
                             // Update to new version, mark as requested for this peer
+                            state.attempt += 1;
                             state.status = Status::Requested(peer_id, version);
-                            Some((peer_id, state.content.collection_id.clone(), state.content.sessions.clone()))
+                            (
+                                state.stamp(),
+                                Some((peer_id, state.content.collection_id.clone(), state.content.sessions.snapshot(), state.attempt)),
+                            )
                             // Return the peer_id to send update to
                         }
                         _ => {
                             // Not established yet, just update to PendingRemote and setup
                             state.status = Status::PendingRemote;
-                            None
+                            (state.stamp(), None)
                         }
                     }
                 }
@@ -188,9 +251,13 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
             }
         };
 
-        match update {
-            Some((peer_id, collection_id, sessions)) => {
-                self.update_query_on_peer(peer_id, query_id, collection_id, selection, version, sessions);
+        let (stamped, target) = update;
+        if let Some((seq, report, livequery)) = stamped {
+            livequery.remote_status(seq, report);
+        }
+        match target {
+            Some((peer_id, collection_id, context_data, attempt)) => {
+                self.update_query_on_peer(peer_id, query_id, collection_id, selection, version, context_data, attempt);
             }
             None => {
                 // Not established yet - use setup_remote_subscriptions for initial setup
@@ -201,6 +268,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn update_query_on_peer(
         &self,
         peer_id: proto::EntityId,
@@ -208,35 +276,49 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         collection_id: CollectionId,
         selection: ankql::ast::Selection,
         version: u32,
-        sessions: crate::session::Sessions<CD>,
+        context_data: Vec<CD>,
+        attempt: u64,
     ) {
         let me = self.clone();
         crate::task::spawn(async move {
             if let Some(node) = me.inner.node.get() {
-                // Get the livequery for error handling
-                let livequery = {
-                    me.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner()).get(&query_id).map(|state| state.livequery.clone())
-                };
-
-                // Send the updated predicate to the peer, under the
-                // credentials current at send time.
-                match node.remote_subscribe(peer_id, query_id, collection_id, selection, sessions.snapshot(), version).await {
+                // Send the updated predicate to the peer
+                match node.remote_subscribe(peer_id, query_id, collection_id, selection, context_data, version).await {
                     Ok(()) => {
-                        // Deltas applied successfully, now activate the livequery
-                        if let Some(lq) = livequery {
+                        // Claim the completion FIRST, then activate: only
+                        // the attempt that wins the transition may run
+                        // activation, through the livequery its own stamp
+                        // carries (activating before the claim would let a
+                        // dead attempt's late completion activate the local
+                        // leg and clear an error a live attempt latched).
+                        // Acceptance is by attempt identity; the full rule
+                        // lives at attempt_subscribe's completion arm.
+                        let (stamped, kick) = {
+                            let mut subscriptions = me.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
+                            match subscriptions.get_mut(&query_id) {
+                                Some(info) => match info.status {
+                                    Status::Requested(peer, v) if peer == peer_id && v == version && info.attempt == attempt => {
+                                        info.status = Status::Established(peer_id, version);
+                                        (info.stamp(), false)
+                                    }
+                                    Status::PendingRemote => (None, true),
+                                    _ => (None, false),
+                                },
+                                None => (None, false),
+                            }
+                        };
+                        if let Some((seq, report, lq)) = stamped {
                             lq.subscription_established(version).await;
+                            lq.remote_status(seq, report);
                         }
-
-                        // Mark as established - subscription succeeded even if livequery activation had issues
-                        let mut subscriptions = me.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
-                        if let Some(info) = subscriptions.get_mut(&query_id) {
-                            info.status = Status::Established(peer_id, version);
+                        if kick {
+                            me.setup_remote_subscriptions();
                         }
                         debug!("Successfully updated predicate {} on peer {} subscription", query_id, peer_id);
                     }
                     Err(e) => {
                         // Handle error with retry logic
-                        me.handle_error(query_id, peer_id, e, livequery).await;
+                        me.handle_error(query_id, peer_id, e, version, attempt).await;
                     }
                 }
             }
@@ -283,14 +365,25 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         // Remove from connected peers
         self.inner.connected_peers.remove(&peer_id);
 
-        for info in self.inner.subscriptions.lock().expect("poisoned lock").values_mut() {
-            if let Status::Established(established_peer_id, _) | Status::Requested(established_peer_id, _) = &info.status {
-                if *established_peer_id == peer_id {
-                    // Update state to pending
-                    info.status = Status::PendingRemote;
-                    warn!("Predicate {} orphaned due to peer {} disconnect", info.content.query_id, peer_id);
-                }
-            }
+        let orphaned: Vec<_> = {
+            let mut subscriptions = self.inner.subscriptions.lock().expect("poisoned lock");
+            subscriptions
+                .values_mut()
+                .filter_map(|info| {
+                    if let Status::Established(established_peer_id, _) | Status::Requested(established_peer_id, _) = &info.status {
+                        if *established_peer_id == peer_id {
+                            // Update state to pending
+                            info.status = Status::PendingRemote;
+                            warn!("Predicate {} orphaned due to peer {} disconnect", info.content.query_id, peer_id);
+                            return info.stamp();
+                        }
+                    }
+                    None
+                })
+                .collect()
+        };
+        for (seq, report, livequery) in orphaned {
+            livequery.remote_status(seq, report);
         }
 
         // Resubscribe any orphaned subscriptions
@@ -365,8 +458,9 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                 .values_mut()
                 .filter_map(|info| {
                     if let Status::PendingRemote = info.status {
+                        info.attempt += 1;
                         info.status = Status::Requested(target_peer, info.content.version);
-                        Some(info.content.clone())
+                        Some((info.content.clone(), info.attempt, info.stamp()))
                     } else {
                         None
                     }
@@ -380,41 +474,66 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
 
         debug!("Registering {} predicates on {} peer subscriptions", pending.len(), self.inner.connected_peers.len());
 
-        for content in pending {
-            crate::task::spawn(self.clone().attempt_subscribe(node.clone(), target_peer, content));
+        for (content, attempt, stamped) in pending {
+            if let Some((seq, report, livequery)) = stamped {
+                livequery.remote_status(seq, report);
+            }
+            crate::task::spawn(self.clone().attempt_subscribe(node.clone(), target_peer, content, attempt));
         }
     }
 
-    async fn attempt_subscribe(self, node: Arc<dyn TNode<CD>>, target_peer: proto::EntityId, content: Arc<Content<CD>>) {
+    async fn attempt_subscribe(self, node: Arc<dyn TNode<CD>>, target_peer: proto::EntityId, content: Arc<Content<CD>>, attempt: u64) {
         let query_id = content.query_id;
         let predicate = content.selection.clone();
-        // Credentials read at send time from the live source.
-        let cdatas = content.sessions.snapshot();
+        let context_data = content.sessions.snapshot();
         let version = content.version;
 
-        // Get the livequery for error handling
-        let livequery =
-            { self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner()).get(&query_id).map(|state| state.livequery.clone()) };
-
         // Call remote_subscribe which fetches known matches, subscribes, applies deltas, and stores events
-        match node.remote_subscribe(target_peer, query_id, content.collection_id.clone(), predicate, cdatas, version).await {
+        match node.remote_subscribe(target_peer, query_id, content.collection_id.clone(), predicate, context_data, version).await {
             Ok(()) => {
-                // Deltas applied successfully, now activate the livequery
-                // The livequery handles its own errors internally
-                if let Some(lq) = livequery {
+                // Claim the completion FIRST, then activate. A report is
+                // acted on ONLY when it matches the outstanding attempt:
+                // every send stamps Requested(peer, version) and bumps the
+                // attempt, so a report that finds anything else is a dead
+                // attempt's late echo (superseded by a newer send, re-routed
+                // after its peer disconnected, or already resolved). A
+                // matching Requested also implies the version IS the newest
+                // content (a newer mint would have re-stamped the entry,
+                // breaking the match). Dead echoes never mutate state; an
+                // entry sitting at PendingRemote gets a kick so a lost
+                // dispatch cannot strand it. Only the claiming attempt runs
+                // activation, through the livequery its own stamp carries:
+                // activating before the claim would let a dead attempt's
+                // late completion activate the local leg and clear an error
+                // a live attempt latched. (remote_subscribe already merged
+                // the response deltas into storage; that data was attested
+                // by the server regardless of which attempt fetched it.)
+                let (stamped, kick) = {
+                    let mut subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
+                    match subscriptions.get_mut(&query_id) {
+                        Some(info) => match info.status {
+                            Status::Requested(peer, v) if peer == target_peer && v == version && info.attempt == attempt => {
+                                info.status = Status::Established(target_peer, version);
+                                (info.stamp(), false)
+                            }
+                            Status::PendingRemote => (None, true),
+                            _ => (None, false),
+                        },
+                        None => (None, false),
+                    }
+                };
+                if let Some((seq, report, lq)) = stamped {
                     lq.subscription_established(version).await;
+                    lq.remote_status(seq, report);
                 }
-
-                // Mark as established - subscription succeeded even if livequery activation had issues
-                let mut subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(info) = subscriptions.get_mut(&query_id) {
-                    info.status = Status::Established(target_peer, version);
+                if kick {
+                    self.setup_remote_subscriptions();
                 }
                 debug!("Successfully registered predicate {} on peer {} subscription", query_id, target_peer);
             }
             Err(e) => {
                 // Handle error with retry logic
-                self.handle_error(query_id, target_peer, e, livequery).await;
+                self.handle_error(query_id, target_peer, e, version, attempt).await;
             }
         }
     }
@@ -440,7 +559,14 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
     }
 
     /// Handle errors with retry logic
-    async fn handle_error(&self, query_id: proto::QueryId, target_peer: proto::EntityId, error: RetrievalError, livequery: Option<Q>) {
+    async fn handle_error(
+        &self,
+        query_id: proto::QueryId,
+        target_peer: proto::EntityId,
+        error: RetrievalError,
+        version: u32,
+        attempt: u64,
+    ) {
         let error_msg = error.to_string();
 
         // Evaluate retriability at failure time
@@ -459,23 +585,66 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
             _ => false,
         };
 
-        // Update state based on retriability
-        let mut subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(info) = subscriptions.get_mut(&query_id) {
-            if is_retryable {
-                // Retryable errors go back to pending for retry by background task
-                info.status = Status::PendingRemote;
-                warn!("Retryable failure for predicate {} with peer {}: {} - will retry", query_id, target_peer, error_msg);
-            } else {
-                // Non-retryable errors are permanently failed
-                info.status = Status::Failed;
-                tracing::error!("Permanent failure for predicate {} with peer {}: {} - no retry", query_id, target_peer, error_msg);
-
-                // Set error on livequery
-                if let Some(lq) = livequery {
-                    lq.set_last_error(error);
-                }
+        // A failure is acted on ONLY when it matches the outstanding
+        // attempt (Requested with this peer and version) — the same rule
+        // as the completion sites; see the comment there. A matching
+        // retryable failure re-queues for the retry task; a matching
+        // terminal failure holds Failed (and latches) until a credential
+        // change or selection update re-kicks. A dead attempt's failure
+        // mutates nothing and latches nothing: the entry is either being
+        // driven by a live attempt or sits at PendingRemote, which gets a
+        // kick so a lost dispatch cannot strand it.
+        let (stamped, kick, latch_error) = {
+            let mut subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
+            match subscriptions.get_mut(&query_id) {
+                Some(info) => match info.status {
+                    Status::Requested(peer, v) if peer == target_peer && v == version && info.attempt == attempt => {
+                        if is_retryable {
+                            // Retryable errors go back to pending for retry by background task
+                            info.status = Status::PendingRemote;
+                            warn!("Retryable failure for predicate {} with peer {}: {} - will retry", query_id, target_peer, error_msg);
+                            (info.stamp(), false, false)
+                        } else {
+                            // Non-retryable: report Denied for a local refusal
+                            // to sign, the error text otherwise.
+                            info.status = Status::Failed;
+                            tracing::error!(
+                                "Failure for predicate {} with peer {}: {} - awaiting re-kick",
+                                query_id,
+                                target_peer,
+                                error_msg
+                            );
+                            let report = if let RetrievalError::RequestError(RequestError::AccessDenied(denied)) = &error {
+                                crate::livequery::RemoteStatus::Denied { reason: denied.to_string() }
+                            } else {
+                                crate::livequery::RemoteStatus::Error { message: error_msg.clone() }
+                            };
+                            (Some(info.stamp_with(report)), false, true)
+                        }
+                    }
+                    Status::PendingRemote => {
+                        debug!(
+                            "Failure for predicate {} from a dead attempt (v{} via {}); entry pending re-drive",
+                            query_id, version, target_peer
+                        );
+                        (None, true, false)
+                    }
+                    _ => {
+                        debug!("Ignoring failure for predicate {} from a dead attempt (v{} via {})", query_id, version, target_peer);
+                        (None, false, false)
+                    }
+                },
+                None => (None, false, false),
             }
+        };
+        if let Some((seq, report, lq)) = stamped {
+            if latch_error {
+                lq.set_last_error(seq, error);
+            }
+            lq.remote_status(seq, report);
+        }
+        if kick {
+            self.setup_remote_subscriptions();
         }
     }
 }
@@ -668,8 +837,12 @@ mod tests {
             // Mock - no-op
         }
 
-        fn set_last_error(&self, _error: RetrievalError) {
+        fn set_last_error(&self, _seq: u64, _error: RetrievalError) {
             // For tests, we don't track errors
+        }
+
+        fn remote_status(&self, _seq: u64, _status: crate::livequery::RemoteStatus) {
+            // For tests, we don't track status transitions
         }
     }
 
