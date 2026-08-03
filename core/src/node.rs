@@ -7,7 +7,6 @@ use rand::prelude::*;
 use rand::rngs::SmallRng;
 use std::{
     fmt,
-    hash::Hash,
     ops::Deref,
     sync::{Arc, Mutex, Weak},
 };
@@ -119,9 +118,7 @@ where PA: PolicyAgent
     fn deref(&self) -> &Self::Target { &self.0 }
 }
 
-/// Represents the user session - or whatever other context the PolicyAgent
-/// Needs to perform it's evaluation.
-pub trait ContextData: Send + Sync + Clone + Hash + Eq + 'static {}
+pub use crate::session::ContextData;
 
 pub struct NodeInner<SE, PA>
 where PA: PolicyAgent
@@ -140,7 +137,10 @@ where PA: PolicyAgent
     /// RNG state and Node is shared across tasks; the lock is only ever held for a single draw.
     rng: Mutex<SmallRng>,
 
-    pub(crate) predicate_context: SafeMap<proto::QueryId, PA::ContextData>,
+    /// The node's live credential sessions, one per ordinary Context
+    /// (a set-backed context reads this whole set instead), culled by
+    /// RAII when the last holder drops.
+    pub sessions: crate::session::SessionSet<PA::ContextData>,
 
     /// The reactor for handling subscriptions
     pub(crate) reactor: Reactor,
@@ -202,7 +202,7 @@ where
             policy_agent,
             system: system_manager,
             catalog: catalog.clone(),
-            predicate_context: SafeMap::new(),
+            sessions: crate::session::SessionSet::new(),
             subscription_relay,
             type_resolver: crate::TypeResolver::new(),
         }));
@@ -535,10 +535,18 @@ where
             }
             proto::NodeRequestBody::SubscribeQuery { query_id, collection, selection, version, known_matches } => {
                 let peer_state = self.peer_connections.get(&request.from).ok_or_else(|| anyhow!("Peer {} not connected", request.from))?;
-                // only one cdata is permitted for SubscribePredicate
-                use itertools::Itertools;
-                let cdata = cdata.iterable().exactly_one().map_err(|_| anyhow!("Only one cdata is permitted for SubscribePredicate"))?;
-                peer_state.subscription_handler.subscribe_query(self, query_id, collection, selection, cdata, version, known_matches).await
+                // Every validated credential governs the subscription: the
+                // policy agent evaluates the union (a system query carries
+                // one per live session; user queries carry exactly one).
+                // An EMPTY list ships too (a set-backed query with no live
+                // sessions asks for the server's own verdict); accepting
+                // it is each agent's vacuous-loop semantics, an open
+                // decision: https://github.com/ankurah/ankurah/issues/432
+                let cdatas: Vec<PA::ContextData> = cdata.iterable().cloned().collect();
+                peer_state
+                    .subscription_handler
+                    .subscribe_query(self, query_id, collection, selection, &cdatas, version, known_matches)
+                    .await
             }
         }
     }
@@ -854,7 +862,7 @@ where
         &self,
         collection_id: &CollectionId,
         ids: Vec<proto::EntityId>,
-        cdata: &PA::ContextData,
+        cdata: &Vec<PA::ContextData>,
     ) -> Result<(), RetrievalError> {
         let peer_id = self.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
 
@@ -965,15 +973,14 @@ where
         query_id: proto::QueryId,
         collection_id: CollectionId,
         selection: ankql::ast::Selection,
-        cdata: PA::ContextData,
+        sessions: crate::session::Sessions<PA::ContextData>,
         version: u32,
         livequery: crate::livequery::WeakEntityLiveQuery,
     ) {
         if let Some(ref relay) = self.subscription_relay {
             // Resolve types in the AST (converts literals for JSON path comparisons)
             let selection = self.type_resolver.resolve_selection_types(selection);
-            self.predicate_context.insert(query_id, cdata.clone());
-            relay.subscribe_query(query_id, collection_id, selection, cdata, version, livequery);
+            relay.subscribe_query(query_id, collection_id, selection, sessions, version, livequery);
         }
     }
 
@@ -1017,9 +1024,6 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     fn unsubscribe_remote_predicate(&self, query_id: proto::QueryId) {
-        // Clean up subscription context
-        self.predicate_context.remove(&query_id);
-
         // Notify subscription relay for remote cleanup
         if let Some(ref relay) = self.subscription_relay {
             relay.unsubscribe_predicate(query_id);

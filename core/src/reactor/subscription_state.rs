@@ -65,6 +65,13 @@ pub struct QueryState<E: AbstractEntity + Filterable> {
     pub(crate) paused: bool, // When true, skip notifications (used during initialization and updates)
     pub(crate) resultset: EntityResultSet<E>,
     pub(crate) version: u32,
+    /// The newest version whose credentials the gap fetcher holds.
+    /// Tracked apart from `version` (the selection floor in
+    /// `update_query`): racing re-subscribes refresh credentials before
+    /// their selection lands, so the refresh needs its own floor or a
+    /// delayed stale subscribe regresses the credentials behind a newer
+    /// selection.
+    pub(crate) credential_version: u32,
 }
 
 // We would call this ReactorSubscription, but that name is reserved for the public API
@@ -191,7 +198,15 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         use std::collections::hash_map::Entry;
         match state.queries.entry(query_id) {
             Entry::Vacant(v) => {
-                v.insert(QueryState { collection_id, selection: None, gap_fetcher, paused: false, resultset, version: 0 });
+                v.insert(QueryState {
+                    collection_id,
+                    selection: None,
+                    gap_fetcher,
+                    paused: false,
+                    resultset,
+                    version: 0,
+                    credential_version: 0,
+                });
                 Ok(())
             }
             Entry::Occupied(_) => Err(anyhow::anyhow!("Query {:?} already exists", query_id)),
@@ -347,6 +362,24 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
     pub fn remove_query(&self, query_id: proto::QueryId) -> Option<QueryState<E>> {
         let mut state = self.state.lock().unwrap();
         state.queries.remove(&query_id)
+    }
+
+    /// Remove a query ONLY if its registered version is at or below the
+    /// given one. The server's claw-back on failed re-validation uses
+    /// this floor: a delayed OLDER request that fails validation must not
+    /// tear down the live newer registration it was superseded by.
+    pub fn remove_query_at_or_below(&self, query_id: proto::QueryId, version: u32) -> Option<QueryState<E>> {
+        let mut state = self.state.lock().unwrap();
+        match state.queries.get(&query_id) {
+            // The floor compares the NEWEST version the entry has seen:
+            // between a newer subscribe's upsert (which seeds
+            // credential_version) and its update_query (which stores
+            // version), `version` still holds the old value, and flooring
+            // on it alone would let a delayed older denial remove the
+            // in-flight newer registration.
+            Some(qs) if qs.version.max(qs.credential_version) <= version => state.queries.remove(&query_id),
+            _ => None,
+        }
     }
 
     /// Get all queries for cleanup (used by unsubscribe)
@@ -685,13 +718,15 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
 impl Subscription<crate::entity::Entity, ankurah_proto::Attested<ankurah_proto::Event>> {
     /// Upsert a query - register if it doesn't exist, or return the existing resultset
     /// Idempotent - safe to call multiple times with the same query_id
+    /// Creates the gap fetcher on first insert; a re-upsert refreshes its credentials in place (wholesale replacement of the fetcher is the fallback for fetchers that cannot refresh)
     /// Constructs gap_fetcher lazily (only if query doesn't exist)
     pub fn upsert_query<SE, PA>(
         &self,
         query_id: proto::QueryId,
         collection_id: proto::CollectionId,
         node: &crate::node::Node<SE, PA>,
-        cdata: &PA::ContextData,
+        cdatas: &[PA::ContextData],
+        version: u32,
     ) -> EntityResultSet<crate::entity::Entity>
     where
         SE: crate::storage::StorageEngine + Send + Sync + 'static,
@@ -703,8 +738,7 @@ impl Subscription<crate::entity::Entity, ankurah_proto::Attested<ankurah_proto::
         match state.queries.entry(query_id) {
             Entry::Vacant(v) => {
                 let resultset = EntityResultSet::empty();
-                // Only create gap fetcher if query doesn't exist
-                let gap_fetcher = std::sync::Arc::new(crate::reactor::fetch_gap::QueryGapFetcher::new(node, cdata.clone()));
+                let gap_fetcher = std::sync::Arc::new(crate::reactor::fetch_gap::QueryGapFetcher::for_server(node, cdatas.to_vec()));
                 v.insert(QueryState {
                     collection_id,
                     selection: None,
@@ -712,10 +746,33 @@ impl Subscription<crate::entity::Entity, ankurah_proto::Attested<ankurah_proto::
                     paused: false,
                     resultset: resultset.clone(),
                     version: 0,
+                    credential_version: version,
                 });
                 resultset
             }
-            Entry::Occupied(o) => o.get().resultset.clone(),
+            Entry::Occupied(o) => {
+                // A re-subscribe carries freshly validated credentials and
+                // the stored fetcher adopts them in place (its private set's
+                // members are replaced), so later gap fills read under the
+                // latest ones. A fetcher that cannot refresh is replaced
+                // instead, never left serving stale claims. The refresh is
+                // floored on its own version: a delayed stale subscribe
+                // must not regress the credentials behind a newer one
+                // (the selection has its own floor in update_query).
+                // AUDITED EXCEPTION to the no-broadcast-under-state rule:
+                // the refresh mutates a SessionHolder, whose private set
+                // has no subscribers by construction, so its registration
+                // and revocation dispatches reach nobody.
+                let entry = o.into_mut();
+                if version >= entry.credential_version {
+                    entry.credential_version = version;
+                    if !entry.gap_fetcher.refresh_credential(Box::new(cdatas.to_vec())) {
+                        entry.gap_fetcher =
+                            std::sync::Arc::new(crate::reactor::fetch_gap::QueryGapFetcher::for_server(node, cdatas.to_vec()));
+                    }
+                }
+                entry.resultset.clone()
+            }
         }
     }
 }

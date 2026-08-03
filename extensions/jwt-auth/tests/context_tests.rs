@@ -25,8 +25,13 @@ fn test_jwt_context_accessors() {
     assert_eq!(ctx.token_bytes(), Some(b"fake-token".as_slice()));
 }
 
+/// Equality is full-value (operational identity per the ContextData
+/// contract): same subject with different claims or token compares
+/// UNEQUAL — Session update delivery gates on this, and a token refresh
+/// must register as a change — and only an identical value compares
+/// equal, with the hash agreeing.
 #[test]
-fn test_jwt_context_equality_by_sub() {
+fn test_jwt_context_equality_is_full_value() {
     let ctx1 = JwtContext::from_claims(
         JwtClaims {
             sub: "user-1".into(),
@@ -37,6 +42,7 @@ fn test_jwt_context_equality_by_sub() {
         },
         "token-1".into(),
     );
+    // Same subject, different claims and token: a re-login or refresh.
     let ctx2 = JwtContext::from_claims(
         JwtClaims {
             sub: "user-1".into(),
@@ -57,8 +63,43 @@ fn test_jwt_context_equality_by_sub() {
         },
         "token-3".into(),
     );
-    assert_eq!(ctx1, ctx2);
+    assert_ne!(ctx1, ctx2, "same subject with different claims or token is a different credential");
     assert_ne!(ctx1, ctx3);
+    let identical = ctx1.clone();
+    assert_eq!(ctx1, identical, "only an identical value compares equal");
+
+    let mut set = std::collections::HashSet::new();
+    set.insert(ctx1);
+    assert!(set.contains(&identical), "hash agrees with eq");
+    assert!(!set.contains(&ctx2));
+}
+
+/// Hash agrees with Eq over custom claims regardless of map insertion
+/// order: json map equality is order-independent, so the hash walks
+/// objects in sorted key order.
+#[test]
+fn test_jwt_context_hash_ignores_custom_claim_insertion_order() {
+    let mut ab = serde_json::Map::new();
+    ab.insert("a".into(), serde_json::json!({"n": 1, "s": ["x", 2.5, null]}));
+    ab.insert("b".into(), serde_json::json!(true));
+    let mut ba = serde_json::Map::new();
+    ba.insert("b".into(), serde_json::json!(true));
+    ba.insert("a".into(), serde_json::json!({"n": 1, "s": ["x", 2.5, null]}));
+
+    let claims = |custom: serde_json::Map<String, serde_json::Value>| JwtClaims {
+        sub: "user-1".into(),
+        roles: vec![],
+        email: "a@b.com".into(),
+        name: None,
+        custom,
+    };
+    let c1 = JwtContext::from_claims(claims(ab), "t".into());
+    let c2 = JwtContext::from_claims(claims(ba), "t".into());
+    assert_eq!(c1, c2, "map equality is insertion-order independent");
+
+    let mut set = std::collections::HashSet::new();
+    set.insert(c1);
+    assert!(set.contains(&c2), "the hash must agree");
 }
 
 // ---------------------------------------------------------------------------

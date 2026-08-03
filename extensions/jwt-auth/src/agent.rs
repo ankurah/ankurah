@@ -112,6 +112,10 @@ impl PolicyAgent for JwtAgent {
     {
         debug!("JwtAgent sign_request");
         let mut auth_data = Vec::new();
+        // All-or-nothing: one unsignable member (Root's auth_data errors
+        // by design) fails the whole request even when other members
+        // could serve. Skip-vs-fail is an open decision:
+        // https://github.com/ankurah/ankurah/issues/432
         for ctx in cdata.iterable() {
             auth_data.push(ctx.auth_data()?);
         }
@@ -239,20 +243,37 @@ impl PolicyAgent for JwtAgent {
             return Ok(predicate);
         }
 
-        let claims = data
-            .iterable()
-            .find_map(|ctx| match ctx {
-                JwtContext::User { claims, .. } => Some(claims),
-                _ => None,
-            })
-            .ok_or(AccessDenied::ByPolicy("No authenticated context for row filtering"))?;
-
-        let mut result = predicate;
-        for filter in scoped_predicates(&state.config, collection.as_str(), claims, ScopeAccess::Read)? {
-            result = Predicate::And(Box::new(result), Box::new(filter));
+        // Each authenticated context sees its own scoped slice; the
+        // query's visibility is their union (OR of the per-context
+        // narrowings), mirroring enforce_read_scope's any-of evaluation.
+        // A single-credential query degenerates to its one narrowing.
+        let mut per_context: Vec<Predicate> = Vec::new();
+        for ctx in data.iterable() {
+            let JwtContext::User { claims, .. } = ctx else {
+                continue;
+            };
+            // The union is over AUTHORIZED contexts, not merely
+            // authenticated ones (mirrors enforce_read_scope): a context
+            // without collection access contributes no branch, else its
+            // scoped slice would expose rows no authorized credential
+            // could read. Access here means the read OR write privilege
+            // BY DESIGN: a write grant implies visibility of the rows it
+            // governs (scope rules still narrow each credential's slice),
+            // so a write-only credential's branch belongs in the union.
+            if !state.config.can_access_collection(ctx.roles(), collection) {
+                continue;
+            }
+            let mut narrowed = predicate.clone();
+            for filter in scoped_predicates(&state.config, collection.as_str(), claims, ScopeAccess::Read)? {
+                narrowed = Predicate::And(Box::new(narrowed), Box::new(filter));
+            }
+            per_context.push(narrowed);
         }
 
-        Ok(result)
+        per_context
+            .into_iter()
+            .reduce(|union, next| Predicate::Or(Box::new(union), Box::new(next)))
+            .ok_or(AccessDenied::ByPolicy("No authorized context for row filtering"))
     }
 
     fn check_read<C>(

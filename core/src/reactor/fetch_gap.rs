@@ -31,17 +31,28 @@ pub trait GapFetcher<E: AbstractEntity>: Send + Sync + 'static {
         last_entity: Option<&E>,
         gap_size: usize,
     ) -> Result<Vec<E>, RetrievalError>;
+
+    /// A re-validated subscribe carries a fresh credential; a fetcher that
+    /// holds one adopts it in place, so later gap fills read under the
+    /// latest credential. Returns false when unsupported (or the type does
+    /// not match), and the caller replaces the fetcher instead: fail-safe,
+    /// never a silent opt-out.
+    fn refresh_credential(&self, _new: Box<dyn std::any::Any + Send>) -> bool { false }
 }
 
-/// Concrete implementation of GapFetcher using a WeakNode and typed ContextData
-#[derive(Clone)]
+/// Concrete implementation of GapFetcher using a WeakNode and a live
+/// credential source, read at fetch time so a refreshed credential is
+/// used without rebuilding the fetcher.
 pub struct QueryGapFetcher<SE, PA>
 where
     SE: StorageEngine,
     PA: PolicyAgent,
 {
     weak_node: Weak<NodeInner<SE, PA>>,
-    cdata: PA::ContextData,
+    /// Client side: the creating context's live source (`One`/`Set`),
+    /// refreshed through the context. Server side: a `Held` set this
+    /// fetcher's owner replaces on every re-validated subscribe.
+    sessions: crate::session::Sessions<PA::ContextData>,
 }
 
 impl<SE, PA> QueryGapFetcher<SE, PA>
@@ -49,7 +60,19 @@ where
     SE: StorageEngine,
     PA: PolicyAgent,
 {
-    pub fn new(node: &Node<SE, PA>, cdata: PA::ContextData) -> Self { Self { weak_node: Arc::downgrade(&node.0), cdata } }
+    /// A fetcher reading through the query's live credential source at
+    /// each fetch (client side: the creating context's session or the
+    /// system context's set).
+    pub fn new(node: &Node<SE, PA>, sessions: crate::session::Sessions<PA::ContextData>) -> Self {
+        Self { weak_node: Arc::downgrade(&node.0), sessions }
+    }
+
+    /// The server side's per-query holder, seeded with the subscriber's
+    /// credentials; [`GapFetcher::refresh_credential`] replaces them so
+    /// later gap fills read under the latest ones.
+    pub fn for_server(node: &Node<SE, PA>, cdatas: Vec<PA::ContextData>) -> Self {
+        Self { weak_node: Arc::downgrade(&node.0), sessions: crate::session::SessionHolder::new(cdatas).into() }
+    }
 }
 
 #[async_trait]
@@ -58,6 +81,22 @@ where
     SE: StorageEngine + 'static,
     PA: PolicyAgent + 'static,
 {
+    fn refresh_credential(&self, new: Box<dyn std::any::Any + Send>) -> bool {
+        let Ok(cdatas) = new.downcast::<Vec<PA::ContextData>>() else {
+            return false;
+        };
+        match &self.sessions {
+            // Client-side fetchers read through the context's own source;
+            // their credentials refresh through the context, never
+            // through here.
+            crate::session::Sessions::One(_) | crate::session::Sessions::Set(_) => false,
+            crate::session::Sessions::Held(holder) => {
+                holder.replace(*cdatas);
+                true
+            }
+        }
+    }
+
     async fn fetch_gap(
         &self,
         collection_id: &proto::CollectionId,
@@ -73,7 +112,7 @@ where
 
         // Create a Node wrapper and NodeAndContext
         let node = Node(node_inner);
-        let node_context = NodeAndContext { node, cdata: self.cdata.clone() };
+        let node_context = NodeAndContext { node, sessions: self.sessions.clone() };
 
         // Build gap predicate if we have a last entity
         let gap_selection = if let Some(last) = last_entity {
