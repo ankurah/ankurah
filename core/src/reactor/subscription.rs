@@ -57,10 +57,6 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
     /// Get the subscription ID
     pub fn id(&self) -> ReactorSubscriptionId { self.0.subscription_id }
 
-    /// Add a predicate to this subscription
-    // TODO: REMOVE this method - predicates should ONLY be added via set_predicate
-    // This creates an inactive predicate that does nothing until initialize() is called
-
     /// Remove a predicate from this subscription
     pub fn remove_predicate(&self, query_id: proto::QueryId) -> Result<(), SubscriptionError> {
         self.0.reactor.remove_query(self.0.subscription_id, query_id)?;

@@ -588,10 +588,9 @@ where
         let collection_id = collection_id.clone();
         Box::new(move |intent: ankql::ast::Selection| {
             let node = Node(weak.upgrade().ok_or_else(|| RetrievalError::Other("Node has been dropped".into()))?);
-            let cdatas = sessions.snapshot();
-            node.policy_agent.can_access_collection(&cdatas, &collection_id)?;
+            node.policy_agent.can_access_collection(&sessions.snapshot(), &collection_id)?;
             let mut effective = intent;
-            effective.predicate = node.policy_agent.filter_predicate(&cdatas, &collection_id, effective.predicate)?;
+            effective.predicate = node.policy_agent.filter_predicate(&sessions.snapshot(), &collection_id, effective.predicate)?;
             // Resolve types in the AST (converts literals for JSON path
             // comparisons), AFTER filtering so injected policy clauses get
             // typed literals too.
@@ -716,7 +715,7 @@ impl EntityLiveQuery {
         PA: PolicyAgent + Send + Sync + 'static,
     {
         let has_relay = node.subscription_relay.is_some();
-        let credential_generation = sessions.generation();
+        let credential_before = sessions.snapshot();
         let (inner, query_id) = create_inner(node, node_ref, collection_id.clone(), args, sessions.clone())?;
 
         let me = Self(inner.clone());
@@ -731,9 +730,12 @@ impl EntityLiveQuery {
         // credential_updated). The guard installs after the relay
         // registration (a listener firing before the query is registered
         // would find no relay entry), which leaves a window between the
-        // creation-time derivation and this line. The session's generation
-        // closes it: an update the derivation missed either bumped before
-        // the re-check below, or stored after the listener was live.
+        // creation-time derivation and this line. Comparing snapshots
+        // closes it: an update the derivation missed either changed the
+        // value before the re-check below, or stored after the listener
+        // was live. (A change-and-revert inside the window compares equal
+        // and is accepted: the reverted-to value is what the derivation
+        // used.)
         let weak = me.weak();
         let guard = sessions.subscribe_changes({
             let weak = weak.clone();
@@ -743,7 +745,7 @@ impl EntityLiveQuery {
         // appears, the discarded NEW guard would silently unsubscribe
         // re-permission for this query. Keep it impossible.
         let _ = inner.session_guard.set(guard);
-        if sessions.generation() != credential_generation {
+        if sessions.snapshot() != credential_before {
             weak.credential_updated();
         }
 

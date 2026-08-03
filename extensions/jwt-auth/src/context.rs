@@ -2,7 +2,6 @@ use crate::claims::JwtClaims;
 use ankurah_core::node::ContextData;
 use ankurah_core::policy::AccessDenied;
 use ankurah_proto as proto;
-use async_trait::async_trait;
 
 /// The context data extracted from a validated JWT, used for all policy checks.
 /// `Root` represents a privileged system context that bypasses all RBAC checks.
@@ -72,5 +71,4 @@ impl JwtContext {
     }
 }
 
-#[async_trait]
 impl ContextData for JwtContext {}
