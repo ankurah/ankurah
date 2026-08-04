@@ -93,13 +93,11 @@ impl ReactorSubscription<crate::entity::Entity, ankurah_proto::Attested<ankurah_
         gap_fetcher: std::sync::Arc<dyn crate::reactor::fetch_gap::GapFetcher<crate::entity::Entity>>,
         version: u32,
     ) -> anyhow::Result<Vec<crate::entity::Entity>> {
-        let subscription = {
-            let subscriptions = self.0.reactor.0.subscriptions.lock().unwrap();
-            subscriptions
-                .get(&self.0.subscription_id)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("Subscription {:?} not found", self.0.subscription_id))?
-        };
+        let subscription = self
+            .0
+            .reactor
+            .subscription(self.0.subscription_id)
+            .ok_or_else(|| anyhow::anyhow!("Subscription {:?} not found", self.0.subscription_id))?;
 
         // Register if new or get the existing resultset.
         let resultset = subscription.register_or_get_query(query_id, collection_id.clone(), gap_fetcher);
