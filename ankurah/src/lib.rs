@@ -155,6 +155,7 @@ pub use ankurah_core::{
     property::{self, Property, Ref},
     query_value::QueryValue,
     resultset::ResultSet,
+    session::{Session, SessionSet},
     storage, transaction, value,
     value::{Value, ValueType},
 };

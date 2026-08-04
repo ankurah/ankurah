@@ -2,6 +2,9 @@ use std::{collections::HashSet, hash::BuildHasher};
 
 /// Trait for types that can provide an iterator over their contents without consuming self.
 /// This allows uniform iteration over both single items (`&T`) and collections (`&HashSet<T>`).
+/// (No `[T]` impl: consumers' generic `C` params carry an implicit `Sized`
+/// bound, so slice support means threading `?Sized` through the policy
+/// trait — take `&Vec<T>` until that is worth doing.)
 pub trait Iterable<T> {
     type Iter<'a>: Iterator<Item = &'a T>
     where

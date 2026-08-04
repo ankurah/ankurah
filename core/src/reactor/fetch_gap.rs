@@ -33,15 +33,19 @@ pub trait GapFetcher<E: AbstractEntity>: Send + Sync + 'static {
     ) -> Result<Vec<E>, RetrievalError>;
 }
 
-/// Concrete implementation of GapFetcher using a WeakNode and typed ContextData
-#[derive(Clone)]
+/// Concrete implementation of GapFetcher using a WeakNode and a live
+/// credential source, read at fetch time so a refreshed credential is
+/// used without rebuilding the fetcher.
 pub struct QueryGapFetcher<SE, PA>
 where
     SE: StorageEngine,
     PA: PolicyAgent,
 {
     weak_node: Weak<NodeInner<SE, PA>>,
-    cdata: PA::ContextData,
+    /// A context's set on the client side; on the server side a private
+    /// set owning the per-query session the peer subscription server
+    /// writes on each re-validated subscribe.
+    sessions: crate::session::SessionSet<PA::ContextData>,
 }
 
 impl<SE, PA> QueryGapFetcher<SE, PA>
@@ -49,7 +53,9 @@ where
     SE: StorageEngine,
     PA: PolicyAgent,
 {
-    pub fn new(node: &Node<SE, PA>, cdata: PA::ContextData) -> Self { Self { weak_node: Arc::downgrade(&node.0), cdata } }
+    pub fn new(node: &Node<SE, PA>, sessions: crate::session::SessionSet<PA::ContextData>) -> Self {
+        Self { weak_node: Arc::downgrade(&node.0), sessions }
+    }
 }
 
 #[async_trait]
@@ -73,7 +79,7 @@ where
 
         // Create a Node wrapper and NodeAndContext
         let node = Node(node_inner);
-        let node_context = NodeAndContext { node, cdata: self.cdata.clone() };
+        let node_context = NodeAndContext { node, sessions: self.sessions.clone() };
 
         // Build gap predicate if we have a last entity
         let gap_selection = if let Some(last) = last_entity {

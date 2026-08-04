@@ -112,6 +112,10 @@ impl PolicyAgent for JwtAgent {
     {
         debug!("JwtAgent sign_request");
         let mut auth_data = Vec::new();
+        // All-or-nothing: one unsignable member (Root's auth_data errors
+        // by design) fails the whole request even when other members
+        // could serve. Skip-vs-fail is an open decision:
+        // https://github.com/ankurah/ankurah/issues/432
         for ctx in cdata.iterable() {
             auth_data.push(ctx.auth_data()?);
         }

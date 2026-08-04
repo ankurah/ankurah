@@ -140,15 +140,23 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
 
         // Remove the query from the subscription
         let query_state = subscription.remove_query(query_id).ok_or(SubscriptionError::PredicateNotFound)?;
+        self.cleanup_removed_query(subscription_id, query_id, &query_state);
+        Ok(())
+    }
 
+    /// Watcher teardown shared by the removal paths.
+    fn cleanup_removed_query(
+        &self,
+        subscription_id: ReactorSubscriptionId,
+        query_id: proto::QueryId,
+        query_state: &subscription_state::QueryState<E>,
+    ) {
         // Remove from watchers (only if selection was set)
         if let Some(selection) = &query_state.selection {
             let mut watcher_set = self.0.watcher_set.lock().unwrap();
             let watcher_id = (subscription_id, query_id);
             watcher_set.recurse_predicate_watchers(&query_state.collection_id, &selection.predicate, watcher_id, WatcherOp::Remove);
         }
-
-        Ok(())
     }
 
     /// Add entity subscriptions to a subscription
@@ -384,53 +392,6 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         for subscription in subscriptions.values() {
             subscription.system_reset();
         }
-    }
-}
-
-// Entity-specific methods for remote subscriptions
-impl Reactor<Entity, ankurah_proto::Attested<ankurah_proto::Event>> {
-    /// Add or update a query for remote subscriptions (server-side)
-    /// This method is idempotent - it works whether the query exists or not
-    /// Constructs gap_fetcher internally using the provided Node and ContextData
-    /// Returns all entities that currently match the selection (for delta generation)
-    pub async fn upsert_query<SE, PA>(
-        &self,
-        subscription_id: ReactorSubscriptionId,
-        query_id: proto::QueryId,
-        collection_id: proto::CollectionId,
-        selection: ankql::ast::Selection,
-        node: &crate::node::Node<SE, PA>,
-        cdata: &PA::ContextData,
-        version: u32,
-    ) -> anyhow::Result<Vec<Entity>>
-    where
-        SE: crate::storage::StorageEngine + Send + Sync + 'static,
-        PA: crate::policy::PolicyAgent + Send + Sync + 'static,
-    {
-        let subscription = {
-            let subscriptions = self.0.subscriptions.lock().unwrap();
-            subscriptions.get(&subscription_id).cloned().ok_or_else(|| anyhow::anyhow!("Subscription {:?} not found", subscription_id))?
-        };
-
-        let included_entities = node.fetch_entities_from_local(&collection_id, &selection).await?;
-
-        // Upsert query - register if new or get existing resultset
-        // Gap fetcher is only created if query doesn't exist yet
-        let resultset = subscription.upsert_query(query_id, collection_id.clone(), node, cdata);
-
-        // Update query - watcher management is handled internally
-        let mut all_entities =
-            subscription.update_query(query_id, collection_id.clone(), selection.clone(), included_entities, version, &mut ())?;
-
-        // Fill gaps if needed for this specific query (also registers entity watchers)
-        // FIXME: Same follow-up — we should confirm whether edit-driven gaps can occur between the
-        // storage fetch and notify_change handling, which would make this gap fill mandatory.
-        subscription.fill_gaps_for_query_entities(query_id, &mut all_entities).await;
-
-        resultset.set_loaded(true);
-
-        // Return all entities (newly added + gap-filled)
-        Ok(all_entities)
     }
 }
 

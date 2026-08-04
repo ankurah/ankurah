@@ -2,13 +2,16 @@ use crate::claims::JwtClaims;
 use ankurah_core::node::ContextData;
 use ankurah_core::policy::AccessDenied;
 use ankurah_proto as proto;
-use async_trait::async_trait;
-use std::hash::{Hash, Hasher};
 
 /// The context data extracted from a validated JWT, used for all policy checks.
 /// `Root` represents a privileged system context that bypasses all RBAC checks.
 /// `NoUser` represents an unauthenticated context (e.g. for reading the policy collection).
-#[derive(Debug, Clone)]
+///
+/// Equality and hash are full-value — claims and token — because
+/// `ContextData`'s contract is operational identity and `Session` update
+/// delivery gates on it: a token refresh compares unequal and
+/// propagates; an identical update is a no-op.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum JwtContext {
     User { claims: JwtClaims, token: String },
     Root,
@@ -68,28 +71,4 @@ impl JwtContext {
     }
 }
 
-impl PartialEq for JwtContext {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (JwtContext::User { claims: a, .. }, JwtContext::User { claims: b, .. }) => a.sub == b.sub,
-            (JwtContext::Root, JwtContext::Root) => true,
-            (JwtContext::NoUser, JwtContext::NoUser) => true,
-            _ => false,
-        }
-    }
-}
-
-impl Eq for JwtContext {}
-
-impl Hash for JwtContext {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        std::mem::discriminant(self).hash(state);
-        match self {
-            JwtContext::User { claims, .. } => claims.sub.hash(state),
-            JwtContext::Root | JwtContext::NoUser => {}
-        }
-    }
-}
-
-#[async_trait]
 impl ContextData for JwtContext {}

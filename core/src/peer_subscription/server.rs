@@ -2,29 +2,42 @@ use ankurah_proto::{self as proto, Attested};
 use tracing::warn;
 
 use crate::{
+    entity::Entity,
     error::SubscriptionError,
     node::Node,
     policy::PolicyAgent,
-    reactor::{ReactorSubscription, ReactorUpdate},
+    reactor::{
+        fetch_gap::{GapFetcher, QueryGapFetcher},
+        ReactorSubscription, ReactorUpdate,
+    },
+    session::{ContextData, SessionSet},
     storage::StorageEngine,
 };
 use ankurah_signals::{Subscribe, SubscriptionGuard};
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 /// Manages a peer's subscription to this node's reactor.
 ///
 /// This handler owns both the ReactorSubscription and the SubscriptionGuard
-/// for listening to changes on that subscription.
-pub struct SubscriptionHandler {
+/// for listening to changes on that subscription — and each standing
+/// query's subscriber session, the typed owner of credential state the
+/// reactor reads but does not manage.
+pub struct SubscriptionHandler<CD: ContextData> {
     _peer_id: proto::EntityId,
     subscription: ReactorSubscription,
     _guard: SubscriptionGuard,
+    /// Each standing query's credential source, shared with its gap
+    /// fetcher and dropped with the handler, so a disconnect releases
+    /// them all.
+    queries: Mutex<HashMap<proto::QueryId, SessionSet<CD>>>,
 }
 
-impl SubscriptionHandler {
+impl<CD: ContextData> SubscriptionHandler<CD> {
     pub fn new<SE, PA>(peer_id: proto::EntityId, node: &Node<SE, PA>) -> Self
     where
         SE: StorageEngine + Send + Sync + 'static,
-        PA: PolicyAgent + Send + Sync + 'static,
+        PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
     {
         let subscription = node.reactor.subscribe();
         let weak_node = node.weak();
@@ -44,7 +57,7 @@ impl SubscriptionHandler {
             }
         });
 
-        Self { _peer_id: peer_id, subscription, _guard: guard }
+        Self { _peer_id: peer_id, subscription, _guard: guard, queries: Mutex::new(HashMap::new()) }
     }
 
     /// Get the subscription ID for this peer.
@@ -53,9 +66,11 @@ impl SubscriptionHandler {
     /// Get a reference to the subscription for adding/removing predicates.
     pub fn subscription(&self) -> &ReactorSubscription { &self.subscription }
 
-    /// Remove a predicate from this peer's subscription.
+    /// Remove a predicate from this peer's subscription, releasing the
+    /// query's session with it.
     pub fn remove_predicate(&self, query_id: proto::QueryId) -> Result<(), SubscriptionError> {
         self.subscription.remove_predicate(query_id)?;
+        self.queries.lock().unwrap_or_else(|e| e.into_inner()).remove(&query_id);
         Ok(())
     }
 
@@ -72,19 +87,51 @@ impl SubscriptionHandler {
     ) -> anyhow::Result<proto::NodeResponseBody>
     where
         SE: StorageEngine + Send + Sync + 'static,
-        PA: PolicyAgent + Send + Sync + 'static,
+        PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
     {
         if version == 0 {
             return Err(anyhow::anyhow!("Invalid version 0 for subscription"));
         }
+        // Re-subscribes re-validate under the peer's current credentials
+        // and refresh the query's standing session below. Denial does
+        // not yet tear down a standing registration — the claw-back
+        // arrives with the re-permission PR:
+        // https://github.com/ankurah/ankurah/pull/426
         node.policy_agent.can_access_collection(cdata, &collection_id)?;
         selection.predicate = node.policy_agent.filter_predicate(cdata, &collection_id, selection.predicate)?;
         let storage_collection = node.collections.get(&collection_id).await?;
 
+        // TODO: consider separating session updating from SubscribeQuery,
+        // reserving that request for actual subscription (selection)
+        // updates and carrying credential refresh on its own wire
+        // message once the protocol grows a session-update vocabulary.
+        //
+        // The query's credential source: minted at first subscribe,
+        // shared with the gap fetcher, refreshed with the re-validated
+        // credentials on re-subscribe (the equality gate makes an
+        // identical credential a no-op).
+        let sessions: SessionSet<CD> = {
+            use std::collections::hash_map::Entry;
+            let mut queries = self.queries.lock().unwrap_or_else(|e| e.into_inner());
+            match queries.entry(query_id) {
+                Entry::Occupied(o) => {
+                    let sessions = o.get().clone();
+                    for session in sessions.sessions() {
+                        session.update(cdata.clone());
+                    }
+                    sessions
+                }
+                Entry::Vacant(v) => v.insert(cdata.clone().into()).clone(),
+            }
+        };
+
+        let gap_fetcher: std::sync::Arc<dyn GapFetcher<Entity>> = std::sync::Arc::new(QueryGapFetcher::new(node, sessions));
+
         // Add or update the query - idempotent, works whether query exists or not
-        let matching_entities = node
-            .reactor
-            .upsert_query(self.subscription.id(), query_id, collection_id.clone(), selection.clone(), node, cdata, version)
+        let included_entities = node.fetch_entities_from_local(&collection_id, &selection).await?;
+        let matching_entities = self
+            .subscription
+            .upsert_query(query_id, collection_id.clone(), selection.clone(), included_entities, gap_fetcher, version)
             .await?;
 
         // TASK: Audit SubscriptionUpdate vs QuerySubscribed sequencing https://github.com/ankurah/ankurah/issues/147
