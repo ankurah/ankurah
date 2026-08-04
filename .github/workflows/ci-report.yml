@@ -11,6 +11,17 @@ name: Report CI status
 # line, and a broken one produces up to four. Benchmarks is deliberately absent:
 # it is advisory and never fails, so it would be pure noise.
 #
+# WHOSE CODE RAN. A pull request from a fork produces a run here, and
+# `workflow_run` fires this job in THIS repository's context with this
+# repository's secrets — while the fork chose the branch name, the commit, and,
+# by whether its code compiles, the conclusion. Reporting `github.repository`
+# for such a run would let anyone with a GitHub account put a line in #ci that
+# reads exactly like ankurah/ankurah's own main going red, under a genuine
+# github.com run link. So the reported repository is the HEAD repository — the
+# one the code came from — marked as a fork whenever that is not this one. Fork
+# runs are still reported, because a contributor's build breaking is worth
+# seeing; what they cannot do is wear our name.
+#
 # AUTHENTICATION. The community endpoint has no login; a delivery proves itself
 # by carrying an HMAC-SHA256 of its own raw body under a shared secret, in the
 # svix header shape (see server/src/ci_hook.rs there). The secret lives in the
@@ -50,7 +61,8 @@ jobs:
         env:
           HOOK_URL: ${{ vars.COMMUNITY_CI_HOOK_URL || 'https://community.ankurah.org/hooks/ci' }}
           HOOK_SECRET: ${{ secrets.COMMUNITY_CI_HOOK_SECRET }}
-          REPO: ${{ github.repository }}
+          BASE_REPO: ${{ github.repository }}
+          HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name || github.repository }}
           WORKFLOW: ${{ github.event.workflow_run.name || 'Manual smoke test' }}
           BRANCH: ${{ github.event.workflow_run.head_branch || github.ref_name }}
           SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
@@ -68,10 +80,18 @@ jobs:
             exit 0
           fi
 
+          # Attribution: a run whose code came from a fork says so, so no
+          # outsider's pull request can render as this repository's own build.
+          # See WHOSE CODE RAN above.
+          repo="${HEAD_REPO}"
+          if [ "${HEAD_REPO}" != "${BASE_REPO}" ]; then
+            repo="${HEAD_REPO} (fork)"
+          fi
+
           # jq builds the JSON so every value is escaped as data, whatever the
           # branch name contains.
           body=$(jq -nc \
-            --arg repo "${REPO}" \
+            --arg repo "${repo}" \
             --arg workflow "${WORKFLOW}" \
             --arg branch "${BRANCH}" \
             --arg sha "${SHA}" \
@@ -93,9 +113,10 @@ jobs:
             | openssl dgst -sha256 -hmac "${HOOK_SECRET}" -binary \
             | base64 -w 0)
 
-          # Retries cover a Cloud Run cold start (the service scales to zero).
-          # They reuse the same id and timestamp, so a retry after a response we
-          # never saw is deduplicated rather than doubled.
+          # Retries cover the community service being briefly unreachable — a
+          # revision rollout, a restart. They reuse the same id and timestamp, so
+          # a retry after a response we never saw is deduplicated rather than
+          # doubled.
           status=$(curl --silent --show-error --output response.txt --write-out '%{http_code}' \
             --max-time 60 --retry 3 --retry-delay 5 --retry-connrefused \
             --request POST "${HOOK_URL}" \
@@ -105,9 +126,18 @@ jobs:
             --header "webhook-signature: v1,${signature}" \
             --data-binary "${body}")
 
+          # A line starting `::` is a command to the Actions runner, not text, so
+          # any run-supplied value echoed below is first stripped of the control
+          # characters that could start one. The `workflows:` filter above
+          # currently constrains these to a handful of literal names, which is a
+          # constraint on the trigger rather than on this echo — the stripping is
+          # what makes the echo safe on its own terms.
+          safe_workflow=$(printf '%s' "${WORKFLOW}" | tr -d '\000-\037')
+          safe_conclusion=$(printf '%s' "${CONCLUSION}" | tr -d '\000-\037')
+
           case "${status}" in
             2*)
-              echo "Reported ${WORKFLOW} (${CONCLUSION}) to #ci: $(cat response.txt)"
+              echo "Reported ${safe_workflow} (${safe_conclusion}) for ${repo} to #ci: $(cat response.txt)"
               ;;
             503)
               # The community server is up but has no CI_HOOK_SECRET yet. That
