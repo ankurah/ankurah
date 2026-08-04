@@ -1,0 +1,124 @@
+name: Report CI status
+
+# Posts each CI conclusion to the #ci room on community.ankurah.org
+# (ankurah/community#66), so the project's build status is readable from chat
+# without opening the Actions tab.
+#
+# WHICH RUNS ARE REPORTED. Every workflow here is gated on `pull_request`, so
+# `main` itself is never built — a main-only filter would make #ci permanently
+# silent. The rule instead is: report every failure, on any branch, plus the two
+# headline workflows even when they pass. A green PR push therefore produces one
+# line, and a broken one produces up to four. Benchmarks is deliberately absent:
+# it is advisory and never fails, so it would be pure noise.
+#
+# AUTHENTICATION. The community endpoint has no login; a delivery proves itself
+# by carrying an HMAC-SHA256 of its own raw body under a shared secret, in the
+# svix header shape (see server/src/ci_hook.rs there). The secret lives in the
+# COMMUNITY_CI_HOOK_SECRET Actions secret on this repo and in Secret Manager on
+# the community side; both must hold the same value.
+#
+# INJECTION. Every field of the payload comes from the triggering run, and a
+# branch name is whatever a contributor called it — including `$(…)` or a
+# backtick. Those values are therefore passed through `env:` and never
+# interpolated into the script body, which is what keeps a hostile branch name
+# from executing here. The community server sanitizes them a second time before
+# they reach message text.
+
+on:
+  workflow_run:
+    workflows: [Tests, WASM Browser Tests, Format Check, Publish Crates]
+    types: [completed]
+  # A manual smoke test of the whole leg (signer → endpoint → #ci message)
+  # without waiting for an organic run. Reports the dispatching ref as a
+  # success.
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  report:
+    name: Post the conclusion to community #ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || github.event.workflow_run.conclusion != 'success'
+      || github.event.workflow_run.name == 'Tests'
+      || github.event.workflow_run.name == 'Publish Crates'
+    steps:
+      - name: Sign and POST the report
+        env:
+          HOOK_URL: ${{ vars.COMMUNITY_CI_HOOK_URL || 'https://community.ankurah.org/hooks/ci' }}
+          HOOK_SECRET: ${{ secrets.COMMUNITY_CI_HOOK_SECRET }}
+          REPO: ${{ github.repository }}
+          WORKFLOW: ${{ github.event.workflow_run.name || 'Manual smoke test' }}
+          BRANCH: ${{ github.event.workflow_run.head_branch || github.ref_name }}
+          SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion || 'success' }}
+          RUN_URL: ${{ github.event.workflow_run.html_url || format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}
+          RUN_ID: ${{ github.event.workflow_run.id || github.run_id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt || github.run_attempt }}
+          ACTOR: ${{ github.event.workflow_run.actor.login || github.actor }}
+        run: |
+          set -euo pipefail
+          # No `set -x` anywhere below: the secret is an argv away from the log.
+
+          if [ -z "${HOOK_SECRET}" ]; then
+            echo "::warning::COMMUNITY_CI_HOOK_SECRET is not set; skipping the #ci report."
+            exit 0
+          fi
+
+          # jq builds the JSON so every value is escaped as data, whatever the
+          # branch name contains.
+          body=$(jq -nc \
+            --arg repo "${REPO}" \
+            --arg workflow "${WORKFLOW}" \
+            --arg branch "${BRANCH}" \
+            --arg sha "${SHA}" \
+            --arg conclusion "${CONCLUSION}" \
+            --arg run_url "${RUN_URL}" \
+            --arg run_id "${RUN_ID}" \
+            --arg actor "${ACTOR}" \
+            '{repo:$repo,workflow:$workflow,branch:$branch,sha:$sha,conclusion:$conclusion,run_url:$run_url,run_id:$run_id,actor:$actor}')
+
+          # The delivery id is stable per (run, attempt, workflow), so a retry
+          # of this job re-posts nothing: the server spends an id once.
+          id="gh-${RUN_ID}-${RUN_ATTEMPT}"
+          timestamp=$(date +%s)
+
+          # The signed content is "<id>.<timestamp>.<raw body>", and the bytes
+          # signed here must be the bytes sent below — hence `printf '%s'` and
+          # `--data-binary`, neither of which adds a newline.
+          signature=$(printf '%s.%s.%s' "${id}" "${timestamp}" "${body}" \
+            | openssl dgst -sha256 -hmac "${HOOK_SECRET}" -binary \
+            | base64 -w 0)
+
+          # Retries cover a Cloud Run cold start (the service scales to zero).
+          # They reuse the same id and timestamp, so a retry after a response we
+          # never saw is deduplicated rather than doubled.
+          status=$(curl --silent --show-error --output response.txt --write-out '%{http_code}' \
+            --max-time 60 --retry 3 --retry-delay 5 --retry-connrefused \
+            --request POST "${HOOK_URL}" \
+            --header 'content-type: application/json' \
+            --header "webhook-id: ${id}" \
+            --header "webhook-timestamp: ${timestamp}" \
+            --header "webhook-signature: v1,${signature}" \
+            --data-binary "${body}")
+
+          case "${status}" in
+            2*)
+              echo "Reported ${WORKFLOW} (${CONCLUSION}) to #ci: $(cat response.txt)"
+              ;;
+            503)
+              # The community server is up but has no CI_HOOK_SECRET yet. That
+              # is their configuration to finish, not a fault in this run — warn
+              # rather than paint ankurah's Actions tab red.
+              echo "::warning::community #ci hook is not configured yet (503); nothing posted."
+              ;;
+            *)
+              # 401 means the two sides hold different secrets; 4xx means this
+              # payload is wrong. Both need a human.
+              echo "::error::#ci report failed with HTTP ${status}: $(cat response.txt)"
+              exit 1
+              ;;
+          esac
