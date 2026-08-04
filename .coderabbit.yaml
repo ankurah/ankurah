@@ -1,0 +1,6 @@
+# CodeRabbit automatic PR reviews are disabled as noise (maintainer,
+# 2026-08-04). On-demand review still works by commenting
+# "@coderabbitai review" on a PR.
+reviews:
+  auto_review:
+    enabled: false
