@@ -85,12 +85,9 @@ is engine-specific -- there is no single scheme enforced across the layer:
   *per-collection* `collection_{id}` tree (sled) or index object stores
   (IndexedDB) holding the materialized, indexable projection used for queries.
 
-`core/src/storage.rs` defines helper functions `state_name()` and
-`event_name()` that produce `{collection}_state` / `{collection}_event`, but
-note that the current engines do not route through them (Postgres/SQLite build
-their own names, and the KV engines use fixed shared-store names); treat those
-helpers as a naming convention rather than the authoritative source of table
-names.
+There is no shared naming helper in the storage layer: each engine builds these
+names inline, so the schemes above describe current engine behavior rather than
+a single convention enforced by common code.
 
 **Write ordering.** The state snapshot and its events are written by different
 calls, and the order matters. The invariant enforced one layer up is: commit
