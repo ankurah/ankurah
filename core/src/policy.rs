@@ -51,6 +51,24 @@ pub use crate::schema::registration::{PlannedModelPropertyMembership, PlannedUpd
 /// - checking access for requests. If approved, yield a ContextData
 /// - attesting events for requests that were approved
 /// - validating attestations for events
+///
+/// The four checks that take a credential collection
+/// ([`Self::can_access_collection`], [`Self::filter_predicate`],
+/// [`Self::check_read`], [`Self::check_read_event`]) can be handed
+/// several credentials, one, or none. An implementation must decide the
+/// empty case deliberately instead of inheriting whatever its loops
+/// happen to do with it: with no credential there is no principal to
+/// attribute the access to, so fail closed unless permissiveness is the
+/// point. The JWT agent in extensions/jwt-auth denies it wherever
+/// admission is decided — `can_access_collection`, and `check_read` and
+/// `check_read_event` which both reach that check (the first as its
+/// opening step, the second after the privileged short-circuit) — carving out only
+/// the policy collection, which is granted before any credential is
+/// consulted. (Its `filter_predicate` does return the predicate
+/// unnarrowed when the collection has no scope rules, which admits
+/// nobody: every caller passes `can_access_collection` before it.)
+/// [`PermissiveAgent`] allows the empty collection, that being the whole
+/// of what it is for.
 #[async_trait]
 pub trait PolicyAgent: Clone + Send + Sync + 'static {
     /// The context type that will be used for all resource requests.
@@ -275,7 +293,7 @@ impl PolicyAgent for PermissiveAgent {
 
     fn can_access_collection<C>(&self, _data: &C, _collection: &proto::CollectionId) -> Result<(), AccessDenied>
     where C: Iterable<Self::ContextData> {
-        // PermissiveAgent allows access if any context is provided
+        // PermissiveAgent allows regardless of which credentials are supplied, including none
         Ok(())
     }
 
@@ -289,13 +307,13 @@ impl PolicyAgent for PermissiveAgent {
     where
         C: Iterable<Self::ContextData>,
     {
-        // PermissiveAgent allows access if any context is provided
+        // PermissiveAgent allows regardless of which credentials are supplied, including none
         Ok(())
     }
 
     fn check_read_event<C>(&self, _data: &C, _event: &Attested<proto::Event>) -> Result<(), AccessDenied>
     where C: Iterable<Self::ContextData> {
-        // PermissiveAgent allows access if any context is provided
+        // PermissiveAgent allows regardless of which credentials are supplied, including none
         Ok(())
     }
 
@@ -315,7 +333,7 @@ impl PolicyAgent for PermissiveAgent {
 
     fn filter_predicate<C>(&self, _data: &C, _collection: &proto::CollectionId, predicate: Predicate) -> Result<Predicate, AccessDenied>
     where C: Iterable<Self::ContextData> {
-        // PermissiveAgent allows access if any context is provided
+        // PermissiveAgent allows regardless of which credentials are supplied, including none
         Ok(predicate)
     }
 

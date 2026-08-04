@@ -11,21 +11,21 @@ use common::*;
 #[tokio::test]
 async fn sessions_extend_through_livequeries() -> anyhow::Result<()> {
     let node = durable_sled_setup().await?;
-    assert!(node.sessions.sessions().is_empty());
+    assert!(node.session_registry().is_empty());
 
     let ctx = node.context(DEFAULT_CONTEXT)?;
-    assert_eq!(node.sessions.sessions().len(), 1, "context construction attaches its source to the registry");
+    assert_eq!(node.session_registry().len(), 1, "context construction attaches its source to the registry");
 
     let second = node.context(DEFAULT_CONTEXT)?;
-    assert_eq!(node.sessions.sessions().len(), 2, "sessions are per-context, never deduplicated");
+    assert_eq!(node.session_registry().len(), 2, "sessions are per-context: an equal credential still gets its own session");
     drop(second);
-    assert_eq!(node.sessions.sessions().len(), 1);
+    assert_eq!(node.session_registry().len(), 1);
 
     ctx.register_model::<Album>().await?;
     let lq = ctx.query_wait::<AlbumView>("true").await?;
     drop(ctx);
-    assert_eq!(node.sessions.sessions().len(), 1, "a live query extends its session past the context drop");
+    assert_eq!(node.session_registry().len(), 1, "a live query extends its session past the context drop");
     drop(lq);
-    assert!(node.sessions.sessions().is_empty(), "the last holder's drop removes the source from the union");
+    assert!(node.session_registry().is_empty(), "the last holder's drop removes the source from the union");
     Ok(())
 }

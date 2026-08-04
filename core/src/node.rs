@@ -141,7 +141,7 @@ where PA: PolicyAgent
     /// this node: each context attaches its credential source here at
     /// construction, so any state the node acts under is enumerable
     /// from one place.
-    pub sessions: SessionSet<PA::ContextData>,
+    pub(crate) sessions: SessionSet<PA::ContextData>,
 
     /// The reactor for handling subscriptions
     pub(crate) reactor: Reactor,
@@ -536,13 +536,14 @@ where
             }
             proto::NodeRequestBody::SubscribeQuery { query_id, collection, selection, version, known_matches } => {
                 let peer_state = self.peer_connections.get(&request.from).ok_or_else(|| anyhow!("Peer {} not connected", request.from))?;
-                // Reads may act under many credentials (the union), but
-                // the per-query session substrate lands with its first
-                // plural consumer (the set-backed context) — until then a
-                // subscribe carries exactly one. The empty and union
-                // verdicts stay fenced: https://github.com/ankurah/ankurah/issues/432
+                // Reads may act under many credentials (the union), and a
+                // context can already hold several: what is missing is
+                // this server accepting them, so a subscribe carries
+                // exactly one and a plural one is refused here. Admitting
+                // several — and with them the empty and union verdicts —
+                // stays fenced: https://github.com/ankurah/ankurah/issues/432
                 let cdata = cdata.iterable().exactly_one().map_err(|_| {
-                    anyhow!("SubscribeQuery currently requires exactly one cdata (plural subscriptions arrive with the set-backed context)")
+                    anyhow!("SubscribeQuery currently requires exactly one cdata (this server does not yet accept several per subscribe)")
                 })?;
                 peer_state.subscription_handler.subscribe_query(self, query_id, collection, selection, cdata, version, known_matches).await
             }
@@ -938,6 +939,19 @@ where
     /// Requires the `test-helpers` feature to be enabled.
     #[cfg(feature = "test-helpers")]
     pub fn insert_durable_peer_for_test(&self, peer_id: proto::EntityId) { self.durable_peers.insert(peer_id); }
+
+    /// TEST ONLY: Observe the session registry — the current credential
+    /// of every session backing a context on this node, in the
+    /// registry's union order. Values, not handles: observation cannot
+    /// become mutation.
+    ///
+    /// Lets tests assert membership (a context's source joining at
+    /// construction, its members leaving when the last holder drops)
+    /// while the registry itself stays core's, unreachable from outside.
+    ///
+    /// Requires the `test-helpers` feature to be enabled.
+    #[cfg(feature = "test-helpers")]
+    pub fn session_registry(&self) -> Vec<PA::ContextData> { self.sessions.current() }
 }
 
 impl<SE, PA> NodeInner<SE, PA>

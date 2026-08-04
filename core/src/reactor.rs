@@ -131,6 +131,15 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         Ok(())
     }
 
+    /// The subscription registered under `id`, cloned out of the map so
+    /// this module's children work off a handle rather than reaching
+    /// through the reactor into its lock. Private, which reaches every
+    /// descendant module: `Subscription` itself is no more visible than
+    /// that.
+    fn subscription(&self, id: ReactorSubscriptionId) -> Option<Subscription<E, Ev>> {
+        self.0.subscriptions.lock().unwrap().get(&id).cloned()
+    }
+
     /// Remove a predicate from a subscription
     pub fn remove_query(&self, subscription_id: ReactorSubscriptionId, query_id: proto::QueryId) -> Result<(), SubscriptionError> {
         let subscription = {
@@ -140,23 +149,14 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
 
         // Remove the query from the subscription
         let query_state = subscription.remove_query(query_id).ok_or(SubscriptionError::PredicateNotFound)?;
-        self.cleanup_removed_query(subscription_id, query_id, &query_state);
-        Ok(())
-    }
 
-    /// Watcher teardown shared by the removal paths.
-    fn cleanup_removed_query(
-        &self,
-        subscription_id: ReactorSubscriptionId,
-        query_id: proto::QueryId,
-        query_state: &subscription_state::QueryState<E>,
-    ) {
         // Remove from watchers (only if selection was set)
         if let Some(selection) = &query_state.selection {
             let mut watcher_set = self.0.watcher_set.lock().unwrap();
             let watcher_id = (subscription_id, query_id);
             watcher_set.recurse_predicate_watchers(&query_state.collection_id, &selection.predicate, watcher_id, WatcherOp::Remove);
         }
+        Ok(())
     }
 
     /// Add entity subscriptions to a subscription

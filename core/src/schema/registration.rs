@@ -143,7 +143,10 @@ pub enum RegistrationError {
     /// context could not act as a single principal.
     #[error("registration refused by policy: {0}")]
     PolicyDenied(
-        /// The policy agent's denial.
+        /// The refusal, from either origin: the policy agent's verdict
+        /// on the resolved plan, or the credential source's own refusal
+        /// when it holds no session or several and so cannot name the
+        /// single principal a registration acts as.
         #[from]
         AccessDenied,
     ),

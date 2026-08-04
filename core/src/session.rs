@@ -78,11 +78,16 @@ impl<CD: ContextData> Session<CD> {
     /// re-permission. A token refresh carries a new token, compares
     /// unequal, and notifies holders and change subscribers.
     pub fn update(&self, cdata: CD) {
-        // The compare and the store take the lock separately; a racing
-        // update can only make this comparison stale in ways that
-        // linearize legally (a suppressed call was a no-op against SOME
-        // current value, and the racing update's own notification covers
-        // the change).
+        // The compare and the store take the lock separately, on
+        // purpose: a gate held across the store would still be held
+        // across the broadcast that follows it, and a subscriber may
+        // call update from its own callback, which would deadlock. So
+        // the suppression below is best effort — two threads storing
+        // the same new value can both read the old one and both store,
+        // firing twice for one effective change. That costs nothing: a
+        // subscriber reads the current value when its callback runs,
+        // rather than being handed the value the writer stored, so the
+        // duplicate re-reads a value that is already correct.
         if self.0.current.value() == cdata {
             return;
         }
@@ -162,6 +167,20 @@ struct SessionSetInner<CD: ContextData> {
     parents: Mutex<Vec<Weak<SessionSetInner<CD>>>>,
 }
 
+/// Serializes [`SessionSet::attach`] across every set of every
+/// credential type: the check that an edge would not form a cycle and
+/// the installation of that edge happen under this one lock, so no two
+/// attaches can each find the graph acyclic and then both make it
+/// cyclic. One global lock covers all `ContextData` types (a static
+/// cannot be generic), which costs nothing — attaching happens when a
+/// context is constructed, not on any hot path.
+// Held across `reaches`, which can drop another set's last handle
+// mid-walk and run its Drop notification under this lock: a subscriber
+// re-entering `attach` from that callback would self-deadlock. No
+// SessionSet subscriber exists in-tree today; the re-permission work
+// (#426) adds the first and must mind this.
+static ATTACH_TOPOLOGY: Mutex<()> = Mutex::new(());
+
 struct AttachedSet<CD: ContextData> {
     set: Weak<SessionSetInner<CD>>,
     /// Forwards the attached set's change signal into `changed`;
@@ -210,10 +229,29 @@ impl<CD: ContextData> SessionSet<CD> {
     /// session backing a context. A no-op for self-attachment (the
     /// registry backing a context is its own source); an attach
     /// that would form a cycle is refused, warned and ignored.
+    ///
+    /// Whether two handles name the same set. Identity, not content:
+    /// the error paths that must decide "is this map entry still the
+    /// set I created" cannot use value equality, which two distinct
+    /// sets can satisfy.
+    pub(crate) fn ptr_eq(&self, other: &SessionSet<CD>) -> bool { Arc::ptr_eq(&self.0, &other.0) }
+
+    /// Attach is the only operation that creates an edge, and it holds
+    /// the module's topology lock across both the reachability check
+    /// and the install, so each refusal is decided against the graph
+    /// the edge would actually join: two threads attaching opposite
+    /// directions between the same pair are ordered, and whichever runs
+    /// second sees the first one's edge and refuses. The graph stays
+    /// acyclic that way — which the walks below tolerate regardless,
+    /// but the forwarded change signals do not: around a cycle every
+    /// set's notification re-enters the next one's, without end. The
+    /// notification fires once every lock is released, as elsewhere in
+    /// this type.
     pub fn attach(&self, other: &SessionSet<CD>) {
         if Arc::ptr_eq(&self.0, &other.0) {
             return;
         }
+        let topology = ATTACH_TOPOLOGY.lock().unwrap_or_else(|e| e.into_inner());
         if other.reaches(self) {
             tracing::warn!("refusing attach: it would form a cycle");
             return;
@@ -238,6 +276,7 @@ impl<CD: ContextData> SessionSet<CD> {
             attached.push(AttachedSet { set: other_weak, _forward: forward });
         }
         other.0.parents.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&self.0));
+        drop(topology);
         // Fire outside the locks: subscribers read the set back.
         self.0.changed.send(());
     }
@@ -303,17 +342,31 @@ impl<CD: ContextData> SessionSet<CD> {
     }
 
     /// Whether `target` is reachable from this set through attached
-    /// edges (including being this set). Attach refuses cycle-forming
-    /// edges, so the walk terminates.
+    /// edges (including being this set). Each set is visited once, like
+    /// [`SessionSet::sessions`], so the walk is total on any graph:
+    /// this is what attach consults to decide whether an edge would
+    /// form a cycle, and that answer cannot be allowed to depend on the
+    /// very property it is deciding.
     fn reaches(&self, target: &SessionSet<CD>) -> bool {
+        let mut visited = HashSet::new();
+        self.reaches_from(target, &mut visited)
+    }
+
+    fn reaches_from(&self, target: &SessionSet<CD>, visited: &mut HashSet<*const ()>) -> bool {
         if Arc::ptr_eq(&self.0, &target.0) {
             return true;
         }
+        if !visited.insert(Arc::as_ptr(&self.0) as *const ()) {
+            return false;
+        }
+        // Snapshot the edges, then recurse with no lock held.
         let edges: Vec<_> = self.0.attached.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|edge| edge.set.clone()).collect();
-        edges.into_iter().filter_map(|edge| edge.upgrade()).any(|inner| SessionSet(inner).reaches(target))
+        edges.into_iter().filter_map(|edge| edge.upgrade()).any(|inner| SessionSet(inner).reaches_from(target, visited))
     }
 
-    /// The current value of every live session, in slot order.
+    /// The current value of every live session — own members in slot
+    /// order, then each attached set's, depth-first (the order
+    /// [`SessionSet::sessions`] lists them in).
     pub fn current(&self) -> Vec<CD> { self.sessions().iter().map(|session| session.snapshot()).collect() }
 
     /// The single credential write paths act as. A write is one
@@ -334,7 +387,7 @@ impl<CD: ContextData> SessionSet<CD> {
 }
 
 impl<CD: ContextData> From<CD> for SessionSet<CD> {
-    /// Bare state becomes a private set owning one freshly minted
+    /// Bare state becomes a private set owning one freshly created
     /// session — the shape of an ordinary context's source.
     fn from(cdata: CD) -> Self {
         let set = SessionSet::new();
@@ -389,126 +442,4 @@ impl<CD: ContextData> Subscribe<Vec<CD>> for SessionSet<CD> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A value-carrying test credential. Equality is full-value
-    /// (operational identity per the [`ContextData`] contract), so a
-    /// token refresh — same subject, new token — compares unequal and an
-    /// identical update compares equal.
-    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-    struct TestCd {
-        subject: u8,
-        token: u8,
-    }
-    impl ContextData for TestCd {}
-
-    /// A context-shaped source — a private set owning its session,
-    /// attached to a registry — joins the registry's union while it
-    /// lives, and its members leave when it drops.
-    #[test]
-    fn attached_set_liveness() {
-        let registry: SessionSet<TestCd> = SessionSet::new();
-        let source: SessionSet<TestCd> = TestCd { subject: 1, token: 0 }.into();
-        registry.attach(&source);
-        assert_eq!(registry.sessions().len(), 1, "attached members join the union");
-
-        let second: SessionSet<TestCd> = TestCd { subject: 2, token: 0 }.into();
-        registry.attach(&second);
-        assert_eq!(registry.sessions().len(), 2);
-
-        drop(second);
-        assert_eq!(registry.sessions().len(), 1, "a dropped source's members leave the union");
-        drop(source);
-        assert!(registry.sessions().is_empty());
-    }
-
-    /// Updates are visible to every holder and fire change subscribers
-    /// with the new value.
-    #[test]
-    fn update_is_shared_and_reactive() {
-        let session = Session::new(TestCd { subject: 1, token: 1 });
-        let holder = session.clone();
-
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let sink = seen.clone();
-        let _guard = session.subscribe(move |value: TestCd| {
-            sink.lock().unwrap().push(value.token);
-        });
-
-        session.update(TestCd { subject: 2, token: 2 });
-        assert_eq!(holder.snapshot().token, 2, "holders read the new value");
-        assert_eq!(seen.lock().unwrap().as_slice(), &[2], "subscriber fired with the new value");
-    }
-
-    /// A token refresh — same subject, new token — is a real change: it
-    /// compares unequal and fires the subscriber. An identical update is
-    /// a complete no-op: no notification.
-    #[test]
-    fn refresh_notifies_and_identical_update_is_a_noop() {
-        let session = Session::new(TestCd { subject: 1, token: 1 });
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let sink = seen.clone();
-        let _guard = session.subscribe(move |value: TestCd| {
-            sink.lock().unwrap().push(value.token);
-        });
-
-        let refreshed = TestCd { subject: 1, token: 2 };
-        assert_ne!(session.snapshot(), refreshed, "a refresh carries a new token, so it compares unequal");
-        session.update(refreshed);
-        assert_eq!(seen.lock().unwrap().as_slice(), &[2], "the refresh fires the subscriber");
-
-        session.update(TestCd { subject: 1, token: 2 });
-        assert_eq!(seen.lock().unwrap().as_slice(), &[2], "an identical update does not notify");
-        assert_eq!(session.snapshot().token, 2, "the stored value is unchanged");
-    }
-
-    /// A new session belongs to no set until something owns it.
-    #[test]
-    fn new_sessions_belong_to_no_set() {
-        let set: SessionSet<TestCd> = SessionSet::new();
-        let _infra = Session::new(TestCd { subject: 1, token: 0 });
-        assert!(set.sessions().is_empty());
-    }
-
-    /// The set is a signal over the union of current values: it fires on
-    /// own, on any member's update, on attach, and when an attached
-    /// source drops.
-    #[test]
-    fn set_fires_on_membership_and_member_updates() {
-        let set: SessionSet<TestCd> = SessionSet::new();
-        let fired = Arc::new(Mutex::new(Vec::new()));
-        let sink = fired.clone();
-        let _guard = set.subscribe(move |current: Vec<TestCd>| {
-            sink.lock().unwrap().push(current.iter().map(|cd| cd.token).collect::<Vec<_>>());
-        });
-
-        let a = Session::new(TestCd { subject: 1, token: 10 });
-        set.own(&a);
-        assert_eq!(fired.lock().unwrap().last(), Some(&vec![10]), "owning fires with the new union");
-
-        a.update(TestCd { subject: 1, token: 11 });
-        assert_eq!(fired.lock().unwrap().last(), Some(&vec![11]), "a member's update fires with its new value");
-
-        let child: SessionSet<TestCd> = TestCd { subject: 2, token: 20 }.into();
-        set.attach(&child);
-        assert_eq!(fired.lock().unwrap().last(), Some(&vec![11, 20]), "attaching fires with the joined union");
-
-        let count = fired.lock().unwrap().len();
-        drop(child);
-        assert_eq!(fired.lock().unwrap().last(), Some(&vec![11]), "a dropped source fires the shrunken union");
-        assert_eq!(fired.lock().unwrap().len(), count + 1, "exactly the drop notification fired");
-    }
-
-    /// Peek reads the union without tracking; the porcelain and the
-    /// inherent accessors agree.
-    #[test]
-    fn porcelain_and_inherent_accessors_agree() {
-        let set: SessionSet<TestCd> = SessionSet::new();
-        let session = Session::new(TestCd { subject: 1, token: 1 });
-        set.own(&session);
-        assert_eq!(session.peek(), session.snapshot());
-        assert_eq!(set.peek(), set.current());
-        assert_eq!(set.peek(), vec![TestCd { subject: 1, token: 1 }]);
-    }
-}
+mod tests;
