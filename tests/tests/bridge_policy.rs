@@ -119,8 +119,15 @@ impl PolicyAgent for BridgePolicyAgent {
         Ok(())
     }
 
-    fn check_read_event<C>(&self, _data: &C, event: &Attested<proto::Event>) -> Result<(), AccessDenied>
-    where C: Iterable<Self::ContextData> {
+    fn check_read_event<C>(
+        &self,
+        _data: &C,
+        event: &Attested<proto::Event>,
+        _current_state: Option<&proto::State>,
+    ) -> Result<(), AccessDenied>
+    where
+        C: Iterable<Self::ContextData>,
+    {
         if self.deny_read_events.lock().unwrap().contains(&event.payload.id()) {
             return Err(AccessDenied::ByPolicy("event read denied by test agent"));
         }

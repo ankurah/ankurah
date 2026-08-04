@@ -521,10 +521,26 @@ where
                 self.policy_agent.can_access_collection(cdata, &collection)?;
                 let storage_collection = self.collections.get(&collection).await?;
 
+                let stored_events = storage_collection.get_events(event_ids).await?;
+
+                // An event carries its entity's content, so the read check needs
+                // the same thing the state path gives it: the entity's current
+                // state. Fetch one state per distinct entity in the batch;
+                // entities with no stored state are absent from the map, and the
+                // policy agent decides what an absent state means.
+                let entity_ids: Vec<proto::EntityId> =
+                    stored_events.iter().map(|e| e.payload.entity_id).collect::<std::collections::HashSet<_>>().into_iter().collect();
+                let states: std::collections::HashMap<proto::EntityId, proto::State> = storage_collection
+                    .get_states(entity_ids)
+                    .await?
+                    .into_iter()
+                    .map(|state| (state.payload.entity_id, state.payload.state))
+                    .collect();
+
                 // filter out any that the policy agent says we don't have access to
                 let mut events = Vec::new();
-                for event in storage_collection.get_events(event_ids).await? {
-                    match self.policy_agent.check_read_event(cdata, &event) {
+                for event in stored_events {
+                    match self.policy_agent.check_read_event(cdata, &event, states.get(&event.payload.entity_id)) {
                         Ok(_) => events.push(event),
                         Err(AccessDenied::ByPolicy(_)) => {}
                         // TODO: we need to have a cleaner delineation between actual access denied versus processing errors
@@ -726,7 +742,7 @@ where
             }
 
             // Case 2: Heads differ → try to build EventBridge (cheaper than full state) ✓
-            match self.collect_event_bridge(storage_collection, known_head, current_head, cdata).await {
+            match self.collect_event_bridge(storage_collection, known_head, &state, cdata).await {
                 Ok(attested_events) if !attested_events.is_empty() => {
                     // Convert Attested<Event> to EventFragments (strips entity_id and collection)
                     let event_fragments: Vec<proto::EventFragment> = attested_events.into_iter().map(|e| e.into()).collect();
@@ -748,13 +764,16 @@ where
         Ok(Some(proto::EntityDelta { entity_id, collection, content: proto::DeltaContent::StateSnapshot { state: state_fragment } }))
     }
 
-    /// Collect events between known_head and current_head using event_dag comparison.
-    /// Returns events needed to advance from known_head to current_head.
+    /// Collect events between known_head and the entity's current head using
+    /// event_dag comparison. Returns events needed to advance from known_head to
+    /// that head. Every event in the window belongs to `current_state`'s entity
+    /// (the walk starts at its head and follows parents), so that state is what
+    /// the read check evaluates each of them against.
     pub(crate) async fn collect_event_bridge<C>(
         &self,
         storage_collection: &crate::storage::StorageCollectionWrapper,
         known_head: &proto::Clock,
-        current_head: &proto::Clock,
+        current_state: &proto::State,
         cdata: &C,
     ) -> anyhow::Result<Vec<proto::Attested<proto::Event>>>
     where
@@ -766,6 +785,7 @@ where
         use crate::retrieval::LocalEventGetter;
         use std::collections::HashSet;
 
+        let current_head = &current_state.head;
         let event_getter = LocalEventGetter::new(storage_collection.clone(), self.durable);
 
         // First check the causal relationship
@@ -808,7 +828,7 @@ where
                 // entirely and let the caller fall back to a state snapshot,
                 // which passes its own read check.
                 for event in &events {
-                    match self.policy_agent.check_read_event(cdata, event) {
+                    match self.policy_agent.check_read_event(cdata, event, Some(current_state)) {
                         Ok(()) => {}
                         Err(AccessDenied::ByPolicy(_)) => return Ok(vec![]),
                         Err(e) => return Err(anyhow!("check_read_event failed while building event bridge: {}", e)),

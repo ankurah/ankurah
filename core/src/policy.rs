@@ -184,8 +184,22 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
         C: Iterable<Self::ContextData>;
 
     /// Check if a context can read an event
-    fn check_read_event<C>(&self, data: &C, event: &Attested<proto::Event>) -> Result<(), AccessDenied>
-    where C: Iterable<Self::ContextData>;
+    ///
+    /// An event replays the same entity content a state carries, so an agent
+    /// that admits entities row by row in [`Self::check_read`] must apply the
+    /// same rule here or the row filter is only as strong as the collection
+    /// gate. `current_state` is the state the serving node currently holds for
+    /// the event's entity, giving that rule something to evaluate; it is `None`
+    /// when the node holds no state for the entity, and an agent whose decision
+    /// depends on state should refuse rather than guess.
+    fn check_read_event<C>(
+        &self,
+        data: &C,
+        event: &Attested<proto::Event>,
+        current_state: Option<&proto::State>,
+    ) -> Result<(), AccessDenied>
+    where
+        C: Iterable<Self::ContextData>;
 
     /// Check if a context can edit an entity
     fn check_write(&self, data: &Self::ContextData, entity: &Entity, event: Option<&proto::Event>) -> Result<(), AccessDenied>;
@@ -311,8 +325,15 @@ impl PolicyAgent for PermissiveAgent {
         Ok(())
     }
 
-    fn check_read_event<C>(&self, _data: &C, _event: &Attested<proto::Event>) -> Result<(), AccessDenied>
-    where C: Iterable<Self::ContextData> {
+    fn check_read_event<C>(
+        &self,
+        _data: &C,
+        _event: &Attested<proto::Event>,
+        _current_state: Option<&proto::State>,
+    ) -> Result<(), AccessDenied>
+    where
+        C: Iterable<Self::ContextData>,
+    {
         // PermissiveAgent allows regardless of which credentials are supplied, including none
         Ok(())
     }

@@ -79,6 +79,47 @@ impl JwtAgent {
 
     /// Replaces the in-memory config with a new one.
     pub fn update_config(&self, new_config: PolicyConfig) { self.state.write().unwrap_or_else(|e| e.into_inner()).config = new_config; }
+
+    /// Row-level read authorization for one entity, evaluated against the state
+    /// the caller holds for it. Both read paths land here -- `check_read` for an
+    /// entity's state and `check_read_event` for its events -- so a caller that
+    /// cannot read a row cannot read that row's events either, which would
+    /// otherwise hand it the same content in replayable form.
+    ///
+    /// `state` is `None` when the caller has no state for the entity. A
+    /// collection carrying scope rules then has nothing to evaluate them
+    /// against and is refused; a collection without scope rules was already
+    /// settled by the collection gate above.
+    fn check_read_entity<C>(
+        &self,
+        data: &C,
+        id: &proto::EntityId,
+        collection: &proto::CollectionId,
+        state: Option<&proto::State>,
+    ) -> Result<(), AccessDenied>
+    where
+        C: Iterable<JwtContext>,
+    {
+        self.can_access_collection(data, collection)?;
+
+        for ctx in data.iterable() {
+            if ctx.is_privileged() {
+                return Ok(());
+            }
+        }
+
+        let guard = self.state.read().unwrap_or_else(|e| e.into_inner());
+        if guard.config.scope_rules_for_collection(collection.as_str()).is_empty() {
+            return Ok(());
+        }
+
+        let Some(state) = state else {
+            return Err(AccessDenied::ByPolicy("Read scope has no current entity state to evaluate"));
+        };
+        let entity = TemporaryEntity::new(*id, collection.clone(), state)
+            .map_err(|_| AccessDenied::ByPolicy("Read scope entity state could not be evaluated"))?;
+        enforce_read_scope(&guard.config, data, &entity)
+    }
 }
 
 #[async_trait]
@@ -269,32 +310,19 @@ impl PolicyAgent for JwtAgent {
     where
         C: Iterable<Self::ContextData>,
     {
-        self.can_access_collection(data, collection)?;
-
-        for ctx in data.iterable() {
-            if ctx.is_privileged() {
-                return Ok(());
-            }
-        }
-
-        let guard = self.state.read().unwrap_or_else(|e| e.into_inner());
-        if guard.config.scope_rules_for_collection(collection.as_str()).is_empty() {
-            return Ok(());
-        }
-
-        let entity = TemporaryEntity::new(*id, collection.clone(), state)
-            .map_err(|_| AccessDenied::ByPolicy("Read scope entity state could not be evaluated"))?;
-        enforce_read_scope(&guard.config, data, &entity)
+        self.check_read_entity(data, id, collection, Some(state))
     }
 
-    fn check_read_event<C>(&self, data: &C, event: &Attested<proto::Event>) -> Result<(), AccessDenied>
-    where C: Iterable<Self::ContextData> {
-        for ctx in data.iterable() {
-            if ctx.is_privileged() {
-                return Ok(());
-            }
-        }
-        self.can_access_collection(data, &event.payload.collection)
+    fn check_read_event<C>(
+        &self,
+        data: &C,
+        event: &Attested<proto::Event>,
+        current_state: Option<&proto::State>,
+    ) -> Result<(), AccessDenied>
+    where
+        C: Iterable<Self::ContextData>,
+    {
+        self.check_read_entity(data, &event.payload.entity_id, &event.payload.collection, current_state)
     }
 
     fn check_write(&self, cdata: &Self::ContextData, entity: &Entity, _event: Option<&proto::Event>) -> Result<(), AccessDenied> {

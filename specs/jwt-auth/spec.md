@@ -208,7 +208,12 @@ Deserializes `AuthData` back into `JwtContext`:
 
 #### `check_read` / `check_read_event`
 
-Delegates to `can_access_collection`.
+Both run the same row-level check, so a caller refused an entity's state is also refused that entity's events (events replay the same content):
+
+- `can_access_collection` first; `Root` context bypasses the rest.
+- No scope rules on the collection: allowed, the collection gate was the whole decision.
+- Otherwise the entity's state is loaded into a `TemporaryEntity` and each read-applicable scope predicate is evaluated against it; a context is admitted when all of its predicates hold.
+- `check_read_event` evaluates against the entity's *current* state, which the serving node passes in. When no current state is available, a collection carrying scope rules is refused (there is nothing to evaluate) and a collection without them is unaffected.
 
 #### `validate_received_event` / `validate_received_state` / `attest_state` / `validate_causal_assertion`
 
