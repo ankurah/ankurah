@@ -89,7 +89,9 @@ impl JwtAgent {
     /// `state` is `None` when the caller has no state for the entity. A
     /// collection carrying scope rules then has nothing to evaluate them
     /// against and is refused; a collection without scope rules was already
-    /// settled by the collection gate above.
+    /// settled by the collection gate above. A `state` that is present must be
+    /// `id`'s own state -- `check_read_event`, whose caller supplies the two
+    /// separately, refuses a mismatched pair before it gets here.
     fn check_read_entity<C>(
         &self,
         data: &C,
@@ -317,11 +319,22 @@ impl PolicyAgent for JwtAgent {
         &self,
         data: &C,
         event: &Attested<proto::Event>,
-        current_state: Option<&proto::State>,
+        current_state: Option<&proto::EntityState>,
     ) -> Result<(), AccessDenied>
     where
         C: Iterable<Self::ContextData>,
     {
+        // The state is only evidence about the row the event belongs to. Handed
+        // another entity's state, the scope rule would be evaluated against a row
+        // the caller may well read, and admit an event from a row it may not --
+        // so a mispaired state is refused outright rather than evaluated.
+        let current_state = match current_state {
+            Some(state) if state.entity_id != event.payload.entity_id => {
+                return Err(AccessDenied::ByPolicy("Read scope state belongs to a different entity than the event"))
+            }
+            Some(state) => Some(&state.state),
+            None => None,
+        };
         self.check_read_entity(data, &event.payload.entity_id, &event.payload.collection, current_state)
     }
 

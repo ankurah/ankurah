@@ -841,7 +841,7 @@ impl ankurah::policy::PolicyAgent for ProbeAgent {
         &self,
         _data: &C,
         _event: &proto::Attested<proto::Event>,
-        _current_state: Option<&proto::State>,
+        _current_state: Option<&proto::EntityState>,
     ) -> Result<(), ankurah::policy::AccessDenied>
     where
         C: ankurah::core::util::Iterable<Self::ContextData>,

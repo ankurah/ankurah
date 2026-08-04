@@ -123,7 +123,7 @@ impl PolicyAgent for DenySecondAlbumEventAgent {
         &self,
         _data: &C,
         _event: &Attested<proto::Event>,
-        _current_state: Option<&proto::State>,
+        _current_state: Option<&proto::EntityState>,
     ) -> Result<(), AccessDenied>
     where
         C: Iterable<Self::ContextData>,

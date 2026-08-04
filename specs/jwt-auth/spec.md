@@ -214,6 +214,11 @@ Both run the same row-level check, so a caller refused an entity's state is also
 - No scope rules on the collection: allowed, the collection gate was the whole decision.
 - Otherwise the entity's state is loaded into a `TemporaryEntity` and each read-applicable scope predicate is evaluated against it; a context is admitted when all of its predicates hold.
 - `check_read_event` evaluates against the entity's *current* state, which the serving node passes in. When no current state is available, a collection carrying scope rules is refused (there is nothing to evaluate) and a collection without them is unaffected.
+- The state must belong to the event's own entity. A mispaired one is refused rather than evaluated: another row's state would answer for a row the caller can read in place of the row the event actually belongs to.
+
+Accepted residual: the verdict is about the row as it stands now, so a caller who can read a row today reads that row's whole history, including the part written while the row sat outside its scope. Per-event historical evaluation is tracked in [issue #445](https://github.com/ankurah/ankurah/issues/445).
+
+Engine-dependent limitation: on the IndexedDB engine events are stored without collection identity, so an event can be relabelled into a collection the caller may read and be judged by that collection's rules rather than its own ([issue #444](https://github.com/ankurah/ankurah/issues/444)).
 
 #### `validate_received_event` / `validate_received_state` / `attest_state` / `validate_causal_assertion`
 

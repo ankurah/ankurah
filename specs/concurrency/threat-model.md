@@ -491,14 +491,25 @@ entities row by row can apply the same rule it applies in `check_read` -- withou
 it the row filter reduced to the collection gate and events reconstructed content
 the state path withheld (#438). The serving node supplies the state it holds for
 the event's entity, or `None` when it holds none, and the agent decides what an
-absent state means.
+absent state means. Three things keep that pairing honest: the state travels as a
+whole `EntityState` so the agent can refuse one belonging to another entity; the
+`GetEvents` arm prefers the resident entity over the stored state buffer, which the
+EventOnly apply path leaves behind; and it serves an event only when the paired
+state's head causally covers it, since a commit publishes its event before it
+persists its state and the event may be the one that moves the row out of scope.
+The bridge walk excludes any event naming a different entity than the state it is
+checked against (a grafted parent pointer), giving up the bridge for a snapshot.
 Falsifying attack (T2): request events for a collection/entity the requester cannot
 read, defeated only if the agent's read checks are correct.
 Planned test arm: read-authorization arm with a restricting agent asserting denied
 events are filtered from both `GetEvents` and `EventBridge` responses.
 Status: enforced as call sites. Note the DoS interaction: `collect_event_bridge`
 filters *after* the unbounded walk (C4-17), so a read-denied bridge still costs the
-full traversal.
+full traversal. Two accepted residuals: the verdict is about the row as it stands
+now, so a caller who can read a row today reads that row's history from before the
+scope change (#445); and the IndexedDB engine stores events without collection
+identity, so an event can be relabelled into a collection whose rules the caller
+passes (#444).
 
 ### 3.5 Local-commit policy claims
 

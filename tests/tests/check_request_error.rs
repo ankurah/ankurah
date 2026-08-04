@@ -126,7 +126,7 @@ impl PolicyAgent for RejectingAgent {
         &self,
         _data: &C,
         _event: &proto::Attested<proto::Event>,
-        _current_state: Option<&proto::State>,
+        _current_state: Option<&proto::EntityState>,
     ) -> std::result::Result<(), AccessDenied>
     where
         C: Iterable<Self::ContextData>,
