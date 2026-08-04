@@ -1,5 +1,5 @@
-use crate::schema::catalog::CatalogManager;
 use crate::selection::filter::Filterable;
+use crate::{schema::catalog::CatalogManager, session::SessionSet};
 use ankurah_proto::{self as proto, Attested, CollectionId, EntityState};
 use anyhow::anyhow;
 
@@ -7,7 +7,6 @@ use rand::prelude::*;
 use rand::rngs::SmallRng;
 use std::{
     fmt,
-    hash::Hash,
     ops::Deref,
     sync::{Arc, Mutex, Weak},
 };
@@ -36,15 +35,15 @@ use tracing::instrument;
 
 use tracing::{debug, error, warn};
 
-pub struct PeerState {
+pub struct PeerState<CD: ContextData> {
     sender: Box<dyn PeerSender>,
     _durable: bool,
-    subscription_handler: SubscriptionHandler,
+    subscription_handler: SubscriptionHandler<CD>,
     pending_requests: SafeMap<proto::RequestId, oneshot::Sender<Result<proto::NodeResponseBody, RequestError>>>,
     pending_updates: SafeMap<proto::UpdateId, oneshot::Sender<Result<proto::NodeResponseBody, RequestError>>>,
 }
 
-impl PeerState {
+impl<CD: ContextData> PeerState<CD> {
     pub fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError> { self.sender.send_message(message) }
 }
 
@@ -119,9 +118,7 @@ where PA: PolicyAgent
     fn deref(&self) -> &Self::Target { &self.0 }
 }
 
-/// Represents the user session - or whatever other context the PolicyAgent
-/// Needs to perform it's evaluation.
-pub trait ContextData: Send + Sync + Clone + Hash + Eq + 'static {}
+pub use crate::session::ContextData;
 
 pub struct NodeInner<SE, PA>
 where PA: PolicyAgent
@@ -131,7 +128,7 @@ where PA: PolicyAgent
     pub collections: CollectionSet<SE>,
 
     pub(crate) entities: WeakEntitySet,
-    peer_connections: SafeMap<proto::EntityId, Arc<PeerState>>,
+    peer_connections: SafeMap<proto::EntityId, Arc<PeerState<PA::ContextData>>>,
     durable_peers: SafeSet<proto::EntityId>,
 
     /// Per-node source of randomness for peer selection. Seeded from entropy in production;
@@ -140,7 +137,11 @@ where PA: PolicyAgent
     /// RNG state and Node is shared across tasks; the lock is only ever held for a single draw.
     rng: Mutex<SmallRng>,
 
-    pub(crate) predicate_context: SafeMap<proto::QueryId, PA::ContextData>,
+    /// The continuous superset of every session backing a context on
+    /// this node: each context attaches its credential source here at
+    /// construction, so any state the node acts under is enumerable
+    /// from one place.
+    pub sessions: SessionSet<PA::ContextData>,
 
     /// The reactor for handling subscriptions
     pub(crate) reactor: Reactor,
@@ -202,7 +203,7 @@ where
             policy_agent,
             system: system_manager,
             catalog: catalog.clone(),
-            predicate_context: SafeMap::new(),
+            sessions: SessionSet::new(),
             subscription_relay,
             type_resolver: crate::TypeResolver::new(),
         }));
@@ -535,9 +536,14 @@ where
             }
             proto::NodeRequestBody::SubscribeQuery { query_id, collection, selection, version, known_matches } => {
                 let peer_state = self.peer_connections.get(&request.from).ok_or_else(|| anyhow!("Peer {} not connected", request.from))?;
-                // only one cdata is permitted for SubscribePredicate
-                use itertools::Itertools;
-                let cdata = cdata.iterable().exactly_one().map_err(|_| anyhow!("Only one cdata is permitted for SubscribePredicate"))?;
+                // Reads may act under many credentials (the union), but
+                // the per-query session substrate lands with its first
+                // plural consumer (the set-backed context) — until then a
+                // subscribe carries exactly one. The empty and union
+                // verdicts stay fenced: https://github.com/ankurah/ankurah/issues/432
+                let cdata = cdata.iterable().exactly_one().map_err(|_| {
+                    anyhow!("SubscribeQuery currently requires exactly one cdata (plural subscriptions arrive with the set-backed context)")
+                })?;
                 peer_state.subscription_handler.subscribe_query(self, query_id, collection, selection, cdata, version, known_matches).await
             }
         }
@@ -838,23 +844,28 @@ where
     /// persisted state.
     pub fn get_resident_entity(&self, id: proto::EntityId) -> Option<crate::entity::Entity> { self.entities.get(&id) }
 
-    pub fn context(&self, data: PA::ContextData) -> Result<Context, anyhow::Error> {
+    /// Build a context over its credential source: bare ContextData, an
+    /// existing session handle, or a whole [`SessionSet`] —
+    /// attached to the node's registry at construction.
+    ///
+    /// [`SessionSet`]: crate::session::SessionSet
+    pub fn context(&self, sessions: impl Into<SessionSet<PA::ContextData>>) -> Result<Context, anyhow::Error> {
         if !self.system.is_system_ready() {
             return Err(anyhow!("System is not ready"));
         }
-        Ok(Context::new(Node::clone(self), data))
+        Ok(Context::new(Node::clone(self), sessions))
     }
 
-    pub async fn context_async(&self, data: PA::ContextData) -> Context {
+    pub async fn context_async(&self, sessions: impl Into<SessionSet<PA::ContextData>>) -> Context {
         self.system.wait_system_ready().await;
-        Context::new(Node::clone(self), data)
+        Context::new(Node::clone(self), sessions)
     }
 
     pub(crate) async fn get_from_peer(
         &self,
         collection_id: &CollectionId,
         ids: Vec<proto::EntityId>,
-        cdata: &PA::ContextData,
+        cdata: &Vec<PA::ContextData>,
     ) -> Result<(), RetrievalError> {
         let peer_id = self.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
 
@@ -965,15 +976,14 @@ where
         query_id: proto::QueryId,
         collection_id: CollectionId,
         selection: ankql::ast::Selection,
-        cdata: PA::ContextData,
+        sessions: SessionSet<PA::ContextData>,
         version: u32,
         livequery: crate::livequery::WeakEntityLiveQuery,
     ) {
         if let Some(ref relay) = self.subscription_relay {
             // Resolve types in the AST (converts literals for JSON path comparisons)
             let selection = self.type_resolver.resolve_selection_types(selection);
-            self.predicate_context.insert(query_id, cdata.clone());
-            relay.subscribe_query(query_id, collection_id, selection, cdata, version, livequery);
+            relay.subscribe_query(query_id, collection_id, selection, sessions, version, livequery);
         }
     }
 
@@ -1017,9 +1027,6 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     fn unsubscribe_remote_predicate(&self, query_id: proto::QueryId) {
-        // Clean up subscription context
-        self.predicate_context.remove(&query_id);
-
         // Notify subscription relay for remote cleanup
         if let Some(ref relay) = self.subscription_relay {
             relay.unsubscribe_predicate(query_id);

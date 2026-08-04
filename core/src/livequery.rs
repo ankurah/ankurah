@@ -25,6 +25,7 @@ use crate::{
         ReactorSubscription, ReactorUpdate,
     },
     resultset::{EntityResultSet, ResultSet},
+    session::SessionSet,
     storage::StorageEngine,
     Node,
 };
@@ -204,12 +205,15 @@ fn create_inner<SE, PA>(
     node_ref: Box<dyn NodeRef>,
     collection_id: CollectionId,
     mut args: MatchArgs,
-    cdata: PA::ContextData,
+    sessions: SessionSet<PA::ContextData>,
 ) -> Result<(Arc<Inner>, proto::QueryId), RetrievalError>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
+    // One credential snapshot for the whole derivation; re-derivation
+    // on change arrives with https://github.com/ankurah/ankurah/pull/426.
+    let cdata = sessions.current();
     node.policy_agent.can_access_collection(&cdata, &collection_id)?;
     args.selection.predicate = node.policy_agent.filter_predicate(&cdata, &collection_id, args.selection.predicate)?;
 
@@ -220,7 +224,7 @@ where
 
     let resultset = EntityResultSet::empty();
     let query_id = proto::QueryId::new();
-    let gap_fetcher: std::sync::Arc<dyn GapFetcher<Entity>> = std::sync::Arc::new(QueryGapFetcher::new(&node, cdata.clone()));
+    let gap_fetcher: std::sync::Arc<dyn GapFetcher<Entity>> = std::sync::Arc::new(QueryGapFetcher::new(&node, sessions));
 
     let inner = Arc::new(Inner {
         query_id,
@@ -263,14 +267,14 @@ impl EntityLiveQuery {
         node: &Node<SE, PA>,
         collection_id: CollectionId,
         args: MatchArgs,
-        cdata: PA::ContextData,
+        sessions: impl Into<SessionSet<PA::ContextData>>,
     ) -> Result<Self, RetrievalError>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
         let node_ref: Box<dyn NodeRef> = Box::new(StrongNodeRef(Arc::clone(&node.0)));
-        Self::new_with_node_ref(node, node_ref, collection_id, args, cdata)
+        Self::new_with_node_ref(node, node_ref, collection_id, args, sessions.into())
     }
 
     /// Create a LiveQuery that does NOT keep the node alive.
@@ -283,14 +287,14 @@ impl EntityLiveQuery {
         node: &Node<SE, PA>,
         collection_id: CollectionId,
         args: MatchArgs,
-        cdata: PA::ContextData,
+        sessions: impl Into<SessionSet<PA::ContextData>>,
     ) -> Result<Self, RetrievalError>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
         let node_ref: Box<dyn NodeRef> = Box::new(WeakNodeRefImpl(Arc::downgrade(&node.0)));
-        Self::new_with_node_ref(node, node_ref, collection_id, args, cdata)
+        Self::new_with_node_ref(node, node_ref, collection_id, args, sessions.into())
     }
 
     fn new_with_node_ref<SE, PA>(
@@ -298,21 +302,21 @@ impl EntityLiveQuery {
         node_ref: Box<dyn NodeRef>,
         collection_id: CollectionId,
         args: MatchArgs,
-        cdata: PA::ContextData,
+        sessions: SessionSet<PA::ContextData>,
     ) -> Result<Self, RetrievalError>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
         let has_relay = node.subscription_relay.is_some();
-        let (inner, query_id) = create_inner(node, node_ref, collection_id.clone(), args, cdata.clone())?;
+        let (inner, query_id) = create_inner(node, node_ref, collection_id.clone(), args, sessions.clone())?;
 
         let me = Self(inner.clone());
 
         // Ephemeral node: register with relay for remote subscription
         // Remote will call activate() after applying deltas via subscription_established
         if has_relay {
-            node.subscribe_remote_query(query_id, collection_id, inner.selection.value().0, cdata, 1, me.weak());
+            node.subscribe_remote_query(query_id, collection_id, inner.selection.value().0, sessions, 1, me.weak());
         }
 
         Ok(me)

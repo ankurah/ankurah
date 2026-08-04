@@ -6,7 +6,10 @@ use serde::{Deserialize, Serialize};
 /// Note: `sub` is stored in the standard JWT `subject` field (not in custom claims)
 /// to avoid serde conflicts with `jwt_simple`'s `#[serde(flatten)]` on custom claims.
 /// The `sub` field here is populated by `SigningKeys::verify()` from the standard claim.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// Eq and Hash ride serde_json's own total impls (`Value` derives both;
+// its Number hash normalizes the +/-0.0 case), so full-value equality
+// needs no hand-rolled walk.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct JwtClaims {
     /// User entity ID (ankurah EntityId serialized as string).
     /// When signing, this is placed in the standard JWT `sub` claim.

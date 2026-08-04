@@ -683,28 +683,22 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
 
 // Entity-specific methods for remote subscriptions
 impl Subscription<crate::entity::Entity, ankurah_proto::Attested<ankurah_proto::Event>> {
-    /// Upsert a query - register if it doesn't exist, or return the existing resultset
-    /// Idempotent - safe to call multiple times with the same query_id
-    /// Constructs gap_fetcher lazily (only if query doesn't exist)
-    pub fn upsert_query<SE, PA>(
+    /// Register a query if absent, installing the caller's gap fetcher,
+    /// or return the already-registered query's resultset. Idempotent
+    /// per query id: for an existing query every argument except the id
+    /// is ignored and the provided fetcher is dropped.
+    pub fn register_or_get_query(
         &self,
         query_id: proto::QueryId,
         collection_id: proto::CollectionId,
-        node: &crate::node::Node<SE, PA>,
-        cdata: &PA::ContextData,
-    ) -> EntityResultSet<crate::entity::Entity>
-    where
-        SE: crate::storage::StorageEngine + Send + Sync + 'static,
-        PA: crate::policy::PolicyAgent + Send + Sync + 'static,
-    {
+        gap_fetcher: std::sync::Arc<dyn crate::reactor::fetch_gap::GapFetcher<crate::entity::Entity>>,
+    ) -> EntityResultSet<crate::entity::Entity> {
         let mut state = self.state.lock().unwrap();
 
         use std::collections::hash_map::Entry;
         match state.queries.entry(query_id) {
             Entry::Vacant(v) => {
                 let resultset = EntityResultSet::empty();
-                // Only create gap fetcher if query doesn't exist
-                let gap_fetcher = std::sync::Arc::new(crate::reactor::fetch_gap::QueryGapFetcher::new(node, cdata.clone()));
                 v.insert(QueryState {
                     collection_id,
                     selection: None,

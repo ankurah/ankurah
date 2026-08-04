@@ -139,7 +139,8 @@ pub enum RegistrationError {
         /// The value type declared by the requester.
         value_type: String,
     },
-    /// The policy agent denied the resolved registration plan.
+    /// The policy agent denied the resolved registration plan, or the
+    /// context could not act as a single principal.
     #[error("registration refused by policy: {0}")]
     PolicyDenied(
         /// The policy agent's denial.
