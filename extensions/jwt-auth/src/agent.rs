@@ -243,20 +243,65 @@ impl PolicyAgent for JwtAgent {
             return Ok(predicate);
         }
 
-        let claims = data
-            .iterable()
-            .find_map(|ctx| match ctx {
-                JwtContext::User { claims, .. } => Some(claims),
-                _ => None,
-            })
-            .ok_or(AccessDenied::ByPolicy("No authenticated context for row filtering"))?;
+        // A caller holding several credentials may read what any one of them
+        // may read, so the query is narrowed to the union of the per-context
+        // slices — the same any-of admission enforce_read_scope applies row by
+        // row. Narrowing by one context alone would drop rows the caller is
+        // entitled to, and a single-credential caller still gets exactly its
+        // own slice. The caller's predicate stays factored in front of the
+        // union — P AND (s1 OR s2), never (P AND s1) OR (P AND s2) — because a
+        // storage planner reads indexable terms off the top-level conjunction
+        // and treats an Or as one opaque term it can only scan. A credential
+        // whose scope cannot be constructed — its filter names a claim the
+        // token does not carry — contributes nothing, warned about rather than
+        // fatal: the union means whatever any resolvable, authorized credential
+        // admits. enforce_read_scope skips such a credential the same way, on
+        // purpose, so neither half's answer turns on the order the caller
+        // happens to present its credentials in. A caller whose every
+        // credential is skipped leaves no slice and is refused below, exactly
+        // as a caller holding nothing authorized is.
+        let mut slices = Vec::new();
+        for ctx in data.iterable() {
+            let JwtContext::User { claims, .. } = ctx else {
+                continue;
+            };
+            // Only authorized contexts contribute, matching the collection
+            // check enforce_read_scope makes before evaluating a context's
+            // scope: a credential that cannot reach the collection must not
+            // widen the query on its own account.
+            if !state.config.can_access_collection(ctx.roles(), collection) {
+                continue;
+            }
 
-        let mut result = predicate;
-        for filter in scoped_predicates(&state.config, collection.as_str(), claims, ScopeAccess::Read)? {
-            result = Predicate::And(Box::new(result), Box::new(filter));
+            let scope = match scoped_predicates(&state.config, collection.as_str(), claims, ScopeAccess::Read) {
+                Ok(scope) => scope,
+                Err(err) => {
+                    tracing::warn!("skipping credential with unresolvable read scope for {collection}: {err}");
+                    continue;
+                }
+            };
+
+            let mut filters = scope.into_iter();
+            let Some(first) = filters.next() else {
+                // No scope constrains this credential, so it may read every row
+                // the caller asked for and the union can be nothing narrower
+                // than the caller's own predicate.
+                return Ok(predicate);
+            };
+            let slice = filters.fold(first, |conjunction, filter| Predicate::And(Box::new(conjunction), Box::new(filter)));
+            // Equal-valued credentials are legal and yield equal slices;
+            // repeating one costs evaluation and index extraction without
+            // admitting a single extra row.
+            if !slices.contains(&slice) {
+                slices.push(slice);
+            }
         }
 
-        Ok(result)
+        let Some(union) = slices.into_iter().reduce(|union, next| Predicate::Or(Box::new(union), Box::new(next))) else {
+            return Err(AccessDenied::ByPolicy("No authorized context for row filtering"));
+        };
+        // Slice order is load-bearing: evaluate tries an Or's left branch first, in the order enforce_read_scope walks the same contexts.
+        Ok(Predicate::And(Box::new(predicate), Box::new(union)))
     }
 
     fn check_read<C>(
@@ -385,8 +430,21 @@ where C: Iterable<JwtContext> {
             continue;
         }
 
+        // Matching filter_predicate deliberately: a credential whose scope
+        // cannot be constructed admits no row and denies none either, so which
+        // credential the caller lists first cannot change the answer. Debug,
+        // not warn: this runs once per row, and the query-time half already
+        // warns once per query about the same credential.
+        let scope = match scoped_predicates(config, entity.collection.as_str(), claims, ScopeAccess::Read) {
+            Ok(scope) => scope,
+            Err(err) => {
+                tracing::debug!("skipping credential with unresolvable read scope for {}: {err}", entity.collection);
+                continue;
+            }
+        };
+
         let mut allowed = true;
-        for predicate in scoped_predicates(config, entity.collection.as_str(), claims, ScopeAccess::Read)? {
+        for predicate in scope {
             match evaluate_predicate(entity, &predicate) {
                 Ok(true) => {}
                 Ok(false) => {

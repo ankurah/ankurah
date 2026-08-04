@@ -134,7 +134,7 @@ Example: with `claims.sub = "user123"`, the filter `"assigned_to = $jwt.sub"` pa
 - An empty `PolicyConfig` (no roles, no collections) denies all access.
 - Collections not listed in the config are inaccessible to non-privileged contexts.
 - Unknown roles grant no privileges.
-- Missing claim variables in scope filters cause the query to be denied.
+- A credential whose scope filter names a claim its token does not carry contributes nothing; a caller with no resolvable, authorized credential is denied.
 
 ## JwtAgent
 
@@ -193,11 +193,14 @@ Deserializes `AuthData` back into `JwtContext`:
 
 #### `filter_predicate`
 
-- `Root` context: returns the predicate unchanged.
-- Looks up scope rules for the collection. For each rule:
-  - If `unless_privilege` is set and the user holds that privilege, the rule is skipped.
-  - Otherwise, substitutes `$jwt.*` variables in the filter string and AND-s the resulting predicate with the query.
-- No scope rules: returns the predicate unchanged.
+Narrows a query so storage returns only rows the caller may read. A caller may present several credentials (its context set) and may read any row that any one of them admits, so the query narrows to the union of per-credential scope slices -- the same any-of admission `check_read` applies row by row.
+
+- `Root` anywhere in the context set: returns the predicate unchanged.
+- No scope rules for the collection: returns the predicate unchanged. This check runs first, so an unscoped collection requires no authorized credential.
+- Otherwise walks every credential in the context set. A credential contributes nothing if it is `NoUser`, if its roles cannot access the collection, or if its scope variables cannot resolve (its filter names a claim the token does not carry -- skipped with a `tracing::warn`).
+- Each surviving credential contributes one slice: its scope rules, minus any whose `unless_privilege` it holds, `$jwt.*`-substituted from its own claims and AND-ed together. Equal slices deduplicate. A credential no rule constrains may read every row the caller asked for, so the union collapses: the caller's predicate is returned unchanged.
+- The query becomes `P AND (s1 OR s2 OR ...)` -- the caller's predicate stays factored in front of the union, where a storage planner reads indexable terms off the top-level conjunction.
+- No credential contributed a slice (none authorized, or none resolvable): the query is refused with `AccessDenied`.
 
 #### `check_event` / `check_write`
 
@@ -206,9 +209,17 @@ Deserializes `AuthData` back into `JwtContext`:
 - `NoUser`: all writes denied.
 - Otherwise: checks `can_write_collection` against the user's roles and the collection's `write` privilege.
 
-#### `check_read` / `check_read_event`
+#### `check_read`
 
-Delegates to `can_access_collection`.
+The row-level half of read scoping: admits or refuses one entity by its serialized state, where `filter_predicate` narrows the query up front.
+
+- Requires `can_access_collection`. `Root` passes unconditionally.
+- No scope rules for the collection: allowed.
+- Otherwise materializes the state into a `TemporaryEntity` (a state that cannot be evaluated is refused) and walks the caller's credentials: a credential admits the row when every one of its substituted scope predicates evaluates true, and the first admitting credential allows the read. Unauthorized and unresolvable credentials are skipped exactly as in `filter_predicate` (logged at `debug` -- the query half already warned once per query), so credential order cannot change the answer. A credential no rule constrains admits every row. A scope predicate that fails to evaluate against the row refuses the read; so does running out of credentials.
+
+#### `check_read_event`
+
+`Root` passes; otherwise delegates to `can_access_collection` for the event's collection.
 
 #### `validate_received_event` / `validate_received_state` / `attest_state` / `validate_causal_assertion`
 
