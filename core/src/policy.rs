@@ -61,8 +61,8 @@ pub use crate::schema::registration::{PlannedModelPropertyMembership, PlannedUpd
 /// attribute the access to, so fail closed unless permissiveness is the
 /// point. The JWT agent in extensions/jwt-auth denies it wherever
 /// admission is decided — `can_access_collection`, and `check_read` and
-/// `check_read_event` which both reach that check (the first as its
-/// opening step, the second after the privileged short-circuit) — carving out only
+/// `check_read_event` which both open on that check (they share one
+/// row-level helper, whose first step it is) — carving out only
 /// the policy collection, which is granted before any credential is
 /// consulted. (Its `filter_predicate` does return the predicate
 /// unnarrowed when the collection has no scope rules, which admits
@@ -184,8 +184,37 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
         C: Iterable<Self::ContextData>;
 
     /// Check if a context can read an event
-    fn check_read_event<C>(&self, data: &C, event: &Attested<proto::Event>) -> Result<(), AccessDenied>
-    where C: Iterable<Self::ContextData>;
+    ///
+    /// An event replays the same entity content a state carries, so an agent
+    /// that admits entities row by row in [`Self::check_read`] must apply the
+    /// same rule here or the row filter is only as strong as the collection
+    /// gate. `current_state` is the state the serving node currently holds for
+    /// the event's entity, giving that rule something to evaluate; it is `None`
+    /// when the node holds no state for the entity, and an agent whose decision
+    /// depends on state should refuse rather than guess.
+    ///
+    /// Contract for callers: `current_state` MUST be the state of the event's
+    /// own entity — `current_state.entity_id == event.payload.entity_id`. An
+    /// agent evaluates a row rule against whatever state it is handed, so
+    /// pairing an event with a different entity's state authorizes the event
+    /// against a row the caller may read instead of the row the event belongs
+    /// to. The state travels as a whole [`proto::EntityState`] so the agent can
+    /// see that pairing and refuse a mismatched one; the JWT agent in
+    /// extensions/jwt-auth does.
+    ///
+    /// The verdict is about the row as it stands now, not as it stood when the
+    /// event was written: a caller who can read a row today may read that row's
+    /// whole history, including the part written while the row sat outside its
+    /// scope. Per-event historical evaluation is tracked in
+    /// <https://github.com/ankurah/ankurah/issues/445>.
+    fn check_read_event<C>(
+        &self,
+        data: &C,
+        event: &Attested<proto::Event>,
+        current_state: Option<&proto::EntityState>,
+    ) -> Result<(), AccessDenied>
+    where
+        C: Iterable<Self::ContextData>;
 
     /// Check if a context can edit an entity
     fn check_write(&self, data: &Self::ContextData, entity: &Entity, event: Option<&proto::Event>) -> Result<(), AccessDenied>;
@@ -311,8 +340,15 @@ impl PolicyAgent for PermissiveAgent {
         Ok(())
     }
 
-    fn check_read_event<C>(&self, _data: &C, _event: &Attested<proto::Event>) -> Result<(), AccessDenied>
-    where C: Iterable<Self::ContextData> {
+    fn check_read_event<C>(
+        &self,
+        _data: &C,
+        _event: &Attested<proto::Event>,
+        _current_state: Option<&proto::EntityState>,
+    ) -> Result<(), AccessDenied>
+    where
+        C: Iterable<Self::ContextData>,
+    {
         // PermissiveAgent allows regardless of which credentials are supplied, including none
         Ok(())
     }

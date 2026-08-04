@@ -521,10 +521,52 @@ where
                 self.policy_agent.can_access_collection(cdata, &collection)?;
                 let storage_collection = self.collections.get(&collection).await?;
 
+                let stored_events = storage_collection.get_events(event_ids).await?;
+
+                // An event carries its entity's content, so the read check needs
+                // the same thing the state path gives it: the entity's current
+                // state. Fetch one state per distinct entity the batch touches --
+                // the default `get_states` walks its argument one `get_state` at a
+                // time, so K distinct entities cost K sequential reads until an
+                // engine overrides it with a real multi-key read. Entities with no
+                // state anywhere are absent from the map, and the policy agent
+                // decides what an absent state means.
+                let entity_ids: Vec<proto::EntityId> =
+                    stored_events.iter().map(|e| e.payload.entity_id).collect::<std::collections::HashSet<_>>().into_iter().collect();
+                let mut states: std::collections::HashMap<proto::EntityId, proto::EntityState> = storage_collection
+                    .get_states(entity_ids.clone())
+                    .await?
+                    .into_iter()
+                    .map(|state| (state.payload.entity_id, state.payload))
+                    .collect();
+
+                // A resident entity outranks the stored state: the EventOnly apply
+                // path advances the in-memory entity and leaves the state buffer
+                // behind, so storage alone can authorize an event against a row
+                // several events out of date.
+                for id in entity_ids {
+                    let Some(entity) = self.get_resident_entity(id) else { continue };
+                    if entity.collection() != &collection {
+                        continue;
+                    }
+                    states.insert(id, proto::EntityState { entity_id: id, collection: collection.clone(), state: entity.to_state()? });
+                }
+
                 // filter out any that the policy agent says we don't have access to
                 let mut events = Vec::new();
-                for event in storage_collection.get_events(event_ids).await? {
-                    match self.policy_agent.check_read_event(cdata, &event) {
+                for event in stored_events {
+                    let current_state = states.get(&event.payload.entity_id);
+                    // A commit publishes its event before it persists the state,
+                    // so the state paired above can predate the event -- including
+                    // an event that moves the row out of the caller's scope, whose
+                    // own effect the authorizing state then does not show. Serve
+                    // only what that state causally accounts for.
+                    if let Some(state) = current_state {
+                        if !self.head_covers_event(&storage_collection, &state.state.head, &event.payload.id()).await? {
+                            continue;
+                        }
+                    }
+                    match self.policy_agent.check_read_event(cdata, &event, current_state) {
                         Ok(_) => events.push(event),
                         Err(AccessDenied::ByPolicy(_)) => {}
                         // TODO: we need to have a cleaner delineation between actual access denied versus processing errors
@@ -714,26 +756,28 @@ where
         PA: PolicyAgent + Send + Sync + 'static,
         C: crate::util::Iterable<PA::ContextData>,
     {
-        // Destructure to take ownership and avoid clones
-        let proto::Attested { payload: proto::EntityState { entity_id, collection, state }, attestations } = entity_state;
-        let current_head = &state.head;
+        // Destructure to take ownership and avoid clones. The entity state stays
+        // whole until the snapshot is built: the bridge walk needs the entity id
+        // alongside the head to keep the window on one entity.
+        let proto::Attested { payload: entity_state, attestations } = entity_state;
+        let current_head = &entity_state.state.head;
 
         // Entity is in known_matches - try to optimize the response
-        if let Some(known_head) = known_map.get(&entity_id) {
+        if let Some(known_head) = known_map.get(&entity_state.entity_id) {
             // Case 1: Heads equal → return None (omit entity, client already has current state) ✓
             if known_head == current_head {
                 return Ok(None);
             }
 
             // Case 2: Heads differ → try to build EventBridge (cheaper than full state) ✓
-            match self.collect_event_bridge(storage_collection, known_head, current_head, cdata).await {
+            match self.collect_event_bridge(storage_collection, known_head, &entity_state, cdata).await {
                 Ok(attested_events) if !attested_events.is_empty() => {
                     // Convert Attested<Event> to EventFragments (strips entity_id and collection)
                     let event_fragments: Vec<proto::EventFragment> = attested_events.into_iter().map(|e| e.into()).collect();
 
                     return Ok(Some(proto::EntityDelta {
-                        entity_id,
-                        collection,
+                        entity_id: entity_state.entity_id,
+                        collection: entity_state.collection,
                         content: proto::DeltaContent::EventBridge { events: event_fragments },
                     }));
                 }
@@ -744,17 +788,22 @@ where
         }
 
         // Case 3: Entity not in known_matches OR bridge building failed → send full StateSnapshot ✓
+        let proto::EntityState { entity_id, collection, state } = entity_state;
         let state_fragment = proto::StateFragment { state, attestations };
         Ok(Some(proto::EntityDelta { entity_id, collection, content: proto::DeltaContent::StateSnapshot { state: state_fragment } }))
     }
 
-    /// Collect events between known_head and current_head using event_dag comparison.
-    /// Returns events needed to advance from known_head to current_head.
+    /// Collect events between known_head and the entity's current head using
+    /// event_dag comparison. Returns events needed to advance from known_head to
+    /// that head. The walk keeps to `current_state`'s own entity: a parent
+    /// pointer that leaves it abandons the bridge, because that state is what
+    /// the read check evaluates every event in the window against, and it is
+    /// evidence about no other row.
     pub(crate) async fn collect_event_bridge<C>(
         &self,
         storage_collection: &crate::storage::StorageCollectionWrapper,
         known_head: &proto::Clock,
-        current_head: &proto::Clock,
+        current_state: &proto::EntityState,
         cdata: &C,
     ) -> anyhow::Result<Vec<proto::Attested<proto::Event>>>
     where
@@ -766,6 +815,7 @@ where
         use crate::retrieval::LocalEventGetter;
         use std::collections::HashSet;
 
+        let current_head = &current_state.state.head;
         let event_getter = LocalEventGetter::new(storage_collection.clone(), self.durable);
 
         // First check the causal relationship
@@ -789,6 +839,21 @@ where
                     let fetched = storage_collection.get_events(batch).await?;
 
                     for event in fetched {
+                        // Parent pointers are event ids, and an event of another
+                        // entity can be reached through one (a graft, whether a
+                        // bug or a forged event). Serving it here would check it
+                        // against this entity's state, which says nothing about
+                        // the row it actually belongs to, so give up the bridge
+                        // and let the caller send a state snapshot instead.
+                        if event.payload.entity_id != current_state.entity_id {
+                            warn!(
+                                "Event {} belongs to entity {} but was reached walking entity {}'s history; abandoning the event bridge",
+                                event.payload.id(),
+                                event.payload.entity_id,
+                                current_state.entity_id
+                            );
+                            return Ok(vec![]);
+                        }
                         let id = event.payload.id();
                         if visited.insert(id.clone()) && !known_set.contains(&id) {
                             // Add parents to frontier (walking backward)
@@ -808,7 +873,7 @@ where
                 // entirely and let the caller fall back to a state snapshot,
                 // which passes its own read check.
                 for event in &events {
-                    match self.policy_agent.check_read_event(cdata, event) {
+                    match self.policy_agent.check_read_event(cdata, event, Some(current_state)) {
                         Ok(()) => {}
                         Err(AccessDenied::ByPolicy(_)) => return Ok(vec![]),
                         Err(e) => return Err(anyhow!("check_read_event failed while building event bridge: {}", e)),
@@ -827,6 +892,36 @@ where
                 Ok(vec![])
             }
         }
+    }
+
+    /// Is `event_id` in `head`'s past, or in `head` itself?
+    ///
+    /// This is what makes a state usable as authorization for an event: a state
+    /// speaks for the events its head accounts for and for no others. An event
+    /// the head does not cover may be the very event that changes who may read
+    /// the row, and the state cannot show that change.
+    ///
+    /// An event named in `head` itself answers immediately; any other costs a
+    /// DAG comparison, which walks back from `head` until it reaches the event.
+    /// That is proportional to the distance between the two, so a peer
+    /// backfilling deep history one event per request pays the depth each time.
+    async fn head_covers_event(
+        &self,
+        storage_collection: &crate::storage::StorageCollectionWrapper,
+        head: &proto::Clock,
+        event_id: &proto::EventId,
+    ) -> anyhow::Result<bool> {
+        use crate::event_dag::{compare, AbstractCausalRelation};
+
+        if head.as_slice().contains(event_id) {
+            return Ok(true);
+        }
+        let event_getter = LocalEventGetter::new(storage_collection.clone(), self.durable);
+        let comparison = compare(&event_getter, head, &proto::Clock::from(event_id.clone()), 100000).await?;
+        // Anything else -- the event ahead of the head, concurrent with it, or
+        // undecided within the budget -- leaves the state unable to speak for
+        // the event, so it is not covered.
+        Ok(matches!(comparison.relation, AbstractCausalRelation::Equal | AbstractCausalRelation::StrictDescends { .. }))
     }
 
     pub fn next_entity_id(&self) -> proto::EntityId { proto::EntityId::new() }
@@ -939,6 +1034,30 @@ where
     /// Requires the `test-helpers` feature to be enabled.
     #[cfg(feature = "test-helpers")]
     pub fn insert_durable_peer_for_test(&self, peer_id: proto::EntityId) { self.durable_peers.insert(peer_id); }
+
+    /// TEST ONLY: Run the event-bridge walk over a caller-supplied head and
+    /// state, returning the window it would put on the wire.
+    ///
+    /// The walk's guards (unreadable events, events belonging to another
+    /// entity) all express themselves as an empty window, which the delta
+    /// builder turns into a state snapshot. Reaching the walk directly lets a
+    /// test tell "the guard refused" from "the causal comparison never reached
+    /// the walk", which the delta on the wire cannot.
+    ///
+    /// Requires the `test-helpers` feature to be enabled.
+    #[cfg(feature = "test-helpers")]
+    pub async fn collect_event_bridge_for_test<C>(
+        &self,
+        storage_collection: &crate::storage::StorageCollectionWrapper,
+        known_head: &proto::Clock,
+        current_state: &proto::EntityState,
+        cdata: &C,
+    ) -> anyhow::Result<Vec<proto::Attested<proto::Event>>>
+    where
+        C: crate::util::Iterable<PA::ContextData>,
+    {
+        self.collect_event_bridge(storage_collection, known_head, current_state, cdata).await
+    }
 
     /// TEST ONLY: Observe the session registry — the current credential
     /// of every session backing a context on this node, in the

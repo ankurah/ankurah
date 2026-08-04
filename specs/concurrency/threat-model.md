@@ -141,7 +141,7 @@ Receive-side arms and the policy hook each gets (verified in
 | `EventBridge` | `apply_delta_inner` | yes | n/a | yes | catch-up batch |
 | `StateAndRelation` | `apply_delta_inner` | unimpl | unimpl | n/a | returns `InvalidUpdate` |
 | `GetEvents` resp, mid-BFS | `CachedEventGetter::get_event` | **NO** (#244) | n/a | n/a | stored via `add_event` unvalidated |
-| `GetEvents` req, served | `node.rs` `GetEvents` arm | n/a | n/a | n/a | serve side DOES `can_access_collection` + `check_read_event` |
+| `GetEvents` req, served | `node.rs` `GetEvents` arm | n/a | n/a | n/a | serve side DOES `can_access_collection` + `check_read_event` (against the entity's current state) |
 | `commit_remote_transaction` | `node.rs` same | via `check_event` | via `attest_state` | n/a | creation-event fork asymmetry (#243) |
 
 ("yes" = via `validate_and_stage`.) The key asymmetry: **every `apply_*` arm
@@ -483,16 +483,33 @@ builder), each event passes the read policy before leaving the node; a peer cann
 read events it is not permitted to.
 Trust tier: attestation-dependent (nil under PermissiveAgent).
 Enforcing seam: `node.rs` `GetEvents` arm calls
-`can_access_collection(cdata, &collection)` then `check_read_event(cdata, &event)`
-per event, pushing only allowed events; `collect_event_bridge` runs
-`check_read_event` over the collected events (post-walk).
+`can_access_collection(cdata, &collection)` then
+`check_read_event(cdata, &event, current_state)` per event, pushing only allowed
+events; `collect_event_bridge` runs `check_read_event` over the collected events
+(post-walk). The current state travels with the event so an agent that admits
+entities row by row can apply the same rule it applies in `check_read` -- without
+it the row filter reduced to the collection gate and events reconstructed content
+the state path withheld (#438). The serving node supplies the state it holds for
+the event's entity, or `None` when it holds none, and the agent decides what an
+absent state means. Three things keep that pairing honest: the state travels as a
+whole `EntityState` so the agent can refuse one belonging to another entity; the
+`GetEvents` arm prefers the resident entity over the stored state buffer, which the
+EventOnly apply path leaves behind; and it serves an event only when the paired
+state's head causally covers it, since a commit publishes its event before it
+persists its state and the event may be the one that moves the row out of scope.
+The bridge walk excludes any event naming a different entity than the state it is
+checked against (a grafted parent pointer), giving up the bridge for a snapshot.
 Falsifying attack (T2): request events for a collection/entity the requester cannot
 read, defeated only if the agent's read checks are correct.
 Planned test arm: read-authorization arm with a restricting agent asserting denied
 events are filtered from both `GetEvents` and `EventBridge` responses.
 Status: enforced as call sites. Note the DoS interaction: `collect_event_bridge`
 filters *after* the unbounded walk (C4-17), so a read-denied bridge still costs the
-full traversal.
+full traversal. Two accepted residuals: the verdict is about the row as it stands
+now, so a caller who can read a row today reads that row's history from before the
+scope change (#445); and the IndexedDB engine stores events without collection
+identity, so an event can be relabelled into a collection whose rules the caller
+passes (#444).
 
 ### 3.5 Local-commit policy claims
 

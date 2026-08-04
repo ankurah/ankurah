@@ -122,8 +122,15 @@ impl PolicyAgent for RejectingAgent {
         Ok(())
     }
 
-    fn check_read_event<C>(&self, _data: &C, _event: &proto::Attested<proto::Event>) -> std::result::Result<(), AccessDenied>
-    where C: Iterable<Self::ContextData> {
+    fn check_read_event<C>(
+        &self,
+        _data: &C,
+        _event: &proto::Attested<proto::Event>,
+        _current_state: Option<&proto::EntityState>,
+    ) -> std::result::Result<(), AccessDenied>
+    where
+        C: Iterable<Self::ContextData>,
+    {
         Ok(())
     }
 

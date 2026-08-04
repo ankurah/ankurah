@@ -837,8 +837,15 @@ impl ankurah::policy::PolicyAgent for ProbeAgent {
         Ok(())
     }
 
-    fn check_read_event<C>(&self, _data: &C, _event: &proto::Attested<proto::Event>) -> Result<(), ankurah::policy::AccessDenied>
-    where C: ankurah::core::util::Iterable<Self::ContextData> {
+    fn check_read_event<C>(
+        &self,
+        _data: &C,
+        _event: &proto::Attested<proto::Event>,
+        _current_state: Option<&proto::EntityState>,
+    ) -> Result<(), ankurah::policy::AccessDenied>
+    where
+        C: ankurah::core::util::Iterable<Self::ContextData>,
+    {
         Ok(())
     }
 
