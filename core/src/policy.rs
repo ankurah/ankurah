@@ -166,6 +166,7 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     where C: Iterable<Self::ContextData>;
 
     /// Filter a predicate based on the context data
+    /// An implementation may refuse a caller holding no authorized context, so callers gate on can_access_collection first.
     fn filter_predicate<C>(&self, data: &C, collection: &proto::CollectionId, predicate: Predicate) -> Result<Predicate, AccessDenied>
     where C: Iterable<Self::ContextData>;
 
