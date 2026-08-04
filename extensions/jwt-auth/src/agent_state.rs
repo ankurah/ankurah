@@ -111,10 +111,13 @@ fn apply_policy_from_resultset(resultset: &EntityResultSet, state: &Arc<RwLock<A
 /// Process a single JwtPolicy view, updating config and keys atomically.
 fn apply_policy_view(view: &crate::JwtPolicyView, state: &Arc<RwLock<AgentState>>) {
     let new_config = match view.config_json() {
-        Ok(json) => match serde_json::from_str::<PolicyConfig>(&json) {
+        // Fail-closed on unknown fields / future version: keep the prior
+        // (deny-all until first sync) config rather than applying a policy
+        // this build may not fully understand.
+        Ok(json) => match PolicyConfig::from_json(&json) {
             Ok(c) => Some(c),
             Err(e) => {
-                tracing::warn!("Ephemeral: failed to parse policy config: {e}");
+                tracing::warn!("Ephemeral: failed to load policy config: {e}");
                 None
             }
         },

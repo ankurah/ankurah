@@ -2,12 +2,52 @@ use ankurah_proto::CollectionId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// The policy-schema version this build of the crate understands.
+///
+/// Bump this when the config shape gains a field or semantic that the agent
+/// must actively consume to enforce policy correctly. A config declaring a
+/// higher version is refused at load (see [`PolicyConfig::from_json`]): a
+/// newer policy may rely on a restriction an older agent cannot apply, so
+/// loading it anyway would be a silent fail-open under version skew — exactly
+/// the class of problem this crate must not have as a data-path admission
+/// engine.
+pub const CURRENT_POLICY_VERSION: u32 = 1;
+
+/// Error loading a [`PolicyConfig`] from JSON. Both variants are fail-closed:
+/// an unrecognized key or a future version stops the config from loading
+/// rather than loading a partially-understood policy.
+#[derive(Debug, thiserror::Error)]
+pub enum PolicyConfigError {
+    /// JSON did not parse, or carried an unknown field (`deny_unknown_fields`).
+    #[error("policy config did not parse: {0}")]
+    Parse(#[from] serde_json::Error),
+    /// The config declares a schema version newer than this build supports.
+    #[error(
+        "policy config declares version {found}, but this build supports at most {max}; \
+         refusing to load a policy this agent may not fully enforce"
+    )]
+    UnsupportedVersion { found: u32, max: u32 },
+}
+
 /// Top-level policy configuration.
 ///
 /// Maps roles to their granted privileges, and defines entity access rules
 /// that map privileges to collection operations.
+///
+/// `deny_unknown_fields`: an unrecognized key fails the load rather than being
+/// silently dropped. A policy authored against a newer schema must not appear
+/// to load "successfully" on an older agent with the unknown restriction
+/// quietly missing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyConfig {
+    /// Config schema version. Absent means "legacy / unversioned", treated as
+    /// [`CURRENT_POLICY_VERSION`] for back-compat with configs written before
+    /// this field existed. A value greater than `CURRENT_POLICY_VERSION` is
+    /// refused at load; see [`PolicyConfig::from_json`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u32>,
+
     /// Role name → list of privilege names
     pub roles: HashMap<String, Vec<String>>,
 
@@ -20,6 +60,7 @@ pub struct PolicyConfig {
 /// If `unless_privilege` is set, the filter is skipped when the user holds that privilege.
 /// Multiple scope rules are AND-ed together (fail-closed).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScopeRule {
     /// AnkQL predicate string with $jwt.* variables (e.g., "assignee = $jwt.sub")
     pub filter: String,
@@ -57,6 +98,7 @@ impl ScopeRuleOp {
 
 /// Access rules for a single collection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CollectionRules {
     /// Privilege required to read entities in this collection (None = no access)
     pub read: Option<String>,
@@ -70,6 +112,30 @@ pub struct CollectionRules {
 }
 
 impl PolicyConfig {
+    /// Parse and validate a policy config from JSON. This is the load path
+    /// every caller should use: it rejects unknown fields
+    /// (`deny_unknown_fields`) and refuses a config whose declared version is
+    /// newer than this build supports. Both failures are fail-closed — the
+    /// config does not load — which is the correct posture for an admission
+    /// engine facing version skew (e.g. a wasm client pinned to a different
+    /// crate version than its server).
+    pub fn from_json(json: &str) -> Result<Self, PolicyConfigError> {
+        let config: PolicyConfig = serde_json::from_str(json)?;
+        config.check_version()?;
+        Ok(config)
+    }
+
+    /// Refuse a config that declares a schema version newer than this build
+    /// supports. An absent version is treated as current (legacy configs).
+    pub fn check_version(&self) -> Result<(), PolicyConfigError> {
+        match self.version {
+            Some(found) if found > CURRENT_POLICY_VERSION => {
+                Err(PolicyConfigError::UnsupportedVersion { found, max: CURRENT_POLICY_VERSION })
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Check if any of the given roles can access a collection (read or write).
     pub fn can_access_collection(&self, roles: &[String], collection: &CollectionId) -> bool {
         for role in roles {
@@ -151,5 +217,79 @@ impl PolicyConfig {
 
 impl Default for PolicyConfig {
     /// Default config: deny-all (no roles or collections defined).
-    fn default() -> Self { Self { roles: HashMap::new(), collections: HashMap::new() } }
+    fn default() -> Self { Self { version: None, roles: HashMap::new(), collections: HashMap::new() } }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MINIMAL: &str = r#"{ "roles": {}, "collections": {} }"#;
+
+    #[test]
+    fn loads_a_versionless_config() {
+        // Configs written before the `version` field must still load.
+        let config = PolicyConfig::from_json(MINIMAL).expect("versionless config loads");
+        assert_eq!(config.version, None);
+    }
+
+    #[test]
+    fn loads_a_current_version_config() {
+        let json = format!(r#"{{ "version": {CURRENT_POLICY_VERSION}, "roles": {{}}, "collections": {{}} }}"#);
+        assert!(PolicyConfig::from_json(&json).is_ok());
+    }
+
+    #[test]
+    fn refuses_a_future_version() {
+        let json = format!(r#"{{ "version": {}, "roles": {{}}, "collections": {{}} }}"#, CURRENT_POLICY_VERSION + 1);
+        match PolicyConfig::from_json(&json) {
+            Err(PolicyConfigError::UnsupportedVersion { found, max }) => {
+                assert_eq!(found, CURRENT_POLICY_VERSION + 1);
+                assert_eq!(max, CURRENT_POLICY_VERSION);
+            }
+            other => panic!("expected UnsupportedVersion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_an_unknown_top_level_key() {
+        // A newer schema's key must not vanish silently on an older agent.
+        let json = r#"{ "roles": {}, "collections": {}, "future_restriction": ["x"] }"#;
+        assert!(matches!(PolicyConfig::from_json(json), Err(PolicyConfigError::Parse(_))));
+    }
+
+    #[test]
+    fn rejects_an_unknown_nested_key() {
+        // Unknown keys inside a scope rule are equally fail-closed.
+        let json = r#"{
+            "roles": {},
+            "collections": {
+                "task": {
+                    "read": "view",
+                    "write": "edit",
+                    "scope": [{ "filter": "assignee = $jwt.sub", "deny_when": "old.locked" }]
+                }
+            }
+        }"#;
+        assert!(matches!(PolicyConfig::from_json(json), Err(PolicyConfigError::Parse(_))));
+    }
+
+    #[test]
+    fn round_trips_a_realistic_config_including_applies_to() {
+        // Serialize→parse of a config using every current field must succeed —
+        // guards against deny_unknown_fields rejecting our own output.
+        let json = r#"{
+            "roles": { "admin": ["*"], "member": ["view", "edit"] },
+            "collections": {
+                "task": {
+                    "read": "view",
+                    "write": "edit",
+                    "scope": [{ "filter": "assignee = $jwt.sub", "unless_privilege": "task:unscoped", "applies_to": "write" }]
+                }
+            }
+        }"#;
+        let config = PolicyConfig::from_json(json).expect("realistic config loads");
+        let reserialized = serde_json::to_string(&config).expect("serializes");
+        PolicyConfig::from_json(&reserialized).expect("own output round-trips");
+    }
 }
