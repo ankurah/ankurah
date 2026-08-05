@@ -103,14 +103,15 @@ Each entry defines access rules for one collection:
 
 ### Scope Rules
 
-Scope rules restrict query results at the row level. Each rule has:
+Scope rules restrict access at the row level: they filter what reads return and constrain what writes may touch. Each rule has:
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `filter` | `String` | AnkQL predicate with `$jwt.*` variable placeholders |
 | `unless_privilege` | `Option<String>` | If the user holds this privilege, skip this filter |
+| `applies_to` | `String` | Which operations the rule constrains: `"read_write"` (the default), `"read"`, or `"write"`. A write-only rule gates writes without hiding rows from reads; a read-only rule filters visibility without constraining writes. |
 
-Multiple scope rules are AND-ed together. If no scope rules are defined for a collection, queries are unfiltered (beyond the collection-level access check).
+Multiple applicable rules are AND-ed together. If no scope rules are defined for a collection, queries are unfiltered and writes unconstrained (beyond the collection-level access check).
 
 ### Variable Substitution
 
@@ -134,7 +135,8 @@ Example: with `claims.sub = "user123"`, the filter `"assigned_to = $jwt.sub"` pa
 - An empty `PolicyConfig` (no roles, no collections) denies all access.
 - Collections not listed in the config are inaccessible to non-privileged contexts.
 - Unknown roles grant no privileges.
-- A credential whose scope filter names a claim its token does not carry contributes nothing; a caller with no resolvable, authorized credential is denied.
+- A credential whose scope filter names a claim its token does not carry contributes nothing to reads; a caller with no resolvable, authorized credential is denied.
+- A write whose scope filter names a claim the writer's token does not carry is refused; the read-side skip does not apply, because dropping a write filter would fail open.
 
 ## JwtAgent
 
@@ -198,16 +200,20 @@ Narrows a query so storage returns only rows the caller may read. A caller may p
 - `Root` anywhere in the context set: returns the predicate unchanged.
 - No scope rules for the collection: returns the predicate unchanged. This check runs first, so an unscoped collection requires no authorized credential.
 - Otherwise walks every credential in the context set. A credential contributes nothing if it is `NoUser`, if its roles cannot access the collection, or if its scope variables cannot resolve (its filter names a claim the token does not carry -- skipped with a `tracing::warn`).
-- Each surviving credential contributes one slice: its scope rules, minus any whose `unless_privilege` it holds, `$jwt.*`-substituted from its own claims and AND-ed together. Equal slices deduplicate. A credential no rule constrains may read every row the caller asked for, so the union collapses: the caller's predicate is returned unchanged.
+- Each surviving credential contributes one slice: its read-applicable scope rules (`applies_to` covering reads), minus any whose `unless_privilege` it holds, `$jwt.*`-substituted from its own claims and AND-ed together. Equal slices deduplicate. A credential no rule constrains may read every row the caller asked for, so the union collapses: the caller's predicate is returned unchanged.
 - The query becomes `P AND (s1 OR s2 OR ...)` -- the caller's predicate stays factored in front of the union, where a storage planner reads indexable terms off the top-level conjunction.
 - No credential contributed a slice (none authorized, or none resolvable): the query is refused with `AccessDenied`.
 
 #### `check_event` / `check_write`
 
+The row-level half of write scoping: a non-privileged writer may only touch rows inside its write scope. `check_write` gates a local write against the entity's current state; `check_event` gates an applied event against both the entity as it stood before (when it has history) and as the event leaves it, so an update can neither start from nor produce a row outside the writer's scope.
+
 - `Root` context: always allowed.
 - `jwtpolicy` collection: only `Root` can write.
+- Catalog collections (`check_event` only): `NoUser` is refused; any authenticated caller passes, because core admits catalog writes only through the schema-registration executor, whose policy check already ran.
 - `NoUser`: all writes denied.
-- Otherwise: checks `can_write_collection` against the user's roles and the collection's `write` privilege.
+- Otherwise requires `can_write_collection` for the writer's roles, then evaluates the write-applicable scope rules (`applies_to` covering writes, minus any whose `unless_privilege` the writer holds), `$jwt.*`-substituted from the writer's claims, against the entity: every predicate must hold, or the write is refused.
+- Asymmetry with the read side, on purpose: a write-scope filter naming a claim the token does not carry refuses the write rather than skipping the credential. On reads a skipped credential merely contributes nothing to the union; on writes skipping would drop the constraint and fail open.
 
 #### `check_read`
 
@@ -215,7 +221,7 @@ The row-level half of read scoping: admits or refuses one entity by its serializ
 
 - Requires `can_access_collection`. `Root` passes unconditionally.
 - No scope rules for the collection: allowed.
-- Otherwise materializes the state into a `TemporaryEntity` (a state that cannot be evaluated is refused) and walks the caller's credentials: a credential admits the row when every one of its substituted scope predicates evaluates true, and the first admitting credential allows the read. Unauthorized and unresolvable credentials are skipped exactly as in `filter_predicate` (logged at `debug` -- the query half already warned once per query), so credential order cannot change the answer. A credential no rule constrains admits every row. A scope predicate that fails to evaluate against the row refuses the read; so does running out of credentials.
+- Otherwise materializes the state into a `TemporaryEntity` (a state that cannot be evaluated is refused) and walks the caller's credentials: a credential admits the row when every one of its read-applicable, substituted scope predicates evaluates true, and the first admitting credential allows the read. Unauthorized and unresolvable credentials are skipped exactly as in `filter_predicate` (logged at `debug` -- the query half already warned once per query), so credential order cannot change the answer. A credential no rule constrains admits every row. A scope predicate that fails to evaluate against the row refuses the read; so does running out of credentials.
 
 #### `check_read_event`
 
