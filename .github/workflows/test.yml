@@ -2,9 +2,25 @@ name: Tests
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, "release/**"]
 
 jobs:
+  release-scripts:
+    name: Validate release scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-edit
+        run: cargo install cargo-edit --version 0.13.8 --locked
+
+      - name: Run release script checks
+        run: |
+          ./.release/tests/release-context.sh
+          ./.release/tests/bump-version.sh
+          ./.release/tests/publish.sh
+
   liaison:
     name: Verify README examples
     runs-on: ubuntu-latest
