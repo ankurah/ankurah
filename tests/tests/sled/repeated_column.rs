@@ -2,10 +2,11 @@
 //!
 //! An index key holds one position per column, so a query naming the same
 //! column twice gives the planner more terms than the key range can carry.
-//! Choosing an index is an optimization; the answer is only correct if every
-//! term the range does not encode is re-checked against the rows the scan
-//! returns. These run that over a real sled node, where a term the planner
-//! forgot shows up as a row the query excluded.
+//! Choosing an index is an optimization; the answer is only correct because
+//! every term is re-checked against the rows the scan returns — index bounds
+//! are a prefilter over keys built by casting stored values to literal-derived
+//! types, not an enforcement of any term. These run that over a real sled
+//! node, where a term the planner forgot shows up as a row the query excluded.
 //!
 //! The planner-level counterpart lives in `storage/common/src/planner.rs`
 //! (`repeated_column_tests`), which pins the plan; these pin the rows.
@@ -28,6 +29,7 @@ pub struct DupNote {
     #[active_type(LWW)]
     pub title: String,
     pub rank: i32,
+    pub score: f64,
     pub owner: Ref<DupUser>,
     pub reviewer: Ref<DupUser>,
 }
@@ -57,11 +59,44 @@ async fn two_owners_two_notes(ctx: &ankurah::Context) -> Result<(ankurah::Entity
     };
     {
         let trx = ctx.begin();
-        trx.create(&DupNote { title: "alice note".into(), rank: 1, owner: Ref::new(alice), reviewer: Ref::new(bob) }).await?;
-        trx.create(&DupNote { title: "bob note".into(), rank: 2, owner: Ref::new(bob), reviewer: Ref::new(alice) }).await?;
+        trx.create(&DupNote { title: "alice note".into(), rank: 1, score: 5.9, owner: Ref::new(alice), reviewer: Ref::new(bob) }).await?;
+        trx.create(&DupNote { title: "bob note".into(), rank: 2, score: 2.0, owner: Ref::new(bob), reviewer: Ref::new(alice) }).await?;
         trx.commit().await?;
     }
     Ok((alice, bob))
+}
+
+/// An integer literal against an f64 column. The planner types the index
+/// keypart from the literal (there is no schema to consult), the key encoding
+/// casts each stored value to that type, and F64 -> I32 truncates — so 5.9
+/// keys as 5 and sits inside the point range for `= 5`. The range therefore
+/// enforces "truncates to 5", not "= 5", and only the retained residual term,
+/// evaluated against the stored f64, keeps the row out. Repeating the term
+/// must not change that: an identical duplicate is exactly the shape a policy
+/// scope composes when the caller already asked for its own rows.
+#[tokio::test]
+async fn f64_column_with_integer_literal_matches_exactly() -> Result<()> {
+    let ctx = setup_context().await?;
+    two_owners_two_notes(&ctx).await?;
+
+    assert_eq!(titles(&ctx.fetch::<DupNoteView>("score = 5").await?), Vec::<String>::new(), "5.9 is not 5, whatever its index key says");
+    assert_eq!(
+        titles(&ctx.fetch::<DupNoteView>("score = 5 AND score = 5").await?),
+        Vec::<String>::new(),
+        "repeating the term must not widen it"
+    );
+    assert_eq!(titles(&ctx.fetch::<DupNoteView>("score = 5 AND score = 6").await?), Vec::<String>::new());
+
+    // Controls: an integer literal that genuinely equals a stored float
+    // (2 vs 2.0) keeps its row, as does a same-typed duplicate on the i32
+    // column — the residual re-check filters truncation artifacts without
+    // over-filtering honest matches. (An exact f64 literal is not a control
+    // available here: the query grammar has no decimal literals.)
+    assert_eq!(titles(&ctx.fetch::<DupNoteView>("score = 2").await?), vec!["bob note"]);
+    assert_eq!(titles(&ctx.fetch::<DupNoteView>("score = 2 AND score = 2").await?), vec!["bob note"]);
+    assert_eq!(titles(&ctx.fetch::<DupNoteView>("rank = 1 AND rank = 1").await?), vec!["alice note"]);
+
+    Ok(())
 }
 
 /// Two equalities on one String column contradict, so the query names no row.
@@ -181,7 +216,7 @@ async fn or_over_two_columns_and_a_repeated_column() -> Result<()> {
     // row to exclude on its own.
     {
         let trx = ctx.begin();
-        trx.create(&DupNote { title: "bob solo".into(), rank: 3, owner: Ref::new(bob), reviewer: Ref::new(bob) }).await?;
+        trx.create(&DupNote { title: "bob solo".into(), rank: 3, score: 1.0, owner: Ref::new(bob), reviewer: Ref::new(bob) }).await?;
         trx.commit().await?;
     }
 

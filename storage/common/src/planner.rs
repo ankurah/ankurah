@@ -21,40 +21,29 @@ impl PlannerConfig {
     pub fn full_support() -> Self { Self::new(true) }
 }
 
-/// The predicate terms an index range actually carries.
+/// The residual predicate for an index or table scan: every conjunct, joined
+/// back with AND.
 ///
-/// This exists to keep the planner honest about a soundness rule: choosing an
-/// index is an optimization, and the residual predicate is what makes the
-/// answer correct. Every term the range does not encode has to be re-checked
-/// against each row the scan returns, so a term that is neither encoded nor
-/// residual is a term nothing enforces — the scan then answers with rows the
-/// query excluded.
+/// Index selection is an optimization, and the residual is what makes the
+/// answer correct: each row the scan returns is re-checked against it by the
+/// engine's predicate evaluator. No conjunct is elided — not even one whose
+/// value became a key-range endpoint — because a key range does not enforce
+/// the comparison it was built from. The planner types each keypart from the
+/// query literal (`resolve_path` has no schema for simple paths), the key
+/// encoding casts every stored value to that type, and a cast can coalesce
+/// values the predicate distinguishes: a stored `F64(5.9)` under an
+/// `I32` keypart encodes as `5` and sits inside the point range for `= 5`,
+/// while the evaluator, casting the literal toward the stored value instead,
+/// correctly rejects it. So the range enforces "encodes like the literal",
+/// the predicate means "compares equal to the literal", and only the residual
+/// checks the latter. Bounds narrow the scan; they never stand in for a term.
 ///
-/// The planner records what it encoded rather than inferring it from column
-/// names, because one column can carry several terms. `owner = A AND owner = B`
-/// puts two terms on `owner`; a key range can encode one of them, and knowing
-/// that `owner` is "handled" says nothing about the other. The same goes for
-/// range terms: folding picks the most restrictive endpoint per side, and a
-/// term whose value the winning endpoint cannot be compared against (values of
-/// different types have no order) is folded away without being enforced, so
-/// only the terms the final endpoints imply are recorded.
-#[derive(Debug, Default)]
-struct EncodedTerms {
-    /// The exact comparisons the bounds enforce, as (column path, operator,
-    /// value). An equality appears as the point bound it became; a range term
-    /// appears only when the final folded endpoint implies it.
-    terms: Vec<(String, ComparisonOperator, Value)>,
-}
-
-impl EncodedTerms {
-    /// Does the key range already enforce this comparison, making a per-row
-    /// re-check redundant? Answer no whenever unsure: an unnecessary re-check
-    /// costs a comparison, a missing one hands back a row the query excluded.
-    fn covers(&self, field: &str, operator: &ComparisonOperator, value: &Value) -> bool {
-        // NotEqual, In and Between never become key-range endpoints, so they
-        // are never recorded and never covered.
-        self.terms.iter().any(|(column, op, encoded)| column == field && op == operator && encoded == value)
-    }
+/// The fold mirrors `build_table_scan_plan` so an index plan and the fallback
+/// answer with the same predicate.
+fn residual_predicate(conjuncts: &[Predicate]) -> Predicate {
+    conjuncts.iter().fold(Predicate::True, |acc, pred| {
+        if matches!(acc, Predicate::True) { pred.clone() } else { Predicate::And(Box::new(acc), Box::new(pred.clone())) }
+    })
 }
 
 /// Append `part` unless the key already covers that path.
@@ -63,8 +52,8 @@ impl EncodedTerms {
 /// would not: both positions read the same stored value. It is worse than
 /// useless, because the bound placed on the second position is copied from the
 /// first position's term, which makes the key look like it enforces a term it
-/// never saw. Keep the key over distinct paths and let the terms it cannot hold
-/// fall through to the residual predicate.
+/// never saw. Keep the key over distinct paths; the residual re-checks every
+/// term regardless.
 fn push_keypart_once(keyparts: &mut Vec<IndexKeyPart>, part: IndexKeyPart) {
     let path = part.full_path();
     if !keyparts.iter().any(|existing| existing.full_path() == path) {
@@ -226,7 +215,7 @@ impl Planner {
             }
         });
 
-        let (bounds, encoded) = match applied_ineq {
+        let bounds = match applied_ineq {
             Some((field, vec)) => self.build_bounds(equalities, Some((field, vec)), &index_keyparts)?,
             None => self.build_bounds(equalities, None, &index_keyparts)?,
         };
@@ -234,8 +223,8 @@ impl Planner {
             return Some(Plan::EmptyScan);
         }
 
-        // Every term the bounds did not encode stays in the residual predicate.
-        let remaining_predicate = self.calculate_remaining_predicate(conjuncts, &encoded);
+        // Bounds only narrow the scan; every conjunct is re-checked per row.
+        let remaining_predicate = residual_predicate(conjuncts);
 
         // Scan direction
         let scan_direction = if self.config.supports_desc_indexes {
@@ -310,13 +299,13 @@ impl Planner {
         push_keypart_once(&mut index_keyparts, IndexKeyPart::asc_path(primary.0, ValueType::of(primary_value))); // Use actual primary key value type
 
         // Bounds: EQ + primary INEQ (most-restrictive)
-        let (bounds, encoded) = self.build_bounds(equalities, Some(primary), &index_keyparts)?;
+        let bounds = self.build_bounds(equalities, Some(primary), &index_keyparts)?;
         if self.is_empty_bounds(&bounds) {
             return Some(Plan::EmptyScan);
         }
 
-        // Every term the bounds did not encode stays in the residual predicate.
-        let remaining_predicate = self.calculate_remaining_predicate(conjuncts, &encoded);
+        // Bounds only narrow the scan; every conjunct is re-checked per row.
+        let remaining_predicate = residual_predicate(conjuncts);
 
         // Scan direction
         let scan_direction = if self.config.supports_desc_indexes {
@@ -441,18 +430,18 @@ impl Planner {
         let bounds = self.build_bounds(equalities, Some((inequality_field, inequality_values)), &index_keyparts);
 
         // Check for empty scan
-        let (bounds, encoded) = match bounds {
-            Some((bounds, encoded)) => {
+        let bounds = match bounds {
+            Some(bounds) => {
                 if self.is_empty_bounds(&bounds) {
                     return Some(Plan::EmptyScan);
                 }
-                (bounds, encoded)
+                bounds
             }
             None => return Some(Plan::EmptyScan),
         };
 
-        // Every term the bounds did not encode stays in the residual predicate.
-        let remaining_predicate = self.calculate_remaining_predicate(conjuncts, &encoded);
+        // Bounds only narrow the scan; every conjunct is re-checked per row.
+        let remaining_predicate = residual_predicate(conjuncts);
 
         // Build OrderByComponents: presort (EQ + inequality) and spill (rest)
         let order_by_spill = if let Some(order_by_items) = order_by {
@@ -487,22 +476,22 @@ impl Planner {
             push_keypart_once(&mut index_keyparts, IndexKeyPart::asc_path(field, ValueType::of(value)));
         }
 
-        // Build bounds (exact match on all equality values)
+        // Build bounds (point range on the first equality per column)
         let bounds = self.build_bounds(equalities, None, &index_keyparts);
 
         // Check for empty scan
-        let (bounds, encoded) = match bounds {
-            Some((bounds, encoded)) => {
+        let bounds = match bounds {
+            Some(bounds) => {
                 if self.is_empty_bounds(&bounds) {
                     return Some(Plan::EmptyScan);
                 }
-                (bounds, encoded)
+                bounds
             }
             None => return Some(Plan::EmptyScan),
         };
 
-        // Every term the bounds did not encode stays in the residual predicate.
-        let remaining_predicate = self.calculate_remaining_predicate(conjuncts, &encoded);
+        // Bounds only narrow the scan; every conjunct is re-checked per row.
+        let remaining_predicate = residual_predicate(conjuncts);
 
         let index_spec = KeySpec::new(index_keyparts);
         Some(Plan::Index {
@@ -518,29 +507,26 @@ impl Planner {
 
     /// Build bounds based on equalities and optional inequality.
     ///
-    /// Returns the bounds together with the terms they encode. The second half
-    /// is not bookkeeping for its own sake: it is the input the residual
-    /// predicate is computed from, so that a term this function declines to
-    /// encode is guaranteed to be re-checked per row rather than forgotten.
-    /// A column carrying several equality terms encodes at most one of them
-    /// here, and a range term is encoded only when the folded endpoint
-    /// implies it.
+    /// The bounds narrow which keys the scan visits and nothing more: the
+    /// residual predicate re-checks every conjunct against the stored values,
+    /// because index keys are stored values cast to the keypart's
+    /// literal-derived type, and that cast can coalesce values the predicate
+    /// distinguishes (see `residual_predicate`).
     fn build_bounds(
         &self,
         equalities: &[(String, Value)],
         inequality: Option<(&str, &Vec<(ComparisonOperator, Value)>)>,
         index_keyparts: &[IndexKeyPart],
-    ) -> Option<(KeyBounds, EncodedTerms)> {
+    ) -> Option<KeyBounds> {
         let mut keypart_bounds = Vec::new();
-        let mut encoded = EncodedTerms::default();
 
         // Build per-column bounds (using full_path for multi-step path support)
         for keypart in index_keyparts {
             let full_path = keypart.full_path();
 
             // Check if this path has an equality constraint. When the column
-            // carries more than one, the first is the one the range holds; the
-            // rest are left for `calculate_remaining_predicate` to keep.
+            // carries more than one, the first is the one the range narrows
+            // by; the residual re-checks all of them either way.
             let equality_value = equalities.iter().find(|(field, _)| field == &full_path).map(|(_, value)| value);
 
             if let Some(value) = equality_value {
@@ -550,7 +536,6 @@ impl Planner {
                     low: Endpoint::incl(value.clone()),
                     high: Endpoint::incl(value.clone()),
                 });
-                encoded.terms.push((full_path.clone(), ComparisonOperator::Equal, value.clone()));
             } else if let Some((ineq_field, inequalities)) = inequality {
                 if ineq_field == full_path {
                     // This column has inequality constraints
@@ -588,37 +573,6 @@ impl Planner {
                         }
                     }
 
-                    // Record the folded terms the final endpoints imply — equal
-                    // to the endpoint, or decisively looser. A term that lost
-                    // the fold to an incomparable value (values of different
-                    // types have no order) is implied by neither endpoint, and
-                    // recording it would drop it from the residual with nothing
-                    // left to re-check it.
-                    for (op, value) in inequalities {
-                        let enforced = match op {
-                            ComparisonOperator::GreaterThan => {
-                                let term = Endpoint::excl(value.clone());
-                                low == term || self.is_more_restrictive_lower(&low, &term)
-                            }
-                            ComparisonOperator::GreaterThanOrEqual => {
-                                let term = Endpoint::incl(value.clone());
-                                low == term || self.is_more_restrictive_lower(&low, &term)
-                            }
-                            ComparisonOperator::LessThan => {
-                                let term = Endpoint::excl(value.clone());
-                                high == term || self.is_more_restrictive_upper(&high, &term)
-                            }
-                            ComparisonOperator::LessThanOrEqual => {
-                                let term = Endpoint::incl(value.clone());
-                                high == term || self.is_more_restrictive_upper(&high, &term)
-                            }
-                            _ => false,
-                        };
-                        if enforced {
-                            encoded.terms.push((full_path.clone(), op.clone(), value.clone()));
-                        }
-                    }
-
                     keypart_bounds.push(KeyBoundComponent { column: full_path.clone(), low, high });
                     break; // Stop at first inequality column
                 } else {
@@ -631,7 +585,7 @@ impl Planner {
             }
         }
 
-        Some((KeyBounds::new(keypart_bounds), encoded))
+        Some(KeyBounds::new(keypart_bounds))
     }
 
     /// Check if candidate lower bound is more restrictive than current
@@ -732,43 +686,6 @@ impl Planner {
         false
     }
 
-    /// Calculate the residual predicate: every conjunct the key range does not
-    /// already enforce.
-    ///
-    /// A conjunct drops out only when `encoded` says the range carries that
-    /// exact term. Matching on the column alone would be wrong, because a
-    /// column can appear in several conjuncts and the range holds at most one
-    /// of them — dropping the others would leave the scan free to return rows
-    /// they exclude.
-    fn calculate_remaining_predicate(&self, conjuncts: &[Predicate], encoded: &EncodedTerms) -> Predicate {
-        let mut remaining_conjuncts = Vec::new();
-
-        for conjunct in conjuncts {
-            let consumed = match self.extract_comparison(conjunct) {
-                Some((field, operator, value)) => encoded.covers(&field, &operator, &value),
-                None => false,
-            };
-
-            if !consumed {
-                remaining_conjuncts.push(conjunct.clone());
-            }
-        }
-
-        // Combine remaining conjuncts with AND
-        if remaining_conjuncts.is_empty() {
-            Predicate::True
-        } else if remaining_conjuncts.len() == 1 {
-            remaining_conjuncts.into_iter().next().unwrap()
-        } else {
-            // Build AND chain
-            let mut result = remaining_conjuncts[0].clone();
-            for conjunct in remaining_conjuncts.into_iter().skip(1) {
-                result = Predicate::And(Box::new(result), Box::new(conjunct));
-            }
-            result
-        }
-    }
-
     /// Deduplicate plans based on index_spec and scan_direction
     fn deduplicate_plans(&self, plans: Vec<Plan>) -> Vec<Plan> {
         let mut unique_plans = Vec::new();
@@ -804,13 +721,7 @@ impl Planner {
         let bounds = self.extract_entity_id_range(conjuncts, primary_key);
 
         // All predicates remain (no index to satisfy any)
-        let remaining_predicate = conjuncts.iter().fold(ankql::ast::Predicate::True, |acc, pred| {
-            if matches!(acc, ankql::ast::Predicate::True) {
-                pred.clone()
-            } else {
-                ankql::ast::Predicate::And(Box::new(acc), Box::new(pred.clone()))
-            }
-        });
+        let remaining_predicate = residual_predicate(conjuncts);
 
         // Determine scan direction and ORDER BY components based on primary key ORDER BY
         let (scan_direction, order_by_spill) = if let Some(order_items) = order_by {
@@ -1205,7 +1116,7 @@ mod tests {
                         ]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album")),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album'").predicate,
                         order_by_spill: order_by_components!(presort: [oby_asc!("foo"), oby_asc!("bar")])
                     },
                     Plan::TableScan {
@@ -1233,7 +1144,7 @@ mod tests {
                         // from is excl because the inequality (foo) is > 10
                         // to is incl because there is no foo < ? in the predicate
                         bounds: bounds_list!(col_range!("__collection" => "album"..="album"), open_lower!("foo" => 10..)),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album' AND foo > 10").predicate,
                         order_by_spill: order_by_components!(presort: [oby_asc!("foo"), oby_asc!("bar")])
                     },
                     Plan::TableScan {
@@ -1259,7 +1170,7 @@ mod tests {
                         ]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("age" => (30..=30)),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("age = 30").predicate,
                         order_by_spill: order_by_components!(presort: [oby_asc!("foo"), oby_asc!("bar")])
                     },
                     Plan::TableScan {
@@ -1287,7 +1198,7 @@ mod tests {
                         ]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album"), "age" => (30..=30)),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album' AND age = 30").predicate,
                         order_by_spill: order_by_components!(presort: [oby_asc!("foo"), oby_asc!("bar")])
                     },
                     Plan::TableScan {
@@ -1310,7 +1221,7 @@ mod tests {
                         index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("name", ValueType::String)]),
                         scan_direction: ScanDirection::Reverse,
                         bounds: bounds!("__collection" => ("album"..="album")),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album'").predicate,
                         order_by_spill: order_by_components!(presort: [oby_desc!("name")])
                     },
                     Plan::TableScan {
@@ -1337,7 +1248,7 @@ mod tests {
                         ]),
                         scan_direction: ScanDirection::Reverse,
                         bounds: bounds!("__collection" => ("album"..="album")),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album'").predicate,
                         order_by_spill: order_by_components!(presort: [oby_desc!("name"), oby_desc!("year")])
                     },
                     Plan::TableScan {
@@ -1360,7 +1271,7 @@ mod tests {
                         index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("name", ValueType::String)]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album")),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album'").predicate,
                         order_by_spill: order_by_components!(presort: [oby_asc!("name")], spill: [oby_desc!("year")])
                     },
                     Plan::TableScan {
@@ -1383,7 +1294,7 @@ mod tests {
                         index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("name", ValueType::String)]),
                         scan_direction: ScanDirection::Reverse,
                         bounds: bounds!("__collection" => ("album"..="album")),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album'").predicate,
                         order_by_spill: order_by_components!(presort: [oby_desc!("name")], spill: [oby_asc!("year")])
                     },
                     Plan::TableScan {
@@ -1406,7 +1317,7 @@ mod tests {
                         index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("a", ValueType::String)]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album")),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album'").predicate,
                         order_by_spill: order_by_components!(presort: [oby_asc!("a")], spill: [oby_desc!("b"), oby_desc!("c")])
                     },
                     Plan::TableScan {
@@ -1433,7 +1344,7 @@ mod tests {
                         ]),
                         scan_direction: ScanDirection::Reverse,
                         bounds: bounds!("__collection" => ("album"..="album")),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album'").predicate,
                         order_by_spill: order_by_components!(presort: [oby_desc!("a"), oby_desc!("b")], spill: [oby_asc!("c")])
                     },
                     Plan::TableScan {
@@ -1464,7 +1375,7 @@ mod tests {
                         ]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album")),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album'").predicate,
                         order_by_spill: order_by_components!(presort: [oby_asc!("a"), oby_asc!("b"), oby_asc!("c")])
                     },
                     Plan::TableScan {
@@ -1491,7 +1402,7 @@ mod tests {
                         ]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album")),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album'").predicate,
                         order_by_spill: order_by_components!(presort: [oby_asc!("a"), oby_asc!("b")], spill: [oby_desc!("c")])
                     },
                     Plan::TableScan {
@@ -1514,7 +1425,7 @@ mod tests {
                         index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("a", ValueType::String)]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album")),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album'").predicate,
                         order_by_spill: order_by_components!(presort: [oby_asc!("a")], spill: [oby_desc!("b"), oby_asc!("c")])
                     },
                     Plan::TableScan {
@@ -1537,7 +1448,7 @@ mod tests {
                         index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("a", ValueType::String)]),
                         scan_direction: ScanDirection::Reverse,
                         bounds: bounds!("__collection" => ("album"..="album")),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album'").predicate,
                         order_by_spill: order_by_components!(presort: [oby_desc!("a")], spill: [oby_asc!("b"), oby_asc!("c")])
                     },
                     Plan::TableScan {
@@ -1560,7 +1471,7 @@ mod tests {
                         index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("a", ValueType::String)]),
                         scan_direction: ScanDirection::Reverse,
                         bounds: bounds!("__collection" => ("album"..="album")),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album'").predicate,
                         order_by_spill: order_by_components!(presort: [oby_desc!("a")], spill: [oby_asc!("b"), oby_desc!("c")])
                     },
                     Plan::TableScan {
@@ -1588,7 +1499,7 @@ mod tests {
                         ]),
                         scan_direction: ScanDirection::Reverse,
                         bounds: bounds!("__collection" => ("album"..="album")),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album'").predicate,
                         order_by_spill: order_by_components!(presort: [oby_desc!("a"), oby_desc!("b"), oby_desc!("c")])
                     },
                     Plan::TableScan {
@@ -1615,7 +1526,7 @@ mod tests {
                         ]),
                         scan_direction: ScanDirection::Reverse,
                         bounds: bounds!("__collection" => ("album"..="album"), "status" => ("active"..="active")),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album' AND status = 'active'").predicate,
                         order_by_spill: order_by_components!(presort: [oby_desc!("name")])
                     },
                     Plan::TableScan {
@@ -1640,7 +1551,7 @@ mod tests {
                         // from is excl because the inequality (age) is > 25
                         // to is incl because there is no age < ? in the predicate
                         bounds: bounds_list!(col_range!("__collection" => "album"..="album"), open_lower!("age" => 25..)),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album' AND age > 25").predicate,
                         order_by_spill: order_by_components!(presort: [oby_desc!("age")])
                     },
                     Plan::TableScan {
@@ -1668,7 +1579,7 @@ mod tests {
                         index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), desc!("name", ValueType::String),]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album")),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album'").predicate,
                         order_by_spill: order_by_components!(presort: [oby_desc!("name")])
                     },
                     Plan::TableScan {
@@ -1696,7 +1607,7 @@ mod tests {
                         ]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album")),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album'").predicate,
                         order_by_spill: order_by_components!(presort: [oby_asc!("name"), oby_desc!("year"), oby_asc!("score")])
                     },
                     Plan::TableScan {
@@ -1723,7 +1634,7 @@ mod tests {
                         ]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album")),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album'").predicate,
                         order_by_spill: order_by_components!(presort: [oby_desc!("name"), oby_desc!("year")])
                     },
                     Plan::TableScan {
@@ -1751,7 +1662,7 @@ mod tests {
                         ]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album"), "status" => ("active"..="active")),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album' AND status = 'active'").predicate,
                         order_by_spill: order_by_components!(presort: [oby_asc!("name"), oby_desc!("year")])
                     },
                     Plan::TableScan {
@@ -1780,7 +1691,7 @@ mod tests {
                         // from is excl because the inequality (age) is > 25
                         // to is incl because there is no age < ? in the predicate
                         bounds: bounds_list!(col_range!("__collection" => "album"..="album"), open_lower!("age" => 25..)),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album' AND age > 25").predicate,
                         order_by_spill: order_by_components!()
                     },
                     Plan::TableScan {
@@ -1804,7 +1715,7 @@ mod tests {
                         // from is excl because the inequality (age) is > 25
                         // to is excl because the inequality (age) is < 50
                         bounds: bounds_list!(col_range!("__collection" => "album"..="album"), open_lower!("age" => 25..50)),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album' AND age > 25 AND age < 50").predicate,
                         order_by_spill: order_by_components!()
                     },
                     Plan::TableScan {
@@ -1830,7 +1741,7 @@ mod tests {
                         // from is excl because the inequality (age) is > 25
                         // from is incl because there is no age < ? in the predicate
                         bounds: bounds_list!(col_range!("__collection" => "album"..="album"), open_lower!("age" => 25..)),
-                        remaining_predicate: selection!("score < 100").predicate,
+                        remaining_predicate: selection!("__collection = 'album' AND age > 25 AND score < 100").predicate,
                         order_by_spill: order_by_components!()
                     },
                     // Plan 2: Uses score index, age remains in predicate
@@ -1840,7 +1751,7 @@ mod tests {
                         // from is incl because there is no score < ? in the predicate
                         // to is excl because the inequality (score) is < 100
                         bounds: bounds!("__collection" => ("album"..="album"), "score" => (..100)),
-                        remaining_predicate: selection!("age > 25").predicate,
+                        remaining_predicate: selection!("__collection = 'album' AND age > 25 AND score < 100").predicate,
                         order_by_spill: order_by_components!()
                     },
                     Plan::TableScan {
@@ -1864,7 +1775,7 @@ mod tests {
                         scan_direction: ScanDirection::Forward,
                         // from is INCLUSIVE because the inequality is >= 25
                         bounds: bounds!("__collection" => ("album"..="album"), "age" => (25..)),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album' AND age >= 25").predicate,
                         order_by_spill: order_by_components!()
                     },
                     Plan::TableScan {
@@ -1888,7 +1799,7 @@ mod tests {
                         scan_direction: ScanDirection::Forward,
                         // to is EXCLUSIVE because the inequality is < 50
                         bounds: bounds!("__collection" => ("album"..="album"), "age" => (..50)),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album' AND age < 50").predicate,
                         order_by_spill: order_by_components!()
                     },
                     Plan::TableScan {
@@ -1912,7 +1823,7 @@ mod tests {
                         scan_direction: ScanDirection::Forward,
                         // to is INCLUSIVE because the inequality is <= 50
                         bounds: bounds!("__collection" => ("album"..="album"), "age" => (..=50)),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album' AND age <= 50").predicate,
                         order_by_spill: order_by_components!()
                     },
                     Plan::TableScan {
@@ -1936,7 +1847,7 @@ mod tests {
                         scan_direction: ScanDirection::Forward,
                         // Both bounds inclusive
                         bounds: bounds!("__collection" => ("album"..="album"), "age" => (25..=50)),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album' AND age >= 25 AND age <= 50").predicate,
                         order_by_spill: order_by_components!()
                     },
                     Plan::TableScan {
@@ -1960,7 +1871,7 @@ mod tests {
                         scan_direction: ScanDirection::Forward,
                         // from inclusive (>=), to exclusive (<)
                         bounds: bounds!("__collection" => ("album"..="album"), "age" => (25..50)),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album' AND age >= 25 AND age < 50").predicate,
                         order_by_spill: order_by_components!()
                     },
                     Plan::TableScan {
@@ -1984,7 +1895,7 @@ mod tests {
                         scan_direction: ScanDirection::Forward,
                         // from exclusive (>), to inclusive (<=)
                         bounds: bounds_list!(col_range!("__collection" => "album"..="album"), open_lower!("age" => 25..=50)),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album' AND age > 25 AND age <= 50").predicate,
                         order_by_spill: order_by_components!()
                     },
                     Plan::TableScan {
@@ -2008,7 +1919,7 @@ mod tests {
                         scan_direction: ScanDirection::Reverse,
                         // from is INCLUSIVE because the inequality is >= 25
                         bounds: bounds!("__collection" => ("album"..="album"), "age" => (25..)),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album' AND age >= 25").predicate,
                         // presort contains ORDER BY columns satisfied by index scan direction
                         order_by_spill: order_by_components!(presort: [oby_desc!("age")])
                     },
@@ -2034,7 +1945,7 @@ mod tests {
                         scan_direction: ScanDirection::Reverse,
                         // to is INCLUSIVE because the inequality is <= 50
                         bounds: bounds!("__collection" => ("album"..="album"), "age" => (..=50)),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album' AND age <= 50").predicate,
                         // presort contains ORDER BY columns satisfied by index scan direction
                         order_by_spill: order_by_components!(presort: [oby_desc!("age")])
                     },
@@ -2063,7 +1974,7 @@ mod tests {
                         index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("name", ValueType::String)]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album"), "name" => ("Alice"..="Alice")),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album' AND name = 'Alice'").predicate,
                         order_by_spill: order_by_components!()
                     },
                     Plan::TableScan {
@@ -2089,7 +2000,7 @@ mod tests {
                         ]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album"), "name" => ("Alice"..="Alice"), "age" => (30..=30)),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album' AND name = 'Alice' AND age = 30").predicate,
                         order_by_spill: order_by_components!()
                     },
                     Plan::TableScan {
@@ -2122,7 +2033,8 @@ mod tests {
                             "year" => (1975..=1975),
                             "genre" => ("Rock"..="Rock")
                         ),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album' AND artist = 'Queen' AND year = 1975 AND genre = 'Rock'")
+                            .predicate,
                         order_by_spill: order_by_components!()
                     },
                     Plan::TableScan {
@@ -2155,7 +2067,7 @@ mod tests {
                             "artist" => ("Queen"..="Queen"),
                             "year" => (1975..=1975)
                         ),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album' AND artist = 'Queen' AND year = 1975").predicate,
                         // ORDER BY title is satisfied by index (title is last column after eq prefix)
                         order_by_spill: order_by_components!(presort: [oby_asc!("title")])
                     },
@@ -2189,7 +2101,8 @@ mod tests {
                             col_range!("year" => 1975..=1975),
                             open_lower!("rating" => 4..)
                         ),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album' AND artist = 'Queen' AND year = 1975 AND rating > 4")
+                            .predicate,
                         order_by_spill: order_by_components!()
                     },
                     Plan::TableScan {
@@ -2227,7 +2140,7 @@ mod tests {
                             col_range!("name" => "Alice"..="Alice"),
                             open_lower!("age" => 25..)
                         ),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album' AND name = 'Alice' AND age > 25").predicate,
                         order_by_spill: order_by_components!()
                     },
                     Plan::TableScan {
@@ -2259,7 +2172,7 @@ mod tests {
                             col_range!("age" => 30..=30),
                             open_lower!("score" => 50..)
                         ),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album' AND score > 50 AND age = 30").predicate,
                         order_by_spill: order_by_components!(presort: [oby_asc!("score")])
                     },
                     Plan::TableScan {
@@ -2273,18 +2186,21 @@ mod tests {
         }
     }
 
-    // A key range can hold one term per column. Everything else a column is
-    // compared against has to stay in the residual predicate, because the scan
-    // enforces only what the range encodes. These pin that for each shape a
+    // One column carrying several terms gives the planner more terms than a
+    // key range can hold — and index keys are stored values cast to a
+    // literal-derived type, so not even the term a bound was built from is
+    // enforced by it (see `residual_predicate`). The bounds narrow the scan;
+    // the residual re-checks every term. These pin that for each shape a
     // repeated column can take.
     mod repeated_column_tests {
         use super::*;
 
-        /// Two equalities on one column: the range holds the first, and the
-        /// second is what makes the answer empty. Dropping it hands back the
-        /// rows the first value names — which is how a policy read scope of
-        /// `owner = <caller>` composed onto a caller's `owner = <someone else>`
-        /// used to return the other principal's row.
+        /// Two equalities on one column: the bounds narrow by the first, and
+        /// the residual keeps both — the second is what makes the answer
+        /// empty. Dropping it used to hand back the rows the first value
+        /// names, which is how a policy read scope of `owner = <caller>`
+        /// composed onto a caller's `owner = <someone else>` returned the
+        /// other principal's row.
         #[test]
         fn two_equalities_on_one_column() {
             assert_eq!(
@@ -2294,7 +2210,7 @@ mod tests {
                         index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("owner", ValueType::String)]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album"), "owner" => ("bob"..="bob")),
-                        remaining_predicate: selection!("owner = 'alice'").predicate,
+                        remaining_predicate: selection!("__collection = 'album' AND owner = 'bob' AND owner = 'alice'").predicate,
                         order_by_spill: order_by_components!()
                     },
                     Plan::TableScan {
@@ -2307,12 +2223,14 @@ mod tests {
             );
         }
 
-        /// The same term written twice constrains nothing further, so the range
-        /// really does enforce both and the residual stays empty. This is the
-        /// shape a policy scope produces when the caller already asked for its
-        /// own rows, and it must keep the cheap no-filter path.
+        /// The same term written twice: the key names the column once, the
+        /// bounds narrow by it once, and the residual re-checks the query as
+        /// written. This is the shape a policy scope produces when the caller
+        /// already asked for its own rows. (A syntactically identical repeat
+        /// could be deduplicated soundly; the planner does not simplify
+        /// predicates, it narrows and re-checks.)
         #[test]
-        fn repeated_identical_equality_needs_no_residual() {
+        fn repeated_identical_equality_keeps_one_key_position() {
             assert_eq!(
                 plan!("__collection = 'album' AND owner = 'bob' AND owner = 'bob'"),
                 vec![
@@ -2320,7 +2238,7 @@ mod tests {
                         index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("owner", ValueType::String)]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album"), "owner" => ("bob"..="bob")),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album' AND owner = 'bob' AND owner = 'bob'").predicate,
                         order_by_spill: order_by_components!()
                     },
                     Plan::TableScan {
@@ -2333,8 +2251,8 @@ mod tests {
             );
         }
 
-        /// Three equalities on one column: the range holds the first and both
-        /// of the others survive, in the order they were written.
+        /// Three equalities on one column: the bounds narrow by the first,
+        /// and the residual keeps all three in the order they were written.
         #[test]
         fn three_equalities_on_one_column() {
             assert_eq!(
@@ -2344,7 +2262,7 @@ mod tests {
                         index_spec: KeySpec::new(vec![asc!("owner", ValueType::String)]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("owner" => ("a"..="a")),
-                        remaining_predicate: selection!("owner = 'b' AND owner = 'c'").predicate,
+                        remaining_predicate: selection!("owner = 'a' AND owner = 'b' AND owner = 'c'").predicate,
                         order_by_spill: order_by_components!()
                     },
                     Plan::TableScan {
@@ -2357,10 +2275,10 @@ mod tests {
             );
         }
 
-        /// An equality and a range on one column. The range endpoint is the
-        /// point bound, so the inequality is left over — including when the two
-        /// contradict, which is the case that used to answer with the equality's
-        /// rows instead of nothing.
+        /// An equality and a range on one column. The equality becomes the
+        /// point bound — the narrower prefilter — and the residual keeps both
+        /// terms, including when they contradict, which is the case that used
+        /// to answer with the equality's rows instead of nothing.
         #[test]
         fn equality_and_range_on_one_column() {
             assert_eq!(
@@ -2370,7 +2288,7 @@ mod tests {
                         index_spec: KeySpec::new(vec![asc!("age", ValueType::I32)]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("age" => (5..=5)),
-                        remaining_predicate: selection!("age > 10").predicate,
+                        remaining_predicate: selection!("age = 5 AND age > 10").predicate,
                         order_by_spill: order_by_components!()
                     },
                     Plan::TableScan {
@@ -2383,8 +2301,8 @@ mod tests {
             );
         }
 
-        /// Writing the range first does not change which term the range holds,
-        /// nor that the other one survives.
+        /// Writing the range first does not change which term the bounds
+        /// narrow by, nor what the residual keeps.
         #[test]
         fn range_and_equality_on_one_column() {
             assert_eq!(
@@ -2394,7 +2312,7 @@ mod tests {
                         index_spec: KeySpec::new(vec![asc!("age", ValueType::I32)]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("age" => (5..=5)),
-                        remaining_predicate: selection!("age > 10").predicate,
+                        remaining_predicate: selection!("age > 10 AND age = 5").predicate,
                         order_by_spill: order_by_components!()
                     },
                     Plan::TableScan {
@@ -2408,9 +2326,10 @@ mod tests {
         }
 
         /// Two ranges on one column fold into that column's low and high
-        /// endpoints, so the range really does enforce both and nothing is left
-        /// over. This shape was always sound; it is here so a future change to
-        /// the folding cannot quietly stop encoding one side.
+        /// endpoints — the narrowest prefilter this shape allows — and the
+        /// residual still re-checks both, because a stored value of another
+        /// type can sit inside the cast key range while failing the
+        /// comparison.
         #[test]
         fn two_ranges_on_one_column_fold_into_the_bounds() {
             assert_eq!(
@@ -2420,7 +2339,7 @@ mod tests {
                         index_spec: KeySpec::new(vec![asc!("age", ValueType::I32)]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds_list!(KeyBoundComponent { column: "age".to_string(), low: gt(3), high: lt(10) }),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("age > 3 AND age < 10").predicate,
                         order_by_spill: order_by_components!()
                     },
                     Plan::TableScan {
@@ -2435,12 +2354,11 @@ mod tests {
 
         /// Two range terms on one column whose values have no order between
         /// them (an integer and a string). The fold keeps the first as the
-        /// endpoint and cannot compare the second against it, so the endpoint
-        /// does not imply the second term and it must survive — the residual
-        /// evaluator, not the range, decides what a cross-typed comparison
-        /// admits.
+        /// endpoint — it cannot rank the second against it — and the keypart
+        /// takes the first literal's type. The residual re-checks both, and
+        /// the evaluator decides what a cross-typed comparison admits.
         #[test]
-        fn incomparably_typed_ranges_on_one_column_keep_the_unfolded_term() {
+        fn incomparably_typed_ranges_on_one_column_narrow_by_the_first() {
             assert_eq!(
                 plan!("age > 5 AND age > 'abc'"),
                 vec![
@@ -2448,7 +2366,7 @@ mod tests {
                         index_spec: KeySpec::new(vec![asc!("age", ValueType::I32)]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds_list!(open_lower!("age" => 5..)),
-                        remaining_predicate: selection!("age > 'abc'").predicate,
+                        remaining_predicate: selection!("age > 5 AND age > 'abc'").predicate,
                         order_by_spill: order_by_components!()
                     },
                     Plan::TableScan {
@@ -2461,9 +2379,9 @@ mod tests {
             );
         }
 
-        /// A repeated column sitting between terms on other columns: the other
-        /// columns still make it into the key, and only the term the range
-        /// could not hold is left over.
+        /// A repeated column sitting between terms on other columns: the
+        /// other columns still make it into the key, and the bounds narrow by
+        /// each column's first term.
         #[test]
         fn repeated_column_alongside_other_columns() {
             assert_eq!(
@@ -2473,7 +2391,7 @@ mod tests {
                         index_spec: KeySpec::new(vec![asc!("owner", ValueType::String), asc!("status", ValueType::String)]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("owner" => ("bob"..="bob"), "status" => ("open"..="open")),
-                        remaining_predicate: selection!("owner = 'alice'").predicate,
+                        remaining_predicate: selection!("owner = 'bob' AND status = 'open' AND owner = 'alice'").predicate,
                         order_by_spill: order_by_components!()
                     },
                     Plan::TableScan {
@@ -2486,9 +2404,9 @@ mod tests {
             );
         }
 
-        /// `!=` never becomes a key-range endpoint, so it survives even on a
-        /// column the range already pins. It used to be dropped for naming a
-        /// column that some other term had been encoded for.
+        /// `!=` never becomes a key-range endpoint; like every other term it
+        /// is enforced by the residual. Pinned because it used to be dropped
+        /// for naming a column another term had bounds on.
         #[test]
         fn not_equal_on_a_pinned_column_survives() {
             assert_eq!(
@@ -2498,7 +2416,7 @@ mod tests {
                         index_spec: KeySpec::new(vec![asc!("age", ValueType::I32)]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("age" => (5..=5)),
-                        remaining_predicate: selection!("age != 5").predicate,
+                        remaining_predicate: selection!("age = 5 AND age != 5").predicate,
                         order_by_spill: order_by_components!()
                     },
                     Plan::TableScan {
@@ -2511,10 +2429,10 @@ mod tests {
             );
         }
 
-        /// An ORDER BY naming a column the predicate already pins does not earn
-        /// that column a second position in the key, and the extra equality
-        /// still survives. The ORDER BY is satisfied either way, because the
-        /// column is constant across the rows the scan returns.
+        /// An ORDER BY naming a column the predicate already pins does not
+        /// earn that column a second position in the key. The ORDER BY is
+        /// satisfied either way, because the column is constant across the
+        /// rows the scan returns.
         #[test]
         fn repeated_equality_under_order_by() {
             assert_eq!(
@@ -2524,7 +2442,7 @@ mod tests {
                         index_spec: KeySpec::new(vec![asc!("owner", ValueType::String), asc!("label", ValueType::String)]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("owner" => ("bob"..="bob")),
-                        remaining_predicate: selection!("owner = 'alice'").predicate,
+                        remaining_predicate: selection!("owner = 'bob' AND owner = 'alice'").predicate,
                         order_by_spill: order_by_components!(presort: [oby_asc!("owner"), oby_asc!("label")])
                     },
                     Plan::TableScan {
@@ -2538,9 +2456,9 @@ mod tests {
         }
 
         /// The predicate a client composes and a server then composes onto
-        /// again: three terms on one column, two of them the same. The range
-        /// holds the first, the repeat of it is genuinely enforced by that same
-        /// bound, and the term that differs survives.
+        /// again: three terms on one column, two of them the same. The bounds
+        /// narrow by the first, and the residual carries the composition
+        /// exactly as written.
         #[test]
         fn twice_composed_repeats_on_one_column() {
             assert_eq!(
@@ -2550,7 +2468,7 @@ mod tests {
                         index_spec: KeySpec::new(vec![asc!("owner", ValueType::String)]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("owner" => ("bob"..="bob")),
-                        remaining_predicate: selection!("owner = 'alice' AND owner = 'alice'").predicate,
+                        remaining_predicate: selection!("owner = 'bob' AND owner = 'alice' AND owner = 'alice'").predicate,
                         order_by_spill: order_by_components!()
                     },
                     Plan::TableScan {
@@ -2563,9 +2481,9 @@ mod tests {
             );
         }
 
-        /// A disjunction is never encoded into a key range, whatever else the
-        /// query says about the columns it names. This shape was always sound;
-        /// pinning it keeps a later change to what the range encodes from
+        /// A disjunction never becomes a key-range bound, whatever else the
+        /// query says about the columns it names. This shape was always
+        /// sound; pinning it keeps a later change to bounds-building from
         /// taking the disjunction along.
         #[test]
         fn disjunction_stays_in_the_residual() {
@@ -2576,7 +2494,7 @@ mod tests {
                         index_spec: KeySpec::new(vec![asc!("owner", ValueType::String)]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("owner" => ("b"..="b")),
-                        remaining_predicate: selection!("owner = 'a' OR reviewer = 'a'").predicate,
+                        remaining_predicate: selection!("(owner = 'a' OR reviewer = 'a') AND owner = 'b'").predicate,
                         order_by_spill: order_by_components!()
                     },
                     Plan::TableScan {
@@ -2589,25 +2507,34 @@ mod tests {
             );
         }
 
-        /// Every plan the planner offers for one query has to answer the same
-        /// question, so the leftover term must appear in all of them — the
-        /// caller picks a plan without re-deriving what it enforces.
+        /// Every plan the planner offers for one query — the ORDER-FIRST and
+        /// INEQ-FIRST strategies and the TableScan fallback alike, under both
+        /// capability configs — must carry the whole predicate as its
+        /// residual. The exact comparison is the point: a regressed plan
+        /// whose residual kept only the term its bounds were built from (say
+        /// `age = 5` without `age > 10`) would still pass a mere
+        /// not-`Predicate::True` check while returning rows the query
+        /// excludes.
         #[test]
-        fn every_plan_for_a_repeated_column_keeps_the_leftover_term() {
-            for plans in [
-                plan!("owner = 'bob' AND owner = 'alice'"),
-                plan_full_support!("owner = 'bob' AND owner = 'alice'"),
-                plan!("age = 5 AND age > 10 ORDER BY label"),
-                plan_full_support!("age = 5 AND age > 10 ORDER BY label"),
-            ] {
-                for plan in &plans {
+        fn every_plan_carries_the_whole_predicate_as_residual() {
+            fn assert_plans_carry(plans: &[Plan], expected: &Predicate) {
+                assert!(plans.len() >= 2, "expected at least one index strategy plus the fallback: {plans:?}");
+                for plan in plans {
                     let residual = match plan {
                         Plan::Index { remaining_predicate, .. } | Plan::TableScan { remaining_predicate, .. } => remaining_predicate,
-                        Plan::EmptyScan => continue,
+                        Plan::EmptyScan => panic!("no shape here is provably empty: {plan:?}"),
                     };
-                    assert_ne!(*residual, Predicate::True, "a plan enforcing nothing beyond its key range: {plan:?}");
+                    assert_eq!(residual, expected, "every plan re-checks the whole predicate: {plan:?}");
                 }
             }
+
+            let two_equalities = selection!("owner = 'bob' AND owner = 'alice'").predicate;
+            assert_plans_carry(&plan!("owner = 'bob' AND owner = 'alice'"), &two_equalities);
+            assert_plans_carry(&plan_full_support!("owner = 'bob' AND owner = 'alice'"), &two_equalities);
+
+            let equality_and_range = selection!("age = 5 AND age > 10").predicate;
+            assert_plans_carry(&plan!("age = 5 AND age > 10 ORDER BY label"), &equality_and_range);
+            assert_plans_carry(&plan_full_support!("age = 5 AND age > 10 ORDER BY label"), &equality_and_range);
         }
     }
 
@@ -2625,7 +2552,7 @@ mod tests {
                         index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String)]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album")),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album'").predicate,
                         order_by_spill: order_by_components!(),
                     },
                     Plan::TableScan {
@@ -2648,7 +2575,7 @@ mod tests {
                         index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String)]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album")),
-                        remaining_predicate: selection!("name != 'Alice'").predicate,
+                        remaining_predicate: selection!("__collection = 'album' AND name != 'Alice'").predicate,
                         order_by_spill: order_by_components!(),
                     },
                     Plan::TableScan {
@@ -2670,7 +2597,7 @@ mod tests {
                         // from is excl because the inequality (age) is > 25
                         // to is incl and the final component is omitted because there is no age < ? in the predicate
                         bounds: bounds_list!(col_range!("__collection" => "album"..="album"), open_lower!("age" => 25..)),
-                        remaining_predicate: selection!("name != 'Alice'").predicate,
+                        remaining_predicate: selection!("__collection = 'album' AND age > 25 AND name != 'Alice'").predicate,
                         order_by_spill: order_by_components!(),
                     },
                     Plan::TableScan {
@@ -2701,7 +2628,7 @@ mod tests {
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album")),
                         // the OR-containing parenthetical is a disjunction, so it must remain in the predicate
-                        remaining_predicate: selection!("age > 25 OR name = 'Alice'").predicate,
+                        remaining_predicate: selection!("__collection = 'album' AND (age > 25 OR name = 'Alice')").predicate,
                         order_by_spill: order_by_components!(),
                     },
                     Plan::TableScan {
@@ -2725,7 +2652,8 @@ mod tests {
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album"), "score" => (100..=100)),
                         // the OR-containing parenthetical is a disjunction, so it must remain in the predicate
-                        remaining_predicate: selection!("age > 25 OR name = 'Alice'").predicate,
+                        remaining_predicate: selection!("__collection = 'album' AND score = 100 AND (age > 25 OR name = 'Alice')")
+                            .predicate,
                         order_by_spill: order_by_components!(),
                     },
                     Plan::TableScan {
@@ -2755,7 +2683,7 @@ mod tests {
                         ]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album"), "age" => (30..=30)),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album' AND age = 30").predicate,
                         order_by_spill: order_by_components!(presort: [oby_asc!("name"), oby_asc!("score")]),
                     },
                     Plan::TableScan {
@@ -2786,11 +2714,7 @@ mod tests {
                         index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("name", ValueType::String)]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album")),
-                        remaining_predicate: Predicate::Comparison {
-                            left: Box::new(Expr::Path(ankql::ast::PathExpr::simple("year"))),
-                            operator: ComparisonOperator::GreaterThanOrEqual,
-                            right: Box::new(Expr::Literal(ankql::ast::Literal::String("2001".to_string()))),
-                        },
+                        remaining_predicate: selection!("__collection = 'album' AND year >= '2001'").predicate,
                         order_by_spill: order_by_components!(presort: [oby_asc!("name")]),
                     },
                     // Strategy 2: Scan by year, sort by name (global sort needed since 'year' not in ORDER BY)
@@ -2798,7 +2722,7 @@ mod tests {
                         index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("year", ValueType::String)]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album"), "year" => ("2001"..)),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album' AND year >= '2001'").predicate,
                         order_by_spill: order_by_components!(spill: [oby_asc!("name")]),
                     },
                     Plan::TableScan {
@@ -2825,7 +2749,7 @@ mod tests {
                         // from: is incl because the most restrictive lower bound inequality (age) is >= 25
                         // to: is incl because the upper bound inequality (age) is <= 50
                         bounds: bounds!("__collection" => ("album"..="album"), "age" => (25..=50)),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album' AND age >= 25 AND age <= 50 AND age > 20").predicate,
                         order_by_spill: order_by_components!(),
                     },
                     Plan::TableScan {
@@ -2854,7 +2778,7 @@ mod tests {
                             col_range!("__collection" => "album"..="album"),
                             open_lower!("timestamp" => 9223372036854775807i64..)
                         ),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album' AND timestamp > 9223372036854775807").predicate,
                         order_by_spill: order_by_components!()
                     },
                     Plan::TableScan {
@@ -2877,7 +2801,7 @@ mod tests {
                         index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("name", ValueType::String)]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album"), "name" => (""..="")),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album' AND name = ''").predicate,
                         order_by_spill: order_by_components!()
                     },
                     Plan::TableScan {
@@ -2904,7 +2828,7 @@ mod tests {
                         ]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album"), "name" => (""..=""), "year" => ("2000"..="2000")),
-                        remaining_predicate: Predicate::True,
+                        remaining_predicate: selection!("__collection = 'album' AND name = '' AND year = '2000'").predicate,
                         order_by_spill: order_by_components!()
                     },
                     Plan::TableScan {
@@ -3032,7 +2956,10 @@ mod tests {
                         index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("name", ValueType::String)]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album"), "name" => ("Alice"..="Alice")),
-                        remaining_predicate: selection!("id > '12345678-1234-1234-1234-123456789abc'").predicate,
+                        remaining_predicate: selection!(
+                            "__collection = 'album' AND id > '12345678-1234-1234-1234-123456789abc' AND name = 'Alice'"
+                        )
+                        .predicate,
                         order_by_spill: order_by_components!()
                     },
                     Plan::TableScan {
@@ -3119,9 +3046,11 @@ mod tests {
             }
         }
 
-        /// Test that JSON path equality has no remaining predicate (fully pushed down)
+        /// A JSON path equality becomes the index bounds, and the residual
+        /// still re-checks it: bounds narrow the scan, they never stand in
+        /// for the term.
         #[test]
-        fn test_json_path_full_pushdown() {
+        fn test_json_path_equality_residual_retained() {
             let planner = Planner::new(PlannerConfig::full_support());
             let selection = selection!("context.session_id = 'sess123'");
             let plans = planner.plan(&selection, "id");
@@ -3129,14 +3058,14 @@ mod tests {
             let index_plan = plans.iter().find(|p| matches!(p, Plan::Index { .. })).expect("Should generate index plan");
 
             if let Plan::Index { remaining_predicate, .. } = index_plan {
-                // Full pushdown: remaining_predicate should be True
-                assert_eq!(*remaining_predicate, Predicate::True, "JSON path equality should be fully pushed down");
+                assert_eq!(*remaining_predicate, selection.predicate, "the residual re-checks the term the bounds narrowed by");
             } else {
                 panic!("Expected Index plan");
             }
         }
 
-        /// Test JSON path with inequality (partial pushdown for range)
+        /// Test JSON path with inequality: the range becomes the bounds, and
+        /// the residual still re-checks it.
         #[test]
         fn test_json_path_inequality() {
             let planner = Planner::new(PlannerConfig::full_support());
@@ -3151,8 +3080,7 @@ mod tests {
                 assert_eq!(keypart.column, "context");
                 assert_eq!(keypart.sub_path, Some(vec!["count".to_string()]));
 
-                // Inequality should be fully pushed to bounds, remaining_predicate is True
-                assert_eq!(*remaining_predicate, Predicate::True, "JSON path inequality should be fully pushed down");
+                assert_eq!(*remaining_predicate, selection.predicate, "the residual re-checks the term the bounds narrowed by");
             }
         }
 
@@ -3178,8 +3106,7 @@ mod tests {
                 assert_eq!(json_kp.column, "context");
                 assert_eq!(json_kp.sub_path, Some(vec!["user_id".to_string()]));
 
-                // Both should be fully pushed, remaining is True
-                assert_eq!(*remaining_predicate, Predicate::True, "Both predicates should be pushed down");
+                assert_eq!(*remaining_predicate, selection.predicate, "the residual re-checks both terms the bounds narrowed by");
             }
         }
     }
