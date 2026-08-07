@@ -24,6 +24,9 @@ pub enum SqliteError {
 
     #[error("Task join error: {0}")]
     TaskJoin(String),
+
+    #[error("Dump error: {0}")]
+    Dump(String),
 }
 
 impl From<SqliteError> for ankurah_core::error::RetrievalError {

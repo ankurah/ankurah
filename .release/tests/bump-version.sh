@@ -11,12 +11,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkdir -p "$sandbox/.release" "$sandbox/base" "$sandbox/app"
+mkdir -p "$sandbox/.release" "$sandbox/base" "$sandbox/legacy-base" "$sandbox/app"
 cp "$root/.release/bump-version.sh" "$root/.release/release-context.sh" "$sandbox/.release/"
 
 printf '%s\n' \
     '[workspace]' \
     'members = ["base", "app"]' \
+    'exclude = ["legacy-base"]' \
     'resolver = "2"' > "$sandbox/Cargo.toml"
 
 printf '%s\n' \
@@ -31,12 +32,23 @@ printf '%s\n' \
 
 printf '%s\n' \
     '[package]' \
+    'name = "release-test-base"' \
+    'version = "0.8.9"' \
+    'edition = "2021"' \
+    '' \
+    '[lib]' \
+    'path = "lib.rs"' > "$sandbox/legacy-base/Cargo.toml"
+printf '' > "$sandbox/legacy-base/lib.rs"
+
+printf '%s\n' \
+    '[package]' \
     'name = "release-test-app"' \
     'version = "0.9.0"' \
     'edition = "2021"' \
     '' \
     '[dependencies]' \
-    'release-test-base = { path = "../base", version = "=0.9.0" }' \
+    'release-test-base-0-9 = { package = "release-test-base", path = "../base", version = "=0.9.0" }' \
+    'release-test-base-0-8 = { package = "release-test-base", path = "../legacy-base", version = "=0.8.9" }' \
     '' \
     '[lib]' \
     'path = "lib.rs"' > "$sandbox/app/Cargo.toml"
@@ -65,8 +77,12 @@ if [[ "$versions" != "0.9.1" ]]; then
     echo "unexpected bumped versions: $versions" >&2
     exit 1
 fi
-if ! grep -Fq 'version = "=0.9.1"' "$sandbox/app/Cargo.toml"; then
-    echo "internal dependency pin was not bumped" >&2
+if ! grep -Fq 'release-test-base-0-9 = { package = "release-test-base", path = "../base", version = "=0.9.1" }' "$sandbox/app/Cargo.toml"; then
+    echo "versioned internal dependency pin was not bumped" >&2
+    exit 1
+fi
+if ! grep -Fq 'release-test-base-0-8 = { package = "release-test-base", path = "../legacy-base", version = "=0.8.9" }' "$sandbox/app/Cargo.toml"; then
+    echo "older versioned dependency alias was moved" >&2
     exit 1
 fi
 
