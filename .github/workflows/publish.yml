@@ -2,8 +2,14 @@ name: Publish Crates
 
 on:
   push:
-    branches: [main]
-    paths: ["**/Cargo.toml"]
+    branches: ["release/**"]
+    # RELEASES changing is explicit publish intent. The version itself comes
+    # from the lockstep Cargo manifests and is validated against the branch.
+    paths: [RELEASES]
+
+concurrency:
+  group: crates-io-publish
+  cancel-in-progress: false
 
 permissions:
   contents: write # Need to create and push tags
@@ -17,6 +23,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

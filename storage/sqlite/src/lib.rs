@@ -32,6 +32,7 @@
 //! ```
 
 mod connection;
+mod dump;
 mod engine;
 mod error;
 pub mod sql_builder;
