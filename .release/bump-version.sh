@@ -65,6 +65,7 @@ done
 
 # Refresh Cargo.lock, then prove the result is internally consistent.
 cargo metadata --no-deps --format-version=1 >/dev/null
+validate_lockfile
 metadata="$(workspace_metadata)"
 actual="$(workspace_release_version "$metadata")"
 if [[ "$actual" != "$version" ]]; then

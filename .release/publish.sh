@@ -11,7 +11,9 @@ PUBLISHED_CRATES_FILE=".release/published_crates"
 metadata="$(workspace_metadata)"
 version="$(workspace_release_version "$metadata")"
 branch="$(release_branch_name)"
+crates="$(release_crates "$PUBLISHED_CRATES_FILE")"
 
+validate_lockfile
 validate_release_version "$version" "$branch"
 validate_release_notes "$version"
 validate_published_crates "$version" "$PUBLISHED_CRATES_FILE" "$metadata"
@@ -26,11 +28,9 @@ git fetch --tags origin
 
 # Reject every tag collision before the first irreversible crate publication.
 while IFS= read -r crate || [[ -n "$crate" ]]; do
-    case "$crate" in
-        "" | \#*) continue ;;
-    esac
+    [[ -z "$crate" ]] && continue
     validate_release_tag "${crate}-v${version}" "$release_commit"
-done < "$PUBLISHED_CRATES_FILE"
+done <<<"$crates"
 
 ensure_release_tag() {
     local tag="$1"
@@ -46,10 +46,7 @@ ensure_release_tag() {
 
 # Publish crates in dependency order and create tags
 while IFS= read -r crate || [[ -n "$crate" ]]; do
-    # Skip comments and empty lines
-    case "$crate" in
-        "" | \#*) continue ;;
-    esac
+    [[ -z "$crate" ]] && continue
 
     echo
     echo "📦 Publishing $crate..."
@@ -68,7 +65,7 @@ while IFS= read -r crate || [[ -n "$crate" ]]; do
     tag="${crate}-v${version}"
     echo "   🏷️  Ensuring $tag points to $release_commit..."
     ensure_release_tag "$tag"
-done < "$PUBLISHED_CRATES_FILE"
+done <<<"$crates"
 
 echo
 echo "🎉 Done!"

@@ -41,6 +41,10 @@ duplicate_crates="$(mktemp)"
 printf 'ankql\nankql\n' > "$duplicate_crates"
 expect_failure validate_published_crates "$workspace_version" "$duplicate_crates"
 
+malformed_crates="$(mktemp)"
+printf '  # indented comment\nankql trailing-token\n' > "$malformed_crates"
+expect_failure validate_published_crates "$workspace_version" "$malformed_crates"
+
 incomplete_crates="$(mktemp)"
 awk 'BEGIN { removed = 0 } /^#/ || NF == 0 { print; next } !removed { removed = 1; next } { print }' \
     "$root/.release/published_crates" > "$incomplete_crates"
@@ -48,7 +52,7 @@ expect_failure validate_published_crates "$workspace_version" "$incomplete_crate
 
 tag_repo="$(mktemp -d)"
 cleanup() {
-    rm -f -- "${notes:?}" "${duplicate_crates:?}" "${incomplete_crates:?}"
+    rm -f -- "${notes:?}" "${duplicate_crates:?}" "${malformed_crates:?}" "${incomplete_crates:?}"
     case "${tag_repo:?}" in
         /tmp/* | /private/tmp/* | /var/folders/* | /private/var/folders/*) rm -rf -- "$tag_repo" ;;
         *) echo "refusing to remove unexpected temporary path: $tag_repo" >&2 ;;

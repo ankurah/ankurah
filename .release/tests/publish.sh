@@ -89,6 +89,8 @@ git -C "$repo" remote add origin "$remote"
 git -C "$repo" push -qu origin release/0.9
 
 PATH="$fake_bin:$PATH" \
+    env -u GITHUB_REF_NAME \
+    RELEASE_BRANCH=release/0.9 \
     RELEASE_TEST_REAL_CARGO="$real_cargo" \
     RELEASE_TEST_PUBLISH_LOG="$publish_log" \
     "$repo/.release/publish.sh"
@@ -104,6 +106,8 @@ done
 
 # A partial-run retry must accept published crates and preserve exact tags.
 PATH="$fake_bin:$PATH" \
+    env -u GITHUB_REF_NAME \
+    RELEASE_BRANCH=release/0.9 \
     RELEASE_TEST_REAL_CARGO="$real_cargo" \
     RELEASE_TEST_PUBLISH_LOG="$publish_log" \
     RELEASE_TEST_ALREADY_EXISTS=1 \

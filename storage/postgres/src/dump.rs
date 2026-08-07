@@ -218,10 +218,14 @@ async fn dump_collections(client: &tokio_postgres::Client) -> anyhow::Result<(Ve
 async fn table_columns(client: &tokio_postgres::Client) -> anyhow::Result<BTreeMap<String, std::collections::BTreeSet<String>>> {
     let rows = client
         .query(
-            "SELECT table_name, column_name
-             FROM information_schema.columns
-             WHERE table_schema = current_schema()
-             ORDER BY table_name, ordinal_position",
+            "SELECT columns.table_name, columns.column_name
+             FROM information_schema.columns AS columns
+             INNER JOIN information_schema.tables AS tables
+                ON tables.table_schema = columns.table_schema
+               AND tables.table_name = columns.table_name
+             WHERE columns.table_schema = current_schema()
+               AND tables.table_type = 'BASE TABLE'
+             ORDER BY columns.table_name, columns.ordinal_position",
             &[],
         )
         .await?;
@@ -277,23 +281,40 @@ mod tests {
             expected_states.insert(entity_id);
         }
 
+        let client = storage.pool.get().await?;
+        client
+            .batch_execute(
+                "CREATE VIEW dump_decoy_event AS
+                     SELECT id, entity_id, operations, parent, attestations FROM dump_pages_event;
+                 CREATE VIEW dump_decoy_state AS
+                     SELECT id, state_buffer, memberships, head, attestations FROM dump_pages;",
+            )
+            .await?;
+        drop(client);
+
         let items = storage.dump().await?;
         pin_mut!(items);
         let mut events = BTreeSet::new();
         let mut states = BTreeSet::new();
+        let mut event_count = 0;
+        let mut state_count = 0;
         let mut saw_state = false;
         while let Some(item) = items.next().await {
             match item? {
                 StorageDumpItem::Event(event) => {
                     assert!(!saw_state, "dump emitted an event after a state");
+                    event_count += 1;
                     events.insert(event.payload.id());
                 }
                 StorageDumpItem::State(state) => {
                     saw_state = true;
+                    state_count += 1;
                     states.insert(state.payload.entity_id);
                 }
             }
         }
+        assert_eq!(event_count, RECORDS, "views must not be discovered as event tables");
+        assert_eq!(state_count, RECORDS, "views must not be discovered as state tables");
         assert_eq!(events, expected_events);
         assert_eq!(states, expected_states);
         Ok(())

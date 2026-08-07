@@ -11,6 +11,7 @@ metadata="$(workspace_metadata)"
 version="$(workspace_release_version "$metadata")"
 branch="$(release_branch_name)"
 
+validate_lockfile
 validate_release_version "$version" "$branch"
 validate_release_notes "$version"
 validate_published_crates "$version" .release/published_crates "$metadata"

@@ -76,6 +76,13 @@ workspace_metadata() {
     cargo metadata --locked --no-deps --format-version=1
 }
 
+validate_lockfile() {
+    # `--no-deps` is useful when inspecting only workspace packages, but it
+    # does not make Cargo resolve the dependency graph and therefore cannot
+    # prove that Cargo.lock is current.
+    cargo metadata --locked --format-version=1 >/dev/null
+}
+
 workspace_release_version() {
     local metadata="${1:-$(workspace_metadata)}"
     local versions
@@ -104,18 +111,20 @@ validate_published_crates() {
     local version="$1"
     local crates_file="${2:-.release/published_crates}"
     local metadata="${3:-$(workspace_metadata)}"
+    local crates
     local crate_count=0
     local crate
     local duplicates
 
-    duplicates="$(awk 'NF && $1 !~ /^#/ { print $1 }' "$crates_file" | sort | uniq -d)"
+    crates="$(release_crates "$crates_file")" || return 1
+    duplicates="$(sort <<<"$crates" | uniq -d)"
     if [[ -n "$duplicates" ]]; then
         release_error "$crates_file contains duplicate crates: ${duplicates//$'\n'/, }"
         return 1
     fi
 
     local listed publishable missing unexpected
-    listed="$(awk 'NF && $1 !~ /^#/ { print $1 }' "$crates_file" | sort)"
+    listed="$(sort <<<"$crates")"
     publishable="$(jq -r '.packages[] | select(.publish != []) | .name' <<<"$metadata" | sort)"
     missing="$(comm -23 <(printf '%s\n' "$publishable") <(printf '%s\n' "$listed"))"
     unexpected="$(comm -13 <(printf '%s\n' "$publishable") <(printf '%s\n' "$listed"))"
@@ -127,7 +136,7 @@ validate_published_crates() {
     fi
 
     while IFS= read -r crate || [[ -n "$crate" ]]; do
-        [[ -z "$crate" || "$crate" == \#* ]] && continue
+        [[ -z "$crate" ]] && continue
         crate_count=$((crate_count + 1))
 
         local matches
@@ -143,12 +152,33 @@ validate_published_crates() {
             release_error "$crate is version $crate_version, expected $version"
             return 1
         fi
-    done < "$crates_file"
+    done <<<"$crates"
 
     if [[ "$crate_count" == "0" ]]; then
         release_error "$crates_file contains no crates"
         return 1
     fi
+}
+
+release_crates() {
+    local crates_file="${1:-.release/published_crates}"
+    local line
+    local crate
+    local trailing
+    local line_number=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line_number=$((line_number + 1))
+        crate=""
+        trailing=""
+        read -r crate trailing <<<"$line" || true
+        [[ -z "$crate" || "$crate" == \#* ]] && continue
+        if [[ -n "$trailing" ]]; then
+            release_error "$crates_file:$line_number must contain one crate name or a comment"
+            return 1
+        fi
+        printf '%s\n' "$crate"
+    done < "$crates_file"
 }
 
 validate_release_tag() {
