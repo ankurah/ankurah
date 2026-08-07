@@ -1,5 +1,5 @@
 use crate::claims::JwtClaims;
-use crate::error::AuthError;
+use crate::{error::AuthError, IssuerVerifier};
 use jwt_simple::prelude::*;
 
 /// Manages RSA keypair for signing and verifying JWTs.
@@ -56,6 +56,7 @@ impl SigningKeys {
 pub enum JwtKeys {
     Signing(SigningKeys),
     VerifyOnly(RS256PublicKey),
+    Issuer(IssuerVerifier),
 }
 
 impl JwtKeys {
@@ -70,6 +71,7 @@ impl JwtKeys {
                 claims.sub = sub;
                 Ok(claims)
             }
+            JwtKeys::Issuer(verifier) => verifier.verify(token),
         }
     }
 
@@ -78,6 +80,7 @@ impl JwtKeys {
         match self {
             JwtKeys::Signing(keys) => keys.public_key_pem(),
             JwtKeys::VerifyOnly(public_key) => public_key.to_pem().map_err(|e| AuthError::KeyExport(e.to_string())),
+            JwtKeys::Issuer(_) => Err(AuthError::KeyExport("issuer trust has no single public key".into())),
         }
     }
 

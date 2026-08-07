@@ -16,4 +16,10 @@ pub enum AuthError {
 
     #[error("Token verification failed: {0}")]
     Verification(String),
+
+    #[error("Invalid issuer trust: {0}")]
+    IssuerTrust(String),
+
+    #[error("Issuer HTTP request failed: {0}")]
+    IssuerHttp(String),
 }
