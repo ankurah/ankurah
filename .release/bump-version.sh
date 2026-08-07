@@ -9,6 +9,8 @@ if [[ "$#" != "1" ]]; then
 fi
 
 version="$1"
+series_suffix="${version%.*}"
+series_suffix="${series_suffix//./-}"
 
 # shellcheck source=.release/release-context.sh
 source .release/release-context.sh
@@ -34,12 +36,16 @@ for manifest in $manifests; do
     for crate in $crates; do
         # Update table dependencies such as:
         # crate = { path = "...", version = "=x.y.z" }
-        RELEASE_CRATE="$crate" RELEASE_VERSION="$version" perl -0pi -e '
+        # crate-0-9 = { package = "crate", path = "...", version = "=x.y.z" }
+        # The versioned form lets one binary depend on multiple minor release
+        # lines without moving older aliases during the current line's bump.
+        RELEASE_CRATE="$crate" RELEASE_CRATE_ALIAS="$crate-$series_suffix" RELEASE_VERSION="$version" perl -0pi -e '
             BEGIN {
                 $crate = quotemeta($ENV{"RELEASE_CRATE"});
+                $alias = quotemeta($ENV{"RELEASE_CRATE_ALIAS"});
                 $version = $ENV{"RELEASE_VERSION"};
             }
-            s/(\b$crate\s*=\s*\{[^}]*\bversion\s*=\s*")[^"]+"/$1=$version"/g;
+            s/(\b(?:$crate|$alias)\s*=\s*\{[^}]*\bversion\s*=\s*")[^"]+"/$1=$version"/g;
         ' "$manifest"
     done
 done

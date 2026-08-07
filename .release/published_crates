@@ -23,5 +23,8 @@ ankurah-storage-postgres
 ankurah-storage-indexeddb-wasm
 ankurah-websocket-client-wasm
 
-# Tier 6: Extensions (depends on ankurah)
+# Tier 6: Operator tooling (depends on native storage engines)
+ankurah-cli
+
+# Tier 7: Extensions (depends on ankurah)
 ankurah-jwt-auth

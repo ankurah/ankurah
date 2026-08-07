@@ -14,6 +14,7 @@ use ankurah_proto::{Attestation, AttestationSet, Attested, EntityState, EventId,
 
 use futures_util::{pin_mut, TryStreamExt};
 
+mod dump;
 pub mod sql_builder;
 pub mod value;
 
