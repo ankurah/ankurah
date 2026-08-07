@@ -214,6 +214,15 @@ impl PolicyAgent for JwtAgent {
 
     fn filter_predicate<C>(&self, data: &C, collection: &proto::CollectionId, predicate: Predicate) -> Result<Predicate, AccessDenied>
     where C: Iterable<Self::ContextData> {
+        // The policy collection is granted before any credential is
+        // consulted, mirroring can_access_collection's carve-out and for the
+        // same reason: an ephemeral node bootstraps its policy through a
+        // livequery on this collection while its config is still deny-all,
+        // and a scan-privilege check here (added with the `retrieve` tier)
+        // would compose that bootstrap query to False.
+        if collection.as_str() == "jwtpolicy" {
+            return Ok(predicate);
+        }
         for ctx in data.iterable() {
             if ctx.is_privileged() {
                 return Ok(predicate);
@@ -221,14 +230,40 @@ impl PolicyAgent for JwtAgent {
         }
 
         let state = self.state.read().unwrap_or_else(|e| e.into_inner());
+
         if state.config.scope_rules_for_collection(collection.as_str()).is_empty() {
-            return Ok(predicate);
+            // An unscoped collection passes a scan-privileged caller's
+            // predicate through untouched. Any other caller the entry gate
+            // admitted — which now includes retrieval-only credentials —
+            // scans nothing: False, an empty answer rather than an error,
+            // because arriving here at the retrieval tier is a tier limit
+            // and not a fault. Every predicate is a scan here, id-shaped or
+            // not: predicate-shaped retrieval (an id-bounded pass at this
+            // tier, for fetch_one("id = …") and named-row live queries) is
+            // a deliberate follow-up, not part of this change. (Before
+            // `retrieve` existed this arm passed unconditionally, and
+            // could: the entry gate had already refused every caller
+            // without read or write.)
+            for ctx in data.iterable() {
+                if state.config.can_scan_collection(ctx.roles(), collection) {
+                    return Ok(predicate);
+                }
+            }
+            return Ok(Predicate::False);
         }
 
+        // Only a scan-authorized credential may stand for the caller here:
+        // a retrieval-only credential reads rows it names, never rows a
+        // scan surfaces, so its scope must not be composed into a query it
+        // could never run (the entry gate now admits it; this arm must
+        // not). Backport note: main composes the union of every authorized
+        // credential's scope here; this branch keeps its single-credential
+        // shape, so the check rides the same find_map that picks the
+        // credential.
         let claims = data
             .iterable()
             .find_map(|ctx| match ctx {
-                JwtContext::User { claims, .. } => Some(claims),
+                JwtContext::User { claims, .. } if state.config.can_scan_collection(ctx.roles(), collection) => Some(claims),
                 _ => None,
             })
             .ok_or(AccessDenied::ByPolicy("No authenticated context for row filtering"))?;

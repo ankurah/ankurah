@@ -1,0 +1,22 @@
+{
+  "roles": {
+    "guest": ["view"],
+    "member": ["view", "signed_in"]
+  },
+  "collections": {
+    "user": {
+      "read": "signed_in",
+      "retrieve": "view",
+      "write": "signed_in"
+    },
+    "note": {
+      "read": "signed_in",
+      "write": "signed_in",
+      "scope": [{ "filter": "owner = $jwt.sub" }]
+    },
+    "message": {
+      "read": "view",
+      "write": "signed_in"
+    }
+  }
+}
