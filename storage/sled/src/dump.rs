@@ -96,7 +96,8 @@ fn event_page(database: Arc<Database>, after: Option<Vec<u8>>) -> Result<(Option
         let (key, bytes) = entry.map_err(sled_error)?;
         let event = bincode::deserialize::<Attested<Event>>(&bytes)?;
         if key.as_ref() != event.payload.id().as_bytes() {
-            return Err(RetrievalError::Other("Sled event key does not match its payload id".to_owned()));
+            let stored_key = key.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+            return Err(RetrievalError::Other(format!("Sled event key {stored_key} does not match payload id {}", event.payload.id())));
         }
         last = Some(key.to_vec());
         page.push(StorageDumpItem::Event(event));

@@ -2,6 +2,7 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
+cd "$root"
 
 # shellcheck source=.release/release-context.sh
 source "$root/.release/release-context.sh"

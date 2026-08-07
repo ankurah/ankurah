@@ -53,16 +53,16 @@ printf '%s\n' 'release-test-base' 'release-test-app' > "$sandbox/.release/publis
 
 (cd "$sandbox" && cargo generate-lockfile --offline)
 
-if RELEASE_BRANCH=release/0.10 "$sandbox/.release/bump-version.sh" >/dev/null 2>&1; then
+if (cd "$sandbox" && RELEASE_BRANCH=release/0.10 ./.release/bump-version.sh >/dev/null 2>&1); then
     echo "bump-version accepted an implicit version" >&2
     exit 1
 fi
-if RELEASE_BRANCH=release/0.10 "$sandbox/.release/bump-version.sh" 0.9.1 >/dev/null 2>&1; then
+if (cd "$sandbox" && RELEASE_BRANCH=release/0.10 ./.release/bump-version.sh 0.9.1 >/dev/null 2>&1); then
     echo "bump-version accepted a version from another release series" >&2
     exit 1
 fi
 
-RELEASE_BRANCH=release/0.10 "$sandbox/.release/bump-version.sh" 0.10.1
+(cd "$sandbox" && RELEASE_BRANCH=release/0.10 ./.release/bump-version.sh 0.10.1)
 
 versions="$(cd "$sandbox" && cargo metadata --locked --no-deps --format-version=1 | jq -r '[.packages[].version] | unique | .[]')"
 if [[ "$versions" != "0.10.1" ]]; then
