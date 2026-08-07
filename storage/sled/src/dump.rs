@@ -95,9 +95,11 @@ fn event_page(database: Arc<Database>, after: Option<Vec<u8>>) -> Result<(Option
     for entry in entries.by_ref().take(PAGE_SIZE) {
         let (key, bytes) = entry.map_err(sled_error)?;
         let event = bincode::deserialize::<Attested<Event>>(&bytes)?;
-        if key.as_ref() != event.payload.id().as_bytes() {
+        let payload_id = event.payload.id();
+        if key.as_ref() != payload_id.as_bytes() {
             let stored_key = key.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
-            return Err(RetrievalError::Other(format!("Sled event key {stored_key} does not match payload id {}", event.payload.id())));
+            let payload_key = payload_id.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+            return Err(RetrievalError::Other(format!("Sled event key {stored_key} does not match payload id bytes {payload_key}")));
         }
         last = Some(key.to_vec());
         page.push(StorageDumpItem::Event(event));
@@ -197,6 +199,35 @@ mod tests {
         let items = storage.dump().await?;
         pin_mut!(items);
         assert!(matches!(items.next().await, Some(Err(RetrievalError::Other(message))) if message.contains("no collection membership")));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dump_identifies_both_sides_of_an_event_key_mismatch() -> anyhow::Result<()> {
+        let storage = SledStorageEngine::new_test()?;
+        let event = Attested {
+            payload: Event {
+                collection: CollectionId::from("mismatched_event"),
+                entity_id: EntityId::new(),
+                operations: Default::default(),
+                parent: Default::default(),
+            },
+            attestations: AttestationSet::default(),
+        };
+        let stored_key = vec![0xab; event.payload.id().as_bytes().len()];
+        {
+            let database = storage.database.lock().unwrap();
+            database.events_tree.insert(&stored_key, bincode::serialize(&event)?)?;
+        }
+
+        let items = storage.dump().await?;
+        pin_mut!(items);
+        let error = items.next().await.expect("corrupt event record").expect_err("mismatched event key must fail");
+        let message = error.to_string();
+        let stored_key = stored_key.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        let payload_key = event.payload.id().as_bytes().iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        assert!(message.contains(&stored_key));
+        assert!(message.contains(&payload_key));
         Ok(())
     }
 

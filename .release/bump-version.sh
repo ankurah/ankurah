@@ -63,8 +63,7 @@ for manifest in $manifests; do
     done
 done
 
-# Refresh Cargo.lock, then prove the result is internally consistent.
-cargo metadata --no-deps --format-version=1 >/dev/null
+# Prove the version bump left Cargo.lock internally consistent.
 validate_lockfile
 metadata="$(workspace_metadata)"
 actual="$(workspace_release_version "$metadata")"
