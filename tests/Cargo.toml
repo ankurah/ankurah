@@ -1,23 +1,23 @@
 [package]
 name    = "ankurah-tests"
-version = "0.9.1"
+version = "0.9.2"
 edition = "2021"
 publish = false
 
 [dependencies]
 anyhow = "1.0"
 tracing = "0.1"
-ankql = { path = "../ankql", version = "=0.9.1" }
+ankql = { path = "../ankql", version = "=0.9.2" }
 ankurah = { path = "../ankurah", features = [
     "derive",
     "instrument",
     "test-helpers",
-], version = "=0.9.1" }
-ankurah-storage-sled = { path = "../storage/sled", version = "=0.9.1" }
-ankurah-connector-local-process = { path = "../connectors/local-process", version = "=0.9.1" }
-ankurah-websocket-client = { path = "../connectors/websocket-client", version = "=0.9.1" }
-ankurah-websocket-server = { path = "../connectors/websocket-server", version = "=0.9.1" }
-ankurah-storage-common = { path = "../storage/common", version = "=0.9.1" }
+], version = "=0.9.2" }
+ankurah-storage-sled = { path = "../storage/sled", version = "=0.9.2" }
+ankurah-connector-local-process = { path = "../connectors/local-process", version = "=0.9.2" }
+ankurah-websocket-client = { path = "../connectors/websocket-client", version = "=0.9.2" }
+ankurah-websocket-server = { path = "../connectors/websocket-server", version = "=0.9.2" }
+ankurah-storage-common = { path = "../storage/common", version = "=0.9.2" }
 tokio = { version = "1.40", features = ["full"] }
 tracing-subscriber = "0.3"
 ctor = "0.2"
