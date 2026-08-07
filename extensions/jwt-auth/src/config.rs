@@ -61,6 +61,21 @@ pub struct CollectionRules {
     /// Privilege required to read entities in this collection (None = no access)
     pub read: Option<String>,
 
+    /// Privilege sufficient to RETRIEVE rows the caller can already name —
+    /// a `Ref` follow and the by-id wire path (`Get{ids}`) — without
+    /// admitting scans. Predicates are all scans for now, even id-shaped
+    /// ones; admitting id-bounded predicates at this tier is a deliberate
+    /// follow-up. None = retrieval requires `read`, the pre-existing
+    /// behavior, so a policy written before this field existed means what
+    /// it always meant. This exists for collections whose rows are public
+    /// to whoever holds their ids while the roster stays private: "any
+    /// holder of a user's id may retrieve that user; only the signed-in may
+    /// list users." `read` or `write` always suffice for a retrieval, and
+    /// row scope rules still bind per row (`check_read` is unchanged by
+    /// this field).
+    #[serde(default)]
+    pub retrieve: Option<String>,
+
     /// Privilege required to write (create/update) entities in this collection (None = no access)
     pub write: Option<String>,
 
@@ -70,8 +85,52 @@ pub struct CollectionRules {
 }
 
 impl PolicyConfig {
-    /// Check if any of the given roles can access a collection (read or write).
+    /// The collection admission gate: true when any role holds `read`,
+    /// `write`, or `retrieve` privilege. Deliberately the WIDEST read
+    /// admission — it is what admits a retrieval-tier caller's `Ref`
+    /// follow: the by-id wire path checks only this gate plus per-row
+    /// `check_read`. Scans are refused downstream in `filter_predicate`,
+    /// which composes to `False` for callers this gate admitted without
+    /// scan privilege. Use [`Self::can_scan_collection`] where only
+    /// scan-privileged credentials may count.
     pub fn can_access_collection(&self, roles: &[String], collection: &CollectionId) -> bool {
+        for role in roles {
+            if self.role_has_wildcard(role) {
+                return true;
+            }
+        }
+
+        let collection_name = collection.as_str();
+        if let Some(rules) = self.collections.get(collection_name) {
+            for role in roles {
+                let privileges = self.privileges_for_role(role);
+                if let Some(ref read_priv) = rules.read {
+                    if privileges.contains(&read_priv.as_str()) {
+                        return true;
+                    }
+                }
+                if let Some(ref write_priv) = rules.write {
+                    if privileges.contains(&write_priv.as_str()) {
+                        return true;
+                    }
+                }
+                if let Some(ref retrieve_priv) = rules.retrieve {
+                    if privileges.contains(&retrieve_priv.as_str()) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
+    /// True when any role may run a SCAN — a predicate query, subscription,
+    /// or listing — against the collection: `read` or `write` privilege
+    /// (exactly what [`Self::can_access_collection`] meant before
+    /// `retrieve` existed). `retrieve` deliberately does not count here:
+    /// naming rows is the whole of what it grants.
+    pub fn can_scan_collection(&self, roles: &[String], collection: &CollectionId) -> bool {
         for role in roles {
             if self.role_has_wildcard(role) {
                 return true;
