@@ -11,6 +11,18 @@ name: Report CI status
 # line, and a broken one produces up to four. Benchmarks is deliberately absent:
 # it is advisory and never fails, so it would be pure noise.
 #
+# RELEASE ANNOUNCEMENTS. Of everything this job reports, the conclusion a
+# reader most wants to see is "a version just shipped". When the completed run
+# is a successful Publish Crates on a `release/*` branch of this repository,
+# the report also carries `release_version` and `release_notes`: the top line
+# of the RELEASES file at the released commit — RELEASES is newest-first, so
+# that line names the version this push shipped (the publish script separately
+# guarantees the file holds exactly one entry for it). The community server
+# renders a report bearing these fields as a release announcement instead of a
+# plain status line (see server/src/ci_hook.rs there). Either side can deploy
+# first: the server ignores fields it does not know, and a report without the
+# fields still renders as the ordinary Publish Crates line.
+#
 # WHOSE CODE RAN. A pull request from a fork produces a run here, and
 # `workflow_run` fires this job in THIS repository's context with this
 # repository's secrets — while the fork chose the branch name, the commit, and,
@@ -88,8 +100,36 @@ jobs:
             repo="${HEAD_REPO} (fork)"
           fi
 
+          # See RELEASE ANNOUNCEMENTS above. The gate mirrors the publish
+          # trigger — a push to release/* of THIS repository, so a fork's run
+          # can never announce a release. The fetch is unauthenticated on
+          # purpose: the repository is public and this workflow holds no
+          # permissions. Any miss (file unreachable, top line not a version)
+          # downgrades the message to a plain status line rather than failing
+          # the report. The RELEASES line reaches the payload the same way
+          # every other value does: a shell variable handed to jq as data,
+          # never spliced into program text.
+          RELEASE_VERSION=""
+          RELEASE_NOTES=""
+          if [ "${WORKFLOW}" = "Publish Crates" ] && [ "${CONCLUSION}" = "success" ] \
+            && [ "${HEAD_REPO}" = "${BASE_REPO}" ]; then
+            case "${BRANCH}" in
+              release/*)
+                releases=$(curl --silent --show-error --fail --max-time 30 \
+                  "https://raw.githubusercontent.com/${BASE_REPO}/${SHA}/RELEASES") || releases=""
+                line="${releases%%$'\n'*}"
+                read -r version notes <<< "${line}" || true
+                if printf '%s' "${version}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+                  RELEASE_VERSION="${version}"
+                  RELEASE_NOTES="${notes}"
+                fi
+                ;;
+            esac
+          fi
+
           # jq builds the JSON so every value is escaped as data, whatever the
-          # branch name contains.
+          # branch name contains. The release fields ride along only when the
+          # gate above filled them.
           body=$(jq -nc \
             --arg repo "${repo}" \
             --arg workflow "${WORKFLOW}" \
@@ -99,7 +139,10 @@ jobs:
             --arg run_url "${RUN_URL}" \
             --arg run_id "${RUN_ID}" \
             --arg actor "${ACTOR}" \
-            '{repo:$repo,workflow:$workflow,branch:$branch,sha:$sha,conclusion:$conclusion,run_url:$run_url,run_id:$run_id,actor:$actor}')
+            --arg release_version "${RELEASE_VERSION}" \
+            --arg release_notes "${RELEASE_NOTES}" \
+            '{repo:$repo,workflow:$workflow,branch:$branch,sha:$sha,conclusion:$conclusion,run_url:$run_url,run_id:$run_id,actor:$actor}
+             + (if $release_version == "" then {} else {release_version:$release_version,release_notes:$release_notes} end)')
 
           # The delivery id is stable per (run, attempt, workflow), so a retry
           # of this job re-posts nothing: the server spends an id once.
