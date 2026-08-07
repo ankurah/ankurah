@@ -1,7 +1,7 @@
 [package]
 name          = "ankurah-core-types"
 description   = "Dependency-leaf identities and values for Ankurah"
-version       = "0.9.0"
+version       = "0.10.0"
 edition       = "2021"
 license       = "MIT OR Apache-2.0"
 documentation = "https://docs.rs/ankurah-core-types"
