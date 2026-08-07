@@ -22,7 +22,7 @@ use crate::{
     error::{MutationError, RequestError, RetrievalError},
     notice_info,
     peer_subscription::{SubscriptionHandler, SubscriptionRelay},
-    policy::{AccessDenied, PolicyAgent},
+    policy::{AccessDenied, PolicyAgent, ReadKind},
     reactor::{AbstractEntity, Reactor},
     retrieval::{LocalEventGetter, LocalStateGetter, SuspenseEvents},
     storage::StorageEngine,
@@ -472,7 +472,7 @@ where
                 }
             }
             proto::NodeRequestBody::Fetch { collection, mut selection, known_matches } => {
-                self.policy_agent.can_access_collection(cdata, &collection)?;
+                self.policy_agent.can_access_collection(cdata, &collection, ReadKind::Scan)?;
                 let storage_collection = self.collections.get(&collection).await?;
                 selection.predicate = self.policy_agent.filter_predicate(cdata, &collection, selection.predicate)?;
 
@@ -488,7 +488,11 @@ where
 
                 let mut deltas = Vec::new();
                 for state in expanded_states {
-                    if self.policy_agent.check_read(cdata, &state.payload.entity_id, &collection, &state.payload.state).is_err() {
+                    if self
+                        .policy_agent
+                        .check_read(cdata, &state.payload.entity_id, &collection, &state.payload.state, ReadKind::Scan)
+                        .is_err()
+                    {
                         continue;
                     }
 
@@ -501,13 +505,13 @@ where
                 Ok(proto::NodeResponseBody::Fetch(deltas))
             }
             proto::NodeRequestBody::Get { collection, ids } => {
-                self.policy_agent.can_access_collection(cdata, &collection)?;
+                self.policy_agent.can_access_collection(cdata, &collection, ReadKind::Get)?;
                 let storage_collection = self.collections.get(&collection).await?;
 
                 // filter out any that the policy agent says we don't have access to
                 let mut states = Vec::new();
                 for state in storage_collection.get_states(ids).await? {
-                    match self.policy_agent.check_read(cdata, &state.payload.entity_id, &collection, &state.payload.state) {
+                    match self.policy_agent.check_read(cdata, &state.payload.entity_id, &collection, &state.payload.state, ReadKind::Get) {
                         Ok(_) => states.push(state),
                         Err(AccessDenied::ByPolicy(_)) => {}
                         // TODO: we need to have a cleaner delineation between actual access denied versus processing errors
@@ -518,7 +522,10 @@ where
                 Ok(proto::NodeResponseBody::Get(states))
             }
             proto::NodeRequestBody::GetEvents { collection, event_ids } => {
-                self.policy_agent.can_access_collection(cdata, &collection)?;
+                // Scan, though the events are addressed by id: an event log
+                // carries the collection's history beyond any one presented
+                // entity id, so answering discloses what a scan discloses.
+                self.policy_agent.can_access_collection(cdata, &collection, ReadKind::Scan)?;
                 let storage_collection = self.collections.get(&collection).await?;
 
                 // filter out any that the policy agent says we don't have access to

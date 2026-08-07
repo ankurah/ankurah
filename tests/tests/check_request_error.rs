@@ -9,7 +9,7 @@ use ankql::ast::Predicate;
 use ankurah::core::node::ContextData;
 use ankurah::core::util::Iterable;
 use ankurah::error::ValidationError;
-use ankurah::policy::{AccessDenied, PolicyAgent, DEFAULT_CONTEXT};
+use ankurah::policy::{AccessDenied, PolicyAgent, ReadKind, DEFAULT_CONTEXT};
 use ankurah::proto::{self, AuthData};
 use ankurah::storage::StorageEngine;
 use ankurah::{Node, PermissiveAgent};
@@ -92,8 +92,15 @@ impl PolicyAgent for RejectingAgent {
         Ok(())
     }
 
-    fn can_access_collection<C>(&self, _data: &C, _collection: &proto::CollectionId) -> std::result::Result<(), AccessDenied>
-    where C: Iterable<Self::ContextData> {
+    fn can_access_collection<C>(
+        &self,
+        _data: &C,
+        _collection: &proto::CollectionId,
+        _kind: ReadKind,
+    ) -> std::result::Result<(), AccessDenied>
+    where
+        C: Iterable<Self::ContextData>,
+    {
         Ok(())
     }
 
@@ -115,6 +122,7 @@ impl PolicyAgent for RejectingAgent {
         _id: &proto::EntityId,
         _collection: &proto::CollectionId,
         _state: &proto::State,
+        _kind: ReadKind,
     ) -> std::result::Result<(), AccessDenied>
     where
         C: Iterable<Self::ContextData>,

@@ -6,7 +6,7 @@ use crate::{
     livequery::{EntityLiveQuery, LiveQuery},
     model::View,
     node::{MatchArgs, Node},
-    policy::{AccessDenied, PolicyAgent},
+    policy::{AccessDenied, PolicyAgent, ReadKind},
     storage::{StorageCollectionWrapper, StorageEngine},
     transaction::Transaction,
 };
@@ -380,7 +380,7 @@ where
             debug!("Node({}).get_entity found local entity - returning", self.node.id);
             let state = local.to_state()?;
             let entity_id = local.id();
-            self.node.policy_agent.check_read(&cdata, &entity_id, collection_id, &state)?;
+            self.node.policy_agent.check_read(&cdata, &entity_id, collection_id, &state, ReadKind::Get)?;
             return Ok(local);
         }
         debug!("{}.get_entity fetching from storage", self.node);
@@ -388,7 +388,13 @@ where
         let collection = self.node.collections.get(collection_id).await?;
         match collection.get_state(id).await {
             Ok(entity_state) => {
-                self.node.policy_agent.check_read(&cdata, &entity_state.payload.entity_id, collection_id, &entity_state.payload.state)?;
+                self.node.policy_agent.check_read(
+                    &cdata,
+                    &entity_state.payload.entity_id,
+                    collection_id,
+                    &entity_state.payload.state,
+                    ReadKind::Get,
+                )?;
                 let state_getter = crate::retrieval::LocalStateGetter::new(collection.clone());
                 let event_getter = CachedEventGetter::new(collection_id.clone(), collection, &self.node, &cdata);
                 let (_changed, entity) = self
@@ -408,7 +414,7 @@ where
         // one policy world, or a mid-operation refresh yields a
         // composite no single credential authorized.
         let cdata = self.sessions.current();
-        self.node.policy_agent.can_access_collection(&cdata, collection_id)?;
+        self.node.policy_agent.can_access_collection(&cdata, collection_id, ReadKind::Scan)?;
         // Fetch raw states from storage
 
         args.selection.predicate = self.node.policy_agent.filter_predicate(&cdata, collection_id, args.selection.predicate)?;

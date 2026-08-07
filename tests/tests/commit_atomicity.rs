@@ -9,6 +9,7 @@ use ankurah::core::{
     storage::StorageEngine,
     util::Iterable,
 };
+use ankurah::policy::ReadKind;
 use ankurah::proto::{self, Attested};
 use ankurah::{Model, Mutable, Node};
 use ankurah_storage_sled::SledStorageEngine;
@@ -96,7 +97,7 @@ impl PolicyAgent for DenySecondAlbumEventAgent {
         Ok(())
     }
 
-    fn can_access_collection<C>(&self, _data: &C, _collection: &proto::CollectionId) -> Result<(), AccessDenied>
+    fn can_access_collection<C>(&self, _data: &C, _collection: &proto::CollectionId, _kind: ReadKind) -> Result<(), AccessDenied>
     where C: Iterable<Self::ContextData> {
         Ok(())
     }
@@ -112,6 +113,7 @@ impl PolicyAgent for DenySecondAlbumEventAgent {
         _id: &proto::EntityId,
         _collection: &proto::CollectionId,
         _state: &proto::State,
+        _kind: ReadKind,
     ) -> Result<(), AccessDenied>
     where
         C: Iterable<Self::ContextData>,

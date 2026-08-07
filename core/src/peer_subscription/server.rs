@@ -5,7 +5,7 @@ use crate::{
     entity::Entity,
     error::SubscriptionError,
     node::Node,
-    policy::PolicyAgent,
+    policy::{PolicyAgent, ReadKind},
     reactor::{
         fetch_gap::{GapFetcher, QueryGapFetcher},
         ReactorSubscription, ReactorUpdate,
@@ -130,7 +130,7 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         // not yet tear down a standing registration — the claw-back
         // arrives with the re-permission PR:
         // https://github.com/ankurah/ankurah/pull/426
-        node.policy_agent.can_access_collection(cdata, &collection_id)?;
+        node.policy_agent.can_access_collection(cdata, &collection_id, ReadKind::Scan)?;
         selection.predicate = node.policy_agent.filter_predicate(cdata, &collection_id, selection.predicate)?;
 
         // TODO: consider separating session updating from SubscribeQuery,
@@ -236,7 +236,8 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
             // are evaluated against entity state, not just the predicate. Skip
             // unreadable entities silently (mirroring the Fetch/Get handlers) so one
             // out-of-scope entity doesn't fail the whole subscription.
-            if node.policy_agent.check_read(cdata, &state.payload.entity_id, &collection_id, &state.payload.state).is_err() {
+            if node.policy_agent.check_read(cdata, &state.payload.entity_id, &collection_id, &state.payload.state, ReadKind::Scan).is_err()
+            {
                 continue;
             }
 

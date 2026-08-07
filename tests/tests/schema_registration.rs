@@ -800,8 +800,15 @@ impl ankurah::policy::PolicyAgent for ProbeAgent {
         Ok(())
     }
 
-    fn can_access_collection<C>(&self, _data: &C, collection: &proto::CollectionId) -> Result<(), ankurah::policy::AccessDenied>
-    where C: ankurah::core::util::Iterable<Self::ContextData> {
+    fn can_access_collection<C>(
+        &self,
+        _data: &C,
+        collection: &proto::CollectionId,
+        _kind: ankurah::policy::ReadKind,
+    ) -> Result<(), ankurah::policy::AccessDenied>
+    where
+        C: ankurah::core::util::Iterable<Self::ContextData>,
+    {
         if let Some(hook) = &self.on_collection_access {
             hook(collection)?;
         }
@@ -830,6 +837,7 @@ impl ankurah::policy::PolicyAgent for ProbeAgent {
         _id: &proto::EntityId,
         _collection: &proto::CollectionId,
         _state: &proto::State,
+        _kind: ankurah::policy::ReadKind,
     ) -> Result<(), ankurah::policy::AccessDenied>
     where
         C: ankurah::core::util::Iterable<Self::ContextData>,

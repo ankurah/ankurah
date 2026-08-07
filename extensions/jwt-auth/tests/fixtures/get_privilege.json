@@ -1,0 +1,21 @@
+{
+  "roles": {
+    "guest": ["view"],
+    "member": ["view", "signed_in"]
+  },
+  "collections": {
+    "user": {
+      "read": "signed_in",
+      "get": "view",
+      "write": "signed_in"
+    },
+    "modaction": {
+      "read": "signed_in",
+      "write": "signed_in"
+    },
+    "message": {
+      "read": "view",
+      "write": "signed_in"
+    }
+  }
+}

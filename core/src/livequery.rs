@@ -19,7 +19,7 @@ use crate::{
     error::RetrievalError,
     model::View,
     node::{MatchArgs, NodeInner, TNodeErased},
-    policy::PolicyAgent,
+    policy::{PolicyAgent, ReadKind},
     reactor::{
         fetch_gap::{GapFetcher, QueryGapFetcher},
         ReactorSubscription, ReactorUpdate,
@@ -214,7 +214,7 @@ where
     // One credential snapshot for the whole derivation; re-derivation
     // on change arrives with https://github.com/ankurah/ankurah/pull/426.
     let cdata = sessions.current();
-    node.policy_agent.can_access_collection(&cdata, &collection_id)?;
+    node.policy_agent.can_access_collection(&cdata, &collection_id, ReadKind::Scan)?;
     args.selection.predicate = node.policy_agent.filter_predicate(&cdata, &collection_id, args.selection.predicate)?;
 
     // Resolve types in the AST (converts literals for JSON path comparisons)

@@ -2,6 +2,7 @@ mod common;
 
 use ankurah::Model;
 use ankurah::Node;
+use ankurah_core::policy::ReadKind;
 use ankurah_jwt_auth::{JwtAgent, JwtContext};
 use ankurah_proto::CollectionId;
 use ankurah_storage_sled::SledStorageEngine;
@@ -59,7 +60,7 @@ async fn test_reader_cannot_write_to_user_collection() -> anyhow::Result<()> {
     let reader_ctx = JwtContext::from_claims(reader_claims, reader_token);
 
     let user_collection = CollectionId::from("user");
-    let result = agent.can_access_collection(&reader_ctx, &user_collection);
+    let result = agent.can_access_collection(&reader_ctx, &user_collection, ReadKind::Scan);
     assert!(result.is_err(), "Reader must not be able to access the user collection");
 
     let config = load_blog_config();
@@ -68,7 +69,7 @@ async fn test_reader_cannot_write_to_user_collection() -> anyhow::Result<()> {
         "Reader role must not have write access to the user collection"
     );
     assert!(
-        !config.can_access_collection(&[String::from("Reader")], &user_collection),
+        !config.can_access_collection(&[String::from("Reader")], &user_collection, ReadKind::Scan),
         "Reader role must not have any access to the user collection"
     );
 
@@ -178,11 +179,18 @@ async fn test_nouser_can_read_jwtpolicy_but_not_other_collections() -> anyhow::R
     let nouser = JwtContext::NoUser;
 
     let jwtpolicy = CollectionId::from("jwtpolicy");
-    assert!(agent.can_access_collection(&nouser, &jwtpolicy).is_ok(), "NoUser must be able to access jwtpolicy for bootstrap");
+    assert!(
+        agent.can_access_collection(&nouser, &jwtpolicy, ReadKind::Scan).is_ok(),
+        "NoUser must be able to access jwtpolicy for bootstrap"
+    );
 
     for name in &["post", "user", "comment", "tag", "secret_stuff"] {
         let col = CollectionId::from(*name);
-        assert!(agent.can_access_collection(&nouser, &col).is_err(), "NoUser must not be able to access the {} collection", name);
+        assert!(
+            agent.can_access_collection(&nouser, &col, ReadKind::Scan).is_err(),
+            "NoUser must not be able to access the {} collection",
+            name
+        );
     }
 
     Ok(())

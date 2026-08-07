@@ -1,3 +1,4 @@
+use ankurah_core::policy::ReadKind;
 use ankurah_proto::CollectionId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -61,6 +62,17 @@ pub struct CollectionRules {
     /// Privilege required to read entities in this collection (None = no access)
     pub read: Option<String>,
 
+    /// Privilege sufficient to read entities addressed by id, without being
+    /// enough to query or subscribe (None = id-addressed reads require the
+    /// `read` privilege, the pre-existing behavior). This exists for
+    /// collections whose rows are public to whoever can name them while the
+    /// roster stays private — "any holder of a user's id may load that
+    /// user, but only the signed-in may list users". Holding `read` or
+    /// `write` always suffices for an id-addressed read; `get` never
+    /// admits a scan.
+    #[serde(default)]
+    pub get: Option<String>,
+
     /// Privilege required to write (create/update) entities in this collection (None = no access)
     pub write: Option<String>,
 
@@ -70,8 +82,12 @@ pub struct CollectionRules {
 }
 
 impl PolicyConfig {
-    /// Check if any of the given roles can access a collection (read or write).
-    pub fn can_access_collection(&self, roles: &[String], collection: &CollectionId) -> bool {
+    /// Check if any of the given roles can access a collection for a read of
+    /// the given kind. `read` or `write` privilege admits every kind (a
+    /// writer may see what it writes); the `get` privilege additionally
+    /// admits [`ReadKind::Get`] alone, so a collection can hand out rows to
+    /// whoever names their ids while refusing to enumerate itself.
+    pub fn can_access_collection(&self, roles: &[String], collection: &CollectionId, kind: ReadKind) -> bool {
         for role in roles {
             if self.role_has_wildcard(role) {
                 return true;
@@ -90,6 +106,13 @@ impl PolicyConfig {
                 if let Some(ref write_priv) = rules.write {
                     if privileges.contains(&write_priv.as_str()) {
                         return true;
+                    }
+                }
+                if kind == ReadKind::Get {
+                    if let Some(ref get_priv) = rules.get {
+                        if privileges.contains(&get_priv.as_str()) {
+                            return true;
+                        }
                     }
                 }
             }

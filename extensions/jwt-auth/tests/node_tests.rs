@@ -3,6 +3,7 @@ mod common;
 use ankurah::{Model, Node, Ref};
 use ankurah_core::model::Mutable;
 use ankurah_core::policy::PolicyAgent;
+use ankurah_core::policy::ReadKind;
 use ankurah_jwt_auth::{JwtAgent, JwtClaims, JwtContext, JwtKeys, PolicyConfig};
 use ankurah_proto::{Clock, Event, OperationSet};
 use ankurah_storage_sled::SledStorageEngine;
@@ -330,7 +331,7 @@ async fn test_jwtpolicy_collection_always_accessible() -> anyhow::Result<()> {
     let ctx = JwtContext::from_claims(claims, token);
 
     use ankurah_core::policy::PolicyAgent;
-    let result = agent.can_access_collection(&ctx, &collection);
+    let result = agent.can_access_collection(&ctx, &collection, ReadKind::Scan);
     assert!(result.is_ok(), "jwtpolicy collection should always be accessible");
 
     Ok(())
@@ -348,7 +349,7 @@ async fn test_jwt_agent_collection_access_denied() -> anyhow::Result<()> {
     let ctx = JwtContext::from_claims(claims, token);
 
     use ankurah_core::policy::PolicyAgent;
-    let result = agent.can_access_collection(&ctx, &collection);
+    let result = agent.can_access_collection(&ctx, &collection, ReadKind::Scan);
     assert!(result.is_err(), "Reader should not be able to access post collection");
 
     Ok(())
@@ -386,8 +387,8 @@ async fn test_root_bypasses_collection_access() -> anyhow::Result<()> {
 
     let post = ankurah_proto::CollectionId::from("post");
     let secret = ankurah_proto::CollectionId::from("secret_stuff");
-    assert!(agent.can_access_collection(&root, &post).is_ok());
-    assert!(agent.can_access_collection(&root, &secret).is_ok());
+    assert!(agent.can_access_collection(&root, &post, ReadKind::Scan).is_ok());
+    assert!(agent.can_access_collection(&root, &secret, ReadKind::Scan).is_ok());
 
     Ok(())
 }

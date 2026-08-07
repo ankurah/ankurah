@@ -46,6 +46,23 @@ impl AccessDenied {}
 // because it is part of this trait's surface.
 pub use crate::schema::registration::{PlannedModelPropertyMembership, PlannedUpdate, RegistrationPlan};
 
+/// How a read reaches into a collection, for policy that holds the two
+/// apart. `Get` answers with entity states the caller already named by id —
+/// a lookup. `Scan` answers with rows or history the caller could not have
+/// named: predicate matches, subscription deliveries, event backfill — an
+/// enumeration. The distinction exists for policies like "any holder of a
+/// row's id may read it, but nobody below this privilege may list the
+/// collection": id-addressed reads disclose one row per id presented, while
+/// a scan discloses membership itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadKind {
+    /// Entity states addressed by id the caller presented.
+    Get,
+    /// Rows or events selected by predicate, subscription, or event id —
+    /// anything whose answer names rows for the caller.
+    Scan,
+}
+
 /// PolicyAgents control access to resources, by:
 /// - signing requests which are sent to other nodes - this may come in the form of a bearer token, or a signature, or some other arbitrary method of authentication as defined by the PolicyAgent
 /// - checking access for requests. If approved, yield a ContextData
@@ -161,8 +178,11 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
         state: &Attested<proto::EntityState>,
     ) -> Result<(), AccessDenied>;
 
-    // For checking if a context can access a collection
-    fn can_access_collection<C>(&self, data: &C, collection: &proto::CollectionId) -> Result<(), AccessDenied>
+    /// The collection admission gate: may this context touch this collection
+    /// at all, for a read of the given [`ReadKind`]? Every read path calls
+    /// this before doing work; `kind` lets a policy admit id-addressed
+    /// lookups at a weaker privilege than scans (see [`ReadKind`]).
+    fn can_access_collection<C>(&self, data: &C, collection: &proto::CollectionId, kind: ReadKind) -> Result<(), AccessDenied>
     where C: Iterable<Self::ContextData>;
 
     /// Filter a predicate based on the context data
@@ -170,7 +190,10 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     fn filter_predicate<C>(&self, data: &C, collection: &proto::CollectionId, predicate: Predicate) -> Result<Predicate, AccessDenied>
     where C: Iterable<Self::ContextData>;
 
-    /// Check if a context can read an entity
+    /// Check if a context can read an entity. `kind` carries how the read
+    /// reached this entity — by presented id or by scan — so a policy that
+    /// admits lookups at a weaker privilege applies the same tier to the
+    /// per-row vet as to the gate.
     /// If the policy agent wants to inspect the entity state, it can do so with either TemporaryEntity::new or entityset.with_state
     /// Optimization: Consider adding a common trait implemented by Entity and TemporaryEntity returned by entityset.get_evaluation_entity that
     /// returns a real entity if resident, falling back to a temporary entity if not. (as the former case would save cycles creating/populating the backends)
@@ -180,6 +203,7 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
         id: &proto::EntityId,
         collection: &proto::CollectionId,
         state: &proto::State,
+        kind: ReadKind,
     ) -> Result<(), AccessDenied>
     where
         C: Iterable<Self::ContextData>;
@@ -292,7 +316,7 @@ impl PolicyAgent for PermissiveAgent {
         Ok(())
     }
 
-    fn can_access_collection<C>(&self, _data: &C, _collection: &proto::CollectionId) -> Result<(), AccessDenied>
+    fn can_access_collection<C>(&self, _data: &C, _collection: &proto::CollectionId, _kind: ReadKind) -> Result<(), AccessDenied>
     where C: Iterable<Self::ContextData> {
         // PermissiveAgent allows regardless of which credentials are supplied, including none
         Ok(())
@@ -304,6 +328,7 @@ impl PolicyAgent for PermissiveAgent {
         _id: &proto::EntityId,
         _collection: &proto::CollectionId,
         _state: &proto::State,
+        _kind: ReadKind,
     ) -> Result<(), AccessDenied>
     where
         C: Iterable<Self::ContextData>,

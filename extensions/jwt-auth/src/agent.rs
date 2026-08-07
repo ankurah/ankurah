@@ -7,7 +7,7 @@ use ankurah_core::{
     error::ValidationError,
     livequery::EntityLiveQuery,
     node::{Node, NodeInner, WeakNode},
-    policy::{AccessDenied, PolicyAgent},
+    policy::{AccessDenied, PolicyAgent, ReadKind},
     selection::filter::evaluate_predicate,
     storage::StorageEngine,
     util::Iterable,
@@ -211,7 +211,7 @@ impl PolicyAgent for JwtAgent {
         Ok(())
     }
 
-    fn can_access_collection<C>(&self, data: &C, collection: &proto::CollectionId) -> Result<(), AccessDenied>
+    fn can_access_collection<C>(&self, data: &C, collection: &proto::CollectionId, kind: ReadKind) -> Result<(), AccessDenied>
     where C: Iterable<Self::ContextData> {
         if collection.as_str() == "jwtpolicy" {
             return Ok(());
@@ -223,7 +223,7 @@ impl PolicyAgent for JwtAgent {
         }
         let state = self.state.read().unwrap_or_else(|e| e.into_inner());
         for ctx in data.iterable() {
-            if state.config.can_access_collection(ctx.roles(), collection) {
+            if state.config.can_access_collection(ctx.roles(), collection, kind) {
                 return Ok(());
             }
         }
@@ -268,8 +268,10 @@ impl PolicyAgent for JwtAgent {
             // Only authorized contexts contribute, matching the collection
             // check enforce_read_scope makes before evaluating a context's
             // scope: a credential that cannot reach the collection must not
-            // widen the query on its own account.
-            if !state.config.can_access_collection(ctx.roles(), collection) {
+            // widen the query on its own account. Scan, because a composed
+            // query is one: a get-tier credential must not widen a query it
+            // could never run.
+            if !state.config.can_access_collection(ctx.roles(), collection, ReadKind::Scan) {
                 continue;
             }
 
@@ -310,11 +312,12 @@ impl PolicyAgent for JwtAgent {
         id: &proto::EntityId,
         collection: &proto::CollectionId,
         state: &proto::State,
+        kind: ReadKind,
     ) -> Result<(), AccessDenied>
     where
         C: Iterable<Self::ContextData>,
     {
-        self.can_access_collection(data, collection)?;
+        self.can_access_collection(data, collection, kind)?;
 
         for ctx in data.iterable() {
             if ctx.is_privileged() {
@@ -329,7 +332,7 @@ impl PolicyAgent for JwtAgent {
 
         let entity = TemporaryEntity::new(*id, collection.clone(), state)
             .map_err(|_| AccessDenied::ByPolicy("Read scope entity state could not be evaluated"))?;
-        enforce_read_scope(&guard.config, data, &entity)
+        enforce_read_scope(&guard.config, data, &entity, kind)
     }
 
     fn check_read_event<C>(&self, data: &C, event: &Attested<proto::Event>) -> Result<(), AccessDenied>
@@ -339,7 +342,10 @@ impl PolicyAgent for JwtAgent {
                 return Ok(());
             }
         }
-        self.can_access_collection(data, &event.payload.collection)
+        // Scan: an event log carries history beyond any one presented id,
+        // so reading events discloses what a scan discloses (the same
+        // ruling the GetEvents handler applies to its gate).
+        self.can_access_collection(data, &event.payload.collection, ReadKind::Scan)
     }
 
     fn check_write(&self, cdata: &Self::ContextData, entity: &Entity, _event: Option<&proto::Event>) -> Result<(), AccessDenied> {
@@ -420,13 +426,15 @@ fn enforce_write_scope(config: &PolicyConfig, cdata: &JwtContext, entity: &Entit
     Ok(())
 }
 
-fn enforce_read_scope<C>(config: &PolicyConfig, data: &C, entity: &TemporaryEntity) -> Result<(), AccessDenied>
+fn enforce_read_scope<C>(config: &PolicyConfig, data: &C, entity: &TemporaryEntity, kind: ReadKind) -> Result<(), AccessDenied>
 where C: Iterable<JwtContext> {
     for ctx in data.iterable() {
         let JwtContext::User { claims, .. } = ctx else {
             continue;
         };
-        if !config.can_access_collection(ctx.roles(), &entity.collection) {
+        // The kind is the caller's: a credential admitted only at the get
+        // tier counts toward a by-id row vet and not toward a scan's.
+        if !config.can_access_collection(ctx.roles(), &entity.collection, kind) {
             continue;
         }
 
