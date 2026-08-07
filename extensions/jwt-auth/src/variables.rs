@@ -210,6 +210,25 @@ mod tests {
         assert_eq!(rhs_literal(&result), &Literal::EntityId(id.to_ulid()));
     }
 
+    /// A subject that is not an entity id substitutes as a plain String
+    /// literal. Deployments mint such a subject on purpose — a distinguished
+    /// literal like `guest` for a reader who is not a user — and every query
+    /// that reader makes carries it through here, so the fallback is
+    /// load-bearing rather than incidental: an error arm added to
+    /// [`typed_expr`] would fail whole queries instead of narrowing them, and a
+    /// value accepted as an id would let `user = $jwt.sub` match a row.
+    ///
+    /// `test_entity_id_value_becomes_typed_literal` above pins the other side
+    /// of the same branch, and the downstream half of the fact — an
+    /// EntityId-typed field never equals a String literal, and answers false
+    /// rather than erroring — is pinned in ankurah-core's `selection::filter`.
+    #[test]
+    fn test_non_id_subject_falls_back_to_string_literal() {
+        let claims = test_claims("guest");
+        let result = parse_and_substitute("user = $jwt.sub", &claims).expect("a subject that is not an id must substitute, not error");
+        assert_eq!(rhs_literal(&result), &Literal::String("guest".to_string()));
+    }
+
     #[test]
     fn test_literal_placeholder_in_filter_fails_closed() {
         // A raw `?` in the filter has no corresponding claim value; the

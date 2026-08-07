@@ -45,6 +45,42 @@ fn test_sign_and_verify_no_name() {
     assert!(verified.name.is_none());
 }
 
+/// A token carrying no subject claim at all is refused by both decode paths.
+///
+/// This is why a deployment that wants a subject meaning "not a user" mints a
+/// distinguished literal instead of leaving the claim out: an absent subject is
+/// not a second, quieter kind of caller, it is a token that does not decode.
+/// Softening either path into a default would turn a token with no subject into
+/// one whose subject is `""`, and a scope rule comparing a field against
+/// `$jwt.sub` would then run against that empty value instead of the token
+/// being refused outright.
+#[test]
+fn test_absent_subject_claim_fails_both_decode_paths() {
+    use jwt_simple::prelude::{Claims, RS256KeyPair, RSAKeyPairLike};
+
+    // SigningKeys::sign always writes claims.sub into the standard subject
+    // claim, so a subject-less token has to be built against jwt_simple
+    // directly. Everything else about the token is well formed and current —
+    // the signature verifies and the expiry is an hour out — so the absent
+    // subject is the only thing either path can be refusing.
+    let keys = common::test_keys();
+    let key_pair = RS256KeyPair::from_pem(&keys.private_key_pem().unwrap()).unwrap();
+    let claims = JwtClaims {
+        sub: String::new(),
+        roles: vec!["Reader".into()],
+        email: "reader@example.com".into(),
+        name: None,
+        custom: serde_json::Map::new(),
+    };
+    let token = key_pair.sign(Claims::with_custom_claims(claims, Duration::from_hours(1))).unwrap();
+
+    let err = keys.verify(&token).expect_err("SigningKeys::verify must refuse a token with no subject claim").to_string();
+    assert!(err.contains("subject"), "the refusal must name the absent subject, got: {err}");
+
+    let err = parse_claims_unverified(&token).expect_err("parse_claims_unverified must refuse a token with no subject claim").to_string();
+    assert!(err.contains("sub"), "the refusal must name the absent subject, got: {err}");
+}
+
 #[test]
 fn test_verify_wrong_key_fails() {
     let keys1 = common::test_keys();

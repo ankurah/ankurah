@@ -361,6 +361,53 @@ mod tests {
         );
     }
 
+    /// A row carrying a `Ref` field, whose value is an EntityId rather than a
+    /// string. Policy filters compare such a field against a claim value, and
+    /// the claim value need not be an id at all.
+    #[derive(Debug, Clone, PartialEq)]
+    struct OwnedItem {
+        owner: ankurah_proto::EntityId,
+    }
+
+    impl Filterable for OwnedItem {
+        fn collection(&self) -> &str { "records" }
+
+        fn value(&self, name: &str) -> Option<Value> {
+            match name {
+                "owner" => Some(Value::EntityId(self.owner)),
+                _ => None,
+            }
+        }
+    }
+
+    /// An EntityId-typed field compared against a string that is not an id
+    /// answers false, and never an error. `evaluate_predicate` propagates an
+    /// error out of the whole predicate, so an erroring comparison here would
+    /// fail the caller's entire query — including the arms of an OR that would
+    /// otherwise have admitted rows — where false merely denies this row.
+    ///
+    /// This is the row-side half of what a scope rule like `owner = $jwt.sub`
+    /// does when the subject is a distinguished literal rather than a user's
+    /// id: ankurah-jwt-auth substitutes such a subject as a String literal
+    /// (its `variables::typed_expr`), and it arrives here.
+    #[test]
+    fn test_entity_id_field_never_equals_a_non_id_string() {
+        let row = OwnedItem { owner: ankurah_proto::EntityId::new() };
+
+        // 'guest' does not parse as an EntityId, so the cast toward the field's
+        // type fails and the surviving comparison is the row's id rendered as
+        // a string — which no non-id value equals.
+        let selection = parse_selection("owner = 'guest'").unwrap();
+        assert_eq!(evaluate_predicate(&row, &selection.predicate), Ok(false), "a subject that is not an id must deny the row, not error");
+
+        // The control that keeps the false above honest: the comparator does
+        // cross this type pair, so the false is a comparison that answered no
+        // and not a comparator that refuses EntityId-against-String outright —
+        // which would answer false for every string, including the right one.
+        let selection = parse_selection(&format!("owner = '{}'", row.owner.to_base64())).unwrap();
+        assert_eq!(evaluate_predicate(&row, &selection.predicate), Ok(true), "the row's own id, as a string, must still match");
+    }
+
     // JSON path traversal tests
     mod json_tests {
         use super::*;
