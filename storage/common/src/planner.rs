@@ -21,6 +21,57 @@ impl PlannerConfig {
     pub fn full_support() -> Self { Self::new(true) }
 }
 
+/// The predicate terms an index range actually carries.
+///
+/// This exists to keep the planner honest about a soundness rule: choosing an
+/// index is an optimization, and the residual predicate is what makes the
+/// answer correct. Every term the range does not encode has to be re-checked
+/// against each row the scan returns, so a term that is neither encoded nor
+/// residual is a term nothing enforces — the scan then answers with rows the
+/// query excluded.
+///
+/// The planner records what it encoded rather than inferring it from column
+/// names, because one column can carry several terms. `owner = A AND owner = B`
+/// puts two terms on `owner`; a key range can encode one of them, and knowing
+/// that `owner` is "handled" says nothing about the other. The same goes for
+/// range terms: folding picks the most restrictive endpoint per side, and a
+/// term whose value the winning endpoint cannot be compared against (values of
+/// different types have no order) is folded away without being enforced, so
+/// only the terms the final endpoints imply are recorded.
+#[derive(Debug, Default)]
+struct EncodedTerms {
+    /// The exact comparisons the bounds enforce, as (column path, operator,
+    /// value). An equality appears as the point bound it became; a range term
+    /// appears only when the final folded endpoint implies it.
+    terms: Vec<(String, ComparisonOperator, Value)>,
+}
+
+impl EncodedTerms {
+    /// Does the key range already enforce this comparison, making a per-row
+    /// re-check redundant? Answer no whenever unsure: an unnecessary re-check
+    /// costs a comparison, a missing one hands back a row the query excluded.
+    fn covers(&self, field: &str, operator: &ComparisonOperator, value: &Value) -> bool {
+        // NotEqual, In and Between never become key-range endpoints, so they
+        // are never recorded and never covered.
+        self.terms.iter().any(|(column, op, encoded)| column == field && op == operator && encoded == value)
+    }
+}
+
+/// Append `part` unless the key already covers that path.
+///
+/// A key that names one column twice narrows nothing the single-column key
+/// would not: both positions read the same stored value. It is worse than
+/// useless, because the bound placed on the second position is copied from the
+/// first position's term, which makes the key look like it enforces a term it
+/// never saw. Keep the key over distinct paths and let the terms it cannot hold
+/// fall through to the residual predicate.
+fn push_keypart_once(keyparts: &mut Vec<IndexKeyPart>, part: IndexKeyPart) {
+    let path = part.full_path();
+    if !keyparts.iter().any(|existing| existing.full_path() == path) {
+        keyparts.push(part);
+    }
+}
+
 pub struct Planner {
     config: PlannerConfig,
 }
@@ -130,17 +181,23 @@ impl Planner {
         }
 
         // Keyparts: EQ prefix (using asc_path for multi-step path support)
-        let mut index_keyparts: Vec<IndexKeyPart> = equalities.iter().map(|(f, v)| IndexKeyPart::asc_path(f, ValueType::of(v))).collect();
+        let mut index_keyparts: Vec<IndexKeyPart> = Vec::new();
+        for (field, value) in equalities {
+            push_keypart_once(&mut index_keyparts, IndexKeyPart::asc_path(field, ValueType::of(value)));
+        }
 
         // Append ORDER BY fields per capability
         if self.config.supports_desc_indexes {
             for item in order_by {
                 if item.path.is_simple() {
                     let name = item.path.first();
-                    index_keyparts.push(match item.direction {
-                        ankql::ast::OrderDirection::Asc => IndexKeyPart::asc(name.to_string(), ValueType::String),
-                        ankql::ast::OrderDirection::Desc => IndexKeyPart::desc(name.to_string(), ValueType::String),
-                    });
+                    push_keypart_once(
+                        &mut index_keyparts,
+                        match item.direction {
+                            ankql::ast::OrderDirection::Asc => IndexKeyPart::asc(name.to_string(), ValueType::String),
+                            ankql::ast::OrderDirection::Desc => IndexKeyPart::desc(name.to_string(), ValueType::String),
+                        },
+                    );
                 }
             }
         } else {
@@ -151,7 +208,7 @@ impl Planner {
                 if item.path.is_simple() {
                     let name = item.path.first();
                     if !broke && item.direction == first_dir {
-                        index_keyparts.push(IndexKeyPart::asc(name.to_string(), ValueType::String));
+                        push_keypart_once(&mut index_keyparts, IndexKeyPart::asc(name.to_string(), ValueType::String));
                     } else {
                         broke = true;
                     }
@@ -169,7 +226,7 @@ impl Planner {
             }
         });
 
-        let bounds = match applied_ineq {
+        let (bounds, encoded) = match applied_ineq {
             Some((field, vec)) => self.build_bounds(equalities, Some((field, vec)), &index_keyparts)?,
             None => self.build_bounds(equalities, None, &index_keyparts)?,
         };
@@ -177,8 +234,8 @@ impl Planner {
             return Some(Plan::EmptyScan);
         }
 
-        // Remaining predicate excludes the applied OB inequality if any
-        let remaining_predicate = self.calculate_remaining_predicate(conjuncts, equalities, applied_ineq.map(|(f, _)| f));
+        // Every term the bounds did not encode stays in the residual predicate.
+        let remaining_predicate = self.calculate_remaining_predicate(conjuncts, &encoded);
 
         // Scan direction
         let scan_direction = if self.config.supports_desc_indexes {
@@ -245,18 +302,21 @@ impl Planner {
         // Keyparts: EQ + primary INEQ (do not append ORDER BY fields; they do not satisfy global order after a range)
         // NOTE (micro-optimization): Appending OB columns after the range could help spill comparator locality,
         // but it does not change correctness and the tests expect the simpler invariant-preserving form.
-        let mut index_keyparts: Vec<IndexKeyPart> = equalities.iter().map(|(f, v)| IndexKeyPart::asc_path(f, ValueType::of(v))).collect();
+        let mut index_keyparts: Vec<IndexKeyPart> = Vec::new();
+        for (field, value) in equalities {
+            push_keypart_once(&mut index_keyparts, IndexKeyPart::asc_path(field, ValueType::of(value)));
+        }
         let primary_value = &primary.1[0].1; // Get Value from first inequality
-        index_keyparts.push(IndexKeyPart::asc_path(primary.0, ValueType::of(primary_value))); // Use actual primary key value type
+        push_keypart_once(&mut index_keyparts, IndexKeyPart::asc_path(primary.0, ValueType::of(primary_value))); // Use actual primary key value type
 
         // Bounds: EQ + primary INEQ (most-restrictive)
-        let bounds = self.build_bounds(equalities, Some(primary), &index_keyparts)?;
+        let (bounds, encoded) = self.build_bounds(equalities, Some(primary), &index_keyparts)?;
         if self.is_empty_bounds(&bounds) {
             return Some(Plan::EmptyScan);
         }
 
-        // Remaining predicate: all inequalities except the primary one
-        let remaining_predicate = self.calculate_remaining_predicate(conjuncts, equalities, Some(primary.0));
+        // Every term the bounds did not encode stays in the residual predicate.
+        let remaining_predicate = self.calculate_remaining_predicate(conjuncts, &encoded);
 
         // Scan direction
         let scan_direction = if self.config.supports_desc_indexes {
@@ -369,30 +429,30 @@ impl Planner {
         // Add equality fields first
         let mut index_keyparts = Vec::new();
         for (field, value) in equalities {
-            index_keyparts.push(IndexKeyPart::asc_path(field, ValueType::of(value)));
+            push_keypart_once(&mut index_keyparts, IndexKeyPart::asc_path(field, ValueType::of(value)));
         }
 
         // Add the inequality field
         let inequality_values = inequalities.get(inequality_field)?;
         let first_inequality_value = &inequality_values[0].1; // Get Value from first inequality
-        index_keyparts.push(IndexKeyPart::asc_path(inequality_field, ValueType::of(first_inequality_value)));
+        push_keypart_once(&mut index_keyparts, IndexKeyPart::asc_path(inequality_field, ValueType::of(first_inequality_value)));
 
         // Build bounds
         let bounds = self.build_bounds(equalities, Some((inequality_field, inequality_values)), &index_keyparts);
 
         // Check for empty scan
-        let bounds = match bounds {
-            Some(bounds) => {
+        let (bounds, encoded) = match bounds {
+            Some((bounds, encoded)) => {
                 if self.is_empty_bounds(&bounds) {
                     return Some(Plan::EmptyScan);
                 }
-                bounds
+                (bounds, encoded)
             }
             None => return Some(Plan::EmptyScan),
         };
 
-        // Calculate remaining predicate (exclude this inequality field)
-        let remaining_predicate = self.calculate_remaining_predicate(conjuncts, equalities, Some(inequality_field));
+        // Every term the bounds did not encode stays in the residual predicate.
+        let remaining_predicate = self.calculate_remaining_predicate(conjuncts, &encoded);
 
         // Build OrderByComponents: presort (EQ + inequality) and spill (rest)
         let order_by_spill = if let Some(order_by_items) = order_by {
@@ -424,25 +484,25 @@ impl Planner {
         // Add all equality fields
         let mut index_keyparts = Vec::new();
         for (field, value) in equalities {
-            index_keyparts.push(IndexKeyPart::asc_path(field, ValueType::of(value)));
+            push_keypart_once(&mut index_keyparts, IndexKeyPart::asc_path(field, ValueType::of(value)));
         }
 
         // Build bounds (exact match on all equality values)
         let bounds = self.build_bounds(equalities, None, &index_keyparts);
 
         // Check for empty scan
-        let bounds = match bounds {
-            Some(bounds) => {
+        let (bounds, encoded) = match bounds {
+            Some((bounds, encoded)) => {
                 if self.is_empty_bounds(&bounds) {
                     return Some(Plan::EmptyScan);
                 }
-                bounds
+                (bounds, encoded)
             }
             None => return Some(Plan::EmptyScan),
         };
 
-        // Calculate remaining predicate
-        let remaining_predicate = self.calculate_remaining_predicate(conjuncts, equalities, None);
+        // Every term the bounds did not encode stays in the residual predicate.
+        let remaining_predicate = self.calculate_remaining_predicate(conjuncts, &encoded);
 
         let index_spec = KeySpec::new(index_keyparts);
         Some(Plan::Index {
@@ -456,20 +516,31 @@ impl Planner {
 
     // removed: specialized ORDER BY bounds builder (use unified per-strategy bounds)
 
-    /// Build bounds based on equalities and optional inequality
+    /// Build bounds based on equalities and optional inequality.
+    ///
+    /// Returns the bounds together with the terms they encode. The second half
+    /// is not bookkeeping for its own sake: it is the input the residual
+    /// predicate is computed from, so that a term this function declines to
+    /// encode is guaranteed to be re-checked per row rather than forgotten.
+    /// A column carrying several equality terms encodes at most one of them
+    /// here, and a range term is encoded only when the folded endpoint
+    /// implies it.
     fn build_bounds(
         &self,
         equalities: &[(String, Value)],
         inequality: Option<(&str, &Vec<(ComparisonOperator, Value)>)>,
         index_keyparts: &[IndexKeyPart],
-    ) -> Option<KeyBounds> {
+    ) -> Option<(KeyBounds, EncodedTerms)> {
         let mut keypart_bounds = Vec::new();
+        let mut encoded = EncodedTerms::default();
 
         // Build per-column bounds (using full_path for multi-step path support)
         for keypart in index_keyparts {
             let full_path = keypart.full_path();
 
-            // Check if this path has an equality constraint
+            // Check if this path has an equality constraint. When the column
+            // carries more than one, the first is the one the range holds; the
+            // rest are left for `calculate_remaining_predicate` to keep.
             let equality_value = equalities.iter().find(|(field, _)| field == &full_path).map(|(_, value)| value);
 
             if let Some(value) = equality_value {
@@ -479,6 +550,7 @@ impl Planner {
                     low: Endpoint::incl(value.clone()),
                     high: Endpoint::incl(value.clone()),
                 });
+                encoded.terms.push((full_path.clone(), ComparisonOperator::Equal, value.clone()));
             } else if let Some((ineq_field, inequalities)) = inequality {
                 if ineq_field == full_path {
                     // This column has inequality constraints
@@ -516,6 +588,37 @@ impl Planner {
                         }
                     }
 
+                    // Record the folded terms the final endpoints imply — equal
+                    // to the endpoint, or decisively looser. A term that lost
+                    // the fold to an incomparable value (values of different
+                    // types have no order) is implied by neither endpoint, and
+                    // recording it would drop it from the residual with nothing
+                    // left to re-check it.
+                    for (op, value) in inequalities {
+                        let enforced = match op {
+                            ComparisonOperator::GreaterThan => {
+                                let term = Endpoint::excl(value.clone());
+                                low == term || self.is_more_restrictive_lower(&low, &term)
+                            }
+                            ComparisonOperator::GreaterThanOrEqual => {
+                                let term = Endpoint::incl(value.clone());
+                                low == term || self.is_more_restrictive_lower(&low, &term)
+                            }
+                            ComparisonOperator::LessThan => {
+                                let term = Endpoint::excl(value.clone());
+                                high == term || self.is_more_restrictive_upper(&high, &term)
+                            }
+                            ComparisonOperator::LessThanOrEqual => {
+                                let term = Endpoint::incl(value.clone());
+                                high == term || self.is_more_restrictive_upper(&high, &term)
+                            }
+                            _ => false,
+                        };
+                        if enforced {
+                            encoded.terms.push((full_path.clone(), op.clone(), value.clone()));
+                        }
+                    }
+
                     keypart_bounds.push(KeyBoundComponent { column: full_path.clone(), low, high });
                     break; // Stop at first inequality column
                 } else {
@@ -528,7 +631,7 @@ impl Planner {
             }
         }
 
-        Some(KeyBounds::new(keypart_bounds))
+        Some((KeyBounds::new(keypart_bounds), encoded))
     }
 
     /// Check if candidate lower bound is more restrictive than current
@@ -629,36 +732,22 @@ impl Planner {
         false
     }
 
-    /// Calculate remaining predicate by removing consumed conjuncts
-    fn calculate_remaining_predicate(
-        &self,
-        conjuncts: &[Predicate],
-        consumed_equalities: &[(String, Value)],
-        consumed_inequality_field: Option<&str>,
-    ) -> Predicate {
+    /// Calculate the residual predicate: every conjunct the key range does not
+    /// already enforce.
+    ///
+    /// A conjunct drops out only when `encoded` says the range carries that
+    /// exact term. Matching on the column alone would be wrong, because a
+    /// column can appear in several conjuncts and the range holds at most one
+    /// of them — dropping the others would leave the scan free to return rows
+    /// they exclude.
+    fn calculate_remaining_predicate(&self, conjuncts: &[Predicate], encoded: &EncodedTerms) -> Predicate {
         let mut remaining_conjuncts = Vec::new();
 
         for conjunct in conjuncts {
-            let mut consumed = false;
-
-            // Check if this conjunct is consumed by equalities
-            if let Some((field, _, _)) = self.extract_comparison(conjunct) {
-                // Check if it's a consumed equality
-                for (eq_field, _) in consumed_equalities {
-                    if field == *eq_field {
-                        consumed = true;
-                        break;
-                    }
-                }
-
-                // Check if it's a consumed inequality
-                if !consumed
-                    && let Some(ineq_field) = consumed_inequality_field
-                    && field == ineq_field
-                {
-                    consumed = true;
-                }
-            }
+            let consumed = match self.extract_comparison(conjunct) {
+                Some((field, operator, value)) => encoded.covers(&field, &operator, &value),
+                None => false,
+            };
 
             if !consumed {
                 remaining_conjuncts.push(conjunct.clone());
@@ -2181,6 +2270,344 @@ mod tests {
                     }
                 ]
             );
+        }
+    }
+
+    // A key range can hold one term per column. Everything else a column is
+    // compared against has to stay in the residual predicate, because the scan
+    // enforces only what the range encodes. These pin that for each shape a
+    // repeated column can take.
+    mod repeated_column_tests {
+        use super::*;
+
+        /// Two equalities on one column: the range holds the first, and the
+        /// second is what makes the answer empty. Dropping it hands back the
+        /// rows the first value names — which is how a policy read scope of
+        /// `owner = <caller>` composed onto a caller's `owner = <someone else>`
+        /// used to return the other principal's row.
+        #[test]
+        fn two_equalities_on_one_column() {
+            assert_eq!(
+                plan!("__collection = 'album' AND owner = 'bob' AND owner = 'alice'"),
+                vec![
+                    Plan::Index {
+                        index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("owner", ValueType::String)]),
+                        scan_direction: ScanDirection::Forward,
+                        bounds: bounds!("__collection" => ("album"..="album"), "owner" => ("bob"..="bob")),
+                        remaining_predicate: selection!("owner = 'alice'").predicate,
+                        order_by_spill: order_by_components!()
+                    },
+                    Plan::TableScan {
+                        bounds: KeyBounds::empty(),
+                        scan_direction: ScanDirection::Forward,
+                        remaining_predicate: selection!("__collection = 'album' AND owner = 'bob' AND owner = 'alice'").predicate,
+                        order_by_spill: order_by_components!()
+                    }
+                ]
+            );
+        }
+
+        /// The same term written twice constrains nothing further, so the range
+        /// really does enforce both and the residual stays empty. This is the
+        /// shape a policy scope produces when the caller already asked for its
+        /// own rows, and it must keep the cheap no-filter path.
+        #[test]
+        fn repeated_identical_equality_needs_no_residual() {
+            assert_eq!(
+                plan!("__collection = 'album' AND owner = 'bob' AND owner = 'bob'"),
+                vec![
+                    Plan::Index {
+                        index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("owner", ValueType::String)]),
+                        scan_direction: ScanDirection::Forward,
+                        bounds: bounds!("__collection" => ("album"..="album"), "owner" => ("bob"..="bob")),
+                        remaining_predicate: Predicate::True,
+                        order_by_spill: order_by_components!()
+                    },
+                    Plan::TableScan {
+                        bounds: KeyBounds::empty(),
+                        scan_direction: ScanDirection::Forward,
+                        remaining_predicate: selection!("__collection = 'album' AND owner = 'bob' AND owner = 'bob'").predicate,
+                        order_by_spill: order_by_components!()
+                    }
+                ]
+            );
+        }
+
+        /// Three equalities on one column: the range holds the first and both
+        /// of the others survive, in the order they were written.
+        #[test]
+        fn three_equalities_on_one_column() {
+            assert_eq!(
+                plan!("owner = 'a' AND owner = 'b' AND owner = 'c'"),
+                vec![
+                    Plan::Index {
+                        index_spec: KeySpec::new(vec![asc!("owner", ValueType::String)]),
+                        scan_direction: ScanDirection::Forward,
+                        bounds: bounds!("owner" => ("a"..="a")),
+                        remaining_predicate: selection!("owner = 'b' AND owner = 'c'").predicate,
+                        order_by_spill: order_by_components!()
+                    },
+                    Plan::TableScan {
+                        bounds: KeyBounds::empty(),
+                        scan_direction: ScanDirection::Forward,
+                        remaining_predicate: selection!("owner = 'a' AND owner = 'b' AND owner = 'c'").predicate,
+                        order_by_spill: order_by_components!()
+                    }
+                ]
+            );
+        }
+
+        /// An equality and a range on one column. The range endpoint is the
+        /// point bound, so the inequality is left over — including when the two
+        /// contradict, which is the case that used to answer with the equality's
+        /// rows instead of nothing.
+        #[test]
+        fn equality_and_range_on_one_column() {
+            assert_eq!(
+                plan!("age = 5 AND age > 10"),
+                vec![
+                    Plan::Index {
+                        index_spec: KeySpec::new(vec![asc!("age", ValueType::I32)]),
+                        scan_direction: ScanDirection::Forward,
+                        bounds: bounds!("age" => (5..=5)),
+                        remaining_predicate: selection!("age > 10").predicate,
+                        order_by_spill: order_by_components!()
+                    },
+                    Plan::TableScan {
+                        bounds: KeyBounds::empty(),
+                        scan_direction: ScanDirection::Forward,
+                        remaining_predicate: selection!("age = 5 AND age > 10").predicate,
+                        order_by_spill: order_by_components!()
+                    }
+                ]
+            );
+        }
+
+        /// Writing the range first does not change which term the range holds,
+        /// nor that the other one survives.
+        #[test]
+        fn range_and_equality_on_one_column() {
+            assert_eq!(
+                plan!("age > 10 AND age = 5"),
+                vec![
+                    Plan::Index {
+                        index_spec: KeySpec::new(vec![asc!("age", ValueType::I32)]),
+                        scan_direction: ScanDirection::Forward,
+                        bounds: bounds!("age" => (5..=5)),
+                        remaining_predicate: selection!("age > 10").predicate,
+                        order_by_spill: order_by_components!()
+                    },
+                    Plan::TableScan {
+                        bounds: KeyBounds::empty(),
+                        scan_direction: ScanDirection::Forward,
+                        remaining_predicate: selection!("age > 10 AND age = 5").predicate,
+                        order_by_spill: order_by_components!()
+                    }
+                ]
+            );
+        }
+
+        /// Two ranges on one column fold into that column's low and high
+        /// endpoints, so the range really does enforce both and nothing is left
+        /// over. This shape was always sound; it is here so a future change to
+        /// the folding cannot quietly stop encoding one side.
+        #[test]
+        fn two_ranges_on_one_column_fold_into_the_bounds() {
+            assert_eq!(
+                plan!("age > 3 AND age < 10"),
+                vec![
+                    Plan::Index {
+                        index_spec: KeySpec::new(vec![asc!("age", ValueType::I32)]),
+                        scan_direction: ScanDirection::Forward,
+                        bounds: bounds_list!(KeyBoundComponent { column: "age".to_string(), low: gt(3), high: lt(10) }),
+                        remaining_predicate: Predicate::True,
+                        order_by_spill: order_by_components!()
+                    },
+                    Plan::TableScan {
+                        bounds: KeyBounds::empty(),
+                        scan_direction: ScanDirection::Forward,
+                        remaining_predicate: selection!("age > 3 AND age < 10").predicate,
+                        order_by_spill: order_by_components!()
+                    }
+                ]
+            );
+        }
+
+        /// Two range terms on one column whose values have no order between
+        /// them (an integer and a string). The fold keeps the first as the
+        /// endpoint and cannot compare the second against it, so the endpoint
+        /// does not imply the second term and it must survive — the residual
+        /// evaluator, not the range, decides what a cross-typed comparison
+        /// admits.
+        #[test]
+        fn incomparably_typed_ranges_on_one_column_keep_the_unfolded_term() {
+            assert_eq!(
+                plan!("age > 5 AND age > 'abc'"),
+                vec![
+                    Plan::Index {
+                        index_spec: KeySpec::new(vec![asc!("age", ValueType::I32)]),
+                        scan_direction: ScanDirection::Forward,
+                        bounds: bounds_list!(open_lower!("age" => 5..)),
+                        remaining_predicate: selection!("age > 'abc'").predicate,
+                        order_by_spill: order_by_components!()
+                    },
+                    Plan::TableScan {
+                        bounds: KeyBounds::empty(),
+                        scan_direction: ScanDirection::Forward,
+                        remaining_predicate: selection!("age > 5 AND age > 'abc'").predicate,
+                        order_by_spill: order_by_components!()
+                    }
+                ]
+            );
+        }
+
+        /// A repeated column sitting between terms on other columns: the other
+        /// columns still make it into the key, and only the term the range
+        /// could not hold is left over.
+        #[test]
+        fn repeated_column_alongside_other_columns() {
+            assert_eq!(
+                plan!("owner = 'bob' AND status = 'open' AND owner = 'alice'"),
+                vec![
+                    Plan::Index {
+                        index_spec: KeySpec::new(vec![asc!("owner", ValueType::String), asc!("status", ValueType::String)]),
+                        scan_direction: ScanDirection::Forward,
+                        bounds: bounds!("owner" => ("bob"..="bob"), "status" => ("open"..="open")),
+                        remaining_predicate: selection!("owner = 'alice'").predicate,
+                        order_by_spill: order_by_components!()
+                    },
+                    Plan::TableScan {
+                        bounds: KeyBounds::empty(),
+                        scan_direction: ScanDirection::Forward,
+                        remaining_predicate: selection!("owner = 'bob' AND status = 'open' AND owner = 'alice'").predicate,
+                        order_by_spill: order_by_components!()
+                    }
+                ]
+            );
+        }
+
+        /// `!=` never becomes a key-range endpoint, so it survives even on a
+        /// column the range already pins. It used to be dropped for naming a
+        /// column that some other term had been encoded for.
+        #[test]
+        fn not_equal_on_a_pinned_column_survives() {
+            assert_eq!(
+                plan!("age = 5 AND age != 5"),
+                vec![
+                    Plan::Index {
+                        index_spec: KeySpec::new(vec![asc!("age", ValueType::I32)]),
+                        scan_direction: ScanDirection::Forward,
+                        bounds: bounds!("age" => (5..=5)),
+                        remaining_predicate: selection!("age != 5").predicate,
+                        order_by_spill: order_by_components!()
+                    },
+                    Plan::TableScan {
+                        bounds: KeyBounds::empty(),
+                        scan_direction: ScanDirection::Forward,
+                        remaining_predicate: selection!("age = 5 AND age != 5").predicate,
+                        order_by_spill: order_by_components!()
+                    }
+                ]
+            );
+        }
+
+        /// An ORDER BY naming a column the predicate already pins does not earn
+        /// that column a second position in the key, and the extra equality
+        /// still survives. The ORDER BY is satisfied either way, because the
+        /// column is constant across the rows the scan returns.
+        #[test]
+        fn repeated_equality_under_order_by() {
+            assert_eq!(
+                plan_full_support!("owner = 'bob' AND owner = 'alice' ORDER BY owner, label"),
+                vec![
+                    Plan::Index {
+                        index_spec: KeySpec::new(vec![asc!("owner", ValueType::String), asc!("label", ValueType::String)]),
+                        scan_direction: ScanDirection::Forward,
+                        bounds: bounds!("owner" => ("bob"..="bob")),
+                        remaining_predicate: selection!("owner = 'alice'").predicate,
+                        order_by_spill: order_by_components!(presort: [oby_asc!("owner"), oby_asc!("label")])
+                    },
+                    Plan::TableScan {
+                        bounds: KeyBounds::empty(),
+                        scan_direction: ScanDirection::Forward,
+                        remaining_predicate: selection!("owner = 'bob' AND owner = 'alice'").predicate,
+                        order_by_spill: order_by_components!(spill: [oby_asc!("owner"), oby_asc!("label")])
+                    }
+                ]
+            );
+        }
+
+        /// The predicate a client composes and a server then composes onto
+        /// again: three terms on one column, two of them the same. The range
+        /// holds the first, the repeat of it is genuinely enforced by that same
+        /// bound, and the term that differs survives.
+        #[test]
+        fn twice_composed_repeats_on_one_column() {
+            assert_eq!(
+                plan!("owner = 'bob' AND owner = 'alice' AND owner = 'alice'"),
+                vec![
+                    Plan::Index {
+                        index_spec: KeySpec::new(vec![asc!("owner", ValueType::String)]),
+                        scan_direction: ScanDirection::Forward,
+                        bounds: bounds!("owner" => ("bob"..="bob")),
+                        remaining_predicate: selection!("owner = 'alice' AND owner = 'alice'").predicate,
+                        order_by_spill: order_by_components!()
+                    },
+                    Plan::TableScan {
+                        bounds: KeyBounds::empty(),
+                        scan_direction: ScanDirection::Forward,
+                        remaining_predicate: selection!("owner = 'bob' AND owner = 'alice' AND owner = 'alice'").predicate,
+                        order_by_spill: order_by_components!()
+                    }
+                ]
+            );
+        }
+
+        /// A disjunction is never encoded into a key range, whatever else the
+        /// query says about the columns it names. This shape was always sound;
+        /// pinning it keeps a later change to what the range encodes from
+        /// taking the disjunction along.
+        #[test]
+        fn disjunction_stays_in_the_residual() {
+            assert_eq!(
+                plan!("(owner = 'a' OR reviewer = 'a') AND owner = 'b'"),
+                vec![
+                    Plan::Index {
+                        index_spec: KeySpec::new(vec![asc!("owner", ValueType::String)]),
+                        scan_direction: ScanDirection::Forward,
+                        bounds: bounds!("owner" => ("b"..="b")),
+                        remaining_predicate: selection!("owner = 'a' OR reviewer = 'a'").predicate,
+                        order_by_spill: order_by_components!()
+                    },
+                    Plan::TableScan {
+                        bounds: KeyBounds::empty(),
+                        scan_direction: ScanDirection::Forward,
+                        remaining_predicate: selection!("(owner = 'a' OR reviewer = 'a') AND owner = 'b'").predicate,
+                        order_by_spill: order_by_components!()
+                    }
+                ]
+            );
+        }
+
+        /// Every plan the planner offers for one query has to answer the same
+        /// question, so the leftover term must appear in all of them — the
+        /// caller picks a plan without re-deriving what it enforces.
+        #[test]
+        fn every_plan_for_a_repeated_column_keeps_the_leftover_term() {
+            for plans in [
+                plan!("owner = 'bob' AND owner = 'alice'"),
+                plan_full_support!("owner = 'bob' AND owner = 'alice'"),
+                plan!("age = 5 AND age > 10 ORDER BY label"),
+                plan_full_support!("age = 5 AND age > 10 ORDER BY label"),
+            ] {
+                for plan in &plans {
+                    let residual = match plan {
+                        Plan::Index { remaining_predicate, .. } | Plan::TableScan { remaining_predicate, .. } => remaining_predicate,
+                        Plan::EmptyScan => continue,
+                    };
+                    assert_ne!(*residual, Predicate::True, "a plan enforcing nothing beyond its key range: {plan:?}");
+                }
+            }
         }
     }
 
