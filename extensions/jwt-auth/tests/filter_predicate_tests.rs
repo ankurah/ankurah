@@ -372,11 +372,13 @@ fn test_filter_predicate_deduplicates_equal_slices() {
     assert_eq!(result, single, "a repeated credential must not repeat its branch");
 }
 
-/// An empty credential set is refused on a scoped collection — there is no
-/// slice to union — but the no-scope early return runs before any credential
-/// is read, so an unscoped collection still returns the caller's predicate
-/// untouched. The refusal is narrower than "a caller with no authorized
-/// context is always denied".
+/// An empty credential set scans nothing anywhere. On a scoped collection it
+/// is refused — there is no slice to union — and on an unscoped collection
+/// it composes to `False`: since the `retrieve` tier widened the entry gate,
+/// the unscoped arm checks scan privilege itself instead of trusting the
+/// gate to have refused already, and an empty set holds none. (This pin
+/// previously recorded the predicate passing untouched, an artifact of that
+/// trust; the trait's empty-set guidance is fail-closed, which this now is.)
 #[test]
 fn test_filter_predicate_empty_context_set() {
     let keys = common::test_keys();
@@ -389,7 +391,7 @@ fn test_filter_predicate_empty_context_set() {
     assert!(scoped.is_err(), "post is scoped, so an empty set has no authorized slice, got: {:?}", scoped);
 
     let unscoped = agent.filter_predicate(&contexts, &CollectionId::from("comment"), predicate.clone()).unwrap();
-    assert_eq!(unscoped, predicate, "comment carries no scope rules, so the query is returned before any credential is read");
+    assert_eq!(unscoped, Predicate::False, "comment carries no scope rules, and an empty set holds no scan privilege: nothing");
 }
 
 /// An authenticated credential that cannot reach the collection contributes

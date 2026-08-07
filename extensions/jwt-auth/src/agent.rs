@@ -232,6 +232,15 @@ impl PolicyAgent for JwtAgent {
 
     fn filter_predicate<C>(&self, data: &C, collection: &proto::CollectionId, predicate: Predicate) -> Result<Predicate, AccessDenied>
     where C: Iterable<Self::ContextData> {
+        // The policy collection is granted before any credential is
+        // consulted, mirroring can_access_collection's carve-out and for the
+        // same reason: an ephemeral node bootstraps its policy through a
+        // livequery on this collection while its config is still deny-all,
+        // and a scan-privilege check here (added with the `retrieve` tier)
+        // would compose that bootstrap query to False.
+        if collection.as_str() == "jwtpolicy" {
+            return Ok(predicate);
+        }
         for ctx in data.iterable() {
             if ctx.is_privileged() {
                 return Ok(predicate);
@@ -239,8 +248,26 @@ impl PolicyAgent for JwtAgent {
         }
 
         let state = self.state.read().unwrap_or_else(|e| e.into_inner());
+
         if state.config.scope_rules_for_collection(collection.as_str()).is_empty() {
-            return Ok(predicate);
+            // An unscoped collection passes a scan-privileged caller's
+            // predicate through untouched. Any other caller the entry gate
+            // admitted — which now includes retrieval-only credentials —
+            // scans nothing: False, an empty answer rather than an error,
+            // because arriving here at the retrieval tier is a tier limit
+            // and not a fault. Every predicate is a scan here, id-shaped or
+            // not: predicate-shaped retrieval (an id-bounded pass at this
+            // tier, for fetch_one("id = …") and named-row live queries) is
+            // a deliberate follow-up, not part of this change. (Before
+            // `retrieve` existed this arm passed unconditionally, and
+            // could: the entry gate had already refused every caller
+            // without read or write.)
+            for ctx in data.iterable() {
+                if state.config.can_scan_collection(ctx.roles(), collection) {
+                    return Ok(predicate);
+                }
+            }
+            return Ok(Predicate::False);
         }
 
         // A caller holding several credentials may read what any one of them
@@ -265,11 +292,14 @@ impl PolicyAgent for JwtAgent {
             let JwtContext::User { claims, .. } = ctx else {
                 continue;
             };
-            // Only authorized contexts contribute, matching the collection
-            // check enforce_read_scope makes before evaluating a context's
-            // scope: a credential that cannot reach the collection must not
-            // widen the query on its own account.
-            if !state.config.can_access_collection(ctx.roles(), collection) {
+            // Only scan-authorized contexts contribute: a credential that
+            // cannot run this query must not widen it on its own account. A
+            // retrieval-only credential reads rows it names, never rows a
+            // scan surfaces, so it contributes no slice here.
+            // (enforce_read_scope keeps the wide check for the per-row
+            // half: a retrieval credential may satisfy a row's scope for a
+            // row it named.)
+            if !state.config.can_scan_collection(ctx.roles(), collection) {
                 continue;
             }
 
