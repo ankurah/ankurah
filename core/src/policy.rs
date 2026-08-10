@@ -2,6 +2,7 @@ use crate::util::Iterable;
 use crate::{
     entity::Entity,
     error::ValidationError,
+    lazy_entity_getter::EntityGetter,
     node::{ContextData, Node, NodeInner, WeakNode},
     property::PropertyError,
     proto::{self},
@@ -25,6 +26,11 @@ pub enum AccessDenied {
     ParseError(ParseError),
     #[error("Insufficient attestation")]
     InsufficientAttestation,
+    /// A check needed the current row and its resolver failed (a storage
+    /// error, not a verdict). Request handling reports this as an error
+    /// instead of quietly withholding the data a refusal would.
+    #[error("Access check could not resolve the entity to evaluate: {0}")]
+    ResolutionFailed(String),
 }
 
 impl From<PropertyError> for AccessDenied {
@@ -61,8 +67,8 @@ pub use crate::schema::registration::{PlannedModelPropertyMembership, PlannedUpd
 /// attribute the access to, so fail closed unless permissiveness is the
 /// point. The JWT agent in extensions/jwt-auth denies it wherever
 /// admission is decided — `can_access_collection`, and `check_read` and
-/// `check_read_event` which both reach that check (the first as its
-/// opening step, the second after the privileged short-circuit) — carving out only
+/// `check_read_event` which both open on that check (they share one
+/// row-level helper, whose first step it is) — carving out only
 /// the policy collection, which is granted before any credential is
 /// consulted. (Its `filter_predicate` does return the predicate
 /// unnarrowed when the collection has no scope rules, which admits
@@ -185,8 +191,35 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
         C: Iterable<Self::ContextData>;
 
     /// Check if a context can read an event
-    fn check_read_event<C>(&self, data: &C, event: &Attested<proto::Event>) -> Result<(), AccessDenied>
-    where C: Iterable<Self::ContextData>;
+    ///
+    /// An event replays the same entity content a state carries, so an agent
+    /// that admits entities row by row in [`Self::check_read`] must apply the
+    /// same rule here or the row filter is only as strong as the collection
+    /// gate. `getter` is bound to the event's own entity and resolves it
+    /// lazily: an agent that settles the verdict without row content
+    /// (privileged caller, unscoped collection, permissive policy) must
+    /// decide before calling `get`, and those paths cost no read.
+    ///
+    /// `get` yields `None` when nothing current exists for the entity, and an
+    /// agent whose decision depends on the row should refuse rather than
+    /// guess. A lookup failure is neither verdict — surface it as
+    /// [`AccessDenied::ResolutionFailed`], which request handling reports as
+    /// an error instead of a refusal.
+    ///
+    /// The verdict is about the row as it stands now, not as it stood when the
+    /// event was written: a caller who can read a row today may read that row's
+    /// whole history, including the part written while the row sat outside its
+    /// scope. Per-event historical evaluation is tracked in
+    /// <https://github.com/ankurah/ankurah/issues/445>.
+    async fn check_read_event<SE, C>(
+        &self,
+        data: &C,
+        event: &Attested<proto::Event>,
+        getter: &EntityGetter<'_, SE, Self>,
+    ) -> Result<(), AccessDenied>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        C: Iterable<Self::ContextData> + Sync;
 
     /// Check if a context can edit an entity
     fn check_write(&self, data: &Self::ContextData, entity: &Entity, event: Option<&proto::Event>) -> Result<(), AccessDenied>;
@@ -312,9 +345,18 @@ impl PolicyAgent for PermissiveAgent {
         Ok(())
     }
 
-    fn check_read_event<C>(&self, _data: &C, _event: &Attested<proto::Event>) -> Result<(), AccessDenied>
-    where C: Iterable<Self::ContextData> {
-        // PermissiveAgent allows regardless of which credentials are supplied, including none
+    async fn check_read_event<SE, C>(
+        &self,
+        _data: &C,
+        _event: &Attested<proto::Event>,
+        _getter: &EntityGetter<'_, SE, Self>,
+    ) -> Result<(), AccessDenied>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        C: Iterable<Self::ContextData> + Sync,
+    {
+        // PermissiveAgent allows regardless of which credentials are supplied,
+        // including none — and never fetches the row it is not going to judge.
         Ok(())
     }
 

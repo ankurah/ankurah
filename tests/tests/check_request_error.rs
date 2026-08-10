@@ -122,8 +122,16 @@ impl PolicyAgent for RejectingAgent {
         Ok(())
     }
 
-    fn check_read_event<C>(&self, _data: &C, _event: &proto::Attested<proto::Event>) -> std::result::Result<(), AccessDenied>
-    where C: Iterable<Self::ContextData> {
+    async fn check_read_event<SE, C>(
+        &self,
+        _data: &C,
+        _event: &proto::Attested<proto::Event>,
+        _getter: &ankurah::core::lazy_entity_getter::EntityGetter<'_, SE, Self>,
+    ) -> std::result::Result<(), AccessDenied>
+    where
+        SE: ankurah::core::storage::StorageEngine + Send + Sync + 'static,
+        C: Iterable<Self::ContextData> + Sync,
+    {
         Ok(())
     }
 
