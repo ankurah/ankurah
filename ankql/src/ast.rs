@@ -2,7 +2,6 @@ use crate::error::ParseError;
 use crate::selection::sql::generate_selection_sql;
 use ankurah_core_types::EntityId;
 use serde::{Deserialize, Serialize};
-use ulid::Ulid;
 
 /// Custom serialization for serde_json::Value that stores as bytes.
 /// This is needed because bincode doesn't support deserialize_any.
@@ -40,7 +39,7 @@ pub enum Literal {
     F64(f64),
     Bool(bool),
     String(String),
-    EntityId(Ulid),
+    EntityId(EntityId),
     Object(Vec<u8>),
     Binary(Vec<u8>),
     /// JSON value - used for comparisons against JSON property subfields.
@@ -594,11 +593,11 @@ impl From<Literal> for Expr {
 }
 
 impl From<EntityId> for Expr {
-    fn from(id: EntityId) -> Expr { Expr::Literal(Literal::EntityId(id.to_ulid())) }
+    fn from(id: EntityId) -> Expr { Expr::Literal(Literal::EntityId(id)) }
 }
 
 impl From<&EntityId> for Expr {
-    fn from(id: &EntityId) -> Expr { Expr::Literal(Literal::EntityId(id.to_ulid())) }
+    fn from(id: &EntityId) -> Expr { Expr::Literal(Literal::EntityId(*id)) }
 }
 
 // These create Expr::ExprList for use in IN clauses

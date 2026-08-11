@@ -94,7 +94,7 @@ impl fmt::Display for PropertyId {
 
 /// The exact inverse of [`Display`](fmt::Display): every variant parses back
 /// to itself. The arms cannot collide -- `"id"` is not a system name, and no
-/// system name decodes to the 16 bytes an entity id requires (the longest,
+/// system name decodes to the 32 bytes an entity id requires (the longest,
 /// `target_model`, is 12 characters and decodes to 9).
 impl FromStr for PropertyId {
     type Err = DecodeError;
@@ -140,7 +140,7 @@ mod tests {
 
     #[test]
     fn display_round_trips_every_variant() {
-        let mut cases = vec![PropertyId::Id, PropertyId::EntityId(EntityId::from_bytes([9; 16]))];
+        let mut cases = vec![PropertyId::Id, PropertyId::EntityId(EntityId::from_bytes([9; 32]))];
         cases.extend(ALL_SYSTEM_PROPERTIES.map(PropertyId::System));
 
         for property in cases {
@@ -151,7 +151,7 @@ mod tests {
 
         assert_eq!(PropertyId::Id.to_string(), "id");
         assert_eq!(PropertyId::System(SystemProperty::TargetModel).to_string(), "target_model");
-        let entity = EntityId::from_bytes([9; 16]);
+        let entity = EntityId::from_bytes([9; 32]);
         assert_eq!(PropertyId::EntityId(entity).to_string(), entity.to_base64());
     }
 
@@ -159,12 +159,12 @@ mod tests {
     fn unparseable_string_is_refused() {
         for input in [
             "",
-            "title",                    // a plausible display name, but no system property
-            "Name",                     // system names are lowercase and exact
-            "id ",                      // no trimming
-            "AAAAAAAAAAAAAAAAAAAA",     // valid base64, decodes to 15 bytes, not 16
-            "AAAAAAAAAAAAAAAAAAAAAAAA", // valid base64, decodes to 18 bytes
-            "!!!!!!!!!!!!!!!!!!!!!!",   // an entity id's width, but not base64
+            "title",                                        // a plausible display name, but no system property
+            "Name",                                         // system names are lowercase and exact
+            "id ",                                          // no trimming
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",   // valid base64, decodes to 31 bytes, not 32
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", // valid base64, decodes to 33 bytes
+            "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!",  // an entity id's width, but not base64
         ] {
             assert!(input.parse::<PropertyId>().is_err(), "{input:?} must not parse as a PropertyId");
         }
@@ -173,7 +173,7 @@ mod tests {
     #[test]
     fn variant_order_and_entity_payload_are_pinned() {
         assert_eq!(bincode::serialize(&PropertyId::Id).unwrap(), 0u32.to_le_bytes());
-        let entity = EntityId::from_bytes([7; 16]);
+        let entity = EntityId::from_bytes([7; 32]);
         assert_eq!(
             bincode::serialize(&PropertyId::EntityId(entity)).unwrap(),
             [1u32.to_le_bytes().as_slice(), entity.to_bytes().as_slice()].concat()

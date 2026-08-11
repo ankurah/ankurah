@@ -18,12 +18,14 @@ async fn server_refuses_commits_into_protected_collections() -> anyhow::Result<(
 
     for collection in PROTECTED {
         let model = ankurah::core::schema::system_model_id(collection).expect("protected collection has a system model");
-        let event = proto::Event {
-            collection: proto::CollectionId::fixed_name(collection),
-            entity_id: EntityId::new(),
-            operations: proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(model))]),
-            parent: proto::Clock::default(),
-        };
+        // A well-formed genesis, so the refusal comes from the protected
+        // collection rule rather than from structural validation.
+        let event = proto::Event::genesis(
+            proto::CollectionId::fixed_name(collection),
+            Some(EntityId::random()),
+            proto::AuthorId::Unknown,
+            proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(model))]),
+        );
         let resp = client
             .request(
                 server.id,

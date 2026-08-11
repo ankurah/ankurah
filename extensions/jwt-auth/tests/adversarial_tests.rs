@@ -93,8 +93,8 @@ async fn test_server_rejects_garbage_auth_data() -> anyhow::Result<()> {
 
     let request = ankurah_proto::NodeRequest {
         id: ankurah_proto::RequestId::new(),
-        to: ankurah_proto::EntityId::new(),
-        from: ankurah_proto::EntityId::new(),
+        to: ankurah_proto::EntityId::random(),
+        from: ankurah_proto::EntityId::random(),
         body: ankurah_proto::NodeRequestBody::Fetch {
             collection: ankurah_proto::CollectionId::from("post"),
             selection: "1 = 1".try_into().unwrap(),

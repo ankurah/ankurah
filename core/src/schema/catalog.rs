@@ -754,7 +754,7 @@ where
     ///
     /// Deterministic protocol simulators forge stable entity, model, and
     /// property identities so two runs have byte-identical traces. They cannot
-    /// use the production allocator, whose fresh ULIDs would intentionally
+    /// use the production allocator, whose fresh ids would intentionally
     /// differ between runs. This helper keeps the compiled binding complete
     /// (every field proven against the supplied rows) while making the
     /// fixture's deliberate storage bypass explicit.

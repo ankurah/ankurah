@@ -70,3 +70,28 @@ async fn test_where_clause_with_id() -> Result<()> {
 
     Ok(())
 }
+
+/// Pins the no-ORDER-BY contract: results arrive in ascending entity-id
+/// order -- deterministic across nodes, semantically arbitrary (entity ids
+/// are content hashes and carry no creation-time signal).
+#[tokio::test]
+async fn no_order_by_returns_ascending_entity_id_order() -> Result<()> {
+    let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    node.system.create().await?;
+    let client = node.context(c)?;
+
+    {
+        let trx = client.begin();
+        trx.create(&Album { name: "A".into(), year: "2001".into() }).await?;
+        trx.create(&Album { name: "B".into(), year: "2002".into() }).await?;
+        trx.create(&Album { name: "C".into(), year: "2003".into() }).await?;
+        trx.commit().await?;
+    }
+
+    let years = vec!["2001", "2002", "2003"];
+    let albums: Vec<AlbumView> = fetch!(client, year IN {years}).await?;
+    let ids: Vec<_> = albums.iter().map(|a| a.id()).collect();
+    assert_eq!(ids.len(), 3);
+    assert!(ids.windows(2).all(|w| w[0] < w[1]), "no-ORDER-BY results must be in ascending entity-id order: {:?}", ids);
+    Ok(())
+}

@@ -33,19 +33,38 @@ use common::{Record, RecordView};
 // ---------------------------------------------------------------------------
 
 /// Forge a Record LWW event setting `title`, parented on the given clock.
-/// The event id is a content hash over (entity_id, operations, parent), so the
-/// forger cannot choose it (C4-01): whatever id the DAG keys on is recomputed
-/// from these contents, never read from any declared field.
+/// The event id is a content hash over the whole update body plus the entity
+/// id and parent clock, so the forger cannot choose it (C4-01): whatever id
+/// the DAG keys on is recomputed from those contents, never read from any
+/// declared field.
 fn forge_title_event(entity_id: proto::EntityId, parent: proto::Clock, title: &str) -> proto::Event {
     let backend = LWWBackend::new();
     backend.set("title".into(), Some(Value::String(title.to_owned())));
     let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
-    proto::Event {
+    proto::Event::update(
+        Record::collection(),
         entity_id,
-        collection: Record::collection(),
-        operations: proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)])),
         parent,
-    }
+        proto::AuthorId::Unknown,
+        proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)])),
+    )
+}
+
+/// Forge a genesis that CLAIMS `entity_id` rather than the entity its own
+/// content derives. Unrepresentable through `Event::genesis`, which is the
+/// point: this is the shape a receiver must refuse.
+fn forge_genesis_claiming(entity_id: proto::EntityId, title: &str) -> proto::Event {
+    let backend = LWWBackend::new();
+    backend.set("title".into(), Some(Value::String(title.to_owned())));
+    let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
+    let mut event = proto::Event::genesis(
+        Record::collection(),
+        None,
+        proto::AuthorId::Unknown,
+        proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)])),
+    );
+    event.entity_id = entity_id;
+    event
 }
 
 fn event_only_item(event: proto::Event) -> proto::SubscriptionUpdateItem {
@@ -203,22 +222,26 @@ async fn malformed_clock_identity_is_order_independent_end_to_end() -> Result<()
         let backend = LWWBackend::new();
         backend.set("artist".into(), Some(Value::String("c-artist".to_owned())));
         let ops = backend.to_operations().unwrap().expect("ops");
-        proto::Event {
-            entity_id: rec_id,
-            collection: Record::collection(),
-            operations: proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)])),
-            parent: head0.clone(),
-        }
+        proto::Event::update(
+            Record::collection(),
+            rec_id,
+            head0.clone(),
+            proto::AuthorId::Unknown,
+            proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)])),
+        )
     };
     f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, vec![ev_b.clone(), ev_c.clone()])])).await?;
 
-    // The head is now the antichain {ev_b, ev_c}. Build a merge event whose
-    // parent lists those two ids in two different orders; both must hash equal.
+    // The head is now the antichain {ev_b, ev_c}. Take one merge event and
+    // re-parent a copy of it on the same two ids in the opposite order;
+    // both must hash equal. The two copies share a nonce on purpose: two
+    // separate mints would differ by nonce and say nothing about the clock.
     let two_ids = vec![ev_b.id(), ev_c.id()];
     let mut reversed = two_ids.clone();
     reversed.reverse();
     let ev_merge_a = forge_title_event(rec_id, proto::Clock::from(two_ids.clone()), "merged");
-    let ev_merge_b = forge_title_event(rec_id, proto::Clock::from(reversed), "merged");
+    let mut ev_merge_b = ev_merge_a.clone();
+    ev_merge_b.parent = proto::Clock::from(reversed);
     assert_eq!(ev_merge_a.id(), ev_merge_b.id(), "parent-clock input order must not change event identity");
 
     // Deliver the merge event; the resulting head is a single valid tip.
@@ -289,12 +312,16 @@ async fn forged_extra_genesis_head_does_not_trigger_wholesale_adoption() -> Resu
         let backend = LWWBackend::new();
         backend.set("artist".into(), Some(Value::String("foreign-x".to_owned())));
         let ops = backend.to_operations().unwrap().expect("ops");
-        proto::Event {
-            entity_id: rec_id,
-            collection: Record::collection(),
-            operations: proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)])),
-            parent: proto::Clock::default(),
-        }
+        // A genesis claiming an existing entity's id: structurally invalid
+        // now that a genesis names whatever entity its own content derives.
+        let mut event = proto::Event::genesis(
+            Record::collection(),
+            None,
+            proto::AuthorId::Unknown,
+            proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)])),
+        );
+        event.entity_id = rec_id;
+        event
     };
     let id_b = ev_b.id();
     let id_x = ev_x.id();
@@ -335,24 +362,26 @@ async fn forged_extra_genesis_head_does_not_trigger_wholesale_adoption() -> Resu
 /// addressing.
 #[test]
 fn declared_cycle_is_unconstructible_content_addressing() {
-    let entity = proto::EntityId::new();
+    let entity = proto::EntityId::random();
     let mk = |title: &str, parent: proto::Clock| forge_title_event(entity, parent, title);
 
     // Start from two independent events and try to wire A.parent := [B.id()]
     // and B.parent := [A.id()]. Compute B first, then A referencing B; now A
     // has a concrete id. To close the cycle we would need B to have referenced
-    // *that* id, but B was built referencing an empty parent, so B.id() is
-    // fixed and does not name A.
-    let b = mk("b", proto::Clock::default());
+    // *that* id, but B's parent was fixed before A existed, so B.id() is fixed
+    // and does not name A.
+    let b = mk("b", proto::Clock::from(vec![proto::EventId::from_bytes([0xAAu8; 32])]));
     let a = mk("a", proto::Clock::from(vec![b.id()]));
     // A names B, but B does NOT name A: no cycle among {a, b}.
     assert!(a.parent.contains(&b.id()), "A references B");
     assert!(!b.parent.contains(&a.id()), "B cannot reference A: its id was fixed before A existed");
 
-    // The only way to make B name A is to rebuild B with A.id() in its parent,
-    // which changes B's id, which breaks A's reference. Demonstrate that the
-    // rebuilt B has a different id, so A's edge no longer points at it.
-    let b2 = mk("b", proto::Clock::from(vec![a.id()]));
+    // The only way to make B name A is to re-parent B onto A.id(), which
+    // changes B's id, which breaks A's reference. Re-parent the SAME event
+    // (rather than mint a fresh one, whose nonce would differ anyway) so the
+    // id change is attributable to the parent alone.
+    let mut b2 = b.clone();
+    b2.parent = proto::Clock::from(vec![a.id()]);
     assert_ne!(b.id(), b2.id(), "adding A to B's parent changes B's content hash");
     assert!(!a.parent.contains(&b2.id()), "A's edge now dangles; the loop cannot be closed");
     // Hence no set of honest events forms a declared parent cycle. A batch that
@@ -450,9 +479,9 @@ async fn forged_second_genesis_rejected_on_durable_node() -> Result<()> {
     let (rec_id, _view) = seed_record(&f, "t0", "a0").await?;
     let before = committed_event_ids(&f.ctx_s, rec_id).await?;
 
-    // Forge a DISTINCT second genesis (empty parent, different ops => different
-    // id) and deliver it to the SERVER attributed to the client peer.
-    let alt = forge_title_event(rec_id, proto::Clock::default(), "ALT-GENESIS");
+    // Forge a DISTINCT second genesis claiming the same entity id and deliver
+    // it to the SERVER attributed to the client peer.
+    let alt = forge_genesis_claiming(rec_id, "ALT-GENESIS");
     assert!(alt.is_entity_create(), "alt is a creation event");
     let alt_id = alt.id();
     f.server.handle_message(deliver(f.client.id, f.server.id, vec![event_only_item(alt)])).await?;
@@ -480,7 +509,7 @@ async fn forged_second_genesis_rejected_on_ephemeral_node() -> Result<()> {
     let (rec_id, view) = seed_record(&f, "t0", "a0").await?;
     let head_before = view.entity().head().clone();
 
-    let alt = forge_title_event(rec_id, proto::Clock::default(), "ALT-EPH");
+    let alt = forge_genesis_claiming(rec_id, "ALT-EPH");
     let alt_id = alt.id();
     f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(alt)])).await?;
 
@@ -502,7 +531,7 @@ async fn phantom_entity_is_evicted_on_failed_apply() -> Result<()> {
     let (a_id, view_a) = seed_record(&f, "a0", "artist-a").await?;
 
     let ev_a = forge_title_event(a_id, view_a.entity().head().clone(), "a1");
-    let unknown_id = proto::EntityId::new();
+    let unknown_id = proto::EntityId::random();
     // Non-creation event (non-empty parent) for an entity the client never saw.
     let ev_unknown = forge_title_event(unknown_id, proto::Clock::from(vec![proto::EventId::from_bytes([7u8; 32])]), "ghost");
 

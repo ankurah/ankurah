@@ -6,9 +6,9 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Model, Debug, Serialize, Deserialize)]
 pub struct NoncanonicalIdModel {
-    // The canonical spelling of sixteen zero bytes ends in `AA`; changing
-    // only the unused trailing bits to `AB` must be rejected.
-    #[property(id = "AAAAAAAAAAAAAAAAAAAAAB")]
+    // The canonical spelling of thirty-two zero bytes ends in `A`; setting
+    // only the unused trailing bits, making it `B`, must be rejected.
+    #[property(id = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB")]
     pub label: String,
 }
 

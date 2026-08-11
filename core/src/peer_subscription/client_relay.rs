@@ -668,7 +668,7 @@ mod tests {
         let query_id = proto::QueryId::new();
         let collection_id = create_test_collection_id();
         let predicate = create_test_selection();
-        let peer_id = EntityId::new();
+        let peer_id = EntityId::random();
 
         // Connect the peer first
         relay.notify_peer_connected(peer_id);
@@ -703,7 +703,7 @@ mod tests {
         let query_id = proto::QueryId::new();
         let collection_id = create_test_collection_id();
         let predicate = create_test_selection();
-        let peer_id = EntityId::new();
+        let peer_id = EntityId::random();
 
         // Connect the peer first
         relay.notify_peer_connected(peer_id);
@@ -732,7 +732,7 @@ mod tests {
         let query_id = proto::QueryId::new();
         let collection_id = create_test_collection_id();
         let predicate = create_test_selection();
-        let peer_id = EntityId::new();
+        let peer_id = EntityId::random();
 
         // Add pending subscription (no peers connected yet)
         relay.subscribe_query(query_id, collection_id.clone(), predicate.clone(), collection_id.clone().into(), 0, MockLiveQuery);
@@ -766,7 +766,7 @@ mod tests {
         let query_id = proto::QueryId::new();
         let collection_id = create_test_collection_id();
         let predicate = create_test_selection();
-        let peer_id = EntityId::new();
+        let peer_id = EntityId::random();
 
         // Connect peer and add subscription (should succeed initially)
         relay.notify_peer_connected(peer_id);
@@ -813,7 +813,7 @@ mod tests {
         let non_retryable_query_id = proto::QueryId::new();
         let collection_id = create_test_collection_id();
         let predicate = create_test_selection();
-        let peer_id = EntityId::new();
+        let peer_id = EntityId::random();
 
         // Add subscriptions
         relay.subscribe_query(retryable_query_id, collection_id.clone(), predicate.clone(), collection_id.clone().into(), 0, MockLiveQuery);
@@ -864,7 +864,7 @@ mod tests {
         let query_id = proto::QueryId::new();
         let collection_id = create_test_collection_id();
         let predicate = create_test_selection();
-        let peer_id = EntityId::new();
+        let peer_id = EntityId::random();
 
         // Connect peer and setup established subscription
         relay.notify_peer_connected(peer_id);
@@ -902,7 +902,7 @@ mod tests {
         let query_id = proto::QueryId::new();
         let collection_id = create_test_collection_id();
         let predicate = create_test_selection();
-        let peer_id = EntityId::new();
+        let peer_id = EntityId::random();
 
         // Test setup without message sender - should not crash
         relay.subscribe_query(query_id, collection_id.clone(), predicate.clone(), collection_id.clone().into(), 0, MockLiveQuery);

@@ -142,20 +142,47 @@ pub(crate) trait ConformanceBackend {
 // Event / layer construction helpers (generic over the adopter)
 // ============================================================================
 
-/// Build an event carrying `operations` for `backend_name`, with the given
-/// parents. Entity id is derived from `seed` so distinct seeds yield distinct
-/// content-hashed event ids. Mirrors the event-building idiom in
-/// `event_dag::tests`.
-fn make_event(seed: u16, backend_name: &str, operations: Vec<Operation>, parents: &[EventId]) -> Event {
-    let mut entity_id_bytes = [0u8; 16];
-    entity_id_bytes[0..2].copy_from_slice(&seed.to_be_bytes());
-    let entity_id = EntityId::from_bytes(entity_id_bytes);
-    Event {
-        entity_id,
-        collection: "conformance".into(),
-        parent: Clock::from(parents.to_vec()),
-        operations: OperationSet::from_backends(BTreeMap::from([(backend_name.to_string(), operations)])),
+/// A synthetic fixture event: a genesis when it has no parents, an update
+/// otherwise, together with the entity id that event names.
+///
+/// The nonce comes from the fixture's seed rather than from entropy, so every
+/// fixture id is reproducible across runs. A genesis derives the entity id from
+/// its own content, the way the production mint does, so the laws below run over
+/// the only genesis shape a node can produce rather than one the commit funnels
+/// would refuse. An update names the seed-derived id instead, because a
+/// fixture's parents are synthetic event ids with no genesis behind them.
+fn fixture_body(
+    nonce_seed: &[u8],
+    seeded_entity_id: EntityId,
+    parent: &Clock,
+    operations: OperationSet,
+) -> (EntityId, ankurah_proto::EventBody) {
+    let mut nonce = [0u8; 32];
+    nonce[..nonce_seed.len()].copy_from_slice(nonce_seed);
+    let author = ankurah_proto::AuthorId::Unknown;
+    if parent.is_empty() {
+        let entity_id = EntityId::from(ankurah_proto::EventId::from_genesis_parts(&None, &nonce, 0, &author, &operations));
+        (entity_id, ankurah_proto::EventBody::Genesis { system: None, nonce, timestamp: 0, author, operations })
+    } else {
+        (seeded_entity_id, ankurah_proto::EventBody::Update { nonce, timestamp: 0, author, operations })
     }
+}
+
+/// Build an event carrying `operations` for `backend_name`, with the given
+/// parents. The seed differentiates otherwise-identical events, so distinct
+/// seeds yield distinct content-hashed event ids. Mirrors the event-building
+/// idiom in `event_dag::tests`.
+fn make_event(seed: u16, backend_name: &str, operations: Vec<Operation>, parents: &[EventId]) -> Event {
+    let mut entity_id_bytes = [0u8; 32];
+    entity_id_bytes[0..2].copy_from_slice(&seed.to_be_bytes());
+    let parent = Clock::from(parents.to_vec());
+    let (entity_id, body) = fixture_body(
+        &seed.to_be_bytes(),
+        EntityId::from_bytes(entity_id_bytes),
+        &parent,
+        OperationSet::from_backends(BTreeMap::from([(backend_name.to_string(), operations)])),
+    );
+    Event { entity_id, collection: "conformance".into(), body, parent }
 }
 
 /// Assemble an [`EventLayer`] from event references, deriving the DAG skeleton
@@ -315,7 +342,7 @@ pub(crate) fn law_within_layer_permutation_invariance<B: ConformanceBackend>() {
     for perm in &permutations {
         let backend = B::new_backend();
         // Seed the root as committed state (the meet the layer branches from).
-        let ops: Vec<_> = root.operations.backend_operations(B::backend_name()).cloned().collect();
+        let ops: Vec<_> = root.operations().backend_operations(B::backend_name()).cloned().collect();
         if !ops.is_empty() {
             backend.apply_operations_with_event(&ops, root.id()).expect("apply root");
         }
@@ -403,7 +430,7 @@ pub(crate) fn law_cross_order_determinism<B: ConformanceBackend>() {
 /// Apply the backend-relevant operations of `root` as committed state, so the
 /// root is the meet the subsequent layers branch from.
 fn apply_committed_root<B: ConformanceBackend>(backend: &Arc<dyn PropertyBackend>, root: &Event) {
-    let ops: Vec<_> = root.operations.backend_operations(B::backend_name()).cloned().collect();
+    let ops: Vec<_> = root.operations().backend_operations(B::backend_name()).cloned().collect();
     if !ops.is_empty() {
         backend.apply_operations_with_event(&ops, root.id()).expect("apply committed root");
     }
@@ -533,7 +560,7 @@ mod lww_conformance {
 
         // Apply earlier as committed state, then the later event via a layer.
         let backend: Arc<dyn PropertyBackend> = Arc::new(LWWBackend::new());
-        let ops: Vec<_> = earlier.operations.backend_operations(LwwAdopter::backend_name()).cloned().collect();
+        let ops: Vec<_> = earlier.operations().backend_operations(LwwAdopter::backend_name()).cloned().collect();
         if !ops.is_empty() {
             backend.apply_operations_with_event(&ops, earlier.id()).unwrap();
         }

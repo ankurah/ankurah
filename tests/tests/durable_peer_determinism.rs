@@ -30,7 +30,7 @@ async fn test_get_durable_peers_is_stable_and_sorted() -> Result<()> {
     let node = common::durable_sled_setup().await?;
 
     // Generate several peer ids, then insert them in an order that is not their sorted order.
-    let mut peers: Vec<proto::EntityId> = (0..8).map(|_| proto::EntityId::new()).collect();
+    let mut peers: Vec<proto::EntityId> = (0..8).map(|_| proto::EntityId::random()).collect();
     peers.sort();
     let mut insertion = peers.clone();
     insertion.reverse();
@@ -53,7 +53,7 @@ async fn test_get_durable_peers_is_stable_and_sorted() -> Result<()> {
 #[tokio::test]
 async fn test_get_durable_peer_random_same_seed_same_sequence() -> Result<()> {
     // Shared peer set; both seeded nodes see the identical set.
-    let peers: Vec<proto::EntityId> = (0..16).map(|_| proto::EntityId::new()).collect();
+    let peers: Vec<proto::EntityId> = (0..16).map(|_| proto::EntityId::random()).collect();
 
     let draw_sequence = |seed: u64| -> Vec<proto::EntityId> {
         let node = Node::new_durable_with_seed(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new(), seed);
@@ -80,7 +80,7 @@ async fn test_get_durable_peer_random_same_seed_same_sequence() -> Result<()> {
 #[tokio::test]
 async fn test_get_durable_peer_random_default_stays_in_set() -> Result<()> {
     let node = common::durable_sled_setup().await?;
-    let peers: Vec<proto::EntityId> = (0..4).map(|_| proto::EntityId::new()).collect();
+    let peers: Vec<proto::EntityId> = (0..4).map(|_| proto::EntityId::random()).collect();
     seed_peers(&node, &peers);
 
     let peer_set: std::collections::HashSet<_> = peers.iter().copied().collect();

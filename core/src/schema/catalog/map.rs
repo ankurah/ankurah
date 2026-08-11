@@ -231,7 +231,7 @@ pub(super) fn apply_entry(map: &mut CatalogMapInner, entry: Entry) {
 mod tests {
     use super::*;
 
-    fn id(byte: u8) -> EntityId { EntityId::from_bytes([byte; 16]) }
+    fn id(byte: u8) -> EntityId { EntityId::from_bytes([byte; 32]) }
 
     fn property(id: EntityId, name: &str) -> PropertyDef {
         PropertyDef {

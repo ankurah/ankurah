@@ -86,7 +86,7 @@ mod wrong_explicit_widget {
     use serde::{Deserialize, Serialize};
 
     #[derive(Model, Debug, Serialize, Deserialize)]
-    #[model(id = "AAAAAAAAAAAAAAAAAAAAAA")]
+    #[model(id = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")]
     pub struct Widget {
         pub label: String,
         pub size: i32,

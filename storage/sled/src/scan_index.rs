@@ -120,12 +120,12 @@ impl Stream for SledIndexScanner<'_> {
 
 // TODO: Add extract_ids method for streams that need to convert back to EntityId streams
 
-/// Decode EntityId from index key suffix (last 16 bytes)
+/// Decode the EntityId that an index key carries as its fixed-width suffix.
 pub fn decode_entity_id_from_index_key(key: &[u8]) -> Result<EntityId, RetrievalError> {
-    if key.len() < 1 + 16 {
+    if key.len() < 1 + EntityId::BYTE_LEN {
         return Err(RetrievalError::StorageError("index key too short".into()));
     }
-    let eid_bytes: [u8; 16] =
-        key[key.len() - 16..].try_into().map_err(|_| RetrievalError::StorageError("invalid entity id suffix".into()))?;
+    let eid_bytes: [u8; EntityId::BYTE_LEN] =
+        key[key.len() - EntityId::BYTE_LEN..].try_into().map_err(|_| RetrievalError::StorageError("invalid entity id suffix".into()))?;
     Ok(EntityId::from_bytes(eid_bytes))
 }

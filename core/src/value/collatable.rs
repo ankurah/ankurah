@@ -1,5 +1,6 @@
 use crate::collation::Collatable;
 use crate::value::Value;
+use ankurah_core_types::EntityId;
 
 // Collation for Value (single value). Tuple framing (type tags/lengths) is handled by higher-level encoders.
 impl Collatable for Value {
@@ -79,7 +80,7 @@ impl Collatable for Value {
             Value::EntityId(entity_id) => {
                 let mut bytes = entity_id.to_bytes();
                 // Increment the byte array (big-endian arithmetic)
-                for i in (0..16).rev() {
+                for i in (0..bytes.len()).rev() {
                     if bytes[i] == 0xFF {
                         bytes[i] = 0;
                     } else {
@@ -142,11 +143,11 @@ impl Collatable for Value {
             }
             Value::EntityId(entity_id) => {
                 let mut bytes = entity_id.to_bytes();
-                if bytes == [0u8; 16] {
+                if bytes == [0u8; EntityId::BYTE_LEN] {
                     None // Already at minimum
                 } else {
                     // Decrement the byte array (big-endian arithmetic)
-                    for i in (0..16).rev() {
+                    for i in (0..bytes.len()).rev() {
                         if bytes[i] == 0 {
                             bytes[i] = 0xFF;
                         } else {
@@ -169,7 +170,7 @@ impl Collatable for Value {
             Value::I64(x) => *x == i64::MIN,
             Value::F64(f) => *f == f64::NEG_INFINITY,
             Value::Bool(b) => !b,
-            Value::EntityId(entity_id) => entity_id.to_bytes() == [0u8; 16],
+            Value::EntityId(entity_id) => entity_id.to_bytes() == [0u8; EntityId::BYTE_LEN],
             Value::Object(_) | Value::Binary(_) | Value::Json(_) => false,
         }
     }
@@ -182,7 +183,7 @@ impl Collatable for Value {
             Value::I64(x) => *x == i64::MAX,
             Value::F64(f) => *f == f64::INFINITY,
             Value::Bool(b) => *b,
-            Value::EntityId(entity_id) => entity_id.to_bytes() == [0xFFu8; 16],
+            Value::EntityId(entity_id) => entity_id.to_bytes() == [0xFFu8; EntityId::BYTE_LEN],
             Value::Object(_) | Value::Binary(_) | Value::Json(_) => false,
         }
     }

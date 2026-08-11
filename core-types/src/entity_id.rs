@@ -1,7 +1,6 @@
 use base64::{engine::general_purpose, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use ulid::Ulid;
 
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
@@ -13,44 +12,59 @@ use crate::IdParseError;
 #[derive(PartialEq, Eq, Hash, Clone, Copy, Ord, PartialOrd)]
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
-/// A durable, globally unique entity identity.
+/// A durable, globally unique entity identity: the 32 bytes of the entity's
+/// genesis event id.
+///
+/// Because the id IS the hash over the genesis content, an entity's identity
+/// cannot be chosen ahead of the content it names; the creation path derives
+/// it (`ankurah_proto::Event::genesis`).
 ///
 /// The human-readable representation is an unpadded URL-safe base64 encoding
-/// of the underlying 16-byte ULID. Binary serializers receive the raw bytes.
-pub struct EntityId(Ulid);
+/// of those 32 bytes. Binary serializers receive the raw bytes.
+pub struct EntityId([u8; 32]);
 
 impl EntityId {
-    /// Generate a new time-sortable identity.
-    pub fn new() -> Self { Self(Ulid::new()) }
+    /// The exact byte width of an entity id.
+    pub const BYTE_LEN: usize = 32;
 
-    /// Construct an identity from its exact 16-byte representation.
-    pub fn from_bytes(bytes: [u8; 16]) -> Self { Self(Ulid::from_bytes(bytes)) }
+    /// Draw 32 random bytes as an identity.
+    ///
+    /// This value names no genesis event, so no entity can ever carry it. It
+    /// exists for the two identities that are not entities: a node's own id
+    /// and test ids that deliberately name nothing. Creating an entity derives
+    /// its id instead.
+    ///
+    /// TODO make this test-only. It cannot be `#[cfg(test)]` yet because a
+    /// node draws its own id from here in production. That use migrates when
+    /// the deferred node-identity work gives nodes their own key-derived type,
+    /// and this becomes a test affordance and nothing else.
+    pub fn random() -> Self {
+        let mut bytes = [0u8; Self::BYTE_LEN];
+        rand::RngCore::fill_bytes(&mut rand::rng(), &mut bytes);
+        Self(bytes)
+    }
 
-    /// Return the exact 16-byte representation.
-    pub fn to_bytes(&self) -> [u8; 16] { self.0.to_bytes() }
+    /// Construct an identity from its exact 32-byte representation.
+    pub fn from_bytes(bytes: [u8; 32]) -> Self { Self(bytes) }
+
+    /// Return the exact 32-byte representation.
+    pub fn to_bytes(&self) -> [u8; 32] { self.0 }
 
     /// Decode an identity from unpadded URL-safe base64.
     pub fn from_base64<T: AsRef<[u8]>>(input: T) -> Result<Self, DecodeError> {
         let decoded = general_purpose::URL_SAFE_NO_PAD.decode(input).map_err(DecodeError::InvalidBase64)?;
-        let bytes: [u8; 16] = decoded.as_slice().try_into().map_err(|_| DecodeError::InvalidLength)?;
-        Ok(Self(Ulid::from_bytes(bytes)))
+        let bytes: [u8; 32] = decoded.as_slice().try_into().map_err(|_| DecodeError::InvalidLength)?;
+        Ok(Self(bytes))
     }
 
     /// Encode this identity as unpadded URL-safe base64.
-    pub fn to_base64(&self) -> String { general_purpose::URL_SAFE_NO_PAD.encode(self.0.to_bytes()) }
+    pub fn to_base64(&self) -> String { general_purpose::URL_SAFE_NO_PAD.encode(self.0) }
 
-    /// Return the final six characters of the base64 representation.
-    ///
-    /// This is suitable only for compact diagnostics, never durable identity.
+    /// Return the first six characters of the base64 representation.
     pub fn to_base64_short(&self) -> String {
         let value = self.to_base64();
-        value[value.len() - 6..].to_owned()
+        value[..6].to_owned()
     }
-
-    /// Return the underlying ULID value.
-    pub fn to_ulid(&self) -> Ulid { self.0 }
-    /// Construct an entity identity from a ULID.
-    pub fn from_ulid(ulid: Ulid) -> Self { Self(ulid) }
 }
 
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
@@ -136,17 +150,9 @@ impl From<&EntityId> for String {
 impl TryFrom<Vec<u8>> for EntityId {
     type Error = DecodeError;
     fn try_from(value: Vec<u8>) -> Result<Self, Self::Error> {
-        let bytes: [u8; 16] = value.try_into().map_err(|_| DecodeError::InvalidLength)?;
+        let bytes: [u8; 32] = value.try_into().map_err(|_| DecodeError::InvalidLength)?;
         Ok(Self::from_bytes(bytes))
     }
-}
-
-impl From<EntityId> for Ulid {
-    fn from(id: EntityId) -> Self { id.0 }
-}
-
-impl Default for EntityId {
-    fn default() -> Self { Self::new() }
 }
 
 impl Serialize for EntityId {
@@ -166,7 +172,7 @@ impl<'de> Deserialize<'de> for EntityId {
         if deserializer.is_human_readable() {
             Self::from_base64(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
         } else {
-            Ok(Self::from_bytes(<[u8; 16]>::deserialize(deserializer)?))
+            Ok(Self::from_bytes(<[u8; 32]>::deserialize(deserializer)?))
         }
     }
 }
@@ -222,10 +228,22 @@ mod tests {
 
     #[test]
     fn json_and_bincode_encodings_are_pinned() {
-        let id = EntityId::from_bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
-        assert_eq!(serde_json::to_string(&id).unwrap(), "\"AQIDBAUGBwgJCgsMDQ4PEA\"");
+        let id = EntityId::from_bytes([
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+        ]);
+        assert_eq!(serde_json::to_string(&id).unwrap(), "\"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA\"");
         assert_eq!(bincode::serialize(&id).unwrap(), id.to_bytes());
         assert_eq!(serde_json::from_str::<EntityId>(&serde_json::to_string(&id).unwrap()).unwrap(), id);
         assert_eq!(bincode::deserialize::<EntityId>(&bincode::serialize(&id).unwrap()).unwrap(), id);
+    }
+
+    /// The base64 form is exactly 43 characters; a 22-character (16-byte)
+    /// string does not decode.
+    #[test]
+    fn only_the_full_width_decodes() {
+        let id = EntityId::from_bytes([0xAB; 32]);
+        assert_eq!(id.to_base64().len(), 43);
+        assert_eq!(EntityId::from_base64(id.to_base64()).unwrap(), id);
+        assert!(matches!(EntityId::from_base64("AQIDBAUGBwgJCgsMDQ4PEA"), Err(DecodeError::InvalidLength)));
     }
 }

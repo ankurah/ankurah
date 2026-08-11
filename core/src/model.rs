@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use ankurah_proto::{CollectionId, EntityId, ModelId, State};
 
-use crate::entity::Entity;
+use crate::entity::{Entity, ProvisionalEntity};
 use crate::error::StateError;
 
 use crate::property::PropertyError;
@@ -40,10 +40,14 @@ pub trait Model: Sized {
     /// derived from the struct's fields.
     fn descriptor() -> &'static crate::schema::ModelStructDescriptor;
 
-    /// Initialize a freshly created entity from this instance: stage its
-    /// membership in `model_id` (this model's registered identity) and seed
-    /// the property backends with the struct's initial field values.
-    fn initialize_new_entity(&self, entity: &Entity, model_id: ModelId);
+    /// Stage everything a new entity starts life with: its membership in
+    /// `model_id` (this model's registered identity) and the struct's initial
+    /// field values in their property backends.
+    ///
+    /// The receiver has no identity yet because these values are exactly what
+    /// the id is derived FROM: `Transaction::create` freezes them into the
+    /// genesis event and takes the entity's id from it.
+    fn initialize_new_entity(&self, provisional: &mut ProvisionalEntity, model_id: ModelId);
 }
 
 /// A read only view of an Entity which offers typed accessors

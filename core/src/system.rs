@@ -95,6 +95,10 @@ where
 
     pub fn root(&self) -> Option<Attested<EntityState>> { self.0.root.read().unwrap().as_ref().map(|r| r.clone()) }
 
+    /// The system root's entity id, which every non-root genesis binds into
+    /// its own id. `None` until this node has created or joined a system.
+    pub fn root_id(&self) -> Option<proto::EntityId> { self.0.root.read().unwrap().as_ref().map(|r| r.payload.entity_id) }
+
     pub fn items(&self) -> Vec<Entity> { self.0.items.read().unwrap().clone() }
 
     /// get an existing collection if it's defined in the system catalog, else insert a SysItem::Collection
@@ -158,13 +162,17 @@ where
         let collection_id = CollectionId::fixed_name(SYSTEM_COLLECTION_ID);
         let storage = self.0.collectionset.get(&collection_id).await?;
 
-        let system_entity = self.0.entities.create(collection_id.clone());
-        system_entity.add_membership(proto::ModelId::System(proto::SystemModel::System));
-
-        let lww_backend = system_entity.get_backend::<LWWBackend>().expect("LWW Backend should exist");
+        // Stage the root's initial values in a vessel with no identity of its
+        // own, then freeze them into its genesis: the root is the one entity
+        // whose genesis carries `system: None`, because there is no system
+        // above it to bind.
+        let mut provisional = crate::entity::ProvisionalEntity::new();
+        provisional.add_membership(proto::ModelId::System(proto::SystemModel::System));
+        let lww_backend = provisional.get_backend::<LWWBackend>().expect("LWW Backend should exist");
         lww_backend.set("item".into(), proto::sys::Item::SysRoot.into_value()?);
 
-        let event = system_entity.generate_commit_event()?.ok_or(anyhow!("Expected event"))?;
+        let event = proto::Event::genesis(collection_id.clone(), None, proto::AuthorId::Unknown, provisional.extract_operations()?);
+        let system_entity = self.0.entities.create_root(collection_id.clone(), event.entity_id);
 
         // Stage the event, apply, then commit
         let event_getter = LocalEventGetter::new(storage.clone(), true);

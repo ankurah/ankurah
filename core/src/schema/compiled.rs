@@ -39,8 +39,9 @@ pub struct ModelStructDescriptor {
     pub properties: &'static [StructProperty],
     /// `#[model(id = "...")]`: bind this model to a KNOWN model entity by
     /// explicit id, bypassing label-based registration. `None` for
-    /// the default label-based registration path. The value is
-    /// URL-safe base64 of a 16-byte EntityId, validated at derive time.
+    /// the default label-based registration path. The value is URL-safe base64
+    /// of a 32-byte EntityId -- the id that model entity's genesis event
+    /// derives -- validated at derive time.
     pub explicit_id: Option<&'static str>,
 }
 
@@ -83,8 +84,9 @@ pub struct StructProperty {
     pub optional: bool,
     /// `#[property(id = "...")]`: bind this field to a KNOWN, possibly
     /// shared, property entity by explicit id. `None` for the
-    /// default by-name registration. URL-safe base64 of a 16-byte EntityId,
-    /// validated at derive time.
+    /// default by-name registration. URL-safe base64 of a 32-byte EntityId --
+    /// the id that property entity's genesis event derives -- validated at
+    /// derive time.
     pub explicit_id: Option<&'static str>,
 }
 

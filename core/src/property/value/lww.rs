@@ -1,7 +1,7 @@
 use std::{marker::PhantomData, sync::Arc};
 
 use crate::{
-    entity::Entity,
+    entity::{Entity, ProvisionalEntity},
     property::{
         backend::{LWWBackend, PropertyBackend},
         traits::{FromActiveType, FromEntity, PropertyError},
@@ -65,10 +65,9 @@ impl<T: Property> FromActiveType<LWW<T>> for T {
 }
 
 impl<T: Property> InitializeWith<T> for LWW<T> {
-    fn initialize_with(entity: &Entity, property_name: PropertyName, value: &T) -> Self {
-        let new = Self::from_entity(property_name, entity);
-        new.set(value).unwrap();
-        new
+    fn initialize_with(provisional: &mut ProvisionalEntity, property_name: PropertyName, value: &T) {
+        let backend = provisional.get_backend::<LWWBackend>().expect("LWW Backend should exist");
+        backend.set(property_name, value.into_value().unwrap());
     }
 }
 

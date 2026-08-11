@@ -157,7 +157,27 @@ pub enum MutationError {
     PeerRejected,
     #[error("invalid event")]
     InvalidEvent,
-    #[error("invalid update")]
+    #[error("malformed event: {0}")]
+    EventStructure(ankurah_proto::EventStructureError),
+    /// The node does not know its system root, so it cannot derive an entity
+    /// id: a non-root genesis binds the root into its own id. A caller that
+    /// reaches this on an ephemeral node can retry once the handshake with a
+    /// durable peer has established the system.
+    #[error("the node does not know its system root yet")]
+    SystemNotReady,
+    /// A commit-path invariant about an event's provenance, as opposed to
+    /// [`MutationError::EventStructure`], which is about its shape. The string
+    /// names which one.
+    #[error("commit refused: {0}")]
+    CommitInvariant(&'static str),
+    /// An entity that was never created in this transaction and has no head to
+    /// extend. Naming it is the point: the caller edited a view it obtained
+    /// some way other than `Transaction::create`.
+    #[error(
+        "cannot commit phantom entity {0}: it has no genesis frozen by create() in this transaction and no head an update could extend"
+    )]
+    PhantomEntity(ankurah_proto::EntityId),
+    #[error("invalid update: {0}")]
     InvalidUpdate(&'static str),
     #[error("property error: {0}")]
     PropertyError(crate::property::PropertyError),
@@ -167,6 +187,10 @@ pub enum MutationError {
     Anyhow(anyhow::Error),
     #[error("TOCTOU attempts exhausted")]
     TOCTOUAttemptsExhausted,
+}
+
+impl From<ankurah_proto::EventStructureError> for MutationError {
+    fn from(err: ankurah_proto::EventStructureError) -> Self { MutationError::EventStructure(err) }
 }
 
 impl From<tokio::task::JoinError> for MutationError {

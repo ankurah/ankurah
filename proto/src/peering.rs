@@ -1,7 +1,7 @@
 use bincode::Options;
 use serde::{Deserialize, Serialize};
 
-use crate::{id::EntityId, Attested, CollectionId, EntityState, State};
+use crate::{clock::Clock, id::EntityId, Attested, CollectionId, EntityState, StateBuffers};
 
 /// The wire protocol version this binary speaks.
 ///
@@ -36,11 +36,13 @@ pub struct Presence {
     pub node_id: EntityId,
     pub durable: bool,
     pub system_root: Option<Attested<EntityState>>,
-    /// See [`PROTOCOL_VERSION`]. Kept as the LAST field so an ephemeral
-    /// pre-#294 Presence (`system_root: None`) is a strict prefix of this one.
-    /// A durable legacy Presence also uses the old collection-bearing nested
-    /// EntityState shape; [`is_version0_presence`] mirrors that shape when
-    /// classifying an otherwise-undecodable handshake.
+    /// See [`PROTOCOL_VERSION`]. Kept as the LAST field, which used to make a
+    /// pre-#294 ephemeral Presence a strict prefix of this one. That prefix
+    /// property ended when the entity id widened to 32 bytes: `node_id` is
+    /// now a different width than the one a 0.9.x peer writes, so no 0.9.x
+    /// Presence is a prefix of a current one. Recognizing those peers is
+    /// [`is_version0_presence`]'s job alone, against the frozen mirror
+    /// structs below.
     pub protocol_version: u32,
 }
 
@@ -89,10 +91,18 @@ impl std::error::Error for PresenceRejection {}
 #[derive(Serialize, Deserialize)]
 #[allow(dead_code)]
 struct LegacyPresence {
-    node_id: EntityId,
+    node_id: LegacyId,
     durable: bool,
     system_root: Option<Attested<LegacyEntityState>>,
 }
+
+/// The 16-byte ULID-shaped id a 0.9.x peer writes for `node_id` and
+/// `entity_id`. Frozen here so widening the live [`EntityId`] leaves
+/// version-0 detection reading exactly the bytes 0.9.x sends. Bincode
+/// encodes a newtype struct as its inner value, matching 0.9.x's
+/// `[u8; 16]` fixed array with no length prefix.
+#[derive(Serialize, Deserialize)]
+struct LegacyId([u8; 16]);
 
 /// The EntityState nested inside a 0.9.x durable Presence, pinned as its own
 /// struct so later changes to the live EntityState shape cannot silently
@@ -100,9 +110,20 @@ struct LegacyPresence {
 #[derive(Serialize, Deserialize)]
 #[allow(dead_code)]
 struct LegacyEntityState {
-    entity_id: EntityId,
+    entity_id: LegacyId,
     collection: CollectionId,
-    state: State,
+    state: LegacyState,
+}
+
+/// The State nested inside a 0.9.x durable Presence: buffers and head only,
+/// with no membership set. Frozen for the same reason as [`LegacyId`] —
+/// the live [`State`] grew a `memberships` field between these two fields,
+/// which a 0.9.x peer does not send.
+#[derive(Serialize, Deserialize, Default)]
+#[allow(dead_code)]
+struct LegacyState {
+    state_buffers: StateBuffers,
+    head: Clock,
 }
 
 /// True if `data` (an entire [`crate::Message`] frame that failed normal
@@ -125,7 +146,7 @@ mod tests {
     use super::*;
 
     fn presence() -> Presence {
-        Presence { node_id: EntityId::new(), durable: true, system_root: None, protocol_version: PROTOCOL_VERSION }
+        Presence { node_id: EntityId::random(), durable: true, system_root: None, protocol_version: PROTOCOL_VERSION }
     }
 
     /// The 0.9.x wire shapes, mirrored for compatibility tests.
@@ -146,24 +167,22 @@ mod tests {
         }
     }
 
-    /// With no nested system root, the pre-#294 encoding remains a strict
-    /// prefix of the current one because protocol_version is last.
+    /// The advertised version is the last field, so a current Presence ends
+    /// with exactly those four bytes. The 0.9.x encoding is not a prefix of
+    /// the current one (the node ids differ in width), which is why
+    /// [`is_version0_presence`] classifies against frozen mirror structs
+    /// rather than by prefix match.
     #[test]
-    fn legacy_encoding_is_a_prefix() {
+    fn the_advertised_version_is_the_last_field() {
         let p = presence();
-        let new_bytes = bincode::serialize(&crate::Message::Presence(p.clone())).unwrap();
-        let old_bytes =
-            bincode::serialize(&LegacyMessage::Presence(LegacyPresence { node_id: p.node_id, durable: p.durable, system_root: None }))
-                .unwrap();
-        assert_eq!(new_bytes[..old_bytes.len()], old_bytes[..]);
-        assert_eq!(new_bytes.len(), old_bytes.len() + 4);
-        assert_eq!(new_bytes[old_bytes.len()..], PROTOCOL_VERSION.to_le_bytes());
+        let bytes = bincode::serialize(&crate::Message::Presence(p.clone())).unwrap();
+        assert_eq!(bytes[bytes.len() - 4..], PROTOCOL_VERSION.to_le_bytes());
     }
 
     #[test]
     fn classifies_version0_presence() {
         let old_bytes =
-            bincode::serialize(&LegacyMessage::Presence(LegacyPresence { node_id: EntityId::new(), durable: false, system_root: None }))
+            bincode::serialize(&LegacyMessage::Presence(LegacyPresence { node_id: LegacyId([7; 16]), durable: false, system_root: None }))
                 .unwrap();
         // An old presence fails current decoding and classifies as version 0.
         assert!(bincode::deserialize::<crate::Message>(&old_bytes).is_err());
@@ -185,13 +204,13 @@ mod tests {
     #[test]
     fn classifies_durable_version0_presence_with_legacy_system_root() {
         let old_bytes = bincode::serialize(&LegacyMessage::Presence(LegacyPresence {
-            node_id: EntityId::new(),
+            node_id: LegacyId([7; 16]),
             durable: true,
             system_root: Some(Attested::opt(
                 LegacyEntityState {
-                    entity_id: EntityId::new(),
+                    entity_id: LegacyId([9; 16]),
                     collection: CollectionId::fixed_name("_ankurah_system"),
-                    state: State::default(),
+                    state: LegacyState::default(),
                 },
                 None,
             )),

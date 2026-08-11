@@ -9,7 +9,7 @@
 //!
 //! Nodes are addressed by a stable logical index (0, 1, 2, ...) assigned at
 //! construction. Scheduling, faults, and the trace key on that index and never
-//! on the node's ULID id, which is random and would leak entropy into the
+//! on the node's id, which is random and would leak entropy into the
 //! schedule.
 
 use ankurah::proto::{self, Attested};

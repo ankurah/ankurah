@@ -163,6 +163,20 @@ where
     }
 }
 
+/// The event in a peer's `GetEvents` response that actually answers a request
+/// for `event_id`: one that recomputes to the id asked for and is structurally
+/// well formed.
+///
+/// Both are the peer's word rather than ours. An event that derives some other
+/// id does not answer this request, and caching it under the requested id would
+/// make every later reader of that id read the wrong event. A malformed one --
+/// a genesis whose content derives a different id, a genesis carrying a parent
+/// clock, an update carrying none -- would reach the DAG layers, where its
+/// backend diffs and its membership are applied to the requesting entity.
+fn answering_event(peer_events: Vec<Attested<Event>>, event_id: &EventId) -> Option<Attested<Event>> {
+    peer_events.into_iter().find(|event| event.payload.id() == *event_id && event.payload.validate_structure().is_ok())
+}
+
 #[async_trait]
 impl<'a, SE, PA, C> GetEvents for CachedEventGetter<'a, SE, PA, C>
 where
@@ -200,11 +214,15 @@ where
             .await?
         {
             proto::NodeResponseBody::GetEvents(peer_events) => {
-                // Store locally for future access
-                for event in peer_events.iter() {
-                    self.collection.add_event(event).await?;
-                }
-                peer_events.into_iter().next().map(|e| e.payload).ok_or_else(|| RetrievalError::EventNotFound(event_id.clone()))
+                // Deliberately not checked here: the policy hook
+                // (validate_received_event) that the other three peer-event
+                // paths call stays with peer-event validation for visibility,
+                // together with the ignored coverage in
+                // tests/tests/adversarial_wire.rs, and membership
+                // admissibility at BFS time is identity-02's.
+                let event = answering_event(peer_events, event_id).ok_or_else(|| RetrievalError::EventNotFound(event_id.clone()))?;
+                self.collection.add_event(&event).await?;
+                Ok(event.payload)
             }
             proto::NodeResponseBody::Error(e) => Err(RetrievalError::StorageError(format!("Error from peer: {}", e).into())),
             _ => Err(RetrievalError::StorageError("Unexpected response type from peer".into())),
@@ -305,12 +323,30 @@ mod tests {
     }
 
     /// Create a test event with a deterministic content-hashed ID.
+    ///
+    /// The nonce comes from the seed rather than from entropy, so every id is
+    /// reproducible across runs. A genesis derives its entity id from its own
+    /// content, the way the production mint does, so the staging lifecycle runs
+    /// over the only genesis shape a node can produce rather than one the
+    /// commit funnels would refuse. An update names the seed-derived id
+    /// instead, because a fixture's parents are synthetic event ids with no
+    /// genesis behind them.
     fn make_test_event(seed: u8, parent_ids: &[EventId]) -> Event {
-        let mut entity_id_bytes = [0u8; 16];
+        let mut entity_id_bytes = [0u8; 32];
         entity_id_bytes[0] = seed;
-        let entity_id = EntityId::from_bytes(entity_id_bytes);
+        let mut nonce = [0u8; 32];
+        nonce[0] = seed;
 
-        Event { entity_id, collection: "test".into(), parent: Clock::from(parent_ids.to_vec()), operations: OperationSet::default() }
+        let parent = Clock::from(parent_ids.to_vec());
+        let author = ankurah_proto::AuthorId::Unknown;
+        let operations = OperationSet::default();
+        let (entity_id, body) = if parent.is_empty() {
+            let entity_id = EntityId::from(EventId::from_genesis_parts(&None, &nonce, 0, &author, &operations));
+            (entity_id, ankurah_proto::EventBody::Genesis { system: None, nonce, timestamp: 0, author, operations })
+        } else {
+            (EntityId::from_bytes(entity_id_bytes), ankurah_proto::EventBody::Update { nonce, timestamp: 0, author, operations })
+        };
+        Event { entity_id, collection: "test".into(), body, parent }
     }
 
     // ====================================================================

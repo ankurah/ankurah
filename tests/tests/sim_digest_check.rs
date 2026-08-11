@@ -30,19 +30,20 @@ fn event_only_message(entity: proto::EntityId, ev: Attested<proto::Event>) -> pr
 
 #[test]
 fn digest_distinguishes_different_eventonly_batches_same_count() {
-    let e = model::entity_id(1);
-    // Two different single-event EventOnly updates for the same entity: same
-    // shape and cardinality, different content.
-    let d1 = message_digest(&event_only_message(e, model::attest(model::genesis_event(e, model::Field::Title, "one"))));
-    let d2 = message_digest(&event_only_message(e, model::attest(model::genesis_event(e, model::Field::Title, "two"))));
+    // Two different single-event EventOnly updates: same shape and
+    // cardinality, different content.
+    let one = model::genesis_event(1, model::Field::Title, "one");
+    let two = model::genesis_event(1, model::Field::Title, "two");
+    let d1 = message_digest(&event_only_message(one.entity_id, model::attest(one.clone())));
+    let d2 = message_digest(&event_only_message(two.entity_id, model::attest(two)));
     assert_ne!(d1, d2, "different EventOnly batches for one entity must have different digests");
 }
 
 #[test]
 fn digest_is_stable_for_identical_content() {
     // The other half of the property: equal content must hash equal.
-    let e = model::entity_id(2);
-    let d1 = message_digest(&event_only_message(e, model::attest(model::genesis_event(e, model::Field::Title, "same"))));
-    let d2 = message_digest(&event_only_message(e, model::attest(model::genesis_event(e, model::Field::Title, "same"))));
+    let same = model::genesis_event(2, model::Field::Title, "same");
+    let d1 = message_digest(&event_only_message(same.entity_id, model::attest(same.clone())));
+    let d2 = message_digest(&event_only_message(same.entity_id, model::attest(same)));
     assert_eq!(d1, d2, "identical content must produce identical digests");
 }

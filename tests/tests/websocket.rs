@@ -193,8 +193,8 @@ async fn test_websocket_bidirectional_subscription_impl() -> Result<()> {
 
     // Subscribe to pets with age > 5
     use ankurah::signals::Subscribe;
-    let server_livequery = server_ctx.query_wait::<PetView>("age > 5").await?;
-    let client_livequery = client_ctx.query_wait::<PetView>("age > 5").await?;
+    let server_livequery = server_ctx.query_wait::<PetView>("age > 5 ORDER BY name").await?;
+    let client_livequery = client_ctx.query_wait::<PetView>("age > 5 ORDER BY name").await?;
 
     let _server_sub = server_livequery.subscribe(&server_watcher);
     let _client_sub = client_livequery.subscribe(&client_watcher);
@@ -232,7 +232,8 @@ async fn test_websocket_bidirectional_subscription_impl() -> Result<()> {
     use ankurah::signals::Peek;
     let server_pets = server_livequery.peek().iter().map(|p| p.id()).collect::<Vec<EntityId>>();
     let client_pets = client_livequery.peek().iter().map(|p| p.id()).collect::<Vec<EntityId>>();
-    let expected_pets = vec![rex_id, buddy_id];
+    // ORDER BY name: Buddy before Rex, on both sides.
+    let expected_pets = vec![buddy_id, rex_id];
 
     assert_eq!(server_pets, expected_pets);
     assert_eq!(client_pets, expected_pets);

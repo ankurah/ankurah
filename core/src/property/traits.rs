@@ -1,13 +1,23 @@
 use anyhow::Result;
 
-use crate::{entity::Entity, error::RetrievalError, property::PropertyName, value::CastError};
+use crate::{
+    entity::{Entity, ProvisionalEntity},
+    error::RetrievalError,
+    property::PropertyName,
+    value::CastError,
+};
 
 use thiserror::Error;
 
 use super::Value;
 
+/// Write a model field's initial value into the backend that will store it.
+///
+/// The receiver is the [`ProvisionalEntity`] being staged for creation:
+/// initial values are what the entity's id is derived from, so they exist
+/// before any entity does.
 pub trait InitializeWith<T> {
-    fn initialize_with(entity: &Entity, property_name: PropertyName, value: &T) -> Self;
+    fn initialize_with(provisional: &mut ProvisionalEntity, property_name: PropertyName, value: &T);
 }
 
 #[derive(Error, Debug)]

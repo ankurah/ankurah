@@ -1,0 +1,14 @@
+# getrandom 0.3 refuses to build for wasm32-unknown-unknown unless the final
+# build names a backend, because the target has no OS entropy source of its own
+# and only the top of the build knows whether a JS one exists. The choice is a
+# rustflag rather than a Cargo feature, so no library can make it: every wasm
+# consumer of this workspace has to set it. Setting it here means any wasm32
+# build run from anywhere inside the workspace gets it, including the two
+# dependency-leaf crates (ankurah-core-types and ankurah-proto) that reach
+# getrandom through rand for EntityId::random and an event's nonce.
+#
+# Cargo does not merge rustflags across config files; the file nearest the
+# working directory wins. This is the only one in the workspace, so it applies
+# uniformly whether cargo runs from the root or from a package directory.
+[target.'cfg(target_arch = "wasm32")']
+rustflags = ["--cfg", "getrandom_backend=\"wasm_js\""]

@@ -3,7 +3,7 @@ use base64::write::EncoderWriter;
 use postgres_protocol::types;
 use postgres_types::{to_sql_checked, FromSql, IsNull, Kind, ToSql, Type};
 
-use crate::{Clock, DecodeError, EventId, OperationSet};
+use crate::{Clock, DecodeError, EventBody, EventId};
 use bytes::{BufMut, BytesMut};
 use std::error::Error;
 use std::io::Write;
@@ -121,8 +121,8 @@ impl<'a> FromSql<'a> for Clock {
     }
 }
 
-// use bytea and bincode to serialize and deserialize OperationSet - do not base64 encode the bytea
-impl ToSql for OperationSet {
+// use bytea and bincode to serialize and deserialize the event body - do not base64 encode the bytea
+impl ToSql for EventBody {
     fn to_sql(&self, ty: &Type, out: &mut BytesMut) -> Result<IsNull, Box<dyn Error + Sync + Send>>
     where Self: Sized {
         if ty.name() != "bytea" {
@@ -143,13 +143,13 @@ impl ToSql for OperationSet {
 
     to_sql_checked!();
 }
-impl<'a> FromSql<'a> for OperationSet {
+impl<'a> FromSql<'a> for EventBody {
     fn from_sql(ty: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn Error + Sync + Send>> {
         if ty.name() != "bytea" {
             return Err("expected bytea type".into());
         }
-        let set: OperationSet = bincode::deserialize(raw).map_err(|_| DecodeError::InvalidFormat)?;
-        Ok(set)
+        let body: EventBody = bincode::deserialize(raw).map_err(|_| DecodeError::InvalidFormat)?;
+        Ok(body)
     }
 
     fn accepts(ty: &Type) -> bool {

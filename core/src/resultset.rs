@@ -272,7 +272,9 @@ impl<'a, E: AbstractEntity> ResultSetWrite<'a, E> {
             guard.order.sort_by(|a, b| {
                 match (&a.sort_key, &b.sort_key) {
                     (Some(key_a), Some(key_b)) => {
-                        // Compare keys first, then entity ID for tie-breaking
+                        // Equal ORDER BY keys tie-break on entity id:
+                        // deterministic across nodes, semantically arbitrary
+                        // (ids are content hashes).
                         key_a.cmp(key_b).then_with(|| a.entity.id().cmp(b.entity.id()))
                     }
                     (Some(_), None) => std::cmp::Ordering::Less,
@@ -281,7 +283,8 @@ impl<'a, E: AbstractEntity> ResultSetWrite<'a, E> {
                 }
             });
         } else {
-            // Sort by entity ID only if no key spec
+            // No ORDER BY: entity-id order -- deterministic across nodes,
+            // semantically arbitrary (ids are content hashes).
             guard.order.sort_by(|a, b| a.entity.id().cmp(b.entity.id()));
         }
 
@@ -567,7 +570,7 @@ mod tests {
 
     impl TestEntity {
         fn new(id: u8, properties: HashMap<String, Value>) -> Self {
-            let mut id_bytes = [0u8; 16];
+            let mut id_bytes = [0u8; 32];
             id_bytes[15] = id;
             Self { id: proto::EntityId::from_bytes(id_bytes), collection: proto::CollectionId::fixed_name("test"), properties }
         }

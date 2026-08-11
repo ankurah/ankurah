@@ -33,11 +33,6 @@ impl<T> Attested<T> {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Principal {
-    // TODO
-}
-
 impl<T: std::fmt::Display> std::fmt::Display for Attested<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "Attested({})", self.payload) }
 }

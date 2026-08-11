@@ -3,8 +3,9 @@
 The maintained design-goals page lives in the Ankurah book:
 https://ankurah.org/design-goals.html
 
-Two notes for readers of historical copies of this file: entity ids are
-ULIDs generated without coordination, and event ids are content hashes of
-the event payload and its parent clock (they have been content-addressed
-for a long time). Earlier drafts of this document described a ULID-based
-operation-id scheme that no longer reflects the implementation.
+Two notes for readers of historical copies of this file: an entity id is the
+32-byte id of that entity's genesis event, so an identity cannot be chosen
+ahead of the content it names, and every event id is a content hash over the
+event body and its parent clock. Earlier drafts of this document described
+coordination-free ULID entity ids and a ULID-based operation-id scheme;
+neither reflects the implementation.

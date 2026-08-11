@@ -80,8 +80,10 @@ mod tests {
 
     #[test]
     fn wire_encoding_and_variant_order_are_pinned() {
-        let id = EntityId::from_bytes([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
-        assert_eq!(bincode::serialize(&ModelId::EntityId(id)).unwrap(), [0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+        let id = EntityId::from_bytes([
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+        ]);
+        assert_eq!(bincode::serialize(&ModelId::EntityId(id)).unwrap(), [0u32.to_le_bytes().to_vec(), id.to_bytes().to_vec()].concat());
 
         let variants = [SystemModel::System, SystemModel::Model, SystemModel::Property, SystemModel::ModelProperty];
         for (ordinal, variant) in variants.into_iter().enumerate() {
@@ -95,7 +97,9 @@ mod tests {
 
     #[test]
     fn entity_ids_never_decode_as_system_models() {
-        for bytes in [[0u8; 16], [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], [0xff; 16]] {
+        let mut low_bit_set = [0u8; 32];
+        low_bit_set[31] = 1;
+        for bytes in [[0u8; 32], low_bit_set, [0xff; 32]] {
             let id = EntityId::from_bytes(bytes);
             let model = ModelId::EntityId(id);
             assert_eq!(bincode::deserialize::<ModelId>(&bincode::serialize(&model).unwrap()).unwrap(), model);

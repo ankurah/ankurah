@@ -237,7 +237,7 @@ impl StorageCollection for IndexedDBBucket {
             let payload = &attested_event.payload;
             event_obj.set(&*ID_KEY, &payload.id())?;
             event_obj.set(&*ENTITY_ID_KEY, payload.entity_id.to_base64())?;
-            event_obj.set(&*OPERATIONS_KEY, &payload.operations)?;
+            event_obj.set(&*BODY_KEY, &payload.body)?;
             event_obj.set(&*ATTESTATIONS_KEY, &attested_event.attestations)?;
             event_obj.set(&*PARENT_KEY, &payload.parent)?;
 
@@ -279,7 +279,7 @@ impl StorageCollection for IndexedDBBucket {
                     payload: ankurah_proto::Event {
                         collection: self.collection_id.clone(),
                         entity_id: event_obj.get(&ENTITY_ID_KEY)?,
-                        operations: event_obj.get(&OPERATIONS_KEY)?,
+                        body: event_obj.get(&BODY_KEY)?,
                         parent: event_obj.get(&PARENT_KEY)?,
                     },
                     attestations: event_obj.get(&ATTESTATIONS_KEY)?,
@@ -320,7 +320,7 @@ impl StorageCollection for IndexedDBBucket {
                         collection: self.collection_id.clone(),
                         // id: event_obj.get(&ID_KEY)?.try_into()?,
                         entity_id: event_obj.get(&ENTITY_ID_KEY)?,
-                        operations: event_obj.get(&OPERATIONS_KEY)?,
+                        body: event_obj.get(&BODY_KEY)?,
                         parent: event_obj.get(&PARENT_KEY)?,
                     },
                     attestations: event_obj.get(&ATTESTATIONS_KEY)?,

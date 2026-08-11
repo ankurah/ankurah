@@ -418,7 +418,7 @@ mod tests {
             Value::F64(1.0),
             Value::Bool(true),
             Value::String("1".into()),
-            Value::EntityId(crate::EntityId::new()),
+            Value::EntityId(crate::EntityId::random()),
             Value::Object(vec![]),
             Value::Binary(vec![1]),
             Value::Json(serde_json::json!(1)),

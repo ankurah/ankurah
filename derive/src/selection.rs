@@ -490,9 +490,15 @@ fn generate_literal_code_with_replacements(
         ankql::ast::Literal::I32(i) => {
             quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Literal::I32(#i)) }
         }
-        ankql::ast::Literal::EntityId(ulid) => {
-            let ulid_u128 = ulid.0;
-            quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Literal::EntityId(::ulid::Ulid(#ulid_u128))) }
+        ankql::ast::Literal::EntityId(id) => {
+            // An entity id is 32 hash bytes with no narrower form to lift it
+            // through, so the literal is emitted as its exact byte array.
+            let bytes = id.to_bytes();
+            quote! {
+                ::ankql::ast::Expr::Literal(::ankql::ast::Literal::EntityId(
+                    ::ankurah::proto::EntityId::from_bytes([#(#bytes),*])
+                ))
+            }
         }
         ankql::ast::Literal::Object(_items) => {
             todo!("Object literals");

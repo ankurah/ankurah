@@ -66,12 +66,12 @@ fn v6_unknown_entity_item_does_not_poison_batch_or_leave_phantom() {
                     // the final states converge.
                     let head_a = w.head_of(a).unwrap();
                     let head_b = w.head_of(b).unwrap();
-                    let ev_a = model::attest(model::edit_event(a, head_a, Field::Body, "a1"));
-                    let ev_b = model::attest(model::edit_event(b, head_b, Field::Body, "b1"));
+                    let ev_a = model::attest(model::edit_event(a, head_a, Field::Body, "a1", w.next_mint_seq()));
+                    let ev_b = model::attest(model::edit_event(b, head_b, Field::Body, "b1", w.next_mint_seq()));
 
                     let unknown = w.reserve_unknown_entity();
                     let ghost_parent = proto::Clock::from(vec![proto::EventId::from_bytes([9u8; 32])]);
-                    let ev_unknown = model::attest(model::edit_event(unknown, ghost_parent, Field::Title, "ghost"));
+                    let ev_unknown = model::attest(model::edit_event(unknown, ghost_parent, Field::Title, "ghost", w.next_mint_seq()));
 
                     // Apply the valid edits at node 0 so it and node 1 converge.
                     w.apply_events_at(0, a, vec![ev_a.clone()]).await;
@@ -113,9 +113,9 @@ fn v4_bridge_events_arrive_child_first() {
                     // Build a two-event chain on node 0: base <- mid <- tip,
                     // writing different fields so both writes are observable.
                     let head0 = w.head_of(e).unwrap();
-                    let ev_mid = model::attest(model::edit_event(e, head0, Field::Body, "mid"));
+                    let ev_mid = model::attest(model::edit_event(e, head0, Field::Body, "mid", w.next_mint_seq()));
                     let mid_clock = proto::Clock::from(vec![ev_mid.payload.id()]);
-                    let ev_tip = model::attest(model::edit_event(e, mid_clock, Field::Title, "tip"));
+                    let ev_tip = model::attest(model::edit_event(e, mid_clock, Field::Title, "tip", w.next_mint_seq()));
 
                     // Apply both at node 0 (parent-first) so it is the source of truth.
                     w.apply_events_at(0, e, vec![ev_mid.clone(), ev_tip.clone()]).await;

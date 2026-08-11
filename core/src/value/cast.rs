@@ -215,7 +215,7 @@ mod tests {
 
     #[test]
     fn test_string_to_entity_id() {
-        let entity_id = EntityId::new();
+        let entity_id = EntityId::random();
         let base64_str = entity_id.to_base64();
         let value = Value::String(base64_str.clone());
 
@@ -228,7 +228,7 @@ mod tests {
 
     #[test]
     fn test_entity_id_to_string() {
-        let entity_id = EntityId::new();
+        let entity_id = EntityId::random();
         let value = Value::EntityId(entity_id.clone());
 
         let result = value.cast_to(ValueType::String).unwrap();

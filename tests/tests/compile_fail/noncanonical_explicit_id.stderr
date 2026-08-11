@@ -1,4 +1,4 @@
-error: explicit id "AAAAAAAAAAAAAAAAAAAAAB" is not a valid EntityId encoding: Invalid Base64: Invalid last symbol 66, offset 21.
+error: explicit id "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB" is not a valid EntityId encoding: Invalid Base64: Invalid last symbol 66, offset 42.
   --> tests/compile_fail/noncanonical_explicit_id.rs:12:16
    |
 12 |     pub label: String,

@@ -94,8 +94,8 @@ fn test_or_composed_scope_denies_the_row_without_erroring() {
     let agent = agent_with(OR_SCOPE_CONFIG, &keys);
     let collection = CollectionId::from("note");
 
-    let owner = EntityId::new();
-    let reviewer = EntityId::new();
+    let owner = EntityId::random();
+    let reviewer = EntityId::random();
     let private = NoteRow { owner, reviewer, visibility: "private" };
     let shared = NoteRow { owner, reviewer, visibility: "shared" };
 
