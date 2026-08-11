@@ -17,7 +17,7 @@
 //! Attributes parsed here: `#[property(renamed_from = "...")]` (the
 //! transient rename hint) and `#[property(id = "...")]` /
 //! `#[model(id = "...")]` (explicit binding). Explicit-id values
-//! are validated at compile time as URL-safe base64 of exactly 16 bytes.
+//! are validated at compile time as URL-safe base64 of exactly 32 bytes.
 
 use proc_macro2::TokenStream;
 use quote::quote;
@@ -40,7 +40,7 @@ struct ValueTypeMapping<'a> {
 /// trait-bound errors.
 ///
 /// Checks: the reserved `_ankurah_` collection prefix, and
-/// the URL-safe-base64/16-byte shape of every `#[property(id = "...")]` and
+/// the URL-safe-base64/32-byte shape of every `#[property(id = "...")]` and
 /// `#[model(id = "...")]` explicit binding. It also surfaces any
 /// malformed `#[property(...)]` list.
 pub fn validate_schema_attrs(model: &ModelDescription) -> syn::Result<()> {
@@ -122,7 +122,7 @@ pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
         let renamed_from_tokens = option_str_tokens(renamed_from.as_deref());
 
         // #[property(id = "...")]: explicit binding to a known property
-        // entity. Validated as URL-safe base64 / 16 bytes.
+        // entity. Validated as URL-safe base64 / 32 bytes.
         let explicit_id = property_str_attr(&field.attrs, "id")?;
         if let Some(ref id) = explicit_id {
             validate_explicit_id(id).map_err(|msg| syn::Error::new(field.ty.span(), msg))?;
@@ -316,14 +316,14 @@ mod tests {
 
     #[test]
     fn explicit_id_validation_matches_the_runtime_parse() {
-        // 16 zero bytes -> "AAAAAAAAAAAAAAAAAAAAAA" (22 chars).
-        assert!(validate_explicit_id("AAAAAAAAAAAAAAAAAAAAAA").is_ok());
-        // 20 chars decode to fewer than 16 bytes.
-        assert!(validate_explicit_id("AAAAAAAAAAAAAAAAAAAA").is_err());
+        // 32 zero bytes -> 43 'A' characters.
+        assert!(validate_explicit_id("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").is_ok());
+        // A 22-character (16-byte) string does not decode.
+        assert!(validate_explicit_id("AAAAAAAAAAAAAAAAAAAAAA").is_err());
         // Bad charset, padding, and noncanonical trailing bits all refuse.
-        assert!(validate_explicit_id("******UGBwgJCgsMDQ4PEA").is_err());
-        assert!(validate_explicit_id("AAAAAAAAAAAAAAAAAAAAA=").is_err());
-        assert!(validate_explicit_id("AAAAAAAAAAAAAAAAAAAAAB").is_err());
+        assert!(validate_explicit_id("******UGBwgJCgsMDQ4PEAAAAAAAAAAAAAAAAAAAAAA").is_err());
+        assert!(validate_explicit_id("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").is_err());
+        assert!(validate_explicit_id("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB").is_err());
     }
 
     /// `Option<T>` unwraps to the inner type (whose `Property` impl

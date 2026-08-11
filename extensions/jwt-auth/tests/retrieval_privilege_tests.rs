@@ -88,10 +88,10 @@ fn retrieval_tier_scans_nothing() {
     for scan in [
         "true",
         "name = 'Ada'",
-        "id = '5xEQjLcNhFLTKwyy2DZzHU'",
-        "id IN ('5xEQjLcNhFLTKwyy2DZzHU', '5xEQjLcNhFLTKwyy2DZzHV')",
-        "id > '5xEQjLcNhFLTKwyy2DZzHU'",
-        "id = '5xEQjLcNhFLTKwyy2DZzHU' AND name = 'Ada'",
+        "id = 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8'",
+        "id IN ('AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8', 'AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA')",
+        "id > 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8'",
+        "id = 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8' AND name = 'Ada'",
     ] {
         let out = agent.filter_predicate(&guest, &user, parse(scan)).unwrap();
         assert_eq!(out, Predicate::False, "every predicate is a scan at the retrieval tier: {scan}");
@@ -106,7 +106,7 @@ fn scan_tier_predicates_pass_untouched() {
     let user = CollectionId::fixed_name("user");
     let member = vec![member_ctx("member-1")];
 
-    for predicate in ["true", "name = 'Ada'", "id = '5xEQjLcNhFLTKwyy2DZzHU'"] {
+    for predicate in ["true", "name = 'Ada'", "id = 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8'"] {
         let out = agent.filter_predicate(&member, &user, parse(predicate)).unwrap();
         assert_eq!(out, parse(predicate), "read privilege scans freely: {predicate}");
     }

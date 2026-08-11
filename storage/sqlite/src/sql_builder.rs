@@ -2,11 +2,9 @@
 //!
 //! Converts AnkQL predicates to SQLite-compatible SQL WHERE clauses.
 
-use ankql::ast::{ComparisonOperator, Expr, Literal, OrderByItem, OrderDirection, Predicate, Selection};
-use ankurah_core::EntityId;
-use thiserror::Error;
-
 use crate::error::SqliteError;
+use ankql::ast::{ComparisonOperator, Expr, Literal, OrderByItem, OrderDirection, Predicate, Selection};
+use thiserror::Error;
 
 #[derive(Debug, Error, Clone)]
 pub enum SqlGenerationError {
@@ -219,7 +217,7 @@ impl SqlBuilder {
             Literal::Bool(b) => self.push_param(rusqlite::types::Value::Integer(if *b { 1 } else { 0 })),
             Literal::I16(i) => self.push_param(rusqlite::types::Value::Integer(*i as i64)),
             Literal::I32(i) => self.push_param(rusqlite::types::Value::Integer(*i as i64)),
-            Literal::EntityId(ulid) => self.push_param(rusqlite::types::Value::Text(EntityId::from_ulid(*ulid).to_base64())),
+            Literal::EntityId(id) => self.push_param(rusqlite::types::Value::Text(id.to_base64())),
             Literal::Object(bytes) => self.push_param(rusqlite::types::Value::Blob(bytes.clone())),
             Literal::Binary(bytes) => self.push_param(rusqlite::types::Value::Blob(bytes.clone())),
             // For JSON literals, extract the raw SQL value since json_extract() returns SQL types.

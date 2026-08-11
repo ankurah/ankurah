@@ -202,7 +202,7 @@ mod tests {
 
     impl TestEntity {
         fn new(id: u8, data: HashMap<String, Value>) -> Self {
-            let mut id_bytes = [0u8; 16];
+            let mut id_bytes = [0u8; 32];
             id_bytes[15] = id;
             Self {
                 id: proto::EntityId::from_bytes(id_bytes),

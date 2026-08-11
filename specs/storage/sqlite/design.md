@@ -48,9 +48,9 @@ Follow the Postgres pattern with dynamic table creation per collection:
 
 ```sql
 CREATE TABLE IF NOT EXISTS "{collection_id}" (
-    id TEXT PRIMARY KEY,          -- Base64-encoded ULID (matches Postgres)
+    id TEXT PRIMARY KEY,          -- Base64-encoded EntityId (matches Postgres)
     state_buffer BLOB NOT NULL,   -- bincode-serialized BTreeMap<String, Vec<u8>>
-    head TEXT NOT NULL,           -- JSON array of ULID strings (Clock)
+    head TEXT NOT NULL,           -- JSON array of base64 event id strings (Clock)
     attestations BLOB             -- bincode-serialized Vec<Vec<u8>>
 );
 ```
@@ -140,7 +140,7 @@ Key implementation details:
 - JSONB path handling: `json_extract("column", '$.path')` for reliable type-aware comparisons
 - Simple paths: Direct column reference `"column"`
 - Multi-step paths: `json_extract("column", '$.step1.step2')`
-- ULID storage: TEXT (base64) matching Postgres
+- Id storage: TEXT (base64) matching Postgres
 
 ## Connection Manager
 
@@ -189,7 +189,7 @@ storage/sqlite/
 1. **WASM support**: Deferred - not needed for initial implementation
 2. **WAL mode**: Enabled by default with additional performance PRAGMAs
 3. **Connection pooling**: Use `bb8` with custom manager (matches Postgres pattern)
-4. **ULID storage**: TEXT (base64) matching Postgres
+4. **Id storage**: TEXT (base64) matching Postgres
 5. **DDL locking**: Use `tokio::sync::Mutex` per collection to serialize ALTER TABLE operations
 6. **JSONB for JSON values**: Use SQLite's JSONB format (stored as BLOB via `jsonb()` function), queried via `json_extract()` for type-aware comparisons
 7. **Event storage**: Separate `{collection}_event` tables with entity_id index for efficient event retrieval

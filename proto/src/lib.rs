@@ -2,6 +2,7 @@
 uniffi::setup_scaffolding!();
 
 pub mod auth;
+pub mod author;
 pub mod clock;
 pub mod collection;
 pub mod data;
@@ -13,6 +14,7 @@ pub mod peering;
 pub mod request;
 mod subscription;
 pub mod sys;
+pub mod time;
 pub mod transaction;
 pub mod update;
 
@@ -26,6 +28,7 @@ pub mod wasm;
 pub use ankurah_core_types::{ModelId, PropertyId, SystemModel, SystemProperty};
 
 pub use auth::*;
+pub use author::*;
 pub use clock::*;
 pub use collection::*;
 pub use data::*;

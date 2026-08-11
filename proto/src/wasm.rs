@@ -5,7 +5,7 @@ use wasm_bindgen::JsValue;
 use crate::AttestationSet;
 use crate::CollectionId;
 use crate::StateBuffers;
-use crate::{Clock, DecodeError, EventId, OperationSet};
+use crate::{Clock, DecodeError, EventBody, EventId};
 
 impl TryFrom<JsValue> for EventId {
     type Error = DecodeError;
@@ -82,23 +82,23 @@ impl TryFrom<&AttestationSet> for JsValue {
     }
 }
 
-impl TryFrom<JsValue> for OperationSet {
+impl TryFrom<JsValue> for EventBody {
     type Error = DecodeError;
 
     fn try_from(value: JsValue) -> Result<Self, Self::Error> {
         let array: js_sys::Uint8Array = value.dyn_into().map_err(|_| DecodeError::InvalidFormat)?;
         let mut buffer = vec![0; array.length() as usize];
         array.copy_to(&mut buffer);
-        let set: OperationSet = bincode::deserialize(&buffer).map_err(|_| DecodeError::InvalidFormat)?;
+        let body: EventBody = bincode::deserialize(&buffer).map_err(|_| DecodeError::InvalidFormat)?;
 
-        Ok(set)
+        Ok(body)
     }
 }
 
-impl TryFrom<&OperationSet> for JsValue {
+impl TryFrom<&EventBody> for JsValue {
     type Error = DecodeError;
 
-    fn try_from(val: &OperationSet) -> Result<Self, Self::Error> {
+    fn try_from(val: &EventBody) -> Result<Self, Self::Error> {
         let buffer = bincode::serialize(&val).map_err(|_| DecodeError::InvalidFormat)?;
         let array = js_sys::Uint8Array::new_with_length(buffer.len() as u32);
         array.copy_from(&buffer);

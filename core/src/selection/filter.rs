@@ -392,7 +392,7 @@ mod tests {
     /// (its `variables::typed_expr`), and it arrives here.
     #[test]
     fn test_entity_id_field_never_equals_a_non_id_string() {
-        let row = OwnedItem { owner: ankurah_proto::EntityId::new() };
+        let row = OwnedItem { owner: ankurah_proto::EntityId::random() };
 
         // 'guest' does not parse as an EntityId, so the cast toward the field's
         // type fails and the surviving comparison is the row's id rendered as

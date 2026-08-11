@@ -9,7 +9,7 @@ async fn get_nonexistent_entity_errors() -> anyhow::Result<()> {
     let node = durable_sled_setup().await?;
     let ctx = node.context(DEFAULT_CONTEXT)?;
 
-    let result = ctx.get::<AlbumView>(EntityId::new()).await;
+    let result = ctx.get::<AlbumView>(EntityId::random()).await;
     assert!(matches!(result, Err(RetrievalError::EntityNotFound(_))));
     Ok(())
 }
@@ -20,7 +20,7 @@ async fn local_rejects_phantom_commit() -> anyhow::Result<()> {
     let node = durable_sled_setup().await?;
     let ctx = node.context(DEFAULT_CONTEXT)?;
 
-    let phantom = AlbumView::from_entity(node.conjure_evil_phantom(EntityId::new(), Album::collection()));
+    let phantom = AlbumView::from_entity(node.conjure_evil_phantom(EntityId::random(), Album::collection()));
     let trx = ctx.begin();
     phantom.edit(&trx)?.name().replace("inside your mind")?;
 
@@ -37,12 +37,13 @@ async fn server_rejects_update_for_nonexistent() -> anyhow::Result<()> {
         LocalProcessConnection::new(&server, &client).await?;
     client.system.wait_system_ready().await;
 
-    let fake_update = proto::Event {
-        collection: Album::collection(),
-        entity_id: EntityId::new(),
-        operations: proto::OperationSet::from_backends(BTreeMap::new()),
-        parent: proto::Clock::new([proto::EventId::from_bytes([1u8; 32])]),
-    };
+    let fake_update = proto::Event::update(
+        Album::collection(),
+        EntityId::random(),
+        proto::Clock::new([proto::EventId::from_bytes([1u8; 32])]),
+        proto::AuthorId::Unknown,
+        proto::OperationSet::from_backends(BTreeMap::new()),
+    );
 
     let resp = client
         .request(
@@ -56,9 +57,17 @@ async fn server_rejects_update_for_nonexistent() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Server rejects create events for entities that already exist.
+/// Server refuses a genesis whose content derives an id other than the one the
+/// event names (`EventStructureError::GenesisIdMismatch`).
+///
+/// The already-exists collision this test used to describe is unrepresentable
+/// under derived ids: a genesis names whatever entity its own content derives,
+/// so naming a foreign entity is a structural refusal that lands before any
+/// existence check runs. Using a real existing id here is what makes that
+/// concrete -- even an id the server certainly knows does not buy the event
+/// admission.
 #[tokio::test]
-async fn server_rejects_create_for_existing() -> anyhow::Result<()> {
+async fn server_refuses_a_genesis_whose_content_derives_a_different_id() -> anyhow::Result<()> {
     let server = durable_sled_setup().await?;
     let client = ephemeral_sled_setup().await?;
     let _conn = LocalProcessConnection::new(&server, &client).await?;
@@ -71,14 +80,11 @@ async fn server_rejects_create_for_existing() -> anyhow::Result<()> {
     let existing_id = album.id();
     trx.commit().await?;
 
-    // Try to send a create event for the same entity
-    // Arguably this is a "collision" but collisions really should not happen
-    let fake_create = proto::Event {
-        collection: Album::collection(),
-        entity_id: existing_id,
-        operations: proto::OperationSet::from_backends(BTreeMap::new()),
-        parent: proto::Clock::new([]),
-    };
+    // Overwrite the derived id with the existing entity's, so the event's own
+    // content no longer derives the id it names.
+    let mut fake_create =
+        proto::Event::genesis(Album::collection(), None, proto::AuthorId::Unknown, proto::OperationSet::from_backends(BTreeMap::new()));
+    fake_create.entity_id = existing_id;
 
     let resp = client
         .request(

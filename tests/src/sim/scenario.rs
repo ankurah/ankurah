@@ -28,6 +28,10 @@ pub struct Workload<'a> {
     rng: &'a mut SimRng,
     trace: &'a mut Trace,
     next_entity: u64,
+    /// How many update events this workload has forged. Folded into each one's
+    /// nonce, so two edits the schedule asked for separately stay two events
+    /// even when their content and parent are identical.
+    next_edit: u64,
     created: Vec<proto::EntityId>,
     /// Cached current head per entity, so an edit can parent correctly without
     /// reading a node (reads would be nondeterministic mid-flight; the harness
@@ -59,10 +63,10 @@ impl<'a> Workload<'a> {
     /// it to all other nodes through the scheduler, and return its id. The id
     /// is deterministic (seed-derived counter).
     pub async fn create_at(&mut self, origin: usize, field: Field, value: &str) -> proto::EntityId {
-        let id = model::entity_id(self.next_entity);
+        let event = model::genesis_event(self.next_entity, field, value);
+        let id = event.entity_id;
         self.next_entity += 1;
 
-        let event = model::genesis_event(id, field, value);
         let head = proto::Clock::from(vec![event.id()]);
         let attested = model::attest(event);
 
@@ -86,7 +90,7 @@ impl<'a> Workload<'a> {
     /// multi-head shape: capture a head, let another edit advance the tracked
     /// head, then edit again from the captured (now stale) head.
     pub async fn edit_from(&mut self, origin: usize, entity: proto::EntityId, parent: proto::Clock, field: Field, value: &str) {
-        let event = model::edit_event(entity, parent, field, value);
+        let event = model::edit_event(entity, parent, field, value, self.next_mint_seq());
         let new_head = proto::Clock::from(vec![event.id()]);
         let attested = model::attest(event);
         self.commit_and_propagate(origin, entity, vec![attested], &new_head).await;
@@ -96,6 +100,17 @@ impl<'a> Workload<'a> {
     /// The head clock the harness last produced for an entity (for building
     /// concurrent edits deliberately).
     pub fn head_of(&self, entity: proto::EntityId) -> Option<proto::Clock> { self.heads.get(&entity).cloned() }
+
+    /// The next mint sequence number, for a scenario forging an update event
+    /// itself rather than through [`Workload::edit_at`]. Pass it to
+    /// `model::edit_event`: it is what keeps two edits of the same field to the
+    /// same value from the same parent two events instead of one. Deterministic,
+    /// because the order of calls is the schedule.
+    pub fn next_mint_seq(&mut self) -> u64 {
+        let seq = self.next_edit;
+        self.next_edit += 1;
+        seq
+    }
 
     /// Drive the scheduler to quiescence mid-workload, so every node has
     /// received everything committed so far. Use this before issuing concurrent
@@ -216,7 +231,7 @@ impl<'a> Workload<'a> {
     pub fn reserve_unknown_entity(&mut self) -> proto::EntityId {
         // Use a high, disjoint id range so it can never collide with a
         // counter-derived created id.
-        let id = model::entity_id(u64::MAX - self.next_entity);
+        let id = model::uncreated_entity_id(u64::MAX - self.next_entity);
         self.next_entity += 1;
         self.forbidden.push(id);
         id
@@ -410,6 +425,7 @@ where
                 rng: &mut rng,
                 trace: &mut trace,
                 next_entity: 0,
+                next_edit: 0,
                 created: Vec::new(),
                 heads: std::collections::HashMap::new(),
                 subscriptions: Vec::new(),

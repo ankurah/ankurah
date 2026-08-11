@@ -10,7 +10,7 @@ use ankurah_core::{
     property::backend::backend_from_string,
     storage::{StorageCollection, StorageEngine},
 };
-use ankurah_proto::{Attestation, AttestationSet, Attested, EntityState, EventId, OperationSet, State, StateBuffers};
+use ankurah_proto::{Attestation, AttestationSet, Attested, EntityState, EventBody, EventId, State, StateBuffers};
 
 use futures_util::{pin_mut, TryStreamExt};
 
@@ -244,8 +244,8 @@ impl PostgresBucket {
         let create_query = format!(
             r#"CREATE TABLE IF NOT EXISTS "{}"(
                 "id" character(43) PRIMARY KEY,
-                "entity_id" character(22),
-                "operations" bytea,
+                "entity_id" character(43),
+                "body" bytea,
                 "parent" character(43)[],
                 "attestations" bytea
             )"#,
@@ -260,7 +260,7 @@ impl PostgresBucket {
     pub async fn create_state_table(&self, client: &mut tokio_postgres::Client) -> Result<(), StateError> {
         let create_query = format!(
             r#"CREATE TABLE IF NOT EXISTS "{}"(
-                "id" character(22) PRIMARY KEY,
+                "id" character(43) PRIMARY KEY,
                 "state_buffer" BYTEA,
                 "memberships" BYTEA,
                 "head" character(43)[],
@@ -656,11 +656,11 @@ impl StorageCollection for PostgresBucket {
     }
 
     async fn add_event(&self, entity_event: &Attested<Event>) -> Result<bool, MutationError> {
-        let operations = bincode::serialize(&entity_event.payload.operations)?;
+        let body = bincode::serialize(&entity_event.payload.body)?;
         let attestations = bincode::serialize(&entity_event.attestations)?;
 
         let query = format!(
-            r#"INSERT INTO "{0}"("id", "entity_id", "operations", "parent", "attestations") VALUES($1, $2, $3, $4, $5)
+            r#"INSERT INTO "{0}"("id", "entity_id", "body", "parent", "attestations") VALUES($1, $2, $3, $4, $5)
                ON CONFLICT ("id") DO NOTHING"#,
             self.event_table(),
         );
@@ -672,13 +672,7 @@ impl StorageCollection for PostgresBucket {
             match client
                 .execute(
                     &query,
-                    &[
-                        &entity_event.payload.id(),
-                        &entity_event.payload.entity_id,
-                        &operations,
-                        &entity_event.payload.parent,
-                        &attestations,
-                    ],
+                    &[&entity_event.payload.id(), &entity_event.payload.entity_id, &body, &entity_event.payload.parent, &attestations],
                 )
                 .await
             {
@@ -706,10 +700,8 @@ impl StorageCollection for PostgresBucket {
             return Ok(Vec::new());
         }
 
-        let query = format!(
-            r#"SELECT "id", "entity_id", "operations", "parent", "attestations" FROM "{0}" WHERE "id" = ANY($1)"#,
-            self.event_table(),
-        );
+        let query =
+            format!(r#"SELECT "id", "entity_id", "body", "parent", "attestations" FROM "{0}" WHERE "id" = ANY($1)"#, self.event_table(),);
 
         let client = self.pool.get().await.map_err(RetrievalError::storage)?;
         let rows = match client.query(&query, &[&event_ids]).await {
@@ -726,13 +718,13 @@ impl StorageCollection for PostgresBucket {
         let mut events = Vec::new();
         for row in rows {
             let entity_id: EntityId = row.try_get("entity_id").map_err(RetrievalError::storage)?;
-            let operations: OperationSet = row.try_get("operations").map_err(RetrievalError::storage)?;
+            let body: EventBody = row.try_get("body").map_err(RetrievalError::storage)?;
             let parent: Clock = row.try_get("parent").map_err(RetrievalError::storage)?;
             let attestations_binary: Vec<u8> = row.try_get("attestations").map_err(RetrievalError::storage)?;
             let attestations: Vec<Attestation> = bincode::deserialize(&attestations_binary).map_err(RetrievalError::storage)?;
 
             let event = Attested {
-                payload: Event { collection: self.collection_id.clone(), entity_id, operations, parent },
+                payload: Event { collection: self.collection_id.clone(), entity_id, body, parent },
                 attestations: AttestationSet(attestations),
             };
             events.push(event);
@@ -741,8 +733,7 @@ impl StorageCollection for PostgresBucket {
     }
 
     async fn dump_entity_events(&self, entity_id: EntityId) -> Result<Vec<Attested<Event>>, ankurah_core::error::RetrievalError> {
-        let query =
-            format!(r#"SELECT "id", "operations", "parent", "attestations" FROM "{0}" WHERE "entity_id" = $1"#, self.event_table(),);
+        let query = format!(r#"SELECT "id", "body", "parent", "attestations" FROM "{0}" WHERE "entity_id" = $1"#, self.event_table(),);
 
         let client = self.pool.get().await.map_err(RetrievalError::storage)?;
         debug!("PostgresBucket({}).get_events: {}", self.collection_id, query);
@@ -763,14 +754,14 @@ impl StorageCollection for PostgresBucket {
         let mut events = Vec::new();
         for row in rows {
             // let event_id: EventId = row.try_get("id").map_err(|err| RetrievalError::storage(err))?;
-            let operations_binary: Vec<u8> = row.try_get("operations").map_err(RetrievalError::storage)?;
-            let operations = bincode::deserialize(&operations_binary).map_err(RetrievalError::storage)?;
+            let body_binary: Vec<u8> = row.try_get("body").map_err(RetrievalError::storage)?;
+            let body: EventBody = bincode::deserialize(&body_binary).map_err(RetrievalError::storage)?;
             let parent: Clock = row.try_get("parent").map_err(RetrievalError::storage)?;
             let attestations_binary: Vec<u8> = row.try_get("attestations").map_err(RetrievalError::storage)?;
             let attestations: Vec<Attestation> = bincode::deserialize(&attestations_binary).map_err(RetrievalError::storage)?;
 
             events.push(Attested {
-                payload: Event { collection: self.collection_id.clone(), entity_id, operations, parent },
+                payload: Event { collection: self.collection_id.clone(), entity_id, body, parent },
                 attestations: AttestationSet(attestations),
             });
         }

@@ -263,7 +263,7 @@ fn assert_agrees_with_check_read<C: Iterable<JwtContext>>(agent: &JwtAgent, cont
     let filtered = agent.filter_predicate(contexts, &collection, base.clone()).expect("every scenario here yields a filter");
 
     for row in rows {
-        let readable = agent.check_read(contexts, &proto::EntityId::new(), &collection, &post_state(*row)).is_ok();
+        let readable = agent.check_read(contexts, &proto::EntityId::random(), &collection, &post_state(*row)).is_ok();
         let selected = admits(base, *row);
         assert_eq!(
             admits(&filtered, *row),
@@ -544,7 +544,7 @@ fn test_filter_predicate_all_unresolvable_refused() {
         "a lone unresolvable credential leaves nothing to read by, got: {:?}",
         filtered
     );
-    let read = agent.check_read(&lone, &proto::EntityId::new(), &collection, &row);
+    let read = agent.check_read(&lone, &proto::EntityId::random(), &collection, &row);
     assert!(
         matches!(read, Err(AccessDenied::ByPolicy("Read outside permitted scope"))),
         "the row-time half must deny the caller the query-time half refused, got: {:?}",
@@ -558,7 +558,7 @@ fn test_filter_predicate_all_unresolvable_refused() {
         "several unresolvable credentials are no better than one, got: {:?}",
         filtered
     );
-    let read = agent.check_read(&several, &proto::EntityId::new(), &collection, &row);
+    let read = agent.check_read(&several, &proto::EntityId::random(), &collection, &row);
     assert!(
         matches!(read, Err(AccessDenied::ByPolicy("Read outside permitted scope"))),
         "the row-time half must deny that caller too, got: {:?}",
@@ -586,8 +586,8 @@ fn test_filter_predicate_unresolvable_order_independent() {
     for row in [Post { author: "author-42", title: "hello" }, Post { author: "no-claim-1", title: "hello" }] {
         let state = post_state(row);
         assert_eq!(
-            agent.check_read(&broken_first, &proto::EntityId::new(), &collection, &state).is_ok(),
-            agent.check_read(&broken_last, &proto::EntityId::new(), &collection, &state).is_ok(),
+            agent.check_read(&broken_first, &proto::EntityId::random(), &collection, &state).is_ok(),
+            agent.check_read(&broken_last, &proto::EntityId::random(), &collection, &state).is_ok(),
             "post {}/{}: the row-time half must not depend on credential order either",
             row.author,
             row.title

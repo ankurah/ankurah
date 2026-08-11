@@ -68,8 +68,10 @@ impl NodeApplier {
         Ok(())
     }
 
-    /// Validate each event fragment against policy and stage it for BFS
-    /// discovery. Shared by every update arm that carries events.
+    /// Validate each event fragment structurally and against policy, then
+    /// stage it for BFS discovery. Shared by every update arm that carries
+    /// events, so it is the one place a subscription update's events are
+    /// admitted.
     fn validate_and_stage<SE, PA, E>(
         node: &Node<SE, PA>,
         from_peer_id: &proto::EntityId,
@@ -86,6 +88,11 @@ impl NodeApplier {
         let mut attested_events = Vec::new();
         for fragment in event_fragments {
             let attested_event: Attested<proto::Event> = (entity_id, collection_id.clone(), fragment).into();
+            // A genesis whose id the entity it claims does not derive, or a
+            // parent clock that disagrees with the body, is refused before
+            // the DAG ever sees it: the sender's framing of the entity id is
+            // what the fragment supplies, and a genesis must derive its own.
+            attested_event.payload.validate_structure()?;
             node.policy_agent.validate_received_event(node, from_peer_id, &attested_event)?;
             event_getter.stage_event(attested_event.payload.clone());
             attested_events.push(attested_event);

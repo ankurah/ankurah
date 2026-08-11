@@ -526,7 +526,7 @@ async fn explicit_id_binding_and_sharing() -> anyhow::Result<()> {
             backend: "lww".into(),
             value_type: "string".into(),
             target_label: None,
-            explicit_id: Some(EntityId::new()),
+            explicit_id: Some(EntityId::random()),
             optional: false,
         }])],
     };
@@ -631,7 +631,7 @@ async fn explicit_id_binding_accepts_castable_type_drift() -> anyhow::Result<()>
 #[tokio::test]
 async fn dangling_explicit_property_refuses_before_writes() -> anyhow::Result<()> {
     let (server, client, _conn) = connected_pair().await?;
-    let missing = EntityId::new();
+    let missing = EntityId::random();
     let request = proto::NodeRequestBody::RegisterSchema {
         models: vec![proto::RegisterModel {
             label: "dangling".into(),
@@ -668,7 +668,7 @@ async fn explicit_model_id_binding() -> anyhow::Result<()> {
     };
 
     // Binding an id that does not exist never mints.
-    expect_error(client.request(server.id, &DEFAULT_CONTEXT, bind("album", Some(EntityId::new()), vec![])).await?, "does not exist");
+    expect_error(client.request(server.id, &DEFAULT_CONTEXT, bind("album", Some(EntityId::random()), vec![])).await?, "does not exist");
 
     // Binding a different collection to album's model entity is a mismatch.
     expect_error(client.request(server.id, &DEFAULT_CONTEXT, bind("albumx", Some(album_model), vec![])).await?, "binder declares");

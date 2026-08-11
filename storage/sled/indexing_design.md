@@ -24,7 +24,7 @@ Composite index keys use length-prefixed encoding to handle variable-length fiel
 - `index_id`: 4-byte identifier for this index
 - `field_len`: 4-byte length prefix for each field
 - `field_bytes`: Variable-length bytes from `Collatable::to_bytes()`
-- `entity_id`: 16-byte entity ID for uniqueness and stable ordering
+- `entity_id`: the 32-byte entity ID for uniqueness and stable ordering
 
 This encoding:
 
@@ -194,7 +194,7 @@ When multiple indexes could satisfy a query:
 ### Storage Overhead
 
 - Each index stores: indexed fields + entity ID per entity
-- Approximate overhead: `(field_sizes + 16 bytes) * entity_count`
+- Approximate overhead: `(field_sizes + 32 bytes) * entity_count`
 
 ### Write Performance
 

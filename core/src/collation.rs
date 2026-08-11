@@ -68,7 +68,7 @@ impl Collatable for ast::Literal {
                 bits.to_be_bytes().to_vec()
             }
             ast::Literal::Bool(b) => vec![*b as u8],
-            ast::Literal::EntityId(ulid) => ulid.to_bytes().to_vec(),
+            ast::Literal::EntityId(id) => id.to_bytes().to_vec(),
             ast::Literal::Object(bytes) => bytes.clone(),
             ast::Literal::Binary(bytes) => bytes.clone(),
             ast::Literal::Json(json) => serde_json::to_vec(json).unwrap_or_default(),
@@ -128,8 +128,8 @@ impl Collatable for ast::Literal {
                     Some(vec![1])
                 }
             }
-            ast::Literal::EntityId(ulid) => {
-                let mut bytes = ulid.to_bytes();
+            ast::Literal::EntityId(id) => {
+                let mut bytes = id.to_bytes();
                 // Find the rightmost byte that can be incremented
                 for i in (0..bytes.len()).rev() {
                     if bytes[i] < 255 {
@@ -212,8 +212,8 @@ impl Collatable for ast::Literal {
                     None
                 }
             }
-            ast::Literal::EntityId(ulid) => {
-                let mut bytes = ulid.to_bytes();
+            ast::Literal::EntityId(id) => {
+                let mut bytes = id.to_bytes();
                 // Find the rightmost byte that can be decremented
                 for i in (0..bytes.len()).rev() {
                     if bytes[i] > 0 {
@@ -265,7 +265,7 @@ impl Collatable for ast::Literal {
             ast::Literal::I64(i) => *i == i64::MIN,
             ast::Literal::F64(f) => *f == f64::NEG_INFINITY,
             ast::Literal::Bool(b) => !b,
-            ast::Literal::EntityId(ulid) => ulid.to_bytes().iter().all(|&b| b == 0),
+            ast::Literal::EntityId(id) => id.to_bytes().iter().all(|&b| b == 0),
             ast::Literal::Object(bytes) | ast::Literal::Binary(bytes) => bytes.is_empty(),
             ast::Literal::Json(_) => false, // JSON doesn't have a minimum
         }
@@ -279,7 +279,7 @@ impl Collatable for ast::Literal {
             ast::Literal::I64(i) => *i == i64::MAX,
             ast::Literal::F64(f) => *f == f64::INFINITY,
             ast::Literal::Bool(b) => *b,
-            ast::Literal::EntityId(ulid) => ulid.to_bytes().iter().all(|&b| b == 255),
+            ast::Literal::EntityId(id) => id.to_bytes().iter().all(|&b| b == 255),
             ast::Literal::Object(_) | ast::Literal::Binary(_) => false, // No theoretical maximum
             ast::Literal::Json(_) => false,                             // JSON doesn't have a maximum
         }
@@ -397,12 +397,9 @@ impl Collatable for f64 {
     fn is_maximum(&self) -> bool { *self == f64::INFINITY }
 }
 
-// Implementation for EntityId (ULIDs have natural lexicographic ordering)
+// Implementation for EntityId: the raw hash bytes order lexicographically.
 impl Collatable for EntityId {
-    fn to_bytes(&self) -> Vec<u8> {
-        // EntityId is based on ULID which has lexicographic ordering
-        self.to_bytes().to_vec()
-    }
+    fn to_bytes(&self) -> Vec<u8> { self.to_bytes().to_vec() }
 
     fn successor_bytes(&self) -> Option<Vec<u8>> {
         if self.is_maximum() {
@@ -555,23 +552,19 @@ mod tests {
 
     #[test]
     fn test_literal_entity_id_collation() {
-        use ulid::Ulid;
-        let ulid = Ulid::new();
-        let lit = ast::Literal::EntityId(ulid);
+        let lit = ast::Literal::EntityId(EntityId::random());
 
         // Test basic operations
         assert!(!lit.is_minimum());
         assert!(!lit.is_maximum());
 
-        // Test minimum ULID (all zeros)
-        let min_ulid = Ulid::from_bytes([0; 16]);
-        let min_lit = ast::Literal::EntityId(min_ulid);
+        // Test minimum id (all zeros)
+        let min_lit = ast::Literal::EntityId(EntityId::from_bytes([0; 32]));
         assert!(min_lit.is_minimum());
         assert!(min_lit.predecessor_bytes().is_none());
 
-        // Test maximum ULID (all 255s)
-        let max_ulid = Ulid::from_bytes([255; 16]);
-        let max_lit = ast::Literal::EntityId(max_ulid);
+        // Test maximum id (all 255s)
+        let max_lit = ast::Literal::EntityId(EntityId::from_bytes([255; 32]));
         assert!(max_lit.is_maximum());
         assert!(max_lit.successor_bytes().is_none());
     }

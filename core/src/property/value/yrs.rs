@@ -1,7 +1,7 @@
 use std::{marker::PhantomData, sync::Arc};
 
 use crate::{
-    entity::Entity,
+    entity::{Entity, ProvisionalEntity},
     error::MutationError,
     property::{
         backend::{PropertyBackend, YrsBackend},
@@ -108,20 +108,21 @@ impl<'a, Projected> FromActiveType<YrsString<Projected>> for std::borrow::Cow<'a
 }
 
 impl<Projected> InitializeWith<String> for YrsString<Projected> {
-    fn initialize_with(entity: &Entity, property_name: PropertyName, value: &String) -> Self {
-        let new_string = Self::from_entity(property_name, entity);
-        new_string.insert(0, value).unwrap();
-        new_string
+    fn initialize_with(provisional: &mut ProvisionalEntity, property_name: PropertyName, value: &String) {
+        let backend = provisional.get_backend::<YrsBackend>().expect("YrsBackend should exist");
+        backend.insert(&property_name, 0, value).unwrap();
     }
 }
 
 impl<Projected> InitializeWith<Option<String>> for YrsString<Projected> {
-    fn initialize_with(entity: &Entity, property_name: PropertyName, value: &Option<String>) -> Self {
-        let new_string = Self::from_entity(property_name, entity);
+    fn initialize_with(provisional: &mut ProvisionalEntity, property_name: PropertyName, value: &Option<String>) {
+        // The backend is created even when there is no value: whether a
+        // model's yrs document exists at all is part of what the genesis
+        // preimage commits to.
+        let backend = provisional.get_backend::<YrsBackend>().expect("YrsBackend should exist");
         if let Some(value) = value {
-            new_string.insert(0, value).unwrap();
+            backend.insert(&property_name, 0, value).unwrap();
         }
-        new_string
     }
 }
 

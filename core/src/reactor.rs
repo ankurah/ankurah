@@ -458,7 +458,7 @@ mod tests {
     impl TestEntity {
         fn new(name: &str, status: &str) -> Self {
             Self {
-                id: proto::EntityId::new(),
+                id: proto::EntityId::random(),
                 collection: proto::CollectionId::fixed_name("album"),
                 state: Arc::new(Mutex::new(HashMap::from([
                     ("name".to_string(), name.to_string()),

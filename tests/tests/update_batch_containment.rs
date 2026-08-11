@@ -17,12 +17,13 @@ fn forge_title_event(entity_id: proto::EntityId, parent: proto::Clock, title: &s
     let backend = LWWBackend::new();
     backend.set("title".into(), Some(Value::String(title.to_owned())));
     let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
-    proto::Event {
+    proto::Event::update(
+        Record::collection(),
         entity_id,
-        collection: Record::collection(),
-        operations: proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)])),
         parent,
-    }
+        proto::AuthorId::Unknown,
+        proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)])),
+    )
 }
 
 fn event_only_item(event: proto::Event) -> proto::SubscriptionUpdateItem {
@@ -73,12 +74,13 @@ async fn test_event_only_multi_event_wire_order_is_untrusted() -> Result<()> {
         let backend = LWWBackend::new();
         backend.set("artist".into(), Some(Value::String("artist-p1".to_owned())));
         let ops = backend.to_operations().unwrap().expect("ops");
-        proto::Event {
-            entity_id: rec_id,
-            collection: ev_parent.collection.clone(),
-            operations: proto::OperationSet::from_backends(std::collections::BTreeMap::from([("lww".to_owned(), ops)])),
-            parent: ev_parent.parent.clone(),
-        }
+        proto::Event::update(
+            ev_parent.collection.clone(),
+            rec_id,
+            ev_parent.parent.clone(),
+            proto::AuthorId::Unknown,
+            proto::OperationSet::from_backends(std::collections::BTreeMap::from([("lww".to_owned(), ops)])),
+        )
     };
     let ev_child = forge_title_event(rec_id, proto::Clock::from(vec![ev_parent.id()]), "t-child");
     let (id_parent, id_child) = (ev_parent.id(), ev_child.id());
@@ -149,7 +151,7 @@ async fn test_event_only_unknown_entity_does_not_poison_batch() -> Result<()> {
     // about in the middle.
     let ev_a = forge_title_event(a_id, view_a.entity().head().clone(), "a1");
     let ev_b = forge_title_event(b_id, view_b.entity().head().clone(), "b1");
-    let unknown_id = proto::EntityId::new();
+    let unknown_id = proto::EntityId::random();
     let ev_unknown = forge_title_event(unknown_id, proto::Clock::from(vec![proto::EventId::from_bytes([7u8; 32])]), "ghost");
     let (id_ev_a, id_ev_b) = (ev_a.id(), ev_b.id());
 

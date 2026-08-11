@@ -4,7 +4,7 @@
 //! Registration is an UPSERT: the executor looks each definition up by its
 //! lookup key (model by source label; property by (model, name);
 //! model-property membership by (model, property)), ALLOCATES a fresh
-//! `EntityId::new()` -- a true ULID -- on miss, and emits ordinary events
+//! fresh entity id on miss, and emits ordinary events
 //! through the policy-checked commit pipeline. The whole execution
 //! serializes on a process-local mutex, and the executor upserts the
 //! resolved definitions into the catalog map synchronously after commit,
@@ -268,9 +268,9 @@ where
         if !node.durable {
             return Err(RegistrationError::NotDurable);
         }
-        if node.system.root().is_none() {
-            return Err(RegistrationError::SystemNotReady);
-        }
+        // Every catalog entity this allocator mints binds the system root
+        // into its id, so the root must already exist.
+        let system = node.system.root_id().ok_or(RegistrationError::SystemNotReady)?;
         let registration_validity = self.registration_validity().ok_or(RegistrationError::SystemNotReady)?;
         // Labels are schema lookup keys, not runtime model identities.
         // Reserved collections are refused before policy is even asked: the
@@ -359,13 +359,14 @@ where
                         (def.id, m.name.clone())
                     }
                     None => {
-                        let id = EntityId::new();
-                        plan.creates_models.push((id, m.clone()));
-                        push(creation(
+                        let event = creation(
+                            system,
                             model_collection(),
-                            id,
                             vec![("label", Value::String(m.label.clone())), ("name", Value::String(m.name.clone()))],
-                        ));
+                        );
+                        let id = event.entity_id;
+                        plan.creates_models.push((id, m.clone()));
+                        push(event);
                         (id, m.name.clone())
                     }
                 },
@@ -388,15 +389,16 @@ where
                             def.id
                         }
                         None => {
-                            let id = EntityId::new();
+                            let event = creation(
+                                system,
+                                model_collection(),
+                                vec![("label", Value::String(l.to_string())), ("name", Value::String(l.to_string()))],
+                            );
+                            let id = event.entity_id;
                             let stub =
                                 RegisterModel { label: l.to_string(), name: l.to_string(), explicit_id: None, properties: Vec::new() };
                             plan.creates_models.push((id, stub));
-                            push(creation(
-                                model_collection(),
-                                id,
-                                vec![("label", Value::String(l.to_string())), ("name", Value::String(l.to_string()))],
-                            ));
+                            push(event);
                             model_ids.insert(l.to_string(), (id, out_models.len()));
                             out_models.push(RegisteredModel { id, label: l.to_string(), name: l.to_string(), properties: Vec::new() });
                             id
@@ -443,7 +445,7 @@ where
                     plan.existing.push(id);
                     let backend = string_field(&values, "backend").unwrap_or_else(|| p.backend.clone());
                     let value_type = string_field(&values, "value_type").unwrap_or_else(|| p.value_type.clone());
-                    let membership_id = self.ensure_membership(&mut plan, &mut push, model_id, id, p.optional).await?;
+                    let membership_id = self.ensure_membership(system, &mut plan, &mut push, model_id, id, p.optional).await?;
                     property_ids.insert((model_id, p.name.clone()), (id, backend.clone(), value_type.clone()));
                     out_models[out_index].properties.push(RegisteredProperty {
                         id,
@@ -548,9 +550,8 @@ where
                     }
                     (None, None) => {
                         // Miss: allocate the property AND its membership. The
-                        // creation events carry the full definition state.
-                        let id = EntityId::new();
-                        plan.creates_properties.push((id, p.clone()));
+                        // creation events carry the full definition state,
+                        // which is what derives each id.
                         let mut fields: Vec<(&str, Value)> = vec![
                             ("minted_for", Value::EntityId(model_id)),
                             ("name", Value::String(p.name.clone())),
@@ -560,8 +561,11 @@ where
                         if let Some(t) = target {
                             fields.push(("target_model", Value::EntityId(t)));
                         }
-                        push(creation(property_collection(), id, fields));
-                        let membership_id = self.ensure_membership(&mut plan, &mut push, model_id, id, p.optional).await?;
+                        let event = creation(system, property_collection(), fields);
+                        let id = event.entity_id;
+                        plan.creates_properties.push((id, p.clone()));
+                        push(event);
+                        let membership_id = self.ensure_membership(system, &mut plan, &mut push, model_id, id, p.optional).await?;
                         (id, membership_id)
                     }
                 };
@@ -622,6 +626,7 @@ where
     /// and difference-patch a stored one, or mint. Returns the membership id.
     async fn ensure_membership(
         &self,
+        system: EntityId,
         plan: &mut RegistrationPlan,
         push: &mut impl FnMut(proto::Event),
         model: EntityId,
@@ -631,13 +636,14 @@ where
         match self.membership_lookup_checked(&model, &property).await? {
             Some(def) => self.ensure_membership_from(plan, push, def, optional).await,
             None => {
-                let id = EntityId::new();
-                plan.creates_memberships.push(PlannedModelPropertyMembership { id, model, property, optional });
-                push(creation(
+                let event = creation(
+                    system,
                     model_property_collection(),
-                    id,
                     vec![("model", Value::EntityId(model)), ("property", Value::EntityId(property)), ("optional", Value::Bool(optional))],
-                ));
+                );
+                let id = event.entity_id;
+                plan.creates_memberships.push(PlannedModelPropertyMembership { id, model, property, optional });
+                push(event);
                 Ok(id)
             }
         }
@@ -957,7 +963,7 @@ fn field_eq(field: &str, value: ankql::ast::Literal) -> ankql::ast::Predicate {
 
 fn field_eq_str(field: &str, value: &str) -> ankql::ast::Predicate { field_eq(field, ankql::ast::Literal::String(value.to_string())) }
 
-fn field_eq_id(field: &str, id: EntityId) -> ankql::ast::Predicate { field_eq(field, ankql::ast::Literal::EntityId(id.to_ulid())) }
+fn field_eq_id(field: &str, id: EntityId) -> ankql::ast::Predicate { field_eq(field, ankql::ast::Literal::EntityId(id)) }
 
 fn and(a: ankql::ast::Predicate, b: ankql::ast::Predicate) -> ankql::ast::Predicate { ankql::ast::Predicate::And(Box::new(a), Box::new(b)) }
 
@@ -978,15 +984,17 @@ fn catalog_collection_id(model: ModelId) -> proto::CollectionId {
     }
 }
 
-/// A creation event: full definition state, empty parent clock. Ordinary
-/// in every respect.
+/// Mint a catalog entity: the genesis carries its full definition state and
+/// its membership, and its own content derives the entity id the allocator
+/// hands out. There is no id before the definition exists.
+///
 /// The membership operation is the authority for the entity's model; the
 /// event's collection field is the routing materialization of the same
 /// fact.
-fn creation(model: ModelId, entity_id: EntityId, fields: Vec<(&str, Value)>) -> proto::Event {
-    let mut event = follow_up(model, entity_id, proto::Clock::default(), fields);
-    event.operations.push(Operation::Membership(Membership::Add(model)));
-    event
+fn creation(system: EntityId, model: ModelId, fields: Vec<(&str, Value)>) -> proto::Event {
+    let mut operations = lww_operations(fields.into_iter().map(|(name, value)| (name, Some(value))).collect());
+    operations.push(Operation::Membership(Membership::Add(model)));
+    proto::Event::genesis(catalog_collection_id(model), Some(system), proto::AuthorId::Unknown, operations)
 }
 
 /// A follow-up event carrying changed metadata, parented at the entity's
@@ -998,18 +1006,18 @@ fn follow_up(model: ModelId, entity_id: EntityId, parent: proto::Clock, fields: 
 
 /// A metadata follow-up that may clear fields as well as replace them.
 fn follow_up_patch(model: ModelId, entity_id: EntityId, parent: proto::Clock, fields: Vec<(&str, Option<Value>)>) -> proto::Event {
+    proto::Event::update(catalog_collection_id(model), entity_id, parent, proto::AuthorId::Unknown, lww_operations(fields))
+}
+
+/// Encode catalog field values as one LWW backend batch.
+fn lww_operations(fields: Vec<(&str, Option<Value>)>) -> OperationSet {
     let backend = LWWBackend::new();
     for (name, value) in fields {
         let property = SystemProperty::from_name(name).expect("catalog event fields are closed SystemProperty variants");
         backend.set(property.to_string(), value);
     }
     let operations = backend.to_operations().expect("LWW encoding of scalar values is infallible").expect("fields are non-empty");
-    proto::Event {
-        collection: catalog_collection_id(model),
-        entity_id,
-        operations: OperationSet::from_backends(BTreeMap::from([("lww".to_string(), operations)])),
-        parent,
-    }
+    OperationSet::from_backends(BTreeMap::from([("lww".to_string(), operations)]))
 }
 
 #[cfg(test)]

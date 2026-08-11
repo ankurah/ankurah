@@ -228,12 +228,13 @@ async fn test_update_scope_requires_before_and_after_state() -> anyhow::Result<(
     let token = keys.sign(&claims, Duration::from_hours(1))?;
     let context = JwtContext::from_claims(claims, token);
 
-    let retag_event = Event {
-        entity_id: denied_record.id(),
-        collection: denied_record.collection().clone(),
-        operations: OperationSet::from_backends(BTreeMap::new()),
-        parent: Clock::new(denied_record.head().to_vec()),
-    };
+    let retag_event = Event::update(
+        denied_record.collection().clone(),
+        denied_record.id(),
+        Clock::new(denied_record.head().to_vec()),
+        ankurah::proto::AuthorId::Unknown,
+        OperationSet::from_backends(BTreeMap::new()),
+    );
 
     let result = agent.check_event(&node, &context, &denied_record, &allowed_record, &retag_event);
     assert!(result.is_err(), "updates must not retag an out-of-scope row into the caller's scope");

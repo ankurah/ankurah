@@ -27,7 +27,7 @@ async fn postgres_get_state_returns_entity_not_found() -> Result<()> {
     let collection = context.collection(&"album".into()).await?;
 
     // Generate a random entity ID that definitely doesn't exist
-    let non_existent_id = EntityId::new();
+    let non_existent_id = EntityId::random();
 
     // Call get_state directly on the storage collection
     let result = collection.get_state(non_existent_id).await;

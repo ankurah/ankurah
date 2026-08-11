@@ -16,6 +16,7 @@
 
 use ankurah::core::connector::{PeerSender, SendError};
 use ankurah::proto;
+use ankurah::Model;
 use std::sync::{Arc, Mutex};
 
 /// A message a node emitted, tagged with the logical index of its sender.
@@ -174,14 +175,26 @@ fn update_item_descriptor(item: &proto::SubscriptionUpdateItem) -> String {
 }
 
 /// Sorted, joined content-derived event ids for a set of `EventFragment`s.
-/// `EventFragment` omits the event id, but it is a pure hash of
-/// `(entity_id, operations, parent)`, so we recompute it: this makes the digest
-/// faithful to the batch's actual events, not merely their count. Keying on the
-/// count alone would let two different batches for one entity share a digest and
+/// `EventFragment` omits the event id, but every field the id hashes is in
+/// the fragment's body (plus the entity id the caller supplies), so we
+/// rebuild the event and recompute it: this makes the digest faithful to the
+/// batch's actual events, not merely their count. Keying on the count alone
+/// would let two different batches for one entity share a digest and
 /// false-pass the determinism audit.
 fn fragment_ids(entity: proto::EntityId, fragments: &[proto::EventFragment]) -> String {
-    let mut ids: Vec<String> =
-        fragments.iter().map(|f| proto::EventId::from_parts(&entity, &f.operations, &f.parent).to_base64_short()).collect();
+    let mut ids: Vec<String> = fragments
+        .iter()
+        .map(|f| {
+            proto::Event {
+                collection: super::model::SimRecord::collection(),
+                entity_id: entity,
+                parent: f.parent.clone(),
+                body: f.body.clone(),
+            }
+            .id()
+            .to_base64_short()
+        })
+        .collect();
     ids.sort();
     ids.join("+")
 }

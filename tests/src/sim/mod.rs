@@ -24,7 +24,7 @@
 //! Determinism boundaries (production entropy the harness must route around,
 //! since it cannot change production code):
 //!
-//! - `EntityId::new()` mints a random ULID and `EventId` is a content hash over
+//! - `EntityId::random()` mints random bytes and `EventId` is a content hash over
 //!   it, so the harness forges events with seed-derived entity ids rather than
 //!   committing through `trx.create`. This is the one entropy source in the
 //!   write path and it is fully neutralized.

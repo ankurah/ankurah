@@ -1,5 +1,5 @@
 use ankql::ast::{ComparisonOperator, Expr, Literal, OrderByItem, OrderDirection, Predicate, Selection};
-use ankurah_core::{error::RetrievalError, EntityId};
+use ankurah_core::error::RetrievalError;
 use thiserror::Error;
 use tokio_postgres::types::ToSql;
 
@@ -284,7 +284,7 @@ impl SqlBuilder {
                 Literal::Bool(bool) => self.arg(*bool),
                 Literal::I16(i) => self.arg(*i),
                 Literal::I32(i) => self.arg(*i),
-                Literal::EntityId(ulid) => self.arg(EntityId::from_ulid(*ulid).to_base64()),
+                Literal::EntityId(id) => self.arg(id.to_base64()),
                 Literal::Object(bytes) => self.arg(bytes.clone()),
                 Literal::Binary(bytes) => self.arg(bytes.clone()),
                 Literal::Json(json) => self.arg(json.clone()),
@@ -323,7 +323,7 @@ impl SqlBuilder {
                             Literal::Bool(bool) => self.arg(*bool),
                             Literal::I16(i) => self.arg(*i),
                             Literal::I32(i) => self.arg(*i),
-                            Literal::EntityId(ulid) => self.arg(EntityId::from_ulid(*ulid).to_base64()),
+                            Literal::EntityId(id) => self.arg(id.to_base64()),
                             Literal::Object(bytes) => self.arg(bytes.clone()),
                             Literal::Binary(bytes) => self.arg(bytes.clone()),
                             Literal::Json(json) => self.arg(json.clone()),

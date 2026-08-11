@@ -74,8 +74,10 @@ ankurah-derive = { path = "../derive", version = "=0.9.0" }
 criterion      = { version = "0.5", features = ["async_tokio"] }
 
 # Event DAG engine benchmarks (workstream E). harness = false because criterion
-# provides its own harness; requires the `bench-internals` feature to reach the
-# crate-internal engine via `bench_support`.
+# provides its own harness. required-features states what the source already
+# needs: without `bench-internals` there is no `bench_support` module to import,
+# so cargo skips the target instead of failing to resolve it.
 [[bench]]
-name    = "event_dag"
-harness = false
+name              = "event_dag"
+harness           = false
+required-features = ["bench-internals"]

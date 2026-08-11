@@ -9,7 +9,7 @@ use crate::{
     reactor::AbstractEntity,
     value::Value,
 };
-use ankurah_proto::{Clock, CollectionId, EntityId, EntityState, Event, EventId, ModelId, OperationSet, State};
+use ankurah_proto::{AuthorId, Clock, CollectionId, EntityId, EntityState, Event, EventId, ModelId, OperationSet, State};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
@@ -38,6 +38,79 @@ pub struct TemporaryEntity(Arc<EntityInner>);
 
 mod membership;
 use membership::MembershipSet;
+
+/// Where a model writes its initial values before the entity they describe has
+/// an identity.
+///
+/// An entity id is the id of its genesis event, so `Transaction::create` cannot
+/// name the entity until the values that go into that genesis exist. They are
+/// staged here, [`ProvisionalEntity::extract_operations`] freezes them, and the
+/// id is derived from what comes out. Nothing here carries an id, nothing here
+/// is resident, and none of it outlives the `create` call that built it.
+///
+/// [`TemporaryEntity`] is the opposite arrangement: an id and existing state,
+/// reconstituted for evaluation.
+#[derive(Debug, Default)]
+pub struct ProvisionalEntity {
+    /// Memberships staged for the genesis; an entity's first event carries
+    /// exactly one.
+    memberships: MembershipSet,
+    backends: BTreeMap<String, Arc<dyn PropertyBackend>>,
+}
+
+impl ProvisionalEntity {
+    /// A vessel with nothing staged.
+    pub fn new() -> Self { Self::default() }
+
+    /// Stage membership in `model`, which rides the genesis as one of its
+    /// frozen initial operations and is therefore inside the derived id.
+    pub fn add_membership(&mut self, model: ModelId) { self.memberships.add(model); }
+
+    /// The named property backend, created empty on first use.
+    pub fn get_backend<P: PropertyBackend>(&mut self) -> Result<Arc<P>, RetrievalError> {
+        let backend_name = P::property_backend_name();
+        if let Some(backend) = self.backends.get(backend_name) {
+            let upcasted = backend.clone().as_arc_dyn_any();
+            return Ok(upcasted.downcast::<P>().unwrap()); // TODO: handle downcast error
+        }
+        let backend = backend_from_string(backend_name, None)?;
+        let typed_backend = backend.clone().as_arc_dyn_any().downcast::<P>().unwrap(); // TODO: handle downcast error
+        self.backends.insert(backend_name.to_owned(), backend);
+        Ok(typed_backend)
+    }
+
+    /// Freeze everything staged into the operation set that becomes the genesis
+    /// preimage. Consumes the vessel: `create` derives the id from these
+    /// operations and builds the real entity from the genesis they produced.
+    pub(crate) fn extract_operations(self) -> Result<OperationSet, MutationError> {
+        let Self { mut memberships, backends } = self;
+        assemble_operations(memberships.to_operations(), &backends)
+    }
+}
+
+/// Assemble one operation set from already-drained membership operations and
+/// each backend's pending diffs.
+///
+/// Both extraction points call this -- the create path out of a
+/// [`ProvisionalEntity`], the commit path out of an [`Entity`] -- so the two
+/// cannot drift in what an extraction contains or in what order it lands, and
+/// an event's operations mean the same thing whichever path minted it.
+fn assemble_operations(
+    membership_operations: Vec<ankurah_proto::Operation>,
+    backends: &BTreeMap<String, Arc<dyn PropertyBackend>>,
+) -> Result<OperationSet, MutationError> {
+    let mut extracted = BTreeMap::<String, Vec<ankurah_proto::BackendOperation>>::new();
+    for (name, backend) in backends {
+        if let Some(ops) = backend.to_operations()? {
+            extracted.insert(name.clone(), ops);
+        }
+    }
+    let mut operations = OperationSet::from_backends(extracted);
+    for operation in membership_operations {
+        operations.push(operation);
+    }
+    Ok(operations)
+}
 
 /// Combined state for atomic updates of head and backends
 #[derive(Debug)]
@@ -208,40 +281,44 @@ impl Entity {
         })))
     }
 
-    /// Generate an event which contains all operations for all backends since the last time they were collected
-    /// Used for transaction commit. Notably this does not apply the head to the entity, which must be done
-    /// using commit_head
-    pub(crate) fn generate_commit_event(&self) -> Result<Option<Event>, MutationError> {
-        // Drain staged memberships in a short exclusive scope, then build the
-        // event under a read lock (backends carry their own interior
-        // mutability). Holding the write lock across event generation showed
-        // up as a read-your-writes delivery failure in the deterministic sim
-        // on CI runners (isolated by A/B probe branches); the exclusive
-        // section stays minimal on the commit path.
+    /// Drain everything staged since the last extraction: each backend's
+    /// pending diffs plus any staged membership additions.
+    ///
+    /// Commit calls this for the edits made after `Transaction::create`
+    /// returned. The genesis was frozen earlier and elsewhere, out of a
+    /// [`ProvisionalEntity`], because it had to exist before this entity's id
+    /// did. The backends remain the single source of truth for where one
+    /// extraction ends and the next begins.
+    pub(crate) fn extract_operations(&self) -> Result<OperationSet, MutationError> {
+        // Drain staged memberships in a short exclusive scope, then read the
+        // backends under a read lock (they carry their own interior
+        // mutability). Holding the write lock across extraction showed up as
+        // a read-your-writes delivery failure in the deterministic sim on CI
+        // runners (isolated by A/B probe branches); the exclusive section
+        // stays minimal on the commit path.
         let membership_operations = self.state.write().expect("other thread panicked, panic here too").memberships.to_operations();
         let state = self.state.read().expect("other thread panicked, panic here too");
-        let mut backends = BTreeMap::<String, Vec<ankurah_proto::BackendOperation>>::new();
-        for (name, backend) in &state.backends {
-            if let Some(ops) = backend.to_operations()? {
-                backends.insert(name.clone(), ops);
-            }
-        }
-        let mut operations = OperationSet::from_backends(backends);
-        for operation in membership_operations {
-            operations.push(operation);
+        assemble_operations(membership_operations, &state.backends)
+    }
+
+    /// Generate the one update event carrying whatever was edited on this
+    /// transaction entity, or `None` when nothing changed.
+    ///
+    /// A created entity's genesis is frozen by `Transaction::create` and held
+    /// there, so this path never mints a creation. An entity that reaches it
+    /// with an empty head was never created; refusing here is what stops a
+    /// phantom from being promoted into an entity.
+    pub(crate) fn generate_commit_event(&self, author: AuthorId) -> Result<Option<Event>, MutationError> {
+        let parent = self.head();
+        if parent.is_empty() {
+            return Err(MutationError::PhantomEntity(self.id));
         }
 
-        // No operations on an EXISTING entity means nothing changed: no event.
-        // A brand-new entity (empty head) emits its event unconditionally:
-        // model creation stages a membership addition, so the event exists,
-        // replicates, and persists even when every field is its default (and
-        // the commit funnels refuse a first event without its membership).
-        if operations.is_empty() && !state.head.is_empty() {
-            Ok(None)
-        } else {
-            let event = Event { entity_id: self.id, collection: self.collection.clone(), operations, parent: state.head.clone() };
-            Ok(Some(event))
+        let operations = self.extract_operations()?;
+        if operations.is_empty() {
+            return Ok(None);
         }
+        Ok(Some(Event::update(self.collection.clone(), self.id, parent, author, operations)))
     }
 
     /// Updates the head of the entity to the given clock, which should come exclusively from generate_commit_event
@@ -317,7 +394,7 @@ impl Entity {
             // Re-check if head is still empty now that we hold the lock
             if state.head.is_empty() {
                 // this is the creation event for a new entity, so we simply accept it
-                state.apply_operations_from_event(&event.operations, event.id())?;
+                state.apply_operations_from_event(event.operations(), event.id())?;
                 state.head = event.id().into();
                 drop(state); // Release lock before broadcast
                              // Notify Signal subscribers about the change
@@ -352,7 +429,7 @@ impl Entity {
                     let new_head: Clock = event.id().into();
                     let event_id = event.id();
                     if self.try_mutate(&mut head, |state| -> Result<(), MutationError> {
-                        state.apply_operations_from_event(&event.operations, event_id.clone())?;
+                        state.apply_operations_from_event(event.operations(), event_id.clone())?;
                         state.head = new_head.clone();
                         Ok(())
                     })? {
@@ -400,7 +477,7 @@ impl Entity {
                             // and union any membership operations the layer carries (application
                             // is total over the operation stream; backends cannot apply these).
                             for evt in &layer.to_apply {
-                                for (backend_name, _) in evt.operations.backends() {
+                                for (backend_name, _) in evt.operations().backends() {
                                     if !state.backends.contains_key(backend_name) {
                                         let backend = backend_from_string(backend_name, None)?;
                                         // Replay earlier layers for this newly-created backend
@@ -410,7 +487,7 @@ impl Entity {
                                         state.backends.insert(backend_name.to_owned(), backend);
                                     }
                                 }
-                                for membership in evt.operations.memberships() {
+                                for membership in evt.operations().memberships() {
                                     let ankurah_proto::Membership::Add(model) = membership;
                                     state.memberships.apply(*model);
                                 }
@@ -526,6 +603,46 @@ impl Entity {
 
         warn!("apply_state retries exhausted while chasing moving head");
         Err(MutationError::TOCTOUAttemptsExhausted)
+    }
+
+    /// Build the transaction-visible state that sits immediately after a
+    /// frozen genesis, leaving `self` the empty resident primary until commit
+    /// applies that genesis to it.
+    ///
+    /// Each applied backend is re-encoded through its state buffer so every
+    /// backend starts the transaction with a clean extraction baseline. This
+    /// matters for Yrs: applying the genesis update mutates the document, but
+    /// only a freshly decoded state advances its local `previous_state`, so
+    /// without the round trip the initial values would be extracted a second
+    /// time into the post-create update event.
+    fn snapshot_after_genesis(&self, genesis: &Event, trx_alive: Arc<AtomicBool>) -> Result<Self, MutationError> {
+        if genesis.entity_id != self.id {
+            return Err(MutationError::CommitInvariant("the genesis being applied names a different entity than the one receiving it"));
+        }
+        genesis.validate_structure()?;
+
+        let event_id = genesis.id();
+        let mut memberships = MembershipSet::default();
+        let mut backends = BTreeMap::new();
+        for operation in genesis.operations().iter() {
+            match operation {
+                ankurah_proto::Operation::Backend { backend: name, operations } => {
+                    let backend = backend_from_string(name, None)?;
+                    backend.apply_operations_with_event(operations, event_id.clone())?;
+                    let buffer = backend.to_state_buffer()?;
+                    backends.insert(name.clone(), backend_from_string(name, Some(&buffer))?);
+                }
+                ankurah_proto::Operation::Membership(ankurah_proto::Membership::Add(model)) => memberships.apply(*model),
+            }
+        }
+
+        Ok(Self(Arc::new(EntityInner {
+            id: self.id,
+            collection: self.collection.clone(),
+            state: std::sync::RwLock::new(EntityInnerState { head: event_id.into(), memberships, backends }),
+            kind: EntityKind::Transacted { trx_alive, upstream: self.clone() },
+            broadcast: ankurah_signals::broadcast::Broadcast::new(),
+        })))
     }
 
     /// Create a snapshot of the Entity which is detached from this one, and will not receive the updates this one does
@@ -741,14 +858,40 @@ impl WeakEntitySet {
             }
         }
     }
-    /// Create a brand new entity and add it to the set. Memberships are
-    /// staged separately ([`Entity::add_membership`]).
-    pub fn create(&self, collection: CollectionId) -> Entity {
+    /// Insert the empty resident primary for the system root, whose genesis
+    /// `SystemManager::create` applies to it directly instead of through a
+    /// transaction.
+    pub(crate) fn create_root(&self, collection: CollectionId, id: EntityId) -> Entity {
         let mut entities = self.0.write().unwrap();
-        let id = EntityId::new();
         let entity = Entity::create(id, collection);
         entities.insert(id, entity.weak());
         entity
+    }
+
+    /// Insert the empty resident primary under the id `genesis` derived, and
+    /// return the transaction entity whose baseline is that genesis.
+    ///
+    /// The primary stays empty until commit applies the genesis to it; the
+    /// returned transaction entity already has the genesis applied, so edits
+    /// made after `create` returns extend it with at most one update event.
+    pub(crate) fn create_transaction_entity(
+        &self,
+        collection: CollectionId,
+        genesis: &Event,
+        trx_alive: Arc<AtomicBool>,
+    ) -> Result<Entity, MutationError> {
+        let primary = Entity::create(genesis.entity_id, collection);
+        let transaction_entity = primary.snapshot_after_genesis(genesis, trx_alive)?;
+
+        let mut entities = self.0.write().unwrap();
+        if entities.get(&primary.id).and_then(|weak| weak.upgrade()).is_some() {
+            // A 256-bit hash over creator-random bytes: reaching this means
+            // the same genesis was minted twice, not that two creations
+            // collided.
+            return Err(MutationError::AlreadyExists);
+        }
+        entities.insert(primary.id, primary.weak());
+        Ok(transaction_entity)
     }
 
     /// Evict an entity from the set only if it is absent from storage-backed

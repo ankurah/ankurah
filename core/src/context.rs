@@ -58,10 +58,18 @@ pub trait TContext {
     ) -> Result<proto::ModelId, crate::schema::registration::RegistrationError>;
 
     fn node_id(&self) -> proto::EntityId;
-    /// Create a brand new entity for a transaction, and add it to the WeakEntitySet.
-    /// Note that this does not actually persist the entity to the storage engine
-    /// It merely ensures that there are no duplicate entities with the same ID (except forked entities)
-    fn create_entity(&self, collection: proto::CollectionId, trx_alive: Arc<AtomicBool>) -> Entity;
+    /// This node's system root entity id, which every non-root genesis binds
+    /// into its own id. `None` before the node has created or joined a system.
+    fn system_id(&self) -> Option<proto::EntityId>;
+    /// Insert the resident (still empty) entity under the id `genesis`
+    /// derived, and return the transaction entity whose baseline is that
+    /// genesis. This is what makes the id available when `create()` returns.
+    fn create_transaction_entity(
+        &self,
+        collection: proto::CollectionId,
+        genesis: &Event,
+        trx_alive: Arc<AtomicBool>,
+    ) -> Result<Entity, MutationError>;
     fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied>;
     async fn get_entity(&self, id: proto::EntityId, collection: &proto::CollectionId, cached: bool) -> Result<Entity, RetrievalError>;
     fn get_resident_entity(&self, id: proto::EntityId) -> Option<Entity>;
@@ -82,9 +90,14 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     }
 
     fn node_id(&self) -> proto::EntityId { self.node.id }
-    fn create_entity(&self, collection: proto::CollectionId, trx_alive: Arc<AtomicBool>) -> Entity {
-        let primary_entity = self.node.entities.create(collection);
-        primary_entity.snapshot(trx_alive)
+    fn system_id(&self) -> Option<proto::EntityId> { self.node.system.root_id() }
+    fn create_transaction_entity(
+        &self,
+        collection: proto::CollectionId,
+        genesis: &Event,
+        trx_alive: Arc<AtomicBool>,
+    ) -> Result<Entity, MutationError> {
+        self.node.entities.create_transaction_entity(collection, genesis, trx_alive)
     }
     fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied> {
         self.node.policy_agent.check_write(&self.sessions.write_credential()?, entity, None)
@@ -109,31 +122,58 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         // mid-commit must not mix credentials across its phases.
         let cdata = self.sessions.write_credential()?;
 
-        // Generate events from the transaction entities
+        // Generate the causally ordered event sequence for each transaction
+        // entity. A created entity contributes its already-frozen genesis
+        // first, then at most one update for edits made after create()
+        // returned.
         let trx_id = trx.id.clone();
+        let genesis_events = trx.genesis_events.read().unwrap().clone();
+
         let mut entity_events = Vec::new();
+        let mut seen_created = std::collections::HashSet::new();
         for entity in trx.entities.iter() {
-            if let Some(event) = entity.generate_commit_event()? {
-                // Validate creation events: if parent is empty, this is a creation event
-                // and the entity must have been created in this transaction via create()
-                if event.is_entity_create() {
-                    let created_ids = trx.created_entity_ids.read().unwrap();
-                    if !created_ids.contains(&entity.id) {
-                        return Err(MutationError::General(
-                            format!(
-                                "Cannot commit phantom entity {}: entity has empty parent (creation event) \
-                             but was not created in this transaction via create()",
-                                entity.id
-                            )
-                            .into(),
-                        ));
-                    }
+            let mut events = Vec::with_capacity(2);
+            if let Some(genesis) = genesis_events.get(&entity.id) {
+                // The genesis is this node's own mint, but it passed through
+                // the transaction between minting and here; re-check the
+                // whole of what makes it admissible rather than trusting it,
+                // one condition at a time so a failure says which.
+                if !seen_created.insert(entity.id) {
+                    return Err(MutationError::CommitInvariant("two transaction entities claim the same frozen genesis"));
                 }
-                // Membership admissibility is a commit-path gate, mirrored on
-                // the remote funnel (commit_remote_transaction).
-                self.node.check_membership_admissibility(&event)?;
-                entity_events.push((entity.clone(), event));
+                if genesis.entity_id != entity.id {
+                    return Err(MutationError::CommitInvariant("the frozen genesis names an entity other than the one holding it"));
+                }
+                if !genesis.is_entity_create() {
+                    return Err(MutationError::CommitInvariant("the event frozen by create() is not a genesis"));
+                }
+                genesis.validate_structure()?;
+                if entity.head() != Clock::new([genesis.id()]) {
+                    return Err(MutationError::CommitInvariant("the created entity's head is not exactly its frozen genesis"));
+                }
+                events.push(genesis.clone());
             }
+
+            // An entity with an empty head and no frozen genesis is a
+            // phantom: never created here, so it has nothing to extend.
+            if let Some(event) = entity.generate_commit_event(proto::AuthorId::Unknown)? {
+                events.push(event);
+            }
+
+            // Membership admissibility is a commit-path gate, mirrored on
+            // the remote funnel (commit_remote_transaction).
+            for event in &events {
+                self.node.check_membership_admissibility(event)?;
+            }
+
+            if !events.is_empty() {
+                entity_events.push((entity.clone(), events));
+            }
+        }
+        // seen_created only ever holds genesis_events keys and refuses
+        // duplicates, so length equality is set equality.
+        if seen_created.len() != genesis_events.len() {
+            return Err(MutationError::CommitInvariant("an entity create() recorded is absent from the transaction's entities"));
         }
 
         // Now commit the events
@@ -142,59 +182,71 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
 
         // Phase 1: check policy and collect attestations for EVERY event
         // before persisting ANY of them, so a later denial leaves nothing
-        // durable (failure atomicity, V7).
-        for (entity, event) in entity_events {
-            // Create a temporary fork to apply the event for validation
+        // durable (failure atomicity, V7). A created entity walks its states
+        // in order: empty, then genesis, then the optional update.
+        for (entity, events) in entity_events {
             use std::sync::atomic::AtomicBool;
-            let trx_alive = Arc::new(AtomicBool::new(true));
-            let forked = entity.snapshot(trx_alive);
+            let validation_alive = Arc::new(AtomicBool::new(true));
 
             // Get the canonical (upstream) entity for before state
-            let entity_before = match &entity.kind {
+            let mut entity_before = match &entity.kind {
                 crate::entity::EntityKind::Transacted { upstream, .. } => upstream.clone(),
                 crate::entity::EntityKind::Primary => entity.clone(),
             };
-
-            // Stage event and apply to fork for after state (no commit_event call here)
-            let collection_id = &event.collection;
-            let collection = self.node.collections.get(collection_id).await?;
+            let collection = self.node.collections.get(entity.collection()).await?;
             let event_getter = crate::retrieval::LocalEventGetter::new(collection, self.node.durable);
-            event_getter.stage_event(event.clone());
-            forked.apply_event(&event_getter, &event).await?;
+            let mut entity_attested = Vec::with_capacity(events.len());
 
-            let attestation = self.node.policy_agent.check_event(&self.node, &cdata, &entity_before, &forked, &event)?;
-            let attested = Attested::opt(event.clone(), attestation);
+            for event in events {
+                // Stage event and apply to a fork for the after state (no
+                // commit_event call here)
+                event_getter.stage_event(event.clone());
+                let entity_after = entity_before.snapshot(validation_alive.clone());
+                entity_after.apply_event(&event_getter, &event).await?;
 
-            attested_events.push(attested.clone());
-            entity_attested_events.push((entity, attested));
+                let attestation = self.node.policy_agent.check_event(&self.node, &cdata, &entity_before, &entity_after, &event)?;
+                let attested = Attested::opt(event, attestation);
+
+                attested_events.push(attested.clone());
+                entity_attested.push(attested);
+                entity_before = entity_after;
+            }
+            entity_attested_events.push((entity, entity_attested));
         }
 
         // Phase 2: all events attested; persist them.
-        for (_, attested) in &entity_attested_events {
-            let collection = self.node.collections.get(&attested.payload.collection).await?;
+        for (entity, events) in &entity_attested_events {
+            let collection = self.node.collections.get(entity.collection()).await?;
             let event_getter = crate::retrieval::LocalEventGetter::new(collection, self.node.durable);
-            event_getter.commit_event(attested).await?;
+            for attested in events {
+                event_getter.commit_event(attested).await?;
+            }
         }
 
         // Update heads BEFORE relaying (makes entities visible to server echo)
-        for (entity, attested_event) in &entity_attested_events {
-            entity.commit_head(Clock::new([attested_event.payload.id()]));
+        for (entity, events) in &entity_attested_events {
+            if let Some(last) = events.last() {
+                entity.commit_head(Clock::new([last.payload.id()]));
+            }
         }
         // Relay to peers and wait for confirmation
         self.node.relay_to_required_peers(&cdata, trx_id, &attested_events).await?;
 
         // All peers confirmed, persist state to storage
         let mut changes: Vec<EntityChange> = Vec::new();
-        for (entity, attested_event) in entity_attested_events {
-            let collection_id = &attested_event.payload.collection;
-            let collection = self.node.collections.get(collection_id).await?;
+        for (entity, events) in entity_attested_events {
+            let collection = self.node.collections.get(entity.collection()).await?;
 
             // Persist canonical entity (upstream for transactional forks, entity itself for primary)
             let canonical_entity = match &entity.kind {
                 crate::entity::EntityKind::Transacted { upstream, .. } => {
-                    // Event is now in storage, construct fresh getter for upstream apply
+                    // Events are now in storage; apply the whole ordered
+                    // sequence to the canonical entity, which for a creation
+                    // is still empty.
                     let event_getter = crate::retrieval::LocalEventGetter::new(collection.clone(), self.node.durable);
-                    upstream.apply_event(&event_getter, &attested_event.payload).await?;
+                    for attested in &events {
+                        upstream.apply_event(&event_getter, &attested.payload).await?;
+                    }
                     upstream.clone()
                 }
                 crate::entity::EntityKind::Primary => entity,
@@ -207,7 +259,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
             let attested = Attested::opt(entity_state, attestation);
             collection.set_state(attested).await?;
 
-            changes.push(EntityChange::new(canonical_entity, vec![attested_event])?);
+            changes.push(EntityChange::new(canonical_entity, events)?);
         }
 
         // Notify reactor of ALL changes

@@ -5,10 +5,8 @@ pub enum DecodeError {
     NotStringValue,
     /// The input was not valid URL-safe base64.
     InvalidBase64(base64::DecodeError),
-    /// The decoded representation did not contain exactly 16 bytes.
+    /// The decoded representation did not contain exactly 32 bytes.
     InvalidLength,
-    /// The input was not a valid ULID.
-    InvalidUlid,
     /// A compatibility fallback could not decode the input.
     InvalidFallback,
     /// The input used an unsupported identity format.
@@ -23,7 +21,6 @@ impl std::fmt::Display for DecodeError {
             Self::NotStringValue => write!(f, "Not a string value"),
             Self::InvalidBase64(error) => write!(f, "Invalid Base64: {error}"),
             Self::InvalidLength => write!(f, "Invalid Length"),
-            Self::InvalidUlid => write!(f, "Invalid ULID"),
             Self::InvalidFallback => write!(f, "Invalid Fallback"),
             Self::InvalidFormat => write!(f, "Invalid Format"),
             Self::Other(error) => write!(f, "Other: {error}"),
@@ -45,7 +42,7 @@ pub enum IdParseError {
     /// The input was not valid URL-safe base64.
     #[error("Invalid base64 encoding")]
     InvalidBase64,
-    /// The decoded input did not contain exactly 16 bytes.
+    /// The decoded input did not contain exactly 32 bytes.
     #[error("Invalid ID length")]
     InvalidLength,
     /// The input used an unsupported format.

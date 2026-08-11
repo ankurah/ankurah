@@ -28,7 +28,7 @@ impl PeerSender for NullSender {
 }
 
 fn presence(protocol_version: u32) -> proto::Presence {
-    proto::Presence { node_id: proto::EntityId::new(), durable: false, system_root: None, protocol_version }
+    proto::Presence { node_id: proto::EntityId::random(), durable: false, system_root: None, protocol_version }
 }
 
 /// The core enforcement point: register_peer refuses incompatible versions
@@ -176,7 +176,7 @@ async fn client_refuses_peer_message_before_presence() -> Result<()> {
         let (mut sink, mut stream) = ws.split();
 
         let early = proto::Message::PeerMessage(proto::NodeMessage::UnsubscribeQuery {
-            from: proto::EntityId::new(),
+            from: proto::EntityId::random(),
             query_id: proto::QueryId::new(),
         });
         sink.send(WsMessage::Binary(bincode::serialize(&early).unwrap().into())).await.expect("send");
@@ -237,7 +237,7 @@ async fn client_refuses_mismatched_server_without_hot_loop() -> Result<()> {
         let ws = tokio_tungstenite::accept_async(stream).await.expect("ws accept");
         let (mut sink, mut stream) = ws.split();
 
-        let doctored = proto::Presence { node_id: proto::EntityId::new(), durable: true, system_root: None, protocol_version: 999 };
+        let doctored = proto::Presence { node_id: proto::EntityId::random(), durable: true, system_root: None, protocol_version: 999 };
         sink.send(WsMessage::Binary(bincode::serialize(&proto::Message::Presence(doctored)).unwrap().into())).await.expect("send");
 
         let mut saw_rejection = None;

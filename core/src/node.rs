@@ -181,7 +181,7 @@ where
     fn build(engine: Arc<SE>, policy_agent: PA, durable: bool, rng: SmallRng) -> Self {
         let collections = CollectionSet::new(engine.clone());
         let entityset: WeakEntitySet = Default::default();
-        let id = proto::EntityId::new();
+        let id = proto::EntityId::random();
         let reactor = Reactor::new();
         notice_info!("Node {id:#} created as {}", if durable { "durable" } else { "ephemeral" });
 
@@ -604,7 +604,7 @@ where
     /// may be EMITTED into it today.
     pub(crate) fn check_membership_admissibility(&self, event: &proto::Event) -> Result<(), MutationError> {
         let memberships: Vec<proto::ModelId> = event
-            .operations
+            .operations()
             .memberships()
             .map(|membership| match membership {
                 proto::Membership::Add(model) => *model,
@@ -645,6 +645,11 @@ where
         let mut changes = Vec::new();
 
         for event in events.iter_mut() {
+            // Structural validity first: an event that contradicts its own
+            // shape -- a genesis naming an entity its content does not
+            // derive, or a parent clock that disagrees with the body -- is
+            // refused before anything stages or stores it.
+            event.payload.validate_structure()?;
             self.check_membership_admissibility(&event.payload)?;
             let collection = self.collections.get(&event.payload.collection).await?;
 
@@ -828,8 +833,6 @@ where
             }
         }
     }
-
-    pub fn next_entity_id(&self) -> proto::EntityId { proto::EntityId::new() }
 
     /// The currently-resident (in-memory) entity for `id`, if one is held.
     ///

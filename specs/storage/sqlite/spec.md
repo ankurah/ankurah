@@ -33,9 +33,9 @@ A SQLite-based storage engine for Ankurah, providing a lightweight embedded data
 
 ### Data Format Compatibility
 
-1. **ULID storage**: TEXT (base64) matching Postgres format
+1. **Id storage**: TEXT (base64) matching Postgres format
 2. **State buffer**: BLOB (bincode-serialized BTreeMap)
-3. **Head/Clock**: JSON array of ULID strings
+3. **Head/Clock**: JSON array of base64 event id strings
 4. **Attestations**: BLOB (bincode-serialized Vec)
 5. **JSON values**: Stored as BLOB (using SQLite JSONB format via `jsonb()` function), queried via `json_extract()` for type-aware comparisons
 

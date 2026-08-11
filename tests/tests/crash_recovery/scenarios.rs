@@ -38,7 +38,7 @@ type CrashNode = Node<CrashStorageEngine<SledStorageEngine>, PermissiveAgent>;
 /// storage writes on registration. Registration is bootstrap here, not
 /// workload.
 fn seed_album_catalog<SE: StorageEngine + Send + Sync + 'static>(node: &Node<SE, PermissiveAgent>) -> Result<()> {
-    let model_id = proto::EntityId::from_bytes([0x6A; 16]);
+    let model_id = proto::EntityId::from_bytes([0x6A; 32]);
     let model = proto::RegisteredModel {
         id: model_id,
         label: Album::descriptor().label.to_owned(),
@@ -47,8 +47,8 @@ fn seed_album_catalog<SE: StorageEngine + Send + Sync + 'static>(node: &Node<SE,
             .iter()
             .enumerate()
             .map(|(i, field)| proto::RegisteredProperty {
-                id: proto::EntityId::from_bytes([0x6B + i as u8; 16]),
-                membership_id: proto::EntityId::from_bytes([0x6D + i as u8; 16]),
+                id: proto::EntityId::from_bytes([0x6B + i as u8; 32]),
+                membership_id: proto::EntityId::from_bytes([0x6D + i as u8; 32]),
                 name: (*field).to_owned(),
                 backend: "yrs".to_owned(),
                 value_type: "string".to_owned(),
@@ -201,6 +201,13 @@ async fn child_mid_batch() -> Result<()> {
 /// not-yet-reached entities entirely absent, with no persisted state ever
 /// referencing an uncommitted event. After reopen, re-delivering the full batch
 /// (the sender resending) converges the node to the complete set.
+///
+/// That re-delivery is also the receiving half of event identity's retry
+/// property: the identical minted events arriving a second time converge on the
+/// same entities rather than duplicating them. The sending half -- a retry
+/// carries the genesis `create()` minted, not a fresh mint under a fresh nonce
+/// -- is pinned by `a_relayed_genesis_is_the_one_create_minted` in
+/// tests/tests/event_identity.rs.
 #[tokio::test]
 async fn scenario_2_mid_batch() -> Result<()> {
     let dir = fresh_sled_dir("s2");
