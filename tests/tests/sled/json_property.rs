@@ -203,11 +203,8 @@ fn test_json_path_planner_generates_sub_path() {
         assert_eq!(keypart.sub_path, Some(vec!["territory".to_string()]), "sub_path should be ['territory']");
         assert_eq!(keypart.full_path(), "licensing.territory", "full_path should be 'licensing.territory'");
 
-        // Verify full pushdown (remaining predicate should be True)
-        assert!(
-            matches!(remaining_predicate, ankql::ast::Predicate::True),
-            "JSON path equality should be fully pushed down, got: {:?}",
-            remaining_predicate
-        );
+        // The bounds narrow by the term; the residual still re-checks it
+        // (bounds are a prefilter over cast-typed keys, never an enforcement).
+        assert_eq!(*remaining_predicate, selection.predicate, "the residual re-checks the term the bounds narrowed by");
     }
 }

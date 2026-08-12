@@ -42,15 +42,20 @@ async fn test_prefix_guard_toggle_effect() -> Result<(), anyhow::Error> {
     .await?;
     create_books(&ctx, vec![("Book1", "2001"), ("Book2", "2002")]).await?;
 
-    // 1) Guard enabled (default): equality prefix should constrain results to year=1969 only
+    // 1) Guard enabled (default): equality prefix constrains the scan to year=1969
     assert_eq!(names(&fetch(&ctx, "year = '1969' ORDER BY name LIMIT 100").await?), vec!["Album5"]);
 
-    // 2) Disable guard: expect overshoot beyond equality prefix (includes following names)
+    // 2) Disable guard: the index scan overshoots the equality prefix, but the
+    //    residual predicate re-checks every row, so the answer does not change.
+    //    (This used to pin the overshoot showing up in the results — that was
+    //    only observable while the planner dropped the equality term from the
+    //    residual. The guard remains a scan-narrowing optimization; the
+    //    residual is what keeps the answer right without it.)
     #[cfg(debug_assertions)]
     engine.set_prefix_guard_disabled(true);
-    assert_eq!(names(&fetch(&ctx, "year = '1969' ORDER BY name LIMIT 100").await?), vec!["Album5", "Album6"]);
+    assert_eq!(names(&fetch(&ctx, "year = '1969' ORDER BY name LIMIT 100").await?), vec!["Album5"]);
 
-    // 3) Re-enable guard: back to constrained results
+    // 3) Re-enable guard: same answer, narrower scan.
     #[cfg(debug_assertions)]
     engine.set_prefix_guard_disabled(false);
     assert_eq!(names(&fetch(&ctx, "year = '1969' ORDER BY name LIMIT 100").await?), vec!["Album5"]);

@@ -9,3 +9,4 @@ mod multi_column_order_by;
 mod normalization_tests;
 mod pagination;
 mod ref_traversal;
+mod repeated_column;
