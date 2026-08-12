@@ -128,7 +128,7 @@
 //! - Entity IDs are derived from their creation operation
 //!
 //! For more details, see the [repository documentation](https://github.com/ankurah/ankurah).
-//! And join the [Discord server](https://discord.gg/XMUUxsbT5S) to be part of the discussion!
+//! And join the [community](https://community.ankurah.org) to be part of the discussion!
 
 // Note: When both wasm and uniffi features are enabled, wasm takes precedence.
 // This allows `cargo test --all-features` to work correctly.

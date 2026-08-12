@@ -8,7 +8,7 @@
   <p>
     <a href="https://ankurah.org/getting-started.html"><strong>Get Started</strong></a> •
     <a href="https://ankurah.org/what-is-ankurah.html">Documentation</a> •
-    <a href="https://discord.gg/XMUUxsbT5S">Discord</a>
+    <a href="https://community.ankurah.org">Community</a>
   </p>
 
   <p>
@@ -206,7 +206,7 @@ Then open http://localhost:5173/ in two browser tabs (one regular, one incognito
 
 <div align="center">
   <a href="https://github.com/ankurah/ankurah">GitHub</a> •
-  <a href="https://discord.gg/XMUUxsbT5S">Discord</a> •
+  <a href="https://community.ankurah.org">Community</a> •
   <a href="https://ankurah.org">Website</a>
   <br><sub>Licensed under MIT or Apache-2.0</sub>
 </div>
