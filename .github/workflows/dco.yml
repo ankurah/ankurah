@@ -1,0 +1,105 @@
+name: DCO
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+
+# Closing a pull request needs write access to pull requests. The
+# pull_request_target event grants a writable token even for pull requests from
+# forks; the ordinary pull_request event does not (its token is read-only for
+# fork PRs), so it could never close an outside contributor's PR. This is safe
+# here only because the job reads commit metadata with git and never checks out
+# or runs any code from the pull request. Do not add build or test steps to this
+# workflow.
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  dco:
+    name: Check sign-off
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the base repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch the pull request commits
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: git fetch --no-tags origin "pull/${PR_NUMBER}/head"
+
+      - name: Verify Developer Certificate of Origin sign-off
+        id: check
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          missing=0
+
+          for sha in $(git rev-list "$BASE_SHA".."$HEAD_SHA"); do
+            # Merge commits are created by the merge, not authored by a
+            # contributor, so they are exempt.
+            if [ "$(git rev-list --parents -n 1 "$sha" | wc -w)" -gt 2 ]; then
+              continue
+            fi
+
+            author_email="$(git show -s --format='%ae' "$sha")"
+            subject="$(git show -s --format='%s' "$sha")"
+
+            # Pull the email out of every Signed-off-by trailer on this commit,
+            # one per line.
+            signoff_emails="$(git show -s \
+              --format='%(trailers:key=Signed-off-by,valueonly,separator=%x0A)' "$sha" \
+              | sed -n 's/.*<\(.*\)>.*/\1/p')"
+
+            if printf '%s\n' "$signoff_emails" | grep -Fxq "$author_email"; then
+              echo "ok    $sha  $subject"
+            else
+              echo "FAIL  $sha  $subject"
+              echo "        author:   $author_email"
+              echo "        sign-off: ${signoff_emails:-(none)}"
+              missing=1
+            fi
+          done
+
+          echo "missing=$missing" >> "$GITHUB_OUTPUT"
+
+      - name: Close the pull request when a sign-off is missing
+        if: steps.check.outputs.missing == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          cat > "$RUNNER_TEMP/dco-close.md" <<'EOF'
+          This pull request was closed automatically because one or more of its
+          commits are missing a Developer Certificate of Origin sign-off that
+          matches the commit author.
+
+          Sign off your commits and reopen the pull request.
+
+          One commit:
+
+              git commit --amend -s --no-edit
+              git push --force-with-lease
+
+          A whole branch:
+
+              git rebase --signoff main
+              git push --force-with-lease
+
+          See AI_POLICY.md for what the sign-off means and why we require it.
+          EOF
+
+          gh pr close "$PR_NUMBER" \
+            --repo "$GITHUB_REPOSITORY" \
+            --comment "$(cat "$RUNNER_TEMP/dco-close.md")"
+
+          echo "Closed PR #$PR_NUMBER for a missing sign-off."
+          exit 1
