@@ -1,5 +1,6 @@
 pub mod collection;
 pub mod database;
+mod dump;
 pub mod engine;
 pub mod entity;
 pub mod error;

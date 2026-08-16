@@ -25,6 +25,8 @@ use bb8_postgres::{tokio_postgres::NoTls, PostgresConnectionManager};
 use tokio_postgres::{error::SqlState, types::ToSql};
 use tracing::{debug, error, info, warn};
 
+mod dump;
+
 /// Default connection pool size for `Postgres::open()`.
 /// Production applications should configure their own pool via `Postgres::new()`.
 pub const DEFAULT_POOL_SIZE: u32 = 15;

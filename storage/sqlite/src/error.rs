@@ -16,6 +16,9 @@ pub enum SqliteError {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
+    #[error("Dump error: {0}")]
+    Dump(String),
+
     #[error("DDL error: {0}")]
     DDL(String),
 
