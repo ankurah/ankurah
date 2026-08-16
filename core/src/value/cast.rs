@@ -102,7 +102,7 @@ impl Value {
                 }
             }
             (Value::F64(n), ValueType::I64) => {
-                if n.is_finite() && *n >= i64::MIN as f64 && *n <= i64::MAX as f64 {
+                if n.is_finite() && *n >= i64::MIN as f64 && *n < i64::MAX as f64 {
                     Ok(Value::I64(*n as i64))
                 } else {
                     Err(CastError::NumericOverflow { value: n.to_string(), target_type: ValueType::I64 })
@@ -262,6 +262,13 @@ mod tests {
 
         let large_value = Value::I32(100000);
         assert!(matches!(large_value.cast_to(ValueType::I16), Err(CastError::NumericOverflow { .. })));
+    }
+
+    #[test]
+    fn test_f64_at_two_pow_63_overflows_i64() {
+        let two_pow_63 = 9_223_372_036_854_775_808.0_f64;
+
+        assert!(matches!(Value::F64(two_pow_63).cast_to(ValueType::I64), Err(CastError::NumericOverflow { .. })));
     }
 
     #[test]
