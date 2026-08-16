@@ -1,10 +1,30 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::Stream;
 use tracing::warn;
 
 use crate::error::{MutationError, RetrievalError};
 use ankurah_proto::{Attested, CollectionId, EntityId, EntityState, Event, EventId};
+
+/// One raw logical record emitted by a storage dump.
+#[derive(Debug)]
+pub enum StorageDumpItem {
+    Event(Attested<Event>),
+    State(Attested<EntityState>),
+}
+
+/// Raw logical export implemented by storage engines that support portable
+/// dumps. Physical tables, cursor pages, and materialized values remain an
+/// implementation detail of the engine.
+#[async_trait]
+pub trait StorageDump: StorageEngine {
+    type DumpStream: Stream<Item = Result<StorageDumpItem, RetrievalError>> + Send + 'static;
+
+    /// Stream events followed by states without exposing the engine's
+    /// physical partitioning.
+    async fn dump(&self) -> Result<Self::DumpStream, RetrievalError>;
+}
 
 pub fn state_name(name: &str) -> String { format!("{}_state", name) }
 
