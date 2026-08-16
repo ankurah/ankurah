@@ -1,3 +1,4 @@
+use ankurah_core_types::Value;
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{parse::Parse, parse::ParseStream, parse_macro_input, Expr, Result, Token};
@@ -467,48 +468,48 @@ fn generate_expr_code_with_replacements(
 }
 
 fn generate_literal_code_with_replacements(
-    literal: &ankql::ast::Literal,
+    literal: &Value,
     _args: &[(Option<String>, String, Expr)],
     _arg_index: &mut usize,
 ) -> proc_macro2::TokenStream {
     match literal {
-        ankql::ast::Literal::String(s) => {
-            quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Literal::String(#s.to_string())) }
+        Value::String(s) => {
+            quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Value::String(#s.to_string())) }
         }
-        ankql::ast::Literal::I64(i) => {
-            quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Literal::I64(#i)) }
+        Value::I64(i) => {
+            quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Value::I64(#i)) }
         }
-        ankql::ast::Literal::F64(f) => {
-            quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Literal::F64(#f)) }
+        Value::F64(f) => {
+            quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Value::F64(#f)) }
         }
-        ankql::ast::Literal::Bool(b) => {
-            quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Literal::Bool(#b)) }
+        Value::Bool(b) => {
+            quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Value::Bool(#b)) }
         }
-        ankql::ast::Literal::I16(i) => {
-            quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Literal::I16(#i)) }
+        Value::I16(i) => {
+            quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Value::I16(#i)) }
         }
-        ankql::ast::Literal::I32(i) => {
-            quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Literal::I32(#i)) }
+        Value::I32(i) => {
+            quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Value::I32(#i)) }
         }
-        ankql::ast::Literal::EntityId(id) => {
+        Value::EntityId(id) => {
             // An entity id is 32 hash bytes with no narrower form to lift it
             // through, so the literal is emitted as its exact byte array.
             let bytes = id.to_bytes();
             quote! {
-                ::ankql::ast::Expr::Literal(::ankql::ast::Literal::EntityId(
+                ::ankql::ast::Expr::Literal(::ankql::ast::Value::EntityId(
                     ::ankurah::proto::EntityId::from_bytes([#(#bytes),*])
                 ))
             }
         }
-        ankql::ast::Literal::Object(_items) => {
+        Value::Object(_items) => {
             todo!("Object literals");
-            // quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Literal::Object(#items)) }
+            // quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Value::Object(#items)) }
         }
-        ankql::ast::Literal::Binary(_items) => {
+        Value::Binary(_items) => {
             todo!("Binary literals");
-            // quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Literal::Binary(#items)) }
+            // quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Value::Binary(#items)) }
         }
-        ankql::ast::Literal::Json(_) => {
+        Value::Json(_) => {
             // Json literals are not parsed from query syntax; created by AST preparation pass
             unreachable!("Json literals cannot appear in parsed queries")
         }

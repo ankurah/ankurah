@@ -1,5 +1,6 @@
-use ankql::ast::{ComparisonOperator, Expr, Literal, OrderByItem, OrderDirection, PathExpr, Predicate, Selection};
+use ankql::ast::{ComparisonOperator, Expr, OrderByItem, OrderDirection, PathExpr, Predicate, Selection};
 use ankurah::{policy::DEFAULT_CONTEXT as c, proto::EntityId, Model, Node, PermissiveAgent};
+use ankurah_core_types::Value;
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -114,7 +115,7 @@ async fn test_id_range_with_where_clause() -> Result<()> {
         predicate: Predicate::Comparison {
             left: Box::new(Expr::Path(PathExpr::simple("id".to_string()))),
             operator: ComparisonOperator::GreaterThanOrEqual,
-            right: Box::new(Expr::Literal(Literal::String(start_id.to_base64()))),
+            right: Box::new(Expr::Literal(Value::String(start_id.to_base64()))),
         },
         order_by: Some(vec![OrderByItem { path: PathExpr::simple("id".to_string()), direction: OrderDirection::Asc }]),
         limit: Some(3),

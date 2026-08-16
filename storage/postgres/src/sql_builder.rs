@@ -1,5 +1,6 @@
-use ankql::ast::{ComparisonOperator, Expr, Literal, OrderByItem, OrderDirection, Predicate, Selection};
+use ankql::ast::{ComparisonOperator, Expr, OrderByItem, OrderDirection, Predicate, Selection};
 use ankurah_core::error::RetrievalError;
+use ankurah_core_types::Value;
 use thiserror::Error;
 use tokio_postgres::types::ToSql;
 
@@ -278,16 +279,16 @@ impl SqlBuilder {
         match expr {
             Expr::Placeholder => return Err(SqlGenerationError::PlaceholderFound),
             Expr::Literal(lit) => match lit {
-                Literal::String(s) => self.arg(s.to_owned()),
-                Literal::I64(int) => self.arg(*int),
-                Literal::F64(float) => self.arg(*float),
-                Literal::Bool(bool) => self.arg(*bool),
-                Literal::I16(i) => self.arg(*i),
-                Literal::I32(i) => self.arg(*i),
-                Literal::EntityId(id) => self.arg(id.to_base64()),
-                Literal::Object(bytes) => self.arg(bytes.clone()),
-                Literal::Binary(bytes) => self.arg(bytes.clone()),
-                Literal::Json(json) => self.arg(json.clone()),
+                Value::String(s) => self.arg(s.to_owned()),
+                Value::I64(int) => self.arg(*int),
+                Value::F64(float) => self.arg(*float),
+                Value::Bool(bool) => self.arg(*bool),
+                Value::I16(i) => self.arg(*i),
+                Value::I32(i) => self.arg(*i),
+                Value::EntityId(id) => self.arg(id.to_base64()),
+                Value::Object(bytes) => self.arg(bytes.clone()),
+                Value::Binary(bytes) => self.arg(bytes.clone()),
+                Value::Json(json) => self.arg(json.clone()),
             },
             Expr::Path(path) => {
                 if path.is_simple() {
@@ -317,16 +318,16 @@ impl SqlBuilder {
                     match expr {
                         Expr::Placeholder => return Err(SqlGenerationError::PlaceholderFound),
                         Expr::Literal(lit) => match lit {
-                            Literal::String(s) => self.arg(s.to_owned()),
-                            Literal::I64(int) => self.arg(*int),
-                            Literal::F64(float) => self.arg(*float),
-                            Literal::Bool(bool) => self.arg(*bool),
-                            Literal::I16(i) => self.arg(*i),
-                            Literal::I32(i) => self.arg(*i),
-                            Literal::EntityId(id) => self.arg(id.to_base64()),
-                            Literal::Object(bytes) => self.arg(bytes.clone()),
-                            Literal::Binary(bytes) => self.arg(bytes.clone()),
-                            Literal::Json(json) => self.arg(json.clone()),
+                            Value::String(s) => self.arg(s.to_owned()),
+                            Value::I64(int) => self.arg(*int),
+                            Value::F64(float) => self.arg(*float),
+                            Value::Bool(bool) => self.arg(*bool),
+                            Value::I16(i) => self.arg(*i),
+                            Value::I32(i) => self.arg(*i),
+                            Value::EntityId(id) => self.arg(id.to_base64()),
+                            Value::Object(bytes) => self.arg(bytes.clone()),
+                            Value::Binary(bytes) => self.arg(bytes.clone()),
+                            Value::Json(json) => self.arg(json.clone()),
                         },
                         _ => {
                             return Err(SqlGenerationError::UnsupportedExpression(
@@ -351,25 +352,25 @@ impl SqlBuilder {
                 // For literals, we need to cast to jsonb
                 // PostgreSQL will compare jsonb values with proper type semantics
                 match lit {
-                    Literal::String(s) => {
+                    Value::String(s) => {
                         // String literals need to be JSON strings: '"value"'::jsonb
                         // Escape for JSON (backslash and quote) then for SQL (single quotes)
                         let json_escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
                         let sql_escaped = format!("\"{}\"", json_escaped).replace('\'', "''");
                         self.sql(format!("'{}'::jsonb", sql_escaped));
                     }
-                    Literal::I64(n) => self.sql(format!("'{}'::jsonb", n)),
-                    Literal::F64(n) => self.sql(format!("'{}'::jsonb", n)),
-                    Literal::Bool(b) => self.sql(format!("'{}'::jsonb", b)),
-                    Literal::I16(n) => self.sql(format!("'{}'::jsonb", n)),
-                    Literal::I32(n) => self.sql(format!("'{}'::jsonb", n)),
+                    Value::I64(n) => self.sql(format!("'{}'::jsonb", n)),
+                    Value::F64(n) => self.sql(format!("'{}'::jsonb", n)),
+                    Value::Bool(b) => self.sql(format!("'{}'::jsonb", b)),
+                    Value::I16(n) => self.sql(format!("'{}'::jsonb", n)),
+                    Value::I32(n) => self.sql(format!("'{}'::jsonb", n)),
                     // EntityId and binary types don't make sense as JSONB
-                    Literal::EntityId(_) | Literal::Object(_) | Literal::Binary(_) => {
+                    Value::EntityId(_) | Value::Object(_) | Value::Binary(_) => {
                         // Fall back to regular expression (will likely fail comparison, but that's correct)
                         self.expr(expr)?;
                     }
                     // JSON literal is already properly typed
-                    Literal::Json(json) => self.sql(format!("'{}'::jsonb", json)),
+                    Value::Json(json) => self.sql(format!("'{}'::jsonb", json)),
                 }
                 Ok(())
             }

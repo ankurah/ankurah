@@ -3,7 +3,8 @@
 //! Converts AnkQL predicates to SQLite-compatible SQL WHERE clauses.
 
 use crate::error::SqliteError;
-use ankql::ast::{ComparisonOperator, Expr, Literal, OrderByItem, OrderDirection, Predicate, Selection};
+use ankql::ast::{ComparisonOperator, Expr, OrderByItem, OrderDirection, Predicate, Selection};
+use ankurah_core_types::Value;
 use thiserror::Error;
 
 #[derive(Debug, Error, Clone)]
@@ -209,20 +210,20 @@ impl SqlBuilder {
         Ok(())
     }
 
-    fn literal(&mut self, lit: &Literal) {
+    fn literal(&mut self, lit: &Value) {
         match lit {
-            Literal::String(s) => self.push_param(rusqlite::types::Value::Text(s.clone())),
-            Literal::I64(i) => self.push_param(rusqlite::types::Value::Integer(*i)),
-            Literal::F64(f) => self.push_param(rusqlite::types::Value::Real(*f)),
-            Literal::Bool(b) => self.push_param(rusqlite::types::Value::Integer(if *b { 1 } else { 0 })),
-            Literal::I16(i) => self.push_param(rusqlite::types::Value::Integer(*i as i64)),
-            Literal::I32(i) => self.push_param(rusqlite::types::Value::Integer(*i as i64)),
-            Literal::EntityId(id) => self.push_param(rusqlite::types::Value::Text(id.to_base64())),
-            Literal::Object(bytes) => self.push_param(rusqlite::types::Value::Blob(bytes.clone())),
-            Literal::Binary(bytes) => self.push_param(rusqlite::types::Value::Blob(bytes.clone())),
+            Value::String(s) => self.push_param(rusqlite::types::Value::Text(s.clone())),
+            Value::I64(i) => self.push_param(rusqlite::types::Value::Integer(*i)),
+            Value::F64(f) => self.push_param(rusqlite::types::Value::Real(*f)),
+            Value::Bool(b) => self.push_param(rusqlite::types::Value::Integer(if *b { 1 } else { 0 })),
+            Value::I16(i) => self.push_param(rusqlite::types::Value::Integer(*i as i64)),
+            Value::I32(i) => self.push_param(rusqlite::types::Value::Integer(*i as i64)),
+            Value::EntityId(id) => self.push_param(rusqlite::types::Value::Text(id.to_base64())),
+            Value::Object(bytes) => self.push_param(rusqlite::types::Value::Blob(bytes.clone())),
+            Value::Binary(bytes) => self.push_param(rusqlite::types::Value::Blob(bytes.clone())),
             // For JSON literals, extract the raw SQL value since json_extract() returns SQL types.
             // json.to_string() would produce "US" (with quotes) but we need just US.
-            Literal::Json(json) => match json {
+            Value::Json(json) => match json {
                 serde_json::Value::String(s) => self.push_param(rusqlite::types::Value::Text(s.clone())),
                 serde_json::Value::Number(n) => {
                     if let Some(i) = n.as_i64() {

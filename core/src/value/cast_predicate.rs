@@ -1,7 +1,7 @@
 use crate::error::RetrievalError;
 use crate::schema::CollectionSchema;
 use crate::value::{Value, ValueType};
-use ankql::ast::{Expr, Literal, Predicate};
+use ankql::ast::{Expr, Predicate};
 use anyhow::Result;
 
 /// Cast all literals in a predicate based on field names using a CollectionSchema
@@ -61,13 +61,10 @@ fn cast_expr_types<S: CollectionSchema>(expr: Expr, schema: &S) -> Result<Expr, 
     }
 }
 
-/// Cast a literal to a specific type using the Value casting system
-fn cast_literal_to_type(literal: Literal, target_type: ValueType) -> Result<Expr, RetrievalError> {
-    // Convert Literal -> Value -> cast -> Literal -> Expr
-    let value: Value = literal.into();
-    let cast_value = value.cast_to(target_type).map_err(|e| RetrievalError::StorageError(format!("Type casting error: {}", e).into()))?;
-    let cast_literal: Literal = cast_value.into();
-    Ok(Expr::Literal(cast_literal))
+/// Cast a literal to the type its field declares
+fn cast_literal_to_type(literal: Value, target_type: ValueType) -> Result<Expr, RetrievalError> {
+    let cast = literal.cast_to(target_type).map_err(|e| RetrievalError::StorageError(format!("Type casting error: {}", e).into()))?;
+    Ok(Expr::Literal(cast))
 }
 
 #[cfg(test)]
@@ -100,7 +97,7 @@ mod tests {
         let predicate = Predicate::Comparison {
             left: Box::new(Expr::Path(PathExpr::simple("id"))),
             operator: ComparisonOperator::Equal,
-            right: Box::new(Expr::Literal(Literal::String(base64_str.clone()))),
+            right: Box::new(Expr::Literal(Value::String(base64_str.clone()))),
         };
 
         let schema = TestSchema;
@@ -108,7 +105,7 @@ mod tests {
 
         // Verify the string literal was cast to EntityId
         if let Predicate::Comparison { right, .. } = cast_predicate {
-            if let Expr::Literal(Literal::EntityId(cast)) = *right {
+            if let Expr::Literal(Value::EntityId(cast)) = *right {
                 assert_eq!(cast, entity_id);
             } else {
                 panic!("Expected EntityId literal, got {:?}", right);
@@ -125,7 +122,7 @@ mod tests {
 
         // Create a predicate: "base64_string" = id (literal on left side)
         let predicate = Predicate::Comparison {
-            left: Box::new(Expr::Literal(Literal::String(base64_str.clone()))),
+            left: Box::new(Expr::Literal(Value::String(base64_str.clone()))),
             operator: ComparisonOperator::Equal,
             right: Box::new(Expr::Path(PathExpr::simple("id"))),
         };
@@ -135,7 +132,7 @@ mod tests {
 
         // Verify the string literal was cast to EntityId
         if let Predicate::Comparison { left, .. } = cast_predicate {
-            if let Expr::Literal(Literal::EntityId(cast)) = *left {
+            if let Expr::Literal(Value::EntityId(cast)) = *left {
                 assert_eq!(cast, entity_id);
             } else {
                 panic!("Expected EntityId literal, got {:?}", left);
@@ -155,12 +152,12 @@ mod tests {
             Box::new(Predicate::Comparison {
                 left: Box::new(Expr::Path(PathExpr::simple("id"))),
                 operator: ComparisonOperator::Equal,
-                right: Box::new(Expr::Literal(Literal::String(base64_str.clone()))),
+                right: Box::new(Expr::Literal(Value::String(base64_str.clone()))),
             }),
             Box::new(Predicate::Comparison {
                 left: Box::new(Expr::Path(PathExpr::simple("name"))),
                 operator: ComparisonOperator::Equal,
-                right: Box::new(Expr::Literal(Literal::String("test".to_string()))),
+                right: Box::new(Expr::Literal(Value::String("test".to_string()))),
             }),
         );
 
@@ -171,7 +168,7 @@ mod tests {
         if let Predicate::And(left_pred, right_pred) = cast_predicate {
             // Check id field was cast to EntityId
             if let Predicate::Comparison { right, .. } = *left_pred {
-                if let Expr::Literal(Literal::EntityId(cast)) = *right {
+                if let Expr::Literal(Value::EntityId(cast)) = *right {
                     assert_eq!(cast, entity_id);
                 } else {
                     panic!("Expected EntityId literal for id field");
@@ -180,7 +177,7 @@ mod tests {
 
             // Check name field remained as String
             if let Predicate::Comparison { right, .. } = *right_pred {
-                if let Expr::Literal(Literal::String(s)) = *right {
+                if let Expr::Literal(Value::String(s)) = *right {
                     assert_eq!(s, "test");
                 } else {
                     panic!("Expected String literal for name field");

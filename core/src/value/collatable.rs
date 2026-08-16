@@ -188,3 +188,40 @@ impl Collatable for Value {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn narrow_integers_collate_at_the_full_i64_width() {
+        for (value, max, min) in
+            [(Value::I16(100), Value::I16(i16::MAX), Value::I16(i16::MIN)), (Value::I32(1000), Value::I32(i32::MAX), Value::I32(i32::MIN))]
+        {
+            assert_eq!(value.to_bytes().len(), 8);
+            assert!(value.successor_bytes().unwrap() > value.to_bytes());
+            assert!(value.predecessor_bytes().unwrap() < value.to_bytes());
+            assert!(!value.is_minimum());
+            assert!(!value.is_maximum());
+
+            assert!(max.successor_bytes().is_none());
+            assert!(min.predecessor_bytes().is_none());
+            assert!(max.is_maximum());
+            assert!(min.is_minimum());
+        }
+    }
+
+    #[test]
+    fn entity_ids_bound_at_the_all_zero_and_all_ones_ids() {
+        assert!(!Value::EntityId(EntityId::random()).is_minimum());
+        assert!(!Value::EntityId(EntityId::random()).is_maximum());
+
+        let min = Value::EntityId(EntityId::from_bytes([0; EntityId::BYTE_LEN]));
+        assert!(min.is_minimum());
+        assert!(min.predecessor_bytes().is_none());
+
+        let max = Value::EntityId(EntityId::from_bytes([255; EntityId::BYTE_LEN]));
+        assert!(max.is_maximum());
+        assert!(max.successor_bytes().is_none());
+    }
+}

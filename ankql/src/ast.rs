@@ -1,52 +1,17 @@
 use crate::error::ParseError;
 use crate::selection::sql::generate_selection_sql;
 use ankurah_core_types::EntityId;
+pub use ankurah_core_types::Value;
 use serde::{Deserialize, Serialize};
-
-/// Custom serialization for serde_json::Value that stores as bytes.
-/// This is needed because bincode doesn't support deserialize_any.
-mod json_as_bytes {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    pub fn serialize<S>(value: &serde_json::Value, serializer: S) -> Result<S::Ok, S::Error>
-    where S: Serializer {
-        let bytes = serde_json::to_vec(value).map_err(serde::ser::Error::custom)?;
-        bytes.serialize(serializer)
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<serde_json::Value, D::Error>
-    where D: Deserializer<'de> {
-        let bytes: Vec<u8> = Vec::deserialize(deserializer)?;
-        serde_json::from_slice(&bytes).map_err(serde::de::Error::custom)
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Expr {
-    Literal(Literal),
+    Literal(Value),
     Path(PathExpr),
     Predicate(Predicate),
     InfixExpr { left: Box<Expr>, operator: InfixOperator, right: Box<Expr> },
     ExprList(Vec<Expr>), // New variant for handling lists like (1,2,3) in IN clauses
     Placeholder,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum Literal {
-    I16(i16),
-    I32(i32),
-    I64(i64),
-    F64(f64),
-    Bool(bool),
-    String(String),
-    EntityId(EntityId),
-    Object(Vec<u8>),
-    Binary(Vec<u8>),
-    /// JSON value - used for comparisons against JSON property subfields.
-    /// Not parsed from query syntax; created by AST preparation pass.
-    /// Serialized as bytes for bincode compatibility.
-    #[serde(with = "json_as_bytes")]
-    Json(serde_json::Value),
 }
 
 /// A dot-separated path like `name` or `licensing.territory`
@@ -468,7 +433,7 @@ mod tests {
         let expected = Predicate::Comparison {
             left: Box::new(Expr::Path(PathExpr::simple("name".to_string()))),
             operator: ComparisonOperator::Equal,
-            right: Box::new(Expr::Literal(Literal::String("Alice".to_string()))),
+            right: Box::new(Expr::Literal(Value::String("Alice".to_string()))),
         };
 
         assert_eq!(populated, expected);
@@ -484,12 +449,12 @@ mod tests {
             Box::new(Predicate::Comparison {
                 left: Box::new(Expr::Path(PathExpr::simple("age".to_string()))),
                 operator: ComparisonOperator::GreaterThan,
-                right: Box::new(Expr::Literal(Literal::I64(25))),
+                right: Box::new(Expr::Literal(Value::I64(25))),
             }),
             Box::new(Predicate::Comparison {
                 left: Box::new(Expr::Path(PathExpr::simple("name".to_string()))),
                 operator: ComparisonOperator::Equal,
-                right: Box::new(Expr::Literal(Literal::String("Bob".to_string()))),
+                right: Box::new(Expr::Literal(Value::String("Bob".to_string()))),
             }),
         );
 
@@ -505,9 +470,9 @@ mod tests {
             left: Box::new(Expr::Path(PathExpr::simple("status".to_string()))),
             operator: ComparisonOperator::In,
             right: Box::new(Expr::ExprList(vec![
-                Expr::Literal(Literal::String("active".to_string())),
-                Expr::Literal(Literal::String("pending".to_string())),
-                Expr::Literal(Literal::String("review".to_string())),
+                Expr::Literal(Value::String("active".to_string())),
+                Expr::Literal(Value::String("pending".to_string())),
+                Expr::Literal(Value::String("review".to_string())),
             ])),
         };
 
@@ -525,16 +490,16 @@ mod tests {
             if let Predicate::And(inner_left, inner_right) = *left {
                 // Check boolean value
                 if let Predicate::Comparison { right: val, .. } = *inner_left {
-                    assert_eq!(*val, Expr::Literal(Literal::Bool(true)));
+                    assert_eq!(*val, Expr::Literal(Value::Bool(true)));
                 }
                 // Check float value
                 if let Predicate::Comparison { right: val, .. } = *inner_right {
-                    assert_eq!(*val, Expr::Literal(Literal::F64(95.5)));
+                    assert_eq!(*val, Expr::Literal(Value::F64(95.5)));
                 }
             }
             // Check string value
             if let Predicate::Comparison { right: val, .. } = *right {
-                assert_eq!(*val, Expr::Literal(Literal::String("Charlie".to_string())));
+                assert_eq!(*val, Expr::Literal(Value::String("Charlie".to_string())));
             }
         }
     }
@@ -569,35 +534,35 @@ mod tests {
 
 // From implementations for single values that wrap them in Expr::Literal
 impl From<String> for Expr {
-    fn from(s: String) -> Expr { Expr::Literal(Literal::String(s)) }
+    fn from(s: String) -> Expr { Expr::Literal(Value::String(s)) }
 }
 
 impl From<&str> for Expr {
-    fn from(s: &str) -> Expr { Expr::Literal(Literal::String(s.to_string())) }
+    fn from(s: &str) -> Expr { Expr::Literal(Value::String(s.to_string())) }
 }
 
 impl From<i64> for Expr {
-    fn from(i: i64) -> Expr { Expr::Literal(Literal::I64(i)) }
+    fn from(i: i64) -> Expr { Expr::Literal(Value::I64(i)) }
 }
 
 impl From<f64> for Expr {
-    fn from(f: f64) -> Expr { Expr::Literal(Literal::F64(f)) }
+    fn from(f: f64) -> Expr { Expr::Literal(Value::F64(f)) }
 }
 
 impl From<bool> for Expr {
-    fn from(b: bool) -> Expr { Expr::Literal(Literal::Bool(b)) }
+    fn from(b: bool) -> Expr { Expr::Literal(Value::Bool(b)) }
 }
 
-impl From<Literal> for Expr {
-    fn from(lit: Literal) -> Expr { Expr::Literal(lit) }
+impl From<Value> for Expr {
+    fn from(value: Value) -> Expr { Expr::Literal(value) }
 }
 
 impl From<EntityId> for Expr {
-    fn from(id: EntityId) -> Expr { Expr::Literal(Literal::EntityId(id)) }
+    fn from(id: EntityId) -> Expr { Expr::Literal(Value::EntityId(id)) }
 }
 
 impl From<&EntityId> for Expr {
-    fn from(id: &EntityId) -> Expr { Expr::Literal(Literal::EntityId(*id)) }
+    fn from(id: &EntityId) -> Expr { Expr::Literal(Value::EntityId(*id)) }
 }
 
 // These create Expr::ExprList for use in IN clauses

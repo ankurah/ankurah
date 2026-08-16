@@ -565,12 +565,13 @@ fn extract_all_fields(entity_obj: &Object, entity_state: &EntityState) -> Result
 
 /// Amend a selection with __collection = 'value' comparison
 pub fn add_collection(selection: &ankql::ast::Selection, collection_id: &ankurah_proto::CollectionId) -> ankql::ast::Selection {
-    use ankql::ast::{ComparisonOperator, Expr, Literal, PathExpr, Predicate};
+    use ankql::ast::{ComparisonOperator, Expr, PathExpr, Predicate};
+    use ankurah_core_types::Value;
 
     let collection_comparison = Predicate::Comparison {
         left: Box::new(Expr::Path(PathExpr::simple("__collection"))),
         operator: ComparisonOperator::Equal,
-        right: Box::new(Expr::Literal(Literal::String(collection_id.to_string()))),
+        right: Box::new(Expr::Literal(Value::String(collection_id.to_string()))),
     };
 
     ankql::ast::Selection {

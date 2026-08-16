@@ -45,7 +45,7 @@ where T: Property
     }
 }
 
-macro_rules! into {
+macro_rules! impl_property {
     ($ty:ty => $variant:ident, $value_type:literal) => {
         impl Property for $ty {
             const VALUE_TYPE: &'static str = $value_type;
@@ -59,20 +59,17 @@ macro_rules! into {
                 }
             }
         }
-        impl From<$ty> for Value {
-            fn from(value: $ty) -> Self { Value::$variant(value) }
-        }
     };
 }
 
-into!(String => String, "string");
-into!(i16 => I16, "i16");
-into!(i32 => I32, "i32");
-into!(i64 => I64, "i64");
-into!(f64 => F64, "f64");
-into!(bool => Bool, "bool");
-into!(EntityId => EntityId, "entityid");
-into!(Vec<u8> => Binary, "binary");
+impl_property!(String => String, "string");
+impl_property!(i16 => I16, "i16");
+impl_property!(i32 => I32, "i32");
+impl_property!(i64 => I64, "i64");
+impl_property!(f64 => F64, "f64");
+impl_property!(bool => Bool, "bool");
+impl_property!(EntityId => EntityId, "entityid");
+impl_property!(Vec<u8> => Binary, "binary");
 
 impl<'a> Property for std::borrow::Cow<'a, str> {
     const VALUE_TYPE: &'static str = "string";
@@ -86,10 +83,6 @@ impl<'a> Property for std::borrow::Cow<'a, str> {
             None => Err(PropertyError::Missing),
         }
     }
-}
-
-impl From<&str> for Value {
-    fn from(value: &str) -> Self { Value::String(value.to_string()) }
 }
 
 #[cfg(test)]

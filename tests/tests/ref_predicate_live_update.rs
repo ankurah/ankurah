@@ -11,6 +11,7 @@ mod common;
 
 use crate::common::*;
 use ankurah::{Model, Ref};
+use ankurah_core_types::Value;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -65,8 +66,7 @@ async fn typed_ref_literal_receives_live_updates() -> Result<()> {
     let room_b = create_room(&ctx, "b").await?;
 
     let mut selection: ankurah::ankql::ast::Selection = "room = ?".try_into()?;
-    selection.predicate =
-        selection.predicate.populate([ankurah::ankql::ast::Expr::Literal(ankurah::ankql::ast::Literal::EntityId(room_a))])?;
+    selection.predicate = selection.predicate.populate([ankurah::ankql::ast::Expr::Literal(Value::EntityId(room_a))])?;
 
     let lq = ctx.query::<RefPredMessageView>(selection)?;
     lq.wait_initialized().await;

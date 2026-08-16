@@ -115,7 +115,7 @@ pub fn build_continuation_predicate<E: AbstractEntity>(
     order_by: &[ankql::ast::OrderByItem],
     last_entity: &E,
 ) -> Result<ankql::ast::Predicate, String> {
-    use ankql::ast::{ComparisonOperator, Expr, Literal, OrderDirection, PathExpr, Predicate};
+    use ankql::ast::{ComparisonOperator, Expr, OrderDirection, PathExpr, Predicate};
 
     let mut gap_conditions = Vec::new();
 
@@ -129,15 +129,9 @@ pub fn build_continuation_predicate<E: AbstractEntity>(
         // Get the field value from the last entity
         if let Some(field_value) = last_entity.value(field_name) {
             let literal = match field_value {
-                Value::String(s) => Literal::String(s),
-                Value::I16(i) => Literal::I16(i),
-                Value::I32(i) => Literal::I32(i),
-                Value::I64(i) => Literal::I64(i),
-                Value::F64(f) => Literal::F64(f),
-                Value::Bool(b) => Literal::Bool(b),
-                Value::EntityId(id) => Literal::EntityId(id.into()),
                 // Skip Object, Binary, and Json for now - they're not commonly used in ORDER BY
                 Value::Object(_) | Value::Binary(_) | Value::Json(_) => continue,
+                literal => literal,
             };
 
             let operator = match order_item.direction {
@@ -159,7 +153,7 @@ pub fn build_continuation_predicate<E: AbstractEntity>(
     let id_exclusion = Predicate::Comparison {
         left: Box::new(Expr::Path(PathExpr::simple("id"))),
         operator: ComparisonOperator::NotEqual,
-        right: Box::new(Expr::Literal(Literal::EntityId((*last_entity.id()).into()))),
+        right: Box::new(Expr::Literal(Value::EntityId(*last_entity.id()))),
     };
     gap_conditions.push(id_exclusion);
 

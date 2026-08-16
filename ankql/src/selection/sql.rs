@@ -1,5 +1,6 @@
-use crate::ast::{ComparisonOperator, Expr, Literal, Predicate};
+use crate::ast::{ComparisonOperator, Expr, Predicate};
 use crate::error::SqlGenerationError;
+use ankurah_core_types::Value;
 
 fn generate_expr_sql(
     expr: &Expr,
@@ -21,22 +22,22 @@ fn generate_expr_sql(
             buffer.push('?');
         }
         Expr::Literal(lit) => match lit {
-            Literal::I16(i) => {
+            Value::I16(i) => {
                 buffer.push_str(&i.to_string());
             }
-            Literal::I32(i) => {
+            Value::I32(i) => {
                 buffer.push_str(&i.to_string());
             }
-            Literal::I64(i) => {
+            Value::I64(i) => {
                 buffer.push_str(&i.to_string());
             }
-            Literal::F64(f) => {
+            Value::F64(f) => {
                 buffer.push_str(&f.to_string());
             }
-            Literal::Bool(b) => {
+            Value::Bool(b) => {
                 buffer.push_str(if *b { "true" } else { "false" });
             }
-            Literal::String(s) => {
+            Value::String(s) => {
                 buffer.push('\'');
                 // Escape problematic characters for SQL safety
                 for c in s.chars() {
@@ -52,17 +53,17 @@ fn generate_expr_sql(
                 }
                 buffer.push('\'');
             }
-            Literal::EntityId(id) => {
+            Value::EntityId(id) => {
                 buffer.push('\'');
                 buffer.push_str(&id.to_base64());
                 buffer.push('\'');
             }
-            Literal::Object(bytes) | Literal::Binary(bytes) => {
+            Value::Object(bytes) | Value::Binary(bytes) => {
                 buffer.push('\'');
                 buffer.push_str(&String::from_utf8_lossy(bytes));
                 buffer.push('\'');
             }
-            Literal::Json(value) => {
+            Value::Json(value) => {
                 // Serialize JSON and wrap in quotes for SQL
                 buffer.push('\'');
                 buffer.push_str(&value.to_string());
@@ -103,19 +104,19 @@ fn generate_expr_sql(
                         buffer.push('?');
                     }
                     Expr::Literal(lit) => match lit {
-                        Literal::I16(i) => {
+                        Value::I16(i) => {
                             buffer.push_str(&i.to_string());
                         }
-                        Literal::I32(i) => {
+                        Value::I32(i) => {
                             buffer.push_str(&i.to_string());
                         }
-                        Literal::I64(i) => {
+                        Value::I64(i) => {
                             buffer.push_str(&i.to_string());
                         }
-                        Literal::F64(f) => {
+                        Value::F64(f) => {
                             buffer.push_str(&f.to_string());
                         }
-                        Literal::String(s) => {
+                        Value::String(s) => {
                             buffer.push('\'');
                             // Escape problematic characters for SQL safety
                             for c in s.chars() {
@@ -131,21 +132,21 @@ fn generate_expr_sql(
                             }
                             buffer.push('\'');
                         }
-                        Literal::Bool(b) => {
+                        Value::Bool(b) => {
                             buffer.push_str(if *b { "true" } else { "false" });
                         }
-                        Literal::EntityId(id) => {
+                        Value::EntityId(id) => {
                             buffer.push('\'');
                             buffer.push_str(&id.to_base64());
                             buffer.push('\'');
                         }
-                        Literal::Object(_bytes) | Literal::Binary(_bytes) => {
+                        Value::Object(_bytes) | Value::Binary(_bytes) => {
                             todo!("Object and Binary literals");
                             // buffer.push('\'');
                             // buffer.push_str(&String::from_utf8_lossy(bytes));
                             // buffer.push('\'');
                         }
-                        Literal::Json(value) => {
+                        Value::Json(value) => {
                             buffer.push('\'');
                             buffer.push_str(&value.to_string());
                             buffer.push('\'');
@@ -242,9 +243,10 @@ fn generate_selection_sql_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{ComparisonOperator, Expr, Literal, PathExpr, Predicate};
+    use crate::ast::{ComparisonOperator, Expr, PathExpr, Predicate};
     use crate::error::SqlGenerationError;
     use crate::parser::parse_selection;
+    use ankurah_core_types::Value;
     use anyhow::Result;
 
     #[test]
@@ -355,7 +357,7 @@ mod tests {
         let predicate = Predicate::Comparison {
             left: Box::new(Expr::Path(PathExpr::simple("name"))),
             operator: ComparisonOperator::Equal,
-            right: Box::new(Expr::Literal(Literal::String("O'Brien".to_string()))),
+            right: Box::new(Expr::Literal(Value::String("O'Brien".to_string()))),
         };
         let sql = generate_selection_sql(&predicate, None)?;
         assert_eq!(sql, r#""name" = 'O''Brien'"#);
@@ -368,7 +370,7 @@ mod tests {
         let predicate = Predicate::Comparison {
             left: Box::new(Expr::Path(PathExpr::simple("data"))),
             operator: ComparisonOperator::Equal,
-            right: Box::new(Expr::Literal(Literal::String("test\0data".to_string()))),
+            right: Box::new(Expr::Literal(Value::String("test\0data".to_string()))),
         };
         let sql = generate_selection_sql(&predicate, None)?;
         assert_eq!(sql, r#""data" = 'testdata'"#);
