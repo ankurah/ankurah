@@ -177,4 +177,29 @@ mod tests {
         assert_eq!(index.find_matching(Value::I64(8)).collect::<Vec<_>>(), vec![]);
         assert_eq!(index.find_matching(Value::I64(9)).collect::<Vec<_>>(), vec![sub0]);
     }
+
+    #[test]
+    fn test_narrow_integer_literals_match_values() {
+        let mut i16_index = ComparisonIndex::<proto::QueryId>::new();
+        let mut i32_index = ComparisonIndex::<proto::QueryId>::new();
+        let i16_sub = proto::QueryId::test(0);
+        let i32_sub = proto::QueryId::test(1);
+
+        i16_index.add(ast::Literal::I16(8), ast::ComparisonOperator::Equal, i16_sub);
+        i32_index.add(ast::Literal::I32(8), ast::ComparisonOperator::Equal, i32_sub);
+
+        assert_eq!(i16_index.find_matching(Value::I16(8)).collect::<Vec<_>>(), vec![i16_sub]);
+        assert_eq!(i32_index.find_matching(Value::I32(8)).collect::<Vec<_>>(), vec![i32_sub]);
+    }
+
+    #[test]
+    fn test_less_than_or_equal_false_matches_false() {
+        let mut index = ComparisonIndex::<proto::QueryId>::new();
+        let sub = proto::QueryId::test(0);
+
+        index.add(ast::Literal::Bool(false), ast::ComparisonOperator::LessThanOrEqual, sub);
+
+        assert_eq!(index.find_matching(Value::Bool(false)).collect::<Vec<_>>(), vec![sub]);
+        assert_eq!(index.find_matching(Value::Bool(true)).collect::<Vec<_>>(), vec![]);
+    }
 }

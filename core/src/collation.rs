@@ -51,8 +51,8 @@ impl Collatable for ast::Literal {
     fn to_bytes(&self) -> Vec<u8> {
         match self {
             ast::Literal::String(s) => s.as_bytes().to_vec(),
-            ast::Literal::I16(i) => i.to_be_bytes().to_vec(),
-            ast::Literal::I32(i) => i.to_be_bytes().to_vec(),
+            ast::Literal::I16(i) => (*i as i64).to_be_bytes().to_vec(),
+            ast::Literal::I32(i) => (*i as i64).to_be_bytes().to_vec(),
             ast::Literal::I64(i) => i.to_be_bytes().to_vec(),
             ast::Literal::F64(f) => {
                 let bits = if f.is_nan() {
@@ -95,14 +95,14 @@ impl Collatable for ast::Literal {
                 if *i == i16::MAX {
                     None
                 } else {
-                    Some((i + 1).to_be_bytes().to_vec())
+                    Some(((*i as i64) + 1).to_be_bytes().to_vec())
                 }
             }
             ast::Literal::I32(i) => {
                 if *i == i32::MAX {
                     None
                 } else {
-                    Some((i + 1).to_be_bytes().to_vec())
+                    Some(((*i as i64) + 1).to_be_bytes().to_vec())
                 }
             }
             ast::Literal::I64(i) => {
@@ -122,7 +122,7 @@ impl Collatable for ast::Literal {
                 }
             }
             ast::Literal::Bool(b) => {
-                if !b {
+                if *b {
                     None
                 } else {
                     Some(vec![1])
@@ -179,14 +179,14 @@ impl Collatable for ast::Literal {
                 if *i == i16::MIN {
                     None
                 } else {
-                    Some((i - 1).to_be_bytes().to_vec())
+                    Some(((*i as i64) - 1).to_be_bytes().to_vec())
                 }
             }
             ast::Literal::I32(i) => {
                 if *i == i32::MIN {
                     None
                 } else {
-                    Some((i - 1).to_be_bytes().to_vec())
+                    Some(((*i as i64) - 1).to_be_bytes().to_vec())
                 }
             }
             ast::Literal::I64(i) => {
