@@ -8,6 +8,7 @@ publish = false
 anyhow = "1.0"
 tracing = "0.1"
 ankql = { path = "../ankql", version = "=0.9.0" }
+ankurah-core-types = { path = "../core-types", version = "=0.9.0" }
 ankurah = { path = "../ankurah", features = [
     "derive",
     "instrument",

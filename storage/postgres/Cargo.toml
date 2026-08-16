@@ -18,13 +18,14 @@ anyhow         = "1.0"
 thiserror      = "2.0"
 tokio          = { version = "1.36", features = ["full"] }
 
-ankql         = { path = "../../ankql", version = "=0.9.0" }
-ankurah-core  = { path = "../../core", version = "=0.9.0" }
-ankurah-proto = { path = "../../proto", version = "=0.9.0", features = ["postgres"] }
-tracing       = "0.1"
-async-trait   = "0.1"
-futures-util  = "0.3"
-bytes         = "1.5"
+ankql              = { path = "../../ankql", version = "=0.9.0" }
+ankurah-core       = { path = "../../core", version = "=0.9.0" }
+ankurah-core-types = { path = "../../core-types", version = "=0.9.0" }
+ankurah-proto      = { path = "../../proto", version = "=0.9.0", features = ["postgres"] }
+tracing            = "0.1"
+async-trait        = "0.1"
+futures-util       = "0.3"
+bytes              = "1.5"
 
 [dev-dependencies]
 ankurah                = { path = "../../ankurah", version = "=0.9.0", features = ["derive"] }

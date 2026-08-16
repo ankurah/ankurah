@@ -1,4 +1,5 @@
 use ankurah::selection;
+use ankurah_core_types::Value;
 
 #[test]
 fn test_selection_macro_unquoted_syntax() {
@@ -14,7 +15,7 @@ fn test_selection_macro_unquoted_syntax() {
             predicate: ankql::ast::Predicate::Comparison {
                 left: Box::new(ankql::ast::Expr::Path(ankql::ast::PathExpr::simple("name".to_string(),))),
                 operator: ankql::ast::ComparisonOperator::Equal,
-                right: Box::new(ankql::ast::Expr::Literal(ankql::ast::Literal::String("Alice".to_string(),))),
+                right: Box::new(ankql::ast::Expr::Literal(Value::String("Alice".to_string(),))),
             },
             order_by: None,
             limit: None,
@@ -30,18 +31,18 @@ fn test_selection_macro_unquoted_syntax() {
                     Box::new(ankql::ast::Predicate::Comparison {
                         left: Box::new(ankql::ast::Expr::Path(ankql::ast::PathExpr::simple("name".to_string(),))),
                         operator: ankql::ast::ComparisonOperator::Equal,
-                        right: Box::new(ankql::ast::Expr::Literal(ankql::ast::Literal::String("Alice".to_string(),))),
+                        right: Box::new(ankql::ast::Expr::Literal(Value::String("Alice".to_string(),))),
                     }),
                     Box::new(ankql::ast::Predicate::Comparison {
                         left: Box::new(ankql::ast::Expr::Path(ankql::ast::PathExpr::simple("age".to_string(),))),
                         operator: ankql::ast::ComparisonOperator::GreaterThan,
-                        right: Box::new(ankql::ast::Expr::Literal(ankql::ast::Literal::I64(25))),
+                        right: Box::new(ankql::ast::Expr::Literal(Value::I64(25))),
                     }),
                 )),
                 Box::new(ankql::ast::Predicate::Comparison {
                     left: Box::new(ankql::ast::Expr::Path(ankql::ast::PathExpr::simple("active".to_string(),))),
                     operator: ankql::ast::ComparisonOperator::Equal,
-                    right: Box::new(ankql::ast::Expr::Literal(ankql::ast::Literal::Bool(true))),
+                    right: Box::new(ankql::ast::Expr::Literal(Value::Bool(true))),
                 }),
             ),
             order_by: None,
@@ -63,8 +64,8 @@ fn test_selection_macro_in_clause() {
                 left: Box::new(ankql::ast::Expr::Path(ankql::ast::PathExpr::simple("status".to_string(),))),
                 operator: ankql::ast::ComparisonOperator::In,
                 right: Box::new(ankql::ast::Expr::ExprList(vec![
-                    ankql::ast::Expr::Literal(ankql::ast::Literal::String("active".to_string())),
-                    ankql::ast::Expr::Literal(ankql::ast::Literal::String("pending".to_string())),
+                    ankql::ast::Expr::Literal(Value::String("active".to_string())),
+                    ankql::ast::Expr::Literal(Value::String("pending".to_string())),
                 ])),
             },
             order_by: None,
@@ -88,18 +89,18 @@ fn test_selection_macro_quoted_syntax() {
                     Box::new(ankql::ast::Predicate::Comparison {
                         left: Box::new(ankql::ast::Expr::Path(ankql::ast::PathExpr::simple("name".to_string(),))),
                         operator: ankql::ast::ComparisonOperator::Equal,
-                        right: Box::new(ankql::ast::Expr::Literal(ankql::ast::Literal::String("Bob".to_string(),))),
+                        right: Box::new(ankql::ast::Expr::Literal(Value::String("Bob".to_string(),))),
                     }),
                     Box::new(ankql::ast::Predicate::Comparison {
                         left: Box::new(ankql::ast::Expr::Path(ankql::ast::PathExpr::simple("age".to_string(),))),
                         operator: ankql::ast::ComparisonOperator::Equal,
-                        right: Box::new(ankql::ast::Expr::Literal(ankql::ast::Literal::I64(30))),
+                        right: Box::new(ankql::ast::Expr::Literal(Value::I64(30))),
                     }),
                 )),
                 Box::new(ankql::ast::Predicate::Comparison {
                     left: Box::new(ankql::ast::Expr::Path(ankql::ast::PathExpr::simple("active".to_string(),))),
                     operator: ankql::ast::ComparisonOperator::Equal,
-                    right: Box::new(ankql::ast::Expr::Literal(ankql::ast::Literal::Bool(true))),
+                    right: Box::new(ankql::ast::Expr::Literal(Value::Bool(true))),
                 }),
             ),
             order_by: None,
@@ -121,7 +122,7 @@ fn test_selection_macro_shorthand_syntax() {
             predicate: ankql::ast::Predicate::Comparison {
                 left: Box::new(ankql::ast::Expr::Path(ankql::ast::PathExpr::simple("name".to_string(),))),
                 operator: ankql::ast::ComparisonOperator::Equal,
-                right: Box::new(ankql::ast::Expr::Literal(ankql::ast::Literal::String("Alice".to_string(),))),
+                right: Box::new(ankql::ast::Expr::Literal(Value::String("Alice".to_string(),))),
             },
             order_by: None,
             limit: None,
@@ -136,12 +137,12 @@ fn test_selection_macro_shorthand_syntax() {
                 Box::new(ankql::ast::Predicate::Comparison {
                     left: Box::new(ankql::ast::Expr::Path(ankql::ast::PathExpr::simple("name".to_string(),))),
                     operator: ankql::ast::ComparisonOperator::Equal,
-                    right: Box::new(ankql::ast::Expr::Literal(ankql::ast::Literal::String("Alice".to_string(),))),
+                    right: Box::new(ankql::ast::Expr::Literal(Value::String("Alice".to_string(),))),
                 }),
                 Box::new(ankql::ast::Predicate::Comparison {
                     left: Box::new(ankql::ast::Expr::Path(ankql::ast::PathExpr::simple("age".to_string(),))),
                     operator: ankql::ast::ComparisonOperator::Equal,
-                    right: Box::new(ankql::ast::Expr::Literal(ankql::ast::Literal::I64(25))),
+                    right: Box::new(ankql::ast::Expr::Literal(Value::I64(25))),
                 }),
             ),
             order_by: None,
@@ -168,7 +169,7 @@ fn test_selection_macro_operator_shorthand() {
             predicate: ankql::ast::Predicate::Comparison {
                 left: Box::new(ankql::ast::Expr::Path(ankql::ast::PathExpr::simple("age".to_string()))),
                 operator: ankql::ast::ComparisonOperator::GreaterThan,
-                right: Box::new(ankql::ast::Expr::Literal(ankql::ast::Literal::I64(25))),
+                right: Box::new(ankql::ast::Expr::Literal(Value::I64(25))),
             },
             order_by: None,
             limit: None,
@@ -182,7 +183,7 @@ fn test_selection_macro_operator_shorthand() {
             predicate: ankql::ast::Predicate::Comparison {
                 left: Box::new(ankql::ast::Expr::Path(ankql::ast::PathExpr::simple("count".to_string()))),
                 operator: ankql::ast::ComparisonOperator::LessThanOrEqual,
-                right: Box::new(ankql::ast::Expr::Literal(ankql::ast::Literal::I64(10))),
+                right: Box::new(ankql::ast::Expr::Literal(Value::I64(10))),
             },
             order_by: None,
             limit: None,
@@ -196,7 +197,7 @@ fn test_selection_macro_operator_shorthand() {
             predicate: ankql::ast::Predicate::Comparison {
                 left: Box::new(ankql::ast::Expr::Path(ankql::ast::PathExpr::simple("status".to_string()))),
                 operator: ankql::ast::ComparisonOperator::NotEqual,
-                right: Box::new(ankql::ast::Expr::Literal(ankql::ast::Literal::String("active".to_string()))),
+                right: Box::new(ankql::ast::Expr::Literal(Value::String("active".to_string()))),
             },
             order_by: None,
             limit: None,
@@ -211,12 +212,12 @@ fn test_selection_macro_operator_shorthand() {
                 Box::new(ankql::ast::Predicate::Comparison {
                     left: Box::new(ankql::ast::Expr::Path(ankql::ast::PathExpr::simple("age".to_string()))),
                     operator: ankql::ast::ComparisonOperator::GreaterThan,
-                    right: Box::new(ankql::ast::Expr::Literal(ankql::ast::Literal::I64(25))),
+                    right: Box::new(ankql::ast::Expr::Literal(Value::I64(25))),
                 }),
                 Box::new(ankql::ast::Predicate::Comparison {
                     left: Box::new(ankql::ast::Expr::Path(ankql::ast::PathExpr::simple("count".to_string()))),
                     operator: ankql::ast::ComparisonOperator::LessThanOrEqual,
-                    right: Box::new(ankql::ast::Expr::Literal(ankql::ast::Literal::I64(10))),
+                    right: Box::new(ankql::ast::Expr::Literal(Value::I64(10))),
                 }),
             ),
             order_by: None,
@@ -231,7 +232,7 @@ fn test_selection_macro_operator_shorthand() {
             predicate: ankql::ast::Predicate::Comparison {
                 left: Box::new(ankql::ast::Expr::Path(ankql::ast::PathExpr::simple("score".to_string()))),
                 operator: ankql::ast::ComparisonOperator::GreaterThanOrEqual,
-                right: Box::new(ankql::ast::Expr::Literal(ankql::ast::Literal::F64(95.5))),
+                right: Box::new(ankql::ast::Expr::Literal(Value::F64(95.5))),
             },
             order_by: None,
             limit: None,
@@ -248,7 +249,7 @@ fn test_selection_macro_operator_shorthand() {
             predicate: ankql::ast::Predicate::Comparison {
                 left: Box::new(ankql::ast::Expr::Path(ankql::ast::PathExpr::simple("status".to_string()))),
                 operator: ankql::ast::ComparisonOperator::NotEqual,
-                right: Box::new(ankql::ast::Expr::Literal(ankql::ast::Literal::String("active".to_string()))),
+                right: Box::new(ankql::ast::Expr::Literal(Value::String("active".to_string()))),
             },
             order_by: None,
             limit: None,
@@ -267,12 +268,12 @@ fn test_selection_macro_syntax_comparison() {
             Box::new(ankql::ast::Predicate::Comparison {
                 left: Box::new(ankql::ast::Expr::Path(ankql::ast::PathExpr::simple("name".to_string()))),
                 operator: ankql::ast::ComparisonOperator::Equal,
-                right: Box::new(ankql::ast::Expr::Literal(ankql::ast::Literal::String("Alice".to_string()))),
+                right: Box::new(ankql::ast::Expr::Literal(Value::String("Alice".to_string()))),
             }),
             Box::new(ankql::ast::Predicate::Comparison {
                 left: Box::new(ankql::ast::Expr::Path(ankql::ast::PathExpr::simple("age".to_string()))),
                 operator: ankql::ast::ComparisonOperator::Equal,
-                right: Box::new(ankql::ast::Expr::Literal(ankql::ast::Literal::I64(25))),
+                right: Box::new(ankql::ast::Expr::Literal(Value::I64(25))),
             }),
         ),
         order_by: None,
@@ -305,12 +306,12 @@ fn test_selection_macro_pure_syntax_forms() {
             Box::new(ankql::ast::Predicate::Comparison {
                 left: Box::new(ankql::ast::Expr::Path(ankql::ast::PathExpr::simple("foo".to_string()))),
                 operator: ankql::ast::ComparisonOperator::Equal,
-                right: Box::new(ankql::ast::Expr::Literal(ankql::ast::Literal::String("test".to_string()))),
+                right: Box::new(ankql::ast::Expr::Literal(Value::String("test".to_string()))),
             }),
             Box::new(ankql::ast::Predicate::Comparison {
                 left: Box::new(ankql::ast::Expr::Path(ankql::ast::PathExpr::simple("bar".to_string()))),
                 operator: ankql::ast::ComparisonOperator::Equal,
-                right: Box::new(ankql::ast::Expr::Literal(ankql::ast::Literal::String("bar_value".to_string()))),
+                right: Box::new(ankql::ast::Expr::Literal(Value::String("bar_value".to_string()))),
             }),
         ),
         order_by: None,
@@ -344,7 +345,7 @@ fn test_selection_macro_edge_cases() {
             Box::new(ankql::ast::Predicate::Comparison {
                 left: Box::new(ankql::ast::Expr::Path(ankql::ast::PathExpr::simple("age".to_string()))),
                 operator: ankql::ast::ComparisonOperator::Equal,
-                right: Box::new(ankql::ast::Expr::Literal(ankql::ast::Literal::I64(25))),
+                right: Box::new(ankql::ast::Expr::Literal(Value::I64(25))),
             }),
         ),
         order_by: None,
@@ -370,9 +371,9 @@ fn test_selection_macro_list_expansion() {
                 left: Box::new(ankql::ast::Expr::Path(ankql::ast::PathExpr::simple("name".to_string()))),
                 operator: ankql::ast::ComparisonOperator::In,
                 right: Box::new(ankql::ast::Expr::ExprList(vec![
-                    ankql::ast::Expr::Literal(ankql::ast::Literal::String("Alice".to_string())),
-                    ankql::ast::Expr::Literal(ankql::ast::Literal::String("Bob".to_string())),
-                    ankql::ast::Expr::Literal(ankql::ast::Literal::String("Charlie".to_string())),
+                    ankql::ast::Expr::Literal(Value::String("Alice".to_string())),
+                    ankql::ast::Expr::Literal(Value::String("Bob".to_string())),
+                    ankql::ast::Expr::Literal(Value::String("Charlie".to_string())),
                 ])),
             },
             order_by: None,
@@ -390,9 +391,9 @@ fn test_selection_macro_list_expansion() {
                 left: Box::new(ankql::ast::Expr::Path(ankql::ast::PathExpr::simple("age".to_string()))),
                 operator: ankql::ast::ComparisonOperator::In,
                 right: Box::new(ankql::ast::Expr::ExprList(vec![
-                    ankql::ast::Expr::Literal(ankql::ast::Literal::I64(25)),
-                    ankql::ast::Expr::Literal(ankql::ast::Literal::I64(30)),
-                    ankql::ast::Expr::Literal(ankql::ast::Literal::I64(35)),
+                    ankql::ast::Expr::Literal(Value::I64(25)),
+                    ankql::ast::Expr::Literal(Value::I64(30)),
+                    ankql::ast::Expr::Literal(Value::I64(35)),
                 ])),
             },
             order_by: None,
@@ -410,8 +411,8 @@ fn test_selection_macro_list_expansion() {
                 left: Box::new(ankql::ast::Expr::Path(ankql::ast::PathExpr::simple("status".to_string()))),
                 operator: ankql::ast::ComparisonOperator::In,
                 right: Box::new(ankql::ast::Expr::ExprList(vec![
-                    ankql::ast::Expr::Literal(ankql::ast::Literal::String("active".to_string())),
-                    ankql::ast::Expr::Literal(ankql::ast::Literal::String("pending".to_string())),
+                    ankql::ast::Expr::Literal(Value::String("active".to_string())),
+                    ankql::ast::Expr::Literal(Value::String("pending".to_string())),
                 ])),
             },
             order_by: None,

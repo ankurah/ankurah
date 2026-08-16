@@ -41,9 +41,8 @@ use crate::error::{MutationError, RetrievalError};
 use crate::policy::{AccessDenied, PolicyAgent};
 use crate::property::backend::{LWWBackend, PropertyBackend};
 use crate::storage::StorageEngine;
-use crate::value::Value;
 use crate::ModelId;
-use ankurah_core_types::ValueType;
+use ankurah_core_types::{Value, ValueType};
 
 use super::{model_collection, model_property_collection, property_collection};
 
@@ -953,7 +952,7 @@ fn bool_field(values: &BTreeMap<String, Option<Value>>, field: &str) -> Option<b
 // and mint no property-definition ids, so their fields are `System` properties,
 // named through the same `system_property` decision the systemize pass uses.
 
-fn field_eq(field: &str, value: ankql::ast::Literal) -> ankql::ast::Predicate {
+fn field_eq(field: &str, value: Value) -> ankql::ast::Predicate {
     ankql::ast::Predicate::Comparison {
         left: Box::new(ankql::ast::Expr::Path(ankql::ast::PathExpr::simple(field))),
         operator: ankql::ast::ComparisonOperator::Equal,
@@ -961,9 +960,9 @@ fn field_eq(field: &str, value: ankql::ast::Literal) -> ankql::ast::Predicate {
     }
 }
 
-fn field_eq_str(field: &str, value: &str) -> ankql::ast::Predicate { field_eq(field, ankql::ast::Literal::String(value.to_string())) }
+fn field_eq_str(field: &str, value: &str) -> ankql::ast::Predicate { field_eq(field, Value::String(value.to_string())) }
 
-fn field_eq_id(field: &str, id: EntityId) -> ankql::ast::Predicate { field_eq(field, ankql::ast::Literal::EntityId(id)) }
+fn field_eq_id(field: &str, id: EntityId) -> ankql::ast::Predicate { field_eq(field, Value::EntityId(id)) }
 
 fn and(a: ankql::ast::Predicate, b: ankql::ast::Predicate) -> ankql::ast::Predicate { ankql::ast::Predicate::And(Box::new(a), Box::new(b)) }
 

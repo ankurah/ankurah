@@ -155,7 +155,7 @@ impl SledStorageCollectionInner {
     // (and we need to make sure that both are using industry best practices for that sort of index -> record scan)
 
     fn fetch_states_blocking(&self, selection: ankql::ast::Selection) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
-        // Type resolution (Literal -> Json for non-simple paths) is handled by TypeResolver
+        // Type resolution (Value -> Json for non-simple paths) is handled by TypeResolver
         // at the entry points (Context/Node). The selection here is already type-resolved.
 
         // Generate query plans and choose the first non-empty one

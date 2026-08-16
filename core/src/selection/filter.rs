@@ -55,7 +55,7 @@ pub trait Filterable {
 fn evaluate_expr<I: Filterable>(item: &I, expr: &Expr) -> Result<ExprOutput<Value>, Error> {
     match expr {
         Expr::Placeholder => Err(Error::PropertyNotFound("Placeholder values must be replaced before filtering".to_string())),
-        Expr::Literal(lit) => Ok(ExprOutput::Value(lit.clone().into())),
+        Expr::Literal(lit) => Ok(ExprOutput::Value(lit.clone())),
         Expr::Path(path) => {
             // For simple paths, use the first step as the property name
             if path.is_simple() {

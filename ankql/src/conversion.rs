@@ -2,6 +2,7 @@ use crate::ast::Predicate;
 use crate::ast::{self, Selection};
 use crate::error::ParseError;
 use crate::parser;
+use ankurah_core_types::Value;
 use std::convert::TryFrom;
 
 impl<'a> TryFrom<&'a str> for Predicate {
@@ -32,8 +33,8 @@ impl TryFrom<ast::Expr> for Predicate {
         match value {
             ast::Expr::Predicate(p) => Ok(p),
             ast::Expr::Placeholder => Ok(Predicate::Placeholder),
-            ast::Expr::Literal(ast::Literal::Bool(true)) => Ok(Predicate::True),
-            ast::Expr::Literal(ast::Literal::Bool(false)) => Ok(Predicate::False),
+            ast::Expr::Literal(Value::Bool(true)) => Ok(Predicate::True),
+            ast::Expr::Literal(Value::Bool(false)) => Ok(Predicate::False),
             _ => Err(ParseError::InvalidPredicate("Expression is not a predicate".into())),
         }
     }
@@ -46,17 +47,17 @@ impl TryFrom<wasm_bindgen::JsValue> for ast::Expr {
     fn try_from(value: wasm_bindgen::JsValue) -> Result<Self, Self::Error> {
         if value.is_null() || value.is_undefined() {
             // TASK: Add NULL literal to ankql AST https://github.com/ankurah/ankurah/issues/143
-            return Ok(ast::Expr::Literal(ast::Literal::String("NULL_IMPROBABLE_VALUE".to_string())));
+            return Ok(ast::Expr::Literal(Value::String("NULL_IMPROBABLE_VALUE".to_string())));
         }
 
         // Try string first
         if let Some(s) = value.as_string() {
-            return Ok(ast::Expr::Literal(ast::Literal::String(s)));
+            return Ok(ast::Expr::Literal(Value::String(s)));
         }
 
         // Try boolean
         if let Some(b) = value.as_bool() {
-            return Ok(ast::Expr::Literal(ast::Literal::Bool(b)));
+            return Ok(ast::Expr::Literal(Value::Bool(b)));
         }
 
         // Try number
@@ -64,9 +65,9 @@ impl TryFrom<wasm_bindgen::JsValue> for ast::Expr {
             // Use I64 for integers, F64 for floats
             if n.fract() == 0.0 {
                 let n_int = n as i64;
-                return Ok(ast::Expr::Literal(ast::Literal::I64(n_int)));
+                return Ok(ast::Expr::Literal(Value::I64(n_int)));
             } else {
-                return Ok(ast::Expr::Literal(ast::Literal::F64(n)));
+                return Ok(ast::Expr::Literal(Value::F64(n)));
             }
         }
 

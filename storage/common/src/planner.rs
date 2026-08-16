@@ -1,7 +1,7 @@
 use crate::{KeyBounds, predicate::ConjunctFinder, types::*};
 use ankql::ast::{ComparisonOperator, Expr, Predicate};
 use ankurah_core::indexing::{IndexKeyPart, KeySpec};
-use ankurah_core::value::{Value, ValueType};
+use ankurah_core_types::{Value, ValueType};
 use indexmap::IndexMap;
 
 #[derive(Debug, Clone)]
@@ -346,7 +346,7 @@ impl Planner {
 
                 // Extract value from right side
                 let value = match right.as_ref() {
-                    Expr::Literal(literal) => literal.into(),
+                    Expr::Literal(literal) => literal.clone(),
                     _ => return None,
                 };
 
@@ -782,8 +782,8 @@ impl Planner {
         if let Predicate::Comparison { left, operator, right } = predicate {
             // Check if this is a primary key comparison
             let value = match (left.as_ref(), right.as_ref()) {
-                (Expr::Path(path), Expr::Literal(literal)) if path.is_simple() && path.first() == primary_key => Value::from(literal),
-                (Expr::Literal(literal), Expr::Path(path)) if path.is_simple() && path.first() == primary_key => Value::from(literal),
+                (Expr::Path(path), Expr::Literal(literal)) if path.is_simple() && path.first() == primary_key => literal.clone(),
+                (Expr::Literal(literal), Expr::Path(path)) if path.is_simple() && path.first() == primary_key => literal.clone(),
                 _ => return None,
             };
 
@@ -935,7 +935,7 @@ impl Planner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ankurah_core::value::Value;
+    use ankurah_core_types::Value;
     use ankurah_derive::selection;
 
     // FIX_ME: rename to plan_indexeddb
@@ -2362,7 +2362,7 @@ mod tests {
                         remaining_predicate: Predicate::Comparison {
                             left: Box::new(Expr::Path(ankql::ast::PathExpr::simple("year"))),
                             operator: ComparisonOperator::GreaterThanOrEqual,
-                            right: Box::new(Expr::Literal(ankql::ast::Literal::String("2001".to_string()))),
+                            right: Box::new(Expr::Literal(Value::String("2001".to_string()))),
                         },
                         order_by_spill: order_by_components!(presort: [oby_asc!("name")]),
                     },

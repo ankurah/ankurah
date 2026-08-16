@@ -454,6 +454,53 @@ mod tests {
     }
 
     #[test]
+    fn entity_ids_round_trip_through_their_base64_text() {
+        let id = crate::EntityId::random();
+        assert_eq!(Value::String(id.to_base64()).cast_to(ValueType::EntityId).unwrap(), Value::EntityId(id));
+        assert_eq!(Value::EntityId(id).cast_to(ValueType::String).unwrap(), Value::String(id.to_base64()));
+        assert!(matches!(Value::String("invalid-entity-id".to_owned()).cast_to(ValueType::EntityId), Err(CastError::InvalidFormat { .. })));
+    }
+
+    #[test]
+    fn numeric_casts_widen_freely_and_narrow_within_range() {
+        assert_eq!(Value::I16(42).cast_to(ValueType::I32).unwrap(), Value::I32(42));
+        assert_eq!(Value::I16(42).cast_to(ValueType::I64).unwrap(), Value::I64(42));
+        assert_eq!(Value::I16(42).cast_to(ValueType::F64).unwrap(), Value::F64(42.0));
+        assert_eq!(Value::I32(42).cast_to(ValueType::I16).unwrap(), Value::I16(42));
+        assert!(matches!(Value::I32(100_000).cast_to(ValueType::I16), Err(CastError::NumericOverflow { .. })));
+    }
+
+    #[test]
+    fn strings_cast_to_the_scalars_they_spell() {
+        assert_eq!(Value::String("42".to_owned()).cast_to(ValueType::I16).unwrap(), Value::I16(42));
+        assert_eq!(Value::String("42".to_owned()).cast_to(ValueType::I32).unwrap(), Value::I32(42));
+        assert_eq!(Value::String("42".to_owned()).cast_to(ValueType::I64).unwrap(), Value::I64(42));
+        assert_eq!(Value::String("42".to_owned()).cast_to(ValueType::F64).unwrap(), Value::F64(42.0));
+        assert_eq!(Value::String("true".to_owned()).cast_to(ValueType::Bool).unwrap(), Value::Bool(true));
+        assert_eq!(Value::String("0".to_owned()).cast_to(ValueType::Bool).unwrap(), Value::Bool(false));
+        assert!(matches!(Value::String("maybe".to_owned()).cast_to(ValueType::Bool), Err(CastError::InvalidFormat { .. })));
+    }
+
+    #[test]
+    fn casts_without_a_path_report_incompatible_types() {
+        assert!(matches!(Value::Binary(vec![1, 2, 3]).cast_to(ValueType::I32), Err(CastError::IncompatibleTypes { .. })));
+        assert_eq!(Value::I32(42).cast_to(ValueType::I32).unwrap(), Value::I32(42));
+    }
+
+    #[test]
+    fn extract_at_path_walks_json_and_stops_at_anything_else() {
+        let value = Value::Json(serde_json::json!({ "context": { "user": { "name": "Alice" } }, "count": 42 }));
+        assert_eq!(value.extract_at_path(&[]), Some(value.clone()));
+        assert_eq!(value.extract_at_path(&["count".to_owned()]), Some(Value::I64(42)));
+        assert_eq!(
+            value.extract_at_path(&["context".to_owned(), "user".to_owned(), "name".to_owned()]),
+            Some(Value::String("Alice".to_owned()))
+        );
+        assert_eq!(value.extract_at_path(&["nonexistent".to_owned()]), None);
+        assert_eq!(Value::String("not json".to_owned()).extract_at_path(&["field".to_owned()]), None);
+    }
+
+    #[test]
     fn f64_to_i64_boundary_overflows_instead_of_saturating() {
         let two_pow_63 = 9_223_372_036_854_775_808.0_f64; // i64::MAX as f64 rounds up to exactly this
         assert!(matches!(Value::F64(two_pow_63).cast_to(ValueType::I64), Err(CastError::NumericOverflow { .. })));
