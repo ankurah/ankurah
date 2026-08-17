@@ -119,8 +119,16 @@ impl PolicyAgent for BridgePolicyAgent {
         Ok(())
     }
 
-    fn check_read_event<C>(&self, _data: &C, event: &Attested<proto::Event>) -> Result<(), AccessDenied>
-    where C: Iterable<Self::ContextData> {
+    async fn check_read_event<SE, C>(
+        &self,
+        _data: &C,
+        event: &Attested<proto::Event>,
+        _getter: &ankurah::core::lazy_entity_getter::EntityGetter<'_, SE, Self>,
+    ) -> Result<(), AccessDenied>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        C: Iterable<Self::ContextData> + Sync,
+    {
         if self.deny_read_events.lock().unwrap().contains(&event.payload.id()) {
             return Err(AccessDenied::ByPolicy("event read denied by test agent"));
         }
@@ -251,6 +259,80 @@ async fn test_event_bridge_respects_read_policy_on_send() -> Result<()> {
     // unverifiable state is not adopted.
     let _ = open_id;
     assert_eq!(ctx_c.get::<PetView>(pet_id).await?.age().unwrap(), "1", "client remains at its last verified state");
+
+    Ok(())
+}
+
+/// A parent pointer names an event id, not an entity, so an entity's history
+/// can be made to reach an event belonging to a different entity -- a graft,
+/// whether from a bug upstream or an event a peer forged. The bridge walk must
+/// not put such an event on the wire: the window travels as `EventFragment`s,
+/// which carry no entity id, so the receiver would apply the other entity's
+/// operations to this one. Nor can the read check catch it, since it evaluates
+/// every event in the window against this entity's state.
+///
+/// The two chains below are the same shape (one middle event, one tip) over the
+/// same known head, and differ only in which entity the middle event names, so
+/// an empty window in the grafted case is the guard's doing and not a causal
+/// comparison that never reached the walk.
+#[tokio::test]
+async fn test_event_bridge_refuses_a_window_that_leaves_the_entity() -> Result<()> {
+    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    server.system.create().await?;
+    let ctx = server.context(DEFAULT_CONTEXT)?;
+
+    let (pet_id, other_id) = {
+        let trx = ctx.begin();
+        let pet = trx.create(&Pet { name: "grafted".to_string(), age: "1".to_string() }).await?;
+        let other = trx.create(&Pet { name: "elsewhere".to_string(), age: "1".to_string() }).await?;
+        let ids = (pet.id(), other.id());
+        trx.commit().await?;
+        ids
+    };
+
+    let collection = ctx.collection(&Pet::collection()).await?;
+    let known_head = collection.get_state(pet_id).await?.payload.state.head.clone();
+
+    // Write two chains onto the pet's creation event. The clean one stays on
+    // the pet throughout; the grafted one routes through an event of the other
+    // pet. Storage is written directly because no commit path will produce the
+    // graft -- that is the point of the guard.
+    let forge = |entity_id: proto::EntityId, parent: proto::Clock| {
+        let event = proto::Event { collection: Pet::collection(), entity_id, operations: proto::OperationSet::default(), parent };
+        proto::Attested::opt(event, None)
+    };
+    let clean_middle = forge(pet_id, known_head.clone());
+    let clean_tip = forge(pet_id, proto::Clock::from(clean_middle.payload.id()));
+    let grafted_middle = forge(other_id, known_head.clone());
+    let grafted_tip = forge(pet_id, proto::Clock::from(grafted_middle.payload.id()));
+    for event in [&clean_middle, &clean_tip, &grafted_middle, &grafted_tip] {
+        collection.add_event(event).await?;
+    }
+
+    let state_at = |head: proto::Clock| proto::EntityState {
+        entity_id: pet_id,
+        collection: Pet::collection(),
+        state: proto::State { head, ..Default::default() },
+    };
+
+    let clean = server
+        .collect_event_bridge_for_test(&collection, &known_head, &state_at(proto::Clock::from(clean_tip.payload.id())), &DEFAULT_CONTEXT)
+        .await?;
+    let clean_ids: HashSet<_> = clean.iter().map(|e| e.payload.id()).collect();
+    assert_eq!(
+        clean_ids,
+        HashSet::from([clean_middle.payload.id(), clean_tip.payload.id()]),
+        "the control chain must bridge, otherwise the grafted case proves nothing"
+    );
+
+    let grafted = server
+        .collect_event_bridge_for_test(&collection, &known_head, &state_at(proto::Clock::from(grafted_tip.payload.id())), &DEFAULT_CONTEXT)
+        .await?;
+    assert!(
+        grafted.is_empty(),
+        "a window reaching another entity's event must yield no bridge (the caller falls back to a state snapshot), got {:?}",
+        grafted.iter().map(|e| e.payload.id()).collect::<Vec<_>>()
+    );
 
     Ok(())
 }
