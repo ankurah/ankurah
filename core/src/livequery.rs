@@ -76,6 +76,11 @@ struct Inner {
     pub(crate) error: Mut<Option<RetrievalError>>,
     pub(crate) initialized: tokio::sync::Notify,
     pub(crate) initialized_version: std::sync::atomic::AtomicU32,
+    // Serializes activate() calls. On relay-bearing nodes two same-version activations race
+    // by design (the local initialization task and the relay's subscription_established);
+    // without serialization both read initialized_version == 0 and both take the reactor's
+    // add path, which refuses duplicates. https://github.com/ankurah/ankurah/issues/146
+    pub(crate) activation_lock: tokio::sync::Mutex<()>,
     // Version tracking for predicate updates
     pub(crate) current_version: std::sync::atomic::AtomicU32,
     // Store selection with its version (starts with version 1, updated on selection changes)
@@ -129,7 +134,20 @@ impl Inner {
     /// Marks initialization as complete regardless of success/failure
     /// Rejects activation if the version is older than the current selection to prevent regression
     async fn activate(&self, version: u32) -> Result<(), RetrievalError> {
-        // Get the current selection and its version
+        // Serialize activations so a racing same-version twin waits for the winner, observes
+        // its mark_initialized, and takes the update path instead of a duplicate add. try_lock
+        // first purely for observability: contention means an activation was coalesced, and a
+        // future scheduling regression should be visible in traces rather than silently absorbed.
+        let _activation = match self.activation_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                debug!("LiveQuery.activate() for query {} (version {}) waiting for in-flight activation", self.query_id, version);
+                self.activation_lock.lock().await
+            }
+        };
+
+        // Both reads below must happen under the lock so this activation sees the effects
+        // of whichever activation ran before it.
         let (selection, stored_version) = self.selection.value();
 
         // Reject activation if this is an older version than what's currently stored
@@ -149,7 +167,9 @@ impl Inner {
         // Determine if this is the first activation (query not yet in reactor)
         if initialized_version == 0 {
             // First activation ever: call reactor.add_query_and_notify which will populate the resultset
-            // Pass the hook as pre_notify_hook to mark initialized before notification
+            // Pass the hook as pre_notify_hook to mark initialized before notification.
+            // On failure the hook never runs, leaving initialized_version at zero so the next
+            // activation retries the add rather than updating a query the reactor never registered.
             reactor
                 .add_query_and_notify(
                     self.subscription.id(),
@@ -182,8 +202,8 @@ impl Inner {
     }
 
     /// Mark initialization as complete for a given version
+    /// Runs inside activate()'s reactor call, so writes are ordered by the activation lock
     fn mark_initialized(&self, version: u32) {
-        // TASK: Serialize or coalesce concurrent activations to prevent version regression https://github.com/ankurah/ankurah/issues/146
         self.initialized_version.store(version, std::sync::atomic::Ordering::Relaxed);
         self.initialized.notify_waiters();
     }
@@ -234,8 +254,9 @@ where
         error: Mut::new(None),
         initialized: tokio::sync::Notify::new(),
         initialized_version: std::sync::atomic::AtomicU32::new(0), // 0 means uninitialized
-        current_version: std::sync::atomic::AtomicU32::new(1),     // Start at version 1
-        selection: Mut::new((args.selection.clone(), 1)),          // Start with version 1
+        activation_lock: tokio::sync::Mutex::new(()),
+        current_version: std::sync::atomic::AtomicU32::new(1), // Start at version 1
+        selection: Mut::new((args.selection.clone(), 1)),      // Start with version 1
         collection_id: collection_id.clone(),
         gap_fetcher,
     });
@@ -504,3 +525,6 @@ where R: View {
 
     ChangeSet { changes, resultset }
 }
+
+#[cfg(test)]
+mod tests;
