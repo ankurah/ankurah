@@ -1,4 +1,4 @@
-use crate::{JwtContext, JwtKeys, PolicyConfig};
+use crate::{IssuerTrustDescriptor, JwtContext, JwtKeys, PolicyConfig};
 use ankurah_core::{livequery::EntityLiveQuery, resultset::EntityResultSet, storage::StorageEngine, Node};
 use ankurah_proto as proto;
 use std::sync::{Arc, Mutex, RwLock};
@@ -8,6 +8,9 @@ use std::sync::{Arc, Mutex, RwLock};
 pub struct AgentState {
     pub config: PolicyConfig,
     pub keys: Option<JwtKeys>,
+    /// Synced issuer metadata. Ephemeral nodes use this for readiness without
+    /// fetching JWKS, because they do not verify inbound server state today.
+    pub issuer_trust: Option<IssuerTrustDescriptor>,
 }
 
 /// A read guard that exposes config fields from the combined AgentState.
@@ -135,16 +138,42 @@ fn apply_policy_view(view: &crate::JwtPolicyView, state: &Arc<RwLock<AgentState>
         _ => None,
     };
 
-    // Update config and keys atomically under a single write lock
-    if new_config.is_some() || new_keys.is_some() {
-        let mut guard = state.write().unwrap_or_else(|e| e.into_inner());
-        if let Some(c) = new_config {
-            guard.config = c;
-            tracing::info!("Ephemeral: policy config updated from LiveQuery");
-        }
-        if let Some(k) = new_keys {
-            guard.keys = Some(k);
+    let new_trust = match view.trust_json() {
+        Ok(Some(json)) if !json.is_empty() => match serde_json::from_str::<IssuerTrustDescriptor>(&json) {
+            Ok(descriptor) => match descriptor.validate() {
+                Ok(()) => Some(descriptor),
+                Err(e) => {
+                    tracing::warn!("Ephemeral: invalid issuer trust descriptor: {e}");
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!("Ephemeral: failed to parse issuer trust descriptor: {e}");
+                None
+            }
+        },
+        _ => None,
+    };
+
+    // Replace both trust alternatives on every update so removed or malformed
+    // material cannot leave stale credentials active. A valid descriptor wins
+    // over a simultaneously populated legacy PEM field.
+    let mut guard = state.write().unwrap_or_else(|e| e.into_inner());
+    if let Some(c) = new_config {
+        guard.config = c;
+        tracing::info!("Ephemeral: policy config updated from LiveQuery");
+    }
+    if let Some(descriptor) = new_trust {
+        guard.keys = None;
+        guard.issuer_trust = Some(descriptor);
+        tracing::info!("Ephemeral: issuer trust descriptor set from LiveQuery");
+    } else {
+        guard.keys = new_keys;
+        guard.issuer_trust = None;
+        if guard.keys.is_some() {
             tracing::info!("Ephemeral: verification keys set from LiveQuery");
+        } else {
+            tracing::warn!("Ephemeral: policy update contained no valid verification material");
         }
     }
 }
