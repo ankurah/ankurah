@@ -3,7 +3,7 @@
 //! Converts AnkQL predicates to SQLite-compatible SQL WHERE clauses.
 
 use crate::error::SqliteError;
-use ankql::ast::{ComparisonOperator, Expr, OrderByItem, OrderDirection, Predicate, Selection};
+use ankql::ast::{ComparisonOperator, Expr, OrderByItem, OrderDirection, OrderKey, Predicate, Selection};
 use ankurah_core_types::Value;
 use thiserror::Error;
 
@@ -117,7 +117,9 @@ fn can_pushdown_comparison(left: &Expr, right: &Expr) -> bool { can_pushdown_exp
 fn can_pushdown_expr(expr: &Expr) -> bool {
     match expr {
         Expr::Literal(_) => true,
-        Expr::Path(path) => !path.steps.is_empty(),
+        // An unresolved path carries no identity to address a column with.
+        Expr::Path(_) => false,
+        Expr::PropertyPath(_) => true,
         Expr::ExprList(exprs) => exprs.iter().all(can_pushdown_expr),
         Expr::Predicate(_) => false,
         Expr::InfixExpr { .. } => false,
@@ -176,23 +178,23 @@ impl SqlBuilder {
         match expr {
             Expr::Placeholder => return Err(SqlGenerationError::PlaceholderFound),
             Expr::Literal(lit) => self.literal(lit),
-            Expr::Path(path) => {
-                if path.is_simple() {
-                    // Single-step path: regular column reference
-                    let escaped = path.first().replace('"', "\"\"");
-                    self.push_sql(&format!(r#""{}""#, escaped));
+            Expr::Path(_) => {
+                // A name is exactly what must not reach the engine: columns
+                // are addressed by resolved identity renderings.
+                return Err(SqlGenerationError::UnsupportedExpression("unresolved property path reached SQL generation"));
+            }
+            Expr::PropertyPath(identifier) => {
+                // Column names are the property id's rendering, always quoted
+                // (URL-safe base64 contains '-' and '_').
+                let column = identifier.property_id().to_string().replace('"', "\"\"");
+                if identifier.is_simple() {
+                    self.push_sql(&format!(r#""{}""#, column));
                 } else {
-                    // Multi-step path: JSONB traversal
-                    // SQLite's -> operator returns JSONB, but for comparisons we need to extract the value.
-                    // Use json_extract() with the full JSON path for reliable comparisons.
-                    let first = path.first().replace('"', "\"\"");
-                    // Build JSON path: $.step1.step2.step3
-                    let json_path = if path.steps.len() == 2 {
-                        format!("$.{}", path.steps[1].replace('\'', "''"))
-                    } else {
-                        format!("$.{}", path.steps.iter().skip(1).map(|s| s.replace('\'', "''")).collect::<Vec<_>>().join("."))
-                    };
-                    self.push_sql(&format!(r#"json_extract("{}", '{}')"#, first, json_path));
+                    // Sub-path: JSONB traversal. SQLite's -> operator returns
+                    // JSONB, but for comparisons we need to extract the value;
+                    // use json_extract() with the full JSON path.
+                    let json_path = format!("$.{}", identifier.subpath.iter().map(|s| s.replace('\'', "''")).collect::<Vec<_>>().join("."));
+                    self.push_sql(&format!(r#"json_extract("{}", '{}')"#, column, json_path));
                 }
             }
             Expr::ExprList(exprs) => {
@@ -314,21 +316,17 @@ impl SqlBuilder {
     }
 
     pub fn order_by_item(&mut self, order_by: &OrderByItem) -> Result<(), SqlGenerationError> {
-        // Handle JSON paths the same way as in expr() - use -> operator for multi-step paths
-        if order_by.path.is_simple() {
-            // Single-step path: regular column reference
-            let escaped = order_by.path.first().replace('"', "\"\"");
-            self.push_sql(&format!(r#""{}""#, escaped));
-        } else {
-            // Multi-step path: JSONB traversal using -> operator
-            let first = order_by.path.first().replace('"', "\"\"");
-            self.push_sql(&format!(r#""{}""#, first));
-
-            for step in order_by.path.steps.iter().skip(1) {
-                let escaped = step.replace('\'', "''");
-                // Use -> to keep as JSONB (not ->> which extracts as text)
-                self.push_sql(&format!("->'{}'", escaped));
-            }
+        let OrderKey::Property(identifier) = &order_by.key else {
+            return Err(SqlGenerationError::UnsupportedExpression("unresolved ORDER BY key reached SQL generation"));
+        };
+        // The sort column is the property id's rendering, quoted; sub-path
+        // steps traverse into a JSONB column with -> (not ->> which extracts
+        // as text).
+        let column = identifier.property_id().to_string().replace('"', "\"\"");
+        self.push_sql(&format!(r#""{}""#, column));
+        for step in &identifier.subpath {
+            let escaped = step.replace('\'', "''");
+            self.push_sql(&format!("->'{}'", escaped));
         }
 
         match order_by.direction {

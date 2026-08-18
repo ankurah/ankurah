@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ModelId;
-use ankurah_proto::{self as proto, EntityId};
+use ankurah_proto::{self as proto, EntityId, PropertyId, SystemProperty};
 
 use crate::{
     property::backend::{LWWBackend, PropertyBackend},
-    schema::{model_collection, model_property_collection, property_collection, ModelStructDescriptor},
+    schema::{model_collection, model_property_collection, property_collection},
     value::Value,
 };
 
@@ -49,15 +49,6 @@ pub struct ModelPropertyMembershipDef {
     /// `None` until the `optional` follow-up event arrives. Until then the
     /// membership is treated as optional.
     pub optional: Option<bool>,
-}
-
-/// Exact durable identities admitted for one compiled model shape.
-#[derive(Debug, Clone)]
-pub(super) struct EnsuredSchemaBinding {
-    pub(super) schema: &'static ModelStructDescriptor,
-    pub(super) model: EntityId,
-    pub(super) fields: BTreeMap<&'static str, EntityId>,
-    pub(super) confirmed: bool,
 }
 
 /// Indexed in-memory view of the catalog entities.
@@ -175,38 +166,38 @@ pub(super) fn parse_state(collection: &ModelId, id: EntityId, state: &proto::Ent
     let buffer = state.state.state_buffers.0.get("lww")?;
     let backend = LWWBackend::from_state_buffer(buffer).ok()?;
     let values = backend.property_values();
-    let get_string = |field: &str| match values.get(field) {
+    let get_string = |field: SystemProperty| match values.get(&PropertyId::System(field)) {
         Some(Some(Value::String(value))) => Some(value.clone()),
         _ => None,
     };
-    let get_entity_id = |field: &str| match values.get(field) {
+    let get_entity_id = |field: SystemProperty| match values.get(&PropertyId::System(field)) {
         Some(Some(Value::EntityId(value))) => Some(*value),
         _ => None,
     };
-    let get_bool = |field: &str| match values.get(field) {
+    let get_bool = |field: SystemProperty| match values.get(&PropertyId::System(field)) {
         Some(Some(Value::Bool(value))) => Some(*value),
         _ => None,
     };
 
     if *collection == model_collection() {
-        let label = get_string("label")?;
-        let name = get_string("name").unwrap_or_else(|| label.clone());
+        let label = get_string(SystemProperty::Label)?;
+        let name = get_string(SystemProperty::Name).unwrap_or_else(|| label.clone());
         Some(Entry::Model(ModelDef { id, label, name }))
     } else if *collection == property_collection() {
         Some(Entry::Property(PropertyDef {
             id,
-            minted_for: get_entity_id("minted_for"),
-            name: get_string("name")?,
-            backend: get_string("backend")?,
-            value_type: get_string("value_type")?,
-            target_model: get_entity_id("target_model"),
+            minted_for: get_entity_id(SystemProperty::MintedFor),
+            name: get_string(SystemProperty::Name)?,
+            backend: get_string(SystemProperty::Backend)?,
+            value_type: get_string(SystemProperty::ValueType)?,
+            target_model: get_entity_id(SystemProperty::TargetModel),
         }))
     } else if *collection == model_property_collection() {
         Some(Entry::Membership(ModelPropertyMembershipDef {
             id,
-            model: get_entity_id("model")?,
-            property: get_entity_id("property")?,
-            optional: get_bool("optional"),
+            model: get_entity_id(SystemProperty::Model)?,
+            property: get_entity_id(SystemProperty::Property)?,
+            optional: get_bool(SystemProperty::Optional),
         }))
     } else {
         None

@@ -22,7 +22,7 @@ async fn local_rejects_phantom_commit() -> anyhow::Result<()> {
 
     let phantom = AlbumView::from_entity(node.conjure_evil_phantom(EntityId::random(), Album::collection()));
     let trx = ctx.begin();
-    phantom.edit(&trx)?.name().replace("inside your mind")?;
+    phantom.edit(&trx)?.name()?.replace("inside your mind")?;
 
     assert!(trx.commit().await.is_err());
     Ok(())

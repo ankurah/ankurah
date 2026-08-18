@@ -99,7 +99,7 @@ async fn an_edit_after_create_becomes_an_update_on_the_frozen_genesis() -> Resul
     let id = {
         let album = trx.create(&Album { name: "Giant Steps".to_owned(), year: "1959".to_owned() }).await?;
         let id = album.id();
-        album.year().overwrite(0, 4, "1960")?;
+        album.year()?.overwrite(0, 4, "1960")?;
         assert_eq!(album.id(), id, "the id did not move when the entity was edited");
         id
     };

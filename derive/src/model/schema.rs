@@ -129,6 +129,9 @@ pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
         }
         let explicit_id_tokens = option_str_tokens(explicit_id.as_deref());
 
+        // Mint this field's per-build random identity at expansion, so it is
+        // baked into the binary (see StructProperty::build_id).
+        let field_build_id = ulid::Ulid::new().to_bytes();
         field_tokens.push(quote! {
             ::ankurah::core::schema::StructProperty {
                 field: #field_name,
@@ -139,6 +142,8 @@ pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
                 target_label: #target_collection_tokens,
                 optional: #optional,
                 explicit_id: #explicit_id_tokens,
+                build_id: [#(#field_build_id),*],
+                resolved: ::ankurah::core::schema::SchemaOnceCell::per_epoch(),
             }
         });
     }
@@ -150,18 +155,28 @@ pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
     }
     let model_explicit_id_tokens = option_str_tokens(model_explicit_id.as_deref());
 
-    // A private static so the returned reference is `&'static` with zero
+    // Private statics so the returned reference is `&'static` with zero
     // per-call cost. Named distinctly to avoid colliding with anything in
-    // the hygiene module.
+    // the hygiene module. The properties array is its own named static
+    // (not an inline `&[...]` literal) because the resolution cells carry
+    // interior mutability, which rustc refuses to promote out of a
+    // temporary.
+    let field_count = field_tokens.len();
+    // The model's per-build random identity, minted at expansion (see
+    // ModelStructDescriptor::build_id).
+    let model_build_id = ulid::Ulid::new().to_bytes();
     Ok(quote! {
         fn descriptor() -> &'static ::ankurah::core::schema::ModelStructDescriptor {
+            static __ANKURAH_MODEL_PROPERTIES: [::ankurah::core::schema::StructProperty; #field_count] = [
+                #(#field_tokens),*
+            ];
             static __ANKURAH_MODEL_SCHEMA: ::ankurah::core::schema::ModelStructDescriptor = ::ankurah::core::schema::ModelStructDescriptor {
                 label: #collection,
                 name: #name_str,
-                properties: &[
-                    #(#field_tokens),*
-                ],
+                properties: &__ANKURAH_MODEL_PROPERTIES,
                 explicit_id: #model_explicit_id_tokens,
+                build_id: [#(#model_build_id),*],
+                resolved: ::ankurah::core::schema::SchemaOnceCell::per_epoch(),
             };
             &__ANKURAH_MODEL_SCHEMA
         }

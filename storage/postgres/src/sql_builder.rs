@@ -1,4 +1,4 @@
-use ankql::ast::{ComparisonOperator, Expr, OrderByItem, OrderDirection, Predicate, Selection};
+use ankql::ast::{ComparisonOperator, Expr, OrderByItem, OrderDirection, OrderKey, Predicate, Selection};
 use ankurah_core::error::RetrievalError;
 use ankurah_core_types::Value;
 use thiserror::Error;
@@ -165,15 +165,18 @@ fn can_pushdown_comparison(left: &Expr, right: &Expr) -> bool { can_pushdown_exp
 fn can_pushdown_expr(expr: &Expr) -> bool {
     match expr {
         Expr::Literal(_) => true,
-        Expr::Path(path) => {
-            // All paths are currently pushdown-capable:
-            // - Single-step: regular column reference
-            // - Multi-step: JSONB traversal (inferred as Json property for now)
+        // An unresolved path carries no identity to address a column with;
+        // it is not pushable, and the post-filter then rejects it loudly.
+        Expr::Path(_) => false,
+        Expr::PropertyPath(_) => {
+            // All resolved references are pushdown-capable:
+            // - No sub-path: regular column reference
+            // - Sub-path: JSONB traversal (inferred as Json property for now)
             //
-            // HACK: We assume multi-step paths are Json properties.
+            // HACK: We assume sub-paths are Json properties.
             // TODO(Phase 3 - Schema Registry): Check property type to distinguish
             // Json traversal (pushable) from Ref<T> traversal (not pushable).
-            !path.steps.is_empty()
+            true
         }
         Expr::ExprList(exprs) => exprs.iter().all(can_pushdown_expr),
         Expr::Predicate(_) => false,     // Nested predicates - not supported in SQL expressions
@@ -290,23 +293,24 @@ impl SqlBuilder {
                 Value::Binary(bytes) => self.arg(bytes.clone()),
                 Value::Json(json) => self.arg(json.clone()),
             },
-            Expr::Path(path) => {
-                if path.is_simple() {
-                    // Single-step path: regular column reference "column_name"
-                    let escaped = path.first().replace('"', "\"\"");
-                    self.sql(format!(r#""{}""#, escaped));
-                } else {
-                    // Multi-step path: JSONB traversal "column"->'nested'->'path'
-                    // Use -> for ALL steps to preserve JSONB type for proper comparison semantics.
-                    // The comparison will use ::jsonb cast on literals to ensure type-aware comparison.
-                    let first = path.first().replace('"', "\"\"");
-                    self.sql(format!(r#""{}""#, first));
-
-                    for step in path.steps.iter().skip(1) {
-                        let escaped = step.replace('\'', "''");
-                        // Always use -> to keep as JSONB (not ->> which extracts as text)
-                        self.sql(format!("->'{}'", escaped));
-                    }
+            Expr::Path(_) => {
+                // A name is exactly what must not reach the engine: columns
+                // are addressed by resolved identity renderings, and guessing
+                // one from a display name would silently read the wrong data.
+                return Err(SqlGenerationError::UnsupportedExpression("unresolved property path reached SQL generation"));
+            }
+            Expr::PropertyPath(identifier) => {
+                // Column names are the property id's rendering (URL-safe
+                // base64 for registered ids), always quoted.
+                let column = identifier.property_id().to_string().replace('"', "\"\"");
+                self.sql(format!(r#""{}""#, column));
+                // Sub-path: JSONB traversal "column"->'nested'->'path'.
+                // Use -> for ALL steps to preserve JSONB type for proper
+                // comparison semantics (literals get ::jsonb casts).
+                for step in &identifier.subpath {
+                    let escaped = step.replace('\'', "''");
+                    // Always use -> to keep as JSONB (not ->> which extracts as text)
+                    self.sql(format!("->'{}'", escaped));
                 }
             }
             Expr::ExprList(exprs) => {
@@ -468,14 +472,16 @@ impl SqlBuilder {
     }
 
     pub fn order_by_item(&mut self, order_by: &OrderByItem) -> Result<(), SqlGenerationError> {
-        // Generate the path expression
-        for (i, step) in order_by.path.steps.iter().enumerate() {
-            if i > 0 {
-                self.sql(".");
-            }
-            // Escape any existing quotes in the step by doubling them
+        let OrderKey::Property(identifier) = &order_by.key else {
+            return Err(SqlGenerationError::UnsupportedExpression("unresolved ORDER BY key reached SQL generation"));
+        };
+        // The sort column is the property id's rendering, quoted; sub-path
+        // steps address into a JSONB column.
+        let column = identifier.property_id().to_string().replace('"', "\"\"");
+        self.sql(format!(r#""{}""#, column));
+        for step in &identifier.subpath {
             let escaped_step = step.replace('"', "\"\"");
-            self.sql(format!(r#""{}""#, escaped_step));
+            self.sql(format!(r#"."{}""#, escaped_step));
         }
 
         // Add the direction
@@ -620,7 +626,10 @@ mod tests {
         let base_selection = ankql::parser::parse_selection("name = 'Alice'").unwrap();
         let selection = Selection {
             predicate: base_selection.predicate,
-            order_by: Some(vec![OrderByItem { path: PathExpr::simple("created_at"), direction: OrderDirection::Desc }]),
+            order_by: Some(vec![OrderByItem {
+                key: ankql::ast::OrderKey::Path(PathExpr::simple("created_at")),
+                direction: OrderDirection::Desc,
+            }]),
             limit: None,
         };
 
@@ -659,8 +668,8 @@ mod tests {
         let selection = Selection {
             predicate: base_selection.predicate,
             order_by: Some(vec![
-                OrderByItem { path: PathExpr::simple("priority"), direction: OrderDirection::Desc },
-                OrderByItem { path: PathExpr::simple("created_at"), direction: OrderDirection::Asc },
+                OrderByItem { key: ankql::ast::OrderKey::Path(PathExpr::simple("priority")), direction: OrderDirection::Desc },
+                OrderByItem { key: ankql::ast::OrderKey::Path(PathExpr::simple("created_at")), direction: OrderDirection::Asc },
             ]),
             limit: Some(5),
         };

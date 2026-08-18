@@ -33,7 +33,7 @@
 use std::collections::BTreeMap;
 
 use ankurah_proto::{
-    self as proto, Attested, EntityId, Membership, Operation, OperationSet, RegisterModel, RegisterProperty, RegisteredModel,
+    self as proto, Attested, EntityId, Membership, Operation, OperationSet, PropertyId, RegisterModel, RegisterProperty, RegisteredModel,
     RegisteredProperty, SystemProperty, TransactionId,
 };
 
@@ -331,7 +331,7 @@ where
                     // Explicit binding: verify, never mint, never mutate the
                     // bound entity's fields; the catalog's display name stands.
                     let values = self.verify_explicit_model_binding(id, m).await?;
-                    let name = string_field(&values, "name").unwrap_or_else(|| m.label.clone());
+                    let name = string_field(&values, SystemProperty::Name).unwrap_or_else(|| m.label.clone());
                     plan.existing.push(id);
                     (id, name)
                 }
@@ -394,8 +394,16 @@ where
                                 vec![("label", Value::String(l.to_string())), ("name", Value::String(l.to_string()))],
                             );
                             let id = event.entity_id;
-                            let stub =
-                                RegisterModel { label: l.to_string(), name: l.to_string(), explicit_id: None, properties: Vec::new() };
+                            // Executor-synthesized stub (a reference target
+                            // allocated on miss): no compiled declaration
+                            // stands behind it, so no build identity either.
+                            let stub = RegisterModel {
+                                label: l.to_string(),
+                                name: l.to_string(),
+                                explicit_id: None,
+                                build_id: [0u8; 16],
+                                properties: Vec::new(),
+                            };
                             plan.creates_models.push((id, stub));
                             push(event);
                             model_ids.insert(l.to_string(), (id, out_models.len()));
@@ -442,18 +450,18 @@ where
                     // elsewhere is intentionally shared.
                     let values = self.verify_explicit_binding(id, &m.label, p).await?;
                     plan.existing.push(id);
-                    let backend = string_field(&values, "backend").unwrap_or_else(|| p.backend.clone());
-                    let value_type = string_field(&values, "value_type").unwrap_or_else(|| p.value_type.clone());
+                    let backend = string_field(&values, SystemProperty::Backend).unwrap_or_else(|| p.backend.clone());
+                    let value_type = string_field(&values, SystemProperty::ValueType).unwrap_or_else(|| p.value_type.clone());
                     let membership_id = self.ensure_membership(system, &mut plan, &mut push, model_id, id, p.optional).await?;
                     property_ids.insert((model_id, p.name.clone()), (id, backend.clone(), value_type.clone()));
                     out_models[out_index].properties.push(RegisteredProperty {
                         id,
                         membership_id,
-                        name: string_field(&values, "name").unwrap_or_else(|| p.name.clone()),
+                        name: string_field(&values, SystemProperty::Name).unwrap_or_else(|| p.name.clone()),
                         backend,
                         value_type,
-                        target_model: entity_id_field(&values, "target_model"),
-                        minted_for: entity_id_field(&values, "minted_for"),
+                        target_model: entity_id_field(&values, SystemProperty::TargetModel),
+                        minted_for: entity_id_field(&values, SystemProperty::MintedFor),
                         optional: p.optional,
                     });
                     continue;
@@ -687,13 +695,13 @@ where
         if let Some(def) = self.model_by_label(label) {
             return Ok(Some(def));
         }
-        let Some((id, values)) = self.catalog_row_by_key(model_collection(), field_eq_str("label", label)).await? else {
+        let Some((id, values)) = self.catalog_row_by_key(model_collection(), field_eq_str(SystemProperty::Label, label)).await? else {
             return Ok(None);
         };
         let def = super::catalog::ModelDef {
             id,
             label: label.to_string(),
-            name: string_field(&values, "name").unwrap_or_else(|| label.to_string()),
+            name: string_field(&values, SystemProperty::Name).unwrap_or_else(|| label.to_string()),
         };
         self.upsert_registered(&[RegisteredModel { id: def.id, label: def.label.clone(), name: def.name.clone(), properties: Vec::new() }]);
         Ok(Some(def))
@@ -717,7 +725,7 @@ where
             }
         }
         let node = self.node().ok_or_else(|| RetrievalError::Other("node dropped during catalog lookup".to_owned()))?;
-        let selection = ankql::ast::Selection { predicate: field_eq_id("model", *model), order_by: None, limit: None };
+        let selection = ankql::ast::Selection { predicate: field_eq_id(SystemProperty::Model, *model), order_by: None, limit: None };
         let mut rows: Vec<proto::Attested<proto::EntityState>> =
             node.collections.get(&catalog_collection_id(model_property_collection())).await?.fetch_states(&selection).await?;
         // Lowest membership id first, so repeated calls are deterministic
@@ -727,24 +735,24 @@ where
             let membership_id = row.payload.entity_id;
             let Some(buffer) = row.payload.state.state_buffers.0.get("lww") else { continue };
             let values = LWWBackend::from_state_buffer(buffer)?.property_values();
-            let Some(property_id) = entity_id_field(&values, "property") else { continue };
+            let Some(property_id) = entity_id_field(&values, SystemProperty::Property) else { continue };
             let Some(prop_values) = self.catalog_entity_values(property_id, &property_collection()).await? else { continue };
-            if string_field(&prop_values, "name").as_deref() != Some(name) {
+            if string_field(&prop_values, SystemProperty::Name).as_deref() != Some(name) {
                 continue;
             }
             let def = super::catalog::PropertyDef {
                 id: property_id,
-                minted_for: entity_id_field(&prop_values, "minted_for"),
+                minted_for: entity_id_field(&prop_values, SystemProperty::MintedFor),
                 name: name.to_string(),
-                backend: string_field(&prop_values, "backend").unwrap_or_default(),
-                value_type: string_field(&prop_values, "value_type").unwrap_or_default(),
-                target_model: entity_id_field(&prop_values, "target_model"),
+                backend: string_field(&prop_values, SystemProperty::Backend).unwrap_or_default(),
+                value_type: string_field(&prop_values, SystemProperty::ValueType).unwrap_or_default(),
+                target_model: entity_id_field(&prop_values, SystemProperty::TargetModel),
             };
             let membership = super::catalog::ModelPropertyMembershipDef {
                 id: membership_id,
                 model: *model,
                 property: property_id,
-                optional: bool_field(&values, "optional"),
+                optional: bool_field(&values, SystemProperty::Optional),
             };
             return Ok(Some((def, membership)));
         }
@@ -761,11 +769,11 @@ where
         if let Some(def) = self.membership(model, property) {
             return Ok(Some(def));
         }
-        let predicate = and(field_eq_id("model", *model), field_eq_id("property", *property));
+        let predicate = and(field_eq_id(SystemProperty::Model, *model), field_eq_id(SystemProperty::Property, *property));
         let Some((id, values)) = self.catalog_row_by_key(model_property_collection(), predicate).await? else {
             return Ok(None);
         };
-        let optional = bool_field(&values, "optional");
+        let optional = bool_field(&values, SystemProperty::Optional);
         // No map fold here: memberships fold with their full registered tree
         // (a flag-less row is TREATED as optional, never defaulted; the
         // executor's diff arm emits the repairing follow-up either way).
@@ -780,9 +788,9 @@ where
         &self,
         collection: ModelId,
         predicate: ankql::ast::Predicate,
-    ) -> Result<Option<(EntityId, BTreeMap<String, Option<Value>>)>, RetrievalError> {
+    ) -> Result<Option<(EntityId, BTreeMap<PropertyId, Option<Value>>)>, RetrievalError> {
         let selection = ankql::ast::Selection { predicate, order_by: None, limit: None };
-        let mut best: Option<(EntityId, BTreeMap<String, Option<Value>>)> = None;
+        let mut best: Option<(EntityId, BTreeMap<PropertyId, Option<Value>>)> = None;
         let node = self.node().ok_or_else(|| RetrievalError::Other("node dropped during catalog lookup".to_owned()))?;
         for state in node.collections.get(&catalog_collection_id(collection)).await?.fetch_states(&selection).await? {
             let id = state.payload.entity_id;
@@ -807,15 +815,15 @@ where
         id: EntityId,
         model_label: &str,
         p: &RegisterProperty,
-    ) -> Result<BTreeMap<String, Option<Value>>, RegistrationError> {
+    ) -> Result<BTreeMap<PropertyId, Option<Value>>, RegistrationError> {
         let Some(values) = self.catalog_entity_values(id, &property_collection()).await? else {
             return Err(RegistrationError::ExplicitIdNotFound { property: id });
         };
-        let get_string = |field: &str| match values.get(field) {
+        let get_string = |field: SystemProperty| match values.get(&PropertyId::System(field)) {
             Some(Some(Value::String(s))) => s.clone(),
             _ => String::new(),
         };
-        let (found_backend, found_value_type) = (get_string("backend"), get_string("value_type"));
+        let (found_backend, found_value_type) = (get_string(SystemProperty::Backend), get_string(SystemProperty::ValueType));
         // Same compatibility bar as the name-keyed upsert: the backend must match, and a drifted
         // value_type is admitted only when mutually castable with the
         // canonical one. The binding never mutates the bound definition.
@@ -840,11 +848,11 @@ where
         &self,
         id: EntityId,
         m: &RegisterModel,
-    ) -> Result<BTreeMap<String, Option<Value>>, RegistrationError> {
+    ) -> Result<BTreeMap<PropertyId, Option<Value>>, RegistrationError> {
         let Some((values, _)) = self.catalog_entity_snapshot(id, &model_collection()).await? else {
             return Err(RegistrationError::ExplicitModelIdNotFound { model: id });
         };
-        let found_label = string_field(&values, "label").unwrap_or_default();
+        let found_label = string_field(&values, SystemProperty::Label).unwrap_or_default();
         if found_label != m.label {
             return Err(RegistrationError::ExplicitModelIdMismatch { model: id, found_label, label: m.label.clone() });
         }
@@ -858,7 +866,7 @@ where
         &self,
         id: EntityId,
         expected_model: &ModelId,
-    ) -> Result<Option<(BTreeMap<String, Option<Value>>, proto::Clock)>, RetrievalError> {
+    ) -> Result<Option<(BTreeMap<PropertyId, Option<Value>>, proto::Clock)>, RetrievalError> {
         let node = self.node().ok_or_else(|| RetrievalError::Other("node dropped during catalog lookup".to_owned()))?;
         let state = match node.collections.get(&catalog_collection_id(*expected_model)).await?.get_state(id).await {
             Ok(state) => state,
@@ -884,13 +892,13 @@ where
         &self,
         id: EntityId,
         expected_model: &ModelId,
-    ) -> Result<Option<BTreeMap<String, Option<Value>>>, RetrievalError> {
+    ) -> Result<Option<BTreeMap<PropertyId, Option<Value>>>, RetrievalError> {
         Ok(self.catalog_entity_snapshot(id, expected_model).await?.map(|(values, _)| values))
     }
 }
 
-fn string_field(values: &BTreeMap<String, Option<Value>>, field: &str) -> Option<String> {
-    match values.get(field) {
+fn string_field(values: &BTreeMap<PropertyId, Option<Value>>, field: SystemProperty) -> Option<String> {
+    match values.get(&PropertyId::System(field)) {
         Some(Some(Value::String(s))) => Some(s.clone()),
         _ => None,
     }
@@ -934,8 +942,8 @@ fn check_property_compat(def: &super::catalog::PropertyDef, model_label: &str, p
     Ok(())
 }
 
-fn bool_field(values: &BTreeMap<String, Option<Value>>, field: &str) -> Option<bool> {
-    match values.get(field) {
+fn bool_field(values: &BTreeMap<PropertyId, Option<Value>>, field: SystemProperty) -> Option<bool> {
+    match values.get(&PropertyId::System(field)) {
         Some(Some(Value::Bool(b))) => Some(*b),
         _ => None,
     }
@@ -952,22 +960,22 @@ fn bool_field(values: &BTreeMap<String, Option<Value>>, field: &str) -> Option<b
 // and mint no property-definition ids, so their fields are `System` properties,
 // named through the same `system_property` decision the systemize pass uses.
 
-fn field_eq(field: &str, value: Value) -> ankql::ast::Predicate {
+fn field_eq(field: SystemProperty, value: Value) -> ankql::ast::Predicate {
     ankql::ast::Predicate::Comparison {
-        left: Box::new(ankql::ast::Expr::Path(ankql::ast::PathExpr::simple(field))),
+        left: Box::new(ankql::ast::Expr::PropertyPath(ankql::ast::PropertyPath::system(field, vec![]))),
         operator: ankql::ast::ComparisonOperator::Equal,
         right: Box::new(ankql::ast::Expr::Literal(value)),
     }
 }
 
-fn field_eq_str(field: &str, value: &str) -> ankql::ast::Predicate { field_eq(field, Value::String(value.to_string())) }
+fn field_eq_str(field: SystemProperty, value: &str) -> ankql::ast::Predicate { field_eq(field, Value::String(value.to_string())) }
 
-fn field_eq_id(field: &str, id: EntityId) -> ankql::ast::Predicate { field_eq(field, Value::EntityId(id)) }
+fn field_eq_id(field: SystemProperty, id: EntityId) -> ankql::ast::Predicate { field_eq(field, Value::EntityId(id)) }
 
 fn and(a: ankql::ast::Predicate, b: ankql::ast::Predicate) -> ankql::ast::Predicate { ankql::ast::Predicate::And(Box::new(a), Box::new(b)) }
 
-fn entity_id_field(values: &BTreeMap<String, Option<Value>>, field: &str) -> Option<EntityId> {
-    match values.get(field) {
+fn entity_id_field(values: &BTreeMap<PropertyId, Option<Value>>, field: SystemProperty) -> Option<EntityId> {
+    match values.get(&PropertyId::System(field)) {
         Some(Some(Value::EntityId(id))) => Some(*id),
         _ => None,
     }
@@ -1013,7 +1021,7 @@ fn lww_operations(fields: Vec<(&str, Option<Value>)>) -> OperationSet {
     let backend = LWWBackend::new();
     for (name, value) in fields {
         let property = SystemProperty::from_name(name).expect("catalog event fields are closed SystemProperty variants");
-        backend.set(property.to_string(), value);
+        backend.set(PropertyId::System(property), value);
     }
     let operations = backend.to_operations().expect("LWW encoding of scalar values is infallible").expect("fields are non-empty");
     OperationSet::from_backends(BTreeMap::from([("lww".to_string(), operations)]))

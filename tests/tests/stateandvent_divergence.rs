@@ -63,8 +63,8 @@ async fn test_stateandvent_divergence_subscription() -> Result<()> {
     let trx_c = ctx_d.begin(); // D's transaction (will be C)
 
     // Set different properties to avoid CRDT merging issues
-    record_e.edit(&trx_b)?.title().set(&"Title-from-E".to_owned())?;
-    record_d.edit(&trx_c)?.artist().set(&"Artist-from-D".to_owned())?;
+    record_e.edit(&trx_b)?.title()?.set(&"Title-from-E".to_owned())?;
+    record_d.edit(&trx_c)?.artist()?.set(&"Artist-from-D".to_owned())?;
 
     // 4. D commits C first
     // This triggers D to send StateAndEvent(C) to E via subscription
@@ -165,8 +165,8 @@ async fn test_two_ephemeral_divergence_subscription() -> Result<()> {
     let trx_b = ctx_e1.begin();
     let trx_c = ctx_e2.begin();
 
-    record_e1.edit(&trx_b)?.title().set(&"Title-from-E1".to_owned())?;
-    record_e2.edit(&trx_c)?.artist().set(&"Artist-from-E2".to_owned())?;
+    record_e1.edit(&trx_b)?.title()?.set(&"Title-from-E1".to_owned())?;
+    record_e2.edit(&trx_c)?.artist()?.set(&"Artist-from-E2".to_owned())?;
 
     // E1 commits B - goes to D via CommitTransaction, D sends StateAndEvent to E2
     dag.enumerate(trx_b.commit_and_return_events().await?); // B

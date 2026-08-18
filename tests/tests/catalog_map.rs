@@ -34,11 +34,19 @@ use tokio::sync::Notify;
 
 type TestNode = Node<SledStorageEngine, PermissiveAgent>;
 
+/// Whether this compiled shape's identity cells are resolved for the node's
+/// current schema epoch -- the registered-right-now probe, read from the
+/// descriptor itself.
+fn schema_registered(node: &TestNode, schema: &'static ankurah::core::schema::ModelStructDescriptor) -> bool {
+    node.system.schema_epoch().is_some_and(|epoch| schema.resolved.get(epoch).is_some())
+}
+
 fn album_entry(name: &str, backend: &str, value_type: &str, optional: bool) -> proto::RegisterModel {
     proto::RegisterModel {
         label: "album".into(),
         name: "Album".into(),
         explicit_id: None,
+        build_id: [0u8; 16],
         properties: vec![proto::RegisterProperty {
             name: name.into(),
             renamed_from: None,
@@ -46,6 +54,7 @@ fn album_entry(name: &str, backend: &str, value_type: &str, optional: bool) -> p
             value_type: value_type.into(),
             target_label: None,
             explicit_id: None,
+            build_id: [0u8; 16],
             optional,
         }],
     }
@@ -417,11 +426,11 @@ async fn hard_reset_rejects_stale_schema_registration_response() -> anyhow::Resu
         .expect("old registration task must not panic");
     assert!(old_result.is_err(), "old-epoch registration must not succeed after reset");
     assert_eq!(client.catalog.counts(), (0, 0, 0));
-    assert!(!client.catalog.is_ensured("album"));
+    assert!(!schema_registered(&client, Album::descriptor()));
 
     // Rejoining rearms a fresh registration owner. A second request must go
-    // over the wire (not hit a stale ensured latch) and its current response
-    // may populate the replacement epoch normally.
+    // over the wire (not answered by stale old-epoch cells) and its current
+    // response may populate the replacement epoch normally.
     client.system.join_system(server.system.root().expect("server root")).await?;
     let new_client = client.clone();
     let new_registration = tokio::spawn(async move { new_client.catalog.ensure_registered(&DEFAULT_CONTEXT, Album::descriptor()).await });
@@ -431,7 +440,7 @@ async fn hard_reset_rejects_stale_schema_registration_response() -> anyhow::Resu
         .await
         .expect("the replacement registration must complete")
         .expect("replacement registration task must not panic")?;
-    assert!(client.catalog.is_ensured("album"));
+    assert!(schema_registered(&client, Album::descriptor()));
     assert!(wait_resolve(&client, "album", "name").await.is_some());
 
     Ok(())

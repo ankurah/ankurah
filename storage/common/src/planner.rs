@@ -4,6 +4,20 @@ use ankurah_core::indexing::{IndexKeyPart, KeySpec};
 use ankurah_core_types::{Value, ValueType};
 use indexmap::IndexMap;
 
+/// The planner's column name for a resolved sort key, when it is a simple
+/// (no JSON sub-path) reference: the property id's rendering. Selections
+/// reach engines resolved (`ankql::ast::Selection::check` is the
+/// boundary), so an unresolved `OrderKey::Path` yields `None` and the
+/// planner treats the key as unplannable, exactly like a sub-path key.
+/// Raw identity renderings are the interim physical vocabulary; friendly
+/// physical naming arrives with the engine-side catalog resolver.
+pub(crate) fn sort_key_root(item: &ankql::ast::OrderByItem) -> Option<String> {
+    match &item.key {
+        ankql::ast::OrderKey::Property(identifier) if identifier.is_simple() => Some(identifier.property_id().to_string()),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PlannerConfig {
     /// Whether the storage backend supports descending indexes
@@ -60,8 +74,7 @@ impl Planner {
                 plans.push(plan);
             }
             // If an ORDER BY field has inequalities (covered inequality), do NOT emit INEQ-FIRST
-            let covered_ineq =
-                order_by.iter().any(|item| if item.path.is_simple() { inequalities.contains_key(item.path.first()) } else { false });
+            let covered_ineq = order_by.iter().any(|item| sort_key_root(item).is_some_and(|name| inequalities.contains_key(&name)));
             if !covered_ineq
                 && !inequalities.is_empty()
                 && let Some(plan) = self.build_ineq_first_plan(&equalities, &inequalities, order_by, &conjuncts)
@@ -130,16 +143,16 @@ impl Planner {
         }
 
         // Keyparts: EQ prefix (using asc_path for multi-step path support)
-        let mut index_keyparts: Vec<IndexKeyPart> = equalities.iter().map(|(f, v)| IndexKeyPart::asc_path(f, ValueType::of(v))).collect();
+        let mut index_keyparts: Vec<IndexKeyPart<String>> =
+            equalities.iter().map(|(f, v)| IndexKeyPart::asc_path(f, ValueType::of(v))).collect();
 
         // Append ORDER BY fields per capability
         if self.config.supports_desc_indexes {
             for item in order_by {
-                if item.path.is_simple() {
-                    let name = item.path.first();
+                if let Some(name) = sort_key_root(item) {
                     index_keyparts.push(match item.direction {
-                        ankql::ast::OrderDirection::Asc => IndexKeyPart::asc(name.to_string(), ValueType::String),
-                        ankql::ast::OrderDirection::Desc => IndexKeyPart::desc(name.to_string(), ValueType::String),
+                        ankql::ast::OrderDirection::Asc => IndexKeyPart::asc(name, ValueType::String),
+                        ankql::ast::OrderDirection::Desc => IndexKeyPart::desc(name, ValueType::String),
                     });
                 }
             }
@@ -148,10 +161,9 @@ impl Planner {
             let first_dir = order_by[0].direction.clone();
             let mut broke = false;
             for item in order_by {
-                if item.path.is_simple() {
-                    let name = item.path.first();
+                if let Some(name) = sort_key_root(item) {
                     if !broke && item.direction == first_dir {
-                        index_keyparts.push(IndexKeyPart::asc(name.to_string(), ValueType::String));
+                        index_keyparts.push(IndexKeyPart::asc(name, ValueType::String));
                     } else {
                         broke = true;
                     }
@@ -160,14 +172,9 @@ impl Planner {
         }
 
         // Bounds: equalities + (optional) bounds on the first ORDER BY field that has inequalities
-        let applied_ineq = order_by.iter().find_map(|item| {
-            if item.path.is_simple() {
-                let name = item.path.first();
-                inequalities.get_key_value(name).map(|(k, v)| (k.as_str(), v))
-            } else {
-                None
-            }
-        });
+        let applied_ineq = order_by
+            .iter()
+            .find_map(|item| sort_key_root(item).and_then(|name| inequalities.get_key_value(&name).map(|(k, v)| (k.as_str(), v))));
 
         let bounds = match applied_ineq {
             Some((field, vec)) => self.build_bounds(equalities, Some((field, vec)), &index_keyparts)?,
@@ -197,7 +204,7 @@ impl Planner {
             let mut spill = Vec::new();
             let mut broke = false;
             for item in order_by {
-                if item.path.is_simple() {
+                if sort_key_root(item).is_some() {
                     if !broke && item.direction == first_dir {
                         presort.push(item.clone());
                     } else {
@@ -232,20 +239,14 @@ impl Planner {
         // Pick primary inequality: prefer first OB field with ineq, else first ineq in map order
         let primary = order_by
             .iter()
-            .find_map(|item| {
-                if item.path.is_simple() {
-                    let name = item.path.first();
-                    inequalities.get_key_value(name).map(|(k, v)| (k.as_str(), v))
-                } else {
-                    None
-                }
-            })
+            .find_map(|item| sort_key_root(item).and_then(|name| inequalities.get_key_value(&name).map(|(k, v)| (k.as_str(), v))))
             .or_else(|| inequalities.iter().next().map(|(k, v)| (k.as_str(), v)))?;
 
         // Keyparts: EQ + primary INEQ (do not append ORDER BY fields; they do not satisfy global order after a range)
         // NOTE (micro-optimization): Appending OB columns after the range could help spill comparator locality,
         // but it does not change correctness and the tests expect the simpler invariant-preserving form.
-        let mut index_keyparts: Vec<IndexKeyPart> = equalities.iter().map(|(f, v)| IndexKeyPart::asc_path(f, ValueType::of(v))).collect();
+        let mut index_keyparts: Vec<IndexKeyPart<String>> =
+            equalities.iter().map(|(f, v)| IndexKeyPart::asc_path(f, ValueType::of(v))).collect();
         let primary_value = &primary.1[0].1; // Get Value from first inequality
         index_keyparts.push(IndexKeyPart::asc_path(primary.0, ValueType::of(primary_value))); // Use actual primary key value type
 
@@ -277,9 +278,8 @@ impl Planner {
         let mut presort = Vec::new();
         let mut spill = Vec::new();
         for item in order_by {
-            if item.path.is_simple() {
-                let name = item.path.first();
-                if covered.contains(name) {
+            if let Some(name) = sort_key_root(item) {
+                if covered.contains(name.as_str()) {
                     presort.push(item.clone());
                 } else {
                     spill.push(item.clone());
@@ -340,6 +340,20 @@ impl Planner {
             Predicate::Comparison { left, operator, right } => {
                 // Extract field path from left side (supports multi-step paths)
                 let field_path = match left.as_ref() {
+                    // Resolved reference: the id rendering plus any JSON
+                    // sub-path, dot-joined -- the engine-side column name.
+                    Expr::PropertyPath(path) => {
+                        let mut rendered = path.property_id().to_string();
+                        for step in &path.subpath {
+                            rendered.push('.');
+                            rendered.push_str(step);
+                        }
+                        rendered
+                    }
+                    // Raw-name arm: user paths resolve before reaching an
+                    // engine, so the only producer left is an engine-injected
+                    // physical conjunct (indexeddb's `__collection`); the
+                    // engine-side catalog resolver (storage cut) retires it.
                     Expr::Path(path) => path.steps.join("."),
                     _ => return None,
                 };
@@ -401,9 +415,8 @@ impl Planner {
             let mut presort = Vec::new();
             let mut spill = Vec::new();
             for item in order_by_items {
-                if item.path.is_simple() {
-                    let name = item.path.first();
-                    if covered_fields.contains(name) {
+                if let Some(name) = sort_key_root(item) {
+                    if covered_fields.contains(name.as_str()) {
                         presort.push(item.clone());
                     } else {
                         spill.push(item.clone());
@@ -461,7 +474,7 @@ impl Planner {
         &self,
         equalities: &[(String, Value)],
         inequality: Option<(&str, &Vec<(ComparisonOperator, Value)>)>,
-        index_keyparts: &[IndexKeyPart],
+        index_keyparts: &[IndexKeyPart<String>],
     ) -> Option<KeyBounds> {
         let mut keypart_bounds = Vec::new();
 
@@ -726,7 +739,7 @@ impl Planner {
         // Determine scan direction and ORDER BY components based on primary key ORDER BY
         let (scan_direction, order_by_spill) = if let Some(order_items) = order_by {
             if let Some(first_item) = order_items.first() {
-                if first_item.path.is_simple() && first_item.path.first() == primary_key {
+                if sort_key_root(first_item).as_deref() == Some(primary_key) {
                     // Primary key ORDER BY is satisfied by scan direction
                     let direction = match first_item.direction {
                         ankql::ast::OrderDirection::Asc => ScanDirection::Forward,
@@ -782,6 +795,12 @@ impl Planner {
         if let Predicate::Comparison { left, operator, right } = predicate {
             // Check if this is a primary key comparison
             let value = match (left.as_ref(), right.as_ref()) {
+                (Expr::PropertyPath(path), Expr::Literal(literal)) if path.is_simple() && path.property_id().to_string() == primary_key => {
+                    literal.clone()
+                }
+                (Expr::Literal(literal), Expr::PropertyPath(path)) if path.is_simple() && path.property_id().to_string() == primary_key => {
+                    literal.clone()
+                }
                 (Expr::Path(path), Expr::Literal(literal)) if path.is_simple() && path.first() == primary_key => literal.clone(),
                 (Expr::Literal(literal), Expr::Path(path)) if path.is_simple() && path.first() == primary_key => literal.clone(),
                 _ => return None,
@@ -882,6 +901,7 @@ impl Planner {
     fn is_primary_key_predicate(&self, predicate: &Predicate, primary_key: &str) -> bool {
         if let Predicate::Comparison { left, operator: _, right: _ } = predicate {
             match left.as_ref() {
+                Expr::PropertyPath(path) if path.is_simple() => path.property_id().to_string() == primary_key,
                 Expr::Path(path) if path.is_simple() => path.first() == primary_key,
                 _ => false,
             }
@@ -894,9 +914,8 @@ impl Planner {
     fn has_primary_key_order_by(&self, order_by: &Option<Vec<ankql::ast::OrderByItem>>, primary_key: &str) -> bool {
         if let Some(order_items) = order_by
             && let Some(first_item) = order_items.first()
-            && first_item.path.is_simple()
         {
-            return first_item.path.first() == primary_key;
+            return sort_key_root(first_item).as_deref() == Some(primary_key);
         }
         false
     }
@@ -907,7 +926,7 @@ impl Planner {
             if let Predicate::Comparison { left, operator, right: _ } = predicate {
                 // Check if this is a primary key comparison with supported operators
                 let is_primary_key_field = match left.as_ref() {
-                    Expr::Path(path) if path.is_simple() => path.first() == primary_key,
+                    Expr::PropertyPath(identifier) if identifier.is_simple() => identifier.property_id().to_string() == primary_key,
                     _ => false,
                 };
 
@@ -935,42 +954,108 @@ impl Planner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ankurah_core_types::Value;
+    use ankql::ast::{PropertyId, PropertyIdExt};
+    use ankql::resolve::{NameResolutionError, NameResolver};
+    use ankurah_core_types::{EntityId, ModelId, Value};
     use ankurah_derive::selection;
+
+    /// Forge the deterministic PropertyId a test name resolves to. The
+    /// planner consumes RESOLVED selections (every name bound to an id
+    /// before an engine plans), so `rsel!` resolves through this fixture and
+    /// the expectation macros rebuild the same ids by name.
+    fn pid(name: &str) -> PropertyId {
+        if name == "id" {
+            return PropertyId::Id;
+        }
+        let mut bytes = [0u8; 32];
+        for (i, byte) in name.bytes().take(32).enumerate() {
+            bytes[i] = byte;
+        }
+        PropertyId::EntityId(EntityId::from_bytes(bytes))
+    }
+
+    /// The engine-side column rendering of a (possibly dotted) test path.
+    fn col(path: &str) -> String {
+        let mut parts = path.split('.');
+        let mut rendered = pid(parts.next().expect("empty path")).to_string();
+        for step in parts {
+            rendered.push('.');
+            rendered.push_str(step);
+        }
+        rendered
+    }
+
+    fn model() -> ModelId { ModelId::EntityId(EntityId::from_bytes([0x11; 32])) }
+
+    struct FixtureResolver;
+
+    impl NameResolver for FixtureResolver {
+        fn resolve_property(&self, _model: &ModelId, name: &str) -> Result<Option<PropertyId>, NameResolutionError> { Ok(Some(pid(name))) }
+
+        fn property_value_type(&self, _model: &ModelId, property: &PropertyId) -> Result<ValueType, NameResolutionError> {
+            // Names the tests compare numerically type as the parser's
+            // integer type, so canonicalizing a number-as-written is the
+            // identity; `year` is genuinely numeric, so its string literals
+            // canonicalize to I32; everything else is String.
+            for numeric in ["age", "score", "rating", "foo", "year"] {
+                if *property == pid(numeric) {
+                    return Ok(ValueType::I32);
+                }
+            }
+            if *property == pid("timestamp") {
+                return Ok(ValueType::I64);
+            }
+            Ok(ValueType::String)
+        }
+    }
+
+    /// Parse and resolve a selection the way the fetch path would before an
+    /// engine sees it.
+    macro_rules! rsel {
+        ($($selection:tt)*) => {
+            selection!($($selection)*).resolve_names(&model(), &FixtureResolver).expect("failed to resolve test selection")
+        };
+    }
 
     // FIX_ME: rename to plan_indexeddb
     macro_rules! plan {
         ($($selection:tt)*) => {{
-            let selection = selection!($($selection)*);
+            let selection = rsel!($($selection)*);
             let planner = Planner::new(PlannerConfig::indexeddb());
             planner.plan(&selection, "id")
         }};
     }
     macro_rules! plan_full_support {
         ($($selection:tt)*) => {{
-            let selection = selection!($($selection)*);
+            let selection = rsel!($($selection)*);
             let planner = Planner::new(PlannerConfig::full_support());
             planner.plan(&selection, "id")
         }};
     }
     macro_rules! asc {
         ($name:expr, $ty:expr) => {
-            IndexKeyPart::asc($name.to_string(), $ty)
+            IndexKeyPart::asc(col($name), $ty)
         };
     }
     macro_rules! desc {
         ($name:expr, $ty:expr) => {
-            IndexKeyPart::desc($name.to_string(), $ty)
+            IndexKeyPart::desc(col($name), $ty)
         };
     }
     macro_rules! oby_asc {
         ($name:expr) => {
-            ankql::ast::OrderByItem { path: ankql::ast::PathExpr::simple($name), direction: ankql::ast::OrderDirection::Asc }
+            ankql::ast::OrderByItem {
+                key: ankql::ast::OrderKey::Property(pid($name).path(&[])),
+                direction: ankql::ast::OrderDirection::Asc,
+            }
         };
     }
     macro_rules! oby_desc {
         ($name:expr) => {
-            ankql::ast::OrderByItem { path: ankql::ast::PathExpr::simple($name), direction: ankql::ast::OrderDirection::Desc }
+            ankql::ast::OrderByItem {
+                key: ankql::ast::OrderKey::Property(pid($name).path(&[])),
+                direction: ankql::ast::OrderDirection::Desc,
+            }
         };
     }
 
@@ -988,50 +1073,50 @@ mod tests {
         ($col:expr => $lo:tt .. $hi:tt) => {{
             let __lo: Value = ($lo).into();
             let __hi: Value = ($hi).into();
-            KeyBoundComponent { column: $col.to_string(), low: ge(__lo), high: lt(__hi) }
+            KeyBoundComponent { column: col($col), low: ge(__lo), high: lt(__hi) }
         }};
         ($col:expr => $lo:tt ..= $hi:tt) => {{
             let __lo: Value = ($lo).into();
             let __hi: Value = ($hi).into();
-            KeyBoundComponent { column: $col.to_string(), low: ge(__lo), high: le(__hi) }
+            KeyBoundComponent { column: col($col), low: ge(__lo), high: le(__hi) }
         }};
         ($col:expr => .. $hi:tt) => {{
             let __hi: Value = ($hi).into();
-            KeyBoundComponent { column: $col.to_string(), low: Endpoint::UnboundedLow(ValueType::of(&__hi)), high: lt(__hi) }
+            KeyBoundComponent { column: col($col), low: Endpoint::UnboundedLow(ValueType::of(&__hi)), high: lt(__hi) }
         }};
         ($col:expr => $lo:tt ..) => {{
             let __lo: Value = ($lo).into();
-            KeyBoundComponent { column: $col.to_string(), low: ge(__lo.clone()), high: Endpoint::UnboundedHigh(ValueType::of(&__lo)) }
+            KeyBoundComponent { column: col($col), low: ge(__lo.clone()), high: Endpoint::UnboundedHigh(ValueType::of(&__lo)) }
         }};
 
         // parenthesized ranges (to avoid parsing conflicts in bounds! macro)
         ($col:expr, ($lo:tt .. $hi:tt)) => {{
             let __lo: Value = ($lo).into();
             let __hi: Value = ($hi).into();
-            KeyBoundComponent { column: $col.to_string(), low: ge(__lo), high: lt(__hi) }
+            KeyBoundComponent { column: col($col), low: ge(__lo), high: lt(__hi) }
         }};
         ($col:expr, ($lo:tt ..= $hi:tt)) => {{
             let __lo: Value = ($lo).into();
             let __hi: Value = ($hi).into();
-            KeyBoundComponent { column: $col.to_string(), low: ge(__lo), high: le(__hi) }
+            KeyBoundComponent { column: col($col), low: ge(__lo), high: le(__hi) }
         }};
         ($col:expr, (.. $hi:tt)) => {{
             let __hi: Value = ($hi).into();
-            KeyBoundComponent { column: $col.to_string(), low: Endpoint::UnboundedLow(ValueType::of(&__hi)), high: lt(__hi) }
+            KeyBoundComponent { column: col($col), low: Endpoint::UnboundedLow(ValueType::of(&__hi)), high: lt(__hi) }
         }};
         ($col:expr, (..= $hi:tt)) => {{
             let __hi: Value = ($hi).into();
-            KeyBoundComponent { column: $col.to_string(), low: Endpoint::UnboundedLow(ValueType::of(&__hi)), high: le(__hi) }
+            KeyBoundComponent { column: col($col), low: Endpoint::UnboundedLow(ValueType::of(&__hi)), high: le(__hi) }
         }};
         ($col:expr, ($lo:tt ..)) => {{
             let __lo: Value = ($lo).into();
-            KeyBoundComponent { column: $col.to_string(), low: ge(__lo.clone()), high: Endpoint::UnboundedHigh(ValueType::of(&__lo)) }
+            KeyBoundComponent { column: col($col), low: ge(__lo.clone()), high: Endpoint::UnboundedHigh(ValueType::of(&__lo)) }
         }};
 
         // explicit equality: = v   (clear and unambiguous)
         ($col:expr, = $v:tt) => {{
             let __pv: Value = ($v).into();
-            KeyBoundComponent { column: $col.to_string(), low: ge(__pv.clone()), high: le(__pv) }
+            KeyBoundComponent { column: col($col), low: ge(__pv.clone()), high: le(__pv) }
         }};
     }
 
@@ -1122,7 +1207,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album'").predicate,
+                        remaining_predicate: rsel!("__collection = 'album'").predicate,
                         order_by_spill: order_by_components!(spill: [oby_asc!("foo"), oby_asc!("bar")])
                     }
                 ]
@@ -1150,7 +1235,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album' AND foo > 10").predicate,
+                        remaining_predicate: rsel!("__collection = 'album' AND foo > 10").predicate,
                         order_by_spill: order_by_components!(spill: [oby_asc!("foo"), oby_asc!("bar")])
                     }
                 ]
@@ -1176,7 +1261,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("age = 30").predicate,
+                        remaining_predicate: rsel!("age = 30").predicate,
                         order_by_spill: order_by_components!(spill: [oby_asc!("foo"), oby_asc!("bar")])
                     }
                 ]
@@ -1204,7 +1289,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album' AND age = 30").predicate,
+                        remaining_predicate: rsel!("__collection = 'album' AND age = 30").predicate,
                         order_by_spill: order_by_components!(spill: [oby_asc!("foo"), oby_asc!("bar")])
                     }
                 ]
@@ -1227,7 +1312,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album'").predicate,
+                        remaining_predicate: rsel!("__collection = 'album'").predicate,
                         order_by_spill: order_by_components!(spill: [oby_desc!("name")])
                     }
                 ]
@@ -1239,6 +1324,9 @@ mod tests {
             // All DESC fields - should scan backwards with ASC indexes
             assert_eq!(
                 plan!("__collection = 'album' ORDER BY name DESC, year DESC"),
+                // `year` appears only in ORDER BY here (no comparison to
+                // infer a type from), so the planner types its keypart
+                // String.
                 vec![
                     Plan::Index {
                         index_spec: KeySpec::new(vec![
@@ -1254,7 +1342,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album'").predicate,
+                        remaining_predicate: rsel!("__collection = 'album'").predicate,
                         order_by_spill: order_by_components!(spill: [oby_desc!("name"), oby_desc!("year")])
                     }
                 ]
@@ -1277,7 +1365,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album'").predicate,
+                        remaining_predicate: rsel!("__collection = 'album'").predicate,
                         order_by_spill: order_by_components!(spill: [oby_asc!("name"), oby_desc!("year")])
                     }
                 ]
@@ -1300,7 +1388,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album'").predicate,
+                        remaining_predicate: rsel!("__collection = 'album'").predicate,
                         order_by_spill: order_by_components!(spill: [oby_desc!("name"), oby_asc!("year")])
                     }
                 ]
@@ -1323,7 +1411,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album'").predicate,
+                        remaining_predicate: rsel!("__collection = 'album'").predicate,
                         order_by_spill: order_by_components!(spill: [oby_asc!("a"), oby_desc!("b"), oby_desc!("c")])
                     }
                 ]
@@ -1350,7 +1438,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album'").predicate,
+                        remaining_predicate: rsel!("__collection = 'album'").predicate,
                         order_by_spill: order_by_components!(spill: [oby_desc!("a"), oby_desc!("b"), oby_asc!("c")])
                     }
                 ]
@@ -1381,7 +1469,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album'").predicate,
+                        remaining_predicate: rsel!("__collection = 'album'").predicate,
                         order_by_spill: order_by_components!(spill: [oby_asc!("a"), oby_asc!("b"), oby_asc!("c")])
                     }
                 ]
@@ -1408,7 +1496,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album'").predicate,
+                        remaining_predicate: rsel!("__collection = 'album'").predicate,
                         order_by_spill: order_by_components!(spill: [oby_asc!("a"), oby_asc!("b"), oby_desc!("c")])
                     }
                 ]
@@ -1431,7 +1519,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album'").predicate,
+                        remaining_predicate: rsel!("__collection = 'album'").predicate,
                         order_by_spill: order_by_components!(spill: [oby_asc!("a"), oby_desc!("b"), oby_asc!("c")])
                     }
                 ]
@@ -1454,7 +1542,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album'").predicate,
+                        remaining_predicate: rsel!("__collection = 'album'").predicate,
                         order_by_spill: order_by_components!(spill: [oby_desc!("a"), oby_asc!("b"), oby_asc!("c")])
                     }
                 ]
@@ -1477,7 +1565,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album'").predicate,
+                        remaining_predicate: rsel!("__collection = 'album'").predicate,
                         order_by_spill: order_by_components!(spill: [oby_desc!("a"), oby_asc!("b"), oby_desc!("c")])
                     }
                 ]
@@ -1505,7 +1593,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album'").predicate,
+                        remaining_predicate: rsel!("__collection = 'album'").predicate,
                         order_by_spill: order_by_components!(spill: [oby_desc!("a"), oby_desc!("b"), oby_desc!("c")])
                     }
                 ]
@@ -1532,7 +1620,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album' AND status = 'active'").predicate,
+                        remaining_predicate: rsel!("__collection = 'album' AND status = 'active'").predicate,
                         order_by_spill: order_by_components!(spill: [oby_desc!("name")])
                     }
                 ]
@@ -1557,7 +1645,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album' AND age > 25").predicate,
+                        remaining_predicate: rsel!("__collection = 'album' AND age > 25").predicate,
                         order_by_spill: order_by_components!(spill: [oby_desc!("age")])
                     }
                 ]
@@ -1585,7 +1673,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album'").predicate,
+                        remaining_predicate: rsel!("__collection = 'album'").predicate,
                         order_by_spill: order_by_components!(spill: [oby_desc!("name")])
                     }
                 ]
@@ -1613,7 +1701,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album'").predicate,
+                        remaining_predicate: rsel!("__collection = 'album'").predicate,
                         order_by_spill: order_by_components!(spill: [oby_asc!("name"), oby_desc!("year"), oby_asc!("score")])
                     }
                 ]
@@ -1640,7 +1728,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album'").predicate,
+                        remaining_predicate: rsel!("__collection = 'album'").predicate,
                         order_by_spill: order_by_components!(spill: [oby_desc!("name"), oby_desc!("year")])
                     }
                 ]
@@ -1668,7 +1756,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album' AND status = 'active'").predicate,
+                        remaining_predicate: rsel!("__collection = 'album' AND status = 'active'").predicate,
                         order_by_spill: order_by_components!(spill: [oby_asc!("name"), oby_desc!("year")])
                     }
                 ]
@@ -1697,7 +1785,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album' AND age > 25").predicate,
+                        remaining_predicate: rsel!("__collection = 'album' AND age > 25").predicate,
                         order_by_spill: order_by_components!()
                     }
                 ]
@@ -1721,7 +1809,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album' AND age > 25 AND age < 50").predicate,
+                        remaining_predicate: rsel!("__collection = 'album' AND age > 25 AND age < 50").predicate,
                         order_by_spill: order_by_components!()
                     }
                 ]
@@ -1741,7 +1829,7 @@ mod tests {
                         // from is excl because the inequality (age) is > 25
                         // from is incl because there is no age < ? in the predicate
                         bounds: bounds_list!(col_range!("__collection" => "album"..="album"), open_lower!("age" => 25..)),
-                        remaining_predicate: selection!("score < 100").predicate,
+                        remaining_predicate: rsel!("score < 100").predicate,
                         order_by_spill: order_by_components!()
                     },
                     // Plan 2: Uses score index, age remains in predicate
@@ -1751,13 +1839,13 @@ mod tests {
                         // from is incl because there is no score < ? in the predicate
                         // to is excl because the inequality (score) is < 100
                         bounds: bounds!("__collection" => ("album"..="album"), "score" => (..100)),
-                        remaining_predicate: selection!("age > 25").predicate,
+                        remaining_predicate: rsel!("age > 25").predicate,
                         order_by_spill: order_by_components!()
                     },
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album' AND age > 25 AND score < 100").predicate,
+                        remaining_predicate: rsel!("__collection = 'album' AND age > 25 AND score < 100").predicate,
                         order_by_spill: order_by_components!()
                     }
                 ]
@@ -1781,7 +1869,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album' AND age >= 25").predicate,
+                        remaining_predicate: rsel!("__collection = 'album' AND age >= 25").predicate,
                         order_by_spill: order_by_components!()
                     }
                 ]
@@ -1805,7 +1893,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album' AND age < 50").predicate,
+                        remaining_predicate: rsel!("__collection = 'album' AND age < 50").predicate,
                         order_by_spill: order_by_components!()
                     }
                 ]
@@ -1829,7 +1917,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album' AND age <= 50").predicate,
+                        remaining_predicate: rsel!("__collection = 'album' AND age <= 50").predicate,
                         order_by_spill: order_by_components!()
                     }
                 ]
@@ -1853,7 +1941,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album' AND age >= 25 AND age <= 50").predicate,
+                        remaining_predicate: rsel!("__collection = 'album' AND age >= 25 AND age <= 50").predicate,
                         order_by_spill: order_by_components!()
                     }
                 ]
@@ -1877,7 +1965,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album' AND age >= 25 AND age < 50").predicate,
+                        remaining_predicate: rsel!("__collection = 'album' AND age >= 25 AND age < 50").predicate,
                         order_by_spill: order_by_components!()
                     }
                 ]
@@ -1901,7 +1989,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album' AND age > 25 AND age <= 50").predicate,
+                        remaining_predicate: rsel!("__collection = 'album' AND age > 25 AND age <= 50").predicate,
                         order_by_spill: order_by_components!()
                     }
                 ]
@@ -1927,7 +2015,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album' AND age >= 25").predicate,
+                        remaining_predicate: rsel!("__collection = 'album' AND age >= 25").predicate,
                         order_by_spill: order_by_components!(spill: [oby_desc!("age")])
                     }
                 ]
@@ -1953,7 +2041,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album' AND age <= 50").predicate,
+                        remaining_predicate: rsel!("__collection = 'album' AND age <= 50").predicate,
                         order_by_spill: order_by_components!(spill: [oby_desc!("age")])
                     }
                 ]
@@ -1980,7 +2068,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album' AND name = 'Alice'").predicate,
+                        remaining_predicate: rsel!("__collection = 'album' AND name = 'Alice'").predicate,
                         order_by_spill: order_by_components!()
                     }
                 ]
@@ -2006,7 +2094,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album' AND name = 'Alice' AND age = 30").predicate,
+                        remaining_predicate: rsel!("__collection = 'album' AND name = 'Alice' AND age = 30").predicate,
                         order_by_spill: order_by_components!()
                     }
                 ]
@@ -2039,7 +2127,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album' AND artist = 'Queen' AND year = 1975 AND genre = 'Rock'")
+                        remaining_predicate: rsel!("__collection = 'album' AND artist = 'Queen' AND year = 1975 AND genre = 'Rock'")
                             .predicate,
                         order_by_spill: order_by_components!()
                     }
@@ -2073,7 +2161,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album' AND artist = 'Queen' AND year = 1975").predicate,
+                        remaining_predicate: rsel!("__collection = 'album' AND artist = 'Queen' AND year = 1975").predicate,
                         order_by_spill: order_by_components!(spill: [oby_asc!("title")])
                     }
                 ]
@@ -2106,8 +2194,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album' AND artist = 'Queen' AND year = 1975 AND rating > 4")
-                            .predicate,
+                        remaining_predicate: rsel!("__collection = 'album' AND artist = 'Queen' AND year = 1975 AND rating > 4").predicate,
                         order_by_spill: order_by_components!()
                     }
                 ]
@@ -2144,7 +2231,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album' AND name = 'Alice' AND age > 25").predicate,
+                        remaining_predicate: rsel!("__collection = 'album' AND name = 'Alice' AND age > 25").predicate,
                         order_by_spill: order_by_components!()
                     }
                 ]
@@ -2176,7 +2263,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album' AND score > 50 AND age = 30").predicate,
+                        remaining_predicate: rsel!("__collection = 'album' AND score > 50 AND age = 30").predicate,
                         order_by_spill: order_by_components!(spill: [oby_asc!("score")])
                     }
                 ]
@@ -2204,7 +2291,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album'").predicate,
+                        remaining_predicate: rsel!("__collection = 'album'").predicate,
                         order_by_spill: order_by_components!()
                     }
                 ]
@@ -2221,13 +2308,13 @@ mod tests {
                         index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String)]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album")),
-                        remaining_predicate: selection!("name != 'Alice'").predicate,
+                        remaining_predicate: rsel!("name != 'Alice'").predicate,
                         order_by_spill: order_by_components!(),
                     },
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album' AND name != 'Alice'").predicate,
+                        remaining_predicate: rsel!("__collection = 'album' AND name != 'Alice'").predicate,
                         order_by_spill: order_by_components!()
                     }
                 ]
@@ -2243,13 +2330,13 @@ mod tests {
                         // from is excl because the inequality (age) is > 25
                         // to is incl and the final component is omitted because there is no age < ? in the predicate
                         bounds: bounds_list!(col_range!("__collection" => "album"..="album"), open_lower!("age" => 25..)),
-                        remaining_predicate: selection!("name != 'Alice'").predicate,
+                        remaining_predicate: rsel!("name != 'Alice'").predicate,
                         order_by_spill: order_by_components!(),
                     },
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album' AND age > 25 AND name != 'Alice'").predicate,
+                        remaining_predicate: rsel!("__collection = 'album' AND age > 25 AND name != 'Alice'").predicate,
                         order_by_spill: order_by_components!()
                     }
                 ]
@@ -2274,13 +2361,13 @@ mod tests {
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album")),
                         // the OR-containing parenthetical is a disjunction, so it must remain in the predicate
-                        remaining_predicate: selection!("age > 25 OR name = 'Alice'").predicate,
+                        remaining_predicate: rsel!("age > 25 OR name = 'Alice'").predicate,
                         order_by_spill: order_by_components!(),
                     },
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album' AND (age > 25 OR name = 'Alice')").predicate,
+                        remaining_predicate: rsel!("__collection = 'album' AND (age > 25 OR name = 'Alice')").predicate,
                         order_by_spill: order_by_components!()
                     }
                 ]
@@ -2298,14 +2385,13 @@ mod tests {
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album"), "score" => (100..=100)),
                         // the OR-containing parenthetical is a disjunction, so it must remain in the predicate
-                        remaining_predicate: selection!("age > 25 OR name = 'Alice'").predicate,
+                        remaining_predicate: rsel!("age > 25 OR name = 'Alice'").predicate,
                         order_by_spill: order_by_components!(),
                     },
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album' AND score = 100 AND (age > 25 OR name = 'Alice')")
-                            .predicate,
+                        remaining_predicate: rsel!("__collection = 'album' AND score = 100 AND (age > 25 OR name = 'Alice')").predicate,
                         order_by_spill: order_by_components!()
                     }
                 ]
@@ -2334,7 +2420,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album' AND age = 30").predicate,
+                        remaining_predicate: rsel!("__collection = 'album' AND age = 30").predicate,
                         order_by_spill: order_by_components!(spill: [oby_asc!("name"), oby_asc!("score")])
                     }
                 ]
@@ -2359,25 +2445,21 @@ mod tests {
                         index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("name", ValueType::String)]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album")),
-                        remaining_predicate: Predicate::Comparison {
-                            left: Box::new(Expr::Path(ankql::ast::PathExpr::simple("year"))),
-                            operator: ComparisonOperator::GreaterThanOrEqual,
-                            right: Box::new(Expr::Literal(Value::String("2001".to_string()))),
-                        },
+                        remaining_predicate: rsel!("year >= '2001'").predicate,
                         order_by_spill: order_by_components!(presort: [oby_asc!("name")]),
                     },
                     // Strategy 2: Scan by year, sort by name (global sort needed since 'year' not in ORDER BY)
                     Plan::Index {
-                        index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("year", ValueType::String)]),
+                        index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("year", ValueType::I32)]),
                         scan_direction: ScanDirection::Forward,
-                        bounds: bounds!("__collection" => ("album"..="album"), "year" => ("2001"..)),
+                        bounds: bounds!("__collection" => ("album"..="album"), "year" => (2001..)),
                         remaining_predicate: Predicate::True,
                         order_by_spill: order_by_components!(spill: [oby_asc!("name")]),
                     },
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album' AND year >= '2001'").predicate,
+                        remaining_predicate: rsel!("__collection = 'album' AND year >= '2001'").predicate,
                         order_by_spill: order_by_components!(spill: [oby_asc!("name")])
                     }
                 ]
@@ -2404,7 +2486,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album' AND age >= 25 AND age <= 50 AND age > 20").predicate,
+                        remaining_predicate: rsel!("__collection = 'album' AND age >= 25 AND age <= 50 AND age > 20").predicate,
                         order_by_spill: order_by_components!()
                     }
                 ]
@@ -2433,7 +2515,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album' AND timestamp > 9223372036854775807").predicate,
+                        remaining_predicate: rsel!("__collection = 'album' AND timestamp > 9223372036854775807").predicate,
                         order_by_spill: order_by_components!()
                     }
                 ]
@@ -2456,7 +2538,7 @@ mod tests {
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album' AND name = ''").predicate,
+                        remaining_predicate: rsel!("__collection = 'album' AND name = ''").predicate,
                         order_by_spill: order_by_components!()
                     }
                 ]
@@ -2473,17 +2555,17 @@ mod tests {
                         index_spec: KeySpec::new(vec![
                             asc!("__collection", ValueType::String),
                             asc!("name", ValueType::String),
-                            asc!("year", ValueType::String)
+                            asc!("year", ValueType::I32)
                         ]),
                         scan_direction: ScanDirection::Forward,
-                        bounds: bounds!("__collection" => ("album"..="album"), "name" => (""..=""), "year" => ("2000"..="2000")),
+                        bounds: bounds!("__collection" => ("album"..="album"), "name" => (""..=""), "year" => (2000..=2000)),
                         remaining_predicate: Predicate::True,
                         order_by_spill: order_by_components!()
                     },
                     Plan::TableScan {
                         bounds: KeyBounds::empty(),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!("__collection = 'album' AND name = '' AND year = '2000'").predicate,
+                        remaining_predicate: rsel!("__collection = 'album' AND name = '' AND year = '2000'").predicate,
                         order_by_spill: order_by_components!()
                     }
                 ]
@@ -2498,7 +2580,7 @@ mod tests {
                 vec![Plan::TableScan {
                     bounds: bounds!("id" => ("12345678-1234-1234-1234-123456789abc"..="12345678-1234-1234-1234-123456789abc")),
                     scan_direction: ScanDirection::Forward,
-                    remaining_predicate: selection!("id = '12345678-1234-1234-1234-123456789abc'").predicate,
+                    remaining_predicate: rsel!("id = '12345678-1234-1234-1234-123456789abc'").predicate,
                     order_by_spill: order_by_components!()
                 }]
             );
@@ -2513,7 +2595,7 @@ mod tests {
                 vec![Plan::TableScan {
                     bounds: bounds_list!(open_lower!("id" => "12345678-1234-1234-1234-123456789abc"..)),
                     scan_direction: ScanDirection::Reverse, // DESC ORDER BY on primary key
-                    remaining_predicate: selection!("id > '12345678-1234-1234-1234-123456789abc'").predicate,
+                    remaining_predicate: rsel!("id > '12345678-1234-1234-1234-123456789abc'").predicate,
                     order_by_spill: order_by_components!(presort: [oby_desc!("id")]) // Primary key ORDER BY satisfied by scan direction
                 }]
             );
@@ -2529,7 +2611,7 @@ mod tests {
                     bounds: bounds!("id" => ("12345678-1234-1234-1234-123456789abc"..="12345678-1234-1234-1234-123456789abc")),
                     scan_direction: ScanDirection::Forward, // name ORDER BY not on primary key
                     // TODO this should be ::true because the id predicate is covered by the table scan
-                    remaining_predicate: selection!("id = '12345678-1234-1234-1234-123456789abc'").predicate,
+                    remaining_predicate: rsel!("id = '12345678-1234-1234-1234-123456789abc'").predicate,
                     order_by_spill: order_by_components!(spill: [oby_asc!("name")]) // name ORDER BY must be sorted in-memory
                 }]
             );
@@ -2544,7 +2626,7 @@ mod tests {
                 vec![Plan::TableScan {
                     bounds: KeyBounds::empty(), // No range extraction for != operator
                     scan_direction: ScanDirection::Forward,
-                    remaining_predicate: selection!("id != '12345678-1234-1234-1234-123456789abc'").predicate,
+                    remaining_predicate: rsel!("id != '12345678-1234-1234-1234-123456789abc'").predicate,
                     order_by_spill: order_by_components!()
                 }]
             );
@@ -2586,7 +2668,7 @@ mod tests {
                 vec![Plan::TableScan {
                     bounds: bounds!("id" => ("12345678-1234-1234-1234-123456789aaa"..="12345678-1234-1234-1234-123456789zzz")),
                     scan_direction: ScanDirection::Forward,
-                    remaining_predicate: selection!(
+                    remaining_predicate: rsel!(
                         "id >= '12345678-1234-1234-1234-123456789aaa' AND id <= '12345678-1234-1234-1234-123456789zzz'"
                     )
                     .predicate,
@@ -2605,13 +2687,13 @@ mod tests {
                         index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("name", ValueType::String)]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album"), "name" => ("Alice"..="Alice")),
-                        remaining_predicate: selection!("id > '12345678-1234-1234-1234-123456789abc'").predicate,
+                        remaining_predicate: rsel!("id > '12345678-1234-1234-1234-123456789abc'").predicate,
                         order_by_spill: order_by_components!()
                     },
                     Plan::TableScan {
                         bounds: bounds_list!(open_lower!("id" => "12345678-1234-1234-1234-123456789abc"..)),
                         scan_direction: ScanDirection::Forward,
-                        remaining_predicate: selection!(
+                        remaining_predicate: rsel!(
                             "__collection = 'album' AND id > '12345678-1234-1234-1234-123456789abc' AND name = 'Alice'"
                         )
                         .predicate,
@@ -2629,7 +2711,7 @@ mod tests {
         #[test]
         fn test_json_path_equality() {
             let planner = Planner::new(PlannerConfig::full_support());
-            let selection = selection!("context.session_id = 'sess123'");
+            let selection = rsel!("context.session_id = 'sess123'");
             let plans = planner.plan(&selection, "id");
 
             // Should generate an index plan with sub_path
@@ -2639,13 +2721,13 @@ mod tests {
                 // Check that the keypart has the correct sub_path
                 assert_eq!(index_spec.keyparts.len(), 1);
                 let keypart = &index_spec.keyparts[0];
-                assert_eq!(keypart.column, "context");
+                assert_eq!(keypart.key, pid("context").to_string());
                 assert_eq!(keypart.sub_path, Some(vec!["session_id".to_string()]));
-                assert_eq!(keypart.full_path(), "context.session_id");
+                assert_eq!(keypart.full_path(), col("context.session_id"));
 
                 // Check bounds use full path
                 assert_eq!(bounds.keyparts.len(), 1);
-                assert_eq!(bounds.keyparts[0].column, "context.session_id");
+                assert_eq!(bounds.keyparts[0].column, col("context.session_id"));
             } else {
                 panic!("Expected Index plan");
             }
@@ -2655,7 +2737,7 @@ mod tests {
         #[test]
         fn test_json_path_with_order_by() {
             let planner = Planner::new(PlannerConfig::full_support());
-            let selection = selection!("context.user_id = 'user123' ORDER BY created DESC");
+            let selection = rsel!("context.user_id = 'user123' ORDER BY created DESC");
             let plans = planner.plan(&selection, "id");
 
             let index_plan = plans.iter().find(|p| matches!(p, Plan::Index { .. })).expect("Should generate index plan");
@@ -2663,13 +2745,13 @@ mod tests {
             if let Plan::Index { index_spec, .. } = index_plan {
                 // First keypart should be the JSON path equality
                 let first = &index_spec.keyparts[0];
-                assert_eq!(first.column, "context");
+                assert_eq!(first.key, pid("context").to_string());
                 assert_eq!(first.sub_path, Some(vec!["user_id".to_string()]));
 
                 // ORDER BY field should be second (simple path)
                 if index_spec.keyparts.len() > 1 {
                     let second = &index_spec.keyparts[1];
-                    assert_eq!(second.column, "created");
+                    assert_eq!(second.key, pid("created").to_string());
                     assert_eq!(second.sub_path, None);
                 }
             }
@@ -2679,16 +2761,16 @@ mod tests {
         #[test]
         fn test_deep_json_path() {
             let planner = Planner::new(PlannerConfig::full_support());
-            let selection = selection!("data.nested.field = 'value'");
+            let selection = rsel!("data.nested.field = 'value'");
             let plans = planner.plan(&selection, "id");
 
             let index_plan = plans.iter().find(|p| matches!(p, Plan::Index { .. })).expect("Should generate index plan");
 
             if let Plan::Index { index_spec, .. } = index_plan {
                 let keypart = &index_spec.keyparts[0];
-                assert_eq!(keypart.column, "data");
+                assert_eq!(keypart.key, pid("data").to_string());
                 assert_eq!(keypart.sub_path, Some(vec!["nested".to_string(), "field".to_string()]));
-                assert_eq!(keypart.full_path(), "data.nested.field");
+                assert_eq!(keypart.full_path(), col("data.nested.field"));
             }
         }
 
@@ -2696,7 +2778,7 @@ mod tests {
         #[test]
         fn test_json_path_full_pushdown() {
             let planner = Planner::new(PlannerConfig::full_support());
-            let selection = selection!("context.session_id = 'sess123'");
+            let selection = rsel!("context.session_id = 'sess123'");
             let plans = planner.plan(&selection, "id");
 
             let index_plan = plans.iter().find(|p| matches!(p, Plan::Index { .. })).expect("Should generate index plan");
@@ -2713,7 +2795,7 @@ mod tests {
         #[test]
         fn test_json_path_inequality() {
             let planner = Planner::new(PlannerConfig::full_support());
-            let selection = selection!("context.count > 100");
+            let selection = rsel!("context.count > 100");
             let plans = planner.plan(&selection, "id");
 
             // Should still generate an index plan
@@ -2721,7 +2803,7 @@ mod tests {
 
             if let Plan::Index { index_spec, remaining_predicate, .. } = index_plan {
                 let keypart = &index_spec.keyparts[0];
-                assert_eq!(keypart.column, "context");
+                assert_eq!(keypart.key, pid("context").to_string());
                 assert_eq!(keypart.sub_path, Some(vec!["count".to_string()]));
 
                 // Inequality should be fully pushed to bounds, remaining_predicate is True
@@ -2733,7 +2815,7 @@ mod tests {
         #[test]
         fn test_json_path_mixed_predicates() {
             let planner = Planner::new(PlannerConfig::full_support());
-            let selection = selection!("status = 'active' AND context.user_id = 'user123'");
+            let selection = rsel!("status = 'active' AND context.user_id = 'user123'");
             let plans = planner.plan(&selection, "id");
 
             // Should have an index plan
@@ -2748,7 +2830,7 @@ mod tests {
                 assert!(json_keypart.is_some(), "Should have a keypart with sub_path");
 
                 let json_kp = json_keypart.unwrap();
-                assert_eq!(json_kp.column, "context");
+                assert_eq!(json_kp.key, pid("context").to_string());
                 assert_eq!(json_kp.sub_path, Some(vec!["user_id".to_string()]));
 
                 // Both should be fully pushed, remaining is True
@@ -2772,12 +2854,12 @@ mod tests {
             if let Plan::Index { order_by_spill, .. } = index_plan {
                 // First column (a) is satisfied by index, remaining are spilled
                 assert_eq!(order_by_spill.presort.len(), 1);
-                assert_eq!(order_by_spill.presort[0].path.property(), "a");
+                assert_eq!(order_by_spill.presort[0].key, ankql::ast::OrderKey::Property(pid("a").path(&[])));
 
                 assert_eq!(order_by_spill.spill.len(), 2);
                 // Verify order: b comes before c
-                assert_eq!(order_by_spill.spill[0].path.property(), "b");
-                assert_eq!(order_by_spill.spill[1].path.property(), "c");
+                assert_eq!(order_by_spill.spill[0].key, ankql::ast::OrderKey::Property(pid("b").path(&[])));
+                assert_eq!(order_by_spill.spill[1].key, ankql::ast::OrderKey::Property(pid("c").path(&[])));
             } else {
                 panic!("Expected Index plan");
             }
@@ -2805,7 +2887,7 @@ mod tests {
             // LIMIT should not affect whether spill is needed
             // ORDER BY a ASC, b DESC LIMIT 10 with index on (a)
             // Spill should still contain [b DESC]
-            let selection = selection!("__collection = 'album' ORDER BY a ASC, b DESC LIMIT 10");
+            let selection = rsel!("__collection = 'album' ORDER BY a ASC, b DESC LIMIT 10");
             let planner = Planner::new(PlannerConfig::indexeddb());
             let plans = planner.plan(&selection, "id");
             let index_plan = &plans[0];
@@ -2813,9 +2895,9 @@ mod tests {
             if let Plan::Index { order_by_spill, .. } = index_plan {
                 // a is presorted, b is spilled regardless of LIMIT
                 assert_eq!(order_by_spill.presort.len(), 1);
-                assert_eq!(order_by_spill.presort[0].path.property(), "a");
+                assert_eq!(order_by_spill.presort[0].key, ankql::ast::OrderKey::Property(pid("a").path(&[])));
                 assert_eq!(order_by_spill.spill.len(), 1);
-                assert_eq!(order_by_spill.spill[0].path.property(), "b");
+                assert_eq!(order_by_spill.spill[0].key, ankql::ast::OrderKey::Property(pid("b").path(&[])));
                 assert_eq!(order_by_spill.spill[0].direction, ankql::ast::OrderDirection::Desc);
             } else {
                 panic!("Expected Index plan");
@@ -2833,11 +2915,11 @@ mod tests {
                 assert!(order_by_spill.presort.is_empty());
                 assert_eq!(order_by_spill.spill.len(), 3);
                 // Verify all columns and directions
-                assert_eq!(order_by_spill.spill[0].path.property(), "x");
+                assert_eq!(order_by_spill.spill[0].key, ankql::ast::OrderKey::Property(pid("x").path(&[])));
                 assert_eq!(order_by_spill.spill[0].direction, ankql::ast::OrderDirection::Desc);
-                assert_eq!(order_by_spill.spill[1].path.property(), "y");
+                assert_eq!(order_by_spill.spill[1].key, ankql::ast::OrderKey::Property(pid("y").path(&[])));
                 assert_eq!(order_by_spill.spill[1].direction, ankql::ast::OrderDirection::Asc);
-                assert_eq!(order_by_spill.spill[2].path.property(), "z");
+                assert_eq!(order_by_spill.spill[2].key, ankql::ast::OrderKey::Property(pid("z").path(&[])));
                 assert_eq!(order_by_spill.spill[2].direction, ankql::ast::OrderDirection::Desc);
             } else {
                 panic!("Expected TableScan plan");
@@ -2854,7 +2936,7 @@ mod tests {
             if let Plan::Index { order_by_spill, .. } = index_plan {
                 // All ORDER BY satisfied by index
                 assert_eq!(order_by_spill.presort.len(), 1);
-                assert_eq!(order_by_spill.presort[0].path.property(), "a");
+                assert_eq!(order_by_spill.presort[0].key, ankql::ast::OrderKey::Property(pid("a").path(&[])));
                 assert!(order_by_spill.spill.is_empty(), "Spill should be empty when ORDER BY is fully satisfied");
             } else {
                 panic!("Expected Index plan");
@@ -2872,7 +2954,7 @@ mod tests {
             if let Plan::Index { order_by_spill, .. } = index_plan {
                 // rating ORDER BY is satisfied after equality prefix
                 assert_eq!(order_by_spill.presort.len(), 1);
-                assert_eq!(order_by_spill.presort[0].path.property(), "rating");
+                assert_eq!(order_by_spill.presort[0].key, ankql::ast::OrderKey::Property(pid("rating").path(&[])));
                 assert!(order_by_spill.spill.is_empty(), "No spill needed with equality prefix + ORDER BY");
             } else {
                 panic!("Expected Index plan");

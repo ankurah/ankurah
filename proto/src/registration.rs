@@ -26,6 +26,13 @@ pub struct RegisterModel {
     /// looking one up by label. Never mints; hard-fails if absent or if the
     /// bound entity's label differs.
     pub explicit_id: Option<EntityId>,
+    /// The sending binary's random per-build identity for this compiled
+    /// declaration (minted at derive expansion). A future fallback matching
+    /// key: a durable node could keep a supplemental lookup from these to
+    /// catalog identities, matching a precompiled binary whose labels have
+    /// drifted and which pins no explicit ids. The executor ignores it
+    /// today.
+    pub build_id: [u8; 16],
     /// The model's properties, in declaration order. Each entry asserts a
     /// model-property membership; an entry with an explicit id references an
     /// existing (possibly shared) property and never mints.
@@ -58,6 +65,10 @@ pub struct RegisterProperty {
     /// Explicit binding: reference an EXISTING property entity instead of
     /// looking one up by name. Never mints; hard-fails if absent.
     pub explicit_id: Option<EntityId>,
+    /// The sending binary's random per-build identity for this compiled
+    /// field, beside the model's `build_id`. A future fallback matching
+    /// key; the executor ignores it today.
+    pub build_id: [u8; 16],
     /// Whether entities of this model may omit the property. Per membership:
     /// the same property may be required in one model and optional in
     /// another.

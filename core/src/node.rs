@@ -153,9 +153,6 @@ where PA: PolicyAgent
     pub catalog: CatalogManager<SE, PA>,
 
     pub(crate) subscription_relay: Option<SubscriptionRelay<PA::ContextData, crate::livequery::WeakEntityLiveQuery>>,
-
-    /// Type resolver for AST preparation (temporary heuristic until Phase 3 schema)
-    pub(crate) type_resolver: crate::TypeResolver,
 }
 
 impl<SE, PA> Node<SE, PA>
@@ -180,12 +177,16 @@ where
 
     fn build(engine: Arc<SE>, policy_agent: PA, durable: bool, rng: SmallRng) -> Self {
         let collections = CollectionSet::new(engine.clone());
-        let entityset: WeakEntitySet = Default::default();
+        // One epoch cell per node: SystemManager assigns it at the
+        // not-ready-to-ready transition, the entity set stamps materializing
+        // entities from it.
+        let schema_epoch = std::sync::Arc::new(std::sync::RwLock::new(None));
+        let entityset = WeakEntitySet::new(schema_epoch.clone());
         let id = proto::EntityId::random();
         let reactor = Reactor::new();
         notice_info!("Node {id:#} created as {}", if durable { "durable" } else { "ephemeral" });
 
-        let system_manager = SystemManager::new(collections.clone(), entityset.clone(), reactor.clone(), durable);
+        let system_manager = SystemManager::new(collections.clone(), entityset.clone(), reactor.clone(), durable, schema_epoch);
         let catalog = CatalogManager::new(engine, durable);
 
         // Only ephemeral nodes relay subscriptions upstream to a durable peer.
@@ -205,7 +206,6 @@ where
             catalog: catalog.clone(),
             sessions: SessionSet::new(),
             subscription_relay,
-            type_resolver: crate::TypeResolver::new(),
         }));
 
         // Set up the message sender for the subscription relay
@@ -998,8 +998,9 @@ where
         livequery: crate::livequery::WeakEntityLiveQuery,
     ) {
         if let Some(ref relay) = self.subscription_relay {
-            // Resolve types in the AST (converts literals for JSON path comparisons)
-            let selection = self.type_resolver.resolve_selection_types(selection);
+            // The selection was admitted (names resolved, comparison values
+            // canonicalized) where the query entered; the relay forwards it
+            // as-is.
             relay.subscribe_query(query_id, collection_id, selection, sessions, version, livequery);
         }
     }
@@ -1052,8 +1053,7 @@ where
 
     fn update_remote_query(&self, query_id: proto::QueryId, selection: ankql::ast::Selection, version: u32) -> Result<(), anyhow::Error> {
         if let Some(ref relay) = self.subscription_relay {
-            // Resolve types in the AST (converts literals for JSON path comparisons)
-            let selection = self.type_resolver.resolve_selection_types(selection);
+            // Admitted at query entry; forwarded as-is.
             relay.update_query(query_id, selection, version)?;
         }
         Ok(())

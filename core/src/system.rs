@@ -1,5 +1,6 @@
 use ankurah_proto::{self as proto, Attested, CollectionId, EntityState, Event};
 use anyhow::{anyhow, Result};
+use proto::PropertyId;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::marker::PhantomData;
@@ -17,6 +18,7 @@ use crate::policy::PolicyAgent;
 use crate::property::{Property, PropertyError};
 use crate::reactor::Reactor;
 use crate::retrieval::{LocalEventGetter, LocalStateGetter, SuspenseEvents};
+use crate::schema::SchemaEpoch;
 use crate::storage::{StorageCollectionWrapper, StorageEngine};
 use crate::{property::backend::LWWBackend, value::Value};
 pub const SYSTEM_COLLECTION_ID: &str = "_ankurah_system";
@@ -43,6 +45,12 @@ struct Inner<SE, PA> {
     loading: Notify,
     system_ready: RwLock<bool>,
     system_ready_notify: Notify,
+    /// This node's current schema epoch: the resolution generation every
+    /// cell read under this node passes explicitly. Assigned from the
+    /// process-wide allocator on each not-ready-to-ready transition; absent
+    /// while no system is ready. Shared with the node's `WeakEntitySet`,
+    /// which stamps materializing entities from it.
+    schema_epoch: Arc<RwLock<Option<SchemaEpoch>>>,
     /// Reset barrier installed by `CatalogManager::start`: begin invalidates
     /// and drains catalog effects before deletion, finish clears catalog
     /// state after system/reactor reset, and resume re-arms durable catalog
@@ -66,7 +74,13 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    pub(crate) fn new(collections: CollectionSet<SE>, entities: WeakEntitySet, reactor: Reactor, durable: bool) -> Self {
+    pub(crate) fn new(
+        collections: CollectionSet<SE>,
+        entities: WeakEntitySet,
+        reactor: Reactor,
+        durable: bool,
+        schema_epoch: Arc<RwLock<Option<SchemaEpoch>>>,
+    ) -> Self {
         let me = Self(Arc::new(Inner {
             collectionset: collections,
             entities,
@@ -78,6 +92,7 @@ where
             collection_map: RwLock::new(BTreeMap::new()),
             system_ready: RwLock::new(false),
             system_ready_notify: Notify::new(),
+            schema_epoch,
             catalog_reset_hook: RwLock::new(None),
             reactor,
             _phantom: PhantomData,
@@ -113,6 +128,32 @@ where
 
     /// Returns true if we've successfully initialized or joined a system
     pub fn is_system_ready(&self) -> bool { *self.0.system_ready.read().unwrap() }
+
+    /// This node's current schema epoch: `None` until a system is ready.
+    /// Every descriptor-cell read under this node passes this value; it is
+    /// never read from the global allocator, because several resident nodes
+    /// in one process each hold their own current epoch.
+    pub fn schema_epoch(&self) -> Option<SchemaEpoch> { *self.0.schema_epoch.read().unwrap() }
+
+    /// Publish system readiness. On the not-ready-to-ready flip this node's
+    /// fresh [`SchemaEpoch`] is assigned BEFORE readiness is observable, so
+    /// anything admitted after readiness reads a present epoch; a redundant
+    /// call on an already-ready node assigns nothing (the epoch must not
+    /// shift under running code). Every become-ready site funnels here so no
+    /// transition can miss the assignment; hard_reset clears the epoch with
+    /// readiness, which is what makes a reset-and-rejoin re-resolve instead
+    /// of reading the previous system's identities.
+    fn mark_system_ready(&self) {
+        {
+            let mut ready = self.0.system_ready.write().unwrap();
+            if !*ready {
+                *self.0.schema_epoch.write().unwrap() = Some(SchemaEpoch::allocate());
+                *ready = true;
+            }
+        }
+        self.resume_catalog();
+        self.0.system_ready_notify.notify_waiters();
+    }
 
     /// Install the catalog reset barrier (called by `CatalogManager::start`).
     /// SystemManager remains the sole owner of destructive storage deletion.
@@ -169,7 +210,7 @@ where
         let mut provisional = crate::entity::ProvisionalEntity::new();
         provisional.add_membership(proto::ModelId::System(proto::SystemModel::System));
         let lww_backend = provisional.get_backend::<LWWBackend>().expect("LWW Backend should exist");
-        lww_backend.set("item".into(), proto::sys::Item::SysRoot.into_value()?);
+        lww_backend.set(PropertyId::System(proto::SystemProperty::Item), proto::sys::Item::SysRoot.into_value()?);
 
         let event = proto::Event::genesis(collection_id.clone(), None, proto::AuthorId::Unknown, provisional.extract_operations()?);
         let system_entity = self.0.entities.create_root(collection_id.clone(), event.entity_id);
@@ -187,14 +228,13 @@ where
         storage.set_state(attested_state.clone()).await?;
 
         // Update our system state
-        let mut items = self.0.items.write().unwrap();
-        items.push(system_entity);
+        {
+            let mut items = self.0.items.write().unwrap();
+            items.push(system_entity);
+        }
         *self.0.root.write().unwrap() = Some(attested_state);
 
-        // Mark system as ready and notify waiters
-        *self.0.system_ready.write().unwrap() = true;
-        self.resume_catalog();
-        self.0.system_ready_notify.notify_waiters();
+        self.mark_system_ready();
 
         Ok(())
     }
@@ -216,9 +256,7 @@ where
         if let Some(root) = root_state {
             if root.payload.state.head == state.payload.state.head {
                 notice_info!("Found matching root - Node is part of the same system");
-                *self.0.system_ready.write().unwrap() = true;
-                self.resume_catalog();
-                self.0.system_ready_notify.notify_waiters();
+                self.mark_system_ready();
                 return Ok(());
             }
             tracing::warn!("Mismatched root state during join: local={:?}, remote={:?}", root, state.payload.state.head);
@@ -244,9 +282,7 @@ where
             let mut root = self.0.root.write().expect("Root lock poisoned");
             *root = Some(state);
         }
-        *self.0.system_ready.write().unwrap() = true;
-        self.resume_catalog();
-        self.0.system_ready_notify.notify_waiters();
+        self.mark_system_ready();
 
         Ok(())
     }
@@ -281,6 +317,13 @@ where
         {
             let mut system_ready = self.0.system_ready.write().unwrap();
             *system_ready = false;
+        }
+        {
+            // The epoch leaves with readiness: cell entries made under it are
+            // permanently inert, and the next become-ready transition
+            // allocates a fresh one.
+            let mut schema_epoch = self.0.schema_epoch.write().unwrap();
+            *schema_epoch = None;
         }
 
         // Reset the reactor state to notify subscriptions
@@ -326,7 +369,7 @@ where
                 .with_state(&state_getter, &event_getter, state.payload.entity_id, collection_id.clone(), state.payload.state.clone())
                 .await?;
             let lww_backend = entity.get_backend::<LWWBackend>().expect("LWW Backend should exist");
-            if let Some(value) = lww_backend.get(&"item".to_string()) {
+            if let Some(value) = lww_backend.get(&PropertyId::System(proto::SystemProperty::Item)) {
                 let item = proto::sys::Item::from_value(Some(value)).expect("Invalid sys item");
 
                 if let proto::sys::Item::SysRoot = &item {
@@ -352,9 +395,7 @@ where
         // Only mark ready if we're a durable node and found a root
         // Ephemeral nodes must explicitly join via join_system()
         if has_root && self.0.durable {
-            *self.0.system_ready.write().unwrap() = true;
-            self.resume_catalog();
-            self.0.system_ready_notify.notify_waiters();
+            self.mark_system_ready();
         }
 
         // Set loaded state and notify waiters

@@ -122,7 +122,7 @@ async fn server_edits_subscription() -> Result<()> {
     // Update Rex's age to 7 on node1
     {
         let trx = server.begin();
-        rex.edit(&trx)?.age().overwrite(0, 1, "7")?;
+        rex.edit(&trx)?.age()?.overwrite(0, 1, "7")?;
         info!("COMMITING REX UPDATE");
         trx.commit().await?;
     }
@@ -147,7 +147,7 @@ async fn server_edits_subscription() -> Result<()> {
         let trx = server.begin();
 
         // rex.edit(&trx)?.age().overwrite(0, 1, "8")?;
-        snuffy.edit(&trx)?.age().overwrite(0, 1, "3")?;
+        snuffy.edit(&trx)?.age()?.overwrite(0, 1, "3")?;
         trx.commit().await?;
     }
 
@@ -247,7 +247,7 @@ async fn subscription_empty_events_from_noop_delta() -> Result<()> {
     // Update carrying the writing event id.
     {
         let trx = server_ctx.begin();
-        rex.edit(&trx)?.age().overwrite(0, 1, "7")?;
+        rex.edit(&trx)?.age()?.overwrite(0, 1, "7")?;
         trx.commit().await?;
     }
     assert_eq!(watcher_a.take_one().await, vec![(rex.id(), ChangeKind::Update, rex.entity().head().to_vec())]);
@@ -404,7 +404,7 @@ async fn test_view_field_subscriptions_with_query_lifecycle() -> Result<()> {
     {
         let trx = server.begin();
         let server_pet = server.get::<PetView>(pet_id).await?;
-        server_pet.edit(&trx)?.age().replace("4")?;
+        server_pet.edit(&trx)?.age()?.replace("4")?;
         trx.commit().await?;
     }
 
@@ -431,7 +431,7 @@ async fn test_view_field_subscriptions_with_query_lifecycle() -> Result<()> {
     {
         let trx = server.begin();
         let server_pet = server.get::<PetView>(pet_id).await?;
-        server_pet.edit(&trx)?.age().replace("4")?;
+        server_pet.edit(&trx)?.age()?.replace("4")?;
         trx.commit().await?;
     }
 
@@ -454,7 +454,7 @@ async fn test_view_field_subscriptions_with_query_lifecycle() -> Result<()> {
     {
         let trx = server.begin();
         let server_pet = server.get::<PetView>(pet_id).await?;
-        server_pet.edit(&trx)?.age().replace("5")?;
+        server_pet.edit(&trx)?.age()?.replace("5")?;
         trx.commit().await?;
     }
     assert_eq!(lq_watcher.quiesce().await, 0, "subscription to LiveQuery signal should still be dead");
@@ -508,7 +508,7 @@ async fn test_lineage_event_bridge() -> Result<()> {
     for i in 2..=12 {
         let trx = server.begin();
         let server_pet = server.get::<PetView>(pet_id).await?;
-        server_pet.edit(&trx)?.age().replace(&i.to_string())?;
+        server_pet.edit(&trx)?.age()?.replace(&i.to_string())?;
         trx.commit().await?;
     }
 
@@ -564,12 +564,12 @@ async fn test_event_bridge_uneven_diamond() -> Result<()> {
     // X then P: the linear trunk on the server.
     let id_x = {
         let trx = ctx_s.begin();
-        ctx_s.get::<PetView>(pet_id).await?.edit(&trx)?.age().replace("age-X")?;
+        ctx_s.get::<PetView>(pet_id).await?.edit(&trx)?.age()?.replace("age-X")?;
         trx.commit_and_return_events().await?[0].id()
     };
     let id_p = {
         let trx = ctx_s.begin();
-        ctx_s.get::<PetView>(pet_id).await?.edit(&trx)?.age().replace("age-P")?;
+        ctx_s.get::<PetView>(pet_id).await?.edit(&trx)?.age()?.replace("age-P")?;
         trx.commit_and_return_events().await?[0].id()
     };
 
@@ -580,8 +580,8 @@ async fn test_event_bridge_uneven_diamond() -> Result<()> {
     let pet_w = ctx_w.get::<PetView>(pet_id).await?;
     let trx_s = ctx_s.begin();
     let trx_w = ctx_w.begin();
-    pet_s.edit(&trx_s)?.name().replace("name-H1")?;
-    pet_w.edit(&trx_w)?.name().replace("name-H2")?;
+    pet_s.edit(&trx_s)?.name()?.replace("name-H1")?;
+    pet_w.edit(&trx_w)?.name()?.replace("name-H2")?;
     let id_h1 = trx_s.commit_and_return_events().await?[0].id();
     let id_h2 = trx_w.commit_and_return_events().await?[0].id();
 
@@ -650,7 +650,7 @@ async fn test_fetch_view_field_subscriptions_behavior() -> Result<()> {
     {
         let trx = server.begin();
         let server_pet = server.get::<PetView>(pet_id).await?;
-        server_pet.edit(&trx)?.name().replace("Stella")?;
+        server_pet.edit(&trx)?.name()?.replace("Stella")?;
         trx.commit().await?;
     }
 

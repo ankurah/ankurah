@@ -2,26 +2,31 @@ use std::{
     any::Any,
     collections::BTreeMap,
     fmt::Debug,
+    str::FromStr,
     sync::{Arc, Mutex},
 };
 
 use yrs::{updates::decoder::Decode, GetString, Observable, ReadTxn, StateVector, Text, Transact};
 use yrs::{Update, WriteTxn};
 
+use ankurah_proto::PropertyId;
+
 use crate::{
     error::{MutationError, StateError},
     property::{
         backend::{Operation, PropertyBackend},
-        PropertyName, Value,
+        Value,
     },
 };
 
-/// Stores one or more properties of an entity
+/// Stores one or more properties of an entity. The internal yrs doc keys its
+/// shared-text roots by the [`PropertyId`]'s canonical string rendering, so a
+/// buffer round-trip preserves durable identities, never display names.
 #[derive(Debug)]
 pub struct YrsBackend {
     pub(crate) doc: yrs::Doc,
     previous_state: Mutex<StateVector>,
-    field_broadcasts: Mutex<BTreeMap<PropertyName, ankurah_signals::broadcast::Broadcast>>,
+    field_broadcasts: Mutex<BTreeMap<PropertyId, ankurah_signals::broadcast::Broadcast>>,
 }
 
 impl Default for YrsBackend {
@@ -35,27 +40,27 @@ impl YrsBackend {
         Self { doc, previous_state: Mutex::new(starting_state), field_broadcasts: Mutex::new(BTreeMap::new()) }
     }
 
-    pub fn get_string(&self, property_name: impl AsRef<str>) -> Option<String> {
+    pub fn get_string(&self, property: &PropertyId) -> Option<String> {
         let txn = self.doc.transact();
-        let text = txn.get_text(property_name.as_ref()); // We only have one field in the yrs doc
+        let text = txn.get_text(property.to_string().as_str());
         text.map(|t| t.get_string(&txn))
     }
 
-    pub fn insert(&self, property_name: impl AsRef<str>, index: u32, value: &str) -> Result<(), MutationError> {
-        let text = self.doc.get_or_insert_text(property_name.as_ref()); // We only have one field in the yrs doc
+    pub fn insert(&self, property: &PropertyId, index: u32, value: &str) -> Result<(), MutationError> {
+        let text = self.doc.get_or_insert_text(*property);
         let mut ytx = self.doc.transact_mut();
         text.insert(&mut ytx, index, value);
         Ok(())
     }
 
-    pub fn delete(&self, property_name: impl AsRef<str>, index: u32, length: u32) -> Result<(), MutationError> {
-        let text = self.doc.get_or_insert_text(property_name.as_ref()); // We only have one field in the yrs doc
+    pub fn delete(&self, property: &PropertyId, index: u32, length: u32) -> Result<(), MutationError> {
+        let text = self.doc.get_or_insert_text(*property);
         let mut ytx = self.doc.transact_mut();
         text.remove_range(&mut ytx, index, length);
         Ok(())
     }
 
-    fn apply_update(&self, update: &[u8], changed_fields: &Arc<Mutex<std::collections::HashSet<String>>>) -> Result<(), MutationError> {
+    fn apply_update(&self, update: &[u8], changed_fields: &Arc<Mutex<std::collections::HashSet<PropertyId>>>) -> Result<(), MutationError> {
         let mut txn = self.doc.transact_mut();
 
         // TODO: There's gotta be a better way to do this - but I don't see it at the time of this writing
@@ -64,12 +69,12 @@ impl YrsBackend {
             .lock()
             .unwrap()
             .keys()
-            .map(|b| {
+            .map(|property| {
                 let changed_fields = changed_fields.clone();
-                let b = b.to_string();
-                txn.get_or_insert_text(b.as_str()).observe(move |_, _| {
+                let property = property.clone();
+                txn.get_or_insert_text(property).observe(move |_, _| {
                     let mut changed_fields = changed_fields.lock().unwrap();
-                    changed_fields.insert(b.clone());
+                    changed_fields.insert(property.clone());
                 })
             })
             .collect();
@@ -81,8 +86,8 @@ impl YrsBackend {
         Ok(())
     }
 
-    fn get_property_string(&self, trx: &yrs::Transaction, property_name: &PropertyName) -> Option<Value> {
-        let value = match trx.get_text(property_name.clone()) {
+    fn get_property_string(&self, trx: &yrs::Transaction, property: &PropertyId) -> Option<Value> {
+        let value = match trx.get_text(property.to_string().as_str()) {
             Some(text_ref) => {
                 let text = text_ref.get_string(trx);
                 Some(text)
@@ -106,25 +111,29 @@ impl PropertyBackend for YrsBackend {
         Arc::new(backend)
     }
 
-    fn properties(&self) -> Vec<String> {
+    fn properties(&self) -> Vec<PropertyId> {
         let trx = Transact::transact(&self.doc);
-        let root_refs = trx.root_refs();
-        root_refs.map(|(name, _)| name.to_owned()).collect()
+        // Runtime writes key roots by PropertyId renderings, so every root
+        // parses. A non-parsing root can only come from a name-keyed
+        // (pre-0.10) buffer -- yrs buffers carry no version header of ours
+        // to refuse it by -- and is skipped: its data is unreadable under
+        // id-keyed addressing either way.
+        trx.root_refs().filter_map(|(name, _)| PropertyId::from_str(name).ok()).collect()
     }
 
-    fn property_value(&self, property_name: &PropertyName) -> Option<Value> {
+    fn property_value(&self, property: &PropertyId) -> Option<Value> {
         let trx = Transact::transact(&self.doc);
-        self.get_property_string(&trx, property_name)
+        self.get_property_string(&trx, property)
     }
 
-    fn property_values(&self) -> BTreeMap<PropertyName, Option<Value>> {
+    fn property_values(&self) -> BTreeMap<PropertyId, Option<Value>> {
         let properties = self.properties();
 
         let mut values = BTreeMap::new();
         let trx = Transact::transact(&self.doc);
-        for property_name in properties {
-            let value = self.get_property_string(&trx, &property_name);
-            values.insert(property_name, value);
+        for property in properties {
+            let value = self.get_property_string(&trx, &property);
+            values.insert(property, value);
         }
 
         values
@@ -147,6 +156,7 @@ impl PropertyBackend for YrsBackend {
         txn.apply_update(update).map_err(|e| crate::error::RetrievalError::FailedUpdate(Box::new(e)))?;
         txn.commit(); // I just don't trust `Drop` too much
         drop(txn);
+
         let starting_state = doc.transact().state_vector();
 
         Ok(Self { doc, previous_state: Mutex::new(starting_state), field_broadcasts: Mutex::new(BTreeMap::new()) })
@@ -198,14 +208,10 @@ impl PropertyBackend for YrsBackend {
         Ok(())
     }
 
-    fn listen_field(
-        &self,
-        field_name: &PropertyName,
-        listener: ankurah_signals::signal::Listener,
-    ) -> ankurah_signals::signal::ListenerGuard {
+    fn listen_field(&self, property: &PropertyId, listener: ankurah_signals::signal::Listener) -> ankurah_signals::signal::ListenerGuard {
         // Get or create the broadcast for this field
         let mut field_broadcasts = self.field_broadcasts.lock().expect("other thread panicked, panic here too");
-        let broadcast = field_broadcasts.entry(field_name.clone()).or_default();
+        let broadcast = field_broadcasts.entry(property.clone()).or_default();
 
         // Subscribe to the broadcast and return the guard
         broadcast.reference().listen(listener).into()
@@ -214,9 +220,9 @@ impl PropertyBackend for YrsBackend {
 
 impl YrsBackend {
     /// Get the broadcast ID for a specific field, creating the broadcast if necessary
-    pub fn field_broadcast_id(&self, field_name: &PropertyName) -> ankurah_signals::broadcast::BroadcastId {
+    pub fn field_broadcast_id(&self, property: &PropertyId) -> ankurah_signals::broadcast::BroadcastId {
         let mut field_broadcasts = self.field_broadcasts.lock().expect("other thread panicked, panic here too");
-        let broadcast = field_broadcasts.entry(field_name.clone()).or_default();
+        let broadcast = field_broadcasts.entry(property.clone()).or_default();
         broadcast.id()
     }
 }

@@ -9,7 +9,7 @@ pub fn mutable_impl(model: &crate::model::description::ModelDescription) -> Toke
     // TODO - add this to the accessors
     let _active_field_visibility = model.active_field_visibility();
     let active_field_names = model.active_field_names();
-    let active_field_name_strs = model.active_field_name_strs();
+    let active_field_indices: Vec<syn::Index> = (0..active_field_names.len()).map(syn::Index::from).collect();
     let active_field_types = match model.active_field_types() {
         Ok(types) => types,
         Err(_) => return quote! { compile_error!("Failed to generate active field types"); },
@@ -81,9 +81,10 @@ pub fn mutable_impl(model: &crate::model::description::ModelDescription) -> Toke
             }
 
             #(
-                pub fn #active_field_names(&self) -> #active_field_types {
+                pub fn #active_field_names(&self) -> Result<#active_field_types, ::ankurah::property::PropertyError> {
                     use ankurah::property::FromEntity;
-                    #active_field_types_turbofish::from_entity(#active_field_name_strs.into(), &self.entity)
+                    let property = <#name as ::ankurah::model::Model>::descriptor().resolved_field(#active_field_indices, &self.entity)?;
+                    Ok(#active_field_types_turbofish::from_entity(property, &self.entity))
                 }
             )*
         }

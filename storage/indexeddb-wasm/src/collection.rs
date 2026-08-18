@@ -473,9 +473,10 @@ impl IdbRecord {
 impl Filterable for IdbRecord {
     fn collection(&self) -> &str { self.collection_id.as_str() }
 
-    fn value(&self, name: &str) -> Option<ankurah_core::value::Value> {
-        // Lazy extraction from JS object
-        let idb_val: crate::idb_value::IdbValue = self.object.get_opt(&name.into()).ok()??;
+    fn value(&self, property: &ankql::ast::PropertyId) -> Option<ankurah_core::value::Value> {
+        // Lazy extraction from JS object; fields are keyed by the property
+        // id's rendering (the materialized column vocabulary).
+        let idb_val: crate::idb_value::IdbValue = self.object.get_opt(&property.to_string().as_str().into()).ok()??;
         Some(idb_val.into_value())
     }
 }
@@ -491,16 +492,11 @@ fn extract_sort_properties(
 ) -> std::collections::BTreeMap<String, ankurah_core::value::Value> {
     let mut map = std::collections::BTreeMap::new();
     // Extract all ORDER BY columns - presort for partition detection, spill for sorting
-    for item in &order_by.presort {
-        let property_name = item.path.property();
-        if let Ok(Some(idb_val)) = entity_obj.get_opt::<crate::idb_value::IdbValue>(&property_name.into()) {
-            map.insert(property_name.to_string(), idb_val.into_value());
-        }
-    }
-    for item in &order_by.spill {
-        let property_name = item.path.property();
-        if let Ok(Some(idb_val)) = entity_obj.get_opt::<crate::idb_value::IdbValue>(&property_name.into()) {
-            map.insert(property_name.to_string(), idb_val.into_value());
+    for item in order_by.presort.iter().chain(order_by.spill.iter()) {
+        let ankql::ast::OrderKey::Property(identifier) = &item.key else { continue };
+        let column = identifier.property_id().to_string();
+        if let Ok(Some(idb_val)) = entity_obj.get_opt::<crate::idb_value::IdbValue>(&column.as_str().into()) {
+            map.insert(column, idb_val.into_value());
         }
     }
     map
@@ -544,11 +540,13 @@ fn extract_all_fields(entity_obj: &Object, entity_state: &EntityState) -> Result
     for (backend_name, state_buffer) in entity_state.state.state_buffers.iter() {
         let backend = backend_from_string(backend_name, Some(state_buffer)).map_err(|e| MutationError::General(Box::new(e)))?;
 
-        for (field_name, value) in backend.property_values() {
-            // Use first occurrence (like Postgres) to handle field name collisions
-            if !seen_fields.insert(field_name.clone()) {
+        for (property, value) in backend.property_values() {
+            // Use first occurrence (like Postgres) to handle collisions.
+            // Fields are keyed by the property id's rendering.
+            if !seen_fields.insert(property.clone()) {
                 continue;
             }
+            let field_name = property.to_string();
 
             // Set field directly on entity object (no prefix - they become the primary fields)
             // Use IdbValue encoding to ensure fields are IndexedDB-key-compatible (bool as 0/1, etc.)

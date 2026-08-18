@@ -41,8 +41,8 @@ async fn test_concurrent_inserts_same_position() -> Result<()> {
     let trx1 = ctx.begin();
     let trx2 = ctx.begin();
 
-    doc.edit(&trx1)?.content().insert(5, " world")?; // Insert at end
-    doc.edit(&trx2)?.content().insert(5, " there")?; // Also insert at end (position 5)
+    doc.edit(&trx1)?.content()?.insert(5, " world")?; // Insert at end
+    doc.edit(&trx2)?.content()?.insert(5, " there")?; // Also insert at end (position 5)
 
     dag.enumerate(trx1.commit_and_return_events().await?); // B
     dag.enumerate(trx2.commit_and_return_events().await?); // C
@@ -95,8 +95,8 @@ async fn test_concurrent_inserts_different_positions() -> Result<()> {
     let trx1 = ctx.begin();
     let trx2 = ctx.begin();
 
-    doc.edit(&trx1)?.content().insert(0, "X")?; // Insert at start
-    doc.edit(&trx2)?.content().insert(11, "Y")?; // Insert at end
+    doc.edit(&trx1)?.content()?.insert(0, "X")?; // Insert at start
+    doc.edit(&trx2)?.content()?.insert(11, "Y")?; // Insert at end
 
     dag.enumerate(trx1.commit_and_return_events().await?);
     dag.enumerate(trx2.commit_and_return_events().await?);
@@ -132,8 +132,8 @@ async fn test_concurrent_deletes() -> Result<()> {
     let trx1 = ctx.begin();
     let trx2 = ctx.begin();
 
-    doc.edit(&trx1)?.content().delete(0, 6)?; // Delete "hello "
-    doc.edit(&trx2)?.content().delete(6, 5)?; // Delete "world"
+    doc.edit(&trx1)?.content()?.delete(0, 6)?; // Delete "hello "
+    doc.edit(&trx2)?.content()?.delete(6, 5)?; // Delete "world"
 
     dag.enumerate(trx1.commit_and_return_events().await?);
     dag.enumerate(trx2.commit_and_return_events().await?);
@@ -169,8 +169,8 @@ async fn test_concurrent_deletes_disjoint_ranges_leave_gap() -> Result<()> {
     let trx1 = ctx.begin();
     let trx2 = ctx.begin();
 
-    doc.edit(&trx1)?.content().delete(0, 5)?; // Delete "hello", leave the space
-    doc.edit(&trx2)?.content().delete(6, 5)?; // Delete "world", leave the space
+    doc.edit(&trx1)?.content()?.delete(0, 5)?; // Delete "hello", leave the space
+    doc.edit(&trx2)?.content()?.delete(6, 5)?; // Delete "world", leave the space
 
     dag.enumerate(trx1.commit_and_return_events().await?);
     dag.enumerate(trx2.commit_and_return_events().await?);
@@ -204,8 +204,8 @@ async fn test_concurrent_insert_and_delete() -> Result<()> {
     let trx1 = ctx.begin();
     let trx2 = ctx.begin();
 
-    doc.edit(&trx1)?.content().insert(5, "X")?; // Insert X after "hello"
-    doc.edit(&trx2)?.content().delete(5, 6)?; // Delete " world"
+    doc.edit(&trx1)?.content()?.insert(5, "X")?; // Insert X after "hello"
+    doc.edit(&trx2)?.content()?.delete(5, 6)?; // Delete " world"
 
     dag.enumerate(trx1.commit_and_return_events().await?);
     dag.enumerate(trx2.commit_and_return_events().await?);
@@ -238,7 +238,7 @@ async fn test_text_replace() -> Result<()> {
 
     // Replace content
     let trx = ctx.begin();
-    doc.edit(&trx)?.content().replace("goodbye")?;
+    doc.edit(&trx)?.content()?.replace("goodbye")?;
     dag.enumerate(trx.commit_and_return_events().await?);
 
     let final_doc = ctx.get::<DocumentView>(doc_id).await?;
@@ -270,9 +270,9 @@ async fn test_yrs_convergence() -> Result<()> {
     let trx2 = ctx.begin();
     let trx3 = ctx.begin();
 
-    doc.edit(&trx1)?.content().insert(0, "1")?; // Insert at start
-    doc.edit(&trx2)?.content().insert(1, "2")?; // Insert after 'a'
-    doc.edit(&trx3)?.content().insert(3, "3")?; // Insert after 'c'
+    doc.edit(&trx1)?.content()?.insert(0, "1")?; // Insert at start
+    doc.edit(&trx2)?.content()?.insert(1, "2")?; // Insert after 'a'
+    doc.edit(&trx3)?.content()?.insert(3, "3")?; // Insert after 'c'
 
     dag.enumerate(trx1.commit_and_return_events().await?);
     dag.enumerate(trx2.commit_and_return_events().await?);
@@ -319,7 +319,7 @@ async fn test_sequential_text_operations() -> Result<()> {
     for word in ["Hello", " ", "World", "!"] {
         let doc = ctx.get::<DocumentView>(doc_id).await?;
         let trx = ctx.begin();
-        let content = doc.edit(&trx)?.content();
+        let content = doc.edit(&trx)?.content()?;
         let len = content.value().map(|s| s.len()).unwrap_or(0);
         content.insert(len as u32, word)?;
         dag.enumerate(trx.commit_and_return_events().await?);

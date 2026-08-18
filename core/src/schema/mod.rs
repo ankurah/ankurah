@@ -27,9 +27,12 @@
 //! record lives with the design documents for this subsystem.
 
 pub mod catalog;
+pub mod cell;
 pub mod compiled;
 pub mod registration;
+pub mod resolver;
 
+pub use cell::{SchemaEpoch, SchemaOnceCell};
 pub use compiled::{ModelStructDescriptor, StructProperty};
 
 use ankurah_proto::{ModelId, SystemModel};

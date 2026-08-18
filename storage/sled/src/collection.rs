@@ -180,7 +180,7 @@ impl SledStorageCollectionInner {
     }
     fn exec_index_scan_plan(
         &self,
-        index_spec: KeySpec,
+        index_spec: KeySpec<String>,
         bounds: KeyBounds,
         scan_direction: ScanDirection,
         remaining_predicate: Predicate,

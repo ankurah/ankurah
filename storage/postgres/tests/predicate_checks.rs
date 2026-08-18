@@ -5,8 +5,8 @@
 
 mod common;
 
+use ankql::ast::PropertyId;
 use ankurah::core::selection::filter::{evaluate_predicate, Filterable};
-use ankurah::core::type_resolver::TypeResolver;
 use ankurah::core::value::Value;
 use ankurah::property::Json;
 use ankurah::{policy::DEFAULT_CONTEXT as c, Model, Node, PermissiveAgent};
@@ -58,27 +58,53 @@ fn all_test_cases() -> Vec<TestCase> {
 
 struct MockFilterable {
     collection: String,
-    values: HashMap<String, Value>,
+    values: HashMap<PropertyId, Value>,
 }
 impl MockFilterable {
     fn new(collection: &str) -> Self { Self { collection: collection.to_string(), values: HashMap::new() } }
     fn with_json(mut self, name: &str, json: serde_json::Value) -> Self {
-        self.values.insert(name.to_string(), Value::Json(json));
+        self.values.insert(fixture_prop(name), Value::Json(json));
         self
     }
 }
 impl Filterable for MockFilterable {
     fn collection(&self) -> &str { &self.collection }
-    fn value(&self, name: &str) -> Option<Value> { self.values.get(name).cloned() }
+    fn value(&self, property: &PropertyId) -> Option<Value> { self.values.get(property).cloned() }
+}
+
+/// A deterministic durable identity for a fixture field name.
+fn fixture_prop(name: &str) -> PropertyId {
+    let mut bytes = [0u8; 32];
+    let n = name.as_bytes();
+    let len = n.len().min(32);
+    bytes[..len].copy_from_slice(&n[..len]);
+    PropertyId::EntityId(ankurah::proto::EntityId::from_bytes(bytes))
+}
+
+/// Bind a case query's names to the fixture identities: every fixture field
+/// is the Json-typed `data` property.
+struct FixtureResolver;
+impl ankql::NameResolver for FixtureResolver {
+    fn resolve_property(&self, _model: &ankurah::proto::ModelId, name: &str) -> Result<Option<PropertyId>, ankql::NameResolutionError> {
+        Ok(Some(fixture_prop(name)))
+    }
+    fn property_value_type(
+        &self,
+        _model: &ankurah::proto::ModelId,
+        _property: &PropertyId,
+    ) -> Result<ankurah::core::value::ValueType, ankql::NameResolutionError> {
+        Ok(ankurah::core::value::ValueType::Json)
+    }
 }
 
 fn verify_filterable(case: &TestCase) {
-    let type_resolver = TypeResolver::new();
+    let model = ankurah::proto::ModelId::EntityId(ankurah::proto::EntityId::from_bytes([0x77; 32]));
     for entity in &case.entities {
         let f = MockFilterable::new("QueryTest").with_json("data", entity.data.clone());
         for exp in &case.expectations {
             let sel = ankql::parser::parse_selection(&exp.query).expect("parse");
-            let resolved_sel = type_resolver.resolve_selection_types(sel);
+            // Bind names and canonicalize literals for JSON path comparisons
+            let resolved_sel = sel.resolve_names(&model, &FixtureResolver).expect("resolve");
             let matches = evaluate_predicate(&f, &resolved_sel.predicate).unwrap_or(false);
             let should = exp.matches.contains(&entity.label);
             assert_eq!(matches, should, "[Filterable] case={} entity={} query='{}'", case.name, entity.label, exp.query);

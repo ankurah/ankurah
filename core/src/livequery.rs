@@ -217,8 +217,10 @@ where
     node.policy_agent.can_access_collection(&cdata, &collection_id)?;
     args.selection.predicate = node.policy_agent.filter_predicate(&cdata, &collection_id, args.selection.predicate)?;
 
-    // Resolve types in the AST (converts literals for JSON path comparisons)
-    args.selection = node.type_resolver.resolve_selection_types(args.selection);
+    // Bind every property name (the caller's and the policy's alike) to
+    // its durable identity and canonicalize comparison values; a typed
+    // entry's already-resolved selection passes through untouched.
+    args.selection = node.catalog.resolve_selection(&collection_id, args.selection)?;
 
     let subscription = node.reactor.subscribe();
 

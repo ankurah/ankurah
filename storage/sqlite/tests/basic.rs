@@ -57,7 +57,7 @@ async fn test_sqlite_update_entity() -> Result<()> {
     // Update the album
     {
         let trx = ctx.begin();
-        album.edit(&trx).unwrap().name().overwrite(0, 13, "Updated Name")?;
+        album.edit(&trx).unwrap().name()?.overwrite(0, 13, "Updated Name")?;
         trx.commit().await?;
     }
 
@@ -88,7 +88,7 @@ async fn test_sqlite_state_change_detection() -> Result<()> {
     // First update should return true (state changed)
     {
         let trx = ctx.begin();
-        album.edit(&trx).unwrap().name().overwrite(0, 10, "Updated")?;
+        album.edit(&trx).unwrap().name()?.overwrite(0, 10, "Updated")?;
         trx.commit().await?;
     }
 
@@ -118,8 +118,8 @@ async fn test_sqlite_multiple_updates() -> Result<()> {
     // Update both albums
     {
         let trx = ctx.begin();
-        album1.edit(&trx).unwrap().name().overwrite(0, 7, "Updated 1")?;
-        album2.edit(&trx).unwrap().name().overwrite(0, 7, "Updated 2")?;
+        album1.edit(&trx).unwrap().name()?.overwrite(0, 7, "Updated 1")?;
+        album2.edit(&trx).unwrap().name()?.overwrite(0, 7, "Updated 2")?;
         trx.commit().await?;
     }
 

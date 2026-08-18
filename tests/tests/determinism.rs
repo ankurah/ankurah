@@ -34,8 +34,8 @@ async fn test_two_event_determinism_same_property() -> Result<()> {
     let record_c = record1.edit(&trx_c)?;
 
     // Both modify same property (title) - creates conflict
-    record_b.title().set(&"Title from B".to_owned())?;
-    record_c.title().set(&"Title from C".to_owned())?;
+    record_b.title()?.set(&"Title from B".to_owned())?;
+    record_c.title()?.set(&"Title from C".to_owned())?;
 
     // Commit in order B, C
     dag.enumerate(trx_b.commit_and_return_events().await?); // B
@@ -118,25 +118,25 @@ async fn test_deep_diamond_determinism() -> Result<()> {
     let record = ctx.get::<RecordView>(record_id).await?;
     {
         let trx = ctx.begin();
-        record.edit(&trx)?.title().set(&"Branch1-depth1".to_owned())?; // B
+        record.edit(&trx)?.title()?.set(&"Branch1-depth1".to_owned())?; // B
         dag.enumerate(trx.commit_and_return_events().await?);
     }
     let record = ctx.get::<RecordView>(record_id).await?;
     {
         let trx = ctx.begin();
-        record.edit(&trx)?.artist().set(&"Artist1".to_owned())?; // C - different property
+        record.edit(&trx)?.artist()?.set(&"Artist1".to_owned())?; // C - different property
         dag.enumerate(trx.commit_and_return_events().await?);
     }
     let record = ctx.get::<RecordView>(record_id).await?;
     {
         let trx = ctx.begin();
-        record.edit(&trx)?.title().set(&"Branch1-depth3".to_owned())?; // D
+        record.edit(&trx)?.title()?.set(&"Branch1-depth3".to_owned())?; // D
         dag.enumerate(trx.commit_and_return_events().await?);
     }
     let record = ctx.get::<RecordView>(record_id).await?;
     let branch1_head = {
         let trx = ctx.begin();
-        record.edit(&trx)?.artist().set(&"Artist2".to_owned())?; // E
+        record.edit(&trx)?.artist()?.set(&"Artist2".to_owned())?; // E
         dag.enumerate(trx.commit_and_return_events().await?);
         ctx.get::<RecordView>(record_id).await?
     };
@@ -184,10 +184,10 @@ async fn test_multi_property_determinism() -> Result<()> {
     let trx2 = ctx.begin();
 
     // Transaction 1: modifies title
-    record.edit(&trx1)?.title().set(&"Title from T1".to_owned())?;
+    record.edit(&trx1)?.title()?.set(&"Title from T1".to_owned())?;
 
     // Transaction 2: modifies artist
-    record.edit(&trx2)?.artist().set(&"Artist from T2".to_owned())?;
+    record.edit(&trx2)?.artist()?.set(&"Artist from T2".to_owned())?;
 
     // Commit both - creates diamond
     dag.enumerate(trx1.commit_and_return_events().await?); // B
@@ -240,9 +240,9 @@ async fn test_three_way_concurrent_determinism() -> Result<()> {
     let trx3 = ctx.begin();
 
     // All modify title - creates conflict
-    record.edit(&trx1)?.title().set(&"Title-T1".to_owned())?;
-    record.edit(&trx2)?.title().set(&"Title-T2".to_owned())?;
-    record.edit(&trx3)?.title().set(&"Title-T3".to_owned())?;
+    record.edit(&trx1)?.title()?.set(&"Title-T1".to_owned())?;
+    record.edit(&trx2)?.title()?.set(&"Title-T2".to_owned())?;
+    record.edit(&trx3)?.title()?.set(&"Title-T3".to_owned())?;
 
     // Commit all three
     dag.enumerate(trx1.commit_and_return_events().await?); // B

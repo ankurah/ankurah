@@ -1,7 +1,6 @@
 mod candidate_changes;
 mod comparison_index;
 pub mod fetch_gap;
-mod property_path;
 mod subscription;
 mod subscription_state;
 mod update;
@@ -37,7 +36,7 @@ use std::{
 pub trait AbstractEntity: Clone + std::fmt::Debug {
     fn collection(&self) -> proto::CollectionId;
     fn id(&self) -> &proto::EntityId;
-    fn value(&self, field: &str) -> Option<Value>;
+    fn value(&self, property: &ankql::ast::PropertyId) -> Option<Value>;
 }
 
 /// Trait for types that can be used in notify_change
@@ -204,23 +203,29 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
 pub(crate) fn build_key_spec_from_selection<E: AbstractEntity>(
     order_by: &[ankql::ast::OrderByItem],
     resultset: &EntityResultSet<E>,
-) -> anyhow::Result<KeySpec> {
+) -> anyhow::Result<KeySpec<ankql::ast::PropertyId>> {
     let mut keyparts = Vec::new();
 
     let read = resultset.read();
     for item in order_by {
-        // Use the property name from the path (currently only simple paths are supported in ORDER BY)
-        let column = item.path.property().to_string();
+        // A sort key must arrive resolved: an unresolved name carries no
+        // durable identity to sort on (`Selection::check` is the boundary
+        // that guarantees this for engine reads; the reactor asserts the
+        // same discipline for its in-memory ordering).
+        let key = match &item.key {
+            ankql::ast::OrderKey::Property(identifier) => identifier.property_id(),
+            ankql::ast::OrderKey::Path(path) => anyhow::bail!("unresolved ORDER BY key `{path}` reached the reactor"),
+        };
 
         // Infer type from first non-null value in resultset entities
-        let value_type = read.iter_entities().find_map(|(_, e)| e.value(&column).map(|v| ValueType::of(&v))).unwrap_or(ValueType::String); // TODO: Get type from system catalog instead of defaulting to String
+        let value_type = read.iter_entities().find_map(|(_, e)| e.value(&key).map(|v| ValueType::of(&v))).unwrap_or(ValueType::String); // TODO: Get type from system catalog instead of defaulting to String
 
         let direction: IndexDirection = match item.direction {
             ankql::ast::OrderDirection::Asc => IndexDirection::Asc,
             ankql::ast::OrderDirection::Desc => IndexDirection::Desc,
         };
 
-        keyparts.push(IndexKeyPart { column, sub_path: None, direction, value_type, nulls: Some(NullsOrder::Last), collation: None });
+        keyparts.push(IndexKeyPart { key, sub_path: None, direction, value_type, nulls: Some(NullsOrder::Last), collation: None });
     }
 
     Ok(KeySpec { keyparts })
@@ -422,6 +427,39 @@ mod tests {
     use proto::{CollectionId, QueryId};
     use std::sync::Arc;
 
+    /// A deterministic durable identity for a fixture field name.
+    fn prop(name: &str) -> ankql::ast::PropertyId {
+        let mut bytes = [0u8; 32];
+        let n = name.as_bytes();
+        let len = n.len().min(32);
+        bytes[..len].copy_from_slice(&n[..len]);
+        ankql::ast::PropertyId::EntityId(proto::EntityId::from_bytes(bytes))
+    }
+
+    /// Parse a fixture query and bind its names to the fixture identities:
+    /// the reactor receives selections the admission pass already resolved.
+    fn sel(query: &str) -> ankql::ast::Selection {
+        struct FixtureResolver;
+        impl ankql::NameResolver for FixtureResolver {
+            fn resolve_property(
+                &self,
+                _model: &proto::ModelId,
+                name: &str,
+            ) -> Result<Option<ankql::ast::PropertyId>, ankql::NameResolutionError> {
+                Ok(Some(prop(name)))
+            }
+            fn property_value_type(
+                &self,
+                _model: &proto::ModelId,
+                _property: &ankql::ast::PropertyId,
+            ) -> Result<crate::value::ValueType, ankql::NameResolutionError> {
+                Ok(crate::value::ValueType::String)
+            }
+        }
+        let model = proto::ModelId::EntityId(proto::EntityId::from_bytes([0x77; 32]));
+        ankql::parser::parse_selection(query).unwrap().resolve_names(&model, &FixtureResolver).unwrap()
+    }
+
     pub fn watcher<T: Clone + Send + 'static>() -> (Box<dyn Fn(T) + Send + Sync>, Box<dyn Fn() -> Vec<T> + Send + Sync>) {
         let values = Arc::new(Mutex::new(Vec::new()));
         let accumulate = {
@@ -440,7 +478,7 @@ mod tests {
     struct TestEntity {
         id: proto::EntityId,
         collection: proto::CollectionId,
-        state: Arc<Mutex<HashMap<String, String>>>,
+        state: Arc<Mutex<HashMap<ankql::ast::PropertyId, String>>>,
     }
     impl Eq for TestEntity {}
     impl PartialEq for TestEntity {
@@ -460,24 +498,21 @@ mod tests {
             Self {
                 id: proto::EntityId::random(),
                 collection: proto::CollectionId::fixed_name("album"),
-                state: Arc::new(Mutex::new(HashMap::from([
-                    ("name".to_string(), name.to_string()),
-                    ("status".to_string(), status.to_string()),
-                ]))),
+                state: Arc::new(Mutex::new(HashMap::from([(prop("name"), name.to_string()), (prop("status"), status.to_string())]))),
             }
         }
     }
     impl Filterable for TestEntity {
         fn collection(&self) -> &str { self.collection.as_str() }
-        fn value(&self, field: &str) -> Option<crate::value::Value> {
-            self.state.lock().unwrap().get(field).cloned().map(crate::value::Value::String)
+        fn value(&self, property: &ankql::ast::PropertyId) -> Option<crate::value::Value> {
+            self.state.lock().unwrap().get(property).cloned().map(crate::value::Value::String)
         }
     }
     impl AbstractEntity for TestEntity {
         fn collection(&self) -> proto::CollectionId { self.collection.clone() }
         fn id(&self) -> &proto::EntityId { &self.id }
-        fn value(&self, field: &str) -> Option<crate::value::Value> {
-            self.state.lock().unwrap().get(field).cloned().map(crate::value::Value::String)
+        fn value(&self, property: &ankql::ast::PropertyId) -> Option<crate::value::Value> {
+            self.state.lock().unwrap().get(property).cloned().map(crate::value::Value::String)
         }
     }
 
@@ -546,7 +581,7 @@ mod tests {
 
         let query_id = QueryId::new();
         let collection_id = CollectionId::fixed_name("album");
-        let selection: ankql::ast::Selection = "status = 'pending'".try_into().unwrap();
+        let selection: ankql::ast::Selection = sel("status = 'pending'");
         let entity1 = TestEntity::new("Test Album", "pending");
         let resultset: EntityResultSet<TestEntity> = EntityResultSet::empty();
         let mock_gap_fetcher = Arc::new(MockGapFetcher::new());

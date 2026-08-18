@@ -34,7 +34,6 @@ pub mod storage;
 pub mod system;
 pub mod task;
 pub mod transaction;
-pub mod type_resolver;
 pub mod util;
 pub mod value;
 
@@ -47,7 +46,6 @@ pub use model::Model;
 pub use node::Node;
 pub use property::Json;
 pub use query_value::QueryValue;
-pub use type_resolver::TypeResolver;
 
 pub use ankurah_proto as proto;
 pub use ankurah_proto::{EntityId, ModelId};

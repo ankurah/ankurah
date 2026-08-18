@@ -3,7 +3,7 @@ use anyhow::Result;
 use crate::{
     entity::{Entity, ProvisionalEntity},
     error::RetrievalError,
-    property::PropertyName,
+    property::PropertyId,
     value::CastError,
 };
 
@@ -17,7 +17,7 @@ use super::Value;
 /// initial values are what the entity's id is derived from, so they exist
 /// before any entity does.
 pub trait InitializeWith<T> {
-    fn initialize_with(provisional: &mut ProvisionalEntity, property_name: PropertyName, value: &T);
+    fn initialize_with(provisional: &mut ProvisionalEntity, property: PropertyId, value: &T);
 }
 
 #[derive(Error, Debug)]
@@ -28,7 +28,7 @@ pub enum PropertyError {
     Missing,
 
     // #[error("property is missing: {name} in collection: {collection}")]
-    // NotFoundInBackend { backend: &'static str, name: PropertyName },
+    // NotFoundInBackend { backend: &'static str, name: PropertyId },
     #[error("serialization error: {0}")]
     SerializeError(Box<dyn std::error::Error + Send + Sync>),
     #[error("deserialization error: {0}")]
@@ -41,6 +41,13 @@ pub enum PropertyError {
     InvalidValue { value: String, ty: String },
     #[error("transaction is no longer alive")]
     TransactionClosed,
+
+    /// A typed access could not resolve its field's durable identity: the
+    /// entity was materialized before a system was ready, the handle
+    /// outlived a system reset, or the model never passed the registration
+    /// gate under this epoch. A mechanical miss, never a wrong identity.
+    #[error("field '{field}' of model '{model}' is not resolved under this entity's schema epoch")]
+    Unresolved { model: &'static str, field: &'static str },
 
     #[error("cast error: {0}")]
     CastError(CastError),
@@ -77,7 +84,7 @@ pub trait ActiveType {
 }
 
 pub trait FromEntity {
-    fn from_entity(property_name: PropertyName, entity: &Entity) -> Self;
+    fn from_entity(property: PropertyId, entity: &Entity) -> Self;
 }
 
 pub trait FromActiveType<A> {

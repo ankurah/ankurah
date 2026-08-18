@@ -216,20 +216,55 @@ struct Post {
     title: &'static str,
 }
 
+/// A deterministic durable identity for a fixture field name.
+fn prop(name: &str) -> ankql::ast::PropertyId {
+    let mut bytes = [0u8; 32];
+    let n = name.as_bytes();
+    let len = n.len().min(32);
+    bytes[..len].copy_from_slice(&n[..len]);
+    ankql::ast::PropertyId::EntityId(proto::EntityId::from_bytes(bytes))
+}
+
+struct FixtureResolver;
+impl ankql::NameResolver for FixtureResolver {
+    fn resolve_property(&self, _model: &proto::ModelId, name: &str) -> Result<Option<ankql::ast::PropertyId>, ankql::NameResolutionError> {
+        Ok(Some(prop(name)))
+    }
+    fn property_value_type(
+        &self,
+        _model: &proto::ModelId,
+        _property: &ankql::ast::PropertyId,
+    ) -> Result<ankurah_core::value::ValueType, ankql::NameResolutionError> {
+        Ok(ankurah_core::value::ValueType::String)
+    }
+}
+
+/// Bind a predicate's names to the fixture identities, the way the shared
+/// query entry does in production before row evaluation.
+fn resolve_fixture(predicate: Predicate) -> Predicate {
+    let model = proto::ModelId::EntityId(proto::EntityId::from_bytes([0x77; 32]));
+    predicate.resolve_names(&model, &FixtureResolver).expect("fixture predicates resolve")
+}
+
+/// The fixture's stand-in for the catalog binding node attach installs.
+fn fixture_binding() -> ankurah_jwt_auth::SelectionResolver { std::sync::Arc::new(|_collection, predicate| Ok(resolve_fixture(predicate))) }
+
 impl Filterable for Post {
     fn collection(&self) -> &str { "post" }
 
-    fn value(&self, name: &str) -> Option<Value> {
-        match name {
-            "author" => Some(Value::String(self.author.to_string())),
-            "title" => Some(Value::String(self.title.to_string())),
-            _ => None,
+    fn value(&self, property: &ankql::ast::PropertyId) -> Option<Value> {
+        if *property == prop("author") {
+            Some(Value::String(self.author.to_string()))
+        } else if *property == prop("title") {
+            Some(Value::String(self.title.to_string()))
+        } else {
+            None
         }
     }
 }
 
 fn admits(predicate: &Predicate, post: Post) -> bool {
-    evaluate_predicate(&post, predicate).expect("filtered predicate must be evaluable against a post")
+    evaluate_predicate(&post, &resolve_fixture(predicate.clone())).expect("filtered predicate must be evaluable against a post")
 }
 
 /// A blog credential holding a single role, signed by `keys`.
@@ -244,8 +279,8 @@ fn blog_context(keys: &SigningKeys, sub: &str, role: &str) -> JwtContext {
 /// row rather than two hand-written copies of it.
 fn post_state(post: Post) -> proto::State {
     let backend = LWWBackend::new();
-    backend.set("author".into(), Some(Value::String(post.author.to_string())));
-    backend.set("title".into(), Some(Value::String(post.title.to_string())));
+    backend.set(prop("author"), Some(Value::String(post.author.to_string())));
+    backend.set(prop("title"), Some(Value::String(post.title.to_string())));
     let operations = backend.to_operations().expect("LWW diff must serialize").expect("both properties were just set");
     // A state buffer carries only values an event committed, so the writes are
     // handed the identity of a synthetic one.
@@ -260,6 +295,9 @@ fn post_state(post: Post) -> proto::State {
 /// check_read would hand it over.
 fn assert_agrees_with_check_read<C: Iterable<JwtContext>>(agent: &JwtAgent, contexts: &C, base: &Predicate, rows: &[Post]) {
     let collection = CollectionId::from("post");
+    // Install the fixture's stand-in for the catalog binding, so the agent's
+    // row-side scope checks resolve the same identities the rows carry.
+    agent.set_selection_resolver(fixture_binding());
     let filtered = agent.filter_predicate(contexts, &collection, base.clone()).expect("every scenario here yields a filter");
 
     for row in rows {

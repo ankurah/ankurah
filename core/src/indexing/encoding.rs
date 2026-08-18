@@ -181,7 +181,7 @@ fn encode_json_value(json: &serde_json::Value, descending: bool) -> Vec<u8> {
 
 /// Type-aware encoding using KeySpec for validation and optimization
 /// TODO: Add NULL handling later
-pub fn encode_tuple_values_with_key_spec(values: &[Value], key_spec: &KeySpec) -> Result<Vec<u8>, IndexError> {
+pub fn encode_tuple_values_with_key_spec<K>(values: &[Value], key_spec: &KeySpec<K>) -> Result<Vec<u8>, IndexError> {
     let mut out = Vec::new();
     for (i, v) in values.iter().enumerate() {
         if i >= key_spec.keyparts.len() {

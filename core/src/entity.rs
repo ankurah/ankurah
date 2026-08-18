@@ -9,6 +9,7 @@ use crate::{
     reactor::AbstractEntity,
     value::Value,
 };
+use ankql::ast::PropertyId;
 use ankurah_proto::{AuthorId, Clock, CollectionId, EntityId, EntityState, Event, EventId, ModelId, OperationSet, State};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -164,6 +165,13 @@ pub struct EntityInner {
     pub(crate) kind: EntityKind,
     /// Broadcast for notifying Signal subscribers about entity changes
     pub(crate) broadcast: ankurah_signals::broadcast::Broadcast,
+    /// The node's schema epoch at this entity's materialization, frozen for
+    /// the entity's lifetime: typed accessors resolve their descriptor
+    /// cells under this stamp. Entities materialized before a system was
+    /// ready (system bootstrap rows) and evaluation-only vessels carry
+    /// [`crate::schema::SchemaEpoch::BOOTSTRAP`], under which only pinned
+    /// identities resolve.
+    schema_epoch: crate::schema::SchemaEpoch,
 }
 
 #[derive(Debug)]
@@ -197,6 +205,10 @@ impl WeakEntity {
 
 impl Entity {
     pub fn id(&self) -> EntityId { self.id }
+
+    /// The schema epoch stamped at this entity's materialization: what typed
+    /// accessors resolve their descriptor cells under.
+    pub fn schema_epoch(&self) -> crate::schema::SchemaEpoch { self.schema_epoch }
 
     // This is intentionally private - only WeakEntitySet should be constructing Entities
     fn weak(&self) -> WeakEntity { WeakEntity(Arc::downgrade(&self.0)) }
@@ -246,7 +258,7 @@ impl Entity {
     /// Construct a new, writable entity with no state and no memberships.
     /// Memberships are staged separately ([`Entity::add_membership`]) and
     /// become canonical when an event records them.
-    pub fn create(id: EntityId, collection: CollectionId) -> Self {
+    pub fn create(id: EntityId, collection: CollectionId, schema_epoch: crate::schema::SchemaEpoch) -> Self {
         Self(Arc::new(EntityInner {
             id,
             collection,
@@ -255,13 +267,19 @@ impl Entity {
                 memberships: MembershipSet::default(),
                 backends: BTreeMap::default(),
             }),
+            schema_epoch,
             kind: EntityKind::Primary,
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
         }))
     }
 
     /// This must remain private - ONLY WeakEntitySet should be constructing Entities
-    fn from_state(id: EntityId, collection: CollectionId, state: &State) -> Result<Self, RetrievalError> {
+    fn from_state(
+        id: EntityId,
+        collection: CollectionId,
+        state: &State,
+        schema_epoch: crate::schema::SchemaEpoch,
+    ) -> Result<Self, RetrievalError> {
         let mut backends = BTreeMap::new();
         for (name, state_buffer) in state.state_buffers.iter() {
             let backend = backend_from_string(name, Some(state_buffer))?;
@@ -278,6 +296,7 @@ impl Entity {
             }),
             kind: EntityKind::Primary,
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
+            schema_epoch,
         })))
     }
 
@@ -642,6 +661,7 @@ impl Entity {
             state: std::sync::RwLock::new(EntityInnerState { head: event_id.into(), memberships, backends }),
             kind: EntityKind::Transacted { trx_alive, upstream: self.clone() },
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
+            schema_epoch: self.schema_epoch,
         })))
     }
 
@@ -665,6 +685,7 @@ impl Entity {
             }),
             kind: EntityKind::Transacted { trx_alive, upstream: self.clone() },
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
+            schema_epoch: self.schema_epoch,
         }))
     }
 
@@ -709,13 +730,13 @@ impl AbstractEntity for Entity {
 
     fn id(&self) -> &ankurah_proto::EntityId { &self.id }
 
-    fn value(&self, field: &str) -> Option<crate::value::Value> {
-        if field == "id" {
+    fn value(&self, property: &PropertyId) -> Option<crate::value::Value> {
+        if *property == PropertyId::Id {
             Some(crate::value::Value::EntityId(self.id))
         } else {
             // Iterate through backends to find one that has this property
             let state = self.state.read().expect("other thread panicked, panic here too");
-            state.backends.values().find_map(|backend| backend.property_value(&field.into()))
+            state.backends.values().find_map(|backend| backend.property_value(property))
         }
     }
 }
@@ -729,13 +750,13 @@ impl std::fmt::Display for Entity {
 impl Filterable for Entity {
     fn collection(&self) -> &str { self.collection.as_str() }
 
-    fn value(&self, name: &str) -> Option<Value> {
-        if name == "id" {
+    fn value(&self, property: &PropertyId) -> Option<Value> {
+        if *property == PropertyId::Id {
             Some(Value::EntityId(self.id))
         } else {
             // Iterate through backends to find one that has this property
             let state = self.state.read().expect("other thread panicked, panic here too");
-            state.backends.values().find_map(|backend| backend.property_value(&name.to_owned()))
+            state.backends.values().find_map(|backend| backend.property_value(property))
         }
     }
 }
@@ -760,11 +781,18 @@ impl TemporaryEntity {
             kind: EntityKind::Primary,
             // slightly annoying that we need to populate this, given that it won't be used
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
+            // Evaluation-only vessel: never typed-accessed.
+            schema_epoch: crate::schema::SchemaEpoch::BOOTSTRAP,
         })))
     }
     pub fn values(&self) -> Vec<(String, Option<Value>)> {
         let state = self.0.state.read().expect("other thread panicked, panic here too");
-        state.backends.values().flat_map(|backend| backend.property_values()).collect()
+        state
+            .backends
+            .values()
+            .flat_map(|backend| backend.property_values())
+            .map(|(property, value)| (property.to_string(), value))
+            .collect()
     }
 }
 
@@ -772,13 +800,13 @@ impl TemporaryEntity {
 impl Filterable for TemporaryEntity {
     fn collection(&self) -> &str { self.0.collection.as_str() }
 
-    fn value(&self, name: &str) -> Option<Value> {
-        if name == "id" {
+    fn value(&self, property: &PropertyId) -> Option<Value> {
+        if *property == PropertyId::Id {
             Some(Value::EntityId(self.0.id))
         } else {
             // Iterate through backends to find one that has this property
             let state = self.0.state.read().expect("other thread panicked, panic here too");
-            state.backends.values().find_map(|backend| backend.property_value(&name.to_owned()))
+            state.backends.values().find_map(|backend| backend.property_value(property))
         }
     }
 }
@@ -791,11 +819,31 @@ impl std::fmt::Display for TemporaryEntity {
 
 // TODO - Implement TOCTOU Race condition tests. Require real backend state mutations to be meaningful. punting that for now
 /// A set of entities held weakly
-#[derive(Clone, Default)]
-pub struct WeakEntitySet(Arc<std::sync::RwLock<BTreeMap<EntityId, WeakEntity>>>);
+#[derive(Clone)]
+pub struct WeakEntitySet {
+    entities: Arc<std::sync::RwLock<BTreeMap<EntityId, WeakEntity>>>,
+    /// The owning node's current schema epoch, shared with its
+    /// SystemManager (the writer). Entities freeze the value at
+    /// construction: the stamp is what accessors resolve under, so a
+    /// handle that outlives a reset misses the new epoch's cells and
+    /// surfaces a mechanical resolution error instead of a wrong identity.
+    epoch_source: Arc<std::sync::RwLock<Option<crate::schema::SchemaEpoch>>>,
+}
+
+impl WeakEntitySet {
+    pub(crate) fn new(epoch_source: Arc<std::sync::RwLock<Option<crate::schema::SchemaEpoch>>>) -> Self {
+        Self { entities: Arc::new(std::sync::RwLock::new(BTreeMap::new())), epoch_source }
+    }
+
+    /// The stamp for an entity materializing right now: the node's current
+    /// epoch, or the reserved bootstrap epoch before any system is ready.
+    fn current_epoch(&self) -> crate::schema::SchemaEpoch {
+        self.epoch_source.read().unwrap().unwrap_or(crate::schema::SchemaEpoch::BOOTSTRAP)
+    }
+}
 impl WeakEntitySet {
     pub fn get(&self, id: &EntityId) -> Option<Entity> {
-        let entities = self.0.read().unwrap();
+        let entities = self.entities.read().unwrap();
         // TODO: call policy agent with cdata
         if let Some(entity) = entities.get(id) {
             entity.upgrade()
@@ -845,14 +893,14 @@ impl WeakEntitySet {
         match self.get_or_retrieve(state_getter, event_getter, collection_id, id).await? {
             Some(entity) => Ok(entity),
             None => {
-                let mut entities = self.0.write().unwrap();
+                let mut entities = self.entities.write().unwrap();
                 // TODO: call policy agent with cdata
                 if let Some(entity) = entities.get(id) {
                     if let Some(entity) = entity.upgrade() {
                         return Ok(entity);
                     }
                 }
-                let entity = Entity::create(*id, collection_id.to_owned());
+                let entity = Entity::create(*id, collection_id.to_owned(), self.current_epoch());
                 entities.insert(*id, entity.weak());
                 Ok(entity)
             }
@@ -862,8 +910,8 @@ impl WeakEntitySet {
     /// `SystemManager::create` applies to it directly instead of through a
     /// transaction.
     pub(crate) fn create_root(&self, collection: CollectionId, id: EntityId) -> Entity {
-        let mut entities = self.0.write().unwrap();
-        let entity = Entity::create(id, collection);
+        let mut entities = self.entities.write().unwrap();
+        let entity = Entity::create(id, collection, self.current_epoch());
         entities.insert(id, entity.weak());
         entity
     }
@@ -880,10 +928,10 @@ impl WeakEntitySet {
         genesis: &Event,
         trx_alive: Arc<AtomicBool>,
     ) -> Result<Entity, MutationError> {
-        let primary = Entity::create(genesis.entity_id, collection);
+        let primary = Entity::create(genesis.entity_id, collection, self.current_epoch());
         let transaction_entity = primary.snapshot_after_genesis(genesis, trx_alive)?;
 
-        let mut entities = self.0.write().unwrap();
+        let mut entities = self.entities.write().unwrap();
         if entities.get(&primary.id).and_then(|weak| weak.upgrade()).is_some() {
             // A 256-bit hash over creator-random bytes: reaching this means
             // the same genesis was minted twice, not that two creations
@@ -900,7 +948,7 @@ impl WeakEntitySet {
     /// update that then failed to apply; leaving it resident makes the entity
     /// appear to exist with no state. Returns true if an entry was removed.
     pub fn remove_if_phantom(&self, id: &EntityId) -> bool {
-        let mut entities = self.0.write().unwrap();
+        let mut entities = self.entities.write().unwrap();
         if let Some(weak) = entities.get(id) {
             if let Some(entity) = weak.upgrade() {
                 if !entity.head().is_empty() {
@@ -925,8 +973,8 @@ impl WeakEntitySet {
     /// Requires the `test-helpers` feature to be enabled.
     #[cfg(feature = "test-helpers")]
     pub fn conjure_evil_phantom(&self, id: EntityId, collection: CollectionId) -> Entity {
-        let mut entities = self.0.write().unwrap();
-        let entity = Entity::create(id, collection);
+        let mut entities = self.entities.write().unwrap();
+        let entity = Entity::create(id, collection, self.current_epoch());
         entities.insert(id, entity.weak());
         entity
     }
@@ -934,14 +982,14 @@ impl WeakEntitySet {
     /// Get or create entity after async operations, checking for race conditions
     /// Returns (existed, entity) where existed is true if the entity was already present
     fn private_get_or_create(&self, id: EntityId, collection_id: &CollectionId, state: &State) -> Result<(bool, Entity), RetrievalError> {
-        let mut entities = self.0.write().unwrap();
+        let mut entities = self.entities.write().unwrap();
         if let Some(existing_weak) = entities.get(&id) {
             if let Some(existing_entity) = existing_weak.upgrade() {
                 debug!("Entity {id} was created by another thread during async work, using that one");
                 return Ok((true, existing_entity));
             }
         }
-        let entity = Entity::from_state(id, collection_id.to_owned(), state)?;
+        let entity = Entity::from_state(id, collection_id.to_owned(), state, self.current_epoch())?;
         entities.insert(id, entity.weak());
         Ok((false, entity))
     }

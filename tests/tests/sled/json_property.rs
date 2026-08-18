@@ -199,7 +199,7 @@ fn test_json_path_planner_generates_sub_path() {
         // Verify keypart has sub_path
         assert!(!index_spec.keyparts.is_empty(), "Should have at least one keypart");
         let keypart = &index_spec.keyparts[0];
-        assert_eq!(keypart.column, "licensing", "Column should be 'licensing'");
+        assert_eq!(keypart.key, "licensing", "Column should be 'licensing'");
         assert_eq!(keypart.sub_path, Some(vec!["territory".to_string()]), "sub_path should be ['territory']");
         assert_eq!(keypart.full_path(), "licensing.territory", "full_path should be 'licensing.territory'");
 

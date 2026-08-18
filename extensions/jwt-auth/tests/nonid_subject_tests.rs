@@ -38,6 +38,43 @@ fn context(keys: &SigningKeys, sub: &str, role: &str) -> JwtContext {
     JwtContext::from_claims(claims, token)
 }
 
+/// A deterministic durable identity for a fixture field name.
+fn prop(name: &str) -> ankql::ast::PropertyId {
+    let mut bytes = [0u8; 32];
+    let n = name.as_bytes();
+    let len = n.len().min(32);
+    bytes[..len].copy_from_slice(&n[..len]);
+    ankql::ast::PropertyId::EntityId(EntityId::from_bytes(bytes))
+}
+
+/// Bind a rule predicate's names to the fixture identities, the way the
+/// shared query entry does in production before row evaluation.
+fn resolve_fixture(predicate: Predicate) -> Predicate {
+    struct FixtureResolver;
+    impl ankql::NameResolver for FixtureResolver {
+        fn resolve_property(
+            &self,
+            _model: &ankurah_proto::ModelId,
+            name: &str,
+        ) -> Result<Option<ankql::ast::PropertyId>, ankql::NameResolutionError> {
+            Ok(Some(prop(name)))
+        }
+        fn property_value_type(
+            &self,
+            _model: &ankurah_proto::ModelId,
+            property: &ankql::ast::PropertyId,
+        ) -> Result<ankurah_core::value::ValueType, ankql::NameResolutionError> {
+            Ok(if *property == prop("owner") || *property == prop("reviewer") {
+                ankurah_core::value::ValueType::EntityId
+            } else {
+                ankurah_core::value::ValueType::String
+            })
+        }
+    }
+    let model = ankurah_proto::ModelId::EntityId(EntityId::from_bytes([0x77; 32]));
+    predicate.resolve_names(&model, &FixtureResolver).expect("fixture rule predicates resolve")
+}
+
 fn agent_with(config_json: &str, keys: &SigningKeys) -> JwtAgent {
     let agent = JwtAgent::new_ephemeral();
     agent.update_config(serde_json::from_str::<PolicyConfig>(config_json).expect("test policy must parse"));
@@ -61,12 +98,15 @@ struct NoteRow {
 impl Filterable for NoteRow {
     fn collection(&self) -> &str { "note" }
 
-    fn value(&self, name: &str) -> Option<Value> {
-        match name {
-            "owner" => Some(Value::EntityId(self.owner)),
-            "reviewer" => Some(Value::EntityId(self.reviewer)),
-            "visibility" => Some(Value::String(self.visibility.to_string())),
-            _ => None,
+    fn value(&self, property: &ankql::ast::PropertyId) -> Option<Value> {
+        if *property == prop("owner") {
+            Some(Value::EntityId(self.owner))
+        } else if *property == prop("reviewer") {
+            Some(Value::EntityId(self.reviewer))
+        } else if *property == prop("visibility") {
+            Some(Value::String(self.visibility.to_string()))
+        } else {
+            None
         }
     }
 }
@@ -102,7 +142,9 @@ fn test_or_composed_scope_denies_the_row_without_erroring() {
     // The caller asks for everything, so the scope rule is the only thing
     // narrowing the query.
     let guest = context(&keys, "guest", "reader");
-    let filtered = agent.filter_predicate(&guest, &collection, Predicate::True).expect("a subject that is not an id must still filter");
+    let filtered = resolve_fixture(
+        agent.filter_predicate(&guest, &collection, Predicate::True).expect("a subject that is not an id must still filter"),
+    );
 
     let admits = |row: NoteRow| evaluate_predicate(&row, &filtered).expect("the filtered predicate must evaluate, not error");
     assert!(!admits(private), "neither id clause can match a subject that is not an id, so the row is denied");
@@ -112,7 +154,7 @@ fn test_or_composed_scope_denies_the_row_without_erroring() {
     // owner's own row when the subject is that owner's id, so the false above
     // is a comparison that answered no rather than a clause that never matches.
     let member = context(&keys, &owner.to_base64(), "reader");
-    let filtered = agent.filter_predicate(&member, &collection, Predicate::True).expect("a member's subject filters too");
+    let filtered = resolve_fixture(agent.filter_predicate(&member, &collection, Predicate::True).expect("a member's subject filters too"));
     assert!(
         evaluate_predicate(&private, &filtered).expect("the filtered predicate must evaluate, not error"),
         "the owner's own row must pass the same clause that denied the guest"

@@ -10,13 +10,13 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
     let ephemeral_field_names = model.ephemeral_field_names();
     let ephemeral_field_types = model.ephemeral_field_types();
     let active_field_names = model.active_field_names();
+    let active_field_indices: Vec<syn::Index> = (0..active_field_names.len()).map(syn::Index::from).collect();
     let projected_field_types = model.projected_field_types();
     let projected_field_types_turbofish = model.projected_field_types_turbofish();
     let active_field_types_turbofish = match model.active_field_types_turbofish() {
         Ok(types) => types,
         Err(e) => return e.into_compile_error(),
     };
-    let active_field_name_strs = model.active_field_name_strs();
 
     // WASM field getters (conditionally generated)
     #[cfg(feature = "wasm")]
@@ -178,7 +178,8 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
                     pub fn #active_field_names(&self) -> Result<#projected_field_types, ankurah::property::PropertyError> {
                         use ankurah::property::{FromActiveType, FromEntity};
                         ::ankurah::signals::CurrentObserver::track(self);
-                        let active_result = #active_field_types_turbofish::from_entity(#active_field_name_strs.into(), &self.entity);
+                        let property = <#name as ::ankurah::model::Model>::descriptor().resolved_field(#active_field_indices, &self.entity)?;
+                        let active_result = #active_field_types_turbofish::from_entity(property, &self.entity);
                         #projected_field_types_turbofish::from_active(active_result)
                     }
                 )*

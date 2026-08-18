@@ -6,7 +6,7 @@ use crate::{
     property::{
         backend::{PropertyBackend, YrsBackend},
         traits::{FromActiveType, FromEntity, InitializeWith, PropertyError},
-        PropertyName,
+        PropertyId,
     },
 };
 
@@ -20,7 +20,7 @@ pub struct YrsString<Projected> {
     // ideally we'd store the yrs::TransactionMut in the Transaction as an ExtendableOp or something like that
     // and call encode_update_v2 on it when we're ready to commit
     // but its got a lifetime of 'doc and that requires some refactoring
-    pub property_name: PropertyName,
+    pub property: PropertyId,
     pub backend: Arc<YrsBackend>,
     pub entity: Entity,
     phantom: PhantomData<Projected>,
@@ -34,36 +34,36 @@ pub struct YrsString<Projected> {
 
 // Starting with basic string type operations
 impl<Projected> YrsString<Projected> {
-    pub fn new(property_name: PropertyName, backend: Arc<YrsBackend>, entity: Entity) -> Self {
-        Self { property_name, backend, entity, phantom: PhantomData }
+    pub fn new(property: PropertyId, backend: Arc<YrsBackend>, entity: Entity) -> Self {
+        Self { property, backend, entity, phantom: PhantomData }
     }
-    pub fn value(&self) -> Option<String> { self.backend.get_string(&self.property_name) }
+    pub fn value(&self) -> Option<String> { self.backend.get_string(&self.property) }
     pub fn insert(&self, index: u32, value: &str) -> Result<(), MutationError> {
         if !self.entity.is_writable() {
             return Err(PropertyError::TransactionClosed.into());
         }
-        self.backend.insert(&self.property_name, index, value)
+        self.backend.insert(&self.property, index, value)
     }
     pub fn delete(&self, index: u32, length: u32) -> Result<(), MutationError> {
         if !self.entity.is_writable() {
             return Err(PropertyError::TransactionClosed.into());
         }
-        self.backend.delete(&self.property_name, index, length)
+        self.backend.delete(&self.property, index, length)
     }
     pub fn overwrite(&self, start: u32, length: u32, value: &str) -> Result<(), MutationError> {
         if !self.entity.is_writable() {
             return Err(PropertyError::TransactionClosed.into());
         }
-        self.backend.delete(&self.property_name, start, length)?;
-        self.backend.insert(&self.property_name, start, value)?;
+        self.backend.delete(&self.property, start, length)?;
+        self.backend.insert(&self.property, start, value)?;
         Ok(())
     }
     pub fn replace(&self, value: &str) -> Result<(), MutationError> {
         if !self.entity.is_writable() {
             return Err(PropertyError::TransactionClosed.into());
         }
-        self.backend.delete(&self.property_name, 0, self.value().unwrap_or_default().len() as u32)?;
-        self.backend.insert(&self.property_name, 0, value)?;
+        self.backend.delete(&self.property, 0, self.value().unwrap_or_default().len() as u32)?;
+        self.backend.insert(&self.property, 0, value)?;
         Ok(())
     }
 }
@@ -73,9 +73,9 @@ impl<Projected> crate::property::traits::ActiveType for YrsString<Projected> {
 }
 
 impl<Projected> FromEntity for YrsString<Projected> {
-    fn from_entity(property_name: PropertyName, entity: &Entity) -> Self {
+    fn from_entity(property: PropertyId, entity: &Entity) -> Self {
         let backend = entity.get_backend::<YrsBackend>().expect("YrsBackend should exist");
-        Self::new(property_name, backend, entity.clone())
+        Self::new(property, backend, entity.clone())
     }
 }
 
@@ -108,29 +108,29 @@ impl<'a, Projected> FromActiveType<YrsString<Projected>> for std::borrow::Cow<'a
 }
 
 impl<Projected> InitializeWith<String> for YrsString<Projected> {
-    fn initialize_with(provisional: &mut ProvisionalEntity, property_name: PropertyName, value: &String) {
+    fn initialize_with(provisional: &mut ProvisionalEntity, property: PropertyId, value: &String) {
         let backend = provisional.get_backend::<YrsBackend>().expect("YrsBackend should exist");
-        backend.insert(&property_name, 0, value).unwrap();
+        backend.insert(&property, 0, value).unwrap();
     }
 }
 
 impl<Projected> InitializeWith<Option<String>> for YrsString<Projected> {
-    fn initialize_with(provisional: &mut ProvisionalEntity, property_name: PropertyName, value: &Option<String>) {
+    fn initialize_with(provisional: &mut ProvisionalEntity, property: PropertyId, value: &Option<String>) {
         // The backend is created even when there is no value: whether a
         // model's yrs document exists at all is part of what the genesis
         // preimage commits to.
         let backend = provisional.get_backend::<YrsBackend>().expect("YrsBackend should exist");
         if let Some(value) = value {
-            backend.insert(&property_name, 0, value).unwrap();
+            backend.insert(&property, 0, value).unwrap();
         }
     }
 }
 
 impl<Projected> ankurah_signals::Signal for YrsString<Projected> {
-    fn listen(&self, listener: Listener) -> ListenerGuard { self.backend.listen_field(&self.property_name, listener) }
+    fn listen(&self, listener: Listener) -> ListenerGuard { self.backend.listen_field(&self.property, listener) }
 
     // TODO: determine if we should cache this or not.
-    fn broadcast_id(&self) -> ankurah_signals::broadcast::BroadcastId { self.backend.field_broadcast_id(&self.property_name) }
+    fn broadcast_id(&self) -> ankurah_signals::broadcast::BroadcastId { self.backend.field_broadcast_id(&self.property) }
 }
 
 impl<Projected> ankurah_signals::Subscribe<String> for YrsString<Projected>

@@ -18,6 +18,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use tracing::debug;
 
+/// Binds a scope rule's property names to durable identities before row
+/// evaluation, scoped to the collection being checked. Installed from the
+/// node's catalog at attach; rows are addressed by property id, so a
+/// name-based rule predicate must resolve before it can be evaluated.
+pub type SelectionResolver = Arc<dyn Fn(&proto::CollectionId, Predicate) -> Result<Predicate, String> + Send + Sync>;
+
 /// JWT-based PolicyAgent for ankurah.
 ///
 /// Validates incoming requests using RS256 JWTs, and enforces access control
@@ -26,6 +32,11 @@ use tracing::debug;
 pub struct JwtAgent {
     state: Arc<RwLock<AgentState>>,
     policy_path: Option<PathBuf>,
+    /// The name binding for rule predicates, installed at node attach
+    /// (tests may install a fixture binding via
+    /// [`JwtAgent::set_selection_resolver`]). Absent until then; row scope
+    /// checks fail closed without it.
+    resolver: Arc<RwLock<Option<SelectionResolver>>>,
     /// Weak-node LiveQuery (EntityLiveQuery::new_weak_node) so the agent never keeps its own node alive
     policy_livequery: Arc<Mutex<Option<EntityLiveQuery>>>,
 }
@@ -42,6 +53,7 @@ impl JwtAgent {
             state: Arc::new(RwLock::new(AgentState { config, keys: Some(JwtKeys::Signing(keys)) })),
             policy_path: Some(path.to_path_buf()),
             policy_livequery: Arc::new(Mutex::new(None)),
+            resolver: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -51,6 +63,7 @@ impl JwtAgent {
             state: Arc::new(RwLock::new(AgentState { config: PolicyConfig::default(), keys: None })),
             policy_path: None,
             policy_livequery: Arc::new(Mutex::new(None)),
+            resolver: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -79,6 +92,15 @@ impl JwtAgent {
 
     /// Replaces the in-memory config with a new one.
     pub fn update_config(&self, new_config: PolicyConfig) { self.state.write().unwrap_or_else(|e| e.into_inner()).config = new_config; }
+
+    /// Install the rule-predicate name binding. Node attach does this with
+    /// the node's catalog; tests exercising row scope checks without a node
+    /// install a fixture binding.
+    pub fn set_selection_resolver(&self, resolver: SelectionResolver) {
+        *self.resolver.write().unwrap_or_else(|e| e.into_inner()) = Some(resolver);
+    }
+
+    fn selection_resolver(&self) -> Option<SelectionResolver> { self.resolver.read().unwrap_or_else(|e| e.into_inner()).clone() }
 }
 
 #[async_trait]
@@ -86,6 +108,16 @@ impl PolicyAgent for JwtAgent {
     type ContextData = JwtContext;
 
     fn on_node_ready<SE: StorageEngine + Send + Sync + 'static>(&self, node: WeakNode<SE, Self>) {
+        if let Some(strong) = node.upgrade() {
+            let catalog = strong.catalog.clone();
+            self.set_selection_resolver(Arc::new(move |collection, predicate| {
+                catalog
+                    .resolve_selection(collection, ankql::ast::Selection { predicate, order_by: None, limit: None })
+                    .map(|selection| selection.predicate)
+                    .map_err(|error| error.to_string())
+            }));
+        }
+
         #[cfg(feature = "watcher")]
         if let Some(ref policy_path) = self.policy_path {
             crate::agent_state::start_durable_policy_watcher(node, policy_path.clone(), self.state_handle());
@@ -185,9 +217,9 @@ impl PolicyAgent for JwtAgent {
             return Err(AccessDenied::CollectionDenied(entity_after.collection().clone()));
         }
         if !entity_before.head().is_empty() {
-            enforce_write_scope(&state.config, cdata, entity_before)?;
+            enforce_write_scope(&state.config, self.selection_resolver().as_ref(), cdata, entity_before)?;
         }
-        enforce_write_scope(&state.config, cdata, entity_after)?;
+        enforce_write_scope(&state.config, self.selection_resolver().as_ref(), cdata, entity_after)?;
         Ok(None)
     }
 
@@ -359,7 +391,7 @@ impl PolicyAgent for JwtAgent {
 
         let entity = TemporaryEntity::new(*id, collection.clone(), state)
             .map_err(|_| AccessDenied::ByPolicy("Read scope entity state could not be evaluated"))?;
-        enforce_read_scope(&guard.config, data, &entity)
+        enforce_read_scope(&guard.config, self.selection_resolver().as_ref(), data, &entity)
     }
 
     fn check_read_event<C>(&self, data: &C, event: &Attested<proto::Event>) -> Result<(), AccessDenied>
@@ -383,7 +415,7 @@ impl PolicyAgent for JwtAgent {
         if !state.config.can_write_collection(cdata.roles(), entity.collection()) {
             Err(AccessDenied::CollectionDenied(entity.collection().clone()))
         } else {
-            enforce_write_scope(&state.config, cdata, entity)
+            enforce_write_scope(&state.config, self.selection_resolver().as_ref(), cdata, entity)
         }
     }
 
@@ -434,12 +466,19 @@ fn scoped_predicates(
     Ok(predicates)
 }
 
-fn enforce_write_scope(config: &PolicyConfig, cdata: &JwtContext, entity: &Entity) -> Result<(), AccessDenied> {
+fn enforce_write_scope(
+    config: &PolicyConfig,
+    resolver: Option<&SelectionResolver>,
+    cdata: &JwtContext,
+    entity: &Entity,
+) -> Result<(), AccessDenied> {
     let JwtContext::User { claims, .. } = cdata else {
         return Err(AccessDenied::ByPolicy("No authenticated context for write scope enforcement"));
     };
 
     for predicate in scoped_predicates(config, entity.collection().as_str(), claims, ScopeAccess::Write)? {
+        let predicate = resolve_rule_predicate(resolver, entity.collection(), predicate)
+            .ok_or(AccessDenied::ByPolicy("Write scope predicate could not be resolved"))?;
         match evaluate_predicate(entity, &predicate) {
             Ok(true) => {}
             Ok(false) => return Err(AccessDenied::ByPolicy("Write outside permitted scope")),
@@ -450,8 +489,33 @@ fn enforce_write_scope(config: &PolicyConfig, cdata: &JwtContext, entity: &Entit
     Ok(())
 }
 
-fn enforce_read_scope<C>(config: &PolicyConfig, data: &C, entity: &TemporaryEntity) -> Result<(), AccessDenied>
-where C: Iterable<JwtContext> {
+/// Bind one rule predicate's names to durable identities for `collection`.
+/// `None` when no binding is installed or the rule's names cannot resolve;
+/// row scope checks fail closed on it.
+fn resolve_rule_predicate(
+    resolver: Option<&SelectionResolver>,
+    collection: &proto::CollectionId,
+    predicate: Predicate,
+) -> Option<Predicate> {
+    let resolver = resolver?;
+    match resolver(collection, predicate) {
+        Ok(resolved) => Some(resolved),
+        Err(error) => {
+            tracing::debug!("rule predicate for {collection} did not resolve: {error}");
+            None
+        }
+    }
+}
+
+fn enforce_read_scope<C>(
+    config: &PolicyConfig,
+    resolver: Option<&SelectionResolver>,
+    data: &C,
+    entity: &TemporaryEntity,
+) -> Result<(), AccessDenied>
+where
+    C: Iterable<JwtContext>,
+{
     for ctx in data.iterable() {
         let JwtContext::User { claims, .. } = ctx else {
             continue;
@@ -475,6 +539,9 @@ where C: Iterable<JwtContext> {
 
         let mut allowed = true;
         for predicate in scope {
+            let Some(predicate) = resolve_rule_predicate(resolver, &entity.collection, predicate) else {
+                return Err(AccessDenied::ByPolicy("Read scope predicate could not be resolved"));
+            };
             match evaluate_predicate(entity, &predicate) {
                 Ok(true) => {}
                 Ok(false) => {

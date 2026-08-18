@@ -60,7 +60,7 @@ async fn test_rapid_concurrent_transactions() -> Result<()> {
         let handle = tokio::spawn(async move {
             let trx = ctx.begin();
             let album_mut = album.edit(&trx)?;
-            album_mut.year().replace(&format!("{}", i))?;
+            album_mut.year()?.replace(&format!("{}", i))?;
             trx.commit().await
         });
         handles.push(handle);
@@ -136,7 +136,7 @@ async fn test_deep_lineage_concurrent_fork() -> Result<()> {
     for i in 1..=50 {
         let album = ctx.get::<AlbumView>(album_id).await?;
         let trx = ctx.begin();
-        album.edit(&trx)?.year().replace(&format!("{}", i))?;
+        album.edit(&trx)?.year()?.replace(&format!("{}", i))?;
         trx.commit().await?;
     }
 
@@ -146,8 +146,8 @@ async fn test_deep_lineage_concurrent_fork() -> Result<()> {
     let trx1 = ctx.begin();
     let trx2 = ctx.begin();
 
-    album.edit(&trx1)?.name().replace("Branch1")?;
-    album.edit(&trx2)?.name().replace("Branch2")?;
+    album.edit(&trx1)?.name()?.replace("Branch1")?;
+    album.edit(&trx2)?.name()?.replace("Branch2")?;
 
     // Both should succeed without BudgetExceeded
     trx1.commit().await?;
@@ -187,30 +187,30 @@ async fn test_multiple_merge_cycles() -> Result<()> {
     let album = ctx.get::<AlbumView>(album_id).await?;
     let trx1 = ctx.begin();
     let trx2 = ctx.begin();
-    album.edit(&trx1)?.name().replace("B")?;
-    album.edit(&trx2)?.year().replace("1")?;
+    album.edit(&trx1)?.name()?.replace("B")?;
+    album.edit(&trx2)?.year()?.replace("1")?;
     dag.enumerate(trx1.commit_and_return_events().await?); // B
     dag.enumerate(trx2.commit_and_return_events().await?); // C
 
     // Merge with D
     let album = ctx.get::<AlbumView>(album_id).await?;
     let trx = ctx.begin();
-    album.edit(&trx)?.name().replace("D")?;
+    album.edit(&trx)?.name()?.replace("D")?;
     dag.enumerate(trx.commit_and_return_events().await?); // D
 
     // Second fork-merge cycle
     let album = ctx.get::<AlbumView>(album_id).await?;
     let trx1 = ctx.begin();
     let trx2 = ctx.begin();
-    album.edit(&trx1)?.name().replace("E")?;
-    album.edit(&trx2)?.year().replace("2")?;
+    album.edit(&trx1)?.name()?.replace("E")?;
+    album.edit(&trx2)?.year()?.replace("2")?;
     dag.enumerate(trx1.commit_and_return_events().await?); // E
     dag.enumerate(trx2.commit_and_return_events().await?); // F
 
     // Final merge with G
     let album = ctx.get::<AlbumView>(album_id).await?;
     let trx = ctx.begin();
-    album.edit(&trx)?.name().replace("Final")?;
+    album.edit(&trx)?.name()?.replace("Final")?;
     dag.enumerate(trx.commit_and_return_events().await?); // G
 
     // Verify structure
@@ -302,8 +302,8 @@ async fn test_apply_state_diverged_since() -> Result<()> {
     let trx1 = ctx.begin();
     let trx2 = ctx.begin();
 
-    album.edit(&trx1)?.name().replace("Name-B")?;
-    album.edit(&trx2)?.year().replace("2025")?;
+    album.edit(&trx1)?.name()?.replace("Name-B")?;
+    album.edit(&trx2)?.year()?.replace("2025")?;
 
     dag.enumerate(trx1.commit_and_return_events().await?); // B
     dag.enumerate(trx2.commit_and_return_events().await?); // C
@@ -355,13 +355,13 @@ async fn test_apply_state_strict_ascends() -> Result<()> {
     {
         let album = ctx.get::<AlbumView>(album_id).await?;
         let trx = ctx.begin();
-        album.edit(&trx)?.name().replace("Name-B")?;
+        album.edit(&trx)?.name()?.replace("Name-B")?;
         trx.commit().await?;
     }
     {
         let album = ctx.get::<AlbumView>(album_id).await?;
         let trx = ctx.begin();
-        album.edit(&trx)?.name().replace("Name-C")?;
+        album.edit(&trx)?.name()?.replace("Name-C")?;
         trx.commit().await?;
     }
 
@@ -446,7 +446,7 @@ async fn test_state_buffer_round_trip() -> Result<()> {
     {
         let album = ctx.get::<AlbumView>(album_id).await?;
         let trx = ctx.begin();
-        album.edit(&trx)?.name().replace("Name-B")?;
+        album.edit(&trx)?.name()?.replace("Name-B")?;
         dag.enumerate(trx.commit_and_return_events().await?); // B
     }
 
@@ -470,7 +470,7 @@ async fn test_state_buffer_round_trip() -> Result<()> {
     {
         let album = ctx.get::<AlbumView>(album_id).await?;
         let trx = ctx.begin();
-        album.edit(&trx)?.year().replace("2025")?;
+        album.edit(&trx)?.year()?.replace("2025")?;
         dag.enumerate(trx.commit_and_return_events().await?); // C
     }
 
@@ -559,8 +559,8 @@ async fn test_multi_head_extend_single_tip_lww() -> Result<()> {
     let trx_b = ctx.begin();
     let trx_c = ctx.begin();
 
-    record.edit(&trx_b)?.title().set(&"Title-B".to_owned())?;
-    record.edit(&trx_c)?.title().set(&"Title-C".to_owned())?;
+    record.edit(&trx_b)?.title()?.set(&"Title-B".to_owned())?;
+    record.edit(&trx_c)?.title()?.set(&"Title-C".to_owned())?;
 
     dag.enumerate(trx_b.commit_and_return_events().await?); // B
     dag.enumerate(trx_c.commit_and_return_events().await?); // C
@@ -591,7 +591,7 @@ async fn test_multi_head_extend_single_tip_lww() -> Result<()> {
     // Get a fresh view that sees both B and C
     let record = ctx.get::<RecordView>(record_id).await?;
     let trx_e = ctx.begin();
-    record.edit(&trx_e)?.title().set(&"Title-E".to_owned())?;
+    record.edit(&trx_e)?.title()?.set(&"Title-E".to_owned())?;
     dag.enumerate(trx_e.commit_and_return_events().await?); // D (really E in our naming)
 
     // Verify head is properly pruned
@@ -650,8 +650,8 @@ async fn test_multi_head_single_tip_extension_cross_node() -> Result<()> {
     let trx_b = ctx_d.begin();
     let trx_c = ctx_e.begin();
 
-    record_d.edit(&trx_b)?.title().set(&"Title-B".to_owned())?;
-    record_e.edit(&trx_c)?.title().set(&"Title-C".to_owned())?;
+    record_d.edit(&trx_b)?.title()?.set(&"Title-B".to_owned())?;
+    record_e.edit(&trx_c)?.title()?.set(&"Title-C".to_owned())?;
 
     // Commit B on durable first
     dag.enumerate(trx_b.commit_and_return_events().await?); // B
@@ -686,7 +686,7 @@ async fn test_multi_head_single_tip_extension_cross_node() -> Result<()> {
 
     let trx_d = ctx_e.begin();
     // Set title to something that should compete with B and C's values
-    record_e.edit(&trx_d)?.title().set(&"Title-D".to_owned())?;
+    record_e.edit(&trx_d)?.title()?.set(&"Title-D".to_owned())?;
     dag.enumerate(trx_d.commit_and_return_events().await?); // D
 
     // Wait for propagation
@@ -743,7 +743,7 @@ async fn test_redelivery_of_ancestor_event_is_noop() -> Result<()> {
     {
         let album = ctx.get::<AlbumView>(album_id).await?;
         let trx = ctx.begin();
-        album.edit(&trx)?.name().replace("Name-B")?;
+        album.edit(&trx)?.name()?.replace("Name-B")?;
         events_b = trx.commit_and_return_events().await?;
         dag.enumerate(events_b.clone());
     }
@@ -755,7 +755,7 @@ async fn test_redelivery_of_ancestor_event_is_noop() -> Result<()> {
     {
         let album = ctx.get::<AlbumView>(album_id).await?;
         let trx = ctx.begin();
-        album.edit(&trx)?.name().replace("Name-C")?;
+        album.edit(&trx)?.name()?.replace("Name-C")?;
         dag.enumerate(trx.commit_and_return_events().await?); // C
     }
 

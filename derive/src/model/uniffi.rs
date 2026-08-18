@@ -93,8 +93,8 @@ pub fn uniffi_mutable_field_methods(model: &crate::model::description::ModelDesc
             Some(quote! {
                 /// Get the active property wrapper for this field
                 #[uniffi::method(name = #field_name_str)]
-                pub fn #uniffi_method_name(&self) -> #wrapper_type {
-                    #wrapper_type(self.#field_name())
+                pub fn #uniffi_method_name(&self) -> Result<#wrapper_type, ::ankurah::property::PropertyError> {
+                    Ok(#wrapper_type(self.#field_name()?))
                 }
             })
         })

@@ -75,9 +75,12 @@ impl Transaction {
 
         // The initial values are staged in a vessel that has no identity of its
         // own: the entity id does not exist until these operations have been
-        // frozen into the genesis preimage.
+        // frozen into the genesis preimage. Each field stages under the
+        // durable identity its descriptor cell resolved for this node's
+        // current epoch (populated by the registration gate above).
+        let epoch = self.dyncontext.schema_epoch().ok_or(MutationError::SystemNotReady)?;
         let mut provisional = ProvisionalEntity::new();
-        model.initialize_new_entity(&mut provisional, model_id);
+        model.initialize_new_entity(&mut provisional, model_id, epoch).map_err(|e| MutationError::General(Box::new(e)))?;
         let system = self.dyncontext.system_id().ok_or(MutationError::SystemNotReady)?;
         let genesis = proto::Event::genesis(M::collection(), Some(system), proto::AuthorId::Unknown, provisional.extract_operations()?);
 

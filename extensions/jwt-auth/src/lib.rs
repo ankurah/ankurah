@@ -15,7 +15,7 @@ mod watcher;
 #[cfg(feature = "uniffi")]
 uniffi::setup_scaffolding!();
 
-pub use agent::{AgentState, JwtAgent};
+pub use agent::{AgentState, JwtAgent, SelectionResolver};
 pub use claims::{parse_claims_unverified, JwtClaims};
 pub use config::{PolicyConfig, ScopeRule, ScopeRuleOp};
 pub use context::JwtContext;

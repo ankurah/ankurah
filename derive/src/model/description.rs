@@ -375,8 +375,8 @@ impl ModelDescription {
 
                 let getter_method = quote::quote! {
                     #[wasm_bindgen(getter, js_name = #field_name)]
-                    pub fn #wasm_method_name(&self) -> #wrapper_type {
-                        #wrapper_type(self.#field_name())
+                    pub fn #wasm_method_name(&self) -> Result<#wrapper_type, JsValue> {
+                        Ok(#wrapper_type(self.#field_name()?))
                     }
                 };
 

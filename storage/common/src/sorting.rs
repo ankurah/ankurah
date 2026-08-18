@@ -12,10 +12,15 @@ use crate::OrderByComponents;
 fn sort_items_by_order<T: Filterable>(items: &mut [T], order_by: &[ankql::ast::OrderByItem]) {
     items.sort_by(|a, b| {
         for order_item in order_by {
-            let property_name = order_item.path.property();
+            let ankql::ast::OrderKey::Property(identifier) = &order_item.key else {
+                // Selections reach engines resolved (`Selection::check`); an
+                // unresolved key has no identity to sort on.
+                continue;
+            };
+            let property = identifier.property_id();
 
-            let a_val = a.value(property_name);
-            let b_val = b.value(property_name);
+            let a_val = a.value(&property);
+            let b_val = b.value(&property);
 
             // Handle None values: None sorts before Some
             let cmp = match (a_val, b_val, &order_item.direction) {
@@ -36,7 +41,13 @@ fn sort_items_by_order<T: Filterable>(items: &mut [T], order_by: &[ankql::ast::O
 
 /// Extract partition key (presort column values) from an item
 fn extract_partition_key<T: Filterable>(item: &T, presort: &[ankql::ast::OrderByItem]) -> Vec<Option<Value>> {
-    presort.iter().map(|p| item.value(p.path.property())).collect()
+    presort
+        .iter()
+        .map(|p| match &p.key {
+            ankql::ast::OrderKey::Property(identifier) => item.value(&identifier.property_id()),
+            ankql::ast::OrderKey::Path(_) => None,
+        })
+        .collect()
 }
 
 /// Sorted stream with partition-aware support.
@@ -249,10 +260,11 @@ impl<T: Filterable> Ord for HeapItem<T> {
         //   - When new item > top, kick out top (it's worse than new).
         //   - Reversed comparison: smaller values are "greater" so BinaryHeap puts them at top.
         for order_item in &self.order_by {
-            let property_name = order_item.path.property();
+            let ankql::ast::OrderKey::Property(identifier) = &order_item.key else { continue };
+            let property = identifier.property_id();
 
-            let self_val = self.item.value(property_name);
-            let other_val = other.item.value(property_name);
+            let self_val = self.item.value(&property);
+            let other_val = other.item.value(&property);
 
             // Handle None values: None is "worst" for the heap (will be kicked out first)
             // For ASC: None is smallest, so it should be "least" (kept longer in max-heap)
@@ -451,9 +463,20 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ankql::ast::{OrderByItem, OrderDirection, PathExpr};
+    use ankql::ast::{OrderByItem, OrderDirection, OrderKey, PropertyId, PropertyIdExt};
     use futures::StreamExt;
     use std::collections::HashMap;
+
+    /// Forge the deterministic PropertyId a test name resolves to: sorting
+    /// consumes resolved sort keys, so fixtures mint ids from the name's own
+    /// bytes and store values under the id's rendering.
+    fn pid(name: &str) -> PropertyId {
+        let mut bytes = [0u8; 32];
+        for (i, byte) in name.bytes().take(32).enumerate() {
+            bytes[i] = byte;
+        }
+        PropertyId::EntityId(ankurah_core_types::EntityId::from_bytes(bytes))
+    }
 
     /// Helper to collect stream items synchronously for testing
     fn collect_stream<S: Stream + Unpin>(stream: S) -> Vec<S::Item> { futures::executor::block_on(stream.collect()) }
@@ -461,17 +484,21 @@ mod tests {
     /// Helper to wrap items in a stream for testing
     fn stream_from<T>(items: Vec<T>) -> futures::stream::Iter<std::vec::IntoIter<T>> { futures::stream::iter(items) }
 
-    /// Test item that implements Filterable for unit testing
+    /// Test item that implements Filterable for unit testing. Values are
+    /// stored under the forged property id's rendering; the inherent `value`
+    /// keeps the tests' name-keyed reads working over that map.
     #[derive(Debug, Clone, PartialEq)]
     struct TestItem {
         values: HashMap<String, Value>,
     }
 
     impl TestItem {
+        fn value(&self, name: &str) -> Option<Value> { self.values.get(&pid(name).to_string()).cloned() }
+
         fn new(pairs: &[(&str, Value)]) -> Self {
             let mut values = HashMap::new();
             for (k, v) in pairs {
-                values.insert(k.to_string(), v.clone());
+                values.insert(pid(k).to_string(), v.clone());
             }
             Self { values }
         }
@@ -479,7 +506,7 @@ mod tests {
         fn int(pairs: &[(&str, i32)]) -> Self {
             let mut values = HashMap::new();
             for (k, v) in pairs {
-                values.insert(k.to_string(), Value::I32(*v));
+                values.insert(pid(k).to_string(), Value::I32(*v));
             }
             Self { values }
         }
@@ -487,38 +514,26 @@ mod tests {
         fn str(pairs: &[(&str, &str)]) -> Self {
             let mut values = HashMap::new();
             for (k, v) in pairs {
-                values.insert(k.to_string(), Value::String(v.to_string()));
+                values.insert(pid(k).to_string(), Value::String(v.to_string()));
             }
             Self { values }
         }
 
         fn mixed(cat: &str, name: &str) -> Self {
-            let mut values = HashMap::new();
-            values.insert("cat".to_string(), Value::String(cat.to_string()));
-            values.insert("name".to_string(), Value::String(name.to_string()));
-            Self { values }
+            Self::new(&[("cat", Value::String(cat.to_string())), ("name", Value::String(name.to_string()))])
         }
 
-        fn cat_val(cat: &str, val: i32) -> Self {
-            let mut values = HashMap::new();
-            values.insert("cat".to_string(), Value::String(cat.to_string()));
-            values.insert("val".to_string(), Value::I32(val));
-            Self { values }
-        }
+        fn cat_val(cat: &str, val: i32) -> Self { Self::new(&[("cat", Value::String(cat.to_string())), ("val", Value::I32(val))]) }
 
         fn cat_subcat_val(cat: &str, subcat: &str, val: i32) -> Self {
-            let mut values = HashMap::new();
-            values.insert("cat".to_string(), Value::String(cat.to_string()));
-            values.insert("subcat".to_string(), Value::String(subcat.to_string()));
-            values.insert("val".to_string(), Value::I32(val));
-            Self { values }
+            Self::new(&[("cat", Value::String(cat.to_string())), ("subcat", Value::String(subcat.to_string())), ("val", Value::I32(val))])
         }
     }
 
     impl Filterable for TestItem {
         fn collection(&self) -> &str { "test" }
 
-        fn value(&self, property: &str) -> Option<Value> { self.values.get(property).cloned() }
+        fn value(&self, property: &PropertyId) -> Option<Value> { self.values.get(&property.to_string()).cloned() }
     }
 
     /// Helper to extract i32 from Value
@@ -537,7 +552,7 @@ mod tests {
         }
     }
 
-    fn oby(col: &str, dir: OrderDirection) -> OrderByItem { OrderByItem { path: PathExpr::simple(col), direction: dir } }
+    fn oby(col: &str, dir: OrderDirection) -> OrderByItem { OrderByItem { key: OrderKey::Property(pid(col).path(&[])), direction: dir } }
 
     fn oby_asc(col: &str) -> OrderByItem { oby(col, OrderDirection::Asc) }
 

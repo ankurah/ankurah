@@ -1,4 +1,6 @@
-use ankql::ast::{ComparisonOperator, Expr, OrderByItem, OrderDirection, PathExpr, Predicate, Selection};
+mod common;
+
+use ankql::ast::{ComparisonOperator, Expr, OrderByItem, OrderDirection, OrderKey, Predicate, PropertyPath, Selection};
 use ankurah::{policy::DEFAULT_CONTEXT as c, proto::EntityId, Model, Node, PermissiveAgent};
 use ankurah_core_types::Value;
 use ankurah_storage_sled::SledStorageEngine;
@@ -35,7 +37,7 @@ async fn test_id_range_optimization_integration() -> Result<()> {
     // Test 1: Simple ORDER BY id ASC with LIMIT (should use optimization)
     let selection_asc = Selection {
         predicate: Predicate::True,
-        order_by: Some(vec![OrderByItem { path: PathExpr::simple("id".to_string()), direction: OrderDirection::Asc }]),
+        order_by: Some(vec![OrderByItem { key: OrderKey::Property(PropertyPath::id()), direction: OrderDirection::Asc }]),
         limit: Some(5),
     };
 
@@ -56,7 +58,7 @@ async fn test_id_range_optimization_integration() -> Result<()> {
     // Test 2: ORDER BY id DESC (should use FullScan reverse + skip sorting)
     let selection_desc = Selection {
         predicate: Predicate::True,
-        order_by: Some(vec![OrderByItem { path: PathExpr::simple("id".to_string()), direction: OrderDirection::Desc }]),
+        order_by: Some(vec![OrderByItem { key: OrderKey::Property(PropertyPath::id()), direction: OrderDirection::Desc }]),
         limit: Some(3),
     };
 
@@ -71,9 +73,11 @@ async fn test_id_range_optimization_integration() -> Result<()> {
     }
 
     // Test 3: ORDER BY name (should require in-memory sorting, no optimization)
+    use ankql::ast::PropertyIdExt;
+    let name_path = common::resolved_prop(&node, TestEntity::descriptor(), "name").path(&[]);
     let selection_name = Selection {
         predicate: Predicate::True,
-        order_by: Some(vec![OrderByItem { path: PathExpr::simple("name".to_string()), direction: OrderDirection::Asc }]),
+        order_by: Some(vec![OrderByItem { key: OrderKey::Property(name_path), direction: OrderDirection::Asc }]),
         limit: Some(5),
     };
 
@@ -110,14 +114,16 @@ async fn test_id_range_with_where_clause() -> Result<()> {
     entity_ids.sort();
     let start_id = entity_ids[2].clone(); // Start from the 3rd entity
 
-    // Query with WHERE id >= start_id ORDER BY id
+    // Query with WHERE id >= start_id ORDER BY id. Hand-built storage-level
+    // selections carry the canonical resolved literal: name resolution casts
+    // an id comparison's string to Value::EntityId before storage sees it.
     let selection = Selection {
         predicate: Predicate::Comparison {
-            left: Box::new(Expr::Path(PathExpr::simple("id".to_string()))),
+            left: Box::new(Expr::PropertyPath(PropertyPath::id())),
             operator: ComparisonOperator::GreaterThanOrEqual,
-            right: Box::new(Expr::Literal(Value::String(start_id.to_base64()))),
+            right: Box::new(Expr::Literal(Value::EntityId(start_id))),
         },
-        order_by: Some(vec![OrderByItem { path: PathExpr::simple("id".to_string()), direction: OrderDirection::Asc }]),
+        order_by: Some(vec![OrderByItem { key: OrderKey::Property(PropertyPath::id()), direction: OrderDirection::Asc }]),
         limit: Some(3),
     };
 

@@ -306,14 +306,23 @@ fn generate_selection_code_with_replacements(
         let order_items: Vec<_> = order_by
             .iter()
             .map(|item| {
-                let steps: Vec<_> = item.path.steps.iter().map(|s| quote! { #s.to_string() }).collect();
+                let key_code = match &item.key {
+                    ankql::ast::OrderKey::Path(path) => {
+                        let steps: Vec<_> = path.steps.iter().map(|s| quote! { #s.to_string() }).collect();
+                        quote! { ::ankql::ast::OrderKey::Path(::ankql::ast::PathExpr { steps: vec![#(#steps),*] }) }
+                    }
+                    ankql::ast::OrderKey::Property(path) => {
+                        let path_code = generate_property_path_code(path);
+                        quote! { ::ankql::ast::OrderKey::Property(#path_code) }
+                    }
+                };
                 let direction_code = match item.direction {
                     ankql::ast::OrderDirection::Asc => quote! { ::ankql::ast::OrderDirection::Asc },
                     ankql::ast::OrderDirection::Desc => quote! { ::ankql::ast::OrderDirection::Desc },
                 };
                 quote! {
                     ::ankql::ast::OrderByItem {
-                        path: ::ankql::ast::PathExpr { steps: vec![#(#steps),*] },
+                        key: #key_code,
                         direction: #direction_code,
                     }
                 }
@@ -442,6 +451,10 @@ fn generate_expr_code_with_replacements(
         }
         ankql::ast::Expr::Literal(lit) => generate_literal_code_with_replacements(lit, args, arg_index),
         ankql::ast::Expr::Path(path) => generate_path_code(path),
+        ankql::ast::Expr::PropertyPath(path) => {
+            let path_code = generate_property_path_code(path);
+            quote! { ::ankql::ast::Expr::PropertyPath(#path_code) }
+        }
         ankql::ast::Expr::Predicate(pred) => {
             let pred_code = generate_predicate_code_with_replacements(pred, args, arg_index);
             quote! { ::ankql::ast::Expr::Predicate(#pred_code) }
@@ -462,6 +475,52 @@ fn generate_expr_code_with_replacements(
             let expr_codes: Vec<_> = exprs.iter().map(|e| generate_expr_code_with_replacements(e, args, arg_index)).collect();
             quote! {
                 ::ankql::ast::Expr::ExprList(vec![#(#expr_codes),*])
+            }
+        }
+    }
+}
+
+fn generate_property_path_code(path: &ankql::ast::PropertyPath) -> proc_macro2::TokenStream {
+    let id = path.property_id();
+    let label = path.to_string().split('.').next().unwrap_or_default().to_string();
+    let subpath = path.subpath.iter().map(|step| quote! { #step.to_string() });
+    match id {
+        ankql::ast::PropertyId::Id => {
+            // An id-with-subpath reference is invalid everywhere (resolution
+            // rejects `id.<anything>`), so refuse to emit one.
+            if !path.subpath.is_empty() {
+                return syn::Error::new(proc_macro2::Span::call_site(), "the id pseudo-property takes no subpath").to_compile_error();
+            }
+            quote! { ::ankql::ast::PropertyPath::id() }
+        }
+        ankql::ast::PropertyId::EntityId(id) => {
+            let bytes = id.to_bytes();
+            quote! {
+                ::ankql::ast::PropertyPath::registered(
+                    ::ankurah::proto::EntityId::from_bytes([#(#bytes),*]),
+                    #label,
+                    vec![#(#subpath),*],
+                )
+            }
+        }
+        ankql::ast::PropertyId::System(property) => {
+            let property = match property {
+                ankql::ast::SystemProperty::Item => quote! { ::ankurah::proto::SystemProperty::Item },
+                ankql::ast::SystemProperty::Label => quote! { ::ankurah::proto::SystemProperty::Label },
+                ankql::ast::SystemProperty::Name => quote! { ::ankurah::proto::SystemProperty::Name },
+                ankql::ast::SystemProperty::MintedFor => quote! { ::ankurah::proto::SystemProperty::MintedFor },
+                ankql::ast::SystemProperty::Backend => quote! { ::ankurah::proto::SystemProperty::Backend },
+                ankql::ast::SystemProperty::ValueType => quote! { ::ankurah::proto::SystemProperty::ValueType },
+                ankql::ast::SystemProperty::TargetModel => quote! { ::ankurah::proto::SystemProperty::TargetModel },
+                ankql::ast::SystemProperty::Model => quote! { ::ankurah::proto::SystemProperty::Model },
+                ankql::ast::SystemProperty::Property => quote! { ::ankurah::proto::SystemProperty::Property },
+                ankql::ast::SystemProperty::Optional => quote! { ::ankurah::proto::SystemProperty::Optional },
+            };
+            quote! {
+                ::ankql::ast::PropertyPath::system(
+                    #property,
+                    vec![#(#subpath),*],
+                )
             }
         }
     }

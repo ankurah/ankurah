@@ -123,11 +123,11 @@ pub fn sim_membership_id(field: Field) -> proto::EntityId {
 pub fn field_values(state: &proto::State) -> (Option<String>, Option<String>) {
     let Some(buffer) = state.state_buffers.0.get("lww") else { return (None, None) };
     let Ok(backend) = LWWBackend::from_state_buffer(buffer) else { return (None, None) };
-    let read = |name: &str| match backend.get(&name.to_string()) {
+    let read = |field: Field| match backend.get(&field.property_id()) {
         Some(Value::String(s)) => Some(s),
         _ => None,
     };
-    (read("title"), read("body"))
+    (read(Field::Title), read(Field::Body))
 }
 
 /// Which LWW field a write targets.
@@ -144,12 +144,17 @@ impl Field {
             Field::Body => "body",
         }
     }
+
+    /// The forged durable identity this field writes under: the same seeded
+    /// id `seed_registered_schema` admits into every node's catalog, so
+    /// harness writes and the compiled binding address one identity.
+    pub fn property_id(self) -> proto::PropertyId { proto::PropertyId::EntityId(sim_property_id(self)) }
 }
 
 /// Build the LWW `OperationSet` for setting one field to a value.
 fn lww_ops(field: Field, value: &str) -> proto::OperationSet {
     let backend = LWWBackend::new();
-    backend.set(field.name().into(), Some(Value::String(value.to_owned())));
+    backend.set(field.property_id(), Some(Value::String(value.to_owned())));
     let ops = backend.to_operations().unwrap().expect("a written LWW backend yields operations");
     proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)]))
 }

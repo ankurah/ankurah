@@ -106,15 +106,13 @@ version = "0.10.0"
 dependencies = [
  "ankurah-core-types",
  "anyhow",
- "base64 0.22.1",
+ "bincode",
  "env_logger",
- "log",
  "pest",
  "pest_derive",
  "serde",
  "serde_json",
  "thiserror 2.0.17",
- "tracing",
  "wasm-bindgen",
 ]
 
@@ -227,6 +225,7 @@ dependencies = [
  "serde",
  "serde_derive_internals 0.29.1",
  "syn",
+ "ulid",
 ]
 
 [[package]]

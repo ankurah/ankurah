@@ -17,14 +17,15 @@
 //! there is no per-call allocation and the schema is a `const`-shaped fact
 //! of the program.
 
-use ankurah_proto::{RegisterModel, RegisterProperty};
+use super::cell::SchemaOnceCell;
+use ankurah_proto::{ModelId, PropertyId, RegisterModel, RegisterProperty};
 
 /// The compiled schema for one model: its registration hints and ordered
 /// active (non-ephemeral) fields. It contains no runtime
 /// [`ankurah_proto::ModelId`]; that
 /// identity is returned by catalog admission. Emitted as a `static` by
 /// `#[derive(Model)]`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct ModelStructDescriptor {
     /// The source-level registration label: the lookup key the allocator
     /// files this model under. Not a runtime model identity and not a
@@ -43,6 +44,18 @@ pub struct ModelStructDescriptor {
     /// of a 32-byte EntityId -- the id that model entity's genesis event
     /// derives -- validated at derive time.
     pub explicit_id: Option<&'static str>,
+    /// A random identity for this compiled declaration, minted fresh each
+    /// time the derive expands (so it is unique to the containing build).
+    /// It rides the registration RPC as a future fallback matching key: a
+    /// durable node could keep a supplemental lookup from these to catalog
+    /// identities, matching a precompiled binary whose labels have drifted
+    /// and which pins no explicit ids. Inoperative today -- the registration
+    /// executor ignores it.
+    pub build_id: [u8; 16],
+    /// The durable model identity this descriptor resolved to, per schema
+    /// epoch. Populated by the registration gate; read by everything past
+    /// it.
+    pub resolved: SchemaOnceCell<ModelId>,
 }
 
 /// The compiled schema for one active field of a model. `(backend,
@@ -51,7 +64,7 @@ pub struct ModelStructDescriptor {
 /// identifies the target of a reference-typed property; `renamed_from` is the
 /// transient rename hint; `explicit_id` is a 5.9 shared-property
 /// binding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct StructProperty {
     /// The Rust field identifier (as declared).
     pub field: &'static str,
@@ -88,11 +101,42 @@ pub struct StructProperty {
     /// the id that property entity's genesis event derives -- validated at
     /// derive time.
     pub explicit_id: Option<&'static str>,
+    /// A random identity for this compiled field, minted fresh each time
+    /// the derive expands (unique to the containing build). Rides the
+    /// registration RPC beside the model's `build_id` as a future fallback
+    /// matching key; inoperative today.
+    pub build_id: [u8; 16],
+    /// The durable property identity this field resolved to, per schema
+    /// epoch. Populated by the registration gate together with the model's
+    /// cell; read by everything past it.
+    pub resolved: SchemaOnceCell<PropertyId>,
 }
 
 impl ModelStructDescriptor {
     /// The active field whose display name is `name`, if any.
     pub fn field_by_name(&self, name: &str) -> Option<&'static StructProperty> { self.properties.iter().find(|f| f.name == name) }
+
+    /// The durable identity of the field at `index` (declaration order),
+    /// resolved under the entity's stamped epoch. This is the read behind
+    /// every generated typed accessor: past the registration gate it always
+    /// hits, and a miss (an entity materialized before any system was ready,
+    /// or a handle that outlived a reset) is a mechanical resolution error,
+    /// never a wrong identity.
+    pub fn resolved_field(
+        &'static self,
+        index: usize,
+        entity: &crate::entity::Entity,
+    ) -> Result<PropertyId, crate::property::PropertyError> {
+        self.resolved_field_at(index, entity.schema_epoch())
+    }
+
+    /// The durable identity of the field at `index`, resolved under a
+    /// caller-held epoch. The create path uses this before any entity
+    /// exists (initial values are staged into a vessel with no identity).
+    pub fn resolved_field_at(&'static self, index: usize, epoch: super::SchemaEpoch) -> Result<PropertyId, crate::property::PropertyError> {
+        let field = &self.properties[index];
+        field.resolved.get(epoch).ok_or(crate::property::PropertyError::Unresolved { model: self.label, field: field.field })
+    }
 }
 
 /// Convert a compiled struct descriptor into the RegisterSchema request
@@ -106,6 +150,7 @@ impl From<&ModelStructDescriptor> for RegisterModel {
             label: schema.label.to_string(),
             name: schema.name.to_string(),
             explicit_id: schema.explicit_id.map(parse_explicit_id),
+            build_id: schema.build_id,
             properties: schema
                 .properties
                 .iter()
@@ -116,6 +161,7 @@ impl From<&ModelStructDescriptor> for RegisterModel {
                     value_type: field.value_type.to_string(),
                     target_label: field.target_label.map(str::to_string),
                     explicit_id: field.explicit_id.map(parse_explicit_id),
+                    build_id: field.build_id,
                     optional: field.optional,
                 })
                 .collect(),

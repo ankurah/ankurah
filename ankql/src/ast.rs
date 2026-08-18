@@ -1,13 +1,14 @@
-use crate::error::ParseError;
+use crate::error::{ParseError, SelectionError};
 use crate::selection::sql::generate_selection_sql;
 use ankurah_core_types::EntityId;
-pub use ankurah_core_types::Value;
+pub use ankurah_core_types::{PropertyId, SystemProperty, Value};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Expr {
     Literal(Value),
     Path(PathExpr),
+    PropertyPath(PropertyPath),
     Predicate(Predicate),
     InfixExpr { left: Box<Expr>, operator: InfixOperator, right: Box<Expr> },
     ExprList(Vec<Expr>), // New variant for handling lists like (1,2,3) in IN clauses
@@ -38,6 +39,9 @@ impl std::fmt::Display for PathExpr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.steps.join(".")) }
 }
 
+mod property_path;
+pub use property_path::{PropertyIdExt, PropertyPath};
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Selection {
     pub predicate: Predicate,
@@ -47,8 +51,30 @@ pub struct Selection {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OrderByItem {
-    pub path: PathExpr,
+    pub key: OrderKey,
     pub direction: OrderDirection,
+}
+
+/// A sort key, mirroring `Expr::Path` vs `Expr::PropertyPath`: the parser
+/// produces the raw [`OrderKey::Path`] form, and the resolution pass rewrites it
+/// to [`OrderKey::Property`] -- including the `id` pseudo-property, which
+/// resolves to [`PropertyPath::id`] (carrying its own [`PropertyId::Id`]), not
+/// to a catalog id. The resolved arm keeps its name private just like
+/// [`PropertyPath`]; a storage engine keys its sort on the identifier's
+/// `id()`, never on a name.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum OrderKey {
+    Path(PathExpr),
+    Property(PropertyPath),
+}
+
+impl std::fmt::Display for OrderKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OrderKey::Path(path) => write!(f, "{}", path),
+            OrderKey::Property(identifier) => write!(f, "{}", identifier),
+        }
+    }
 }
 
 impl std::fmt::Display for OrderByItem {
@@ -56,7 +82,7 @@ impl std::fmt::Display for OrderByItem {
         write!(
             f,
             "{} {}",
-            self.path,
+            self.key,
             match self.direction {
                 OrderDirection::Asc => "ASC",
                 OrderDirection::Desc => "DESC",
@@ -117,41 +143,122 @@ impl std::fmt::Display for Predicate {
 }
 
 impl Selection {
-    /// Transform the selection to assume the given columns are NULL.
-    /// This filters out ORDER BY items that reference missing columns.
-    pub fn assume_null(&self, columns: &[String]) -> Self {
-        let order_by = self.order_by.as_ref().map(|items| {
-            items
-                .iter()
-                .filter(|item| {
-                    // Use the property name (last step) for column matching
-                    let col_name = item.path.property();
-                    !columns.contains(&col_name.to_string())
-                })
-                .cloned()
-                .collect::<Vec<_>>()
-        });
-        // If all ORDER BY items were filtered out, set to None
-        let order_by = order_by.and_then(|v| if v.is_empty() { None } else { Some(v) });
-
-        Self { predicate: self.predicate.assume_null(columns), order_by, limit: self.limit }
+    /// Verify that this selection is fully resolved and populated: every
+    /// property reference carries a durable [`PropertyId`], and no placeholder
+    /// is left unfilled.
+    ///
+    /// A storage engine addresses a property only by identity, translating a
+    /// [`PropertyId`] to its assigned column through its own durable map. A raw
+    /// [`Expr::Path`] leaves it nothing to address but a name, and a name is
+    /// exactly what must not reach it: names move under rename, columns do not,
+    /// so guessing a column from one silently reads the wrong data. An engine
+    /// therefore calls this before reading, and an unresolved selection fails
+    /// loudly at the boundary rather than emitting SQL against a column that
+    /// does not exist, or that belongs to some other property.
+    ///
+    /// [`Selection::resolve_names`] establishes this by binding every
+    /// reference to an id or failing closed. Anything that hand-builds a
+    /// selection and skips that pass is the caller this catches.
+    pub fn check(&self) -> Result<(), SelectionError> {
+        self.predicate.check()?;
+        for item in self.order_by.iter().flatten() {
+            if let OrderKey::Path(path) = &item.key {
+                return Err(SelectionError::UnresolvedPath(path.to_string()));
+            }
+        }
+        Ok(())
     }
 
-    /// Collect all column names referenced in this selection (WHERE + ORDER BY).
-    /// For JSON paths like `licensing.territory`, returns the column name (`licensing`),
-    /// not the JSON path step (`territory`).
-    pub fn referenced_columns(&self) -> Vec<String> {
-        let mut columns = self.predicate.referenced_columns();
+    /// Transform the selection to assume the given properties are absent
+    /// (evaluate to NULL). This also drops ORDER BY items that sort on an
+    /// absent property. Properties are matched by durable identity, so a
+    /// rename cannot change which sort key or comparison is affected.
+    ///
+    /// Returns an error if the selection is not fully resolved and populated.
+    /// An unresolved name carries no durable identity, so this transform cannot
+    /// determine whether it belongs to `absent` and must fail closed.
+    pub fn assume_null(&self, absent: &[PropertyId]) -> Result<Self, SelectionError> {
+        self.predicate.check()?;
+
+        let order_by = match &self.order_by {
+            None => None,
+            Some(items) => {
+                let mut retained = Vec::with_capacity(items.len());
+                for item in items {
+                    match &item.key {
+                        // A sort on an absent property is dropped. `id` resolves
+                        // to `OrderKey::Property` carrying `PropertyId::Id`,
+                        // which engines pin to the primary key and never report
+                        // absent.
+                        OrderKey::Property(identifier) if absent.contains(&identifier.property_id()) => {}
+                        OrderKey::Property(_) => retained.push(item.clone()),
+                        OrderKey::Path(path) => return Err(SelectionError::UnresolvedPath(path.to_string())),
+                    }
+                }
+                if retained.is_empty() {
+                    None
+                } else {
+                    Some(retained)
+                }
+            }
+        };
+
+        Ok(Self { predicate: self.predicate.assume_null(absent), order_by, limit: self.limit })
+    }
+
+    /// Collect the durable addresses of every property referenced in this
+    /// selection (WHERE + ORDER BY), including the `id` pseudo-property (as
+    /// [`PropertyId::Id`]). Only a raw, unresolved `Path`/`OrderKey::Path` key --
+    /// which carries no identity -- is omitted; after resolution every reference
+    /// is a resolved identifier and is reported.
+    pub fn referenced_properties(&self) -> Vec<PropertyId> {
+        let mut properties = self.predicate.referenced_properties();
         if let Some(order_by) = &self.order_by {
             for item in order_by {
-                // Use first step for column reference (actual PostgreSQL column name)
-                let col = item.path.first().to_string();
-                if !columns.contains(&col) {
-                    columns.push(col);
+                if let OrderKey::Property(identifier) = &item.key {
+                    let id = identifier.property_id();
+                    if !properties.contains(&id) {
+                        properties.push(id);
+                    }
                 }
             }
         }
-        columns
+        properties
+    }
+}
+
+/// The durable property address an expression references, if any. A resolved
+/// [`PropertyPath`] yields its [`PropertyId`]; everything else -- a literal, a
+/// raw (unresolved) `Path`, an expression list -- addresses no durable property.
+/// The `id` pseudo-property resolves to a [`PropertyPath`] carrying
+/// [`PropertyId::Id`], so it IS reported here, not omitted.
+///
+/// A resolved identifier carries a single identity, so the old JSON
+/// first-step-vs-last-step asymmetry (a `Path` reported its root by first
+/// step but its property by last step) no longer arises: `licensing.territory`
+/// resolves to the `licensing` property, subpath `[territory]`, and this returns
+/// that one property's address regardless of the subpath.
+fn expr_referenced_property(expr: &Expr) -> Option<PropertyId> {
+    match expr {
+        Expr::PropertyPath(identifier) => Some(identifier.property_id()),
+        _ => None,
+    }
+}
+
+/// See [`Selection::check`]. Exhaustive over [`Expr`] on purpose: a new variant
+/// that can carry a property reference must decide, here, whether it is
+/// addressable by identity.
+fn expr_check(expr: &Expr) -> Result<(), SelectionError> {
+    match expr {
+        Expr::Path(path) => Err(SelectionError::UnresolvedPath(path.to_string())),
+        Expr::Placeholder => Err(SelectionError::UnpopulatedPlaceholder),
+        Expr::PropertyPath(_) | Expr::Literal(_) => Ok(()),
+        Expr::ExprList(exprs) => exprs.iter().try_for_each(expr_check),
+        Expr::Predicate(predicate) => predicate.check(),
+        Expr::InfixExpr { left, operator: _, right } => {
+            expr_check(left)?;
+            expr_check(right)
+        }
     }
 }
 
@@ -170,49 +277,67 @@ impl Predicate {
         }
     }
 
-    /// Collect all column names referenced in this predicate.
-    /// For JSON paths like `licensing.territory`, returns the column name (`licensing`),
-    /// not the JSON path step (`territory`).
-    pub fn referenced_columns(&self) -> Vec<String> {
-        self.walk(Vec::new(), &mut |mut cols, pred| {
+    /// See [`Selection::check`].
+    pub fn check(&self) -> Result<(), SelectionError> {
+        match self {
+            Predicate::Comparison { left, operator: _, right } => {
+                expr_check(left)?;
+                expr_check(right)
+            }
+            Predicate::And(left, right) | Predicate::Or(left, right) => {
+                left.check()?;
+                right.check()
+            }
+            Predicate::Not(inner) => inner.check(),
+            Predicate::IsNull(expr) => expr_check(expr),
+            Predicate::True | Predicate::False => Ok(()),
+            Predicate::Placeholder => Err(SelectionError::UnpopulatedPlaceholder),
+        }
+    }
+
+    /// Collect the durable addresses of every property referenced in this
+    /// predicate, including the `id` pseudo-property (as [`PropertyId::Id`]).
+    /// Only a raw, unresolved `Path` reference carries no identity and is
+    /// omitted; after resolution every reference is a resolved identifier.
+    /// [`Selection::check`] is what guarantees no such reference reaches an
+    /// engine, so an engine's absence scan sees every property it will emit.
+    pub fn referenced_properties(&self) -> Vec<PropertyId> {
+        self.walk(Vec::new(), &mut |mut properties, pred| {
             match pred {
                 Predicate::Comparison { left, right, .. } => {
                     for expr in [&**left, &**right] {
-                        if let Expr::Path(path) = expr {
-                            // Use first step for column reference (actual PostgreSQL column name)
-                            // For `licensing.territory`, the column is `licensing`
-                            let col = path.first().to_string();
-                            if !cols.contains(&col) {
-                                cols.push(col);
+                        if let Some(property) = expr_referenced_property(expr) {
+                            if !properties.contains(&property) {
+                                properties.push(property);
                             }
                         }
                     }
                 }
                 Predicate::IsNull(expr) => {
-                    if let Expr::Path(path) = &**expr {
-                        let col = path.first().to_string();
-                        if !cols.contains(&col) {
-                            cols.push(col);
+                    if let Some(property) = expr_referenced_property(expr) {
+                        if !properties.contains(&property) {
+                            properties.push(property);
                         }
                     }
                 }
                 _ => {}
             }
-            cols
+            properties
         })
     }
 
-    /// Clones the predicate tree and evaluates comparisons involving missing columns as if they were NULL
-    pub fn assume_null(&self, columns: &[String]) -> Self {
+    /// Clones the predicate tree and evaluates comparisons involving absent
+    /// properties as if they were NULL. Properties are matched by durable
+    /// identity ([`PropertyId`]); a resolved identifier's subpath does not
+    /// change which property is referenced.
+    pub fn assume_null(&self, absent: &[PropertyId]) -> Self {
         match self {
             Predicate::Comparison { left, operator, right } => {
-                // Check if either side is a path whose property is in our null list
-                let has_null_path = match (&**left, &**right) {
-                    (Expr::Path(path), _) | (_, Expr::Path(path)) => columns.contains(&path.property().to_string()),
-                    _ => false,
-                };
+                // Check if either side references a property that is in our absent list.
+                let has_absent =
+                    [&**left, &**right].iter().filter_map(|expr| expr_referenced_property(expr)).any(|property| absent.contains(&property));
 
-                if has_null_path {
+                if has_absent {
                     match operator {
                         // NULL = anything is false
                         ComparisonOperator::Equal => Predicate::False,
@@ -237,23 +362,16 @@ impl Predicate {
                 }
             }
             Predicate::IsNull(expr) => {
-                // If we're explicitly checking for NULL and the path's property is in our null list,
-                // then this evaluates to true
-                match &**expr {
-                    Expr::Path(path) => {
-                        let is_null = columns.contains(&path.property().to_string());
-                        if is_null {
-                            Predicate::True
-                        } else {
-                            Predicate::IsNull(expr.clone())
-                        }
-                    }
+                // An explicit IS NULL check against an absent property is TRUE.
+                // A resolved identifier's subpath does not change its identity.
+                match expr_referenced_property(expr) {
+                    Some(property) if absent.contains(&property) => Predicate::True,
                     _ => Predicate::IsNull(expr.clone()),
                 }
             }
             Predicate::And(left, right) => {
-                let left = left.assume_null(columns);
-                let right = right.assume_null(columns);
+                let left = left.assume_null(absent);
+                let right = right.assume_null(absent);
 
                 // Optimize
                 match (&left, &right) {
@@ -267,8 +385,8 @@ impl Predicate {
                 }
             }
             Predicate::Or(left, right) => {
-                let left = left.assume_null(columns);
-                let right = right.assume_null(columns);
+                let left = left.assume_null(absent);
+                let right = right.assume_null(absent);
 
                 // Optimize
                 match (&left, &right) {
@@ -283,7 +401,7 @@ impl Predicate {
                 }
             }
             Predicate::Not(pred) => {
-                let inner = pred.assume_null(columns);
+                let inner = pred.assume_null(absent);
                 match inner {
                     Predicate::True => Predicate::False,
                     Predicate::False => Predicate::True,
@@ -357,6 +475,8 @@ impl Expr {
             },
             Expr::Literal(lit) => Ok(Expr::Literal(lit)),
             Expr::Path(path) => Ok(Expr::Path(path)),
+            // A resolved PropertyPath is a property reference, not a placeholder; pass through.
+            Expr::PropertyPath(identifier) => Ok(Expr::PropertyPath(identifier)),
             Expr::Predicate(pred) => Ok(Expr::Predicate(pred.populate_recursive(values)?)),
             Expr::InfixExpr { left, operator, right } => Ok(Expr::InfixExpr {
                 left: Box::new(left.populate_recursive(values)?),
@@ -399,30 +519,51 @@ mod tests {
     use super::*;
     use crate::parser::parse_selection;
 
-    fn nullify_columns(input: &str, null_columns: &[&str]) -> Result<String, ParseError> {
-        let selection = parse_selection(input)?;
-        let result = selection.predicate.assume_null(&null_columns.iter().map(|s| s.to_string()).collect::<Vec<_>>());
-        generate_selection_sql(&result, None).map_err(|_| ParseError::InvalidPredicate("SQL generation failed".to_string()))
+    /// A deterministic property id for a name, so a test can name the identity
+    /// it marks absent. `assume_null` keys on identity, not on the name.
+    fn prop_id(name: &str) -> EntityId {
+        let mut bytes = [0u8; 32];
+        let n = name.as_bytes();
+        let len = n.len().min(32);
+        bytes[..len].copy_from_slice(&n[..len]);
+        EntityId::from_bytes(bytes)
+    }
+
+    /// `<name> = 'x'` as a RESOLVED comparison against a registered property.
+    fn cmp(name: &str) -> Predicate {
+        Predicate::Comparison {
+            left: Box::new(Expr::PropertyPath(PropertyPath::registered(prop_id(name), name, vec![]))),
+            operator: ComparisonOperator::Equal,
+            right: Box::new(Expr::Literal(Value::String("x".to_string()))),
+        }
+    }
+
+    /// The absent-property list addressing the named properties by identity.
+    fn absent(names: &[&str]) -> Vec<PropertyId> { names.iter().map(|n| PropertyId::EntityId(prop_id(n))).collect() }
+
+    #[test]
+    fn single_comparison_absent_handling() {
+        // Any comparison against an absent property collapses to FALSE.
+        assert_eq!(cmp("status").assume_null(&absent(&["status"])), Predicate::False);
+        // IS NULL against an absent property is TRUE.
+        let is_null = Predicate::IsNull(Box::new(Expr::PropertyPath(PropertyPath::registered(prop_id("status"), "status", vec![]))));
+        assert_eq!(is_null.assume_null(&absent(&["status"])), Predicate::True);
+        // An unrelated absent property leaves the comparison intact.
+        assert_eq!(cmp("role").assume_null(&absent(&["other"])), cmp("role"));
     }
 
     #[test]
-    fn test_single_comparison_null_handling() {
-        assert_eq!(nullify_columns("status = 'active'", &["status"]).unwrap(), "FALSE");
-        assert_eq!(nullify_columns("age > 30", &["age"]).unwrap(), "FALSE");
-        assert_eq!(nullify_columns("count >= 100", &["count"]).unwrap(), "FALSE");
-        assert_eq!(nullify_columns("name < 'Z'", &["name"]).unwrap(), "FALSE");
-        assert_eq!(nullify_columns("score <= 90", &["score"]).unwrap(), "FALSE");
-        assert_eq!(nullify_columns("status IS NULL", &["status"]).unwrap(), "TRUE");
-        assert_eq!(nullify_columns("role = 'admin'", &["other"]).unwrap(), r#""role" = 'admin'"#);
-    }
-
-    #[test]
-    fn nested_predicate_null_handling() {
-        let input = "alpha = 1 AND (beta = 2 OR charlie = 3)";
-        assert_eq!(nullify_columns(input, &["charlie"]).unwrap(), r#""alpha" = 1 AND "beta" = 2"#);
-        assert_eq!(nullify_columns(input, &["beta", "charlie"]).unwrap(), r#"FALSE"#);
-        assert_eq!(nullify_columns(input, &["alpha"]).unwrap(), r#"FALSE"#);
-        assert_eq!(nullify_columns(input, &["other"]).unwrap(), r#""alpha" = 1 AND ("beta" = 2 OR "charlie" = 3)"#);
+    fn nested_predicate_absent_handling() {
+        // alpha AND (beta OR charlie)
+        let input = Predicate::And(Box::new(cmp("alpha")), Box::new(Predicate::Or(Box::new(cmp("beta")), Box::new(cmp("charlie")))));
+        // charlie absent: (beta OR FALSE) -> beta, so alpha AND beta.
+        assert_eq!(input.assume_null(&absent(&["charlie"])), Predicate::And(Box::new(cmp("alpha")), Box::new(cmp("beta"))));
+        // beta and charlie absent: (FALSE OR FALSE) -> FALSE, so alpha AND FALSE -> FALSE.
+        assert_eq!(input.assume_null(&absent(&["beta", "charlie"])), Predicate::False);
+        // alpha absent: FALSE AND _ -> FALSE.
+        assert_eq!(input.assume_null(&absent(&["alpha"])), Predicate::False);
+        // Unrelated absent property: unchanged.
+        assert_eq!(input.assume_null(&absent(&["other"])), input);
     }
 
     #[test]
@@ -530,6 +671,186 @@ mod tests {
         // Should be unchanged
         assert_eq!(populated, selection.predicate);
     }
+
+    // -- Identifier (resolved property reference) --
+
+    /// A Selection whose predicate compares a resolved registered property
+    /// (id `[7; 32]`) against a literal.
+    fn identifier_selection(name: &str, subpath: Vec<&str>) -> Selection {
+        Selection {
+            predicate: Predicate::Comparison {
+                left: Box::new(Expr::PropertyPath(PropertyPath::registered(
+                    EntityId::from_bytes([7u8; 32]),
+                    name,
+                    subpath.into_iter().map(|s| s.to_string()).collect(),
+                ))),
+                operator: ComparisonOperator::Equal,
+                right: Box::new(Expr::Literal(Value::String("US".to_string()))),
+            },
+            order_by: None,
+            limit: None,
+        }
+    }
+
+    /// The durable identity of the property [`identifier_selection`] builds.
+    fn identifier_selection_id() -> PropertyId { PropertyId::EntityId(EntityId::from_bytes([7u8; 32])) }
+
+    /// `left = 'US'`, for whatever operand is handed in.
+    fn cmp_with(left: Expr) -> Predicate {
+        Predicate::Comparison {
+            left: Box::new(left),
+            operator: ComparisonOperator::Equal,
+            right: Box::new(Expr::Literal(Value::String("US".to_string()))),
+        }
+    }
+
+    fn raw_path(name: &str) -> Expr { Expr::Path(PathExpr::simple(name)) }
+
+    #[test]
+    fn check_passes_every_resolved_identity_arm() {
+        // All three PropertyId arms are addressable by identity, so all three pass.
+        for left in [
+            Expr::PropertyPath(PropertyPath::registered(EntityId::from_bytes([7u8; 32]), "status", vec![])),
+            Expr::PropertyPath(PropertyPath::system(SystemProperty::Label, vec![])),
+            Expr::PropertyPath(PropertyPath::id()),
+        ] {
+            let selection = Selection { predicate: cmp_with(left), order_by: None, limit: None };
+            assert!(selection.check().is_ok());
+        }
+        // A subpath into a resolved property is still addressable by identity.
+        assert!(identifier_selection("licensing", vec!["territory"]).check().is_ok());
+    }
+
+    #[test]
+    fn check_rejects_raw_path_and_names_it() {
+        let selection = Selection { predicate: cmp_with(raw_path("collection")), order_by: None, limit: None };
+        let err = selection.check().expect_err("a raw path carries no identity");
+        assert!(matches!(&err, SelectionError::UnresolvedPath(p) if p == "collection"), "got {err:?}");
+    }
+
+    #[test]
+    fn check_recurses_through_every_nesting_form() {
+        // Each form buries the same raw path one level down. A check that fails
+        // to recurse would pass these, which is precisely the leak it exists to
+        // catch, so assert the walk actually reaches them.
+        let buried = cmp_with(raw_path("collection"));
+        let forms = [
+            Predicate::And(Box::new(Predicate::True), Box::new(buried.clone())),
+            Predicate::Or(Box::new(Predicate::True), Box::new(buried.clone())),
+            Predicate::Not(Box::new(buried.clone())),
+            Predicate::IsNull(Box::new(raw_path("collection"))),
+            cmp_with(Expr::ExprList(vec![raw_path("collection")])),
+            cmp_with(Expr::Predicate(buried.clone())),
+            cmp_with(Expr::InfixExpr {
+                left: Box::new(raw_path("collection")),
+                operator: InfixOperator::Add,
+                right: Box::new(Expr::Literal(Value::I32(1))),
+            }),
+        ];
+        for predicate in forms {
+            let selection = Selection { predicate: predicate.clone(), order_by: None, limit: None };
+            assert!(matches!(selection.check(), Err(SelectionError::UnresolvedPath(_))), "did not recurse into {predicate:?}");
+        }
+    }
+
+    #[test]
+    fn check_rejects_unpopulated_placeholders() {
+        // A placeholder survives resolution untouched, so an unpopulated one is
+        // its own class of leak: it carries no value to compare against.
+        for predicate in [Predicate::Placeholder, cmp_with(Expr::Placeholder)] {
+            let selection = Selection { predicate, order_by: None, limit: None };
+            assert!(matches!(selection.check(), Err(SelectionError::UnpopulatedPlaceholder)));
+        }
+    }
+
+    #[test]
+    fn check_covers_order_by_not_just_the_predicate() {
+        let resolved = cmp_with(Expr::PropertyPath(PropertyPath::id()));
+        let order_by = |key| Selection {
+            predicate: resolved.clone(),
+            order_by: Some(vec![OrderByItem { key, direction: OrderDirection::Asc }]),
+            limit: None,
+        };
+
+        assert!(order_by(OrderKey::Property(PropertyPath::system(SystemProperty::Name, vec![]))).check().is_ok());
+
+        let unresolved = order_by(OrderKey::Path(PathExpr::simple("name")));
+        let check_error = unresolved.check().expect_err("a raw sort key carries no identity");
+        assert!(matches!(&check_error, SelectionError::UnresolvedPath(p) if p == "name"), "got {check_error:?}");
+
+        let assume_error = unresolved.assume_null(&[]).expect_err("absence folding must also reject a raw sort key");
+        assert!(matches!(&assume_error, SelectionError::UnresolvedPath(p) if p == "name"), "got {assume_error:?}");
+    }
+
+    #[test]
+    fn identifier_selection_bincode_roundtrip() {
+        // Simple identifier and a JSON-subpath identifier both survive a bincode round-trip.
+        for selection in [identifier_selection("name", vec![]), identifier_selection("licensing", vec!["territory"])] {
+            let bytes = bincode::serialize(&selection).expect("serialize");
+            let decoded: Selection = bincode::deserialize(&bytes).expect("deserialize");
+            assert_eq!(decoded, selection);
+        }
+    }
+
+    #[test]
+    fn resolved_order_by_bincode_roundtrip() {
+        let property = EntityId::from_bytes([9u8; 32]);
+        let mut selection = identifier_selection("score", vec![]);
+        selection.order_by = Some(vec![OrderByItem {
+            key: OrderKey::Property(PropertyPath::registered(property, "score", vec![])),
+            direction: OrderDirection::Desc,
+        }]);
+
+        let bytes = bincode::serialize(&selection).expect("serialize");
+        let decoded: Selection = bincode::deserialize(&bytes).expect("deserialize");
+        assert_eq!(decoded, selection);
+    }
+
+    #[test]
+    fn identifier_selection_json_roundtrip() {
+        for selection in [identifier_selection("name", vec![]), identifier_selection("licensing", vec!["rights", "holder"])] {
+            let json = serde_json::to_string(&selection).expect("to_json");
+            let decoded: Selection = serde_json::from_str(&json).expect("from_json");
+            assert_eq!(decoded, selection);
+        }
+    }
+
+    #[test]
+    fn identifier_assume_null_keys_on_identity_not_subpath() {
+        // A resolved identifier carries a single identity; its subpath does NOT
+        // change which property it references. So a JSON-subpath identifier
+        // collapses when the PROPERTY is absent, and is untouched when some
+        // unrelated identity is absent. This is the whole point of the
+        // resolution pass: identity is fixed once, removing the old Path
+        // first-vs-last-step ambiguity.
+        let id_pred = identifier_selection("licensing", vec!["territory"]).predicate;
+
+        // The property itself absent -> collapse to False.
+        assert_eq!(id_pred.assume_null(&[identifier_selection_id()]), Predicate::False);
+        // Some unrelated identity absent (e.g. a would-be subpath step) -> unchanged.
+        assert_eq!(id_pred.assume_null(&[PropertyId::EntityId(EntityId::from_bytes([8u8; 32]))]), id_pred);
+    }
+
+    #[test]
+    fn identifier_referenced_properties_returns_identity() {
+        // referenced_properties reports the resolved identity, regardless of subpath.
+        let id_sel = identifier_selection("licensing", vec!["territory"]);
+        assert_eq!(id_sel.referenced_properties(), vec![identifier_selection_id()]);
+
+        // A simple identifier reports the same identity shape.
+        assert_eq!(identifier_selection("status", vec![]).referenced_properties(), vec![identifier_selection_id()]);
+    }
+
+    #[test]
+    fn identifier_display_matches_path() {
+        // Display renders the resolved-from label then dotted subpath, consistent with PathExpr.
+        let ident = PropertyPath::registered(EntityId::from_bytes([1u8; 32]), "licensing", vec!["territory".to_string()]);
+        assert_eq!(ident.to_string(), "licensing.territory");
+        assert_eq!(ident.to_string(), PathExpr { steps: vec!["licensing".to_string(), "territory".to_string()] }.to_string());
+
+        let simple = PropertyPath::registered(EntityId::from_bytes([1u8; 32]), "status", vec![]);
+        assert_eq!(simple.to_string(), "status");
+    }
 }
 
 // From implementations for single values that wrap them in Expr::Literal
@@ -558,11 +879,11 @@ impl From<Value> for Expr {
 }
 
 impl From<EntityId> for Expr {
-    fn from(id: EntityId) -> Expr { Expr::Literal(Value::EntityId(id)) }
+    fn from(id: EntityId) -> Self { Expr::Literal(Value::EntityId(id)) }
 }
 
 impl From<&EntityId> for Expr {
-    fn from(id: &EntityId) -> Expr { Expr::Literal(Value::EntityId(*id)) }
+    fn from(id: &EntityId) -> Self { Expr::Literal(Value::EntityId(*id)) }
 }
 
 // These create Expr::ExprList for use in IN clauses

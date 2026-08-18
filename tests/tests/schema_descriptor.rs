@@ -203,9 +203,10 @@ async fn catalog_values(
     use ankurah::core::property::backend::{LWWBackend, PropertyBackend};
     let state = node.collections.get(&proto::CollectionId::fixed_name(collection)).await?.get_state(id).await?;
     let buffer = state.payload.state.state_buffers.0.get("lww").expect("catalog entities are LWW").clone();
-    // Catalog collections are name-keyed at the backend layer (the bootstrap
-    // exemption), so the values are already keyed by their registered names.
-    Ok(LWWBackend::from_state_buffer(&buffer)?.property_values())
+    // Catalog fields are closed system properties; their id renderings ARE
+    // their registered names, so rendering the keys gives the name map the
+    // assertions read.
+    Ok(LWWBackend::from_state_buffer(&buffer)?.property_values().into_iter().map(|(k, v)| (k.to_string(), v)).collect())
 }
 
 /// Build a RegisterSchema request from `Model::descriptor()` via

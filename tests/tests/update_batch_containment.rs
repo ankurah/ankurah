@@ -13,9 +13,9 @@ use std::sync::Arc;
 use common::{Record, RecordView};
 
 /// Forge a Record LWW event setting `title`, parented on the given clock.
-fn forge_title_event(entity_id: proto::EntityId, parent: proto::Clock, title: &str) -> proto::Event {
+fn forge_title_event(title_prop: proto::PropertyId, entity_id: proto::EntityId, parent: proto::Clock, title: &str) -> proto::Event {
     let backend = LWWBackend::new();
-    backend.set("title".into(), Some(Value::String(title.to_owned())));
+    backend.set(title_prop, Some(Value::String(title.to_owned())));
     let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
     proto::Event::update(
         Record::collection(),
@@ -64,15 +64,18 @@ async fn test_event_only_multi_event_wire_order_is_untrusted() -> Result<()> {
     let view = ctx_c.get::<RecordView>(rec_id).await?;
     assert_eq!(view.title().unwrap(), "t0");
 
+    let title_prop = common::resolved_prop(&server, Record::descriptor(), "title");
+    let artist_prop = common::resolved_prop(&server, Record::descriptor(), "artist");
+
     // Forge parent (writes artist) then child (writes title), and put the
     // CHILD first on the wire.
-    let ev_parent = forge_title_event(rec_id, view.entity().head().clone(), "ignored");
+    let ev_parent = forge_title_event(title_prop, rec_id, view.entity().head().clone(), "ignored");
     // rebuild parent event to write artist instead of title
     let ev_parent = {
         use ankurah::core::property::backend::{lww::LWWBackend, PropertyBackend};
         use ankurah::core::value::Value;
         let backend = LWWBackend::new();
-        backend.set("artist".into(), Some(Value::String("artist-p1".to_owned())));
+        backend.set(artist_prop, Some(Value::String("artist-p1".to_owned())));
         let ops = backend.to_operations().unwrap().expect("ops");
         proto::Event::update(
             ev_parent.collection.clone(),
@@ -82,7 +85,7 @@ async fn test_event_only_multi_event_wire_order_is_untrusted() -> Result<()> {
             proto::OperationSet::from_backends(std::collections::BTreeMap::from([("lww".to_owned(), ops)])),
         )
     };
-    let ev_child = forge_title_event(rec_id, proto::Clock::from(vec![ev_parent.id()]), "t-child");
+    let ev_child = forge_title_event(title_prop, rec_id, proto::Clock::from(vec![ev_parent.id()]), "t-child");
     let (id_parent, id_child) = (ev_parent.id(), ev_child.id());
 
     let item = proto::SubscriptionUpdateItem {
@@ -146,13 +149,15 @@ async fn test_event_only_unknown_entity_does_not_poison_batch() -> Result<()> {
     assert_eq!(view_a.title().unwrap(), "a0");
     assert_eq!(view_b.title().unwrap(), "b0");
 
+    let title_prop = common::resolved_prop(&server, Record::descriptor(), "title");
+
     // Forge the batch: valid events for A and B (parented on their current
     // heads), and a non-creation event for an entity the client knows nothing
     // about in the middle.
-    let ev_a = forge_title_event(a_id, view_a.entity().head().clone(), "a1");
-    let ev_b = forge_title_event(b_id, view_b.entity().head().clone(), "b1");
+    let ev_a = forge_title_event(title_prop, a_id, view_a.entity().head().clone(), "a1");
+    let ev_b = forge_title_event(title_prop, b_id, view_b.entity().head().clone(), "b1");
     let unknown_id = proto::EntityId::random();
-    let ev_unknown = forge_title_event(unknown_id, proto::Clock::from(vec![proto::EventId::from_bytes([7u8; 32])]), "ghost");
+    let ev_unknown = forge_title_event(title_prop, unknown_id, proto::Clock::from(vec![proto::EventId::from_bytes([7u8; 32])]), "ghost");
     let (id_ev_a, id_ev_b) = (ev_a.id(), ev_b.id());
 
     let update = proto::NodeUpdate {

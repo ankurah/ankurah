@@ -693,3 +693,20 @@ pub async fn start_test_server() -> anyhow::Result<(Node<SledStorageEngine, Perm
 
     Err(anyhow::anyhow!("Failed to start test server after {} attempts. Last error: {:?}", MAX_PORT_RETRIES, last_error))
 }
+
+/// The durable identity `name` resolved to on `node`: the descriptor-cell
+/// read under the node's current epoch. Forging tests use this so raw
+/// operations they write land under the identity typed accessors read back.
+#[allow(dead_code)]
+pub fn resolved_prop<SE, PA>(
+    node: &ankurah::Node<SE, PA>,
+    schema: &'static ankurah::core::schema::ModelStructDescriptor,
+    name: &str,
+) -> ankurah::proto::PropertyId
+where
+    SE: ankurah::storage::StorageEngine + Send + Sync + 'static,
+    PA: ankurah::policy::PolicyAgent + Send + Sync + 'static,
+{
+    let epoch = node.system.schema_epoch().expect("a ready system");
+    schema.field_by_name(name).expect("a compiled field").resolved.get(epoch).expect("field resolved under the current epoch")
+}

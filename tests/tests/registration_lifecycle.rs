@@ -13,10 +13,11 @@
 //!      no durable peer fails at create, while an exact schema whose every
 //!      field is already bound compatibly keeps writing offline;
 //!   c. explicit `register_model::<M>()` propagates every failure and is idempotent (heads
-//!      unchanged on repeat), and fails offline without latching;
+//!      unchanged on repeat), and fails offline leaving the descriptor
+//!      unresolved;
 //!   d. predicate queries and typed direct gets register at first use;
-//!   e. hard_reset flushes the map and the ensured latch (allocations
-//!      belong to one system);
+//!   e. hard_reset flushes the map and steps the epoch past every
+//!      resolved cell (allocations belong to one system);
 //!   f. fail-loud offline read: with no durable peer, a fetch over a
 //!      never-registered collection errs loudly instead of answering empty;
 //!   g. a custom Property type's declared VALUE_TYPE flows through the
@@ -34,6 +35,13 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 type TestNode = Node<SledStorageEngine, PermissiveAgent>;
+
+/// Whether this compiled shape's identity cells are resolved for the node's
+/// current schema epoch -- the registered-right-now probe, read from the
+/// descriptor itself.
+fn schema_registered(node: &TestNode, schema: &'static ankurah::core::schema::ModelStructDescriptor) -> bool {
+    node.system.schema_epoch().is_some_and(|epoch| schema.resolved.get(epoch).is_some())
+}
 
 // Distinct models per behavior so the collections never collide.
 #[derive(Model, Debug, Serialize, Deserialize)]
@@ -210,7 +218,7 @@ async fn offline_create_unregistered_is_strict_registered_proceeds() -> anyhow::
         assert!(msg.contains("never been registered") && msg.contains("'gadget'"), "actionable strict error, got: {msg}");
     }
     assert!(resolve_by_collection(&server, "gadget", "name").is_none(), "nothing reached the durable");
-    assert!(!client.catalog.is_ensured("gadget"), "a strict failure must not latch");
+    assert!(!schema_registered(&client, Gadget::descriptor()), "a strict failure must leave the descriptor unresolved");
 
     // An explicit model id is part of the exact binding. The ordinary Widget
     // model and its compatible fields must not satisfy a declaration bound to
@@ -303,7 +311,7 @@ async fn predicate_read_path_registers_at_first_use() -> anyhow::Result<()> {
     // The predicate read durably registered and latched the collection.
     let tag_id = resolve_by_collection(&server, "doohickey", "tag");
     assert!(tag_id.is_some(), "first-use registration fed the catalog");
-    assert!(server.catalog.is_ensured("doohickey"), "first-use registration latches");
+    assert!(schema_registered(&server, Doohickey::descriptor()), "first-use registration resolves the descriptor");
 
     // The explicit register is an idempotent no-op against the same rows.
     ctx.register_model::<Doohickey>().await?;
@@ -347,7 +355,7 @@ async fn offline_read_unregistered_fails_loud() -> anyhow::Result<()> {
         ctx.fetch::<ContraptionView>("state = 'x'").await.expect_err("offline fetch over a never-registered collection must fail loud");
     let msg = err.to_string();
     assert!(msg.contains("never been registered") && msg.contains("contraption"), "loud error naming the collection, got: {msg}");
-    assert!(!client.catalog.is_ensured("contraption"), "a failed first-use registration must not latch");
+    assert!(!schema_registered(&client, Contraption::descriptor()), "a failed first-use registration must leave the descriptor unresolved");
 
     Ok(())
 }
@@ -376,13 +384,13 @@ async fn direct_get_registers_before_edit() -> anyhow::Result<()> {
     let ctx_b = client_b.context_async(DEFAULT_CONTEXT).await;
 
     let view = ctx_b.get::<ContraptionView>(id).await?;
-    assert!(client_b.catalog.is_ensured("contraption"), "a typed direct id get must admit its exact schema before decoding");
+    assert!(schema_registered(&client_b, Contraption::descriptor()), "a typed direct id get must resolve its exact schema before decoding");
 
     let trx = ctx_b.begin();
-    view.edit(&trx)?.state().replace("polished")?;
+    view.edit(&trx)?.state()?.replace("polished")?;
     trx.commit().await?;
 
-    assert!(client_b.catalog.is_ensured("contraption"), "the admitted binding remains available through the edit-only commit");
+    assert!(schema_registered(&client_b, Contraption::descriptor()), "the resolved binding remains available through the edit-only commit");
     Ok(())
 }
 
@@ -445,7 +453,7 @@ async fn offline_register_is_strict_reconnect_proceeds() -> anyhow::Result<()> {
     let err = ctx.register_model::<Gadget>().await.expect_err("offline register of an unregistered collection must fail");
     assert!(err.to_string().contains("gadget"), "actionable strict error naming the collection, got: {err}");
     assert!(resolve_by_collection(&server, "gadget", "name").is_none(), "nothing reached the durable");
-    assert!(!client.catalog.is_ensured("gadget"), "a strict failure must not latch");
+    assert!(!schema_registered(&client, Gadget::descriptor()), "a strict failure must leave the descriptor unresolved");
 
     // RECONNECT: the same register now forwards, allocates, and latches.
     let _conn2 = LocalProcessConnection::new(&server, &client).await?;
@@ -457,7 +465,7 @@ async fn offline_register_is_strict_reconnect_proceeds() -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     ctx.register_model::<Gadget>().await?;
-    assert!(client.catalog.is_ensured("gadget"), "the forwarded registration latches on ack");
+    assert!(schema_registered(&client, Gadget::descriptor()), "the forwarded registration resolves on ack");
     let name_id = wait_resolve(&server, "gadget", "name").await.expect("durable allocates gadget.name after reconnect");
     assert_eq!(
         resolve_by_collection(&client, "gadget", "name"),
@@ -478,12 +486,12 @@ async fn hard_reset_clears_ensured_and_map() -> anyhow::Result<()> {
 
     ctx.register_model::<Gizmo>().await?;
     wait_resolve(&server, "gizmo", "title").await.expect("gizmo resolves before reset");
-    assert!(server.catalog.is_ensured("gizmo"));
+    assert!(schema_registered(&server, Gizmo::descriptor()));
 
     server.system.hard_reset().await?;
 
     assert!(resolve_by_collection(&server, "gizmo", "title").is_none(), "map flushed after reset");
-    assert!(!server.catalog.is_ensured("gizmo"), "ensured latch flushed after reset");
+    assert!(!schema_registered(&server, Gizmo::descriptor()), "descriptor unreadable after reset (the epoch moved on)");
     assert_eq!(server.catalog.counts(), (0, 0, 0), "catalog map empty after reset");
 
     Ok(())

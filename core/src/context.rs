@@ -57,10 +57,23 @@ pub trait TContext {
         schema: &'static crate::schema::ModelStructDescriptor,
     ) -> Result<proto::ModelId, crate::schema::registration::RegistrationError>;
 
+    /// Resolve a typed selection's property names through the compiled
+    /// declaration's descriptor cells (catalog fallback for names the
+    /// struct does not carry), and canonicalize its comparison values.
+    /// After the registration gate the cells are the admitted binding, so
+    /// a display-name change cannot re-aim a typed query.
+    fn resolve_selection_with_descriptor(
+        &self,
+        schema: &'static crate::schema::ModelStructDescriptor,
+        selection: ankql::ast::Selection,
+    ) -> Result<ankql::ast::Selection, RetrievalError>;
+
     fn node_id(&self) -> proto::EntityId;
     /// This node's system root entity id, which every non-root genesis binds
     /// into its own id. `None` before the node has created or joined a system.
     fn system_id(&self) -> Option<proto::EntityId>;
+    /// This node's current schema epoch. `None` before a system is ready.
+    fn schema_epoch(&self) -> Option<crate::schema::SchemaEpoch>;
     /// Insert the resident (still empty) entity under the id `genesis`
     /// derived, and return the transaction entity whose baseline is that
     /// genesis. This is what makes the id available when `create()` returns.
@@ -89,8 +102,17 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         self.node.catalog.ensure_schema_for_use(&self.sessions.write_credential()?, schema).await
     }
 
+    fn resolve_selection_with_descriptor(
+        &self,
+        schema: &'static crate::schema::ModelStructDescriptor,
+        selection: ankql::ast::Selection,
+    ) -> Result<ankql::ast::Selection, RetrievalError> {
+        self.node.catalog.resolve_selection_with_descriptor(schema, selection)
+    }
+
     fn node_id(&self) -> proto::EntityId { self.node.id }
     fn system_id(&self) -> Option<proto::EntityId> { self.node.system.root_id() }
+    fn schema_epoch(&self) -> Option<crate::schema::SchemaEpoch> { self.node.system.schema_epoch() }
     fn create_transaction_entity(
         &self,
         collection: proto::CollectionId,
@@ -359,6 +381,8 @@ impl Context {
         // answering empty).
         self.0.ensure_registered(R::Model::descriptor()).await?;
         let collection_id = R::Model::collection();
+        let mut args = args;
+        args.selection = self.0.resolve_selection_with_descriptor(R::Model::descriptor(), args.selection)?;
 
         let entities = self.0.fetch_entities(&collection_id, args).await?;
 
@@ -375,8 +399,9 @@ impl Context {
     /// Subscribe to changes in entities matching a selection
     pub fn query<R>(&self, args: impl TryInto<MatchArgs, Error = impl Into<RetrievalError>>) -> Result<LiveQuery<R>, RetrievalError>
     where R: View {
-        let args: MatchArgs = args.try_into().map_err(|e| e.into())?;
+        let mut args: MatchArgs = args.try_into().map_err(|e| e.into())?;
         use crate::model::Model;
+        args.selection = self.0.resolve_selection_with_descriptor(R::Model::descriptor(), args.selection)?;
         Ok(self.0.query(R::Model::collection(), args)?.map::<R>())
     }
 
@@ -465,8 +490,10 @@ where
 
         args.selection.predicate = self.node.policy_agent.filter_predicate(&cdata, collection_id, args.selection.predicate)?;
 
-        // Resolve types in the AST (converts literals for JSON path comparisons)
-        args.selection = self.node.type_resolver.resolve_selection_types(args.selection);
+        // Bind every property name (the caller's and the policy's alike) to
+        // its durable identity and canonicalize comparison values; a typed
+        // entry's already-resolved selection passes through untouched.
+        args.selection = self.node.catalog.resolve_selection(collection_id, args.selection)?;
 
         // TODO implement cached: true
         if !self.node.durable {

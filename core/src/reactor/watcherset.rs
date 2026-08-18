@@ -1,10 +1,34 @@
 use crate::reactor::candidate_changes::CandidateChanges;
 use crate::reactor::comparison_index::ComparisonIndex;
-use crate::reactor::property_path::PropertyPath;
 use crate::reactor::{AbstractEntity, ReactorSubscriptionId};
+use crate::value::Value;
+use ankql::ast::PropertyPath;
 use ankurah_proto as proto;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+
+/// Extract the value a watcher key compares against: the property's value by
+/// durable identity, then the identifier's JSON sub-path within it. JSON
+/// leaves stay wrapped as `Value::Json`, matching how comparison-index
+/// literals are stored after origin-side canonicalization.
+fn extract_value<E: AbstractEntity>(identifier: &PropertyPath, entity: &E) -> Option<Value> {
+    let root_value = E::value(entity, &identifier.property_id())?;
+    if identifier.subpath.is_empty() {
+        return Some(root_value);
+    }
+    let json = match root_value {
+        Value::Json(json) => json,
+        Value::Binary(bytes) => serde_json::from_slice(&bytes).ok()?,
+        // Can't traverse into non-JSON types
+        _ => return None,
+    };
+    let mut current = &json;
+    for key in &identifier.subpath {
+        current = current.get(key)?;
+    }
+    // Keep as Value::Json to match index keys
+    Some(Value::Json(current.clone()))
+}
 
 pub struct WatcherSet {
     /// Each property path has a ComparisonIndex so we can quickly find all subscriptions that care if a given value CHANGES (creation and deletion also count as change)
@@ -33,7 +57,7 @@ impl WatcherSet {
         for ((collection_id, property_path), index_ref) in &self.index_watchers {
             if *collection_id == AbstractEntity::collection(entity) {
                 // Extract value at the property path (handles both simple fields and JSON paths)
-                if let Some(value) = property_path.extract_value(entity) {
+                if let Some(value) = extract_value(property_path, entity) {
                     for (subscription_id, query_id) in index_ref.find_matching(value) {
                         candidates_by_sub
                             .entry(subscription_id)
@@ -168,13 +192,14 @@ impl WatcherSet {
         use ankql::ast::{Expr, Predicate};
         match predicate {
             Predicate::Comparison { left, operator, right } => {
-                if let (Expr::Path(path), Expr::Literal(literal)) | (Expr::Literal(literal), Expr::Path(path)) = (&**left, &**right) {
-                    // Use the full path for indexing.
-                    // For simple paths like `name`, this is just "name".
-                    // For JSON paths like `context.task_id`, this is "context.task_id".
-                    // accumulate_interested_watchers will extract the value at this path.
-                    let property_path = PropertyPath::from_path(path);
-                    let index = self.index_watchers.entry((collection_id.clone(), property_path)).or_default();
+                if let (Expr::PropertyPath(identifier), Expr::Literal(literal)) | (Expr::Literal(literal), Expr::PropertyPath(identifier)) =
+                    (&**left, &**right)
+                {
+                    // Index on the resolved identity plus its JSON sub-path.
+                    // Identity-keyed watchers stay attached across display-name
+                    // changes; accumulate_interested_watchers extracts the
+                    // value at this identifier.
+                    let index = self.index_watchers.entry((collection_id.clone(), identifier.clone())).or_default();
 
                     match op {
                         WatcherOp::Add => {

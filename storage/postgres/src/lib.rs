@@ -58,7 +58,9 @@ impl Postgres {
             match char {
                 char if char.is_alphanumeric() => {}
                 char if char.is_numeric() => {}
-                '_' | '.' | ':' => {}
+                // '-' appears in property-id renderings (URL-safe base64),
+                // which name materialized columns; always emitted quoted.
+                '_' | '.' | ':' | '-' => {}
                 _ => return false,
             }
         }
@@ -367,11 +369,15 @@ impl StorageCollection for PostgresBucket {
         let mut materialized: Vec<(String, Option<PGValue>)> = Vec::new();
         let mut seen_properties = std::collections::HashSet::new();
 
-        // Process property values directly from state buffers
+        // Process property values directly from state buffers. Columns are
+        // named by the property id's rendering (raw identity vocabulary;
+        // friendly physical naming arrives with the engine-side catalog
+        // resolver).
         for (name, state_buffer) in state.payload.state.state_buffers.iter() {
             let backend = backend_from_string(name, Some(state_buffer))?;
-            for (column, value) in backend.property_values() {
-                if !seen_properties.insert(column.clone()) {
+            for (property, value) in backend.property_values() {
+                let column = property.to_string();
+                if !seen_properties.insert(property.clone()) {
                     // Skip if property already seen in another backend
                     // TODO: this should cause all (or subsequent?) fields with the same name
                     // to be suffixed with the property id when we have property ids
@@ -533,9 +539,10 @@ impl StorageCollection for PostgresBucket {
         // If we see columns not in our cache, refresh it first (they might have been added).
         // TODO: Once property metadata is in the system catalog, we can create missing columns
         // on-demand here instead of refreshing the cache each time we see unknown columns.
-        let referenced = selection.referenced_columns();
+        let referenced: Vec<(ankql::ast::PropertyId, String)> =
+            selection.referenced_properties().into_iter().map(|p| (p, p.to_string())).collect();
         let cached = self.existing_columns();
-        let unknown_to_cache: Vec<&String> = referenced.iter().filter(|col| !cached.contains(col)).collect();
+        let unknown_to_cache: Vec<&String> = referenced.iter().map(|(_, col)| col).filter(|col| !cached.contains(*col)).collect();
 
         // Refresh cache if we see columns we haven't seen before
         if !unknown_to_cache.is_empty() {
@@ -545,13 +552,14 @@ impl StorageCollection for PostgresBucket {
 
         // Now check with (possibly refreshed) cache - columns still missing truly don't exist
         let existing = self.existing_columns();
-        let missing: Vec<String> = referenced.into_iter().filter(|col| !existing.contains(col)).collect();
+        let missing: Vec<ankql::ast::PropertyId> =
+            referenced.into_iter().filter(|(_, col)| !existing.contains(col)).map(|(p, _)| p).collect();
 
         let effective_selection = if missing.is_empty() {
             selection.clone()
         } else {
             debug!("PostgresBucket({}).fetch_states: Columns {:?} don't exist, treating as NULL", self.collection_id, missing);
-            selection.assume_null(&missing)
+            selection.assume_null(&missing).map_err(|e| RetrievalError::StorageError(Box::new(e)))?
         };
 
         // Split predicate into parts we can pushdown to PostgreSQL vs post-filter in Rust

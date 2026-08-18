@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use ankql::ast::PropertyId;
 use ankurah_core::entity::TemporaryEntity;
 use ankurah_core::error::{MutationError, RetrievalError};
 use ankurah_core::property::backend::backend_from_string;
@@ -51,7 +52,9 @@ impl SqliteStorageEngine {
         for char in collection.chars() {
             match char {
                 c if c.is_alphanumeric() => {}
-                '_' | '.' | ':' => {}
+                // '-' appears in property-id renderings (URL-safe base64),
+                // which name materialized columns; always emitted quoted.
+                '_' | '.' | ':' | '-' => {}
                 _ => return false,
             }
         }
@@ -275,10 +278,14 @@ impl StorageCollection for SqliteBucket {
         let mut materialized: Vec<(String, Option<SqliteValue>, bool)> = Vec::new(); // (name, value, is_jsonb)
         let mut seen_properties = std::collections::HashSet::new();
 
+        // Columns are named by the property id's rendering (raw identity
+        // vocabulary; friendly physical naming arrives with the engine-side
+        // catalog resolver).
         for (name, state_buffer) in state.payload.state.state_buffers.iter() {
             let backend = backend_from_string(name, Some(state_buffer))?;
-            for (column, value) in backend.property_values() {
-                if !seen_properties.insert(column.clone()) {
+            for (property, value) in backend.property_values() {
+                let column = property.to_string();
+                if !seen_properties.insert(property.clone()) {
                     continue;
                 }
 
@@ -445,9 +452,9 @@ impl StorageCollection for SqliteBucket {
 
         // Pre-filter selection based on cached schema to avoid undefined column errors.
         // If we see columns not in our cache, refresh it first (they might have been added).
-        let referenced = selection.referenced_columns();
+        let referenced: Vec<(PropertyId, String)> = selection.referenced_properties().into_iter().map(|p| (p, p.to_string())).collect();
         let cached = self.existing_columns();
-        let unknown_to_cache: Vec<&String> = referenced.iter().filter(|col| !cached.contains(col)).collect();
+        let unknown_to_cache: Vec<&String> = referenced.iter().map(|(_, col)| col).filter(|col| !cached.contains(*col)).collect();
 
         // Refresh cache if we see columns we haven't seen before
         if !unknown_to_cache.is_empty() {
@@ -457,20 +464,16 @@ impl StorageCollection for SqliteBucket {
 
         // Now check with (possibly refreshed) cache - columns still missing truly don't exist
         let existing = self.existing_columns();
-        let missing: Vec<String> = referenced.into_iter().filter(|col| !existing.contains(col)).collect();
+        let missing: Vec<PropertyId> = referenced.into_iter().filter(|(_, col)| !existing.contains(col)).map(|(p, _)| p).collect();
 
         let effective_selection = if missing.is_empty() {
             selection.clone()
         } else {
             debug!("SqliteBucket({}).fetch_states: Columns {:?} don't exist, treating as NULL", self.collection_id, missing);
-            // Note: assume_null() has a limitation with JSON paths - it checks path.property()
-            // (last step) instead of path.first() (column name). This means for paths like
-            // "licensing.territory", if "licensing" is missing, assume_null() won't match
-            // because it checks "territory". However, this should be rare since columns
-            // are created on-demand during set_state. If it happens, assume_null() will
-            // leave the predicate unchanged, which may cause the query to fail.
-            // TODO: Fix assume_null() in ankql to check path.first() for multi-step paths.
-            selection.assume_null(&missing)
+            // Absence folding keys on the resolved property identity, so a
+            // sub-path reference collapses with its missing root column (the
+            // old last-step-vs-first-step limitation no longer arises).
+            selection.assume_null(&missing).map_err(|e| RetrievalError::StorageError(Box::new(e)))?
         };
 
         // Split predicate for pushdown

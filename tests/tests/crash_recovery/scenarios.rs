@@ -310,7 +310,7 @@ async fn child_mid_merge() -> Result<()> {
     // B: first edit (parent A). Head becomes {B}.
     let a_view = ctx.get::<AlbumView>(album).await?;
     let t1 = ctx.begin();
-    a_view.edit(&t1)?.name().overwrite(0, 5, "Merge-B")?;
+    a_view.edit(&t1)?.name()?.overwrite(0, 5, "Merge-B")?;
     t1.commit().await?;
 
     // Record the pre-merge head (should be {B}) so the parent can compare.
@@ -323,7 +323,7 @@ async fn child_mid_merge() -> Result<()> {
     // taking a fresh transaction on the pre-B view snapshot). Committing C merges
     // B and C. Arm the crash so the merged set_state aborts.
     let t2 = ctx.begin();
-    a_view.edit(&t2)?.year().overwrite(0, 4, "2099")?;
+    a_view.edit(&t2)?.year()?.overwrite(0, 4, "2099")?;
     engine.arm();
     t2.commit().await?;
 
