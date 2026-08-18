@@ -1,24 +1,27 @@
-//! The resolved property reference of the AnkQL AST: a durable
-//! [`PropertyId`] plus any JSON sub-path, produced by
-//! [`crate::ast::Selection::resolve_names`] from a source-level path.
+//! A resolved property reference: a durable [`PropertyId`] plus any JSON
+//! sub-path into that property's value.
+//!
+//! This lives beside [`PropertyId`] rather than in the query crate because
+//! every layer downstream of name resolution addresses a property this way --
+//! the query AST's resolved stage, the reactor's watcher keys, a storage
+//! engine's durable property map -- and none of them needs the parser.
 
-use ankurah_core_types::{EntityId, PropertyId, SystemProperty};
 use serde::{Deserialize, Serialize};
+
+use crate::{EntityId, PropertyId, SystemProperty};
 
 /// A property reference resolved against the catalog: the `id`
 /// pseudo-property, a registered property's stable entity id, or a system
 /// property's durable name -- plus any JSON sub-path into the property's
-/// value. This is the resolved counterpart of [`PathExpr`], which names a
-/// property by string alone. The parser only ever produces `PathExpr`; a
-/// `PropertyPath` appears after [`Selection::resolve_names`] has bound the
-/// reference through a model-scoped [`crate::NameResolver`].
+/// value. A source-level name binds to one of these exactly once, where a
+/// query enters the system; nothing downstream carries a name.
 ///
 /// `label` is carried as its own field, for every arm, rather than folded
 /// into one arm of `id`'s type the way it used to be. Today a `System`
 /// label always equals its `PropertyId::System` name, and the `id`
 /// pseudo-property's label is always the literal `"id"` -- both look
 /// recoverable from `id` alone, but that is an accident of the current
-/// arms, not a rule resolution should lean on: a future path -> `PropertyId`
+/// arms, not a rule resolution should lean on: a future name -> `PropertyId`
 /// resolution is not guaranteed a label derivable from the id after the
 /// fact, and the source label (usable only for `Display`, never a physical
 /// storage name) must survive regardless of which arm minted the id.
@@ -28,7 +31,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PropertyPath {
     id: PropertyId,
-    /// The input name from the unparsed AST which was resolved to this id (usable only for Display)
+    /// The source-level name that resolved to this id (usable only for Display)
     label: String,
     /// JSON sub-path into the property's value; empty for a plain reference.
     pub subpath: Vec<String>,
@@ -79,7 +82,7 @@ impl PropertyPath {
     /// value and uses it as an opaque key (see [`PropertyId`] for the one
     /// sanctioned exception, a `System` name). When a display name is genuinely
     /// needed, pick by which name is meant: the `Display` impl on
-    /// [`PropertyPath`] gives the name AS WRITTEN in this ankql statement (the
+    /// [`PropertyPath`] gives the name AS WRITTEN in the ankql statement (the
     /// resolved-from label), whereas a catalog resolver's `property_name`
     /// lookup gives the property's CURRENT name; the two can diverge after a
     /// rename.
@@ -101,11 +104,12 @@ impl std::fmt::Display for PropertyPath {
     }
 }
 
-/// AnkQL path construction for durable property identities: the
-/// [`PropertyId`] -> [`PropertyPath`] conversion, as a method on the id.
-/// A path built from a bare id has no source name, so a registered
-/// property's label falls back to the id's own rendering.
+/// Path construction for durable property identities: the [`PropertyId`] ->
+/// [`PropertyPath`] conversion, as a method on the id. A path built from a
+/// bare id has no source name, so a registered property's label falls back to
+/// the id's own rendering.
 pub trait PropertyIdExt {
+    /// This id as a property reference, with `subpath` as its JSON sub-path.
     fn path(&self, subpath: &[String]) -> PropertyPath;
 }
 

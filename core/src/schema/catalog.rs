@@ -63,10 +63,15 @@ struct CatalogBinding {
 impl CatalogBinding {
     fn resolve_cells(&self, schema: &'static super::ModelStructDescriptor, epoch: super::SchemaEpoch) {
         debug_assert_eq!(self.fields.len(), schema.properties.len());
-        schema.resolved.set(epoch, ModelId::EntityId(self.model));
+        // Field cells first, model cell last: the registration gate's
+        // fast path probes only the model cell, so the model entry is the
+        // publication point and must not become visible while any field
+        // cell is still empty (a concurrent gate would report success and
+        // then read an unresolved field).
         for (field, id) in schema.properties.iter().zip(self.fields.iter()) {
             field.resolved.set(epoch, PropertyId::EntityId(*id));
         }
+        schema.resolved.set(epoch, ModelId::EntityId(self.model));
     }
 }
 
@@ -638,10 +643,14 @@ where
         &self,
         cdata: &PA::ContextData,
         schema: &'static ModelStructDescriptor,
-    ) -> Result<proto::ModelId, RegistrationError> {
+    ) -> Result<(proto::ModelId, super::SchemaEpoch), RegistrationError> {
         let epoch = self.schema_epoch().ok_or(RegistrationError::SystemNotReady)?;
+        // The snapshot epoch returns WITH the identity: one logical
+        // operation (ensure, field resolution, entity stamp) must observe
+        // exactly one epoch, so callers use this pair instead of re-reading
+        // the node's epoch after the await.
         match self.ensure_registered_at(cdata, schema, epoch).await {
-            Ok(()) => schema.resolved.get(epoch).ok_or_else(|| {
+            Ok(()) => schema.resolved.get(epoch).map(|model| (model, epoch)).ok_or_else(|| {
                 RegistrationError::Retrieval(crate::error::RetrievalError::Other(format!(
                     "registration of '{}' did not retain its exact model identity",
                     schema.label
@@ -653,7 +662,7 @@ where
                     schema.label,
                     error
                 );
-                schema.resolved.get(epoch).ok_or_else(|| {
+                schema.resolved.get(epoch).map(|model| (model, epoch)).ok_or_else(|| {
                     RegistrationError::Retrieval(crate::error::RetrievalError::Other(format!(
                         "compatible binding for '{}' did not retain its exact model identity",
                         schema.label

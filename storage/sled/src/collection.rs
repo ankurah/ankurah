@@ -1,7 +1,7 @@
 #[cfg(debug_assertions)]
 use std::sync::atomic::AtomicBool;
 
-use ankql::ast::Predicate;
+use ankql::ast::{Predicate, Resolved};
 use ankurah_core::indexing::KeySpec;
 use ankurah_core::{
     entity::TemporaryEntity,
@@ -10,7 +10,9 @@ use ankurah_core::{
     EntityId,
 };
 use ankurah_proto::{Attested, CollectionId, EntityState, Event, EventId, StateFragment};
-use ankurah_storage_common::{filtering::ValueSetStream, KeyBounds, OrderByComponents, Plan, Planner, PlannerConfig, ScanDirection};
+use ankurah_storage_common::{
+    filtering::ValueSetStream, EngineColumns, KeyBounds, OrderByComponents, Plan, Planner, PlannerConfig, ScanDirection,
+};
 use async_trait::async_trait;
 use futures::StreamExt;
 use std::sync::Arc;
@@ -71,9 +73,11 @@ impl StorageCollection for SledStorageCollection {
         Ok(task::spawn_blocking(move || inner.get_state_blocking(id)).await??)
     }
 
-    async fn fetch_states(&self, selection: &ankql::ast::Selection) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+    async fn fetch_states(&self, selection: &ankql::ast::Selection<Resolved>) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         let inner = self.0.clone();
-        let selection = selection.clone();
+        // Bind the resolved properties to the columns this engine
+        // materializes them under before anything here reads the selection.
+        let selection = crate::lower::lower(selection);
         Ok(task::spawn_blocking(move || inner.fetch_states_blocking(selection)).await??)
     }
 
@@ -154,7 +158,7 @@ impl SledStorageCollectionInner {
     // They BOTH need to then do a secondary lookup in the entities tree to get the state fragment
     // (and we need to make sure that both are using industry best practices for that sort of index -> record scan)
 
-    fn fetch_states_blocking(&self, selection: ankql::ast::Selection) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+    fn fetch_states_blocking(&self, selection: ankql::ast::Selection<EngineColumns>) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         // Type resolution (Value -> Json for non-simple paths) is handled by TypeResolver
         // at the entry points (Context/Node). The selection here is already type-resolved.
 
@@ -183,7 +187,7 @@ impl SledStorageCollectionInner {
         index_spec: KeySpec<String>,
         bounds: KeyBounds,
         scan_direction: ScanDirection,
-        remaining_predicate: Predicate,
+        remaining_predicate: Predicate<EngineColumns>,
         order_by_spill: OrderByComponents,
         limit: Option<u64>,
     ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
@@ -256,7 +260,7 @@ impl SledStorageCollectionInner {
         &self,
         bounds: KeyBounds,
         scan_direction: ScanDirection,
-        remaining_predicate: Predicate,
+        remaining_predicate: Predicate<EngineColumns>,
         order_by_spill: OrderByComponents,
         limit: Option<u64>,
     ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {

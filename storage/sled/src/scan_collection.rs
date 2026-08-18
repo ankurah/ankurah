@@ -165,11 +165,7 @@ impl Stream for SledCollectionScanner<'_> {
             }
         }
 
-        Poll::Ready(Some(crate::materialization::ProjectedEntity {
-            id: entity_id,
-            collection: ankurah_proto::CollectionId::from("unknown"), // TODO: get from context
-            map,
-        }))
+        Poll::Ready(Some(crate::materialization::ProjectedEntity { id: entity_id, map }))
     }
 }
 
@@ -222,10 +218,6 @@ impl<S: EntityIdStream> Stream for SledCollectionLookup<S> {
             }
         }
 
-        Poll::Ready(Some(crate::materialization::ProjectedEntity {
-            id: entity_id,
-            collection: ankurah_proto::CollectionId::from("unknown"), // TODO: get from context
-            map,
-        }))
+        Poll::Ready(Some(crate::materialization::ProjectedEntity { id: entity_id, map }))
     }
 }

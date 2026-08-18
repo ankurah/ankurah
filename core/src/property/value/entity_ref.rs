@@ -110,12 +110,12 @@ impl<T> fmt::Display for Ref<T> {
 }
 
 // Ref<T> support for predicates (queries)
-impl<T> From<Ref<T>> for ::ankql::ast::Expr {
-    fn from(r: Ref<T>) -> ::ankql::ast::Expr { r.id.into() }
+impl<T, S: ::ankql::ast::Stage> From<Ref<T>> for ::ankql::ast::Expr<S> {
+    fn from(r: Ref<T>) -> ::ankql::ast::Expr<S> { r.id.into() }
 }
 
-impl<T> From<&Ref<T>> for ::ankql::ast::Expr {
-    fn from(r: &Ref<T>) -> ::ankql::ast::Expr { (&r.id).into() }
+impl<T, S: ::ankql::ast::Stage> From<&Ref<T>> for ::ankql::ast::Expr<S> {
+    fn from(r: &Ref<T>) -> ::ankql::ast::Expr<S> { (&r.id).into() }
 }
 
 // Any View can be converted to Ref<Model> by borrowing

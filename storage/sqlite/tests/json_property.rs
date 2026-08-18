@@ -12,7 +12,7 @@
 //! This enables using JSONB functions (`jsonb()`, `->`, `->>`) for efficient path queries.
 //! SQLite 3.45.0+ is required for JSONB support.
 
-use ankql::resolve::{NameResolutionError, NameResolver};
+use ankurah::core::schema::resolver::{resolve_selection, ModelResolutionError, ModelResolver, ResolvedProperty};
 use ankurah::property::Json;
 use ankurah::{policy::DEFAULT_CONTEXT as c, EntityId, Model, ModelId, Node, PermissiveAgent, PropertyId, ValueType};
 use ankurah_storage_sqlite::sql_builder::{split_predicate_for_sqlite, SplitPredicate};
@@ -27,26 +27,22 @@ use std::sync::Arc;
 /// forged from the name's own bytes.
 struct FixtureResolver;
 
-impl NameResolver for FixtureResolver {
-    fn resolve_property(&self, _model: &ModelId, name: &str) -> Result<Option<PropertyId>, NameResolutionError> {
+impl ModelResolver for FixtureResolver {
+    fn resolve_property(&self, _model: &ModelId, name: &str) -> Result<Option<ResolvedProperty>, ModelResolutionError> {
         let mut bytes = [0u8; 32];
         for (i, byte) in name.bytes().take(32).enumerate() {
             bytes[i] = byte;
         }
-        Ok(Some(PropertyId::EntityId(EntityId::from_bytes(bytes))))
-    }
-
-    fn property_value_type(&self, _model: &ModelId, _property: &PropertyId) -> Result<ValueType, NameResolutionError> {
-        Ok(ValueType::String)
+        Ok(Some(ResolvedProperty { id: PropertyId::EntityId(EntityId::from_bytes(bytes)), value_type: ValueType::String }))
     }
 }
 
 /// Parse and resolve a query the way the fetch path would before the engine
 /// sees it.
-fn resolve(query: &str) -> ankql::ast::Selection {
+fn resolve(query: &str) -> ankql::ast::Selection<ankql::ast::Resolved> {
     let selection = ankql::parser::parse_selection(query).expect("Failed to parse query");
     let model = ModelId::EntityId(EntityId::from_bytes([0x77; 32]));
-    selection.resolve_names(&model, &FixtureResolver).expect("Failed to resolve query")
+    resolve_selection(&model, &FixtureResolver, selection).expect("Failed to resolve query")
 }
 
 /// Assert that a query predicate fully pushes down to SQLite (no post-filtering required).

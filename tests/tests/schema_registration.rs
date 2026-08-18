@@ -835,13 +835,20 @@ impl ankurah::policy::PolicyAgent for ProbeAgent {
         &self,
         _data: &C,
         collection: &proto::CollectionId,
-        predicate: ankql::ast::Predicate,
-    ) -> Result<ankql::ast::Predicate, ankurah::policy::AccessDenied>
+        predicate: ankql::ast::Predicate<ankql::ast::Resolved>,
+    ) -> Result<ankql::ast::Predicate<ankql::ast::Resolved>, ankurah::policy::AccessDenied>
     where
         C: ankurah::core::util::Iterable<Self::ContextData>,
     {
         if self.filter_catalog_properties && collection.as_str() == ankurah::core::schema::PROPERTY_COLLECTION_ID {
-            let name_filter = ankql::parser::parse_selection("name != '__never__'").expect("static catalog policy filter parses").predicate;
+            // An agent narrows a query in the query's own vocabulary, so this
+            // is built bound: the catalog's `name` is a frozen system
+            // property, addressed by its own identity.
+            let name_filter = ankql::ast::Predicate::Comparison {
+                left: Box::new(ankql::ast::Expr::Path(ankql::ast::PropertyPath::system(proto::SystemProperty::Name, vec![]))),
+                operator: ankql::ast::ComparisonOperator::NotEqual,
+                right: Box::new(ankql::ast::Expr::Literal(ankql::ast::Value::String("__never__".to_string()))),
+            };
             return Ok(ankql::ast::Predicate::And(Box::new(predicate), Box::new(name_filter)));
         }
         Ok(predicate)

@@ -3,6 +3,7 @@ use crate::{
     reactor::{AbstractEntity, Reactor, ReactorUpdate},
     selection::filter::Filterable,
 };
+use ankql::ast::Resolved;
 
 use ankurah_proto::{self as proto};
 use ankurah_signals::{
@@ -88,7 +89,7 @@ impl ReactorSubscription<crate::entity::Entity, ankurah_proto::Attested<ankurah_
         &self,
         query_id: proto::QueryId,
         collection_id: proto::CollectionId,
-        selection: ankql::ast::Selection,
+        selection: ankql::ast::Selection<Resolved>,
         included_entities: Vec<crate::entity::Entity>,
         gap_fetcher: std::sync::Arc<dyn crate::reactor::fetch_gap::GapFetcher<crate::entity::Entity>>,
         version: u32,

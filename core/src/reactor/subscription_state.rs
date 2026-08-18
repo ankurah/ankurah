@@ -6,6 +6,7 @@ use crate::{
     resultset::EntityResultSet,
     selection::filter::{evaluate_predicate, Filterable},
 };
+use ankql::ast::Resolved;
 use ankurah_proto::{self as proto};
 use futures::future;
 use indexmap::IndexMap;
@@ -48,7 +49,7 @@ type GapFillData<E> = (
     proto::QueryId,
     std::sync::Arc<dyn crate::reactor::fetch_gap::GapFetcher<E>>,
     proto::CollectionId,
-    ankql::ast::Selection,
+    ankql::ast::Selection<Resolved>,
     EntityResultSet<E>,
     Option<E>,
     usize,
@@ -59,7 +60,7 @@ pub struct QueryState<E: AbstractEntity + Filterable> {
     // TODO make this a clonable PredicateSubscription and store it instead of the channel?
     pub(crate) collection_id: proto::CollectionId,
     /// Selection is None until first update_query call (after register_query)
-    pub(crate) selection: Option<ankql::ast::Selection>,
+    pub(crate) selection: Option<ankql::ast::Selection<Resolved>>,
     pub(crate) gap_fetcher: std::sync::Arc<dyn crate::reactor::fetch_gap::GapFetcher<E>>, // For filling gaps when LIMIT is applied
     // I think we need to move these out of PredicateState and into WatcherState
     pub(crate) paused: bool, // When true, skip notifications (used during initialization and updates)
@@ -205,8 +206,8 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         &self,
         query_id: proto::QueryId,
         collection_id: &proto::CollectionId,
-        old_predicate: Option<&ankql::ast::Predicate>,
-        new_predicate: &ankql::ast::Predicate,
+        old_predicate: Option<&ankql::ast::Predicate<Resolved>>,
+        new_predicate: &ankql::ast::Predicate<Resolved>,
     ) {
         let mut watcher_set = self.watcher_set.lock().unwrap();
         let watcher_id = (self.id, query_id);
@@ -230,7 +231,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         &self,
         query_id: proto::QueryId,
         collection_id: proto::CollectionId,
-        selection: ankql::ast::Selection,
+        selection: ankql::ast::Selection<Resolved>,
         included_entities: Vec<E>,
         version: u32,
         reactor_updates: &mut A,
@@ -533,7 +534,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         query_id: proto::QueryId,
         gap_fetcher: std::sync::Arc<dyn crate::reactor::fetch_gap::GapFetcher<E>>,
         collection_id: proto::CollectionId,
-        selection: ankql::ast::Selection,
+        selection: ankql::ast::Selection<Resolved>,
         resultset: EntityResultSet<E>,
         last_entity: Option<E>,
         gap_size: usize,
@@ -640,7 +641,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         query_id: proto::QueryId,
         gap_fetcher: std::sync::Arc<dyn crate::reactor::fetch_gap::GapFetcher<E>>,
         collection_id: proto::CollectionId,
-        selection: ankql::ast::Selection,
+        selection: ankql::ast::Selection<Resolved>,
         resultset: EntityResultSet<E>,
         last_entity: Option<E>,
         gap_size: usize,

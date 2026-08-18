@@ -63,7 +63,7 @@ pub(crate) fn start_ephemeral_policy_sync<SE, PA>(
     SE: StorageEngine + Send + Sync + 'static,
     PA: ankurah_core::policy::PolicyAgent<ContextData = JwtContext> + Send + Sync + 'static,
 {
-    let args: ankurah_core::node::MatchArgs = match "true".try_into() {
+    let args: ankurah_core::node::MatchArgs<ankql::ast::Parsed> = match "true".try_into() {
         Ok(a) => a,
         Err(e) => {
             tracing::error!("on_node_ready: failed to parse selection: {}", e);

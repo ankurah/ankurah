@@ -926,9 +926,10 @@ impl WeakEntitySet {
         &self,
         collection: CollectionId,
         genesis: &Event,
+        epoch: crate::schema::SchemaEpoch,
         trx_alive: Arc<AtomicBool>,
     ) -> Result<Entity, MutationError> {
-        let primary = Entity::create(genesis.entity_id, collection, self.current_epoch());
+        let primary = Entity::create(genesis.entity_id, collection, epoch);
         let transaction_entity = primary.snapshot_after_genesis(genesis, trx_alive)?;
 
         let mut entities = self.entities.write().unwrap();

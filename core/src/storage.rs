@@ -1,3 +1,4 @@
+use ankql::ast::Resolved;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -45,7 +46,7 @@ pub trait StorageCollection: Send + Sync {
     async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError>;
 
     // Fetch raw entity states matching a selection (predicate + order by + limit)
-    async fn fetch_states(&self, selection: &ankql::ast::Selection) -> Result<Vec<Attested<EntityState>>, RetrievalError>;
+    async fn fetch_states(&self, selection: &ankql::ast::Selection<Resolved>) -> Result<Vec<Attested<EntityState>>, RetrievalError>;
 
     async fn set_states(&self, states: Vec<Attested<EntityState>>) -> Result<(), MutationError> {
         for state in states {

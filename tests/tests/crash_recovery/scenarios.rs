@@ -245,10 +245,12 @@ async fn scenario_2_mid_batch() -> Result<()> {
     // Reconvergence: reopen the node under test and re-deliver the whole batch,
     // exactly as the sending peer would on retry. Everything must converge.
     let node = Node::new_durable(Arc::new(engine), PermissiveAgent::new());
-    seed_album_catalog(&node)?;
     // The system root persisted before the workload, so the reopened durable
-    // node loads it and becomes ready on its own (no create/join). Awaiting a
-    // collection drives the async catalog load first.
+    // node loads it and becomes ready on its own (no create/join). Seeding
+    // must wait for that readiness: the seeded binding resolves under the
+    // node's schema epoch, which exists only once the system is ready.
+    node.system.wait_system_ready().await;
+    seed_album_catalog(&node)?;
     let collection2 = node.system.collection(&Album::collection()).await?;
     node.system.wait_system_ready().await;
     assert!(node.system.is_system_ready(), "reopened durable node must load its persisted system root");
@@ -420,10 +422,12 @@ async fn scenario_4_entity_creation() -> Result<()> {
 
     // Reconvergence via re-delivery of the identical creation event.
     let node = Node::new_durable(Arc::new(engine), PermissiveAgent::new());
-    seed_album_catalog(&node)?;
-    let collection2 = node.system.collection(&Album::collection()).await?;
+    // Seeding resolves the compiled binding under the node's schema epoch,
+    // which exists only once the reopened system is ready.
     node.system.wait_system_ready().await;
     assert!(node.system.is_system_ready(), "reopened durable node must be system-ready");
+    seed_album_catalog(&node)?;
+    let collection2 = node.system.collection(&Album::collection()).await?;
     redeliver(&node, events.clone()).await?;
 
     assert_state_heads_resolvable(&collection2, &[entity_id]).await?;

@@ -101,8 +101,15 @@ impl PolicyAgent for DenySecondAlbumEventAgent {
         Ok(())
     }
 
-    fn filter_predicate<C>(&self, _data: &C, _collection: &proto::CollectionId, predicate: Predicate) -> Result<Predicate, AccessDenied>
-    where C: Iterable<Self::ContextData> {
+    fn filter_predicate<C>(
+        &self,
+        _data: &C,
+        _collection: &proto::CollectionId,
+        predicate: Predicate<ankql::ast::Resolved>,
+    ) -> Result<Predicate<ankql::ast::Resolved>, AccessDenied>
+    where
+        C: Iterable<Self::ContextData>,
+    {
         Ok(predicate)
     }
 

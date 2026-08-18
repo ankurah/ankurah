@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use ankql::ast::PropertyId;
+use ankql::ast::{PropertyId, Resolved};
 use ankurah_core::entity::TemporaryEntity;
 use ankurah_core::error::{MutationError, RetrievalError};
 use ankurah_core::property::backend::backend_from_string;
@@ -445,7 +445,7 @@ impl StorageCollection for SqliteBucket {
         Ok(result)
     }
 
-    async fn fetch_states(&self, selection: &ankql::ast::Selection) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+    async fn fetch_states(&self, selection: &ankql::ast::Selection<Resolved>) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         debug!("SqliteBucket({}).fetch_states: {:?}", self.collection_id, selection);
 
         let conn = self.pool.get().await.map_err(|e| SqliteError::Pool(e.to_string()))?;
@@ -473,7 +473,7 @@ impl StorageCollection for SqliteBucket {
             // Absence folding keys on the resolved property identity, so a
             // sub-path reference collapses with its missing root column (the
             // old last-step-vs-first-step limitation no longer arises).
-            selection.assume_null(&missing).map_err(|e| RetrievalError::StorageError(Box::new(e)))?
+            selection.assume_null(&missing)
         };
 
         // Split predicate for pushdown
@@ -481,12 +481,14 @@ impl StorageCollection for SqliteBucket {
         let needs_post_filter = split.needs_post_filter();
         let remaining_predicate = split.remaining_predicate.clone();
 
-        // Build SQL
-        let sql_selection = ankql::ast::Selection {
+        // Build SQL. Only the pushed-down half is lowered into this engine's
+        // columns; what is left over is evaluated in Rust against entities,
+        // which answer by property identity rather than by column.
+        let sql_selection = crate::lower::lower(&ankql::ast::Selection {
             predicate: split.sql_predicate,
             order_by: effective_selection.order_by.clone(),
             limit: if needs_post_filter { None } else { effective_selection.limit },
-        };
+        });
 
         let mut builder = SqlBuilder::with_fields(vec!["id", "state_buffer", "memberships", "head", "attestations"]);
         builder.table_name(self.state_table());
@@ -683,7 +685,7 @@ impl StorageCollection for SqliteBucket {
 /// Post-filter EntityStates using a predicate that couldn't be pushed to SQL.
 fn post_filter_states(
     states: &[Attested<EntityState>],
-    predicate: &ankql::ast::Predicate,
+    predicate: &ankql::ast::Predicate<Resolved>,
     collection_id: &CollectionId,
 ) -> Vec<Attested<EntityState>> {
     states
@@ -789,8 +791,31 @@ mod tests {
         use crate::sql_builder::SqlBuilder;
         use ankql::parser::parse_selection;
 
-        // Test that the SQL builder generates correct JSONB syntax
-        let selection = parse_selection(r#"data.status = 'active'"#).expect("Failed to parse query");
+        // Test that the SQL builder generates correct JSONB syntax. The
+        // builder consumes RESOLVED selections, so bind `data` to a forged
+        // id the way the fetch path binds names to catalog ids.
+        use ankurah_core::schema::resolver::{resolve_selection, ModelResolutionError, ModelResolver, ResolvedProperty};
+        struct FixtureResolver(ankurah_proto::PropertyId);
+        impl ModelResolver for FixtureResolver {
+            fn resolve_property(
+                &self,
+                _model: &ankurah_proto::ModelId,
+                _name: &str,
+            ) -> Result<Option<ResolvedProperty>, ModelResolutionError> {
+                Ok(Some(ResolvedProperty { id: self.0, value_type: ankurah_core::value::ValueType::String }))
+            }
+        }
+        let data_id = ankurah_proto::PropertyId::EntityId(ankurah_proto::EntityId::from_bytes([0x64; 32]));
+        let model = ankurah_proto::ModelId::EntityId(ankurah_proto::EntityId::from_bytes([0x77; 32]));
+        let selection = resolve_selection(
+            &model,
+            &FixtureResolver(data_id),
+            parse_selection(r#"data.status = 'active'"#).expect("Failed to parse query"),
+        )
+        .expect("Failed to resolve query");
+        // The builder reads this engine's columns, so lower the resolved
+        // selection first, exactly as fetch_states does.
+        let selection = crate::lower::lower(&selection);
         let mut builder = SqlBuilder::with_fields(vec!["id", "state_buffer"]);
         builder.table_name("test_table");
         builder.selection(&selection).map_err(|e| SqliteError::SqlGeneration(e.to_string()))?;
@@ -799,7 +824,8 @@ mod tests {
 
         // Verify the SQL uses json_extract() for reliable JSON path comparisons
         assert!(sql.contains("json_extract"), "SQL should use json_extract() for JSON path: {}", sql);
-        assert!(sql.contains(r#"json_extract("data", '$.status')"#), "SQL should extract from data column with $.status path: {}", sql);
+        let expected = format!(r#"json_extract("{}", '$.status')"#, data_id);
+        assert!(sql.contains(&expected), "SQL should extract from the data column's rendering with $.status path: {}", sql);
 
         Ok(())
     }

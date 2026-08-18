@@ -1,9 +1,9 @@
-use crate::ast::{ComparisonOperator, Expr, Predicate};
+use crate::ast::{ComparisonOperator, Expr, Predicate, Stage};
 use crate::error::SqlGenerationError;
 use ankurah_core_types::Value;
 
-fn generate_expr_sql(
-    expr: &Expr,
+fn generate_expr_sql<S: Stage>(
+    expr: &Expr<S>,
     placeholder_count: &mut Option<usize>,
     found_placeholders: &mut usize,
     buffer: &mut String,
@@ -71,24 +71,14 @@ fn generate_expr_sql(
             }
         },
         Expr::Path(path) => {
-            // Output each step quoted and dot-separated: "a"."b"."c"
-            for (i, step) in path.steps.iter().enumerate() {
-                if i > 0 {
-                    buffer.push('.');
-                }
-                buffer.push('"');
-                buffer.push_str(step);
-                buffer.push('"');
-            }
-        }
-        Expr::PropertyPath(identifier) => {
             // Human-readable rendering only. `generate_selection_sql` backs the
             // `Display` impls for `Predicate`/`Selection`; it is NOT the query
             // path (each storage engine translates a resolved identity to its
-            // own physical address in its own SQL builder). Render the
-            // identifier's display label, never a physical name.
+            // own physical address in its own SQL builder). At the resolved
+            // stage this writes the path's display label, never a physical
+            // name.
             use std::fmt::Write as _;
-            let _ = write!(buffer, "{}", identifier);
+            let _ = write!(buffer, "{}", path);
         }
         Expr::ExprList(exprs) => {
             buffer.push('(');
@@ -188,7 +178,10 @@ fn comparison_op_to_sql(op: &ComparisonOperator) -> Result<&'static str, SqlGene
     })
 }
 
-pub fn generate_selection_sql(predicate: &Predicate, expected_placeholders: Option<usize>) -> Result<String, SqlGenerationError> {
+pub fn generate_selection_sql<S: Stage>(
+    predicate: &Predicate<S>,
+    expected_placeholders: Option<usize>,
+) -> Result<String, SqlGenerationError> {
     let mut placeholder_count = expected_placeholders;
     let mut found_placeholders = 0;
     let mut buffer = String::new();
@@ -204,8 +197,8 @@ pub fn generate_selection_sql(predicate: &Predicate, expected_placeholders: Opti
     Ok(buffer)
 }
 
-fn generate_selection_sql_inner(
-    predicate: &Predicate,
+fn generate_selection_sql_inner<S: Stage>(
+    predicate: &Predicate<S>,
     placeholder_count: &mut Option<usize>,
     found_placeholders: &mut usize,
     buffer: &mut String,
@@ -262,7 +255,7 @@ mod tests {
     fn test_simple_equality() -> Result<()> {
         let selection = parse_selection("name = 'Alice'").unwrap();
         let sql = generate_selection_sql(&selection.predicate, None)?;
-        assert_eq!(sql, r#""name" = 'Alice'"#);
+        assert_eq!(sql, "name = 'Alice'");
         Ok(())
     }
 
@@ -270,7 +263,7 @@ mod tests {
     fn test_and_condition() -> Result<()> {
         let selection = parse_selection("name = 'Alice' AND age = '30'").unwrap();
         let sql = generate_selection_sql(&selection.predicate, None)?;
-        assert_eq!(sql, r#""name" = 'Alice' AND "age" = '30'"#);
+        assert_eq!(sql, "name = 'Alice' AND age = '30'");
         Ok(())
     }
 
@@ -278,7 +271,7 @@ mod tests {
     fn test_complex_condition() -> Result<()> {
         let selection = parse_selection("(name = 'Alice' OR name = 'Charlie') AND age >= '30' AND age <= '40'").unwrap();
         let sql = generate_selection_sql(&selection.predicate, None)?;
-        assert_eq!(sql, r#"("name" = 'Alice' OR "name" = 'Charlie') AND "age" >= '30' AND "age" <= '40'"#);
+        assert_eq!(sql, "(name = 'Alice' OR name = 'Charlie') AND age >= '30' AND age <= '40'");
         Ok(())
     }
 
@@ -286,7 +279,7 @@ mod tests {
     fn test_including_collection_identifier() -> Result<()> {
         let selection = parse_selection("person.name = 'Alice'").unwrap();
         let sql = generate_selection_sql(&selection.predicate, None)?;
-        assert_eq!(sql, r#""person"."name" = 'Alice'"#);
+        assert_eq!(sql, "person.name = 'Alice'");
         Ok(())
     }
 
@@ -294,7 +287,7 @@ mod tests {
     fn test_in_operator() -> Result<()> {
         let selection = parse_selection("name IN ('Alice', 'Bob', 'Charlie')").unwrap();
         let sql = generate_selection_sql(&selection.predicate, None)?;
-        assert_eq!(sql, r#""name" IN ('Alice', 'Bob', 'Charlie')"#);
+        assert_eq!(sql, "name IN ('Alice', 'Bob', 'Charlie')");
         Ok(())
     }
 
@@ -303,7 +296,7 @@ mod tests {
         let query = "user_id = ?";
         let selection = parse_selection(query).unwrap();
         let sql = generate_selection_sql(&selection.predicate, None)?;
-        assert_eq!(sql, r#""user_id" = ?"#);
+        assert_eq!(sql, "user_id = ?");
         Ok(())
     }
 
@@ -312,7 +305,7 @@ mod tests {
         let query = "user_id = ? AND status = ?";
         let selection = parse_selection(query).unwrap();
         let sql = generate_selection_sql(&selection.predicate, Some(2))?;
-        assert_eq!(sql, r#""user_id" = ? AND "status" = ?"#);
+        assert_eq!(sql, "user_id = ? AND status = ?");
         Ok(())
     }
 
@@ -347,7 +340,7 @@ mod tests {
         let query = "status IN (?, ?, ?)";
         let selection = parse_selection(query).unwrap();
         let sql = generate_selection_sql(&selection.predicate, Some(3))?;
-        assert_eq!(sql, r#""status" IN (?, ?, ?)"#);
+        assert_eq!(sql, "status IN (?, ?, ?)");
         Ok(())
     }
 
@@ -356,33 +349,33 @@ mod tests {
         let query = "user_id = 123";
         let selection = parse_selection(query).unwrap();
         let sql = generate_selection_sql(&selection.predicate, Some(0))?;
-        assert_eq!(sql, r#""user_id" = 123"#);
+        assert_eq!(sql, "user_id = 123");
         Ok(())
     }
 
     #[test]
     fn test_string_escaping() -> Result<()> {
         // Create a predicate with a string containing single quotes directly
-        let predicate = Predicate::Comparison {
+        let predicate: Predicate<crate::ast::Parsed> = Predicate::Comparison {
             left: Box::new(Expr::Path(PathExpr::simple("name"))),
             operator: ComparisonOperator::Equal,
             right: Box::new(Expr::Literal(Value::String("O'Brien".to_string()))),
         };
         let sql = generate_selection_sql(&predicate, None)?;
-        assert_eq!(sql, r#""name" = 'O''Brien'"#);
+        assert_eq!(sql, "name = 'O''Brien'");
         Ok(())
     }
 
     #[test]
     fn test_null_byte_handling() -> Result<()> {
         // Test that null bytes are removed for safety
-        let predicate = Predicate::Comparison {
+        let predicate: Predicate<crate::ast::Parsed> = Predicate::Comparison {
             left: Box::new(Expr::Path(PathExpr::simple("data"))),
             operator: ComparisonOperator::Equal,
             right: Box::new(Expr::Literal(Value::String("test\0data".to_string()))),
         };
         let sql = generate_selection_sql(&predicate, None)?;
-        assert_eq!(sql, r#""data" = 'testdata'"#);
+        assert_eq!(sql, "data = 'testdata'");
         Ok(())
     }
 

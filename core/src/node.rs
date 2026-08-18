@@ -1,5 +1,6 @@
 use crate::selection::filter::Filterable;
 use crate::{schema::catalog::CatalogManager, session::SessionSet};
+use ankql::ast::{Parsed, Resolved, Stage};
 use ankurah_proto::{self as proto, Attested, CollectionId, EntityState};
 use anyhow::anyhow;
 
@@ -47,42 +48,50 @@ impl<CD: ContextData> PeerState<CD> {
     pub fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError> { self.sender.send_message(message) }
 }
 
-pub struct MatchArgs {
-    pub selection: ankql::ast::Selection,
+/// A query's selection plus its caching intent, at whatever stage the
+/// selection has reached: parsing a query string produces
+/// `MatchArgs<Parsed>`, and admission binds its names, producing the
+/// `MatchArgs<Resolved>` every execution path takes.
+pub struct MatchArgs<S: Stage> {
+    pub selection: ankql::ast::Selection<S>,
     pub cached: bool,
 }
 
-impl TryInto<MatchArgs> for &str {
+impl TryInto<MatchArgs<Parsed>> for &str {
     type Error = ankql::error::ParseError;
-    fn try_into(self) -> Result<MatchArgs, Self::Error> { Ok(MatchArgs { selection: ankql::parser::parse_selection(self)?, cached: true }) }
+    fn try_into(self) -> Result<MatchArgs<Parsed>, Self::Error> {
+        Ok(MatchArgs { selection: ankql::parser::parse_selection(self)?, cached: true })
+    }
 }
-impl TryInto<MatchArgs> for String {
+impl TryInto<MatchArgs<Parsed>> for String {
     type Error = ankql::error::ParseError;
-    fn try_into(self) -> Result<MatchArgs, Self::Error> {
+    fn try_into(self) -> Result<MatchArgs<Parsed>, Self::Error> {
         Ok(MatchArgs { selection: ankql::parser::parse_selection(&self)?, cached: true })
     }
 }
 
-impl From<ankql::ast::Predicate> for MatchArgs {
-    fn from(val: ankql::ast::Predicate) -> Self {
+impl<S: Stage> From<ankql::ast::Predicate<S>> for MatchArgs<S> {
+    fn from(val: ankql::ast::Predicate<S>) -> Self {
         MatchArgs { selection: ankql::ast::Selection { predicate: val, order_by: None, limit: None }, cached: true }
     }
 }
 
-impl From<ankql::ast::Selection> for MatchArgs {
-    fn from(val: ankql::ast::Selection) -> Self { MatchArgs { selection: val, cached: true } }
+impl<S: Stage> From<ankql::ast::Selection<S>> for MatchArgs<S> {
+    fn from(val: ankql::ast::Selection<S>) -> Self { MatchArgs { selection: val, cached: true } }
 }
 
 impl From<ankql::error::ParseError> for RetrievalError {
     fn from(e: ankql::error::ParseError) -> Self { RetrievalError::ParseError(e) }
 }
 
-pub fn nocache<T: TryInto<ankql::ast::Selection, Error = ankql::error::ParseError>>(s: T) -> Result<MatchArgs, ankql::error::ParseError> {
+pub fn nocache<T: TryInto<ankql::ast::Selection<Parsed>, Error = ankql::error::ParseError>>(
+    s: T,
+) -> Result<MatchArgs<Parsed>, ankql::error::ParseError> {
     MatchArgs::nocache(s)
 }
-impl MatchArgs {
+impl MatchArgs<Parsed> {
     pub fn nocache<T>(s: T) -> Result<Self, ankql::error::ParseError>
-    where T: TryInto<ankql::ast::Selection, Error = ankql::error::ParseError> {
+    where T: TryInto<ankql::ast::Selection<Parsed>, Error = ankql::error::ParseError> {
         Ok(Self { selection: s.try_into()?, cached: false })
     }
 }
@@ -474,6 +483,9 @@ where
             proto::NodeRequestBody::Fetch { collection, mut selection, known_matches } => {
                 self.policy_agent.can_access_collection(cdata, &collection)?;
                 let storage_collection = self.collections.get(&collection).await?;
+                // The requester's selection arrives resolved, and the policy
+                // narrows it in the same vocabulary: what the agent ANDs in
+                // is resolved too, so nothing here is left to bind.
                 selection.predicate = self.policy_agent.filter_predicate(cdata, &collection, selection.predicate)?;
 
                 // Expand initial_states to include entities from known_matches that weren't in the predicate results
@@ -992,7 +1004,7 @@ where
         &self,
         query_id: proto::QueryId,
         collection_id: CollectionId,
-        selection: ankql::ast::Selection,
+        selection: ankql::ast::Selection<Resolved>,
         sessions: SessionSet<PA::ContextData>,
         version: u32,
         livequery: crate::livequery::WeakEntityLiveQuery,
@@ -1008,7 +1020,7 @@ where
     pub async fn fetch_entities_from_local(
         &self,
         collection_id: &CollectionId,
-        selection: &ankql::ast::Selection,
+        selection: &ankql::ast::Selection<Resolved>,
     ) -> Result<Vec<Entity>, RetrievalError> {
         let storage_collection = self.collections.get(collection_id).await?;
         let initial_states = storage_collection.fetch_states(selection).await?;
@@ -1028,14 +1040,28 @@ where
 #[async_trait::async_trait]
 pub trait TNodeErased<E: AbstractEntity + Filterable + Send + 'static = Entity>: Send + Sync + 'static {
     fn unsubscribe_remote_predicate(&self, query_id: proto::QueryId);
-    fn update_remote_query(&self, query_id: proto::QueryId, selection: ankql::ast::Selection, version: u32) -> Result<(), anyhow::Error>;
+    fn update_remote_query(
+        &self,
+        query_id: proto::QueryId,
+        selection: ankql::ast::Selection<Resolved>,
+        version: u32,
+    ) -> Result<(), anyhow::Error>;
     async fn fetch_entities_from_local(
         &self,
         collection_id: &CollectionId,
-        selection: &ankql::ast::Selection,
+        selection: &ankql::ast::Selection<Resolved>,
     ) -> Result<Vec<E>, RetrievalError>;
     fn reactor(&self) -> &Reactor<E>;
     fn has_subscription_relay(&self) -> bool;
+    /// Bind a selection's property names through this node's catalog (the
+    /// raw, collection-scoped resolution). A replacement live-query
+    /// selection arrives here as a parsed string, below the typed entries,
+    /// and must resolve before the reactor or the relay sees it.
+    fn resolve_selection(
+        &self,
+        collection: &CollectionId,
+        selection: ankql::ast::Selection<Parsed>,
+    ) -> Result<ankql::ast::Selection<Resolved>, RetrievalError>;
 }
 
 #[async_trait::async_trait]
@@ -1051,7 +1077,20 @@ where
         }
     }
 
-    fn update_remote_query(&self, query_id: proto::QueryId, selection: ankql::ast::Selection, version: u32) -> Result<(), anyhow::Error> {
+    fn resolve_selection(
+        &self,
+        collection: &CollectionId,
+        selection: ankql::ast::Selection<Parsed>,
+    ) -> Result<ankql::ast::Selection<Resolved>, RetrievalError> {
+        self.catalog.resolve_selection(collection, selection)
+    }
+
+    fn update_remote_query(
+        &self,
+        query_id: proto::QueryId,
+        selection: ankql::ast::Selection<Resolved>,
+        version: u32,
+    ) -> Result<(), anyhow::Error> {
         if let Some(ref relay) = self.subscription_relay {
             // Admitted at query entry; forwarded as-is.
             relay.update_query(query_id, selection, version)?;
@@ -1062,7 +1101,7 @@ where
     async fn fetch_entities_from_local(
         &self,
         collection_id: &CollectionId,
-        selection: &ankql::ast::Selection,
+        selection: &ankql::ast::Selection<Resolved>,
     ) -> Result<Vec<Entity>, RetrievalError> {
         Node::fetch_entities_from_local(self, collection_id, selection).await
     }

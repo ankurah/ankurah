@@ -29,7 +29,7 @@ pub enum QueryValue {
     EntityId(String),
 }
 
-impl TryFrom<QueryValue> for ankql::ast::Expr {
+impl<S: ankql::ast::Stage> TryFrom<QueryValue> for ankql::ast::Expr<S> {
     type Error = ankql::error::ParseError;
 
     fn try_from(value: QueryValue) -> Result<Self, Self::Error> {

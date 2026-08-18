@@ -2,7 +2,7 @@ use crate::reactor::candidate_changes::CandidateChanges;
 use crate::reactor::comparison_index::ComparisonIndex;
 use crate::reactor::{AbstractEntity, ReactorSubscriptionId};
 use crate::value::Value;
-use ankql::ast::PropertyPath;
+use ankql::ast::{PropertyPath, Resolved};
 use ankurah_proto as proto;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -185,14 +185,14 @@ impl WatcherSet {
     pub fn recurse_predicate_watchers(
         &mut self,
         collection_id: &proto::CollectionId,
-        predicate: &ankql::ast::Predicate,
+        predicate: &ankql::ast::Predicate<Resolved>,
         watcher_id: (ReactorSubscriptionId, proto::QueryId), // Should this be a tuple of (subscription_id, query_id) or just subscription_id?
         op: WatcherOp,
     ) {
         use ankql::ast::{Expr, Predicate};
         match predicate {
             Predicate::Comparison { left, operator, right } => {
-                if let (Expr::PropertyPath(identifier), Expr::Literal(literal)) | (Expr::Literal(literal), Expr::PropertyPath(identifier)) =
+                if let (Expr::Path(identifier), Expr::Literal(literal)) | (Expr::Literal(literal), Expr::Path(identifier)) =
                     (&**left, &**right)
                 {
                     // Index on the resolved identity plus its JSON sub-path.

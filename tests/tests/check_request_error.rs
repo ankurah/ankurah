@@ -101,8 +101,8 @@ impl PolicyAgent for RejectingAgent {
         &self,
         _data: &C,
         _collection: &proto::CollectionId,
-        predicate: Predicate,
-    ) -> std::result::Result<Predicate, AccessDenied>
+        predicate: Predicate<ankql::ast::Resolved>,
+    ) -> std::result::Result<Predicate<ankql::ast::Resolved>, AccessDenied>
     where
         C: Iterable<Self::ContextData>,
     {

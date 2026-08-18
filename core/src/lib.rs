@@ -46,6 +46,16 @@ pub use model::Model;
 pub use node::Node;
 pub use property::Json;
 pub use query_value::QueryValue;
+pub use schema::resolver::{ModelResolutionError, ModelResolver, ResolvedProperty};
 
 pub use ankurah_proto as proto;
 pub use ankurah_proto::{EntityId, ModelId};
+
+// Derived code addresses its dependencies through ONE base path (the
+// `#[model(base = "...")]` option, `::ankurah::core` by default). These
+// re-exports are what let core's own models -- the catalog rows -- name that
+// base as `crate` and still reach the same items every other model does.
+#[doc(hidden)]
+pub use ankql;
+#[doc(hidden)]
+pub use ankurah_signals as signals;

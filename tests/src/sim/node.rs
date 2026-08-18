@@ -142,13 +142,30 @@ pub async fn build_nodes(n: usize, captured: Captured) -> anyhow::Result<Vec<Sim
         nodes.push(SimNode { index, durable: false, node, captured: captured.clone() });
     }
 
-    // The harness forges events and states directly, bypassing schema
-    // registration and the catalog relay. Seed and explicitly admit a complete
-    // deterministic `SimRecord` catalog on every node so commit admissibility
-    // can route each forged creation event's membership and the compiled
-    // binding is provably complete. The test-helper path keeps every id byte-identical
-    // across nodes and runs; hard_reset is not part of these scenarios.
-    let sim_model = proto::RegisteredModel {
+    // Seeding resolves the compiled binding under the node's schema epoch,
+    // which exists only once that node's system is READY. Node 0 is ready
+    // here (it just created the system); the ephemerals are not (they join
+    // during the scenario's settle phase), so the scenario seeds each of
+    // them right after its readiness wait, via `seed_sim_schema`.
+    seed_sim_schema(&nodes[0])?;
+
+    Ok(nodes)
+}
+
+/// Seed and admit the deterministic `SimRecord` catalog on one node. The
+/// node's system must be READY (the seeded binding resolves under its
+/// schema epoch).
+pub fn seed_sim_schema(node: &SimNode) -> anyhow::Result<()> {
+    node.node.catalog.seed_registered_schema(SimRecord::descriptor(), std::slice::from_ref(&sim_model_definition()))?;
+    Ok(())
+}
+
+/// The deterministic `SimRecord` catalog definition every node seeds. The
+/// harness forges events and states directly, bypassing schema registration
+/// and the catalog relay, so this keeps every id byte-identical across nodes
+/// and runs; hard_reset is not part of these scenarios.
+fn sim_model_definition() -> proto::RegisteredModel {
+    proto::RegisteredModel {
         id: super::model::sim_model_id(),
         label: SimRecord::descriptor().label.to_owned(),
         name: "SimRecord".to_string(),
@@ -165,10 +182,5 @@ pub async fn build_nodes(n: usize, captured: Captured) -> anyhow::Result<Vec<Sim
                 optional: false,
             })
             .collect(),
-    };
-    for node in &nodes {
-        node.node.catalog.seed_registered_schema(SimRecord::descriptor(), std::slice::from_ref(&sim_model))?;
     }
-
-    Ok(nodes)
 }

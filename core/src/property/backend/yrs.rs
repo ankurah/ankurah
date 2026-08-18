@@ -2,7 +2,6 @@ use std::{
     any::Any,
     collections::BTreeMap,
     fmt::Debug,
-    str::FromStr,
     sync::{Arc, Mutex},
 };
 
@@ -113,12 +112,16 @@ impl PropertyBackend for YrsBackend {
 
     fn properties(&self) -> Vec<PropertyId> {
         let trx = Transact::transact(&self.doc);
-        // Runtime writes key roots by PropertyId renderings, so every root
-        // parses. A non-parsing root can only come from a name-keyed
-        // (pre-0.10) buffer -- yrs buffers carry no version header of ours
-        // to refuse it by -- and is skipped: its data is unreadable under
-        // id-keyed addressing either way.
-        trx.root_refs().filter_map(|(name, _)| PropertyId::from_str(name).ok()).collect()
+        // Runtime writes key roots by registered-property id renderings
+        // (never the `id` pseudo-property, never a system name), so a root
+        // is recognized ONLY as an EntityId rendering. Anything else is a
+        // name-keyed (pre-0.10) legacy root -- yrs buffers carry no version
+        // header of ours to refuse it by -- and is skipped: parsing the
+        // broader PropertyId vocabulary here would silently misattribute a
+        // legacy root named `name`/`label`/`id` to a live system identity.
+        // (A 43-character legacy field name that happens to decode as
+        // base64 remains ambiguous; nothing can distinguish it.)
+        trx.root_refs().filter_map(|(name, _)| ankurah_proto::EntityId::from_base64(name).ok().map(PropertyId::EntityId)).collect()
     }
 
     fn property_value(&self, property: &PropertyId) -> Option<Value> {

@@ -12,8 +12,8 @@ pub mod conversion;
 pub mod error;
 pub mod grammar;
 pub mod parser;
-/// Source-name resolution and point-of-use comparison-value casting.
+/// Point-of-use comparison-value casting.
 pub mod resolve;
 pub mod selection;
 
-pub use resolve::{ComparisonValueCastError, NameResolutionError, NameResolver};
+pub use resolve::ComparisonValueCastError;

@@ -5,6 +5,7 @@
 
 mod common;
 
+use ankurah::core::schema::resolver::{resolve_selection, ModelResolutionError, ModelResolver, ResolvedProperty};
 use ankurah::core::selection::filter::{evaluate_predicate, Filterable};
 use ankurah::core::value::Value;
 use ankurah::property::Json;
@@ -84,20 +85,9 @@ fn fixture_prop(name: &str) -> ankql::ast::PropertyId {
 /// Bind a case query's names to the fixture identities: every fixture field
 /// is the Json-typed `data` property.
 struct FixtureResolver;
-impl ankql::NameResolver for FixtureResolver {
-    fn resolve_property(
-        &self,
-        _model: &ankurah::proto::ModelId,
-        name: &str,
-    ) -> Result<Option<ankql::ast::PropertyId>, ankql::NameResolutionError> {
-        Ok(Some(fixture_prop(name)))
-    }
-    fn property_value_type(
-        &self,
-        _model: &ankurah::proto::ModelId,
-        _property: &ankql::ast::PropertyId,
-    ) -> Result<ankurah::core::value::ValueType, ankql::NameResolutionError> {
-        Ok(ankurah::core::value::ValueType::Json)
+impl ModelResolver for FixtureResolver {
+    fn resolve_property(&self, _model: &ankurah::proto::ModelId, name: &str) -> Result<Option<ResolvedProperty>, ModelResolutionError> {
+        Ok(Some(ResolvedProperty { id: fixture_prop(name), value_type: ankurah::core::value::ValueType::Json }))
     }
 }
 
@@ -108,7 +98,7 @@ fn verify_filterable(case: &TestCase) {
         for exp in &case.expectations {
             let sel = ankql::parser::parse_selection(&exp.query).expect("parse");
             // Bind names and canonicalize literals for JSON path comparisons
-            let resolved_sel = sel.resolve_names(&model, &FixtureResolver).expect("resolve");
+            let resolved_sel = resolve_selection(&model, &FixtureResolver, sel).expect("resolve");
             let matches = evaluate_predicate(&f, &resolved_sel.predicate).unwrap_or(false);
             let should = exp.matches.contains(&entity.label);
             assert_eq!(matches, should, "[Filterable] case={} entity={} query='{}'", case.name, entity.label, exp.query);

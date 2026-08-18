@@ -134,13 +134,13 @@ pub enum NodeRequestBody {
     },
     Fetch {
         collection: CollectionId,
-        selection: ast::Selection,
+        selection: ast::Selection<ast::Resolved>,
         known_matches: Vec<KnownEntity>,
     },
     SubscribeQuery {
         query_id: QueryId,
         collection: CollectionId,
-        selection: ast::Selection,
+        selection: ast::Selection<ast::Resolved>,
         version: u32,
         known_matches: Vec<KnownEntity>,
     },

@@ -7,6 +7,7 @@ use crate::{
     storage::StorageEngine,
     value::Value,
 };
+use ankql::ast::Resolved;
 use ankurah_proto as proto;
 use async_trait::async_trait;
 use std::sync::{Arc, Weak};
@@ -27,7 +28,7 @@ pub trait GapFetcher<E: AbstractEntity>: Send + Sync + 'static {
     async fn fetch_gap(
         &self,
         collection_id: &proto::CollectionId,
-        selection: &ankql::ast::Selection,
+        selection: &ankql::ast::Selection<Resolved>,
         last_entity: Option<&E>,
         gap_size: usize,
     ) -> Result<Vec<E>, RetrievalError>;
@@ -67,7 +68,7 @@ where
     async fn fetch_gap(
         &self,
         collection_id: &proto::CollectionId,
-        selection: &ankql::ast::Selection,
+        selection: &ankql::ast::Selection<Resolved>,
         last_entity: Option<&crate::entity::Entity>,
         gap_size: usize,
     ) -> Result<Vec<crate::entity::Entity>, RetrievalError> {
@@ -111,11 +112,11 @@ where
 /// For ORDER BY a ASC, b DESC with last entity having a=5, b=10:
 /// Returns: a >= 5 AND b <= 10 AND NOT (id = last_entity.id)
 pub fn build_continuation_predicate<E: AbstractEntity>(
-    original_predicate: &ankql::ast::Predicate,
-    order_by: &[ankql::ast::OrderByItem],
+    original_predicate: &ankql::ast::Predicate<Resolved>,
+    order_by: &[ankql::ast::OrderByItem<Resolved>],
     last_entity: &E,
-) -> Result<ankql::ast::Predicate, String> {
-    use ankql::ast::{ComparisonOperator, Expr, OrderDirection, PathExpr, Predicate};
+) -> Result<ankql::ast::Predicate<Resolved>, String> {
+    use ankql::ast::{ComparisonOperator, Expr, OrderDirection, Predicate};
 
     let mut gap_conditions = Vec::new();
 
@@ -124,11 +125,7 @@ pub fn build_continuation_predicate<E: AbstractEntity>(
 
     // Add ORDER BY continuation conditions
     for order_item in order_by {
-        // Sort keys arrive resolved (`Selection::check` discipline); an
-        // unresolved key here carries no identity to continue from.
-        let ankql::ast::OrderKey::Property(identifier) = &order_item.key else {
-            return Err(format!("unresolved ORDER BY key `{}` reached gap filling", order_item.key));
-        };
+        let identifier = &order_item.path;
 
         // Get the field value from the last entity
         if let Some(field_value) = last_entity.value(&identifier.property_id()) {
@@ -143,11 +140,8 @@ pub fn build_continuation_predicate<E: AbstractEntity>(
                 OrderDirection::Desc => ComparisonOperator::LessThanOrEqual,
             };
 
-            let condition = Predicate::Comparison {
-                left: Box::new(Expr::PropertyPath(identifier.clone())),
-                operator,
-                right: Box::new(Expr::Literal(literal)),
-            };
+            let condition =
+                Predicate::Comparison { left: Box::new(Expr::Path(identifier.clone())), operator, right: Box::new(Expr::Literal(literal)) };
 
             gap_conditions.push(condition);
         }
@@ -155,7 +149,7 @@ pub fn build_continuation_predicate<E: AbstractEntity>(
 
     // Add entity ID exclusion to avoid fetching the last entity again
     let id_exclusion = Predicate::Comparison {
-        left: Box::new(Expr::PropertyPath(ankql::ast::PropertyPath::id())),
+        left: Box::new(Expr::Path(ankql::ast::PropertyPath::id())),
         operator: ComparisonOperator::NotEqual,
         right: Box::new(Expr::Literal(Value::EntityId(*last_entity.id()))),
     };
@@ -172,7 +166,7 @@ pub fn build_continuation_predicate<E: AbstractEntity>(
 mod tests {
     use super::*;
     use crate::value::Value;
-    use ankql::ast::{OrderByItem, OrderDirection, PathExpr, Predicate, PropertyId};
+    use ankql::ast::{OrderByItem, OrderDirection, Parsed, Predicate, PropertyId, Resolved};
     use ankurah_derive::selection;
     use ankurah_proto as proto;
     use maplit::hashmap;
@@ -189,18 +183,18 @@ mod tests {
     }
 
     /// A resolved sort key over a fixture field.
-    fn key(name: &str, direction: OrderDirection) -> OrderByItem {
+    fn key(name: &str, direction: OrderDirection) -> OrderByItem<Resolved> {
         use ankql::ast::PropertyIdExt;
-        OrderByItem { key: ankql::ast::OrderKey::Property(prop(name).path(&[])), direction }
+        OrderByItem { path: prop(name).path(&[]), direction }
     }
 
     /// Bind a `selection!` literal's names to the fixture identities, so the
     /// expected predicate compares equal to the resolved one the builder
     /// emits (PropertyPath equality is identity + sub-path; labels differ
     /// freely).
-    fn resolve(selection: ankql::ast::Selection) -> ankql::ast::Selection {
+    fn resolve(selection: ankql::ast::Selection<Parsed>) -> ankql::ast::Selection<Resolved> {
         struct FixtureResolver;
-        impl ankql::NameResolver for FixtureResolver {
+        impl ankql::Resolver for FixtureResolver {
             fn resolve_property(&self, _model: &proto::ModelId, name: &str) -> Result<Option<PropertyId>, ankql::NameResolutionError> {
                 Ok(Some(prop(name)))
             }

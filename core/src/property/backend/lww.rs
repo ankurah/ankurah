@@ -170,8 +170,21 @@ impl PropertyBackend for LWWBackend {
             )));
         }
         let raw_map = bincode::deserialize::<BTreeMap<PropertyId, CommittedEntry>>(payload)?;
-        let map =
-            raw_map.into_iter().map(|(k, entry)| (k, ValueEntry::Committed { value: entry.value, event_id: entry.event_id })).collect();
+        // The id pseudo-property refers to the entity's own id and is never
+        // a stored property; a buffer carrying it (only forged or corrupt
+        // data can) has that entry skipped at decode, like an unparseable
+        // yrs root -- never an error.
+        let map = raw_map
+            .into_iter()
+            .filter(|(k, _)| {
+                if matches!(k, PropertyId::Id) {
+                    tracing::warn!("skipping id pseudo-property key in LWW state buffer");
+                    return false;
+                }
+                true
+            })
+            .map(|(k, entry)| (k, ValueEntry::Committed { value: entry.value, event_id: entry.event_id }))
+            .collect();
         Ok(Self { values: RwLock::new(map), field_broadcasts: Mutex::new(BTreeMap::new()) })
     }
 
@@ -335,6 +348,12 @@ impl LWWBackend {
 
                     let mut values = self.values.write().unwrap();
                     for (property, new_value) in changes {
+                        // Skipped at decode like from_state_buffer: never a
+                        // stored property, never an error.
+                        if matches!(property, PropertyId::Id) {
+                            tracing::warn!("skipping id pseudo-property key in LWW diff");
+                            continue;
+                        }
                         let entry = match event_id.clone() {
                             Some(event_id) => ValueEntry::Committed { value: new_value, event_id },
                             None => ValueEntry::Pending { value: new_value },

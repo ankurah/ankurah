@@ -19,6 +19,11 @@ async fn get_nonexistent_entity_errors() -> anyhow::Result<()> {
 async fn local_rejects_phantom_commit() -> anyhow::Result<()> {
     let node = durable_sled_setup().await?;
     let ctx = node.context(DEFAULT_CONTEXT)?;
+    // The phantom bypasses creation, so nothing has run the registration
+    // gate for Album on this node; register explicitly so the typed
+    // accessors below resolve and the assertion lands on the phantom's
+    // nonexistent BASELINE at commit, which is what this test pins.
+    ctx.register_model::<Album>().await?;
 
     let phantom = AlbumView::from_entity(node.conjure_evil_phantom(EntityId::random(), Album::collection()));
     let trx = ctx.begin();

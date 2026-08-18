@@ -71,14 +71,15 @@ impl Transaction {
     pub async fn create<'rec, 'trx: 'rec, M: Model>(&'trx self, model: &M) -> Result<MutableBorrow<'rec, M::Mutable>, MutationError> {
         // First-use registration: the new entity's membership asserts the
         // model's durable identity, so it must exist before the entity does.
-        let model_id = self.dyncontext.ensure_registered(M::descriptor()).await?;
+        let (model_id, epoch) = self.dyncontext.ensure_registered(M::descriptor()).await?;
 
         // The initial values are staged in a vessel that has no identity of its
         // own: the entity id does not exist until these operations have been
         // frozen into the genesis preimage. Each field stages under the
-        // durable identity its descriptor cell resolved for this node's
-        // current epoch (populated by the registration gate above).
-        let epoch = self.dyncontext.schema_epoch().ok_or(MutationError::SystemNotReady)?;
+        // durable identity its descriptor cell resolved for the SAME epoch
+        // the registration gate above snapshotted (returned with the model
+        // id, never re-read: a reset between the await and a re-read could
+        // mix two systems' identities in one entity).
         let mut provisional = ProvisionalEntity::new();
         model.initialize_new_entity(&mut provisional, model_id, epoch).map_err(|e| MutationError::General(Box::new(e)))?;
         let system = self.dyncontext.system_id().ok_or(MutationError::SystemNotReady)?;
@@ -87,7 +88,7 @@ impl Transaction {
         // Insert the resident primary under the derived id, and take the
         // transaction entity whose baseline is that genesis, so later edits
         // parent onto it and are extracted separately.
-        let entity = self.dyncontext.create_transaction_entity(M::collection(), &genesis, self.alive.clone())?;
+        let entity = self.dyncontext.create_transaction_entity(M::collection(), &genesis, epoch, self.alive.clone())?;
         self.dyncontext.check_write(&entity)?;
 
         // Store the already-extracted genesis exactly once. Commit must never

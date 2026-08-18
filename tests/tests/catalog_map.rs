@@ -190,7 +190,10 @@ impl StorageCollection for GatedCatalogCollection {
         self.inner.get_state(id).await
     }
 
-    async fn fetch_states(&self, selection: &ankql::ast::Selection) -> Result<Vec<proto::Attested<proto::EntityState>>, RetrievalError> {
+    async fn fetch_states(
+        &self,
+        selection: &ankql::ast::Selection<ankql::ast::Resolved>,
+    ) -> Result<Vec<proto::Attested<proto::EntityState>>, RetrievalError> {
         // The warm is recognizable by its full-scan selection; registration's
         // duplicate-check lookups are keyed and pass through. One warm entry
         // per generation is observable on the models catalog, the first

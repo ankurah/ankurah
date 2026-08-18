@@ -97,7 +97,9 @@ async fn test_server_rejects_garbage_auth_data() -> anyhow::Result<()> {
         from: ankurah_proto::EntityId::random(),
         body: ankurah_proto::NodeRequestBody::Fetch {
             collection: ankurah_proto::CollectionId::from("post"),
-            selection: "1 = 1".try_into().unwrap(),
+            // A request carries a bound selection; this one names no
+            // property, so binding it is the identity.
+            selection: ankurah_core::schema::resolver::resolve_without_model(&ankql::parser::parse_selection("1 = 1").unwrap()).unwrap(),
             known_matches: vec![],
         },
     };

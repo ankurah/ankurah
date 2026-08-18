@@ -1,22 +1,30 @@
-use crate::error::{ParseError, SelectionError};
+use crate::error::ParseError;
 use crate::selection::sql::generate_selection_sql;
 use ankurah_core_types::EntityId;
-pub use ankurah_core_types::{PropertyId, SystemProperty, Value};
+pub use ankurah_core_types::{PropertyId, PropertyIdExt, PropertyPath, SystemProperty, Value};
 use serde::{Deserialize, Serialize};
 
+mod stage;
+pub use stage::{Parsed, Resolved, Stage};
+
+/// An expression at stage `S`. The one property-reference arm is
+/// [`Expr::Path`], written the way `S` writes a path.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum Expr {
+#[serde(bound(serialize = "S::Path: Serialize", deserialize = "S::Path: Deserialize<'de>"))]
+pub enum Expr<S: Stage> {
     Literal(Value),
-    Path(PathExpr),
-    PropertyPath(PropertyPath),
-    Predicate(Predicate),
-    InfixExpr { left: Box<Expr>, operator: InfixOperator, right: Box<Expr> },
-    ExprList(Vec<Expr>), // New variant for handling lists like (1,2,3) in IN clauses
+    Path(S::Path),
+    Predicate(Predicate<S>),
+    InfixExpr { left: Box<Expr<S>>, operator: InfixOperator, right: Box<Expr<S>> },
+    ExprList(Vec<Expr<S>>), // Handles lists like (1,2,3) in IN clauses
     Placeholder,
 }
 
-/// A dot-separated path like `name` or `licensing.territory`
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// A dot-separated path like `name` or `licensing.territory`: how the
+/// [`Parsed`] stage writes a property reference. Deliberately not
+/// serializable -- a name means something only in the model scope it was
+/// written against, so it never crosses the wire.
+#[derive(Debug, Clone, PartialEq)]
 pub struct PathExpr {
     pub steps: Vec<String>,
 }
@@ -39,50 +47,32 @@ impl std::fmt::Display for PathExpr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.steps.join(".")) }
 }
 
-mod property_path;
-pub use property_path::{PropertyIdExt, PropertyPath};
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Selection {
-    pub predicate: Predicate,
-    pub order_by: Option<Vec<OrderByItem>>,
+#[serde(bound(serialize = "S::Path: Serialize", deserialize = "S::Path: Deserialize<'de>"))]
+pub struct Selection<S: Stage> {
+    pub predicate: Predicate<S>,
+    pub order_by: Option<Vec<OrderByItem<S>>>,
     pub limit: Option<u64>,
 }
 
+/// One ORDER BY term: the property to sort on, written the way stage `S`
+/// writes a path, and the direction. A sort key names a whole property --
+/// resolution rejects a JSON sub-path here -- including the `id`
+/// pseudo-property, which at the [`Resolved`] stage carries its own
+/// [`PropertyId::Id`] rather than a catalog id.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct OrderByItem {
-    pub key: OrderKey,
+#[serde(bound(serialize = "S::Path: Serialize", deserialize = "S::Path: Deserialize<'de>"))]
+pub struct OrderByItem<S: Stage> {
+    pub path: S::Path,
     pub direction: OrderDirection,
 }
 
-/// A sort key, mirroring `Expr::Path` vs `Expr::PropertyPath`: the parser
-/// produces the raw [`OrderKey::Path`] form, and the resolution pass rewrites it
-/// to [`OrderKey::Property`] -- including the `id` pseudo-property, which
-/// resolves to [`PropertyPath::id`] (carrying its own [`PropertyId::Id`]), not
-/// to a catalog id. The resolved arm keeps its name private just like
-/// [`PropertyPath`]; a storage engine keys its sort on the identifier's
-/// `id()`, never on a name.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum OrderKey {
-    Path(PathExpr),
-    Property(PropertyPath),
-}
-
-impl std::fmt::Display for OrderKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            OrderKey::Path(path) => write!(f, "{}", path),
-            OrderKey::Property(identifier) => write!(f, "{}", identifier),
-        }
-    }
-}
-
-impl std::fmt::Display for OrderByItem {
+impl<S: Stage> std::fmt::Display for OrderByItem<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
             "{} {}",
-            self.key,
+            self.path,
             match self.direction {
                 OrderDirection::Asc => "ASC",
                 OrderDirection::Desc => "DESC",
@@ -97,7 +87,7 @@ pub enum OrderDirection {
     Desc,
 }
 
-impl std::fmt::Display for Selection {
+impl<S: Stage> std::fmt::Display for Selection<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.predicate)?;
         if let Some(order_by) = &self.order_by {
@@ -117,23 +107,24 @@ impl std::fmt::Display for Selection {
 }
 
 // Backward compatibility
-impl From<Predicate> for Selection {
-    fn from(predicate: Predicate) -> Self { Selection { predicate, order_by: None, limit: None } }
+impl<S: Stage> From<Predicate<S>> for Selection<S> {
+    fn from(predicate: Predicate<S>) -> Self { Selection { predicate, order_by: None, limit: None } }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum Predicate {
-    Comparison { left: Box<Expr>, operator: ComparisonOperator, right: Box<Expr> },
-    IsNull(Box<Expr>),
-    And(Box<Predicate>, Box<Predicate>),
-    Or(Box<Predicate>, Box<Predicate>),
-    Not(Box<Predicate>),
+#[serde(bound(serialize = "S::Path: Serialize", deserialize = "S::Path: Deserialize<'de>"))]
+pub enum Predicate<S: Stage> {
+    Comparison { left: Box<Expr<S>>, operator: ComparisonOperator, right: Box<Expr<S>> },
+    IsNull(Box<Expr<S>>),
+    And(Box<Predicate<S>>, Box<Predicate<S>>),
+    Or(Box<Predicate<S>>, Box<Predicate<S>>),
+    Not(Box<Predicate<S>>),
     True,
     False,
     Placeholder,
 }
 
-impl std::fmt::Display for Predicate {
+impl<S: Stage> std::fmt::Display for Predicate<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match generate_selection_sql(self, None) {
             Ok(sql) => write!(f, "{}", sql),
@@ -142,59 +133,19 @@ impl std::fmt::Display for Predicate {
     }
 }
 
-impl Selection {
-    /// Verify that this selection is fully resolved and populated: every
-    /// property reference carries a durable [`PropertyId`], and no placeholder
-    /// is left unfilled.
-    ///
-    /// A storage engine addresses a property only by identity, translating a
-    /// [`PropertyId`] to its assigned column through its own durable map. A raw
-    /// [`Expr::Path`] leaves it nothing to address but a name, and a name is
-    /// exactly what must not reach it: names move under rename, columns do not,
-    /// so guessing a column from one silently reads the wrong data. An engine
-    /// therefore calls this before reading, and an unresolved selection fails
-    /// loudly at the boundary rather than emitting SQL against a column that
-    /// does not exist, or that belongs to some other property.
-    ///
-    /// [`Selection::resolve_names`] establishes this by binding every
-    /// reference to an id or failing closed. Anything that hand-builds a
-    /// selection and skips that pass is the caller this catches.
-    pub fn check(&self) -> Result<(), SelectionError> {
-        self.predicate.check()?;
-        for item in self.order_by.iter().flatten() {
-            if let OrderKey::Path(path) = &item.key {
-                return Err(SelectionError::UnresolvedPath(path.to_string()));
-            }
-        }
-        Ok(())
-    }
-
+impl Selection<Resolved> {
     /// Transform the selection to assume the given properties are absent
     /// (evaluate to NULL). This also drops ORDER BY items that sort on an
     /// absent property. Properties are matched by durable identity, so a
     /// rename cannot change which sort key or comparison is affected.
-    ///
-    /// Returns an error if the selection is not fully resolved and populated.
-    /// An unresolved name carries no durable identity, so this transform cannot
-    /// determine whether it belongs to `absent` and must fail closed.
-    pub fn assume_null(&self, absent: &[PropertyId]) -> Result<Self, SelectionError> {
-        self.predicate.check()?;
-
+    pub fn assume_null(&self, absent: &[PropertyId]) -> Self {
         let order_by = match &self.order_by {
             None => None,
             Some(items) => {
-                let mut retained = Vec::with_capacity(items.len());
-                for item in items {
-                    match &item.key {
-                        // A sort on an absent property is dropped. `id` resolves
-                        // to `OrderKey::Property` carrying `PropertyId::Id`,
-                        // which engines pin to the primary key and never report
-                        // absent.
-                        OrderKey::Property(identifier) if absent.contains(&identifier.property_id()) => {}
-                        OrderKey::Property(_) => retained.push(item.clone()),
-                        OrderKey::Path(path) => return Err(SelectionError::UnresolvedPath(path.to_string())),
-                    }
-                }
+                // A sort on an absent property is dropped. `id` resolves to a
+                // path carrying `PropertyId::Id`, which engines pin to the
+                // primary key and never report absent.
+                let retained: Vec<_> = items.iter().filter(|item| !absent.contains(&item.path.property_id())).cloned().collect();
                 if retained.is_empty() {
                     None
                 } else {
@@ -203,23 +154,19 @@ impl Selection {
             }
         };
 
-        Ok(Self { predicate: self.predicate.assume_null(absent), order_by, limit: self.limit })
+        Self { predicate: self.predicate.assume_null(absent), order_by, limit: self.limit }
     }
 
     /// Collect the durable addresses of every property referenced in this
     /// selection (WHERE + ORDER BY), including the `id` pseudo-property (as
-    /// [`PropertyId::Id`]). Only a raw, unresolved `Path`/`OrderKey::Path` key --
-    /// which carries no identity -- is omitted; after resolution every reference
-    /// is a resolved identifier and is reported.
+    /// [`PropertyId::Id`]).
     pub fn referenced_properties(&self) -> Vec<PropertyId> {
         let mut properties = self.predicate.referenced_properties();
         if let Some(order_by) = &self.order_by {
             for item in order_by {
-                if let OrderKey::Property(identifier) = &item.key {
-                    let id = identifier.property_id();
-                    if !properties.contains(&id) {
-                        properties.push(id);
-                    }
+                let id = item.path.property_id();
+                if !properties.contains(&id) {
+                    properties.push(id);
                 }
             }
         }
@@ -227,45 +174,29 @@ impl Selection {
     }
 }
 
-/// The durable property address an expression references, if any. A resolved
-/// [`PropertyPath`] yields its [`PropertyId`]; everything else -- a literal, a
-/// raw (unresolved) `Path`, an expression list -- addresses no durable property.
-/// The `id` pseudo-property resolves to a [`PropertyPath`] carrying
-/// [`PropertyId::Id`], so it IS reported here, not omitted.
+/// The durable property address an expression references, if any. A
+/// [`PropertyPath`] yields its [`PropertyId`]; everything else -- a literal,
+/// an expression list -- addresses no durable property. The `id`
+/// pseudo-property resolves to a path carrying [`PropertyId::Id`], so it IS
+/// reported here, not omitted.
 ///
-/// A resolved identifier carries a single identity, so the old JSON
-/// first-step-vs-last-step asymmetry (a `Path` reported its root by first
-/// step but its property by last step) no longer arises: `licensing.territory`
-/// resolves to the `licensing` property, subpath `[territory]`, and this returns
-/// that one property's address regardless of the subpath.
-fn expr_referenced_property(expr: &Expr) -> Option<PropertyId> {
+/// A resolved path carries a single identity, so the old JSON
+/// first-step-vs-last-step asymmetry (a name path reported its root by first
+/// step but its property by last step) no longer arises:
+/// `licensing.territory` resolves to the `licensing` property, subpath
+/// `[territory]`, and this returns that one property's address regardless of
+/// the subpath.
+fn expr_referenced_property(expr: &Expr<Resolved>) -> Option<PropertyId> {
     match expr {
-        Expr::PropertyPath(identifier) => Some(identifier.property_id()),
+        Expr::Path(identifier) => Some(identifier.property_id()),
         _ => None,
     }
 }
 
-/// See [`Selection::check`]. Exhaustive over [`Expr`] on purpose: a new variant
-/// that can carry a property reference must decide, here, whether it is
-/// addressable by identity.
-fn expr_check(expr: &Expr) -> Result<(), SelectionError> {
-    match expr {
-        Expr::Path(path) => Err(SelectionError::UnresolvedPath(path.to_string())),
-        Expr::Placeholder => Err(SelectionError::UnpopulatedPlaceholder),
-        Expr::PropertyPath(_) | Expr::Literal(_) => Ok(()),
-        Expr::ExprList(exprs) => exprs.iter().try_for_each(expr_check),
-        Expr::Predicate(predicate) => predicate.check(),
-        Expr::InfixExpr { left, operator: _, right } => {
-            expr_check(left)?;
-            expr_check(right)
-        }
-    }
-}
-
-impl Predicate {
+impl<S: Stage> Predicate<S> {
     /// Recursively walk a predicate tree and accumulate results using a closure
     pub fn walk<T, F>(&self, accumulator: T, visitor: &mut F) -> T
-    where F: FnMut(T, &Predicate) -> T {
+    where F: FnMut(T, &Predicate<S>) -> T {
         let accumulator = visitor(accumulator, self);
         match self {
             Predicate::And(left, right) | Predicate::Or(left, right) => {
@@ -277,30 +208,57 @@ impl Predicate {
         }
     }
 
-    /// See [`Selection::check`].
-    pub fn check(&self) -> Result<(), SelectionError> {
-        match self {
-            Predicate::Comparison { left, operator: _, right } => {
-                expr_check(left)?;
-                expr_check(right)
-            }
-            Predicate::And(left, right) | Predicate::Or(left, right) => {
-                left.check()?;
-                right.check()
-            }
-            Predicate::Not(inner) => inner.check(),
-            Predicate::IsNull(expr) => expr_check(expr),
-            Predicate::True | Predicate::False => Ok(()),
-            Predicate::Placeholder => Err(SelectionError::UnpopulatedPlaceholder),
+    /// Populate placeholders in the predicate with actual values
+    pub fn populate<I, V, E>(self, values: I) -> Result<Predicate<S>, ParseError>
+    where
+        I: IntoIterator<Item = V>,
+        V: TryInto<Expr<S>, Error = E>,
+        E: Into<ParseError>,
+    {
+        let mut values_iter = values.into_iter();
+        let result = self.populate_recursive(&mut values_iter)?;
+
+        // Check if there are any unused values
+        if values_iter.next().is_some() {
+            return Err(ParseError::InvalidPredicate("Too many values provided for placeholders".to_string()));
         }
+
+        Ok(result)
     }
 
+    fn populate_recursive<I, V, E>(self, values: &mut I) -> Result<Predicate<S>, ParseError>
+    where
+        I: Iterator<Item = V>,
+        V: TryInto<Expr<S>, Error = E>,
+        E: Into<ParseError>,
+    {
+        match self {
+            Predicate::Comparison { left, operator, right } => Ok(Predicate::Comparison {
+                left: Box::new(left.populate_recursive(values)?),
+                operator,
+                right: Box::new(right.populate_recursive(values)?),
+            }),
+            Predicate::And(left, right) => {
+                Ok(Predicate::And(Box::new(left.populate_recursive(values)?), Box::new(right.populate_recursive(values)?)))
+            }
+            Predicate::Or(left, right) => {
+                Ok(Predicate::Or(Box::new(left.populate_recursive(values)?), Box::new(right.populate_recursive(values)?)))
+            }
+            Predicate::Not(pred) => Ok(Predicate::Not(Box::new(pred.populate_recursive(values)?))),
+            Predicate::IsNull(expr) => Ok(Predicate::IsNull(Box::new(expr.populate_recursive(values)?))),
+            Predicate::True => Ok(Predicate::True),
+            Predicate::False => Ok(Predicate::False),
+            // Placeholder should be transformed to a comparison before population
+            Predicate::Placeholder => Err(ParseError::InvalidPredicate("Placeholder must be transformed before population".to_string())),
+        }
+    }
+}
+
+impl Predicate<Resolved> {
     /// Collect the durable addresses of every property referenced in this
     /// predicate, including the `id` pseudo-property (as [`PropertyId::Id`]).
-    /// Only a raw, unresolved `Path` reference carries no identity and is
-    /// omitted; after resolution every reference is a resolved identifier.
-    /// [`Selection::check`] is what guarantees no such reference reaches an
-    /// engine, so an engine's absence scan sees every property it will emit.
+    /// Every reference in a resolved predicate carries an identity, so an
+    /// engine's absence scan sees every property it will emit.
     pub fn referenced_properties(&self) -> Vec<PropertyId> {
         self.walk(Vec::new(), &mut |mut properties, pred| {
             match pred {
@@ -328,8 +286,8 @@ impl Predicate {
 
     /// Clones the predicate tree and evaluates comparisons involving absent
     /// properties as if they were NULL. Properties are matched by durable
-    /// identity ([`PropertyId`]); a resolved identifier's subpath does not
-    /// change which property is referenced.
+    /// identity ([`PropertyId`]); a resolved path's subpath does not change
+    /// which property is referenced.
     pub fn assume_null(&self, absent: &[PropertyId]) -> Self {
         match self {
             Predicate::Comparison { left, operator, right } => {
@@ -363,7 +321,7 @@ impl Predicate {
             }
             Predicate::IsNull(expr) => {
                 // An explicit IS NULL check against an absent property is TRUE.
-                // A resolved identifier's subpath does not change its identity.
+                // A resolved path's subpath does not change its identity.
                 match expr_referenced_property(expr) {
                     Some(property) if absent.contains(&property) => Predicate::True,
                     _ => Predicate::IsNull(expr.clone()),
@@ -414,58 +372,13 @@ impl Predicate {
             Predicate::Placeholder => Predicate::Placeholder,
         }
     }
-
-    /// Populate placeholders in the predicate with actual values
-    pub fn populate<I, V, E>(self, values: I) -> Result<Predicate, ParseError>
-    where
-        I: IntoIterator<Item = V>,
-        V: TryInto<Expr, Error = E>,
-        E: Into<ParseError>,
-    {
-        let mut values_iter = values.into_iter();
-        let result = self.populate_recursive(&mut values_iter)?;
-
-        // Check if there are any unused values
-        if values_iter.next().is_some() {
-            return Err(ParseError::InvalidPredicate("Too many values provided for placeholders".to_string()));
-        }
-
-        Ok(result)
-    }
-
-    fn populate_recursive<I, V, E>(self, values: &mut I) -> Result<Predicate, ParseError>
-    where
-        I: Iterator<Item = V>,
-        V: TryInto<Expr, Error = E>,
-        E: Into<ParseError>,
-    {
-        match self {
-            Predicate::Comparison { left, operator, right } => Ok(Predicate::Comparison {
-                left: Box::new(left.populate_recursive(values)?),
-                operator,
-                right: Box::new(right.populate_recursive(values)?),
-            }),
-            Predicate::And(left, right) => {
-                Ok(Predicate::And(Box::new(left.populate_recursive(values)?), Box::new(right.populate_recursive(values)?)))
-            }
-            Predicate::Or(left, right) => {
-                Ok(Predicate::Or(Box::new(left.populate_recursive(values)?), Box::new(right.populate_recursive(values)?)))
-            }
-            Predicate::Not(pred) => Ok(Predicate::Not(Box::new(pred.populate_recursive(values)?))),
-            Predicate::IsNull(expr) => Ok(Predicate::IsNull(Box::new(expr.populate_recursive(values)?))),
-            Predicate::True => Ok(Predicate::True),
-            Predicate::False => Ok(Predicate::False),
-            // Placeholder should be transformed to a comparison before population
-            Predicate::Placeholder => Err(ParseError::InvalidPredicate("Placeholder must be transformed before population".to_string())),
-        }
-    }
 }
 
-impl Expr {
-    fn populate_recursive<I, V, E>(self, values: &mut I) -> Result<Expr, ParseError>
+impl<S: Stage> Expr<S> {
+    fn populate_recursive<I, V, E>(self, values: &mut I) -> Result<Expr<S>, ParseError>
     where
         I: Iterator<Item = V>,
-        V: TryInto<Expr, Error = E>,
+        V: TryInto<Expr<S>, Error = E>,
         E: Into<ParseError>,
     {
         match self {
@@ -475,8 +388,6 @@ impl Expr {
             },
             Expr::Literal(lit) => Ok(Expr::Literal(lit)),
             Expr::Path(path) => Ok(Expr::Path(path)),
-            // A resolved PropertyPath is a property reference, not a placeholder; pass through.
-            Expr::PropertyPath(identifier) => Ok(Expr::PropertyPath(identifier)),
             Expr::Predicate(pred) => Ok(Expr::Predicate(pred.populate_recursive(values)?)),
             Expr::InfixExpr { left, operator, right } => Ok(Expr::InfixExpr {
                 left: Box::new(left.populate_recursive(values)?),
@@ -530,9 +441,9 @@ mod tests {
     }
 
     /// `<name> = 'x'` as a RESOLVED comparison against a registered property.
-    fn cmp(name: &str) -> Predicate {
+    fn cmp(name: &str) -> Predicate<Resolved> {
         Predicate::Comparison {
-            left: Box::new(Expr::PropertyPath(PropertyPath::registered(prop_id(name), name, vec![]))),
+            left: Box::new(Expr::Path(PropertyPath::registered(prop_id(name), name, vec![]))),
             operator: ComparisonOperator::Equal,
             right: Box::new(Expr::Literal(Value::String("x".to_string()))),
         }
@@ -546,7 +457,7 @@ mod tests {
         // Any comparison against an absent property collapses to FALSE.
         assert_eq!(cmp("status").assume_null(&absent(&["status"])), Predicate::False);
         // IS NULL against an absent property is TRUE.
-        let is_null = Predicate::IsNull(Box::new(Expr::PropertyPath(PropertyPath::registered(prop_id("status"), "status", vec![]))));
+        let is_null = Predicate::IsNull(Box::new(Expr::Path(PropertyPath::registered(prop_id("status"), "status", vec![]))));
         assert_eq!(is_null.assume_null(&absent(&["status"])), Predicate::True);
         // An unrelated absent property leaves the comparison intact.
         assert_eq!(cmp("role").assume_null(&absent(&["other"])), cmp("role"));
@@ -583,7 +494,7 @@ mod tests {
     #[test]
     fn test_populate_multiple_placeholders() {
         let selection = parse_selection("age > ? AND name = ?").unwrap();
-        let values: Vec<Expr> = vec![25i64.into(), "Bob".into()];
+        let values: Vec<Expr<Parsed>> = vec![25i64.into(), "Bob".into()];
         let populated = selection.predicate.populate(values).unwrap();
 
         let expected = Predicate::And(
@@ -623,7 +534,7 @@ mod tests {
     #[test]
     fn test_populate_mixed_types() {
         let selection = parse_selection("active = ? AND score > ? AND name = ?").unwrap();
-        let values: Vec<Expr> = vec![true.into(), 95.5f64.into(), "Charlie".into()];
+        let values: Vec<Expr<Parsed>> = vec![true.into(), 95.5f64.into(), "Charlie".into()];
         let populated = selection.predicate.populate(values).unwrap();
 
         // Verify the structure is correct
@@ -672,14 +583,14 @@ mod tests {
         assert_eq!(populated, selection.predicate);
     }
 
-    // -- Identifier (resolved property reference) --
+    // -- Resolved property references --
 
     /// A Selection whose predicate compares a resolved registered property
     /// (id `[7; 32]`) against a literal.
-    fn identifier_selection(name: &str, subpath: Vec<&str>) -> Selection {
+    fn identifier_selection(name: &str, subpath: Vec<&str>) -> Selection<Resolved> {
         Selection {
             predicate: Predicate::Comparison {
-                left: Box::new(Expr::PropertyPath(PropertyPath::registered(
+                left: Box::new(Expr::Path(PropertyPath::registered(
                     EntityId::from_bytes([7u8; 32]),
                     name,
                     subpath.into_iter().map(|s| s.to_string()).collect(),
@@ -695,99 +606,12 @@ mod tests {
     /// The durable identity of the property [`identifier_selection`] builds.
     fn identifier_selection_id() -> PropertyId { PropertyId::EntityId(EntityId::from_bytes([7u8; 32])) }
 
-    /// `left = 'US'`, for whatever operand is handed in.
-    fn cmp_with(left: Expr) -> Predicate {
-        Predicate::Comparison {
-            left: Box::new(left),
-            operator: ComparisonOperator::Equal,
-            right: Box::new(Expr::Literal(Value::String("US".to_string()))),
-        }
-    }
-
-    fn raw_path(name: &str) -> Expr { Expr::Path(PathExpr::simple(name)) }
-
-    #[test]
-    fn check_passes_every_resolved_identity_arm() {
-        // All three PropertyId arms are addressable by identity, so all three pass.
-        for left in [
-            Expr::PropertyPath(PropertyPath::registered(EntityId::from_bytes([7u8; 32]), "status", vec![])),
-            Expr::PropertyPath(PropertyPath::system(SystemProperty::Label, vec![])),
-            Expr::PropertyPath(PropertyPath::id()),
-        ] {
-            let selection = Selection { predicate: cmp_with(left), order_by: None, limit: None };
-            assert!(selection.check().is_ok());
-        }
-        // A subpath into a resolved property is still addressable by identity.
-        assert!(identifier_selection("licensing", vec!["territory"]).check().is_ok());
-    }
-
-    #[test]
-    fn check_rejects_raw_path_and_names_it() {
-        let selection = Selection { predicate: cmp_with(raw_path("collection")), order_by: None, limit: None };
-        let err = selection.check().expect_err("a raw path carries no identity");
-        assert!(matches!(&err, SelectionError::UnresolvedPath(p) if p == "collection"), "got {err:?}");
-    }
-
-    #[test]
-    fn check_recurses_through_every_nesting_form() {
-        // Each form buries the same raw path one level down. A check that fails
-        // to recurse would pass these, which is precisely the leak it exists to
-        // catch, so assert the walk actually reaches them.
-        let buried = cmp_with(raw_path("collection"));
-        let forms = [
-            Predicate::And(Box::new(Predicate::True), Box::new(buried.clone())),
-            Predicate::Or(Box::new(Predicate::True), Box::new(buried.clone())),
-            Predicate::Not(Box::new(buried.clone())),
-            Predicate::IsNull(Box::new(raw_path("collection"))),
-            cmp_with(Expr::ExprList(vec![raw_path("collection")])),
-            cmp_with(Expr::Predicate(buried.clone())),
-            cmp_with(Expr::InfixExpr {
-                left: Box::new(raw_path("collection")),
-                operator: InfixOperator::Add,
-                right: Box::new(Expr::Literal(Value::I32(1))),
-            }),
-        ];
-        for predicate in forms {
-            let selection = Selection { predicate: predicate.clone(), order_by: None, limit: None };
-            assert!(matches!(selection.check(), Err(SelectionError::UnresolvedPath(_))), "did not recurse into {predicate:?}");
-        }
-    }
-
-    #[test]
-    fn check_rejects_unpopulated_placeholders() {
-        // A placeholder survives resolution untouched, so an unpopulated one is
-        // its own class of leak: it carries no value to compare against.
-        for predicate in [Predicate::Placeholder, cmp_with(Expr::Placeholder)] {
-            let selection = Selection { predicate, order_by: None, limit: None };
-            assert!(matches!(selection.check(), Err(SelectionError::UnpopulatedPlaceholder)));
-        }
-    }
-
-    #[test]
-    fn check_covers_order_by_not_just_the_predicate() {
-        let resolved = cmp_with(Expr::PropertyPath(PropertyPath::id()));
-        let order_by = |key| Selection {
-            predicate: resolved.clone(),
-            order_by: Some(vec![OrderByItem { key, direction: OrderDirection::Asc }]),
-            limit: None,
-        };
-
-        assert!(order_by(OrderKey::Property(PropertyPath::system(SystemProperty::Name, vec![]))).check().is_ok());
-
-        let unresolved = order_by(OrderKey::Path(PathExpr::simple("name")));
-        let check_error = unresolved.check().expect_err("a raw sort key carries no identity");
-        assert!(matches!(&check_error, SelectionError::UnresolvedPath(p) if p == "name"), "got {check_error:?}");
-
-        let assume_error = unresolved.assume_null(&[]).expect_err("absence folding must also reject a raw sort key");
-        assert!(matches!(&assume_error, SelectionError::UnresolvedPath(p) if p == "name"), "got {assume_error:?}");
-    }
-
     #[test]
     fn identifier_selection_bincode_roundtrip() {
         // Simple identifier and a JSON-subpath identifier both survive a bincode round-trip.
         for selection in [identifier_selection("name", vec![]), identifier_selection("licensing", vec!["territory"])] {
             let bytes = bincode::serialize(&selection).expect("serialize");
-            let decoded: Selection = bincode::deserialize(&bytes).expect("deserialize");
+            let decoded: Selection<Resolved> = bincode::deserialize(&bytes).expect("deserialize");
             assert_eq!(decoded, selection);
         }
     }
@@ -796,13 +620,11 @@ mod tests {
     fn resolved_order_by_bincode_roundtrip() {
         let property = EntityId::from_bytes([9u8; 32]);
         let mut selection = identifier_selection("score", vec![]);
-        selection.order_by = Some(vec![OrderByItem {
-            key: OrderKey::Property(PropertyPath::registered(property, "score", vec![])),
-            direction: OrderDirection::Desc,
-        }]);
+        selection.order_by =
+            Some(vec![OrderByItem { path: PropertyPath::registered(property, "score", vec![]), direction: OrderDirection::Desc }]);
 
         let bytes = bincode::serialize(&selection).expect("serialize");
-        let decoded: Selection = bincode::deserialize(&bytes).expect("deserialize");
+        let decoded: Selection<Resolved> = bincode::deserialize(&bytes).expect("deserialize");
         assert_eq!(decoded, selection);
     }
 
@@ -810,18 +632,18 @@ mod tests {
     fn identifier_selection_json_roundtrip() {
         for selection in [identifier_selection("name", vec![]), identifier_selection("licensing", vec!["rights", "holder"])] {
             let json = serde_json::to_string(&selection).expect("to_json");
-            let decoded: Selection = serde_json::from_str(&json).expect("from_json");
+            let decoded: Selection<Resolved> = serde_json::from_str(&json).expect("from_json");
             assert_eq!(decoded, selection);
         }
     }
 
     #[test]
     fn identifier_assume_null_keys_on_identity_not_subpath() {
-        // A resolved identifier carries a single identity; its subpath does NOT
-        // change which property it references. So a JSON-subpath identifier
+        // A resolved path carries a single identity; its subpath does NOT
+        // change which property it references. So a JSON-subpath path
         // collapses when the PROPERTY is absent, and is untouched when some
         // unrelated identity is absent. This is the whole point of the
-        // resolution pass: identity is fixed once, removing the old Path
+        // resolution pass: identity is fixed once, removing the old name-path
         // first-vs-last-step ambiguity.
         let id_pred = identifier_selection("licensing", vec!["territory"]).predicate;
 
@@ -829,6 +651,19 @@ mod tests {
         assert_eq!(id_pred.assume_null(&[identifier_selection_id()]), Predicate::False);
         // Some unrelated identity absent (e.g. a would-be subpath step) -> unchanged.
         assert_eq!(id_pred.assume_null(&[PropertyId::EntityId(EntityId::from_bytes([8u8; 32]))]), id_pred);
+    }
+
+    #[test]
+    fn assume_null_drops_a_sort_on_an_absent_property() {
+        let mut selection = identifier_selection("status", vec![]);
+        let absent_property = EntityId::from_bytes([9u8; 32]);
+        selection.order_by = Some(vec![
+            OrderByItem { path: PropertyPath::registered(absent_property, "score", vec![]), direction: OrderDirection::Asc },
+            OrderByItem { path: PropertyPath::id(), direction: OrderDirection::Asc },
+        ]);
+
+        let folded = selection.assume_null(&[PropertyId::EntityId(absent_property)]);
+        assert_eq!(folded.order_by, Some(vec![OrderByItem { path: PropertyPath::id(), direction: OrderDirection::Asc }]));
     }
 
     #[test]
@@ -854,59 +689,59 @@ mod tests {
 }
 
 // From implementations for single values that wrap them in Expr::Literal
-impl From<String> for Expr {
-    fn from(s: String) -> Expr { Expr::Literal(Value::String(s)) }
+impl<S: Stage> From<String> for Expr<S> {
+    fn from(s: String) -> Expr<S> { Expr::Literal(Value::String(s)) }
 }
 
-impl From<&str> for Expr {
-    fn from(s: &str) -> Expr { Expr::Literal(Value::String(s.to_string())) }
+impl<S: Stage> From<&str> for Expr<S> {
+    fn from(s: &str) -> Expr<S> { Expr::Literal(Value::String(s.to_string())) }
 }
 
-impl From<i64> for Expr {
-    fn from(i: i64) -> Expr { Expr::Literal(Value::I64(i)) }
+impl<S: Stage> From<i64> for Expr<S> {
+    fn from(i: i64) -> Expr<S> { Expr::Literal(Value::I64(i)) }
 }
 
-impl From<f64> for Expr {
-    fn from(f: f64) -> Expr { Expr::Literal(Value::F64(f)) }
+impl<S: Stage> From<f64> for Expr<S> {
+    fn from(f: f64) -> Expr<S> { Expr::Literal(Value::F64(f)) }
 }
 
-impl From<bool> for Expr {
-    fn from(b: bool) -> Expr { Expr::Literal(Value::Bool(b)) }
+impl<S: Stage> From<bool> for Expr<S> {
+    fn from(b: bool) -> Expr<S> { Expr::Literal(Value::Bool(b)) }
 }
 
-impl From<Value> for Expr {
-    fn from(value: Value) -> Expr { Expr::Literal(value) }
+impl<S: Stage> From<Value> for Expr<S> {
+    fn from(value: Value) -> Expr<S> { Expr::Literal(value) }
 }
 
-impl From<EntityId> for Expr {
+impl<S: Stage> From<EntityId> for Expr<S> {
     fn from(id: EntityId) -> Self { Expr::Literal(Value::EntityId(id)) }
 }
 
-impl From<&EntityId> for Expr {
+impl<S: Stage> From<&EntityId> for Expr<S> {
     fn from(id: &EntityId) -> Self { Expr::Literal(Value::EntityId(*id)) }
 }
 
 // These create Expr::ExprList for use in IN clauses
-impl<T> From<Vec<T>> for Expr
-where T: Into<Expr>
+impl<S: Stage, T> From<Vec<T>> for Expr<S>
+where T: Into<Expr<S>>
 {
     fn from(vec: Vec<T>) -> Self { Expr::ExprList(vec.into_iter().map(|item| item.into()).collect()) }
 }
 
-impl<T, const N: usize> From<[T; N]> for Expr
-where T: Into<Expr>
+impl<S: Stage, T, const N: usize> From<[T; N]> for Expr<S>
+where T: Into<Expr<S>>
 {
     fn from(arr: [T; N]) -> Self { Expr::ExprList(arr.into_iter().map(|item| item.into()).collect()) }
 }
 
-impl<T> From<&[T]> for Expr
-where T: Into<Expr> + Clone
+impl<S: Stage, T> From<&[T]> for Expr<S>
+where T: Into<Expr<S>> + Clone
 {
     fn from(slice: &[T]) -> Self { Expr::ExprList(slice.iter().map(|item| item.clone().into()).collect()) }
 }
 
-impl<T, const N: usize> From<&[T; N]> for Expr
-where T: Into<Expr> + Clone
+impl<S: Stage, T, const N: usize> From<&[T; N]> for Expr<S>
+where T: Into<Expr<S>> + Clone
 {
     fn from(arr: &[T; N]) -> Self { Expr::ExprList(arr.iter().map(|item| item.clone().into()).collect()) }
 }

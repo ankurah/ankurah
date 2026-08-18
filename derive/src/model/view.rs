@@ -74,14 +74,14 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
                 )*
             }
 
-            impl From<#view_name> for ::ankurah::ankql::ast::Expr {
-                fn from(view: #view_name) -> ::ankurah::ankql::ast::Expr {
+            impl<S: ::ankurah::ankql::ast::Stage> From<#view_name> for ::ankurah::ankql::ast::Expr<S> {
+                fn from(view: #view_name) -> ::ankurah::ankql::ast::Expr<S> {
                     view.entity.id().into()
                 }
             }
 
-            impl From<&#view_name> for ::ankurah::ankql::ast::Expr {
-                fn from(view: &#view_name) -> ::ankurah::ankql::ast::Expr {
+            impl<S: ::ankurah::ankql::ast::Stage> From<&#view_name> for ::ankurah::ankql::ast::Expr<S> {
+                fn from(view: &#view_name) -> ::ankurah::ankql::ast::Expr<S> {
                     view.entity.id().into()
                 }
             }

@@ -410,6 +410,9 @@ where
         for node in &nodes {
             if !node.durable {
                 node.node.system.wait_system_ready().await;
+                // Ready means this node now holds a schema epoch; admit the
+                // deterministic SimRecord binding under it (see build_nodes).
+                super::node::seed_sim_schema(node).expect("sim schema seeds on a ready node");
             }
             scheduler.run_to_quiescence(&nodes, &mut rng, &mut trace).await;
         }

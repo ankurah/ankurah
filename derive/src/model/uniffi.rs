@@ -639,10 +639,12 @@ fn uniffi_livequery_wrapper(
                 Ok(())
             }
 
-            /// Get the current selection predicate as a string
+            /// Get the current selection predicate as a string. Empty while
+            /// the query's admission is still running: it has no selection
+            /// yet, and rendering one would name a query that is not running.
             pub fn current_selection(&self) -> String {
                 use ::ankurah::signals::With;
-                self.0.selection().with(|(sel, _version)| sel.to_string())
+                self.0.selection().with(|admitted| admitted.as_ref().map(|(sel, _version)| sel.to_string()).unwrap_or_default())
             }
 
             /// Subscribe to changes in the LiveQuery resultset

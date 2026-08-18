@@ -1,3 +1,4 @@
+use ankql::ast::Resolved;
 use ankurah_proto::{self as proto, Attested};
 use tracing::warn;
 
@@ -113,7 +114,7 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         node: &Node<SE, PA>,
         query_id: proto::QueryId,
         collection_id: proto::CollectionId,
-        mut selection: ankql::ast::Selection,
+        mut selection: ankql::ast::Selection<Resolved>,
         cdata: &PA::ContextData,
         version: u32,
         known_matches: Vec<proto::KnownEntity>,
@@ -131,6 +132,9 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         // arrives with the re-permission PR:
         // https://github.com/ankurah/ankurah/pull/426
         node.policy_agent.can_access_collection(cdata, &collection_id)?;
+        // The requester's selection arrives resolved, and the policy narrows
+        // it in the same vocabulary: what the agent ANDs in is resolved too,
+        // so nothing here is left to bind.
         selection.predicate = node.policy_agent.filter_predicate(cdata, &collection_id, selection.predicate)?;
 
         // TODO: consider separating session updating from SubscribeQuery,
@@ -183,7 +187,7 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         node: &Node<SE, PA>,
         query_id: proto::QueryId,
         collection_id: proto::CollectionId,
-        selection: ankql::ast::Selection,
+        selection: ankql::ast::Selection<Resolved>,
         sessions: &SessionSet<CD>,
         cdata: &PA::ContextData,
         version: u32,

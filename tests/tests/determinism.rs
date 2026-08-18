@@ -14,6 +14,44 @@ async fn test_two_event_determinism_same_property() -> Result<()> {
 
     let mut dag = TestDag::new();
 
+    // node2 receives node1's state and events by raw storage transplant, so
+    // the two independent systems must agree on Record's property ids:
+    // register on node1 (allocating them), then seed node2 with node1's
+    // exact allocated definitions, the same move the sim and crash-recovery
+    // harnesses make for cross-node forged deliveries.
+    let record_model_id = ctx1.register_model::<Record>().await?;
+    {
+        let proto::ModelId::EntityId(model_eid) = record_model_id else {
+            panic!("registered model must be catalog-backed");
+        };
+        let descriptor = Record::descriptor();
+        let properties = descriptor
+            .properties
+            .iter()
+            .map(|field| {
+                let ankurah::PropertyId::EntityId(pid) =
+                    node1.catalog.resolve(&record_model_id, field.name).expect("node1 allocated this property")
+                else {
+                    panic!("registered property must be catalog-backed");
+                };
+                let membership = node1.catalog.membership(&model_eid, &pid).expect("node1 recorded the membership");
+                proto::RegisteredProperty {
+                    id: pid,
+                    membership_id: membership.id,
+                    name: field.name.to_owned(),
+                    backend: field.backend.to_owned(),
+                    value_type: field.value_type.to_owned(),
+                    target_model: None,
+                    minted_for: Some(model_eid),
+                    optional: field.optional,
+                }
+            })
+            .collect();
+        let registered =
+            proto::RegisteredModel { id: model_eid, label: descriptor.label.to_owned(), name: descriptor.name.to_owned(), properties };
+        node2.catalog.seed_registered_schema(descriptor, std::slice::from_ref(&registered))?;
+    }
+
     // Create genesis on node1
     let record_id = {
         let trx = ctx1.begin();

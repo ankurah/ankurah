@@ -206,9 +206,9 @@ pub fn js_preprocess_ref_field(obj: &wasm_bindgen::JsValue, field_name: &str) ->
 #[doc(hidden)]
 #[cfg(feature = "wasm")]
 pub fn js_populate_predicate(
-    predicate: ankql::ast::Predicate,
+    predicate: ankql::ast::Predicate<ankql::ast::Parsed>,
     substitution_values: &wasm_bindgen::JsValue,
-) -> Result<ankql::ast::Predicate, wasm_bindgen::JsValue> {
+) -> Result<ankql::ast::Predicate<ankql::ast::Parsed>, wasm_bindgen::JsValue> {
     let args_array: js_sys::Array =
         substitution_values.clone().try_into().map_err(|_| wasm_bindgen::JsValue::from_str("Invalid arguments array"))?;
 

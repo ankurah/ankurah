@@ -25,6 +25,7 @@ use crate::{
     selection::filter::Filterable,
     value::{Value, ValueType},
 };
+use ankql::ast::Resolved;
 use ankurah_proto::{self as proto};
 use futures::future::join_all;
 use std::{
@@ -201,21 +202,16 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
 
 /// Build KeySpec from Selection's ORDER BY clause with type inference from sample entities
 pub(crate) fn build_key_spec_from_selection<E: AbstractEntity>(
-    order_by: &[ankql::ast::OrderByItem],
+    order_by: &[ankql::ast::OrderByItem<Resolved>],
     resultset: &EntityResultSet<E>,
 ) -> anyhow::Result<KeySpec<ankql::ast::PropertyId>> {
     let mut keyparts = Vec::new();
 
     let read = resultset.read();
     for item in order_by {
-        // A sort key must arrive resolved: an unresolved name carries no
-        // durable identity to sort on (`Selection::check` is the boundary
-        // that guarantees this for engine reads; the reactor asserts the
-        // same discipline for its in-memory ordering).
-        let key = match &item.key {
-            ankql::ast::OrderKey::Property(identifier) => identifier.property_id(),
-            ankql::ast::OrderKey::Path(path) => anyhow::bail!("unresolved ORDER BY key `{path}` reached the reactor"),
-        };
+        // A resolved sort key names one property by its durable identity,
+        // which is what the reactor's in-memory ordering keys on.
+        let key = item.path.property_id();
 
         // Infer type from first non-null value in resultset entities
         let value_type = read.iter_entities().find_map(|(_, e)| e.value(&key).map(|v| ValueType::of(&v))).unwrap_or(ValueType::String); // TODO: Get type from system catalog instead of defaulting to String
@@ -243,7 +239,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         subscription_id: ReactorSubscriptionId,
         query_id: proto::QueryId,
         collection_id: proto::CollectionId,
-        selection: ankql::ast::Selection,
+        selection: ankql::ast::Selection<Resolved>,
         node: &dyn crate::node::TNodeErased<E>,
         resultset: EntityResultSet<E>,
         gap_fetcher: std::sync::Arc<dyn GapFetcher<E>>,
@@ -300,7 +296,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         subscription_id: ReactorSubscriptionId,
         query_id: proto::QueryId,
         collection_id: proto::CollectionId,
-        selection: ankql::ast::Selection,
+        selection: ankql::ast::Selection<Resolved>,
         node: &dyn crate::node::TNodeErased<E>,
         version: u32,
         pre_notify_hook: H,
@@ -436,29 +432,22 @@ mod tests {
         ankql::ast::PropertyId::EntityId(proto::EntityId::from_bytes(bytes))
     }
 
-    /// Parse a fixture query and bind its names to the fixture identities:
-    /// the reactor receives selections the admission pass already resolved.
-    fn sel(query: &str) -> ankql::ast::Selection {
+    /// Bind a parsed selection's names to the fixture identities: the reactor
+    /// receives selections the admission pass already resolved.
+    fn resolve_fixture(selection: ankql::ast::Selection<ankql::ast::Parsed>) -> ankql::ast::Selection<Resolved> {
+        use crate::schema::resolver::{resolve_selection, ModelResolutionError, ModelResolver, ResolvedProperty};
         struct FixtureResolver;
-        impl ankql::NameResolver for FixtureResolver {
-            fn resolve_property(
-                &self,
-                _model: &proto::ModelId,
-                name: &str,
-            ) -> Result<Option<ankql::ast::PropertyId>, ankql::NameResolutionError> {
-                Ok(Some(prop(name)))
-            }
-            fn property_value_type(
-                &self,
-                _model: &proto::ModelId,
-                _property: &ankql::ast::PropertyId,
-            ) -> Result<crate::value::ValueType, ankql::NameResolutionError> {
-                Ok(crate::value::ValueType::String)
+        impl ModelResolver for FixtureResolver {
+            fn resolve_property(&self, _model: &proto::ModelId, name: &str) -> Result<Option<ResolvedProperty>, ModelResolutionError> {
+                Ok(Some(ResolvedProperty { id: prop(name), value_type: crate::value::ValueType::String }))
             }
         }
         let model = proto::ModelId::EntityId(proto::EntityId::from_bytes([0x77; 32]));
-        ankql::parser::parse_selection(query).unwrap().resolve_names(&model, &FixtureResolver).unwrap()
+        resolve_selection(&model, &FixtureResolver, selection).unwrap()
     }
+
+    /// Parse a fixture query and bind it, in one step.
+    fn sel(query: &str) -> ankql::ast::Selection<Resolved> { resolve_fixture(ankql::parser::parse_selection(query).unwrap()) }
 
     pub fn watcher<T: Clone + Send + 'static>() -> (Box<dyn Fn(T) + Send + Sync>, Box<dyn Fn() -> Vec<T> + Send + Sync>) {
         let values = Arc::new(Mutex::new(Vec::new()));
@@ -532,7 +521,7 @@ mod tests {
         async fn fetch_gap(
             &self,
             _collection_id: &proto::CollectionId,
-            _selection: &ankql::ast::Selection,
+            _selection: &ankql::ast::Selection<Resolved>,
             _last_entity: Option<&TestEntity>,
             _gap_size: usize,
         ) -> Result<Vec<TestEntity>, crate::error::RetrievalError> {
@@ -552,7 +541,7 @@ mod tests {
         fn update_remote_query(
             &self,
             _query_id: proto::QueryId,
-            _selection: ankql::ast::Selection,
+            _selection: ankql::ast::Selection<Resolved>,
             _version: u32,
         ) -> Result<(), anyhow::Error> {
             Ok(())
@@ -560,12 +549,19 @@ mod tests {
         async fn fetch_entities_from_local(
             &self,
             _collection_id: &proto::CollectionId,
-            _selection: &ankql::ast::Selection,
+            _selection: &ankql::ast::Selection<Resolved>,
         ) -> Result<Vec<TestEntity>, crate::error::RetrievalError> {
             Ok(self.entities.clone())
         }
         fn reactor(&self) -> &Reactor<TestEntity> { panic!("MockNode::reactor() should not be called in this test") }
         fn has_subscription_relay(&self) -> bool { false }
+        fn resolve_selection(
+            &self,
+            _collection: &proto::CollectionId,
+            selection: ankql::ast::Selection<ankql::ast::Parsed>,
+        ) -> Result<ankql::ast::Selection<Resolved>, crate::error::RetrievalError> {
+            Ok(resolve_fixture(selection))
+        }
     }
 
     /// Test that once a predicate matches an entity, that entity continues to be watched
@@ -581,7 +577,7 @@ mod tests {
 
         let query_id = QueryId::new();
         let collection_id = CollectionId::fixed_name("album");
-        let selection: ankql::ast::Selection = sel("status = 'pending'");
+        let selection: ankql::ast::Selection<Resolved> = sel("status = 'pending'");
         let entity1 = TestEntity::new("Test Album", "pending");
         let resultset: EntityResultSet<TestEntity> = EntityResultSet::empty();
         let mock_gap_fetcher = Arc::new(MockGapFetcher::new());

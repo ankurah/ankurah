@@ -1,6 +1,6 @@
 mod common;
 
-use ankql::ast::{ComparisonOperator, Expr, OrderByItem, OrderDirection, OrderKey, Predicate, PropertyPath, Selection};
+use ankql::ast::{ComparisonOperator, Expr, OrderByItem, OrderDirection, Predicate, PropertyPath, Resolved, Selection};
 use ankurah::{policy::DEFAULT_CONTEXT as c, proto::EntityId, Model, Node, PermissiveAgent};
 use ankurah_core_types::Value;
 use ankurah_storage_sled::SledStorageEngine;
@@ -37,7 +37,7 @@ async fn test_id_range_optimization_integration() -> Result<()> {
     // Test 1: Simple ORDER BY id ASC with LIMIT (should use optimization)
     let selection_asc = Selection {
         predicate: Predicate::True,
-        order_by: Some(vec![OrderByItem { key: OrderKey::Property(PropertyPath::id()), direction: OrderDirection::Asc }]),
+        order_by: Some(vec![OrderByItem { path: PropertyPath::id(), direction: OrderDirection::Asc }]),
         limit: Some(5),
     };
 
@@ -58,7 +58,7 @@ async fn test_id_range_optimization_integration() -> Result<()> {
     // Test 2: ORDER BY id DESC (should use FullScan reverse + skip sorting)
     let selection_desc = Selection {
         predicate: Predicate::True,
-        order_by: Some(vec![OrderByItem { key: OrderKey::Property(PropertyPath::id()), direction: OrderDirection::Desc }]),
+        order_by: Some(vec![OrderByItem { path: PropertyPath::id(), direction: OrderDirection::Desc }]),
         limit: Some(3),
     };
 
@@ -77,7 +77,7 @@ async fn test_id_range_optimization_integration() -> Result<()> {
     let name_path = common::resolved_prop(&node, TestEntity::descriptor(), "name").path(&[]);
     let selection_name = Selection {
         predicate: Predicate::True,
-        order_by: Some(vec![OrderByItem { key: OrderKey::Property(name_path), direction: OrderDirection::Asc }]),
+        order_by: Some(vec![OrderByItem { path: name_path, direction: OrderDirection::Asc }]),
         limit: Some(5),
     };
 
@@ -119,11 +119,11 @@ async fn test_id_range_with_where_clause() -> Result<()> {
     // an id comparison's string to Value::EntityId before storage sees it.
     let selection = Selection {
         predicate: Predicate::Comparison {
-            left: Box::new(Expr::PropertyPath(PropertyPath::id())),
+            left: Box::new(Expr::Path(PropertyPath::id())),
             operator: ComparisonOperator::GreaterThanOrEqual,
             right: Box::new(Expr::Literal(Value::EntityId(start_id))),
         },
-        order_by: Some(vec![OrderByItem { key: OrderKey::Property(PropertyPath::id()), direction: OrderDirection::Asc }]),
+        order_by: Some(vec![OrderByItem { path: PropertyPath::id(), direction: OrderDirection::Asc }]),
         limit: Some(3),
     };
 

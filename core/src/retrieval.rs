@@ -282,6 +282,7 @@ impl GetState for LocalStateGetter {
 mod tests {
     use super::*;
     use crate::storage::{StorageCollection, StorageCollectionWrapper};
+    use ankql::ast::Resolved;
     use ankurah_proto::{AttestationSet, Attested, Clock, EntityId, EntityState, Event, EventId, OperationSet};
     use async_trait::async_trait;
     use std::collections::{BTreeMap, HashMap};
@@ -304,7 +305,7 @@ mod tests {
 
         async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError> { Err(RetrievalError::EntityNotFound(id)) }
 
-        async fn fetch_states(&self, _selection: &ankql::ast::Selection) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+        async fn fetch_states(&self, _selection: &ankql::ast::Selection<Resolved>) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
             Ok(vec![])
         }
 

@@ -40,7 +40,16 @@ impl SchemaEpoch {
     /// reset therefore gets a fresh epoch on rejoin, same-root rejoin
     /// included, and a redundant ready-marking on an already-ready node
     /// allocates nothing.
-    pub(crate) fn allocate() -> Self { Self(NEXT_SCHEMA_EPOCH.fetch_add(1, Ordering::Relaxed)) }
+    pub(crate) fn allocate() -> Self {
+        let raw = NEXT_SCHEMA_EPOCH.fetch_add(1, Ordering::Relaxed);
+        // Wrapping would re-issue 0 (reserved for BOOTSTRAP) and then every
+        // historical epoch, silently re-aiming their still-final cell
+        // entries. Practically unreachable (one allocation per node
+        // become-ready transition), but the collision must be impossible,
+        // not just unlikely.
+        assert!(raw != 0, "schema epoch allocator exhausted (u32 wrapped)");
+        Self(raw)
+    }
 }
 
 impl std::fmt::Display for SchemaEpoch {

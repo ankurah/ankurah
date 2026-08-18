@@ -2,7 +2,7 @@
 //! which has not been pre-filtered by an index search - or to supplement/validate an index search with additional filtering.
 
 use crate::value::Value;
-use ankql::ast::{ComparisonOperator, Expr, Predicate, PropertyId, PropertyPath};
+use ankql::ast::{ComparisonOperator, Expr, Predicate, PropertyId, PropertyPath, Resolved, Stage};
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq)]
@@ -11,8 +11,6 @@ pub enum Error {
     CollectionMismatch { expected: String, actual: String },
     #[error("property not found: {0}")]
     PropertyNotFound(String),
-    #[error("unresolved property path `{0}` reached filtering: a selection must be resolved to property ids before evaluation")]
-    UnresolvedPath(String),
     #[error("Unsupported expression: {0}")]
     UnsupportedExpression(&'static str),
     #[error("Unsupported operator: {0}")]
@@ -194,7 +192,7 @@ where
     I: Iterator<Item = R>,
     R: Filterable,
 {
-    pub fn new(iter: I, predicate: Predicate) -> Self { Self { iter, predicate } }
+    pub fn new(iter: I, predicate: Predicate<Resolved>) -> Self { Self { iter, predicate } }
 }
 
 impl<I, R> Iterator for FilterIterator<I>

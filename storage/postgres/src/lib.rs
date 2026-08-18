@@ -5,6 +5,7 @@ use std::{
     time::Duration,
 };
 
+use ankql::ast::Resolved;
 use ankurah_core::{
     error::{MutationError, RetrievalError, StateError},
     property::backend::backend_from_string,
@@ -14,6 +15,7 @@ use ankurah_proto::{Attestation, AttestationSet, Attested, EntityState, EventBod
 
 use futures_util::{pin_mut, TryStreamExt};
 
+pub mod lower;
 pub mod sql_builder;
 pub mod value;
 
@@ -186,7 +188,7 @@ pub struct PostgresBucket {
     columns: Arc<RwLock<Vec<PostgresColumn>>>,
     /// Tracks the last predicate that spilled to post-filtering (debug builds only)
     #[cfg(debug_assertions)]
-    last_spilled_predicate: Arc<RwLock<Option<ankql::ast::Predicate>>>,
+    last_spilled_predicate: Arc<RwLock<Option<ankql::ast::Predicate<Resolved>>>>,
 }
 
 impl PostgresBucket {
@@ -202,7 +204,7 @@ impl PostgresBucket {
     /// assert!(spilled.is_none(), "Expected full pushdown, but got spill: {:?}", spilled);
     /// ```
     #[cfg(debug_assertions)]
-    pub fn last_spilled_predicate(&self) -> Option<ankql::ast::Predicate> { self.last_spilled_predicate.read().unwrap().clone() }
+    pub fn last_spilled_predicate(&self) -> Option<ankql::ast::Predicate<Resolved>> { self.last_spilled_predicate.read().unwrap().clone() }
 
     /// Rebuild the cache of columns in the table.
     pub async fn rebuild_columns_cache(&self, client: &mut tokio_postgres::Client) -> Result<(), StateError> {
@@ -531,7 +533,7 @@ impl StorageCollection for PostgresBucket {
         })
     }
 
-    async fn fetch_states(&self, selection: &ankql::ast::Selection) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+    async fn fetch_states(&self, selection: &ankql::ast::Selection<Resolved>) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         debug!("fetch_states: {:?}", selection);
         let mut client = self.pool.get().await.map_err(|err| RetrievalError::StorageError(Box::new(err)))?;
 
@@ -559,7 +561,7 @@ impl StorageCollection for PostgresBucket {
             selection.clone()
         } else {
             debug!("PostgresBucket({}).fetch_states: Columns {:?} don't exist, treating as NULL", self.collection_id, missing);
-            selection.assume_null(&missing).map_err(|e| RetrievalError::StorageError(Box::new(e)))?
+            selection.assume_null(&missing)
         };
 
         // Split predicate into parts we can pushdown to PostgreSQL vs post-filter in Rust
@@ -585,8 +587,11 @@ impl StorageCollection for PostgresBucket {
             *self.last_spilled_predicate.write().unwrap() = spilled;
         }
 
-        // Build SQL with only the pushdown-capable predicate
-        let sql_selection = ankql::ast::Selection {
+        // Build SQL with only the pushdown-capable predicate. Only that half
+        // is lowered into this engine's columns; what is left over is
+        // evaluated in Rust against entities, which answer by property
+        // identity rather than by column.
+        let sql_selection = crate::lower::lower(&ankql::ast::Selection {
             predicate: split.sql_predicate,
             order_by: effective_selection.order_by.clone(),
             limit: if needs_post_filter {
@@ -594,7 +599,7 @@ impl StorageCollection for PostgresBucket {
             } else {
                 effective_selection.limit
             },
-        };
+        });
 
         let mut results = Vec::new();
         let mut builder = SqlBuilder::with_fields(vec!["id", "state_buffer", "memberships", "head", "attestations"]);
@@ -873,7 +878,7 @@ use crate::sql_builder::SqlBuilder;
 /// such as complex JSON traversals or future features like Ref traversal.
 fn post_filter_states(
     states: &[Attested<EntityState>],
-    predicate: &ankql::ast::Predicate,
+    predicate: &ankql::ast::Predicate<Resolved>,
     collection_id: &CollectionId,
 ) -> Vec<Attested<EntityState>> {
     use ankurah_core::entity::TemporaryEntity;

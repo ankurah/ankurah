@@ -1,7 +1,7 @@
 use crate::agent_state::start_ephemeral_policy_sync;
 pub use crate::agent_state::{AgentState, AgentStateReadGuard};
 use crate::{JwtContext, JwtKeys, PolicyConfig, SigningKeys};
-use ankql::ast::Predicate;
+use ankql::ast::{Parsed, Predicate, Resolved};
 use ankurah_core::{
     entity::{Entity, TemporaryEntity},
     error::ValidationError,
@@ -18,11 +18,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use tracing::debug;
 
-/// Binds a scope rule's property names to durable identities before row
-/// evaluation, scoped to the collection being checked. Installed from the
-/// node's catalog at attach; rows are addressed by property id, so a
-/// name-based rule predicate must resolve before it can be evaluated.
-pub type SelectionResolver = Arc<dyn Fn(&proto::CollectionId, Predicate) -> Result<Predicate, String> + Send + Sync>;
+/// Binds a scope rule's property names to durable identities, scoped to the
+/// collection being checked. Installed from the node's catalog at attach. A
+/// rule is written in names, and everything that consumes one -- a row check
+/// evaluating it, a query it narrows -- addresses properties by id, so this
+/// is what carries a rule across that boundary.
+pub type SelectionResolver = Arc<dyn Fn(&proto::CollectionId, Predicate<Parsed>) -> Result<Predicate<Resolved>, String> + Send + Sync>;
 
 /// JWT-based PolicyAgent for ankurah.
 ///
@@ -262,8 +263,15 @@ impl PolicyAgent for JwtAgent {
         Err(AccessDenied::CollectionDenied(collection.clone()))
     }
 
-    fn filter_predicate<C>(&self, data: &C, collection: &proto::CollectionId, predicate: Predicate) -> Result<Predicate, AccessDenied>
-    where C: Iterable<Self::ContextData> {
+    fn filter_predicate<C>(
+        &self,
+        data: &C,
+        collection: &proto::CollectionId,
+        predicate: Predicate<Resolved>,
+    ) -> Result<Predicate<Resolved>, AccessDenied>
+    where
+        C: Iterable<Self::ContextData>,
+    {
         // The policy collection is granted before any credential is
         // consulted, mirroring can_access_collection's carve-out and for the
         // same reason: an ephemeral node bootstraps its policy through a
@@ -319,6 +327,7 @@ impl PolicyAgent for JwtAgent {
         // happens to present its credentials in. A caller whose every
         // credential is skipped leaves no slice and is refused below, exactly
         // as a caller holding nothing authorized is.
+        let resolver = self.selection_resolver();
         let mut slices = Vec::new();
         for ctx in data.iterable() {
             let JwtContext::User { claims, .. } = ctx else {
@@ -351,6 +360,17 @@ impl PolicyAgent for JwtAgent {
                 return Ok(predicate);
             };
             let slice = filters.fold(first, |conjunction, filter| Predicate::And(Box::new(conjunction), Box::new(filter)));
+            // A rule is authored in names and the query it narrows is
+            // addressed by property id, so the slice binds here, against the
+            // collection being read. A slice whose names do not bind admits
+            // nothing and is skipped, the same as one that could not be
+            // constructed; a caller left with no slice at all is refused
+            // below.
+            // TODO: perform this resolution at rule load time, not here
+            let Some(slice) = resolve_rule_predicate(resolver.as_ref(), collection, slice) else {
+                tracing::warn!("skipping credential whose read scope did not resolve for {collection}");
+                continue;
+            };
             // Equal-valued credentials are legal and yield equal slices;
             // repeating one costs evaluation and index extraction without
             // admitting a single extra row.
@@ -441,7 +461,7 @@ fn scoped_predicates(
     collection: &str,
     claims: &crate::JwtClaims,
     access: ScopeAccess,
-) -> Result<Vec<Predicate>, AccessDenied> {
+) -> Result<Vec<Predicate<Parsed>>, AccessDenied> {
     let mut predicates = Vec::new();
 
     for rule in config.scope_rules_for_collection(collection) {
@@ -495,13 +515,13 @@ fn enforce_write_scope(
 fn resolve_rule_predicate(
     resolver: Option<&SelectionResolver>,
     collection: &proto::CollectionId,
-    predicate: Predicate,
-) -> Option<Predicate> {
+    predicate: Predicate<Parsed>,
+) -> Option<Predicate<Resolved>> {
     let resolver = resolver?;
     match resolver(collection, predicate) {
         Ok(resolved) => Some(resolved),
         Err(error) => {
-            tracing::debug!("rule predicate for {collection} did not resolve: {error}");
+            tracing::warn!("rule predicate for {collection} did not resolve (row denied): {error}");
             None
         }
     }

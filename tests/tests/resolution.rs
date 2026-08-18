@@ -3,7 +3,8 @@
 //! the pass directly for precise shape assertions.
 
 mod common;
-use ankql::ast::{Expr, OrderByItem, OrderKey, Predicate, PropertyId, Selection};
+use ankql::ast::{Expr, OrderByItem, Parsed, PathExpr, Predicate, PropertyId, Resolved, Selection};
+use ankurah::core::schema::resolver::resolve_selection;
 use ankurah::proto::EntityId;
 use common::*;
 use std::collections::BTreeMap;
@@ -49,7 +50,7 @@ async fn register_and_map(
     }
 }
 
-fn first_expr(selection: &Selection) -> &Expr {
+fn first_expr(selection: &Selection<Resolved>) -> &Expr<Resolved> {
     match &selection.predicate {
         Predicate::Comparison { left, .. } => left,
         other => panic!("expected comparison, got {other:?}"),
@@ -58,28 +59,17 @@ fn first_expr(selection: &Selection) -> &Expr {
 
 fn entity_id_literal() -> String { EntityId::from_bytes([1; EntityId::BYTE_LEN]).to_base64() }
 
-/// The resolved catalog property id an ORDER BY key carries, or `None` for an
-/// unresolved path or the `id` pseudo-property. Mirrors the pre-column-layering
-/// `OrderByItem::property` field the `OrderKey` enum replaced.
-fn order_property_id(item: &OrderByItem) -> Option<EntityId> {
-    match &item.key {
-        OrderKey::Property(identifier) => match identifier.property_id() {
-            PropertyId::EntityId(id) => Some(id),
-            _ => None,
-        },
-        OrderKey::Path(_) => None,
+/// The catalog property id an ORDER BY key carries, or `None` for the `id`
+/// pseudo-property (which carries its own identity, not a catalog one).
+fn order_property_id(item: &OrderByItem<Resolved>) -> Option<EntityId> {
+    match item.path.property_id() {
+        PropertyId::EntityId(id) => Some(id),
+        _ => None,
     }
 }
 
-/// The display name an ORDER BY key renders to (the resolved-from label, or the
-/// raw path's first step when unresolved). Mirrors the old
-/// `OrderByItem::path.first()`.
-fn order_display(item: &OrderByItem) -> String {
-    match &item.key {
-        OrderKey::Property(identifier) => identifier.to_string(),
-        OrderKey::Path(path) => path.first().to_string(),
-    }
-}
+/// The display name an ORDER BY key renders to: the resolved-from label.
+fn order_display(item: &OrderByItem<Resolved>) -> String { item.path.to_string() }
 
 #[tokio::test]
 async fn resolution_binds_names_and_fails_closed() -> anyhow::Result<()> {
@@ -96,9 +86,9 @@ async fn resolution_binds_names_and_fails_closed() -> anyhow::Result<()> {
     let collection = server.catalog.model_id_for("album").expect("album model registered");
 
     // Simple reference resolves to the allocated property id.
-    let resolved = ankql::parser::parse_selection("name = 'x'")?.resolve_names(&collection, &server.catalog)?;
+    let resolved = resolve_selection(&collection, &server.catalog, ankql::parser::parse_selection("name = 'x'")?)?;
     match first_expr(&resolved) {
-        Expr::PropertyPath(ident) => {
+        Expr::Path(ident) => {
             assert_eq!(ident.property_id(), PropertyId::EntityId(name_id));
             assert_eq!(ident.to_string(), "name");
             assert!(ident.subpath.is_empty());
@@ -107,9 +97,9 @@ async fn resolution_binds_names_and_fails_closed() -> anyhow::Result<()> {
     }
 
     // JSON subpath is preserved past the resolved property step.
-    let resolved = ankql::parser::parse_selection("payload.meta.genre = 'jazz'")?.resolve_names(&collection, &server.catalog)?;
+    let resolved = resolve_selection(&collection, &server.catalog, ankql::parser::parse_selection("payload.meta.genre = 'jazz'")?)?;
     match first_expr(&resolved) {
-        Expr::PropertyPath(ident) => {
+        Expr::Path(ident) => {
             assert_eq!(ident.property_id(), PropertyId::EntityId(payload_id));
             assert_eq!(ident.subpath, vec!["meta".to_string(), "genre".to_string()]);
         }
@@ -119,28 +109,24 @@ async fn resolution_binds_names_and_fails_closed() -> anyhow::Result<()> {
     // The id pseudo-property resolves to its own identity (`PropertyId::Id`),
     // not a catalog property or raw path.
     let resolved =
-        ankql::parser::parse_selection(&format!("id = '{}'", entity_id_literal()))?.resolve_names(&collection, &server.catalog)?;
+        resolve_selection(&collection, &server.catalog, ankql::parser::parse_selection(&format!("id = '{}'", entity_id_literal()))?)?;
     match first_expr(&resolved) {
-        Expr::PropertyPath(ident) => assert_eq!(ident.property_id(), PropertyId::Id),
+        Expr::Path(ident) => assert_eq!(ident.property_id(), PropertyId::Id),
         other => panic!("expected the id pseudo-property to resolve to PropertyId::Id, got {other:?}"),
     }
 
     // The legacy collection-qualified form normalizes away.
-    let resolved = ankql::parser::parse_selection("album.name = 'x'")?.resolve_names(&collection, &server.catalog)?;
+    let resolved = resolve_selection(&collection, &server.catalog, ankql::parser::parse_selection("album.name = 'x'")?)?;
     match first_expr(&resolved) {
-        Expr::PropertyPath(ident) => {
+        Expr::Path(ident) => {
             assert_eq!((ident.property_id(), ident.to_string().as_str()), (PropertyId::EntityId(name_id), "name"))
         }
         other => panic!("expected Identifier, got {other:?}"),
     }
 
     // Unknown references fail closed, naming the exact model identity and property.
-    let err = ankql::parser::parse_selection("bogus = 1")?.resolve_names(&collection, &server.catalog).unwrap_err();
+    let err = resolve_selection(&collection, &server.catalog, ankql::parser::parse_selection("bogus = 1")?).unwrap_err();
     assert!(err.to_string().contains("bogus") && err.to_string().contains(&collection.to_string()), "got: {err}");
-
-    // Idempotent: resolving an already-resolved selection is a no-op.
-    let twice = resolved.resolve_names(&collection, &server.catalog)?;
-    assert_eq!(format!("{:?}", twice), format!("{:?}", resolved));
 
     Ok(())
 }
@@ -156,9 +142,9 @@ async fn resolution_follows_renames_to_the_same_id() -> anyhow::Result<()> {
     register_and_map(&client, server.id, register("album", &[("name", "yrs", "string")])).await?;
     let collection = server.catalog.model_id_for("album").expect("album model registered");
 
-    let before = ankql::parser::parse_selection("name = 'x' ORDER BY name")?.resolve_names(&collection, &server.catalog)?;
+    let before = resolve_selection(&collection, &server.catalog, ankql::parser::parse_selection("name = 'x' ORDER BY name")?)?;
     let before_id = match first_expr(&before) {
-        Expr::PropertyPath(i) => match i.property_id() {
+        Expr::Path(i) => match i.property_id() {
             PropertyId::EntityId(id) => id,
             other => panic!("expected a registered property id, got {other:?}"),
         },
@@ -190,24 +176,21 @@ async fn resolution_follows_renames_to_the_same_id() -> anyhow::Result<()> {
         other => panic!("expected SchemaRegistered, got {other}"),
     }
 
-    let after = ankql::parser::parse_selection("title = 'x'")?.resolve_names(&collection, &server.catalog)?;
+    let after = resolve_selection(&collection, &server.catalog, ankql::parser::parse_selection("title = 'x'")?)?;
     match first_expr(&after) {
-        Expr::PropertyPath(i) => {
+        Expr::Path(i) => {
             assert_eq!(i.property_id(), PropertyId::EntityId(before_id), "rename must keep the property id")
         }
         other => panic!("expected Identifier, got {other:?}"),
     }
-    let refreshed = before.resolve_names(&collection, &server.catalog)?;
-    let refreshed_order = &refreshed.order_by.as_ref().unwrap()[0];
-    assert_eq!(order_property_id(refreshed_order), Some(before_id), "ORDER BY must retain stable identity");
-    // An already-resolved ORDER BY key is an idempotent pass-through. Sorting
-    // addresses by id, so the display label is a
-    // resolved-at snapshot and is deliberately NOT refreshed on re-resolution;
-    // it keeps the pre-rename
-    // "name", while a FRESH resolve of the new "title" (above) carries the id.
-    assert_eq!(order_display(refreshed_order), "name", "re-resolution keeps the resolved-at display label (not refreshed)");
+    // A selection bound before the rename still addresses the same property,
+    // and keeps the label it was written under: sorting addresses by id, so
+    // the label is a resolved-at snapshot that a later rename cannot move.
+    let before_order = &before.order_by.as_ref().unwrap()[0];
+    assert_eq!(order_property_id(before_order), Some(before_id), "ORDER BY must retain stable identity");
+    assert_eq!(order_display(before_order), "name", "the label is the one the selection was written under");
     // The retired display name no longer resolves.
-    assert!(ankql::parser::parse_selection("name = 'x'")?.resolve_names(&collection, &server.catalog).is_err());
+    assert!(resolve_selection(&collection, &server.catalog, ankql::parser::parse_selection("name = 'x'")?).is_err());
 
     Ok(())
 }
@@ -226,25 +209,25 @@ async fn order_by_resolves_fail_closed() -> anyhow::Result<()> {
 
     // Known key resolves to a stable id; unknown key fails closed; id passes
     // through without pretending to be a catalog property.
-    let known = ankql::parser::parse_selection("true ORDER BY name")?.resolve_names(&collection, &server.catalog)?;
+    let known = resolve_selection(&collection, &server.catalog, ankql::parser::parse_selection("true ORDER BY name")?)?;
     assert!(order_property_id(&known.order_by.as_ref().unwrap()[0]).is_some());
-    let pseudo = ankql::parser::parse_selection("true ORDER BY id")?.resolve_names(&collection, &server.catalog)?;
+    let pseudo = resolve_selection(&collection, &server.catalog, ankql::parser::parse_selection("true ORDER BY id")?)?;
     assert_eq!(order_property_id(&pseudo.order_by.as_ref().unwrap()[0]), None);
-    let err = ankql::parser::parse_selection("true ORDER BY bogus")?.resolve_names(&collection, &server.catalog).unwrap_err();
+    let err = resolve_selection(&collection, &server.catalog, ankql::parser::parse_selection("true ORDER BY bogus")?).unwrap_err();
     assert!(err.to_string().contains("bogus"), "got: {err}");
 
     // The legacy collection-qualified form normalizes away. The parser
     // does not produce dotted ORDER BY keys, so build the AST directly
     // (the form arrives from programmatic selections).
-    let qualified = Selection {
+    let qualified = Selection::<Parsed> {
         predicate: ankql::ast::Predicate::True,
         order_by: Some(vec![ankql::ast::OrderByItem {
-            key: OrderKey::Path(ankql::ast::PathExpr { steps: vec!["album".into(), "name".into()] }),
+            path: PathExpr { steps: vec!["album".into(), "name".into()] },
             direction: ankql::ast::OrderDirection::Asc,
         }]),
         limit: None,
     };
-    let resolved = qualified.resolve_names(&collection, &server.catalog)?;
+    let resolved = resolve_selection(&collection, &server.catalog, qualified)?;
     let items = resolved.order_by.expect("order_by present");
     assert_eq!(order_display(&items[0]), "name");
     assert!(order_property_id(&items[0]).is_some());
@@ -268,10 +251,10 @@ async fn subpath_order_keys_and_id_subpaths_are_refused() -> anyhow::Result<()> 
     register_and_map(&client, server.id, register("album", &[("payload", "lww", "json")])).await?;
     let collection = server.catalog.model_id_for("album").expect("album model registered");
 
-    let order = |steps: &[&str]| Selection {
+    let order = |steps: &[&str]| Selection::<Parsed> {
         predicate: ankql::ast::Predicate::True,
         order_by: Some(vec![OrderByItem {
-            key: OrderKey::Path(ankql::ast::PathExpr { steps: steps.iter().map(|s| s.to_string()).collect() }),
+            path: PathExpr { steps: steps.iter().map(|s| s.to_string()).collect() },
             direction: ankql::ast::OrderDirection::Asc,
         }]),
         limit: None,
@@ -280,25 +263,25 @@ async fn subpath_order_keys_and_id_subpaths_are_refused() -> anyhow::Result<()> 
     // A subpath under a registered property, bare and collection-qualified,
     // and under the id pseudo-property.
     for steps in [&["payload", "meta"][..], &["album", "payload", "meta"][..], &["id", "x"][..], &["album", "id", "x"][..]] {
-        let err = order(steps).resolve_names(&collection, &server.catalog).unwrap_err();
+        let err = resolve_selection(&collection, &server.catalog, order(steps)).unwrap_err();
         assert!(err.to_string().contains("unsupported subpath"), "steps {steps:?}: {err}");
     }
 
     // The same restriction governs the frozen system/catalog collections.
     let catalog_collection = ankurah::core::schema::model_collection();
-    let err = order(&["name", "x"]).resolve_names(&catalog_collection, &server.catalog).unwrap_err();
+    let err = resolve_selection(&catalog_collection, &server.catalog, order(&["name", "x"])).unwrap_err();
     assert!(err.to_string().contains("not sortable"), "got: {err}");
 
     // Predicates: a JSON subpath under a registered property stays
     // supported...
-    assert!(ankql::parser::parse_selection("payload.meta.genre = 'jazz'")?.resolve_names(&collection, &server.catalog).is_ok());
+    assert!(resolve_selection(&collection, &server.catalog, ankql::parser::parse_selection("payload.meta.genre = 'jazz'")?).is_ok());
     // ...but the id pseudo-property has no subfields, bare or qualified, on
     // user and system collections alike.
     for query in ["id.foo = 'x'", "album.id.foo = 'x'"] {
-        let err = ankql::parser::parse_selection(query)?.resolve_names(&collection, &server.catalog).unwrap_err();
+        let err = resolve_selection(&collection, &server.catalog, ankql::parser::parse_selection(query)?).unwrap_err();
         assert!(err.to_string().contains("has no subfields"), "query {query:?}: {err}");
     }
-    let err = ankql::parser::parse_selection("id.foo = 'x'")?.resolve_names(&catalog_collection, &server.catalog).unwrap_err();
+    let err = resolve_selection(&catalog_collection, &server.catalog, ankql::parser::parse_selection("id.foo = 'x'")?).unwrap_err();
     assert!(err.to_string().contains("has no subfields"), "got: {err}");
 
     Ok(())
@@ -314,9 +297,9 @@ async fn systemize_strips_the_collection_qualifier() -> anyhow::Result<()> {
     let collection = ankurah::core::schema::model_collection();
 
     // Qualified predicate reference: the qualifier normalizes away.
-    let resolved = ankql::parser::parse_selection("_ankurah_model.name = 'x'")?.resolve_names(&collection, &server.catalog)?;
+    let resolved = resolve_selection(&collection, &server.catalog, ankql::parser::parse_selection("_ankurah_model.name = 'x'")?)?;
     match first_expr(&resolved) {
-        Expr::PropertyPath(ident) => {
+        Expr::Path(ident) => {
             assert_eq!(ident.property_id(), PropertyId::System(proto::SystemProperty::Name));
             assert!(ident.subpath.is_empty());
         }
@@ -324,9 +307,9 @@ async fn systemize_strips_the_collection_qualifier() -> anyhow::Result<()> {
     }
 
     // Qualified reference with a JSON subpath keeps the subpath.
-    let resolved = ankql::parser::parse_selection("_ankurah_model.name.x = 'y'")?.resolve_names(&collection, &server.catalog)?;
+    let resolved = resolve_selection(&collection, &server.catalog, ankql::parser::parse_selection("_ankurah_model.name.x = 'y'")?)?;
     match first_expr(&resolved) {
-        Expr::PropertyPath(ident) => {
+        Expr::Path(ident) => {
             assert_eq!(ident.property_id(), PropertyId::System(proto::SystemProperty::Name));
             assert_eq!(ident.subpath, vec!["x".to_string()]);
         }
@@ -335,35 +318,33 @@ async fn systemize_strips_the_collection_qualifier() -> anyhow::Result<()> {
 
     // Qualified id resolves to the id pseudo-property; a subpath on it is
     // still refused through the qualified form.
-    let resolved = ankql::parser::parse_selection(&format!("_ankurah_model.id = '{}'", entity_id_literal()))?
-        .resolve_names(&collection, &server.catalog)?;
+    let resolved = resolve_selection(
+        &collection,
+        &server.catalog,
+        ankql::parser::parse_selection(&format!("_ankurah_model.id = '{}'", entity_id_literal()))?,
+    )?;
     match first_expr(&resolved) {
-        Expr::PropertyPath(ident) => assert_eq!(ident.property_id(), PropertyId::Id),
+        Expr::Path(ident) => assert_eq!(ident.property_id(), PropertyId::Id),
         other => panic!("expected Identifier, got {other:?}"),
     }
-    let err = ankql::parser::parse_selection("_ankurah_model.id.x = 'y'")?.resolve_names(&collection, &server.catalog).unwrap_err();
+    let err = resolve_selection(&collection, &server.catalog, ankql::parser::parse_selection("_ankurah_model.id.x = 'y'")?).unwrap_err();
     assert!(err.to_string().contains("has no subfields"), "got: {err}");
 
     // ORDER BY: the qualified whole-property key normalizes; a subpath left
     // after stripping is refused.
-    let order = |steps: &[&str]| Selection {
+    let order = |steps: &[&str]| Selection::<Parsed> {
         predicate: ankql::ast::Predicate::True,
         order_by: Some(vec![OrderByItem {
-            key: OrderKey::Path(ankql::ast::PathExpr { steps: steps.iter().map(|s| s.to_string()).collect() }),
+            path: PathExpr { steps: steps.iter().map(|s| s.to_string()).collect() },
             direction: ankql::ast::OrderDirection::Asc,
         }]),
         limit: None,
     };
-    let resolved = order(&["_ankurah_model", "name"]).resolve_names(&collection, &server.catalog)?;
+    let resolved = resolve_selection(&collection, &server.catalog, order(&["_ankurah_model", "name"]))?;
     let items = resolved.order_by.expect("order_by present");
-    match &items[0].key {
-        OrderKey::Property(ident) => {
-            assert_eq!(ident.property_id(), PropertyId::System(proto::SystemProperty::Name));
-            assert!(ident.subpath.is_empty());
-        }
-        other => panic!("expected resolved order key, got {other:?}"),
-    }
-    let err = order(&["_ankurah_model", "name", "x"]).resolve_names(&collection, &server.catalog).unwrap_err();
+    assert_eq!(items[0].path.property_id(), PropertyId::System(proto::SystemProperty::Name));
+    assert!(items[0].path.subpath.is_empty());
+    let err = resolve_selection(&collection, &server.catalog, order(&["_ankurah_model", "name", "x"])).unwrap_err();
     assert!(err.to_string().contains("not sortable"), "got: {err}");
 
     Ok(())

@@ -48,6 +48,25 @@ impl SystemProperty {
         }
     }
 
+    /// The Rust variant identifier. A system model's `#[derive(Model)]`
+    /// fields pin their identities at compile time, so the macro re-emits
+    /// this spelling as a path; keeping it beside the enum means the macro
+    /// reads the vocabulary rather than restating it.
+    pub const fn variant_name(self) -> &'static str {
+        match self {
+            Self::Item => "Item",
+            Self::Label => "Label",
+            Self::Name => "Name",
+            Self::MintedFor => "MintedFor",
+            Self::Backend => "Backend",
+            Self::ValueType => "ValueType",
+            Self::TargetModel => "TargetModel",
+            Self::Model => "Model",
+            Self::Property => "Property",
+            Self::Optional => "Optional",
+        }
+    }
+
     /// Parse a canonical system-property name.
     pub fn from_name(name: &str) -> Option<Self> {
         Some(match name {

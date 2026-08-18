@@ -1,4 +1,5 @@
 // TODO: Rename this module from client_relay to remote_subscription for clarity
+use ankql::ast::Resolved;
 use ankurah_proto::{self as proto, CollectionId};
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -38,7 +39,7 @@ pub enum Status {
 pub struct Content<CD: ContextData> {
     pub query_id: proto::QueryId,
     pub collection_id: CollectionId,
-    pub selection: ankql::ast::Selection,
+    pub selection: ankql::ast::Selection<Resolved>,
     /// The live credential source, read at each attempt's start, so a
     /// reconnect re-registration after a refresh carries the fresh
     /// values. A set-backed query sends every live credential.
@@ -110,7 +111,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         &self,
         query_id: proto::QueryId,
         collection_id: CollectionId,
-        selection: ankql::ast::Selection,
+        selection: ankql::ast::Selection<Resolved>,
         sessions: SessionSet<CD>,
         version: u32,
         livequery: Q,
@@ -132,7 +133,12 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
             self.setup_remote_subscriptions()
         }
     }
-    pub fn update_query(&self, query_id: proto::QueryId, selection: ankql::ast::Selection, version: u32) -> Result<(), anyhow::Error> {
+    pub fn update_query(
+        &self,
+        query_id: proto::QueryId,
+        selection: ankql::ast::Selection<Resolved>,
+        version: u32,
+    ) -> Result<(), anyhow::Error> {
         debug!("SubscriptionRelay.update_query() - New query {} needs remote registration", query_id);
 
         let update = {
@@ -185,7 +191,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         peer_id: proto::EntityId,
         query_id: proto::QueryId,
         collection_id: CollectionId,
-        selection: ankql::ast::Selection,
+        selection: ankql::ast::Selection<Resolved>,
         version: u32,
         sessions: SessionSet<CD>,
     ) {
@@ -470,7 +476,7 @@ pub trait TNode<CD: ContextData>: Send + Sync {
         peer_id: proto::EntityId,
         query_id: proto::QueryId,
         collection_id: CollectionId,
-        selection: ankql::ast::Selection,
+        selection: ankql::ast::Selection<Resolved>,
         context_data: Vec<CD>,
         version: u32,
     ) -> Result<(), RetrievalError>;
@@ -492,7 +498,7 @@ where
         peer_id: proto::EntityId,
         query_id: proto::QueryId,
         collection_id: CollectionId,
-        selection: ankql::ast::Selection,
+        selection: ankql::ast::Selection<Resolved>,
         context_data: Vec<PA::ContextData>,
         version: u32,
     ) -> Result<(), RetrievalError> {
@@ -555,7 +561,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ankql::ast::Predicate;
     use ankurah_proto::EntityId;
     use std::sync::{Arc, Mutex};
 
@@ -572,7 +577,7 @@ mod tests {
     #[derive(Debug)]
     struct MockMessageSender<CD: ContextData> {
         next_error: Arc<Mutex<Option<RequestError>>>,
-        sent_requests: Arc<Mutex<Vec<(EntityId, proto::QueryId, CollectionId, ankql::ast::Selection)>>>,
+        sent_requests: Arc<Mutex<Vec<(EntityId, proto::QueryId, CollectionId, ankql::ast::Selection<Resolved>)>>>,
         should_fail: Arc<Mutex<bool>>,
         failure_message: Arc<Mutex<String>>,
         _phantom: std::marker::PhantomData<CD>,
@@ -591,7 +596,7 @@ mod tests {
 
         fn set_fail_next(&self, error: RequestError) { *self.next_error.lock().unwrap() = Some(error); }
 
-        fn get_sent_requests(&self) -> Vec<(EntityId, proto::QueryId, CollectionId, ankql::ast::Selection)> {
+        fn get_sent_requests(&self) -> Vec<(EntityId, proto::QueryId, CollectionId, ankql::ast::Selection<Resolved>)> {
             self.sent_requests.lock().unwrap().clone()
         }
 
@@ -605,7 +610,7 @@ mod tests {
             peer_id: EntityId,
             query_id: proto::QueryId,
             collection_id: CollectionId,
-            selection: ankql::ast::Selection,
+            selection: ankql::ast::Selection<Resolved>,
             _context_data: Vec<CD>,
             _version: u32,
         ) -> Result<(), RetrievalError> {
@@ -652,7 +657,7 @@ mod tests {
         }
     }
 
-    fn create_test_selection() -> ankql::ast::Selection {
+    fn create_test_selection() -> ankql::ast::Selection<Resolved> {
         // Create a simple test predicate
         ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None }
     }

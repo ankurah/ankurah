@@ -1,4 +1,5 @@
 use crate::{
+    EngineColumns,
     filtering::FilteredStream,
     sorting::{LimitedStream, SortedStream, TopKStream},
 };
@@ -50,17 +51,17 @@ impl<S> EntityStateStream for S where S: Stream<Item = Result<Attested<EntitySta
 /// GetPropertyValueStream: default combinators that construct wrapper streams
 pub trait GetPropertyValueStream: Stream + Unpin + Sized {
     /// Filter: returns a FilteredStream over this stream
-    fn filter_predicate(self, _predicate: &ankql::ast::Predicate) -> FilteredStream<Self> {
+    fn filter_predicate(self, _predicate: &ankql::ast::Predicate<EngineColumns>) -> FilteredStream<Self> {
         todo!("construct FilteredStream(self, predicate.clone())");
     }
 
     /// Sort: returns a SortedStream over this stream (mutually exclusive with limit/top_k)
-    fn sort_by(self, _order_by: &[ankql::ast::OrderByItem]) -> SortedStream<Self> {
+    fn sort_by(self, _order_by: &[ankql::ast::OrderByItem<EngineColumns>]) -> SortedStream<Self> {
         todo!("construct SortedStream(self, order_by.to_vec())");
     }
 
     /// Top-K: returns a TopKStream over this stream (mutually exclusive with sort/limit)
-    fn top_k(self, _order_by: &[ankql::ast::OrderByItem], _k: usize) -> TopKStream<Self> {
+    fn top_k(self, _order_by: &[ankql::ast::OrderByItem<EngineColumns>], _k: usize) -> TopKStream<Self> {
         todo!("construct TopKStream(self, order_by.to_vec(), k)");
     }
 }

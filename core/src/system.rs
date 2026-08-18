@@ -315,15 +315,17 @@ where
             collection_map.clear();
         }
         {
+            // The epoch leaves with readiness, cleared under the SAME
+            // readiness write lock that `mark_system_ready` assigns them
+            // under (same nesting order): clearing them in two separate
+            // lock scopes would let a concurrent become-ready transition
+            // interleave between the writes and be clobbered into a
+            // permanently ready-with-no-epoch node. Cell entries made
+            // under the departing epoch are permanently inert, and the
+            // next become-ready transition allocates a fresh epoch.
             let mut system_ready = self.0.system_ready.write().unwrap();
+            *self.0.schema_epoch.write().unwrap() = None;
             *system_ready = false;
-        }
-        {
-            // The epoch leaves with readiness: cell entries made under it are
-            // permanently inert, and the next become-ready transition
-            // allocates a fresh one.
-            let mut schema_epoch = self.0.schema_epoch.write().unwrap();
-            *schema_epoch = None;
         }
 
         // Reset the reactor state to notify subscriptions

@@ -1,3 +1,4 @@
+use ankql::ast::{Parsed, Resolved};
 use std::{
     marker::PhantomData,
     sync::{Arc, Weak},
@@ -81,7 +82,7 @@ struct Inner {
     // Store selection with its version (starts with version 1, updated on selection changes)
     // This represents user intent (client-side state), separate from reactor's QueryState.selection (reactor-side state)
     // Using Mut for reactive updates that can be observed in WASM
-    pub(crate) selection: Mut<(ankql::ast::Selection, u32)>,
+    pub(crate) selection: Mut<(ankql::ast::Selection<Resolved>, u32)>,
     // Store collection_id for selection updates
     pub(crate) collection_id: CollectionId,
     // Gap fetcher for reactor.add_query (type-erased)
@@ -204,7 +205,7 @@ fn create_inner<SE, PA>(
     node: &Node<SE, PA>,
     node_ref: Box<dyn NodeRef>,
     collection_id: CollectionId,
-    mut args: MatchArgs,
+    args: MatchArgs<Parsed>,
     sessions: SessionSet<PA::ContextData>,
 ) -> Result<(Arc<Inner>, proto::QueryId), RetrievalError>
 where
@@ -215,12 +216,12 @@ where
     // on change arrives with https://github.com/ankurah/ankurah/pull/426.
     let cdata = sessions.current();
     node.policy_agent.can_access_collection(&cdata, &collection_id)?;
-    args.selection.predicate = node.policy_agent.filter_predicate(&cdata, &collection_id, args.selection.predicate)?;
-
-    // Bind every property name (the caller's and the policy's alike) to
-    // its durable identity and canonicalize comparison values; a typed
-    // entry's already-resolved selection passes through untouched.
-    args.selection = node.catalog.resolve_selection(&collection_id, args.selection)?;
+    // Bind every property name to its durable identity and canonicalize
+    // comparison values, then let the policy narrow what came back: the
+    // agent ANDs its own conditions in in the same resolved vocabulary the
+    // reactor and the relay consume.
+    let mut selection = node.catalog.resolve_selection(&collection_id, args.selection)?;
+    selection.predicate = node.policy_agent.filter_predicate(&cdata, &collection_id, selection.predicate)?;
 
     let subscription = node.reactor.subscribe();
 
@@ -237,7 +238,7 @@ where
         initialized: tokio::sync::Notify::new(),
         initialized_version: std::sync::atomic::AtomicU32::new(0), // 0 means uninitialized
         current_version: std::sync::atomic::AtomicU32::new(1),     // Start at version 1
-        selection: Mut::new((args.selection.clone(), 1)),          // Start with version 1
+        selection: Mut::new((selection, 1)),                       // Start with version 1
         collection_id: collection_id.clone(),
         gap_fetcher,
     });
@@ -255,6 +256,10 @@ where
             if let Err(e) = inner2.activate(1).await {
                 debug!("LiveQuery initialization failed for predicate {}: {}", query_id, e);
                 inner2.error.set(Some(e));
+                // Initialization is over, unsuccessfully: wake waiters so
+                // wait_initialized returns instead of hanging on a query
+                // that will never activate. The error slot carries why.
+                inner2.initialized.notify_waiters();
             } else {
                 debug!("LiveQuery initialization completed for predicate {}", query_id);
             }
@@ -268,7 +273,7 @@ impl EntityLiveQuery {
     pub fn new<SE, PA>(
         node: &Node<SE, PA>,
         collection_id: CollectionId,
-        args: MatchArgs,
+        args: MatchArgs<Parsed>,
         sessions: impl Into<SessionSet<PA::ContextData>>,
     ) -> Result<Self, RetrievalError>
     where
@@ -288,7 +293,7 @@ impl EntityLiveQuery {
     pub fn new_weak_node<SE, PA>(
         node: &Node<SE, PA>,
         collection_id: CollectionId,
-        args: MatchArgs,
+        args: MatchArgs<Parsed>,
         sessions: impl Into<SessionSet<PA::ContextData>>,
     ) -> Result<Self, RetrievalError>
     where
@@ -303,7 +308,7 @@ impl EntityLiveQuery {
         node: &Node<SE, PA>,
         node_ref: Box<dyn NodeRef>,
         collection_id: CollectionId,
-        args: MatchArgs,
+        args: MatchArgs<Parsed>,
         sessions: SessionSet<PA::ContextData>,
     ) -> Result<Self, RetrievalError>
     where
@@ -325,15 +330,28 @@ impl EntityLiveQuery {
     }
     pub fn map<R: View>(self) -> LiveQuery<R> { LiveQuery(self, PhantomData) }
 
+    /// The initialization/admission failure, if one occurred, rendered as a
+    /// message. Waking from [`Self::wait_initialized`] with this set means
+    /// the query will never populate.
+    pub fn error_message(&self) -> Option<String> { self.0.error.with(|e| e.as_ref().map(|e| e.to_string())) }
+
     /// Wait for the LiveQuery to be fully initialized with initial states
     pub async fn wait_initialized(&self) { self.0.wait_initialized().await; }
 
     pub fn update_selection(
         &self,
-        new_selection: impl TryInto<ankql::ast::Selection, Error = impl Into<RetrievalError>>,
+        new_selection: impl TryInto<ankql::ast::Selection<Parsed>, Error = impl Into<RetrievalError>>,
     ) -> Result<(), RetrievalError> {
         let new_selection = new_selection.try_into().map_err(|e| e.into())?;
         let node = self.0.node().ok_or_else(|| RetrievalError::Other("Node has been dropped".into()))?;
+
+        // A replacement selection arrives as a parsed string, below the
+        // typed entries: bind its names through the catalog before anything
+        // stores or forwards it -- the reactor and the relay consume
+        // resolved selections only. (Policy re-injection on replacement is
+        // a recorded gap, tracked with the update_selection admission
+        // issue.)
+        let new_selection = node.resolve_selection(&self.0.collection_id, new_selection)?;
 
         // Increment current_version atomically and get the new version number
         let new_version = self.0.current_version.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
@@ -359,6 +377,9 @@ impl EntityLiveQuery {
                 if let Err(e) = inner.activate(new_version).await {
                     tracing::error!("LiveQuery update failed for predicate {}: {}", query_id, e);
                     inner.error.set(Some(e));
+                    // Wake update_selection_wait: the update is over,
+                    // unsuccessfully, and the error slot carries why.
+                    inner.initialized.notify_waiters();
                 }
             });
         }
@@ -368,7 +389,7 @@ impl EntityLiveQuery {
 
     pub async fn update_selection_wait(
         &self,
-        new_selection: impl TryInto<ankql::ast::Selection, Error = impl Into<RetrievalError>>,
+        new_selection: impl TryInto<ankql::ast::Selection<Parsed>, Error = impl Into<RetrievalError>>,
     ) -> Result<(), RetrievalError> {
         self.update_selection(new_selection)?;
         self.0.wait_initialized().await;
@@ -377,7 +398,7 @@ impl EntityLiveQuery {
 
     pub fn error(&self) -> Read<Option<RetrievalError>> { self.0.error.read() }
     pub fn query_id(&self) -> proto::QueryId { self.0.query_id }
-    pub fn selection(&self) -> Read<(ankql::ast::Selection, u32)> { self.0.selection.read() }
+    pub fn selection(&self) -> Read<(ankql::ast::Selection<Resolved>, u32)> { self.0.selection.read() }
     pub fn resultset(&self) -> EntityResultSet { self.0.resultset.clone() }
 
     /// Create a weak reference to this LiveQuery

@@ -417,6 +417,7 @@ dependencies = [
  "ankurah-core",
  "ankurah-core-types",
  "ankurah-proto",
+ "ankurah-storage-common",
  "anyhow",
  "async-trait",
  "bb8",

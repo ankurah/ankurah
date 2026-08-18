@@ -7,7 +7,10 @@ use crate::{
     proto::{self},
     storage::StorageEngine,
 };
-use ankql::{ast::Predicate, error::ParseError};
+use ankql::{
+    ast::{Predicate, Resolved},
+    error::ParseError,
+};
 use ankurah_proto::Attested;
 use async_trait::async_trait;
 use thiserror::Error;
@@ -167,8 +170,14 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
 
     /// Filter a predicate based on the context data
     /// An implementation may refuse a caller holding no authorized context, so callers gate on can_access_collection first.
-    fn filter_predicate<C>(&self, data: &C, collection: &proto::CollectionId, predicate: Predicate) -> Result<Predicate, AccessDenied>
-    where C: Iterable<Self::ContextData>;
+    fn filter_predicate<C>(
+        &self,
+        data: &C,
+        collection: &proto::CollectionId,
+        predicate: Predicate<Resolved>,
+    ) -> Result<Predicate<Resolved>, AccessDenied>
+    where
+        C: Iterable<Self::ContextData>;
 
     /// Check if a context can read an entity
     /// If the policy agent wants to inspect the entity state, it can do so with either TemporaryEntity::new or entityset.with_state
@@ -332,8 +341,15 @@ impl PolicyAgent for PermissiveAgent {
         Ok(())
     }
 
-    fn filter_predicate<C>(&self, _data: &C, _collection: &proto::CollectionId, predicate: Predicate) -> Result<Predicate, AccessDenied>
-    where C: Iterable<Self::ContextData> {
+    fn filter_predicate<C>(
+        &self,
+        _data: &C,
+        _collection: &proto::CollectionId,
+        predicate: Predicate<Resolved>,
+    ) -> Result<Predicate<Resolved>, AccessDenied>
+    where
+        C: Iterable<Self::ContextData>,
+    {
         // PermissiveAgent allows regardless of which credentials are supplied, including none
         Ok(predicate)
     }
