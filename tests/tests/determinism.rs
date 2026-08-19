@@ -34,10 +34,10 @@ async fn test_two_event_determinism_same_property() -> Result<()> {
                 else {
                     panic!("registered property must be catalog-backed");
                 };
-                let membership = node1.catalog.membership(&model_eid, &pid).expect("node1 recorded the membership");
+                let (membership_id, _) = node1.catalog.membership(&model_eid, &pid).expect("node1 recorded the membership");
                 proto::RegisteredProperty {
                     id: pid,
-                    membership_id: membership.id,
+                    membership_id,
                     name: field.name.to_owned(),
                     backend: field.backend.to_owned(),
                     value_type: field.value_type.to_owned(),

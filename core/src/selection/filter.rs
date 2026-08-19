@@ -55,22 +55,35 @@ pub trait Filterable {
     fn value(&self, property: &PropertyId) -> Option<Value>;
 }
 
-fn evaluate_expr<I: Filterable>(item: &I, expr: &Expr) -> Result<ExprOutput<Value>, Error> {
+/// What predicate evaluation needs of an item: the value the path in front of
+/// it addresses. Each selection stage writes paths its own way -- a resolved
+/// selection addresses a property by durable identity, a lowered one by the
+/// engine's own column name -- so an item answers for the stage whose paths it
+/// understands, and [`evaluate_predicate`] walks either tree the same way.
+pub trait PathLookup<S: Stage> {
+    /// The value at `path`, sub-path included; `None` when this item carries
+    /// no such property, or nothing at that sub-path.
+    fn value_at(&self, path: &S::Path) -> Option<Value>;
+}
+
+/// Every id-keyed item answers resolved paths: look the property up by its
+/// durable identity, then walk any JSON sub-path into the value.
+impl<T: Filterable> PathLookup<Resolved> for T {
+    fn value_at(&self, path: &PropertyPath) -> Option<Value> {
+        let value = self.value(&path.property_id())?;
+        if path.subpath.is_empty() {
+            Some(value)
+        } else {
+            value.extract_at_path(&path.subpath)
+        }
+    }
+}
+
+fn evaluate_expr<S: Stage, I: PathLookup<S>>(item: &I, expr: &Expr<S>) -> Result<ExprOutput<Value>, Error> {
     match expr {
         Expr::Placeholder => Err(Error::PropertyNotFound("Placeholder values must be replaced before filtering".to_string())),
         Expr::Literal(lit) => Ok(ExprOutput::Value(lit.clone())),
-        // A raw name reached evaluation without resolving to an identity.
-        // Answering it by name would silently re-introduce name-keyed reads,
-        // so this fails loudly instead (`Selection::resolve_names` is the
-        // pass that should have run).
-        Expr::Path(path) => Err(Error::UnresolvedPath(path.to_string())),
-        Expr::PropertyPath(identifier) => {
-            if identifier.is_simple() {
-                Ok(ExprOutput::Value(item.value(&identifier.property_id()).ok_or_else(|| Error::PropertyNotFound(identifier.to_string()))?))
-            } else {
-                evaluate_sub_path(item, identifier)
-            }
-        }
+        Expr::Path(path) => Ok(ExprOutput::Value(item.value_at(path).ok_or_else(|| Error::PropertyNotFound(path.to_string()))?)),
         Expr::ExprList(exprs) => {
             let mut result = Vec::new();
             for expr in exprs {
@@ -78,20 +91,8 @@ fn evaluate_expr<I: Filterable>(item: &I, expr: &Expr) -> Result<ExprOutput<Valu
             }
             Ok(ExprOutput::List(result))
         }
-        _ => Err(Error::UnsupportedExpression("Only literal, resolved-property, and list expressions are supported")),
+        _ => Err(Error::UnsupportedExpression("Only literal, property, and list expressions are supported")),
     }
-}
-
-/// Evaluate a sub-path traversal: get the property's value by identity, then
-/// extract the nested value at the identifier's JSON sub-path.
-/// Delegates to Value::extract_at_path for the actual traversal.
-fn evaluate_sub_path<I: Filterable>(item: &I, identifier: &PropertyPath) -> Result<ExprOutput<Value>, Error> {
-    let property_value = item.value(&identifier.property_id()).ok_or_else(|| Error::PropertyNotFound(identifier.to_string()))?;
-
-    property_value
-        .extract_at_path(&identifier.subpath)
-        .map(ExprOutput::Value)
-        .ok_or_else(|| Error::PropertyNotFound(format!("Sub-path not found in property '{}'", identifier)))
 }
 
 /// Compare two values with automatic casting (for regular schema-typed fields).
@@ -118,7 +119,7 @@ fn compare_values_with_cast(left: &Value, right: &Value, op: impl Fn(&Value, &Va
     false
 }
 
-pub fn evaluate_predicate<I: Filterable>(item: &I, predicate: &Predicate) -> Result<bool, Error> {
+pub fn evaluate_predicate<S: Stage, I: PathLookup<S>>(item: &I, predicate: &Predicate<S>) -> Result<bool, Error> {
     match predicate {
         Predicate::Comparison { left, operator, right } => {
             let left_val = evaluate_expr(item, left)?;
@@ -184,7 +185,7 @@ pub enum FilterResult<R> {
 
 pub struct FilterIterator<I> {
     iter: I,
-    predicate: Predicate,
+    predicate: Predicate<Resolved>,
 }
 
 impl<I, R> FilterIterator<I>
@@ -214,10 +215,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::resolver::{resolve_selection, ModelResolutionError, ModelResolver, ResolvedProperty};
     use crate::value::ValueType;
-    use ankql::ast::{Selection, SystemProperty};
+    use ankql::ast::{Resolved, Selection, SystemProperty};
     use ankql::parser::parse_selection;
-    use ankql::{NameResolutionError, NameResolver};
     use ankurah_proto::EntityId;
     use ankurah_proto::ModelId;
 
@@ -237,33 +238,37 @@ mod tests {
     /// model qualifier "tracks" resolves, exercising qualified paths.
     struct FixtureResolver(&'static [(&'static str, ValueType)]);
 
-    impl NameResolver for FixtureResolver {
-        fn resolve_model_name(&self, name: &str) -> Result<Option<ModelId>, NameResolutionError> { Ok((name == "tracks").then(model)) }
-
-        fn resolve_property(&self, _model: &ModelId, name: &str) -> Result<Option<PropertyId>, NameResolutionError> {
-            Ok(self.0.iter().find(|(field, _)| *field == name).map(|(field, _)| prop_id(field)))
-        }
-
-        fn property_value_type(&self, model: &ModelId, property: &PropertyId) -> Result<ValueType, NameResolutionError> {
-            self.0.iter().find(|(field, _)| prop_id(field) == *property).map(|(_, ty)| *ty).ok_or_else(|| {
-                NameResolutionError::ValueTypeLookup { model: *model, property: *property, message: "not a fixture field".into() }
-            })
+    impl FixtureResolver {
+        /// The fixture's own type lookup, for the point-of-use cast an
+        /// eval-time consumer runs at its trust boundary (the resolution
+        /// walk gets its types through the trait below).
+        fn value_type(&self, property: &PropertyId) -> Option<ValueType> {
+            self.0.iter().find(|(field, _)| prop_id(field) == *property).map(|(_, ty)| *ty)
         }
     }
 
-    /// Parse and bind names to identities (no origin-side value casting, so
-    /// eval-side casting stays under test).
-    fn resolve(query: &str, fields: &'static [(&'static str, ValueType)]) -> Selection {
-        parse_selection(query).unwrap().resolve_names(&model(), &FixtureResolver(fields)).unwrap()
+    impl ModelResolver for FixtureResolver {
+        fn resolve_model(&self, name: &str) -> Result<Option<ModelId>, ModelResolutionError> { Ok((name == "tracks").then(model)) }
+
+        fn resolve_property(&self, _model: &ModelId, name: &str) -> Result<Option<ResolvedProperty>, ModelResolutionError> {
+            let Some((field, value_type)) = self.0.iter().find(|(field, _)| *field == name) else { return Ok(None) };
+            Ok(Some(ResolvedProperty { id: prop_id(field), value_type: *value_type }))
+        }
     }
 
-    /// Parse, bind, and canonicalize comparison values at origin -- the full
-    /// admission treatment (sub-path comparisons coerce their literals to
-    /// Json, replacing what the deleted TypeResolver heuristic did).
-    fn resolve_cast(query: &str, fields: &'static [(&'static str, ValueType)]) -> Selection {
+    /// Parse and bind names to identities, the way the query entry does.
+    fn resolve(query: &str, fields: &'static [(&'static str, ValueType)]) -> Selection<Resolved> {
+        resolve_selection(&model(), &FixtureResolver(fields), parse_selection(query).unwrap()).unwrap()
+    }
+
+    /// Bind, then re-cast comparison values at a consumer's trust boundary --
+    /// what an eval-time consumer does on top of the origin's
+    /// canonicalization (sub-path comparisons coerce their literals to Json,
+    /// replacing what the deleted TypeResolver heuristic did).
+    fn resolve_cast(query: &str, fields: &'static [(&'static str, ValueType)]) -> Selection<Resolved> {
         let resolver = FixtureResolver(fields);
-        let resolved = parse_selection(query).unwrap().resolve_names(&model(), &resolver).unwrap();
-        let type_of = |path: &ankql::ast::PropertyPath| resolver.property_value_type(&model(), &path.property_id()).ok();
+        let resolved = resolve_selection(&model(), &resolver, parse_selection(query).unwrap()).unwrap();
+        let type_of = |path: &ankql::ast::PropertyPath| resolver.value_type(&path.property_id());
         resolved.cast_comparison_values(&type_of).unwrap()
     }
 
@@ -393,16 +398,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unresolved_path_errors_at_evaluation() {
-        // A raw (unresolved) reference reaching evaluation is the leak the
-        // admission pass exists to prevent; answering it by name would
-        // silently reintroduce name-keyed reads.
-        let selection = parse_selection("name = 'Alice'").unwrap();
-        let result = evaluate_predicate(&TestItem::new("Alice", "30"), &selection.predicate);
-        assert!(matches!(result, Err(Error::UnresolvedPath(_))), "got {result:?}");
-    }
-
     /// A row carrying a `Ref` field, whose value is an EntityId rather than a
     /// string. Policy filters compare such a field against a claim value, and
     /// the claim value need not be an id at all.
@@ -434,26 +429,28 @@ mod tests {
     /// This is the row-side half of what a scope rule like `owner = $jwt.sub`
     /// does when the subject is a distinguished literal rather than a user's
     /// id: ankurah-jwt-auth substitutes such a subject as a String literal
-    /// (its `variables::typed_expr`), and it arrives here. (Origin-side
-    /// canonicalization declines to cast such a literal and leaves the
-    /// comparison for this eval-side path; see `admit_selection`.)
+    /// (its `variables::typed_expr`), and it reaches resolution, which
+    /// refuses it: an uncastable comparison literal is a query-time type
+    /// error surfaced by the operation that ran it, never a silently
+    /// false predicate (a lenient false inverts under `!=`, which would
+    /// GRANT the row).
     #[test]
-    fn test_entity_id_field_never_equals_a_non_id_string() {
+    fn test_entity_id_field_against_a_non_id_string_is_a_type_error() {
         let row = OwnedItem { owner: ankurah_proto::EntityId::random() };
 
-        // 'guest' does not parse as an EntityId, so the cast toward the field's
-        // type fails and the surviving comparison is the row's id rendered as
-        // a string — which no non-id value equals.
-        let selection = resolve("owner = 'guest'", RECORDS);
-        assert_eq!(evaluate_predicate(&row, &selection.predicate), Ok(false), "a subject that is not an id must deny the row, not error");
+        // 'guest' does not parse as an EntityId: resolution refuses the
+        // comparison outright instead of letting it evaluate leniently.
+        let error = resolve_selection(&model(), &FixtureResolver(RECORDS), parse_selection("owner = 'guest'").unwrap()).unwrap_err();
+        assert!(
+            matches!(error, ModelResolutionError::Canonicalization { .. }),
+            "a subject that is not an id must fail resolution as a type error, got {error:?}"
+        );
 
-        // The control that keeps the false above honest: the comparator does
-        // cross this type pair, so the false is a comparison that answered no
-        // and not a comparator that refuses EntityId-against-String outright —
-        // which would answer false for every string, including the right one.
+        // The control that keeps the refusal honest: a literal that IS a
+        // valid id canonicalizes and matches the row by identity.
         let query = format!("owner = '{}'", row.owner.to_base64());
-        let selection = parse_selection(&query).unwrap().resolve_names(&model(), &FixtureResolver(RECORDS)).unwrap();
-        assert_eq!(evaluate_predicate(&row, &selection.predicate), Ok(true), "the row's own id, as a string, must still match");
+        let selection = resolve_selection(&model(), &FixtureResolver(RECORDS), parse_selection(&query).unwrap()).unwrap();
+        assert_eq!(evaluate_predicate(&row, &selection.predicate), Ok(true), "the row's own id, as a string literal, must still match");
     }
 
     #[test]
@@ -483,16 +480,13 @@ mod tests {
             }
         }
         struct SystemResolver;
-        impl NameResolver for SystemResolver {
-            fn resolve_property(&self, _model: &ModelId, name: &str) -> Result<Option<PropertyId>, NameResolutionError> {
-                Ok(SystemProperty::from_name(name).map(PropertyId::System))
-            }
-            fn property_value_type(&self, _model: &ModelId, property: &PropertyId) -> Result<ValueType, NameResolutionError> {
-                let _ = property;
-                Ok(ValueType::String)
+        impl ModelResolver for SystemResolver {
+            fn resolve_property(&self, _model: &ModelId, name: &str) -> Result<Option<ResolvedProperty>, ModelResolutionError> {
+                Ok(SystemProperty::from_name(name)
+                    .map(|system| ResolvedProperty { id: PropertyId::System(system), value_type: ValueType::String }))
             }
         }
-        let selection = parse_selection("label = 'album'").unwrap().resolve_names(&model(), &SystemResolver).unwrap();
+        let selection = resolve_selection(&model(), &SystemResolver, parse_selection("label = 'album'").unwrap()).unwrap();
         assert_eq!(evaluate_predicate(&SysRow, &selection.predicate), Ok(true));
     }
 

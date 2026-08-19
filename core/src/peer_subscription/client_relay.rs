@@ -3,7 +3,7 @@ use ankql::ast::Resolved;
 use ankurah_proto::{self as proto, CollectionId};
 use anyhow::anyhow;
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 use tracing::{debug, warn};
 
@@ -54,8 +54,13 @@ pub struct RemoteQueryState<CD: ContextData, Q: RemoteQuerySubscriber> {
 }
 
 struct SubscriptionRelayInner<CD: ContextData, Q: RemoteQuerySubscriber> {
-    // All subscription information in one place
-    subscriptions: std::sync::Mutex<HashMap<proto::QueryId, RemoteQueryState<CD, Q>>>,
+    // All subscription information in one place. A BTreeMap, not a HashMap:
+    // registration walks this map to decide which queries to send and in what
+    // order, and hash iteration order is randomized per process. That
+    // randomness reaches the wire, which the deterministic simulation harness
+    // detects as a nondeterminism leak (the same reason its own sets are
+    // ordered). QueryId is a ULID, so sorted order is also creation order.
+    subscriptions: std::sync::Mutex<BTreeMap<proto::QueryId, RemoteQueryState<CD, Q>>>,
     // Track connected durable peers
     connected_peers: SafeSet<proto::EntityId>,
     // Node for communicating with remote peers
@@ -84,7 +89,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
 
         let relay = Self {
             inner: Arc::new(SubscriptionRelayInner {
-                subscriptions: std::sync::Mutex::new(HashMap::new()),
+                subscriptions: std::sync::Mutex::new(BTreeMap::new()),
                 connected_peers: SafeSet::new(),
                 node: OnceLock::new(),
                 _shutdown_tx: shutdown_tx,

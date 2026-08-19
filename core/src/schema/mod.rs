@@ -20,9 +20,10 @@
 //! get the same ids; a binary whose declaration conflicts is refused.
 //!
 //! Each node keeps an in-memory index of the catalog entities
-//! ([`catalog::CatalogManager`]) so lookups don't touch storage: parsed into
-//! `ModelDef`/`PropertyDef`/`ModelPropertyMembershipDef`, warmed from local storage on
-//! durable nodes and from registration responses on ephemeral ones. The
+//! ([`catalog::CatalogManager`]) so lookups don't touch storage: the catalog's
+//! own typed rows ([`catalog::rows`]), keyed by catalog entity id and derived
+//! from the projection livequeries — every node from its own storage, and an
+//! ephemeral node additionally from the durable peer it subscribes to. The
 //! wire request/response types live in ankurah-proto. The full design
 //! record lives with the design documents for this subsystem.
 
@@ -47,10 +48,12 @@ pub trait CollectionSchema {
     fn field_type(&self, path: &PathExpr) -> Result<ValueType, PropertyError>;
 }
 
-/// The metadata catalog collections. Catalog entities are SYSTEM MODELS: raw Entity/backend
-/// access only, like SysRoot; deriving a Model for one of these is the
-/// self-description ouroboros: the catalog must never need itself to
-/// describe itself.
+/// The metadata catalog collections. Catalog entities are SYSTEM MODELS:
+/// their model and property identities are built-ins fixed at compile time
+/// ([`catalog::rows`]), never allocated. That is what keeps them out of the
+/// self-description ouroboros -- reading a catalog row asks the catalog
+/// nothing -- and it is also what lets them have an ordinary derived Model,
+/// which is how the catalog projects itself into every node's map.
 pub const MODEL_COLLECTION_ID: &str = "_ankurah_model";
 pub const PROPERTY_COLLECTION_ID: &str = "_ankurah_property";
 pub const MODEL_PROPERTY_COLLECTION_ID: &str = "_ankurah_model_property";
@@ -68,6 +71,32 @@ pub const fn model_property_collection() -> ModelId { ModelId::System(SystemMode
 /// its own trust story).
 pub fn is_catalog_collection(id: &ModelId) -> bool {
     matches!(id, ModelId::System(SystemModel::Model | SystemModel::Property | SystemModel::ModelProperty))
+}
+
+/// Whether READS of `collection` bypass the [`crate::policy::PolicyAgent`].
+///
+/// The catalog is what turns a name into an identity, so every node needs the
+/// whole of it before it can run any query at all -- including the query that
+/// would ask the agent whether it may read. Making catalog reads answerable
+/// without a credential is what breaks that circle, and it is a documented
+/// 0.10 property: the catalog is readable to any connected peer.
+///
+/// The exemption is symmetric and complete. A node skips its own admission
+/// checks, sends the request with NO credential, and the serving node neither
+/// authenticates the request nor authorizes what it returns. Authentication
+/// is included deliberately: an agent that checks credentials per request
+/// would refuse the empty one, and the peer would never obtain the catalog it
+/// needs in order to authenticate anything. Connection is the gate.
+///
+/// Temporary posture, scoped to exactly these three collections: the policy
+/// re-derivation work (https://github.com/ankurah/ankurah/pull/426) is the
+/// intended replacement for this carve.
+///
+/// It covers READS only. Catalog writes stay exactly as protected as every
+/// other write: registration is the only writer, its requests are signed and
+/// checked like any other, and each event it emits still passes `check_event`.
+pub fn reads_bypass_policy(collection: &ankurah_proto::CollectionId) -> bool {
+    matches!(collection.as_str(), MODEL_COLLECTION_ID | PROPERTY_COLLECTION_ID | MODEL_PROPERTY_COLLECTION_ID)
 }
 
 /// Whether `id` names one of Ankurah's built-in collections. Built-ins are

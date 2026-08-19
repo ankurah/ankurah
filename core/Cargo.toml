@@ -18,6 +18,11 @@ wasm = [
     "ankql/wasm",
     "ankurah-core-types/wasm",
     "ankurah-proto/wasm",
+    # Core derives models of its own (the catalog rows), and `Model` grows its
+    # RefWrapper associated type under this feature. The generator has to be
+    # emitting for the same surface, or core's own models would not implement
+    # the trait core just widened.
+    "ankurah-derive/wasm",
     "futures-timer/wasm-bindgen",
 ]
 uniffi = ["dep:uniffi", "ankurah-proto/uniffi"]

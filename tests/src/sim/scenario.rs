@@ -386,36 +386,66 @@ where
         let captured = Captured::new();
         let nodes = build_nodes(node_count, captured.clone()).await.expect("nodes build");
 
-        // Full mesh: every node knows every other. Ephemeral nodes join node 0's
-        // system as a side effect of registering it as a durable peer.
-        for a in &nodes {
-            for b in &nodes {
-                if a.index != b.index {
-                    a.connect_to(b);
-                }
-            }
-        }
+        // The mesh is built in two phases, and the order matters. An ephemeral
+        // node joins node 0's system as a side effect of registering it as a
+        // durable peer, and joining now also starts a catalog projection that
+        // subscribes over the wire. Connecting every node at once would leave
+        // several nodes' bring-up concurrently in flight, and how that race
+        // landed would decide what crossed the wire first -- a property of the
+        // executor rather than of the seed, which the determinism audit
+        // rightly refuses. So each ephemeral node is connected to the durable
+        // node and brought fully ready before the next one starts (below), and
+        // the remaining ephemeral-to-ephemeral links close afterwards. The
+        // workload that follows is as concurrent as it ever was.
+        let durable = nodes.iter().find(|node| node.durable).expect("the simulation has a durable node");
 
         let node_ids: Vec<proto::EntityId> = nodes.iter().map(|n| n.id()).collect();
         let mut scheduler = Scheduler::new(captured.clone(), faults, node_ids);
         let mut trace = Trace::new();
 
-        // Let the system settle (ephemeral nodes join node 0). This runs under
-        // the *actual* fault config; even join traffic is subject to the
-        // schedule, matching a real cold start. Ephemeral nodes join from the
-        // durable node's system root carried in their Presence, which is a local
-        // operation on a spawned task; awaiting readiness drives that task to
-        // completion deterministically, interleaved with draining any traffic it
-        // produces.
+        // Bring each ephemeral node up in turn. Readiness is NOT a local
+        // property any more: joining from the Presence root is local, but the
+        // catalog projection readiness also waits for subscribes to the
+        // durable node, and that traffic only moves when the
+        // scheduler delivers it. So drive the schedule and the readiness wait
+        // TOGETHER -- awaiting readiness first would wait forever for a
+        // message nothing is carrying. This runs under the actual fault
+        // config, so even bring-up traffic is perturbed, matching a real cold
+        // start.
         for node in &nodes {
             if !node.durable {
-                node.node.system.wait_system_ready().await;
+                node.connect_to(durable);
+                durable.connect_to(node);
+                let ready = node.node.system.wait_system_ready();
+                tokio::pin!(ready);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+                while !futures_util::poll!(ready.as_mut()).is_ready() {
+                    scheduler.drain(&nodes, &mut rng, &mut trace).await;
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "node {} never became ready (system_ready={}, catalog_ready={}, warm_failure={:?})",
+                        node.index,
+                        node.node.system.is_system_ready(),
+                        node.node.catalog.is_catalog_ready(),
+                        node.node.catalog.catalog_warm_failure()
+                    );
+                }
                 // Ready means this node now holds a schema epoch; admit the
                 // deterministic SimRecord binding under it (see build_nodes).
                 super::node::seed_sim_schema(node).expect("sim schema seeds on a ready node");
             }
             scheduler.run_to_quiescence(&nodes, &mut rng, &mut trace).await;
         }
+
+        // Close the rest of the mesh now that every node is up.
+        for a in &nodes {
+            for b in &nodes {
+                if a.index != b.index && !a.durable && !b.durable {
+                    a.connect_to(b);
+                }
+            }
+        }
+        scheduler.run_to_quiescence(&nodes, &mut rng, &mut trace).await;
 
         // Run the workload in an inner scope so its mutable borrows of the
         // scheduler/rng/trace end before the quiescence barrier reuses them.

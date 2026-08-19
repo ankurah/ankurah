@@ -196,7 +196,7 @@ where
         notice_info!("Node {id:#} created as {}", if durable { "durable" } else { "ephemeral" });
 
         let system_manager = SystemManager::new(collections.clone(), entityset.clone(), reactor.clone(), durable, schema_epoch);
-        let catalog = CatalogManager::new(engine, durable);
+        let catalog = CatalogManager::new(durable);
 
         // Only ephemeral nodes relay subscriptions upstream to a durable peer.
         let subscription_relay = if durable { None } else { Some(SubscriptionRelay::new()) };

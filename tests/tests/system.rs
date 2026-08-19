@@ -216,9 +216,11 @@ async fn test_system_root_change_behavior() -> Result<()> {
         trx.create(&Pet { name: "Fido".into(), age: "3".to_string() }).await?;
         trx.commit().await?;
 
+        // Every node materializes the catalog collections now: readiness means
+        // the catalog projection has run, and its queries open them.
         assert_eq!(
-            ephemeral_engine.list_collections()?,
-            vec![CollectionId::fixed_name("_ankurah_system"), CollectionId::fixed_name("pet")]
+            sorted(ephemeral_engine.list_collections()?),
+            with_catalog(vec![CollectionId::fixed_name("_ankurah_system"), CollectionId::fixed_name("pet")])
         );
 
         durable_node.catalog.wait_catalog_ready().await;
@@ -291,8 +293,8 @@ async fn test_system_root_change_behavior() -> Result<()> {
         assert!(!ephemeral_node.system.is_system_ready()); // should not be ready before joining
         assert_eq!(ephemeral_node.system.root(), Some(initial_root), "Ephemeral node should have old root prior to joining");
         assert_eq!(
-            ephemeral_engine.list_collections()?,
-            vec![CollectionId::fixed_name("_ankurah_system"), CollectionId::fixed_name("pet")]
+            sorted(ephemeral_engine.list_collections()?),
+            with_catalog(vec![CollectionId::fixed_name("_ankurah_system"), CollectionId::fixed_name("pet")])
         );
 
         // Connect nodes
@@ -303,7 +305,7 @@ async fn test_system_root_change_behavior() -> Result<()> {
 
         assert_eq!(ephemeral_node.system.root(), Some(second_root), "Ephemeral node should have new root after joining");
 
-        assert_eq!(ephemeral_engine.list_collections()?, vec![CollectionId::fixed_name("_ankurah_system")]);
+        assert_eq!(sorted(ephemeral_engine.list_collections()?), with_catalog(vec![CollectionId::fixed_name("_ankurah_system")]));
     }
 
     Ok(())

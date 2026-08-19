@@ -27,7 +27,13 @@ fn load_config() -> PolicyConfig { serde_json::from_str(&std::fs::read_to_string
 
 fn parse(predicate: &str) -> Predicate { ankql::parser::parse_selection(predicate).unwrap().predicate }
 
-fn agent() -> JwtAgent { JwtAgent::new_durable(common::test_keys(), config_path()).unwrap() }
+fn agent() -> JwtAgent {
+    let agent = JwtAgent::new_durable(common::test_keys(), config_path()).unwrap();
+    // What node attach installs from the node's catalog: scope rules are
+    // authored in names and everything that consumes one addresses ids.
+    agent.set_selection_resolver(common::fixture_binding());
+    agent
+}
 
 fn guest_ctx() -> JwtContext {
     let claims = make_claims("guest", &["guest"], "");

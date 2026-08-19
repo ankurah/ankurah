@@ -30,7 +30,11 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
     }
 
     let hygiene_module = quote::format_ident!("__ankurah_derive_impl_{}", to_snake_case(&desc.name().to_string()));
-    let wasm_imports = if cfg!(feature = "wasm") {
+    // A `no_ffi` model generates no binding layer, so it must not pull the
+    // bindgen prelude in either: it is declared where the `ankurah` facade
+    // that re-exports those dependencies may not even be reachable.
+    let no_ffi = desc.no_ffi();
+    let wasm_imports = if cfg!(feature = "wasm") && !no_ffi {
         quote! {
             use ::ankurah::derive_deps::wasm_bindgen::prelude::*;
             use ::ankurah::derive_deps::wasm_bindgen_futures;
@@ -44,11 +48,19 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
     let view_impl = model::view::view_impl(&desc);
     let mutable_impl = model::mutable::mutable_impl(&desc);
     #[cfg(feature = "wasm")]
-    let wasm_impl = model::wasm::wasm_impl(&input, &desc);
+    let wasm_impl = if no_ffi {
+        quote! {}
+    } else {
+        model::wasm::wasm_impl(&input, &desc)
+    };
     #[cfg(not(feature = "wasm"))]
     let wasm_impl = quote! {};
     #[cfg(all(feature = "uniffi", not(feature = "wasm")))]
-    let uniffi_impl = model::uniffi::uniffi_impl(&desc);
+    let uniffi_impl = if no_ffi {
+        quote! {}
+    } else {
+        model::uniffi::uniffi_impl(&desc)
+    };
     #[cfg(any(not(feature = "uniffi"), feature = "wasm"))]
     let uniffi_impl = quote! {};
 

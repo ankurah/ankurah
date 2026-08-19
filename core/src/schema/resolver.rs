@@ -208,7 +208,7 @@ pub(crate) struct DescriptorResolver<'a, SE, PA: PolicyAgent> {
     pub catalog: &'a CatalogManager<SE, PA>,
 }
 
-impl<SE, PA> Resolver for DescriptorResolver<'_, SE, PA>
+impl<SE, PA> ModelResolver for DescriptorResolver<'_, SE, PA>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,

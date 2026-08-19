@@ -79,10 +79,15 @@ struct Inner {
     pub(crate) initialized_version: std::sync::atomic::AtomicU32,
     // Version tracking for predicate updates
     pub(crate) current_version: std::sync::atomic::AtomicU32,
-    // Store selection with its version (starts with version 1, updated on selection changes)
-    // This represents user intent (client-side state), separate from reactor's QueryState.selection (reactor-side state)
-    // Using Mut for reactive updates that can be observed in WASM
-    pub(crate) selection: Mut<(ankql::ast::Selection<Resolved>, u32)>,
+    // The admitted selection with its version (starts with version 1, updated
+    // on selection changes). This represents user intent (client-side state),
+    // separate from reactor's QueryState.selection (reactor-side state).
+    // Using Mut for reactive updates that can be observed in WASM.
+    //
+    // Optional because the inner is built before `start_admitted` installs
+    // the selection; nothing runs against the query in that window, since it
+    // is neither activated nor registered with the relay until one lands.
+    pub(crate) selection: Mut<Option<(ankql::ast::Selection<Resolved>, u32)>>,
     // Store collection_id for selection updates
     pub(crate) collection_id: CollectionId,
     // Gap fetcher for reactor.add_query (type-erased)

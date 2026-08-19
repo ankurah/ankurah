@@ -1,6 +1,21 @@
+use ankurah_core_types::SystemModel;
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use syn::{Data, DeriveInput, Fields, Ident, Type, Visibility};
+use syn::{meta::ParseNestedMeta, Data, DeriveInput, Fields, Ident, LitStr, Type, Visibility};
+
+/// The complete struct-level `#[model(...)]` vocabulary, parsed once.
+///
+/// One closed parse is what keeps an unknown, duplicate, or malformed option
+/// from being silently ignored: independent per-key lookups have no way to
+/// notice a key nobody asked about, so a typo would change nothing and say
+/// nothing.
+#[derive(Default)]
+struct ModelOptions {
+    base: Option<String>,
+    system: Option<String>,
+    explicit_id: Option<String>,
+    no_ffi: bool,
+}
 
 /// Encapsulates all the parsed information about a model and provides clean accessors
 pub struct ModelDescription {
@@ -14,8 +29,25 @@ pub struct ModelDescription {
     // Backend manager for configuration lookup
     pub(crate) backend_registry: crate::model::backend_registry::BackendRegistry,
 
-    // Struct-level attributes, retained for #[model(...)] parsing
-    struct_attrs: Vec<syn::Attribute>,
+    /// `#[model(base = "...")]`: the path generated code addresses the core
+    /// crate through. Default `::ankurah::core` (through the facade);
+    /// `crate` lets core derive models of its own, which is how the catalog
+    /// rows get a typed surface without core depending on the facade.
+    base: syn::Path,
+    /// Whether generated active-type paths take the backend registry's
+    /// crate-relative substitutions. Only the literal `crate` base selects
+    /// them; any other base stays external.
+    uses_crate_paths: bool,
+    /// `#[model(no_ffi)]`: omit the WASM and UniFFI binding layers while
+    /// keeping the ordinary Rust model, view, and mutable surface. Core's own
+    /// models are implementation types with no place in a language binding.
+    no_ffi: bool,
+    /// `#[model(system = "...")]`: a built-in [`SystemModel`] identity. The
+    /// model's collection is that built-in's reserved label and its
+    /// identities are pinned at compile time, so it never registers.
+    system: Option<SystemModel>,
+    /// `#[model(id = "...")]`: an explicit durable catalog model identity.
+    explicit_id: Option<String>,
 }
 
 impl ModelDescription {

@@ -1,13 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::ModelId;
-use ankurah_proto::{self as proto, EntityId, PropertyId, SystemProperty};
+use ankurah_proto::EntityId;
 
-use crate::{
-    property::backend::{LWWBackend, PropertyBackend},
-    schema::{model_collection, model_property_collection, property_collection},
-    value::Value,
-};
+use crate::property::PropertyError;
+
+use super::rows::{SysModelPropertyRowView, SysModelRowView, SysPropertyRowView};
 
 /// A parsed model definition entity (`_ankurah_model`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,8 +43,11 @@ pub struct ModelPropertyMembershipDef {
     pub model: EntityId,
     /// The property participating in the membership.
     pub property: EntityId,
-    /// `None` until the `optional` follow-up event arrives. Until then the
-    /// membership is treated as optional.
+    /// Whether the property is optional in this model's contract. `None`
+    /// only where a raw storage lookup found the field absent (the
+    /// registration executor's own duplicate checks); the typed projection
+    /// requires it, since registration has always written it at creation.
+    /// An absent value is treated as optional.
     pub optional: Option<bool>,
 }
 
@@ -159,62 +159,6 @@ impl CatalogMapInner {
             let membership = self.memberships.get(id)?;
             (membership.property == *property).then(|| membership.clone())
         })
-    }
-}
-
-pub(super) fn parse_state(collection: &ModelId, id: EntityId, state: &proto::EntityState) -> Option<Entry> {
-    let buffer = state.state.state_buffers.0.get("lww")?;
-    let backend = LWWBackend::from_state_buffer(buffer).ok()?;
-    let values = backend.property_values();
-    let get_string = |field: SystemProperty| match values.get(&PropertyId::System(field)) {
-        Some(Some(Value::String(value))) => Some(value.clone()),
-        _ => None,
-    };
-    let get_entity_id = |field: SystemProperty| match values.get(&PropertyId::System(field)) {
-        Some(Some(Value::EntityId(value))) => Some(*value),
-        _ => None,
-    };
-    let get_bool = |field: SystemProperty| match values.get(&PropertyId::System(field)) {
-        Some(Some(Value::Bool(value))) => Some(*value),
-        _ => None,
-    };
-
-    if *collection == model_collection() {
-        let label = get_string(SystemProperty::Label)?;
-        let name = get_string(SystemProperty::Name).unwrap_or_else(|| label.clone());
-        Some(Entry::Model(ModelDef { id, label, name }))
-    } else if *collection == property_collection() {
-        Some(Entry::Property(PropertyDef {
-            id,
-            minted_for: get_entity_id(SystemProperty::MintedFor),
-            name: get_string(SystemProperty::Name)?,
-            backend: get_string(SystemProperty::Backend)?,
-            value_type: get_string(SystemProperty::ValueType)?,
-            target_model: get_entity_id(SystemProperty::TargetModel),
-        }))
-    } else if *collection == model_property_collection() {
-        Some(Entry::Membership(ModelPropertyMembershipDef {
-            id,
-            model: get_entity_id(SystemProperty::Model)?,
-            property: get_entity_id(SystemProperty::Property)?,
-            optional: get_bool(SystemProperty::Optional),
-        }))
-    } else {
-        None
-    }
-}
-
-pub(super) enum Entry {
-    Model(ModelDef),
-    Property(PropertyDef),
-    Membership(ModelPropertyMembershipDef),
-}
-
-pub(super) fn apply_entry(map: &mut CatalogMapInner, entry: Entry) {
-    match entry {
-        Entry::Model(definition) => map.upsert_model(definition),
-        Entry::Property(definition) => map.upsert_property(definition),
-        Entry::Membership(definition) => map.upsert_membership(definition),
     }
 }
 

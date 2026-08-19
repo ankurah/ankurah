@@ -61,8 +61,8 @@ pub trait TContext {
     /// Resolve a typed selection's property names through the compiled
     /// declaration's descriptor cells (catalog fallback for names the
     /// struct does not carry), and canonicalize its comparison values.
-    /// After the registration gate the cells are the admitted binding, so
-    /// a display-name change cannot re-aim a typed query.
+    /// Binds the declaration on the way past, so a display-name change
+    /// cannot re-aim a typed query.
     fn resolve_selection_with_descriptor(
         &self,
         schema: &'static crate::schema::ModelStructDescriptor,

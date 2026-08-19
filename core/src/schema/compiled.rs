@@ -18,7 +18,7 @@
 //! of the program.
 
 use super::cell::SchemaOnceCell;
-use ankurah_proto::{ModelId, PropertyId, RegisterModel, RegisterProperty};
+use ankurah_proto::{ModelId, PropertyId, RegisterModel, RegisterProperty, SystemModel};
 
 /// The compiled schema for one model: its registration hints and ordered
 /// active (non-ephemeral) fields. It contains no runtime
@@ -38,6 +38,11 @@ pub struct ModelStructDescriptor {
     /// EXCLUDED (they carry no persisted state and never enter the catalog;
     /// they are struct-only conveniences).
     pub properties: &'static [StructProperty],
+    /// `#[model(system = "...")]`: the built-in this declaration IS. A system
+    /// model's identity is fixed at compile time, so it never passes through
+    /// the allocator and its `resolved` cells are `Pinned`. `None` for every
+    /// ordinary model.
+    pub system: Option<SystemModel>,
     /// `#[model(id = "...")]`: bind this model to a KNOWN model entity by
     /// explicit id, bypassing label-based registration. `None` for
     /// the default label-based registration path. The value is URL-safe base64

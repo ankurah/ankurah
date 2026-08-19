@@ -439,6 +439,11 @@ async fn scenario_4_entity_creation() -> Result<()> {
     let peer = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
     let _conn = LocalProcessConnection::new(&peer, &node).await?;
     peer.system.wait_system_ready().await;
+    // The peer must read the entity under the SAME forged identities the child
+    // wrote it with. Those were seeded into the map, never written as catalog
+    // rows, so the peer's catalog projection cannot have learned them: seed the
+    // peer the same way, as the rest of this deterministic fixture does.
+    seed_album_catalog(&peer)?;
     let peer_ctx = peer.context(c)?;
     let query = format!("id = '{}'", entity_id.to_base64());
     let fetched = peer_ctx.fetch::<AlbumView>(query.as_str()).await?;

@@ -12,6 +12,12 @@ pub(crate) mod wasm;
 
 use proc_macro2::TokenStream;
 
+/// The label prefix reserved for Ankurah's built-in collections. A user model
+/// may not claim it (checked in [`schema::validate_schema_attrs`]); a
+/// `#[model(system = "...")]` model is built FROM it. Core states the same
+/// constant for the runtime side (`ankurah_core::schema::RESERVED_COLLECTION_PREFIX`).
+pub(crate) const RESERVED_COLLECTION_PREFIX: &str = "_ankurah_";
+
 /// FFI-specific attributes for View struct generation.
 pub(crate) struct ViewAttributes {
     /// Attribute on the struct definition (e.g., `#[wasm_bindgen]`, `#[derive(uniffi::Object)]`)

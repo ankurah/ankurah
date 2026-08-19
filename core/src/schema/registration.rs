@@ -30,6 +30,7 @@
 //! pair, refuses the registration loudly. Changing a canonical type is a
 //! deliberate migration (#303), never a model-struct edit.
 
+use ankql::ast::Resolved;
 use std::collections::BTreeMap;
 
 use ankurah_proto::{
@@ -44,6 +45,7 @@ use crate::storage::StorageEngine;
 use crate::ModelId;
 use ankurah_core_types::{Value, ValueType};
 
+use super::catalog::rows::{SysModelRow, SysPropertyRow};
 use super::{model_collection, model_property_collection, property_collection};
 
 /// A durable schema-registration request could not be completed.
