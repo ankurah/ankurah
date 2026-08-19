@@ -9,7 +9,7 @@
 
 mod common;
 
-use ankurah::{policy::DEFAULT_CONTEXT as c, proto, Model, Node, PermissiveAgent};
+use ankurah::{policy::DEFAULT_CONTEXT as c, proto, Node, PermissiveAgent};
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
 use common::{Album, AlbumView, GatedConnection, Record};
@@ -22,10 +22,10 @@ async fn durable_node() -> Result<ankurah::Context> {
 }
 
 async fn entity_events(ctx: &ankurah::Context, id: proto::EntityId) -> Result<Vec<proto::Event>> {
-    events_in(ctx, &Album::collection(), id).await
+    events_in(ctx, &common::model_id::<Album>(ctx).await?, id).await
 }
 
-async fn events_in(ctx: &ankurah::Context, collection: &proto::CollectionId, id: proto::EntityId) -> Result<Vec<proto::Event>> {
+async fn events_in(ctx: &ankurah::Context, collection: &proto::ModelId, id: proto::EntityId) -> Result<Vec<proto::Event>> {
     let collection = ctx.collection(collection).await?;
     Ok(collection.dump_entity_events(id).await?.into_iter().map(|e| e.payload).collect())
 }
@@ -79,7 +79,7 @@ async fn identical_payloads_mint_distinct_entities() -> Result<()> {
 
     assert_ne!(first, second, "identical payloads are still two distinct entities");
 
-    let collection = Record::collection();
+    let collection = common::model_id::<Record>(&ctx).await?;
     let first_genesis = events_in(&ctx, &collection, first).await?.into_iter().find(|e| e.is_entity_create()).expect("first genesis");
     let second_genesis = events_in(&ctx, &collection, second).await?.into_iter().find(|e| e.is_entity_create()).expect("second genesis");
     assert_eq!(first_genesis.operations(), second_genesis.operations(), "the two mints froze identical operations");
@@ -212,7 +212,7 @@ async fn the_root_binds_no_system_and_everything_else_binds_the_root() -> Result
         proto::EventBody::Update { .. } => panic!("is_entity_create disagreed with the body"),
     }
 
-    let root_collection = ctx.collection(&proto::CollectionId::fixed_name(ankurah::core::system::SYSTEM_COLLECTION_ID)).await?;
+    let root_collection = ctx.collection(&ankurah::core::system::system_collection()).await?;
     let root_genesis = root_collection
         .dump_entity_events(root_id)
         .await?

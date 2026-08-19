@@ -20,7 +20,7 @@ async fn test_single_event_entity() -> Result<()> {
     };
 
     // Verify initial state: head=[A]
-    let collection = ctx.collection(&Album::collection()).await?;
+    let collection = collection_of::<Album>(&ctx).await?;
     let state = collection.get_state(album_id).await?;
     clock_eq!(dag, state.payload.state.head, [A]);
 
@@ -99,7 +99,7 @@ async fn test_rapid_concurrent_transactions() -> Result<()> {
     assert!(!final_year.is_empty(), "Year should not be empty after concurrent updates");
 
     // Verify DAG is valid - no orphans, all events have valid parents
-    let collection = ctx.collection(&Album::collection()).await?;
+    let collection = collection_of::<Album>(&ctx).await?;
     let events = collection.dump_entity_events(album_id).await?;
 
     // All events except genesis should have parents
@@ -214,7 +214,7 @@ async fn test_multiple_merge_cycles() -> Result<()> {
     dag.enumerate(trx.commit_and_return_events().await?); // G
 
     // Verify structure
-    let collection = ctx.collection(&Album::collection()).await?;
+    let collection = collection_of::<Album>(&ctx).await?;
     let events = collection.dump_entity_events(album_id).await?;
 
     assert_eq!(events.len(), 7, "Should have 7 events");
@@ -254,7 +254,7 @@ async fn test_empty_transaction() -> Result<()> {
     };
 
     // Get event count before empty transaction
-    let collection = ctx.collection(&Album::collection()).await?;
+    let collection = collection_of::<Album>(&ctx).await?;
     let events_before = collection.dump_entity_events(album_id).await?;
     let count_before = events_before.len();
 
@@ -309,7 +309,7 @@ async fn test_apply_state_diverged_since() -> Result<()> {
     dag.enumerate(trx2.commit_and_return_events().await?); // C
 
     // Verify DAG structure - B and C both have parent A (true concurrency)
-    let collection = ctx.collection(&Album::collection()).await?;
+    let collection = collection_of::<Album>(&ctx).await?;
     let events = collection.dump_entity_events(album_id).await?;
 
     assert_dag!(dag, events, {
@@ -347,7 +347,7 @@ async fn test_apply_state_strict_ascends() -> Result<()> {
     };
 
     // Capture state at A
-    let collection = ctx.collection(&Album::collection()).await?;
+    let collection = collection_of::<Album>(&ctx).await?;
     let state_at_a = collection.get_state(album_id).await?;
     let old_head = state_at_a.payload.state.head.clone();
 
@@ -415,7 +415,7 @@ async fn test_empty_clock_handling() -> Result<()> {
     };
 
     // Get entity and its head
-    let collection = ctx.collection(&Album::collection()).await?;
+    let collection = collection_of::<Album>(&ctx).await?;
     let state = collection.get_state(album_id).await?;
     let head = state.payload.state.head;
 
@@ -451,7 +451,7 @@ async fn test_state_buffer_round_trip() -> Result<()> {
     }
 
     // Get state after B
-    let collection = ctx.collection(&Album::collection()).await?;
+    let collection = collection_of::<Album>(&ctx).await?;
     let state_after_b = collection.get_state(album_id).await?;
 
     // Serialize state to bytes
@@ -516,7 +516,7 @@ async fn test_backend_error_handling() -> Result<()> {
     };
 
     // Get the collection
-    let collection = ctx.collection(&Album::collection()).await?;
+    let collection = collection_of::<Album>(&ctx).await?;
 
     // Verify that the valid entity works correctly
     let valid_state = collection.get_state(album_id).await?;
@@ -566,7 +566,7 @@ async fn test_multi_head_extend_single_tip_lww() -> Result<()> {
     dag.enumerate(trx_c.commit_and_return_events().await?); // C
 
     // Head should be [B, C]
-    let collection = ctx.collection(&Record::collection()).await?;
+    let collection = collection_of::<Record>(&ctx).await?;
     let state = collection.get_state(record_id).await?;
     clock_eq!(dag, state.payload.state.head, [B, C]);
 
@@ -663,7 +663,7 @@ async fn test_multi_head_single_tip_extension_cross_node() -> Result<()> {
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     // 4. Verify durable has multi-head [B, C]
-    let collection = ctx_d.collection(&Record::collection()).await?;
+    let collection = collection_of::<Record>(&ctx_d).await?;
     let state = collection.get_state(record_id).await?;
     clock_eq!(dag, state.payload.state.head, [B, C]);
 
@@ -734,7 +734,7 @@ async fn test_redelivery_of_ancestor_event_is_noop() -> Result<()> {
         id
     };
 
-    let collection = ctx.collection(&Album::collection()).await?;
+    let collection = collection_of::<Album>(&ctx).await?;
     let state = collection.get_state(album_id).await?;
     clock_eq!(dag, state.payload.state.head, [A]);
 

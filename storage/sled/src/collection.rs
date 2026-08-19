@@ -9,7 +9,7 @@ use ankurah_core::{
     storage::StorageCollection,
     EntityId,
 };
-use ankurah_proto::{Attested, CollectionId, EntityState, Event, EventId, StateFragment};
+use ankurah_proto::{Attested, EntityState, Event, EventId, ModelId, StateFragment};
 use ankurah_storage_common::{
     filtering::ValueSetStream, EngineColumns, KeyBounds, OrderByComponents, Plan, Planner, PlannerConfig, ScanDirection,
 };
@@ -32,7 +32,7 @@ use ankurah_storage_common::traits::{EntityIdStream, EntityStateStream};
 
 #[derive(Clone)]
 pub struct SledStorageCollectionInner {
-    pub collection_id: CollectionId,
+    pub collection_id: ModelId,
     pub database: Arc<Database>,
     pub tree: sled::Tree,
     #[cfg(debug_assertions)]
@@ -43,7 +43,7 @@ pub struct SledStorageCollection(SledStorageCollectionInner);
 
 impl SledStorageCollection {
     pub fn new(
-        collection_id: CollectionId,
+        collection_id: ModelId,
         database: Arc<Database>,
         tree: sled::Tree,
         #[cfg(debug_assertions)] prefix_guard_disabled: Arc<AtomicBool>,
@@ -131,7 +131,7 @@ impl SledStorageCollectionInner {
         };
 
         // 2c) Update indexes for this collection based on old/new mats
-        self.database.index_manager.update_indexes_for_entity(self.collection_id.as_str(), &entity_id, old_mat.as_deref(), &mat)?;
+        self.database.index_manager.update_indexes_for_entity(&self.collection_id.to_string(), &entity_id, old_mat.as_deref(), &mat)?;
 
         Ok(changed)
     }
@@ -203,7 +203,7 @@ impl SledStorageCollectionInner {
         };
 
         let (index, match_type) = self.database.index_manager.assure_index_exists(
-            self.collection_id.as_str(),
+            &self.collection_id.to_string(),
             &index_spec,
             &self.database.db,
             &self.database.property_manager,

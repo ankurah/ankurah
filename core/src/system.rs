@@ -1,4 +1,4 @@
-use ankurah_proto::{self as proto, Attested, CollectionId, EntityState, Event};
+use ankurah_proto::{self as proto, Attested, EntityState, Event, ModelId};
 use anyhow::{anyhow, Result};
 use proto::PropertyId;
 use std::collections::BTreeMap;
@@ -21,8 +21,13 @@ use crate::retrieval::{LocalEventGetter, LocalStateGetter, SuspenseEvents};
 use crate::schema::SchemaEpoch;
 use crate::storage::{StorageCollectionWrapper, StorageEngine};
 use crate::{property::backend::LWWBackend, value::Value};
+/// The source-level label the system collection is declared under. A label,
+/// not an address: the system entity is addressed by
+/// `ModelId::System(SystemModel::System)` everywhere past name resolution.
 pub const SYSTEM_COLLECTION_ID: &str = "_ankurah_system";
-pub const PROTECTED_COLLECTIONS: &[&str] = &[SYSTEM_COLLECTION_ID];
+
+/// The system entity's model identity.
+pub const fn system_collection() -> ModelId { ModelId::System(proto::SystemModel::System) }
 
 /// System catalog manager for storing various metadata about the system
 /// * root clock
@@ -36,7 +41,7 @@ impl<SE, PA> Clone for SystemManager<SE, PA> {
 
 struct Inner<SE, PA> {
     collectionset: CollectionSet<SE>,
-    collection_map: RwLock<BTreeMap<CollectionId, Entity>>,
+    collection_map: RwLock<BTreeMap<ModelId, Entity>>,
     entities: WeakEntitySet,
     durable: bool,
     root: RwLock<Option<Attested<EntityState>>>,
@@ -139,7 +144,7 @@ where
 
     /// get an existing collection if it's defined in the system catalog, else insert a SysItem::Collection
     /// then return collections.get to get the StorageCollectionWrapper
-    pub async fn collection(&self, id: &CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
+    pub async fn collection(&self, id: &ModelId) -> Result<StorageCollectionWrapper, RetrievalError> {
         self.wait_loaded().await;
         // TODO - update the system catalog to create an entity for this collection
 
@@ -245,7 +250,7 @@ where
         }
 
         // TODO - see if we can use the Model derive macro for a SysCatalogItem model rather than doing this manually
-        let collection_id = CollectionId::fixed_name(SYSTEM_COLLECTION_ID);
+        let collection_id = system_collection();
         let storage = self.0.collectionset.get(&collection_id).await?;
 
         // Stage the root's initial values in a vessel with no identity of its
@@ -370,7 +375,7 @@ where
         if !still_ours {
             return Ok(());
         }
-        let collection_id = CollectionId::fixed_name(SYSTEM_COLLECTION_ID);
+        let collection_id = system_collection();
         self.0.collectionset.get(&collection_id).await?.set_state(state).await?;
         Ok(())
     }
@@ -447,7 +452,7 @@ where
             return Err(anyhow!("System catalog already loaded"));
         }
 
-        let collection_id = CollectionId::fixed_name(SYSTEM_COLLECTION_ID);
+        let collection_id = system_collection();
         let storage = self.0.collectionset.get(&collection_id).await?;
 
         let mut entities = Vec::new();

@@ -10,7 +10,7 @@ use ankurah_core::error::{MutationError, RetrievalError};
 use ankurah_core::property::backend::backend_from_string;
 use ankurah_core::selection::filter::evaluate_predicate;
 use ankurah_core::storage::{StorageCollection, StorageEngine};
-use ankurah_proto::{AttestationSet, Attested, Clock, CollectionId, EntityId, EntityState, Event, EventBody, EventId, State, StateBuffers};
+use ankurah_proto::{AttestationSet, Attested, Clock, EntityId, EntityState, Event, EventBody, EventId, ModelId, State, StateBuffers};
 use async_trait::async_trait;
 use rusqlite::{params_from_iter, Connection};
 use tracing::{debug, warn};
@@ -47,13 +47,16 @@ impl SqliteStorageEngine {
         Ok(Self::new(pool))
     }
 
-    /// Check if a collection name is valid
-    pub fn sane_name(collection: &str) -> bool {
-        for char in collection.chars() {
+    /// Check if a physical name is valid.
+    ///
+    /// The alphabet is the one identity renderings use: URL-safe base64
+    /// (alphanumerics, `-` and `_`) for an allocated id, plus the built-in
+    /// renderings, which spell themselves in lowercase words joined by `-`.
+    /// Every emitted name is quoted, so a leading digit is not a problem.
+    pub fn sane_name(name: &str) -> bool {
+        for char in name.chars() {
             match char {
                 c if c.is_alphanumeric() => {}
-                // '-' appears in property-id renderings (URL-safe base64),
-                // which name materialized columns; always emitted quoted.
                 '_' | '.' | ':' | '-' => {}
                 _ => return false,
             }
@@ -69,8 +72,10 @@ impl SqliteStorageEngine {
 impl StorageEngine for SqliteStorageEngine {
     type Value = SqliteValue;
 
-    async fn collection(&self, collection_id: &CollectionId) -> Result<Arc<dyn StorageCollection>, RetrievalError> {
-        if !Self::sane_name(collection_id.as_str()) {
+    async fn collection(&self, collection_id: &ModelId) -> Result<Arc<dyn StorageCollection>, RetrievalError> {
+        // The tables are named by the model's own rendering, so this rejects
+        // a rendering this engine could not spell rather than a user's label.
+        if !Self::sane_name(&collection_id.to_string()) {
             return Err(RetrievalError::InvalidBucketName);
         }
 
@@ -116,8 +121,8 @@ impl StorageEngine for SqliteStorageEngine {
     }
 }
 
-fn create_state_table(conn: &Connection, collection_id: &CollectionId) -> Result<(), SqliteError> {
-    let table_name = collection_id.as_str();
+fn create_state_table(conn: &Connection, collection_id: &ModelId) -> Result<(), SqliteError> {
+    let table_name = collection_id.to_string();
     let query = format!(
         r#"CREATE TABLE IF NOT EXISTS "{}"(
             "id" TEXT PRIMARY KEY,
@@ -133,8 +138,8 @@ fn create_state_table(conn: &Connection, collection_id: &CollectionId) -> Result
     Ok(())
 }
 
-fn create_event_table(conn: &Connection, collection_id: &CollectionId) -> Result<(), SqliteError> {
-    let table_name = format!("{}_event", collection_id.as_str());
+fn create_event_table(conn: &Connection, collection_id: &ModelId) -> Result<(), SqliteError> {
+    let table_name = format!("{collection_id}_event");
     let query = format!(
         r#"CREATE TABLE IF NOT EXISTS "{}"(
             "id" TEXT PRIMARY KEY,
@@ -166,7 +171,7 @@ pub struct SqliteColumn {
 /// SQLite storage bucket (collection)
 pub struct SqliteBucket {
     pool: bb8::Pool<SqliteConnectionManager>,
-    collection_id: CollectionId,
+    collection_id: ModelId,
     /// Cached state table name (avoids repeated allocations)
     state_table_name: String,
     /// Cached event table name (avoids repeated allocations)
@@ -177,9 +182,9 @@ pub struct SqliteBucket {
 
 impl SqliteBucket {
     /// Create a new bucket with cached table names
-    fn new(pool: bb8::Pool<SqliteConnectionManager>, collection_id: CollectionId) -> Self {
-        let state_table_name = collection_id.as_str().to_string();
-        let event_table_name = format!("{}_event", collection_id.as_str());
+    fn new(pool: bb8::Pool<SqliteConnectionManager>, collection_id: ModelId) -> Self {
+        let state_table_name = collection_id.to_string();
+        let event_table_name = format!("{collection_id}_event");
         Self {
             pool,
             collection_id,
@@ -686,7 +691,7 @@ impl StorageCollection for SqliteBucket {
 fn post_filter_states(
     states: &[Attested<EntityState>],
     predicate: &ankql::ast::Predicate<Resolved>,
-    collection_id: &CollectionId,
+    collection_id: &ModelId,
 ) -> Vec<Attested<EntityState>> {
     states
         .iter()
@@ -714,7 +719,7 @@ mod tests {
     #[tokio::test]
     async fn test_open_in_memory() {
         let engine = SqliteStorageEngine::open_in_memory().await.unwrap();
-        let collection = engine.collection(&"test_collection".into()).await.unwrap();
+        let collection = engine.collection(&ModelId::EntityId(EntityId::from_bytes([0xfc; 32]))).await.unwrap();
         let all = ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None };
         assert!(collection.fetch_states(&all).await.unwrap().is_empty());
     }

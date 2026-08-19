@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::str::FromStr;
 
-use crate::EntityId;
+use crate::{DecodeError, EntityId};
 
 /// A built-in model's logical identity. Variant order is part of the bincode
 /// contract; append variants, never reorder them without a protocol bump.
@@ -41,17 +42,33 @@ impl SystemModel {
             _ => return None,
         })
     }
-}
 
-impl fmt::Display for SystemModel {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
+    /// The canonical rendering of a built-in identity, the form
+    /// [`Display`](fmt::Display) writes and [`Self::from_rendering`] reads.
+    /// Storage engines name a built-in's physical table with it.
+    pub const fn as_str(self) -> &'static str {
+        match self {
             Self::System => "system",
             Self::Model => "model",
             Self::Property => "property",
             Self::ModelProperty => "model-property",
+        }
+    }
+
+    /// Parse a canonical rendering, the form [`Self::as_str`] writes.
+    pub fn from_rendering(rendering: &str) -> Option<Self> {
+        Some(match rendering {
+            "system" => Self::System,
+            "model" => Self::Model,
+            "property" => Self::Property,
+            "model-property" => Self::ModelProperty,
+            _ => return None,
         })
     }
+}
+
+impl fmt::Display for SystemModel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(self.as_str()) }
 }
 
 /// The durable address of a model. Registered models use their real catalog
@@ -100,6 +117,22 @@ impl fmt::Display for ModelId {
     }
 }
 
+/// The exact inverse of [`Display`](fmt::Display): every variant parses back
+/// to itself, which is what lets a storage engine read an identity off a
+/// physical name it wrote. The arms cannot collide -- no built-in rendering
+/// decodes to the 32 bytes an entity id requires (the longest,
+/// `model-property`, is 14 characters and decodes to 10).
+impl FromStr for ModelId {
+    type Err = DecodeError;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        if let Some(model) = SystemModel::from_rendering(input) {
+            return Ok(Self::System(model));
+        }
+        EntityId::from_base64(input).map(Self::EntityId).map_err(|_| DecodeError::InvalidFormat)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,6 +152,24 @@ mod tests {
                 [1u32.to_le_bytes(), (ordinal as u32).to_le_bytes()].concat()
             );
         }
+    }
+
+    #[test]
+    fn display_round_trips_every_variant() {
+        let entity = EntityId::from_bytes([9; 32]);
+        let mut cases = vec![ModelId::EntityId(entity)];
+        cases.extend([SystemModel::System, SystemModel::Model, SystemModel::Property, SystemModel::ModelProperty].map(ModelId::System));
+
+        for model in cases {
+            let rendering = model.to_string();
+            let parsed =
+                rendering.parse::<ModelId>().unwrap_or_else(|e| panic!("{rendering:?} must parse back to the id that wrote it: {e}"));
+            assert_eq!(parsed, model, "{rendering:?} round-tripped to the wrong identity");
+        }
+
+        assert_eq!(ModelId::System(SystemModel::ModelProperty).to_string(), "model-property");
+        assert_eq!(ModelId::EntityId(entity).to_string(), entity.to_base64());
+        assert!("albums".parse::<ModelId>().is_err(), "a source-level label is not a rendering");
     }
 
     #[test]

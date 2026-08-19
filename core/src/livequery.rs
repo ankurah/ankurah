@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, Weak},
 };
 
-use ankurah_proto::{self as proto, CollectionId};
+use ankurah_proto::{self as proto, ModelId};
 
 use ankurah_signals::{
     broadcast::BroadcastId,
@@ -94,8 +94,12 @@ struct Inner {
     // the selection; nothing runs against the query in that window, since it
     // is neither activated nor registered with the relay until one lands.
     pub(crate) selection: Mut<Option<(ankql::ast::Selection<Resolved>, u32)>>,
-    // Store collection_id for selection updates
-    pub(crate) collection_id: CollectionId,
+    // The model this query reads, which is also what it addresses storage
+    // and the relay by. Absent for the same window as `selection` and filled
+    // by the same `start_admitted`: a typed query written against a
+    // declaration this system has never been told about has no model
+    // identity until its healing registration returns one.
+    pub(crate) collection_id: std::sync::RwLock<Option<ModelId>>,
     // Gap fetcher for reactor.add_query (type-erased)
     pub(crate) gap_fetcher: std::sync::Arc<dyn GapFetcher<Entity>>,
 }
@@ -186,6 +190,9 @@ impl Inner {
         }
     }
 
+    /// The model this query reads, once admission has settled it.
+    fn collection_id(&self) -> Option<ModelId> { *self.collection_id.read().unwrap() }
+
     /// Record that a remote has answered, and wake everyone waiting on it.
     fn mark_remote_answered(&self) {
         self.remote_answered.store(true, std::sync::atomic::Ordering::Release);
@@ -216,7 +223,10 @@ impl Inner {
     /// Marks initialization as complete regardless of success/failure
     /// Rejects activation if the version is older than the current selection to prevent regression
     async fn activate(&self, version: u32) -> Result<(), RetrievalError> {
-        // Get the current selection and its version
+        // Get the model being read, the current selection, and its version
+        let Some(collection_id) = self.collection_id() else {
+            return Err(RetrievalError::Other("live query activated before its model was admitted".into()));
+        };
         let Some((selection, stored_version)) = self.selection.value() else {
             // Unreachable by construction -- a query is started only once its
             // admitted selection is installed -- but a query with no
@@ -247,7 +257,7 @@ impl Inner {
                 .add_query_and_notify(
                     self.subscription.id(),
                     self.query_id,
-                    self.collection_id.clone(),
+                    collection_id,
                     selection,
                     &*node,
                     self.resultset.clone(),
@@ -259,15 +269,7 @@ impl Inner {
             // Subsequent activation (including cached re-initialization or selection update): use update_query_and_notify
             // This handles both: (1) cached queries re-activating after remote deltas, and (2) selection updates
             reactor
-                .update_query_and_notify(
-                    self.subscription.id(),
-                    self.query_id,
-                    self.collection_id.clone(),
-                    selection,
-                    &*node,
-                    version,
-                    &hook,
-                )
+                .update_query_and_notify(self.subscription.id(), self.query_id, collection_id, selection, &*node, version, &hook)
                 .await?;
         };
 
@@ -304,21 +306,21 @@ impl crate::reactor::PreNotifyHook for &InnerPreNotifyHook<'_> {
 /// through the catalog's current display names.
 ///
 /// A catalog collection skips the agent entirely, on both counts
-/// ([`crate::schema::reads_bypass_policy`]): the catalog projection runs
+/// ([`crate::schema::is_catalog_collection`]): the catalog projection runs
 /// before this node has a credential to be judged under, and it is what makes
 /// every other query resolvable.
 fn admit<SE, PA>(
     node: &Node<SE, PA>,
     sessions: &SessionSet<PA::ContextData>,
     schema: Option<&'static crate::schema::ModelStructDescriptor>,
-    collection_id: &CollectionId,
+    collection_id: &ModelId,
     selection: ankql::ast::Selection<Parsed>,
 ) -> Result<ankql::ast::Selection<Resolved>, RetrievalError>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    let exempt = crate::schema::reads_bypass_policy(collection_id);
+    let exempt = crate::schema::is_catalog_collection(collection_id);
     // One credential snapshot for the whole derivation; re-derivation
     // on change arrives with https://github.com/ankurah/ankurah/pull/426.
     let cdata = sessions.current();
@@ -341,7 +343,6 @@ where
 fn create_inner<SE, PA>(
     node: &Node<SE, PA>,
     node_ref: Box<dyn NodeRef>,
-    collection_id: CollectionId,
     selection: Option<ankql::ast::Selection<Resolved>>,
     sessions: SessionSet<PA::ContextData>,
 ) -> (Arc<Inner>, proto::QueryId)
@@ -367,7 +368,7 @@ where
         remote_answered_notify: tokio::sync::Notify::new(),
         current_version: std::sync::atomic::AtomicU32::new(1), // Start at version 1
         selection: Mut::new(selection.map(|selection| (selection, 1))), // Start with version 1
-        collection_id: collection_id.clone(),
+        collection_id: std::sync::RwLock::new(None),
         gap_fetcher,
     });
 
@@ -389,6 +390,15 @@ pub(crate) enum RemoteSubscription {
     OnRequest,
 }
 
+/// What a live query reads. A typed query is written against a compiled
+/// declaration and takes its model identity from that declaration's binding;
+/// a raw one is handed the identity outright.
+#[derive(Clone, Copy)]
+enum QueryTarget {
+    Raw(ModelId),
+    Typed(&'static crate::schema::ModelStructDescriptor),
+}
+
 /// Install an admitted selection and set the query running for this node
 /// kind: a durable node (and any cached query) activates against local
 /// storage, and an ephemeral node registers the query with its relay, whose
@@ -399,6 +409,7 @@ fn start_admitted<SE, PA>(
     inner: &Arc<Inner>,
     node: &Node<SE, PA>,
     me: &EntityLiveQuery,
+    collection_id: ModelId,
     selection: ankql::ast::Selection<Resolved>,
     cached: bool,
     sessions: SessionSet<PA::ContextData>,
@@ -408,6 +419,9 @@ fn start_admitted<SE, PA>(
     PA: PolicyAgent + Send + Sync + 'static,
 {
     let query_id = inner.query_id;
+    // The model first: it is what the activation below addresses storage by,
+    // and what the relay subscribes to.
+    *inner.collection_id.write().unwrap() = Some(collection_id);
     inner.selection.set(Some((selection.clone(), 1)));
 
     let has_relay = node.subscription_relay.is_some();
@@ -425,9 +439,7 @@ fn start_admitted<SE, PA>(
         });
     }
     match (has_relay, remote) {
-        (true, RemoteSubscription::AtStart) => {
-            node.subscribe_remote_query(query_id, inner.collection_id.clone(), selection, sessions, 1, me.weak())
-        }
+        (true, RemoteSubscription::AtStart) => node.subscribe_remote_query(query_id, collection_id, selection, sessions, 1, me.weak()),
         // Waiting for the owner to ask; it marks the query answered when the
         // relay confirms what it attached.
         (true, RemoteSubscription::OnRequest) => {}
@@ -441,7 +453,7 @@ fn start_admitted<SE, PA>(
 impl EntityLiveQuery {
     pub fn new<SE, PA>(
         node: &Node<SE, PA>,
-        collection_id: CollectionId,
+        collection_id: ModelId,
         args: MatchArgs<Parsed>,
         sessions: impl Into<SessionSet<PA::ContextData>>,
     ) -> Result<Self, RetrievalError>
@@ -450,7 +462,7 @@ impl EntityLiveQuery {
         PA: PolicyAgent + Send + Sync + 'static,
     {
         let node_ref: Box<dyn NodeRef> = Box::new(StrongNodeRef(Arc::clone(&node.0)));
-        Self::new_with_node_ref(node, node_ref, None, collection_id, args, sessions.into(), RemoteSubscription::AtStart)
+        Self::new_with_node_ref(node, node_ref, QueryTarget::Raw(collection_id), args, sessions.into(), RemoteSubscription::AtStart)
     }
 
     /// Create a LiveQuery that does NOT keep the node alive.
@@ -462,7 +474,7 @@ impl EntityLiveQuery {
     /// once the node is gone.
     pub fn new_weak_node<SE, PA>(
         node: &Node<SE, PA>,
-        collection_id: CollectionId,
+        collection_id: ModelId,
         args: MatchArgs<Parsed>,
         sessions: impl Into<SessionSet<PA::ContextData>>,
     ) -> Result<Self, RetrievalError>
@@ -471,7 +483,7 @@ impl EntityLiveQuery {
         PA: PolicyAgent + Send + Sync + 'static,
     {
         let node_ref: Box<dyn NodeRef> = Box::new(WeakNodeRefImpl(Arc::downgrade(&node.0)));
-        Self::new_with_node_ref(node, node_ref, None, collection_id, args, sessions.into(), RemoteSubscription::AtStart)
+        Self::new_with_node_ref(node, node_ref, QueryTarget::Raw(collection_id), args, sessions.into(), RemoteSubscription::AtStart)
     }
 
     /// [`Self::new_weak_node`] for a query whose owner attaches the remote
@@ -480,7 +492,7 @@ impl EntityLiveQuery {
     /// why the catalog projection is built this way.
     pub(crate) fn new_weak_node_local<SE, PA>(
         node: &Node<SE, PA>,
-        collection_id: CollectionId,
+        collection_id: ModelId,
         args: MatchArgs<Parsed>,
         sessions: impl Into<SessionSet<PA::ContextData>>,
     ) -> Result<Self, RetrievalError>
@@ -489,7 +501,7 @@ impl EntityLiveQuery {
         PA: PolicyAgent + Send + Sync + 'static,
     {
         let node_ref: Box<dyn NodeRef> = Box::new(WeakNodeRefImpl(Arc::downgrade(&node.0)));
-        Self::new_with_node_ref(node, node_ref, None, collection_id, args, sessions.into(), RemoteSubscription::OnRequest)
+        Self::new_with_node_ref(node, node_ref, QueryTarget::Raw(collection_id), args, sessions.into(), RemoteSubscription::OnRequest)
     }
 
     /// Create a typed LiveQuery: one written against a compiled declaration,
@@ -507,7 +519,6 @@ impl EntityLiveQuery {
     pub fn new_typed<SE, PA>(
         node: &Node<SE, PA>,
         schema: &'static crate::schema::ModelStructDescriptor,
-        collection_id: CollectionId,
         args: MatchArgs<Parsed>,
         sessions: impl Into<SessionSet<PA::ContextData>>,
     ) -> Result<Self, RetrievalError>
@@ -516,27 +527,28 @@ impl EntityLiveQuery {
         PA: PolicyAgent + Send + Sync + 'static,
     {
         let node_ref: Box<dyn NodeRef> = Box::new(StrongNodeRef(Arc::clone(&node.0)));
-        Self::new_with_node_ref(node, node_ref, Some(schema), collection_id, args, sessions.into(), RemoteSubscription::AtStart)
+        Self::new_with_node_ref(node, node_ref, QueryTarget::Typed(schema), args, sessions.into(), RemoteSubscription::AtStart)
     }
 
-    /// The one construction path: admit the selection, build the inner, and
-    /// set the query running. `schema` distinguishes a typed entry (names
-    /// bind through the compiled declaration's cells) from a raw one (names
-    /// bind through the catalog's current display names); the node reference
-    /// distinguishes a query that keeps its node alive from one that does
-    /// not. An admission failure is this call's error, never a query that
-    /// will never populate.
+    /// The one construction path: settle what the query reads, admit its
+    /// selection, build the inner, and set the query running. The target
+    /// distinguishes a typed entry (the model comes from the declaration's
+    /// binding, and names bind through its cells) from a raw one (the caller
+    /// names the model, and names bind through the catalog's current display
+    /// names); the node reference distinguishes a query that keeps its node
+    /// alive from one that does not. An admission failure is this call's
+    /// error, never a query that will never populate.
     ///
     /// The single exception is a typed entry whose declaration this system
     /// has never been told about. Healing it means registering it, which
     /// means awaiting the durable allocator, and this entry is synchronous:
-    /// so that one case builds the query first and finishes admitting it in
-    /// a spawned task, where a failure lands in the error slot instead.
+    /// so that one case builds the query first, and finishes settling and
+    /// admitting it in a spawned task, where a failure lands in the error
+    /// slot instead.
     fn new_with_node_ref<SE, PA>(
         node: &Node<SE, PA>,
         node_ref: Box<dyn NodeRef>,
-        schema: Option<&'static crate::schema::ModelStructDescriptor>,
-        collection_id: CollectionId,
+        target: QueryTarget,
         args: MatchArgs<Parsed>,
         sessions: SessionSet<PA::ContextData>,
         remote: RemoteSubscription,
@@ -545,23 +557,29 @@ impl EntityLiveQuery {
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
-        // Binding is what the synchronous judgment rests on, so ask for it
+        // Binding is what the synchronous judgment rests on, and it is also
+        // what a typed query takes its model identity from, so ask for it
         // here: a declaration that binds admits inline, and only one that
-        // does not takes the deferred path.
-        let unbound = match schema {
-            Some(schema) if node.catalog.bind_descriptor(schema).is_err() => schema,
-            _ => {
-                let selection = admit(node, &sessions, schema, &collection_id, args.selection)?;
-                let (inner, _query_id) = create_inner(node, node_ref, collection_id, None, sessions.clone());
+        // does not takes the deferred path. A raw query needs no binding --
+        // the caller named the model.
+        let settled = match target {
+            QueryTarget::Raw(collection_id) => Some((None, collection_id)),
+            QueryTarget::Typed(schema) => node.catalog.bind_descriptor(schema).ok().map(|(model, _epoch)| (Some(schema), model)),
+        };
+        if let Some((schema, collection_id)) = settled {
+            let selection = admit(node, &sessions, schema, &collection_id, args.selection)?;
+            let (inner, _query_id) = create_inner(node, node_ref, None, sessions.clone());
 
-                let me = Self(inner.clone());
-                start_admitted(&inner, node, &me, selection, args.cached, sessions, remote);
+            let me = Self(inner.clone());
+            start_admitted(&inner, node, &me, collection_id, selection, args.cached, sessions, remote);
 
-                return Ok(me);
-            }
+            return Ok(me);
+        }
+        let QueryTarget::Typed(unbound) = target else {
+            unreachable!("a raw query settles above; only a declaration can be unbound");
         };
 
-        let (inner, _query_id) = create_inner(node, node_ref, collection_id, None, sessions.clone());
+        let (inner, _query_id) = create_inner(node, node_ref, None, sessions.clone());
         let me = Self(inner.clone());
 
         // The task holds neither the query nor the node: a caller who drops
@@ -575,14 +593,19 @@ impl EntityLiveQuery {
                 inner.fail_initialization(RetrievalError::Other("Node has been dropped".into()));
                 return;
             };
+            // Registration is also what supplies the model identity: until
+            // this system has been told about the declaration, there is no
+            // identity for the query to be addressed to.
             let admitted = match node.catalog.bind_or_register(&sessions, unbound).await {
-                Ok(_) => admit(&node, &sessions, Some(unbound), &inner.collection_id, selection),
+                Ok((collection_id, _epoch)) => {
+                    admit(&node, &sessions, Some(unbound), &collection_id, selection).map(|selection| (collection_id, selection))
+                }
                 Err(error) => Err(error),
             };
             match admitted {
-                Ok(selection) => {
+                Ok((collection_id, selection)) => {
                     let me = Self(inner.clone());
-                    start_admitted(&inner, &node, &me, selection, cached, sessions, remote);
+                    start_admitted(&inner, &node, &me, collection_id, selection, cached, sessions, remote);
                 }
                 Err(error) => inner.fail_initialization(error),
             }
@@ -617,10 +640,10 @@ impl EntityLiveQuery {
             self.0.mark_remote_answered();
             return Ok(());
         }
-        let Some((selection, version)) = self.0.selection.value() else {
+        let (Some(collection_id), Some((selection, version))) = (self.0.collection_id(), self.0.selection.value()) else {
             return Err(RetrievalError::Other("live query subscribed remotely before its selection was admitted".into()));
         };
-        node.subscribe_remote_query(self.0.query_id, self.0.collection_id.clone(), selection, sessions, version, self.weak());
+        node.subscribe_remote_query(self.0.query_id, collection_id, selection, sessions, version, self.weak());
         Ok(())
     }
 
@@ -637,7 +660,10 @@ impl EntityLiveQuery {
         // resolved selections only. (Policy re-injection on replacement is
         // a recorded gap, tracked with the update_selection admission
         // issue.)
-        let new_selection = node.resolve_selection(&self.0.collection_id, new_selection)?;
+        let Some(collection_id) = self.0.collection_id() else {
+            return Err(RetrievalError::Other("live query selection updated before its model was admitted".into()));
+        };
+        let new_selection = node.resolve_selection(&collection_id, new_selection)?;
 
         // Increment current_version atomically and get the new version number
         let new_version = self.0.current_version.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;

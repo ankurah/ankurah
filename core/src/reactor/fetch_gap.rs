@@ -27,7 +27,7 @@ pub trait GapFetcher<E: AbstractEntity>: Send + Sync + 'static {
     /// Vector of entities that match the selection and come after `last_entity` in sort order
     async fn fetch_gap(
         &self,
-        collection_id: &proto::CollectionId,
+        collection_id: &proto::ModelId,
         selection: &ankql::ast::Selection<Resolved>,
         last_entity: Option<&E>,
         gap_size: usize,
@@ -67,7 +67,7 @@ where
 {
     async fn fetch_gap(
         &self,
-        collection_id: &proto::CollectionId,
+        collection_id: &proto::ModelId,
         selection: &ankql::ast::Selection<Resolved>,
         last_entity: Option<&crate::entity::Entity>,
         gap_size: usize,
@@ -209,7 +209,7 @@ mod tests {
     #[derive(Debug, Clone)]
     struct TestEntity {
         id: proto::EntityId,
-        collection: proto::CollectionId,
+        collection: proto::ModelId,
         data: Arc<Mutex<HashMap<PropertyId, Value>>>,
     }
 
@@ -219,14 +219,14 @@ mod tests {
             id_bytes[15] = id;
             Self {
                 id: proto::EntityId::from_bytes(id_bytes),
-                collection: proto::CollectionId::fixed_name("test"),
+                collection: proto::ModelId::EntityId(proto::EntityId::from_bytes([0xfc; 32])),
                 data: Arc::new(Mutex::new(data)),
             }
         }
     }
 
     impl AbstractEntity for TestEntity {
-        fn collection(&self) -> proto::CollectionId { self.collection.clone() }
+        fn collection(&self) -> proto::ModelId { self.collection }
 
         fn id(&self) -> &proto::EntityId { &self.id }
 

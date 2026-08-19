@@ -1,5 +1,5 @@
 use ankurah_core::selection::filter::PathLookup;
-use ankurah_proto::CollectionId;
+use ankurah_proto::ModelId;
 use ankurah_storage_common::filtering::{HasEntityId, ValueSetStream};
 use ankurah_storage_common::traits::EntityIdStream;
 use ankurah_storage_common::EngineColumns;
@@ -10,12 +10,12 @@ use std::task::{Context, Poll};
 /// Sled-specific entity state lookup that hydrates EntityIds into full EntityStates
 pub struct SledEntityLookup<S> {
     pub entities_tree: sled::Tree,
-    pub collection_id: CollectionId,
+    pub collection_id: ModelId,
     pub stream: S,
 }
 
 impl<S: EntityIdStream> SledEntityLookup<S> {
-    pub fn new(entities_tree: &sled::Tree, collection_id: &CollectionId, stream: S) -> Self {
+    pub fn new(entities_tree: &sled::Tree, collection_id: &ModelId, stream: S) -> Self {
         Self { entities_tree: entities_tree.clone(), collection_id: collection_id.clone(), stream }
     }
 }
@@ -63,7 +63,7 @@ impl<S: EntityIdStream> Stream for SledEntityLookup<S> {
 /// Trait that provides a convenient `.entities()` combinator for EntityId streams
 pub trait SledEntityExt: EntityIdStream + Sized {
     /// Hydrate EntityIds into EntityStates using the sled entities tree
-    fn entities(self, entities_tree: &sled::Tree, collection_id: &CollectionId) -> SledEntityLookup<Self> {
+    fn entities(self, entities_tree: &sled::Tree, collection_id: &ModelId) -> SledEntityLookup<Self> {
         SledEntityLookup::new(entities_tree, collection_id, self)
     }
 }
@@ -73,7 +73,7 @@ pub trait SledEntityExtFromMats: ValueSetStream + Sized
 where Self::Item: HasEntityId + PathLookup<EngineColumns>
 {
     /// Extract EntityIds and hydrate into EntityStates using the sled entities tree
-    fn entities(self, entities_tree: &sled::Tree, collection_id: &CollectionId) -> SledEntityLookup<impl EntityIdStream> {
+    fn entities(self, entities_tree: &sled::Tree, collection_id: &ModelId) -> SledEntityLookup<impl EntityIdStream> {
         let ids = self.extract_ids();
         SledEntityLookup::new(entities_tree, collection_id, ids)
     }

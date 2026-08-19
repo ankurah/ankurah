@@ -5,7 +5,7 @@ use crate::connector::PeerSender;
 use crate::{
     error::RetrievalError,
     policy::AccessResult,
-    proto::{CollectionId, Event, NodeId, State, ID},
+    proto::{Event, ModelId, NodeId, State, ID},
 };
 use ankql::ast::Predicate;
 use ankurah_proto as proto;

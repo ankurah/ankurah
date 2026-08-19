@@ -1,4 +1,3 @@
-use ankurah_proto::CollectionId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -93,15 +92,18 @@ impl PolicyConfig {
     /// which composes to `False` for callers this gate admitted without
     /// scan privilege. Use [`Self::can_scan_collection`] where only
     /// scan-privileged credentials may count.
-    pub fn can_access_collection(&self, roles: &[String], collection: &CollectionId) -> bool {
+    ///
+    /// `collection` is the config key naming the model being read, which the
+    /// agent resolved; `None` means this policy names no rules for it, and
+    /// only a wildcard role admits that.
+    pub fn can_access_collection(&self, roles: &[String], collection: Option<&str>) -> bool {
         for role in roles {
             if self.role_has_wildcard(role) {
                 return true;
             }
         }
 
-        let collection_name = collection.as_str();
-        if let Some(rules) = self.collections.get(collection_name) {
+        if let Some(rules) = collection.and_then(|name| self.collections.get(name)) {
             for role in roles {
                 let privileges = self.privileges_for_role(role);
                 if let Some(ref read_priv) = rules.read {
@@ -130,15 +132,14 @@ impl PolicyConfig {
     /// (exactly what [`Self::can_access_collection`] meant before
     /// `retrieve` existed). `retrieve` deliberately does not count here:
     /// naming rows is the whole of what it grants.
-    pub fn can_scan_collection(&self, roles: &[String], collection: &CollectionId) -> bool {
+    pub fn can_scan_collection(&self, roles: &[String], collection: Option<&str>) -> bool {
         for role in roles {
             if self.role_has_wildcard(role) {
                 return true;
             }
         }
 
-        let collection_name = collection.as_str();
-        if let Some(rules) = self.collections.get(collection_name) {
+        if let Some(rules) = collection.and_then(|name| self.collections.get(name)) {
             for role in roles {
                 let privileges = self.privileges_for_role(role);
                 if let Some(ref read_priv) = rules.read {
@@ -158,15 +159,15 @@ impl PolicyConfig {
     }
 
     /// Check if any of the given roles can write to a collection.
-    pub fn can_write_collection(&self, roles: &[String], collection: &CollectionId) -> bool {
+    /// `collection` is the config key, as in [`Self::can_access_collection`].
+    pub fn can_write_collection(&self, roles: &[String], collection: Option<&str>) -> bool {
         for role in roles {
             if self.role_has_wildcard(role) {
                 return true;
             }
         }
 
-        let collection_name = collection.as_str();
-        if let Some(rules) = self.collections.get(collection_name) {
+        if let Some(rules) = collection.and_then(|name| self.collections.get(name)) {
             for role in roles {
                 let privileges = self.privileges_for_role(role);
                 if let Some(ref write_priv) = rules.write {
@@ -180,9 +181,11 @@ impl PolicyConfig {
         false
     }
 
-    /// Returns the scope rules for a given collection, or an empty slice if none.
-    pub fn scope_rules_for_collection(&self, collection: &str) -> &[ScopeRule] {
-        self.collections.get(collection).map_or(&[], |r| &r.scope)
+    /// Returns the scope rules for a given collection, or an empty slice if
+    /// none. `collection` is the config key, as in
+    /// [`Self::can_access_collection`].
+    pub fn scope_rules_for_collection(&self, collection: Option<&str>) -> &[ScopeRule] {
+        collection.and_then(|name| self.collections.get(name)).map_or(&[], |r| &r.scope)
     }
 
     /// Check if any of the given roles has a specific privilege (or wildcard).

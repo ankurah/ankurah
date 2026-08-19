@@ -66,16 +66,21 @@ mod tests {
     use crate::model::Model;
     use ankurah_proto::SystemModel;
 
-    /// The derive builds a system model's collection label from its variant
-    /// name; core declares the same three labels as constants, and the
-    /// registration executor writes to those. If the two ever disagreed the
-    /// projection would read an empty collection and report an empty catalog,
-    /// so pin them together here.
+    /// The derive builds a system model's declared label from its variant
+    /// name; core declares the same three labels as constants, and
+    /// `system_model_id` resolves those. If the two ever disagreed, a query
+    /// that names a catalog collection by label would resolve to nothing, so
+    /// pin them together here. The rows themselves are addressed by the
+    /// pinned identity below, never by the label.
     #[test]
     fn row_models_match_the_canonical_system_labels() {
-        assert_eq!(SysModelRow::collection().as_str(), crate::schema::MODEL_COLLECTION_ID);
-        assert_eq!(SysPropertyRow::collection().as_str(), crate::schema::PROPERTY_COLLECTION_ID);
-        assert_eq!(SysModelPropertyRow::collection().as_str(), crate::schema::MODEL_PROPERTY_COLLECTION_ID);
+        use crate::schema::system_model_id;
+        assert_eq!(system_model_id(SysModelRow::descriptor().label), Some(crate::schema::model_collection()));
+        assert_eq!(system_model_id(SysPropertyRow::descriptor().label), Some(crate::schema::property_collection()));
+        assert_eq!(system_model_id(SysModelPropertyRow::descriptor().label), Some(crate::schema::model_property_collection()));
+        assert_eq!(SysModelRow::descriptor().label, crate::schema::MODEL_COLLECTION_ID);
+        assert_eq!(SysPropertyRow::descriptor().label, crate::schema::PROPERTY_COLLECTION_ID);
+        assert_eq!(SysModelPropertyRow::descriptor().label, crate::schema::MODEL_PROPERTY_COLLECTION_ID);
         assert_eq!(SysModelRow::descriptor().system, Some(SystemModel::Model));
         assert_eq!(SysPropertyRow::descriptor().system, Some(SystemModel::Property));
         assert_eq!(SysModelPropertyRow::descriptor().system, Some(SystemModel::ModelProperty));

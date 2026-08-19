@@ -21,7 +21,7 @@ pub enum AccessDenied {
     #[error("Access denied by policy: {0}")]
     ByPolicy(&'static str),
     #[error("Access denied by collection: {0}")]
-    CollectionDenied(proto::CollectionId),
+    CollectionDenied(proto::ModelId),
     #[error("Access denied by property error: {0}")]
     PropertyError(Box<PropertyError>),
     #[error("Access denied by parse error: {0}")]
@@ -165,7 +165,7 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     ) -> Result<(), AccessDenied>;
 
     // For checking if a context can access a collection
-    fn can_access_collection<C>(&self, data: &C, collection: &proto::CollectionId) -> Result<(), AccessDenied>
+    fn can_access_collection<C>(&self, data: &C, collection: &proto::ModelId) -> Result<(), AccessDenied>
     where C: Iterable<Self::ContextData>;
 
     /// Filter a predicate based on the context data
@@ -173,7 +173,7 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     fn filter_predicate<C>(
         &self,
         data: &C,
-        collection: &proto::CollectionId,
+        collection: &proto::ModelId,
         predicate: Predicate<Resolved>,
     ) -> Result<Predicate<Resolved>, AccessDenied>
     where
@@ -183,15 +183,8 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     /// If the policy agent wants to inspect the entity state, it can do so with either TemporaryEntity::new or entityset.with_state
     /// Optimization: Consider adding a common trait implemented by Entity and TemporaryEntity returned by entityset.get_evaluation_entity that
     /// returns a real entity if resident, falling back to a temporary entity if not. (as the former case would save cycles creating/populating the backends)
-    fn check_read<C>(
-        &self,
-        data: &C,
-        id: &proto::EntityId,
-        collection: &proto::CollectionId,
-        state: &proto::State,
-    ) -> Result<(), AccessDenied>
-    where
-        C: Iterable<Self::ContextData>;
+    fn check_read<C>(&self, data: &C, id: &proto::EntityId, collection: &proto::ModelId, state: &proto::State) -> Result<(), AccessDenied>
+    where C: Iterable<Self::ContextData>;
 
     /// Check if a context can read an event
     fn check_read_event<C>(&self, data: &C, event: &Attested<proto::Event>) -> Result<(), AccessDenied>
@@ -212,7 +205,7 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     // fn check_write_event(&self, data: &Self::ContextData, entity: &Entity, event: &proto::Event) -> Result<(), AccessDenied>;
 
     // // For checking if a context can subscribe to changes
-    // fn can_subscribe(&self, data: &Self::ContextData, collection: &CollectionId, predicate: &Predicate) -> AccessResult;
+    // fn can_subscribe(&self, data: &Self::ContextData, collection: &ModelId, predicate: &Predicate) -> AccessResult;
 
     // // For checking if a context can communicate with another node
     // fn can_communicate_with_node(&self, data: &Self::ContextData, node_id: &ID) -> AccessResult;
@@ -301,7 +294,7 @@ impl PolicyAgent for PermissiveAgent {
         Ok(())
     }
 
-    fn can_access_collection<C>(&self, _data: &C, _collection: &proto::CollectionId) -> Result<(), AccessDenied>
+    fn can_access_collection<C>(&self, _data: &C, _collection: &proto::ModelId) -> Result<(), AccessDenied>
     where C: Iterable<Self::ContextData> {
         // PermissiveAgent allows regardless of which credentials are supplied, including none
         Ok(())
@@ -311,7 +304,7 @@ impl PolicyAgent for PermissiveAgent {
         &self,
         _data: &C,
         _id: &proto::EntityId,
-        _collection: &proto::CollectionId,
+        _collection: &proto::ModelId,
         _state: &proto::State,
     ) -> Result<(), AccessDenied>
     where
@@ -344,7 +337,7 @@ impl PolicyAgent for PermissiveAgent {
     fn filter_predicate<C>(
         &self,
         _data: &C,
-        _collection: &proto::CollectionId,
+        _collection: &proto::ModelId,
         predicate: Predicate<Resolved>,
     ) -> Result<Predicate<Resolved>, AccessDenied>
     where
@@ -356,11 +349,11 @@ impl PolicyAgent for PermissiveAgent {
 
     // fn can_read_entity(&self, _context: &Self::ContextData, _entity: &Entity) -> AccessResult { AccessResult::Allow }
 
-    // fn can_modify_entity(&self, _context: &Self::ContextData, _collection: &CollectionId, _id: &ID) -> AccessResult { AccessResult::Allow }
+    // fn can_modify_entity(&self, _context: &Self::ContextData, _collection: &ModelId, _id: &ID) -> AccessResult { AccessResult::Allow }
 
-    // fn can_create_in_collection(&self, _context: &Self::ContextData, _collection: &CollectionId) -> AccessResult { AccessResult::Allow }
+    // fn can_create_in_collection(&self, _context: &Self::ContextData, _collection: &ModelId) -> AccessResult { AccessResult::Allow }
 
-    // fn can_subscribe(&self, _context: &Self::ContextData, _collection: &CollectionId, _predicate: &Predicate) -> AccessResult {
+    // fn can_subscribe(&self, _context: &Self::ContextData, _collection: &ModelId, _predicate: &Predicate) -> AccessResult {
     //     AccessResult::Allow
     // }
 

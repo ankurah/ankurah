@@ -92,7 +92,7 @@ impl PolicyAgent for RejectingAgent {
         Ok(())
     }
 
-    fn can_access_collection<C>(&self, _data: &C, _collection: &proto::CollectionId) -> std::result::Result<(), AccessDenied>
+    fn can_access_collection<C>(&self, _data: &C, _collection: &proto::ModelId) -> std::result::Result<(), AccessDenied>
     where C: Iterable<Self::ContextData> {
         Ok(())
     }
@@ -100,7 +100,7 @@ impl PolicyAgent for RejectingAgent {
     fn filter_predicate<C>(
         &self,
         _data: &C,
-        _collection: &proto::CollectionId,
+        _collection: &proto::ModelId,
         predicate: Predicate<ankql::ast::Resolved>,
     ) -> std::result::Result<Predicate<ankql::ast::Resolved>, AccessDenied>
     where
@@ -113,7 +113,7 @@ impl PolicyAgent for RejectingAgent {
         &self,
         _data: &C,
         _id: &proto::EntityId,
-        _collection: &proto::CollectionId,
+        _collection: &proto::ModelId,
         _state: &proto::State,
     ) -> std::result::Result<(), AccessDenied>
     where

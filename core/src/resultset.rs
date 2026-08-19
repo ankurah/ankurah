@@ -579,7 +579,7 @@ mod tests {
     #[derive(Debug, Clone)]
     struct TestEntity {
         id: proto::EntityId,
-        collection: proto::CollectionId,
+        collection: proto::ModelId,
         properties: HashMap<PropertyId, Value>,
     }
 
@@ -587,12 +587,16 @@ mod tests {
         fn new(id: u8, properties: HashMap<PropertyId, Value>) -> Self {
             let mut id_bytes = [0u8; 32];
             id_bytes[15] = id;
-            Self { id: proto::EntityId::from_bytes(id_bytes), collection: proto::CollectionId::fixed_name("test"), properties }
+            Self {
+                id: proto::EntityId::from_bytes(id_bytes),
+                collection: proto::ModelId::EntityId(proto::EntityId::from_bytes([0xfc; 32])),
+                properties,
+            }
         }
     }
 
     impl AbstractEntity for TestEntity {
-        fn collection(&self) -> proto::CollectionId { self.collection.clone() }
+        fn collection(&self) -> proto::ModelId { self.collection }
 
         fn id(&self) -> &proto::EntityId { &self.id }
 

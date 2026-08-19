@@ -466,6 +466,29 @@ pub async fn ephemeral_sled_setup() -> Result<Node<SledStorageEngine, Permissive
     Ok(node)
 }
 
+/// A stand-in model identity: a test that addresses SOME model, never a
+/// particular one -- a raw query over `true`, an event forged for a shape
+/// nothing registered.
+#[allow(unused)]
+pub fn fixture_model() -> proto::ModelId { proto::ModelId::EntityId(proto::EntityId::from_bytes([0xfc; 32])) }
+
+/// The durable identity of `M` in this context's system, which is what
+/// addresses its entities in storage and on the wire. `register_model` is the
+/// public way to ask for it: a model already registered gets its identity
+/// back, and one that is not is registered on the spot.
+#[allow(unused)]
+pub async fn model_id<M: ankurah::Model>(ctx: &ankurah::Context) -> Result<proto::ModelId, anyhow::Error> {
+    Ok(ctx.register_model::<M>().await?)
+}
+
+/// The storage collection holding `M`'s entities.
+#[allow(unused)]
+pub async fn collection_of<M: ankurah::Model>(
+    ctx: &ankurah::Context,
+) -> Result<ankurah::core::storage::StorageCollectionWrapper, anyhow::Error> {
+    Ok(ctx.collection(&model_id::<M>(ctx).await?).await?)
+}
+
 // ============================================================================
 // DAG STRUCTURE VERIFICATION (TestDag and assert_dag! macro)
 // ============================================================================
@@ -698,6 +721,19 @@ pub async fn start_test_server() -> anyhow::Result<(Node<SledStorageEngine, Perm
 /// read under the node's current epoch. Forging tests use this so raw
 /// operations they write land under the identity typed accessors read back.
 #[allow(dead_code)]
+/// The durable identity `schema` resolved in this node's system: what
+/// addresses a model's entities in storage and on the wire, read the same way
+/// a typed accessor reads a property's.
+#[allow(unused)]
+pub fn resolved_model<SE, PA>(node: &ankurah::Node<SE, PA>, schema: &'static ankurah::core::schema::ModelStructDescriptor) -> proto::ModelId
+where
+    SE: ankurah::storage::StorageEngine + Send + Sync + 'static,
+    PA: ankurah::policy::PolicyAgent + Send + Sync + 'static,
+{
+    let epoch = node.system.schema_epoch().expect("a ready system");
+    schema.resolved.get(epoch).expect("model resolved under the current epoch")
+}
+
 pub fn resolved_prop<SE, PA>(
     node: &ankurah::Node<SE, PA>,
     schema: &'static ankurah::core::schema::ModelStructDescriptor,

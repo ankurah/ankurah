@@ -30,7 +30,7 @@ async fn rt106() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
     let album_id = server_album.id();
 
-    let client_collection = client_storage.collection(&"album".into()).await?;
+    let client_collection = client_storage.collection(&common::model_id::<Album>(&client_ctx).await?).await?;
     assert_eq!(0, client_collection.dump_entity_events(album_id.clone()).await?.len()); // before subscribe
 
     // Subscribe on the client

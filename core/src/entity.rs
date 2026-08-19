@@ -4,13 +4,12 @@ use crate::selection::filter::Filterable;
 use crate::{
     error::{LineageError, MutationError, RetrievalError, StateError},
     event_dag::AbstractCausalRelation,
-    model::View,
     property::backend::{backend_from_string, PropertyBackend},
     reactor::AbstractEntity,
     value::Value,
 };
 use ankql::ast::PropertyId;
-use ankurah_proto::{AuthorId, Clock, CollectionId, EntityId, EntityState, Event, EventId, ModelId, OperationSet, State};
+use ankurah_proto::{AuthorId, Clock, EntityId, EntityState, Event, EventId, ModelId, OperationSet, State};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
@@ -159,7 +158,7 @@ impl EntityInnerState {
 #[derive(Debug)]
 pub struct EntityInner {
     pub id: EntityId,
-    pub collection: CollectionId,
+    pub collection: ModelId,
     /// Combined state RwLock for atomic head/backends updates
     state: std::sync::RwLock<EntityInnerState>,
     pub(crate) kind: EntityKind,
@@ -213,7 +212,7 @@ impl Entity {
     // This is intentionally private - only WeakEntitySet should be constructing Entities
     fn weak(&self) -> WeakEntity { WeakEntity(Arc::downgrade(&self.0)) }
 
-    pub fn collection(&self) -> &CollectionId { &self.collection }
+    pub fn collection(&self) -> &ModelId { &self.collection }
 
     pub fn head(&self) -> Clock { self.state.read().unwrap().head.clone() }
 
@@ -258,7 +257,7 @@ impl Entity {
     /// Construct a new, writable entity with no state and no memberships.
     /// Memberships are staged separately ([`Entity::add_membership`]) and
     /// become canonical when an event records them.
-    pub fn create(id: EntityId, collection: CollectionId, schema_epoch: crate::schema::SchemaEpoch) -> Self {
+    pub fn create(id: EntityId, collection: ModelId, schema_epoch: crate::schema::SchemaEpoch) -> Self {
         Self(Arc::new(EntityInner {
             id,
             collection,
@@ -276,7 +275,7 @@ impl Entity {
     /// This must remain private - ONLY WeakEntitySet should be constructing Entities
     fn from_state(
         id: EntityId,
-        collection: CollectionId,
+        collection: ModelId,
         state: &State,
         schema_epoch: crate::schema::SchemaEpoch,
     ) -> Result<Self, RetrievalError> {
@@ -364,14 +363,6 @@ impl Entity {
         }
         body(&mut state)?;
         Ok(true)
-    }
-
-    pub fn view<V: View>(&self) -> Option<V> {
-        if self.collection() != &V::collection() {
-            None
-        } else {
-            Some(V::from_entity(self.clone()))
-        }
     }
 
     /// Attempt to apply an event to the entity
@@ -726,7 +717,7 @@ impl Entity {
 
 // Implement AbstractEntity for Entity (used by reactor)
 impl AbstractEntity for Entity {
-    fn collection(&self) -> ankurah_proto::CollectionId { self.collection.clone() }
+    fn collection(&self) -> ankurah_proto::ModelId { self.collection }
 
     fn id(&self) -> &ankurah_proto::EntityId { &self.id }
 
@@ -748,8 +739,6 @@ impl std::fmt::Display for Entity {
 }
 
 impl Filterable for Entity {
-    fn collection(&self) -> &str { self.collection.as_str() }
-
     fn value(&self, property: &PropertyId) -> Option<Value> {
         if *property == PropertyId::Id {
             Some(Value::EntityId(self.id))
@@ -762,7 +751,7 @@ impl Filterable for Entity {
 }
 
 impl TemporaryEntity {
-    pub fn new(id: EntityId, collection: CollectionId, state: &State) -> Result<Self, RetrievalError> {
+    pub fn new(id: EntityId, collection: ModelId, state: &State) -> Result<Self, RetrievalError> {
         // Inline from_state_buffers logic
         let mut backends = BTreeMap::new();
         for (name, state_buffer) in state.state_buffers.iter() {
@@ -798,8 +787,6 @@ impl TemporaryEntity {
 
 // TODO - clean this up and consolidate with Entity somehow, while still preventing anyone from creating unregistered (non-temporary) Entities
 impl Filterable for TemporaryEntity {
-    fn collection(&self) -> &str { self.0.collection.as_str() }
-
     fn value(&self, property: &PropertyId) -> Option<Value> {
         if *property == PropertyId::Id {
             Some(Value::EntityId(self.0.id))
@@ -856,7 +843,7 @@ impl WeakEntitySet {
         &self,
         state_getter: &S,
         event_getter: &E,
-        collection_id: &CollectionId,
+        collection_id: &ModelId,
         id: &EntityId,
     ) -> Result<Option<Entity>, RetrievalError>
     where
@@ -883,7 +870,7 @@ impl WeakEntitySet {
         &self,
         state_getter: &S,
         event_getter: &E,
-        collection_id: &CollectionId,
+        collection_id: &ModelId,
         id: &EntityId,
     ) -> Result<Entity, RetrievalError>
     where
@@ -909,7 +896,7 @@ impl WeakEntitySet {
     /// Insert the empty resident primary for the system root, whose genesis
     /// `SystemManager::create` applies to it directly instead of through a
     /// transaction.
-    pub(crate) fn create_root(&self, collection: CollectionId, id: EntityId) -> Entity {
+    pub(crate) fn create_root(&self, collection: ModelId, id: EntityId) -> Entity {
         let mut entities = self.entities.write().unwrap();
         let entity = Entity::create(id, collection, self.current_epoch());
         entities.insert(id, entity.weak());
@@ -924,7 +911,7 @@ impl WeakEntitySet {
     /// made after `create` returns extend it with at most one update event.
     pub(crate) fn create_transaction_entity(
         &self,
-        collection: CollectionId,
+        collection: ModelId,
         genesis: &Event,
         epoch: crate::schema::SchemaEpoch,
         trx_alive: Arc<AtomicBool>,
@@ -973,7 +960,7 @@ impl WeakEntitySet {
     ///
     /// Requires the `test-helpers` feature to be enabled.
     #[cfg(feature = "test-helpers")]
-    pub fn conjure_evil_phantom(&self, id: EntityId, collection: CollectionId) -> Entity {
+    pub fn conjure_evil_phantom(&self, id: EntityId, collection: ModelId) -> Entity {
         let mut entities = self.entities.write().unwrap();
         let entity = Entity::create(id, collection, self.current_epoch());
         entities.insert(id, entity.weak());
@@ -982,7 +969,7 @@ impl WeakEntitySet {
 
     /// Get or create entity after async operations, checking for race conditions
     /// Returns (existed, entity) where existed is true if the entity was already present
-    fn private_get_or_create(&self, id: EntityId, collection_id: &CollectionId, state: &State) -> Result<(bool, Entity), RetrievalError> {
+    fn private_get_or_create(&self, id: EntityId, collection_id: &ModelId, state: &State) -> Result<(bool, Entity), RetrievalError> {
         let mut entities = self.entities.write().unwrap();
         if let Some(existing_weak) = entities.get(&id) {
             if let Some(existing_entity) = existing_weak.upgrade() {
@@ -1003,7 +990,7 @@ impl WeakEntitySet {
         state_getter: &S,
         event_getter: &E,
         id: EntityId,
-        collection_id: CollectionId,
+        collection_id: ModelId,
         state: State,
     ) -> Result<(Option<bool>, Entity), RetrievalError>
     where

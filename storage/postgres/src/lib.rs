@@ -21,7 +21,7 @@ pub mod value;
 
 use value::PGValue;
 
-use ankurah_proto::{Clock, CollectionId, EntityId, Event};
+use ankurah_proto::{Clock, EntityId, Event, ModelId};
 use async_trait::async_trait;
 use bb8_postgres::{tokio_postgres::NoTls, PostgresConnectionManager};
 use tokio_postgres::{error::SqlState, types::ToSql};
@@ -55,13 +55,16 @@ impl Postgres {
 
     // TODO: newtype this to `BucketName(&str)` with a constructor that
     // only accepts a subset of characters.
-    pub fn sane_name(collection: &str) -> bool {
-        for char in collection.chars() {
+    //
+    // The alphabet is the one identity renderings use: URL-safe base64
+    // (alphanumerics, `-` and `_`) for an allocated id, plus the built-in
+    // renderings, which spell themselves in lowercase words joined by `-`.
+    // Every emitted name is quoted, so a leading digit is not a problem.
+    pub fn sane_name(name: &str) -> bool {
+        for char in name.chars() {
             match char {
                 char if char.is_alphanumeric() => {}
                 char if char.is_numeric() => {}
-                // '-' appears in property-id renderings (URL-safe base64),
-                // which name materialized columns; always emitted quoted.
                 '_' | '.' | ':' | '-' => {}
                 _ => return false,
             }
@@ -103,8 +106,10 @@ async fn release_ddl_lock(client: &tokio_postgres::Client, lock_key: i64) -> Res
 impl StorageEngine for Postgres {
     type Value = PGValue;
 
-    async fn collection(&self, collection_id: &CollectionId) -> Result<std::sync::Arc<dyn StorageCollection>, RetrievalError> {
-        if !Postgres::sane_name(collection_id.as_str()) {
+    async fn collection(&self, collection_id: &ModelId) -> Result<std::sync::Arc<dyn StorageCollection>, RetrievalError> {
+        // The tables are named by the model's own rendering, so this rejects
+        // a rendering this engine could not spell rather than a user's label.
+        if !Postgres::sane_name(&collection_id.to_string()) {
             return Err(RetrievalError::InvalidBucketName);
         }
 
@@ -124,7 +129,7 @@ impl StorageEngine for Postgres {
         };
 
         // Acquire advisory lock to serialize DDL operations for this collection
-        let lock_key = acquire_ddl_lock(&client, collection_id.as_str()).await?;
+        let lock_key = acquire_ddl_lock(&client, &collection_id.to_string()).await?;
 
         // Create tables if they don't exist (protected by advisory lock)
         let result = async {
@@ -183,7 +188,7 @@ pub struct PostgresColumn {
 
 pub struct PostgresBucket {
     pool: bb8::Pool<PostgresConnectionManager<NoTls>>,
-    collection_id: CollectionId,
+    collection_id: ModelId,
     schema: String,
     columns: Arc<RwLock<Vec<PostgresColumn>>>,
     /// Tracks the last predicate that spilled to post-filtering (debug builds only)
@@ -192,9 +197,9 @@ pub struct PostgresBucket {
 }
 
 impl PostgresBucket {
-    fn state_table(&self) -> String { self.collection_id.as_str().to_string() }
+    fn state_table(&self) -> String { self.collection_id.to_string() }
 
-    pub fn event_table(&self) -> String { format!("{}_event", self.collection_id.as_str()) }
+    pub fn event_table(&self) -> String { format!("{}_event", self.collection_id) }
 
     /// Returns the last predicate that spilled to post-filtering (debug builds only).
     ///
@@ -213,11 +218,9 @@ impl PostgresBucket {
             r#"SELECT column_name, is_nullable, data_type FROM information_schema.columns WHERE table_catalog = $1 AND table_name = $2;"#
                 .to_string();
         let mut new_columns = Vec::new();
-        debug!("Querying existing columns: {:?}, [{:?}, {:?}]", column_query, &self.schema, &self.collection_id.as_str());
-        let rows = client
-            .query(&column_query, &[&self.schema, &self.collection_id.as_str()])
-            .await
-            .map_err(|err| StateError::DDLError(Box::new(err)))?;
+        debug!("Querying existing columns: {:?}, [{:?}, {:?}]", column_query, &self.schema, &self.collection_id);
+        let rows =
+            client.query(&column_query, &[&self.schema, &self.state_table()]).await.map_err(|err| StateError::DDLError(Box::new(err)))?;
         for row in rows {
             let is_nullable: String = row.get("is_nullable");
             new_columns.push(PostgresColumn {
@@ -300,7 +303,7 @@ impl PostgresBucket {
         }
 
         // Acquire advisory lock to serialize DDL operations for this collection
-        let lock_key = acquire_ddl_lock(client, self.collection_id.as_str()).await?;
+        let lock_key = acquire_ddl_lock(client, &self.collection_id.to_string()).await?;
 
         let result = async {
             // Re-check columns after acquiring lock (another session may have added them)
@@ -879,7 +882,7 @@ use crate::sql_builder::SqlBuilder;
 fn post_filter_states(
     states: &[Attested<EntityState>],
     predicate: &ankql::ast::Predicate<Resolved>,
-    collection_id: &CollectionId,
+    collection_id: &ModelId,
 ) -> Vec<Attested<EntityState>> {
     use ankurah_core::entity::TemporaryEntity;
     use ankurah_core::selection::filter::evaluate_predicate;

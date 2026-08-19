@@ -6,7 +6,7 @@ use futures::Stream;
 use tracing::warn;
 
 use crate::error::{MutationError, RetrievalError};
-use ankurah_proto::{Attested, CollectionId, EntityId, EntityState, Event, EventId};
+use ankurah_proto::{Attested, EntityId, EntityState, Event, EventId, ModelId};
 
 /// One raw logical record emitted by a storage dump.
 #[derive(Debug)]
@@ -35,7 +35,7 @@ pub fn event_name(name: &str) -> String { format!("{}_event", name) }
 pub trait StorageEngine: Send + Sync {
     type Value;
     // Opens and/or creates a storage collection.
-    async fn collection(&self, id: &CollectionId) -> Result<Arc<dyn StorageCollection>, RetrievalError>;
+    async fn collection(&self, id: &ModelId) -> Result<Arc<dyn StorageCollection>, RetrievalError>;
     // Delete all collections and their data from the storage engine
     async fn delete_all_collections(&self) -> Result<bool, MutationError>;
 }

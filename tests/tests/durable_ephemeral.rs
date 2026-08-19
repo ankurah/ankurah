@@ -49,7 +49,7 @@ async fn test_ephemeral_writes_durable_receives() -> Result<()> {
     // Wait for propagation to durable
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     // 4. Verify durable node has both events with correct structure
-    let collection_d = ctx_d.collection(&Album::collection()).await?;
+    let collection_d = collection_of::<Album>(&ctx_d).await?;
     let events = collection_d.dump_entity_events(album_id).await?;
 
     // Verify DAG structure on durable node
@@ -182,7 +182,7 @@ async fn test_durable_vs_ephemeral_concurrent_write() -> Result<()> {
     assert_eq!(final_e.year().unwrap(), "2025");
 
     // Verify DAG structure on durable
-    let collection_d = ctx_d.collection(&Album::collection()).await?;
+    let collection_d = collection_of::<Album>(&ctx_d).await?;
     let events = collection_d.dump_entity_events(album_id).await?;
 
     assert_dag!(dag, events, {

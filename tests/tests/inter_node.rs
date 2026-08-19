@@ -600,7 +600,7 @@ async fn test_event_bridge_uneven_diamond() -> Result<()> {
 
     // Prove the bridge (not a state snapshot fallback) served this fetch: the
     // receiver committed the bridge events to its local storage.
-    let collection_r = ctx_r.collection(&Pet::collection()).await?;
+    let collection_r = collection_of::<Pet>(&ctx_r).await?;
     let events_r = collection_r.dump_entity_events(pet_id).await?;
     let ids: std::collections::HashSet<_> = events_r.iter().map(|e| e.payload.id()).collect();
     for (label, id) in [("X", &id_x), ("P", &id_p), ("H1", &id_h1), ("H2", &id_h2)] {

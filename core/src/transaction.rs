@@ -83,12 +83,12 @@ impl Transaction {
         let mut provisional = ProvisionalEntity::new();
         model.initialize_new_entity(&mut provisional, model_id, epoch).map_err(|e| MutationError::General(Box::new(e)))?;
         let system = self.dyncontext.system_id().ok_or(MutationError::SystemNotReady)?;
-        let genesis = proto::Event::genesis(M::collection(), Some(system), proto::AuthorId::Unknown, provisional.extract_operations()?);
+        let genesis = proto::Event::genesis(model_id, Some(system), proto::AuthorId::Unknown, provisional.extract_operations()?);
 
         // Insert the resident primary under the derived id, and take the
         // transaction entity whose baseline is that genesis, so later edits
         // parent onto it and are extracted separately.
-        let entity = self.dyncontext.create_transaction_entity(M::collection(), &genesis, epoch, self.alive.clone())?;
+        let entity = self.dyncontext.create_transaction_entity(model_id, &genesis, epoch, self.alive.clone())?;
         self.dyncontext.check_write(&entity)?;
 
         // Store the already-extracted genesis exactly once. Commit must never
@@ -105,8 +105,11 @@ impl Transaction {
         match self.get_trx_entity(id) {
             Some(entity) => Ok(MutableBorrow::new(entity)),
             None => {
-                // go fetch the entity from the context
-                let retrieved_entity = self.dyncontext.get_entity(*id, &M::collection(), false).await?;
+                // The entity is addressed by the model's durable identity, so
+                // the declaration is admitted first -- and the typed handle
+                // this returns reads its accessors off the same binding.
+                let model_id = self.dyncontext.bind_or_register(M::descriptor()).await?;
+                let retrieved_entity = self.dyncontext.get_entity(*id, &model_id, false).await?;
                 // double check to make sure somebody didn't add the entity to the trx during the await
                 // because we're forking the entity, we need to make sure we aren't adding the same entity twice
                 if let Some(entity) = self.get_trx_entity(&retrieved_entity.id) {
@@ -156,7 +159,7 @@ impl Transaction {
         id: impl Into<ID>,
     ) -> Result<(), crate::error::RetrievalError> {
         let id = id.into();
-        let entity = self.fetch_entity(id, M::collection()).await?;
+        let entity = self.fetch_entity(id, model_id).await?;
         let entity = Arc::new(entity.clone());
         self.node.delete_entity(entity).await?;
         Ok(())

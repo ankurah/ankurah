@@ -27,7 +27,7 @@ use ankurah_core::{
     value::Value,
 };
 use ankurah_jwt_auth::{JwtAgent, JwtContext, JwtKeys, PolicyConfig, SigningKeys};
-use ankurah_proto::{CollectionId, EntityId};
+use ankurah_proto::EntityId;
 use ankurah_storage_sled::SledStorageEngine;
 use std::sync::Arc;
 
@@ -82,6 +82,7 @@ fn agent_with(config_json: &str, keys: &SigningKeys) -> JwtAgent {
     agent.set_selection_resolver(std::sync::Arc::new(|_collection, predicate| {
         try_resolve_fixture(predicate).map_err(|error| error.to_string())
     }));
+    agent.set_model_lookup(common::fixture_models());
     agent
 }
 
@@ -99,8 +100,6 @@ struct NoteRow {
 }
 
 impl Filterable for NoteRow {
-    fn collection(&self) -> &str { "note" }
-
     fn value(&self, property: &ankql::ast::PropertyId) -> Option<Value> {
         if *property == prop("owner") {
             Some(Value::EntityId(self.owner))
@@ -138,7 +137,7 @@ const OR_SCOPE_CONFIG: &str = r#"{
 fn test_or_composed_scope_with_a_non_id_subject_is_a_type_error() {
     let keys = common::test_keys();
     let agent = agent_with(OR_SCOPE_CONFIG, &keys);
-    let collection = CollectionId::from("note");
+    let collection = common::model("note");
 
     let owner = EntityId::random();
     let reviewer = EntityId::random();

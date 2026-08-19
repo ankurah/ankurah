@@ -34,7 +34,7 @@ use std::sync::Arc;
 
 use ankurah::core::error::{MutationError, RetrievalError};
 use ankurah::core::storage::{StorageCollection, StorageEngine};
-use ankurah::proto::{self, Attested, CollectionId, EntityId, EntityState, Event, EventId};
+use ankurah::proto::{self, Attested, EntityId, EntityState, Event, EventId, ModelId};
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -204,7 +204,7 @@ impl CrashState {
 impl<E: StorageEngine + CrashFlushable + 'static> StorageEngine for CrashStorageEngine<E> {
     type Value = ();
 
-    async fn collection(&self, id: &CollectionId) -> Result<Arc<dyn StorageCollection>, RetrievalError> {
+    async fn collection(&self, id: &ModelId) -> Result<Arc<dyn StorageCollection>, RetrievalError> {
         let inner = self.inner.collection(id).await?;
         Ok(Arc::new(CrashStorageCollection { inner, state: self.state.clone(), flush: self.inner.clone() }))
     }

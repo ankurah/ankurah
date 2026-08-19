@@ -72,6 +72,10 @@ fn fixture_body(nonce_seed: &[u8], parent: &Clock, operations: OperationSet) -> 
     }
 }
 
+/// A stand-in model identity for fixtures: the tests here need entities that
+/// belong to SOME model, never a particular one.
+fn fixture_collection() -> ankurah_proto::ModelId { ankurah_proto::ModelId::EntityId(EntityId::from_bytes([0xfc; 32])) }
+
 /// Create a test event with deterministic content-hashed IDs.
 /// The seed differentiates events; parent_ids determine the parent clock.
 /// Returns the event (call `.id()` on it to get the computed EventId).
@@ -81,7 +85,7 @@ fn make_test_event(seed: u8, parent_ids: &[EventId]) -> Event {
     let entity_id = EntityId::from_bytes(entity_id_bytes);
 
     let parent = Clock::from(parent_ids.to_vec());
-    Event { entity_id, collection: "test".into(), body: fixture_body(&[seed], &parent, OperationSet::default()), parent }
+    Event { entity_id, collection: fixture_collection(), body: fixture_body(&[seed], &parent, OperationSet::default()), parent }
 }
 
 /// Like make_test_event but with a two-byte seed, for tests that need a wide
@@ -91,7 +95,7 @@ fn make_test_event_u16(seed: u16, parent_ids: &[EventId]) -> Event {
     entity_id_bytes[0..2].copy_from_slice(&seed.to_be_bytes());
     let entity_id = EntityId::from_bytes(entity_id_bytes);
     let parent = Clock::from(parent_ids.to_vec());
-    Event { entity_id, collection: "test".into(), body: fixture_body(&seed.to_be_bytes(), &parent, OperationSet::default()), parent }
+    Event { entity_id, collection: fixture_collection(), body: fixture_body(&seed.to_be_bytes(), &parent, OperationSet::default()), parent }
 }
 
 /// Create a Clock from EventIds without consuming them.
@@ -117,7 +121,7 @@ fn make_lww_event(seed: u8, properties: Vec<(&str, &str)>) -> Event {
     let parent = Clock::default();
     Event {
         entity_id,
-        collection: "test".into(),
+        collection: fixture_collection(),
         body: fixture_body(&[seed], &parent, OperationSet::from_backends(BTreeMap::from([("lww".to_string(), ops)]))),
         parent,
     }
@@ -1378,7 +1382,7 @@ mod yrs_layer_tests {
         let parent = Clock::default();
         Event {
             entity_id,
-            collection: "test".into(),
+            collection: fixture_collection(),
             body: fixture_body(&[seed], &parent, OperationSet::from_backends(BTreeMap::from([("yrs".to_string(), ops)]))),
             parent,
         }
@@ -1615,7 +1619,7 @@ mod edge_case_tests {
         let parent = Clock::default();
         let empty_event = Event {
             entity_id,
-            collection: "test".into(),
+            collection: fixture_collection(),
             body: fixture_body(&[99], &parent, OperationSet::default()), // No operations
             parent,
         };
@@ -1682,7 +1686,7 @@ mod edge_case_tests {
         let parent = Clock::default();
         let delete_event = Event {
             entity_id,
-            collection: "test".into(),
+            collection: fixture_collection(),
             body: fixture_body(&[2], &parent, OperationSet::from_backends(BTreeMap::from([("lww".to_string(), ops)]))),
             parent,
         };
@@ -1856,7 +1860,7 @@ mod phase4_duplicate_creation {
         let parent = Clock::default(); // no parent = genesis
         Event {
             entity_id,
-            collection: "test".into(),
+            collection: fixture_collection(),
             body: fixture_body(&[seed], &parent, OperationSet::from_backends(BTreeMap::from([("lww".to_string(), ops)]))),
             parent,
         }
@@ -1867,7 +1871,7 @@ mod phase4_duplicate_creation {
         let mut entity_id_bytes = [0u8; 32];
         entity_id_bytes[0] = 42;
         let entity_id = EntityId::from_bytes(entity_id_bytes);
-        let entity = Entity::create(entity_id, "test".into(), crate::schema::SchemaEpoch::BOOTSTRAP);
+        let entity = Entity::create(entity_id, fixture_collection(), crate::schema::SchemaEpoch::BOOTSTRAP);
 
         let mut retriever = MockRetriever::new();
 
@@ -1898,7 +1902,7 @@ mod phase4_duplicate_creation {
         let mut entity_id_bytes = [0u8; 32];
         entity_id_bytes[0] = 42;
         let entity_id = EntityId::from_bytes(entity_id_bytes);
-        let entity = Entity::create(entity_id, "test".into(), crate::schema::SchemaEpoch::BOOTSTRAP);
+        let entity = Entity::create(entity_id, fixture_collection(), crate::schema::SchemaEpoch::BOOTSTRAP);
 
         let mut retriever = MockRetriever::new();
 
@@ -2680,7 +2684,7 @@ mod strict_descends_gap_jump {
         let mut entity_id_bytes = [0u8; 32];
         entity_id_bytes[0] = 42;
         let entity_id = EntityId::from_bytes(entity_id_bytes);
-        let entity = Entity::create(entity_id, "test".into(), crate::schema::SchemaEpoch::BOOTSTRAP);
+        let entity = Entity::create(entity_id, fixture_collection(), crate::schema::SchemaEpoch::BOOTSTRAP);
 
         let mut retriever = MockRetriever::new();
 
@@ -2997,7 +3001,7 @@ mod entity_change_batches {
         let parent = Clock::from(parent_ids.to_vec());
         Event {
             entity_id,
-            collection: "test".into(),
+            collection: fixture_collection(),
             body: fixture_body(
                 entity_id.to_bytes().as_slice(),
                 &parent,
@@ -3016,7 +3020,7 @@ mod entity_change_batches {
         let mut entity_id_bytes = [0u8; 32];
         entity_id_bytes[0] = 77;
         let entity_id = EntityId::from_bytes(entity_id_bytes);
-        let entity = Entity::create(entity_id, "test".into(), crate::schema::SchemaEpoch::BOOTSTRAP);
+        let entity = Entity::create(entity_id, fixture_collection(), crate::schema::SchemaEpoch::BOOTSTRAP);
 
         let mut retriever = MockRetriever::new();
 

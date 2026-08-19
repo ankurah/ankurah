@@ -32,9 +32,9 @@ fn extract_value<E: AbstractEntity>(identifier: &PropertyPath, entity: &E) -> Op
 
 pub struct WatcherSet {
     /// Each property path has a ComparisonIndex so we can quickly find all subscriptions that care if a given value CHANGES (creation and deletion also count as change)
-    index_watchers: HashMap<(proto::CollectionId, PropertyPath), ComparisonIndex<(ReactorSubscriptionId, proto::QueryId)>>,
+    index_watchers: HashMap<(proto::ModelId, PropertyPath), ComparisonIndex<(ReactorSubscriptionId, proto::QueryId)>>,
     /// The set of watchers who want to be notified of any changes to a given collection
-    wildcard_watchers: HashMap<proto::CollectionId, HashSet<(ReactorSubscriptionId, proto::QueryId)>>,
+    wildcard_watchers: HashMap<proto::ModelId, HashSet<(ReactorSubscriptionId, proto::QueryId)>>,
     /// Index of subscriptions that presently match each entity, either by predicate or by entity subscription.
     /// This is used to quickly find all subscriptions that need to be notified when an entity changes.
     /// We have to maintain this to add and remove subscriptions when their matching state changes.
@@ -149,8 +149,8 @@ impl WatcherSet {
     pub fn debug_data(
         &self,
     ) -> (
-        &HashMap<(proto::CollectionId, PropertyPath), ComparisonIndex<(ReactorSubscriptionId, proto::QueryId)>>,
-        &HashMap<proto::CollectionId, HashSet<(ReactorSubscriptionId, proto::QueryId)>>,
+        &HashMap<(proto::ModelId, PropertyPath), ComparisonIndex<(ReactorSubscriptionId, proto::QueryId)>>,
+        &HashMap<proto::ModelId, HashSet<(ReactorSubscriptionId, proto::QueryId)>>,
         &HashMap<ankurah_proto::EntityId, HashSet<EntityWatcherId>>,
     ) {
         (&self.index_watchers, &self.wildcard_watchers, &self.entity_watchers)
@@ -184,7 +184,7 @@ impl WatcherSet {
     }
     pub fn recurse_predicate_watchers(
         &mut self,
-        collection_id: &proto::CollectionId,
+        collection_id: &proto::ModelId,
         predicate: &ankql::ast::Predicate<Resolved>,
         watcher_id: (ReactorSubscriptionId, proto::QueryId), // Should this be a tuple of (subscription_id, query_id) or just subscription_id?
         op: WatcherOp,

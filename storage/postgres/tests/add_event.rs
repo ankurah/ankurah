@@ -31,7 +31,7 @@ async fn add_event_postgres() -> Result<()> {
     album2.name()?.insert(3, "o) ")?;
     trx2.commit().await?;
 
-    let albums = context.collection(&"album".into()).await?;
+    let albums = context.collection(&context.register_model::<Album>().await?).await?;
     let events = albums.dump_entity_events(album_id).await?;
     assert_eq!(events.len(), 3);
 

@@ -42,11 +42,34 @@ pub fn prop(name: &str) -> ankql::ast::PropertyId {
     ankql::ast::PropertyId::EntityId(ankurah_proto::EntityId::from_bytes(bytes))
 }
 
+/// A deterministic durable identity for a fixture collection label. A policy
+/// config is keyed by label and an agent decides about a model, so a test
+/// that names "post" and the fixture lookup below have to mean the same
+/// model by it.
+pub fn model(label: &str) -> ankurah_proto::ModelId {
+    let mut bytes = [0u8; 32];
+    let n = label.as_bytes();
+    let len = n.len().min(32);
+    bytes[..len].copy_from_slice(&n[..len]);
+    ankurah_proto::ModelId::EntityId(ankurah_proto::EntityId::from_bytes(bytes))
+}
+
 /// The rule binding node attach installs from the node's catalog. An agent
 /// composing a scope rule into a query needs one, so a test exercising scope
 /// rules installs this.
 pub fn fixture_binding() -> ankurah_jwt_auth::SelectionResolver {
     std::sync::Arc::new(|_collection, predicate| Ok(resolve_fixture(predicate)))
+}
+
+/// The label binding node attach installs from the node's catalog: it is what
+/// lets the agent find the authored rules for the model it is asked about.
+pub fn fixture_models() -> ankurah_jwt_auth::ModelLookup { std::sync::Arc::new(|label| Some(model(label))) }
+
+/// Install both bindings node attach installs, for a test that exercises the
+/// agent without a node.
+pub fn install_fixture_bindings(agent: &ankurah_jwt_auth::JwtAgent) {
+    agent.set_selection_resolver(fixture_binding());
+    agent.set_model_lookup(fixture_models());
 }
 
 /// Bind a predicate's names to the fixture identities.

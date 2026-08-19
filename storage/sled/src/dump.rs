@@ -11,7 +11,7 @@ use ankurah_core::{
     error::RetrievalError,
     storage::{StorageDump, StorageDumpItem},
 };
-use ankurah_proto::{Attested, CollectionId, EntityId, EntityState, Event, StateFragment};
+use ankurah_proto::{Attested, EntityId, EntityState, Event, ModelId, StateFragment};
 use async_trait::async_trait;
 use futures::{stream, Stream};
 
@@ -50,7 +50,7 @@ struct SledDumpCursor {
     phase: DumpPhase,
     event_entries: Option<sled::Iter>,
     state_entries: Option<sled::Iter>,
-    collection_trees: Arc<Vec<(CollectionId, sled::Tree)>>,
+    collection_trees: Arc<Vec<(ModelId, sled::Tree)>>,
     pending: VecDeque<StorageDumpItem>,
 }
 
@@ -108,7 +108,7 @@ fn event_page(mut entries: sled::Iter) -> Result<(sled::Iter, Vec<StorageDumpIte
 
 fn state_page(
     mut entries: sled::Iter,
-    collection_trees: Arc<Vec<(CollectionId, sled::Tree)>>,
+    collection_trees: Arc<Vec<(ModelId, sled::Tree)>>,
 ) -> Result<(sled::Iter, Vec<StorageDumpItem>), RetrievalError> {
     let mut raw_states = BTreeMap::<Vec<u8>, Vec<u8>>::new();
     for entry in entries.by_ref().take(PAGE_SIZE) {
@@ -123,7 +123,7 @@ fn state_page(
     // Canonical states are global and StateFragment does not carry its
     // collection. Use the per-collection materialization trees only to recover
     // ownership, while keeping the canonical state bytes as the dump source.
-    let mut ownership = BTreeMap::<Vec<u8>, CollectionId>::new();
+    let mut ownership = BTreeMap::<Vec<u8>, ModelId>::new();
     for (collection, tree) in collection_trees.iter() {
         for entry in tree.range::<Vec<u8>, _>((Included(first.clone()), Included(last.clone()))) {
             let (key, _) = entry.map_err(sled_error)?;
@@ -150,7 +150,7 @@ fn state_page(
     Ok((entries, page))
 }
 
-fn collection_trees(database: &Database) -> Result<Vec<(CollectionId, sled::Tree)>, RetrievalError> {
+fn collection_trees(database: &Database) -> Result<Vec<(ModelId, sled::Tree)>, RetrievalError> {
     let mut collections = Vec::new();
     for name in database.db.tree_names() {
         let Some(collection) = name.as_ref().strip_prefix(b"collection_") else {
@@ -158,7 +158,11 @@ fn collection_trees(database: &Database) -> Result<Vec<(CollectionId, sled::Tree
         };
         let collection = std::str::from_utf8(collection)
             .map_err(|error| RetrievalError::Other(format!("invalid UTF-8 in Sled collection tree name: {error}")))?;
-        let collection = CollectionId::from(collection);
+        // A tree is named by the rendering of the model it holds, so the
+        // identity reads straight back off the name this engine wrote.
+        let collection = collection
+            .parse::<ModelId>()
+            .map_err(|error| RetrievalError::Other(format!("Sled collection tree '{collection}' does not name a model: {error}")))?;
         let tree = database.db.open_tree(name).map_err(sled_error)?;
         collections.push((collection, tree));
     }
@@ -198,11 +202,15 @@ mod tests {
         Ok(())
     }
 
+    /// A stand-in model identity for fixtures: these tests need records that
+    /// belong to SOME model, never a particular one.
+    fn fixture_collection() -> ModelId { ModelId::EntityId(EntityId::from_bytes([0xfc; 32])) }
+
     #[tokio::test]
     async fn dump_identifies_both_sides_of_an_event_key_mismatch() -> anyhow::Result<()> {
         let storage = SledStorageEngine::new_test()?;
         let event = Attested {
-            payload: Event::genesis(CollectionId::from("mismatched_event"), None, AuthorId::Unknown, OperationSet::default()),
+            payload: Event::genesis(fixture_collection(), None, AuthorId::Unknown, OperationSet::default()),
             attestations: AttestationSet::default(),
         };
         let stored_key = vec![0xab; event.payload.id().as_bytes().len()];
@@ -227,7 +235,7 @@ mod tests {
         const RECORDS: usize = PAGE_SIZE + 1;
 
         let storage = SledStorageEngine::new_test()?;
-        let collection_id = CollectionId::from("dump_pages");
+        let collection_id = fixture_collection();
         let collection = storage.collection(&collection_id).await?;
         let mut expected_events = BTreeSet::new();
         let mut expected_states = BTreeSet::new();

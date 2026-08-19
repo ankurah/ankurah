@@ -114,7 +114,13 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
 
                 fn from_entity(entity: #base::entity::Entity) -> Self {
                     use #base::model::View;
-                    assert_eq!(&Self::collection(), entity.collection());
+                    // The entity must be one of this model's. Checked against
+                    // the identity the declaration resolved for the entity's
+                    // own epoch; before that resolution there is no identity
+                    // to check against, and every accessor says so for itself.
+                    if let Some(model) = <#name as #base::model::Model>::descriptor().resolved.get(entity.schema_epoch()) {
+                        assert_eq!(entity.collection(), &model);
+                    }
                     #view_name {
                         entity,
                         #(

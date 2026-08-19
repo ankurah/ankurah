@@ -8,7 +8,7 @@ use ankurah_core::{
     error::{MutationError, RetrievalError},
     storage::{StorageCollection, StorageEngine},
 };
-use ankurah_proto::CollectionId;
+use ankurah_proto::ModelId;
 use async_trait::async_trait;
 use sled::Config;
 
@@ -60,22 +60,18 @@ impl SledStorageEngine {
     }
 
     /// List all collections in the storage engine by looking for trees that start with collection_
-    pub fn list_collections(&self) -> Result<Vec<CollectionId>, RetrievalError> {
+    pub fn list_collections(&self) -> Result<Vec<ModelId>, RetrievalError> {
         let database = self.database.lock().unwrap();
-        let collections: Vec<CollectionId> = database
+        let collections: Vec<ModelId> = database
             .db
             .tree_names()
             .into_iter()
             .filter_map(|name| {
                 // Convert &[u8] to String, skip if invalid UTF-8
                 let name_str = String::from_utf8(name.to_vec()).ok()?;
-                // Only include collections that start with collection_
-                if name_str.starts_with("collection_") {
-                    // Strip collection_ prefix and convert to CollectionId
-                    Some(name_str.strip_prefix("collection_")?.to_string().into())
-                } else {
-                    None
-                }
+                // A collection tree is named for the model it holds, so the
+                // identity reads back off the name this engine wrote.
+                name_str.strip_prefix("collection_")?.parse::<ModelId>().ok()
             })
             .collect();
         Ok(collections)
@@ -85,7 +81,7 @@ impl SledStorageEngine {
 #[async_trait]
 impl StorageEngine for SledStorageEngine {
     type Value = Vec<u8>;
-    async fn collection(&self, id: &CollectionId) -> Result<Arc<dyn StorageCollection>, RetrievalError> {
+    async fn collection(&self, id: &ModelId) -> Result<Arc<dyn StorageCollection>, RetrievalError> {
         // could this block for any meaningful period of time? We might consider spawn_blocking
 
         let database = self.database.lock().unwrap().clone();

@@ -85,8 +85,9 @@ fn content_nonce(mint_seq: u64, parts: &[&[u8]]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// The `SimRecord` collection id.
-pub fn sim_collection() -> proto::CollectionId { SimRecord::collection() }
+/// The `SimRecord` model identity: the collection every forged event routes
+/// to, and the same identity its membership operation asserts.
+pub fn sim_collection() -> proto::ModelId { proto::ModelId::EntityId(sim_model_id()) }
 
 /// The deterministic model-entity id the sim seeds into every node's catalog
 /// and asserts in every forged creation event's membership Add. Constant, so
@@ -165,13 +166,13 @@ fn lww_ops(field: Field, value: &str) -> proto::OperationSet {
 /// be created with identical content; `field`/`value` seed the initial state.
 pub fn genesis_event(counter: u64, field: Field, value: &str) -> proto::Event {
     let mut operations = lww_ops(field, value);
-    operations.push(proto::Operation::Membership(proto::Membership::Add(ankurah::ModelId::EntityId(sim_model_id()))));
+    operations.push(proto::Operation::Membership(proto::Membership::Add(sim_collection())));
     let system = Some(sim_system_id());
     let nonce = content_nonce(counter, &[field.name().as_bytes(), value.as_bytes()]);
     let author = proto::AuthorId::Unknown;
     let entity_id: proto::EntityId = proto::EventId::from_genesis_parts(&system, &nonce, SIM_TIMESTAMP, &author, &operations).into();
     proto::Event {
-        collection: SimRecord::collection(),
+        collection: sim_collection(),
         entity_id,
         parent: proto::Clock::default(),
         body: proto::EventBody::Genesis { system, nonce, timestamp: SIM_TIMESTAMP, author, operations },
@@ -187,7 +188,7 @@ pub fn edit_event(entity: proto::EntityId, parent: proto::Clock, field: Field, v
     let nonce =
         content_nonce(mint_seq, &[entity.to_bytes().as_slice(), parent.to_base64().as_bytes(), field.name().as_bytes(), value.as_bytes()]);
     proto::Event {
-        collection: SimRecord::collection(),
+        collection: sim_collection(),
         entity_id: entity,
         parent,
         body: proto::EventBody::Update {

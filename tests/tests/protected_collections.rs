@@ -21,7 +21,7 @@ async fn server_refuses_commits_into_protected_collections() -> anyhow::Result<(
         // A well-formed genesis, so the refusal comes from the protected
         // collection rule rather than from structural validation.
         let event = proto::Event::genesis(
-            proto::CollectionId::fixed_name(collection),
+            model,
             Some(EntityId::random()),
             proto::AuthorId::Unknown,
             proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(model))]),

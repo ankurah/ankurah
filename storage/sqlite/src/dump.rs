@@ -10,7 +10,7 @@ use ankurah_core::{
     storage::{StorageDump, StorageDumpItem},
 };
 use ankurah_proto::{
-    AttestationSet, Attested, Clock, CollectionId, EntityId, EntityState, Event, EventBody, EventFragment, EventId, State, StateBuffers,
+    AttestationSet, Attested, Clock, EntityId, EntityState, Event, EventBody, EventFragment, EventId, ModelId, State, StateBuffers,
     StateFragment,
 };
 use async_trait::async_trait;
@@ -57,8 +57,8 @@ enum DumpPhase {
 struct SqliteDumpCursor {
     pool: Pool,
     phase: DumpPhase,
-    event_collections: Vec<CollectionId>,
-    state_collections: Vec<CollectionId>,
+    event_collections: Vec<ModelId>,
+    state_collections: Vec<ModelId>,
     collection_index: usize,
     after: Option<String>,
     pending: VecDeque<StorageDumpItem>,
@@ -111,11 +111,7 @@ impl SqliteDumpCursor {
     }
 }
 
-fn event_page(
-    conn: &Connection,
-    collection: &CollectionId,
-    after: Option<&str>,
-) -> Result<(Option<String>, Vec<StorageDumpItem>), SqliteError> {
+fn event_page(conn: &Connection, collection: &ModelId, after: Option<&str>) -> Result<(Option<String>, Vec<StorageDumpItem>), SqliteError> {
     let table = quote_identifier(&format!("{collection}_event"));
     let (query, arguments): (String, Vec<rusqlite::types::Value>) = if let Some(after) = after {
         (
@@ -146,12 +142,8 @@ fn event_page(
     Ok((last, page))
 }
 
-fn state_page(
-    conn: &Connection,
-    collection: &CollectionId,
-    after: Option<&str>,
-) -> Result<(Option<String>, Vec<StorageDumpItem>), SqliteError> {
-    let table = quote_identifier(collection.as_str());
+fn state_page(conn: &Connection, collection: &ModelId, after: Option<&str>) -> Result<(Option<String>, Vec<StorageDumpItem>), SqliteError> {
+    let table = quote_identifier(&collection.to_string());
     let (query, arguments): (String, Vec<rusqlite::types::Value>) = if let Some(after) = after {
         (
             format!("SELECT id, state_buffer, memberships, head, attestations FROM {table} WHERE id > ? ORDER BY id LIMIT ?"),
@@ -180,19 +172,24 @@ fn state_page(
 
 // Temporary until StorageEngine exposes its collection registry: recognize
 // current Ankurah tables by their required columns.
-fn discover_collections_from_schema(conn: &Connection) -> Result<(Vec<CollectionId>, Vec<CollectionId>), SqliteError> {
+fn discover_collections_from_schema(conn: &Connection) -> Result<(Vec<ModelId>, Vec<ModelId>), SqliteError> {
     let columns = table_columns(conn)?;
     let state_columns = ["id", "state_buffer", "memberships", "head", "attestations"];
     let event_columns = ["id", "entity_id", "body", "parent", "attestations"];
     let mut events = Vec::new();
     let mut states = Vec::new();
     for (name, columns) in columns {
+        // A table is named for the model it holds, so the identity reads
+        // back off the name this engine wrote; a table that is not one of
+        // ours does not name a model and is not part of the dump.
         if state_columns.iter().all(|column| columns.contains(*column)) {
-            states.push(CollectionId::from(name.clone()));
+            if let Ok(collection) = name.parse::<ModelId>() {
+                states.push(collection);
+            }
         }
         if event_columns.iter().all(|column| columns.contains(*column)) {
-            if let Some(collection) = name.strip_suffix("_event") {
-                events.push(CollectionId::from(collection));
+            if let Some(Ok(collection)) = name.strip_suffix("_event").map(str::parse::<ModelId>) {
+                events.push(collection);
             }
         }
     }
@@ -238,6 +235,10 @@ mod tests {
         node.system.create().await?;
         let context = node.context(DEFAULT_CONTEXT)?;
 
+        // The dump's own records are addressed by the model's identity, which
+        // is also what named its tables.
+        let collection = context.register_model::<DumpAlbum>().await?;
+
         let mut expected = BTreeSet::new();
         for index in 0..RECORDS {
             let transaction = context.begin();
@@ -250,7 +251,6 @@ mod tests {
 
         let items = storage.dump().await?;
         pin_mut!(items);
-        let collection = CollectionId::from("dumpalbum");
         let mut events = BTreeSet::new();
         let mut states = BTreeSet::new();
         let mut saw_state = false;

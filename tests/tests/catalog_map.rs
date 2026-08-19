@@ -13,7 +13,6 @@
 
 mod common;
 use ankurah::core::error::{MutationError, RetrievalError};
-use ankurah::core::schema::{MODEL_COLLECTION_ID, MODEL_PROPERTY_COLLECTION_ID, PROPERTY_COLLECTION_ID};
 use ankurah::core::storage::{StorageCollection, StorageEngine};
 use ankurah::PropertyId;
 use async_trait::async_trait;
@@ -151,12 +150,12 @@ struct GatedWarmEngine {
 impl StorageEngine for GatedWarmEngine {
     type Value = Vec<u8>;
 
-    async fn collection(&self, id: &proto::CollectionId) -> Result<Arc<dyn StorageCollection>, RetrievalError> {
+    async fn collection(&self, id: &proto::ModelId) -> Result<Arc<dyn StorageCollection>, RetrievalError> {
         let inner = self.inner.collection(id).await?;
         // Gate only the three catalog collections; the system collection must
         // load freely or node construction itself would park.
-        if [MODEL_COLLECTION_ID, PROPERTY_COLLECTION_ID, MODEL_PROPERTY_COLLECTION_ID].contains(&id.as_ref()) {
-            Ok(Arc::new(GatedCatalogCollection { collection: id.clone(), inner, gate: self.gate.clone() }))
+        if ankurah::core::schema::is_catalog_collection(id) {
+            Ok(Arc::new(GatedCatalogCollection { collection: *id, inner, gate: self.gate.clone() }))
         } else {
             Ok(inner)
         }
@@ -170,7 +169,7 @@ impl StorageEngine for GatedWarmEngine {
 }
 
 struct GatedCatalogCollection {
-    collection: proto::CollectionId,
+    collection: proto::ModelId,
     inner: Arc<dyn StorageCollection>,
     gate: Arc<DurableWarmGate>,
 }
@@ -194,7 +193,7 @@ impl StorageCollection for GatedCatalogCollection {
         // per generation is observable on the models catalog, the first
         // collection each warm scans.
         if matches!(selection.predicate, ankql::ast::Predicate::True) {
-            if self.collection.as_ref() == MODEL_COLLECTION_ID {
+            if self.collection == ankurah::core::schema::model_collection() {
                 self.gate.warm_scans.fetch_add(1, Ordering::AcqRel);
                 self.gate.scan_entered.notify_waiters();
             }

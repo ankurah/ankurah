@@ -11,7 +11,7 @@ use crate::{
     transaction::Transaction,
 };
 use ankql::ast::{Parsed, Resolved};
-use ankurah_proto::{self as proto, Attested, Clock, CollectionId, EntityState, Event};
+use ankurah_proto::{self as proto, Attested, Clock, EntityState, Event, ModelId};
 use async_trait::async_trait;
 use std::sync::{atomic::AtomicBool, Arc};
 use tracing::debug;
@@ -64,8 +64,9 @@ pub trait TContext {
     /// the declaration first if the catalog cannot prove it yet. This is the
     /// read-path admission: a declaration the system has never been told
     /// about is healed here, and a credential that may not register it is
-    /// told so.
-    async fn bind_or_register(&self, schema: &'static crate::schema::ModelStructDescriptor) -> Result<(), RetrievalError>;
+    /// told so. Answers with the model's durable identity, which is what
+    /// every read past this point addresses its collection by.
+    async fn bind_or_register(&self, schema: &'static crate::schema::ModelStructDescriptor) -> Result<proto::ModelId, RetrievalError>;
 
     /// Resolve a typed selection's property names through the compiled
     /// declaration's descriptor cells (catalog fallback for names the
@@ -89,15 +90,15 @@ pub trait TContext {
     /// genesis. This is what makes the id available when `create()` returns.
     fn create_transaction_entity(
         &self,
-        collection: proto::CollectionId,
+        collection: proto::ModelId,
         genesis: &Event,
         epoch: crate::schema::SchemaEpoch,
         trx_alive: Arc<AtomicBool>,
     ) -> Result<Entity, MutationError>;
     fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied>;
-    async fn get_entity(&self, id: proto::EntityId, collection: &proto::CollectionId, cached: bool) -> Result<Entity, RetrievalError>;
+    async fn get_entity(&self, id: proto::EntityId, collection: &proto::ModelId, cached: bool) -> Result<Entity, RetrievalError>;
     fn get_resident_entity(&self, id: proto::EntityId) -> Option<Entity>;
-    async fn fetch_entities(&self, collection: &proto::CollectionId, args: MatchArgs<Resolved>) -> Result<Vec<Entity>, RetrievalError>;
+    async fn fetch_entities(&self, collection: &proto::ModelId, args: MatchArgs<Resolved>) -> Result<Vec<Entity>, RetrievalError>;
     async fn commit_local_trx(&self, trx: &Transaction) -> Result<Vec<Event>, MutationError>;
     /// The live-query entry. Admission (name resolution against `schema`'s
     /// descriptor cells, policy injection) happens right here whenever those
@@ -108,10 +109,9 @@ pub trait TContext {
     fn query(
         &self,
         schema: &'static crate::schema::ModelStructDescriptor,
-        collection_id: proto::CollectionId,
         args: MatchArgs<Parsed>,
     ) -> Result<EntityLiveQuery, RetrievalError>;
-    async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError>;
+    async fn collection(&self, id: &proto::ModelId) -> Result<StorageCollectionWrapper, RetrievalError>;
 }
 
 #[async_trait]
@@ -124,8 +124,8 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         self.node.catalog.ensure_schema_for_use(&self.sessions.write_credential()?, schema).await
     }
 
-    async fn bind_or_register(&self, schema: &'static crate::schema::ModelStructDescriptor) -> Result<(), RetrievalError> {
-        self.node.catalog.bind_or_register(&self.sessions, schema).await.map(|_| ())
+    async fn bind_or_register(&self, schema: &'static crate::schema::ModelStructDescriptor) -> Result<proto::ModelId, RetrievalError> {
+        self.node.catalog.bind_or_register(&self.sessions, schema).await.map(|(model, _epoch)| model)
     }
 
     fn resolve_selection_with_descriptor(
@@ -141,7 +141,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     fn schema_epoch(&self) -> Option<crate::schema::SchemaEpoch> { self.node.system.schema_epoch() }
     fn create_transaction_entity(
         &self,
-        collection: proto::CollectionId,
+        collection: proto::ModelId,
         genesis: &Event,
         epoch: crate::schema::SchemaEpoch,
         trx_alive: Arc<AtomicBool>,
@@ -151,11 +151,11 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied> {
         self.node.policy_agent.check_write(&self.sessions.write_credential()?, entity, None)
     }
-    async fn get_entity(&self, id: proto::EntityId, collection: &proto::CollectionId, cached: bool) -> Result<Entity, RetrievalError> {
+    async fn get_entity(&self, id: proto::EntityId, collection: &proto::ModelId, cached: bool) -> Result<Entity, RetrievalError> {
         self.get_entity(collection, id, cached).await
     }
     fn get_resident_entity(&self, id: proto::EntityId) -> Option<Entity> { self.node.entities.get(&id) }
-    async fn fetch_entities(&self, collection: &proto::CollectionId, args: MatchArgs<Resolved>) -> Result<Vec<Entity>, RetrievalError> {
+    async fn fetch_entities(&self, collection: &proto::ModelId, args: MatchArgs<Resolved>) -> Result<Vec<Entity>, RetrievalError> {
         self.fetch_entities(collection, args).await
     }
     async fn commit_local_trx(&self, trx: &Transaction) -> Result<Vec<Event>, MutationError> {
@@ -319,12 +319,11 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     fn query(
         &self,
         schema: &'static crate::schema::ModelStructDescriptor,
-        collection_id: proto::CollectionId,
         args: MatchArgs<Parsed>,
     ) -> Result<EntityLiveQuery, RetrievalError> {
-        EntityLiveQuery::new_typed(&self.node, schema, collection_id, args, self.sessions.clone())
+        EntityLiveQuery::new_typed(&self.node, schema, args, self.sessions.clone())
     }
-    async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
+    async fn collection(&self, id: &proto::ModelId) -> Result<StorageCollectionWrapper, RetrievalError> {
         self.node.system.collection(id).await
     }
 }
@@ -393,16 +392,16 @@ impl Context {
         // declaration's cells, so admit the declaration before decoding: a
         // shape this system already knows binds outright, and one it does
         // not is registered here so the accessors have identities to read.
-        self.0.bind_or_register(R::Model::descriptor()).await?;
-        let entity = self.0.get_entity(id, &R::collection(), false).await?;
+        let model_id = self.0.bind_or_register(R::Model::descriptor()).await?;
+        let entity = self.0.get_entity(id, &model_id, false).await?;
         Ok(R::from_entity(entity))
     }
 
     /// Get an entity, but its ok to return early if the entity is already in the local node storage
     pub async fn get_cached<R: View>(&self, id: proto::EntityId) -> Result<R, RetrievalError> {
         use crate::model::Model;
-        self.0.bind_or_register(R::Model::descriptor()).await?;
-        let entity = self.0.get_entity(id, &R::collection(), true).await?;
+        let model_id = self.0.bind_or_register(R::Model::descriptor()).await?;
+        let entity = self.0.get_entity(id, &model_id, true).await?;
         Ok(R::from_entity(entity))
     }
 
@@ -415,8 +414,7 @@ impl Context {
         // Admit the declaration first: it heals a shape this system has not
         // been told about, and once every cell is bound the selection either
         // resolves here and now or names something the query got wrong.
-        self.0.bind_or_register(R::Model::descriptor()).await?;
-        let collection_id = R::Model::collection();
+        let collection_id = self.0.bind_or_register(R::Model::descriptor()).await?;
         let args =
             MatchArgs { selection: self.0.resolve_selection_with_descriptor(R::Model::descriptor(), args.selection)?, cached: args.cached };
 
@@ -449,7 +447,7 @@ impl Context {
     {
         let args: MatchArgs<Parsed> = args.try_into().map_err(|e| e.into())?;
         use crate::model::Model;
-        Ok(self.0.query(R::Model::descriptor(), R::Model::collection(), args)?.map::<R>())
+        Ok(self.0.query(R::Model::descriptor(), args)?.map::<R>())
     }
 
     /// Subscribe to changes in entities matching a selection and wait for initialization
@@ -469,9 +467,7 @@ impl Context {
         livequery.wait_initialized().await?;
         Ok(livequery)
     }
-    pub async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
-        self.0.collection(id).await
-    }
+    pub async fn collection(&self, id: &proto::ModelId) -> Result<StorageCollectionWrapper, RetrievalError> { self.0.collection(id).await }
 }
 
 impl<SE, PA> NodeAndContext<SE, PA>
@@ -480,12 +476,7 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     /// Retrieve a single entity, either by cloning the resident Entity from the Node's WeakEntitySet or fetching from storage
-    pub(crate) async fn get_entity(
-        &self,
-        collection_id: &CollectionId,
-        id: proto::EntityId,
-        cached: bool,
-    ) -> Result<Entity, RetrievalError> {
+    pub(crate) async fn get_entity(&self, collection_id: &ModelId, id: proto::EntityId, cached: bool) -> Result<Entity, RetrievalError> {
         debug!("Node({}).get_entity {:?}-{:?}", self.node.id, id, collection_id);
         let cdata = self.sessions.current();
 
@@ -500,8 +491,8 @@ where
             }
         }
 
-        // Catalog reads never consult the agent (crate::schema::reads_bypass_policy).
-        let exempt = crate::schema::reads_bypass_policy(collection_id);
+        // Catalog reads never consult the agent (crate::schema::is_catalog_collection).
+        let exempt = crate::schema::is_catalog_collection(collection_id);
 
         if let Some(local) = self.node.entities.get(&id) {
             debug!("Node({}).get_entity found local entity - returning", self.node.id);
@@ -538,14 +529,14 @@ where
         }
     }
     /// Fetch a list of entities based on a selection
-    pub async fn fetch_entities(&self, collection_id: &CollectionId, mut args: MatchArgs<Resolved>) -> Result<Vec<Entity>, RetrievalError> {
+    pub async fn fetch_entities(&self, collection_id: &ModelId, mut args: MatchArgs<Resolved>) -> Result<Vec<Entity>, RetrievalError> {
         // One credential snapshot for the whole operation: the composed
         // checks (collection gate, predicate narrowing) must come from
         // one policy world, or a mid-operation refresh yields a
         // composite no single credential authorized.
         let cdata = self.sessions.current();
-        // Catalog reads never consult the agent (crate::schema::reads_bypass_policy).
-        if !crate::schema::reads_bypass_policy(collection_id) {
+        // Catalog reads never consult the agent (crate::schema::is_catalog_collection).
+        if !crate::schema::is_catalog_collection(collection_id) {
             self.node.policy_agent.can_access_collection(&cdata, collection_id)?;
             // The selection arrives resolved (its names bound where the query
             // entered), and the policy narrows it in the same vocabulary: what
@@ -581,7 +572,7 @@ where
     /// Fetch entities from the first available durable peer with known_matches support
     async fn fetch_from_peer(
         &self,
-        collection_id: &proto::CollectionId,
+        collection_id: &proto::ModelId,
         selection: ankql::ast::Selection<Resolved>,
         cdata: &Vec<PA::ContextData>,
     ) -> Result<Vec<crate::entity::Entity>, RetrievalError> {

@@ -16,7 +16,6 @@
 
 use ankurah::core::connector::{PeerSender, SendError};
 use ankurah::proto;
-use ankurah::Model;
 use std::sync::{Arc, Mutex};
 
 /// A message a node emitted, tagged with the logical index of its sender.
@@ -185,14 +184,9 @@ fn fragment_ids(entity: proto::EntityId, fragments: &[proto::EventFragment]) -> 
     let mut ids: Vec<String> = fragments
         .iter()
         .map(|f| {
-            proto::Event {
-                collection: super::model::SimRecord::collection(),
-                entity_id: entity,
-                parent: f.parent.clone(),
-                body: f.body.clone(),
-            }
-            .id()
-            .to_base64_short()
+            proto::Event { collection: super::model::sim_collection(), entity_id: entity, parent: f.parent.clone(), body: f.body.clone() }
+                .id()
+                .to_base64_short()
         })
         .collect();
     ids.sort();

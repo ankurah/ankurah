@@ -16,7 +16,6 @@ use ankql::ast::Predicate;
 use ankurah::policy::PolicyAgent;
 use ankurah::{Model, Node};
 use ankurah_jwt_auth::{JwtAgent, JwtContext, PolicyConfig};
-use ankurah_proto::CollectionId;
 use ankurah_storage_sled::SledStorageEngine;
 use common::{make_claims, sign_token};
 use std::sync::Arc;
@@ -33,7 +32,7 @@ fn agent() -> JwtAgent {
     let agent = JwtAgent::new_durable(common::test_keys(), config_path()).unwrap();
     // What node attach installs from the node's catalog: scope rules are
     // authored in names and everything that consumes one addresses ids.
-    agent.set_selection_resolver(common::fixture_binding());
+    common::install_fixture_bindings(&agent);
     agent
 }
 
@@ -70,17 +69,17 @@ fn gate_is_wide_and_scan_check_is_narrow() {
     let config = load_config();
     let guest = [String::from("guest")];
     let member = [String::from("member")];
-    let user = CollectionId::fixed_name("user");
-    let note = CollectionId::fixed_name("note");
+    let user = common::model("user");
+    let note = common::model("note");
 
-    assert!(config.can_access_collection(&guest, &user), "retrieval admits the entry gate");
-    assert!(!config.can_scan_collection(&guest, &user), "retrieval never admits a scan");
-    assert!(config.can_access_collection(&member, &user));
-    assert!(config.can_scan_collection(&member, &user));
+    assert!(config.can_access_collection(&guest, Some("user")), "retrieval admits the entry gate");
+    assert!(!config.can_scan_collection(&guest, Some("user")), "retrieval never admits a scan");
+    assert!(config.can_access_collection(&member, Some("user")));
+    assert!(config.can_scan_collection(&member, Some("user")));
 
     // No retrieve field on note: the gate means what it meant before the
     // field existed.
-    assert!(!config.can_access_collection(&guest, &note), "absent retrieve field, no weakening");
+    assert!(!config.can_access_collection(&guest, Some("note")), "absent retrieve field, no weakening");
 }
 
 /// At the retrieval tier every predicate is a scan and composes to `False`
@@ -90,7 +89,7 @@ fn gate_is_wide_and_scan_check_is_narrow() {
 #[test]
 fn retrieval_tier_scans_nothing() {
     let agent = agent();
-    let user = CollectionId::fixed_name("user");
+    let user = common::model("user");
     let guest = vec![guest_ctx()];
 
     for scan in [
@@ -111,7 +110,7 @@ fn retrieval_tier_scans_nothing() {
 #[test]
 fn scan_tier_predicates_pass_untouched() {
     let agent = agent();
-    let user = CollectionId::fixed_name("user");
+    let user = common::model("user");
     let member = vec![member_ctx("member-1")];
 
     for predicate in ["true", "name = 'Ada'", "id = 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8'"] {
@@ -126,7 +125,7 @@ fn scan_tier_predicates_pass_untouched() {
 #[test]
 fn retrieval_credential_never_widens_a_scoped_scan() {
     let agent = agent();
-    let note = CollectionId::fixed_name("note");
+    let note = common::model("note");
 
     // The guest's only privilege is view; note grants view nothing. The
     // scan reaches the scoped arm and no credential contributes a slice.

@@ -323,8 +323,9 @@ async fn test_jwt_check_request_roundtrip() -> anyhow::Result<()> {
 async fn test_jwtpolicy_collection_always_accessible() -> anyhow::Result<()> {
     let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path())?;
+    common::install_fixture_bindings(&agent);
 
-    let collection = ankurah_proto::CollectionId::from("jwtpolicy");
+    let collection = common::model("jwtpolicy");
 
     let claims = make_claims("reader-1", &["Reader"], "reader@blog.com");
     let token = sign_token(&keys, &claims);
@@ -342,7 +343,7 @@ async fn test_jwt_agent_collection_access_denied() -> anyhow::Result<()> {
     let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path())?;
 
-    let collection = ankurah_proto::CollectionId::from("post");
+    let collection = common::model("post");
 
     let claims = make_claims("reader-1", &["Reader"], "reader@blog.com");
     let token = sign_token(&keys, &claims);
@@ -385,8 +386,8 @@ async fn test_root_bypasses_collection_access() -> anyhow::Result<()> {
     use ankurah_core::policy::PolicyAgent;
     let root = JwtContext::system();
 
-    let post = ankurah_proto::CollectionId::from("post");
-    let secret = ankurah_proto::CollectionId::from("secret_stuff");
+    let post = common::model("post");
+    let secret = common::model("secret_stuff");
     assert!(agent.can_access_collection(&root, &post).is_ok());
     assert!(agent.can_access_collection(&root, &secret).is_ok());
 

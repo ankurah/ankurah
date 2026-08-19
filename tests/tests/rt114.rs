@@ -33,7 +33,7 @@ async fn rt114() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let album1_id = server_album1.id();
     let album2_id = server_album2.id();
 
-    let client_collection = client_storage.collection(&"album".into()).await?;
+    let client_collection = client_storage.collection(&common::model_id::<Album>(&client_ctx).await?).await?;
     assert_eq!(0, client_collection.dump_entity_events(album1_id.clone()).await?.len()); // before subscribe
     assert_eq!(0, client_collection.dump_entity_events(album2_id.clone()).await?.len()); // before subscribe
 
@@ -111,7 +111,7 @@ async fn rt114_b() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let album1_id = server_album1.id();
     let album2_id = server_album2.id();
 
-    let client_collection = client_storage.collection(&"album".into()).await?;
+    let client_collection = client_storage.collection(&common::model_id::<Album>(&client_ctx).await?).await?;
     assert_eq!(0, client_collection.dump_entity_events(album1_id.clone()).await?.len()); // before fetch
     assert_eq!(0, client_collection.dump_entity_events(album2_id.clone()).await?.len()); // before fetch
 

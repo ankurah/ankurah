@@ -1,7 +1,6 @@
 mod common;
 
 use ankurah_jwt_auth::{JwtAgent, JwtClaims, JwtContext};
-use ankurah_proto::CollectionId;
 use common::blog_config_path;
 
 // ---------------------------------------------------------------------------
@@ -199,13 +198,14 @@ fn test_nouser_context_equality() {
 fn test_nouser_can_access_jwtpolicy_collection() {
     let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys, blog_config_path()).unwrap();
+    common::install_fixture_bindings(&agent);
 
     use ankurah_core::policy::PolicyAgent;
     let ctx = JwtContext::NoUser;
-    let jwtpolicy = CollectionId::from("jwtpolicy");
+    let jwtpolicy = common::model("jwtpolicy");
     assert!(agent.can_access_collection(&ctx, &jwtpolicy).is_ok());
 
     // But NoUser cannot access other collections
-    let post = CollectionId::from("post");
+    let post = common::model("post");
     assert!(agent.can_access_collection(&ctx, &post).is_err());
 }

@@ -27,7 +27,7 @@ async fn postgres_duplicate_event_idempotency() -> Result<()> {
     trx.commit().await?;
 
     // Get the collection to access storage directly
-    let collection = context.collection(&"album".into()).await?;
+    let collection = context.collection(&context.register_model::<Album>().await?).await?;
 
     // Get the first event that was created
     let events = collection.dump_entity_events(album_id).await?;

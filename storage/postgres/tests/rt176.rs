@@ -24,7 +24,7 @@ async fn postgres_get_state_returns_entity_not_found() -> Result<()> {
     let context = node.context(c)?;
 
     // Get a collection (this creates the tables)
-    let collection = context.collection(&"album".into()).await?;
+    let collection = context.collection(&context.register_model::<common::Album>().await?).await?;
 
     // Generate a random entity ID that definitely doesn't exist
     let non_existent_id = EntityId::random();

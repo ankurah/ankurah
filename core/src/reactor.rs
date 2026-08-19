@@ -35,7 +35,7 @@ use std::{
 
 /// Trait for entities that can be used in reactor notifications
 pub trait AbstractEntity: Clone + std::fmt::Debug {
-    fn collection(&self) -> proto::CollectionId;
+    fn collection(&self) -> proto::ModelId;
     fn id(&self) -> &proto::EntityId;
     fn value(&self, property: &ankql::ast::PropertyId) -> Option<Value>;
 }
@@ -238,7 +238,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         &self,
         subscription_id: ReactorSubscriptionId,
         query_id: proto::QueryId,
-        collection_id: proto::CollectionId,
+        collection_id: proto::ModelId,
         selection: ankql::ast::Selection<Resolved>,
         node: &dyn crate::node::TNodeErased<E>,
         resultset: EntityResultSet<E>,
@@ -295,7 +295,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         &self,
         subscription_id: ReactorSubscriptionId,
         query_id: proto::QueryId,
-        collection_id: proto::CollectionId,
+        collection_id: proto::ModelId,
         selection: ankql::ast::Selection<Resolved>,
         node: &dyn crate::node::TNodeErased<E>,
         version: u32,
@@ -420,7 +420,7 @@ mod tests {
     use super::*;
     use crate::selection::filter::Filterable;
     use ankurah_signals::Subscribe;
-    use proto::{CollectionId, QueryId};
+    use proto::QueryId;
     use std::sync::Arc;
 
     /// A deterministic durable identity for a fixture field name.
@@ -466,7 +466,7 @@ mod tests {
     #[derive(Debug, Clone)]
     struct TestEntity {
         id: proto::EntityId,
-        collection: proto::CollectionId,
+        collection: proto::ModelId,
         state: Arc<Mutex<HashMap<ankql::ast::PropertyId, String>>>,
     }
     impl Eq for TestEntity {}
@@ -479,26 +479,29 @@ mod tests {
     #[derive(Debug, Clone, PartialEq)]
     struct TestEvent {
         id: proto::EventId,
-        collection: proto::CollectionId,
+        collection: proto::ModelId,
         changes: HashMap<String, String>,
     }
+    /// A stand-in model identity for fixtures: these tests need entities that
+    /// belong to SOME model, never a particular one.
+    fn fixture_collection() -> proto::ModelId { proto::ModelId::EntityId(proto::EntityId::from_bytes([0xfc; 32])) }
+
     impl TestEntity {
         fn new(name: &str, status: &str) -> Self {
             Self {
                 id: proto::EntityId::random(),
-                collection: proto::CollectionId::fixed_name("album"),
+                collection: fixture_collection(),
                 state: Arc::new(Mutex::new(HashMap::from([(prop("name"), name.to_string()), (prop("status"), status.to_string())]))),
             }
         }
     }
     impl Filterable for TestEntity {
-        fn collection(&self) -> &str { self.collection.as_str() }
         fn value(&self, property: &ankql::ast::PropertyId) -> Option<crate::value::Value> {
             self.state.lock().unwrap().get(property).cloned().map(crate::value::Value::String)
         }
     }
     impl AbstractEntity for TestEntity {
-        fn collection(&self) -> proto::CollectionId { self.collection.clone() }
+        fn collection(&self) -> proto::ModelId { self.collection }
         fn id(&self) -> &proto::EntityId { &self.id }
         fn value(&self, property: &ankql::ast::PropertyId) -> Option<crate::value::Value> {
             self.state.lock().unwrap().get(property).cloned().map(crate::value::Value::String)
@@ -520,7 +523,7 @@ mod tests {
     impl GapFetcher<TestEntity> for MockGapFetcher {
         async fn fetch_gap(
             &self,
-            _collection_id: &proto::CollectionId,
+            _collection_id: &proto::ModelId,
             _selection: &ankql::ast::Selection<Resolved>,
             _last_entity: Option<&TestEntity>,
             _gap_size: usize,
@@ -548,7 +551,7 @@ mod tests {
         }
         async fn fetch_entities_from_local(
             &self,
-            _collection_id: &proto::CollectionId,
+            _collection_id: &proto::ModelId,
             _selection: &ankql::ast::Selection<Resolved>,
         ) -> Result<Vec<TestEntity>, crate::error::RetrievalError> {
             Ok(self.entities.clone())
@@ -557,7 +560,7 @@ mod tests {
         fn has_subscription_relay(&self) -> bool { false }
         fn resolve_selection(
             &self,
-            _collection: &proto::CollectionId,
+            _collection: &proto::ModelId,
             selection: ankql::ast::Selection<ankql::ast::Parsed>,
         ) -> Result<ankql::ast::Selection<Resolved>, crate::error::RetrievalError> {
             Ok(resolve_fixture(selection))
@@ -576,7 +579,7 @@ mod tests {
         let _guard = rsub.subscribe(w);
 
         let query_id = QueryId::new();
-        let collection_id = CollectionId::fixed_name("album");
+        let collection_id = fixture_collection();
         let selection: ankql::ast::Selection<Resolved> = sel("status = 'pending'");
         let entity1 = TestEntity::new("Test Album", "pending");
         let resultset: EntityResultSet<TestEntity> = EntityResultSet::empty();

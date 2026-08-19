@@ -42,7 +42,7 @@ fn forge_title_event(f: &Fixture, entity_id: proto::EntityId, parent: proto::Clo
     backend.set(common::resolved_prop(&f.server, Record::descriptor(), "title"), Some(Value::String(title.to_owned())));
     let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
     proto::Event::update(
-        Record::collection(),
+        common::resolved_model(&f.server, Record::descriptor()),
         entity_id,
         parent,
         proto::AuthorId::Unknown,
@@ -58,7 +58,7 @@ fn forge_genesis_claiming(f: &Fixture, entity_id: proto::EntityId, title: &str) 
     backend.set(common::resolved_prop(&f.server, Record::descriptor(), "title"), Some(Value::String(title.to_owned())));
     let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
     let mut event = proto::Event::genesis(
-        Record::collection(),
+        common::resolved_model(&f.server, Record::descriptor()),
         None,
         proto::AuthorId::Unknown,
         proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)])),
@@ -78,10 +78,10 @@ fn event_only_item(event: proto::Event) -> proto::SubscriptionUpdateItem {
 
 /// A single EventOnly item carrying several events (delivered in the given
 /// wire order, which the receiver must not trust).
-fn event_only_multi(entity_id: proto::EntityId, events: Vec<proto::Event>) -> proto::SubscriptionUpdateItem {
+fn event_only_multi(f: &Fixture, entity_id: proto::EntityId, events: Vec<proto::Event>) -> proto::SubscriptionUpdateItem {
     proto::SubscriptionUpdateItem {
         entity_id,
-        collection: Record::collection(),
+        collection: common::resolved_model(&f.server, Record::descriptor()),
         content: proto::UpdateContent::EventOnly(events.into_iter().map(|e| Attested::opt(e, None).into()).collect()),
         predicate_relevance: vec![],
     }
@@ -140,7 +140,7 @@ async fn seed_record(f: &Fixture, title: &str, artist: &str) -> Result<(proto::E
 }
 
 async fn committed_event_ids(ctx: &ankurah::Context, id: proto::EntityId) -> Result<Vec<proto::EventId>> {
-    let collection = ctx.collection(&Record::collection()).await?;
+    let collection = collection_of::<Record>(&ctx).await?;
     Ok(collection.dump_entity_events(id).await?.iter().map(|e| e.payload.id()).collect())
 }
 
@@ -223,14 +223,16 @@ async fn malformed_clock_identity_is_order_independent_end_to_end() -> Result<()
         backend.set(common::resolved_prop(&f.server, Record::descriptor(), "artist"), Some(Value::String("c-artist".to_owned())));
         let ops = backend.to_operations().unwrap().expect("ops");
         proto::Event::update(
-            Record::collection(),
+            common::resolved_model(&f.server, Record::descriptor()),
             rec_id,
             head0.clone(),
             proto::AuthorId::Unknown,
             proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)])),
         )
     };
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, vec![ev_b.clone(), ev_c.clone()])])).await?;
+    f.client
+        .handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(&f, rec_id, vec![ev_b.clone(), ev_c.clone()])]))
+        .await?;
 
     // The head is now the antichain {ev_b, ev_c}. Take one merge event and
     // re-parent a copy of it on the same two ids in the opposite order;
@@ -315,7 +317,7 @@ async fn forged_extra_genesis_head_does_not_trigger_wholesale_adoption() -> Resu
         // A genesis claiming an existing entity's id: structurally invalid
         // now that a genesis names whatever entity its own content derives.
         let mut event = proto::Event::genesis(
-            Record::collection(),
+            common::resolved_model(&f.server, Record::descriptor()),
             None,
             proto::AuthorId::Unknown,
             proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)])),
@@ -330,7 +332,7 @@ async fn forged_extra_genesis_head_does_not_trigger_wholesale_adoption() -> Resu
     // security property is: the legitimate child's write is not lost, and the
     // foreign root does not get adopted as the sole head (which would discard
     // the real genesis lineage).
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, vec![ev_b, ev_x])])).await?;
+    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(&f, rec_id, vec![ev_b, ev_x])])).await?;
 
     let head = view.entity().head();
     // The original genesis lineage must not have been wholesale-replaced by the
@@ -363,15 +365,17 @@ async fn forged_extra_genesis_head_does_not_trigger_wholesale_adoption() -> Resu
 #[test]
 fn declared_cycle_is_unconstructible_content_addressing() {
     let entity = proto::EntityId::random();
-    // No node exists in this constructive proof; the property identity is
-    // forged like the entity id (content addressing is indifferent to it).
+    // No node exists in this constructive proof; the model and property
+    // identities are forged like the entity id (content addressing is
+    // indifferent to them).
+    let model = proto::ModelId::EntityId(proto::EntityId::from_bytes([0x72; 32]));
     let title_prop = proto::PropertyId::EntityId(proto::EntityId::from_bytes([0x71; 32]));
     let mk = |title: &str, parent: proto::Clock| {
         let backend = LWWBackend::new();
         backend.set(title_prop, Some(Value::String(title.to_owned())));
         let ops = backend.to_operations().unwrap().expect("ops");
         proto::Event::update(
-            Record::collection(),
+            model,
             entity,
             parent,
             proto::AuthorId::Unknown,
@@ -424,7 +428,7 @@ async fn fabricated_cycle_batch_is_contained() -> Result<()> {
     let id1 = ev1.id();
     let id2 = ev2.id();
 
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, vec![ev1, ev2])])).await?;
+    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(&f, rec_id, vec![ev1, ev2])])).await?;
 
     // Neither fabricated-parent event grounds (their parents do not exist), so
     // the entity is unchanged and no fabricated event enters the head.
@@ -463,7 +467,7 @@ async fn replay_flood_is_idempotent() -> Result<()> {
     }
     // And the same event redelivered inside a multi-event batch alongside
     // itself (duplicate within one item), out of order.
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, vec![ev.clone(), ev.clone()])])).await?;
+    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(&f, rec_id, vec![ev.clone(), ev.clone()])])).await?;
 
     assert_eq!(view.title().unwrap(), "t1", "state reflects exactly one application");
     let head = view.entity().head();
@@ -598,7 +602,7 @@ async fn oversized_event_batch_is_rejected() -> Result<()> {
     // handle_message returns Ok regardless (error rides the ack path); the
     // observable expectation once #246 lands is that NOTHING from an oversized
     // batch is committed. Today many events commit, so this assertion fails.
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, events)])).await?;
+    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(&f, rec_id, events)])).await?;
     let after = committed_event_ids(&f.ctx_c, rec_id).await?.len();
 
     assert_eq!(after, before, "an oversized batch must be rejected wholesale, committing nothing (G-3, #246)");

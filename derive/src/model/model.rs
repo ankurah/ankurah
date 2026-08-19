@@ -7,7 +7,6 @@ pub fn model_impl(model: &crate::model::description::ModelDescription) -> TokenS
     let name = model.name();
     let view_name = model.view_name();
     let mutable_name = model.mutable_name();
-    let collection_str = model.collection_str();
     let active_field_names = model.active_field_names();
     let active_field_indices: Vec<syn::Index> = (0..active_field_names.len()).map(syn::Index::from).collect();
     let active_field_types_turbofish = match model.active_field_types_turbofish() {
@@ -53,9 +52,6 @@ pub fn model_impl(model: &crate::model::description::ModelDescription) -> TokenS
             type Mutable = #mutable_name;
             #ref_wrapper_type
             #schema_method
-            fn collection() -> #base::proto::CollectionId {
-                #collection_str.into()
-            }
             fn initialize_new_entity(
                 &self,
                 provisional: &mut #base::entity::ProvisionalEntity,

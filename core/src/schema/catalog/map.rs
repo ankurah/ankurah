@@ -88,7 +88,9 @@ impl CatalogProjection {
 /// names the row, because that identity is the caller's to supply -- the
 /// derived table cannot name what it could not read.
 fn entry<R: View>(row: &R) -> Result<(EntityId, R::Model), String> {
-    row.to_model().map(|model| (row.id(), model)).map_err(|error| format!("{} row {}: {error}", R::collection(), row.id()))
+    row.to_model()
+        .map(|model| (row.id(), model))
+        .map_err(|error| format!("{} row {}: {error}", <R::Model as crate::model::Model>::descriptor().label, row.id()))
 }
 
 /// Definitions the allocator has already confirmed but the projection has not

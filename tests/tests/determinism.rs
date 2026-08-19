@@ -85,7 +85,7 @@ async fn test_two_event_determinism_same_property() -> Result<()> {
 
     // Now replay on node2 in different order: A, C, B
     // We need to get the raw events and apply them
-    let collection1 = ctx1.collection(&Record::collection()).await?;
+    let collection1 = collection_of::<Record>(&ctx1).await?;
     let events = collection1.dump_entity_events(record_id).await?;
 
     // Verify DAG structure first
@@ -99,7 +99,7 @@ async fn test_two_event_determinism_same_property() -> Result<()> {
     let state1 = collection1.get_state(record_id).await?;
 
     // Apply state to node2
-    let collection2 = ctx2.collection(&Record::collection()).await?;
+    let collection2 = collection_of::<Record>(&ctx2).await?;
     collection2.set_state(state1.clone()).await?;
 
     // Apply events in reverse order (C before B)
@@ -180,7 +180,7 @@ async fn test_deep_diamond_determinism() -> Result<()> {
     };
 
     // Now verify the deep chain has correct structure
-    let collection = ctx.collection(&Record::collection()).await?;
+    let collection = collection_of::<Record>(&ctx).await?;
     let events = collection.dump_entity_events(record_id).await?;
 
     assert_dag!(dag, events, {
@@ -231,7 +231,7 @@ async fn test_multi_property_determinism() -> Result<()> {
     dag.enumerate(trx1.commit_and_return_events().await?); // B
     dag.enumerate(trx2.commit_and_return_events().await?); // C
 
-    let collection = ctx.collection(&Record::collection()).await?;
+    let collection = collection_of::<Record>(&ctx).await?;
     let events = collection.dump_entity_events(record_id).await?;
 
     // Verify diamond structure
@@ -287,7 +287,7 @@ async fn test_three_way_concurrent_determinism() -> Result<()> {
     dag.enumerate(trx2.commit_and_return_events().await?); // C
     dag.enumerate(trx3.commit_and_return_events().await?); // D
 
-    let collection = ctx.collection(&Record::collection()).await?;
+    let collection = collection_of::<Record>(&ctx).await?;
     let events = collection.dump_entity_events(record_id).await?;
 
     // Verify three-way fork structure

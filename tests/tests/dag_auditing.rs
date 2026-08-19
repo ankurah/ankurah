@@ -27,7 +27,7 @@ async fn test_linear_history_structure() -> Result<()> {
         dag.enumerate(trx.commit_and_return_events().await?); // B, C, D
     }
 
-    let collection = ctx.collection(&Album::collection()).await?;
+    let collection = collection_of::<Album>(&ctx).await?;
     let events = collection.dump_entity_events(album_id).await?;
 
     // Verify linear structure: A → B → C → D
@@ -75,7 +75,7 @@ async fn test_simple_diamond_structure() -> Result<()> {
     dag.enumerate(trx1.commit_and_return_events().await?); // B
     dag.enumerate(trx2.commit_and_return_events().await?); // C
 
-    let collection = ctx.collection(&Album::collection()).await?;
+    let collection = collection_of::<Album>(&ctx).await?;
     let events = collection.dump_entity_events(album_id).await?;
 
     // Verify diamond structure:
@@ -131,7 +131,7 @@ async fn test_diamond_with_merge_structure() -> Result<()> {
     album.edit(&trx3)?.name()?.replace("Merged Name")?;
     dag.enumerate(trx3.commit_and_return_events().await?); // D
 
-    let collection = ctx.collection(&Album::collection()).await?;
+    let collection = collection_of::<Album>(&ctx).await?;
     let events = collection.dump_entity_events(album_id).await?;
 
     // Verify diamond-with-merge structure:
@@ -188,7 +188,7 @@ async fn test_complex_multi_merge_structure() -> Result<()> {
     dag.enumerate(trx3.commit_and_return_events().await?); // D
 
     // Verify three-way fork
-    let collection = ctx.collection(&Album::collection()).await?;
+    let collection = collection_of::<Album>(&ctx).await?;
     let events = collection.dump_entity_events(album_id).await?;
 
     assert_eq!(events.len(), 4, "Should have 4 events");
@@ -239,7 +239,7 @@ async fn test_head_evolution() -> Result<()> {
     let ctx = node.context_async(DEFAULT_CONTEXT).await;
     let mut dag = TestDag::new();
 
-    let collection = ctx.collection(&Album::collection()).await?;
+    let collection = collection_of::<Album>(&ctx).await?;
 
     // Step 1: Create A → head=[A]
     let album_id = {
@@ -336,7 +336,7 @@ async fn test_event_count_verification() -> Result<()> {
         dag.enumerate(trx.commit_and_return_events().await?);
     }
 
-    let collection = ctx.collection(&Album::collection()).await?;
+    let collection = collection_of::<Album>(&ctx).await?;
     let events = collection.dump_entity_events(album_id).await?;
 
     // Should have exactly 11 events (1 create + 10 updates)

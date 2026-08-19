@@ -2,7 +2,7 @@ pub mod tsify;
 
 use std::sync::Arc;
 
-use ankurah_proto::{CollectionId, EntityId, ModelId, State};
+use ankurah_proto::{EntityId, ModelId, State};
 
 use crate::entity::{Entity, ProvisionalEntity};
 use crate::error::StateError;
@@ -29,8 +29,6 @@ pub trait Model: Sized {
     /// provides methods like `.get(ctx)` and `.id()` with proper TypeScript types.
     #[cfg(feature = "wasm")]
     type RefWrapper: From<crate::property::Ref<Self>> + Into<crate::property::Ref<Self>>;
-
-    fn collection() -> CollectionId;
 
     /// The local compiled schema: the names and types a binary registers and
     /// binds against the catalog (ids exist only there) and the
@@ -63,7 +61,6 @@ pub trait View {
     type Mutable: Mutable;
     fn id(&self) -> EntityId { self.entity().id() }
 
-    fn collection() -> CollectionId { <Self::Model as Model>::collection() }
     fn entity(&self) -> &Entity;
     fn from_entity(inner: Entity) -> Self;
     fn to_model(&self) -> Result<Self::Model, PropertyError>;
@@ -98,7 +95,6 @@ pub trait Mutable {
     type Model: Model;
     type View: View;
     fn id(&self) -> EntityId { self.entity().id() }
-    fn collection() -> CollectionId { <Self::Model as Model>::collection() }
 
     fn entity(&self) -> &Entity;
     fn new(entity: Entity) -> Self

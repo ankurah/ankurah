@@ -33,11 +33,14 @@ from scratch.
 
 `StorageEngine` is the collection factory and lifecycle handle. It is small:
 
-- `collection(&CollectionId) -> Arc<dyn StorageCollection>` -- open or create
-  the storage for one collection. This is where an engine does per-collection
-  setup: sled opens a tree, Postgres and SQLite run `CREATE TABLE IF NOT
-  EXISTS` for the state and event tables under a DDL lock, IndexedDB hands back
-  a bucket bound to the shared object stores.
+- `collection(&ModelId) -> Arc<dyn StorageCollection>` -- open or create
+  the storage for one model's entities. This is where an engine does
+  per-collection setup: sled opens a tree, Postgres and SQLite run `CREATE
+  TABLE IF NOT EXISTS` for the state and event tables under a DDL lock,
+  IndexedDB hands back a bucket bound to the shared object stores. The
+  physical name is the model identity's own rendering (its base64 for an
+  allocated id, its canonical spelling for a built-in), plus the `_event`
+  suffix for the event table; source-level labels never reach an engine.
 - `delete_all_collections()` -- drop everything (used by tests and resets).
 - an associated `Value` type -- the engine's native value representation
   (`Vec<u8>` for sled, `PGValue` for Postgres, `SqliteValue`, `JsValue`).

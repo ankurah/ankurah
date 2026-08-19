@@ -1,6 +1,5 @@
 use crate::{JwtContext, JwtKeys, PolicyConfig};
 use ankurah_core::{livequery::EntityLiveQuery, resultset::EntityResultSet, storage::StorageEngine, Node};
-use ankurah_proto as proto;
 use std::sync::{Arc, Mutex, RwLock};
 
 /// Combined policy config and verification keys, always updated atomically.
@@ -52,9 +51,9 @@ pub(crate) fn start_durable_policy_watcher<SE, PA>(
     });
 }
 
-/// Start ephemeral policy sync: creates a weak-node LiveQuery on "jwtpolicy" (so the
-/// agent does not keep its own node alive) and spawns a background task that applies
-/// policy updates from the durable node.
+/// Start ephemeral policy sync: spawns a background task that opens a
+/// weak-node LiveQuery over the policy collection (so the agent does not keep
+/// its own node alive) and applies policy updates from the durable node.
 pub(crate) fn start_ephemeral_policy_sync<SE, PA>(
     node: &Node<SE, PA>,
     state_handle: Arc<RwLock<AgentState>>,
@@ -70,19 +69,54 @@ pub(crate) fn start_ephemeral_policy_sync<SE, PA>(
             return;
         }
     };
-    let lq = match EntityLiveQuery::new_weak_node(node, proto::CollectionId::from("jwtpolicy"), args, JwtContext::NoUser) {
-        Ok(lq) => lq,
-        Err(e) => {
-            tracing::error!("on_node_ready: failed to create policy livequery: {}", e);
-            return;
-        }
-    };
-
-    let lq_clone = lq.clone();
-    *policy_livequery.lock().unwrap_or_else(|e| e.into_inner()) = Some(lq);
 
     let weak_node = node.weak();
+    let policy_livequery = policy_livequery.clone();
     ankurah_core::task::spawn(async move {
+        // The query is addressed to the policy MODEL, and an ephemeral node
+        // learns that identity from the system it joins: the catalog it
+        // projects from its durable peer is what turns the declaration into
+        // an identity. So this waits for readiness first -- the catalog is
+        // loaded by then, and it loads without consulting any policy, which
+        // is what keeps this from waiting on itself.
+        //
+        // Registration is asserted in the same breath, for the reads below:
+        // they go through JwtPolicy's typed accessors, which resolve fields
+        // via the descriptor's cells at this node's epoch, and nothing else
+        // on an ephemeral node runs the registration gate for this model. The
+        // durable side already holds the schema, so the forwarded request is
+        // a no-op plan that skips the policy verb. The readiness wait runs on
+        // a cloned SystemManager with the strong node handle dropped: this
+        // task must never keep its own node alive.
+        let system = match weak_node.upgrade() {
+            Some(node) => node.system.clone(),
+            None => return,
+        };
+        system.wait_system_ready().await;
+        let Some(node) = weak_node.upgrade() else { return };
+        use ankurah_core::model::Model;
+        if let Err(error) = node.catalog.ensure_registered(&JwtContext::NoUser, crate::JwtPolicy::descriptor()).await {
+            tracing::warn!("ephemeral policy sync: JwtPolicy registration did not confirm: {error}");
+        }
+        let Some(model) = node.catalog.model_id_for(crate::agent::policy_collection_label()) else {
+            tracing::error!("ephemeral policy sync: this system has no policy model registered, so no policy will be applied");
+            return;
+        };
+
+        // Raw rather than typed on purpose: the query names the model
+        // outright and its selection is `true`, so it asks the catalog for
+        // nothing that the binding above has not already settled.
+        let lq = match EntityLiveQuery::new_weak_node(&node, model, args, JwtContext::NoUser) {
+            Ok(lq) => lq,
+            Err(e) => {
+                tracing::error!("on_node_ready: failed to create policy livequery: {}", e);
+                return;
+            }
+        };
+        let lq_clone = lq.clone();
+        *policy_livequery.lock().unwrap_or_else(|e| e.into_inner()) = Some(lq);
+        drop(node);
+
         // A policy query that failed to initialize will never carry a key or
         // a config: reading its resultset applies nothing and the
         // subscription below would never fire, leaving an agent that behaves
@@ -90,30 +124,6 @@ pub(crate) fn start_ephemeral_policy_sync<SE, PA>(
         if let Err(error) = lq_clone.wait_initialized().await {
             tracing::error!("ephemeral policy sync: the policy livequery never initialized, so no policy will be applied: {error}");
             return;
-        }
-
-        // Reading the arriving policy rows goes through JwtPolicy's typed
-        // accessors, which resolve fields via the descriptor's cells at this
-        // node's epoch -- and nothing else on an ephemeral node runs the
-        // registration gate for this model (the livequery itself is raw).
-        // Assert registration once, after the system is actually ready (this
-        // task starts at node construction, and the livequery initializes
-        // pre-join, so neither implies readiness), so the cells resolve
-        // before the first read; the durable side already holds the schema,
-        // so the forwarded request is a no-op plan that skips the policy
-        // verb. The readiness wait runs on a cloned SystemManager with the
-        // strong node handle dropped: this task must never keep its own
-        // node alive.
-        let system = match weak_node.upgrade() {
-            Some(node) => node.system.clone(),
-            None => return,
-        };
-        system.wait_system_ready().await;
-        if let Some(node) = weak_node.upgrade() {
-            use ankurah_core::model::Model;
-            if let Err(e) = node.catalog.ensure_registered(&JwtContext::NoUser, crate::JwtPolicy::descriptor()).await {
-                tracing::warn!("ephemeral policy sync: JwtPolicy registration did not confirm: {e}");
-            }
         }
 
         apply_policy_from_resultset(&lq_clone.resultset(), &state_handle);

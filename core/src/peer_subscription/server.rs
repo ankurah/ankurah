@@ -125,7 +125,7 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         &self,
         node: &Node<SE, PA>,
         query_id: proto::QueryId,
-        collection_id: proto::CollectionId,
+        collection_id: proto::ModelId,
         mut selection: ankql::ast::Selection<Resolved>,
         cdata: Option<&PA::ContextData>,
         version: u32,
@@ -139,9 +139,9 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
             return Err(anyhow::anyhow!("Invalid version 0 for subscription"));
         }
         // A subscribe to a catalog collection never consults the agent
-        // (crate::schema::reads_bypass_policy): this is how a peer's catalog
+        // (crate::schema::is_catalog_collection): this is how a peer's catalog
         // projection is fed, and it runs before that peer has any credential.
-        let exempt = crate::schema::reads_bypass_policy(&collection_id);
+        let exempt = crate::schema::is_catalog_collection(&collection_id);
         if !exempt {
             // Re-subscribes re-validate under the peer's current credentials
             // and refresh the query's standing session below. Denial does
@@ -206,7 +206,7 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         &self,
         node: &Node<SE, PA>,
         query_id: proto::QueryId,
-        collection_id: proto::CollectionId,
+        collection_id: proto::ModelId,
         selection: ankql::ast::Selection<Resolved>,
         sessions: &SessionSet<CD>,
         cdata: Option<&PA::ContextData>,

@@ -22,7 +22,7 @@ use crate::statics::COLLECTION_KEY;
 /// This is IndexedDB's own seam, deliberately not shared with the other
 /// engines: the engine-side catalog resolver replaces this rendering with the
 /// physical field name this engine assigned the property.
-pub fn lower(selection: &Selection<Resolved>, collection: &ankurah_proto::CollectionId) -> Selection<EngineColumns> {
+pub fn lower(selection: &Selection<Resolved>, collection: &ankurah_proto::ModelId) -> Selection<EngineColumns> {
     let mut lowered =
         lower_selection(selection, &|path: &PropertyPath| ColumnPath::new(path.property_id().to_string(), path.subpath.clone()));
 

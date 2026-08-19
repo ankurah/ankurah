@@ -10,7 +10,7 @@ use ankurah::core::{
     util::Iterable,
 };
 use ankurah::proto::{self, Attested, EventId};
-use ankurah::{Model, Node, PermissiveAgent};
+use ankurah::{Node, PermissiveAgent};
 use ankurah_connector_local_process::LocalProcessConnection;
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
@@ -96,7 +96,7 @@ impl PolicyAgent for BridgePolicyAgent {
         Ok(())
     }
 
-    fn can_access_collection<C>(&self, _data: &C, _collection: &proto::CollectionId) -> Result<(), AccessDenied>
+    fn can_access_collection<C>(&self, _data: &C, _collection: &proto::ModelId) -> Result<(), AccessDenied>
     where C: Iterable<Self::ContextData> {
         Ok(())
     }
@@ -104,7 +104,7 @@ impl PolicyAgent for BridgePolicyAgent {
     fn filter_predicate<C>(
         &self,
         _data: &C,
-        _collection: &proto::CollectionId,
+        _collection: &proto::ModelId,
         predicate: Predicate<ankql::ast::Resolved>,
     ) -> Result<Predicate<ankql::ast::Resolved>, AccessDenied>
     where
@@ -117,7 +117,7 @@ impl PolicyAgent for BridgePolicyAgent {
         &self,
         _data: &C,
         _id: &proto::EntityId,
-        _collection: &proto::CollectionId,
+        _collection: &proto::ModelId,
         _state: &proto::State,
     ) -> Result<(), AccessDenied>
     where
@@ -249,7 +249,7 @@ async fn test_event_bridge_respects_read_policy_on_send() -> Result<()> {
     // The security property: the hidden event never reached the client, and
     // neither did the rest of the redacted window (a partial chain would
     // lose operations). The client's view of the entity is stale but honest.
-    let collection_c = ctx_c.collection(&Pet::collection()).await?;
+    let collection_c = common::collection_of::<Pet>(&ctx_c).await?;
     let ids: HashSet<_> = collection_c.dump_entity_events(pet_id).await?.iter().map(|e| e.payload.id()).collect();
     assert!(!ids.contains(&denied_id), "the read-denied event must not reach the client through any path");
     // The non-denied tip MAY reach the client: its verification attempt

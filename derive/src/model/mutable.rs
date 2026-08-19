@@ -70,7 +70,12 @@ pub fn mutable_impl(model: &crate::model::description::ModelDescription) -> Toke
 
             fn new(entity: #base::entity::Entity) -> Self {
                 use #base::property::FromEntity;
-                assert_eq!(entity.collection(), &Self::collection());
+                // See the matching check in the generated View: the entity
+                // belongs to this model, whenever the declaration has an
+                // identity for the entity's epoch to check it against.
+                if let Some(model) = <#name as #base::model::Model>::descriptor().resolved.get(entity.schema_epoch()) {
+                    assert_eq!(entity.collection(), &model);
+                }
                 Self {
                     // #( #active_field_names: #active_field_types_turbofish::from_entity(#active_field_name_strs.into(), &entity), )*
                     entity,

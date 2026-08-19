@@ -734,7 +734,7 @@ where
         let node = self.node().ok_or_else(|| RetrievalError::Other("node dropped during catalog lookup".to_owned()))?;
         let selection = ankql::ast::Selection { predicate: field_eq_id(SystemProperty::Model, *model), order_by: None, limit: None };
         let mut rows: Vec<proto::Attested<proto::EntityState>> =
-            node.collections.get(&catalog_collection_id(model_property_collection())).await?.fetch_states(&selection).await?;
+            node.collections.get(&model_property_collection()).await?.fetch_states(&selection).await?;
         // Lowest membership id first, so repeated calls are deterministic
         // even over historical duplicates.
         rows.sort_by_key(|state| state.payload.entity_id);
@@ -792,7 +792,7 @@ where
         let selection = ankql::ast::Selection { predicate, order_by: None, limit: None };
         let mut best: Option<(EntityId, BTreeMap<PropertyId, Option<Value>>)> = None;
         let node = self.node().ok_or_else(|| RetrievalError::Other("node dropped during catalog lookup".to_owned()))?;
-        for state in node.collections.get(&catalog_collection_id(collection)).await?.fetch_states(&selection).await? {
+        for state in node.collections.get(&collection).await?.fetch_states(&selection).await? {
             let id = state.payload.entity_id;
             if best.as_ref().is_some_and(|(b, _)| *b <= id) {
                 continue;
@@ -868,7 +868,7 @@ where
         expected_model: &ModelId,
     ) -> Result<Option<(BTreeMap<PropertyId, Option<Value>>, proto::Clock)>, RetrievalError> {
         let node = self.node().ok_or_else(|| RetrievalError::Other("node dropped during catalog lookup".to_owned()))?;
-        let state = match node.collections.get(&catalog_collection_id(*expected_model)).await?.get_state(id).await {
+        let state = match node.collections.get(expected_model).await?.get_state(id).await {
             Ok(state) => state,
             Err(RetrievalError::EntityNotFound(_)) => return Ok(None),
             Err(e) => return Err(e),
@@ -876,7 +876,7 @@ where
         // Per-collection storage already scopes the read; keep the routing
         // check anyway so a mis-filed id reads as absent rather than as a
         // definition of the wrong kind.
-        if state.payload.collection != catalog_collection_id(*expected_model) {
+        if state.payload.collection != *expected_model {
             return Ok(None);
         }
         let head = state.payload.state.head.clone();
@@ -984,16 +984,6 @@ fn entity_id_field(values: &BTreeMap<PropertyId, Option<Value>>, field: SystemPr
     }
 }
 
-/// The storage collection for a catalog model: the event's routing
-/// materialization in this write-only phase, always derived from the same
-/// model the membership operation asserts.
-fn catalog_collection_id(model: ModelId) -> proto::CollectionId {
-    match model {
-        ModelId::System(system) => proto::CollectionId::fixed_name(crate::schema::system_collection_label(system)),
-        ModelId::EntityId(_) => unreachable!("catalog collections are system models"),
-    }
-}
-
 /// Mint a catalog entity: the genesis carries its full definition state and
 /// its membership, and its own content derives the entity id the allocator
 /// hands out. There is no id before the definition exists.
@@ -1004,7 +994,7 @@ fn catalog_collection_id(model: ModelId) -> proto::CollectionId {
 fn creation(system: EntityId, model: ModelId, fields: Vec<(&str, Value)>) -> proto::Event {
     let mut operations = lww_operations(fields.into_iter().map(|(name, value)| (name, Some(value))).collect());
     operations.push(Operation::Membership(Membership::Add(model)));
-    proto::Event::genesis(catalog_collection_id(model), Some(system), proto::AuthorId::Unknown, operations)
+    proto::Event::genesis(model, Some(system), proto::AuthorId::Unknown, operations)
 }
 
 /// A follow-up event carrying changed metadata, parented at the entity's
@@ -1016,7 +1006,7 @@ fn follow_up(model: ModelId, entity_id: EntityId, parent: proto::Clock, fields: 
 
 /// A metadata follow-up that may clear fields as well as replace them.
 fn follow_up_patch(model: ModelId, entity_id: EntityId, parent: proto::Clock, fields: Vec<(&str, Option<Value>)>) -> proto::Event {
-    proto::Event::update(catalog_collection_id(model), entity_id, parent, proto::AuthorId::Unknown, lww_operations(fields))
+    proto::Event::update(model, entity_id, parent, proto::AuthorId::Unknown, lww_operations(fields))
 }
 
 /// Encode catalog field values as one LWW backend batch.

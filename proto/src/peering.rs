@@ -1,7 +1,7 @@
 use bincode::Options;
 use serde::{Deserialize, Serialize};
 
-use crate::{clock::Clock, id::EntityId, Attested, CollectionId, EntityState, StateBuffers};
+use crate::{clock::Clock, id::EntityId, Attested, EntityState, StateBuffers};
 
 /// The wire protocol version this binary speaks.
 ///
@@ -111,7 +111,11 @@ struct LegacyId([u8; 16]);
 #[allow(dead_code)]
 struct LegacyEntityState {
     entity_id: LegacyId,
-    collection: CollectionId,
+    /// A 0.9.x peer addressed the collection by source-level label, so this
+    /// stays the bincode String that encoding puts on the wire. Frozen for
+    /// [`LegacyId`]'s reason: version-0 detection must keep reading exactly
+    /// the bytes 0.9.x sends, whatever the live shape becomes.
+    collection: String,
     state: LegacyState,
 }
 
@@ -209,7 +213,7 @@ mod tests {
             system_root: Some(Attested::opt(
                 LegacyEntityState {
                     entity_id: LegacyId([9; 16]),
-                    collection: CollectionId::fixed_name("_ankurah_system"),
+                    collection: "_ankurah_system".to_string(),
                     state: LegacyState::default(),
                 },
                 None,

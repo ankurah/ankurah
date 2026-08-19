@@ -10,7 +10,7 @@ use ankurah_core::{
     storage::{StorageDump, StorageDumpItem},
 };
 use ankurah_proto::{
-    Attestation, AttestationSet, Attested, Clock, CollectionId, EntityId, EntityState, Event, EventBody, EventFragment, EventId, State,
+    Attestation, AttestationSet, Attested, Clock, EntityId, EntityState, Event, EventBody, EventFragment, EventId, ModelId, State,
     StateBuffers, StateFragment,
 };
 use async_trait::async_trait;
@@ -58,8 +58,8 @@ enum DumpPhase {
 struct PostgresDumpCursor {
     pool: Pool,
     phase: DumpPhase,
-    event_collections: Vec<CollectionId>,
-    state_collections: Vec<CollectionId>,
+    event_collections: Vec<ModelId>,
+    state_collections: Vec<ModelId>,
     collection_index: usize,
     after_event: Option<EventId>,
     after_state: Option<EntityId>,
@@ -112,7 +112,7 @@ impl PostgresDumpCursor {
 
 async fn event_page(
     client: &tokio_postgres::Client,
-    collection: &CollectionId,
+    collection: &ModelId,
     after: Option<&EventId>,
 ) -> anyhow::Result<Vec<(EventId, Attested<Event>)>> {
     let table = quote_identifier(&format!("{collection}_event"));
@@ -144,10 +144,10 @@ async fn event_page(
 
 async fn state_page(
     client: &tokio_postgres::Client,
-    collection: &CollectionId,
+    collection: &ModelId,
     after: Option<&EntityId>,
 ) -> anyhow::Result<Vec<(EntityId, Attested<EntityState>)>> {
-    let table = quote_identifier(collection.as_str());
+    let table = quote_identifier(&collection.to_string());
     let rows = if let Some(after) = after {
         client
             .query(
@@ -185,19 +185,24 @@ async fn state_page(
 
 // Temporary until StorageEngine exposes its collection registry: recognize
 // current Ankurah tables by their required columns.
-async fn discover_collections_from_schema(client: &tokio_postgres::Client) -> anyhow::Result<(Vec<CollectionId>, Vec<CollectionId>)> {
+async fn discover_collections_from_schema(client: &tokio_postgres::Client) -> anyhow::Result<(Vec<ModelId>, Vec<ModelId>)> {
     let columns = table_columns(client).await?;
     let state_columns = ["id", "state_buffer", "memberships", "head", "attestations"];
     let event_columns = ["id", "entity_id", "body", "parent", "attestations"];
     let mut events = Vec::new();
     let mut states = Vec::new();
     for (name, columns) in columns {
+        // A table is named for the model it holds, so the identity reads
+        // back off the name this engine wrote; a table that is not one of
+        // ours does not name a model and is not part of the dump.
         if state_columns.iter().all(|column| columns.contains(*column)) {
-            states.push(CollectionId::from(name.clone()));
+            if let Ok(collection) = name.parse::<ModelId>() {
+                states.push(collection);
+            }
         }
         if event_columns.iter().all(|column| columns.contains(*column)) {
-            if let Some(collection) = name.strip_suffix("_event") {
-                events.push(CollectionId::from(collection));
+            if let Some(Ok(collection)) = name.strip_suffix("_event").map(str::parse::<ModelId>) {
+                events.push(collection);
             }
         }
     }
@@ -247,7 +252,9 @@ mod tests {
         let host = container.get_host().await?;
         let port = container.get_host_port_ipv4(5432).await?;
         let storage = Postgres::open(&format!("host={host} port={port} user=postgres password=postgres dbname=ankurah")).await?;
-        let collection_id = CollectionId::from("dump_pages");
+        // A stand-in model identity: this test needs SOME collection, never a
+        // particular one.
+        let collection_id = ModelId::EntityId(EntityId::from_bytes([0xfc; 32]));
         let collection = storage.collection(&collection_id).await?;
 
         let mut expected_events = BTreeSet::new();

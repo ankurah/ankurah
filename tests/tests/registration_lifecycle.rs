@@ -135,7 +135,11 @@ fn resolve_by_collection(node: &TestNode, collection: &str, name: &str) -> Optio
 /// The stored catalog head for an entity (head-comparison helper; mirrors
 /// schema_registration.rs).
 async fn catalog_head(node: &TestNode, collection: &str, id: EntityId) -> anyhow::Result<proto::Clock> {
-    Ok(node.collections.get(&proto::CollectionId::fixed_name(collection)).await?.get_state(id).await?.payload.state.head)
+    // A test names a catalog collection the way a person does, by its
+    // reserved label; `system_model_id` is the door from that label to the
+    // identity everything past it addresses.
+    let model = ankurah::core::schema::system_model_id(collection).expect("a built-in collection label");
+    Ok(node.collections.get(&model).await?.get_state(id).await?.payload.state.head)
 }
 
 // (a) Auto-assert: create on the ephemeral; the durable executes the

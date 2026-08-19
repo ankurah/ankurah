@@ -54,6 +54,10 @@ pub trait CollectionSchema {
 /// self-description ouroboros -- reading a catalog row asks the catalog
 /// nothing -- and it is also what lets them have an ordinary derived Model,
 /// which is how the catalog projects itself into every node's map.
+///
+/// These are the source-level LABELS a declaration is written under, not
+/// addresses: everything past a query's name-resolution boundary addresses a
+/// model by its [`ModelId`], and a built-in's is fixed at compile time.
 pub const MODEL_COLLECTION_ID: &str = "_ankurah_model";
 pub const PROPERTY_COLLECTION_ID: &str = "_ankurah_property";
 pub const MODEL_PROPERTY_COLLECTION_ID: &str = "_ankurah_model_property";
@@ -66,14 +70,12 @@ pub const fn model_collection() -> ModelId { ModelId::System(SystemModel::Model)
 pub const fn property_collection() -> ModelId { ModelId::System(SystemModel::Property) }
 pub const fn model_property_collection() -> ModelId { ModelId::System(SystemModel::ModelProperty) }
 
-/// Whether `id` is one of the three metadata catalog collections (NOT the
-/// system collection, which replicates via the Presence handshake and has
-/// its own trust story).
-pub fn is_catalog_collection(id: &ModelId) -> bool {
-    matches!(id, ModelId::System(SystemModel::Model | SystemModel::Property | SystemModel::ModelProperty))
-}
-
-/// Whether READS of `collection` bypass the [`crate::policy::PolicyAgent`].
+/// Whether `model` is one of the three metadata catalog collections (NOT the
+/// system collection, which replicates via the Presence handshake and has its
+/// own trust story).
+///
+/// This is the read exemption from the [`crate::policy::PolicyAgent`], and
+/// the classification a write path uses to recognize a catalog event.
 ///
 /// The catalog is what turns a name into an identity, so every node needs the
 /// whole of it before it can run any query at all -- including the query that
@@ -95,8 +97,8 @@ pub fn is_catalog_collection(id: &ModelId) -> bool {
 /// It covers READS only. Catalog writes stay exactly as protected as every
 /// other write: registration is the only writer, its requests are signed and
 /// checked like any other, and each event it emits still passes `check_event`.
-pub fn reads_bypass_policy(collection: &ankurah_proto::CollectionId) -> bool {
-    matches!(collection.as_str(), MODEL_COLLECTION_ID | PROPERTY_COLLECTION_ID | MODEL_PROPERTY_COLLECTION_ID)
+pub fn is_catalog_collection(model: &ModelId) -> bool {
+    matches!(model, ModelId::System(SystemModel::Model | SystemModel::Property | SystemModel::ModelProperty))
 }
 
 /// Whether `id` names one of Ankurah's built-in collections. Built-ins are
@@ -104,11 +106,12 @@ pub fn reads_bypass_policy(collection: &ankurah_proto::CollectionId) -> bool {
 /// cannot be mutated through ordinary user transactions.
 pub fn is_protected_collection(id: &ModelId) -> bool { matches!(id, ModelId::System(_)) }
 
-/// The logical protocol model for today's built-in storage key. This mapping
-/// is deliberately core-local: protocol identity must not depend on the
-/// current materialization name.
-pub fn system_model_id(collection: &str) -> Option<ModelId> {
-    let model = match collection {
+/// The built-in a source-level label names. Labels are what a declaration is
+/// WRITTEN under -- a derived model's `#[model(system = "...")]`, a policy
+/// config key, a query's collection qualifier -- so this is the one door a
+/// built-in's label passes through; past it, the identity travels.
+pub fn system_model_id(label: &str) -> Option<ModelId> {
+    let model = match label {
         crate::system::SYSTEM_COLLECTION_ID => SystemModel::System,
         MODEL_COLLECTION_ID => SystemModel::Model,
         PROPERTY_COLLECTION_ID => SystemModel::Property,
@@ -118,33 +121,20 @@ pub fn system_model_id(collection: &str) -> Option<ModelId> {
     Some(ModelId::System(model))
 }
 
-/// Today's declared collection label for a built-in model. This is schema and
-/// query-qualifier metadata only; storage engines assign private names.
-pub const fn system_collection_label(model: SystemModel) -> &'static str {
-    match model {
-        SystemModel::System => crate::system::SYSTEM_COLLECTION_ID,
-        SystemModel::Model => MODEL_COLLECTION_ID,
-        SystemModel::Property => PROPERTY_COLLECTION_ID,
-        SystemModel::ModelProperty => MODEL_PROPERTY_COLLECTION_ID,
-    }
-}
-
 #[cfg(test)]
 mod model_mapping_tests {
     use super::*;
 
     #[test]
-    fn every_system_model_maps_to_the_current_storage_key_and_back() {
+    fn every_system_model_resolves_from_its_declared_label() {
         let pairs = [
             (SystemModel::System, crate::system::SYSTEM_COLLECTION_ID),
             (SystemModel::Model, MODEL_COLLECTION_ID),
             (SystemModel::Property, PROPERTY_COLLECTION_ID),
             (SystemModel::ModelProperty, MODEL_PROPERTY_COLLECTION_ID),
         ];
-        for (system_model, collection) in pairs {
-            let model = ModelId::System(system_model);
-            assert_eq!(system_collection_label(system_model), collection);
-            assert_eq!(system_model_id(collection), Some(model));
+        for (system_model, label) in pairs {
+            assert_eq!(system_model_id(label), Some(ModelId::System(system_model)));
         }
         assert_eq!(system_model_id("albums"), None);
     }

@@ -23,9 +23,9 @@ async fn local_rejects_phantom_commit() -> anyhow::Result<()> {
     // gate for Album on this node; register explicitly so the typed
     // accessors below resolve and the assertion lands on the phantom's
     // nonexistent BASELINE at commit, which is what this test pins.
-    ctx.register_model::<Album>().await?;
+    let album_model = ctx.register_model::<Album>().await?;
 
-    let phantom = AlbumView::from_entity(node.conjure_evil_phantom(EntityId::random(), Album::collection()));
+    let phantom = AlbumView::from_entity(node.conjure_evil_phantom(EntityId::random(), album_model));
     let trx = ctx.begin();
     phantom.edit(&trx)?.name()?.replace("inside your mind")?;
 
@@ -43,7 +43,7 @@ async fn server_rejects_update_for_nonexistent() -> anyhow::Result<()> {
     client.system.wait_system_ready().await;
 
     let fake_update = proto::Event::update(
-        Album::collection(),
+        common::model_id::<Album>(&client.context(DEFAULT_CONTEXT)?).await?,
         EntityId::random(),
         proto::Clock::new([proto::EventId::from_bytes([1u8; 32])]),
         proto::AuthorId::Unknown,
@@ -87,8 +87,12 @@ async fn server_refuses_a_genesis_whose_content_derives_a_different_id() -> anyh
 
     // Overwrite the derived id with the existing entity's, so the event's own
     // content no longer derives the id it names.
-    let mut fake_create =
-        proto::Event::genesis(Album::collection(), None, proto::AuthorId::Unknown, proto::OperationSet::from_backends(BTreeMap::new()));
+    let mut fake_create = proto::Event::genesis(
+        common::model_id::<Album>(&ctx).await?,
+        None,
+        proto::AuthorId::Unknown,
+        proto::OperationSet::from_backends(BTreeMap::new()),
+    );
     fake_create.entity_id = existing_id;
 
     let resp = client

@@ -10,7 +10,6 @@
 //! and is byte-equal across nodes.
 
 use ankurah::proto;
-use ankurah::Model;
 
 use super::node::SimNode;
 
@@ -166,7 +165,7 @@ pub async fn check_head_antichain(nodes: &[SimNode], universe: &ExpectedUniverse
             }
             // Build the parent map from this node's stored events.
             let events = {
-                let collection = match node.node.collections.get(&super::model::SimRecord::collection()).await {
+                let collection = match node.node.collections.get(&super::model::sim_collection()).await {
                     Ok(c) => c,
                     Err(_) => continue,
                 };
@@ -215,7 +214,7 @@ pub async fn causal_closure(
     frontier: &[proto::EventId],
 ) -> std::collections::HashSet<proto::EventId> {
     let events = {
-        let collection = match node.node.collections.get(&super::model::SimRecord::collection()).await {
+        let collection = match node.node.collections.get(&super::model::sim_collection()).await {
             Ok(c) => c,
             Err(_) => return std::collections::HashSet::new(),
         };

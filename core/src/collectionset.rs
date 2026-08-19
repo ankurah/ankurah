@@ -3,7 +3,7 @@ use std::{
     sync::Arc,
 };
 
-use ankurah_proto::CollectionId;
+use ankurah_proto::ModelId;
 use tokio::sync::RwLock;
 
 use crate::{
@@ -19,13 +19,13 @@ impl<SE> Clone for CollectionSet<SE> {
 
 pub struct Inner<SE> {
     storage_engine: Arc<SE>,
-    collections: RwLock<BTreeMap<CollectionId, StorageCollectionWrapper>>,
+    collections: RwLock<BTreeMap<ModelId, StorageCollectionWrapper>>,
 }
 
 impl<SE: StorageEngine> CollectionSet<SE> {
     pub fn new(storage_engine: Arc<SE>) -> Self { Self(Arc::new(Inner { storage_engine, collections: RwLock::new(BTreeMap::new()) })) }
 
-    pub async fn get(&self, id: &CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
+    pub async fn get(&self, id: &ModelId) -> Result<StorageCollectionWrapper, RetrievalError> {
         let collections = self.0.collections.read().await;
         if let Some(store) = collections.get(id) {
             return Ok(store.clone());
@@ -45,7 +45,7 @@ impl<SE: StorageEngine> CollectionSet<SE> {
         Ok(collection)
     }
 
-    pub async fn list_collections(&self) -> Result<Vec<CollectionId>, RetrievalError> {
+    pub async fn list_collections(&self) -> Result<Vec<ModelId>, RetrievalError> {
         // Just return collections we have in memory
         let memory_collections = self.0.collections.read().await;
         Ok(memory_collections.keys().cloned().collect())

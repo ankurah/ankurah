@@ -17,7 +17,7 @@ use ankurah::{Node, PermissiveAgent};
 use ankurah_storage_sled::SledStorageEngine;
 use std::sync::Arc;
 
-use super::model::{Field, SimRecord};
+use super::model::{sim_collection, Field, SimRecord};
 use super::transport::{Captured, SimSender};
 use ankurah::Model;
 
@@ -86,7 +86,7 @@ impl SimNode {
                 return Some(state);
             }
         }
-        let collection = self.node.collections.get(&SimRecord::collection()).await.ok()?;
+        let collection = self.node.collections.get(&sim_collection()).await.ok()?;
         match collection.get_state(entity).await {
             Ok(state) => Some(state.payload.state),
             Err(_) => None,
@@ -96,7 +96,7 @@ impl SimNode {
     /// Every entity id this node currently holds materialized state for, in the
     /// `SimRecord` collection. A full table scan via a match-all selection.
     pub async fn known_entities(&self) -> Vec<proto::EntityId> {
-        let Ok(collection) = self.node.collections.get(&SimRecord::collection()).await else {
+        let Ok(collection) = self.node.collections.get(&sim_collection()).await else {
             return Vec::new();
         };
         let selection = ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None };
@@ -117,7 +117,7 @@ impl SimNode {
     /// an unseen entity is correctly rejected by the empty-head guard, so
     /// propagating only the newest event would strand out-of-order receivers).
     pub async fn stored_events(&self, entity: proto::EntityId) -> Vec<Attested<proto::Event>> {
-        let Ok(collection) = self.node.collections.get(&SimRecord::collection()).await else {
+        let Ok(collection) = self.node.collections.get(&sim_collection()).await else {
             return Vec::new();
         };
         collection.dump_entity_events(entity).await.unwrap_or_default()

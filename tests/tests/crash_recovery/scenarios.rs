@@ -37,8 +37,16 @@ type CrashNode = Node<CrashStorageEngine<SledStorageEngine>, PermissiveAgent>;
 /// creation event's membership asserts -- without spending crash-countable
 /// storage writes on registration. Registration is bootstrap here, not
 /// workload.
+/// The Album model identity these scenarios seed, which is also the
+/// collection its entities are stored in. Deterministic on purpose: a parent
+/// that reopens a crashed child's storage has no catalog to ask, so the
+/// address has to be one both processes already agree on.
+fn album_collection() -> proto::ModelId { proto::ModelId::EntityId(album_model_id()) }
+
+fn album_model_id() -> proto::EntityId { proto::EntityId::from_bytes([0x6A; 32]) }
+
 fn seed_album_catalog<SE: StorageEngine + Send + Sync + 'static>(node: &Node<SE, PermissiveAgent>) -> Result<()> {
-    let model_id = proto::EntityId::from_bytes([0x6A; 32]);
+    let model_id = album_model_id();
     let model = proto::RegisteredModel {
         id: model_id,
         label: Album::descriptor().label.to_owned(),
@@ -146,7 +154,7 @@ async fn scenario_1_commit_event_before_set_state() -> Result<()> {
 
     // Reopen the surviving sled directory through the production opener.
     let engine = reopen_sled(&dir)?;
-    let collection = engine.collection(&Album::collection()).await?;
+    let collection = engine.collection(&album_collection()).await?;
 
     // The core invariant: no persisted state references a missing event.
     assert_state_heads_resolvable(&collection, &[entity_id]).await?;
@@ -223,7 +231,7 @@ async fn scenario_2_mid_batch() -> Result<()> {
 
     // Reopen and verify partial-batch durability against the invariant.
     let engine = reopen_sled(&dir)?;
-    let collection = engine.collection(&Album::collection()).await?;
+    let collection = engine.collection(&album_collection()).await?;
 
     // Global invariant: nothing persisted references a missing event.
     assert_state_heads_resolvable(&collection, &entity_ids).await?;
@@ -251,7 +259,7 @@ async fn scenario_2_mid_batch() -> Result<()> {
     // node's schema epoch, which exists only once the system is ready.
     node.system.wait_system_ready().await;
     seed_album_catalog(&node)?;
-    let collection2 = node.system.collection(&Album::collection()).await?;
+    let collection2 = node.system.collection(&album_collection()).await?;
     node.system.wait_system_ready().await;
     assert!(node.system.is_system_ready(), "reopened durable node must load its persisted system root");
     redeliver(&node, events.clone()).await?;
@@ -349,7 +357,7 @@ async fn scenario_3_mid_merge() -> Result<()> {
     assert!(!pre_head.is_empty(), "child must record the pre-merge head");
 
     let engine = reopen_sled(&dir)?;
-    let collection = engine.collection(&Album::collection()).await?;
+    let collection = engine.collection(&album_collection()).await?;
 
     // Invariant 1: no persisted state references a missing event.
     assert_state_heads_resolvable(&collection, &[entity_id]).await?;
@@ -410,7 +418,7 @@ async fn scenario_4_entity_creation() -> Result<()> {
     assert_eq!(events.len(), 1, "expected the creation event recorded");
 
     let engine = reopen_sled(&dir)?;
-    let collection = engine.collection(&Album::collection()).await?;
+    let collection = engine.collection(&album_collection()).await?;
 
     // Invariant: no persisted state references a missing event. The state write
     // never started, so there must be no persisted state for the entity.
@@ -427,7 +435,7 @@ async fn scenario_4_entity_creation() -> Result<()> {
     node.system.wait_system_ready().await;
     assert!(node.system.is_system_ready(), "reopened durable node must be system-ready");
     seed_album_catalog(&node)?;
-    let collection2 = node.system.collection(&Album::collection()).await?;
+    let collection2 = node.system.collection(&album_collection()).await?;
     redeliver(&node, events.clone()).await?;
 
     assert_state_heads_resolvable(&collection2, &[entity_id]).await?;

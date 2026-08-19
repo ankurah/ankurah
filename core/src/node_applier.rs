@@ -54,10 +54,10 @@ impl NodeApplier {
                 // the read to; with none, this node holds no query that could
                 // have asked for it. The catalog projection is the one
                 // standing query that carries no credential by design
-                // (crate::schema::reads_bypass_policy), and its pushes are
+                // (crate::schema::is_catalog_collection), and its pushes are
                 // what keep every node's catalog current, so they are admitted
                 // on the subscription alone.
-                if cdata.is_empty() && !crate::schema::reads_bypass_policy(&update.collection) {
+                if cdata.is_empty() && !crate::schema::is_catalog_collection(&update.collection) {
                     return Err(MutationError::InvalidUpdate("Should not be receiving updates without at least predicate context"));
                 }
                 let collection = node.collections.get(&update.collection).await?;
@@ -88,7 +88,7 @@ impl NodeApplier {
         node: &Node<SE, PA>,
         from_peer_id: &proto::EntityId,
         entity_id: proto::EntityId,
-        collection_id: &proto::CollectionId,
+        collection_id: &proto::ModelId,
         event_fragments: Vec<proto::EventFragment>,
         event_getter: &E,
     ) -> Result<Vec<Attested<proto::Event>>, MutationError>

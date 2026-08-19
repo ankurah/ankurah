@@ -192,8 +192,12 @@ fn make_event(seed: u16, backend_name: &str, operations: Vec<Operation>, parents
         &parent,
         OperationSet::from_backends(BTreeMap::from([(backend_name.to_string(), operations)])),
     );
-    Event { entity_id, collection: "conformance".into(), body, parent }
+    Event { entity_id, collection: fixture_collection(), body, parent }
 }
+
+/// A stand-in model identity for fixtures: these tests need events that
+/// belong to SOME model, never a particular one.
+fn fixture_collection() -> ankurah_proto::ModelId { ankurah_proto::ModelId::EntityId(EntityId::from_bytes([0xfc; 32])) }
 
 /// Assemble an [`EventLayer`] from event references, deriving the DAG skeleton
 /// (event id -> parent ids) from the events themselves plus any extra context

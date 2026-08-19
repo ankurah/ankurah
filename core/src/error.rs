@@ -1,6 +1,6 @@
 use std::{collections::BTreeSet, convert::Infallible};
 
-use ankurah_proto::{CollectionId, DecodeError, EntityId, EventId};
+use ankurah_proto::{DecodeError, EntityId, EventId, ModelId};
 use thiserror::Error;
 
 use crate::{connector::SendError, policy::AccessDenied};
@@ -20,7 +20,7 @@ pub enum RetrievalError {
     #[error("Storage error: {0}")]
     StorageError(Box<dyn std::error::Error + Send + Sync + 'static>),
     #[error("Collection not found: {0}")]
-    CollectionNotFound(CollectionId),
+    CollectionNotFound(ModelId),
     #[error("Update failed: {0}")]
     FailedUpdate(Box<dyn std::error::Error + Send + Sync + 'static>),
     #[error("Deserialization error: {0}")]
@@ -307,7 +307,7 @@ pub enum ValidationError {
 #[derive(Debug)]
 pub enum ApplyError {
     Items(Vec<ApplyErrorItem>),
-    CollectionNotFound(CollectionId),
+    CollectionNotFound(ModelId),
     RetrievalError(Box<RetrievalError>),
     MutationError(Box<MutationError>),
 }
@@ -343,7 +343,7 @@ impl std::error::Error for ApplyError {
 #[derive(Debug)]
 pub struct ApplyErrorItem {
     pub entity_id: EntityId,
-    pub collection: CollectionId,
+    pub collection: ModelId,
     pub cause: MutationError,
 }
 

@@ -21,7 +21,7 @@
 //! NULL.
 
 use ankql::ast::{Expr, OrderByItem, Parsed, PathExpr, Predicate, PropertyIdExt, PropertyPath, Resolved, Selection};
-use ankurah_proto::{CollectionId, ModelId, PropertyId, SystemProperty};
+use ankurah_proto::{ModelId, PropertyId, SystemProperty};
 use thiserror::Error;
 
 use super::catalog::CatalogManager;
@@ -508,21 +508,16 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    /// Resolve a RAW selection against `collection`: bind its names through
-    /// the catalog's current display names and canonicalize its comparison
-    /// values. A selection with no property references never needs the model
-    /// scope at all.
-    pub fn resolve_selection(
-        &self,
-        collection: &CollectionId,
-        selection: Selection<Parsed>,
-    ) -> Result<Selection<Resolved>, RetrievalError> {
-        let Some(model) = self.model_id_for(collection.as_str()) else {
-            return resolve_without_model(&selection).ok_or_else(|| {
-                RetrievalError::Other(format!("collection '{collection}' is not a registered model; its property names cannot resolve"))
-            });
-        };
-        resolve_selection(&model, self, selection).map_err(|error| RetrievalError::Other(error.to_string()))
+    /// Resolve a RAW selection against `model`: bind its names through the
+    /// catalog's current display names and canonicalize its comparison
+    /// values. A selection with no property references never needs the
+    /// catalog at all, which is what lets a query over `true` run against a
+    /// model this node's catalog has not heard of yet.
+    pub fn resolve_selection(&self, model: &ModelId, selection: Selection<Parsed>) -> Result<Selection<Resolved>, RetrievalError> {
+        if let Some(resolved) = resolve_without_model(&selection) {
+            return Ok(resolved);
+        }
+        resolve_selection(model, self, selection).map_err(|error| RetrievalError::Other(error.to_string()))
     }
 
     /// Bind a compiled declaration to this system's durable identities from

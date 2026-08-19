@@ -10,7 +10,7 @@ use ankurah::core::{
     util::Iterable,
 };
 use ankurah::proto::{self, Attested};
-use ankurah::{Model, Mutable, Node};
+use ankurah::Node;
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -19,10 +19,11 @@ use std::sync::Arc;
 
 use common::{Album, AlbumView};
 
-/// Permissive except for `check_event` on the album collection, where only
-/// the first event is allowed. Used to pin commit failure atomicity: a
-/// denial partway through a multi-entity transaction must leave NOTHING
-/// durable.
+/// Permissive except for `check_event` on an ordinary collection, where only
+/// the first event is allowed. Built-in collections are exempt so the
+/// catalog writes of the test's own registration do not consume the
+/// allowance. Used to pin commit failure atomicity: a denial partway through
+/// a multi-entity transaction must leave NOTHING durable.
 #[derive(Clone)]
 struct DenySecondAlbumEventAgent {
     album_checks: Arc<AtomicUsize>,
@@ -68,7 +69,7 @@ impl PolicyAgent for DenySecondAlbumEventAgent {
         _entity_after: &Entity,
         event: &proto::Event,
     ) -> Result<Option<proto::Attestation>, AccessDenied> {
-        if event.collection.as_str() == "album" && self.album_checks.fetch_add(1, Ordering::SeqCst) >= 1 {
+        if !ankurah::core::schema::is_protected_collection(&event.collection) && self.album_checks.fetch_add(1, Ordering::SeqCst) >= 1 {
             return Err(AccessDenied::ByPolicy("test agent denies the second album event"));
         }
         Ok(None)
@@ -96,7 +97,7 @@ impl PolicyAgent for DenySecondAlbumEventAgent {
         Ok(())
     }
 
-    fn can_access_collection<C>(&self, _data: &C, _collection: &proto::CollectionId) -> Result<(), AccessDenied>
+    fn can_access_collection<C>(&self, _data: &C, _collection: &proto::ModelId) -> Result<(), AccessDenied>
     where C: Iterable<Self::ContextData> {
         Ok(())
     }
@@ -104,7 +105,7 @@ impl PolicyAgent for DenySecondAlbumEventAgent {
     fn filter_predicate<C>(
         &self,
         _data: &C,
-        _collection: &proto::CollectionId,
+        _collection: &proto::ModelId,
         predicate: Predicate<ankql::ast::Resolved>,
     ) -> Result<Predicate<ankql::ast::Resolved>, AccessDenied>
     where
@@ -117,7 +118,7 @@ impl PolicyAgent for DenySecondAlbumEventAgent {
         &self,
         _data: &C,
         _id: &proto::EntityId,
-        _collection: &proto::CollectionId,
+        _collection: &proto::ModelId,
         _state: &proto::State,
     ) -> Result<(), AccessDenied>
     where
@@ -163,7 +164,7 @@ async fn test_multi_entity_commit_denial_leaves_nothing_durable() -> Result<()> 
     assert!(result.is_err(), "commit must fail when any event is denied, got {result:?}");
 
     // Failure atomicity: no event for EITHER entity may be durable.
-    let collection = ctx.collection(&Album::collection()).await?;
+    let collection = common::collection_of::<Album>(&ctx).await?;
     for (label, id) in [("first", id1), ("second", id2)] {
         let events = collection.dump_entity_events(id).await?;
         assert!(events.is_empty(), "{label} entity must have zero durable events after denied commit, found {}", events.len());

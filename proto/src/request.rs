@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::{
-    auth::Attested, clock::Clock, collection::CollectionId, data::Event, id::EntityId, subscription::QueryId, transaction::TransactionId,
-    EntityState, EventFragment, EventId, RegisterModel, RegisteredModel, StateFragment,
+    auth::Attested, clock::Clock, data::Event, id::EntityId, subscription::QueryId, transaction::TransactionId, EntityState, EventFragment,
+    EventId, ModelId, RegisterModel, RegisteredModel, StateFragment,
 };
 
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Serialize, Deserialize, Hash, Default)]
@@ -111,7 +111,7 @@ pub enum DeltaContent {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct EntityDelta {
     pub entity_id: EntityId,
-    pub collection: CollectionId,
+    pub collection: ModelId,
     pub content: DeltaContent,
 }
 
@@ -125,21 +125,21 @@ pub enum NodeRequestBody {
     },
     // Request to fetch entities matching a predicate
     Get {
-        collection: CollectionId,
+        collection: ModelId,
         ids: Vec<EntityId>,
     },
     GetEvents {
-        collection: CollectionId,
+        collection: ModelId,
         event_ids: Vec<EventId>,
     },
     Fetch {
-        collection: CollectionId,
+        collection: ModelId,
         selection: ast::Selection<ast::Resolved>,
         known_matches: Vec<KnownEntity>,
     },
     SubscribeQuery {
         query_id: QueryId,
-        collection: CollectionId,
+        collection: ModelId,
         selection: ast::Selection<ast::Resolved>,
         version: u32,
         known_matches: Vec<KnownEntity>,

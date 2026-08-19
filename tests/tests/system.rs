@@ -1,6 +1,6 @@
 mod common;
 use ankurah::core::storage::StorageEngine;
-use ankurah::{policy::DEFAULT_CONTEXT, proto::CollectionId, Node, PermissiveAgent};
+use ankurah::{policy::DEFAULT_CONTEXT, proto::ModelId, Node, PermissiveAgent};
 use ankurah_connector_local_process::LocalProcessConnection;
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
@@ -276,7 +276,7 @@ async fn a_pending_join_never_overwrites_the_system_actually_joined() -> Result<
 /// over it would load. Reads what is there without opening the collection,
 /// so asking the question cannot itself materialize it.
 async fn root_persisted(engine: &Arc<SledStorageEngine>) -> Result<bool> {
-    let collection_id = CollectionId::fixed_name("_ankurah_system");
+    let collection_id = ankurah::core::system::system_collection();
     if !engine.list_collections()?.contains(&collection_id) {
         return Ok(false);
     }
@@ -301,13 +301,22 @@ async fn wait_root_persisted(engine: &Arc<SledStorageEngine>) -> Result<()> {
 
 /// The three catalog collections the durable warm opens at startup, in
 /// sorted order for census comparisons.
-fn with_catalog(mut others: Vec<CollectionId>) -> Vec<CollectionId> {
-    others.extend(["_ankurah_model", "_ankurah_model_property", "_ankurah_property"].map(CollectionId::fixed_name));
+fn with_catalog(mut others: Vec<ModelId>) -> Vec<ModelId> {
+    use ankurah::core::schema::{model_collection, model_property_collection, property_collection};
+    others.extend([model_collection(), model_property_collection(), property_collection()]);
     others.sort();
     others
 }
 
-fn sorted(mut v: Vec<CollectionId>) -> Vec<CollectionId> {
+/// The system collection plus `others`, sorted: the census a node's storage
+/// shows once its catalog projection has run.
+fn with_system(others: Vec<ModelId>) -> Vec<ModelId> {
+    let mut all = vec![ankurah::core::system::system_collection()];
+    all.extend(others);
+    with_catalog(all)
+}
+
+fn sorted(mut v: Vec<ModelId>) -> Vec<ModelId> {
     v.sort();
     v
 }
@@ -319,7 +328,7 @@ async fn test_system_root_change_behavior() -> Result<()> {
     let ephemeral_engine = Arc::new(SledStorageEngine::new_test().unwrap());
 
     // Get initial root state
-    let initial_root = {
+    let (initial_root, pet) = {
         // Create and initialize durable node
         let durable_node = Node::new_durable(durable_engine.clone(), PermissiveAgent::new());
         durable_node.system.create().await?;
@@ -356,28 +365,26 @@ async fn test_system_root_change_behavior() -> Result<()> {
             "Both nodes should have same root state after initial setup"
         );
 
-        let trx = ephemeral_node.context(DEFAULT_CONTEXT)?.begin();
+        let ctx = ephemeral_node.context(DEFAULT_CONTEXT)?;
+        let trx = ctx.begin();
         trx.create(&Pet { name: "Fido".into(), age: "3".to_string() }).await?;
         trx.commit().await?;
+        // The identity that create registered: the collection its entities
+        // are stored in, and the one later blocks look for in this engine.
+        let pet = ctx.register_model::<Pet>().await?;
 
         // Every node materializes the catalog collections now: readiness means
         // the catalog projection has run, and its queries open them.
-        assert_eq!(
-            sorted(ephemeral_engine.list_collections()?),
-            with_catalog(vec![CollectionId::fixed_name("_ankurah_system"), CollectionId::fixed_name("pet")])
-        );
+        assert_eq!(sorted(ephemeral_engine.list_collections()?), with_system(vec![pet]));
 
         durable_node.catalog.wait_catalog_ready().await;
-        assert_eq!(
-            sorted(durable_engine.list_collections()?),
-            with_catalog(vec![CollectionId::fixed_name("_ankurah_system"), CollectionId::fixed_name("pet")])
-        );
+        assert_eq!(sorted(durable_engine.list_collections()?), with_system(vec![pet]));
 
-        initial_root
+        (initial_root, pet)
     }; // Both nodes and connection are dropped here
 
     // Reset durable node's system (creating new root) but NOT ephemeral node
-    let second_root = {
+    let (second_root, album) = {
         let durable_node = Node::new_durable(durable_engine.clone(), PermissiveAgent::new());
         durable_node.system.wait_loaded().await;
 
@@ -385,22 +392,19 @@ async fn test_system_root_change_behavior() -> Result<()> {
         assert!(durable_node.system.is_system_ready());
 
         durable_node.catalog.wait_catalog_ready().await;
-        assert_eq!(
-            sorted(durable_engine.list_collections()?),
-            with_catalog(vec![CollectionId::fixed_name("_ankurah_system"), CollectionId::fixed_name("pet")])
-        );
+        assert_eq!(sorted(durable_engine.list_collections()?), with_system(vec![pet]));
 
         // Reset storage and reinitialize
         durable_node.system.hard_reset().await?;
 
-        assert_eq!(durable_engine.list_collections()?, Vec::<CollectionId>::new());
+        assert_eq!(durable_engine.list_collections()?, Vec::<ModelId>::new());
 
         assert!(!durable_node.system.is_system_ready());
 
         durable_node.system.create().await?;
 
         durable_node.catalog.wait_catalog_ready().await;
-        assert_eq!(sorted(durable_engine.list_collections()?), with_catalog(vec![CollectionId::fixed_name("_ankurah_system")]));
+        assert_eq!(sorted(durable_engine.list_collections()?), with_system(vec![]));
 
         // Verify root has changed
         let second_root = durable_node.system.root().expect("Should have new root state");
@@ -408,16 +412,15 @@ async fn test_system_root_change_behavior() -> Result<()> {
 
         assert_eq!(second_root.payload.state.head.len(), 1);
 
-        let trx = durable_node.context(DEFAULT_CONTEXT)?.begin();
+        let ctx = durable_node.context(DEFAULT_CONTEXT)?;
+        let trx = ctx.begin();
         trx.create(&Album { name: "Leonard Skynyrd".into(), year: "1973".to_string() }).await?;
         trx.commit().await?;
+        let album = ctx.register_model::<Album>().await?;
 
-        assert_eq!(
-            sorted(durable_engine.list_collections()?),
-            with_catalog(vec![CollectionId::fixed_name("_ankurah_system"), CollectionId::fixed_name("album")])
-        );
+        assert_eq!(sorted(durable_engine.list_collections()?), with_system(vec![album]));
 
-        second_root
+        (second_root, album)
     }; // Drop durable node
 
     // Ephemeral node joins the new system and resets everything
@@ -427,19 +430,13 @@ async fn test_system_root_change_behavior() -> Result<()> {
         assert!(durable_node.system.is_system_ready()); // should be ready when loaded
         assert_eq!(durable_node.system.root(), Some(second_root.clone()));
         durable_node.catalog.wait_catalog_ready().await;
-        assert_eq!(
-            sorted(durable_engine.list_collections()?),
-            with_catalog(vec![CollectionId::fixed_name("_ankurah_system"), CollectionId::fixed_name("album")])
-        );
+        assert_eq!(sorted(durable_engine.list_collections()?), with_system(vec![album]));
 
         let ephemeral_node = Node::new(ephemeral_engine.clone(), PermissiveAgent::new());
         ephemeral_node.system.wait_loaded().await;
         assert!(!ephemeral_node.system.is_system_ready()); // should not be ready before joining
         assert_eq!(ephemeral_node.system.root(), Some(initial_root), "Ephemeral node should have old root prior to joining");
-        assert_eq!(
-            sorted(ephemeral_engine.list_collections()?),
-            with_catalog(vec![CollectionId::fixed_name("_ankurah_system"), CollectionId::fixed_name("pet")])
-        );
+        assert_eq!(sorted(ephemeral_engine.list_collections()?), with_system(vec![pet]));
 
         // Connect nodes
         let _conn = LocalProcessConnection::new(&durable_node, &ephemeral_node).await?;
@@ -452,7 +449,7 @@ async fn test_system_root_change_behavior() -> Result<()> {
         // The re-join wiped storage and starts over: the system collection
         // comes back with the root, once the replacement catalog answers.
         wait_root_persisted(&ephemeral_engine).await?;
-        assert_eq!(sorted(ephemeral_engine.list_collections()?), with_catalog(vec![CollectionId::fixed_name("_ankurah_system")]));
+        assert_eq!(sorted(ephemeral_engine.list_collections()?), with_system(vec![]));
     }
 
     Ok(())

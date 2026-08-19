@@ -201,7 +201,11 @@ async fn catalog_values(
     id: EntityId,
 ) -> anyhow::Result<BTreeMap<String, Option<Value>>> {
     use ankurah::core::property::backend::{LWWBackend, PropertyBackend};
-    let state = node.collections.get(&proto::CollectionId::fixed_name(collection)).await?.get_state(id).await?;
+    // A test names a catalog collection the way a person does, by its
+    // reserved label; `system_model_id` is the door from that label to the
+    // identity everything past it addresses.
+    let model = ankurah::core::schema::system_model_id(collection).expect("a built-in collection label");
+    let state = node.collections.get(&model).await?.get_state(id).await?;
     let buffer = state.payload.state.state_buffers.0.get("lww").expect("catalog entities are LWW").clone();
     // Catalog fields are closed system properties; their id renderings ARE
     // their registered names, so rendering the keys gives the name map the

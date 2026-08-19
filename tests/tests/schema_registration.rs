@@ -49,7 +49,11 @@ fn album_request() -> proto::NodeRequestBody {
 }
 
 async fn catalog_values(node: &TestNode, collection: &str, id: EntityId) -> anyhow::Result<BTreeMap<String, Option<Value>>> {
-    let state = node.collections.get(&proto::CollectionId::fixed_name(collection)).await?.get_state(id).await?;
+    // A test names a catalog collection the way a person does, by its
+    // reserved label; `system_model_id` is the door from that label to the
+    // identity everything past it addresses.
+    let model = ankurah::core::schema::system_model_id(collection).expect("a built-in collection label");
+    let state = node.collections.get(&model).await?.get_state(id).await?;
     let buffer = state.payload.state.state_buffers.0.get("lww").expect("catalog entities are LWW").clone();
     // Catalog collections are name-keyed at the backend layer (the bootstrap
     // exemption), so the values are already keyed by their registered names.
@@ -57,7 +61,11 @@ async fn catalog_values(node: &TestNode, collection: &str, id: EntityId) -> anyh
 }
 
 async fn catalog_head(node: &TestNode, collection: &str, id: EntityId) -> anyhow::Result<proto::Clock> {
-    Ok(node.collections.get(&proto::CollectionId::fixed_name(collection)).await?.get_state(id).await?.payload.state.head)
+    // A test names a catalog collection the way a person does, by its
+    // reserved label; `system_model_id` is the door from that label to the
+    // identity everything past it addresses.
+    let model = ankurah::core::schema::system_model_id(collection).expect("a built-in collection label");
+    Ok(node.collections.get(&model).await?.get_state(id).await?.payload.state.head)
 }
 
 async fn connected_pair(
@@ -737,9 +745,8 @@ async fn ephemeral_node_refuses_execution() -> anyhow::Result<()> {
 struct ProbeAgent {
     on_schema_registration:
         Option<std::sync::Arc<dyn Fn(&ankurah::policy::RegistrationPlan) -> Result<(), ankurah::policy::AccessDenied> + Send + Sync>>,
-    on_event:
-        Option<std::sync::Arc<dyn Fn(&proto::CollectionId, &proto::Event) -> Result<(), ankurah::policy::AccessDenied> + Send + Sync>>,
-    on_collection_access: Option<std::sync::Arc<dyn Fn(&proto::CollectionId) -> Result<(), ankurah::policy::AccessDenied> + Send + Sync>>,
+    on_event: Option<std::sync::Arc<dyn Fn(&proto::ModelId, &proto::Event) -> Result<(), ankurah::policy::AccessDenied> + Send + Sync>>,
+    on_collection_access: Option<std::sync::Arc<dyn Fn(&proto::ModelId) -> Result<(), ankurah::policy::AccessDenied> + Send + Sync>>,
     filter_catalog_properties: bool,
 }
 
@@ -823,7 +830,7 @@ impl ankurah::policy::PolicyAgent for ProbeAgent {
         Ok(())
     }
 
-    fn can_access_collection<C>(&self, _data: &C, collection: &proto::CollectionId) -> Result<(), ankurah::policy::AccessDenied>
+    fn can_access_collection<C>(&self, _data: &C, collection: &proto::ModelId) -> Result<(), ankurah::policy::AccessDenied>
     where C: ankurah::core::util::Iterable<Self::ContextData> {
         if let Some(hook) = &self.on_collection_access {
             hook(collection)?;
@@ -834,13 +841,13 @@ impl ankurah::policy::PolicyAgent for ProbeAgent {
     fn filter_predicate<C>(
         &self,
         _data: &C,
-        collection: &proto::CollectionId,
+        collection: &proto::ModelId,
         predicate: ankql::ast::Predicate<ankql::ast::Resolved>,
     ) -> Result<ankql::ast::Predicate<ankql::ast::Resolved>, ankurah::policy::AccessDenied>
     where
         C: ankurah::core::util::Iterable<Self::ContextData>,
     {
-        if self.filter_catalog_properties && collection.as_str() == ankurah::core::schema::PROPERTY_COLLECTION_ID {
+        if self.filter_catalog_properties && *collection == ankurah::core::schema::property_collection() {
             // An agent narrows a query in the query's own vocabulary, so this
             // is built bound: the catalog's `name` is a frozen system
             // property, addressed by its own identity.
@@ -858,7 +865,7 @@ impl ankurah::policy::PolicyAgent for ProbeAgent {
         &self,
         _data: &C,
         _id: &proto::EntityId,
-        _collection: &proto::CollectionId,
+        _collection: &proto::ModelId,
         _state: &proto::State,
     ) -> Result<(), ankurah::policy::AccessDenied>
     where
@@ -970,7 +977,11 @@ async fn policy_verb_skipped_on_noop_reregistration() -> anyhow::Result<()> {
 async fn count_rows<PA>(node: &Node<SledStorageEngine, PA>, collection: &str) -> anyhow::Result<usize>
 where PA: ankurah::policy::PolicyAgent + Send + Sync + 'static {
     let selection = ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None };
-    Ok(node.collections.get(&proto::CollectionId::fixed_name(collection)).await?.fetch_states(&selection).await?.len())
+    // A test names a catalog collection the way a person does, by its
+    // reserved label; `system_model_id` is the door from that label to the
+    // identity everything past it addresses.
+    let model = ankurah::core::schema::system_model_id(collection).expect("a built-in collection label");
+    Ok(node.collections.get(&model).await?.fetch_states(&selection).await?.len())
 }
 
 /// Duplicate descriptors inside ONE request must coalesce onto a single
@@ -1011,11 +1022,8 @@ async fn registration_policy_denial_aborts_the_remainder_and_heals_on_retry() ->
     let deny_property_once = {
         let armed = armed.clone();
         ProbeAgent {
-            on_event: Some(std::sync::Arc::new(move |collection: &proto::CollectionId, _event: &proto::Event| {
-                // The built-in property catalog routes by its system name.
-                if collection.as_str() == ankurah::core::schema::PROPERTY_COLLECTION_ID
-                    && armed.swap(false, std::sync::atomic::Ordering::SeqCst)
-                {
+            on_event: Some(std::sync::Arc::new(move |collection: &proto::ModelId, _event: &proto::Event| {
+                if *collection == ankurah::core::schema::property_collection() && armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
                     return Err(ankurah::policy::AccessDenied::ByPolicy("property event denied once"));
                 }
                 Ok(())

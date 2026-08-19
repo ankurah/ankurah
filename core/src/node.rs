@@ -1,7 +1,7 @@
 use crate::selection::filter::Filterable;
 use crate::{schema::catalog::CatalogManager, session::SessionSet};
 use ankql::ast::{Parsed, Resolved, Stage};
-use ankurah_proto::{self as proto, Attested, CollectionId, EntityState};
+use ankurah_proto::{self as proto, Attested, EntityState, ModelId};
 use anyhow::anyhow;
 
 use rand::prelude::*;
@@ -98,11 +98,11 @@ impl MatchArgs<Parsed> {
 
 /// The catalog collection a request READS, when it reads one. These are the
 /// requests that bypass the PolicyAgent on both sides
-/// ([`crate::schema::reads_bypass_policy`]): the sender attaches one empty
+/// ([`crate::schema::is_catalog_collection`]): the sender attaches one empty
 /// credential instead of signing, and the server serves them without
 /// consulting its agent. A request that WRITES names no collection here, so a
 /// write can never take the exemption.
-fn catalog_read_collection(body: &proto::NodeRequestBody) -> Option<&proto::CollectionId> {
+fn catalog_read_collection(body: &proto::NodeRequestBody) -> Option<&proto::ModelId> {
     let collection = match body {
         proto::NodeRequestBody::Fetch { collection, .. }
         | proto::NodeRequestBody::Get { collection, .. }
@@ -110,7 +110,7 @@ fn catalog_read_collection(body: &proto::NodeRequestBody) -> Option<&proto::Coll
         | proto::NodeRequestBody::SubscribeQuery { collection, .. } => collection,
         proto::NodeRequestBody::CommitTransaction { .. } | proto::NodeRequestBody::RegisterSchema { .. } => return None,
     };
-    crate::schema::reads_bypass_policy(collection).then_some(collection)
+    crate::schema::is_catalog_collection(collection).then_some(collection)
 }
 
 /// A participant in the Ankurah network, and primary place where queries are initiated
@@ -336,7 +336,7 @@ where
         // A read of a catalog collection carries NO credential. The catalog
         // projection that fills this node's map runs before any session
         // exists to sign with, and the receiving side neither authenticates
-        // nor authorizes these reads (crate::schema::reads_bypass_policy), so
+        // nor authorizes these reads (crate::schema::is_catalog_collection), so
         // there is nothing for a signature to be checked against. Writes are
         // unaffected: they name no collection here and take the ordinary
         // signing path.
@@ -498,8 +498,8 @@ where
                 // through a direct commit_remote_transaction call that
                 // bypasses this guard.
                 for event in &events {
-                    let collection = event.payload.collection.as_str();
-                    if collection.starts_with(crate::schema::RESERVED_COLLECTION_PREFIX) {
+                    let collection = &event.payload.collection;
+                    if crate::schema::is_protected_collection(collection) {
                         return Ok(proto::NodeResponseBody::Error(format!(
                             "collection '{collection}' is protected and not writable by transactions"
                         )));
@@ -680,9 +680,9 @@ where
     /// gate beside the PolicyAgent's policy gate (`check_event`). Membership
     /// operations are ordinary operations on any event; what is restricted
     /// today is emission: an entity's first event must carry exactly one
-    /// Membership::Add -- asserting the same model fact the event's
-    /// collection field materializes (the built-in mapping for system
-    /// collections, the registered model for app collections) -- and no
+    /// Membership::Add, naming the same model the event's own collection
+    /// field names -- an arriving event states the fact twice and this is
+    /// where the two are held to each other -- and no
     /// membership mutations are admitted on later events yet. Application
     /// (`Entity::apply_event`) is deliberately unchecked: the attested event
     /// stream is the membership authority, and this gate controls only what
@@ -707,16 +707,12 @@ where
             [] => return Err(MutationError::InvalidUpdate("an entity's first event must add exactly one membership")),
             _ => return Err(MutationError::InvalidUpdate("an entity's first event cannot add more than one membership")),
         };
-        let expected =
-            crate::schema::system_model_id(event.collection.as_str()).or_else(|| self.catalog.model_id_for(event.collection.as_str()));
-        match expected {
-            Some(expected) if expected == model => Ok(()),
-            Some(_) => Err(MutationError::General(
+        if model == event.collection {
+            Ok(())
+        } else {
+            Err(MutationError::General(
                 format!("membership asserts model {model} but the event routes to collection '{}'", event.collection).into(),
-            )),
-            None => Err(MutationError::General(
-                format!("membership asserts model {model} but collection '{}' has no registered model", event.collection).into(),
-            )),
+            ))
         }
     }
 
@@ -952,7 +948,7 @@ where
 
     pub(crate) async fn get_from_peer(
         &self,
-        collection_id: &CollectionId,
+        collection_id: &ModelId,
         ids: Vec<proto::EntityId>,
         cdata: &Vec<PA::ContextData>,
     ) -> Result<(), RetrievalError> {
@@ -1015,7 +1011,7 @@ where
     ///
     /// Requires the `test-helpers` feature to be enabled.
     #[cfg(feature = "test-helpers")]
-    pub fn conjure_evil_phantom(&self, id: proto::EntityId, collection: proto::CollectionId) -> crate::entity::Entity {
+    pub fn conjure_evil_phantom(&self, id: proto::EntityId, collection: proto::ModelId) -> crate::entity::Entity {
         self.entities.conjure_evil_phantom(id, collection)
     }
 
@@ -1076,7 +1072,7 @@ where
     pub(crate) fn subscribe_remote_query(
         &self,
         query_id: proto::QueryId,
-        collection_id: CollectionId,
+        collection_id: ModelId,
         selection: ankql::ast::Selection<Resolved>,
         sessions: SessionSet<PA::ContextData>,
         version: u32,
@@ -1092,7 +1088,7 @@ where
 
     pub async fn fetch_entities_from_local(
         &self,
-        collection_id: &CollectionId,
+        collection_id: &ModelId,
         selection: &ankql::ast::Selection<Resolved>,
     ) -> Result<Vec<Entity>, RetrievalError> {
         let storage_collection = self.collections.get(collection_id).await?;
@@ -1121,7 +1117,7 @@ pub trait TNodeErased<E: AbstractEntity + Filterable + Send + 'static = Entity>:
     ) -> Result<(), anyhow::Error>;
     async fn fetch_entities_from_local(
         &self,
-        collection_id: &CollectionId,
+        collection_id: &ModelId,
         selection: &ankql::ast::Selection<Resolved>,
     ) -> Result<Vec<E>, RetrievalError>;
     fn reactor(&self) -> &Reactor<E>;
@@ -1132,7 +1128,7 @@ pub trait TNodeErased<E: AbstractEntity + Filterable + Send + 'static = Entity>:
     /// and must resolve before the reactor or the relay sees it.
     fn resolve_selection(
         &self,
-        collection: &CollectionId,
+        collection: &ModelId,
         selection: ankql::ast::Selection<Parsed>,
     ) -> Result<ankql::ast::Selection<Resolved>, RetrievalError>;
 }
@@ -1152,7 +1148,7 @@ where
 
     fn resolve_selection(
         &self,
-        collection: &CollectionId,
+        collection: &ModelId,
         selection: ankql::ast::Selection<Parsed>,
     ) -> Result<ankql::ast::Selection<Resolved>, RetrievalError> {
         self.catalog.resolve_selection(collection, selection)
@@ -1173,7 +1169,7 @@ where
 
     async fn fetch_entities_from_local(
         &self,
-        collection_id: &CollectionId,
+        collection_id: &ModelId,
         selection: &ankql::ast::Selection<Resolved>,
     ) -> Result<Vec<Entity>, RetrievalError> {
         Node::fetch_entities_from_local(self, collection_id, selection).await

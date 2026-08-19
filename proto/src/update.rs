@@ -1,4 +1,4 @@
-use crate::{auth::Attested, data::EntityState, id::EntityId, subscription::QueryId, CollectionId, EventFragment, StateFragment};
+use crate::{auth::Attested, data::EntityState, id::EntityId, subscription::QueryId, EventFragment, ModelId, StateFragment};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -45,7 +45,7 @@ pub enum MembershipChange {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SubscriptionUpdateItem {
     pub entity_id: EntityId,
-    pub collection: CollectionId,
+    pub collection: ModelId,
     pub content: UpdateContent,
     /// Which predicates this update is relevant to and how
     /// Uses PredicateId for remote subscriptions

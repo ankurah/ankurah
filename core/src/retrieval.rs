@@ -145,7 +145,7 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
     C: Iterable<PA::ContextData> + Send + Sync + 'a,
 {
-    collection_id: proto::CollectionId,
+    collection_id: proto::ModelId,
     collection: StorageCollectionWrapper,
     node: &'a Node<SE, PA>,
     cdata: &'a C,
@@ -158,7 +158,7 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
     C: Iterable<PA::ContextData> + Send + Sync + 'a,
 {
-    pub fn new(collection_id: proto::CollectionId, collection: StorageCollectionWrapper, node: &'a Node<SE, PA>, cdata: &'a C) -> Self {
+    pub fn new(collection_id: proto::ModelId, collection: StorageCollectionWrapper, node: &'a Node<SE, PA>, cdata: &'a C) -> Self {
         Self { collection_id, collection, node, cdata, staging: Arc::new(RwLock::new(HashMap::new())) }
     }
 }
@@ -332,6 +332,10 @@ mod tests {
     /// commit funnels would refuse. An update names the seed-derived id
     /// instead, because a fixture's parents are synthetic event ids with no
     /// genesis behind them.
+    /// A stand-in model identity for fixtures: these tests need events that
+    /// belong to SOME model, never a particular one.
+    fn fixture_collection() -> ankurah_proto::ModelId { ankurah_proto::ModelId::EntityId(EntityId::from_bytes([0xfc; 32])) }
+
     fn make_test_event(seed: u8, parent_ids: &[EventId]) -> Event {
         let mut entity_id_bytes = [0u8; 32];
         entity_id_bytes[0] = seed;
@@ -347,7 +351,7 @@ mod tests {
         } else {
             (EntityId::from_bytes(entity_id_bytes), ankurah_proto::EventBody::Update { nonce, timestamp: 0, author, operations })
         };
-        Event { entity_id, collection: "test".into(), body, parent }
+        Event { entity_id, collection: fixture_collection(), body, parent }
     }
 
     // ====================================================================

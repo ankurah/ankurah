@@ -54,7 +54,7 @@ async fn test_concurrent_transactions_same_entity() -> Result<()> {
     assert_eq!(final_album.year().unwrap(), "2025");
 
     // Persisted state must include both concurrent commits in its head
-    let collection = context.collection(&Album::collection()).await?;
+    let collection = common::collection_of::<Album>(&context).await?;
     let stored_state = collection.get_state(album_id).await?;
     let persisted_head = stored_state.payload.state.head;
     let persisted_head_ids: Vec<_> = persisted_head.iter().map(|id| id.to_base64_short()).collect();

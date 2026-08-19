@@ -42,7 +42,7 @@ use tracing::debug;
 #[derive(Debug)]
 pub struct IndexedDBBucket {
     pub(crate) db: Database,
-    pub(crate) collection_id: proto::CollectionId,
+    pub(crate) collection_id: proto::ModelId,
     pub(crate) mutex: tokio::sync::Mutex<()>, // should probably be implemented by Database, but not certain
     pub(crate) invocation_count: AtomicUsize,
     #[cfg(debug_assertions)]
@@ -90,7 +90,7 @@ impl StorageCollection for IndexedDBBucket {
 
             let entity = Object::new(js_sys::Object::new().into());
             entity.set(&*ID_KEY, state.payload.entity_id.to_string())?;
-            entity.set(&*COLLECTION_KEY, self.collection_id.as_str())?;
+            entity.set(&*COLLECTION_KEY, self.collection_id.to_string().as_str())?;
             entity.set(&*STATE_BUFFER_KEY, &state.payload.state.state_buffers)?;
             entity.set(&*MEMBERSHIPS_KEY, memberships_to_js(&state.payload.state.memberships)?)?;
             entity.set(&*HEAD_KEY, &state.payload.state.head)?;
@@ -360,7 +360,7 @@ impl IndexedDBBucket {
         predicate: &ankql::ast::Predicate<EngineColumns>,
         cursor_direction: web_sys::IdbCursorDirection,
         limit: Option<u64>,
-        collection_id: &ankurah_proto::CollectionId,
+        collection_id: &ankurah_proto::ModelId,
         upper_open_ended: bool,
         eq_prefix_len: usize,
         eq_prefix_values: Vec<ankurah_core::value::Value>,
@@ -456,12 +456,12 @@ impl IndexedDBBucket {
 struct IdbRecord {
     id: ankurah_proto::EntityId,
     object: Object,
-    collection_id: ankurah_proto::CollectionId,
+    collection_id: ankurah_proto::ModelId,
 }
 
 impl IdbRecord {
     /// Create a new IdbRecord from a JS object
-    fn new(object: Object, collection_id: ankurah_proto::CollectionId) -> Result<Self, RetrievalError> {
+    fn new(object: Object, collection_id: ankurah_proto::ModelId) -> Result<Self, RetrievalError> {
         let id: ankurah_proto::EntityId = object.get(&ID_KEY)?;
         Ok(Self { id, object, collection_id })
     }
@@ -510,10 +510,7 @@ fn extract_sort_properties(
 }
 
 /// Convert JS object to EntityState using the correct field extraction
-fn js_object_to_entity_state(
-    entity_obj: &Object,
-    collection_id: &ankurah_proto::CollectionId,
-) -> Result<Attested<EntityState>, RetrievalError> {
+fn js_object_to_entity_state(entity_obj: &Object, collection_id: &ankurah_proto::ModelId) -> Result<Attested<EntityState>, RetrievalError> {
     use crate::statics::{ATTESTATIONS_KEY, HEAD_KEY, ID_KEY, MEMBERSHIPS_KEY, STATE_BUFFER_KEY};
     use ankurah_proto::{Attested, EntityId, EntityState, State};
 

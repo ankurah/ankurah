@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{auth::Attested, author::AuthorId, clock::Clock, collection::CollectionId, id::EntityId, AttestationSet, DecodeError};
+use crate::{auth::Attested, author::AuthorId, clock::Clock, id::EntityId, AttestationSet, DecodeError};
 use ankurah_core_types::ModelId;
 
 /// Domain tag for genesis event ids. Separates the two preimage shapes so no
@@ -174,7 +174,7 @@ impl<'de> Deserialize<'de> for EventId {
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Event {
-    pub collection: CollectionId,
+    pub collection: ModelId,
     /// For a genesis this EQUALS the id derived from the body (checked by
     /// [`Event::validate_structure`]); for an update it names the entity the
     /// event extends.
@@ -243,7 +243,7 @@ impl Event {
     /// Mint an entity: freeze `operations` into a genesis, draw its nonce and
     /// timestamp, and derive the entity id from the whole of it. The id is
     /// the return value's `entity_id`.
-    pub fn genesis(collection: CollectionId, system: Option<EntityId>, author: AuthorId, operations: OperationSet) -> Self {
+    pub fn genesis(collection: ModelId, system: Option<EntityId>, author: AuthorId, operations: OperationSet) -> Self {
         let nonce = draw_nonce();
         let timestamp = crate::time::unix_ms_now();
         let entity_id: EntityId = EventId::from_genesis_parts(&system, &nonce, timestamp, &author, &operations).into();
@@ -251,7 +251,7 @@ impl Event {
     }
 
     /// Mint an update extending `parent`, drawing its nonce and timestamp.
-    pub fn update(collection: CollectionId, entity_id: EntityId, parent: Clock, author: AuthorId, operations: OperationSet) -> Self {
+    pub fn update(collection: ModelId, entity_id: EntityId, parent: Clock, author: AuthorId, operations: OperationSet) -> Self {
         Event {
             collection,
             entity_id,
@@ -348,8 +348,8 @@ impl From<Attested<Event>> for EventFragment {
     }
 }
 
-impl From<(EntityId, CollectionId, EventFragment)> for Attested<Event> {
-    fn from(value: (EntityId, CollectionId, EventFragment)) -> Self {
+impl From<(EntityId, ModelId, EventFragment)> for Attested<Event> {
+    fn from(value: (EntityId, ModelId, EventFragment)) -> Self {
         let event = Event { entity_id: value.0, collection: value.1, body: value.2.body, parent: value.2.parent };
         Attested { payload: event, attestations: value.2.attestations }
     }
@@ -364,8 +364,8 @@ pub struct StateFragment {
 impl From<Attested<EntityState>> for StateFragment {
     fn from(attested: Attested<EntityState>) -> Self { Self { state: attested.payload.state, attestations: attested.attestations } }
 }
-impl From<(EntityId, CollectionId, StateFragment)> for Attested<EntityState> {
-    fn from(value: (EntityId, CollectionId, StateFragment)) -> Self {
+impl From<(EntityId, ModelId, StateFragment)> for Attested<EntityState> {
+    fn from(value: (EntityId, ModelId, StateFragment)) -> Self {
         let entity_state = EntityState { entity_id: value.0, collection: value.1, state: value.2.state };
         Attested { payload: entity_state, attestations: value.2.attestations }
     }
@@ -476,7 +476,7 @@ pub struct BackendOperation {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct EntityState {
     pub entity_id: EntityId,
-    pub collection: CollectionId,
+    pub collection: ModelId,
     pub state: State,
 }
 
@@ -549,7 +549,7 @@ impl std::fmt::Display for EntityState {
 }
 
 impl Attested<Event> {
-    pub fn collection(&self) -> &CollectionId { &self.payload.collection }
+    pub fn collection(&self) -> &ModelId { &self.payload.collection }
 }
 
 impl From<Event> for Attested<Event> {
@@ -561,16 +561,16 @@ impl From<EntityState> for Attested<EntityState> {
 }
 
 impl Attested<EntityState> {
-    pub fn to_parts(self) -> (EntityId, CollectionId, StateFragment) {
+    pub fn to_parts(self) -> (EntityId, ModelId, StateFragment) {
         (self.payload.entity_id, self.payload.collection, StateFragment { state: self.payload.state, attestations: self.attestations })
     }
-    pub fn from_parts(entity_id: EntityId, collection: CollectionId, fragment: StateFragment) -> Self {
+    pub fn from_parts(entity_id: EntityId, collection: ModelId, fragment: StateFragment) -> Self {
         Self { payload: EntityState { entity_id, collection, state: fragment.state }, attestations: fragment.attestations }
     }
 }
 
 impl Attested<Event> {
-    pub fn from_parts(entity_id: EntityId, collection: CollectionId, frag: EventFragment) -> Self {
+    pub fn from_parts(entity_id: EntityId, collection: ModelId, frag: EventFragment) -> Self {
         Self { payload: Event { entity_id, collection, body: frag.body, parent: frag.parent }, attestations: frag.attestations }
     }
 }
@@ -605,6 +605,10 @@ mod tests {
     fn operations() -> OperationSet {
         OperationSet::from_backends(BTreeMap::from([("lww".to_string(), vec![BackendOperation { diff: vec![1, 2, 3] }])]))
     }
+
+    /// A registered model's durable identity, standing in here for whatever
+    /// the catalog would have allocated.
+    fn model() -> ModelId { ModelId::EntityId(EntityId::from_bytes([0x9e; 32])) }
 
     /// Both preimages, computed independently, byte for byte. Concatenating
     /// the fields' bincode encodings is the same as encoding the tuple,
@@ -694,7 +698,7 @@ mod tests {
 
     #[test]
     fn a_minted_genesis_names_the_entity_its_content_derives() {
-        let event = Event::genesis("pet".into(), Some(EntityId::from_bytes([9u8; 32])), AuthorId::Unknown, operations());
+        let event = Event::genesis(model(), Some(EntityId::from_bytes([9u8; 32])), AuthorId::Unknown, operations());
         assert!(event.is_entity_create());
         assert!(event.parent.is_empty());
         assert_eq!(EntityId::from(event.id()), event.entity_id);
@@ -702,7 +706,7 @@ mod tests {
 
         // Two create calls draw two nonces: identical payloads are still two
         // distinct entities.
-        let again = Event::genesis("pet".into(), Some(EntityId::from_bytes([9u8; 32])), AuthorId::Unknown, operations());
+        let again = Event::genesis(model(), Some(EntityId::from_bytes([9u8; 32])), AuthorId::Unknown, operations());
         assert_ne!(event.entity_id, again.entity_id);
         assert_ne!(event.nonce(), again.nonce());
     }
@@ -710,21 +714,21 @@ mod tests {
     #[test]
     fn structural_validation_refuses_contradictory_shapes() {
         // A genesis that claims some other entity's id.
-        let mut genesis = Event::genesis("pet".into(), None, AuthorId::Unknown, operations());
+        let mut genesis = Event::genesis(model(), None, AuthorId::Unknown, operations());
         genesis.entity_id = EntityId::from_bytes([0xABu8; 32]);
         assert!(matches!(genesis.validate_structure(), Err(EventStructureError::GenesisIdMismatch { .. })));
 
         // A genesis with a parent clock.
-        let mut genesis = Event::genesis("pet".into(), None, AuthorId::Unknown, operations());
+        let mut genesis = Event::genesis(model(), None, AuthorId::Unknown, operations());
         genesis.parent = Clock::new([EventId::from_bytes([1u8; 32])]);
         assert_eq!(genesis.validate_structure(), Err(EventStructureError::GenesisWithParent));
 
         // An update with no parent: parent is empty if and only if genesis.
-        let update = Event::update("pet".into(), EntityId::from_bytes([7u8; 32]), Clock::default(), AuthorId::Unknown, operations());
+        let update = Event::update(model(), EntityId::from_bytes([7u8; 32]), Clock::default(), AuthorId::Unknown, operations());
         assert_eq!(update.validate_structure(), Err(EventStructureError::UpdateWithoutParent));
 
         let update = Event::update(
-            "pet".into(),
+            model(),
             EntityId::from_bytes([7u8; 32]),
             Clock::new([EventId::from_bytes([1u8; 32])]),
             AuthorId::Unknown,

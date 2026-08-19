@@ -1,6 +1,6 @@
 // TODO: Rename this module from client_relay to remote_subscription for clarity
 use ankql::ast::Resolved;
-use ankurah_proto::{self as proto, CollectionId};
+use ankurah_proto::{self as proto, ModelId};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use std::collections::BTreeMap;
@@ -38,7 +38,7 @@ pub enum Status {
 #[derive(Debug)]
 pub struct Content<CD: ContextData> {
     pub query_id: proto::QueryId,
-    pub collection_id: CollectionId,
+    pub collection_id: ModelId,
     pub selection: ankql::ast::Selection<Resolved>,
     /// The live credential source, read at each attempt's start, so a
     /// reconnect re-registration after a refresh carries the fresh
@@ -115,7 +115,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
     pub fn subscribe_query(
         &self,
         query_id: proto::QueryId,
-        collection_id: CollectionId,
+        collection_id: ModelId,
         selection: ankql::ast::Selection<Resolved>,
         sessions: SessionSet<CD>,
         version: u32,
@@ -195,7 +195,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         &self,
         peer_id: proto::EntityId,
         query_id: proto::QueryId,
-        collection_id: CollectionId,
+        collection_id: ModelId,
         selection: ankql::ast::Selection<Resolved>,
         version: u32,
         sessions: SessionSet<CD>,
@@ -496,7 +496,7 @@ pub trait TNode<CD: ContextData>: Send + Sync {
         &self,
         peer_id: proto::EntityId,
         query_id: proto::QueryId,
-        collection_id: CollectionId,
+        collection_id: ModelId,
         selection: ankql::ast::Selection<Resolved>,
         context_data: Vec<CD>,
         version: u32,
@@ -518,7 +518,7 @@ where
         &self,
         peer_id: proto::EntityId,
         query_id: proto::QueryId,
-        collection_id: CollectionId,
+        collection_id: ModelId,
         selection: ankql::ast::Selection<Resolved>,
         context_data: Vec<PA::ContextData>,
         version: u32,
@@ -591,14 +591,14 @@ mod tests {
     // - Direct calls test the setup mechanism itself (error handling, state transitions)
     // - Event-driven calls test the integration and user-facing API
 
-    // For testing, we'll use CollectionId as our ContextData
-    impl ContextData for CollectionId {}
+    // For testing, we'll use ModelId as our ContextData
+    impl ContextData for ModelId {}
 
     /// Mock message sender for testing
     #[derive(Debug)]
     struct MockMessageSender<CD: ContextData> {
         next_error: Arc<Mutex<Option<RequestError>>>,
-        sent_requests: Arc<Mutex<Vec<(EntityId, proto::QueryId, CollectionId, ankql::ast::Selection<Resolved>)>>>,
+        sent_requests: Arc<Mutex<Vec<(EntityId, proto::QueryId, ModelId, ankql::ast::Selection<Resolved>)>>>,
         should_fail: Arc<Mutex<bool>>,
         failure_message: Arc<Mutex<String>>,
         _phantom: std::marker::PhantomData<CD>,
@@ -617,7 +617,7 @@ mod tests {
 
         fn set_fail_next(&self, error: RequestError) { *self.next_error.lock().unwrap() = Some(error); }
 
-        fn get_sent_requests(&self) -> Vec<(EntityId, proto::QueryId, CollectionId, ankql::ast::Selection<Resolved>)> {
+        fn get_sent_requests(&self) -> Vec<(EntityId, proto::QueryId, ModelId, ankql::ast::Selection<Resolved>)> {
             self.sent_requests.lock().unwrap().clone()
         }
 
@@ -630,7 +630,7 @@ mod tests {
             &self,
             peer_id: EntityId,
             query_id: proto::QueryId,
-            collection_id: CollectionId,
+            collection_id: ModelId,
             selection: ankql::ast::Selection<Resolved>,
             _context_data: Vec<CD>,
             _version: u32,
@@ -650,7 +650,7 @@ mod tests {
             self.sent_requests.lock().unwrap().push((
                 peer_id,
                 query_id,
-                CollectionId::from("unsubscribe"),
+                ModelId::EntityId(EntityId::from_bytes([0xfb; 32])),
                 ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None },
             ));
 
@@ -683,12 +683,12 @@ mod tests {
         ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None }
     }
 
-    fn create_test_collection_id() -> CollectionId { CollectionId::from("test_collection") }
+    fn create_test_collection_id() -> ModelId { ModelId::EntityId(EntityId::from_bytes([0xfc; 32])) }
 
     #[tokio::test]
     async fn test_new_subscription_setup() {
         let relay = SubscriptionRelay::new();
-        let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
+        let mock_sender = Arc::new(MockMessageSender::<ModelId>::new());
         relay.set_node(mock_sender.clone()).expect("Failed to set message sender");
 
         let query_id = proto::QueryId::new();
@@ -723,7 +723,7 @@ mod tests {
     async fn test_peer_disconnection_orphans_subscriptions() {
         let relay = SubscriptionRelay::new();
 
-        let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
+        let mock_sender = Arc::new(MockMessageSender::<ModelId>::new());
         relay.set_node(mock_sender.clone()).expect("Failed to set message sender");
 
         let query_id = proto::QueryId::new();
@@ -752,7 +752,7 @@ mod tests {
     #[tokio::test]
     async fn test_peer_connection_triggers_setup() {
         let relay = SubscriptionRelay::new();
-        let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
+        let mock_sender = Arc::new(MockMessageSender::<ModelId>::new());
         relay.set_node(mock_sender.clone()).expect("Failed to set message sender");
 
         let query_id = proto::QueryId::new();
@@ -786,7 +786,7 @@ mod tests {
     #[tokio::test]
     async fn test_failed_subscription_retry() {
         let relay = SubscriptionRelay::new();
-        let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
+        let mock_sender = Arc::new(MockMessageSender::<ModelId>::new());
         relay.set_node(mock_sender.clone()).expect("Failed to set message sender");
 
         let query_id = proto::QueryId::new();
@@ -832,7 +832,7 @@ mod tests {
     #[tokio::test]
     async fn test_retryable_vs_non_retryable_failures() {
         let relay = SubscriptionRelay::new();
-        let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
+        let mock_sender = Arc::new(MockMessageSender::<ModelId>::new());
         relay.set_node(mock_sender.clone()).expect("Failed to set message sender");
 
         let retryable_query_id = proto::QueryId::new();
@@ -884,7 +884,7 @@ mod tests {
     #[tokio::test]
     async fn test_subscription_removal() {
         let relay = SubscriptionRelay::new();
-        let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
+        let mock_sender = Arc::new(MockMessageSender::<ModelId>::new());
         relay.set_node(mock_sender.clone()).expect("Failed to set message sender");
 
         let query_id = proto::QueryId::new();
@@ -923,7 +923,7 @@ mod tests {
     #[tokio::test]
     async fn test_edge_cases() {
         let relay = SubscriptionRelay::new();
-        let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
+        let mock_sender = Arc::new(MockMessageSender::<ModelId>::new());
 
         let query_id = proto::QueryId::new();
         let collection_id = create_test_collection_id();
@@ -959,7 +959,7 @@ mod tests {
     #[tokio::test]
     async fn test_notify_unsubscribe_with_no_established_subscription() {
         let relay = SubscriptionRelay::new();
-        let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
+        let mock_sender = Arc::new(MockMessageSender::<ModelId>::new());
         relay.set_node(mock_sender.clone()).expect("Failed to set message sender");
 
         let query_id = proto::QueryId::new();

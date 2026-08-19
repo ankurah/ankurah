@@ -111,11 +111,11 @@ const WARM_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(5);
 /// says why. A failure is the warm's failure -- publishing readiness on a
 /// query that will never populate would publish an empty catalog as
 /// authoritative -- and the retry loop tries again.
-async fn wait_projection<R: crate::model::View>(query: &LiveQuery<R>, label: &str) -> Result<(), RetrievalError> {
+async fn wait_projection<R: crate::model::View>(query: &LiveQuery<R>, model: ModelId) -> Result<(), RetrievalError> {
     query
         .wait_initialized()
         .await
-        .map_err(|error| RetrievalError::Other(format!("catalog projection over '{label}' failed to initialize: {error}")))
+        .map_err(|error| RetrievalError::Other(format!("catalog projection over '{model}' failed to initialize: {error}")))
 }
 
 /// Maintains the in-memory catalog map for a node. Held by `Node` beside
@@ -362,11 +362,11 @@ where
         // catalog collections), so reset must not begin deleting collections
         // until it is over. A reset that lands meanwhile invalidates the
         // generation and then waits here, which is the barrier working.
-        let models = self.projection_query::<SysModelRowView>(&node, crate::schema::MODEL_COLLECTION_ID)?;
+        let models = self.projection_query::<SysModelRowView>(&node, crate::schema::model_collection())?;
         models.subscribe_remote(&node, SessionSet::new())?;
-        wait_projection(&models, crate::schema::MODEL_COLLECTION_ID).await?;
-        let properties = self.open_projection(&node, crate::schema::PROPERTY_COLLECTION_ID).await?;
-        let memberships = self.open_projection(&node, crate::schema::MODEL_PROPERTY_COLLECTION_ID).await?;
+        wait_projection(&models, crate::schema::model_collection()).await?;
+        let properties = self.open_projection(&node, crate::schema::property_collection()).await?;
+        let memberships = self.open_projection(&node, crate::schema::model_property_collection()).await?;
 
         // The held setup guard excludes a reset's generation bump (a setup
         // write) between this check and projection/readiness publication.
@@ -388,10 +388,10 @@ where
     /// Open ONE catalog collection's projection query and wait for its first
     /// resultset. Its subscribe request goes out later, one at a time
     /// ([`Self::attach_projection_relays`]).
-    async fn open_projection<R>(&self, node: &Node<SE, PA>, label: &'static str) -> Result<LiveQuery<R>, RetrievalError>
+    async fn open_projection<R>(&self, node: &Node<SE, PA>, model: proto::ModelId) -> Result<LiveQuery<R>, RetrievalError>
     where R: crate::model::View + Clone + Send + Sync + 'static {
-        let query = self.projection_query::<R>(node, label)?;
-        wait_projection(&query, label).await?;
+        let query = self.projection_query::<R>(node, model)?;
+        wait_projection(&query, model).await?;
         Ok(query)
     }
 
@@ -409,12 +409,12 @@ where
     /// a strong one would keep the node alive through its own catalog. The
     /// query carries no credential, which is what the catalog read exemption
     /// makes sufficient.
-    fn projection_query<R: crate::model::View>(&self, node: &Node<SE, PA>, label: &str) -> Result<LiveQuery<R>, RetrievalError> {
+    fn projection_query<R: crate::model::View>(&self, node: &Node<SE, PA>, model: proto::ModelId) -> Result<LiveQuery<R>, RetrievalError> {
         let args = MatchArgs {
             selection: ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None },
             cached: true,
         };
-        Ok(EntityLiveQuery::new_weak_node_local(node, proto::CollectionId::fixed_name(label), args, SessionSet::new())?.map::<R>())
+        Ok(EntityLiveQuery::new_weak_node_local(node, model, args, SessionSet::new())?.map::<R>())
     }
 
     /// Put the rest of the projection's subscribe requests on the wire, each

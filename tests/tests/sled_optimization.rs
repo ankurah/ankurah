@@ -42,7 +42,7 @@ async fn test_id_range_optimization_integration() -> Result<()> {
     };
 
     // Fetch results directly from storage collection to test optimization
-    let collection_id = TestEntity::collection();
+    let collection_id = common::model_id::<TestEntity>(&context).await?;
     let storage_collection = node.collections.get(&collection_id).await?;
     let results_asc = storage_collection.fetch_states(&selection_asc).await?;
 
@@ -127,7 +127,7 @@ async fn test_id_range_with_where_clause() -> Result<()> {
         limit: Some(3),
     };
 
-    let collection_id = TestEntity::collection();
+    let collection_id = common::model_id::<TestEntity>(&context).await?;
     let storage_collection = node.collections.get(&collection_id).await?;
     let results = storage_collection.fetch_states(&selection).await?;
 

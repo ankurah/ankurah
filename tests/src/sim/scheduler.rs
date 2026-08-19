@@ -160,7 +160,7 @@ impl Scheduler {
                     | proto::NodeRequestBody::SubscribeQuery { collection, .. } => collection,
                     _ => return false,
                 };
-                if !ankurah::core::schema::reads_bypass_policy(collection) {
+                if !ankurah::core::schema::is_catalog_collection(collection) {
                     return false;
                 }
                 self.catalog_requests.insert(request.id.clone());
