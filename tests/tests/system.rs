@@ -1,4 +1,5 @@
 mod common;
+use ankurah::core::storage::StorageEngine;
 use ankurah::{policy::DEFAULT_CONTEXT, proto::CollectionId, Node, PermissiveAgent};
 use ankurah_connector_local_process::LocalProcessConnection;
 use ankurah_storage_sled::SledStorageEngine;
@@ -160,6 +161,144 @@ async fn test_system_persistence_across_reconstruction() -> Result<()> {
     Ok(())
 }
 
+/// A node that joins a system it never hears back from has joined in memory
+/// only: the root is written after the first catalog sync, so a crash before
+/// that leaves nothing behind and the node joins again from scratch.
+///
+/// The alternative -- writing the root at join -- is what makes that crash
+/// silent: the reopened node loads a root, stops joining because it has one,
+/// and serves an empty catalog as if it were the system's.
+#[tokio::test]
+async fn a_join_that_never_synced_leaves_no_root_behind() -> Result<()> {
+    let durable_engine = Arc::new(SledStorageEngine::new_test().unwrap());
+    let ephemeral_engine = Arc::new(SledStorageEngine::new_test().unwrap());
+
+    let durable_node = Node::new_durable(durable_engine.clone(), PermissiveAgent::new());
+    durable_node.system.create().await?;
+    let root = durable_node.system.root().expect("the durable node has a root to join");
+
+    // Join with nobody connected: the catalog projection runs over local
+    // storage, so the node is READY, and no peer has answered a word of it.
+    {
+        let ephemeral_node = Node::new(ephemeral_engine.clone(), PermissiveAgent::new());
+        ephemeral_node.system.wait_loaded().await;
+        ephemeral_node.system.join_system(root.clone()).await?;
+        assert!(ephemeral_node.system.is_system_ready(), "the join completes in memory");
+        ephemeral_node.catalog.wait_catalog_ready().await;
+        assert_eq!(ephemeral_node.system.root(), Some(root.clone()), "the node holds the root it joined");
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!root_persisted(&ephemeral_engine).await?, "an unanswered catalog must leave the join in memory");
+    } // kill
+
+    // Reopen: nothing was joined, so this node joins rather than pretending
+    // it already had.
+    {
+        let ephemeral_node = Node::new(ephemeral_engine.clone(), PermissiveAgent::new());
+        ephemeral_node.system.wait_loaded().await;
+        assert_eq!(ephemeral_node.system.root(), None, "the unsynced join left nothing to load");
+        assert!(!ephemeral_node.system.is_system_ready());
+
+        // The re-join is the same join, and this time a peer answers it.
+        let _conn = LocalProcessConnection::new(&durable_node, &ephemeral_node).await?;
+        ephemeral_node.system.wait_system_ready().await;
+        assert_eq!(ephemeral_node.system.root(), Some(root.clone()), "the replayed join reaches the same system");
+        wait_root_persisted(&ephemeral_engine).await?;
+    }
+
+    // Reopen once more: a synced join IS durable.
+    {
+        let ephemeral_node = Node::new(ephemeral_engine.clone(), PermissiveAgent::new());
+        ephemeral_node.system.wait_loaded().await;
+        assert_eq!(
+            ephemeral_node.system.root().map(|loaded| loaded.payload.state.head),
+            Some(root.payload.state.head),
+            "the synced join survives a restart"
+        );
+    }
+
+    Ok(())
+}
+
+/// A join whose catalog is never answered stays pending for as long as the
+/// node lives, so joining a DIFFERENT system in the meantime has to win: the
+/// pending write is conditional on the node still holding the root it was
+/// asked to write, and by then it holds another one.
+#[tokio::test]
+async fn a_pending_join_never_overwrites_the_system_actually_joined() -> Result<()> {
+    let abandoned_engine = Arc::new(SledStorageEngine::new_test().unwrap());
+    let joined_engine = Arc::new(SledStorageEngine::new_test().unwrap());
+    let ephemeral_engine = Arc::new(SledStorageEngine::new_test().unwrap());
+
+    let abandoned = Node::new_durable(abandoned_engine, PermissiveAgent::new());
+    abandoned.system.create().await?;
+    let abandoned_root = abandoned.system.root().expect("the abandoned system has a root");
+
+    let joined = Node::new_durable(joined_engine, PermissiveAgent::new());
+    joined.system.create().await?;
+    let joined_root = joined.system.root().expect("the joined system has a root");
+
+    let ephemeral_node = Node::new(ephemeral_engine.clone(), PermissiveAgent::new());
+    ephemeral_node.system.wait_loaded().await;
+
+    // Join a system nobody is connected to: in memory, and its write is
+    // still waiting for a catalog answer that has not come.
+    ephemeral_node.system.join_system(abandoned_root.clone()).await?;
+    assert!(!root_persisted(&ephemeral_engine).await?);
+
+    // Connect to a DIFFERENT system. The mismatched root resets this node and
+    // joins that one instead, and its catalog is answered -- which is also
+    // when the abandoned join's pending write gets its turn.
+    let _conn = LocalProcessConnection::new(&joined, &ephemeral_node).await?;
+    ephemeral_node.system.wait_system_ready().await;
+    wait_root_persisted(&ephemeral_engine).await?;
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(ephemeral_node.system.root(), Some(joined_root.clone()), "the node holds the system it actually joined");
+
+    // Reopen: one root on disk, and it is the system this node joined.
+    let reopened = Node::new(ephemeral_engine.clone(), PermissiveAgent::new());
+    reopened.system.wait_loaded().await;
+    assert_eq!(
+        reopened.system.root().map(|root| root.payload.state.head),
+        Some(joined_root.payload.state.head),
+        "the abandoned join must not resurrect itself over the joined one"
+    );
+    assert_ne!(reopened.system.root().map(|root| root.payload.entity_id), Some(abandoned_root.payload.entity_id));
+    assert_eq!(reopened.system.items().len(), 1, "exactly one root was ever written");
+
+    Ok(())
+}
+
+/// Whether this engine holds a system root: exactly what a node reopened
+/// over it would load. Reads what is there without opening the collection,
+/// so asking the question cannot itself materialize it.
+async fn root_persisted(engine: &Arc<SledStorageEngine>) -> Result<bool> {
+    let collection_id = CollectionId::fixed_name("_ankurah_system");
+    if !engine.list_collections()?.contains(&collection_id) {
+        return Ok(false);
+    }
+    let selection = ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None };
+    Ok(!engine.collection(&collection_id).await?.fetch_states(&selection).await?.is_empty())
+}
+
+/// Wait for a join to become durable. An ephemeral node's join is held in
+/// memory until its catalog has been answered, and the write that follows
+/// that answer is a task hop behind it, so a test that reopens the engine
+/// waits for the write rather than for readiness.
+async fn wait_root_persisted(engine: &Arc<SledStorageEngine>) -> Result<()> {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !root_persisted(engine).await? {
+            tokio::task::yield_now().await;
+        }
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("the joined root was never written to storage"))?
+}
+
 /// The three catalog collections the durable warm opens at startup, in
 /// sorted order for census comparisons.
 fn with_catalog(mut others: Vec<CollectionId>) -> Vec<CollectionId> {
@@ -201,6 +340,11 @@ async fn test_system_root_change_behavior() -> Result<()> {
 
         // now we should be ready because we joined the system
         assert!(ephemeral_node.system.is_system_ready());
+
+        // A later block reopens this engine and expects the old root there,
+        // so wait for the join to become durable, which is the first catalog
+        // sync plus the write behind it.
+        wait_root_persisted(&ephemeral_engine).await?;
 
         // Store initial root state for comparison
         let initial_root = durable_node.system.root().expect("Should have root state");
@@ -305,6 +449,9 @@ async fn test_system_root_change_behavior() -> Result<()> {
 
         assert_eq!(ephemeral_node.system.root(), Some(second_root), "Ephemeral node should have new root after joining");
 
+        // The re-join wiped storage and starts over: the system collection
+        // comes back with the root, once the replacement catalog answers.
+        wait_root_persisted(&ephemeral_engine).await?;
         assert_eq!(sorted(ephemeral_engine.list_collections()?), with_catalog(vec![CollectionId::fixed_name("_ankurah_system")]));
     }
 

@@ -193,21 +193,17 @@ mod tests {
     /// emits (PropertyPath equality is identity + sub-path; labels differ
     /// freely).
     fn resolve(selection: ankql::ast::Selection<Parsed>) -> ankql::ast::Selection<Resolved> {
+        use crate::schema::resolver::{resolve_selection, ModelResolutionError, ModelResolver, ResolvedProperty};
         struct FixtureResolver;
-        impl ankql::Resolver for FixtureResolver {
-            fn resolve_property(&self, _model: &proto::ModelId, name: &str) -> Result<Option<PropertyId>, ankql::NameResolutionError> {
-                Ok(Some(prop(name)))
-            }
-            fn property_value_type(
-                &self,
-                _model: &proto::ModelId,
-                property: &PropertyId,
-            ) -> Result<crate::value::ValueType, ankql::NameResolutionError> {
-                Ok(if *property == prop("age") { crate::value::ValueType::I32 } else { crate::value::ValueType::String })
+        impl ModelResolver for FixtureResolver {
+            fn resolve_property(&self, _model: &proto::ModelId, name: &str) -> Result<Option<ResolvedProperty>, ModelResolutionError> {
+                let id = prop(name);
+                let value_type = if id == prop("age") { crate::value::ValueType::I32 } else { crate::value::ValueType::String };
+                Ok(Some(ResolvedProperty { id, value_type }))
             }
         }
         let model = proto::ModelId::EntityId(proto::EntityId::from_bytes([0x77; 32]));
-        selection.resolve_names(&model, &FixtureResolver).unwrap()
+        resolve_selection(&model, &FixtureResolver, selection).unwrap()
     }
 
     #[derive(Debug, Clone)]

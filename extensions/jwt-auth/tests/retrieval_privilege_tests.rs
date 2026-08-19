@@ -25,7 +25,9 @@ fn config_path() -> String { format!("{}/tests/fixtures/retrieval_privilege.json
 
 fn load_config() -> PolicyConfig { serde_json::from_str(&std::fs::read_to_string(config_path()).unwrap()).unwrap() }
 
-fn parse(predicate: &str) -> Predicate { ankql::parser::parse_selection(predicate).unwrap().predicate }
+/// The caller's predicate as the agent receives it: bound to durable
+/// identities, the way the query entry binds one before the agent narrows it.
+fn parse(predicate: &str) -> Predicate<ankql::ast::Resolved> { common::make_predicate(predicate) }
 
 fn agent() -> JwtAgent {
     let agent = JwtAgent::new_durable(common::test_keys(), config_path()).unwrap();

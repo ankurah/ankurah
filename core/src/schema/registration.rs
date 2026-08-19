@@ -338,26 +338,26 @@ where
                     (id, name)
                 }
                 None => match self.model_lookup_checked(&m.label).await? {
-                    Some(def) => {
+                    Some((model_id, model)) => {
                         // Display names follow the most recent registration;
                         // emit only on difference.
-                        if def.name != m.name {
+                        if model.name != m.name {
                             let (_, head) = self
-                                .catalog_entity_snapshot(def.id, &model_collection())
+                                .catalog_entity_snapshot(model_id, &model_collection())
                                 .await?
-                                .ok_or_else(|| RetrievalError::Other(format!("catalog map holds model {} absent from storage", def.id)))?;
+                                .ok_or_else(|| RetrievalError::Other(format!("catalog map holds model {model_id} absent from storage")))?;
                             plan.updates.push(PlannedUpdate {
                                 collection: model_collection(),
-                                entity: def.id,
+                                entity: model_id,
                                 field: "name".into(),
-                                from: Some(Value::String(def.name.clone())),
+                                from: Some(Value::String(model.name.clone())),
                                 to: Some(Value::String(m.name.clone())),
                             });
-                            push(follow_up(model_collection(), def.id, head, vec![("name", Value::String(m.name.clone()))]));
+                            push(follow_up(model_collection(), model_id, head, vec![("name", Value::String(m.name.clone()))]));
                         } else {
-                            plan.existing.push(def.id);
+                            plan.existing.push(model_id);
                         }
-                        (def.id, m.name.clone())
+                        (model_id, m.name.clone())
                     }
                     None => {
                         let event = creation(
@@ -384,10 +384,10 @@ where
                 match model_ids.get(l) {
                     Some((id, _)) => *id,
                     None => match self.model_lookup_checked(l).await? {
-                        Some(def) => {
-                            model_ids.insert(l.to_string(), (def.id, out_models.len()));
-                            out_models.push(RegisteredModel { id: def.id, label: def.label, name: def.name, properties: Vec::new() });
-                            def.id
+                        Some((id, model)) => {
+                            model_ids.insert(l.to_string(), (id, out_models.len()));
+                            out_models.push(RegisteredModel { id, label: model.label, name: model.name, properties: Vec::new() });
+                            id
                         }
                         None => {
                             let event = creation(
@@ -494,68 +494,71 @@ where
                 // and reads through the cast) and the response carries the
                 // CANONICAL types so the requester's map holds its cast
                 // target.
-                let canonical = current.as_ref().or(renamed.as_ref()).map(|(def, _)| (def.backend.clone(), def.value_type.clone()));
-                if let Some((def, _)) = current.as_ref().or(renamed.as_ref()) {
-                    check_property_compat(def, &m.label, p)?;
+                let canonical =
+                    current.as_ref().or(renamed.as_ref()).map(|((_, property), _)| (property.backend.clone(), property.value_type.clone()));
+                if let Some(((_, property), _)) = current.as_ref().or(renamed.as_ref()) {
+                    check_property_compat(property, &m.label, p)?;
                 }
 
                 let (property_id, membership_id) = match (&current, &renamed) {
-                    (Some((def, membership)), _) => {
+                    (Some(((found_id, property), (membership, membership_optional))), _) => {
                         // Plain hit: name matches by construction; only the
                         // target reference can differ.
                         let mut fields: Vec<(&str, Option<Value>)> = Vec::new();
-                        if def.target_model != target {
+                        if property.target_model != target {
                             let target_value = target.map(Value::EntityId);
                             plan.updates.push(PlannedUpdate {
                                 collection: property_collection(),
-                                entity: def.id,
+                                entity: *found_id,
                                 field: "target_model".into(),
-                                from: def.target_model.map(Value::EntityId),
+                                from: property.target_model.map(Value::EntityId),
                                 to: target_value.clone(),
                             });
                             fields.push(("target_model", target_value));
                         }
                         if fields.is_empty() {
-                            plan.existing.push(def.id);
+                            plan.existing.push(*found_id);
                         } else {
-                            let (_, head) = self.catalog_entity_snapshot(def.id, &property_collection()).await?.ok_or_else(|| {
-                                RetrievalError::Other(format!("catalog map holds property {} absent from storage", def.id))
+                            let (_, head) = self.catalog_entity_snapshot(*found_id, &property_collection()).await?.ok_or_else(|| {
+                                RetrievalError::Other(format!("catalog map holds property {found_id} absent from storage"))
                             })?;
-                            push(follow_up_patch(property_collection(), def.id, head, fields));
+                            push(follow_up_patch(property_collection(), *found_id, head, fields));
                         }
-                        let membership_id = self.ensure_membership_from(&mut plan, &mut push, membership.clone(), p.optional).await?;
-                        (def.id, membership_id)
+                        let membership_id =
+                            self.ensure_membership_from(&mut plan, &mut push, *membership, *membership_optional, p.optional).await?;
+                        (*found_id, membership_id)
                     }
-                    (None, Some((def, membership))) => {
+                    (None, Some(((found_id, property), (membership, membership_optional)))) => {
                         // The rename hint applies: update `name` on the
                         // existing lineage, plus any target change, in one
                         // follow-up.
                         let mut fields: Vec<(&str, Option<Value>)> = vec![("name", Some(Value::String(p.name.clone())))];
                         plan.updates.push(PlannedUpdate {
                             collection: property_collection(),
-                            entity: def.id,
+                            entity: *found_id,
                             field: "name".into(),
-                            from: Some(Value::String(def.name.clone())),
+                            from: Some(Value::String(property.name.clone())),
                             to: Some(Value::String(p.name.clone())),
                         });
-                        if def.target_model != target {
+                        if property.target_model != target {
                             let target_value = target.map(Value::EntityId);
                             plan.updates.push(PlannedUpdate {
                                 collection: property_collection(),
-                                entity: def.id,
+                                entity: *found_id,
                                 field: "target_model".into(),
-                                from: def.target_model.map(Value::EntityId),
+                                from: property.target_model.map(Value::EntityId),
                                 to: target_value.clone(),
                             });
                             fields.push(("target_model", target_value));
                         }
                         let (_, head) = self
-                            .catalog_entity_snapshot(def.id, &property_collection())
+                            .catalog_entity_snapshot(*found_id, &property_collection())
                             .await?
-                            .ok_or_else(|| RetrievalError::Other(format!("catalog map holds property {} absent from storage", def.id)))?;
-                        push(follow_up_patch(property_collection(), def.id, head, fields));
-                        let membership_id = self.ensure_membership_from(&mut plan, &mut push, membership.clone(), p.optional).await?;
-                        (def.id, membership_id)
+                            .ok_or_else(|| RetrievalError::Other(format!("catalog map holds property {found_id} absent from storage")))?;
+                        push(follow_up_patch(property_collection(), *found_id, head, fields));
+                        let membership_id =
+                            self.ensure_membership_from(&mut plan, &mut push, *membership, *membership_optional, p.optional).await?;
+                        (*found_id, membership_id)
                     }
                     (None, None) => {
                         // Miss: allocate the property AND its membership. The
@@ -582,7 +585,7 @@ where
 
                 let (backend, value_type) = canonical.unwrap_or_else(|| (p.backend.clone(), p.value_type.clone()));
                 let minted_for = match (&current, &renamed) {
-                    (Some((def, _)), _) | (None, Some((def, _))) => def.minted_for,
+                    (Some(((_, property), _)), _) | (None, Some(((_, property), _))) => property.minted_for,
                     (None, None) => Some(model_id),
                 };
                 property_ids.insert((model_id, p.name.clone()), (property_id, backend.clone(), value_type.clone()));
@@ -643,7 +646,7 @@ where
         optional: bool,
     ) -> Result<EntityId, RegistrationError> {
         match self.membership_lookup_checked(&model, &property).await? {
-            Some(def) => self.ensure_membership_from(plan, push, def, optional).await,
+            Some((membership, current)) => self.ensure_membership_from(plan, push, membership, current, optional).await,
             None => {
                 let event = creation(
                     system,
@@ -659,30 +662,33 @@ where
     }
 
     /// Difference-patch an already-resolved membership's `optional` flag.
+    /// `current` is the flag that membership carries now, absent where a raw
+    /// storage row has none at all.
     async fn ensure_membership_from(
         &self,
         plan: &mut RegistrationPlan,
         push: &mut impl FnMut(proto::Event),
-        def: super::catalog::ModelPropertyMembershipDef,
+        membership: EntityId,
+        current: Option<bool>,
         optional: bool,
     ) -> Result<EntityId, RegistrationError> {
-        if def.optional != Some(optional) {
+        if current != Some(optional) {
             let (_, head) = self
-                .catalog_entity_snapshot(def.id, &model_property_collection())
+                .catalog_entity_snapshot(membership, &model_property_collection())
                 .await?
-                .ok_or_else(|| RetrievalError::Other(format!("catalog map holds membership {} absent from storage", def.id)))?;
+                .ok_or_else(|| RetrievalError::Other(format!("catalog map holds membership {membership} absent from storage")))?;
             plan.updates.push(PlannedUpdate {
                 collection: model_property_collection(),
-                entity: def.id,
+                entity: membership,
                 field: "optional".into(),
-                from: def.optional.map(Value::Bool),
+                from: current.map(Value::Bool),
                 to: Some(Value::Bool(optional)),
             });
-            push(follow_up(model_property_collection(), def.id, head, vec![("optional", Value::Bool(optional))]));
+            push(follow_up(model_property_collection(), membership, head, vec![("optional", Value::Bool(optional))]));
         } else {
-            plan.existing.push(def.id);
+            plan.existing.push(membership);
         }
-        Ok(def.id)
+        Ok(membership)
     }
 
     /// Allocator lookup for a model: the catalog map first, then durable
@@ -693,20 +699,19 @@ where
     /// is folded into the map so the rest of the request (and the next one)
     /// sees it; ordinary first sightings miss both and pay one bounded
     /// fetch under the allocator mutex.
-    async fn model_lookup_checked(&self, label: &str) -> Result<Option<super::catalog::ModelDef>, RetrievalError> {
-        if let Some(def) = self.model_by_label(label) {
-            return Ok(Some(def));
+    async fn model_lookup_checked(&self, label: &str) -> Result<Option<(EntityId, SysModelRow)>, RetrievalError> {
+        if let Some(found) = self.model_by_label(label) {
+            return Ok(Some(found));
         }
         let Some((id, values)) = self.catalog_row_by_key(model_collection(), field_eq_str(SystemProperty::Label, label)).await? else {
             return Ok(None);
         };
-        let def = super::catalog::ModelDef {
-            id,
+        let model = SysModelRow {
             label: label.to_string(),
             name: string_field(&values, SystemProperty::Name).unwrap_or_else(|| label.to_string()),
         };
-        self.upsert_registered(&[RegisteredModel { id: def.id, label: def.label.clone(), name: def.name.clone(), properties: Vec::new() }]);
-        Ok(Some(def))
+        self.upsert_registered(&[RegisteredModel { id, label: model.label.clone(), name: model.name.clone(), properties: Vec::new() }]);
+        Ok(Some((id, model)))
     }
 
     /// Allocator lookup for a property by name WITHIN a model's membership
@@ -720,10 +725,10 @@ where
         &self,
         model: &EntityId,
         name: &str,
-    ) -> Result<Option<(super::catalog::PropertyDef, super::catalog::ModelPropertyMembershipDef)>, RetrievalError> {
-        if let Some(def) = self.property_by_name(model, name) {
-            if let Some(membership) = self.membership(model, &def.id) {
-                return Ok(Some((def, membership)));
+    ) -> Result<Option<((EntityId, SysPropertyRow), (EntityId, Option<bool>))>, RetrievalError> {
+        if let Some((property_id, property)) = self.property_by_name(model, name) {
+            if let Some((membership_id, membership)) = self.membership(model, &property_id) {
+                return Ok(Some(((property_id, property), (membership_id, Some(membership.optional)))));
             }
         }
         let node = self.node().ok_or_else(|| RetrievalError::Other("node dropped during catalog lookup".to_owned()))?;
@@ -742,21 +747,14 @@ where
             if string_field(&prop_values, SystemProperty::Name).as_deref() != Some(name) {
                 continue;
             }
-            let def = super::catalog::PropertyDef {
-                id: property_id,
+            let property = SysPropertyRow {
                 minted_for: entity_id_field(&prop_values, SystemProperty::MintedFor),
                 name: name.to_string(),
                 backend: string_field(&prop_values, SystemProperty::Backend).unwrap_or_default(),
                 value_type: string_field(&prop_values, SystemProperty::ValueType).unwrap_or_default(),
                 target_model: entity_id_field(&prop_values, SystemProperty::TargetModel),
             };
-            let membership = super::catalog::ModelPropertyMembershipDef {
-                id: membership_id,
-                model: *model,
-                property: property_id,
-                optional: bool_field(&values, SystemProperty::Optional),
-            };
-            return Ok(Some((def, membership)));
+            return Ok(Some(((property_id, property), (membership_id, bool_field(&values, SystemProperty::Optional)))));
         }
         Ok(None)
     }
@@ -767,19 +765,19 @@ where
         &self,
         model: &EntityId,
         property: &EntityId,
-    ) -> Result<Option<super::catalog::ModelPropertyMembershipDef>, RetrievalError> {
-        if let Some(def) = self.membership(model, property) {
-            return Ok(Some(def));
+    ) -> Result<Option<(EntityId, Option<bool>)>, RetrievalError> {
+        if let Some((id, membership)) = self.membership(model, property) {
+            return Ok(Some((id, Some(membership.optional))));
         }
         let predicate = and(field_eq_id(SystemProperty::Model, *model), field_eq_id(SystemProperty::Property, *property));
         let Some((id, values)) = self.catalog_row_by_key(model_property_collection(), predicate).await? else {
             return Ok(None);
         };
         let optional = bool_field(&values, SystemProperty::Optional);
-        // No map fold here: memberships fold with their full registered tree
-        // (a flag-less row is TREATED as optional, never defaulted; the
+        // No overlay fold here: memberships fold with their full registered
+        // tree (a flag-less row is TREATED as optional, never defaulted; the
         // executor's diff arm emits the repairing follow-up either way).
-        Ok(Some(super::catalog::ModelPropertyMembershipDef { id, model: *model, property: *property, optional }))
+        Ok(Some((id, optional)))
     }
 
     /// Fetch the catalog row matching `predicate` straight from durable
@@ -789,7 +787,7 @@ where
     async fn catalog_row_by_key(
         &self,
         collection: ModelId,
-        predicate: ankql::ast::Predicate,
+        predicate: ankql::ast::Predicate<Resolved>,
     ) -> Result<Option<(EntityId, BTreeMap<PropertyId, Option<Value>>)>, RetrievalError> {
         let selection = ankql::ast::Selection { predicate, order_by: None, limit: None };
         let mut best: Option<(EntityId, BTreeMap<PropertyId, Option<Value>>)> = None;
@@ -920,7 +918,7 @@ pub(crate) fn value_types_compatible(canonical: &str, declared: &str) -> bool {
 
 /// The canonical-type compatibility gate
 /// for a name-keyed upsert hit. Never mutates the found definition.
-fn check_property_compat(def: &super::catalog::PropertyDef, model_label: &str, p: &RegisterProperty) -> Result<(), RegistrationError> {
+fn check_property_compat(def: &SysPropertyRow, model_label: &str, p: &RegisterProperty) -> Result<(), RegistrationError> {
     if def.backend != p.backend || !value_types_compatible(&def.value_type, &p.value_type) {
         return Err(RegistrationError::NonCastable {
             collection: model_label.to_string(),
@@ -957,24 +955,27 @@ fn bool_field(values: &BTreeMap<PropertyId, Option<Value>>, field: SystemPropert
 // straight from storage (`catalog_row_by_key`), bypassing catalog-backed name
 // resolution because these lookups bootstrap the catalog that resolution
 // would read. A storage engine can only address a property by
-// identity and rejects anything else (`ankql::ast::Selection::check`), so these
-// predicates must arrive resolved on their own. Catalog collections are frozen
+// identity and nothing else can reach it (only `Selection<Resolved>` does), so
+// these predicates are built resolved. Catalog collections are frozen
 // and mint no property-definition ids, so their fields are `System` properties,
-// named through the same `system_property` decision the systemize pass uses.
+// named from the same closed `SystemProperty` vocabulary the resolution walk
+// answers a system model's names from.
 
-fn field_eq(field: SystemProperty, value: Value) -> ankql::ast::Predicate {
+fn field_eq(field: SystemProperty, value: Value) -> ankql::ast::Predicate<Resolved> {
     ankql::ast::Predicate::Comparison {
-        left: Box::new(ankql::ast::Expr::PropertyPath(ankql::ast::PropertyPath::system(field, vec![]))),
+        left: Box::new(ankql::ast::Expr::Path(ankql::ast::PropertyPath::system(field, vec![]))),
         operator: ankql::ast::ComparisonOperator::Equal,
         right: Box::new(ankql::ast::Expr::Literal(value)),
     }
 }
 
-fn field_eq_str(field: SystemProperty, value: &str) -> ankql::ast::Predicate { field_eq(field, Value::String(value.to_string())) }
+fn field_eq_str(field: SystemProperty, value: &str) -> ankql::ast::Predicate<Resolved> { field_eq(field, Value::String(value.to_string())) }
 
-fn field_eq_id(field: SystemProperty, id: EntityId) -> ankql::ast::Predicate { field_eq(field, Value::EntityId(id)) }
+fn field_eq_id(field: SystemProperty, id: EntityId) -> ankql::ast::Predicate<Resolved> { field_eq(field, Value::EntityId(id)) }
 
-fn and(a: ankql::ast::Predicate, b: ankql::ast::Predicate) -> ankql::ast::Predicate { ankql::ast::Predicate::And(Box::new(a), Box::new(b)) }
+fn and(a: ankql::ast::Predicate<Resolved>, b: ankql::ast::Predicate<Resolved>) -> ankql::ast::Predicate<Resolved> {
+    ankql::ast::Predicate::And(Box::new(a), Box::new(b))
+}
 
 fn entity_id_field(values: &BTreeMap<PropertyId, Option<Value>>, field: SystemProperty) -> Option<EntityId> {
     match values.get(&PropertyId::System(field)) {
@@ -1033,7 +1034,7 @@ fn lww_operations(fields: Vec<(&str, Option<Value>)>) -> OperationSet {
 mod tests {
     use super::*;
 
-    fn selection(predicate: ankql::ast::Predicate) -> ankql::ast::Selection {
+    fn selection(predicate: ankql::ast::Predicate<Resolved>) -> ankql::ast::Selection<Resolved> {
         ankql::ast::Selection { predicate, order_by: None, limit: None }
     }
 }

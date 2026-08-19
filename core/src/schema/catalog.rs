@@ -1,54 +1,69 @@
 //! The in-memory catalog map and its maintenance
-//!.
 //!
 //! Every node keeps an in-memory view of the three catalog collections
-//! (`_ankurah_model`, `_ankurah_property`, `_ankurah_model_property`). In
-//! this write-only phase the map exists for the catalog's own maintenance
-//! (registration duplicate checks and allocation), and it fills two ways,
-//! mirroring how the two node kinds already replicate:
+//! (`_ankurah_model`, `_ankurah_property`, `_ankurah_model_property`),
+//! because every query and every typed accessor turns a name into a durable
+//! identity through it, and neither can afford a storage round trip.
 //!
-//! - DURABLE nodes have the catalog in local storage. Once the system is
-//!   ready the manager warms the map by scanning the three collections
-//!   (`fetch_states` with `Predicate::True`, the same move
-//!   `SystemManager::load_system_catalog` makes for the system collection).
-//!   Afterward the registration executor folds its own commits into the map
-//!   synchronously under the allocator mutex; no other catalog writer
-//!   exists this phase. The POLICY-FREE reactor subscription that keeps the
-//!   map fresh under the read flip returns with that PR (the map is node
-//!   infrastructure like `SystemManager`, which reads storage with no
-//!   policy; mutation stays gated by `check_event` in the executor).
-//! - EPHEMERAL nodes fill their map only by folding SchemaRegistered
-//!   responses to their own forwarded registrations. The three catalog
-//!   subscriptions through the ordinary relay (and the credential-scoped
-//!   visibility they imply) return with the read flip.
+//! The map fills ONE way on both node kinds: the catalog feeds itself. Three
+//! ordinary live queries over the typed row models ([`rows`]) are indexed by
+//! catalog entity id, and the tables they derive ([`map`]) are what every
+//! lookup here answers from. On a durable node those queries read local
+//! storage; on an ephemeral one they read local storage AND subscribe through
+//! the relay to a durable peer, which is also how catalog changes get PUSHED
+//! to ephemerals -- there is no separate replication mechanism for schema.
+//! Registration additionally folds its own resolved definitions in
+//! synchronously ([`CatalogManager::upsert_registered`]), which is what lets
+//! consecutive registrations observe each other before the reactor has
+//! delivered anything.
 //!
-//! Catalog entities are SYSTEM MODELS: they are read
-//! through the raw state-buffer interface, never a `View`, because
-//! deriving a `Model` for a catalog collection would be the
-//! self-description ouroboros: resolving the catalog's own rows through
-//! catalog resolution would be circular. Storage states are parsed
-//! through `LWWBackend::from_state_buffer` + `property_values`, exactly as
-//! `registration::catalog_entity_values` does.
+//! Readiness is the projection running over the LOCAL store, and nothing
+//! here waits on the network to claim it. A node whose store holds no catalog
+//! rows is ready with an empty map, and a node whose rows are stale is ready
+//! with those: the two are the same epistemic state, and in both a miss is
+//! honest and heals when the durable's rows arrive. A caller who needs the
+//! PUSHED catalog rather than the stored one waits for
+//! [`CatalogManager::wait_catalog_synced`], which is a different claim and
+//! says so.
+//!
+//! These are PRE-READY queries. The map is what makes the system ready, so
+//! gating the queries that fill it on system readiness would deadlock the
+//! gate they feed. They are therefore built with the immediate raw
+//! constructors, carry no credential, and address only built-in identities:
+//! the row models pin their `ModelId` and every `PropertyId` at compile time,
+//! so they resolve on a stone-cold node, at the bootstrap epoch, without
+//! consulting the catalog they are filling.
+//!
+//! Reads of these three collections bypass the [`PolicyAgent`] entirely, on
+//! both sides of the wire (a node's own admission and a durable's serving
+//! handlers): the catalog is readable to connected peers as a documented
+//! 0.10 property. Catalog WRITES remain exactly as protected as they were --
+//! registration is the only writer, and every event it emits still passes
+//! `check_event`.
 
 use std::sync::{Arc, RwLock};
 
-use crate::ModelId;
 use ankurah_proto::{self as proto, EntityId, PropertyId, SystemProperty};
 use tokio::sync::Notify;
-use tracing::{debug, error};
+use tracing::{debug, warn};
 
 use crate::{
-    node::{Node, WeakNode},
+    error::RetrievalError,
+    livequery::{EntityLiveQuery, LiveQuery},
+    node::{MatchArgs, Node, WeakNode},
     policy::PolicyAgent,
+    session::SessionSet,
     storage::StorageEngine,
     util::request_fence::{RequestFence, RequestLease, RequestValidity},
+    ModelId,
 };
 
-use super::{model_collection, model_property_collection, property_collection, registration::RegistrationError, ModelStructDescriptor};
+use super::{registration::RegistrationError, ModelStructDescriptor};
 
 mod map;
-use map::{apply_entry, parse_state, CatalogMapInner};
-pub use map::{ModelDef, ModelPropertyMembershipDef, PropertyDef};
+pub mod rows;
+use map::{CatalogMap, CatalogProjection};
+use rows::{SysModelPropertyRow, SysModelRow, SysModelRowView, SysPropertyRow};
 
 /// The catalog lookup result for one compiled model shape: the model's
 /// durable id plus each field's, in the descriptor's declaration order,
@@ -77,8 +92,31 @@ impl CatalogBinding {
 
 // -- manager ----------------------------------------------------------------
 
-/// The three catalog collections warmed and maintained by this manager.
-fn catalog_collections() -> [ModelId; 3] { [model_collection(), property_collection(), model_property_collection()] }
+/// How far a warm attempt got. A superseded attempt found its generation
+/// already bumped by a reset and published nothing; retrying it would only
+/// race the reset that replaced it.
+enum WarmOutcome {
+    Published,
+    Superseded,
+}
+
+/// The first retry delay after a failed warm, doubling to [`WARM_RETRY_MAX`].
+const WARM_RETRY_MIN: std::time::Duration = std::time::Duration::from_millis(50);
+const WARM_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Wait for one projection query's first resultset.
+///
+/// The wait is over LOCAL storage and is bounded by that read, so there is no
+/// timeout here and nothing to tear down: the query answers, or it fails and
+/// says why. A failure is the warm's failure -- publishing readiness on a
+/// query that will never populate would publish an empty catalog as
+/// authoritative -- and the retry loop tries again.
+async fn wait_projection<R: crate::model::View>(query: &LiveQuery<R>, label: &str) -> Result<(), RetrievalError> {
+    query
+        .wait_initialized()
+        .await
+        .map_err(|error| RetrievalError::Other(format!("catalog projection over '{label}' failed to initialize: {error}")))
+}
 
 /// Maintains the in-memory catalog map for a node. Held by `Node` beside
 /// `SystemManager`; mirrors its `<SE, PA>` generics.
@@ -94,7 +132,6 @@ where PA: PolicyAgent
 struct CatalogInner<SE, PA>
 where PA: PolicyAgent
 {
-    storage: Arc<SE>,
     /// The owning node, installed by `start` (weak: the node owns the
     /// manager, never the reverse). Registration executes and forwards
     /// through it.
@@ -106,39 +143,37 @@ where PA: PolicyAgent
     /// it, so consecutive registrations observe each other and never
     /// double-allocate.
     allocator: tokio::sync::Mutex<()>,
-    map: RwLock<CatalogMapInner>,
+    map: CatalogMap,
     ready: RwLock<bool>,
     ready_notify: Notify,
-    /// Monotonic catalog-warm generation plus the ephemeral first-call-wins
-    /// latch. Reset invalidates the generation before clearing the catalog so
-    /// neither a detached ephemeral warm nor a slow durable startup warm can
-    /// publish afterward.
+    /// Why the most recent warm attempt failed, while the retry loop backs
+    /// off. A published warm clears it. This is the honest reading of an
+    /// un-ready catalog: not "still starting", but "this went wrong".
+    warm_failure: RwLock<Option<String>>,
+    /// Monotonic catalog-warm generation. Reset invalidates the generation
+    /// before clearing the catalog, so a warm that started beforehand cannot
+    /// publish pre-reset rows into the post-reset map.
     setup_state: RwLock<CatalogSetupState>,
-    /// Wakes detached ephemeral warm tasks when reset invalidates their
-    /// generation, so they promptly remove in-flight relay entries rather
-    /// than waiting for a response or the grace deadline.
+    /// Wakes a warm that is backing off between retries when reset
+    /// invalidates its generation, so it abandons promptly instead of holding
+    /// reset's drain for the rest of its delay.
     setup_changed: Notify,
     /// The manager stays generic over the node's PolicyAgent for its
-    /// Node-taking methods (ensure_registered, ensure_subscribed).
+    /// Node-taking methods (ensure_registered, the projection queries).
     _pa: std::marker::PhantomData<PA>,
 }
 
 #[derive(Debug, Default)]
 struct CatalogSetupState {
     generation: u64,
-    ephemeral_active: bool,
-    /// While true, `ensure_subscribed` may wait but cannot claim a new warm.
-    /// SystemManager clears it only after storage and reactor reset finish.
+    /// While true, no new warm may be claimed. SystemManager clears it only
+    /// after storage and reactor reset finish.
     resetting: bool,
-    /// Quiescing owner fence for initial relay responses. Reset invalidates it
-    /// before storage deletion and waits for responses already admitted at
-    /// schema ingress to finish NodeApplier.
-    ephemeral_fence: Option<RequestFence>,
-    /// Quiescing owner fence for the current durable storage warm. The warm
-    /// retains one lease from before its first storage access through
-    /// subscription/readiness publication, so reset can invalidate the
-    /// generation and drain it before deleting storage.
-    durable_fence: Option<RequestFence>,
+    /// Quiescing owner fence for the current warm. The warm retains one lease
+    /// from before its first read through projection/readiness publication, so
+    /// reset can invalidate the generation and drain it before deleting
+    /// storage.
+    warm_fence: Option<RequestFence>,
     /// Owner fence for schema registration in the current system epoch.
     /// It remains absent while no system is ready and is rearmed only by the
     /// ready hook after startup or reset. Both allocator execution and
@@ -149,9 +184,9 @@ struct CatalogSetupState {
     /// drains the same fences instead of bypassing work whose first waiter was
     /// canceled.
     draining_fences: Vec<RequestFence>,
-    /// A durable hard reset drops its reactor subscription. Once the new
-    /// system root is ready, one warm must attach the current generation.
-    durable_resume_pending: bool,
+    /// A hard reset drops the projection. Once the new system root is ready,
+    /// one warm must attach the current generation.
+    warm_resume_pending: bool,
 }
 
 // The name-to-id lookup behind `CatalogManager::resolve`. The wider catalog
@@ -169,10 +204,10 @@ where
         let proto::ModelId::EntityId(id) = model else {
             return Ok(SystemProperty::from_name(name).map(PropertyId::System));
         };
-        let Some(label) = self.map.read().unwrap().models.get(id).map(|model| model.label.clone()) else {
+        if !self.map.knows_model(id) {
             return Ok(None);
-        };
-        Ok(self.map.read().unwrap().resolve(&label, name)?.map(PropertyId::EntityId))
+        }
+        Ok(self.map.resolve(id, name)?.map(PropertyId::EntityId))
     }
 }
 
@@ -181,15 +216,15 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    pub(crate) fn new(storage: Arc<SE>, durable: bool) -> Self {
+    pub(crate) fn new(durable: bool) -> Self {
         Self(Arc::new(CatalogInner {
-            storage,
             node: RwLock::new(None),
             durable,
             allocator: tokio::sync::Mutex::new(()),
-            map: RwLock::new(CatalogMapInner::default()),
+            map: CatalogMap::default(),
             ready: RwLock::new(false),
             ready_notify: Notify::new(),
+            warm_failure: RwLock::new(None),
             setup_state: RwLock::new(CatalogSetupState::default()),
             setup_changed: Notify::new(),
             _pa: std::marker::PhantomData,
@@ -198,15 +233,15 @@ where
 
     /// Called right after the `NodeInner` Arc exists (beside
     /// `policy_agent.on_node_ready`). It installs the hard-reset/readiness
-    /// hooks. Durable nodes arm a warm that the system-ready hook launches;
-    /// ephemeral catalog setup remains driven by `ensure_subscribed`.
+    /// hooks and arms the one warm that the system-ready hook launches.
     pub(crate) fn start(&self, node: WeakNode<SE, PA>) {
         let Some(strong) = node.upgrade() else { return };
         *self.0.node.write().unwrap() = Some(node);
 
         // Install the hard-reset flush hook on the system manager so
         // SystemManager::hard_reset can clear the catalog in-place (it does
-        // not hold the CatalogManager directly).
+        // not hold the CatalogManager directly), and the readiness gate that
+        // makes a ready system mean a loaded catalog.
         {
             let begin_manager = self.clone();
             let finish_manager = self.clone();
@@ -219,15 +254,23 @@ where
                 Arc::new(move || finish_manager.finish_reset()),
                 Arc::new(move || resume_manager.resume_after_system_ready()),
             );
+            let gate_manager = self.clone();
+            strong.system.set_catalog_ready_gate(Arc::new(move || {
+                let manager = gate_manager.clone();
+                Box::pin(async move { manager.wait_catalog_ready().await })
+            }));
+            let synced_manager = self.clone();
+            strong.system.set_catalog_synced_gate(Arc::new(move || {
+                let manager = synced_manager.clone();
+                Box::pin(async move { manager.wait_catalog_synced().await })
+            }));
         }
 
-        if self.0.durable {
-            // A durable node may remain deliberately uninitialized. Do not
-            // spawn a task that owns the managers while waiting indefinitely
-            // for a system root. Instead, arm exactly one warm and let
-            // SystemManager's create/load-ready transition call the hook.
-            self.0.setup_state.write().unwrap().durable_resume_pending = true;
-        }
+        // A node may remain deliberately uninitialized. Do not spawn a task
+        // that owns the managers while waiting indefinitely for a system
+        // root. Instead, arm exactly one warm and let SystemManager's
+        // create/load/join ready transition call the hook.
+        self.0.setup_state.write().unwrap().warm_resume_pending = true;
 
         // Every ready system epoch gets one registration fence, on either
         // node kind. If loading/joining won the race before hook installation,
@@ -237,74 +280,182 @@ where
         }
     }
 
-    /// Fill the catalog map from local storage ("the warm"), then mark the
-    /// map ready. `generation` counts hard resets: the scan re-checks it at
-    /// each step, so a fill that started before a reset stops instead of
-    /// publishing pre-reset rows into the post-reset map. A FAILED scan
-    /// still marks readiness (for a still-current generation): registration
-    /// waits on catalog readiness, so a permanently un-ready catalog would
-    /// turn one failed fill into a hang; with a partial map, later
-    /// registrations instead fail loudly on their storage double-checks,
-    /// which is retryable. The system-ready hook launches one such fill at
-    /// startup and one after each reset; no task waits indefinitely for a
-    /// root.
-    async fn run_durable_warm(&self, generation: u64, _lease: RequestLease) {
-        if let Err(e) = self.warm_durable(generation).await {
-            error!("CatalogManager durable warm failed: {}", e);
-            // Readiness must still latch: registration's readiness wait
-            // (`wait_catalog_ready_if_current`) parks on it, and a permanently
-            // un-ready catalog would turn one failed warm into a hang.
-            // With a partial map, later registrations reject loudly on their
-            // storage double-checks instead, which is the retryable failure
-            // mode we want.
-            let setup = self.0.setup_state.read().unwrap();
-            if setup.generation == generation {
-                self.mark_ready();
+    /// Drive warm attempts until one publishes or a reset supersedes them.
+    ///
+    /// A failed warm does NOT mark readiness. Readiness is the claim that the
+    /// map is authoritative, and a node whose catalog never loaded cannot
+    /// honestly make it: a query resolved against an empty map would report
+    /// a model that exists as unknown, which is a wrong answer rather than a
+    /// delay. So the failure is recorded and warned about, and the attempt
+    /// repeats on a widening backoff until it succeeds, the node is dropped,
+    /// or a reset takes over.
+    async fn run_warm(&self, generation: u64, lease: RequestLease, validity: RequestValidity) {
+        let mut delay = WARM_RETRY_MIN;
+        loop {
+            match self.warm(generation).await {
+                // Published: the map answers from this node's store, and the
+                // peer subscriptions that keep it current go out behind that.
+                Ok(WarmOutcome::Published) => {
+                    // The warm's own lease covered its storage reads and ends
+                    // here; each attachment takes its own, so a reset waiting
+                    // on a peer that never answers is not a thing that happens.
+                    drop(lease);
+                    return self.attach_projection_relays(generation, validity).await;
+                }
+                // Superseded: a reset already replaced this generation, and
+                // retrying would only race the warm it armed.
+                Ok(WarmOutcome::Superseded) => return,
+                Err(error) => {
+                    warn!("CatalogManager warm failed; the catalog stays unready and retries in {delay:?}: {error}");
+                    *self.0.warm_failure.write().unwrap() = Some(error.to_string());
+                }
             }
+
+            // Reset invalidates the generation and then drains this warm's
+            // fence, so waking on that change is what keeps a backing-off
+            // retry from holding the reset barrier for a whole delay.
+            let changed = self.0.setup_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.0.setup_state.read().unwrap().generation != generation {
+                return;
+            }
+            futures::future::select(changed, futures_timer::Delay::new(delay)).await;
+            if self.0.setup_state.read().unwrap().generation != generation {
+                return;
+            }
+            delay = (delay * 2).min(WARM_RETRY_MAX);
         }
     }
 
-    /// Durable path: warm the map by scanning the catalog collections, then
-    /// mark ready. Registration keeps the map fresh afterward: the executor
-    /// folds its own commits synchronously under the allocator mutex, and in
-    /// this write-only phase no other writer exists (peers forward
-    /// RegisterSchema rather than committing catalog entities directly). The
-    /// reactor-fed incremental subscription returns with the read flip.
+    /// One warm attempt: open the three catalog projection queries, derive
+    /// the lookup tables from them, publish those, and mark the map ready.
     ///
-    /// A schema-less durable node has no catalog rows yet: it warms nothing
-    /// and is immediately ready with an empty (correct) map. Opening the
-    /// collections creates their empty materializations on first startup,
-    /// which is harmless and makes the catalog tables inspectable.
-    async fn warm_durable(&self, generation: u64) -> Result<(), crate::error::RetrievalError> {
+    /// The queries are the same on both node kinds; what differs is who else
+    /// answers them. Both read local storage, which is what readiness rests
+    /// on. An ephemeral node's ALSO subscribe to a durable peer, which is how
+    /// catalog changes are pushed to it -- behind readiness, one request at a
+    /// time ([`Self::attach_projection_relays`]).
+    ///
+    /// A node with no catalog rows warms nothing and is ready with an empty
+    /// map, which is the correct answer for a system that has registered
+    /// nothing -- and the honest one for a node whose peer has not answered
+    /// yet, whose misses heal when it does.
+    async fn warm(&self, generation: u64) -> Result<WarmOutcome, RetrievalError> {
         if self.0.setup_state.read().unwrap().generation != generation {
-            return Ok(());
+            return Ok(WarmOutcome::Superseded);
         }
+        let node = self.node().ok_or_else(|| RetrievalError::Other("catalog warm ran without a node".to_owned()))?;
 
-        let everything = ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None };
-        for model in catalog_collections() {
-            let label = match model {
-                ModelId::System(system) => crate::schema::system_collection_label(system),
-                ModelId::EntityId(_) => unreachable!("catalog collections are system models"),
-            };
-            let states = self.0.storage.collection(&proto::CollectionId::fixed_name(label)).await?.fetch_states(&everything).await?;
-            let setup = self.0.setup_state.read().unwrap();
-            if setup.generation != generation {
-                return Ok(());
-            }
-            let mut map = self.0.map.write().unwrap();
-            for state in states {
-                if let Some(entry) = parse_state(&model, state.payload.entity_id, &state.payload) {
-                    apply_entry(&mut map, entry);
-                }
-            }
-        }
+        // One collection at a time, in a fixed order, and each query's own
+        // first read is over local storage -- that is the whole of what
+        // readiness waits for.
+        //
+        // The models query also puts its subscribe request on the wire here,
+        // rather than waiting for the other two: nothing is in flight ahead
+        // of it, and it is the request that starts this node hearing from the
+        // system. The other two follow it one at a time
+        // ([`Self::attach_projection_relays`]).
+        //
+        // The warm holds its lease across all of it, and that is the point:
+        // this is where the queries touch storage (their activation scans the
+        // catalog collections), so reset must not begin deleting collections
+        // until it is over. A reset that lands meanwhile invalidates the
+        // generation and then waits here, which is the barrier working.
+        let models = self.projection_query::<SysModelRowView>(&node, crate::schema::MODEL_COLLECTION_ID)?;
+        models.subscribe_remote(&node, SessionSet::new())?;
+        wait_projection(&models, crate::schema::MODEL_COLLECTION_ID).await?;
+        let properties = self.open_projection(&node, crate::schema::PROPERTY_COLLECTION_ID).await?;
+        let memberships = self.open_projection(&node, crate::schema::MODEL_PROPERTY_COLLECTION_ID).await?;
 
+        // The held setup guard excludes a reset's generation bump (a setup
+        // write) between this check and projection/readiness publication.
         let setup = self.0.setup_state.read().unwrap();
         if setup.generation != generation {
-            return Ok(());
+            return Ok(WarmOutcome::Superseded);
         }
+        let replaced = self.0.map.install(CatalogProjection::new(models, properties, memberships));
+        *self.0.warm_failure.write().unwrap() = None;
         self.mark_ready();
-        Ok(())
+        // Outside the setup guard: dropping a projection unsubscribes the
+        // queries it owns, which must not run under catalog setup
+        // synchronization.
+        drop(setup);
+        drop(replaced);
+        Ok(WarmOutcome::Published)
+    }
+
+    /// Open ONE catalog collection's projection query and wait for its first
+    /// resultset. Its subscribe request goes out later, one at a time
+    /// ([`Self::attach_projection_relays`]).
+    async fn open_projection<R>(&self, node: &Node<SE, PA>, label: &'static str) -> Result<LiveQuery<R>, RetrievalError>
+    where R: crate::model::View + Clone + Send + Sync + 'static {
+        let query = self.projection_query::<R>(node, label)?;
+        wait_projection(&query, label).await?;
+        Ok(query)
+    }
+
+    /// One catalog projection query: every row of one catalog collection.
+    ///
+    /// It is raw (it names its collection, not a compiled declaration) and
+    /// pre-ready by construction: the immediate constructor admits inline
+    /// rather than waiting on a registration gate, and `Predicate::True`
+    /// names no property, so nothing here consults the map it is about to
+    /// fill. It is CACHED, which is what makes local storage answer it on
+    /// both node kinds while the relay's subscription refreshes it; the two
+    /// are not alternatives. Its remote subscription waits for
+    /// [`Self::attach_projection_relays`] rather than going out as the query
+    /// starts. The node reference is weak because the node owns this manager;
+    /// a strong one would keep the node alive through its own catalog. The
+    /// query carries no credential, which is what the catalog read exemption
+    /// makes sufficient.
+    fn projection_query<R: crate::model::View>(&self, node: &Node<SE, PA>, label: &str) -> Result<LiveQuery<R>, RetrievalError> {
+        let args = MatchArgs {
+            selection: ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None },
+            cached: true,
+        };
+        Ok(EntityLiveQuery::new_weak_node_local(node, proto::CollectionId::fixed_name(label), args, SessionSet::new())?.map::<R>())
+    }
+
+    /// Put the rest of the projection's subscribe requests on the wire, each
+    /// one after the request before it was answered.
+    ///
+    /// This is how catalog changes reach an ephemeral node, and it runs AFTER
+    /// readiness rather than before it: readiness is the projection over this
+    /// node's own store, and a node whose peer has not answered is unhelpful,
+    /// not unready.
+    ///
+    /// One at a time, because a subscribe request is sent when its query's
+    /// storage read finishes: three at once would reach the wire in whatever
+    /// order those reads landed, and a node's traffic must be a function of
+    /// the node's inputs, not of how a disk race went. The warm already sent
+    /// the models query's request -- nothing was in flight ahead of it -- so
+    /// this waits for that answer before sending the next. On a durable node
+    /// there is no relay and every query answers for itself, so this walks
+    /// through without sending anything.
+    ///
+    /// The lease is taken per request and released while waiting, so a reset
+    /// drains this promptly instead of waiting out a peer that may never
+    /// answer.
+    async fn attach_projection_relays(&self, generation: u64, validity: RequestValidity) {
+        let Some(queries) = self.0.map.queries() else { return };
+        for (index, query) in queries.iter().enumerate() {
+            if index > 0 {
+                let Some(node) = self.node() else { return };
+                let Some(_lease) = validity.try_acquire() else { return };
+                if self.0.setup_state.read().unwrap().generation != generation {
+                    return;
+                }
+                if let Err(error) = query.subscribe_remote(&node, SessionSet::new()) {
+                    warn!("catalog projection could not subscribe to a durable peer: {error}");
+                    return;
+                }
+            }
+            if let Err(error) = query.wait_remote_answered().await {
+                warn!("catalog projection subscription failed; this node keeps serving what it has stored: {error}");
+                return;
+            }
+        }
     }
 
     // -- readiness ----------------------------------------------------------
@@ -315,6 +466,11 @@ where
 
     /// Whether the catalog map is authoritative for the current system epoch.
     pub fn is_catalog_ready(&self) -> bool { *self.0.ready.read().unwrap() }
+
+    /// Why the most recent warm attempt failed, while the retry loop is
+    /// backing off. An un-ready catalog with no failure here is one whose
+    /// first warm has simply not finished.
+    pub fn catalog_warm_failure(&self) -> Option<String> { self.0.warm_failure.read().unwrap().clone() }
 
     /// Wait until the catalog map is authoritative for the current system epoch.
     pub async fn wait_catalog_ready(&self) {
@@ -335,6 +491,46 @@ where
         }
     }
 
+    /// Wait until a durable peer has ANSWERED this node's catalog projection:
+    /// the relay's confirmation that a peer took all three subscriptions and
+    /// their rows are applied.
+    ///
+    /// This is a stronger claim than readiness and a different one. Readiness
+    /// says the projection is running over what this node has stored;
+    /// this says the catalog it holds came from the system's authority.
+    /// A caller that must see definitions another node registered waits here.
+    /// On a node with no relay -- a durable one, which IS that authority --
+    /// its own projection answers it, so this completes with readiness.
+    ///
+    /// A reset replaces the projection with a fresh one; a wait outstanding
+    /// across a reset picks up the replacement rather than waiting out queries
+    /// that reset has already torn down.
+    pub async fn wait_catalog_synced(&self) -> Result<(), RetrievalError> {
+        loop {
+            // Register for the readiness change BEFORE reading the
+            // projection, for `wait_catalog_ready`'s reason and one more: a
+            // reset between the read and the wait would otherwise leave this
+            // waiting on queries nothing will ever answer.
+            let changed = self.0.ready_notify.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let Some(queries) = self.0.map.queries() else {
+                changed.await;
+                continue;
+            };
+            let answered = async move {
+                for query in queries {
+                    query.wait_remote_answered().await?;
+                }
+                Ok(())
+            };
+            match futures::future::select(std::pin::pin!(answered), changed).await {
+                futures::future::Either::Left((answered, _)) => return answered,
+                futures::future::Either::Right(((), _)) => continue,
+            }
+        }
+    }
+
     /// Snapshot the current system epoch's schema-registration owner. It is
     /// absent before a root is ready and throughout hard reset; callers must
     /// still acquire a lease immediately before applying epoch-bound effects.
@@ -342,7 +538,7 @@ where
         self.0.setup_state.read().unwrap().registration_fence.clone().map(RequestValidity::fenced)
     }
 
-    /// Wait for the durable catalog warm without letting reset strand an old
+    /// Wait for the catalog warm without letting reset strand an old
     /// allocator request. The caller acquires the validity lease after this
     /// returns, closing the ready-to-reset race atomically at the fence.
     pub(crate) async fn wait_catalog_ready_if_current(&self, validity: &RequestValidity) -> bool {
@@ -366,10 +562,9 @@ where
     }
 
     /// Begin SystemManager's reset barrier. Invalidate the generation and all
-    /// epoch owners synchronously, tear down old live queries before waiting,
-    /// then drain durable warming, ephemeral setup/local/wire application, and
-    /// schema-registration effects. Storage deletion cannot begin until this
-    /// returns.
+    /// epoch owners synchronously, then drain the warm (its retries and its
+    /// storage reads) and schema-registration effects. Storage deletion
+    /// cannot begin until this returns.
     async fn begin_reset(&self) {
         let draining_fences = {
             let mut setup = self.0.setup_state.write().unwrap();
@@ -377,12 +572,7 @@ where
                 setup.resetting = true;
                 setup.generation = setup.generation.wrapping_add(1);
             }
-            setup.ephemeral_active = false;
-            if let Some(fence) = setup.ephemeral_fence.take() {
-                fence.invalidate();
-                setup.draining_fences.push(fence);
-            }
-            if let Some(fence) = setup.durable_fence.take() {
+            if let Some(fence) = setup.warm_fence.take() {
                 fence.invalidate();
                 setup.draining_fences.push(fence);
             }
@@ -403,12 +593,18 @@ where
     }
 
     /// Finish SystemManager's reset only after storage, system state, and the
-    /// reactor have been cleared. This is the point where a new ephemeral
-    /// setup may claim the next generation.
+    /// reactor have been cleared. This is the point where the next
+    /// become-ready transition may claim a fresh warm.
     fn finish_reset(&self) {
         let mut setup = self.0.setup_state.write().unwrap();
-        self.0.map.write().unwrap().clear();
+        // Detach the drained projection and drop what registration confirmed
+        // under the departing system, but drop the projection itself after the
+        // setup guard releases, so unsubscribe teardown never runs under
+        // catalog setup synchronization. The next generation's warm builds a
+        // new one.
+        let projection = self.0.map.clear();
         *self.0.ready.write().unwrap() = false;
+        *self.0.warm_failure.write().unwrap() = None;
         // Resolved identities belong to one system, but there is nothing to
         // clear here: they live on the descriptor cells keyed by the OLD
         // epoch, which nothing reads once SystemManager clears the node's
@@ -416,22 +612,21 @@ where
         // everything against the new system's allocator.
         setup.draining_fences.clear();
         setup.resetting = false;
-        setup.durable_resume_pending = self.0.durable;
-        // Wake any ensure_subscribed waiters so they observe the cleared
-        // latch instead of sleeping on a readiness that will never come, and
-        // cancel the detached owner so it removes its relay attempts before a
-        // held stale response can reach NodeApplier.
+        setup.warm_resume_pending = true;
+        // Wake readiness waiters so they observe the cleared state instead of
+        // sleeping on a readiness that will never come.
         drop(setup);
+        drop(projection);
         self.0.setup_changed.notify_waiters();
         self.0.ready_notify.notify_waiters();
         debug!("CatalogManager reset (map cleared, not ready)");
     }
 
     /// Re-arm epoch-bound catalog work after `SystemManager` has published a
-    /// ready root. Every node kind gets exactly one registration fence; a
-    /// durable node also claims its one pending storage warm.
+    /// ready root. Every node kind gets exactly one registration fence, and
+    /// claims its one pending warm.
     fn resume_after_system_ready(&self) {
-        let durable_claim = {
+        let claim = {
             let mut setup = self.0.setup_state.write().unwrap();
             if setup.resetting {
                 return;
@@ -439,18 +634,19 @@ where
             if setup.registration_fence.is_none() {
                 setup.registration_fence = Some(RequestFence::new());
             }
-            if !self.0.durable || !setup.durable_resume_pending {
+            if !setup.warm_resume_pending {
                 return;
             }
-            setup.durable_resume_pending = false;
+            setup.warm_resume_pending = false;
             let fence = RequestFence::new();
-            let lease = fence.try_acquire().expect("a newly-created durable warm fence must admit its owner");
-            setup.durable_fence = Some(fence);
-            (setup.generation, lease)
+            let lease = fence.try_acquire().expect("a newly-created warm fence must admit its owner");
+            let validity = RequestValidity::fenced(fence.clone());
+            setup.warm_fence = Some(fence);
+            (setup.generation, lease, validity)
         };
-        let (generation, lease) = durable_claim;
+        let (generation, lease, validity) = claim;
         let me = self.clone();
-        crate::task::spawn(async move { me.run_durable_warm(generation, lease).await });
+        crate::task::spawn(async move { me.run_warm(generation, lease, validity).await });
     }
 
     // -- public lookup API (cheap clones) -----------------------------------
@@ -472,16 +668,13 @@ where
     }
 
     /// Return the current catalog definition for a durable property identity.
-    pub fn property_by_id(&self, id: &EntityId) -> Option<PropertyDef> { self.0.map.read().unwrap().properties.get(id).cloned() }
+    pub fn property_by_id(&self, id: &EntityId) -> Option<SysPropertyRow> { self.0.map.property(id) }
 
-    /// Return the model currently registered under a source label.
+    /// Return the model currently registered under a source label, with the
+    /// catalog entity id that identifies it.
     ///
     /// This is catalog metadata, not a storage-engine materialization lookup.
-    pub fn model_by_label(&self, label: &str) -> Option<ModelDef> {
-        let map = self.0.map.read().unwrap();
-        let id = map.by_label.get(label)?;
-        map.models.get(id).cloned()
-    }
+    pub fn model_by_label(&self, label: &str) -> Option<(EntityId, SysModelRow)> { self.0.map.model_by_label(label) }
 
     /// Whether this catalog recognizes a wire model identity. System models
     /// are the bootstrap base case, answerable on a stone-cold node; allocated
@@ -490,32 +683,30 @@ where
     pub fn knows_model(&self, model: &proto::ModelId) -> bool {
         match model {
             proto::ModelId::System(_) => true,
-            proto::ModelId::EntityId(id) => self.0.map.read().unwrap().models.contains_key(id),
+            proto::ModelId::EntityId(id) => self.0.map.knows_model(id),
         }
     }
 
-    /// Catalog lookup for the model definition currently bound to a declared
+    /// Catalog lookup for the model identity currently bound to a declared
     /// model label. This is schema information, not the authoritative
     /// storage materialization reverse map; wire egress must ask the storage
     /// engine for that mapping.
     pub fn model_id_for(&self, label: &str) -> Option<proto::ModelId> {
-        crate::schema::system_model_id(label)
-            .or_else(|| self.0.map.read().unwrap().by_label.get(label).copied().map(proto::ModelId::EntityId))
+        crate::schema::system_model_id(label).or_else(|| self.0.map.model_by_label(label).map(|(id, _)| proto::ModelId::EntityId(id)))
     }
 
-    /// Return the membership connecting `model` and `property`, if present.
-    pub fn membership(&self, model: &EntityId, property: &EntityId) -> Option<ModelPropertyMembershipDef> {
-        self.0.map.read().unwrap().membership(model, property)
+    /// Return the membership connecting `model` and `property`, if present,
+    /// with the catalog entity id that identifies it.
+    pub fn membership(&self, model: &EntityId, property: &EntityId) -> Option<(EntityId, SysModelPropertyRow)> {
+        self.0.map.membership(model, property)
     }
 
-    /// Return all property memberships currently registered for `model`.
-    pub fn memberships_of(&self, model: &EntityId) -> Vec<ModelPropertyMembershipDef> { self.0.map.read().unwrap().memberships_of(model) }
+    /// Return all property memberships currently registered for `model`, each
+    /// with the catalog entity id that identifies it.
+    pub fn memberships_of(&self, model: &EntityId) -> Vec<(EntityId, SysModelPropertyRow)> { self.0.map.memberships_of(model) }
 
-    /// Property ids sharing display name `name` across ALL contracts (the
-    /// map's global name index, which also backs [`Self::property_by_name`]).
-    pub fn siblings_by_name(&self, name: &str) -> Vec<EntityId> {
-        self.0.map.read().unwrap().names_global.get(name).into_iter().flat_map(|s| s.iter().copied()).collect()
-    }
+    /// Property ids sharing display name `name` across ALL contracts.
+    pub fn siblings_by_name(&self, name: &str) -> Vec<EntityId> { self.0.map.siblings_by_name(name) }
 
     // -- registration lifecycle --------------------------------------------
 
@@ -532,14 +723,12 @@ where
     /// second identity. Used by the executor's upsert and the rename hint
     /// pre-pass.
     /// The property `name` currently addresses within `model`'s membership
-    /// set. Membership is the lookup scope -- a property shared into this
-    /// model resolves here regardless of where it was minted; `minted_for`
-    /// is provenance metadata, never a matching key.
-    pub fn property_by_name(&self, model: &EntityId, name: &str) -> Option<PropertyDef> {
-        let map = self.0.map.read().unwrap();
-        map.memberships_of(model)
-            .into_iter()
-            .find_map(|membership| map.properties.get(&membership.property).filter(|p| p.name == name).cloned())
+    /// set, with the catalog entity id that identifies it. Membership is the
+    /// lookup scope -- a property shared into this model resolves here
+    /// regardless of where it was minted; `minted_for` is provenance
+    /// metadata, never a matching key.
+    pub fn property_by_name(&self, model: &EntityId, name: &str) -> Option<(EntityId, SysPropertyRow)> {
+        self.0.map.property_by_name(model, name)
     }
 
     /// Build the proven binding from the allocator's response itself.
@@ -582,29 +771,29 @@ where
     /// model id must itself be the label's live model. Every field then
     /// needs a compatible immutable backend/type pair.
     fn compatible_binding(&self, schema: &'static ModelStructDescriptor) -> Option<CatalogBinding> {
-        let map = self.0.map.read().unwrap();
+        let map = &self.0.map;
+        let (label_model, _) = map.model_by_label(schema.label)?;
         let model = match schema.explicit_id {
             Some(id) => {
                 let id = super::compiled::parse_explicit_id(id);
-                let def = map.models.get(&id)?;
-                if def.label != schema.label || map.by_label.get(schema.label) != Some(&id) {
+                if label_model != id {
                     return None;
                 }
                 id
             }
-            None => *map.by_label.get(schema.label)?,
+            None => label_model,
         };
 
         let mut fields = Vec::with_capacity(schema.properties.len());
         for field in schema.properties {
             let id = match field.explicit_id {
                 Some(id) => super::compiled::parse_explicit_id(id),
-                None => map.resolve(schema.label, field.name).ok().flatten()?,
+                None => map.resolve(&model, field.name).ok().flatten()?,
             };
             if map.membership(&model, &id).is_none() {
                 return None;
             }
-            let def = map.properties.get(&id)?;
+            let def = map.property(&id)?;
             if def.backend != field.backend || !super::registration::value_types_compatible(&def.value_type, field.value_type) {
                 return None;
             }
@@ -644,6 +833,11 @@ where
         cdata: &PA::ContextData,
         schema: &'static ModelStructDescriptor,
     ) -> Result<(proto::ModelId, super::SchemaEpoch), RegistrationError> {
+        // A built-in is already resolved at every epoch, including the
+        // bootstrap epoch a pre-system node stamps its entities with.
+        if let Some(system) = schema.system {
+            return Ok((proto::ModelId::System(system), self.schema_epoch().unwrap_or(super::SchemaEpoch::BOOTSTRAP)));
+        }
         let epoch = self.schema_epoch().ok_or(RegistrationError::SystemNotReady)?;
         // The snapshot epoch returns WITH the identity: one logical
         // operation (ensure, field resolution, entity stamp) must observe
@@ -679,34 +873,17 @@ where
         }
     }
 
-    /// Fold resolved definitions into the map: the executor calls this
-    /// synchronously post-commit (before releasing the allocator mutex),
+    /// Fold resolved definitions into the map's overlay: the executor calls
+    /// this synchronously post-commit (before releasing the allocator mutex),
     /// and `ensure_registered` calls it with a SchemaRegistered response so
-    /// binding proceeds ahead of the catalog subscription.
-    /// Idempotent (keyed by entity id); the reactor later re-delivers the
-    /// same entities harmlessly.
-    pub fn upsert_registered(&self, models: &[proto::RegisteredModel]) {
-        let mut map = self.0.map.write().unwrap();
-        for m in models {
-            map.upsert_model(ModelDef { id: m.id, label: m.label.clone(), name: m.name.clone() });
-            for p in &m.properties {
-                map.upsert_property(PropertyDef {
-                    id: p.id,
-                    minted_for: p.minted_for,
-                    name: p.name.clone(),
-                    backend: p.backend.clone(),
-                    value_type: p.value_type.clone(),
-                    target_model: p.target_model,
-                });
-                map.upsert_membership(ModelPropertyMembershipDef {
-                    id: p.membership_id,
-                    model: m.id,
-                    property: p.id,
-                    optional: Some(p.optional),
-                });
-            }
-        }
-    }
+    /// binding proceeds ahead of the projection.
+    ///
+    /// What lands here is what ONE registration was told, so the projection's
+    /// rows outrank it for every id it has delivered -- a definition renamed
+    /// since is read from the catalog, not from this. Idempotent (keyed by
+    /// catalog entity id); the projection later delivers the same rows and
+    /// simply takes over answering for them.
+    pub fn upsert_registered(&self, models: &[proto::RegisteredModel]) { self.0.map.upsert_registered(models) }
 
     /// TEST ONLY: seed deterministic catalog rows and admit their exact
     /// compiled-schema binding without writing catalog entities.
@@ -766,6 +943,13 @@ where
         schema: &'static ModelStructDescriptor,
         epoch: super::SchemaEpoch,
     ) -> Result<(), RegistrationError> {
+        // A built-in's identities are compile-time constants, so there is
+        // nothing to allocate and nobody to ask. It answers before the
+        // registration fence exists, which is what lets the catalog's own row
+        // models be used on a node whose system is not ready yet.
+        if schema.system.is_some() {
+            return Ok(());
+        }
         let collection = schema.label.to_string();
         // Snapshot and enter the registration fence before consulting the
         // cells. Checking first would allow reset to install a new fence
@@ -856,8 +1040,5 @@ where
     /// TEST/INTROSPECTION: number of parsed entities of each kind
     /// (models, properties, memberships).
     #[cfg(any(test, feature = "test-helpers"))]
-    pub fn counts(&self) -> (usize, usize, usize) {
-        let map = self.0.map.read().unwrap();
-        (map.models.len(), map.properties.len(), map.memberships.len())
-    }
+    pub fn counts(&self) -> (usize, usize, usize) { self.0.map.counts() }
 }

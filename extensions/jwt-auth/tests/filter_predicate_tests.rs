@@ -4,6 +4,7 @@ use ankql::ast::Predicate;
 use ankurah_core::{
     policy::{AccessDenied, PolicyAgent},
     property::backend::{LWWBackend, PropertyBackend},
+    schema::resolver::{resolve_selection, ModelResolutionError, ModelResolver, ResolvedProperty},
     selection::filter::{evaluate_predicate, Filterable},
     util::Iterable,
     value::Value,
@@ -19,6 +20,7 @@ use std::collections::BTreeMap;
 fn test_filter_predicate_privileged_bypasses() {
     let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys, blog_config_path()).unwrap();
+    agent.set_selection_resolver(fixture_binding());
 
     let ctx = JwtContext::Root;
     let predicate = make_predicate("title = 'hello'");
@@ -33,6 +35,7 @@ fn test_filter_predicate_privileged_bypasses() {
 fn test_filter_predicate_no_scope_rules() {
     let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path()).unwrap();
+    agent.set_selection_resolver(fixture_binding());
 
     let claims = JwtClaims {
         sub: "user-1".into(),
@@ -55,6 +58,7 @@ fn test_filter_predicate_no_scope_rules() {
 fn test_filter_predicate_applies_scope_rule() {
     let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path()).unwrap();
+    agent.set_selection_resolver(fixture_binding());
 
     let claims = JwtClaims {
         sub: "author-42".into(),
@@ -86,6 +90,7 @@ fn test_filter_predicate_applies_scope_rule() {
 fn test_filter_predicate_unless_privilege_bypasses() {
     let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path()).unwrap();
+    agent.set_selection_resolver(fixture_binding());
 
     let claims = JwtClaims {
         sub: "editor-1".into(),
@@ -118,6 +123,7 @@ fn test_filter_predicate_nouser_denied() {
     }"#;
     let config: PolicyConfig = serde_json::from_str(config_json).unwrap();
     let agent = JwtAgent::new_ephemeral();
+    agent.set_selection_resolver(fixture_binding());
     agent.update_config(config);
 
     let ctx = JwtContext::NoUser;
@@ -145,6 +151,7 @@ fn test_filter_predicate_unconditional_scope_rule() {
 
     let keys = common::test_keys();
     let agent = JwtAgent::new_ephemeral();
+    agent.set_selection_resolver(fixture_binding());
     agent.update_config(config);
     agent.set_keys(JwtKeys::Signing(keys.clone()));
 
@@ -170,6 +177,7 @@ fn test_filter_predicate_unconditional_scope_rule() {
 fn test_filter_predicate_injection_payload_is_inert() {
     let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path()).unwrap();
+    agent.set_selection_resolver(fixture_binding());
 
     let payload = "'; DROP TABLE posts; --";
     let claims = JwtClaims {
@@ -226,24 +234,17 @@ fn prop(name: &str) -> ankql::ast::PropertyId {
 }
 
 struct FixtureResolver;
-impl ankql::NameResolver for FixtureResolver {
-    fn resolve_property(&self, _model: &proto::ModelId, name: &str) -> Result<Option<ankql::ast::PropertyId>, ankql::NameResolutionError> {
-        Ok(Some(prop(name)))
-    }
-    fn property_value_type(
-        &self,
-        _model: &proto::ModelId,
-        _property: &ankql::ast::PropertyId,
-    ) -> Result<ankurah_core::value::ValueType, ankql::NameResolutionError> {
-        Ok(ankurah_core::value::ValueType::String)
+impl ModelResolver for FixtureResolver {
+    fn resolve_property(&self, _model: &proto::ModelId, name: &str) -> Result<Option<ResolvedProperty>, ModelResolutionError> {
+        Ok(Some(ResolvedProperty { id: prop(name), value_type: ankurah_core::value::ValueType::String }))
     }
 }
 
-/// Bind a predicate's names to the fixture identities, the way the shared
-/// query entry does in production before row evaluation.
-fn resolve_fixture(predicate: Predicate) -> Predicate {
+/// Bind a rule predicate's names to the fixture identities, the way node
+/// attach binds them through the catalog.
+fn resolve_fixture(predicate: Predicate<ankql::ast::Parsed>) -> Predicate<ankql::ast::Resolved> {
     let model = proto::ModelId::EntityId(proto::EntityId::from_bytes([0x77; 32]));
-    predicate.resolve_names(&model, &FixtureResolver).expect("fixture predicates resolve")
+    resolve_selection(&model, &FixtureResolver, predicate.into()).expect("fixture predicates resolve").predicate
 }
 
 /// The fixture's stand-in for the catalog binding node attach installs.
@@ -263,8 +264,8 @@ impl Filterable for Post {
     }
 }
 
-fn admits(predicate: &Predicate, post: Post) -> bool {
-    evaluate_predicate(&post, &resolve_fixture(predicate.clone())).expect("filtered predicate must be evaluable against a post")
+fn admits(predicate: &Predicate<ankql::ast::Resolved>, post: Post) -> bool {
+    evaluate_predicate(&post, predicate).expect("filtered predicate must be evaluable against a post")
 }
 
 /// A blog credential holding a single role, signed by `keys`.
@@ -293,7 +294,12 @@ fn post_state(post: Post) -> proto::State {
 /// on the durable fetch and livequery paths, which never call it. For each
 /// row: the filter admits it exactly when the caller asked for it and
 /// check_read would hand it over.
-fn assert_agrees_with_check_read<C: Iterable<JwtContext>>(agent: &JwtAgent, contexts: &C, base: &Predicate, rows: &[Post]) {
+fn assert_agrees_with_check_read<C: Iterable<JwtContext>>(
+    agent: &JwtAgent,
+    contexts: &C,
+    base: &Predicate<ankql::ast::Resolved>,
+    rows: &[Post],
+) {
     let collection = CollectionId::from("post");
     // Install the fixture's stand-in for the catalog binding, so the agent's
     // row-side scope checks resolve the same identities the rows carry.
@@ -322,6 +328,7 @@ fn assert_agrees_with_check_read<C: Iterable<JwtContext>>(agent: &JwtAgent, cont
 fn test_filter_predicate_single_context_parity() {
     let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path()).unwrap();
+    agent.set_selection_resolver(fixture_binding());
 
     let ctx = blog_context(&keys, "author-42", "Author");
     let collection = CollectionId::from("post");
@@ -337,6 +344,7 @@ fn test_filter_predicate_single_context_parity() {
 fn test_filter_predicate_unions_across_contexts() {
     let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path()).unwrap();
+    agent.set_selection_resolver(fixture_binding());
 
     let contexts = vec![blog_context(&keys, "author-1", "Author"), blog_context(&keys, "author-2", "Author")];
     let collection = CollectionId::from("post");
@@ -357,6 +365,7 @@ fn test_filter_predicate_unions_across_contexts() {
 fn test_filter_predicate_unrestricted_context_collapses_union() {
     let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path()).unwrap();
+    agent.set_selection_resolver(fixture_binding());
 
     let contexts = vec![blog_context(&keys, "author-42", "Author"), blog_context(&keys, "editor-1", "Editor")];
     let collection = CollectionId::from("post");
@@ -376,6 +385,7 @@ fn test_filter_predicate_unrestricted_context_collapses_union() {
 fn test_filter_predicate_unions_three_contexts() {
     let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path()).unwrap();
+    agent.set_selection_resolver(fixture_binding());
 
     let contexts = vec![
         blog_context(&keys, "author-1", "Author"),
@@ -399,6 +409,7 @@ fn test_filter_predicate_unions_three_contexts() {
 fn test_filter_predicate_deduplicates_equal_slices() {
     let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path()).unwrap();
+    agent.set_selection_resolver(fixture_binding());
     let collection = CollectionId::from("post");
 
     let lone = blog_context(&keys, "author-42", "Author");
@@ -421,6 +432,7 @@ fn test_filter_predicate_deduplicates_equal_slices() {
 fn test_filter_predicate_empty_context_set() {
     let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys, blog_config_path()).unwrap();
+    agent.set_selection_resolver(fixture_binding());
 
     let contexts: Vec<JwtContext> = Vec::new();
     let predicate = make_predicate("title = 'hello'");
@@ -440,6 +452,7 @@ fn test_filter_predicate_empty_context_set() {
 fn test_filter_predicate_ignores_unauthorized_context() {
     let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path()).unwrap();
+    agent.set_selection_resolver(fixture_binding());
 
     let contexts = vec![blog_context(&keys, "reader-1", "Reader"), blog_context(&keys, "author-42", "Author")];
     let collection = CollectionId::from("post");
@@ -456,6 +469,7 @@ fn test_filter_predicate_ignores_unauthorized_context() {
 fn test_filter_predicate_no_authorized_context_denied() {
     let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path()).unwrap();
+    agent.set_selection_resolver(fixture_binding());
 
     let ctx = blog_context(&keys, "reader-1", "Reader");
     let collection = CollectionId::from("post");
@@ -470,6 +484,7 @@ fn test_filter_predicate_no_authorized_context_denied() {
 fn test_filter_predicate_privileged_precedes_union() {
     let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path()).unwrap();
+    agent.set_selection_resolver(fixture_binding());
 
     let contexts = vec![blog_context(&keys, "author-42", "Author"), JwtContext::Root];
     let predicate = make_predicate("title = 'hello'");
@@ -514,6 +529,7 @@ fn custom_author_agent(keys: &SigningKeys) -> JwtAgent {
     let config: PolicyConfig = serde_json::from_str(config_json).unwrap();
 
     let agent = JwtAgent::new_ephemeral();
+    agent.set_selection_resolver(fixture_binding());
     agent.update_config(config);
     agent.set_keys(JwtKeys::Signing(keys.clone()));
     agent
@@ -640,6 +656,7 @@ fn test_filter_predicate_unresolvable_order_independent() {
 fn test_filter_predicate_agrees_with_check_read() {
     let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path()).unwrap();
+    agent.set_selection_resolver(fixture_binding());
     let base = make_predicate("title = 'hello'");
     let rows = [
         Post { author: "author-1", title: "hello" },

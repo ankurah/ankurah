@@ -81,8 +81,40 @@ pub(crate) fn start_ephemeral_policy_sync<SE, PA>(
     let lq_clone = lq.clone();
     *policy_livequery.lock().unwrap_or_else(|e| e.into_inner()) = Some(lq);
 
+    let weak_node = node.weak();
     ankurah_core::task::spawn(async move {
-        lq_clone.wait_initialized().await;
+        // A policy query that failed to initialize will never carry a key or
+        // a config: reading its resultset applies nothing and the
+        // subscription below would never fire, leaving an agent that behaves
+        // like a system with no policy at all. Say so once, loudly, instead.
+        if let Err(error) = lq_clone.wait_initialized().await {
+            tracing::error!("ephemeral policy sync: the policy livequery never initialized, so no policy will be applied: {error}");
+            return;
+        }
+
+        // Reading the arriving policy rows goes through JwtPolicy's typed
+        // accessors, which resolve fields via the descriptor's cells at this
+        // node's epoch -- and nothing else on an ephemeral node runs the
+        // registration gate for this model (the livequery itself is raw).
+        // Assert registration once, after the system is actually ready (this
+        // task starts at node construction, and the livequery initializes
+        // pre-join, so neither implies readiness), so the cells resolve
+        // before the first read; the durable side already holds the schema,
+        // so the forwarded request is a no-op plan that skips the policy
+        // verb. The readiness wait runs on a cloned SystemManager with the
+        // strong node handle dropped: this task must never keep its own
+        // node alive.
+        let system = match weak_node.upgrade() {
+            Some(node) => node.system.clone(),
+            None => return,
+        };
+        system.wait_system_ready().await;
+        if let Some(node) = weak_node.upgrade() {
+            use ankurah_core::model::Model;
+            if let Err(e) = node.catalog.ensure_registered(&JwtContext::NoUser, crate::JwtPolicy::descriptor()).await {
+                tracing::warn!("ephemeral policy sync: JwtPolicy registration did not confirm: {e}");
+            }
+        }
 
         apply_policy_from_resultset(&lq_clone.resultset(), &state_handle);
 

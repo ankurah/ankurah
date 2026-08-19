@@ -54,6 +54,7 @@ impl ModelDescription {
     /// Parse a DeriveInput and create a ModelDescription
     pub fn parse(input: &DeriveInput) -> syn::Result<Self> {
         let name = input.ident.clone();
+        let options = parse_model_options(&input.attrs)?;
 
         let fields = match &input.data {
             Data::Struct(data) => match &data.fields {
@@ -67,7 +68,7 @@ impl ModelDescription {
         let mut active_fields = Vec::new();
         let mut ephemeral_fields = Vec::new();
         for field in fields.into_iter() {
-            if get_model_flag(&field.attrs, "ephemeral") {
+            if field_is_ephemeral(&field.attrs)? {
                 ephemeral_fields.push(field);
             } else {
                 active_fields.push(field);
@@ -77,14 +78,55 @@ impl ModelDescription {
         // Load backend configurations at compile time
         let backend_registry = crate::model::backend_registry::BackendRegistry::new()?;
 
-        Ok(Self { name, active_fields, ephemeral_fields, backend_registry, struct_attrs: input.attrs.clone() })
+        let base: syn::Path = match &options.base {
+            Some(path) => syn::parse_str(path)
+                .map_err(|_| syn::Error::new_spanned(&name, format!("#[model(base = {path:?})] is not a valid path")))?,
+            None => syn::parse_str("::ankurah::core").expect("the default base path parses"),
+        };
+        let uses_crate_paths = base.is_ident("crate");
+        let system = match &options.system {
+            Some(variant) => Some(SystemModel::from_variant_name(variant).ok_or_else(|| {
+                syn::Error::new_spanned(
+                    &name,
+                    format!(
+                        "#[model(system = {variant:?})] is not a built-in system model; expected System, Model, Property, or ModelProperty"
+                    ),
+                )
+            })?),
+            None => None,
+        };
+
+        Ok(Self {
+            name,
+            active_fields,
+            ephemeral_fields,
+            backend_registry,
+            base,
+            uses_crate_paths,
+            no_ffi: options.no_ffi,
+            system,
+            explicit_id: options.explicit_id,
+        })
     }
 
     // Basic identifier accessors
     pub fn name(&self) -> &Ident { &self.name }
-    /// Struct-level attributes, for `#[model(id = "...")]` parsing.
-    pub fn struct_attrs(&self) -> &[syn::Attribute] { &self.struct_attrs }
-    pub fn collection_str(&self) -> String { self.name.to_string().to_lowercase() }
+    pub fn collection_str(&self) -> String {
+        match self.system {
+            // A built-in lives at its own reserved label, never at a name
+            // derived from whatever struct happens to declare it.
+            Some(model) => format!("{}{}", crate::model::RESERVED_COLLECTION_PREFIX, to_snake(model.variant_name())),
+            None => self.name.to_string().to_lowercase(),
+        }
+    }
+    /// The path generated code reaches the core crate through.
+    pub fn base(&self) -> &syn::Path { &self.base }
+    /// Whether this model deliberately omits WASM and UniFFI bindings.
+    pub fn no_ffi(&self) -> bool { self.no_ffi }
+    /// The built-in identity this model pins, when it is a system model.
+    pub fn system(&self) -> Option<SystemModel> { self.system }
+    /// The explicit durable catalog model identity, when supplied.
+    pub fn explicit_id(&self) -> Option<&str> { self.explicit_id.as_deref() }
     pub fn view_name(&self) -> Ident { format_ident!("{}View", self.name) }
     pub fn mutable_name(&self) -> Ident { format_ident!("{}Mut", self.name) }
 
@@ -142,9 +184,10 @@ impl ModelDescription {
     pub fn active_field_types(&self) -> syn::Result<Vec<syn::Type>> {
         let descs = self.active_field_descs()?;
         let mut results = Vec::new();
+        let context = if self.uses_crate_paths { "local" } else { "external" };
 
         for (i, desc) in descs.iter().enumerate() {
-            let rust_type = desc.rust_type().map_err(|e| {
+            let rust_type = desc.rust_type_with_context(context).map_err(|e| {
                 let field = &self.active_fields[i];
                 syn::Error::new_spanned(&field.ty, format!("Failed to generate Rust type: {}", e))
             })?;
@@ -420,11 +463,93 @@ impl ModelDescription {
     }
 }
 
-fn get_model_flag(attrs: &Vec<syn::Attribute>, flag_name: &str) -> bool {
-    attrs.iter().any(|attr| {
-        attr.path().segments.iter().any(|seg| seg.ident == "model")
-            && attr.meta.require_list().ok().and_then(|list| list.parse_args::<syn::Ident>().ok()).is_some_and(|ident| ident == flag_name)
-    })
+/// Parse every struct-level `#[model(...)]` attribute into the closed option
+/// set. An unrecognized key, a repeated key, a flag given a value, or a
+/// string option given a non-string are all compile errors here.
+fn parse_model_options(attrs: &[syn::Attribute]) -> syn::Result<ModelOptions> {
+    let mut options = ModelOptions::default();
+    for attr in attrs {
+        if !attr.path().is_ident("model") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            let key = meta.path.get_ident().map(|ident| ident.to_string()).unwrap_or_default();
+            match key.as_str() {
+                "base" => set_model_option(&mut options.base, model_option_str(&meta, "base")?, &meta, "base"),
+                "system" => set_model_option(&mut options.system, model_option_str(&meta, "system")?, &meta, "system"),
+                "id" => set_model_option(&mut options.explicit_id, model_option_str(&meta, "id")?, &meta, "id"),
+                "no_ffi" => {
+                    if !meta.input.is_empty() && meta.input.peek(syn::Token![=]) {
+                        return Err(meta.error("#[model(no_ffi)] is a bare flag and does not take a value"));
+                    }
+                    if options.no_ffi {
+                        return Err(meta.error("duplicate #[model(no_ffi)] option"));
+                    }
+                    options.no_ffi = true;
+                    Ok(())
+                }
+                _ => Err(meta.error("unknown #[model(...)] option; expected `base`, `system`, `id`, or `no_ffi`")),
+            }
+        })?;
+    }
+    Ok(options)
+}
+
+/// Read the string value of a `#[model(key = "...")]` option.
+fn model_option_str(meta: &ParseNestedMeta<'_>, key: &str) -> syn::Result<String> {
+    if !meta.input.peek(syn::Token![=]) {
+        return Err(meta.error(format!("#[model({key} = ...)] expects a string literal")));
+    }
+    let value = meta.value()?;
+    let literal = value
+        .parse::<LitStr>()
+        .map_err(|_| syn::Error::new_spanned(&meta.path, format!("#[model({key} = ...)] expects a string literal")))?;
+    Ok(literal.value())
+}
+
+fn set_model_option(slot: &mut Option<String>, value: String, meta: &ParseNestedMeta<'_>, key: &str) -> syn::Result<()> {
+    if slot.replace(value).is_some() {
+        return Err(meta.error(format!("duplicate #[model({key} = ...)] option")));
+    }
+    Ok(())
+}
+
+/// Field-level `#[model(...)]` has its own closed vocabulary; the bare
+/// `ephemeral` flag is the whole of it today.
+fn field_is_ephemeral(attrs: &[syn::Attribute]) -> syn::Result<bool> {
+    let mut ephemeral = false;
+    for attr in attrs {
+        if !attr.path().is_ident("model") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if !meta.path.is_ident("ephemeral") {
+                return Err(meta.error("unknown field #[model(...)] option; expected `ephemeral`"));
+            }
+            if ephemeral {
+                return Err(meta.error("duplicate #[model(ephemeral)] option"));
+            }
+            if !meta.input.is_empty() && meta.input.peek(syn::Token![=]) {
+                return Err(meta.error("#[model(ephemeral)] is a bare flag and does not take a value"));
+            }
+            ephemeral = true;
+            Ok(())
+        })?;
+    }
+    Ok(ephemeral)
+}
+
+/// PascalCase to snake_case, the spelling a built-in's reserved collection
+/// label takes (`ModelProperty` -> `model_property`).
+fn to_snake(ident: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in ident.chars().enumerate() {
+        if c.is_uppercase() && i > 0 {
+            out.push('_');
+        }
+        out.push(c.to_ascii_lowercase());
+    }
+    out
 }
 
 fn as_turbofish(type_path: &syn::Type) -> proc_macro2::TokenStream {

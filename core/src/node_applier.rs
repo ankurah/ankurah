@@ -34,10 +34,12 @@ impl NodeApplier {
         let Some(relay) = &node.subscription_relay else {
             return Err(MutationError::InvalidUpdate("Should not be receiving updates without a subscription relay").into());
         };
-        let cdata = relay.get_contexts_for_peer(from_peer_id);
-        if cdata.is_empty() {
-            return Err(MutationError::InvalidUpdate("Should not be receiving updates without at least predicate context").into());
+        // A peer may push only what we asked it for, so a push is admissible
+        // only against a standing query of ours with that peer.
+        if !relay.has_subscription_with_peer(from_peer_id) {
+            return Err(MutationError::InvalidUpdate("Should not be receiving updates from a peer we hold no subscription with").into());
         }
+        let cdata = relay.get_contexts_for_peer(from_peer_id);
 
         // Apply all updates. One bad item must not poison the batch: failures
         // are collected per item, the remaining items still apply, and the
@@ -48,6 +50,16 @@ impl NodeApplier {
             let entity_id = update.entity_id;
             let item_collection = update.collection.clone();
             let result = async {
+                // Ordinary data additionally needs a principal to attribute
+                // the read to; with none, this node holds no query that could
+                // have asked for it. The catalog projection is the one
+                // standing query that carries no credential by design
+                // (crate::schema::reads_bypass_policy), and its pushes are
+                // what keep every node's catalog current, so they are admitted
+                // on the subscription alone.
+                if cdata.is_empty() && !crate::schema::reads_bypass_policy(&update.collection) {
+                    return Err(MutationError::InvalidUpdate("Should not be receiving updates without at least predicate context"));
+                }
                 let collection = node.collections.get(&update.collection).await?;
                 let event_getter = CachedEventGetter::new(update.collection.clone(), collection.clone(), node, &cdata);
                 let state_getter = LocalStateGetter::new(collection);

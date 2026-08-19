@@ -48,15 +48,24 @@ pub trait TContext {
     /// locally on a durable node, forwarded as a RegisterSchema request on
     /// an ephemeral one). Idempotent and latched; with no reachable peer it
     /// may proceed only from a binding proven against locally held,
-    /// allocator-derived catalog rows. Every registration path funnels
-    /// here -- typed first use (create/fetch/get/query_wait) and the
-    /// explicit [`Context::register_model`] alike; callers convert the
-    /// typed error at their boundary (From impls into RetrievalError and
-    /// MutationError).
+    /// allocator-derived catalog rows. This is the write path's entry --
+    /// `Transaction::create` and the explicit [`Context::register_model`];
+    /// a read reaches the same registration through
+    /// [`Self::bind_or_register`], which only registers what the catalog
+    /// cannot already prove. Callers convert the typed error at their
+    /// boundary (From impls into RetrievalError and MutationError).
     async fn ensure_registered(
         &self,
         schema: &'static crate::schema::ModelStructDescriptor,
     ) -> Result<(proto::ModelId, crate::schema::SchemaEpoch), crate::schema::registration::RegistrationError>;
+
+    /// Bind a compiled declaration to this system's durable identities, so
+    /// the views a typed read returns resolve every accessor, and register
+    /// the declaration first if the catalog cannot prove it yet. This is the
+    /// read-path admission: a declaration the system has never been told
+    /// about is healed here, and a credential that may not register it is
+    /// told so.
+    async fn bind_or_register(&self, schema: &'static crate::schema::ModelStructDescriptor) -> Result<(), RetrievalError>;
 
     /// Resolve a typed selection's property names through the compiled
     /// declaration's descriptor cells (catalog fallback for names the
@@ -90,7 +99,18 @@ pub trait TContext {
     fn get_resident_entity(&self, id: proto::EntityId) -> Option<Entity>;
     async fn fetch_entities(&self, collection: &proto::CollectionId, args: MatchArgs<Resolved>) -> Result<Vec<Entity>, RetrievalError>;
     async fn commit_local_trx(&self, trx: &Transaction) -> Result<Vec<Event>, MutationError>;
-    fn query(&self, collection_id: proto::CollectionId, args: MatchArgs) -> Result<EntityLiveQuery, RetrievalError>;
+    /// The live-query entry. Admission (name resolution against `schema`'s
+    /// descriptor cells, policy injection) happens right here whenever those
+    /// cells are bound, so an unresolvable name is this call's error rather
+    /// than a query that quietly never populates. A declaration this system
+    /// has not been told about is registered inside the query's
+    /// initialization instead, since this entry cannot await.
+    fn query(
+        &self,
+        schema: &'static crate::schema::ModelStructDescriptor,
+        collection_id: proto::CollectionId,
+        args: MatchArgs<Parsed>,
+    ) -> Result<EntityLiveQuery, RetrievalError>;
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError>;
 }
 
@@ -102,6 +122,10 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     ) -> Result<(proto::ModelId, crate::schema::SchemaEpoch), crate::schema::registration::RegistrationError> {
         // Registration acts as one principal, like every write path.
         self.node.catalog.ensure_schema_for_use(&self.sessions.write_credential()?, schema).await
+    }
+
+    async fn bind_or_register(&self, schema: &'static crate::schema::ModelStructDescriptor) -> Result<(), RetrievalError> {
+        self.node.catalog.bind_or_register(&self.sessions, schema).await.map(|_| ())
     }
 
     fn resolve_selection_with_descriptor(
@@ -292,8 +316,13 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
 
         Ok(attested_events.into_iter().map(|a| a.payload).collect())
     }
-    fn query(&self, collection_id: proto::CollectionId, args: MatchArgs) -> Result<EntityLiveQuery, RetrievalError> {
-        EntityLiveQuery::new(&self.node, collection_id, args, self.sessions.clone())
+    fn query(
+        &self,
+        schema: &'static crate::schema::ModelStructDescriptor,
+        collection_id: proto::CollectionId,
+        args: MatchArgs<Parsed>,
+    ) -> Result<EntityLiveQuery, RetrievalError> {
+        EntityLiveQuery::new_typed(&self.node, schema, collection_id, args, self.sessions.clone())
     }
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
         self.node.system.collection(id).await
@@ -318,7 +347,7 @@ impl Context {
     /// before anything else runs. A second call for the same compiled shape
     /// is a no-op.
     pub async fn register_model<M: crate::model::Model>(&self) -> Result<proto::ModelId, crate::schema::registration::RegistrationError> {
-        self.0.ensure_registered(M::descriptor()).await
+        self.0.ensure_registered(M::descriptor()).await.map(|(model, _epoch)| model)
     }
 }
 
@@ -360,9 +389,11 @@ impl Context {
 
     pub async fn get<R: View>(&self, id: proto::EntityId) -> Result<R, RetrievalError> {
         use crate::model::Model;
-        // A typed direct get is a schema-dependent use: admit the exact
-        // compiled schema (first-use registration) before decoding.
-        self.0.ensure_registered(R::Model::descriptor()).await?;
+        // The decoded View's accessors read identities off the compiled
+        // declaration's cells, so admit the declaration before decoding: a
+        // shape this system already knows binds outright, and one it does
+        // not is registered here so the accessors have identities to read.
+        self.0.bind_or_register(R::Model::descriptor()).await?;
         let entity = self.0.get_entity(id, &R::collection(), false).await?;
         Ok(R::from_entity(entity))
     }
@@ -370,7 +401,7 @@ impl Context {
     /// Get an entity, but its ok to return early if the entity is already in the local node storage
     pub async fn get_cached<R: View>(&self, id: proto::EntityId) -> Result<R, RetrievalError> {
         use crate::model::Model;
-        self.0.ensure_registered(R::Model::descriptor()).await?;
+        self.0.bind_or_register(R::Model::descriptor()).await?;
         let entity = self.0.get_entity(id, &R::collection(), true).await?;
         Ok(R::from_entity(entity))
     }
@@ -381,11 +412,10 @@ impl Context {
     ) -> Result<Vec<R>, RetrievalError> {
         let args: MatchArgs<Parsed> = args.try_into().map_err(|e| e.into())?;
         use crate::model::Model;
-        // Typed predicate reads register at first use, so the fetch runs
-        // against authoritative catalog rows instead of failing loud as
-        // unregistered (and offline with no peer, it fails loud instead of
-        // answering empty).
-        self.0.ensure_registered(R::Model::descriptor()).await?;
+        // Admit the declaration first: it heals a shape this system has not
+        // been told about, and once every cell is bound the selection either
+        // resolves here and now or names something the query got wrong.
+        self.0.bind_or_register(R::Model::descriptor()).await?;
         let collection_id = R::Model::collection();
         let args =
             MatchArgs { selection: self.0.resolve_selection_with_descriptor(R::Model::descriptor(), args.selection)?, cached: args.cached };
@@ -402,11 +432,14 @@ impl Context {
         let views = self.fetch::<R>(args).await?;
         Ok(views.into_iter().next())
     }
-    /// Subscribe to changes in entities matching a selection. Admission
-    /// (first-use registration, policy injection, name resolution) runs
-    /// inside the query's asynchronous initialization -- this entry cannot
-    /// await the registration gate itself -- so the query starts empty and
-    /// an admission failure surfaces through its error slot.
+    /// Subscribe to changes in entities matching a selection.
+    ///
+    /// A declaration this system already knows is admitted right here (name
+    /// resolution, policy injection), so a query the caller got wrong is
+    /// this call's error. One it does not know is registered inside the
+    /// query's initialization, because this entry cannot await -- the query
+    /// starts empty and a failure there surfaces through its error slot.
+    /// [`Self::query_wait`] awaits that healing first and gets the error.
     pub fn query<R>(
         &self,
         args: impl TryInto<MatchArgs<Parsed>, Error = impl Into<RetrievalError>>,
@@ -428,12 +461,12 @@ impl Context {
         R: View,
     {
         use crate::model::Model;
-        // The synchronous `query` cannot await first-use registration (its
-        // initialization pipeline takes that over with the
-        // propertyid-resolution PR); the awaited form registers here.
-        self.0.ensure_registered(R::Model::descriptor()).await?;
+        // Heal here rather than inside the query: with the declaration bound
+        // before construction, the query admits synchronously and every
+        // admission failure is this call's error.
+        self.0.bind_or_register(R::Model::descriptor()).await?;
         let livequery = self.query::<R>(args)?;
-        livequery.wait_initialized().await;
+        livequery.wait_initialized().await?;
         Ok(livequery)
     }
     pub async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
@@ -467,11 +500,16 @@ where
             }
         }
 
+        // Catalog reads never consult the agent (crate::schema::reads_bypass_policy).
+        let exempt = crate::schema::reads_bypass_policy(collection_id);
+
         if let Some(local) = self.node.entities.get(&id) {
             debug!("Node({}).get_entity found local entity - returning", self.node.id);
             let state = local.to_state()?;
             let entity_id = local.id();
-            self.node.policy_agent.check_read(&cdata, &entity_id, collection_id, &state)?;
+            if !exempt {
+                self.node.policy_agent.check_read(&cdata, &entity_id, collection_id, &state)?;
+            }
             return Ok(local);
         }
         debug!("{}.get_entity fetching from storage", self.node);
@@ -479,7 +517,14 @@ where
         let collection = self.node.collections.get(collection_id).await?;
         match collection.get_state(id).await {
             Ok(entity_state) => {
-                self.node.policy_agent.check_read(&cdata, &entity_state.payload.entity_id, collection_id, &entity_state.payload.state)?;
+                if !exempt {
+                    self.node.policy_agent.check_read(
+                        &cdata,
+                        &entity_state.payload.entity_id,
+                        collection_id,
+                        &entity_state.payload.state,
+                    )?;
+                }
                 let state_getter = crate::retrieval::LocalStateGetter::new(collection.clone());
                 let event_getter = CachedEventGetter::new(collection_id.clone(), collection, &self.node, &cdata);
                 let (_changed, entity) = self
@@ -499,13 +544,14 @@ where
         // one policy world, or a mid-operation refresh yields a
         // composite no single credential authorized.
         let cdata = self.sessions.current();
-        self.node.policy_agent.can_access_collection(&cdata, collection_id)?;
-        // Fetch raw states from storage
-
-        // The selection arrives resolved (its names bound where the query
-        // entered), and the policy narrows it in the same vocabulary: what
-        // the agent ANDs in is resolved too, so nothing here is left to bind.
-        args.selection.predicate = self.node.policy_agent.filter_predicate(&cdata, collection_id, args.selection.predicate)?;
+        // Catalog reads never consult the agent (crate::schema::reads_bypass_policy).
+        if !crate::schema::reads_bypass_policy(collection_id) {
+            self.node.policy_agent.can_access_collection(&cdata, collection_id)?;
+            // The selection arrives resolved (its names bound where the query
+            // entered), and the policy narrows it in the same vocabulary: what
+            // the agent ANDs in is resolved too, so nothing here is left to bind.
+            args.selection.predicate = self.node.policy_agent.filter_predicate(&cdata, collection_id, args.selection.predicate)?;
+        }
 
         // TODO implement cached: true
         if !self.node.durable {

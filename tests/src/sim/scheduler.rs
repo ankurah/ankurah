@@ -86,11 +86,22 @@ pub struct Scheduler {
     /// starving a load-bearing message) surfaces as a loud failure rather than
     /// an infinite loop.
     max_rounds: usize,
+    /// Request ids of catalog reads let through, so their responses are
+    /// recognized as load-bearing too (a response carries no collection).
+    catalog_requests: std::collections::BTreeSet<proto::RequestId>,
 }
 
 impl Scheduler {
     pub fn new(captured: Captured, faults: FaultConfig, node_ids: Vec<proto::EntityId>) -> Self {
-        Self { inflight: Vec::new(), partitions: std::collections::BTreeSet::new(), captured, faults, node_ids, max_rounds: 100_000 }
+        Self {
+            inflight: Vec::new(),
+            partitions: std::collections::BTreeSet::new(),
+            captured,
+            faults,
+            node_ids,
+            max_rounds: 100_000,
+            catalog_requests: std::collections::BTreeSet::new(),
+        }
     }
 
     fn node_count(&self) -> usize { self.node_ids.len() }
@@ -120,11 +131,43 @@ impl Scheduler {
     /// Pull everything nodes have emitted since the last pump into the in-flight
     /// queue. Node-emitted messages (acks, responses, relay traffic) are
     /// droppable; losing one only costs a retry, never convergence.
+    ///
+    /// Catalog reads are the exception. A node's readiness waits on its
+    /// catalog projection, so losing one of those outright would strand the
+    /// node until a wall-clock retry fires -- a real-time dependency this
+    /// harness, whose whole point is being a pure function of the seed, cannot
+    /// model. They are delivered like load-bearing propagation; every other
+    /// kind of node traffic stays advisory.
     fn absorb_captured(&mut self) {
         for out in self.captured.drain() {
             let Some(dst) = recipient_id(&out.message).and_then(|id| self.index_of(&id)) else { continue };
             let digest = message_digest(&out.message);
-            self.inflight.push(InFlight { src: out.src, dst, message: out.message, digest, droppable: true, accept: None });
+            let droppable = !self.is_catalog_read(&out.message);
+            self.inflight.push(InFlight { src: out.src, dst, message: out.message, digest, droppable, accept: None });
+        }
+    }
+
+    /// Whether this message is a catalog read or the answer to one. Requests
+    /// are recognized by the collection they name; responses carry none, so
+    /// the request ids let through are remembered and matched here.
+    fn is_catalog_read(&mut self, message: &proto::NodeMessage) -> bool {
+        match message {
+            proto::NodeMessage::Request { request, .. } => {
+                let collection = match &request.body {
+                    proto::NodeRequestBody::Fetch { collection, .. }
+                    | proto::NodeRequestBody::Get { collection, .. }
+                    | proto::NodeRequestBody::GetEvents { collection, .. }
+                    | proto::NodeRequestBody::SubscribeQuery { collection, .. } => collection,
+                    _ => return false,
+                };
+                if !ankurah::core::schema::reads_bypass_policy(collection) {
+                    return false;
+                }
+                self.catalog_requests.insert(request.id.clone());
+                true
+            }
+            proto::NodeMessage::Response(response) => self.catalog_requests.contains(&response.request_id),
+            _ => false,
         }
     }
 
@@ -172,6 +215,20 @@ impl Scheduler {
     /// to deliver and every acceptance target is satisfied. Faults apply to
     /// every round before the final heal-and-flush.
     pub async fn run_to_quiescence(&mut self, nodes: &[SimNode], rng: &mut SimRng, trace: &mut Trace) {
+        self.quiesce(nodes, rng, trace, true).await;
+    }
+
+    /// A barrier that delivers exactly as [`Self::run_to_quiescence`] does but
+    /// records no round count. Node bring-up uses it: coming up costs network
+    /// round trips (the durable peer answering this node's catalog
+    /// projection), so how many barriers it takes is a property of how quickly
+    /// a node's own tasks ran rather than of the seed. The deliveries
+    /// themselves still enter the trace, so nothing about what crossed the
+    /// wire is hidden -- only the harness's own round tally, which would
+    /// otherwise report that timing as a schedule difference.
+    pub async fn drain(&mut self, nodes: &[SimNode], rng: &mut SimRng, trace: &mut Trace) { self.quiesce(nodes, rng, trace, false).await; }
+
+    async fn quiesce(&mut self, nodes: &[SimNode], rng: &mut SimRng, trace: &mut Trace, record_rounds: bool) {
         let mut rounds = 0;
         loop {
             rounds += 1;
@@ -270,7 +327,9 @@ impl Scheduler {
             // partition (handled above) or genuine non-convergence (caught by
             // max_rounds). Delay is probabilistic so it cannot livelock alone.
         }
-        trace.record(TraceEvent::Quiesced { rounds });
+        if record_rounds {
+            trace.record(TraceEvent::Quiesced { rounds });
+        }
     }
 }
 

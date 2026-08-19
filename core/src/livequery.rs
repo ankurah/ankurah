@@ -77,6 +77,12 @@ struct Inner {
     pub(crate) error: Mut<Option<RetrievalError>>,
     pub(crate) initialized: tokio::sync::Notify,
     pub(crate) initialized_version: std::sync::atomic::AtomicU32,
+    // Whether a remote peer has answered this query: the relay reports its
+    // subscription established once the peer's deltas are applied. A query
+    // with no relay is answered by its own storage and is marked here as
+    // soon as it starts, because no remote will ever answer it.
+    pub(crate) remote_answered: std::sync::atomic::AtomicBool,
+    pub(crate) remote_answered_notify: tokio::sync::Notify,
     // Version tracking for predicate updates
     pub(crate) current_version: std::sync::atomic::AtomicU32,
     // The admitted selection with its version (starts with version 1, updated
@@ -116,17 +122,92 @@ impl<R: View> std::ops::Deref for LiveQuery<R> {
 impl Inner {
     fn node(&self) -> Option<Box<dyn TNodeErased>> { self.node.upgrade() }
 
-    async fn wait_initialized(&self) {
+    async fn wait_initialized(&self) -> Result<(), RetrievalError> {
+        // `notify_waiters` wakes the waiters REGISTERED at that instant and
+        // stores no permit, so this waiter registers (enable) BEFORE reading
+        // what it is waiting for. Reading first would lose an initialization
+        // -- or a failure -- that lands in between, and park for the
+        // lifetime of a query whose news has already come and gone.
+        let notified = self.initialized.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        // A failure ends initialization: it is not something more waiting
+        // will fix, so it is this call's answer whenever the slot holds one.
+        if let Some(error) = self.initialization_error() {
+            return Err(error);
+        }
+
         // If already initialized, return immediately
         if self.initialized_version.load(std::sync::atomic::Ordering::Relaxed)
             >= self.current_version.load(std::sync::atomic::Ordering::Relaxed)
         {
-            return;
+            return Ok(());
         }
 
         // FIXME - this should be waiting for the correct version, not any version
         // Otherwise wait for the notification
-        self.initialized.notified().await;
+        notified.await;
+
+        match self.initialization_error() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// Wait for a remote peer to have answered this query at least once.
+    ///
+    /// Initialization says the query has run; this says whose data it ran
+    /// over. A cached query on an ephemeral node initializes from local
+    /// storage, which may hold nothing or hold yesterday's rows, and only the
+    /// relay's confirmation tells a caller that a durable peer took the
+    /// subscription and its rows are applied. A query with no relay has no
+    /// remote to hear from -- its own storage is the authority -- so for one
+    /// of those this is exactly initialization.
+    ///
+    /// A failure that ends initialization ends this wait too, for the same
+    /// reason: nothing further is coming.
+    async fn wait_remote_answered(&self) -> Result<(), RetrievalError> {
+        self.wait_initialized().await?;
+        loop {
+            // Register before reading, like `wait_initialized`: a
+            // confirmation landing between the read and the wait would
+            // otherwise be lost and this waiter parked for good.
+            let notified = self.remote_answered_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(error) = self.initialization_error() {
+                return Err(error);
+            }
+            if self.remote_answered.load(std::sync::atomic::Ordering::Acquire) {
+                return Ok(());
+            }
+            notified.await;
+        }
+    }
+
+    /// Record that a remote has answered, and wake everyone waiting on it.
+    fn mark_remote_answered(&self) {
+        self.remote_answered.store(true, std::sync::atomic::Ordering::Release);
+        self.remote_answered_notify.notify_waiters();
+    }
+
+    /// The failure that ended initialization, if one did. The slot keeps the
+    /// original for [`EntityLiveQuery::error`] to hand out; a waiter gets its
+    /// rendering, because the error itself is not clonable.
+    fn initialization_error(&self) -> Option<RetrievalError> {
+        self.error.with(|error| error.as_ref().map(|error| RetrievalError::Other(error.to_string())))
+    }
+
+    /// Record a failure that ends initialization, and wake everyone waiting
+    /// on it: the query will never populate, and the slot says why. Waiters
+    /// on a remote answer hear it too -- a failure is the end of that news
+    /// as well, and one that lands after initialization succeeded would
+    /// otherwise leave them parked forever.
+    fn fail_initialization(&self, error: RetrievalError) {
+        self.error.set(Some(error));
+        self.initialized.notify_waiters();
+        self.remote_answered_notify.notify_waiters();
     }
 
     /// Activate the LiveQuery by fetching entities and calling reactor.add_query or reactor.update_query
@@ -136,7 +217,13 @@ impl Inner {
     /// Rejects activation if the version is older than the current selection to prevent regression
     async fn activate(&self, version: u32) -> Result<(), RetrievalError> {
         // Get the current selection and its version
-        let (selection, stored_version) = self.selection.value();
+        let Some((selection, stored_version)) = self.selection.value() else {
+            // Unreachable by construction -- a query is started only once its
+            // admitted selection is installed -- but a query with no
+            // selection has nothing to run, and inventing one here would run
+            // the wrong query.
+            return Err(RetrievalError::Other("live query activated before its selection was admitted".into()));
+        };
 
         // Reject activation if this is an older version than what's currently stored
         // This prevents out-of-order activations from regressing the state
@@ -205,29 +292,63 @@ impl crate::reactor::PreNotifyHook for &InnerPreNotifyHook<'_> {
     }
 }
 
-/// Helper: create the Inner and set up initialization (shared by strong- and weak-node constructors)
-fn create_inner<SE, PA>(
+/// Admit a selection for `collection_id`: bind every property name to its
+/// durable identity and canonicalize comparison values, then let the policy
+/// narrow what came back. The agent ANDs its own conditions in in the same
+/// resolved vocabulary the reactor and the relay consume, so nothing past
+/// this point is left to bind.
+///
+/// `schema` is the compiled declaration a typed query was written against,
+/// and `None` for a raw one that names its collection by string: the typed
+/// form binds field names through the descriptor's cells, the raw form
+/// through the catalog's current display names.
+///
+/// A catalog collection skips the agent entirely, on both counts
+/// ([`crate::schema::reads_bypass_policy`]): the catalog projection runs
+/// before this node has a credential to be judged under, and it is what makes
+/// every other query resolvable.
+fn admit<SE, PA>(
     node: &Node<SE, PA>,
-    node_ref: Box<dyn NodeRef>,
-    collection_id: CollectionId,
-    args: MatchArgs<Parsed>,
-    sessions: SessionSet<PA::ContextData>,
-) -> Result<(Arc<Inner>, proto::QueryId), RetrievalError>
+    sessions: &SessionSet<PA::ContextData>,
+    schema: Option<&'static crate::schema::ModelStructDescriptor>,
+    collection_id: &CollectionId,
+    selection: ankql::ast::Selection<Parsed>,
+) -> Result<ankql::ast::Selection<Resolved>, RetrievalError>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
+    let exempt = crate::schema::reads_bypass_policy(collection_id);
     // One credential snapshot for the whole derivation; re-derivation
     // on change arrives with https://github.com/ankurah/ankurah/pull/426.
     let cdata = sessions.current();
-    node.policy_agent.can_access_collection(&cdata, &collection_id)?;
-    // Bind every property name to its durable identity and canonicalize
-    // comparison values, then let the policy narrow what came back: the
-    // agent ANDs its own conditions in in the same resolved vocabulary the
-    // reactor and the relay consume.
-    let mut selection = node.catalog.resolve_selection(&collection_id, args.selection)?;
-    selection.predicate = node.policy_agent.filter_predicate(&cdata, &collection_id, selection.predicate)?;
+    if !exempt {
+        node.policy_agent.can_access_collection(&cdata, collection_id)?;
+    }
+    let mut selection = match schema {
+        Some(schema) => node.catalog.resolve_selection_with_descriptor(schema, selection)?,
+        None => node.catalog.resolve_selection(collection_id, selection)?,
+    };
+    if !exempt {
+        selection.predicate = node.policy_agent.filter_predicate(&cdata, collection_id, selection.predicate)?;
+    }
+    Ok(selection)
+}
 
+/// Helper: create the Inner shared by every constructor. `selection` is the
+/// admitted selection, or `None` when [`start_admitted`] installs it a moment
+/// later; nothing runs against the query until one is there.
+fn create_inner<SE, PA>(
+    node: &Node<SE, PA>,
+    node_ref: Box<dyn NodeRef>,
+    collection_id: CollectionId,
+    selection: Option<ankql::ast::Selection<Resolved>>,
+    sessions: SessionSet<PA::ContextData>,
+) -> (Arc<Inner>, proto::QueryId)
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
     let subscription = node.reactor.subscribe();
 
     let resultset = EntityResultSet::empty();
@@ -242,36 +363,79 @@ where
         error: Mut::new(None),
         initialized: tokio::sync::Notify::new(),
         initialized_version: std::sync::atomic::AtomicU32::new(0), // 0 means uninitialized
-        current_version: std::sync::atomic::AtomicU32::new(1),     // Start at version 1
-        selection: Mut::new((selection, 1)),                       // Start with version 1
+        remote_answered: std::sync::atomic::AtomicBool::new(false),
+        remote_answered_notify: tokio::sync::Notify::new(),
+        current_version: std::sync::atomic::AtomicU32::new(1), // Start at version 1
+        selection: Mut::new(selection.map(|selection| (selection, 1))), // Start with version 1
         collection_id: collection_id.clone(),
         gap_fetcher,
     });
 
-    // Check if this is a durable node (no relay) or ephemeral node (has relay)
+    (inner, query_id)
+}
+
+/// When a query registers with the subscription relay: as it starts, or when
+/// its owner says so.
+///
+/// Only the catalog projection asks for the second. Its three queries all
+/// start at once, and each subscribe request is sent when that query's own
+/// storage read finishes, so subscribing them at start would put three
+/// requests on the wire in whatever order those reads landed -- traffic that
+/// is not a function of the node's inputs. The catalog therefore attaches
+/// them one at a time, each after the last was answered.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteSubscription {
+    AtStart,
+    OnRequest,
+}
+
+/// Install an admitted selection and set the query running for this node
+/// kind: a durable node (and any cached query) activates against local
+/// storage, and an ephemeral node registers the query with its relay, whose
+/// established callback activates it once the remote's deltas are applied.
+/// A cached ephemeral query does BOTH -- storage serves what it already holds
+/// while the remote subscription refreshes it; these are not alternatives.
+fn start_admitted<SE, PA>(
+    inner: &Arc<Inner>,
+    node: &Node<SE, PA>,
+    me: &EntityLiveQuery,
+    selection: ankql::ast::Selection<Resolved>,
+    cached: bool,
+    sessions: SessionSet<PA::ContextData>,
+    remote: RemoteSubscription,
+) where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    let query_id = inner.query_id;
+    inner.selection.set(Some((selection.clone(), 1)));
+
     let has_relay = node.subscription_relay.is_some();
-
-    if args.cached || !has_relay {
-        // Durable node: spawn initialization task directly (no remote subscription needed)
-        let inner2 = inner.clone();
-
-        debug!("LiveQuery::new() spawning initialization task for durable node predicate {}", query_id);
+    if cached || !has_relay {
+        let inner = inner.clone();
+        debug!("LiveQuery spawning initialization task for predicate {}", query_id);
         crate::task::spawn(async move {
             debug!("LiveQuery initialization task starting for predicate {}", query_id);
-            if let Err(e) = inner2.activate(1).await {
+            if let Err(e) = inner.activate(1).await {
                 debug!("LiveQuery initialization failed for predicate {}: {}", query_id, e);
-                inner2.error.set(Some(e));
-                // Initialization is over, unsuccessfully: wake waiters so
-                // wait_initialized returns instead of hanging on a query
-                // that will never activate. The error slot carries why.
-                inner2.initialized.notify_waiters();
+                inner.fail_initialization(e);
             } else {
                 debug!("LiveQuery initialization completed for predicate {}", query_id);
             }
         });
     }
-
-    Ok((inner, query_id))
+    match (has_relay, remote) {
+        (true, RemoteSubscription::AtStart) => {
+            node.subscribe_remote_query(query_id, inner.collection_id.clone(), selection, sessions, 1, me.weak())
+        }
+        // Waiting for the owner to ask; it marks the query answered when the
+        // relay confirms what it attached.
+        (true, RemoteSubscription::OnRequest) => {}
+        // No relay, no remote: this query's own storage is the authority, so
+        // there is no confirmation to wait for and a waiter for one must not
+        // wait for something that will never happen.
+        (false, _) => inner.mark_remote_answered(),
+    }
 }
 
 impl EntityLiveQuery {
@@ -286,14 +450,15 @@ impl EntityLiveQuery {
         PA: PolicyAgent + Send + Sync + 'static,
     {
         let node_ref: Box<dyn NodeRef> = Box::new(StrongNodeRef(Arc::clone(&node.0)));
-        Self::new_with_node_ref(node, node_ref, collection_id, args, sessions.into())
+        Self::new_with_node_ref(node, node_ref, None, collection_id, args, sessions.into(), RemoteSubscription::AtStart)
     }
 
     /// Create a LiveQuery that does NOT keep the node alive.
     ///
-    /// Used by PolicyAgent and other internal subscribers that should not create
-    /// reference cycles (node → agent → livequery → node). Operations that need
-    /// the node (activation, selection updates) fail with "Node has been dropped"
+    /// Used by the PolicyAgent's own bootstrap query and the catalog
+    /// projection: node-owned subscribers whose strong reference would cycle
+    /// (node → agent or catalog → livequery → node). Operations that need the
+    /// node (activation, selection updates) fail with "Node has been dropped"
     /// once the node is gone.
     pub fn new_weak_node<SE, PA>(
         node: &Node<SE, PA>,
@@ -306,42 +471,158 @@ impl EntityLiveQuery {
         PA: PolicyAgent + Send + Sync + 'static,
     {
         let node_ref: Box<dyn NodeRef> = Box::new(WeakNodeRefImpl(Arc::downgrade(&node.0)));
-        Self::new_with_node_ref(node, node_ref, collection_id, args, sessions.into())
+        Self::new_with_node_ref(node, node_ref, None, collection_id, args, sessions.into(), RemoteSubscription::AtStart)
     }
 
-    fn new_with_node_ref<SE, PA>(
+    /// [`Self::new_weak_node`] for a query whose owner attaches the remote
+    /// subscription itself, with [`Self::subscribe_remote`], rather than
+    /// having it go out as the query starts. See [`RemoteSubscription`] for
+    /// why the catalog projection is built this way.
+    pub(crate) fn new_weak_node_local<SE, PA>(
         node: &Node<SE, PA>,
-        node_ref: Box<dyn NodeRef>,
         collection_id: CollectionId,
         args: MatchArgs<Parsed>,
-        sessions: SessionSet<PA::ContextData>,
+        sessions: impl Into<SessionSet<PA::ContextData>>,
     ) -> Result<Self, RetrievalError>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
-        let has_relay = node.subscription_relay.is_some();
-        let (inner, query_id) = create_inner(node, node_ref, collection_id.clone(), args, sessions.clone())?;
+        let node_ref: Box<dyn NodeRef> = Box::new(WeakNodeRefImpl(Arc::downgrade(&node.0)));
+        Self::new_with_node_ref(node, node_ref, None, collection_id, args, sessions.into(), RemoteSubscription::OnRequest)
+    }
 
+    /// Create a typed LiveQuery: one written against a compiled declaration,
+    /// whose field names bind through that declaration's descriptor cells.
+    ///
+    /// Admission is synchronous whenever those cells are bound: the
+    /// resolver's answers are then definitive, so this either binds every
+    /// name and returns a running query, or it returns the error now -- a
+    /// name that does not resolve against a bound declaration is a mistake,
+    /// not a race. A declaration this system has never been told about is
+    /// the one exception, and it is healed inside the query's initialization
+    /// rather than refused (the catalog's `bind_or_register`), because this
+    /// entry cannot await. The node is held strongly, like
+    /// [`EntityLiveQuery::new`].
+    pub fn new_typed<SE, PA>(
+        node: &Node<SE, PA>,
+        schema: &'static crate::schema::ModelStructDescriptor,
+        collection_id: CollectionId,
+        args: MatchArgs<Parsed>,
+        sessions: impl Into<SessionSet<PA::ContextData>>,
+    ) -> Result<Self, RetrievalError>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+    {
+        let node_ref: Box<dyn NodeRef> = Box::new(StrongNodeRef(Arc::clone(&node.0)));
+        Self::new_with_node_ref(node, node_ref, Some(schema), collection_id, args, sessions.into(), RemoteSubscription::AtStart)
+    }
+
+    /// The one construction path: admit the selection, build the inner, and
+    /// set the query running. `schema` distinguishes a typed entry (names
+    /// bind through the compiled declaration's cells) from a raw one (names
+    /// bind through the catalog's current display names); the node reference
+    /// distinguishes a query that keeps its node alive from one that does
+    /// not. An admission failure is this call's error, never a query that
+    /// will never populate.
+    ///
+    /// The single exception is a typed entry whose declaration this system
+    /// has never been told about. Healing it means registering it, which
+    /// means awaiting the durable allocator, and this entry is synchronous:
+    /// so that one case builds the query first and finishes admitting it in
+    /// a spawned task, where a failure lands in the error slot instead.
+    fn new_with_node_ref<SE, PA>(
+        node: &Node<SE, PA>,
+        node_ref: Box<dyn NodeRef>,
+        schema: Option<&'static crate::schema::ModelStructDescriptor>,
+        collection_id: CollectionId,
+        args: MatchArgs<Parsed>,
+        sessions: SessionSet<PA::ContextData>,
+        remote: RemoteSubscription,
+    ) -> Result<Self, RetrievalError>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+    {
+        // Binding is what the synchronous judgment rests on, so ask for it
+        // here: a declaration that binds admits inline, and only one that
+        // does not takes the deferred path.
+        let unbound = match schema {
+            Some(schema) if node.catalog.bind_descriptor(schema).is_err() => schema,
+            _ => {
+                let selection = admit(node, &sessions, schema, &collection_id, args.selection)?;
+                let (inner, _query_id) = create_inner(node, node_ref, collection_id, None, sessions.clone());
+
+                let me = Self(inner.clone());
+                start_admitted(&inner, node, &me, selection, args.cached, sessions, remote);
+
+                return Ok(me);
+            }
+        };
+
+        let (inner, _query_id) = create_inner(node, node_ref, collection_id, None, sessions.clone());
         let me = Self(inner.clone());
 
-        // Ephemeral node: register with relay for remote subscription
-        // Remote will call activate() after applying deltas via subscription_established
-        if has_relay {
-            node.subscribe_remote_query(query_id, collection_id, inner.selection.value().0, sessions, 1, me.weak());
-        }
+        // The task holds neither the query nor the node: a caller who drops
+        // the query before healing finishes has abandoned it, and this
+        // background work must not be what keeps either alive.
+        let (weak_inner, weak_node) = (Arc::downgrade(&inner), node.weak());
+        let MatchArgs { selection, cached } = args;
+        crate::task::spawn(async move {
+            let Some(inner) = weak_inner.upgrade() else { return };
+            let Some(node) = weak_node.upgrade() else {
+                inner.fail_initialization(RetrievalError::Other("Node has been dropped".into()));
+                return;
+            };
+            let admitted = match node.catalog.bind_or_register(&sessions, unbound).await {
+                Ok(_) => admit(&node, &sessions, Some(unbound), &inner.collection_id, selection),
+                Err(error) => Err(error),
+            };
+            match admitted {
+                Ok(selection) => {
+                    let me = Self(inner.clone());
+                    start_admitted(&inner, &node, &me, selection, cached, sessions, remote);
+                }
+                Err(error) => inner.fail_initialization(error),
+            }
+        });
 
         Ok(me)
     }
     pub fn map<R: View>(self) -> LiveQuery<R> { LiveQuery(self, PhantomData) }
 
-    /// The initialization/admission failure, if one occurred, rendered as a
-    /// message. Waking from [`Self::wait_initialized`] with this set means
-    /// the query will never populate.
-    pub fn error_message(&self) -> Option<String> { self.0.error.with(|e| e.as_ref().map(|e| e.to_string())) }
+    /// Wait for the LiveQuery to be fully initialized with initial states.
+    /// An initialization that failed is this call's error: the query will
+    /// never populate, and waiting longer would not change that.
+    pub async fn wait_initialized(&self) -> Result<(), RetrievalError> { self.0.wait_initialized().await }
 
-    /// Wait for the LiveQuery to be fully initialized with initial states
-    pub async fn wait_initialized(&self) { self.0.wait_initialized().await; }
+    /// Wait for a remote peer to have answered this query: the relay's
+    /// confirmation that a peer took the subscription and its rows are
+    /// applied. See [`Inner::wait_remote_answered`] for what that adds to
+    /// initialization, and what it means on a query with no relay.
+    pub async fn wait_remote_answered(&self) -> Result<(), RetrievalError> { self.0.wait_remote_answered().await }
+
+    /// Put this query's subscribe request on the wire now.
+    ///
+    /// For a query built with [`Self::new_weak_node_local`], whose owner
+    /// decides when that request goes out. A node with no relay has no remote
+    /// to subscribe to, and answers for itself.
+    pub(crate) fn subscribe_remote<SE, PA>(&self, node: &Node<SE, PA>, sessions: SessionSet<PA::ContextData>) -> Result<(), RetrievalError>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+    {
+        if node.subscription_relay.is_none() {
+            self.0.mark_remote_answered();
+            return Ok(());
+        }
+        let Some((selection, version)) = self.0.selection.value() else {
+            return Err(RetrievalError::Other("live query subscribed remotely before its selection was admitted".into()));
+        };
+        node.subscribe_remote_query(self.0.query_id, self.0.collection_id.clone(), selection, sessions, version, self.weak());
+        Ok(())
+    }
 
     pub fn update_selection(
         &self,
@@ -365,7 +646,7 @@ impl EntityLiveQuery {
         self.0.resultset.set_loaded(false);
 
         // Store new selection and version
-        self.0.selection.set((new_selection.clone(), new_version));
+        self.0.selection.set(Some((new_selection.clone(), new_version)));
 
         // Check if this node has a relay (ephemeral) or not (durable)
         let has_relay = node.has_subscription_relay();
@@ -381,10 +662,9 @@ impl EntityLiveQuery {
             crate::task::spawn(async move {
                 if let Err(e) = inner.activate(new_version).await {
                     tracing::error!("LiveQuery update failed for predicate {}: {}", query_id, e);
-                    inner.error.set(Some(e));
-                    // Wake update_selection_wait: the update is over,
+                    // Wakes update_selection_wait: the update is over,
                     // unsuccessfully, and the error slot carries why.
-                    inner.initialized.notify_waiters();
+                    inner.fail_initialization(e);
                 }
             });
         }
@@ -397,13 +677,14 @@ impl EntityLiveQuery {
         new_selection: impl TryInto<ankql::ast::Selection<Parsed>, Error = impl Into<RetrievalError>>,
     ) -> Result<(), RetrievalError> {
         self.update_selection(new_selection)?;
-        self.0.wait_initialized().await;
-        Ok(())
+        self.0.wait_initialized().await
     }
 
     pub fn error(&self) -> Read<Option<RetrievalError>> { self.0.error.read() }
     pub fn query_id(&self) -> proto::QueryId { self.0.query_id }
-    pub fn selection(&self) -> Read<(ankql::ast::Selection<Resolved>, u32)> { self.0.selection.read() }
+    /// The admitted selection and its version, or `None` while a typed
+    /// query's admission is still running.
+    pub fn selection(&self) -> Read<Option<(ankql::ast::Selection<Resolved>, u32)>> { self.0.selection.read() }
     pub fn resultset(&self) -> EntityResultSet { self.0.resultset.clone() }
 
     /// Create a weak reference to this LiveQuery
@@ -427,9 +708,20 @@ impl crate::peer_subscription::RemoteQuerySubscriber for WeakEntityLiveQuery {
             // Activate the query (fetch entities, call reactor, and mark initialized)
             // Handle errors internally by setting last_error
             tracing::debug!("Subscription established for query {}: {}", inner.query_id, version);
-            if let Err(e) = inner.activate(version).await {
-                tracing::error!("Failed to activate subscription for query {}: {}", inner.query_id, e);
-                inner.error.set(Some(e));
+            match inner.activate(version).await {
+                // The peer's rows are applied and the query has run over
+                // them: this is the remote answer, and what anyone waiting
+                // for confirmed freshness is waiting for.
+                Ok(()) => inner.mark_remote_answered(),
+                Err(e) => {
+                    tracing::error!("Failed to activate subscription for query {}: {}", inner.query_id, e);
+                    // This was the query's initialization on an ephemeral node
+                    // -- the relay established the subscription and handed it
+                    // here -- so a failure ends it, and everyone waiting must
+                    // hear that rather than wait out a query that will never
+                    // populate.
+                    inner.fail_initialization(e);
+                }
             }
         }
         // If upgrade fails, the LiveQuery was already dropped - nothing to do
@@ -439,15 +731,19 @@ impl crate::peer_subscription::RemoteQuerySubscriber for WeakEntityLiveQuery {
         // Try to upgrade the weak reference
         if let Some(inner) = self.0.upgrade() {
             tracing::info!("Setting last error for LiveQuery {}: {}", inner.query_id, error);
-            inner.error.set(Some(error));
+            // The relay reports a PERMANENT failure here (a retryable one goes
+            // back to pending instead), so nothing further will initialize
+            // this query and its waiters are owed the news.
+            inner.fail_initialization(error);
         }
         // If upgrade fails, the LiveQuery was already dropped - nothing to do
     }
 }
 
 impl<R: View> LiveQuery<R> {
-    /// Wait for the LiveQuery to be fully initialized with initial states
-    pub async fn wait_initialized(&self) { self.0.wait_initialized().await; }
+    /// Wait for the LiveQuery to be fully initialized with initial states.
+    /// An initialization that failed is this call's error.
+    pub async fn wait_initialized(&self) -> Result<(), RetrievalError> { self.0.wait_initialized().await }
 
     pub fn resultset(&self) -> ResultSet<R> { self.0 .0.resultset.wrap::<R>() }
 

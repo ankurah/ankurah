@@ -53,14 +53,32 @@ struct Inner<SE, PA> {
     schema_epoch: Arc<RwLock<Option<SchemaEpoch>>>,
     /// Reset barrier installed by `CatalogManager::start`: begin invalidates
     /// and drains catalog effects before deletion, finish clears catalog
-    /// state after system/reactor reset, and resume re-arms durable catalog
+    /// state after system/reactor reset, and resume re-arms catalog
     /// maintenance whenever the system becomes ready.
     catalog_reset_hook: RwLock<Option<CatalogResetHook>>,
+    /// The catalog's readiness wait, installed by `CatalogManager::start`.
+    /// It is the second half of [`SystemManager::wait_system_ready`]: a
+    /// system that is ready but whose catalog has not loaded cannot answer
+    /// what a model or property is, so waiting for readiness has to mean
+    /// waiting for both. SystemManager does not hold the CatalogManager, so
+    /// the wait arrives as a hook like the reset barrier does.
+    catalog_ready_gate: RwLock<Option<Arc<dyn Fn() -> CatalogResetFuture + Send + Sync>>>,
+    /// The catalog's SYNC wait, installed alongside the readiness gate. It is
+    /// what [`SystemManager::join_system`] holds root persistence behind, so
+    /// a stored root means a system this node has actually heard from.
+    catalog_synced_gate: RwLock<Option<Arc<dyn Fn() -> CatalogSyncedFuture + Send + Sync>>>,
+    /// Serializes the two writers of the durable root: the persist that
+    /// follows a join's first catalog sync, and the reset that deletes it.
+    /// A persist decides whether to write under this lock, so a reset can
+    /// never land between that decision and the write and leave the wiped
+    /// storage holding the root it just deleted.
+    root_write: tokio::sync::Mutex<()>,
     reactor: Reactor,
     _phantom: PhantomData<PA>,
 }
 
 type CatalogResetFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+type CatalogSyncedFuture = Pin<Box<dyn Future<Output = Result<(), RetrievalError>> + Send + 'static>>;
 
 #[derive(Clone)]
 struct CatalogResetHook {
@@ -94,6 +112,9 @@ where
             system_ready_notify: Notify::new(),
             schema_epoch,
             catalog_reset_hook: RwLock::new(None),
+            catalog_ready_gate: RwLock::new(None),
+            catalog_synced_gate: RwLock::new(None),
+            root_write: tokio::sync::Mutex::new(()),
             reactor,
             _phantom: PhantomData,
         }));
@@ -166,6 +187,18 @@ where
         *self.0.catalog_reset_hook.write().unwrap() = Some(CatalogResetHook { begin, finish, resume });
     }
 
+    /// Install the catalog readiness wait (called by `CatalogManager::start`),
+    /// the second half of [`Self::wait_system_ready`].
+    pub(crate) fn set_catalog_ready_gate(&self, gate: Arc<dyn Fn() -> CatalogResetFuture + Send + Sync>) {
+        *self.0.catalog_ready_gate.write().unwrap() = Some(gate);
+    }
+
+    /// Install the catalog sync wait (called by `CatalogManager::start`),
+    /// which is what a join's root persistence waits behind.
+    pub(crate) fn set_catalog_synced_gate(&self, gate: Arc<dyn Fn() -> CatalogSyncedFuture + Send + Sync>) {
+        *self.0.catalog_synced_gate.write().unwrap() = Some(gate);
+    }
+
     /// Re-arm epoch-bound catalog maintenance; called at every
     /// system-becomes-ready transition (create, load, join, and the
     /// matching-root fast path).
@@ -175,10 +208,22 @@ where
         }
     }
 
-    /// Waits until we've successfully initialized or joined a system
+    /// Waits until this node has a system AND its catalog projection has
+    /// loaded.
+    ///
+    /// Both halves, because a caller waiting for readiness is waiting to use
+    /// the node, and using it means naming models and properties. A system
+    /// root alone leaves those names unresolvable: the very first query would
+    /// be told its model does not exist. A warm that fails does not shorten
+    /// this wait -- it retries -- so readiness never means "loaded, or
+    /// possibly empty".
     pub async fn wait_system_ready(&self) {
         if !self.is_system_ready() {
             self.0.system_ready_notify.notified().await;
+        }
+        let gate = self.0.catalog_ready_gate.read().unwrap().clone();
+        if let Some(gate) = gate {
+            gate().await;
         }
     }
 
@@ -271,19 +316,62 @@ where
             self.hard_reset().await.map_err(|e| MutationError::General(Box::new(std::io::Error::other(e.to_string()))))?;
         }
 
-        let collection_id = CollectionId::fixed_name(SYSTEM_COLLECTION_ID);
-        let storage = self.0.collectionset.get(&collection_id).await?;
-
-        // Set the state
-        storage.set_state(state.clone()).await?;
-
-        // Set root and mark system as ready
+        // Join in memory, and only in memory. A joined node cannot say what
+        // any model or property is until its catalog has been answered, so a
+        // root written before then would, on the next open, claim membership
+        // in a system this node never heard a word from -- and it would claim
+        // it silently, because a loaded root is exactly what suppresses
+        // joining again. Persistence therefore waits for the first catalog
+        // sync (see [`Self::persist_root_after_catalog_sync`]); a crash
+        // before it finds no root and replays this join, which is idempotent.
         {
             let mut root = self.0.root.write().expect("Root lock poisoned");
-            *root = Some(state);
+            *root = Some(state.clone());
         }
         self.mark_system_ready();
+        self.persist_root_after_catalog_sync(state);
 
+        Ok(())
+    }
+
+    /// Write the joined root to storage once the catalog projection has been
+    /// answered, so root presence means joined AND synced.
+    ///
+    /// The write is conditional on this node still holding exactly the root
+    /// that was joined: a reset, or a join of a different system, has already
+    /// decided what this node's root is, and a sync that finishes afterwards
+    /// must not undo that decision.
+    fn persist_root_after_catalog_sync(&self, state: Attested<EntityState>) {
+        let gate = self.0.catalog_synced_gate.read().unwrap().clone();
+        let weak = Arc::downgrade(&self.0);
+        crate::task::spawn(async move {
+            // No catalog maintains itself on this node, so there is nothing
+            // to hear back from and nothing to wait for.
+            if let Some(gate) = gate {
+                if let Err(error) = gate().await {
+                    warn!("joined system stays in memory: its catalog was never answered: {error}");
+                    return;
+                }
+            }
+            let Some(inner) = weak.upgrade() else { return };
+            if let Err(error) = Self(inner).persist_root(state).await {
+                error!("failed to persist the joined system root: {error}");
+            }
+        });
+    }
+
+    /// See [`Self::persist_root_after_catalog_sync`]. Holds the root-write
+    /// lock across the check and the write.
+    async fn persist_root(&self, state: Attested<EntityState>) -> Result<()> {
+        let _write = self.0.root_write.lock().await;
+        let still_ours = self
+            .root()
+            .is_some_and(|root| root.payload.entity_id == state.payload.entity_id && root.payload.state.head == state.payload.state.head);
+        if !still_ours {
+            return Ok(());
+        }
+        let collection_id = CollectionId::fixed_name(SYSTEM_COLLECTION_ID);
+        self.0.collectionset.get(&collection_id).await?.set_state(state).await?;
         Ok(())
     }
 
@@ -297,6 +385,12 @@ where
         if let Some(hook) = &catalog_reset_hook {
             (hook.begin)().await;
         }
+
+        // Exclude a join's pending root persist for the whole reset: it
+        // decides whether to write under this same lock, so it either wrote
+        // before the wipe (and the wipe removes it) or finds the root gone
+        // afterwards and writes nothing.
+        let _root_write = self.0.root_write.lock().await;
 
         // Delete all collections from storage
         self.0.collectionset.delete_all_collections().await?;

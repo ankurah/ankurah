@@ -25,6 +25,7 @@ use ankurah_proto::{CollectionId, ModelId, PropertyId, SystemProperty};
 use thiserror::Error;
 
 use super::catalog::CatalogManager;
+use super::registration::RegistrationError;
 use super::{ModelStructDescriptor, SchemaEpoch};
 use crate::error::RetrievalError;
 use crate::policy::PolicyAgent;
@@ -190,9 +191,9 @@ where
             PropertyId::Id => Ok(ValueType::EntityId),
             PropertyId::System(system) => Ok(system_property_value_type(*system)),
             PropertyId::EntityId(id) => {
-                let def = self.property_by_id(id).ok_or_else(|| lookup_failed("no catalog definition"))?;
-                ValueType::from_property_str(&def.value_type)
-                    .ok_or_else(|| lookup_failed(&format!("unparseable registered type '{}'", def.value_type)))
+                let property = self.property_by_id(id).ok_or_else(|| lookup_failed("no catalog definition"))?;
+                ValueType::from_property_str(&property.value_type)
+                    .ok_or_else(|| lookup_failed(&format!("unparseable registered type '{}'", property.value_type)))
             }
         }
     }
@@ -213,71 +214,293 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    fn resolve_model_name(&self, name: &str) -> Result<Option<ModelId>, NameResolutionError> {
+    fn resolve_model(&self, name: &str) -> Result<Option<ModelId>, ModelResolutionError> {
         // The declaration's own label answers from its cells (the admitted
-        // identity); anything else falls back to the catalog, like a raw
-        // reference.
+        // identity, put there by the bind every typed entry runs first);
+        // anything else falls back to the catalog, like a raw reference.
         if name == self.schema.label {
             if let Some(model) = self.schema.resolved.get(self.epoch) {
                 return Ok(Some(model));
             }
         }
-        self.catalog.resolve_model_name(name)
+        self.catalog.resolve_model(name)
     }
 
-    fn resolve_property(&self, model: &ModelId, name: &str) -> Result<Option<PropertyId>, NameResolutionError> {
+    fn resolve_property(&self, model: &ModelId, name: &str) -> Result<Option<ResolvedProperty>, ModelResolutionError> {
         if let Some(field) = self.schema.field_by_name(name) {
             // A populated cell is the admitted binding, which a later
-            // display-name change cannot re-aim. A miss means this epoch has
-            // not passed the registration gate (the synchronous query entry
-            // cannot await it); before the gate there is no admitted binding
-            // to protect, so the name resolves like a raw one, against the
-            // catalog's current names. After the gate the cells always hit.
+            // display-name change cannot re-aim, and the compiled
+            // declaration states the type. A miss means the catalog could not
+            // prove this shape and there is no admitted binding to protect,
+            // so the name resolves like a raw one, against the catalog's
+            // current names.
             if let Some(id) = field.resolved.get(self.epoch) {
-                return Ok(Some(id));
+                let value_type = ValueType::from_property_str(field.value_type).ok_or_else(|| ModelResolutionError::ValueTypeLookup {
+                    model: *model,
+                    property: id,
+                    message: format!("unparseable compiled type '{}'", field.value_type),
+                })?;
+                return Ok(Some(ResolvedProperty { id, value_type }));
             }
         }
         self.catalog.resolve_property(model, name)
     }
+}
 
-    fn property_value_type(&self, model: &ModelId, property: &PropertyId) -> Result<ValueType, NameResolutionError> {
-        if let Some(field) = self.schema.properties.iter().find(|field| field.resolved.get(self.epoch) == Some(*property)) {
-            return ValueType::from_property_str(field.value_type).ok_or_else(|| NameResolutionError::ValueTypeLookup {
-                model: *model,
-                property: *property,
-                message: format!("unparseable compiled type '{}'", field.value_type),
-            });
+/// Bind every source-level property path in `selection` to a durable
+/// [`PropertyId`] under `model`, casting each comparison's literals to the
+/// registered type of the property they are compared against.
+///
+/// This is the one door between the two stages: nothing else produces a
+/// [`Selection<Resolved>`] from a [`Selection<Parsed>`], so a resolved
+/// selection anywhere in the system was bound in one model scope, by one
+/// resolver, and carries literals already canonicalized to the types that
+/// resolver reported.
+///
+/// A literal that cannot take its property's registered type is a query-time
+/// type error surfaced by the operation that ran the comparison, never a
+/// silent false predicate and never a lenient pass-through -- policy-injected
+/// comparisons included: a rule whose literal cannot type against the
+/// credential fails the request loudly instead of silently filtering rows.
+pub fn resolve_selection<R: ModelResolver + ?Sized>(
+    model: &ModelId,
+    resolver: &R,
+    selection: Selection<Parsed>,
+) -> Result<Selection<Resolved>, ModelResolutionError> {
+    let order_by = selection
+        .order_by
+        .as_ref()
+        .map(|items| items.iter().map(|item| resolve_order_by_item(model, resolver, item)).collect())
+        .transpose()?;
+    Ok(Selection { predicate: resolve_predicate(model, resolver, &selection.predicate)?, order_by, limit: selection.limit })
+}
+
+/// The resolved form of a selection that names no property at all -- `true`,
+/// `false`, a comparison of two literals -- and `None` for one that does.
+///
+/// Such a selection has nothing to bind, so it resolves without a model scope
+/// and without a catalog. That matters where a query names a collection that
+/// is not a registered model: a live query over `true` (an ephemeral node
+/// bootstrapping its policy, say) must still run, and only a selection that
+/// actually names a property needs the model whose catalog would bind it.
+pub fn resolve_without_model(selection: &Selection<Parsed>) -> Option<Selection<Resolved>> {
+    if selection.order_by.is_some() {
+        return None;
+    }
+    Some(Selection { predicate: predicate_without_model(&selection.predicate)?, order_by: None, limit: selection.limit })
+}
+
+/// See [`resolve_without_model`].
+fn predicate_without_model(predicate: &Predicate<Parsed>) -> Option<Predicate<Resolved>> {
+    Some(match predicate {
+        Predicate::Comparison { left, operator, right } => Predicate::Comparison {
+            left: Box::new(expr_without_names(left)?),
+            operator: operator.clone(),
+            right: Box::new(expr_without_names(right)?),
+        },
+        Predicate::IsNull(expr) => Predicate::IsNull(Box::new(expr_without_names(expr)?)),
+        Predicate::And(left, right) => Predicate::And(Box::new(predicate_without_model(left)?), Box::new(predicate_without_model(right)?)),
+        Predicate::Or(left, right) => Predicate::Or(Box::new(predicate_without_model(left)?), Box::new(predicate_without_model(right)?)),
+        Predicate::Not(inner) => Predicate::Not(Box::new(predicate_without_model(inner)?)),
+        Predicate::True => Predicate::True,
+        Predicate::False => Predicate::False,
+        Predicate::Placeholder => Predicate::Placeholder,
+    })
+}
+
+/// See [`resolve_without_model`]: `None` as soon as a property name appears,
+/// since binding that name is what needs a model.
+fn expr_without_names(expr: &Expr<Parsed>) -> Option<Expr<Resolved>> {
+    Some(match expr {
+        Expr::Path(_) => return None,
+        Expr::Literal(value) => Expr::Literal(value.clone()),
+        Expr::Placeholder => Expr::Placeholder,
+        Expr::ExprList(items) => Expr::ExprList(items.iter().map(expr_without_names).collect::<Option<Vec<_>>>()?),
+        Expr::Predicate(predicate) => Expr::Predicate(predicate_without_model(predicate)?),
+        Expr::InfixExpr { left, operator, right } => Expr::InfixExpr {
+            left: Box::new(expr_without_names(left)?),
+            operator: operator.clone(),
+            right: Box::new(expr_without_names(right)?),
+        },
+    })
+}
+
+/// Resolve an ORDER BY key under the same rules as predicate paths. Sort keys
+/// must address a whole property; JSON subpaths are rejected.
+fn resolve_order_by_item<R: ModelResolver + ?Sized>(
+    model: &ModelId,
+    resolver: &R,
+    item: &OrderByItem<Parsed>,
+) -> Result<OrderByItem<Resolved>, ModelResolutionError> {
+    let path = &item.path;
+    let head = property_head_index(model, resolver, path)?;
+    let Some(name) = path.steps.get(head) else {
+        return Err(unknown_property(model, ""));
+    };
+    whole_property_order(model, path, &path.steps[head + 1..])?;
+    let (property, _sorts_by_identity) = resolve_path_head(model, resolver, name, vec![])?;
+    Ok(OrderByItem { path: property, direction: item.direction.clone() })
+}
+
+/// Bind every source-level property path in this predicate and cast each
+/// comparison's literals against the type the compared property resolved
+/// with.
+fn resolve_predicate<R: ModelResolver + ?Sized>(
+    model: &ModelId,
+    resolver: &R,
+    predicate: &Predicate<Parsed>,
+) -> Result<Predicate<Resolved>, ModelResolutionError> {
+    Ok(match predicate {
+        Predicate::Comparison { left, operator, right } => {
+            let (left, left_type) = resolve_expr(model, resolver, left)?;
+            let (right, right_type) = resolve_expr(model, resolver, right)?;
+            // One side names a property and the other does not: the named
+            // property's registered type is the one the other side's literals
+            // must take. Two properties (or two literals) leave both as they
+            // came.
+            let (left, right) = match (left_type, right_type) {
+                (Some(target), None) => (left, cast_comparison_value(model, right, target)?),
+                (None, Some(target)) => (cast_comparison_value(model, left, target)?, right),
+                _ => (left, right),
+            };
+            Predicate::Comparison { left: Box::new(left), operator: operator.clone(), right: Box::new(right) }
         }
-        self.catalog.property_value_type(model, property)
+        Predicate::And(left, right) => {
+            Predicate::And(Box::new(resolve_predicate(model, resolver, left)?), Box::new(resolve_predicate(model, resolver, right)?))
+        }
+        Predicate::Or(left, right) => {
+            Predicate::Or(Box::new(resolve_predicate(model, resolver, left)?), Box::new(resolve_predicate(model, resolver, right)?))
+        }
+        Predicate::Not(inner) => Predicate::Not(Box::new(resolve_predicate(model, resolver, inner)?)),
+        Predicate::IsNull(expr) => Predicate::IsNull(Box::new(resolve_expr(model, resolver, expr)?.0)),
+        Predicate::True => Predicate::True,
+        Predicate::False => Predicate::False,
+        Predicate::Placeholder => Predicate::Placeholder,
+    })
+}
+
+/// Bind one expression, reporting alongside it the type a comparison against
+/// it canonicalizes to -- `None` when the expression names no property, which
+/// is what makes it the side that gets cast.
+fn resolve_expr<R: ModelResolver + ?Sized>(
+    model: &ModelId,
+    resolver: &R,
+    expr: &Expr<Parsed>,
+) -> Result<(Expr<Resolved>, Option<ValueType>), ModelResolutionError> {
+    Ok(match expr {
+        Expr::Path(path) => {
+            let head = property_head_index(model, resolver, path)?;
+            let Some(name) = path.steps.get(head) else {
+                return Err(unknown_property(model, ""));
+            };
+            if name == "id" && path.steps.len() > head + 1 {
+                return Err(id_subpath_error(model, path));
+            }
+            let (resolved, value_type) = resolve_path_head(model, resolver, name, path.steps[head + 1..].to_vec())?;
+            // A JSON sub-path compares as JSON whatever the whole property's
+            // registered type is: the sub-path addresses a value inside the
+            // document, not the document.
+            let value_type = if resolved.subpath.is_empty() { value_type } else { ValueType::Json };
+            (Expr::Path(resolved), Some(value_type))
+        }
+        Expr::Literal(value) => (Expr::Literal(value.clone()), None),
+        Expr::Placeholder => (Expr::Placeholder, None),
+        Expr::ExprList(items) => (
+            Expr::ExprList(
+                items.iter().map(|item| resolve_expr(model, resolver, item).map(|(expr, _)| expr)).collect::<Result<Vec<_>, _>>()?,
+            ),
+            None,
+        ),
+        Expr::Predicate(predicate) => (Expr::Predicate(resolve_predicate(model, resolver, predicate)?), None),
+        Expr::InfixExpr { left, operator, right } => (
+            Expr::InfixExpr {
+                left: Box::new(resolve_expr(model, resolver, left)?.0),
+                operator: operator.clone(),
+                right: Box::new(resolve_expr(model, resolver, right)?.0),
+            },
+            None,
+        ),
+    })
+}
+
+/// Cast one side of a comparison to the type the other side's property
+/// resolved with.
+fn cast_comparison_value(model: &ModelId, expr: Expr<Resolved>, target: ValueType) -> Result<Expr<Resolved>, ModelResolutionError> {
+    Ok(match expr {
+        Expr::Literal(value) => Expr::Literal(
+            value.cast_to(target).map_err(|error| ModelResolutionError::Canonicalization { model: *model, message: error.to_string() })?,
+        ),
+        Expr::ExprList(values) => {
+            Expr::ExprList(values.into_iter().map(|value| cast_comparison_value(model, value, target)).collect::<Result<Vec<_>, _>>()?)
+        }
+        other => other,
+    })
+}
+
+/// Which step of a path is the property: the second one when the first is
+/// this model's own name (the legacy collection-qualified form), the first
+/// otherwise.
+fn property_head_index<R: ModelResolver + ?Sized>(model: &ModelId, resolver: &R, path: &PathExpr) -> Result<usize, ModelResolutionError> {
+    let Some(first) = path.steps.first() else { return Ok(0) };
+    if path.steps.len() > 1 && resolver.resolve_model(first)?.as_ref() == Some(model) {
+        Ok(1)
+    } else {
+        Ok(0)
     }
 }
 
-/// Resolve one selection under `model` scope: bind its names to durable
-/// ids, then convert comparison literals to the properties' registered
-/// types. A selection that already passes [`Selection::check`] (fully
-/// resolved, fully populated -- including one with no property references
-/// at all) passes through untouched, which is what makes the shared entry
-/// points idempotent over selections the typed entry already resolved.
-pub(crate) fn resolve_selection_with<R: NameResolver + ?Sized>(
-    selection: Selection,
+/// Bind the property step of a path: the `id` pseudo-property and the frozen
+/// system vocabulary answer here, everything else asks the resolver.
+fn resolve_path_head<R: ModelResolver + ?Sized>(
     model: &ModelId,
     resolver: &R,
-) -> Result<Selection, RetrievalError> {
-    if selection.check().is_ok() {
-        return Ok(selection);
+    name: &str,
+    subpath: Vec<String>,
+) -> Result<(PropertyPath, ValueType), ModelResolutionError> {
+    if name == "id" {
+        return Ok((PropertyPath::id(), ValueType::EntityId));
     }
-    let resolved = selection.resolve_names(model, resolver).map_err(|error| RetrievalError::Other(error.to_string()))?;
-    let type_of = |path: &PropertyPath| resolver.property_value_type(model, &path.property_id()).ok();
-    match resolved.cast_comparison_values(&type_of) {
-        Ok(casted) => Ok(casted),
-        // A value that cannot take its property's registered type does not
-        // fail the query: policy-injected comparisons deliberately hold a
-        // typed field against a non-conforming literal (the row is denied,
-        // never the query), and every execution consumer re-casts at its own
-        // trust boundary regardless -- a normalized AST is never treated as
-        // proof. The selection proceeds resolved but uncanonicalized.
-        Err(_) => Ok(resolved),
+    let resolved = match model {
+        // A system model's properties are the frozen bootstrap vocabulary:
+        // no catalog rows describe them, so the walk answers them from the
+        // closed vocabulary and never asks a resolver about them.
+        ModelId::System(_) => SystemProperty::from_name(name)
+            .map(|system| ResolvedProperty { id: PropertyId::System(system), value_type: system_property_value_type(system) }),
+        ModelId::EntityId(_) => resolver.resolve_property(model, name)?,
     }
+    .ok_or_else(|| unknown_property(model, name))?;
+    Ok((resolved_property_path(resolved.id, name, subpath), resolved.value_type))
+}
+
+fn resolved_property_path(property: PropertyId, label: &str, subpath: Vec<String>) -> PropertyPath {
+    match property {
+        PropertyId::Id => PropertyId::Id.path(&subpath),
+        PropertyId::EntityId(id) => PropertyPath::registered(id, label, subpath),
+        PropertyId::System(system) => PropertyPath::system(system, subpath),
+    }
+}
+
+fn whole_property_order(model: &ModelId, path: &PathExpr, rest: &[String]) -> Result<(), ModelResolutionError> {
+    if rest.is_empty() {
+        return Ok(());
+    }
+    Err(ModelResolutionError::UnsupportedSubpath {
+        model: *model,
+        path: path.steps.join("."),
+        reason: "ORDER BY keys name whole properties; JSON subpaths are not sortable".to_owned(),
+    })
+}
+
+fn id_subpath_error(model: &ModelId, path: &PathExpr) -> ModelResolutionError {
+    ModelResolutionError::UnsupportedSubpath {
+        model: *model,
+        path: path.steps.join("."),
+        reason: "the id pseudo-property is the entity id and has no subfields".to_owned(),
+    }
+}
+
+fn unknown_property(model: &ModelId, name: impl Into<String>) -> ModelResolutionError {
+    ModelResolutionError::UnknownProperty { model: *model, name: name.into() }
 }
 
 impl<SE, PA> CatalogManager<SE, PA>
@@ -286,44 +509,233 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     /// Resolve a RAW selection against `collection`: bind its names through
-    /// the catalog's current display names and convert its comparison
-    /// values. Selections that are already resolved (typed entries resolve
-    /// descriptor-backed before reaching the shared paths) pass through
-    /// untouched, and a selection with no property references never needs
-    /// the model scope at all.
-    pub fn resolve_selection(&self, collection: &CollectionId, selection: Selection) -> Result<Selection, RetrievalError> {
-        if selection.check().is_ok() {
-            return Ok(selection);
+    /// the catalog's current display names and canonicalize its comparison
+    /// values. A selection with no property references never needs the model
+    /// scope at all.
+    pub fn resolve_selection(
+        &self,
+        collection: &CollectionId,
+        selection: Selection<Parsed>,
+    ) -> Result<Selection<Resolved>, RetrievalError> {
+        let Some(model) = self.model_id_for(collection.as_str()) else {
+            return resolve_without_model(&selection).ok_or_else(|| {
+                RetrievalError::Other(format!("collection '{collection}' is not a registered model; its property names cannot resolve"))
+            });
+        };
+        resolve_selection(&model, self, selection).map_err(|error| RetrievalError::Other(error.to_string()))
+    }
+
+    /// Bind a compiled declaration to this system's durable identities from
+    /// what the catalog already holds, answering with the model identity and
+    /// the epoch the binding holds under.
+    ///
+    /// It defines nothing. Either the catalog already proves this exact
+    /// compiled shape, in which case the WHOLE declaration binds here --
+    /// every field's cell, not just the names a query happens to mention, so
+    /// an accessor on an unqueried field resolves too -- or it does not, and
+    /// this call says so rather than handing back an empty result. Which of
+    /// the two it is decides whether a read may judge its query on the spot;
+    /// healing what the catalog cannot prove is
+    /// [`Self::bind_or_register`]'s job.
+    pub(crate) fn bind_descriptor(&self, schema: &'static ModelStructDescriptor) -> Result<(ModelId, SchemaEpoch), RetrievalError> {
+        // A built-in's identities are pinned at compile time and valid at
+        // every epoch, so its rows are readable on a node with no system.
+        if let Some(system) = schema.system {
+            return Ok((ModelId::System(system), self.schema_epoch().unwrap_or(SchemaEpoch::BOOTSTRAP)));
         }
-        let model = self.model_id_for(collection.as_str()).ok_or_else(|| {
-            RetrievalError::Other(format!("collection '{collection}' is not a registered model; its property names cannot resolve"))
+        let epoch = self
+            .schema_epoch()
+            .ok_or_else(|| RetrievalError::Other("no system is ready; a typed read cannot resolve its model".to_string()))?;
+        if schema.resolved.get(epoch).is_none() {
+            self.bind_compatible_schema(schema, epoch);
+        }
+        let model = schema.resolved.get(epoch).ok_or_else(|| {
+            RetrievalError::Other(format!(
+                "model '{}' is not registered in this system, or its registered shape differs from this binary's declaration; a typed read cannot resolve it",
+                schema.label
+            ))
         })?;
-        resolve_selection_with(selection, &model, self)
+        Ok((model, epoch))
+    }
+
+    /// Admit a compiled declaration for reading: bind it to this system's
+    /// durable identities, registering the declaration first when the catalog
+    /// cannot prove it yet.
+    ///
+    /// A FULLY BOUND descriptor is what licenses a synchronous judgment. Its
+    /// cells hold an identity for the model and for every field, so whatever
+    /// the query still gets wrong -- a name neither the declaration nor the
+    /// catalog carries, a literal that will not take its property's type --
+    /// is a mistake in the query, and the caller hears about it now rather
+    /// than waiting on a registration that would not change the answer.
+    ///
+    /// Anything less means this system has never been told about this shape,
+    /// which a read heals instead of refusing: registration writes the
+    /// DECLARED delta (a field added since the model was registered
+    /// registers that field alone, against the model already there), and the
+    /// re-bind resolves every cell. A credential that may not register says
+    /// exactly that, rather than reporting the model as unknown.
+    pub(crate) async fn bind_or_register(
+        &self,
+        sessions: &crate::session::SessionSet<PA::ContextData>,
+        schema: &'static ModelStructDescriptor,
+    ) -> Result<(ModelId, SchemaEpoch), RetrievalError> {
+        let unbound = match self.bind_descriptor(schema) {
+            Ok(bound) => return Ok(bound),
+            Err(error) => error,
+        };
+        // There is nothing to heal before this node has a system: no epoch
+        // to bind under, and no allocator to register with. The binding
+        // failure already says exactly that.
+        if self.schema_epoch().is_none() {
+            return Err(unbound);
+        }
+        let may_not_register = |refusal: &dyn std::fmt::Display| {
+            RetrievalError::Other(format!(
+                "model '{}' is not registered in this system, and this credential may not register it: {refusal}",
+                schema.label
+            ))
+        };
+        let cdata = sessions.write_credential().map_err(|denied| may_not_register(&denied))?;
+        if let Err(error) = self.ensure_schema_for_use(&cdata, schema).await {
+            return Err(match error {
+                RegistrationError::PolicyDenied(denied) => may_not_register(&denied),
+                other => other.into(),
+            });
+        }
+        self.bind_descriptor(schema)
     }
 
     /// Resolve a selection under a compiled declaration: field names bind
-    /// through the descriptor's cells at this node's current epoch. Callers
-    /// run this after the registration gate, so the cells are populated for
-    /// the epoch snapshotted here.
+    /// through the descriptor's cells at this node's current epoch.
     pub fn resolve_selection_with_descriptor(
         &self,
         schema: &'static ModelStructDescriptor,
-        selection: Selection,
-    ) -> Result<Selection, RetrievalError> {
-        if selection.check().is_ok() {
-            return Ok(selection);
+        selection: Selection<Parsed>,
+    ) -> Result<Selection<Resolved>, RetrievalError> {
+        // Bind FIRST, whatever the selection says. The views this query
+        // returns read their identities off these cells, so a selection that
+        // happens to name no property (`true`, a limit-only page) must not
+        // leave the declaration unbound and every accessor broken.
+        let (model, epoch) = self.bind_descriptor(schema)?;
+        if let Some(resolved) = resolve_without_model(&selection) {
+            return Ok(resolved);
         }
-        let epoch =
-            self.schema_epoch().ok_or_else(|| RetrievalError::Other("no system is ready; typed selection cannot resolve".to_string()))?;
-        // The model scope prefers the admitted identity; before the gate
-        // (the synchronous query entry) it falls back to the catalog's
-        // label binding, like a raw query.
-        let model = match schema.resolved.get(epoch) {
-            Some(model) => model,
-            None => self.model_id_for(schema.label).ok_or_else(|| {
-                RetrievalError::Other(format!("model '{}' is not registered; its property names cannot resolve", schema.label))
-            })?,
-        };
-        resolve_selection_with(selection, &model, &DescriptorResolver { schema, epoch, catalog: self })
+        let resolver = DescriptorResolver { schema, epoch, catalog: self };
+        resolve_selection(&model, &resolver, selection).map_err(|error| RetrievalError::Other(error.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ankql::ast::{ComparisonOperator, PathExpr, Value};
+    use ankurah_proto::{EntityId, SystemModel};
+
+    use super::*;
+
+    fn model() -> ModelId { ModelId::EntityId(EntityId::from_bytes([0x11; 32])) }
+    fn property() -> PropertyId { PropertyId::EntityId(EntityId::from_bytes([0x22; 32])) }
+
+    /// A resolver whose catalog holds one typed property, and one name it
+    /// knows but cannot type.
+    struct WarmResolver;
+
+    /// A resolver whose catalog holds nothing.
+    struct ColdResolver;
+
+    impl ModelResolver for WarmResolver {
+        fn resolve_property(&self, model: &ModelId, name: &str) -> Result<Option<ResolvedProperty>, ModelResolutionError> {
+            Ok(match name {
+                "value" => Some(ResolvedProperty { id: property(), value_type: ValueType::I64 }),
+                // A name whose type the catalog cannot supply: half a
+                // resolution is not a resolution, so the lookup fails
+                // instead of answering an untyped identity.
+                "typeless" => {
+                    return Err(ModelResolutionError::ValueTypeLookup {
+                        model: *model,
+                        property: PropertyId::System(SystemProperty::Name),
+                        message: "test resolver has no type for this property".to_owned(),
+                    })
+                }
+                _ => None,
+            })
+        }
+    }
+
+    impl ModelResolver for ColdResolver {
+        fn resolve_property(&self, _model: &ModelId, _name: &str) -> Result<Option<ResolvedProperty>, ModelResolutionError> {
+            // Answers nothing; a miss is authoritative.
+            Ok(None)
+        }
+    }
+
+    fn comparison(path: PathExpr, value: Value) -> Selection<Parsed> {
+        Predicate::Comparison {
+            left: Box::new(Expr::Path(path)),
+            operator: ComparisonOperator::Equal,
+            right: Box::new(Expr::Literal(value)),
+        }
+        .into()
+    }
+
+    #[test]
+    fn the_lookup_is_object_safe() {
+        // A resolver reaches the walk through type-erased boundaries (the
+        // context behind `Arc<dyn TContext>` hands one over), so `dyn
+        // ModelResolver` has to be a legal type: a generic method or a
+        // `Self`-returning one here would foreclose that, silently, at the
+        // next edit.
+        let erased: &dyn ModelResolver = &ColdResolver;
+        assert!(resolve_selection(&model(), erased, Selection::from(Predicate::True)).is_ok());
+    }
+
+    #[test]
+    fn property_free_selection_needs_no_resolver() {
+        let resolved = resolve_selection(&model(), &ColdResolver, Selection::from(Predicate::True)).unwrap();
+        assert_eq!(resolved.predicate, Predicate::True);
+    }
+
+    #[test]
+    fn unresolved_property_is_unknown() {
+        let error = resolve_selection(&model(), &ColdResolver, comparison(PathExpr::simple("value"), Value::I64(42))).unwrap_err();
+        assert!(matches!(error, ModelResolutionError::UnknownProperty { .. }));
+    }
+
+    #[test]
+    fn resolution_casts_registered_property_literal() {
+        let resolved = resolve_selection(&model(), &WarmResolver, comparison(PathExpr::simple("value"), Value::I32(42))).unwrap();
+        let Predicate::Comparison { right, .. } = resolved.predicate else { panic!("expected comparison") };
+        assert_eq!(*right, Expr::Literal(Value::I64(42)));
+    }
+
+    #[test]
+    fn resolved_property_without_a_type_is_rejected() {
+        let error = resolve_selection(&model(), &WarmResolver, comparison(PathExpr::simple("typeless"), Value::String("value".to_owned())))
+            .unwrap_err();
+        assert!(matches!(error, ModelResolutionError::ValueTypeLookup { property: PropertyId::System(SystemProperty::Name), .. }));
+    }
+
+    #[test]
+    fn resolution_casts_json_subpath_literal() {
+        let resolved = resolve_selection(
+            &model(),
+            &WarmResolver,
+            comparison(PathExpr { steps: vec!["value".to_owned(), "nested".to_owned()] }, Value::String("hello".to_owned())),
+        )
+        .unwrap();
+        let Predicate::Comparison { right, .. } = resolved.predicate else { panic!("expected comparison") };
+        assert_eq!(*right, Expr::Literal(Value::Json(serde_json::json!("hello"))));
+    }
+
+    #[test]
+    fn system_model_properties_type_from_the_frozen_vocabulary() {
+        // A system model's properties never reach the resolver: the closed
+        // vocabulary answers both identity and type, which is why a resolver
+        // that knows nothing still resolves them.
+        let model = ModelId::System(SystemModel::Model);
+        let resolved =
+            resolve_selection(&model, &ColdResolver, comparison(PathExpr::simple("optional"), Value::String("true".to_owned()))).unwrap();
+        let Predicate::Comparison { right, .. } = resolved.predicate else { panic!("expected comparison") };
+        assert_eq!(*right, Expr::Literal(Value::Bool(true)));
     }
 }
