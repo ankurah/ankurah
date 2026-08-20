@@ -277,6 +277,7 @@ where
 impl EntityLiveQuery {
     pub fn new<SE, PA>(
         node: &Node<SE, PA>,
+        schema: Option<&'static crate::schema::ModelStructDescriptor>,
         collection_id: CollectionId,
         args: MatchArgs<Parsed>,
         sessions: impl Into<SessionSet<PA::ContextData>>,
@@ -286,14 +287,16 @@ impl EntityLiveQuery {
         PA: PolicyAgent + Send + Sync + 'static,
     {
         let node_ref: Box<dyn NodeRef> = Box::new(StrongNodeRef(Arc::clone(&node.0)));
-        Self::new_with_node_ref(node, node_ref, collection_id, args, sessions.into())
+        Self::new_with_node_ref(node, node_ref, schema, collection_id, args, sessions.into(), RemoteSubscription::AtStart)
     }
+
 
     /// Create a LiveQuery that does NOT keep the node alive.
     ///
-    /// Used by PolicyAgent and other internal subscribers that should not create
-    /// reference cycles (node → agent → livequery → node). Operations that need
-    /// the node (activation, selection updates) fail with "Node has been dropped"
+    /// Used by the PolicyAgent's own bootstrap query and the catalog
+    /// projection: node-owned subscribers whose strong reference would cycle
+    /// (node → agent or catalog → livequery → node). Operations that need the
+    /// node (activation, selection updates) fail with "Node has been dropped"
     /// once the node is gone.
     pub fn new_weak_node<SE, PA>(
         node: &Node<SE, PA>,
@@ -306,12 +309,13 @@ impl EntityLiveQuery {
         PA: PolicyAgent + Send + Sync + 'static,
     {
         let node_ref: Box<dyn NodeRef> = Box::new(WeakNodeRefImpl(Arc::downgrade(&node.0)));
-        Self::new_with_node_ref(node, node_ref, collection_id, args, sessions.into())
+        Self::new_with_node_ref(node, node_ref, None, collection_id, args, sessions.into(), RemoteSubscription::AtStart)
     }
 
     fn new_with_node_ref<SE, PA>(
         node: &Node<SE, PA>,
         node_ref: Box<dyn NodeRef>,
+        schema: Option<&'static crate::schema::ModelStructDescriptor>,
         collection_id: CollectionId,
         args: MatchArgs<Parsed>,
         sessions: SessionSet<PA::ContextData>,

@@ -1,21 +1,20 @@
-use crate::{KeyBounds, predicate::ConjunctFinder, types::*};
+use crate::{ColumnPath, EngineColumns, KeyBounds, predicate::ConjunctFinder, types::*};
 use ankql::ast::{ComparisonOperator, Expr, Predicate};
 use ankurah_core::indexing::{IndexKeyPart, KeySpec};
 use ankurah_core_types::{Value, ValueType};
 use indexmap::IndexMap;
 
-/// The planner's column name for a resolved sort key, when it is a simple
-/// (no JSON sub-path) reference: the property id's rendering. Selections
-/// reach engines resolved (`ankql::ast::Selection::check` is the
-/// boundary), so an unresolved `OrderKey::Path` yields `None` and the
-/// planner treats the key as unplannable, exactly like a sub-path key.
-/// Raw identity renderings are the interim physical vocabulary; friendly
-/// physical naming arrives with the engine-side catalog resolver.
-pub(crate) fn sort_key_root(item: &ankql::ast::OrderByItem) -> Option<String> {
-    match &item.key {
-        ankql::ast::OrderKey::Property(identifier) if identifier.is_simple() => Some(identifier.property_id().to_string()),
-        _ => None,
+/// The index-key name for one column path: the column, with any JSON
+/// sub-path dotted on. This is the vocabulary index specs and bounds are
+/// written in, and the engine's lowering is what put those column names
+/// there.
+fn column_key(path: &ColumnPath) -> String {
+    let mut key = path.column.clone();
+    for step in &path.subpath {
+        key.push('.');
+        key.push_str(step);
     }
+    key
 }
 
 #[derive(Debug, Clone)]
@@ -46,7 +45,7 @@ impl Planner {
     ///
     /// Input: Selection with predicate, primary key field name
     /// Output: Vector of all viable plans (index plans + table scan fallback)
-    pub fn plan(&self, selection: &ankql::ast::Selection, primary_key: &str) -> Vec<Plan> {
+    pub fn plan(&self, selection: &ankql::ast::Selection<EngineColumns>, primary_key: &str) -> Vec<Plan> {
         let conjuncts = ConjunctFinder::find(&selection.predicate);
 
         // Separate conjuncts into equalities and inequalities, filtering out primary key predicates
@@ -74,7 +73,7 @@ impl Planner {
                 plans.push(plan);
             }
             // If an ORDER BY field has inequalities (covered inequality), do NOT emit INEQ-FIRST
-            let covered_ineq = order_by.iter().any(|item| sort_key_root(item).is_some_and(|name| inequalities.contains_key(&name)));
+            let covered_ineq = order_by.iter().any(|item| inequalities.contains_key(&column_key(&item.path)));
             if !covered_ineq
                 && !inequalities.is_empty()
                 && let Some(plan) = self.build_ineq_first_plan(&equalities, &inequalities, order_by, &conjuncts)
@@ -135,8 +134,8 @@ impl Planner {
         &self,
         equalities: &[(String, Value)],
         inequalities: &IndexMap<String, Vec<(ComparisonOperator, Value)>>,
-        order_by: &[ankql::ast::OrderByItem],
-        conjuncts: &[Predicate],
+        order_by: &[ankql::ast::OrderByItem<EngineColumns>],
+        conjuncts: &[Predicate<EngineColumns>],
     ) -> Option<Plan> {
         if order_by.is_empty() {
             return None;

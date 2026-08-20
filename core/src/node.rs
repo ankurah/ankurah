@@ -96,6 +96,18 @@ impl MatchArgs<Parsed> {
     }
 }
 
+/// Temporarily bypass PolicyAgent for catalog data
+fn catalog_read_collection(body: &proto::NodeRequestBody) -> Option<&proto::CollectionId> {
+    let collection = match body {
+        proto::NodeRequestBody::Fetch { collection, .. }
+        | proto::NodeRequestBody::Get { collection, .. }
+        | proto::NodeRequestBody::GetEvents { collection, .. }
+        | proto::NodeRequestBody::SubscribeQuery { collection, .. } => collection,
+        proto::NodeRequestBody::CommitTransaction { .. } | proto::NodeRequestBody::RegisterSchema { .. } => return None,
+    };
+    crate::schema::reads_bypass_policy(collection).then_some(collection)
+}
+
 /// A participant in the Ankurah network, and primary place where queries are initiated
 
 pub struct Node<SE, PA>(pub(crate) Arc<NodeInner<SE, PA>>)
@@ -106,18 +118,23 @@ where PA: PolicyAgent
     fn clone(&self) -> Self { Self(self.0.clone()) }
 }
 
-pub struct WeakNode<SE, PA>(Weak<NodeInner<SE, PA>>)
-where PA: PolicyAgent;
+pub struct WeakNode<SE, PA>
+where PA: PolicyAgent
+{
+    node: Weak<NodeInner<SE, PA>>,
+    node_id: proto::EntityId,
+}
 impl<SE, PA> Clone for WeakNode<SE, PA>
 where PA: PolicyAgent
 {
-    fn clone(&self) -> Self { Self(self.0.clone()) }
+    fn clone(&self) -> Self { Self { node: self.node.clone(), node_id: self.node_id } }
 }
 
 impl<SE, PA> WeakNode<SE, PA>
 where PA: PolicyAgent
 {
-    pub fn upgrade(&self) -> Option<Node<SE, PA>> { self.0.upgrade().map(Node) }
+    pub fn upgrade(&self) -> Option<Node<SE, PA>> { self.node.upgrade().map(Node) }
+    pub fn node_id(&self) -> proto::EntityId { self.node_id }
 }
 
 impl<SE, PA> Deref for Node<SE, PA>
@@ -157,8 +174,6 @@ where PA: PolicyAgent
     pub(crate) policy_agent: PA,
     pub system: SystemManager<SE, PA>,
 
-    /// The metadata catalog map (write-only in this phase: registration
-    /// maintains it; nothing resolves through it yet).
     pub catalog: CatalogManager<SE, PA>,
 
     pub(crate) subscription_relay: Option<SubscriptionRelay<PA::ContextData, crate::livequery::WeakEntityLiveQuery>>,
@@ -226,11 +241,16 @@ where
         }
 
         node.policy_agent.on_node_ready(node.weak());
-        node.catalog.start(node.weak());
+
+        // The catalog's projection queries need the node to exist, so they are
+        // injected here rather than constructed in the struct literal. The
+        // context is weak: the node owns the catalog, never the reverse.
+        let catalog_ctx = Context::new_weak(&node, SessionSet::new());
+        node.catalog.inject(&catalog_ctx).expect("catalog projection queries are constructible on a fresh node");
 
         node
     }
-    pub fn weak(&self) -> WeakNode<SE, PA> { WeakNode(Arc::downgrade(&self.0)) }
+    pub fn weak(&self) -> WeakNode<SE, PA> { WeakNode { node: Arc::downgrade(&self.0), node_id: self.0.id } }
 
     /// Register a peer connection after its Presence handshake.
     ///
@@ -316,7 +336,12 @@ where
         let request_id = proto::RequestId::new();
 
         let request = proto::NodeRequest { id: request_id.clone(), to: node_id, from: self.id, body: request_body };
-        let auth = self.policy_agent.sign_request(self, cdata, &request)?;
+
+        // A read of a catalog collection carries no credential.
+        let auth = match catalog_read_collection(&request.body) {
+            Some(_) => Vec::new(),
+            None => self.policy_agent.sign_request(self, cdata, &request)?,
+        };
 
         // Get the peer connection
         let connection = self.peer_connections.get(&node_id).ok_or(RequestError::PeerNotConnected)?;
@@ -410,13 +435,19 @@ where
                         return Ok(());
                     }
 
-                    // Validate the request auth first, converting errors to error responses
-                    let body = match self.policy_agent.check_request(self, &auth, &request).await {
-                        Ok(cdata) => match self.handle_request(&cdata, request).await {
+                    // Validate the request auth first, converting errors to error responses -- EXCEPT catalog collections
+                    let body = match catalog_read_collection(&request.body) {
+                        Some(_) => match self.handle_request(&Vec::<PA::ContextData>::new(), request).await {
                             Ok(result) => result,
                             Err(e) => proto::NodeResponseBody::Error(e.to_string()),
                         },
-                        Err(e) => proto::NodeResponseBody::Error(e.to_string()),
+                        None => match self.policy_agent.check_request(self, &auth, &request).await {
+                            Ok(cdata) => match self.handle_request(&cdata, request).await {
+                                Ok(result) => result,
+                                Err(e) => proto::NodeResponseBody::Error(e.to_string()),
+                            },
+                            Err(e) => proto::NodeResponseBody::Error(e.to_string()),
+                        },
                     };
                     let _result = sender.send_message(proto::NodeMessage::Response(proto::NodeResponse {
                         request_id,
@@ -446,6 +477,7 @@ where
     #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(request = %request)))]
     async fn handle_request<C>(&self, cdata: &C, request: proto::NodeRequest) -> anyhow::Result<proto::NodeResponseBody>
     where C: Iterable<PA::ContextData> {
+        let exempt = catalog_read_collection(&request.body).is_some();
         match request.body {
             proto::NodeRequestBody::CommitTransaction { id, events } => {
                 // Protected collections (the system collection and the
@@ -481,12 +513,16 @@ where
                 }
             }
             proto::NodeRequestBody::Fetch { collection, mut selection, known_matches } => {
-                self.policy_agent.can_access_collection(cdata, &collection)?;
+                if !exempt {
+                    self.policy_agent.can_access_collection(cdata, &collection)?;
+                }
                 let storage_collection = self.collections.get(&collection).await?;
                 // The requester's selection arrives resolved, and the policy
                 // narrows it in the same vocabulary: what the agent ANDs in
                 // is resolved too, so nothing here is left to bind.
-                selection.predicate = self.policy_agent.filter_predicate(cdata, &collection, selection.predicate)?;
+                if !exempt {
+                    selection.predicate = self.policy_agent.filter_predicate(cdata, &collection, selection.predicate)?;
+                }
 
                 // Expand initial_states to include entities from known_matches that weren't in the predicate results
                 let expanded_states = crate::util::expand_states::expand_states(
@@ -500,7 +536,8 @@ where
 
                 let mut deltas = Vec::new();
                 for state in expanded_states {
-                    if self.policy_agent.check_read(cdata, &state.payload.entity_id, &collection, &state.payload.state).is_err() {
+                    if !exempt && self.policy_agent.check_read(cdata, &state.payload.entity_id, &collection, &state.payload.state).is_err()
+                    {
                         continue;
                     }
 
@@ -513,12 +550,18 @@ where
                 Ok(proto::NodeResponseBody::Fetch(deltas))
             }
             proto::NodeRequestBody::Get { collection, ids } => {
-                self.policy_agent.can_access_collection(cdata, &collection)?;
+                if !exempt {
+                    self.policy_agent.can_access_collection(cdata, &collection)?;
+                }
                 let storage_collection = self.collections.get(&collection).await?;
 
                 // filter out any that the policy agent says we don't have access to
                 let mut states = Vec::new();
                 for state in storage_collection.get_states(ids).await? {
+                    if exempt {
+                        states.push(state);
+                        continue;
+                    }
                     match self.policy_agent.check_read(cdata, &state.payload.entity_id, &collection, &state.payload.state) {
                         Ok(_) => states.push(state),
                         Err(AccessDenied::ByPolicy(_)) => {}
@@ -530,12 +573,18 @@ where
                 Ok(proto::NodeResponseBody::Get(states))
             }
             proto::NodeRequestBody::GetEvents { collection, event_ids } => {
-                self.policy_agent.can_access_collection(cdata, &collection)?;
+                if !exempt {
+                    self.policy_agent.can_access_collection(cdata, &collection)?;
+                }
                 let storage_collection = self.collections.get(&collection).await?;
 
                 // filter out any that the policy agent says we don't have access to
                 let mut events = Vec::new();
                 for event in storage_collection.get_events(event_ids).await? {
+                    if exempt {
+                        events.push(event);
+                        continue;
+                    }
                     match self.policy_agent.check_read_event(cdata, &event) {
                         Ok(_) => events.push(event),
                         Err(AccessDenied::ByPolicy(_)) => {}
@@ -554,9 +603,22 @@ where
                 // exactly one and a plural one is refused here. Admitting
                 // several — and with them the empty and union verdicts —
                 // stays fenced: https://github.com/ankurah/ankurah/issues/432
-                let cdata = cdata.iterable().exactly_one().map_err(|_| {
-                    anyhow!("SubscribeQuery currently requires exactly one cdata (this server does not yet accept several per subscribe)")
-                })?;
+                //
+                // A catalog subscribe is the exception: it carries an empty
+                // credential by design, so a server whose agent yields no
+                // context for it (the JWT agent's does yield one; a stricter
+                // agent need not) must still serve it.
+                let cdata = match cdata.iterable().at_most_one() {
+                    Ok(cdata) => cdata,
+                    Err(_) => {
+                        return Err(anyhow!(
+                            "SubscribeQuery currently requires at most one cdata (this server does not yet accept several per subscribe)"
+                        ))
+                    }
+                };
+                if cdata.is_none() && !exempt {
+                    return Err(anyhow!("SubscribeQuery requires a credential for '{collection}'"));
+                }
                 peer_state.subscription_handler.subscribe_query(self, query_id, collection, selection, cdata, version, known_matches).await
             }
         }

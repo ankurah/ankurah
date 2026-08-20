@@ -28,6 +28,8 @@ pub enum AccessDenied {
     ParseError(ParseError),
     #[error("Insufficient attestation")]
     InsufficientAttestation,
+    #[error("Node has been dropped")]
+    NodeDropped,
 }
 
 impl From<PropertyError> for AccessDenied {

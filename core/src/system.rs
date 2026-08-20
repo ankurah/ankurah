@@ -2,9 +2,7 @@ use ankurah_proto::{self as proto, Attested, CollectionId, EntityState, Event};
 use anyhow::{anyhow, Result};
 use proto::PropertyId;
 use std::collections::BTreeMap;
-use std::future::Future;
 use std::marker::PhantomData;
-use std::pin::Pin;
 use std::sync::{Arc, OnceLock, RwLock};
 use tokio::sync::Notify;
 use tracing::{error, warn};
@@ -58,15 +56,6 @@ struct Inner<SE, PA> {
     catalog_reset_hook: RwLock<Option<CatalogResetHook>>,
     reactor: Reactor,
     _phantom: PhantomData<PA>,
-}
-
-type CatalogResetFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
-
-#[derive(Clone)]
-struct CatalogResetHook {
-    begin: Arc<dyn Fn() -> CatalogResetFuture + Send + Sync>,
-    finish: Arc<dyn Fn() + Send + Sync>,
-    resume: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl<SE, PA> SystemManager<SE, PA>
@@ -151,31 +140,12 @@ where
                 *ready = true;
             }
         }
-        self.resume_catalog();
         self.0.system_ready_notify.notify_waiters();
     }
 
-    /// Install the catalog reset barrier (called by `CatalogManager::start`).
-    /// SystemManager remains the sole owner of destructive storage deletion.
-    pub(crate) fn set_catalog_reset_hook(
-        &self,
-        begin: Arc<dyn Fn() -> CatalogResetFuture + Send + Sync>,
-        finish: Arc<dyn Fn() + Send + Sync>,
-        resume: Arc<dyn Fn() + Send + Sync>,
-    ) {
-        *self.0.catalog_reset_hook.write().unwrap() = Some(CatalogResetHook { begin, finish, resume });
-    }
-
-    /// Re-arm epoch-bound catalog maintenance; called at every
-    /// system-becomes-ready transition (create, load, join, and the
-    /// matching-root fast path).
-    fn resume_catalog(&self) {
-        if let Some(hook) = self.0.catalog_reset_hook.read().unwrap().clone() {
-            (hook.resume)();
-        }
-    }
-
-    /// Waits until we've successfully initialized or joined a system
+    /// Waits until this node has a system: a root exists and an epoch is
+    /// assigned. It says nothing about the catalog's fill; queries that need
+    /// catalog names defer behind the catalog's own sync instead.
     pub async fn wait_system_ready(&self) {
         if !self.is_system_ready() {
             self.0.system_ready_notify.notified().await;
