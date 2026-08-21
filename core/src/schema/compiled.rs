@@ -108,8 +108,9 @@ pub struct StructProperty {
     pub explicit_id: Option<&'static str>,
     /// A random identity for this compiled field, minted fresh each time
     /// the derive expands (unique to the containing build). Rides the
-    /// registration RPC beside the model's `build_id` as a future fallback
-    /// matching key; inoperative today.
+    /// registration request and is echoed in the response, where it is the
+    /// correlator that binds each resolved property back onto this field --
+    /// immune to display-name drift.
     pub build_id: [u8; 16],
     /// The durable property identity this field resolved to, per schema
     /// epoch. Populated by the registration gate together with the model's

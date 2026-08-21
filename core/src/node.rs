@@ -680,7 +680,11 @@ where
     /// (`Entity::apply_event`) is deliberately unchecked: the attested event
     /// stream is the membership authority, and this gate controls only what
     /// may be EMITTED into it today.
-    pub(crate) fn check_membership_admissibility(&self, event: &proto::Event) -> Result<(), MutationError> {
+    pub(crate) fn check_membership_admissibility(
+        &self,
+        schema: Option<&'static crate::schema::ModelStructDescriptor>,
+        event: &proto::Event,
+    ) -> Result<(), MutationError> {
         let memberships: Vec<proto::ModelId> = event
             .operations()
             .memberships()
@@ -700,8 +704,20 @@ where
             [] => return Err(MutationError::InvalidUpdate("an entity's first event must add exactly one membership")),
             _ => return Err(MutationError::InvalidUpdate("an entity's first event cannot add more than one membership")),
         };
-        let expected =
-            crate::schema::system_model_id(event.collection.as_str()).or_else(|| self.catalog.model_id_for(event.collection.as_str()));
+        // The expected model, by authority order: the built-in mapping; the
+        // compiled declaration's resolved cell at the current epoch (a local
+        // create's registration response bound it, so an ephemeral's first
+        // write is judged without waiting on its catalog subscription); the
+        // local catalog. The remote funnel passes no declaration -- peers
+        // commit models this binary never compiled -- and judges by catalog
+        // alone.
+        let expected = crate::schema::system_model_id(event.collection.as_str())
+            .or_else(|| {
+                schema
+                    .filter(|schema| schema.label == event.collection.as_str())
+                    .and_then(|schema| self.system.schema_epoch().and_then(|epoch| schema.resolved.get(epoch)))
+            })
+            .or_else(|| self.catalog.model_id_for(event.collection.as_str()));
         match expected {
             Some(expected) if expected == model => Ok(()),
             Some(_) => Err(MutationError::General(
@@ -728,7 +744,7 @@ where
             // derive, or a parent clock that disagrees with the body -- is
             // refused before anything stages or stores it.
             event.payload.validate_structure()?;
-            self.check_membership_admissibility(&event.payload)?;
+            self.check_membership_admissibility(None, &event.payload)?;
             let collection = self.collections.get(&event.payload.collection).await?;
 
             // When applying an event, we should only look at the local storage for the lineage

@@ -64,6 +64,14 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         Ok(())
     }
 
+    /// Install the hook a system reset invokes after clearing this
+    /// subscription's results; the owning query re-admits itself there.
+    pub fn set_reset_hook(&self, hook: impl Fn() + Send + Sync + 'static) {
+        if let Some(subscription) = self.0.reactor.subscription(self.0.subscription_id) {
+            subscription.set_reset_hook(Arc::new(hook));
+        }
+    }
+
     /// Add entity subscriptions
     pub fn add_entity_subscriptions(&self, entity_ids: impl IntoIterator<Item = proto::EntityId>) {
         let entity_ids: Vec<_> = entity_ids.into_iter().collect();

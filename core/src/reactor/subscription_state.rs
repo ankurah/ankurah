@@ -134,44 +134,57 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         state.entity_subscriptions.remove(&entity_id);
     }
 
+    /// Install the reset re-admission hook (see `State::reset_hook`).
+    pub fn set_reset_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        let mut state = self.state.lock().unwrap();
+        state.reset_hook = Some(hook);
+    }
+
     /// Check if any queries match this entity (for determining if entity watcher should be removed)
     pub fn any_query_matches(&self, entity_id: &proto::EntityId) -> bool {
         let state = self.state.lock().unwrap();
         state.queries.values().any(|q| q.resultset.contains_key(entity_id))
     }
 
-    /// System reset - clear all matching entities and notify
+    /// System reset - clear all matching entities, notify, and invoke the
+    /// re-admission hook outside the state lock.
     pub fn system_reset(&self) {
-        let state = &mut *self.state.lock().unwrap();
-        let mut update_items: Vec<ReactorUpdateItem<E, Ev>> = Vec::new();
+        let reset_hook = {
+            let state = &mut *self.state.lock().unwrap();
+            let mut update_items: Vec<ReactorUpdateItem<E, Ev>> = Vec::new();
 
-        // For each query in this subscription
-        for (query_id, query_state) in &mut state.queries {
-            // For each entity that was matching this query
-            for entity_id in query_state.resultset.keys() {
-                // Try to get the entity from the subscription's cache
-                if let Some(entity) = state.entities.get(&entity_id) {
-                    update_items.push(ReactorUpdateItem {
-                        entity: entity.clone(),
-                        events: vec![], // No events for system reset
-                        predicate_relevance: vec![(*query_id, MembershipChange::Remove)],
-                    });
+            // For each query in this subscription
+            for (query_id, query_state) in &mut state.queries {
+                // For each entity that was matching this query
+                for entity_id in query_state.resultset.keys() {
+                    // Try to get the entity from the subscription's cache
+                    if let Some(entity) = state.entities.get(&entity_id) {
+                        update_items.push(ReactorUpdateItem {
+                            entity: entity.clone(),
+                            events: vec![], // No events for system reset
+                            predicate_relevance: vec![(*query_id, MembershipChange::Remove)],
+                        });
+                    }
                 }
+
+                // Clear the matching entities for this query
+                query_state.resultset.clear();
+                query_state.resultset.set_loaded(false);
             }
 
-            // Clear the matching entities for this query
-            query_state.resultset.clear();
-            query_state.resultset.set_loaded(false);
-        }
+            // Clear entity subscriptions and cached entities
+            state.entity_subscriptions.clear();
+            state.entities.clear();
 
-        // Clear entity subscriptions and cached entities
-        state.entity_subscriptions.clear();
-        state.entities.clear();
-
-        // Send the notification if there were any updates
-        if !update_items.is_empty() {
-            let reactor_update = ReactorUpdate { items: update_items };
-            state.broadcast.send(reactor_update);
+            // Send the notification if there were any updates
+            if !update_items.is_empty() {
+                let reactor_update = ReactorUpdate { items: update_items };
+                state.broadcast.send(reactor_update);
+            }
+            state.reset_hook.clone()
+        };
+        if let Some(hook) = reset_hook {
+            hook();
         }
     }
 

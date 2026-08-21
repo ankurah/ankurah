@@ -66,8 +66,9 @@ pub struct RegisterProperty {
     /// looking one up by name. Never mints; hard-fails if absent.
     pub explicit_id: Option<EntityId>,
     /// The sending binary's random per-build identity for this compiled
-    /// field, beside the model's `build_id`. A future fallback matching
-    /// key; the executor ignores it today.
+    /// field, beside the model's `build_id`. Echoed in
+    /// [`RegisteredProperty::build_id`], where it correlates the resolution
+    /// back onto the requester's compiled field.
     pub build_id: [u8; 16],
     /// Whether entities of this model may omit the property. Per membership:
     /// the same property may be required in one model and optional in

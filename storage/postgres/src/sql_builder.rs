@@ -339,42 +339,6 @@ impl SqlBuilder {
         Ok(())
     }
 
-    /// Emit a literal expression with ::jsonb cast for proper JSONB comparison semantics.
-    /// This ensures that comparisons like `"data"->'count' > '10'::jsonb` work correctly
-    /// with PostgreSQL's type-aware JSONB comparison (numeric vs lexicographic).
-    pub fn expr_as_jsonb(&mut self, expr: &Expr<EngineColumns>) -> Result<(), SqlGenerationError> {
-        match expr {
-            Expr::Literal(lit) => {
-                // For literals, we need to cast to jsonb
-                // PostgreSQL will compare jsonb values with proper type semantics
-                match lit {
-                    Value::String(s) => {
-                        // String literals need to be JSON strings: '"value"'::jsonb
-                        // Escape for JSON (backslash and quote) then for SQL (single quotes)
-                        let json_escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
-                        let sql_escaped = format!("\"{}\"", json_escaped).replace('\'', "''");
-                        self.sql(format!("'{}'::jsonb", sql_escaped));
-                    }
-                    Value::I64(n) => self.sql(format!("'{}'::jsonb", n)),
-                    Value::F64(n) => self.sql(format!("'{}'::jsonb", n)),
-                    Value::Bool(b) => self.sql(format!("'{}'::jsonb", b)),
-                    Value::I16(n) => self.sql(format!("'{}'::jsonb", n)),
-                    Value::I32(n) => self.sql(format!("'{}'::jsonb", n)),
-                    // EntityId and binary types don't make sense as JSONB
-                    Value::EntityId(_) | Value::Object(_) | Value::Binary(_) => {
-                        // Fall back to regular expression (will likely fail comparison, but that's correct)
-                        self.expr(expr)?;
-                    }
-                    // JSON literal is already properly typed
-                    Value::Json(json) => self.sql(format!("'{}'::jsonb", json)),
-                }
-                Ok(())
-            }
-            // For non-literals, just emit normally (they're already JSONB paths or complex expressions)
-            _ => self.expr(expr),
-        }
-    }
-
     pub fn comparison_op(&mut self, op: &ComparisonOperator) -> Result<(), SqlGenerationError> {
         self.sql(comparison_op_to_sql(op)?);
         Ok(())
@@ -383,27 +347,18 @@ impl SqlBuilder {
     pub fn predicate(&mut self, predicate: &Predicate<EngineColumns>) -> Result<(), SqlGenerationError> {
         match predicate {
             Predicate::Comparison { left, operator, right } => {
-                // Check if either side is a JSONB path (multi-step path)
-                // TODO: Replace path depth heuristic with schema metadata when available.
-                // We infer JSON type from !is_simple(), but with a schema registry we could
-                // look up the actual field type. See phase-3-schema.md for details.
-                let left_is_jsonb = matches!(left.as_ref(), Expr::Path(p) if !p.is_simple());
-                let right_is_jsonb = matches!(right.as_ref(), Expr::Path(p) if !p.is_simple());
-
+                // A literal compared against a JSONB traversal arrives as a
+                // canonicalized Value::Json (origin resolution types subpath
+                // comparisons as Json), and Json args bind as jsonb
+                // parameters -- so both sides of `"col"->'k' = $N` compare
+                // with PostgreSQL's type-aware jsonb semantics. No inline
+                // cast form exists anymore; it was dead for resolved inputs
+                // before the stage collapse and wrongly resurrected by it.
                 self.expr(left)?;
                 self.sql(" ");
                 self.comparison_op(operator)?;
                 self.sql(" ");
-
-                if left_is_jsonb && matches!(right.as_ref(), Expr::Literal(_)) {
-                    // Comparing JSONB path to literal: cast literal to jsonb
-                    self.expr_as_jsonb(right)?;
-                } else if right_is_jsonb && matches!(left.as_ref(), Expr::Literal(_)) {
-                    // Comparing literal to JSONB path: cast literal to jsonb
-                    self.expr_as_jsonb(right)?;
-                } else {
-                    self.expr(right)?;
-                }
+                self.expr(right)?;
             }
             Predicate::And(left, right) => {
                 self.predicate(left)?;
