@@ -18,7 +18,7 @@
 //! of the program.
 
 use super::cell::SchemaOnceCell;
-use ankurah_proto::{EntityId, ModelId, PropertyId, RegisterModel, RegisterProperty, SystemModel};
+use ankurah_proto::{ModelId, PropertyId, RegisterModel, RegisterProperty, SystemModel};
 
 /// The compiled schema for one model: its registration hints and ordered
 /// active (non-ephemeral) fields. It contains no runtime

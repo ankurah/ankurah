@@ -20,7 +20,6 @@ pub mod indexing;
 pub mod livequery;
 pub mod model;
 pub mod node;
-pub mod node_applier;
 pub mod peer_subscription;
 pub mod policy;
 pub mod property;

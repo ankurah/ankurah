@@ -15,12 +15,18 @@
 //!   no value-type vocabulary of its own.
 //!
 //! Attributes parsed here: `#[property(renamed_from = "...")]` (the
-//! transient rename hint) and `#[property(id = "...")]` /
-//! `#[model(id = "...")]` (explicit binding). Explicit-id values
-//! are validated at compile time as URL-safe base64 of exactly 32 bytes.
+//! transient rename hint) and `#[property(id = "...")]` (explicit binding).
+//! Explicit-id values are validated at compile time as URL-safe base64 of
+//! exactly 32 bytes. Struct-level `#[model(...)]` options arrive already
+//! parsed on the [`ModelDescription`].
+//!
+//! A `#[model(system = "...")]` model is the exception to all of it: its
+//! model identity and every field's property identity are built-ins fixed at
+//! compile time, so its cells are emitted PINNED and it never registers.
 
+use ankurah_core_types::SystemProperty;
 use proc_macro2::TokenStream;
-use quote::quote;
+use quote::{format_ident, quote};
 use syn::{spanned::Spanned, Type};
 
 use crate::model::description::ModelDescription;
@@ -46,9 +52,10 @@ struct ValueTypeMapping<'a> {
 pub fn validate_schema_attrs(model: &ModelDescription) -> syn::Result<()> {
     // The `_ankurah_` prefix is reserved for system collections; a user
     // model must never claim it, complementing the
-    // receiver-side structural protection.
+    // receiver-side structural protection. A `#[model(system = "...")]`
+    // declaration is the built-in itself, so it takes that label by right.
     let collection = model.collection_str();
-    if collection.starts_with("_ankurah_") {
+    if model.system().is_none() && collection.starts_with(crate::model::RESERVED_COLLECTION_PREFIX) {
         return Err(syn::Error::new(
             model.name().span(),
             format!("collection '{collection}' uses the reserved `_ankurah_` prefix, which is reserved for system collections; rename the model"),
@@ -63,8 +70,8 @@ pub fn validate_schema_attrs(model: &ModelDescription) -> syn::Result<()> {
         }
     }
 
-    if let Some(id) = model_str_attr(model, "id")? {
-        validate_explicit_id(&id).map_err(|msg| syn::Error::new(model.name().span(), msg))?;
+    if let Some(id) = model.explicit_id() {
+        validate_explicit_id(id).map_err(|msg| syn::Error::new(model.name().span(), msg))?;
     }
 
     Ok(())
@@ -76,17 +83,36 @@ pub fn validate_schema_attrs(model: &ModelDescription) -> syn::Result<()> {
 /// [`validate_schema_attrs`] already ran (it re-derives the same facts, so
 /// it is safe to call independently).
 pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
+    let base = model.base();
     let collection = model.collection_str();
 
     let name = model.name();
     let name_str = name.to_string();
 
+    // A built-in's identity is a compile-time constant, so its cells are
+    // pinned rather than per-epoch: it resolves on a stone-cold node and is
+    // never handed to the allocator.
+    let system_tokens = match model.system() {
+        Some(system) => {
+            let variant = format_ident!("{}", system.variant_name());
+            quote! { ::core::option::Option::Some(#base::proto::SystemModel::#variant) }
+        }
+        None => quote! { ::core::option::Option::None },
+    };
+    let model_resolved = match model.system() {
+        Some(system) => {
+            let variant = format_ident!("{}", system.variant_name());
+            quote! { #base::schema::SchemaOnceCell::Pinned(#base::proto::ModelId::System(#base::proto::SystemModel::#variant)) }
+        }
+        None => quote! { #base::schema::SchemaOnceCell::per_epoch() },
+    };
+
     // Per-field descriptors, in declaration order (ephemeral fields already
     // excluded by ModelDescription's active/ephemeral split).
-    let descs = model.active_field_descs()?;
+    let active_types = model.active_field_types()?;
     let mut field_tokens = Vec::with_capacity(model.active_fields().len());
 
-    for (field, desc) in model.active_fields().iter().zip(descs.iter()) {
+    for (field, active_type) in model.active_fields().iter().zip(active_types.iter()) {
         let field_ident = field.ident.as_ref().expect("named field");
         let field_name = field_ident.to_string();
         // Display name matches the runtime property key: the derive macro
@@ -94,13 +120,33 @@ pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
         // (description.rs active_field_name_strs), so mirror that here.
         let display_name = field_name.to_lowercase();
 
+        // A system model's fields ARE the built-in property vocabulary, so
+        // each field name must name one; anything else is a declaration of a
+        // property that can never exist, caught here rather than resolving to
+        // nothing at runtime.
+        let field_resolved = match model.system() {
+            Some(_) => {
+                let system = SystemProperty::from_name(&display_name).ok_or_else(|| {
+                    syn::Error::new(
+                        field_ident.span(),
+                        format!(
+                            "field '{display_name}' is not a built-in system property; a #[model(system = \"...\")] model may only declare fields named after ankurah_proto::SystemProperty variants"
+                        ),
+                    )
+                })?;
+                let variant = format_ident!("{}", system.variant_name());
+                quote! { #base::schema::SchemaOnceCell::Pinned(#base::proto::PropertyId::System(#base::proto::SystemProperty::#variant)) }
+            }
+            None => quote! { #base::schema::SchemaOnceCell::per_epoch() },
+        };
+
         let mapping = map_value_type(&field.ty);
         let optional = mapping.optional;
         // The field's own `Property` impl declares its value_type (an
         // associated const, resolved inside the static initializer). The
         // derive carries no value-type vocabulary of its own.
         let inner = mapping.inner;
-        let value_type = quote! { <#inner as ::ankurah::Property>::VALUE_TYPE };
+        let value_type = quote! { <#inner as #base::property::Property>::VALUE_TYPE };
 
         // Ref<T> names its target model by source label in the registration
         // descriptor. Source model labels are the lowercased model type name
@@ -112,8 +158,7 @@ pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
         // The active type declares which backend stores it (an associated
         // const, resolved inside the static initializer). Like value_type,
         // the derive tabulates nothing.
-        let active_type = desc.rust_type()?;
-        let backend = quote! { <#active_type as ::ankurah::property::ActiveType>::BACKEND };
+        let backend = quote! { <#active_type as #base::property::ActiveType>::BACKEND };
 
         // #[property(renamed_from = "...")]: the transient rename hint. Applied by the registration executor before lookup-or-create,
         // guarded; removable from source once every target system has seen
@@ -133,7 +178,7 @@ pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
         // baked into the binary (see StructProperty::build_id).
         let field_build_id = ulid::Ulid::new().to_bytes();
         field_tokens.push(quote! {
-            ::ankurah::core::schema::StructProperty {
+            #base::schema::StructProperty {
                 field: #field_name,
                 name: #display_name,
                 renamed_from: #renamed_from_tokens,
@@ -143,17 +188,17 @@ pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
                 optional: #optional,
                 explicit_id: #explicit_id_tokens,
                 build_id: [#(#field_build_id),*],
-                resolved: ::ankurah::core::schema::SchemaOnceCell::per_epoch(),
+                resolved: #field_resolved,
             }
         });
     }
 
     // #[model(id = "...")]: explicit binding to a known model entity.
-    let model_explicit_id = model_str_attr(model, "id")?;
-    if let Some(ref id) = model_explicit_id {
+    let model_explicit_id = model.explicit_id();
+    if let Some(id) = model_explicit_id {
         validate_explicit_id(id).map_err(|msg| syn::Error::new(name.span(), msg))?;
     }
-    let model_explicit_id_tokens = option_str_tokens(model_explicit_id.as_deref());
+    let model_explicit_id_tokens = option_str_tokens(model_explicit_id);
 
     // Private statics so the returned reference is `&'static` with zero
     // per-call cost. Named distinctly to avoid colliding with anything in
@@ -166,17 +211,18 @@ pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
     // ModelStructDescriptor::build_id).
     let model_build_id = ulid::Ulid::new().to_bytes();
     Ok(quote! {
-        fn descriptor() -> &'static ::ankurah::core::schema::ModelStructDescriptor {
-            static __ANKURAH_MODEL_PROPERTIES: [::ankurah::core::schema::StructProperty; #field_count] = [
+        fn descriptor() -> &'static #base::schema::ModelStructDescriptor {
+            static __ANKURAH_MODEL_PROPERTIES: [#base::schema::StructProperty; #field_count] = [
                 #(#field_tokens),*
             ];
-            static __ANKURAH_MODEL_SCHEMA: ::ankurah::core::schema::ModelStructDescriptor = ::ankurah::core::schema::ModelStructDescriptor {
+            static __ANKURAH_MODEL_SCHEMA: #base::schema::ModelStructDescriptor = #base::schema::ModelStructDescriptor {
                 label: #collection,
                 name: #name_str,
                 properties: &__ANKURAH_MODEL_PROPERTIES,
+                system: #system_tokens,
                 explicit_id: #model_explicit_id_tokens,
                 build_id: [#(#model_build_id),*],
-                resolved: ::ankurah::core::schema::SchemaOnceCell::per_epoch(),
+                resolved: #model_resolved,
             };
             &__ANKURAH_MODEL_SCHEMA
         }
@@ -263,48 +309,6 @@ fn property_str_attr(attrs: &[syn::Attribute], key: &str) -> syn::Result<Option<
                 _ => Err(meta.error("unsupported #[property(...)] key; expected `renamed_from` or `id`")),
             }
         })?;
-    }
-    Ok(found)
-}
-
-/// Parse a `#[model(key = "value")]` string attribute off the struct.
-/// Coexists with the existing flag form `#[model(ephemeral)]`-style parsing
-/// (get_model_flag): a bare-ident meta and unrelated keys are skipped, a
-/// `key = "lit"` is captured, and a `key = <non-string>` value is a hard
-/// error (previously it was silently ignored, so `#[model(id = 5)]` would
-/// fall back to derivation without a diagnostic).
-fn model_str_attr(model: &ModelDescription, key: &str) -> syn::Result<Option<String>> {
-    let mut found = None;
-    let mut bad_value: Option<syn::Error> = None;
-    for attr in model.struct_attrs() {
-        if !attr.path().is_ident("model") {
-            continue;
-        }
-        // Ignore parse failures from the flag form (e.g. #[model(ephemeral)]),
-        // which is not a name-value list; only capture name = "value".
-        let _ = attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident(key) {
-                // Only ours if it is a name-value; a bare flag is skipped.
-                if let Ok(value) = meta.value() {
-                    match value.parse::<syn::LitStr>() {
-                        Ok(lit) => found = Some(lit.value()),
-                        Err(_) => {
-                            bad_value = Some(syn::Error::new(meta.path.span(), format!("#[model({key} = ...)] expects a string literal")));
-                        }
-                    }
-                }
-            }
-            // Consume any value token for unrelated keys so the walk
-            // continues past `key = value` we do not handle.
-            if meta.input.peek(syn::Token![=]) {
-                let value = meta.value()?;
-                let _: syn::Expr = value.parse()?;
-            }
-            Ok(())
-        });
-    }
-    if let Some(err) = bad_value {
-        return Err(err);
     }
     Ok(found)
 }

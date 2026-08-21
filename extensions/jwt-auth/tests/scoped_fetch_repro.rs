@@ -118,7 +118,7 @@ async fn enduser_scoped_cached_fetch_over_relay() -> anyhow::Result<()> {
 
     let owner_q = format!("user = '{}'", user_id.to_base64());
     let owner_lq = owner_ctx.query::<ScopeCredView>(owner_q.as_str())?;
-    owner_lq.wait_initialized().await;
+    owner_lq.wait_initialized().await?;
     assert_eq!(eventually_count(&owner_lq, 1).await, 1, "owner-scoped cached fetch should return the credential");
 
     // EndUser: read only; account+domain claims; sub = the credential's user id.
@@ -137,7 +137,7 @@ async fn enduser_scoped_cached_fetch_over_relay() -> anyhow::Result<()> {
 
     let enduser_q = format!("user = '{}'", user_id.to_base64());
     let enduser_lq = enduser_ctx.query::<ScopeCredView>(enduser_q.as_str())?;
-    enduser_lq.wait_initialized().await;
+    enduser_lq.wait_initialized().await?;
     assert_eq!(
         eventually_count(&enduser_lq, 1).await,
         1,

@@ -307,6 +307,22 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         subscriptions.get(&query_id).map(|info| info.status.clone())
     }
 
+    /// Whether any standing query of ours is registered with this peer,
+    /// established or still in flight.
+    ///
+    /// This is what makes a push from that peer admissible: it may send only
+    /// what we asked for. Deliberately separate from
+    /// [`Self::get_contexts_for_peer`] -- a query may legitimately carry no
+    /// credential (the catalog projection does), and holding no principal is
+    /// not the same as holding no subscription.
+    pub fn has_subscription_with_peer(&self, peer_id: &proto::EntityId) -> bool {
+        let subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
+        subscriptions.values().any(|state| match &state.status {
+            Status::Established(established_peer, _) | Status::Requested(established_peer, _) => established_peer == peer_id,
+            _ => false,
+        })
+    }
+
     /// Get all unique contexts for predicates established or requested with a specific peer
     /// TODO: update the data structure to do this via a direct lookup rather than having to scan the entire map
     pub fn get_contexts_for_peer(&self, peer_id: &proto::EntityId) -> std::collections::HashSet<CD> {
@@ -548,7 +564,7 @@ where
         let collection = node.collections.get(&collection_id).await?;
         let event_getter = crate::retrieval::CachedEventGetter::new(collection_id, collection.clone(), &node, &context_data);
         let state_getter = crate::retrieval::LocalStateGetter::new(collection);
-        crate::node_applier::NodeApplier::apply_deltas(&node, &peer_id, deltas, &event_getter, &state_getter).await?;
+        crate::node::applier::NodeApplier::apply_deltas(&node, &peer_id, deltas, &event_getter, &state_getter).await?;
 
         Ok(())
     }

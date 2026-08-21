@@ -98,6 +98,10 @@ struct State<E: AbstractEntity + Filterable, Ev> {
     // not sure if we actually need this
     pub(crate) entities: HashMap<proto::EntityId, E>,
     pub(crate) broadcast: ankurah_signals::broadcast::Broadcast<ReactorUpdate<E, Ev>>,
+    /// Invoked by a system reset after this subscription's results are
+    /// cleared: the owning query re-admits its name-form selection under
+    /// the new system.
+    pub(crate) reset_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static> Subscription<E, Ev> {
@@ -112,6 +116,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
                 entity_subscriptions: HashSet::new(),
                 entities: HashMap::new(),
                 broadcast,
+                reset_hook: None,
             }),
             watcher_set,
         }))

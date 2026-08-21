@@ -223,17 +223,18 @@ async fn register_from_model_schema_end_to_end() -> anyhow::Result<()> {
 
     // The whole point: the request is built from the compiled schema, no
     // hand-written descriptors.
-    let request = proto::NodeRequestBody::RegisterSchema { models: vec![proto::RegisterModel::from(DescAllTypes::descriptor())] };
+    let request = proto::NodeRequestBody::RegisterSchema { model: proto::RegisterModel::from(DescAllTypes::descriptor()) };
 
     let reg_models = match client.request(server.id, &DEFAULT_CONTEXT, request).await? {
-        proto::NodeResponseBody::SchemaRegistered { models } => models,
+        proto::NodeResponseBody::SchemaRegistered { model } => model,
         other => panic!("expected SchemaRegistered, got {other}"),
     };
 
     // The allocator resolved the ids; the response nests them by model.
-    let registered = reg_models.iter().find(|m| m.label == "descalltypes").expect("model returned");
+    let registered = &reg_models;
+    assert_eq!(registered.label, "descalltypes");
     let model_id = registered.id;
-    let artist_model_id = reg_models.iter().find(|m| m.label == "descartist").expect("reference target model returned").id;
+    let artist_model_id = registered.properties.iter().find_map(|p| p.target_model).expect("reference target resolved via the property");
     let property_ids: BTreeMap<String, EntityId> = registered.properties.iter().map(|p| (p.name.clone(), p.id)).collect();
 
     // The model entity exists with its collection + display name.

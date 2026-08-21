@@ -31,6 +31,7 @@ fn test_filter_predicate_custom_claim_variable() {
 
     let keys = common::test_keys();
     let agent = JwtAgent::new_ephemeral();
+    agent.set_selection_resolver(common::fixture_binding());
     agent.update_config(config);
     agent.set_keys(JwtKeys::Signing(keys.clone()));
 
@@ -72,6 +73,7 @@ fn test_filter_predicate_missing_claim_denied() {
 
     let keys = common::test_keys();
     let agent = JwtAgent::new_ephemeral();
+    agent.set_selection_resolver(common::fixture_binding());
     agent.update_config(config);
     agent.set_keys(JwtKeys::Signing(keys.clone()));
 
@@ -119,6 +121,7 @@ fn test_filter_predicate_multiple_rules_anded() {
 
     let keys = common::test_keys();
     let agent = JwtAgent::new_ephemeral();
+    agent.set_selection_resolver(common::fixture_binding());
     agent.update_config(config);
     agent.set_keys(JwtKeys::Signing(keys.clone()));
 

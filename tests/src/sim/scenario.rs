@@ -403,22 +403,27 @@ where
         let mut scheduler = Scheduler::new(captured.clone(), faults, node_ids);
         let mut trace = Trace::new();
 
-        // Bring each ephemeral node up in turn. Readiness is NOT a local
-        // property any more: joining from the Presence root is local, but the
-        // catalog projection readiness also waits for subscribes to the
-        // durable node, and that traffic only moves when the
-        // scheduler delivers it. So drive the schedule and the readiness wait
-        // TOGETHER -- awaiting readiness first would wait forever for a
-        // message nothing is carrying. This runs under the actual fault
-        // config, so even bring-up traffic is perturbed, matching a real cold
-        // start.
+        // Bring each ephemeral node up in turn. Bring-up is NOT a local
+        // property: joining from the Presence root is local, and so is
+        // catalog readiness (the projection reads this node's own store), but
+        // a node is only up once a durable peer has ANSWERED that projection,
+        // and that traffic only moves when the scheduler delivers it. So
+        // drive the schedule and the bring-up waits TOGETHER -- awaiting
+        // either first would wait forever for a message nothing is carrying.
+        //
+        // Both waits happen under `drain`, which delivers without recording a
+        // round count: how many rounds a node takes to come up is a property
+        // of how quickly its own tasks ran, not of the seed. The recorded
+        // quiescence comes after, when the node has nothing left in flight.
+        // This runs under the actual fault config, so even bring-up traffic
+        // is perturbed, matching a real cold start.
         for node in &nodes {
             if !node.durable {
                 node.connect_to(durable);
                 durable.connect_to(node);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
                 let ready = node.node.system.wait_system_ready();
                 tokio::pin!(ready);
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
                 while !futures_util::poll!(ready.as_mut()).is_ready() {
                     scheduler.drain(&nodes, &mut rng, &mut trace).await;
                     assert!(
@@ -433,6 +438,18 @@ where
                 // Ready means this node now holds a schema epoch; admit the
                 // deterministic SimRecord binding under it (see build_nodes).
                 super::node::seed_sim_schema(node).expect("sim schema seeds on a ready node");
+                let synced = node.node.catalog.wait_catalog_synced();
+                tokio::pin!(synced);
+                loop {
+                    match futures_util::poll!(synced.as_mut()) {
+                        std::task::Poll::Ready(answered) => {
+                            answered.expect("the durable peer must answer this node's catalog projection");
+                            break;
+                        }
+                        std::task::Poll::Pending => scheduler.drain(&nodes, &mut rng, &mut trace).await,
+                    }
+                    assert!(std::time::Instant::now() < deadline, "node {}'s catalog projection was never answered", node.index);
+                }
             }
             scheduler.run_to_quiescence(&nodes, &mut rng, &mut trace).await;
         }

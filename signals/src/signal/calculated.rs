@@ -106,6 +106,14 @@ fn trigger<T: Send + Sync + 'static>(inner: &Arc<Inner<T>>) {
     inner.broadcast.send(());
 }
 
+impl<T: 'static> Calculated<T> {
+    /// Lend the current value, registering nothing. The untracked partner of
+    /// [`With::with`], for readers resolving mid-work that must not subscribe.
+    pub fn peek_with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        self.0.value.with(|opt| f(opt.as_ref().expect("Calculated value not initialized")))
+    }
+}
+
 impl<T: Clone + 'static> Get<T> for Calculated<T> {
     fn get(&self) -> T {
         CurrentObserver::track(self);

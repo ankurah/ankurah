@@ -1,4 +1,3 @@
-use crate::selection::filter::Filterable;
 use crate::{schema::catalog::CatalogManager, session::SessionSet};
 use ankql::ast::{Parsed, Resolved, Stage};
 use ankurah_proto::{self as proto, Attested, CollectionId, EntityState};
@@ -24,7 +23,7 @@ use crate::{
     notice_info,
     peer_subscription::{SubscriptionHandler, SubscriptionRelay},
     policy::{AccessDenied, PolicyAgent},
-    reactor::{AbstractEntity, Reactor},
+    reactor::Reactor,
     retrieval::{LocalEventGetter, LocalStateGetter, SuspenseEvents},
     storage::StorageEngine,
     system::SystemManager,
@@ -35,6 +34,13 @@ use itertools::Itertools;
 use tracing::instrument;
 
 use tracing::{debug, error, warn};
+
+pub mod applier;
+pub mod erased;
+pub mod handles;
+
+pub use erased::TNodeErased;
+pub use handles::{NodeRef, NodeType};
 
 pub struct PeerState<CD: ContextData> {
     sender: Box<dyn PeerSender>,
@@ -174,7 +180,7 @@ where PA: PolicyAgent
     pub(crate) policy_agent: PA,
     pub system: SystemManager<SE, PA>,
 
-    pub catalog: CatalogManager<SE, PA>,
+    pub catalog: CatalogManager,
 
     pub(crate) subscription_relay: Option<SubscriptionRelay<PA::ContextData, crate::livequery::WeakEntityLiveQuery>>,
 }
@@ -211,7 +217,6 @@ where
         notice_info!("Node {id:#} created as {}", if durable { "durable" } else { "ephemeral" });
 
         let system_manager = SystemManager::new(collections.clone(), entityset.clone(), reactor.clone(), durable, schema_epoch);
-        let catalog = CatalogManager::new(durable);
 
         // Only ephemeral nodes relay subscriptions upstream to a durable peer.
         let subscription_relay = if durable { None } else { Some(SubscriptionRelay::new()) };
@@ -227,7 +232,7 @@ where
             durable,
             policy_agent,
             system: system_manager,
-            catalog: catalog.clone(),
+            catalog: CatalogManager::default(),
             sessions: SessionSet::new(),
             subscription_relay,
         }));
@@ -483,9 +488,8 @@ where
                 // Protected collections (the system collection and the
                 // metadata catalog) are not mutable through ordinary
                 // transactions; the catalog's only mutation path is the
-                // registration operation. Registration writes the catalog
-                // through a direct commit_remote_transaction call that
-                // bypasses this guard.
+                // registration operation, which commits locally through the
+                // durable node's privileged context and never relays here.
                 for event in &events {
                     let collection = event.payload.collection.as_str();
                     if collection.starts_with(crate::schema::RESERVED_COLLECTION_PREFIX) {
@@ -503,12 +507,12 @@ where
                     Err(e) => Ok(proto::NodeResponseBody::Error(e.to_string())),
                 }
             }
-            proto::NodeRequestBody::RegisterSchema { models } => {
+            proto::NodeRequestBody::RegisterSchema { model } => {
                 let cdata = cdata.iterable().exactly_one().map_err(|_| anyhow!("Only one cdata is permitted for RegisterSchema"))?;
-                match self.catalog.register_schema(cdata, models).await {
-                    // The resolved definitions ARE the response: the
-                    // requester folds them into its catalog map on ack.
-                    Ok(models) => Ok(proto::NodeResponseBody::SchemaRegistered { models }),
+                match self.catalog.register_schema(self, cdata, model).await {
+                    // The resolved definition IS the response: the requester
+                    // binds its descriptor cells from it on ack.
+                    Ok(model) => Ok(proto::NodeResponseBody::SchemaRegistered { model }),
                     Err(e) => Ok(proto::NodeResponseBody::Error(e.to_string())),
                 }
             }
@@ -632,7 +636,7 @@ where
         match notification.body {
             proto::NodeUpdateBody::SubscriptionUpdate { items } => {
                 tracing::debug!("Node({}) received subscription update from peer {}", self.id, notification.from);
-                crate::node_applier::NodeApplier::apply_updates(self, &notification.from, items).await?;
+                crate::node::applier::NodeApplier::apply_updates(self, &notification.from, items).await?;
                 Ok(())
             }
         }
@@ -939,6 +943,11 @@ where
         Context::new(Node::clone(self), sessions)
     }
 
+    /// The node's own context, for internal use (in practice the system and
+    /// catalog tables): carries no principal, never consults the
+    /// PolicyAgent, and commits stay local.
+    pub(crate) fn privileged_context(&self) -> Context { Context::new_privileged(Node::clone(self)) }
+
     pub(crate) async fn get_from_peer(
         &self,
         collection_id: &CollectionId,
@@ -1099,80 +1108,6 @@ where
         Ok(entities)
     }
 }
-#[async_trait::async_trait]
-pub trait TNodeErased<E: AbstractEntity + Filterable + Send + 'static = Entity>: Send + Sync + 'static {
-    fn unsubscribe_remote_predicate(&self, query_id: proto::QueryId);
-    fn update_remote_query(
-        &self,
-        query_id: proto::QueryId,
-        selection: ankql::ast::Selection<Resolved>,
-        version: u32,
-    ) -> Result<(), anyhow::Error>;
-    async fn fetch_entities_from_local(
-        &self,
-        collection_id: &CollectionId,
-        selection: &ankql::ast::Selection<Resolved>,
-    ) -> Result<Vec<E>, RetrievalError>;
-    fn reactor(&self) -> &Reactor<E>;
-    fn has_subscription_relay(&self) -> bool;
-    /// Bind a selection's property names through this node's catalog (the
-    /// raw, collection-scoped resolution). A replacement live-query
-    /// selection arrives here as a parsed string, below the typed entries,
-    /// and must resolve before the reactor or the relay sees it.
-    fn resolve_selection(
-        &self,
-        collection: &CollectionId,
-        selection: ankql::ast::Selection<Parsed>,
-    ) -> Result<ankql::ast::Selection<Resolved>, RetrievalError>;
-}
-
-#[async_trait::async_trait]
-impl<SE, PA> TNodeErased<Entity> for Node<SE, PA>
-where
-    SE: StorageEngine + Send + Sync + 'static,
-    PA: PolicyAgent + Send + Sync + 'static,
-{
-    fn unsubscribe_remote_predicate(&self, query_id: proto::QueryId) {
-        // Notify subscription relay for remote cleanup
-        if let Some(ref relay) = self.subscription_relay {
-            relay.unsubscribe_predicate(query_id);
-        }
-    }
-
-    fn resolve_selection(
-        &self,
-        collection: &CollectionId,
-        selection: ankql::ast::Selection<Parsed>,
-    ) -> Result<ankql::ast::Selection<Resolved>, RetrievalError> {
-        self.catalog.resolve_selection(collection, selection)
-    }
-
-    fn update_remote_query(
-        &self,
-        query_id: proto::QueryId,
-        selection: ankql::ast::Selection<Resolved>,
-        version: u32,
-    ) -> Result<(), anyhow::Error> {
-        if let Some(ref relay) = self.subscription_relay {
-            // Admitted at query entry; forwarded as-is.
-            relay.update_query(query_id, selection, version)?;
-        }
-        Ok(())
-    }
-
-    async fn fetch_entities_from_local(
-        &self,
-        collection_id: &CollectionId,
-        selection: &ankql::ast::Selection<Resolved>,
-    ) -> Result<Vec<Entity>, RetrievalError> {
-        Node::fetch_entities_from_local(self, collection_id, selection).await
-    }
-
-    fn reactor(&self) -> &Reactor<Entity> { &self.0.reactor }
-
-    fn has_subscription_relay(&self) -> bool { self.subscription_relay.is_some() }
-}
-
 impl<SE, PA> fmt::Display for Node<SE, PA>
 where PA: PolicyAgent
 {

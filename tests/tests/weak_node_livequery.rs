@@ -59,7 +59,7 @@ async fn test_entity_livequery_keeps_node_alive() -> Result<()> {
     // Create a regular EntityLiveQuery
     let collection_id = CollectionId::fixed_name("pet");
     let args: MatchArgs<ankql::ast::Parsed> = "true".try_into()?;
-    let lq = EntityLiveQuery::new(&node, collection_id, args, DEFAULT_CONTEXT)?;
+    let lq = EntityLiveQuery::new(&node, None, collection_id, args, DEFAULT_CONTEXT)?;
 
     // Get weak ref to test node liveness
     let weak_node = node.weak();

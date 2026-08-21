@@ -19,7 +19,7 @@ use crate::{
     entity::Entity,
     error::RetrievalError,
     model::View,
-    node::{MatchArgs, NodeInner, TNodeErased},
+    node::{erased::ErasedNodeRef, MatchArgs, NodeType, TNodeErased},
     policy::PolicyAgent,
     reactor::{
         fetch_gap::{GapFetcher, QueryGapFetcher},
@@ -39,44 +39,25 @@ use crate::{
 #[derive(Clone)]
 pub struct EntityLiveQuery(Arc<Inner>);
 
-/// Type-erased reference to a node. Strong variants keep the node alive; weak variants do not.
-trait NodeRef: Send + Sync {
-    fn upgrade(&self) -> Option<Box<dyn TNodeErased>>;
-}
-
-/// Strong node reference — keeps the node alive as long as Inner exists.
-struct StrongNodeRef<SE, PA: PolicyAgent>(Arc<NodeInner<SE, PA>>);
-
-impl<SE, PA> NodeRef for StrongNodeRef<SE, PA>
-where
-    SE: StorageEngine + Send + Sync + 'static,
-    PA: PolicyAgent + Send + Sync + 'static,
-{
-    fn upgrade(&self) -> Option<Box<dyn TNodeErased>> { Some(Box::new(Node(self.0.clone()))) }
-}
-
-/// Weak node reference — does NOT keep the node alive.
-struct WeakNodeRefImpl<SE, PA: PolicyAgent>(Weak<NodeInner<SE, PA>>);
-
-impl<SE, PA> NodeRef for WeakNodeRefImpl<SE, PA>
-where
-    SE: StorageEngine + Send + Sync + 'static,
-    PA: PolicyAgent + Send + Sync + 'static,
-{
-    fn upgrade(&self) -> Option<Box<dyn TNodeErased>> { self.0.upgrade().map(|inner| Box::new(Node(inner)) as Box<dyn TNodeErased>) }
-}
-
 struct Inner {
     pub(crate) query_id: proto::QueryId,
     // subscription must be declared before node so it drops first —
-    // dropping node (StrongNodeRef) deallocates the reactor, and
+    // dropping a strong node handle deallocates the reactor, and
     // subscription's Drop needs the reactor to unsubscribe.
     pub(crate) subscription: ReactorSubscription,
-    pub(crate) node: Box<dyn NodeRef>,
+    pub(crate) node: Box<dyn ErasedNodeRef>,
     pub(crate) resultset: EntityResultSet,
     pub(crate) error: Mut<Option<RetrievalError>>,
     pub(crate) initialized: tokio::sync::Notify,
     pub(crate) initialized_version: std::sync::atomic::AtomicU32,
+    // The newest selection version a durable authority has answered: the
+    // relay reports its subscription established once the peer's deltas are
+    // applied, and a node with no relay is its own authority and marks each
+    // version as it starts. Compared against current_version, exactly like
+    // initialized_version: a selection update or a system reset bumps
+    // current_version, which downgrades both without any flag to clear.
+    pub(crate) durable_version: std::sync::atomic::AtomicU32,
+    pub(crate) durable_notify: tokio::sync::Notify,
     // Version tracking for predicate updates
     pub(crate) current_version: std::sync::atomic::AtomicU32,
     // The admitted selection with its version (starts with version 1, updated
@@ -92,6 +73,12 @@ struct Inner {
     pub(crate) collection_id: CollectionId,
     // Gap fetcher for reactor.add_query (type-erased)
     pub(crate) gap_fetcher: std::sync::Arc<dyn GapFetcher<Entity>>,
+    // The admission INPUT, retained so a system reset can re-admit under the
+    // new epoch: the compiled declaration (typed entries) and the name-form
+    // selection, kept current by update_selection. Resolved selections are
+    // epoch-scoped; these are not.
+    pub(crate) schema: Option<&'static crate::schema::ModelStructDescriptor>,
+    pub(crate) parsed: Mut<ankql::ast::Selection<Parsed>>,
 }
 
 /// Weak reference to EntityLiveQuery for breaking circular dependencies
@@ -116,17 +103,106 @@ impl<R: View> std::ops::Deref for LiveQuery<R> {
 impl Inner {
     fn node(&self) -> Option<Box<dyn TNodeErased>> { self.node.upgrade() }
 
-    async fn wait_initialized(&self) {
+    async fn wait_initialized(&self) -> Result<(), RetrievalError> {
+        // `notify_waiters` wakes the waiters REGISTERED at that instant and
+        // stores no permit, so this waiter registers (enable) BEFORE reading
+        // what it is waiting for. Reading first would lose an initialization
+        // -- or a failure -- that lands in between, and park for the
+        // lifetime of a query whose news has already come and gone.
+        let notified = self.initialized.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        // A failure ends initialization: it is not something more waiting
+        // will fix, so it is this call's answer whenever the slot holds one.
+        if let Some(error) = self.initialization_error() {
+            return Err(error);
+        }
+
         // If already initialized, return immediately
         if self.initialized_version.load(std::sync::atomic::Ordering::Relaxed)
             >= self.current_version.load(std::sync::atomic::Ordering::Relaxed)
         {
-            return;
+            return Ok(());
         }
 
         // FIXME - this should be waiting for the correct version, not any version
         // Otherwise wait for the notification
-        self.initialized.notified().await;
+        notified.await;
+
+        match self.initialization_error() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// Wait for a durable authority to have answered this query's CURRENT
+    /// selection version.
+    ///
+    /// Initialization says the query has run; this says whose data it ran
+    /// over. A cached query on an ephemeral node initializes from local
+    /// storage, which may hold nothing or hold yesterday's rows, and only the
+    /// relay's confirmation tells a caller that a durable peer took the
+    /// subscription and its rows are applied. A query with no relay has no
+    /// remote to hear from -- its own storage is the authority -- so for one
+    /// of those this is exactly initialization.
+    ///
+    /// A failure that ends initialization ends this wait too, for the same
+    /// reason: nothing further is coming.
+    async fn wait_durable_answered(&self) -> Result<(), RetrievalError> {
+        self.wait_initialized().await?;
+        loop {
+            // Register before reading, like `wait_initialized`: a
+            // confirmation landing between the read and the wait would
+            // otherwise be lost and this waiter parked for good.
+            let notified = self.durable_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(error) = self.initialization_error() {
+                return Err(error);
+            }
+            if self.durable_version.load(std::sync::atomic::Ordering::Acquire)
+                >= self.current_version.load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Ok(());
+            }
+            notified.await;
+        }
+    }
+
+    /// Whether a durable authority has answered the current selection
+    /// version and the query has initialized it. Registering nothing: the
+    /// synchronous-admission probe, not a wait.
+    fn is_durable_answered(&self) -> bool {
+        let current = self.current_version.load(std::sync::atomic::Ordering::Acquire);
+        self.durable_version.load(std::sync::atomic::Ordering::Acquire) >= current
+            && self.initialized_version.load(std::sync::atomic::Ordering::Relaxed) >= current
+    }
+
+    /// Record that a durable authority has answered `version`, and wake
+    /// everyone waiting on it. `fetch_max`, so an out-of-order confirmation
+    /// never regresses a newer one.
+    fn mark_durable_answered(&self, version: u32) {
+        self.durable_version.fetch_max(version, std::sync::atomic::Ordering::AcqRel);
+        self.durable_notify.notify_waiters();
+    }
+
+    /// The failure that ended initialization, if one did. The slot keeps the
+    /// original for [`EntityLiveQuery::error`] to hand out; a waiter gets its
+    /// rendering, because the error itself is not clonable.
+    fn initialization_error(&self) -> Option<RetrievalError> {
+        self.error.with(|error| error.as_ref().map(|error| RetrievalError::Other(error.to_string())))
+    }
+
+    /// Record a failure that ends initialization, and wake everyone waiting
+    /// on it: the query will never populate, and the slot says why. Waiters
+    /// on a remote answer hear it too -- a failure is the end of that news
+    /// as well, and one that lands after initialization succeeded would
+    /// otherwise leave them parked forever.
+    fn fail_initialization(&self, error: RetrievalError) {
+        self.error.set(Some(error));
+        self.initialized.notify_waiters();
+        self.durable_notify.notify_waiters();
     }
 
     /// Activate the LiveQuery by fetching entities and calling reactor.add_query or reactor.update_query
@@ -136,7 +212,13 @@ impl Inner {
     /// Rejects activation if the version is older than the current selection to prevent regression
     async fn activate(&self, version: u32) -> Result<(), RetrievalError> {
         // Get the current selection and its version
-        let (selection, stored_version) = self.selection.value();
+        let Some((selection, stored_version)) = self.selection.value() else {
+            // Unreachable by construction -- a query is started only once its
+            // admitted selection is installed -- but a query with no
+            // selection has nothing to run, and inventing one here would run
+            // the wrong query.
+            return Err(RetrievalError::Other("live query activated before its selection was admitted".into()));
+        };
 
         // Reject activation if this is an older version than what's currently stored
         // This prevents out-of-order activations from regressing the state

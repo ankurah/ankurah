@@ -94,6 +94,10 @@ pub struct RegisteredModel {
 /// A resolved property within a [`RegisteredModel`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisteredProperty {
+    /// Echo of the request entry's `build_id`: the correlator that binds
+    /// this resolution back onto the requester's compiled field, immune to
+    /// display-name drift.
+    pub build_id: [u8; 16],
     /// The property's allocated or previously registered catalog entity id.
     pub id: EntityId,
     /// The membership entity binding this property to the parent model.

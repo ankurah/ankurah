@@ -144,17 +144,17 @@ pub enum NodeRequestBody {
         version: u32,
         known_matches: Vec<KnownEntity>,
     },
-    /// Register schema definitions: an UPSERT the durable node
+    /// Register one model's schema: an UPSERT the durable node
     /// executes under a process-local mutex. Carries everything the durable
     /// side needs: the receiver policy-checks, looks each definition up by
     /// its lookup key, allocates a fresh EntityId on miss, emits ordinary
-    /// events, persists, relays, and responds with
-    /// [`NodeResponseBody::SchemaRegistered`] carrying the full resolved
-    /// definitions. Idempotent as an upsert: a repeat registration finds
+    /// events, persists, and responds with
+    /// [`NodeResponseBody::SchemaRegistered`] carrying the resolved
+    /// definition. Idempotent as an upsert: a repeat registration finds
     /// every key, emits zero events, and returns the same ids. The catalog
     /// collections are not writable any other way.
     RegisterSchema {
-        models: Vec<RegisterModel>,
+        model: RegisterModel,
     },
 }
 
@@ -180,12 +180,12 @@ pub enum NodeResponseBody {
         query_id: QueryId,
         deltas: Vec<EntityDelta>,
     },
-    /// Response to RegisterSchema: the full resolved definitions,
-    /// ids included -- allocated on this execution or already existing. The
-    /// requester upserts these into its catalog map immediately on ack, so
-    /// catalog maintenance proceeds without waiting for replication.
+    /// Response to RegisterSchema: the resolved definition, ids included --
+    /// allocated on this execution or already existing. Each property echoes
+    /// the request entry's `build_id`, which is how the requester binds the
+    /// response back onto its compiled declaration.
     SchemaRegistered {
-        models: Vec<RegisteredModel>,
+        model: RegisteredModel,
     },
     Success,
     Error(String),
@@ -221,8 +221,8 @@ impl std::fmt::Display for NodeRequestBody {
             NodeRequestBody::SubscribeQuery { query_id, collection, selection: query, version, known_matches } => {
                 write!(f, "Subscribe {query_id} {collection} {query} v{version} known:{}", known_matches.len())
             }
-            NodeRequestBody::RegisterSchema { models } => {
-                write!(f, "RegisterSchema models:{} properties:{}", models.len(), models.iter().map(|m| m.properties.len()).sum::<usize>())
+            NodeRequestBody::RegisterSchema { model } => {
+                write!(f, "RegisterSchema {} properties:{}", model.label, model.properties.len())
             }
         }
     }
@@ -241,13 +241,8 @@ impl std::fmt::Display for NodeResponseBody {
                 write!(f, "GetEvents [{}]", events.iter().map(|e| e.payload.to_string()).collect::<Vec<_>>().join(", "))
             }
             NodeResponseBody::QuerySubscribed { query_id, deltas: initial } => write!(f, "Subscribed {query_id} initial:{}", initial.len()),
-            NodeResponseBody::SchemaRegistered { models } => {
-                write!(
-                    f,
-                    "SchemaRegistered models:{} properties:{}",
-                    models.len(),
-                    models.iter().map(|m| m.properties.len()).sum::<usize>()
-                )
+            NodeResponseBody::SchemaRegistered { model } => {
+                write!(f, "SchemaRegistered {} properties:{}", model.label, model.properties.len())
             }
             NodeResponseBody::Success => write!(f, "Success"),
             NodeResponseBody::Error(e) => write!(f, "Error: {e}"),

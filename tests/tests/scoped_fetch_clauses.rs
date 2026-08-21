@@ -68,7 +68,7 @@ async fn relay_client_cached_fetch_with_composed_scope_clauses() -> Result<()> {
     // Owner-shaped two-clause predicate (this worked downstream).
     let owner_q = format!("user = '{}' AND account = '{}'", user_id.to_base64(), account_id.to_base64());
     let owner_lq = client_ctx.query::<ScopeCredView>(owner_q.as_str())?;
-    owner_lq.wait_initialized().await;
+    owner_lq.wait_initialized().await?;
     assert_eq!(eventually_count(&owner_lq, 1).await, 1, "two-clause Ref predicate should fetch the credential");
 
     // EndUser-shaped composition: ((user AND account) AND domain) AND user.
@@ -80,7 +80,7 @@ async fn relay_client_cached_fetch_with_composed_scope_clauses() -> Result<()> {
         user_id.to_base64()
     );
     let enduser_lq = client_ctx.query::<ScopeCredView>(enduser_q.as_str())?;
-    enduser_lq.wait_initialized().await;
+    enduser_lq.wait_initialized().await?;
     assert_eq!(
         eventually_count(&enduser_lq, 1).await,
         1,

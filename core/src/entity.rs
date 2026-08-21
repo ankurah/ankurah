@@ -385,7 +385,7 @@ impl Entity {
         // - Event is ancestor of head -> StrictAscends -> no-op (Ok(false))
         // - Event re-delivered but already integrated -> BFS finds it -> StrictAscends
         // An explicit event_stored() check is not used here because callers
-        // (node_applier, system.rs) store events to storage BEFORE calling
+        // (node/applier.rs, system.rs) store events to storage BEFORE calling
         // apply_event (so BFS can find them), which would cause false positives.
 
         // Creation event on entity with non-empty head: either re-delivery or attack.

@@ -22,7 +22,7 @@ mod common;
 use ankql::ast::Predicate;
 use ankurah::{Model, Node, Ref};
 use ankurah_core::{
-    policy::PolicyAgent,
+    policy::{AccessDenied, PolicyAgent},
     selection::filter::{evaluate_predicate, Filterable},
     value::Value,
 };
@@ -47,38 +47,41 @@ fn prop(name: &str) -> ankql::ast::PropertyId {
     ankql::ast::PropertyId::EntityId(EntityId::from_bytes(bytes))
 }
 
-/// Bind a rule predicate's names to the fixture identities, the way the
-/// shared query entry does in production before row evaluation.
-fn resolve_fixture(predicate: Predicate) -> Predicate {
+/// Bind a rule predicate's names to the fixture identities, the way node
+/// attach binds them through the catalog.
+fn try_resolve_fixture(
+    predicate: Predicate<ankql::ast::Parsed>,
+) -> Result<Predicate<ankql::ast::Resolved>, ankurah_core::ModelResolutionError> {
+    use ankurah_core::schema::resolver::{resolve_selection, ModelResolutionError, ModelResolver, ResolvedProperty};
     struct FixtureResolver;
-    impl ankql::NameResolver for FixtureResolver {
-        fn resolve_property(
-            &self,
-            _model: &ankurah_proto::ModelId,
-            name: &str,
-        ) -> Result<Option<ankql::ast::PropertyId>, ankql::NameResolutionError> {
-            Ok(Some(prop(name)))
-        }
-        fn property_value_type(
-            &self,
-            _model: &ankurah_proto::ModelId,
-            property: &ankql::ast::PropertyId,
-        ) -> Result<ankurah_core::value::ValueType, ankql::NameResolutionError> {
-            Ok(if *property == prop("owner") || *property == prop("reviewer") {
+    impl ModelResolver for FixtureResolver {
+        fn resolve_property(&self, _model: &ankurah_proto::ModelId, name: &str) -> Result<Option<ResolvedProperty>, ModelResolutionError> {
+            let id = prop(name);
+            let value_type = if id == prop("owner") || id == prop("reviewer") {
                 ankurah_core::value::ValueType::EntityId
             } else {
                 ankurah_core::value::ValueType::String
-            })
+            };
+            Ok(Some(ResolvedProperty { id, value_type }))
         }
     }
     let model = ankurah_proto::ModelId::EntityId(EntityId::from_bytes([0x77; 32]));
-    predicate.resolve_names(&model, &FixtureResolver).expect("fixture rule predicates resolve")
+    Ok(resolve_selection(&model, &FixtureResolver, predicate.into())?.predicate)
+}
+
+fn resolve_fixture(predicate: Predicate<ankql::ast::Parsed>) -> Predicate<ankql::ast::Resolved> {
+    try_resolve_fixture(predicate).expect("fixture rule predicates resolve")
 }
 
 fn agent_with(config_json: &str, keys: &SigningKeys) -> JwtAgent {
     let agent = JwtAgent::new_ephemeral();
     agent.update_config(serde_json::from_str::<PolicyConfig>(config_json).expect("test policy must parse"));
     agent.set_keys(JwtKeys::Signing(keys.clone()));
+    // What node attach installs from the node's catalog: scope rules are
+    // authored in names and everything that consumes one addresses ids.
+    agent.set_selection_resolver(std::sync::Arc::new(|_collection, predicate| {
+        try_resolve_fixture(predicate).map_err(|error| error.to_string())
+    }));
     agent
 }
 
@@ -122,14 +125,17 @@ const OR_SCOPE_CONFIG: &str = r#"{
     }
 }"#;
 
-/// A subject that is not an entity id makes each `$jwt.sub` clause answer
-/// false, and a false clause is only a false clause: it denies the rows no
-/// other clause admits, and admits the rows another clause does. An error in
-/// one clause would instead escape the whole OR — the row-by-row half via
-/// `enforce_read_scope`, which turns any evaluation error into a refusal, and
-/// the query half by failing the caller's fetch outright.
+/// A subject that is not an entity id cannot take the id-comparing clauses'
+/// registered type, so binding the composed rule is a TYPE ERROR
+/// (`Canonicalization`) even though one OR clause reads no subject at all.
+/// A slice that cannot bind admits nothing, so the credential contributes
+/// none, and a caller left with no slice at all is refused -- never
+/// silently narrowed to a false clause, which inverts under negation and
+/// would grant instead of deny. A rule that must serve both distinguished
+/// string subjects and entity ids is a schema/rule design question,
+/// recorded on https://github.com/ankurah/ankurah/issues/472.
 #[test]
-fn test_or_composed_scope_denies_the_row_without_erroring() {
+fn test_or_composed_scope_with_a_non_id_subject_is_a_type_error() {
     let keys = common::test_keys();
     let agent = agent_with(OR_SCOPE_CONFIG, &keys);
     let collection = CollectionId::from("note");
@@ -137,27 +143,36 @@ fn test_or_composed_scope_denies_the_row_without_erroring() {
     let owner = EntityId::random();
     let reviewer = EntityId::random();
     let private = NoteRow { owner, reviewer, visibility: "private" };
-    let shared = NoteRow { owner, reviewer, visibility: "shared" };
 
-    // The caller asks for everything, so the scope rule is the only thing
-    // narrowing the query.
-    let guest = context(&keys, "guest", "reader");
-    let filtered = resolve_fixture(
-        agent.filter_predicate(&guest, &collection, Predicate::True).expect("a subject that is not an id must still filter"),
+    // The rule binding itself is what refuses the guest's subject: naming it
+    // here pins that the refusal below is that type error and not some other
+    // denial.
+    let guest_rule = ankql::parser::parse_selection(&format!("owner = 'guest' OR reviewer = 'guest' OR visibility = 'shared'"))
+        .expect("the rule text parses")
+        .predicate;
+    let error = try_resolve_fixture(guest_rule).expect_err("a subject that is not an id must fail binding as a type error");
+    assert!(
+        matches!(error, ankurah_core::ModelResolutionError::Canonicalization { .. }),
+        "expected a canonicalization type error, got {error:?}"
     );
 
-    let admits = |row: NoteRow| evaluate_predicate(&row, &filtered).expect("the filtered predicate must evaluate, not error");
-    assert!(!admits(private), "neither id clause can match a subject that is not an id, so the row is denied");
-    assert!(admits(shared), "the clause that does not read the subject still admits its rows");
-
-    // The control that keeps the denial honest: the same clauses admit the
-    // owner's own row when the subject is that owner's id, so the false above
-    // is a comparison that answered no rather than a clause that never matches.
-    let member = context(&keys, &owner.to_base64(), "reader");
-    let filtered = resolve_fixture(agent.filter_predicate(&member, &collection, Predicate::True).expect("a member's subject filters too"));
+    // The caller asks for everything, so the scope rule is the only thing
+    // narrowing the query -- and its slice cannot bind, so this lone
+    // credential leaves nothing to read by.
+    let guest = context(&keys, "guest", "reader");
+    let refused = agent.filter_predicate(&guest, &collection, Predicate::True);
     assert!(
-        evaluate_predicate(&private, &filtered).expect("the filtered predicate must evaluate, not error"),
-        "the owner's own row must pass the same clause that denied the guest"
+        matches!(refused, Err(AccessDenied::ByPolicy("No authorized context for row filtering"))),
+        "a credential whose scope cannot bind leaves nothing to read by, got: {refused:?}"
+    );
+
+    // The control that keeps the refusal honest: a subject that IS an id
+    // binds, and the same clauses admit that owner's own row.
+    let member = context(&keys, &owner.to_base64(), "reader");
+    let filtered = agent.filter_predicate(&member, &collection, Predicate::True).expect("a member's subject filters too");
+    assert!(
+        evaluate_predicate(&private, &filtered).expect("the bound predicate must evaluate"),
+        "the owner's own row must pass the clauses that refused the guest's credential"
     );
 }
 

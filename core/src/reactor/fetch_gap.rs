@@ -80,7 +80,10 @@ where
 
         // Create a Node wrapper and NodeAndContext
         let node = Node(node_inner);
-        let node_context = NodeAndContext { node: crate::context::NodeType::Strong(node), sessions: self.sessions.clone() };
+        let node_context = NodeAndContext {
+            node: crate::node::NodeType::Strong(node),
+            auth: crate::context::ContextAuth::Sessions(self.sessions.clone()),
+        };
 
         // Build gap predicate if we have a last entity
         let gap_selection = if let Some(last) = last_entity {

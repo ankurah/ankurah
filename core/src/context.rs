@@ -5,7 +5,7 @@ use crate::{
     error::{MutationError, RetrievalError},
     livequery::{EntityLiveQuery, LiveQuery},
     model::View,
-    node::{MatchArgs, Node, WeakNode},
+    node::{MatchArgs, Node, NodeRef, NodeType},
     policy::{AccessDenied, PolicyAgent},
     storage::{StorageCollectionWrapper, StorageEngine},
     transaction::Transaction,
@@ -29,62 +29,19 @@ impl Clone for Context {
     fn clone(&self) -> Self { Self(self.0.clone()) }
 }
 
-pub enum NodeType<SE, PA>
+pub(crate) enum ContextAuth<PA>
 where PA: PolicyAgent
 {
-    Weak(WeakNode<SE, PA>),
-    Strong(Node<SE, PA>),
+    Sessions(crate::session::SessionSet<PA::ContextData>),
+    /// The local node's own authority, for internal use -- in practice the
+    /// system and catalog tables. Not possible to construct by the user, or
+    /// over the wire. The PolicyAgent is never consulted and commits never
+    /// relay, so internal callers must not privileged-write state that
+    /// durable peers are authoritative for.
+    Privileged,
 }
 
-impl<SE, PA> NodeType<SE, PA>
-where PA: PolicyAgent
-{
-    pub fn upgrade(&self) -> Option<NodeRef<'_, SE, PA>> {
-        match self {
-            Self::Weak(node) => node.upgrade().map(NodeRef::Owned),
-            Self::Strong(node) => Some(NodeRef::Ref(node)),
-        }
-    }
-
-    pub fn node_id(&self) -> proto::EntityId {
-        match self {
-            Self::Weak(node) => node.node_id(),
-            Self::Strong(node) => node.id,
-        }
-    }
-}
-
-pub enum NodeRef<'a, SE, PA>
-where PA: PolicyAgent
-{
-    Ref(&'a Node<SE, PA>),
-    Owned(Node<SE, PA>),
-}
-
-impl<'a, SE, PA> std::ops::Deref for NodeRef<'a, SE, PA>
-where PA: PolicyAgent
-{
-    type Target = Node<SE, PA>;
-    fn deref(&self) -> &Node<SE, PA> {
-        match self {
-            Self::Ref(node) => node,
-            Self::Owned(node) => node,
-        }
-    }
-}
-
-impl<'a, SE, PA> AsRef<Node<SE, PA>> for NodeRef<'a, SE, PA>
-where PA: PolicyAgent
-{
-    fn as_ref(&self) -> &Node<SE, PA> {
-        match self {
-            Self::Ref(node) => node,
-            Self::Owned(node) => node,
-        }
-    }
-}
-
-pub struct NodeAndContext<SE, PA: PolicyAgent>
+pub(crate) struct NodeAndContext<SE, PA: PolicyAgent>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
@@ -92,7 +49,7 @@ where
     pub node: NodeType<SE, PA>,
     /// The credential source for this context. Typically this is only one session
     /// except for system queries, which need a node's aggregate permissions
-    pub sessions: crate::session::SessionSet<PA::ContextData>,
+    pub auth: ContextAuth<PA>,
 }
 
 #[async_trait]

@@ -31,7 +31,7 @@ pub mod catalog;
 pub mod cell;
 pub mod compiled;
 pub mod registration;
-pub mod resolver;
+pub use catalog::resolver;
 
 pub use cell::{SchemaEpoch, SchemaOnceCell};
 pub use compiled::{ModelStructDescriptor, StructProperty};
@@ -92,9 +92,10 @@ pub fn is_catalog_collection(id: &ModelId) -> bool {
 /// re-derivation work (https://github.com/ankurah/ankurah/pull/426) is the
 /// intended replacement for this carve.
 ///
-/// It covers READS only. Catalog writes stay exactly as protected as every
-/// other write: registration is the only writer, its requests are signed and
-/// checked like any other, and each event it emits still passes `check_event`.
+/// It covers READS only. Catalog writes are confined to the node's own
+/// privileged context, reachable solely through the registration executor,
+/// whose resolved plan passes `PolicyAgent::check_schema_registration` under
+/// the requesting principal before anything commits.
 pub fn reads_bypass_policy(collection: &ankurah_proto::CollectionId) -> bool {
     matches!(collection.as_str(), MODEL_COLLECTION_ID | PROPERTY_COLLECTION_ID | MODEL_PROPERTY_COLLECTION_ID)
 }
@@ -103,6 +104,12 @@ pub fn reads_bypass_policy(collection: &ankurah_proto::CollectionId) -> bool {
 /// the only collections permitted under [`RESERVED_COLLECTION_PREFIX`] and
 /// cannot be mutated through ordinary user transactions.
 pub fn is_protected_collection(id: &ModelId) -> bool { matches!(id, ModelId::System(_)) }
+
+/// Whether writes to `collection` are confined to the node's privileged
+/// context: the reserved system and catalog collections, and nothing else.
+pub fn is_reserved_collection(collection: &ankurah_proto::CollectionId) -> bool {
+    collection.as_str().starts_with(RESERVED_COLLECTION_PREFIX)
+}
 
 /// The logical protocol model for today's built-in storage key. This mapping
 /// is deliberately core-local: protocol identity must not depend on the

@@ -49,11 +49,11 @@ struct Inner<SE, PA> {
     /// while no system is ready. Shared with the node's `WeakEntitySet`,
     /// which stamps materializing entities from it.
     schema_epoch: Arc<RwLock<Option<SchemaEpoch>>>,
-    /// Reset barrier installed by `CatalogManager::start`: begin invalidates
-    /// and drains catalog effects before deletion, finish clears catalog
-    /// state after system/reactor reset, and resume re-arms durable catalog
-    /// maintenance whenever the system becomes ready.
-    catalog_reset_hook: RwLock<Option<CatalogResetHook>>,
+    /// Serializes the two writers of the durable root: a join's persist and
+    /// the reset that deletes it. A persist decides whether to write under
+    /// this lock, so a reset can never land between that decision and the
+    /// write and leave the wiped storage holding the root it just deleted.
+    root_write: tokio::sync::Mutex<()>,
     reactor: Reactor,
     _phantom: PhantomData<PA>,
 }
@@ -82,7 +82,7 @@ where
             system_ready: RwLock::new(false),
             system_ready_notify: Notify::new(),
             schema_epoch,
-            catalog_reset_hook: RwLock::new(None),
+            root_write: tokio::sync::Mutex::new(()),
             reactor,
             _phantom: PhantomData,
         }));
@@ -241,19 +241,36 @@ where
             self.hard_reset().await.map_err(|e| MutationError::General(Box::new(std::io::Error::other(e.to_string()))))?;
         }
 
-        let collection_id = CollectionId::fixed_name(SYSTEM_COLLECTION_ID);
-        let storage = self.0.collectionset.get(&collection_id).await?;
-
-        // Set the state
-        storage.set_state(state.clone()).await?;
-
-        // Set root and mark system as ready
+        // A stored root means "joined once"; it does not certify sync.
+        // Whether this node has heard from the system is a per-process,
+        // per-query fact (durable_version), re-established at every start,
+        // so a restart after a crash here serves nothing stale -- raw
+        // resolution defers behind the catalog's first durable answer either
+        // way.
         {
             let mut root = self.0.root.write().expect("Root lock poisoned");
-            *root = Some(state);
+            *root = Some(state.clone());
         }
         self.mark_system_ready();
+        self.persist_root(state).await.map_err(|e| MutationError::General(Box::new(std::io::Error::other(e.to_string()))))?;
 
+        Ok(())
+    }
+
+    /// Write the joined root, conditional on this node still holding exactly
+    /// the root that was joined: a reset, or a join of a different system,
+    /// has already decided what this node's root is. Holds the root-write
+    /// lock across the check and the write.
+    async fn persist_root(&self, state: Attested<EntityState>) -> Result<()> {
+        let _write = self.0.root_write.lock().await;
+        let still_ours = self
+            .root()
+            .is_some_and(|root| root.payload.entity_id == state.payload.entity_id && root.payload.state.head == state.payload.state.head);
+        if !still_ours {
+            return Ok(());
+        }
+        let collection_id = CollectionId::fixed_name(SYSTEM_COLLECTION_ID);
+        self.0.collectionset.get(&collection_id).await?.set_state(state).await?;
         Ok(())
     }
 
@@ -261,12 +278,11 @@ where
     /// This is used when an ephemeral node needs to join a system with a different root.
     /// **This is a destructive operation and should be used with extreme caution.**
     pub async fn hard_reset(&self) -> Result<()> {
-        // Refuse new catalog effects and wait out admitted ones before any
-        // deletion, so nothing applies across the wipe.
-        let catalog_reset_hook = self.0.catalog_reset_hook.read().unwrap().clone();
-        if let Some(hook) = &catalog_reset_hook {
-            (hook.begin)().await;
-        }
+        // Exclude a join's pending root persist for the whole reset: it
+        // decides whether to write under this same lock, so it either wrote
+        // before the wipe (and the wipe removes it) or finds the root gone
+        // afterwards and writes nothing.
+        let _root_write = self.0.root_write.lock().await;
 
         // Delete all collections from storage
         self.0.collectionset.delete_all_collections().await?;
@@ -298,12 +314,10 @@ where
             *system_ready = false;
         }
 
-        // Reset the reactor state to notify subscriptions
+        // Reset the reactor state to notify subscriptions. Standing queries
+        // (the catalog's included) survive the reset: their resultsets are
+        // emptied here and refill from the new system's rows.
         self.0.reactor.system_reset();
-
-        if let Some(hook) = &catalog_reset_hook {
-            (hook.finish)();
-        }
 
         Ok(())
     }

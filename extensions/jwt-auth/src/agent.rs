@@ -109,10 +109,11 @@ impl PolicyAgent for JwtAgent {
     type ContextData = JwtContext;
 
     fn on_node_ready<SE: StorageEngine + Send + Sync + 'static>(&self, node: WeakNode<SE, Self>) {
-        if let Some(strong) = node.upgrade() {
-            let catalog = strong.catalog.clone();
+        {
+            let node = node.clone();
             self.set_selection_resolver(Arc::new(move |collection, predicate| {
-                catalog
+                let Some(node) = node.upgrade() else { return Err("Node has been dropped".to_string()) };
+                node.catalog
                     .resolve_selection(collection, ankql::ast::Selection { predicate, order_by: None, limit: None })
                     .map(|selection| selection.predicate)
                     .map_err(|error| error.to_string())
@@ -195,20 +196,6 @@ impl PolicyAgent for JwtAgent {
         }
         if entity_after.collection().as_str() == "jwtpolicy" {
             return Err(AccessDenied::ByPolicy("Only privileged contexts may write to jwtpolicy"));
-        }
-        // Core admits writes to the catalog collections only through the
-        // schema-registration executor, whose resolved-plan policy check runs
-        // before this per-event check. An authenticated caller that passed
-        // that gate may persist the catalog effects of its own registration;
-        // NoUser is still denied below.
-        if ankurah_core::schema::system_model_id(entity_after.collection().as_str())
-            .is_some_and(|model| ankurah_core::schema::is_catalog_collection(&model))
-        {
-            return if matches!(cdata, JwtContext::NoUser) {
-                Err(AccessDenied::ByPolicy("NoUser context cannot write schema metadata"))
-            } else {
-                Ok(None)
-            };
         }
         if matches!(cdata, JwtContext::NoUser) {
             return Err(AccessDenied::ByPolicy("NoUser context cannot write events"));

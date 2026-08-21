@@ -1,20 +1,15 @@
-//! The catalog map in its write-only phase.
+//! The catalog map and the projection that maintains it.
 //!
-//! A durable node warms its in-memory catalog map from the three catalog
-//! collections at startup and keeps it fresh by folding its own registrations
-//! synchronously under the allocator mutex; an ephemeral node fills its map
-//! only by folding SchemaRegistered responses. These tests drive
-//! RegisterSchema over the wire (the same schema-less-durable harness as
-//! schema_registration.rs), assert the map resolves to the ids the allocator
-//! handed back, and pin the reset barrier that keeps hard_reset from deleting
-//! storage under an in-flight warm.
-//!
-//! Excised with the read flip (write-only phase): the reactor-fed durable
-//! subscription, the ephemeral relay warm and its generation/deadline/
-//! cancellation semantics, wire-state ingestion with the stale-generation
-//! admission fence, live-query resolution against the map, and resolver
-//! behavior for unwarmed catalogs. Their tests return with that machinery
-//! (successor notes in core/src/schema/catalog.rs).
+//! Every node derives its in-memory catalog map from three live queries over
+//! the catalog collections, which keep it current for as long as they run;
+//! registration additionally folds its own resolved definitions in
+//! synchronously under the allocator mutex, so consecutive registrations
+//! observe each other. These tests drive RegisterSchema over the wire (the
+//! same schema-less-durable harness as schema_registration.rs), assert the
+//! map resolves to the ids the allocator handed back, pin what an ephemeral
+//! node gets once its catalog has been ANSWERED by a durable peer, and pin
+//! the reset barrier that keeps hard_reset from deleting storage under an
+//! in-flight warm.
 
 mod common;
 use ankurah::core::error::{MutationError, RetrievalError};
@@ -61,12 +56,12 @@ fn album_entry(name: &str, backend: &str, value_type: &str, optional: bool) -> p
 }
 
 fn album_request() -> proto::NodeRequestBody {
-    proto::NodeRequestBody::RegisterSchema { models: vec![album_entry("name", "yrs", "string", false)] }
+    proto::NodeRequestBody::RegisterSchema { model: album_entry("name", "yrs", "string", false) }
 }
 
 /// Register a second property `year` on the album model (incremental).
 fn album_year_request() -> proto::NodeRequestBody {
-    proto::NodeRequestBody::RegisterSchema { models: vec![album_entry("year", "lww", "i64", true)] }
+    proto::NodeRequestBody::RegisterSchema { model: album_entry("year", "lww", "i64", true) }
 }
 
 async fn connected_pair(
@@ -78,10 +73,10 @@ async fn connected_pair(
     Ok((server, client, conn))
 }
 
-/// Unpack a SchemaRegistered response (the resolved definitions, ids included).
-fn expect_registered(resp: proto::NodeResponseBody) -> Vec<proto::RegisteredModel> {
+/// Unpack a SchemaRegistered response (the resolved definition, ids included).
+fn expect_registered(resp: proto::NodeResponseBody) -> proto::RegisteredModel {
     match resp {
-        proto::NodeResponseBody::SchemaRegistered { models } => models,
+        proto::NodeResponseBody::SchemaRegistered { model } => model,
         other => panic!("expected SchemaRegistered, got {other}"),
     }
 }
@@ -246,7 +241,7 @@ async fn durable_map_resolves_after_registration() -> anyhow::Result<()> {
 
     // The allocator hands back the resolved ids in the response.
     let models = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
-    let (model_id, property_id, membership_id) = (models[0].id, models[0].properties[0].id, models[0].properties[0].membership_id);
+    let (model_id, property_id, membership_id) = (models.id, models.properties[0].id, models.properties[0].membership_id);
 
     // The executor's synchronous fold resolves the display name to the
     // allocated id.
@@ -261,14 +256,14 @@ async fn durable_map_resolves_after_registration() -> anyhow::Result<()> {
     assert_eq!(prop.minted_for, Some(model_id));
 
     // Model is indexed by collection at the allocated id.
-    let model = server.catalog.model_by_label("album").expect("model def present");
-    assert_eq!(model.id, model_id);
+    let (found_model_id, model) = server.catalog.model_by_label("album").expect("model def present");
+    assert_eq!(found_model_id, model_id);
     assert_eq!(model.name, "Album");
 
     // Membership carries the (required) optional flag, at the allocated id.
-    let membership = server.catalog.membership(&model_id, &property_id).expect("membership present");
-    assert_eq!(membership.id, membership_id);
-    assert_eq!(membership.optional, Some(false), "required membership => optional=Some(false)");
+    let (found_membership_id, membership) = server.catalog.membership(&model_id, &property_id).expect("membership present");
+    assert_eq!(found_membership_id, membership_id);
+    assert!(!membership.optional, "a required field's membership is not optional");
 
     Ok(())
 }
@@ -281,18 +276,41 @@ async fn durable_map_updates_incrementally() -> anyhow::Result<()> {
     server.catalog.wait_catalog_ready().await;
 
     let models = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
-    let model_id = models[0].id;
+    let model_id = models.id;
     wait_resolve(&server, "album", "name").await.expect("name resolves");
 
     // Second registration adds `year` -- no restart.
     let year = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_year_request()).await?);
-    let year_property_id = year[0].properties[0].id;
+    let year_property_id = year.properties[0].id;
     let year_id = wait_resolve(&server, "album", "year").await.expect("year resolves incrementally");
     assert_eq!(year_id, year_property_id, "the map resolves year to the allocated id");
 
     // Both properties are now memberships of the album model.
     let memberships = server.catalog.memberships_of(&model_id);
     assert_eq!(memberships.len(), 2, "album now has two memberships");
+
+    Ok(())
+}
+
+// Test 3: the projection is how a catalog reaches an ephemeral node. Rows the
+// durable already held arrive on a client that registered nothing, and the
+// wait that means they have arrived is the catalog being ANSWERED --
+// readiness only says the client's own store was read, which for a fresh
+// client is a store with nothing in it.
+#[tokio::test]
+async fn an_answered_ephemeral_carries_the_catalog_it_never_registered() -> anyhow::Result<()> {
+    let server = durable_sled_setup().await?;
+    server.catalog.wait_catalog_ready().await;
+    server.context_async(DEFAULT_CONTEXT).await.register_model::<Album>().await?;
+    let model = server.catalog.model_id_for("album").expect("the durable registered album");
+
+    let client = ephemeral_sled_setup().await?;
+    let _conn = LocalProcessConnection::new(&server, &client).await?;
+    client.system.wait_system_ready().await;
+    client.catalog.wait_catalog_synced().await?;
+
+    assert_eq!(client.catalog.model_id_for("album"), Some(model), "an answered catalog carries what the durable holds");
+    assert!(client.catalog.resolve(&model, "name").is_some(), "and resolves its properties without registering them");
 
     Ok(())
 }
@@ -542,16 +560,16 @@ async fn rename_updates_resolution_and_sibling_index() -> anyhow::Result<()> {
     server.catalog.wait_catalog_ready().await;
 
     let first = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
-    let property_id = first[0].properties[0].id;
+    let property_id = first.properties[0].id;
     wait_resolve(&server, "album", "name").await.expect("resolves under original name");
 
     // Rename: the renamed_from hint moves the display name to "title" WITHOUT
     // re-keying (same allocated property id).
     let mut rename_entry = album_entry("title", "yrs", "string", false);
     rename_entry.properties[0].renamed_from = Some("name".into());
-    let rename = proto::NodeRequestBody::RegisterSchema { models: vec![rename_entry] };
+    let rename = proto::NodeRequestBody::RegisterSchema { model: rename_entry };
     let renamed = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, rename).await?);
-    assert_eq!(renamed[0].properties[0].id, property_id, "the hint preserves the lineage id");
+    assert_eq!(renamed.properties[0].id, property_id, "the hint preserves the lineage id");
 
     // New display name resolves to the SAME property id; old name is gone.
     let renamed_id = wait_resolve(&server, "album", "title").await.expect("resolves under new name after rename");

@@ -29,6 +29,7 @@
 //! properties failing closed). Their tests return with that machinery.
 
 mod common;
+use ankurah::core::session::SessionSet;
 use ankurah::proto::PropertyId;
 use common::*;
 use serde::{Deserialize, Serialize};
@@ -172,7 +173,7 @@ async fn auto_assert_create_registers_on_durable() -> anyhow::Result<()> {
     assert_eq!(resolve_by_collection(&client, "widget", "size"), Some(PropertyId::EntityId(size_id)));
 
     // The model entity is indexed by its collection with the struct name.
-    let model = server.catalog.model_by_label("widget").expect("model present on durable");
+    let (_, model) = server.catalog.model_by_label("widget").expect("model present on durable");
     assert_eq!(model.name, "Widget");
 
     Ok(())
@@ -291,33 +292,29 @@ async fn offline_reassert_requires_every_compiled_field_to_be_bound() -> anyhow:
     Ok(())
 }
 
-// (d) Predicate-query paths register at first use (REN 2 revised, plan
-// decision 25b): a compiled model's first query triggers the idempotent registration
-// upsert, so resolution runs against authoritative rows instead of
-// failing loud as unregistered. The fetch still answers EMPTY -- the
-// freshly registered collection holds no entities -- and a second,
-// explicit register is a no-op against the same rows.
+// (d) Predicate-query paths HEAL. A compiled declaration the catalog cannot
+// prove is a system that has not been told about this shape yet, not a
+// mistake in the query, so the read registers the declaration and then
+// answers -- here, EMPTY, because the collection it just defined holds no
+// entities. A second, explicit register is a no-op against the same rows.
 #[tokio::test]
-async fn predicate_read_path_registers_at_first_use() -> anyhow::Result<()> {
+async fn predicate_read_path_heals_and_defines() -> anyhow::Result<()> {
     let server = durable_sled_setup().await?;
     server.catalog.wait_catalog_ready().await;
     let ctx = server.context(DEFAULT_CONTEXT)?;
 
-    // The compiled schema anticipates `doohickey`; the catalog does not
-    // know it yet. The fetch registers it at first use and answers empty.
+    // The compiled schema anticipates `doohickey`; the catalog does not know
+    // it. The read defines it and answers.
     let results = ctx.fetch::<DoohickeyView>("tag = 'x'").await?;
     assert!(results.is_empty(), "a just-registered collection holds no entities");
 
-    // The predicate read durably registered and latched the collection.
     let tag_id = resolve_by_collection(&server, "doohickey", "tag");
-    assert!(tag_id.is_some(), "first-use registration fed the catalog");
-    assert!(schema_registered(&server, Doohickey::descriptor()), "first-use registration resolves the descriptor");
+    assert!(tag_id.is_some(), "the healing read fed the catalog");
+    assert!(schema_registered(&server, Doohickey::descriptor()), "the healing read resolves the descriptor");
 
-    // The explicit register is an idempotent no-op against the same rows.
+    // A second register is idempotent against the same rows.
     ctx.register_model::<Doohickey>().await?;
     assert_eq!(resolve_by_collection(&server, "doohickey", "tag"), tag_id, "re-register must not re-mint");
-    let results = ctx.fetch::<DoohickeyView>("tag = 'x'").await?;
-    assert!(results.is_empty(), "no entities were created");
 
     // The fail-closed rejection of a typo'd property in a registered
     // collection is predicate-resolution behavior; its assertion returns
@@ -326,10 +323,84 @@ async fn predicate_read_path_registers_at_first_use() -> anyhow::Result<()> {
     Ok(())
 }
 
-// (f) Fail-loud offline read: with no durable peer, a fetch over a NEVER-registered compiled
-// collection cannot run first-use registration, and the reference surfaces
-// the loud UnregisteredCollection error naming the collection -- never an
-// empty resultset, and never the weaker unknown-property shape.
+// (d) The delta a healing read registers is INCREMENTAL. A binary compiled
+// against a model that has since grown a field registers THAT FIELD, against
+// the model already there: nothing is re-minted and no catalog row already
+// written is rewritten. That is what makes healing something every read can
+// afford to do, rather than something to be avoided.
+#[tokio::test]
+async fn healing_registers_only_the_added_field() -> anyhow::Result<()> {
+    let server = durable_sled_setup().await?;
+    server.catalog.wait_catalog_ready().await;
+    let ctx = server.context(DEFAULT_CONTEXT)?;
+
+    // The system knows the one-field shape.
+    ctx.register_model::<offline_v1::Evolving>().await?;
+    let (model, _) = server.catalog.model_by_label("evolving").expect("evolving model");
+    let Some(PropertyId::EntityId(label)) = resolve_by_collection(&server, "evolving", "label") else {
+        anyhow::bail!("evolving.label resolves after the first registration");
+    };
+    let (membership, _) = server.catalog.membership(&model, &label).expect("evolving.label membership");
+    let heads_before = (
+        catalog_head(&server, "_ankurah_model", model).await?,
+        catalog_head(&server, "_ankurah_property", label).await?,
+        catalog_head(&server, "_ankurah_model_property", membership).await?,
+    );
+
+    // A binary compiled against the two-field shape reads; healing registers
+    // the difference and the read answers.
+    let results = ctx.fetch::<offline_v2::EvolvingView>("added = 1").await?;
+    assert!(results.is_empty(), "nothing was ever created in this collection");
+
+    assert_eq!(server.catalog.model_by_label("evolving").expect("evolving model").0, model, "the model must not be re-minted");
+    assert_eq!(
+        resolve_by_collection(&server, "evolving", "label"),
+        Some(PropertyId::EntityId(label)),
+        "the known field keeps its identity"
+    );
+    let heads_after = (
+        catalog_head(&server, "_ankurah_model", model).await?,
+        catalog_head(&server, "_ankurah_property", label).await?,
+        catalog_head(&server, "_ankurah_model_property", membership).await?,
+    );
+    assert_eq!(heads_before, heads_after, "registering the delta must not rewrite what was already registered");
+
+    let Some(PropertyId::EntityId(added)) = resolve_by_collection(&server, "evolving", "added") else {
+        anyhow::bail!("the healing read must register the field this binary added");
+    };
+    assert!(server.catalog.membership(&model, &added).is_some(), "the added field joins the model already there");
+    assert!(schema_registered(&server, offline_v2::Evolving::descriptor()), "the two-field declaration binds after healing");
+
+    Ok(())
+}
+
+// (d) Where healing stops: registering is a write, so a credential that
+// cannot write cannot heal. The read then says BOTH things -- the model is
+// not registered, and this credential may not register it -- rather than
+// reporting a declared model as unknown or defining schema on behalf of a
+// principal that may not define any.
+#[tokio::test]
+async fn read_only_credential_cannot_heal() -> anyhow::Result<()> {
+    let server = durable_sled_setup().await?;
+    server.catalog.wait_catalog_ready().await;
+    // A session-less source reads, but can never name the single principal a
+    // registration acts as.
+    let ctx = server.context(SessionSet::new())?;
+
+    let error = ctx.fetch::<GadgetView>("name = 'x'").await.expect_err("a read that cannot heal must not answer");
+    let msg = error.to_string();
+    assert!(msg.contains("gadget") && msg.contains("may not register"), "the error must name the model and the refusal, got: {msg}");
+    assert!(server.catalog.model_by_label("gadget").is_none(), "a refused read must define nothing");
+    assert!(!schema_registered(&server, Gadget::descriptor()), "a refused read must resolve nothing");
+
+    Ok(())
+}
+
+// (f) Fail-loud read over a never-registered collection with nowhere to heal
+// from: the reference surfaces a loud error naming the collection -- never an
+// empty resultset, and never the weaker unknown-property shape. Only the
+// durable allocator mints identity, so with no peer connected the read can
+// neither prove the model nor register it.
 #[tokio::test]
 async fn offline_read_unregistered_fails_loud() -> anyhow::Result<()> {
     let server = durable_sled_setup().await?;
@@ -410,18 +481,18 @@ async fn explicit_register_is_strict_and_idempotent() -> anyhow::Result<()> {
     // Catalog entries exist locally after the explicit register; the ids
     // are this durable's allocations.
     let title_id = wait_resolve(&server, "gizmo", "title").await.expect("gizmo.title resolves after register");
-    let model_id = server.catalog.model_by_label("gizmo").expect("gizmo model").id;
-    let membership = server.catalog.membership(&model_id, &title_id).expect("gizmo.title membership");
+    let (model_id, _) = server.catalog.model_by_label("gizmo").expect("gizmo model");
+    let (membership, _) = server.catalog.membership(&model_id, &title_id).expect("gizmo.title membership");
 
     let head_before = catalog_head(&server, "_ankurah_property", title_id).await?;
-    let ms_head_before = catalog_head(&server, "_ankurah_model_property", membership.id).await?;
+    let ms_head_before = catalog_head(&server, "_ankurah_model_property", membership).await?;
 
     // Second call: the collection is latched as ensured, so it is a pure
     // no-op -- no new events, catalog heads unchanged.
     ctx.register_model::<Gizmo>().await?;
 
     let head_after = catalog_head(&server, "_ankurah_property", title_id).await?;
-    let ms_head_after = catalog_head(&server, "_ankurah_model_property", membership.id).await?;
+    let ms_head_after = catalog_head(&server, "_ankurah_model_property", membership).await?;
     assert_eq!(head_before, head_after, "second register must not mint new property events");
     assert_eq!(ms_head_before, ms_head_after, "second register must not mint new membership events");
 

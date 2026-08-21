@@ -298,7 +298,7 @@ impl Planner {
     /// Categorize conjuncts into equalities and inequalities
     fn categorize_conjuncts_excluding_primary_key(
         &self,
-        conjuncts: &[Predicate],
+        conjuncts: &[Predicate<EngineColumns>],
         primary_key: &str,
     ) -> (Vec<(String, Value)>, IndexMap<String, Vec<(ComparisonOperator, Value)>>) {
         let mut equalities = Vec::new();
@@ -334,7 +334,7 @@ impl Planner {
 
     /// Extract field path, operator, and value from a comparison predicate.
     /// Returns the full path as a dot-separated string (e.g., "context.session_id").
-    fn extract_comparison(&self, predicate: &Predicate) -> Option<(String, ComparisonOperator, Value)> {
+    fn extract_comparison(&self, predicate: &Predicate<EngineColumns>) -> Option<(String, ComparisonOperator, Value)> {
         match predicate {
             Predicate::Comparison { left, operator, right } => {
                 // Extract field path from left side (supports multi-step paths)
@@ -432,7 +432,7 @@ impl Planner {
     }
 
     /// Generate plan for equality-only queries
-    fn generate_equality_plan(&self, equalities: &[(String, Value)], conjuncts: &[Predicate]) -> Option<Plan> {
+    fn generate_equality_plan(&self, equalities: &[(String, Value)], conjuncts: &[Predicate<EngineColumns>]) -> Option<Plan> {
         // Add all equality fields
         let mut index_keyparts = Vec::new();
         for (field, value) in equalities {
@@ -644,10 +644,10 @@ impl Planner {
     /// Calculate remaining predicate by removing consumed conjuncts
     fn calculate_remaining_predicate(
         &self,
-        conjuncts: &[Predicate],
+        conjuncts: &[Predicate<EngineColumns>],
         consumed_equalities: &[(String, Value)],
         consumed_inequality_field: Option<&str>,
-    ) -> Predicate {
+    ) -> Predicate<EngineColumns> {
         let mut remaining_conjuncts = Vec::new();
 
         for conjunct in conjuncts {
@@ -722,7 +722,12 @@ impl Planner {
     }
 
     /// Build a table scan plan with optional entity ID range extraction
-    fn build_table_scan_plan(&self, conjuncts: &[Predicate], primary_key: &str, order_by: &Option<Vec<ankql::ast::OrderByItem>>) -> Plan {
+    fn build_table_scan_plan(
+        &self,
+        conjuncts: &[Predicate<EngineColumns>],
+        primary_key: &str,
+        order_by: &Option<Vec<ankql::ast::OrderByItem<EngineColumns>>>,
+    ) -> Plan {
         // Extract entity ID range from predicates on the primary key
         let bounds = self.extract_entity_id_range(conjuncts, primary_key);
 
@@ -738,7 +743,7 @@ impl Planner {
         // Determine scan direction and ORDER BY components based on primary key ORDER BY
         let (scan_direction, order_by_spill) = if let Some(order_items) = order_by {
             if let Some(first_item) = order_items.first() {
-                if sort_key_root(first_item).as_deref() == Some(primary_key) {
+                if column_key(&first_item.path) == primary_key {
                     // Primary key ORDER BY is satisfied by scan direction
                     let direction = match first_item.direction {
                         ankql::ast::OrderDirection::Asc => ScanDirection::Forward,

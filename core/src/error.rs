@@ -49,6 +49,10 @@ pub enum RetrievalError {
     RequestError(RequestError),
     #[error("Apply error: {0}")]
     ApplyError(ApplyError),
+    #[error(
+        "model '{label}' is not registered in this system, or its registered shape differs from this binary's declaration; a typed read cannot resolve it"
+    )]
+    UnboundDeclaration { label: String },
 }
 
 impl From<RequestError> for RetrievalError {
