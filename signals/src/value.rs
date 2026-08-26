@@ -26,6 +26,12 @@ impl<T> ValueCell<T> {
         let guard = self.0.read().unwrap();
         f(&*guard)
     }
+    /// Calls a closure with a mutable borrow of the current value.
+    /// The write lock is held only for the duration of the closure.
+    pub fn with_mut<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        let mut guard = self.0.write().unwrap();
+        f(&mut *guard)
+    }
     #[allow(unused)]
     pub fn set_with<R>(&self, value: T, f: impl Fn(&T) -> R) -> R {
         let mut current = self.0.write().unwrap();
