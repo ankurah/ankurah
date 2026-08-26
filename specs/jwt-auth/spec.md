@@ -217,15 +217,16 @@ The row-level half of write scoping: a non-privileged writer may only touch rows
 
 #### `check_read`
 
-The row-level half of read scoping: admits or refuses one entity by its serialized state, where `filter_predicate` narrows the query up front.
+The row-level half of read scoping: admits or refuses one entity by its serialized state, where `filter_predicate` narrows the query up front. `check_read` and `check_read_event` run the same row-level check through one shared helper, so a caller refused an entity's state is also refused that entity's events (events replay the same content):
 
 - Requires `can_access_collection`. `Root` passes unconditionally.
 - No scope rules for the collection: allowed.
 - Otherwise materializes the state into a `TemporaryEntity` (a state that cannot be evaluated is refused) and walks the caller's credentials: a credential admits the row when every one of its read-applicable, substituted scope predicates evaluates true, and the first admitting credential allows the read. Unauthorized and unresolvable credentials are skipped exactly as in `filter_predicate` (logged at `debug` -- the query half already warned once per query), so credential order cannot change the answer. A credential no rule constrains admits every row. A scope predicate that fails to evaluate against the row refuses the read; so does running out of credentials.
+- `check_read_event` runs the same rules against the entity as it *currently* stands, fetched through a getter the serving node hands in. The getter is bound to the event's own entity at construction -- there is no way to hand the check another row -- and the verdict fetches only when it must: a privileged caller or an unscoped collection decides before any fetch happens. When nothing current exists for an event of a scoped collection, the event is refused (there is nothing to evaluate); an unscoped collection is unaffected. A fetch failure is surfaced as an error, not a refusal.
 
-#### `check_read_event`
+Accepted residual: the verdict is about the row as it stands now, so a caller who can read a row today reads that row's whole history, including the part written while the row sat outside its scope. Per-event historical evaluation is tracked in [issue #445](https://github.com/ankurah/ankurah/issues/445).
 
-`Root` passes; otherwise delegates to `can_access_collection` for the event's collection.
+Engine-dependent limitation: on the IndexedDB engine events are stored without collection identity, so an event can be relabelled into a collection the caller may read and be judged by that collection's rules rather than its own ([issue #444](https://github.com/ankurah/ankurah/issues/444)).
 
 #### `validate_received_event` / `validate_received_state` / `attest_state` / `validate_causal_assertion`
 

@@ -5,6 +5,9 @@ use ankql::ast::Predicate;
 use ankurah_core::{
     entity::{Entity, TemporaryEntity},
     error::ValidationError,
+    entity::EntityInner,
+    lazy_entity_getter::EntityGetter,
+    selection::filter::Filterable,
     livequery::EntityLiveQuery,
     node::{Node, NodeInner, WeakNode},
     policy::{AccessDenied, PolicyAgent},
@@ -79,6 +82,41 @@ impl JwtAgent {
 
     /// Replaces the in-memory config with a new one.
     pub fn update_config(&self, new_config: PolicyConfig) { self.state.write().unwrap_or_else(|e| e.into_inner()).config = new_config; }
+
+    /// The verdict both read paths share before any row is examined:
+    /// collection access, then the privileged bypass, then whether the
+    /// collection carries scope rules at all. `Ok(false)` means the caller is
+    /// admitted outright; `Ok(true)` means admission depends on the row, which
+    /// the caller of this helper must then produce and evaluate. Splitting the
+    /// decision this way is what lets `check_read_event` leave the row
+    /// unresolved on every path that never needed it.
+    fn read_needs_row<C>(&self, data: &C, collection: &proto::CollectionId) -> Result<bool, AccessDenied>
+    where C: Iterable<JwtContext> {
+        self.can_access_collection(data, collection)?;
+
+        for ctx in data.iterable() {
+            if ctx.is_privileged() {
+                return Ok(false);
+            }
+        }
+
+        let guard = self.state.read().unwrap_or_else(|e| e.into_inner());
+        Ok(!guard.config.scope_rules_for_collection(collection.as_str()).is_empty())
+    }
+
+    /// The row-level half both read paths share: evaluates the collection's
+    /// scope rules against the row, so a caller that cannot read a row cannot
+    /// read that row's events either, which would otherwise hand it the same
+    /// content in replayable form. Only called once [`Self::read_needs_row`]
+    /// said the verdict depends on the row.
+    fn enforce_row_scope<C, E>(&self, data: &C, entity: &E) -> Result<(), AccessDenied>
+    where
+        C: Iterable<JwtContext>,
+        E: Filterable + std::ops::Deref<Target = EntityInner>,
+    {
+        let guard = self.state.read().unwrap_or_else(|e| e.into_inner());
+        enforce_read_scope(&guard.config, data, entity)
+    }
 }
 
 #[async_trait]
@@ -344,32 +382,35 @@ impl PolicyAgent for JwtAgent {
     where
         C: Iterable<Self::ContextData>,
     {
-        self.can_access_collection(data, collection)?;
-
-        for ctx in data.iterable() {
-            if ctx.is_privileged() {
-                return Ok(());
-            }
-        }
-
-        let guard = self.state.read().unwrap_or_else(|e| e.into_inner());
-        if guard.config.scope_rules_for_collection(collection.as_str()).is_empty() {
+        if !self.read_needs_row(data, collection)? {
             return Ok(());
         }
-
         let entity = TemporaryEntity::new(*id, collection.clone(), state)
             .map_err(|_| AccessDenied::ByPolicy("Read scope entity state could not be evaluated"))?;
-        enforce_read_scope(&guard.config, data, &entity)
+        self.enforce_row_scope(data, &entity)
     }
 
-    fn check_read_event<C>(&self, data: &C, event: &Attested<proto::Event>) -> Result<(), AccessDenied>
-    where C: Iterable<Self::ContextData> {
-        for ctx in data.iterable() {
-            if ctx.is_privileged() {
-                return Ok(());
-            }
+    async fn check_read_event<SE, C>(
+        &self,
+        data: &C,
+        event: &Attested<proto::Event>,
+        getter: &EntityGetter<'_, SE, Self>,
+    ) -> Result<(), AccessDenied>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        C: Iterable<Self::ContextData> + Sync,
+    {
+        if !self.read_needs_row(data, &event.payload.collection)? {
+            return Ok(());
         }
-        self.can_access_collection(data, &event.payload.collection)
+        // Only now does the row's cost exist: every verdict above fetched
+        // nothing. A lookup failure is a fault, not a refusal, and is
+        // surfaced as such.
+        let row = getter.get().await.map_err(|e| AccessDenied::ResolutionFailed(e.to_string()))?;
+        let Some(entity) = row else {
+            return Err(AccessDenied::ByPolicy("Read scope has no current entity state to evaluate"));
+        };
+        self.enforce_row_scope(data, &entity)
     }
 
     fn check_write(&self, cdata: &Self::ContextData, entity: &Entity, _event: Option<&proto::Event>) -> Result<(), AccessDenied> {
@@ -450,8 +491,11 @@ fn enforce_write_scope(config: &PolicyConfig, cdata: &JwtContext, entity: &Entit
     Ok(())
 }
 
-fn enforce_read_scope<C>(config: &PolicyConfig, data: &C, entity: &TemporaryEntity) -> Result<(), AccessDenied>
-where C: Iterable<JwtContext> {
+fn enforce_read_scope<C, E>(config: &PolicyConfig, data: &C, entity: &E) -> Result<(), AccessDenied>
+where
+    C: Iterable<JwtContext>,
+    E: Filterable + std::ops::Deref<Target = EntityInner>,
+{
     for ctx in data.iterable() {
         let JwtContext::User { claims, .. } = ctx else {
             continue;

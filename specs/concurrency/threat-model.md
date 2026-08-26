@@ -141,7 +141,7 @@ Receive-side arms and the policy hook each gets (verified in
 | `EventBridge` | `apply_delta_inner` | yes | n/a | yes | catch-up batch |
 | `StateAndRelation` | `apply_delta_inner` | unimpl | unimpl | n/a | returns `InvalidUpdate` |
 | `GetEvents` resp, mid-BFS | `CachedEventGetter::get_event` | **NO** (#244) | n/a | n/a | stored via `add_event` unvalidated |
-| `GetEvents` req, served | `node.rs` `GetEvents` arm | n/a | n/a | n/a | serve side DOES `can_access_collection` + `check_read_event` |
+| `GetEvents` req, served | `node.rs` `GetEvents` arm | n/a | n/a | n/a | serve side DOES `can_access_collection` + `check_read_event` (against the entity as currently held, fetched lazily) |
 | `commit_remote_transaction` | `node.rs` same | via `check_event` | via `attest_state` | n/a | creation-event fork asymmetry (#243) |
 
 ("yes" = via `validate_and_stage`.) The key asymmetry: **every `apply_*` arm
@@ -483,16 +483,46 @@ builder), each event passes the read policy before leaving the node; a peer cann
 read events it is not permitted to.
 Trust tier: attestation-dependent (nil under PermissiveAgent).
 Enforcing seam: `node.rs` `GetEvents` arm calls
-`can_access_collection(cdata, &collection)` then `check_read_event(cdata, &event)`
-per event, pushing only allowed events; `collect_event_bridge` runs
-`check_read_event` over the collected events (post-walk).
+`can_access_collection(cdata, &collection)` then
+`check_read_event(cdata, &event, getter)` per event, pushing only allowed
+events; `collect_event_bridge` runs `check_read_event` over the collected events
+(post-walk). The getter (`core/src/lazy_entity_getter.rs`) is bound at
+construction to the event's own entity and collection, and fetches the row only
+if the agent's verdict turns on row content -- so an agent that admits entities
+row by row applies the same rule it applies in `check_read`, and without that
+the row filter reduced to the collection gate and events reconstructed content
+the state path withheld (#438). Fetching goes through the node's own entity
+machinery: the resident entity when one is held (the EventOnly apply path
+advances it past the stored state buffer), otherwise materialized from stored
+state, and `None` when nothing current exists, which an agent whose verdict
+needs the row treats as refusal. Binding the getter to the event's entity at
+construction is what closed the old hazard of judging an event against some
+other, readable row's state.
+The bridge walk excludes any event naming a different entity than the state it
+walks from (a grafted parent pointer), giving up the bridge for a snapshot.
 Falsifying attack (T2): request events for a collection/entity the requester cannot
 read, defeated only if the agent's read checks are correct.
 Planned test arm: read-authorization arm with a restricting agent asserting denied
 events are filtered from both `GetEvents` and `EventBridge` responses.
 Status: enforced as call sites. Note the DoS interaction: `collect_event_bridge`
 filters *after* the unbounded walk (C4-17), so a read-denied bridge still costs the
-full traversal.
+full traversal. Two accepted residuals: the verdict is about the row as it stands
+now, so a caller who can read a row today reads that row's history from before the
+scope change (#445); and the IndexedDB engine stores events without collection
+identity, so an event can be relabelled into a collection whose rules the caller
+passes (#444).
+
+Why serving events is gated at all, given that a caller must already name event
+ids: ids are not capabilities. `EventId` derives from content
+(`EventId::from_parts(entity_id, operations, parent)`, proto/src/data.rs), and a
+genesis event's parent is empty, so for a row whose creation operations are
+deterministic and low-entropy the genesis id is computable offline from guessed
+content, and each later id from the guessed chain before it. Histories carrying
+high-entropy payloads (CRDT text updates carry internal client state) are not
+practically computable, so the offline route is largely theoretical today.
+Independent of guessing, a head learned while a row was in scope keeps naming
+that row's events after the scope changes (#445). The row check holds however
+the id was obtained.
 
 ### 3.5 Local-commit policy claims
 

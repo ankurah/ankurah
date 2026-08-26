@@ -837,8 +837,16 @@ impl ankurah::policy::PolicyAgent for ProbeAgent {
         Ok(())
     }
 
-    fn check_read_event<C>(&self, _data: &C, _event: &proto::Attested<proto::Event>) -> Result<(), ankurah::policy::AccessDenied>
-    where C: ankurah::core::util::Iterable<Self::ContextData> {
+    async fn check_read_event<SE, C>(
+        &self,
+        _data: &C,
+        _event: &proto::Attested<proto::Event>,
+        _getter: &ankurah::core::lazy_entity_getter::EntityGetter<'_, SE, Self>,
+    ) -> Result<(), ankurah::policy::AccessDenied>
+    where
+        SE: ankurah::core::storage::StorageEngine + Send + Sync + 'static,
+        C: ankurah::core::util::Iterable<Self::ContextData> + Sync,
+    {
         Ok(())
     }
 
