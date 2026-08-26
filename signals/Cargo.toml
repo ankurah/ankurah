@@ -23,6 +23,9 @@ singlethread = []
 # Global observer stack - for cross-thread environments like React Native
 # Only active when singlethread is NOT enabled
 multithread = []
+# Broadcast dispatch in subscription order (BTreeMap listener map instead of HashMap)
+# For consumers that need run-to-run reproducibility, like deterministic simulators
+deterministic = []
 
 [dependencies]
 tokio          = { version = "1.40", features = ["sync"], optional = true }

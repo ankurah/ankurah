@@ -45,9 +45,9 @@ where
 {
     async fn wait_value(&self, target_value: T)
     where T: PartialEq + Clone + Send + Sync {
-        // Check if current value already matches
-
         use std::sync::Arc;
+
+        // Fast path: return without subscribing if the value already matches
         if self.get_readcell().with(|v| *v == target_value) {
             return;
         }
@@ -59,6 +59,11 @@ where
         let _subscription = self.listen(Arc::new(move |_| {
             let _ = tx.send(());
         }));
+
+        // Re-check after subscribing
+        if self.get_readcell().with(|v| *v == target_value) {
+            return;
+        }
 
         // Loop over notifications until we find a match
         loop {
@@ -82,9 +87,9 @@ where
         R: WaitResult,
         T: Send + Sync,
     {
-        // Check current value first
-
         use std::sync::Arc;
+
+        // Fast path: return without subscribing if the predicate is already satisfied
         if let Some(result) = self.get_readcell().with(|value| predicate(value).result()) {
             return result;
         }
@@ -96,6 +101,11 @@ where
         let _subscription = self.listen(Arc::new(move |_| {
             let _ = tx.send(());
         }));
+
+        // Re-check after subscribing
+        if let Some(result) = self.get_readcell().with(|value| predicate(value).result()) {
+            return result;
+        }
 
         // Wait for notifications
         loop {
