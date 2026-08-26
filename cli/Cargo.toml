@@ -1,6 +1,6 @@
 [package]
 name          = "ankurah-cli"
-version       = "0.9.2"
+version       = "0.9.3"
 edition       = "2021"
 description   = "Command-line tools for Ankurah"
 license       = "MIT OR Apache-2.0"
@@ -14,11 +14,11 @@ name = "ak"
 path = "src/main.rs"
 
 [dependencies]
-ankurah-core                 = { path = "../core", version = "=0.9.2" }
-ankurah-proto                = { path = "../proto", version = "=0.9.2" }
-ankurah-storage-postgres-0-9 = { package = "ankurah-storage-postgres", path = "../storage/postgres", version = "=0.9.2" }
-ankurah-storage-sled-0-9     = { package = "ankurah-storage-sled", path = "../storage/sled", version = "=0.9.2" }
-ankurah-storage-sqlite-0-9   = { package = "ankurah-storage-sqlite", path = "../storage/sqlite", version = "=0.9.2" }
+ankurah-core                 = { path = "../core", version = "=0.9.3" }
+ankurah-proto                = { path = "../proto", version = "=0.9.3" }
+ankurah-storage-postgres-0-9 = { package = "ankurah-storage-postgres", path = "../storage/postgres", version = "=0.9.3" }
+ankurah-storage-sled-0-9     = { package = "ankurah-storage-sled", path = "../storage/sled", version = "=0.9.3" }
+ankurah-storage-sqlite-0-9   = { package = "ankurah-storage-sqlite", path = "../storage/sqlite", version = "=0.9.3" }
 anyhow                       = "1.0"
 base64                       = "0.22"
 clap                         = { version = "4.5", features = ["derive", "env"] }
@@ -31,8 +31,8 @@ thiserror                    = "2.0"
 tokio                        = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [dev-dependencies]
-ankurah                = { path = "../ankurah", version = "=0.9.2", features = ["derive"] }
-ankql                  = { path = "../ankql", version = "=0.9.2" }
+ankurah                = { path = "../ankurah", version = "=0.9.3", features = ["derive"] }
+ankql                  = { path = "../ankql", version = "=0.9.3" }
 serde                  = { version = "1.0", features = ["derive"] }
 testcontainers         = { version = "0.23", features = ["reusable-containers"] }
 testcontainers-modules = { version = "0.11.4", features = ["postgres"] }
