@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Weak};
 
@@ -35,8 +34,17 @@ pub trait IntoBroadcastListener<T> {
 #[derive(Clone)]
 pub struct Broadcast<T = ()>(Arc<Inner<T>>);
 
+// `send` dispatches by iterating this map, so the map type decides dispatch order.
+// The default HashMap iterates in arbitrary order; the `deterministic`
+// feature swaps in a BTreeMap so listeners fire in subscription-id order, which
+// is subscription order because ids are allocated monotonically.
+#[cfg(not(feature = "deterministic"))]
+type ListenerMap<T> = std::collections::HashMap<usize, BroadcastListener<T>>;
+#[cfg(feature = "deterministic")]
+type ListenerMap<T> = std::collections::BTreeMap<usize, BroadcastListener<T>>;
+
 struct Inner<T> {
-    listeners: std::sync::RwLock<HashMap<usize, BroadcastListener<T>>>,
+    listeners: std::sync::RwLock<ListenerMap<T>>,
     next_id: AtomicUsize,
 }
 
@@ -86,7 +94,7 @@ impl<T> Broadcast<T>
 where T: Clone
 {
     /// Creates a new Broadcast struct
-    pub fn new() -> Self { Self(Arc::new(Inner { listeners: std::sync::RwLock::new(HashMap::new()), next_id: AtomicUsize::new(0) })) }
+    pub fn new() -> Self { Self(Arc::new(Inner { listeners: std::sync::RwLock::new(ListenerMap::new()), next_id: AtomicUsize::new(0) })) }
 
     /// Get the unique identifier for this broadcast
     pub fn id(&self) -> BroadcastId { BroadcastId(Arc::as_ptr(&self.0) as usize) }
@@ -265,6 +273,29 @@ mod tests {
 
         // Should have been called once
         assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    #[cfg(feature = "deterministic")]
+    fn test_deterministic_dispatch_order() {
+        let sender = Broadcast::<()>::new();
+        let order = Arc::new(Mutex::new(Vec::new()));
+
+        let mut guards: Vec<_> = (0..10)
+            .map(|i| {
+                let order = order.clone();
+                sender.reference().listen(move |_| order.lock().unwrap().push(i))
+            })
+            .collect();
+
+        sender.send(());
+        assert_eq!(*order.lock().unwrap(), (0..10).collect::<Vec<_>>());
+
+        // Dropping a middle subscriber leaves the rest firing in subscription order
+        drop(guards.remove(4));
+        order.lock().unwrap().clear();
+        sender.send(());
+        assert_eq!(*order.lock().unwrap(), vec![0, 1, 2, 3, 5, 6, 7, 8, 9]);
     }
 
     #[test]

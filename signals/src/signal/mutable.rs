@@ -27,6 +27,18 @@ impl<T: 'static> Mut<T> {
         self.broadcast.send(());
     }
 
+    /// Mutates the value in place and notifies listeners.
+    ///
+    /// The closure runs under the value's write lock, and the lock is released
+    /// before listeners are notified, so a listener that immediately re-reads
+    /// never executes under the writer's lock. Listeners are notified even if
+    /// the closure leaves the value unchanged.
+    pub fn update<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        let result = self.value.with_mut(f);
+        self.broadcast.send(());
+        result
+    }
+
     /// Calls a closure with a borrow of the current value
     /// not tracked by the current context
     pub fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R { self.value.with(f) }
@@ -83,5 +95,35 @@ where T: Clone + Send + Sync + 'static
             listener(current_value);
         }));
         SubscriptionGuard::new(subscription)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[test]
+    fn test_update_mutates_in_place_and_notifies() {
+        let signal = Mut::new(vec![1, 2]);
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+        let cell = signal.get_readcell();
+        // Reading during the callback would deadlock if update still held the
+        // write lock while notifying
+        let _guard = signal.listen(Arc::new(move |_| {
+            seen_clone.lock().unwrap().push(cell.value());
+        }));
+
+        let len = signal.update(|v| {
+            v.push(3);
+            v.len()
+        });
+
+        assert_eq!(len, 3);
+        assert_eq!(signal.value(), vec![1, 2, 3]);
+        // Fired exactly once, and the listener observed the updated value
+        assert_eq!(*seen.lock().unwrap(), vec![vec![1, 2, 3]]);
     }
 }
