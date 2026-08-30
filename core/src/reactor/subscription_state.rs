@@ -1,13 +1,10 @@
-use crate::{
-    reactor::{
-        AbstractEntity, CandidateChanges, ChangeNotification, MembershipChange, ReactorSubscriptionId, ReactorUpdate, ReactorUpdateItem,
-        WatcherChange,
-    },
-    resultset::EntityResultSet,
-    selection::filter::{evaluate_predicate, Filterable},
+use crate::internal::prelude::*;
+use crate::reactor::{
+    AbstractEntity, CandidateChanges, ChangeNotification, MembershipChange, ReactorSubscriptionId, ReactorUpdate, ReactorUpdateItem,
+    WatcherChange,
 };
+use crate::selection::filter::{evaluate_predicate, Filterable};
 use ankql::ast::Resolved;
-use ankurah_proto::{self as proto};
 use futures::future;
 use indexmap::IndexMap;
 use std::{
@@ -98,10 +95,6 @@ struct State<E: AbstractEntity + Filterable, Ev> {
     // not sure if we actually need this
     pub(crate) entities: HashMap<proto::EntityId, E>,
     pub(crate) broadcast: ankurah_signals::broadcast::Broadcast<ReactorUpdate<E, Ev>>,
-    /// Invoked by a system reset after this subscription's results are
-    /// cleared: the owning query re-admits its name-form selection under
-    /// the new system.
-    pub(crate) reset_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static> Subscription<E, Ev> {
@@ -116,7 +109,6 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
                 entity_subscriptions: HashSet::new(),
                 entities: HashMap::new(),
                 broadcast,
-                reset_hook: None,
             }),
             watcher_set,
         }))
@@ -140,7 +132,9 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         state.queries.values().any(|q| q.resultset.contains_key(entity_id))
     }
 
-    /// System reset - clear all matching entities and notify
+    /// System reset - clear all matching entities and notify. Re-admitting
+    /// the owning queries under the new system is the node's live-query
+    /// registry's job, run after every subscription is cleared.
     pub fn system_reset(&self) {
         let state = &mut *self.state.lock().unwrap();
         let mut update_items: Vec<ReactorUpdateItem<E, Ev>> = Vec::new();
@@ -689,33 +683,60 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
 
 // Entity-specific methods for remote subscriptions
 impl Subscription<crate::entity::Entity, ankurah_proto::Attested<ankurah_proto::Event>> {
-    /// Register a query if absent, installing the caller's gap fetcher,
-    /// or return the already-registered query's resultset. Idempotent
-    /// per query id: for an existing query every argument except the id
-    /// is ignored and the provided fetcher is dropped.
+    /// Register a query if absent, installing the caller's gap fetcher, or
+    /// RESET an existing registration to a fresh baseline. A repeated
+    /// SubscribeQuery is a re-subscribe: the answer owed to the peer is a
+    /// function of ITS request (its known_matches), never of the resultset
+    /// retained from an earlier subscription -- a peer that reset holds
+    /// nothing, and diffing against yesterday's baseline would answer it
+    /// with nothing. The retained selection and its watchers are cleared so
+    /// the versioned update flow re-answers from scratch.
     pub fn register_or_get_query(
         &self,
         query_id: proto::QueryId,
         collection_id: proto::CollectionId,
         gap_fetcher: std::sync::Arc<dyn crate::reactor::fetch_gap::GapFetcher<crate::entity::Entity>>,
     ) -> EntityResultSet<crate::entity::Entity> {
-        let mut state = self.state.lock().unwrap();
+        let (resultset, stale) = {
+            let mut state = self.state.lock().unwrap();
 
-        use std::collections::hash_map::Entry;
-        match state.queries.entry(query_id) {
-            Entry::Vacant(v) => {
-                let resultset = EntityResultSet::empty();
-                v.insert(QueryState {
-                    collection_id,
-                    selection: None,
-                    gap_fetcher,
-                    paused: false,
-                    resultset: resultset.clone(),
-                    version: 0,
-                });
-                resultset
+            use std::collections::hash_map::Entry;
+            match state.queries.entry(query_id) {
+                Entry::Vacant(v) => {
+                    let resultset = EntityResultSet::empty();
+                    v.insert(QueryState {
+                        collection_id: collection_id.clone(),
+                        selection: None,
+                        gap_fetcher,
+                        paused: false,
+                        resultset: resultset.clone(),
+                        version: 0,
+                    });
+                    (resultset, None)
+                }
+                Entry::Occupied(mut o) => {
+                    let query_state = o.get_mut();
+                    let old_selection = query_state.selection.take();
+                    let old_ids: Vec<proto::EntityId> = query_state.resultset.keys().collect();
+                    query_state.resultset.clear();
+                    query_state.resultset.set_loaded(false);
+                    query_state.gap_fetcher = gap_fetcher;
+                    (query_state.resultset.clone(), old_selection.map(|selection| (selection, old_ids)))
+                }
             }
-            Entry::Occupied(o) => o.get().resultset.clone(),
+        };
+        // The stale selection's watchers go with its baseline, outside the
+        // state lock (same lock order as update_query).
+        if let Some((old_selection, old_ids)) = stale {
+            let mut watcher_set = self.watcher_set.lock().unwrap();
+            watcher_set.recurse_predicate_watchers(
+                &collection_id,
+                &old_selection.predicate,
+                (self.id, query_id),
+                crate::reactor::watcherset::WatcherOp::Remove,
+            );
+            watcher_set.cleanup_removed_predicate_watchers(self.id, query_id, &old_ids);
         }
+        resultset
     }
 }

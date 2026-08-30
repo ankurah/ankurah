@@ -8,6 +8,9 @@ use crate::selection::filter::Filterable;
 #[async_trait::async_trait]
 pub trait TNodeErased<E: AbstractEntity + Filterable + Send + 'static = Entity>: Send + Sync + 'static {
     fn unsubscribe_remote_predicate(&self, query_id: proto::QueryId);
+    /// Remove the query's entry from the node's live-query registry; a
+    /// dropping query calls this so the registry never outlives its owner.
+    fn unregister_live_query(&self, query_id: proto::QueryId);
     fn update_remote_query(
         &self,
         query_id: proto::QueryId,
@@ -50,6 +53,8 @@ where
             relay.unsubscribe_predicate(query_id);
         }
     }
+
+    fn unregister_live_query(&self, query_id: proto::QueryId) { self.0.live_queries.remove(&query_id); }
 
     fn resolve_selection(
         &self,

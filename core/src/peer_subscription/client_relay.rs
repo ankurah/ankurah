@@ -50,16 +50,25 @@ pub struct RemoteQueryState<CD: ContextData, Q: RemoteQuerySubscriber> {
     pub content: Arc<Content<CD>>,
     pub status: Status,
     pub livequery: Q,
+    /// Registration order, stamped at insert: the flush sends pending
+    /// queries in this order. QueryId ULIDs cannot carry it -- two queries
+    /// born in the same millisecond sort by their random component, which
+    /// reaches the wire as per-run message reordering.
+    pub seq: u64,
 }
 
 struct SubscriptionRelayInner<CD: ContextData, Q: RemoteQuerySubscriber> {
     // All subscription information in one place. A BTreeMap, not a HashMap:
-    // registration walks this map to decide which queries to send and in what
-    // order, and hash iteration order is randomized per process. That
-    // randomness reaches the wire, which the deterministic simulation harness
-    // detects as a nondeterminism leak (the same reason its own sets are
-    // ordered). QueryId is a ULID, so sorted order is also creation order.
+    // registration walks this map to decide which queries to send, and hash
+    // iteration order is randomized per process. That randomness reaches the
+    // wire, which the deterministic simulation harness detects as a
+    // nondeterminism leak (the same reason its own sets are ordered). Send
+    // ORDER does not come from the key -- QueryId ULIDs born in the same
+    // millisecond sort by their random component -- but from each entry's
+    // `seq`, stamped at registration.
     subscriptions: std::sync::Mutex<BTreeMap<proto::QueryId, RemoteQueryState<CD, Q>>>,
+    /// The registration-order stamp `RemoteQueryState::seq` draws from.
+    next_seq: std::sync::atomic::AtomicU64,
     // Track connected durable peers
     connected_peers: SafeSet<proto::EntityId>,
     // Node for communicating with remote peers
@@ -89,6 +98,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         let relay = Self {
             inner: Arc::new(SubscriptionRelayInner {
                 subscriptions: std::sync::Mutex::new(BTreeMap::new()),
+                next_seq: std::sync::atomic::AtomicU64::new(0),
                 connected_peers: SafeSet::new(),
                 node: OnceLock::new(),
                 _shutdown_tx: shutdown_tx,
@@ -128,6 +138,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                     content: Arc::new(Content { collection_id, selection, sessions, query_id, version }),
                     status: Status::PendingRemote,
                     livequery,
+                    seq: self.inner.next_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 },
             );
         }
@@ -361,9 +372,11 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
 
         let target_peer = connected_peers[0];
 
-        // Atomically get pending subscriptions and mark them as requested
+        // Atomically get pending subscriptions and mark them as requested,
+        // in registration order (see `RemoteQueryState::seq`).
         let pending: Vec<_> = {
-            self.inner
+            let mut pending: Vec<_> = self
+                .inner
                 .subscriptions
                 .lock()
                 .expect("poisoned lock")
@@ -371,12 +384,14 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                 .filter_map(|info| {
                     if let Status::PendingRemote = info.status {
                         info.status = Status::Requested(target_peer, info.content.version);
-                        Some(info.content.clone())
+                        Some((info.seq, info.content.clone()))
                     } else {
                         None
                     }
                 })
-                .collect()
+                .collect();
+            pending.sort_by_key(|(seq, _)| *seq);
+            pending.into_iter().map(|(_, content)| content).collect()
         };
 
         if pending.is_empty() {

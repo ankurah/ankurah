@@ -1,7 +1,21 @@
 //! What the commit paths admit for emission into the attested event stream.
 
 use crate::internal::prelude::*;
-use ankurah_proto::EventStructureError;
+use ankurah_proto::ModelId;
+
+/// An event the commit paths refuse to emit: it breaks a rule that binds
+/// every writer, credential or none.
+#[derive(Debug, thiserror::Error, PartialEq)]
+pub enum InadmissibleEvent {
+    #[error("membership changes after an entity's first event are not admissible")]
+    MembershipAfterGenesis,
+    #[error("an entity's first event must add exactly one membership, found {found}")]
+    GenesisMembershipCount { found: usize },
+    #[error("membership asserts model {asserted} but collection '{collection}' resolves to model {expected}")]
+    MembershipModelMismatch { asserted: ModelId, collection: CollectionId, expected: ModelId },
+    #[error("membership asserts model {asserted} but collection '{collection}' has no registered model")]
+    MembershipUnresolvedCollection { asserted: ModelId, collection: CollectionId },
+}
 
 /// An entity's first event must add exactly one membership, naming the model
 /// its collection resolves to; later events may add no memberships at all.
@@ -9,7 +23,7 @@ pub(crate) fn check_membership<SE, PA>(
     node: &Node<SE, PA>,
     schema: Option<&'static ModelStructDescriptor>,
     event: &proto::Event,
-) -> Result<(), EventStructureError>
+) -> Result<(), InadmissibleEvent>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
@@ -19,12 +33,12 @@ where
     if !event.is_entity_create() {
         return match memberships.next() {
             None => Ok(()),
-            Some(_) => Err(EventStructureError::MembershipAfterGenesis),
+            Some(_) => Err(InadmissibleEvent::MembershipAfterGenesis),
         };
     }
 
     let (Some(model), None) = (memberships.next(), memberships.next()) else {
-        return Err(EventStructureError::GenesisMembershipCount { found: event.operations().memberships().count() });
+        return Err(InadmissibleEvent::GenesisMembershipCount { found: event.operations().memberships().count() });
     };
 
     // Authority order: the built-in system mapping, then the declaration's
@@ -40,8 +54,8 @@ where
     match expected {
         Some(expected) if expected == model => Ok(()),
         Some(expected) => {
-            Err(EventStructureError::MembershipModelMismatch { asserted: model, collection: event.collection.clone(), expected })
+            Err(InadmissibleEvent::MembershipModelMismatch { asserted: model, collection: event.collection.clone(), expected })
         }
-        None => Err(EventStructureError::MembershipUnresolvedCollection { asserted: model, collection: event.collection.clone() }),
+        None => Err(InadmissibleEvent::MembershipUnresolvedCollection { asserted: model, collection: event.collection.clone() }),
     }
 }

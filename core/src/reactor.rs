@@ -16,17 +16,15 @@ pub(crate) use self::{
 // Re-export fetch_gap items
 pub(crate) use self::fetch_gap::GapFetcher;
 
-use crate::{
-    entity::Entity,
-    error::SubscriptionError,
-    indexing::{IndexDirection, IndexKeyPart, KeySpec, NullsOrder},
-    reactor::{subscription::ReactorSubInner, subscription_state::Subscription, watcherset::WatcherOp},
-    resultset::EntityResultSet,
-    selection::filter::Filterable,
-    value::{Value, ValueType},
-};
+use crate::error::SubscriptionError;
+use crate::indexing::{IndexDirection, IndexKeyPart, KeySpec, NullsOrder};
+use crate::internal::prelude::*;
+use crate::reactor::subscription::ReactorSubInner;
+use crate::reactor::subscription_state::Subscription;
+use crate::reactor::watcherset::WatcherOp;
+use crate::selection::filter::Filterable;
+use crate::value::{Value, ValueType};
 use ankql::ast::Resolved;
-use ankurah_proto::{self as proto};
 use futures::future::join_all;
 use std::{
     collections::{BTreeMap, HashMap},
@@ -538,6 +536,7 @@ mod tests {
     #[async_trait::async_trait]
     impl crate::node::TNodeErased<TestEntity> for MockNode {
         fn unsubscribe_remote_predicate(&self, _query_id: proto::QueryId) {}
+        fn unregister_live_query(&self, _query_id: proto::QueryId) {}
         fn update_remote_query(
             &self,
             _query_id: proto::QueryId,

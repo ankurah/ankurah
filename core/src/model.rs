@@ -1,10 +1,11 @@
 pub mod tsify;
 
+use crate::internal::prelude::*;
 use std::sync::Arc;
 
-use ankurah_proto::{CollectionId, EntityId, ModelId, State};
+use ankurah_proto::{EntityId, ModelId, State};
 
-use crate::entity::{Entity, ProvisionalEntity};
+use crate::entity::ProvisionalEntity;
 use crate::error::StateError;
 
 use crate::property::PropertyError;

@@ -1,10 +1,9 @@
+use crate::internal::prelude::*;
 use ankql::ast::{Parsed, Resolved};
 use std::{
     marker::PhantomData,
     sync::{Arc, Weak},
 };
-
-use ankurah_proto::{self as proto, CollectionId};
 
 use ankurah_signals::{
     broadcast::BroadcastId,
@@ -14,19 +13,10 @@ use ankurah_signals::{
 };
 use tracing::{debug, warn};
 
-use crate::{
-    changes::ChangeSet,
-    entity::Entity,
-    error::RetrievalError,
-    model::View,
-    node::{erased::ErasedNodeRef, MatchArgs, NodeType, TNodeErased},
-    policy::PolicyAgent,
-    reactor::{fetch_gap::GapFetcher, ReactorSubscription, ReactorUpdate},
-    resultset::{EntityResultSet, ResultSet},
-    session::SessionSet,
-    storage::StorageEngine,
-    Node,
-};
+use crate::node::erased::ErasedNodeRef;
+use crate::reactor::fetch_gap::GapFetcher;
+use crate::reactor::{ReactorSubscription, ReactorUpdate};
+use crate::resultset::ResultSet;
 
 mod registry;
 mod selection;
@@ -86,14 +76,11 @@ struct Inner {
 }
 
 /// Weak reference to EntityLiveQuery for breaking circular dependencies
+#[derive(Clone)]
 pub struct WeakEntityLiveQuery(Weak<Inner>);
 
 impl WeakEntityLiveQuery {
     pub fn upgrade(&self) -> Option<EntityLiveQuery> { self.0.upgrade().map(EntityLiveQuery) }
-}
-
-impl Clone for WeakEntityLiveQuery {
-    fn clone(&self) -> Self { Self(self.0.clone()) }
 }
 
 #[derive(Clone)]
@@ -108,35 +95,35 @@ impl Inner {
     fn node(&self) -> Option<Box<dyn TNodeErased>> { self.node.upgrade() }
 
     async fn wait_initialized(&self) -> Result<(), RetrievalError> {
-        // `notify_waiters` wakes the waiters REGISTERED at that instant and
-        // stores no permit, so this waiter registers (enable) BEFORE reading
-        // what it is waiting for. Reading first would lose an initialization
-        // -- or a failure -- that lands in between, and park for the
-        // lifetime of a query whose news has already come and gone.
-        let notified = self.initialized.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
+        loop {
+            // `notify_waiters` wakes the waiters REGISTERED at that instant
+            // and stores no permit, so this waiter registers (enable) BEFORE
+            // reading what it is waiting for. Reading first would lose an
+            // initialization -- or a failure -- that lands in between, and
+            // park for the lifetime of a query whose news has already come
+            // and gone.
+            let notified = self.initialized.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
 
-        // A failure ends initialization: it is not something more waiting
-        // will fix, so it is this call's answer whenever the slot holds one.
-        if let Some(error) = self.initialization_error() {
-            return Err(error);
-        }
+            // A failure ends initialization: it is not something more
+            // waiting will fix, so it is this call's answer whenever the
+            // slot holds one.
+            if let Some(error) = self.initialization_error() {
+                return Err(error);
+            }
 
-        // If already initialized, return immediately
-        if self.initialized_version.load(std::sync::atomic::Ordering::Relaxed)
-            >= self.current_version.load(std::sync::atomic::Ordering::Relaxed)
-        {
-            return Ok(());
-        }
+            // Initialized THROUGH the current version, not merely notified:
+            // a wake for an older version's initialization (a selection
+            // update or a reset bumped current_version in between) goes
+            // around again rather than answering early.
+            if self.initialized_version.load(std::sync::atomic::Ordering::Relaxed)
+                >= self.current_version.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Ok(());
+            }
 
-        // FIXME - this should be waiting for the correct version, not any version
-        // Otherwise wait for the notification
-        notified.await;
-
-        match self.initialization_error() {
-            Some(error) => Err(error),
-            None => Ok(()),
+            notified.await;
         }
     }
 
@@ -291,75 +278,6 @@ impl crate::reactor::PreNotifyHook for &InnerPreNotifyHook<'_> {
     }
 }
 
-/// Helper: create the Inner and set up initialization (shared by strong- and weak-node constructors)
-fn create_inner<SE, PA>(
-    node: &Node<SE, PA>,
-    node_ref: Box<dyn NodeRef>,
-    collection_id: CollectionId,
-    args: MatchArgs<Parsed>,
-    sessions: SessionSet<PA::ContextData>,
-) -> Result<(Arc<Inner>, proto::QueryId), RetrievalError>
-where
-    SE: StorageEngine + Send + Sync + 'static,
-    PA: PolicyAgent + Send + Sync + 'static,
-{
-    // One credential snapshot for the whole derivation; re-derivation
-    // on change arrives with https://github.com/ankurah/ankurah/pull/426.
-    let cdata = sessions.current();
-    node.policy_agent.can_access_collection(&cdata, &collection_id)?;
-    // Bind every property name to its durable identity and canonicalize
-    // comparison values, then let the policy narrow what came back: the
-    // agent ANDs its own conditions in in the same resolved vocabulary the
-    // reactor and the relay consume.
-    let mut selection = node.catalog.resolve_selection(&collection_id, args.selection)?;
-    selection.predicate = node.policy_agent.filter_predicate(&cdata, &collection_id, selection.predicate)?;
-
-    let subscription = node.reactor.subscribe();
-
-    let resultset = EntityResultSet::empty();
-    let query_id = proto::QueryId::new();
-    let gap_fetcher: std::sync::Arc<dyn GapFetcher<Entity>> = std::sync::Arc::new(QueryGapFetcher::new(&node, sessions));
-
-    let inner = Arc::new(Inner {
-        query_id,
-        node: node_ref,
-        subscription,
-        resultset: resultset.clone(),
-        error: Mut::new(None),
-        initialized: tokio::sync::Notify::new(),
-        initialized_version: std::sync::atomic::AtomicU32::new(0), // 0 means uninitialized
-        current_version: std::sync::atomic::AtomicU32::new(1),     // Start at version 1
-        selection: Mut::new((selection, 1)),                       // Start with version 1
-        collection_id: collection_id.clone(),
-        gap_fetcher,
-    });
-
-    // Check if this is a durable node (no relay) or ephemeral node (has relay)
-    let has_relay = node.subscription_relay.is_some();
-
-    if args.cached || !has_relay {
-        // Durable node: spawn initialization task directly (no remote subscription needed)
-        let inner2 = inner.clone();
-
-        debug!("LiveQuery::new() spawning initialization task for durable node predicate {}", query_id);
-        crate::task::spawn(async move {
-            debug!("LiveQuery initialization task starting for predicate {}", query_id);
-            if let Err(e) = inner2.activate(1).await {
-                debug!("LiveQuery initialization failed for predicate {}: {}", query_id, e);
-                inner2.error.set(Some(e));
-                // Initialization is over, unsuccessfully: wake waiters so
-                // wait_initialized returns instead of hanging on a query
-                // that will never activate. The error slot carries why.
-                inner2.initialized.notify_waiters();
-            } else {
-                debug!("LiveQuery initialization completed for predicate {}", query_id);
-            }
-        });
-    }
-
-    Ok((inner, query_id))
-}
-
 impl EntityLiveQuery {
     pub fn new<SE, PA>(
         node: &Node<SE, PA>,
@@ -372,10 +290,9 @@ impl EntityLiveQuery {
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
-        let node_ref: Box<dyn NodeRef> = Box::new(StrongNodeRef(Arc::clone(&node.0)));
-        Self::new_with_node_ref(node, node_ref, schema, collection_id, args, sessions.into(), RemoteSubscription::AtStart)
+        let node_ref: Box<dyn ErasedNodeRef> = Box::new(NodeType::Strong(node.clone()));
+        Self::new_with_node_ref(node, node_ref, schema, collection_id, args, sessions.into())
     }
-
 
     /// Create a LiveQuery that does NOT keep the node alive.
     ///
@@ -386,6 +303,7 @@ impl EntityLiveQuery {
     /// once the node is gone.
     pub fn new_weak_node<SE, PA>(
         node: &Node<SE, PA>,
+        schema: Option<&'static crate::schema::ModelStructDescriptor>,
         collection_id: CollectionId,
         args: MatchArgs<Parsed>,
         sessions: impl Into<SessionSet<PA::ContextData>>,
@@ -394,13 +312,24 @@ impl EntityLiveQuery {
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
-        let node_ref: Box<dyn NodeRef> = Box::new(WeakNodeRefImpl(Arc::downgrade(&node.0)));
-        Self::new_with_node_ref(node, node_ref, None, collection_id, args, sessions.into(), RemoteSubscription::AtStart)
+        let node_ref: Box<dyn ErasedNodeRef> = Box::new(NodeType::Weak(node.weak()));
+        Self::new_with_node_ref(node, node_ref, schema, collection_id, args, sessions.into())
     }
 
+    /// The one construction path: admit the selection, build the inner, and
+    /// set the query running. `schema` distinguishes a typed entry (names
+    /// bind through the compiled declaration's cells) from a raw one (names
+    /// bind through the catalog's current display names); the node reference
+    /// distinguishes a query that keeps its node alive from one that does
+    /// not. An admission failure is this call's error, never a query that
+    /// will never populate.
+    ///
+    /// Two cases cannot be judged synchronously and finish admitting in a
+    /// spawned task instead ([`DeferredAdmission`]), failures landing in the
+    /// error slot.
     fn new_with_node_ref<SE, PA>(
         node: &Node<SE, PA>,
-        node_ref: Box<dyn NodeRef>,
+        node_ref: Box<dyn ErasedNodeRef>,
         schema: Option<&'static crate::schema::ModelStructDescriptor>,
         collection_id: CollectionId,
         args: MatchArgs<Parsed>,
@@ -410,28 +339,92 @@ impl EntityLiveQuery {
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
-        let has_relay = node.subscription_relay.is_some();
-        let (inner, query_id) = create_inner(node, node_ref, collection_id.clone(), args, sessions.clone())?;
+        let MatchArgs { selection, cached } = args;
+        let parsed_input = selection.clone();
+        // Binding is what the synchronous judgment rests on: a typed entry
+        // whose declaration binds admits inline, and a raw entry admits
+        // inline whenever it can (a name-free selection needs no catalog at
+        // all). What cannot be judged now defers; an admission failure on a
+        // synced catalog is the caller's error, here and now.
+        let admission: Result<ankql::ast::Selection<Resolved>, DeferredAdmission> = match schema {
+            Some(schema) => match admit(node, &sessions, Some(schema), &collection_id, selection.clone()) {
+                Err(RetrievalError::UnboundDeclaration { .. }) => Err(DeferredAdmission::Typed(schema, selection)),
+                result => Ok(result?),
+            },
+            None => match admit(node, &sessions, None, &collection_id, selection.clone()) {
+                Err(_) if !node.catalog.is_synced() => Err(DeferredAdmission::Raw(selection)),
+                result => Ok(result?),
+            },
+        };
 
+        let (inner, _query_id) = create_inner(node, node_ref, schema, parsed_input, collection_id, None, sessions.clone());
         let me = Self(inner.clone());
 
-        // Ephemeral node: register with relay for remote subscription
-        // Remote will call activate() after applying deltas via subscription_established
-        if has_relay {
-            node.subscribe_remote_query(query_id, collection_id, inner.selection.value().0, sessions, 1, me.weak());
-        }
+        // The node's registry holds this query for its whole life: weakly,
+        // so registration never extends it. Enumeration reads the registry,
+        // and a system reset sweeps it -- re-admitting the retained
+        // name-form input under the new system. Removed on `Inner::drop`.
+        node.live_queries.insert(
+            inner.query_id,
+            RegistryEntry { query: me.weak(), collection: inner.collection_id.clone(), sessions: sessions.clone(), node: node.weak() },
+        );
+
+        let deferred = match admission {
+            Ok(selection) => {
+                start_admitted(&inner, node, &me, selection, cached, sessions);
+                return Ok(me);
+            }
+            Err(deferred) => deferred,
+        };
+
+        // The task holds neither the query nor the node: a caller who drops
+        // the query before admission finishes has abandoned it, and this
+        // background work must not be what keeps either alive.
+        let (weak_inner, weak_node) = (Arc::downgrade(&inner), node.weak());
+        crate::task::spawn(async move {
+            let Some(inner) = weak_inner.upgrade() else { return };
+            let Some(node) = weak_node.upgrade() else {
+                inner.fail_initialization(RetrievalError::Other("Node has been dropped".into()));
+                return;
+            };
+            let admitted = match deferred {
+                DeferredAdmission::Typed(unbound, selection) => match crate::context::register_for_read(&node, &sessions, unbound).await {
+                    Ok(()) => admit(&node, &sessions, Some(unbound), &inner.collection_id, selection),
+                    Err(error) => Err(error),
+                },
+                DeferredAdmission::Raw(selection) => match node.catalog.wait_synced().await {
+                    Ok(()) => admit(&node, &sessions, None, &inner.collection_id, selection),
+                    Err(error) => Err(error),
+                },
+            };
+            match admitted {
+                Ok(selection) => {
+                    let me = Self(inner.clone());
+                    start_admitted(&inner, &node, &me, selection, cached, sessions);
+                }
+                Err(error) => inner.fail_initialization(error),
+            }
+        });
 
         Ok(me)
     }
     pub fn map<R: View>(self) -> LiveQuery<R> { LiveQuery(self, PhantomData) }
 
-    /// The initialization/admission failure, if one occurred, rendered as a
-    /// message. Waking from [`Self::wait_initialized`] with this set means
-    /// the query will never populate.
-    pub fn error_message(&self) -> Option<String> { self.0.error.with(|e| e.as_ref().map(|e| e.to_string())) }
+    /// Wait for the LiveQuery to be fully initialized with initial states.
+    /// An initialization that failed is this call's error: the query will
+    /// never populate, and waiting longer would not change that.
+    pub async fn wait_initialized(&self) -> Result<(), RetrievalError> { self.0.wait_initialized().await }
 
-    /// Wait for the LiveQuery to be fully initialized with initial states
-    pub async fn wait_initialized(&self) { self.0.wait_initialized().await; }
+    /// Wait for a durable authority to have answered this query's current
+    /// selection version: the relay's confirmation that a peer took the
+    /// subscription and its rows are applied. See
+    /// [`Inner::wait_durable_answered`] for what that adds to
+    /// initialization, and what it means on a query with no relay.
+    pub async fn wait_durable_answered(&self) -> Result<(), RetrievalError> { self.0.wait_durable_answered().await }
+
+    /// Whether a durable authority has answered the current selection
+    /// version. The synchronous probe behind [`Self::wait_durable_answered`].
+    pub(crate) fn is_durable_answered(&self) -> bool { self.0.is_durable_answered() }
 
     pub fn update_selection(
         &self,
@@ -443,38 +436,77 @@ impl EntityLiveQuery {
         // A replacement selection arrives as a parsed string, below the
         // typed entries: bind its names through the catalog before anything
         // stores or forwards it -- the reactor and the relay consume
-        // resolved selections only. (Policy re-injection on replacement is
-        // a recorded gap, tracked with the update_selection admission
-        // issue.)
-        let new_selection = node.resolve_selection(&self.0.collection_id, new_selection)?;
+        // resolved selections only. A resolution failure on a synced catalog
+        // is the caller's error, here and now; one before the catalog has
+        // synced is not yet authoritative, so the update defers behind the
+        // sync and a real failure reports through the error slot. (Policy
+        // re-injection on replacement is a recorded gap, tracked with the
+        // update_selection admission issue.)
+        match node.resolve_selection(&self.0.collection_id, new_selection.clone()) {
+            Ok(resolved) => {
+                let new_version = self.0.current_version.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                self.0.resultset.set_loaded(false);
+                self.0.parsed.set(new_selection);
+                self.install_selection_update(node, resolved, new_version)
+            }
+            Err(error) if node.is_catalog_synced() => Err(error),
+            Err(_) => {
+                // The version is assigned NOW, so update_selection_wait
+                // waits for this update rather than being satisfied by the
+                // previous version's initialization.
+                let new_version = self.0.current_version.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                self.0.resultset.set_loaded(false);
+                self.0.parsed.set(new_selection.clone());
+                let weak = self.weak();
+                crate::task::spawn(async move {
+                    let Some(me) = weak.upgrade() else { return };
+                    let Some(node) = me.0.node() else {
+                        me.0.fail_initialization(RetrievalError::Other("Node has been dropped".into()));
+                        return;
+                    };
+                    let installed = match node.wait_catalog_synced().await {
+                        Ok(()) => node
+                            .resolve_selection(&me.0.collection_id, new_selection)
+                            .and_then(|resolved| me.install_selection_update(node, resolved, new_version)),
+                        Err(error) => Err(error),
+                    };
+                    if let Err(error) = installed {
+                        me.0.fail_initialization(error);
+                    }
+                });
+                Ok(())
+            }
+        }
+    }
 
-        // Increment current_version atomically and get the new version number
-        let new_version = self.0.current_version.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    /// Install an already-resolved replacement selection under its assigned
+    /// version and set it running for this node kind.
+    fn install_selection_update(
+        &self,
+        node: Box<dyn TNodeErased>,
+        new_selection: ankql::ast::Selection<Resolved>,
+        new_version: u32,
+    ) -> Result<(), RetrievalError> {
+        self.0.selection.set(Some((new_selection.clone(), new_version)));
 
-        // Mark resultset as not loaded since we're changing the selection
-        self.0.resultset.set_loaded(false);
-
-        // Store new selection and version
-        self.0.selection.set((new_selection.clone(), new_version));
-
-        // Check if this node has a relay (ephemeral) or not (durable)
-        let has_relay = node.has_subscription_relay();
-
-        if has_relay {
-            // Ephemeral node: delegate to relay, which will call update_selection_init after applying deltas
-            node.update_remote_query(self.0.query_id, new_selection.clone(), new_version)?;
+        if node.has_subscription_relay() {
+            // Ephemeral node: delegate to relay; its established callback
+            // activates this version and marks its durable answer.
+            node.update_remote_query(self.0.query_id, new_selection, new_version)?;
         } else {
-            // Durable node: spawn task to call update_selection_init directly
+            // Durable node: activate directly. Its own storage is the
+            // authority, so success answers this version durably too.
             let inner = self.0.clone();
             let query_id = self.0.query_id;
-
             crate::task::spawn(async move {
-                if let Err(e) = inner.activate(new_version).await {
-                    tracing::error!("LiveQuery update failed for predicate {}: {}", query_id, e);
-                    inner.error.set(Some(e));
-                    // Wake update_selection_wait: the update is over,
-                    // unsuccessfully, and the error slot carries why.
-                    inner.initialized.notify_waiters();
+                match inner.activate(new_version).await {
+                    Ok(()) => inner.mark_durable_answered(new_version),
+                    Err(e) => {
+                        tracing::error!("LiveQuery update failed for predicate {}: {}", query_id, e);
+                        // Wakes update_selection_wait: the update is over,
+                        // unsuccessfully, and the error slot carries why.
+                        inner.fail_initialization(e);
+                    }
                 }
             });
         }
@@ -487,13 +519,14 @@ impl EntityLiveQuery {
         new_selection: impl TryInto<ankql::ast::Selection<Parsed>, Error = impl Into<RetrievalError>>,
     ) -> Result<(), RetrievalError> {
         self.update_selection(new_selection)?;
-        self.0.wait_initialized().await;
-        Ok(())
+        self.0.wait_initialized().await
     }
 
     pub fn error(&self) -> Read<Option<RetrievalError>> { self.0.error.read() }
     pub fn query_id(&self) -> proto::QueryId { self.0.query_id }
-    pub fn selection(&self) -> Read<(ankql::ast::Selection<Resolved>, u32)> { self.0.selection.read() }
+    /// The admitted selection and its version, or `None` while a typed
+    /// query's admission is still running.
+    pub fn selection(&self) -> Read<Option<(ankql::ast::Selection<Resolved>, u32)>> { self.0.selection.read() }
     pub fn resultset(&self) -> EntityResultSet { self.0.resultset.clone() }
 
     /// Create a weak reference to this LiveQuery
@@ -504,6 +537,7 @@ impl Drop for Inner {
     fn drop(&mut self) {
         if let Some(node) = self.node.upgrade() {
             node.unsubscribe_remote_predicate(self.query_id);
+            node.unregister_live_query(self.query_id);
         }
     }
 }
@@ -517,9 +551,20 @@ impl crate::peer_subscription::RemoteQuerySubscriber for WeakEntityLiveQuery {
             // Activate the query (fetch entities, call reactor, and mark initialized)
             // Handle errors internally by setting last_error
             tracing::debug!("Subscription established for query {}: {}", inner.query_id, version);
-            if let Err(e) = inner.activate(version).await {
-                tracing::error!("Failed to activate subscription for query {}: {}", inner.query_id, e);
-                inner.error.set(Some(e));
+            match inner.activate(version).await {
+                // The peer's rows are applied and the query has run over
+                // them: this is the durable answer, and what anyone waiting
+                // for confirmed freshness is waiting for.
+                Ok(()) => inner.mark_durable_answered(version),
+                Err(e) => {
+                    tracing::error!("Failed to activate subscription for query {}: {}", inner.query_id, e);
+                    // This was the query's initialization on an ephemeral node
+                    // -- the relay established the subscription and handed it
+                    // here -- so a failure ends it, and everyone waiting must
+                    // hear that rather than wait out a query that will never
+                    // populate.
+                    inner.fail_initialization(e);
+                }
             }
         }
         // If upgrade fails, the LiveQuery was already dropped - nothing to do
@@ -529,15 +574,19 @@ impl crate::peer_subscription::RemoteQuerySubscriber for WeakEntityLiveQuery {
         // Try to upgrade the weak reference
         if let Some(inner) = self.0.upgrade() {
             tracing::info!("Setting last error for LiveQuery {}: {}", inner.query_id, error);
-            inner.error.set(Some(error));
+            // The relay reports a PERMANENT failure here (a retryable one goes
+            // back to pending instead), so nothing further will initialize
+            // this query and its waiters are owed the news.
+            inner.fail_initialization(error);
         }
         // If upgrade fails, the LiveQuery was already dropped - nothing to do
     }
 }
 
 impl<R: View> LiveQuery<R> {
-    /// Wait for the LiveQuery to be fully initialized with initial states
-    pub async fn wait_initialized(&self) { self.0.wait_initialized().await; }
+    /// Wait for the LiveQuery to be fully initialized with initial states.
+    /// An initialization that failed is this call's error.
+    pub async fn wait_initialized(&self) -> Result<(), RetrievalError> { self.0.wait_initialized().await }
 
     pub fn resultset(&self) -> ResultSet<R> { self.0 .0.resultset.wrap::<R>() }
 

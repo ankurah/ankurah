@@ -79,6 +79,10 @@ pub trait TContext {
         selection: ankql::ast::Selection<Parsed>,
     ) -> Result<ankql::ast::Selection<Resolved>, RetrievalError>;
 
+    /// Gate a resolved registration plan on this context's write credential,
+    /// before the executor commits anything.
+    fn check_schema_registration(&self, plan: &crate::schema::registration::RegistrationPlan) -> Result<(), AccessDenied>;
+
     fn node_id(&self) -> proto::EntityId;
     /// This node's system root entity id, which every non-root genesis binds
     /// into its own id. `None` before the node has created or joined a system.
@@ -115,19 +119,80 @@ pub trait TContext {
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError>;
 }
 
+/// Admit a compiled declaration for reading, as the one principal
+/// `sessions` names: a built-in or an already-bound declaration needs no
+/// credential, and anything else this system has not been told about is
+/// registered here. A credential that may not register says exactly that,
+/// rather than reporting the model as unknown.
+pub(crate) async fn register_for_read<SE, PA>(
+    node: &Node<SE, PA>,
+    sessions: &crate::session::SessionSet<PA::ContextData>,
+    schema: &'static crate::schema::ModelStructDescriptor,
+) -> Result<(), RetrievalError>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    if schema.system.is_some() || node.system.schema_epoch().and_then(|epoch| schema.resolved.get(epoch)).is_some() {
+        return Ok(());
+    }
+    let may_not_register = |refusal: &dyn std::fmt::Display| {
+        RetrievalError::Other(format!(
+            "model '{}' is not registered in this system, and this credential may not register it: {refusal}",
+            schema.label
+        ))
+    };
+    let cdata = sessions.write_credential().map_err(|denied| may_not_register(&denied))?;
+    node.catalog.ensure_schema_for_use(node, &cdata, schema).await.map(|_| ()).map_err(|error| match error {
+        crate::schema::registration::RegistrationError::PolicyDenied(denied) => may_not_register(&denied),
+        other => other.into(),
+    })
+}
+
 #[async_trait]
 impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> TContext for NodeAndContext<SE, PA> {
     async fn ensure_registered(
         &self,
         schema: &'static crate::schema::ModelStructDescriptor,
     ) -> Result<(proto::ModelId, crate::schema::SchemaEpoch), crate::schema::registration::RegistrationError> {
-        // Registration acts as one principal, like every write path.
         let node = self.node().map_err(crate::schema::registration::RegistrationError::Retrieval)?;
-        node.catalog.ensure_schema_for_use(&self.sessions.write_credential()?, schema).await
+        // A built-in is already resolved at every epoch, including the
+        // bootstrap epoch a pre-system node stamps its entities with; no
+        // credential and no auth arm involved.
+        if let Some(system) = schema.system {
+            return Ok((proto::ModelId::System(system), node.system.schema_epoch().unwrap_or(crate::schema::SchemaEpoch::BOOTSTRAP)));
+        }
+        match &self.auth {
+            // Registration acts as one principal, like every write path.
+            ContextAuth::Sessions(sessions) => node.catalog.ensure_schema_for_use(&node, &sessions.write_credential()?, schema).await,
+            // The privileged context has no principal to register models as:
+            // an already-bound declaration rides its resolved cells, and
+            // anything else has nobody to ask.
+            ContextAuth::Privileged => {
+                let epoch = node.system.schema_epoch().ok_or(crate::schema::registration::RegistrationError::SystemNotReady)?;
+                match schema.resolved.get(epoch) {
+                    Some(model) => Ok((model, epoch)),
+                    None => Err(AccessDenied::ByPolicy("the privileged context has no principal to register models as").into()),
+                }
+            }
+        }
     }
 
     async fn bind_or_register(&self, schema: &'static crate::schema::ModelStructDescriptor) -> Result<(), RetrievalError> {
-        self.node()?.catalog.bind_or_register(&self.sessions, schema).await.map(|_| ())
+        match &self.auth {
+            ContextAuth::Sessions(sessions) => {
+                let node = self.node()?;
+                register_for_read(node.as_ref(), sessions, schema).await
+            }
+            ContextAuth::Privileged => {
+                let node = self.node()?;
+                if schema.system.is_some() || node.system.schema_epoch().and_then(|epoch| schema.resolved.get(epoch)).is_some() {
+                    Ok(())
+                } else {
+                    Err(AccessDenied::ByPolicy("the privileged context has no principal to register models as").into())
+                }
+            }
+        }
     }
 
     fn resolve_selection_with_descriptor(
@@ -135,7 +200,18 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         schema: &'static crate::schema::ModelStructDescriptor,
         selection: ankql::ast::Selection<Parsed>,
     ) -> Result<ankql::ast::Selection<Resolved>, RetrievalError> {
-        self.node()?.catalog.resolve_selection_with_descriptor(schema, selection)
+        let node = self.node()?;
+        node.catalog.resolve_selection_with_descriptor(&node, schema, selection)
+    }
+
+    fn check_schema_registration(&self, plan: &crate::schema::registration::RegistrationPlan) -> Result<(), AccessDenied> {
+        let node = self.node.upgrade().ok_or(AccessDenied::NodeDropped)?;
+        match &self.auth {
+            ContextAuth::Sessions(sessions) => {
+                node.policy_agent.check_schema_registration(node.as_ref(), &sessions.write_credential()?, plan)
+            }
+            ContextAuth::Privileged => Ok(()),
+        }
     }
 
     fn node_id(&self) -> proto::EntityId { self.node.node_id() }
@@ -152,7 +228,13 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     }
     fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied> {
         let node = self.node.upgrade().ok_or(AccessDenied::NodeDropped)?;
-        node.policy_agent.check_write(&self.sessions.write_credential()?, entity, None)
+        match &self.auth {
+            ContextAuth::Sessions(_) if crate::schema::is_reserved_collection(entity.collection()) => {
+                Err(AccessDenied::ByPolicy("reserved collections accept writes only from the node's privileged context"))
+            }
+            ContextAuth::Sessions(sessions) => node.policy_agent.check_write(&sessions.write_credential()?, entity, None),
+            ContextAuth::Privileged => Ok(()),
+        }
     }
     async fn get_entity(&self, id: proto::EntityId, collection: &proto::CollectionId, cached: bool) -> Result<Entity, RetrievalError> {
         self.get_entity(collection, id, cached).await
@@ -173,8 +255,12 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         }
 
         // One credential snapshot for the whole commit: a session update
-        // mid-commit must not mix credentials across its phases.
-        let cdata = self.sessions.write_credential()?;
+        // mid-commit must not mix credentials across its phases. A privileged
+        // commit has no principal: the PolicyAgent holds no voice over it.
+        let cdata = match &self.auth {
+            ContextAuth::Sessions(sessions) => Some(sessions.write_credential()?),
+            ContextAuth::Privileged => None,
+        };
 
         // Generate the causally ordered event sequence for each transaction
         // entity. A created entity contributes its already-frozen genesis
@@ -187,7 +273,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         let mut seen_created = std::collections::HashSet::new();
         for entity in trx.entities.iter() {
             let mut events = Vec::with_capacity(2);
-            if let Some(genesis) = genesis_events.get(&entity.id) {
+            if let Some((genesis, schema)) = genesis_events.get(&entity.id) {
                 // The genesis is this node's own mint, but it passed through
                 // the transaction between minting and here; re-check the
                 // whole of what makes it admissible rather than trusting it,
@@ -205,19 +291,17 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
                 if entity.head() != Clock::new([genesis.id()]) {
                     return Err(MutationError::CommitInvariant("the created entity's head is not exactly its frozen genesis"));
                 }
+                // Membership admissibility, mirrored on the remote funnel
+                // (commit_remote_transaction).
+                check_membership(&node, Some(schema), genesis)?;
                 events.push(genesis.clone());
             }
 
             // An entity with an empty head and no frozen genesis is a
             // phantom: never created here, so it has nothing to extend.
             if let Some(event) = entity.generate_commit_event(proto::AuthorId::Unknown)? {
+                check_membership(&node, None, &event)?;
                 events.push(event);
-            }
-
-            // Membership admissibility is a commit-path gate, mirrored on
-            // the remote funnel (commit_remote_transaction).
-            for event in &events {
-                node.check_membership_admissibility(event)?;
             }
 
             if !events.is_empty() {
@@ -240,6 +324,12 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         // in order: empty, then genesis, then the optional update.
         for (entity, events) in entity_events {
             use std::sync::atomic::AtomicBool;
+            // Write confinement, enforced on every commit (staging through
+            // get() never ran check_write): sessions never write reserved
+            // collections.
+            if matches!(&self.auth, ContextAuth::Sessions(_)) && crate::schema::is_reserved_collection(entity.collection()) {
+                return Err(AccessDenied::ByPolicy("reserved collections accept writes only from the node's privileged context").into());
+            }
             let validation_alive = Arc::new(AtomicBool::new(true));
 
             // Get the canonical (upstream) entity for before state
@@ -258,7 +348,10 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
                 let entity_after = entity_before.snapshot(validation_alive.clone());
                 entity_after.apply_event(&event_getter, &event).await?;
 
-                let attestation = node.policy_agent.check_event(node.as_ref(), &cdata, &entity_before, &entity_after, &event)?;
+                let attestation = match &cdata {
+                    Some(cdata) => node.policy_agent.check_event(node.as_ref(), cdata, &entity_before, &entity_after, &event)?,
+                    None => None,
+                };
                 let attested = Attested::opt(event, attestation);
 
                 attested_events.push(attested.clone());
@@ -283,8 +376,13 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
                 entity.commit_head(Clock::new([last.payload.id()]));
             }
         }
-        // Relay to peers and wait for confirmation
-        node.relay_to_required_peers(&cdata, trx_id, &attested_events).await?;
+        // Relay to peers and wait for confirmation. A privileged commit never
+        // relays: its events route to the reserved catalog collections, which
+        // a peer's CommitTransaction handler refuses, and peers take the
+        // catalog through their catalog subscriptions instead.
+        if let Some(cdata) = &cdata {
+            node.relay_to_required_peers(cdata, trx_id, &attested_events).await?;
+        }
 
         // All peers confirmed, persist state to storage
         let mut changes: Vec<EntityChange> = Vec::new();
@@ -327,7 +425,20 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         collection_id: proto::CollectionId,
         args: MatchArgs<Parsed>,
     ) -> Result<EntityLiveQuery, RetrievalError> {
-        EntityLiveQuery::new(self.node()?.as_ref(), Some(schema), collection_id, args, self.sessions.clone())
+        // The query's node-liveness follows the context's: a weak context
+        // (the catalog's own projection) must not create queries that keep
+        // the node alive through itself.
+        let sessions = match &self.auth {
+            ContextAuth::Sessions(sessions) => sessions.clone(),
+            ContextAuth::Privileged => return Err(RetrievalError::Other("the privileged context does not query".into())),
+        };
+        match &self.node {
+            NodeType::Strong(node) => EntityLiveQuery::new(node, Some(schema), collection_id, args, sessions),
+            NodeType::Weak(_) => {
+                let node = self.node()?;
+                EntityLiveQuery::new_weak_node(node.as_ref(), Some(schema), collection_id, args, sessions)
+            }
+        }
     }
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
         self.node()?.system.collection(id).await
@@ -365,6 +476,12 @@ impl Context {
 }
 
 impl Context {
+    pub(crate) fn check_schema_registration(&self, plan: &crate::schema::registration::RegistrationPlan) -> Result<(), AccessDenied> {
+        self.0.check_schema_registration(plan)
+    }
+}
+
+impl Context {
     /// Type-erased query and transaction initiation context
     pub fn new<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static>(
         node: Node<SE, PA>,
@@ -375,7 +492,7 @@ impl Context {
         // it the continuous superset of every session backing a context
         // (a no-op when the source IS the registry).
         node.sessions.attach(&sessions);
-        Self(Arc::new(NodeAndContext { node: NodeType::Strong(node), sessions }))
+        Self(Arc::new(NodeAndContext { node: NodeType::Strong(node), auth: ContextAuth::Sessions(sessions) }))
     }
 
     /// A context that does NOT keep the node alive, for node-owned machinery
@@ -386,7 +503,17 @@ impl Context {
     ) -> Self {
         let sessions = sessions.into();
         node.sessions.attach(&sessions);
-        Self(Arc::new(NodeAndContext { node: NodeType::Weak(node.weak()), sessions }))
+        Self(Arc::new(NodeAndContext { node: NodeType::Weak(node.weak()), auth: ContextAuth::Sessions(sessions) }))
+    }
+
+    /// The node's own context, minted only by the local node for internal
+    /// use -- in practice the system and catalog tables. Carries no
+    /// principal: the PolicyAgent is never consulted, and commits stay
+    /// local.
+    pub(crate) fn new_privileged<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static>(
+        node: Node<SE, PA>,
+    ) -> Self {
+        Self(Arc::new(NodeAndContext { node: NodeType::Strong(node), auth: ContextAuth::Privileged }))
     }
 
     pub fn node_id(&self) -> proto::EntityId { self.0.node_id() }
@@ -508,7 +635,10 @@ where
     ) -> Result<Entity, RetrievalError> {
         let node = self.node()?;
         debug!("Node({}).get_entity {:?}-{:?}", node.id, id, collection_id);
-        let cdata = self.sessions.current();
+        let cdata = match &self.auth {
+            ContextAuth::Sessions(sessions) => sessions.current(),
+            ContextAuth::Privileged => Vec::new(),
+        };
 
         if !node.durable {
             // Fetch from peers and commit first response
@@ -521,8 +651,9 @@ where
             }
         }
 
-        // Catalog reads never consult the agent (crate::schema::reads_bypass_policy).
-        let exempt = crate::schema::reads_bypass_policy(collection_id);
+        // Catalog reads never consult the agent (crate::schema::reads_bypass_policy),
+        // and neither does the node's own privileged context.
+        let exempt = matches!(&self.auth, ContextAuth::Privileged) || crate::schema::reads_bypass_policy(collection_id);
 
         if let Some(local) = node.entities.get(&id) {
             debug!("Node({}).get_entity found local entity - returning", node.id);
@@ -557,9 +688,13 @@ where
         // one policy world, or a mid-operation refresh yields a
         // composite no single credential authorized.
         let node = self.node()?;
-        let cdata = self.sessions.current();
-        // Catalog reads never consult the agent (crate::schema::reads_bypass_policy).
-        if !crate::schema::reads_bypass_policy(collection_id) {
+        let cdata = match &self.auth {
+            ContextAuth::Sessions(sessions) => sessions.current(),
+            ContextAuth::Privileged => Vec::new(),
+        };
+        // Catalog reads never consult the agent (crate::schema::reads_bypass_policy),
+        // and neither does the node's own privileged context.
+        if !matches!(&self.auth, ContextAuth::Privileged) && !crate::schema::reads_bypass_policy(collection_id) {
             node.policy_agent.can_access_collection(&cdata, collection_id)?;
             // The selection arrives resolved (its names bound where the query
             // entered), and the policy narrows it in the same vocabulary: what
@@ -579,7 +714,7 @@ where
             // Convert states to entities
             let mut entities = Vec::new();
             let state_getter = crate::retrieval::LocalStateGetter::new(storage_collection.clone());
-            let event_getter = CachedEventGetter::new(collection_id.clone(), storage_collection, &node, &cdata);
+            let event_getter = CachedEventGetter::new(collection_id.clone(), storage_collection, node.as_ref(), &cdata);
             for state in states {
                 let (_, entity) = node
                     .entities
@@ -617,11 +752,11 @@ where
         {
             proto::NodeResponseBody::Fetch(deltas) => {
                 let collection = node.collections.get(collection_id).await?;
-                let event_getter = CachedEventGetter::new(collection_id.clone(), collection.clone(), &node, cdata);
+                let event_getter = CachedEventGetter::new(collection_id.clone(), collection.clone(), node.as_ref(), cdata);
                 let state_getter = crate::retrieval::LocalStateGetter::new(collection);
 
                 // 3. Apply deltas to local storage using NodeApplier
-                crate::node_applier::NodeApplier::apply_deltas(&node, &peer_id, deltas, &event_getter, &state_getter).await?;
+                crate::node::applier::NodeApplier::apply_deltas(node.as_ref(), &peer_id, deltas, &event_getter, &state_getter).await?;
                 // ARCHITECTURAL QUESTION: Optimize in-place mutation vs re-fetching for remote-peer-assisted operations https://github.com/ankurah/ankurah/issues/145
 
                 // 4. Re-fetch entities from local storage after applying deltas

@@ -85,19 +85,31 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
     /// it created, never one an earlier subscribe established. The
     /// per-query set owns exactly one session by construction; the loop is
     /// just how that member is reached.
-    fn sync_session(&self, query_id: proto::QueryId, cdata: &CD) -> (SessionSet<CD>, bool) {
+    ///
+    /// A catalog subscribe conveys NO credential, and its reconstitution is
+    /// correspondingly empty: there is no principal to record, and the reads
+    /// it serves never consult the agent anyway.
+    fn sync_session(&self, query_id: proto::QueryId, cdata: Option<&CD>) -> (SessionSet<CD>, bool) {
         use std::collections::hash_map::Entry;
         let mut queries = self.queries.lock().unwrap_or_else(|e| e.into_inner());
         match queries.entry(query_id) {
             Entry::Occupied(o) => {
                 let sessions = o.get().clone();
-                debug_assert_eq!(sessions.sessions().len(), 1, "the per-query set owns exactly one session");
-                for session in sessions.sessions() {
-                    session.update(cdata.clone());
+                if let Some(cdata) = cdata {
+                    debug_assert_eq!(sessions.sessions().len(), 1, "a credentialed query's set owns exactly one session");
+                    for session in sessions.sessions() {
+                        session.update(cdata.clone());
+                    }
                 }
                 (sessions, false)
             }
-            Entry::Vacant(v) => (v.insert(cdata.clone().into()).clone(), true),
+            Entry::Vacant(v) => {
+                let sessions = match cdata {
+                    Some(cdata) => cdata.clone().into(),
+                    None => SessionSet::new(),
+                };
+                (v.insert(sessions).clone(), true)
+            }
         }
     }
 
@@ -108,7 +120,7 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         query_id: proto::QueryId,
         collection_id: proto::CollectionId,
         mut selection: ankql::ast::Selection<Resolved>,
-        cdata: &PA::ContextData,
+        cdata: Option<&PA::ContextData>,
         version: u32,
         known_matches: Vec<proto::KnownEntity>,
     ) -> anyhow::Result<proto::NodeResponseBody>
@@ -119,16 +131,23 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         if version == 0 {
             return Err(anyhow::anyhow!("Invalid version 0 for subscription"));
         }
-        // Re-subscribes re-validate under the peer's current credentials
-        // and refresh the query's standing session below. Denial does
-        // not yet tear down a standing registration — the claw-back
-        // arrives with the re-permission PR:
-        // https://github.com/ankurah/ankurah/pull/426
-        node.policy_agent.can_access_collection(cdata, &collection_id)?;
-        // The requester's selection arrives resolved, and the policy narrows
-        // it in the same vocabulary: what the agent ANDs in is resolved too,
-        // so nothing here is left to bind.
-        selection.predicate = node.policy_agent.filter_predicate(cdata, &collection_id, selection.predicate)?;
+        // A subscribe to a catalog collection never consults the agent
+        // (crate::schema::reads_bypass_policy): this is how a peer's catalog
+        // projection is fed, and it runs before that peer has any credential.
+        let exempt = crate::schema::reads_bypass_policy(&collection_id);
+        if !exempt {
+            // Re-subscribes re-validate under the peer's current credentials
+            // and refresh the query's standing session below. Denial does
+            // not yet tear down a standing registration — the claw-back
+            // arrives with the re-permission PR:
+            // https://github.com/ankurah/ankurah/pull/426
+            let cdata = cdata.ok_or_else(|| anyhow::anyhow!("subscribe to '{collection_id}' requires a credential"))?;
+            node.policy_agent.can_access_collection(cdata, &collection_id)?;
+            // The requester's selection arrives resolved, and the policy narrows
+            // it in the same vocabulary: what the agent ANDs in is resolved too,
+            // so nothing here is left to bind.
+            selection.predicate = node.policy_agent.filter_predicate(cdata, &collection_id, selection.predicate)?;
+        }
 
         // TODO: consider separating session updating from SubscribeQuery,
         // reserving that request for actual subscription (selection)
@@ -143,7 +162,8 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         // subscription and no credential outlives the attempt that
         // created it. A failed re-subscribe leaves the standing query in
         // place (the claw-back work in #426 owns that seam).
-        let response = self.subscribe_query_inner(node, query_id, collection_id, selection, &sessions, cdata, version, known_matches).await;
+        let response =
+            self.subscribe_query_inner(node, query_id, collection_id, selection, &sessions, cdata, exempt, version, known_matches).await;
 
         if response.is_err() && session_created {
             let mut queries = self.queries.lock().unwrap_or_else(|e| e.into_inner());
@@ -182,7 +202,8 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         collection_id: proto::CollectionId,
         selection: ankql::ast::Selection<Resolved>,
         sessions: &SessionSet<CD>,
-        cdata: &PA::ContextData,
+        cdata: Option<&PA::ContextData>,
+        exempt: bool,
         version: u32,
         known_matches: Vec<proto::KnownEntity>,
     ) -> anyhow::Result<proto::NodeResponseBody>
@@ -233,12 +254,25 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
             // are evaluated against entity state, not just the predicate. Skip
             // unreadable entities silently (mirroring the Fetch/Get handlers) so one
             // out-of-scope entity doesn't fail the whole subscription.
-            if node.policy_agent.check_read(cdata, &state.payload.entity_id, &collection_id, &state.payload.state).is_err() {
+            if !exempt
+                && node
+                    .policy_agent
+                    .check_read(
+                        cdata.expect("a non-exempt subscribe holds a credential"),
+                        &state.payload.entity_id,
+                        &collection_id,
+                        &state.payload.state,
+                    )
+                    .is_err()
+            {
                 continue;
             }
 
             // Only include delta if heads differ (None means heads are equal)
-            if let Some(delta) = node.generate_entity_delta(&known_map, state, &storage_collection, cdata).await? {
+            // Event bridging reads under whatever credentials the query
+            // carries, which for an exempt catalog subscribe is none.
+            let credentials: Vec<CD> = cdata.cloned().into_iter().collect();
+            if let Some(delta) = node.generate_entity_delta(&known_map, state, &storage_collection, &credentials).await? {
                 deltas.push(delta);
             }
         }

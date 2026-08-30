@@ -164,6 +164,8 @@ pub enum MutationError {
     InvalidEvent,
     #[error("malformed event: {0}")]
     EventStructure(ankurah_proto::EventStructureError),
+    #[error("inadmissible event: {0}")]
+    InadmissibleEvent(crate::node::event_admissibility::InadmissibleEvent),
     /// The node does not know its system root, so it cannot derive an entity
     /// id: a non-root genesis binds the root into its own id. A caller that
     /// reaches this on an ephemeral node can retry once the handshake with a
@@ -196,6 +198,10 @@ pub enum MutationError {
 
 impl From<ankurah_proto::EventStructureError> for MutationError {
     fn from(err: ankurah_proto::EventStructureError) -> Self { MutationError::EventStructure(err) }
+}
+
+impl From<crate::node::event_admissibility::InadmissibleEvent> for MutationError {
+    fn from(err: crate::node::event_admissibility::InadmissibleEvent) -> Self { MutationError::InadmissibleEvent(err) }
 }
 
 impl From<tokio::task::JoinError> for MutationError {

@@ -69,7 +69,7 @@ fn seed_album_catalog<SE: StorageEngine + Send + Sync + 'static>(node: &Node<SE,
             })
             .collect(),
     };
-    node.seed_registered_schema(Album::descriptor(), &model)?;
+    ankurah::core::test_helpers::seed_registered_schema(node, Album::descriptor(), &model)?;
     Ok(())
 }
 

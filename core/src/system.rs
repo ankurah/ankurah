@@ -23,12 +23,12 @@ pub const PROTECTED_COLLECTIONS: &[&str] = &[SYSTEM_COLLECTION_ID];
 /// * valid collections (TODO)
 /// * property definitions (TODO)
 
-pub struct SystemManager<SE, PA>(Arc<Inner<SE, PA>>);
-impl<SE, PA> Clone for SystemManager<SE, PA> {
+pub struct SystemManager<SE, PA: PolicyAgent>(Arc<Inner<SE, PA>>);
+impl<SE, PA: PolicyAgent> Clone for SystemManager<SE, PA> {
     fn clone(&self) -> Self { Self(self.0.clone()) }
 }
 
-struct Inner<SE, PA> {
+struct Inner<SE, PA: PolicyAgent> {
     collectionset: CollectionSet<SE>,
     collection_map: RwLock<BTreeMap<CollectionId, Entity>>,
     entities: WeakEntitySet,
@@ -340,11 +340,11 @@ where
             let notified = self.0.loading.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            
+
             if self.is_loaded() {
                 return;
             }
-            
+
             notified.await;
         }
     }

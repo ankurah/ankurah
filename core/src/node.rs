@@ -515,10 +515,18 @@ where
             }
             proto::NodeRequestBody::RegisterSchema { model } => {
                 let cdata = cdata.iterable().exactly_one().map_err(|_| anyhow!("Only one cdata is permitted for RegisterSchema"))?;
-                match self.catalog.register_schema(self, cdata, model).await {
-                    // The resolved definition IS the response: the requester
-                    // binds its descriptor cells from it on ack.
-                    Ok(model) => Ok(proto::NodeResponseBody::SchemaRegistered { model }),
+                // The registrant accumulates the resolved definition, which
+                // IS the response: the requester binds its descriptor cells
+                // from it on ack.
+                let mut registrant = crate::schema::catalog::register::WireRegistrant::new(model);
+                match self.catalog.register_schema(self, cdata, &mut registrant).await {
+                    Ok(()) => match registrant.into_response() {
+                        Some(model) => Ok(proto::NodeResponseBody::SchemaRegistered { model }),
+                        // Unreachable by construction -- a successful
+                        // registration always binds -- but a missing response
+                        // must fail the request, not invent one.
+                        None => Ok(proto::NodeResponseBody::Error("registration succeeded without binding its response".to_string())),
+                    },
                     Err(e) => Ok(proto::NodeResponseBody::Error(e.to_string())),
                 }
             }
@@ -689,7 +697,7 @@ where
             // derive, or a parent clock that disagrees with the body -- is
             // refused before anything stages or stores it.
             event.payload.validate_structure()?;
-            event_admissibility::check_membership_admissibility(self, None, &event.payload)?;
+            event_admissibility::check_membership(self, None, &event.payload)?;
             let collection = self.collections.get(&event.payload.collection).await?;
 
             // When applying an event, we should only look at the local storage for the lineage

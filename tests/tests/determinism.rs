@@ -50,7 +50,7 @@ async fn test_two_event_determinism_same_property() -> Result<()> {
             .collect();
         let registered =
             proto::RegisteredModel { id: model_eid, label: descriptor.label.to_owned(), name: descriptor.name.to_owned(), properties };
-        node2.seed_registered_schema(descriptor, &registered)?;
+        ankurah::core::test_helpers::seed_registered_schema(&node2, descriptor, &registered)?;
     }
 
     // Create genesis on node1

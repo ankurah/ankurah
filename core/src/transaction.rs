@@ -27,7 +27,8 @@ pub struct Transaction {
     /// commit persists it; the entity cannot regenerate it. The entity itself
     /// contributes at most one Update to the commit: the edits made after
     /// `create()`, if any.
-    pub(crate) genesis_events: std::sync::RwLock<std::collections::BTreeMap<EntityId, proto::Event>>,
+    pub(crate) genesis_events:
+        std::sync::RwLock<std::collections::BTreeMap<EntityId, (proto::Event, &'static crate::schema::ModelStructDescriptor)>>,
 }
 
 #[cfg(feature = "wasm")]
@@ -87,9 +88,11 @@ impl Transaction {
         let entity = self.dyncontext.create_transaction_entity(M::collection(), &genesis, epoch, self.alive.clone())?;
         self.dyncontext.check_write(&entity)?;
 
-        // Store the already-extracted genesis exactly once. Commit must never
-        // ask this entity to reconstruct those operations.
-        if self.genesis_events.write().unwrap().insert(entity.id, genesis).is_some() {
+        // Store the already-extracted genesis exactly once, with the compiled
+        // declaration it was minted from (the commit gate judges the genesis's
+        // membership against its descriptor cells). Commit must never ask this
+        // entity to reconstruct those operations.
+        if self.genesis_events.write().unwrap().insert(entity.id, (genesis, M::descriptor())).is_some() {
             return Err(MutationError::AlreadyExists);
         }
 
