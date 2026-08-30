@@ -32,7 +32,7 @@ pub enum TraceEvent {
 
 impl TraceEvent {
     /// Canonical one-line rendering; the trace hash is over these lines.
-    fn canonical(&self) -> String {
+    pub(crate) fn canonical(&self) -> String {
         match self {
             TraceEvent::Origin { node, entity, head } => format!("ORIGIN n{node} {entity} {head}"),
             TraceEvent::Deliver { src, dst, digest, duplicate } => {

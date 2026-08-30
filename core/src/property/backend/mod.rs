@@ -1,3 +1,4 @@
+use crate::internal::prelude::*;
 use ankurah_proto::{BackendOperation as Operation, EventId};
 use anyhow::Result;
 use std::any::Any;
@@ -16,7 +17,7 @@ use std::{collections::BTreeMap, sync::Arc};
 mod conformance;
 pub mod lww;
 pub mod yrs;
-use crate::error::{MutationError, RetrievalError, StateError};
+use crate::error::StateError;
 use crate::event_dag::EventLayer;
 pub use lww::LWWBackend;
 pub use yrs::YrsBackend;

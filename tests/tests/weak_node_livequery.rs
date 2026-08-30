@@ -16,7 +16,7 @@ async fn test_weak_node_livequery_does_not_keep_node_alive() -> Result<()> {
     // Create a LiveQuery with a weak node binding
     let collection_id = CollectionId::fixed_name("pet");
     let args: MatchArgs<ankql::ast::Parsed> = "true".try_into()?;
-    let weak_lq = EntityLiveQuery::new_weak_node(&node, collection_id, args, DEFAULT_CONTEXT)?;
+    let weak_lq = EntityLiveQuery::new_weak_node(&node, None, collection_id, args, DEFAULT_CONTEXT)?;
 
     // Get the query_id before dropping the node
     let query_id = weak_lq.query_id();
@@ -36,7 +36,7 @@ async fn test_weak_node_livequery_does_not_keep_node_alive() -> Result<()> {
     let weak_node = node2.weak();
 
     let args2: MatchArgs<ankql::ast::Parsed> = "true".try_into()?;
-    let weak_lq2 = EntityLiveQuery::new_weak_node(&node2, CollectionId::fixed_name("pet"), args2, DEFAULT_CONTEXT)?;
+    let weak_lq2 = EntityLiveQuery::new_weak_node(&node2, None, CollectionId::fixed_name("pet"), args2, DEFAULT_CONTEXT)?;
 
     // Node should be alive while we hold it
     assert!(weak_node.upgrade().is_some(), "Node should be alive");

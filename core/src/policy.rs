@@ -1,11 +1,9 @@
+use crate::error::ValidationError;
+use crate::internal::prelude::*;
 use crate::util::Iterable;
 use crate::{
-    entity::Entity,
-    error::ValidationError,
-    node::{ContextData, Node, NodeInner, WeakNode},
+    node::{ContextData, NodeInner},
     property::PropertyError,
-    proto::{self},
-    storage::StorageEngine,
 };
 use ankql::{
     ast::{Predicate, Resolved},
@@ -109,25 +107,8 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
         Self: Sized,
         A: Iterable<proto::AuthData> + Send + Sync;
 
-    /// Check the event and optionally return an attestation
-    /// This could be used to attest that the event has passed the policy check for a given context
-    /// or you could just return None if you don't want to attest to the event
-    /// entity_before: Entity state before the event is applied
-    /// entity_after: Entity state after the event has been applied (allows inspection of resulting state)
-    /// Gate a schema registration on its resolved effect. Called by
-    /// the registration executor after its lookup
-    /// phase and before any event is emitted, still under the allocation
-    /// mutex, with the request's actual consequences: what will be created,
-    /// what will be updated, what already exists. Agents may discriminate
-    /// on the principal (`cdata`: who may define schema) or on the object
-    /// (the planned definitions themselves); both styles are first-class.
-    /// Refusal fails the whole registration before anything is emitted --
-    /// and it is the agent's ONLY voice on catalog writes: the executor
-    /// commits through the node's privileged context, which consults no
-    /// further policy check. The commit batch is still not transactional
-    /// (#313 tracks the upgrade); the executor's signal-fed lookups keep
-    /// identity convergent across a storage-failure partial. The default
-    /// allows.
+    /// Check whether this registration plan is allowed -- the agent's only
+    /// voice on catalog writes (the executor commits privileged).
     fn check_schema_registration<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
@@ -137,6 +118,8 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
         Ok(())
     }
 
+    /// Judge an event under this credential, seeing the entity state both
+    /// before and after it applies; optionally return an attestation.
     fn check_event<SE: StorageEngine>(
         &self,
         node: &Node<SE, Self>,

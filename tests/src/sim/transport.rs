@@ -92,7 +92,7 @@ pub fn message_digest(message: &proto::NodeMessage) -> String {
 }
 
 /// Canonical, correlation-id-free description of a message's payload.
-fn semantic_descriptor(message: &proto::NodeMessage) -> String {
+pub(crate) fn semantic_descriptor(message: &proto::NodeMessage) -> String {
     match message {
         proto::NodeMessage::Request { request, .. } => {
             format!("REQ {}", request_descriptor(&request.body))

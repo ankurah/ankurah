@@ -1,23 +1,19 @@
-use ankurah_proto::{self as proto, Attested, CollectionId, EntityState, Event};
+use crate::internal::prelude::*;
+use ankurah_proto::{Attested, EntityState, Event};
 use anyhow::{anyhow, Result};
 use proto::PropertyId;
 use std::collections::BTreeMap;
-use std::marker::PhantomData;
 use std::sync::{Arc, OnceLock, RwLock};
 use tokio::sync::Notify;
 use tracing::{error, warn};
 
 use crate::collectionset::CollectionSet;
-use crate::entity::{Entity, WeakEntitySet};
-use crate::error::MutationError;
-use crate::error::RetrievalError;
+use crate::entity::WeakEntitySet;
+use crate::livequery::LiveQueryRegistry;
 use crate::notice_info;
-use crate::policy::PolicyAgent;
 use crate::property::{Property, PropertyError};
 use crate::reactor::Reactor;
 use crate::retrieval::{LocalEventGetter, LocalStateGetter, SuspenseEvents};
-use crate::schema::SchemaEpoch;
-use crate::storage::{StorageCollectionWrapper, StorageEngine};
 use crate::{property::backend::LWWBackend, value::Value};
 pub const SYSTEM_COLLECTION_ID: &str = "_ankurah_system";
 pub const PROTECTED_COLLECTIONS: &[&str] = &[SYSTEM_COLLECTION_ID];
@@ -55,7 +51,10 @@ struct Inner<SE, PA> {
     /// write and leave the wiped storage holding the root it just deleted.
     root_write: tokio::sync::Mutex<()>,
     reactor: Reactor,
-    _phantom: PhantomData<PA>,
+    /// The node's live-query registry, shared with the node exactly like
+    /// the reactor: a hard reset drives its re-admission sweep after the
+    /// reactor clears the resultsets.
+    live_queries: Arc<LiveQueryRegistry<SE, PA>>,
 }
 
 impl<SE, PA> SystemManager<SE, PA>
@@ -69,6 +68,7 @@ where
         reactor: Reactor,
         durable: bool,
         schema_epoch: Arc<RwLock<Option<SchemaEpoch>>>,
+        live_queries: Arc<LiveQueryRegistry<SE, PA>>,
     ) -> Self {
         let me = Self(Arc::new(Inner {
             collectionset: collections,
@@ -84,7 +84,7 @@ where
             schema_epoch,
             root_write: tokio::sync::Mutex::new(()),
             reactor,
-            _phantom: PhantomData,
+            live_queries,
         }));
         {
             let me = me.clone();
@@ -143,12 +143,19 @@ where
         self.0.system_ready_notify.notify_waiters();
     }
 
-    /// Waits until this node has a system: a root exists and an epoch is
-    /// assigned. It says nothing about the catalog's fill; queries that need
-    /// catalog names defer behind the catalog's own sync instead.
+    /// Waits until this node has a system root
     pub async fn wait_system_ready(&self) {
-        if !self.is_system_ready() {
-            self.0.system_ready_notify.notified().await;
+        loop {
+            if self.is_system_ready() {
+                return;
+            }
+            let notified = self.0.system_ready_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_system_ready() {
+                return;
+            }
+            notified.await;
         }
     }
 
@@ -314,10 +321,8 @@ where
             *system_ready = false;
         }
 
-        // Reset the reactor state to notify subscriptions. Standing queries
-        // (the catalog's included) survive the reset: their resultsets are
-        // emptied here and refill from the new system's rows.
         self.0.reactor.system_reset();
+        self.0.live_queries.system_reset();
 
         Ok(())
     }
@@ -325,10 +330,22 @@ where
     /// Returns true if the local system catalog is loaded
     pub fn is_loaded(&self) -> bool { self.0.loaded.get().is_some() }
 
-    /// Waits for the local system catalog to be loaded
+    /// Wait for the local system catalog to be loaded
     pub async fn wait_loaded(&self) {
-        if !self.is_loaded() {
-            self.0.loading.notified().await;
+        loop {
+            if self.is_loaded() {
+                return;
+            }
+
+            let notified = self.0.loading.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            
+            if self.is_loaded() {
+                return;
+            }
+            
+            notified.await;
         }
     }
 

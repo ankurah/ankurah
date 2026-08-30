@@ -379,7 +379,25 @@ where
     F: for<'w, 'b> FnOnce(&'b mut Workload<'w>) -> ScenarioFut<'b>,
     C: for<'a> FnOnce(&'a [SimNode], &'a [super::recorder::SubscriptionRecorder]) -> CheckFut<'a>,
 {
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("current-thread runtime builds");
+    // Current-thread for deterministic task interleaving, and EXACTLY ONE
+    // blocking thread: sled runs its operations through spawn_blocking, and
+    // with more threads two concurrent storage reads complete in racy pool
+    // order, which reaches the wire as per-run message reordering (each
+    // relay subscription pre-fetches its known matches before sending). One
+    // thread makes the blocking queue FIFO in submission order, which the
+    // single-threaded async side already makes deterministic.
+    //
+    // The keep-alive outlives any run: with a cap of one, tokio's idle
+    // reaping is fatal -- a job submitted while the lone thread is timing
+    // out queues without respawning it, and since everything here awaits
+    // that job, no later submission ever comes to respawn one (observed as
+    // a 0%-CPU wedge with zero blocking threads alive).
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .thread_keep_alive(std::time::Duration::from_secs(24 * 60 * 60))
+        .enable_all()
+        .build()
+        .expect("current-thread runtime builds");
 
     runtime.block_on(async move {
         let mut rng = SimRng::new(seed);
@@ -428,17 +446,16 @@ where
                     scheduler.drain(&nodes, &mut rng, &mut trace).await;
                     assert!(
                         std::time::Instant::now() < deadline,
-                        "node {} never became ready (system_ready={}, catalog_ready={}, warm_failure={:?})",
+                        "node {} never became ready (system_ready={}, catalog_counts={:?})",
                         node.index,
                         node.node.system.is_system_ready(),
-                        node.node.catalog.is_catalog_ready(),
-                        node.node.catalog.catalog_warm_failure()
+                        node.node.catalog.counts()
                     );
                 }
                 // Ready means this node now holds a schema epoch; admit the
                 // deterministic SimRecord binding under it (see build_nodes).
                 super::node::seed_sim_schema(node).expect("sim schema seeds on a ready node");
-                let synced = node.node.catalog.wait_catalog_synced();
+                let synced = node.node.catalog.wait_synced();
                 tokio::pin!(synced);
                 loop {
                     match futures_util::poll!(synced.as_mut()) {

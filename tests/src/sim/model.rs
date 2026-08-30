@@ -88,30 +88,51 @@ fn content_nonce(mint_seq: u64, parts: &[&[u8]]) -> [u8; 32] {
 /// The `SimRecord` collection id.
 pub fn sim_collection() -> proto::CollectionId { SimRecord::collection() }
 
-/// The deterministic model-entity id the sim seeds into every node's catalog
-/// and asserts in every forged creation event's membership Add. Constant, so
-/// it is identical across every node in a run and across the two
-/// determinism-audit runs.
-pub fn sim_model_id() -> proto::EntityId { proto::EntityId::from_bytes([0x5B; 32]) }
+/// The model-entity id the sim seeds into every node's catalog and asserts
+/// in every forged creation event's membership Add. Derived from the forged
+/// catalog genesis's own content ([`forged_catalog_rows`]), so it is a pure
+/// function of fixed content: identical across every node in a run and
+/// across the two determinism-audit runs.
+pub fn sim_model_id() -> proto::EntityId { forged_catalog_rows().model }
 
-/// Stable seeded catalog identity for each simulated property.
+/// The catalog identity of each simulated property, derived like
+/// [`sim_model_id`].
 pub fn sim_property_id(field: Field) -> proto::EntityId {
-    let mut bytes = [0x5C; 32];
-    bytes[31] = match field {
-        Field::Title => 1,
-        Field::Body => 2,
-    };
-    proto::EntityId::from_bytes(bytes)
+    let rows = forged_catalog_rows();
+    match field {
+        Field::Title => rows.properties[0],
+        Field::Body => rows.properties[1],
+    }
 }
 
-/// Stable seeded membership identity for each simulated property.
+/// The membership identity binding each simulated property to the model,
+/// derived like [`sim_model_id`].
 pub fn sim_membership_id(field: Field) -> proto::EntityId {
-    let mut bytes = [0x5D; 32];
-    bytes[31] = match field {
-        Field::Title => 1,
-        Field::Body => 2,
-    };
-    proto::EntityId::from_bytes(bytes)
+    let rows = forged_catalog_rows();
+    match field {
+        Field::Title => rows.memberships[0],
+        Field::Body => rows.memberships[1],
+    }
+}
+
+/// The catalog rows describing `SimRecord`: one model row, a property row
+/// per field, and the membership row binding each to the model, forged by
+/// [`crate::catalog_forge`] with ids derived from each row's own genesis
+/// content -- a pure function of the definition, identical across nodes,
+/// runs, and the determinism audit's paired executions.
+///
+/// The rows are planted in the durable engine BEFORE its node is
+/// constructed, so the catalog projection derives resolution for
+/// "simrecord" from real stored rows -- the membership gate on the remote
+/// commit funnel judges every forged genesis against that resolution -- and
+/// serves them to each ephemeral node's projection over the sim transport
+/// with real event lineage behind every state. `seed_sim_schema` still
+/// binds each node's compiled descriptor cells locally.
+pub fn forged_catalog_rows() -> &'static crate::catalog_forge::ForgedCatalog {
+    static FORGED: std::sync::OnceLock<crate::catalog_forge::ForgedCatalog> = std::sync::OnceLock::new();
+    FORGED.get_or_init(|| {
+        crate::catalog_forge::forge_catalog("simrecord", "SimRecord", &[("title", "lww", "string"), ("body", "lww", "string")], b"sim")
+    })
 }
 
 /// Decode the `(title, body)` LWW field values from a materialized `proto::State`

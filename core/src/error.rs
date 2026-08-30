@@ -1,9 +1,10 @@
+use crate::internal::prelude::*;
 use std::{collections::BTreeSet, convert::Infallible};
 
-use ankurah_proto::{CollectionId, DecodeError, EntityId, EventId};
+use ankurah_proto::{DecodeError, EntityId, EventId};
 use thiserror::Error;
 
-use crate::{connector::SendError, policy::AccessDenied};
+use crate::connector::SendError;
 
 #[derive(Error, Debug)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Error))]

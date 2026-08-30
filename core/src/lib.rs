@@ -17,6 +17,7 @@ pub mod event_dag;
 #[cfg(feature = "bench-internals")]
 pub mod bench_support;
 pub mod indexing;
+pub(crate) mod internal;
 pub mod livequery;
 pub mod model;
 pub mod node;
@@ -32,6 +33,8 @@ pub mod session;
 pub mod storage;
 pub mod system;
 pub mod task;
+#[cfg(feature = "test-helpers")]
+pub mod test_helpers;
 pub mod transaction;
 pub mod util;
 pub mod value;

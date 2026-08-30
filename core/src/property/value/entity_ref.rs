@@ -15,7 +15,7 @@
 //! let artist: ArtistView = album.artist().get(&ctx).await?;
 //! ```
 
-use crate::model::View;
+use crate::internal::prelude::*;
 use ankurah_proto::EntityId;
 use serde::{Deserialize, Serialize};
 use std::borrow::Borrow;
@@ -24,7 +24,6 @@ use std::marker::PhantomData;
 use std::ops::Deref;
 
 use crate::context::Context;
-use crate::error::RetrievalError;
 use crate::model::Model;
 use crate::property::{Property, PropertyError};
 use crate::value::Value;

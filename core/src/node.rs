@@ -1,6 +1,6 @@
-use crate::{schema::catalog::CatalogManager, session::SessionSet};
+use crate::internal::prelude::*;
 use ankql::ast::{Parsed, Resolved, Stage};
-use ankurah_proto::{self as proto, Attested, CollectionId, EntityState};
+use ankurah_proto::{Attested, EntityState};
 use anyhow::anyhow;
 
 use rand::prelude::*;
@@ -12,23 +12,19 @@ use std::{
 };
 use tokio::sync::oneshot;
 
-use crate::{
-    action_error, action_info,
-    changes::EntityChange,
-    collectionset::CollectionSet,
-    connector::{PeerSender, SendError},
-    context::Context,
-    entity::{Entity, WeakEntitySet},
-    error::{MutationError, RequestError, RetrievalError},
-    notice_info,
-    peer_subscription::{SubscriptionHandler, SubscriptionRelay},
-    policy::{AccessDenied, PolicyAgent},
-    reactor::Reactor,
-    retrieval::{LocalEventGetter, LocalStateGetter, SuspenseEvents},
-    storage::StorageEngine,
-    system::SystemManager,
-    util::{safemap::SafeMap, safeset::SafeSet, Iterable},
-};
+use crate::collectionset::CollectionSet;
+use crate::connector::{PeerSender, SendError};
+use crate::context::Context;
+use crate::entity::WeakEntitySet;
+use crate::error::RequestError;
+use crate::peer_subscription::{SubscriptionHandler, SubscriptionRelay};
+use crate::reactor::Reactor;
+use crate::retrieval::{LocalEventGetter, LocalStateGetter, SuspenseEvents};
+use crate::system::SystemManager;
+use crate::util::safemap::SafeMap;
+use crate::util::safeset::SafeSet;
+use crate::util::Iterable;
+use crate::{action_error, action_info, notice_info};
 use itertools::Itertools;
 #[cfg(feature = "instrument")]
 use tracing::instrument;
@@ -37,6 +33,7 @@ use tracing::{debug, error, warn};
 
 pub mod applier;
 pub mod erased;
+pub(crate) mod event_admissibility;
 pub mod handles;
 
 pub use erased::TNodeErased;
@@ -182,6 +179,12 @@ where PA: PolicyAgent
 
     pub catalog: CatalogManager,
 
+    /// Every live query on this node, held weakly: enumeration reads it,
+    /// and a system reset sweeps it to re-admit each retained query under
+    /// the new system. Shared with the [`SystemManager`], which drives that
+    /// sweep from `hard_reset`.
+    pub(crate) live_queries: Arc<crate::livequery::LiveQueryRegistry<SE, PA>>,
+
     pub(crate) subscription_relay: Option<SubscriptionRelay<PA::ContextData, crate::livequery::WeakEntityLiveQuery>>,
 }
 
@@ -216,7 +219,9 @@ where
         let reactor = Reactor::new();
         notice_info!("Node {id:#} created as {}", if durable { "durable" } else { "ephemeral" });
 
-        let system_manager = SystemManager::new(collections.clone(), entityset.clone(), reactor.clone(), durable, schema_epoch);
+        let live_queries = Arc::new(crate::livequery::LiveQueryRegistry::new());
+        let system_manager =
+            SystemManager::new(collections.clone(), entityset.clone(), reactor.clone(), durable, schema_epoch, live_queries.clone());
 
         // Only ephemeral nodes relay subscriptions upstream to a durable peer.
         let subscription_relay = if durable { None } else { Some(SubscriptionRelay::new()) };
@@ -234,6 +239,7 @@ where
             system: system_manager,
             catalog: CatalogManager::default(),
             sessions: SessionSet::new(),
+            live_queries,
             subscription_relay,
         }));
 
@@ -668,51 +674,6 @@ where
         Ok(())
     }
 
-    /// Does all the things necessary to commit a remote transaction
-    /// Commit-path admissibility for membership operations: the protocol
-    /// gate beside the PolicyAgent's policy gate (`check_event`). Membership
-    /// operations are ordinary operations on any event; what is restricted
-    /// today is emission: an entity's first event must carry exactly one
-    /// Membership::Add -- asserting the same model fact the event's
-    /// collection field materializes (the built-in mapping for system
-    /// collections, the registered model for app collections) -- and no
-    /// membership mutations are admitted on later events yet. Application
-    /// (`Entity::apply_event`) is deliberately unchecked: the attested event
-    /// stream is the membership authority, and this gate controls only what
-    /// may be EMITTED into it today.
-    pub(crate) fn check_membership_admissibility(&self, event: &proto::Event) -> Result<(), MutationError> {
-        let memberships: Vec<proto::ModelId> = event
-            .operations()
-            .memberships()
-            .map(|membership| match membership {
-                proto::Membership::Add(model) => *model,
-            })
-            .collect();
-        if !event.is_entity_create() {
-            return if memberships.is_empty() {
-                Ok(())
-            } else {
-                Err(MutationError::InvalidUpdate("membership changes after an entity's first event are not admissible yet"))
-            };
-        }
-        let model = match memberships.as_slice() {
-            [model] => *model,
-            [] => return Err(MutationError::InvalidUpdate("an entity's first event must add exactly one membership")),
-            _ => return Err(MutationError::InvalidUpdate("an entity's first event cannot add more than one membership")),
-        };
-        let expected =
-            crate::schema::system_model_id(event.collection.as_str()).or_else(|| self.catalog.model_id_for(event.collection.as_str()));
-        match expected {
-            Some(expected) if expected == model => Ok(()),
-            Some(_) => Err(MutationError::General(
-                format!("membership asserts model {model} but the event routes to collection '{}'", event.collection).into(),
-            )),
-            None => Err(MutationError::General(
-                format!("membership asserts model {model} but collection '{}' has no registered model", event.collection).into(),
-            )),
-        }
-    }
-
     pub async fn commit_remote_transaction(
         &self,
         cdata: &PA::ContextData,
@@ -728,7 +689,7 @@ where
             // derive, or a parent clock that disagrees with the body -- is
             // refused before anything stages or stores it.
             event.payload.validate_structure()?;
-            self.check_membership_admissibility(&event.payload)?;
+            event_admissibility::check_membership_admissibility(self, None, &event.payload)?;
             let collection = self.collections.get(&event.payload.collection).await?;
 
             // When applying an event, we should only look at the local storage for the lineage

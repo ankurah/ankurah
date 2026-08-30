@@ -1,17 +1,8 @@
+use crate::internal::prelude::*;
+use crate::node::event_admissibility::check_membership;
 use crate::retrieval::{CachedEventGetter, SuspenseEvents};
-use crate::{
-    changes::EntityChange,
-    entity::Entity,
-    error::{MutationError, RetrievalError},
-    livequery::{EntityLiveQuery, LiveQuery},
-    model::View,
-    node::{MatchArgs, Node, NodeRef, NodeType},
-    policy::{AccessDenied, PolicyAgent},
-    storage::{StorageCollectionWrapper, StorageEngine},
-    transaction::Transaction,
-};
 use ankql::ast::{Parsed, Resolved};
-use ankurah_proto::{self as proto, Attested, Clock, CollectionId, EntityState, Event};
+use ankurah_proto::{Attested, Clock, EntityState, Event};
 use async_trait::async_trait;
 use std::sync::{atomic::AtomicBool, Arc};
 use tracing::debug;
@@ -24,10 +15,8 @@ use wasm_bindgen::prelude::*;
 /// later operation without rebuilding the Context.
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
+#[derive(Clone)]
 pub struct Context(Arc<dyn TContext + Send + Sync + 'static>);
-impl Clone for Context {
-    fn clone(&self) -> Self { Self(self.0.clone()) }
-}
 
 pub(crate) enum ContextAuth<PA>
 where PA: PolicyAgent

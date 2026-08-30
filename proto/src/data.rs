@@ -23,32 +23,8 @@ impl std::fmt::Debug for EventId {
 
 impl EventId {
     /// The id of a genesis event: `SHA-256(GENESIS_TAG || bincode(system,
-    /// nonce, timestamp, author, operations))`. An entity's id IS this value,
-    /// so the preimage is a commitment to the whole of what distinguishes one
-    /// creation from another.
-    ///
-    /// Three things are deliberately outside it. `entity_id` is the output.
-    /// `parent` is always empty for a genesis, and the tag plus the body shape
-    /// already carry that fact. `collection` is envelope attribution, not
-    /// identity — the same exclusion update ids already had, and a standing
-    /// ruling for this series.
-    ///
-    /// What pins the model is therefore the `Membership::Add` inside
-    /// `operations`, which IS hashed. The envelope `collection` is routing, and
-    /// the two are compared only on the two commit funnels
-    /// (`Node::commit_remote_transaction` and `Context::commit_local_trx`, both
-    /// through `check_membership_admissibility`). The applier paths take the
-    /// collection from the envelope and do not compare it: a correctly derived,
-    /// structurally valid genesis arriving as a subscription update or an event
-    /// bridge materializes its entity in whatever collection the envelope
-    /// names. Cross-checking the envelope against the event's own membership on
-    /// those paths is identity-02's.
-    ///
-    /// Binding `system` gives one-id-one-system a hash-level backstop: the
-    /// same content under a different system root is a different entity, so
-    /// an id cannot be replayed into a foreign system. `None` is the system
-    /// root's own genesis, and the Option encoding keeps it distinct from any
-    /// `Some` without needing a third tag.
+    /// nonce, timestamp, author, operations))`. The envelope `collection` is
+    /// deliberately outside the hash: routing, not identity (standing ruling).
     pub fn from_genesis_parts(
         system: &Option<EntityId>,
         nonce: &[u8; 32],

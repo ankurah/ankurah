@@ -21,15 +21,19 @@ use crate::{
     model::View,
     node::{erased::ErasedNodeRef, MatchArgs, NodeType, TNodeErased},
     policy::PolicyAgent,
-    reactor::{
-        fetch_gap::{GapFetcher, QueryGapFetcher},
-        ReactorSubscription, ReactorUpdate,
-    },
+    reactor::{fetch_gap::GapFetcher, ReactorSubscription, ReactorUpdate},
     resultset::{EntityResultSet, ResultSet},
     session::SessionSet,
     storage::StorageEngine,
     Node,
 };
+
+mod registry;
+mod selection;
+
+pub use registry::LiveQueryRegistry;
+use registry::RegistryEntry;
+use selection::{admit, create_inner, start_admitted, DeferredAdmission};
 
 /// A local subscription that handles both reactor subscription and remote cleanup
 /// This is a type-erased version that can be used in the TContext trait

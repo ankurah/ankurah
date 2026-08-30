@@ -5,17 +5,12 @@
 //! where incoming events are temporarily staged for BFS discovery before being committed
 //! to permanent storage.
 
+use crate::internal::prelude::*;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use crate::{
-    error::{MutationError, RetrievalError},
-    policy::PolicyAgent,
-    storage::{StorageCollectionWrapper, StorageEngine},
-    util::Iterable,
-    Node,
-};
-use ankurah_proto::{self as proto, Attested, EntityId, Event, EventId};
+use crate::util::Iterable;
+use ankurah_proto::{Attested, EntityId, Event, EventId};
 use async_trait::async_trait;
 
 // ============================================================================

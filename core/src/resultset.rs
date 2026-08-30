@@ -1,5 +1,6 @@
 use crate::indexing::{encode_tuple_values_with_key_spec, KeySpec};
-use crate::{entity::Entity, model::View, reactor::AbstractEntity};
+use crate::internal::prelude::*;
+use crate::reactor::AbstractEntity;
 use ankql::ast::PropertyId;
 use ankurah_proto as proto;
 use ankurah_signals::{

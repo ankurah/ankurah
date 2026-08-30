@@ -140,13 +140,13 @@ async fn catalog_head(node: &TestNode, collection: &str, id: EntityId) -> anyhow
 
 // (a) Auto-assert: create on the ephemeral; the durable executes the
 // registration (allocating the ids) and both sides converge on the same
-// allocations. `create` awaits the RegisterSchema response internally, so
-// the client map is seeded on ack; the durable's own map is updated
-// synchronously by the executor.
+// allocations. `create` awaits the RegisterSchema response internally --
+// the ack binds the client's compiled cells -- and each side's raw catalog
+// resolution follows its own projection to the same ids.
 #[tokio::test]
 async fn auto_assert_create_registers_on_durable() -> anyhow::Result<()> {
     let (server, client, _conn) = connected_pair().await?;
-    server.catalog.wait_catalog_ready().await;
+    server.catalog.wait_ready().await?;
 
     let ctx = client.context_async(DEFAULT_CONTEXT).await;
     let trx = ctx.begin();
@@ -163,14 +163,12 @@ async fn auto_assert_create_registers_on_durable() -> anyhow::Result<()> {
     let size = server.catalog.property_by_id(&size_id).expect("size def");
     assert_eq!((size.backend.as_str(), size.value_type.as_str()), ("lww", "i32"), "i32 field -> (lww, i32)");
 
-    // The client's map was seeded from the SchemaRegistered response: the
-    // SAME ids, no waiting on the catalog subscription.
-    assert_eq!(
-        resolve_by_collection(&client, "widget", "label"),
-        Some(PropertyId::EntityId(label_id)),
-        "response-fed client map agrees with the allocator"
-    );
-    assert_eq!(resolve_by_collection(&client, "widget", "size"), Some(PropertyId::EntityId(size_id)));
+    // The SchemaRegistered response binds the client's COMPILED cells on ack
+    // (that is what let the create proceed); the client's raw catalog
+    // resolution follows its projection, and converges on the allocator's
+    // own ids.
+    assert_eq!(wait_resolve(&client, "widget", "label").await, Some(label_id), "the client's projection converges on the allocator's ids");
+    assert_eq!(wait_resolve(&client, "widget", "size").await, Some(size_id));
 
     // The model entity is indexed by its collection with the struct name.
     let (_, model) = server.catalog.model_by_label("widget").expect("model present on durable");
@@ -190,13 +188,17 @@ async fn offline_create_unregistered_is_strict_registered_proceeds() -> anyhow::
     let client = ephemeral_sled_setup().await?;
     let conn = LocalProcessConnection::new(&server, &client).await?;
     client.system.wait_system_ready().await;
-    server.catalog.wait_catalog_ready().await;
+    server.catalog.wait_ready().await?;
 
     // Build the context while connected (join_system needs a peer), and
-    // register Widget while connected so it is a KNOWN collection later.
+    // register Widget while connected so it is a KNOWN collection later --
+    // known to the client's CATALOG too, which fills from its projection's
+    // update stream, so wait for the registration's rows before going
+    // offline.
     let ctx = client.context_async(DEFAULT_CONTEXT).await;
     ctx.register_model::<Widget>().await?;
-    assert!(client.catalog.model_by_label("widget").is_some(), "widget bound while connected");
+    wait_resolve(&client, "widget", "label").await.expect("the projection delivers widget's rows while connected");
+    assert!(client.catalog.model_by_label("widget").is_some(), "widget known to the client's catalog while connected");
 
     // DISCONNECT: dropping the connection deregisters the peer on both
     // sides, so the ephemeral now has no durable peer.
@@ -255,11 +257,7 @@ async fn offline_create_unregistered_is_strict_registered_proceeds() -> anyhow::
         let _g = trx.create(&Gadget { name: "online".into() }).await?;
     }
     let name_id = wait_resolve(&server, "gadget", "name").await.expect("durable allocates gadget.name after reconnect");
-    assert_eq!(
-        resolve_by_collection(&client, "gadget", "name"),
-        Some(PropertyId::EntityId(name_id)),
-        "client map seeded from the response"
-    );
+    assert_eq!(wait_resolve(&client, "gadget", "name").await, Some(name_id), "the client's projection converges on the allocator's ids");
 
     Ok(())
 }
@@ -272,6 +270,11 @@ async fn offline_reassert_requires_every_compiled_field_to_be_bound() -> anyhow:
     client.system.wait_system_ready().await;
     let ctx = client.context_async(DEFAULT_CONTEXT).await;
     ctx.register_model::<offline_v1::Evolving>().await?;
+    // The offline judgment below distinguishes an UNCONFIRMED known label
+    // from a never-registered one by the client's own catalog, which fills
+    // from its projection's update stream: wait for the registration's rows
+    // before going offline.
+    wait_resolve(&client, "evolving", "label").await.expect("the projection delivers evolving's rows while connected");
 
     drop(conn);
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -300,7 +303,7 @@ async fn offline_reassert_requires_every_compiled_field_to_be_bound() -> anyhow:
 #[tokio::test]
 async fn predicate_read_path_heals_and_defines() -> anyhow::Result<()> {
     let server = durable_sled_setup().await?;
-    server.catalog.wait_catalog_ready().await;
+    server.catalog.wait_ready().await?;
     let ctx = server.context(DEFAULT_CONTEXT)?;
 
     // The compiled schema anticipates `doohickey`; the catalog does not know
@@ -331,7 +334,7 @@ async fn predicate_read_path_heals_and_defines() -> anyhow::Result<()> {
 #[tokio::test]
 async fn healing_registers_only_the_added_field() -> anyhow::Result<()> {
     let server = durable_sled_setup().await?;
-    server.catalog.wait_catalog_ready().await;
+    server.catalog.wait_ready().await?;
     let ctx = server.context(DEFAULT_CONTEXT)?;
 
     // The system knows the one-field shape.
@@ -382,7 +385,7 @@ async fn healing_registers_only_the_added_field() -> anyhow::Result<()> {
 #[tokio::test]
 async fn read_only_credential_cannot_heal() -> anyhow::Result<()> {
     let server = durable_sled_setup().await?;
-    server.catalog.wait_catalog_ready().await;
+    server.catalog.wait_ready().await?;
     // A session-less source reads, but can never name the single principal a
     // registration acts as.
     let ctx = server.context(SessionSet::new())?;
@@ -407,7 +410,7 @@ async fn offline_read_unregistered_fails_loud() -> anyhow::Result<()> {
     let client = ephemeral_sled_setup().await?;
     let conn = LocalProcessConnection::new(&server, &client).await?;
     client.system.wait_system_ready().await;
-    server.catalog.wait_catalog_ready().await;
+    server.catalog.wait_ready().await?;
 
     // Context built while connected (join needs a peer); the catalog warms
     // (empty) via the context kick. Contraption is never registered.
@@ -472,7 +475,7 @@ async fn direct_get_registers_before_edit() -> anyhow::Result<()> {
 #[tokio::test]
 async fn explicit_register_is_strict_and_idempotent() -> anyhow::Result<()> {
     let server = durable_sled_setup().await?;
-    server.catalog.wait_catalog_ready().await;
+    server.catalog.wait_ready().await?;
     let ctx = server.context(DEFAULT_CONTEXT)?;
 
     // Strict register: propagates errors (here, succeeds).
@@ -505,7 +508,7 @@ async fn explicit_register_is_strict_and_idempotent() -> anyhow::Result<()> {
 #[tokio::test]
 async fn offline_register_is_strict_reconnect_proceeds() -> anyhow::Result<()> {
     let (server, client, conn) = connected_pair().await?;
-    server.catalog.wait_catalog_ready().await;
+    server.catalog.wait_ready().await?;
 
     // Build the context while connected (join_system needs a peer).
     let ctx = client.context_async(DEFAULT_CONTEXT).await;
@@ -538,11 +541,7 @@ async fn offline_register_is_strict_reconnect_proceeds() -> anyhow::Result<()> {
     ctx.register_model::<Gadget>().await?;
     assert!(schema_registered(&client, Gadget::descriptor()), "the forwarded registration resolves on ack");
     let name_id = wait_resolve(&server, "gadget", "name").await.expect("durable allocates gadget.name after reconnect");
-    assert_eq!(
-        resolve_by_collection(&client, "gadget", "name"),
-        Some(PropertyId::EntityId(name_id)),
-        "client map seeded from the response"
-    );
+    assert_eq!(wait_resolve(&client, "gadget", "name").await, Some(name_id), "the client's projection converges on the allocator's ids");
 
     Ok(())
 }
@@ -552,7 +551,7 @@ async fn offline_register_is_strict_reconnect_proceeds() -> anyhow::Result<()> {
 #[tokio::test]
 async fn hard_reset_clears_ensured_and_map() -> anyhow::Result<()> {
     let server = durable_sled_setup().await?;
-    server.catalog.wait_catalog_ready().await;
+    server.catalog.wait_ready().await?;
     let ctx = server.context(DEFAULT_CONTEXT)?;
 
     ctx.register_model::<Gizmo>().await?;

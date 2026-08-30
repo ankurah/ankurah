@@ -20,10 +20,9 @@
 //! Changing a canonical type is a deliberate migration (#303), never a
 //! model-struct edit.
 
+use crate::internal::prelude::*;
 use ankurah_proto::{EntityId, RegisterModel, RegisterProperty};
 
-use crate::error::{MutationError, RetrievalError};
-use crate::policy::AccessDenied;
 use crate::property::PropertyError;
 
 /// A durable schema-registration request could not be completed.

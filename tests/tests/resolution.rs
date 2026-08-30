@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 /// value_type)` properties, each a required membership.
 fn register(collection: &str, props: &[(&str, &str, &str)]) -> proto::NodeRequestBody {
     proto::NodeRequestBody::RegisterSchema {
-        models: vec![proto::RegisterModel {
+        model: proto::RegisterModel {
             label: collection.into(),
             name: collection.into(),
             explicit_id: None,
@@ -31,7 +31,7 @@ fn register(collection: &str, props: &[(&str, &str, &str)]) -> proto::NodeReques
                     optional: false,
                 })
                 .collect(),
-        }],
+        },
     }
 }
 
@@ -43,8 +43,8 @@ async fn register_and_map(
     request: proto::NodeRequestBody,
 ) -> anyhow::Result<BTreeMap<String, EntityId>> {
     match client.request(server_id, &DEFAULT_CONTEXT, request).await? {
-        proto::NodeResponseBody::SchemaRegistered { models } => {
-            Ok(models.into_iter().flat_map(|model| model.properties).map(|property| (property.name, property.id)).collect())
+        proto::NodeResponseBody::SchemaRegistered { model } => {
+            Ok(model.properties.into_iter().map(|property| (property.name, property.id)).collect())
         }
         other => panic!("expected SchemaRegistered, got {other}"),
     }
@@ -154,7 +154,7 @@ async fn resolution_follows_renames_to_the_same_id() -> anyhow::Result<()> {
 
     // Rename: hint renamed_from "name", display name "title".
     let rename = proto::NodeRequestBody::RegisterSchema {
-        models: vec![proto::RegisterModel {
+        model: proto::RegisterModel {
             label: "album".into(),
             name: "album".into(),
             explicit_id: None,
@@ -169,7 +169,7 @@ async fn resolution_follows_renames_to_the_same_id() -> anyhow::Result<()> {
                 build_id: [0u8; 16],
                 optional: false,
             }],
-        }],
+        },
     };
     match client.request(server.id, &DEFAULT_CONTEXT, rename).await? {
         proto::NodeResponseBody::SchemaRegistered { .. } => {}

@@ -1,31 +1,27 @@
-//! The catalog map and the projection that maintains it.
+//! The catalog signals and the projection that maintains them.
 //!
-//! Every node derives its in-memory catalog map from three live queries over
+//! Every node derives its catalog resolution from three live queries over
 //! the catalog collections, which keep it current for as long as they run;
-//! registration additionally folds its own resolved definitions in
-//! synchronously under the allocator mutex, so consecutive registrations
-//! observe each other. These tests drive RegisterSchema over the wire (the
-//! same schema-less-durable harness as schema_registration.rs), assert the
-//! map resolves to the ids the allocator handed back, pin what an ephemeral
-//! node gets once its catalog has been ANSWERED by a durable peer, and pin
-//! the reset barrier that keeps hard_reset from deleting storage under an
-//! in-flight warm.
+//! on the durable node the commit's reactor notification updates those
+//! queries before a registration returns, so consecutive registrations
+//! observe each other under the allocator mutex. These tests drive
+//! RegisterSchema over the wire (the same schema-less-durable harness as
+//! schema_registration.rs), assert resolution lands on the ids the
+//! allocator handed back, pin what an ephemeral node gets once its catalog
+//! has been ANSWERED by a durable peer, and pin the epoch keying that keeps
+//! a stale registration response from polluting a replacement system.
 
 mod common;
-use ankurah::core::error::{MutationError, RetrievalError};
-use ankurah::core::schema::{MODEL_COLLECTION_ID, MODEL_PROPERTY_COLLECTION_ID, PROPERTY_COLLECTION_ID};
-use ankurah::core::storage::{StorageCollection, StorageEngine};
+use ankurah::core::storage::StorageEngine;
 use ankurah::PropertyId;
-use async_trait::async_trait;
 use common::*;
 use std::{
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
         Arc,
     },
     time::Duration,
 };
-use tokio::sync::Notify;
 
 type TestNode = Node<SledStorageEngine, PermissiveAgent>;
 
@@ -81,9 +77,10 @@ fn expect_registered(resp: proto::NodeResponseBody) -> proto::RegisteredModel {
     }
 }
 
-/// The durable fold runs synchronously under the allocator mutex, but the
-/// forwarded-response fold lands in a separate task, so poll until the map
-/// resolves the given (collection, name) or time out.
+/// On the durable node the commit's reactor notification updates the catalog
+/// queries before the registration returns, but a remote requester's view
+/// (and an ephemeral's projection) lands in separate tasks, so poll until
+/// resolution answers the given (collection, name) or time out.
 async fn wait_resolve<SE>(node: &Node<SE, PermissiveAgent>, collection: &str, name: &str) -> Option<EntityId>
 where SE: StorageEngine + Send + Sync + 'static {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -100,124 +97,6 @@ where SE: StorageEngine + Send + Sync + 'static {
     }
 }
 
-/// Park the durable warm's catalog scans and count storage deletions, at
-/// main's StorageEngine seam (`collection()` + `delete_all_collections`).
-#[derive(Default)]
-struct DurableWarmGate {
-    warm_scans: AtomicUsize,
-    scan_entered: Notify,
-    released: AtomicBool,
-    release: Notify,
-    delete_calls: AtomicUsize,
-}
-
-impl DurableWarmGate {
-    async fn wait_for_first_scan(&self) {
-        loop {
-            let notified = self.scan_entered.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if self.warm_scans.load(Ordering::Acquire) > 0 {
-                return;
-            }
-            notified.await;
-        }
-    }
-
-    async fn wait_for_release(&self) {
-        loop {
-            let notified = self.release.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if self.released.load(Ordering::Acquire) {
-                return;
-            }
-            notified.await;
-        }
-    }
-
-    fn release(&self) {
-        self.released.store(true, Ordering::Release);
-        self.release.notify_waiters();
-    }
-}
-
-struct GatedWarmEngine {
-    inner: Arc<SledStorageEngine>,
-    gate: Arc<DurableWarmGate>,
-}
-
-#[async_trait]
-impl StorageEngine for GatedWarmEngine {
-    type Value = Vec<u8>;
-
-    async fn collection(&self, id: &proto::CollectionId) -> Result<Arc<dyn StorageCollection>, RetrievalError> {
-        let inner = self.inner.collection(id).await?;
-        // Gate only the three catalog collections; the system collection must
-        // load freely or node construction itself would park.
-        if [MODEL_COLLECTION_ID, PROPERTY_COLLECTION_ID, MODEL_PROPERTY_COLLECTION_ID].contains(&id.as_ref()) {
-            Ok(Arc::new(GatedCatalogCollection { collection: id.clone(), inner, gate: self.gate.clone() }))
-        } else {
-            Ok(inner)
-        }
-    }
-
-    async fn delete_all_collections(&self) -> Result<bool, MutationError> {
-        let result = self.inner.delete_all_collections().await;
-        self.gate.delete_calls.fetch_add(1, Ordering::AcqRel);
-        result
-    }
-}
-
-struct GatedCatalogCollection {
-    collection: proto::CollectionId,
-    inner: Arc<dyn StorageCollection>,
-    gate: Arc<DurableWarmGate>,
-}
-
-#[async_trait]
-impl StorageCollection for GatedCatalogCollection {
-    async fn set_state(&self, state: proto::Attested<proto::EntityState>) -> Result<bool, MutationError> {
-        self.inner.set_state(state).await
-    }
-
-    async fn get_state(&self, id: proto::EntityId) -> Result<proto::Attested<proto::EntityState>, RetrievalError> {
-        self.inner.get_state(id).await
-    }
-
-    async fn fetch_states(
-        &self,
-        selection: &ankql::ast::Selection<ankql::ast::Resolved>,
-    ) -> Result<Vec<proto::Attested<proto::EntityState>>, RetrievalError> {
-        // The warm is recognizable by its full-scan selection; registration's
-        // duplicate-check lookups are keyed and pass through. One warm entry
-        // per generation is observable on the models catalog, the first
-        // collection each warm scans.
-        if matches!(selection.predicate, ankql::ast::Predicate::True) {
-            if self.collection.as_ref() == MODEL_COLLECTION_ID {
-                self.gate.warm_scans.fetch_add(1, Ordering::AcqRel);
-                self.gate.scan_entered.notify_waiters();
-            }
-            if !self.gate.released.load(Ordering::Acquire) {
-                self.gate.wait_for_release().await;
-            }
-        }
-        self.inner.fetch_states(selection).await
-    }
-
-    async fn add_event(&self, entity_event: &proto::Attested<proto::Event>) -> Result<bool, MutationError> {
-        self.inner.add_event(entity_event).await
-    }
-
-    async fn get_events(&self, event_ids: Vec<proto::EventId>) -> Result<Vec<proto::Attested<proto::Event>>, RetrievalError> {
-        self.inner.get_events(event_ids).await
-    }
-
-    async fn dump_entity_events(&self, id: proto::EntityId) -> Result<Vec<proto::Attested<proto::Event>>, RetrievalError> {
-        self.inner.dump_entity_events(id).await
-    }
-}
-
 async fn wait_for_count(counter: &AtomicUsize, expected: usize, label: &str) -> anyhow::Result<()> {
     tokio::time::timeout(Duration::from_secs(2), async {
         while counter.load(Ordering::Acquire) < expected {
@@ -228,25 +107,22 @@ async fn wait_for_count(counter: &AtomicUsize, expected: usize, label: &str) -> 
     .map_err(|_| anyhow::anyhow!("timed out waiting for {expected} {label}; observed {}", counter.load(Ordering::Acquire)))
 }
 
-// Test 1: durable node -- register schema, map resolves (collection,name) ->
-// the allocated property id; membership optional flag visible;
-// wait_catalog_ready resolves.
+// Test 1: durable node -- register schema, resolution answers (collection,
+// name) with the allocated property id; membership optional flag visible.
 #[tokio::test]
 async fn durable_map_resolves_after_registration() -> anyhow::Result<()> {
     let (server, client, _conn) = connected_pair().await?;
 
-    // wait_catalog_ready must resolve (durable warm marks ready at startup).
-    server.catalog.wait_catalog_ready().await;
-    assert!(server.catalog.is_catalog_ready());
+    // The catalog queries answer their first local read at startup.
+    server.catalog.wait_ready().await?;
 
     // The allocator hands back the resolved ids in the response.
     let models = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
     let (model_id, property_id, membership_id) = (models.id, models.properties[0].id, models.properties[0].membership_id);
 
-    // The executor's synchronous fold resolves the display name to the
-    // allocated id.
+    // Resolution answers the display name with the allocated id.
     let resolved = wait_resolve(&server, "album", "name").await.expect("catalog should resolve album.name on the durable node");
-    assert_eq!(resolved, property_id, "the map resolves to the allocated property id");
+    assert_eq!(resolved, property_id, "resolution lands on the allocated property id");
 
     // Property definition is parsed.
     let prop = server.catalog.property_by_id(&property_id).expect("property def present");
@@ -268,26 +144,27 @@ async fn durable_map_resolves_after_registration() -> anyhow::Result<()> {
     Ok(())
 }
 
-// Test 2: incremental -- a second registration (new property) updates the map
-// without restart.
+// Test 2: incremental -- a second registration (new property) updates
+// resolution without restart.
 #[tokio::test]
 async fn durable_map_updates_incrementally() -> anyhow::Result<()> {
     let (server, client, _conn) = connected_pair().await?;
-    server.catalog.wait_catalog_ready().await;
+    server.catalog.wait_ready().await?;
 
     let models = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
     let model_id = models.id;
+    let name_property_id = models.properties[0].id;
     wait_resolve(&server, "album", "name").await.expect("name resolves");
 
     // Second registration adds `year` -- no restart.
     let year = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_year_request()).await?);
     let year_property_id = year.properties[0].id;
     let year_id = wait_resolve(&server, "album", "year").await.expect("year resolves incrementally");
-    assert_eq!(year_id, year_property_id, "the map resolves year to the allocated id");
+    assert_eq!(year_id, year_property_id, "resolution answers year with the allocated id");
 
     // Both properties are now memberships of the album model.
-    let memberships = server.catalog.memberships_of(&model_id);
-    assert_eq!(memberships.len(), 2, "album now has two memberships");
+    assert!(server.catalog.membership(&model_id, &name_property_id).is_some(), "name remains a membership of album");
+    assert!(server.catalog.membership(&model_id, &year_property_id).is_some(), "year joined album's membership set");
 
     Ok(())
 }
@@ -300,14 +177,14 @@ async fn durable_map_updates_incrementally() -> anyhow::Result<()> {
 #[tokio::test]
 async fn an_answered_ephemeral_carries_the_catalog_it_never_registered() -> anyhow::Result<()> {
     let server = durable_sled_setup().await?;
-    server.catalog.wait_catalog_ready().await;
+    server.catalog.wait_ready().await?;
     server.context_async(DEFAULT_CONTEXT).await.register_model::<Album>().await?;
     let model = server.catalog.model_id_for("album").expect("the durable registered album");
 
     let client = ephemeral_sled_setup().await?;
     let _conn = LocalProcessConnection::new(&server, &client).await?;
     client.system.wait_system_ready().await;
-    client.catalog.wait_catalog_synced().await?;
+    client.catalog.wait_synced().await?;
 
     assert_eq!(client.catalog.model_id_for("album"), Some(model), "an answered catalog carries what the durable holds");
     assert!(client.catalog.resolve(&model, "name").is_some(), "and resolves its properties without registering them");
@@ -315,102 +192,13 @@ async fn an_answered_ephemeral_carries_the_catalog_it_never_registered() -> anyh
     Ok(())
 }
 
-// A durable restart can still be scanning catalog storage when a destructive
-// reset begins. The old generation holds a warm lease for the complete scan,
-// so storage deletion must wait for that drain; otherwise Sled could
-// drop/recreate its trees while the scan is using stale collection handles.
-// A canceled reset retains its drain for the next attempt, and a concurrent
-// reset waits behind the same fence.
-#[tokio::test]
-async fn hard_reset_drains_in_flight_durable_catalog_warm() -> anyhow::Result<()> {
-    let inner = Arc::new(SledStorageEngine::new_test()?);
-
-    // Seed one complete durable epoch, then drop its owners so the gated node
-    // below reconstructs from real persisted catalog collections.
-    let seed = Node::new_durable(inner.clone(), PermissiveAgent::new());
-    seed.system.create().await?;
-    let seed_context = seed.context_async(DEFAULT_CONTEXT).await;
-    seed_context.register_model::<Album>().await?;
-    let seed_probe = seed.catalog.liveness_probe();
-    drop(seed_context);
-    drop(seed);
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while seed_probe() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the seed node must release the shared engine before reconstruction");
-
-    let gate = Arc::new(DurableWarmGate::default());
-    let node = Node::new_durable(Arc::new(GatedWarmEngine { inner: inner.clone(), gate: gate.clone() }), PermissiveAgent::new());
-    tokio::time::timeout(Duration::from_secs(2), gate.wait_for_first_scan())
-        .await
-        .expect("reconstructed durable warm must reach the gated catalog scan");
-    assert!(node.system.is_system_ready(), "the persisted root must be ready before the durable warm scans storage");
-
-    // Reset A parks at the warm's drain: begin_reset invalidates the warm's
-    // fence and waits out its lease, so deletion cannot start while the scan
-    // is parked in storage.
-    let reset_node = node.clone();
-    let reset = tokio::spawn(async move { reset_node.system.hard_reset().await });
-    for _ in 0..32 {
-        tokio::task::yield_now().await;
-    }
-    assert_eq!(gate.delete_calls.load(Ordering::Acquire), 0, "storage deletion must wait for the durable warm lease");
-    assert!(!reset.is_finished(), "hard_reset must remain parked behind the durable warm");
-
-    // Cancel reset A at its await point. The catalog must retain the
-    // invalidated fence so retry B resumes the same drain instead of seeing
-    // `resetting = true`, taking no owner, and deleting immediately.
-    reset.abort();
-    assert!(reset.await.expect_err("reset A must be canceled").is_cancelled());
-    let retry_reset_node = node.clone();
-    let retry_reset = tokio::spawn(async move { retry_reset_node.system.hard_reset().await });
-    for _ in 0..16 {
-        tokio::task::yield_now().await;
-    }
-    assert_eq!(gate.delete_calls.load(Ordering::Acquire), 0, "a canceled reset's retry must resume its retained drain");
-    assert!(!retry_reset.is_finished(), "reset B must remain parked behind reset A's durable fence");
-
-    // Reset C must drain the same retained fence before deleting.
-    let second_reset_node = node.clone();
-    let second_reset = tokio::spawn(async move { second_reset_node.system.hard_reset().await });
-    for _ in 0..16 {
-        tokio::task::yield_now().await;
-    }
-    assert_eq!(gate.delete_calls.load(Ordering::Acquire), 0, "a concurrent reset must not bypass the retained drain");
-    assert!(!second_reset.is_finished(), "reset C must wait behind the same drain");
-
-    gate.release();
-    tokio::time::timeout(Duration::from_secs(2), retry_reset)
-        .await
-        .expect("retried hard_reset must complete after the durable warm is released")
-        .expect("retried hard_reset task must not panic")?;
-    tokio::time::timeout(Duration::from_secs(2), second_reset)
-        .await
-        .expect("reset C must complete after retry B")
-        .expect("reset C task must not panic")?;
-    assert_eq!(gate.delete_calls.load(Ordering::Acquire), 2);
-
-    // Recreate the root in place. The ready transition must launch exactly
-    // one new-generation warm, after which registration repopulates the
-    // freshly-cleared catalog normally.
-    node.system.create().await?;
-    tokio::time::timeout(Duration::from_secs(2), node.catalog.wait_catalog_ready())
-        .await
-        .expect("the replacement durable warm must become ready");
-    let context = node.context_async(DEFAULT_CONTEXT).await;
-    context.register_model::<Album>().await?;
-    wait_resolve(&node, "album", "name").await.expect("schema registration must repopulate the replacement catalog");
-    assert_eq!(gate.warm_scans.load(Ordering::Acquire), 2, "startup and replacement generations must each warm exactly once");
-
-    Ok(())
-}
-
 // Forwarded registration may remain pending while reset clears the system.
-// Its old response must be rejected at schema ingress, never folded or
-// latched into either the cleared epoch or a replacement epoch.
+// The reset guard is the epoch keying: the in-flight call snapshotted the
+// OLD epoch at entry, so its late response binds descriptor cells tagged
+// with that epoch, which nothing reads after the reset. Whatever the old
+// call reports, no current-epoch resolution may appear from it, and a
+// replacement registration under the new system must go over the wire and
+// bind normally.
 #[tokio::test]
 async fn hard_reset_rejects_stale_schema_registration_response() -> anyhow::Result<()> {
     let server = durable_sled_setup().await?;
@@ -433,79 +221,74 @@ async fn hard_reset_rejects_stale_schema_registration_response() -> anyhow::Resu
     client.system.wait_system_ready().await;
 
     let old_client = client.clone();
-    let old_registration = tokio::spawn(async move { old_client.catalog.ensure_registered(&DEFAULT_CONTEXT, Album::descriptor()).await });
+    let old_registration = tokio::spawn(async move {
+        let descriptor = Album::descriptor();
+        old_client.catalog.ensure_schema_for_use(&old_client, &DEFAULT_CONTEXT, descriptor).await
+    });
     wait_for_count(&held_responses, 1, "old-epoch SchemaRegistered response").await?;
 
     // Do not cancel the request future: pending-request cleanup is response
-    // driven. Reset invalidates its owner, then the held response exercises
-    // the real admission rejection and releases the waiter.
+    // driven. Reset the system, then release the held response into it.
     client.system.hard_reset().await?;
     gate.release_first(&client, 1).await;
     let old_result = tokio::time::timeout(Duration::from_secs(1), old_registration)
         .await
-        .expect("the rejected old response must release its request future")
+        .expect("the released old response must release its request future")
         .expect("old registration task must not panic");
-    assert!(old_result.is_err(), "old-epoch registration must not succeed after reset");
-    assert_eq!(client.catalog.counts(), (0, 0, 0));
+    // The old call bound (at most) cells tagged with the departed epoch;
+    // whether it reports success is incidental to the guard.
+    let _ = old_result;
+    assert_eq!(client.catalog.counts(), (0, 0, 0), "no catalog row survives the reset");
     assert!(!schema_registered(&client, Album::descriptor()));
 
-    // Rejoining rearms a fresh registration owner. A second request must go
-    // over the wire (not answered by stale old-epoch cells) and its current
-    // response may populate the replacement epoch normally.
+    // Rejoining assigns a fresh epoch, and the reset sweep re-subscribes
+    // the catalog projection with a clean baseline, so the durable's rows
+    // flow back in. Wait for that sync: with the catalog refilled, the
+    // replacement registration binds from the catalog's own proof under
+    // the NEW epoch -- and until it runs, the stale old-epoch response
+    // must not have satisfied that epoch.
     client.system.join_system(server.system.root().expect("server root")).await?;
-    let new_client = client.clone();
-    let new_registration = tokio::spawn(async move { new_client.catalog.ensure_registered(&DEFAULT_CONTEXT, Album::descriptor()).await });
-    wait_for_count(&held_responses, 2, "old and replacement SchemaRegistered responses").await?;
-    gate.release_last(&client, 1).await;
-    tokio::time::timeout(Duration::from_secs(1), new_registration)
-        .await
-        .expect("the replacement registration must complete")
-        .expect("replacement registration task must not panic")?;
-    assert!(schema_registered(&client, Album::descriptor()));
-    assert!(wait_resolve(&client, "album", "name").await.is_some());
+    client.catalog.wait_synced().await?;
+    assert!(wait_resolve(&client, "album", "name").await.is_some(), "the re-subscribed projection refills from the durable");
+    assert!(!schema_registered(&client, Album::descriptor()), "the old epoch's response must not satisfy the replacement epoch");
+    client.catalog.ensure_schema_for_use(&client, &DEFAULT_CONTEXT, Album::descriptor()).await?;
+    assert!(schema_registered(&client, Album::descriptor()), "the replacement epoch binds from the refilled catalog's proof");
 
     Ok(())
 }
 
-// The reset/readiness hooks installed on SystemManager hold catalog-manager
-// clones, and the durable warm runs as a detached task. Neither may retain
-// the node: dropping it must release the catalog inner and the node alike,
-// on both node kinds.
+// The catalog's projection queries and the reset sweep hold the node weakly.
+// Nothing launched at construction may retain it: dropping the last handle
+// must free the node (and with it the catalog), on both node kinds.
 #[tokio::test]
-async fn catalog_hooks_do_not_retain_manager() -> anyhow::Result<()> {
+async fn catalog_projection_does_not_retain_node() -> anyhow::Result<()> {
+    async fn assert_releases(weak: ankurah::core::node::WeakNode<SledStorageEngine, PermissiveAgent>, kind: &str) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("dropping the last {kind} handle must free the node"));
+    }
+
     let durable = durable_sled_setup().await?;
-    durable.catalog.wait_catalog_ready().await;
-    let durable_probe = durable.catalog.liveness_probe();
+    durable.catalog.wait_ready().await?;
     let durable_weak = durable.weak();
     drop(durable);
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while durable_probe() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("durable catalog hooks must not form a retain cycle");
-    assert!(durable_weak.upgrade().is_none());
+    assert_releases(durable_weak, "durable").await;
 
     let ephemeral = ephemeral_sled_setup().await?;
-    let ephemeral_probe = ephemeral.catalog.liveness_probe();
     let ephemeral_weak = ephemeral.weak();
     drop(ephemeral);
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while ephemeral_probe() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("ephemeral catalog hooks must not form a retain cycle");
-    assert!(ephemeral_weak.upgrade().is_none());
+    assert_releases(ephemeral_weak, "ephemeral").await;
 
     Ok(())
 }
 
 // Constructing a durable node without creating or loading a system is a valid
-// idle state. Catalog startup must not retain the managers forever while
-// waiting for readiness that may never arrive.
+// idle state. Catalog startup must not retain the node forever while waiting
+// for readiness that may never arrive.
 #[tokio::test]
 async fn uninitialized_durable_does_not_retain_catalog_manager() -> anyhow::Result<()> {
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
@@ -513,51 +296,49 @@ async fn uninitialized_durable_does_not_retain_catalog_manager() -> anyhow::Resu
     assert!(!node.system.is_system_ready());
     assert!(node.system.root().is_none());
 
-    let probe = node.catalog.liveness_probe();
     let weak = node.weak();
     drop(node);
     tokio::time::timeout(Duration::from_secs(1), async {
-        while probe() {
+        while weak.upgrade().is_some() {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("an uninitialized durable node must not be retained by a catalog readiness task");
-    assert!(weak.upgrade().is_none());
+    .expect("an uninitialized durable node must not be retained by catalog startup");
 
     Ok(())
 }
 
-// Test 5: hard_reset flushes -- after reset, map empty and not ready.
+// Test 5: hard_reset flushes -- after reset, resolution answers nothing.
 #[tokio::test]
 async fn hard_reset_flushes_catalog() -> anyhow::Result<()> {
     let server = durable_sled_setup().await?;
     let client = ephemeral_sled_setup().await?;
     let _conn = LocalProcessConnection::new(&server, &client).await?;
     client.system.wait_system_ready().await;
-    server.catalog.wait_catalog_ready().await;
+    server.catalog.wait_ready().await?;
 
     expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
     wait_resolve(&server, "album", "name").await.expect("server resolves before reset");
     let (models, properties, memberships) = server.catalog.counts();
-    assert!(models > 0 && properties > 0 && memberships > 0, "map is populated before reset");
+    assert!(models > 0 && properties > 0 && memberships > 0, "catalog is populated before reset");
 
-    // hard_reset must flush the catalog map and clear readiness.
+    // hard_reset must clear every catalog resultset with the rest of the
+    // reactor's state.
     server.system.hard_reset().await?;
 
-    assert!(!server.catalog.is_catalog_ready(), "catalog not ready after hard_reset");
-    assert_eq!(server.catalog.counts(), (0, 0, 0), "catalog map cleared after hard_reset");
+    assert_eq!(server.catalog.counts(), (0, 0, 0), "catalog cleared after hard_reset");
     assert!(server.catalog.model_id_for("album").is_none(), "resolve returns nothing after hard_reset");
 
     Ok(())
 }
 
-// Test 6: rename follow-up -- the display-name index updates (old name gone,
-// new present) while the allocated property id is unchanged.
+// Test 6: rename follow-up -- the display name moves (old name gone, new
+// present) while the allocated property id is unchanged.
 #[tokio::test]
-async fn rename_updates_resolution_and_sibling_index() -> anyhow::Result<()> {
+async fn rename_updates_resolution() -> anyhow::Result<()> {
     let (server, client, _conn) = connected_pair().await?;
-    server.catalog.wait_catalog_ready().await;
+    server.catalog.wait_ready().await?;
 
     let first = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
     let property_id = first.properties[0].id;
@@ -574,14 +355,13 @@ async fn rename_updates_resolution_and_sibling_index() -> anyhow::Result<()> {
     // New display name resolves to the SAME property id; old name is gone.
     let renamed_id = wait_resolve(&server, "album", "title").await.expect("resolves under new name after rename");
     assert_eq!(renamed_id, property_id, "rename keeps the allocated id (hint-moved lineage)");
-    assert!(
-        server.catalog.resolve(&server.catalog.model_id_for("album").expect("album remains registered"), "name").is_none(),
-        "old display name no longer resolves"
-    );
+    let model_id = server.catalog.model_id_for("album").expect("album remains registered");
+    assert!(server.catalog.resolve(&model_id, "name").is_none(), "old display name no longer resolves");
 
-    // The global sibling index reflects the current display name.
-    assert_eq!(server.catalog.siblings_by_name("title"), vec![property_id]);
-    assert!(server.catalog.siblings_by_name("name").is_empty(), "old name removed from the sibling index");
+    // The membership-scoped name lookup reflects the current display name.
+    let ankurah::ModelId::EntityId(model_eid) = model_id else { panic!("album is catalog-backed") };
+    assert_eq!(server.catalog.property_by_name(&model_eid, "title").map(|(id, _)| id), Some(property_id));
+    assert!(server.catalog.property_by_name(&model_eid, "name").is_none(), "old name removed from the name lookup");
 
     Ok(())
 }

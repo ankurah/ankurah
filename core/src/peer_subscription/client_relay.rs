@@ -1,15 +1,14 @@
 // TODO: Rename this module from client_relay to remote_subscription for clarity
+use crate::internal::prelude::*;
 use ankql::ast::Resolved;
-use ankurah_proto::{self as proto, CollectionId};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 use tracing::{debug, warn};
 
-use crate::error::{RequestError, RetrievalError};
+use crate::error::RequestError;
 use crate::node::ContextData;
-use crate::session::SessionSet;
 use crate::util::safeset::SafeSet;
 
 /// Trait for query initialization that can be driven by SubscriptionRelay

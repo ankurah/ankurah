@@ -1,3 +1,4 @@
+use crate::internal::prelude::*;
 use ankql::ast::Resolved;
 use std::sync::Arc;
 
@@ -5,8 +6,7 @@ use async_trait::async_trait;
 use futures::Stream;
 use tracing::warn;
 
-use crate::error::{MutationError, RetrievalError};
-use ankurah_proto::{Attested, CollectionId, EntityId, EntityState, Event, EventId};
+use ankurah_proto::{Attested, EntityId, EntityState, Event, EventId};
 
 /// One raw logical record emitted by a storage dump.
 #[derive(Debug)]

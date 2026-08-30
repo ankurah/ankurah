@@ -119,9 +119,9 @@ async fn an_edit_after_create_becomes_an_update_on_the_frozen_genesis() -> Resul
 }
 
 /// The genesis carries exactly one `Membership::Add`, which is what
-/// `check_membership_admissibility` requires of an entity's first event. The
-/// membership is one of the frozen initial operations, so it is inside the
-/// hash that derives the id.
+/// `event_admissibility::check_membership` requires of an entity's first
+/// event. The membership is one of the frozen initial operations, so it is
+/// inside the hash that derives the id.
 #[tokio::test]
 async fn the_genesis_carries_exactly_one_membership() -> Result<()> {
     let ctx = durable_node().await?;

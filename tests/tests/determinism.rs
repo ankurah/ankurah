@@ -36,6 +36,7 @@ async fn test_two_event_determinism_same_property() -> Result<()> {
                 };
                 let (membership_id, _) = node1.catalog.membership(&model_eid, &pid).expect("node1 recorded the membership");
                 proto::RegisteredProperty {
+                    build_id: field.build_id,
                     id: pid,
                     membership_id,
                     name: field.name.to_owned(),
@@ -49,7 +50,7 @@ async fn test_two_event_determinism_same_property() -> Result<()> {
             .collect();
         let registered =
             proto::RegisteredModel { id: model_eid, label: descriptor.label.to_owned(), name: descriptor.name.to_owned(), properties };
-        node2.catalog.seed_registered_schema(descriptor, std::slice::from_ref(&registered))?;
+        node2.seed_registered_schema(descriptor, &registered)?;
     }
 
     // Create genesis on node1

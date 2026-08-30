@@ -45,6 +45,16 @@ struct InFlight {
     /// drop fault; load-bearing propagation may only be delayed, never lost, so
     /// quiescence can still converge. This flag marks the droppable ones.
     droppable: bool,
+    /// Whether the duplication fault may deliver this message an extra time.
+    /// Catalog reads are excluded: request/response matching is at-most-once,
+    /// so a duplicated request makes the server answer twice and the client's
+    /// request slot takes whichever answer lands first -- the second server
+    /// answer is legitimately EMPTY (the rows already sit in that peer
+    /// subscription's resultset), so reordering turns the duplicate into a
+    /// silently empty catalog. The production transports are
+    /// connection-oriented and cannot duplicate a request within a
+    /// connection, so the exclusion models reality rather than hiding a bug.
+    duplicable: bool,
     /// For load-bearing single-event propagation, the (entity, event) the
     /// receiver must end up holding for the delivery to count as accepted. If
     /// absent after delivery, the message is redelivered. `None` for advisory
@@ -115,7 +125,7 @@ impl Scheduler {
     /// the receiver holds `event`. Never dropped outright.
     pub fn enqueue_event(&mut self, src: usize, dst: usize, entity: proto::EntityId, event: proto::EventId, message: proto::NodeMessage) {
         let digest = message_digest(&message);
-        self.inflight.push(InFlight { src, dst, message, digest, droppable: false, accept: Some((entity, event)) });
+        self.inflight.push(InFlight { src, dst, message, digest, droppable: false, duplicable: true, accept: Some((entity, event)) });
     }
 
     /// Enqueue a load-bearing message with no single acceptance target (e.g. a
@@ -123,7 +133,7 @@ impl Scheduler {
     /// dropped, not acceptance-retried; may be reordered/delayed/duplicated.
     pub fn enqueue(&mut self, src: usize, dst: usize, message: proto::NodeMessage) {
         let digest = message_digest(&message);
-        self.inflight.push(InFlight { src, dst, message, digest, droppable: false, accept: None });
+        self.inflight.push(InFlight { src, dst, message, digest, droppable: false, duplicable: true, accept: None });
     }
 
     fn link_up(&self, a: usize, b: usize) -> bool { !self.partitions.contains(&pair(a, b)) }
@@ -136,14 +146,23 @@ impl Scheduler {
     /// catalog projection, so losing one of those outright would strand the
     /// node until a wall-clock retry fires -- a real-time dependency this
     /// harness, whose whole point is being a pure function of the seed, cannot
-    /// model. They are delivered like load-bearing propagation; every other
-    /// kind of node traffic stays advisory.
+    /// model. They are delivered like load-bearing propagation, and never
+    /// duplicated (`InFlight::duplicable`); every other kind of node traffic
+    /// stays advisory.
     fn absorb_captured(&mut self) {
         for out in self.captured.drain() {
             let Some(dst) = recipient_id(&out.message).and_then(|id| self.index_of(&id)) else { continue };
             let digest = message_digest(&out.message);
-            let droppable = !self.is_catalog_read(&out.message);
-            self.inflight.push(InFlight { src: out.src, dst, message: out.message, digest, droppable, accept: None });
+            let catalog_read = self.is_catalog_read(&out.message);
+            self.inflight.push(InFlight {
+                src: out.src,
+                dst,
+                message: out.message,
+                digest,
+                droppable: !catalog_read,
+                duplicable: !catalog_read,
+                accept: None,
+            });
         }
     }
 
@@ -153,14 +172,20 @@ impl Scheduler {
     fn is_catalog_read(&mut self, message: &proto::NodeMessage) -> bool {
         match message {
             proto::NodeMessage::Request { request, .. } => {
-                let collection = match &request.body {
+                let protected = match &request.body {
                     proto::NodeRequestBody::Fetch { collection, .. }
                     | proto::NodeRequestBody::Get { collection, .. }
-                    | proto::NodeRequestBody::GetEvents { collection, .. }
-                    | proto::NodeRequestBody::SubscribeQuery { collection, .. } => collection,
+                    | proto::NodeRequestBody::GetEvents { collection, .. } => ankurah::core::schema::reads_bypass_policy(collection),
+                    // EVERY subscription handshake, not only the catalog's: a
+                    // dropped SubscribeQuery heals only through the relay's
+                    // wall-clock retry timer, which a harness that is a pure
+                    // function of the seed cannot model -- the recording
+                    // checks would park forever on a subscription that can
+                    // only establish in real time.
+                    proto::NodeRequestBody::SubscribeQuery { .. } => true,
                     _ => return false,
                 };
-                if !ankurah::core::schema::reads_bypass_policy(collection) {
+                if !protected {
                     return false;
                 }
                 self.catalog_requests.insert(request.id.clone());
@@ -232,11 +257,31 @@ impl Scheduler {
         let mut rounds = 0;
         loop {
             rounds += 1;
-            assert!(
-                rounds <= self.max_rounds,
-                "scheduler exceeded {} rounds without quiescing (harness bug or non-convergence)",
-                self.max_rounds
-            );
+            if rounds > self.max_rounds {
+                // Name the traffic that would not stop: the looping message
+                // kind is usually the whole diagnosis.
+                let mut histogram: std::collections::BTreeMap<(usize, usize, String), usize> = std::collections::BTreeMap::new();
+                for message in &self.inflight {
+                    *histogram.entry((message.src, message.dst, super::transport::semantic_descriptor(&message.message))).or_default() += 1;
+                }
+                let tail: Vec<String> = trace.events().iter().rev().take(8).map(|event| event.canonical()).collect();
+                let node_states: Vec<String> = nodes
+                    .iter()
+                    .map(|n| {
+                        format!(
+                            "n{}: system_ready={} catalog_counts={:?}",
+                            n.index,
+                            n.node.system.is_system_ready(),
+                            n.node.catalog.counts()
+                        )
+                    })
+                    .collect();
+                panic!(
+                    "scheduler exceeded {} rounds without quiescing (harness bug or non-convergence)\n\
+                     inflight now: {histogram:?}\ntrace tail (newest first): {tail:#?}\nnodes: {node_states:#?}",
+                    self.max_rounds
+                );
+            }
 
             self.absorb_captured();
 
@@ -305,8 +350,9 @@ impl Scheduler {
                     requeue.push(item);
                     continue;
                 }
-                // Deliver, optionally an extra time (duplication).
-                let dup = self.faults.duplicate && rng.chance(self.faults.duplicate_p);
+                // Deliver, optionally an extra time (duplication; see
+                // `InFlight::duplicable` for the catalog-read exclusion).
+                let dup = item.duplicable && self.faults.duplicate && rng.chance(self.faults.duplicate_p);
                 let accepted = self.deliver(&item, nodes, trace, false).await;
                 if dup {
                     let _ = self.deliver(&item, nodes, trace, true).await;

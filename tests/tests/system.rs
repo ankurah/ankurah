@@ -161,15 +161,14 @@ async fn test_system_persistence_across_reconstruction() -> Result<()> {
     Ok(())
 }
 
-/// A node that joins a system it never hears back from has joined in memory
-/// only: the root is written after the first catalog sync, so a crash before
-/// that leaves nothing behind and the node joins again from scratch.
-///
-/// The alternative -- writing the root at join -- is what makes that crash
-/// silent: the reopened node loads a root, stops joining because it has one,
-/// and serves an empty catalog as if it were the system's.
+/// A stored root means "joined once"; it does not certify sync (the
+/// join_system contract). The join persists its root right away, and what
+/// keeps a crash-restart from serving staleness is not the write's timing:
+/// a reopened EPHEMERAL never marks itself ready from a loaded root (it
+/// must join again), and raw resolution defers behind the catalog's own
+/// per-process durable answer either way.
 #[tokio::test]
-async fn a_join_that_never_synced_leaves_no_root_behind() -> Result<()> {
+async fn a_persisted_join_reloads_without_conferring_readiness() -> Result<()> {
     let durable_engine = Arc::new(SledStorageEngine::new_test().unwrap());
     let ephemeral_engine = Arc::new(SledStorageEngine::new_test().unwrap());
 
@@ -177,56 +176,49 @@ async fn a_join_that_never_synced_leaves_no_root_behind() -> Result<()> {
     durable_node.system.create().await?;
     let root = durable_node.system.root().expect("the durable node has a root to join");
 
-    // Join with nobody connected: the catalog projection runs over local
-    // storage, so the node is READY, and no peer has answered a word of it.
+    // Join with nobody connected: ready in memory, and the root is written
+    // durably as part of the join itself.
     {
         let ephemeral_node = Node::new(ephemeral_engine.clone(), PermissiveAgent::new());
         ephemeral_node.system.wait_loaded().await;
         ephemeral_node.system.join_system(root.clone()).await?;
         assert!(ephemeral_node.system.is_system_ready(), "the join completes in memory");
-        ephemeral_node.catalog.wait_catalog_ready().await;
+        ephemeral_node.catalog.wait_ready().await?;
         assert_eq!(ephemeral_node.system.root(), Some(root.clone()), "the node holds the root it joined");
-        for _ in 0..32 {
-            tokio::task::yield_now().await;
-        }
-        assert!(!root_persisted(&ephemeral_engine).await?, "an unanswered catalog must leave the join in memory");
+        wait_root_persisted(&ephemeral_engine).await?;
     } // kill
 
-    // Reopen: nothing was joined, so this node joins rather than pretending
-    // it already had.
-    {
-        let ephemeral_node = Node::new(ephemeral_engine.clone(), PermissiveAgent::new());
-        ephemeral_node.system.wait_loaded().await;
-        assert_eq!(ephemeral_node.system.root(), None, "the unsynced join left nothing to load");
-        assert!(!ephemeral_node.system.is_system_ready());
-
-        // The re-join is the same join, and this time a peer answers it.
-        let _conn = LocalProcessConnection::new(&durable_node, &ephemeral_node).await?;
-        ephemeral_node.system.wait_system_ready().await;
-        assert_eq!(ephemeral_node.system.root(), Some(root.clone()), "the replayed join reaches the same system");
-        wait_root_persisted(&ephemeral_engine).await?;
-    }
-
-    // Reopen once more: a synced join IS durable.
+    // Reopen: the root loads ("joined once"), but readiness is not loaded
+    // with it -- an ephemeral node must join again to be part of a system.
     {
         let ephemeral_node = Node::new(ephemeral_engine.clone(), PermissiveAgent::new());
         ephemeral_node.system.wait_loaded().await;
         assert_eq!(
             ephemeral_node.system.root().map(|loaded| loaded.payload.state.head),
-            Some(root.payload.state.head),
-            "the synced join survives a restart"
+            Some(root.payload.state.head.clone()),
+            "the persisted join survives a restart"
         );
+        assert!(!ephemeral_node.system.is_system_ready(), "a loaded root never confers readiness on an ephemeral node");
+
+        // The re-join is the same join: the matching root marks ready
+        // without resetting anything.
+        let _conn = LocalProcessConnection::new(&durable_node, &ephemeral_node).await?;
+        ephemeral_node.system.wait_system_ready().await;
+        assert_eq!(ephemeral_node.system.root(), Some(root.clone()), "the replayed join reaches the same system");
+        assert_eq!(ephemeral_node.system.items().len(), 1, "exactly one root was ever written");
     }
 
     Ok(())
 }
 
-/// A join whose catalog is never answered stays pending for as long as the
-/// node lives, so joining a DIFFERENT system in the meantime has to win: the
-/// pending write is conditional on the node still holding the root it was
-/// asked to write, and by then it holds another one.
+/// Joining a DIFFERENT system replaces a previously persisted root: the
+/// mismatched root hard-resets the node (wiping the earlier root with the
+/// rest of storage) before the new join writes its own. The persist is
+/// conditional on the node still holding the root it was asked to write, so
+/// no interleaving lets the earlier system's write land over the one
+/// actually joined.
 #[tokio::test]
-async fn a_pending_join_never_overwrites_the_system_actually_joined() -> Result<()> {
+async fn joining_a_different_system_replaces_a_persisted_root() -> Result<()> {
     let abandoned_engine = Arc::new(SledStorageEngine::new_test().unwrap());
     let joined_engine = Arc::new(SledStorageEngine::new_test().unwrap());
     let ephemeral_engine = Arc::new(SledStorageEngine::new_test().unwrap());
@@ -242,14 +234,14 @@ async fn a_pending_join_never_overwrites_the_system_actually_joined() -> Result<
     let ephemeral_node = Node::new(ephemeral_engine.clone(), PermissiveAgent::new());
     ephemeral_node.system.wait_loaded().await;
 
-    // Join a system nobody is connected to: in memory, and its write is
-    // still waiting for a catalog answer that has not come.
+    // Join a system nobody is connected to: the join writes its root
+    // durably right away.
     ephemeral_node.system.join_system(abandoned_root.clone()).await?;
-    assert!(!root_persisted(&ephemeral_engine).await?);
+    wait_root_persisted(&ephemeral_engine).await?;
 
-    // Connect to a DIFFERENT system. The mismatched root resets this node and
-    // joins that one instead, and its catalog is answered -- which is also
-    // when the abandoned join's pending write gets its turn.
+    // Connect to a DIFFERENT system. The mismatched root resets this node
+    // (wiping the abandoned root with the rest of storage) and joins that
+    // one instead.
     let _conn = LocalProcessConnection::new(&joined, &ephemeral_node).await?;
     ephemeral_node.system.wait_system_ready().await;
     wait_root_persisted(&ephemeral_engine).await?;
@@ -367,7 +359,7 @@ async fn test_system_root_change_behavior() -> Result<()> {
             with_catalog(vec![CollectionId::fixed_name("_ankurah_system"), CollectionId::fixed_name("pet")])
         );
 
-        durable_node.catalog.wait_catalog_ready().await;
+        durable_node.catalog.wait_ready().await?;
         assert_eq!(
             sorted(durable_engine.list_collections()?),
             with_catalog(vec![CollectionId::fixed_name("_ankurah_system"), CollectionId::fixed_name("pet")])
@@ -384,7 +376,7 @@ async fn test_system_root_change_behavior() -> Result<()> {
         // should be ready because we previously initialized a system
         assert!(durable_node.system.is_system_ready());
 
-        durable_node.catalog.wait_catalog_ready().await;
+        durable_node.catalog.wait_ready().await?;
         assert_eq!(
             sorted(durable_engine.list_collections()?),
             with_catalog(vec![CollectionId::fixed_name("_ankurah_system"), CollectionId::fixed_name("pet")])
@@ -399,7 +391,7 @@ async fn test_system_root_change_behavior() -> Result<()> {
 
         durable_node.system.create().await?;
 
-        durable_node.catalog.wait_catalog_ready().await;
+        durable_node.catalog.wait_ready().await?;
         assert_eq!(sorted(durable_engine.list_collections()?), with_catalog(vec![CollectionId::fixed_name("_ankurah_system")]));
 
         // Verify root has changed
@@ -426,7 +418,7 @@ async fn test_system_root_change_behavior() -> Result<()> {
         durable_node.system.wait_loaded().await;
         assert!(durable_node.system.is_system_ready()); // should be ready when loaded
         assert_eq!(durable_node.system.root(), Some(second_root.clone()));
-        durable_node.catalog.wait_catalog_ready().await;
+        durable_node.catalog.wait_ready().await?;
         assert_eq!(
             sorted(durable_engine.list_collections()?),
             with_catalog(vec![CollectionId::fixed_name("_ankurah_system"), CollectionId::fixed_name("album")])
