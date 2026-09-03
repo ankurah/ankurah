@@ -1,7 +1,8 @@
-use ankurah_core::selection::filter::Filterable;
+use ankurah_core::selection::filter::PathLookup;
 use ankurah_proto::CollectionId;
 use ankurah_storage_common::filtering::{HasEntityId, ValueSetStream};
 use ankurah_storage_common::traits::EntityIdStream;
+use ankurah_storage_common::EngineColumns;
 use futures::Stream;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -69,7 +70,7 @@ pub trait SledEntityExt: EntityIdStream + Sized {
 
 /// Trait that provides a convenient `.entities()` combinator for materialized value streams
 pub trait SledEntityExtFromMats: ValueSetStream + Sized
-where Self::Item: HasEntityId + Filterable
+where Self::Item: HasEntityId + PathLookup<EngineColumns>
 {
     /// Extract EntityIds and hydrate into EntityStates using the sled entities tree
     fn entities(self, entities_tree: &sled::Tree, collection_id: &CollectionId) -> SledEntityLookup<impl EntityIdStream> {
@@ -81,10 +82,10 @@ where Self::Item: HasEntityId + Filterable
 // Blanket implementation for all EntityId streams
 impl<S: EntityIdStream> SledEntityExt for S {}
 
-// Blanket implementation for all streams with HasEntityId + Filterable items
+// Blanket implementation for all streams with HasEntityId + column-lookup items
 impl<S> SledEntityExtFromMats for S
 where
     S: Stream + Unpin + ValueSetStream,
-    S::Item: HasEntityId + Filterable,
+    S::Item: HasEntityId + PathLookup<EngineColumns>,
 {
 }

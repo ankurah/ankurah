@@ -296,7 +296,7 @@ fn generate_selection_from_template(template: &str, args: &[Expr]) -> proc_macro
 }
 
 fn generate_selection_code_with_replacements(
-    selection: &ankql::ast::Selection,
+    selection: &ankql::ast::Selection<ankql::ast::Parsed>,
     args: &[(Option<String>, String, Expr)],
     arg_index: &mut usize,
 ) -> proc_macro2::TokenStream {
@@ -330,8 +330,10 @@ fn generate_selection_code_with_replacements(
         quote! { None }
     };
 
+    // Always the parsed stage: this macro parses a query string, and binding
+    // its names to identities is a later pass with a catalog behind it.
     quote! {
-        ::ankql::ast::Selection {
+        ::ankql::ast::Selection::<::ankql::ast::Parsed> {
             predicate: #predicate_code,
             order_by: #order_by_code,
             limit: #limit_code,
@@ -340,7 +342,7 @@ fn generate_selection_code_with_replacements(
 }
 
 fn generate_predicate_code_with_replacements(
-    predicate: &ankql::ast::Predicate,
+    predicate: &ankql::ast::Predicate<ankql::ast::Parsed>,
     args: &[(Option<String>, String, Expr)],
     arg_index: &mut usize,
 ) -> proc_macro2::TokenStream {
@@ -426,7 +428,7 @@ fn generate_predicate_code_with_replacements(
 }
 
 fn generate_expr_code_with_replacements(
-    expr: &ankql::ast::Expr,
+    expr: &ankql::ast::Expr<ankql::ast::Parsed>,
     args: &[(Option<String>, String, Expr)],
     arg_index: &mut usize,
 ) -> proc_macro2::TokenStream {

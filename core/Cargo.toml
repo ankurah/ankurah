@@ -18,10 +18,14 @@ wasm = [
     "ankql/wasm",
     "ankurah-core-types/wasm",
     "ankurah-proto/wasm",
-    "ankurah-derive",
+    # Core derives models of its own (the catalog rows), and `Model` grows its
+    # RefWrapper associated type under this feature. The generator has to be
+    # emitting for the same surface, or core's own models would not implement
+    # the trait core just widened.
+    "ankurah-derive/wasm",
     "futures-timer/wasm-bindgen",
 ]
-uniffi = ["dep:uniffi", "ankurah-proto/uniffi", "ankurah-derive"]
+uniffi = ["dep:uniffi", "ankurah-proto/uniffi"]
 default = []
 instrument = []
 # Enables test helper methods for adversarial testing (e.g., creating phantom entities)
@@ -34,7 +38,7 @@ bench-internals = []
 
 [dependencies]
 # Internal dependencies
-ankurah-derive     = { path = "../derive", optional = true, version = "=0.10.0" }
+ankurah-derive     = { path = "../derive", version = "=0.10.0" }
 ankql              = { path = "../ankql", version = "=0.10.0" }
 ankurah-core-types = { path = "../core-types", version = "=0.10.0" }
 ankurah-proto      = { path = "../proto", version = "=0.10.0" }
@@ -70,9 +74,8 @@ base64               = { version = "0.22" }
 uniffi               = { version = "0.29", optional = true }
 
 [dev-dependencies]
-maplit         = "1.0"
-ankurah-derive = { path = "../derive", version = "=0.10.0" }
-criterion      = { version = "0.5", features = ["async_tokio"] }
+maplit    = "1.0"
+criterion = { version = "0.5", features = ["async_tokio"] }
 
 # Event DAG engine benchmarks (workstream E). harness = false because criterion
 # provides its own harness. required-features states what the source already

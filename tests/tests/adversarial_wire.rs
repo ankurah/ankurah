@@ -37,9 +37,9 @@ use common::{Record, RecordView};
 /// id and parent clock, so the forger cannot choose it (C4-01): whatever id
 /// the DAG keys on is recomputed from those contents, never read from any
 /// declared field.
-fn forge_title_event(entity_id: proto::EntityId, parent: proto::Clock, title: &str) -> proto::Event {
+fn forge_title_event(f: &Fixture, entity_id: proto::EntityId, parent: proto::Clock, title: &str) -> proto::Event {
     let backend = LWWBackend::new();
-    backend.set("title".into(), Some(Value::String(title.to_owned())));
+    backend.set(common::resolved_prop(&f.server, Record::descriptor(), "title"), Some(Value::String(title.to_owned())));
     let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
     proto::Event::update(
         Record::collection(),
@@ -53,9 +53,9 @@ fn forge_title_event(entity_id: proto::EntityId, parent: proto::Clock, title: &s
 /// Forge a genesis that CLAIMS `entity_id` rather than the entity its own
 /// content derives. Unrepresentable through `Event::genesis`, which is the
 /// point: this is the shape a receiver must refuse.
-fn forge_genesis_claiming(entity_id: proto::EntityId, title: &str) -> proto::Event {
+fn forge_genesis_claiming(f: &Fixture, entity_id: proto::EntityId, title: &str) -> proto::Event {
     let backend = LWWBackend::new();
-    backend.set("title".into(), Some(Value::String(title.to_owned())));
+    backend.set(common::resolved_prop(&f.server, Record::descriptor(), "title"), Some(Value::String(title.to_owned())));
     let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
     let mut event = proto::Event::genesis(
         Record::collection(),
@@ -216,11 +216,11 @@ async fn malformed_clock_identity_is_order_independent_end_to_end() -> Result<()
     // Two concurrent children of the same head, committed so the head becomes
     // a two-id antichain we can then feed back in scrambled order.
     let head0 = view.entity().head().clone();
-    let ev_b = forge_title_event(rec_id, head0.clone(), "b");
+    let ev_b = forge_title_event(&f, rec_id, head0.clone(), "b");
     let ev_c = {
         // Distinct ops so ev_c is a sibling, not a duplicate of ev_b.
         let backend = LWWBackend::new();
-        backend.set("artist".into(), Some(Value::String("c-artist".to_owned())));
+        backend.set(common::resolved_prop(&f.server, Record::descriptor(), "artist"), Some(Value::String("c-artist".to_owned())));
         let ops = backend.to_operations().unwrap().expect("ops");
         proto::Event::update(
             Record::collection(),
@@ -239,7 +239,7 @@ async fn malformed_clock_identity_is_order_independent_end_to_end() -> Result<()
     let two_ids = vec![ev_b.id(), ev_c.id()];
     let mut reversed = two_ids.clone();
     reversed.reverse();
-    let ev_merge_a = forge_title_event(rec_id, proto::Clock::from(two_ids.clone()), "merged");
+    let ev_merge_a = forge_title_event(&f, rec_id, proto::Clock::from(two_ids.clone()), "merged");
     let mut ev_merge_b = ev_merge_a.clone();
     ev_merge_b.parent = proto::Clock::from(reversed);
     assert_eq!(ev_merge_a.id(), ev_merge_b.id(), "parent-clock input order must not change event identity");
@@ -272,10 +272,10 @@ async fn forged_dangling_parent_is_contained() -> Result<()> {
 
     // Valid event for A; forged event for B parented on an id that was never
     // created (a fabricated 32-byte hash below any real history).
-    let ev_a = forge_title_event(a_id, view_a.entity().head().clone(), "a1");
+    let ev_a = forge_title_event(&f, a_id, view_a.entity().head().clone(), "a1");
     let id_ev_a = ev_a.id();
     let dangling = proto::Clock::from(vec![proto::EventId::from_bytes([0xAB; 32])]);
-    let ev_b_forged = forge_title_event(b_id, dangling, "forged");
+    let ev_b_forged = forge_title_event(&f, b_id, dangling, "forged");
     let id_forged = ev_b_forged.id();
 
     // handle_message returns Ok; the per-item failure rides the ack path.
@@ -307,10 +307,10 @@ async fn forged_extra_genesis_head_does_not_trigger_wholesale_adoption() -> Resu
 
     // A legitimate child B of the current head, and an independent genesis X
     // (empty parent) for the same entity id: X shares no lineage with the head.
-    let ev_b = forge_title_event(rec_id, head0.clone(), "child-b");
+    let ev_b = forge_title_event(&f, rec_id, head0.clone(), "child-b");
     let ev_x = {
         let backend = LWWBackend::new();
-        backend.set("artist".into(), Some(Value::String("foreign-x".to_owned())));
+        backend.set(common::resolved_prop(&f.server, Record::descriptor(), "artist"), Some(Value::String("foreign-x".to_owned())));
         let ops = backend.to_operations().unwrap().expect("ops");
         // A genesis claiming an existing entity's id: structurally invalid
         // now that a genesis names whatever entity its own content derives.
@@ -363,7 +363,21 @@ async fn forged_extra_genesis_head_does_not_trigger_wholesale_adoption() -> Resu
 #[test]
 fn declared_cycle_is_unconstructible_content_addressing() {
     let entity = proto::EntityId::random();
-    let mk = |title: &str, parent: proto::Clock| forge_title_event(entity, parent, title);
+    // No node exists in this constructive proof; the property identity is
+    // forged like the entity id (content addressing is indifferent to it).
+    let title_prop = proto::PropertyId::EntityId(proto::EntityId::from_bytes([0x71; 32]));
+    let mk = |title: &str, parent: proto::Clock| {
+        let backend = LWWBackend::new();
+        backend.set(title_prop, Some(Value::String(title.to_owned())));
+        let ops = backend.to_operations().unwrap().expect("ops");
+        proto::Event::update(
+            Record::collection(),
+            entity,
+            parent,
+            proto::AuthorId::Unknown,
+            proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)])),
+        )
+    };
 
     // Start from two independent events and try to wire A.parent := [B.id()]
     // and B.parent := [A.id()]. Compute B first, then A referencing B; now A
@@ -405,8 +419,8 @@ async fn fabricated_cycle_batch_is_contained() -> Result<()> {
     // recomputed content id, so the batch graph has no edges between them.
     let fake1 = proto::EventId::from_bytes([0x11; 32]);
     let fake2 = proto::EventId::from_bytes([0x22; 32]);
-    let ev1 = forge_title_event(rec_id, proto::Clock::from(vec![fake2]), "cycle-1");
-    let ev2 = forge_title_event(rec_id, proto::Clock::from(vec![fake1]), "cycle-2");
+    let ev1 = forge_title_event(&f, rec_id, proto::Clock::from(vec![fake2]), "cycle-1");
+    let ev2 = forge_title_event(&f, rec_id, proto::Clock::from(vec![fake1]), "cycle-2");
     let id1 = ev1.id();
     let id2 = ev2.id();
 
@@ -440,7 +454,7 @@ async fn replay_flood_is_idempotent() -> Result<()> {
     let query = f.ctx_c.query_wait::<RecordView>(nocache(format!("id = '{}'", rec_id).as_str())?).await?;
     let _guard = query.subscribe(&watcher);
 
-    let ev = forge_title_event(rec_id, view.entity().head().clone(), "t1");
+    let ev = forge_title_event(&f, rec_id, view.entity().head().clone(), "t1");
     let id_ev = ev.id();
 
     // Flood: 10 identical single-event deliveries, none may error.
@@ -481,7 +495,7 @@ async fn forged_second_genesis_rejected_on_durable_node() -> Result<()> {
 
     // Forge a DISTINCT second genesis claiming the same entity id and deliver
     // it to the SERVER attributed to the client peer.
-    let alt = forge_genesis_claiming(rec_id, "ALT-GENESIS");
+    let alt = forge_genesis_claiming(&f, rec_id, "ALT-GENESIS");
     assert!(alt.is_entity_create(), "alt is a creation event");
     let alt_id = alt.id();
     f.server.handle_message(deliver(f.client.id, f.server.id, vec![event_only_item(alt)])).await?;
@@ -509,7 +523,7 @@ async fn forged_second_genesis_rejected_on_ephemeral_node() -> Result<()> {
     let (rec_id, view) = seed_record(&f, "t0", "a0").await?;
     let head_before = view.entity().head().clone();
 
-    let alt = forge_genesis_claiming(rec_id, "ALT-EPH");
+    let alt = forge_genesis_claiming(&f, rec_id, "ALT-EPH");
     let alt_id = alt.id();
     f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(alt)])).await?;
 
@@ -530,10 +544,10 @@ async fn phantom_entity_is_evicted_on_failed_apply() -> Result<()> {
     let f = fixture().await?;
     let (a_id, view_a) = seed_record(&f, "a0", "artist-a").await?;
 
-    let ev_a = forge_title_event(a_id, view_a.entity().head().clone(), "a1");
+    let ev_a = forge_title_event(&f, a_id, view_a.entity().head().clone(), "a1");
     let unknown_id = proto::EntityId::random();
     // Non-creation event (non-empty parent) for an entity the client never saw.
-    let ev_unknown = forge_title_event(unknown_id, proto::Clock::from(vec![proto::EventId::from_bytes([7u8; 32])]), "ghost");
+    let ev_unknown = forge_title_event(&f, unknown_id, proto::Clock::from(vec![proto::EventId::from_bytes([7u8; 32])]), "ghost");
 
     f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(ev_a), event_only_item(ev_unknown)])).await?;
 
@@ -575,7 +589,7 @@ async fn oversized_event_batch_is_rejected() -> Result<()> {
     let mut parent = view.entity().head().clone();
     let mut events: Vec<proto::Event> = Vec::with_capacity(OVERSIZED);
     for i in 0..OVERSIZED {
-        let ev = forge_title_event(rec_id, parent.clone(), &format!("flood-{i}"));
+        let ev = forge_title_event(&f, rec_id, parent.clone(), &format!("flood-{i}"));
         parent = proto::Clock::from(vec![ev.id()]);
         events.push(ev);
     }
@@ -644,7 +658,7 @@ async fn equivocation_flood_antichain_is_bounded() -> Result<()> {
     // Many distinct siblings of the same head: each is a genuine, distinct
     // content hash (different title), so de-dup does not collapse them.
     const FLOOD: usize = 256;
-    let siblings: Vec<proto::Event> = (0..FLOOD).map(|i| forge_title_event(rec_id, head0.clone(), &format!("equiv-{i}"))).collect();
+    let siblings: Vec<proto::Event> = (0..FLOOD).map(|i| forge_title_event(&f, rec_id, head0.clone(), &format!("equiv-{i}"))).collect();
     for ev in siblings {
         f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(ev)])).await?;
     }

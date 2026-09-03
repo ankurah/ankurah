@@ -1,39 +1,20 @@
-//! A11b: the client-side registration lifecycle
-//!, as scoped for
-//! the write-only catalog phase.
-//!
-//! These tests drive registration through the ORDINARY client surface --
-//! `ctx.register_model::<M>()` -- rather than hand-built RegisterSchema requests
-//! (that lower layer is covered by schema_registration.rs / catalog_map.rs).
-//! They pin the lifecycle behaviors:
-//!
-//!   a. auto-assert: `trx.create` on an ephemeral registers durably, and
-//!      the ids everywhere are the durable's allocations;
-//!   b. strict offline: creating into a NEVER-registered collection with
-//!      no durable peer fails at create, while an exact schema whose every
-//!      field is already bound compatibly keeps writing offline;
-//!   c. explicit `register_model::<M>()` propagates every failure and is idempotent (heads
-//!      unchanged on repeat), and fails offline without latching;
-//!   d. predicate queries and typed direct gets register at first use;
-//!   e. hard_reset flushes the map and the ensured latch (allocations
-//!      belong to one system);
-//!   f. fail-loud offline read: with no durable peer, a fetch over a
-//!      never-registered collection errs loudly instead of answering empty;
-//!   g. a custom Property type's declared VALUE_TYPE flows through the
-//!      compiled schema into the allocated catalog definition.
-//!
-//! Excised with the read flip: the relay-warmed offline reassertion
-//! scenario (a client's map learning another node's registrations needs the
-//! catalog subscriptions) and predicate-resolution assertions (unknown
-//! properties failing closed). Their tests return with that machinery.
+//! Registration through the typed client API.
 
 mod common;
+use ankurah::core::session::SessionSet;
 use ankurah::proto::PropertyId;
 use common::*;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 type TestNode = Node<SledStorageEngine, PermissiveAgent>;
+
+/// Whether this compiled shape's identity cells are resolved for the node's
+/// current schema epoch -- the registered-right-now probe, read from the
+/// descriptor itself.
+fn schema_registered(node: &TestNode, schema: &'static ankurah::core::schema::ModelStructDescriptor) -> bool {
+    node.system.schema_epoch().is_some_and(|epoch| schema.resolved.get(epoch).is_some())
+}
 
 // Distinct models per behavior so the collections never collide.
 #[derive(Model, Debug, Serialize, Deserialize)]
@@ -131,13 +112,13 @@ async fn catalog_head(node: &TestNode, collection: &str, id: EntityId) -> anyhow
 
 // (a) Auto-assert: create on the ephemeral; the durable executes the
 // registration (allocating the ids) and both sides converge on the same
-// allocations. `create` awaits the RegisterSchema response internally, so
-// the client map is seeded on ack; the durable's own map is updated
-// synchronously by the executor.
+// allocations. `create` awaits the RegisterSchema response internally --
+// the ack binds the client's compiled cells -- and each side's raw catalog
+// resolution follows its own projection to the same ids.
 #[tokio::test]
 async fn auto_assert_create_registers_on_durable() -> anyhow::Result<()> {
     let (server, client, _conn) = connected_pair().await?;
-    server.catalog.wait_catalog_ready().await;
+    server.catalog.wait_ready().await?;
 
     let ctx = client.context_async(DEFAULT_CONTEXT).await;
     let trx = ctx.begin();
@@ -154,17 +135,12 @@ async fn auto_assert_create_registers_on_durable() -> anyhow::Result<()> {
     let size = server.catalog.property_by_id(&size_id).expect("size def");
     assert_eq!((size.backend.as_str(), size.value_type.as_str()), ("lww", "i32"), "i32 field -> (lww, i32)");
 
-    // The client's map was seeded from the SchemaRegistered response: the
-    // SAME ids, no waiting on the catalog subscription.
-    assert_eq!(
-        resolve_by_collection(&client, "widget", "label"),
-        Some(PropertyId::EntityId(label_id)),
-        "response-fed client map agrees with the allocator"
-    );
-    assert_eq!(resolve_by_collection(&client, "widget", "size"), Some(PropertyId::EntityId(size_id)));
+    // The client catalog converges separately from descriptor binding on ack.
+    assert_eq!(wait_resolve(&client, "widget", "label").await, Some(label_id), "the client's projection converges on the allocator's ids");
+    assert_eq!(wait_resolve(&client, "widget", "size").await, Some(size_id));
 
     // The model entity is indexed by its collection with the struct name.
-    let model = server.catalog.model_by_label("widget").expect("model present on durable");
+    let (_, model) = server.catalog.model_by_label("widget").expect("model present on durable");
     assert_eq!(model.name, "Widget");
 
     Ok(())
@@ -181,13 +157,14 @@ async fn offline_create_unregistered_is_strict_registered_proceeds() -> anyhow::
     let client = ephemeral_sled_setup().await?;
     let conn = LocalProcessConnection::new(&server, &client).await?;
     client.system.wait_system_ready().await;
-    server.catalog.wait_catalog_ready().await;
+    server.catalog.wait_ready().await?;
 
     // Build the context while connected (join_system needs a peer), and
-    // register Widget while connected so it is a KNOWN collection later.
+    // Wait until Widget is known to the client's catalog before disconnecting.
     let ctx = client.context_async(DEFAULT_CONTEXT).await;
     ctx.register_model::<Widget>().await?;
-    assert!(client.catalog.model_by_label("widget").is_some(), "widget bound while connected");
+    wait_resolve(&client, "widget", "label").await.expect("the projection delivers widget's rows while connected");
+    assert!(client.catalog.model_by_label("widget").is_some(), "widget known to the client's catalog while connected");
 
     // DISCONNECT: dropping the connection deregisters the peer on both
     // sides, so the ephemeral now has no durable peer.
@@ -210,7 +187,7 @@ async fn offline_create_unregistered_is_strict_registered_proceeds() -> anyhow::
         assert!(msg.contains("never been registered") && msg.contains("'gadget'"), "actionable strict error, got: {msg}");
     }
     assert!(resolve_by_collection(&server, "gadget", "name").is_none(), "nothing reached the durable");
-    assert!(!client.catalog.is_ensured("gadget"), "a strict failure must not latch");
+    assert!(!schema_registered(&client, Gadget::descriptor()), "a strict failure must leave the descriptor unresolved");
 
     // An explicit model id is part of the exact binding. The ordinary Widget
     // model and its compatible fields must not satisfy a declaration bound to
@@ -246,11 +223,7 @@ async fn offline_create_unregistered_is_strict_registered_proceeds() -> anyhow::
         let _g = trx.create(&Gadget { name: "online".into() }).await?;
     }
     let name_id = wait_resolve(&server, "gadget", "name").await.expect("durable allocates gadget.name after reconnect");
-    assert_eq!(
-        resolve_by_collection(&client, "gadget", "name"),
-        Some(PropertyId::EntityId(name_id)),
-        "client map seeded from the response"
-    );
+    assert_eq!(wait_resolve(&client, "gadget", "name").await, Some(name_id), "the client's projection converges on the allocator's ids");
 
     Ok(())
 }
@@ -263,6 +236,8 @@ async fn offline_reassert_requires_every_compiled_field_to_be_bound() -> anyhow:
     client.system.wait_system_ready().await;
     let ctx = client.context_async(DEFAULT_CONTEXT).await;
     ctx.register_model::<offline_v1::Evolving>().await?;
+    // Wait until Evolving is known locally before testing offline reassertion.
+    wait_resolve(&client, "evolving", "label").await.expect("the projection delivers evolving's rows while connected");
 
     drop(conn);
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -283,52 +258,120 @@ async fn offline_reassert_requires_every_compiled_field_to_be_bound() -> anyhow:
     Ok(())
 }
 
-// (d) Predicate-query paths register at first use (REN 2 revised, plan
-// decision 25b): a compiled model's first query triggers the idempotent registration
-// upsert, so resolution runs against authoritative rows instead of
-// failing loud as unregistered. The fetch still answers EMPTY -- the
-// freshly registered collection holds no entities -- and a second,
-// explicit register is a no-op against the same rows.
 #[tokio::test]
-async fn predicate_read_path_registers_at_first_use() -> anyhow::Result<()> {
+async fn descriptor_reasserts_mutable_catalog_metadata() -> anyhow::Result<()> {
+    let (server, client, _conn) = connected_pair().await?;
+    let mut declaration = proto::RegisterModel::from(Widget::descriptor());
+    declaration.name = "Temporary name".into();
+    declaration.properties[0].optional = true;
+    client.request(server.id, &DEFAULT_CONTEXT, proto::NodeRequestBody::RegisterSchema { model: declaration }).await?;
+
+    server.catalog.ensure_schema_for_use(&server, &DEFAULT_CONTEXT, Widget::descriptor()).await?;
+
+    let (model_id, model) = server.catalog.model_by_label("widget").expect("widget model");
+    assert_eq!(model.name, "Widget");
+    let property = server.catalog.property_by_name(&model_id, "label").expect("widget.label").0;
+    let membership = server.catalog.membership(&model_id, &property).expect("widget.label membership").1;
+    assert!(!membership.optional);
+    Ok(())
+}
+
+// A predicate read registers an unknown compiled schema before querying it.
+#[tokio::test]
+async fn predicate_read_path_heals_and_defines() -> anyhow::Result<()> {
     let server = durable_sled_setup().await?;
-    server.catalog.wait_catalog_ready().await;
+    server.catalog.wait_ready().await?;
     let ctx = server.context(DEFAULT_CONTEXT)?;
 
-    // The compiled schema anticipates `doohickey`; the catalog does not
-    // know it yet. The fetch registers it at first use and answers empty.
+    // The compiled schema anticipates `doohickey`; the catalog does not know
+    // it. The read defines it and answers.
     let results = ctx.fetch::<DoohickeyView>("tag = 'x'").await?;
     assert!(results.is_empty(), "a just-registered collection holds no entities");
 
-    // The predicate read durably registered and latched the collection.
     let tag_id = resolve_by_collection(&server, "doohickey", "tag");
-    assert!(tag_id.is_some(), "first-use registration fed the catalog");
-    assert!(server.catalog.is_ensured("doohickey"), "first-use registration latches");
+    assert!(tag_id.is_some(), "the healing read fed the catalog");
+    assert!(schema_registered(&server, Doohickey::descriptor()), "the healing read resolves the descriptor");
 
-    // The explicit register is an idempotent no-op against the same rows.
+    // A second register is idempotent against the same rows.
     ctx.register_model::<Doohickey>().await?;
     assert_eq!(resolve_by_collection(&server, "doohickey", "tag"), tag_id, "re-register must not re-mint");
-    let results = ctx.fetch::<DoohickeyView>("tag = 'x'").await?;
-    assert!(results.is_empty(), "no entities were created");
-
-    // The fail-closed rejection of a typo'd property in a registered
-    // collection is predicate-resolution behavior; its assertion returns
-    // with the propertyid-resolution PR.
 
     Ok(())
 }
 
-// (f) Fail-loud offline read: with no durable peer, a fetch over a NEVER-registered compiled
-// collection cannot run first-use registration, and the reference surfaces
-// the loud UnregisteredCollection error naming the collection -- never an
-// empty resultset, and never the weaker unknown-property shape.
+// Healing an evolved descriptor registers only its new field.
+#[tokio::test]
+async fn healing_registers_only_the_added_field() -> anyhow::Result<()> {
+    let server = durable_sled_setup().await?;
+    server.catalog.wait_ready().await?;
+    let ctx = server.context(DEFAULT_CONTEXT)?;
+
+    // The system knows the one-field shape.
+    ctx.register_model::<offline_v1::Evolving>().await?;
+    let (model, _) = server.catalog.model_by_label("evolving").expect("evolving model");
+    let Some(PropertyId::EntityId(label)) = resolve_by_collection(&server, "evolving", "label") else {
+        anyhow::bail!("evolving.label resolves after the first registration");
+    };
+    let (membership, _) = server.catalog.membership(&model, &label).expect("evolving.label membership");
+    let heads_before = (
+        catalog_head(&server, "_ankurah_model", model).await?,
+        catalog_head(&server, "_ankurah_property", label).await?,
+        catalog_head(&server, "_ankurah_model_property", membership).await?,
+    );
+
+    // A binary compiled against the two-field shape reads; healing registers
+    // the difference and the read answers.
+    let results = ctx.fetch::<offline_v2::EvolvingView>("added = 1").await?;
+    assert!(results.is_empty(), "nothing was ever created in this collection");
+
+    assert_eq!(server.catalog.model_by_label("evolving").expect("evolving model").0, model, "the model must not be re-minted");
+    assert_eq!(
+        resolve_by_collection(&server, "evolving", "label"),
+        Some(PropertyId::EntityId(label)),
+        "the known field keeps its identity"
+    );
+    let heads_after = (
+        catalog_head(&server, "_ankurah_model", model).await?,
+        catalog_head(&server, "_ankurah_property", label).await?,
+        catalog_head(&server, "_ankurah_model_property", membership).await?,
+    );
+    assert_eq!(heads_before, heads_after, "registering the delta must not rewrite what was already registered");
+
+    let Some(PropertyId::EntityId(added)) = resolve_by_collection(&server, "evolving", "added") else {
+        anyhow::bail!("the healing read must register the field this binary added");
+    };
+    assert!(server.catalog.membership(&model, &added).is_some(), "the added field joins the model already there");
+    assert!(schema_registered(&server, offline_v2::Evolving::descriptor()), "the two-field declaration binds after healing");
+
+    Ok(())
+}
+
+// A credential that cannot register schema cannot heal a read.
+#[tokio::test]
+async fn read_only_credential_cannot_heal() -> anyhow::Result<()> {
+    let server = durable_sled_setup().await?;
+    server.catalog.wait_ready().await?;
+    // A session-less source reads, but can never name the single principal a
+    // registration acts as.
+    let ctx = server.context(SessionSet::new())?;
+
+    let error = ctx.fetch::<GadgetView>("name = 'x'").await.expect_err("a read that cannot heal must not answer");
+    let msg = error.to_string();
+    assert!(msg.contains("gadget") && msg.contains("may not register"), "the error must name the model and the refusal, got: {msg}");
+    assert!(server.catalog.model_by_label("gadget").is_none(), "a refused read must define nothing");
+    assert!(!schema_registered(&server, Gadget::descriptor()), "a refused read must resolve nothing");
+
+    Ok(())
+}
+
+// An offline read cannot heal a never-registered collection.
 #[tokio::test]
 async fn offline_read_unregistered_fails_loud() -> anyhow::Result<()> {
     let server = durable_sled_setup().await?;
     let client = ephemeral_sled_setup().await?;
     let conn = LocalProcessConnection::new(&server, &client).await?;
     client.system.wait_system_ready().await;
-    server.catalog.wait_catalog_ready().await;
+    server.catalog.wait_ready().await?;
 
     // Context built while connected (join needs a peer); the catalog warms
     // (empty) via the context kick. Contraption is never registered.
@@ -347,7 +390,7 @@ async fn offline_read_unregistered_fails_loud() -> anyhow::Result<()> {
         ctx.fetch::<ContraptionView>("state = 'x'").await.expect_err("offline fetch over a never-registered collection must fail loud");
     let msg = err.to_string();
     assert!(msg.contains("never been registered") && msg.contains("contraption"), "loud error naming the collection, got: {msg}");
-    assert!(!client.catalog.is_ensured("contraption"), "a failed first-use registration must not latch");
+    assert!(!schema_registered(&client, Contraption::descriptor()), "a failed first-use registration must leave the descriptor unresolved");
 
     Ok(())
 }
@@ -376,13 +419,36 @@ async fn direct_get_registers_before_edit() -> anyhow::Result<()> {
     let ctx_b = client_b.context_async(DEFAULT_CONTEXT).await;
 
     let view = ctx_b.get::<ContraptionView>(id).await?;
-    assert!(client_b.catalog.is_ensured("contraption"), "a typed direct id get must admit its exact schema before decoding");
+    assert!(schema_registered(&client_b, Contraption::descriptor()), "a typed direct id get must resolve its exact schema before decoding");
 
     let trx = ctx_b.begin();
-    view.edit(&trx)?.state().replace("polished")?;
+    view.edit(&trx)?.state()?.replace("polished")?;
     trx.commit().await?;
 
-    assert!(client_b.catalog.is_ensured("contraption"), "the admitted binding remains available through the edit-only commit");
+    assert!(schema_registered(&client_b, Contraption::descriptor()), "the resolved binding remains available through the edit-only commit");
+    Ok(())
+}
+
+#[tokio::test]
+async fn transaction_get_binds_the_model_before_field_access() -> anyhow::Result<()> {
+    let (server, client_a, _conn_a) = connected_pair().await?;
+    let ctx_a = client_a.context_async(DEFAULT_CONTEXT).await;
+    let id = {
+        let trx = ctx_a.begin();
+        let entity = trx.create(&Contraption { state: "ready".into() }).await?;
+        let id = entity.id();
+        trx.commit().await?;
+        id
+    };
+
+    let client_b = ephemeral_sled_setup().await?;
+    let _conn_b = LocalProcessConnection::new(&server, &client_b).await?;
+    client_b.system.wait_system_ready().await;
+    let ctx_b = client_b.context_async(DEFAULT_CONTEXT).await;
+    let trx = ctx_b.begin();
+    let entity = trx.get::<Contraption>(&id).await?;
+
+    assert_eq!(entity.state()?.value().as_deref(), Some("ready"));
     Ok(())
 }
 
@@ -393,7 +459,7 @@ async fn direct_get_registers_before_edit() -> anyhow::Result<()> {
 #[tokio::test]
 async fn explicit_register_is_strict_and_idempotent() -> anyhow::Result<()> {
     let server = durable_sled_setup().await?;
-    server.catalog.wait_catalog_ready().await;
+    server.catalog.wait_ready().await?;
     let ctx = server.context(DEFAULT_CONTEXT)?;
 
     // Strict register: propagates errors (here, succeeds).
@@ -402,18 +468,18 @@ async fn explicit_register_is_strict_and_idempotent() -> anyhow::Result<()> {
     // Catalog entries exist locally after the explicit register; the ids
     // are this durable's allocations.
     let title_id = wait_resolve(&server, "gizmo", "title").await.expect("gizmo.title resolves after register");
-    let model_id = server.catalog.model_by_label("gizmo").expect("gizmo model").id;
-    let membership = server.catalog.membership(&model_id, &title_id).expect("gizmo.title membership");
+    let (model_id, _) = server.catalog.model_by_label("gizmo").expect("gizmo model");
+    let (membership, _) = server.catalog.membership(&model_id, &title_id).expect("gizmo.title membership");
 
     let head_before = catalog_head(&server, "_ankurah_property", title_id).await?;
-    let ms_head_before = catalog_head(&server, "_ankurah_model_property", membership.id).await?;
+    let ms_head_before = catalog_head(&server, "_ankurah_model_property", membership).await?;
 
     // Second call: the collection is latched as ensured, so it is a pure
     // no-op -- no new events, catalog heads unchanged.
     ctx.register_model::<Gizmo>().await?;
 
     let head_after = catalog_head(&server, "_ankurah_property", title_id).await?;
-    let ms_head_after = catalog_head(&server, "_ankurah_model_property", membership.id).await?;
+    let ms_head_after = catalog_head(&server, "_ankurah_model_property", membership).await?;
     assert_eq!(head_before, head_after, "second register must not mint new property events");
     assert_eq!(ms_head_before, ms_head_after, "second register must not mint new membership events");
 
@@ -426,7 +492,7 @@ async fn explicit_register_is_strict_and_idempotent() -> anyhow::Result<()> {
 #[tokio::test]
 async fn offline_register_is_strict_reconnect_proceeds() -> anyhow::Result<()> {
     let (server, client, conn) = connected_pair().await?;
-    server.catalog.wait_catalog_ready().await;
+    server.catalog.wait_ready().await?;
 
     // Build the context while connected (join_system needs a peer).
     let ctx = client.context_async(DEFAULT_CONTEXT).await;
@@ -445,7 +511,7 @@ async fn offline_register_is_strict_reconnect_proceeds() -> anyhow::Result<()> {
     let err = ctx.register_model::<Gadget>().await.expect_err("offline register of an unregistered collection must fail");
     assert!(err.to_string().contains("gadget"), "actionable strict error naming the collection, got: {err}");
     assert!(resolve_by_collection(&server, "gadget", "name").is_none(), "nothing reached the durable");
-    assert!(!client.catalog.is_ensured("gadget"), "a strict failure must not latch");
+    assert!(!schema_registered(&client, Gadget::descriptor()), "a strict failure must leave the descriptor unresolved");
 
     // RECONNECT: the same register now forwards, allocates, and latches.
     let _conn2 = LocalProcessConnection::new(&server, &client).await?;
@@ -457,13 +523,9 @@ async fn offline_register_is_strict_reconnect_proceeds() -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     ctx.register_model::<Gadget>().await?;
-    assert!(client.catalog.is_ensured("gadget"), "the forwarded registration latches on ack");
+    assert!(schema_registered(&client, Gadget::descriptor()), "the forwarded registration resolves on ack");
     let name_id = wait_resolve(&server, "gadget", "name").await.expect("durable allocates gadget.name after reconnect");
-    assert_eq!(
-        resolve_by_collection(&client, "gadget", "name"),
-        Some(PropertyId::EntityId(name_id)),
-        "client map seeded from the response"
-    );
+    assert_eq!(wait_resolve(&client, "gadget", "name").await, Some(name_id), "the client's projection converges on the allocator's ids");
 
     Ok(())
 }
@@ -473,17 +535,24 @@ async fn offline_register_is_strict_reconnect_proceeds() -> anyhow::Result<()> {
 #[tokio::test]
 async fn hard_reset_clears_ensured_and_map() -> anyhow::Result<()> {
     let server = durable_sled_setup().await?;
-    server.catalog.wait_catalog_ready().await;
+    server.catalog.wait_ready().await?;
     let ctx = server.context(DEFAULT_CONTEXT)?;
 
-    ctx.register_model::<Gizmo>().await?;
+    let trx = ctx.begin();
+    let gizmo = trx.create(&Gizmo { title: "before reset".into() }).await?;
+    let gizmo_id = gizmo.id();
+    drop(gizmo);
+    trx.commit().await?;
+    let stale_view = ctx.get::<GizmoView>(gizmo_id).await?;
+    assert_eq!(stale_view.title()?, "before reset");
     wait_resolve(&server, "gizmo", "title").await.expect("gizmo resolves before reset");
-    assert!(server.catalog.is_ensured("gizmo"));
+    assert!(schema_registered(&server, Gizmo::descriptor()));
 
     server.system.hard_reset().await?;
 
+    assert!(matches!(stale_view.title(), Err(ankurah::property::PropertyError::Unresolved { .. })));
     assert!(resolve_by_collection(&server, "gizmo", "title").is_none(), "map flushed after reset");
-    assert!(!server.catalog.is_ensured("gizmo"), "ensured latch flushed after reset");
+    assert!(!schema_registered(&server, Gizmo::descriptor()), "descriptor unreadable after reset (the epoch moved on)");
     assert_eq!(server.catalog.counts(), (0, 0, 0), "catalog map empty after reset");
 
     Ok(())

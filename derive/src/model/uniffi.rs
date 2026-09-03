@@ -50,7 +50,7 @@ pub fn uniffi_view_edit_impl(view_name: &Ident, model_name: &Ident, mutable_name
                 use ::ankurah::model::View;
                 match trx.edit::<#model_name>(&self.entity) {
                     Ok(mutable_borrow) => Ok(mutable_borrow.into_core()),
-                    Err(e) => Err(::ankurah::core::error::MutationError::AccessDenied(e))
+                    Err(e) => Err(::ankurah::core::error::MutationError::from(e))
                 }
             }
         }
@@ -93,8 +93,8 @@ pub fn uniffi_mutable_field_methods(model: &crate::model::description::ModelDesc
             Some(quote! {
                 /// Get the active property wrapper for this field
                 #[uniffi::method(name = #field_name_str)]
-                pub fn #uniffi_method_name(&self) -> #wrapper_type {
-                    #wrapper_type(self.#field_name())
+                pub fn #uniffi_method_name(&self) -> Result<#wrapper_type, ::ankurah::property::PropertyError> {
+                    Ok(#wrapper_type(self.#field_name()?))
                 }
             })
         })
@@ -639,10 +639,12 @@ fn uniffi_livequery_wrapper(
                 Ok(())
             }
 
-            /// Get the current selection predicate as a string
+            /// Get the current selection predicate as a string. Empty while
+            /// the query's resolution is still running: it has no selection
+            /// yet, and rendering one would name a query that is not running.
             pub fn current_selection(&self) -> String {
                 use ::ankurah::signals::With;
-                self.0.selection().with(|(sel, _version)| sel.to_string())
+                self.0.selection().with(|resolved| resolved.as_ref().map(|(sel, _version)| sel.to_string()).unwrap_or_default())
             }
 
             /// Subscribe to changes in the LiveQuery resultset

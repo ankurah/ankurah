@@ -230,7 +230,10 @@ impl<E: CrashFlushable + Send + Sync + 'static> StorageCollection for CrashStora
 
     async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError> { self.inner.get_state(id).await }
 
-    async fn fetch_states(&self, selection: &ankql::ast::Selection) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+    async fn fetch_states(
+        &self,
+        selection: &ankql::ast::Selection<ankql::ast::Resolved>,
+    ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         self.inner.fetch_states(selection).await
     }
 

@@ -277,11 +277,11 @@ pub fn wasm_livequery_wrapper(livequery_name: &Ident, view_name: &Ident, results
 
             }
 
-            /// Get the current selection as a string, tracked by the observer
+            /// The tracked current selection, or empty while resolution is pending.
             #[wasm_bindgen(getter, js_name = currentSelection)]
             pub fn current_selection(&self) -> String {
                 use ::ankurah::signals::With;
-                self.0.selection().with(|(sel, _version)| sel.to_string())
+                self.0.selection().with(|resolved| resolved.as_ref().map(|(sel, _version)| sel.to_string()).unwrap_or_default())
             }
 
             #[wasm_bindgen(skip_typescript)]

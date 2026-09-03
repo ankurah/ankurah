@@ -101,8 +101,15 @@ impl PolicyAgent for BridgePolicyAgent {
         Ok(())
     }
 
-    fn filter_predicate<C>(&self, _data: &C, _collection: &proto::CollectionId, predicate: Predicate) -> Result<Predicate, AccessDenied>
-    where C: Iterable<Self::ContextData> {
+    fn filter_predicate<C>(
+        &self,
+        _data: &C,
+        _collection: &proto::CollectionId,
+        predicate: Predicate<ankql::ast::Resolved>,
+    ) -> Result<Predicate<ankql::ast::Resolved>, AccessDenied>
+    where
+        C: Iterable<Self::ContextData>,
+    {
         Ok(predicate)
     }
 
@@ -171,7 +178,7 @@ async fn test_event_bridge_events_are_policy_validated_on_receive() -> Result<()
     // Server advances two events; the client's re-fetch is served by a bridge.
     for age in ["2", "3"] {
         let trx = ctx_s.begin();
-        ctx_s.get::<PetView>(pet_id).await?.edit(&trx)?.age().replace(age)?;
+        ctx_s.get::<PetView>(pet_id).await?.edit(&trx)?.age()?.replace(age)?;
         trx.commit().await?;
     }
     let results = ctx_c.fetch::<PetView>(query.as_str()).await?;
@@ -221,13 +228,13 @@ async fn test_event_bridge_respects_read_policy_on_send() -> Result<()> {
     // Two more server events; the first one is read-denied for peers.
     let denied_id = {
         let trx = ctx_s.begin();
-        ctx_s.get::<PetView>(pet_id).await?.edit(&trx)?.age().replace("2")?;
+        ctx_s.get::<PetView>(pet_id).await?.edit(&trx)?.age()?.replace("2")?;
         trx.commit_and_return_events().await?[0].id()
     };
     server_agent.deny_read_events.lock().unwrap().insert(denied_id.clone());
     let open_id = {
         let trx = ctx_s.begin();
-        ctx_s.get::<PetView>(pet_id).await?.edit(&trx)?.age().replace("3")?;
+        ctx_s.get::<PetView>(pet_id).await?.edit(&trx)?.age()?.replace("3")?;
         trx.commit_and_return_events().await?[0].id()
     };
 

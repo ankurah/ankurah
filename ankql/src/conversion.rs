@@ -1,35 +1,35 @@
 use crate::ast::Predicate;
-use crate::ast::{self, Selection};
+use crate::ast::{self, Parsed, Selection, Stage};
 use crate::error::ParseError;
 use crate::parser;
 use ankurah_core_types::Value;
 use std::convert::TryFrom;
 
-impl<'a> TryFrom<&'a str> for Predicate {
+impl<'a> TryFrom<&'a str> for Predicate<Parsed> {
     type Error = ParseError;
 
     fn try_from(value: &'a str) -> Result<Self, Self::Error> { Ok(parser::parse_selection(value)?.predicate) }
 }
-impl TryFrom<String> for Predicate {
+impl TryFrom<String> for Predicate<Parsed> {
     type Error = ParseError;
 
     fn try_from(value: String) -> Result<Self, Self::Error> { Ok(parser::parse_selection(&value)?.predicate) }
 }
-impl<'a> TryFrom<&'a str> for Selection {
+impl<'a> TryFrom<&'a str> for Selection<Parsed> {
     type Error = ParseError;
 
     fn try_from(value: &'a str) -> Result<Self, Self::Error> { parser::parse_selection(value) }
 }
-impl TryFrom<String> for Selection {
+impl TryFrom<String> for Selection<Parsed> {
     type Error = ParseError;
 
     fn try_from(value: String) -> Result<Self, Self::Error> { parser::parse_selection(&value) }
 }
 
-impl TryFrom<ast::Expr> for Predicate {
+impl<S: Stage> TryFrom<ast::Expr<S>> for Predicate<S> {
     type Error = ParseError;
 
-    fn try_from(value: ast::Expr) -> Result<Self, Self::Error> {
+    fn try_from(value: ast::Expr<S>) -> Result<Self, Self::Error> {
         match value {
             ast::Expr::Predicate(p) => Ok(p),
             ast::Expr::Placeholder => Ok(Predicate::Placeholder),
@@ -41,7 +41,7 @@ impl TryFrom<ast::Expr> for Predicate {
 }
 
 #[cfg(feature = "wasm")]
-impl TryFrom<wasm_bindgen::JsValue> for ast::Expr {
+impl<S: Stage> TryFrom<wasm_bindgen::JsValue> for ast::Expr<S> {
     type Error = ParseError;
 
     fn try_from(value: wasm_bindgen::JsValue) -> Result<Self, Self::Error> {

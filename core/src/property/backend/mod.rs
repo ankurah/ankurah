@@ -1,3 +1,4 @@
+use crate::internal::prelude::*;
 use ankurah_proto::{BackendOperation as Operation, EventId};
 use anyhow::Result;
 use std::any::Any;
@@ -16,12 +17,13 @@ use std::{collections::BTreeMap, sync::Arc};
 mod conformance;
 pub mod lww;
 pub mod yrs;
-use crate::error::{MutationError, RetrievalError, StateError};
+use crate::error::StateError;
 use crate::event_dag::EventLayer;
 pub use lww::LWWBackend;
 pub use yrs::YrsBackend;
 
-use super::{PropertyName, Value};
+use super::Value;
+use ankurah_proto::PropertyId;
 
 // TODO - implement a property backend value iterator so we don't have to alloc a HashMap for every call to values()
 
@@ -30,12 +32,12 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
     fn as_debug(&self) -> &dyn Debug;
     fn fork(&self) -> Arc<dyn PropertyBackend>;
 
-    fn properties(&self) -> Vec<PropertyName>;
-    fn property_value(&self, property_name: &PropertyName) -> Option<Value> {
+    fn properties(&self) -> Vec<PropertyId>;
+    fn property_value(&self, property: &PropertyId) -> Option<Value> {
         let mut map = self.property_values();
-        map.remove(property_name).flatten()
+        map.remove(property).flatten()
     }
-    fn property_values(&self) -> BTreeMap<PropertyName, Option<Value>>;
+    fn property_values(&self) -> BTreeMap<PropertyId, Option<Value>>;
 
     /// Unique property backend identifier.
     fn property_backend_name() -> &'static str
@@ -94,11 +96,7 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
     /// Listen to changes for a specific field managed by this backend.
     /// Auto-creates the broadcast if it doesn't exist yet.
     /// Returns a subscription guard that will unsubscribe when dropped.
-    fn listen_field(
-        &self,
-        field_name: &PropertyName,
-        listener: ankurah_signals::signal::Listener,
-    ) -> ankurah_signals::signal::ListenerGuard;
+    fn listen_field(&self, property: &PropertyId, listener: ankurah_signals::signal::Listener) -> ankurah_signals::signal::ListenerGuard;
 }
 
 // This is where this gets a bit tough.
@@ -106,14 +104,14 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
 // or if they can take a generic, they should also take a `Vec<u8>`.
 
 // TODO: Implement a property backend type registry rather than this hardcoded nonsense.
-/// Fire the change broadcast for each named field that has subscribers.
+/// Fire the change broadcast for each changed field that has subscribers.
 pub(crate) fn notify_changed_fields<'a>(
-    field_broadcasts: &std::sync::Mutex<std::collections::BTreeMap<crate::property::PropertyName, ankurah_signals::broadcast::Broadcast>>,
-    changed: impl IntoIterator<Item = &'a crate::property::PropertyName>,
+    field_broadcasts: &std::sync::Mutex<std::collections::BTreeMap<PropertyId, ankurah_signals::broadcast::Broadcast>>,
+    changed: impl IntoIterator<Item = &'a PropertyId>,
 ) {
     let broadcasts = field_broadcasts.lock().expect("field_broadcasts lock is poisoned");
-    for field_name in changed {
-        if let Some(broadcast) = broadcasts.get(field_name) {
+    for property in changed {
+        if let Some(broadcast) = broadcasts.get(property) {
             broadcast.send(());
         }
     }

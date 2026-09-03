@@ -52,12 +52,12 @@ async fn rt106() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Make two changes on the server while client is unsubscribed
     {
         let trx = server_ctx.begin();
-        server_album.edit(&trx)?.year().overwrite(0, 4, "2021")?;
+        server_album.edit(&trx)?.year()?.overwrite(0, 4, "2021")?;
         trx.commit().await?;
     }
     {
         let trx = server_ctx.begin();
-        server_album.edit(&trx)?.year().overwrite(0, 4, "2022")?;
+        server_album.edit(&trx)?.year()?.overwrite(0, 4, "2022")?;
         trx.commit().await?;
     }
 

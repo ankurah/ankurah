@@ -40,8 +40,8 @@ async fn test_one_notification_per_change() -> Result<()> {
     let trx1 = server_ctx.begin();
     let trx2 = server_ctx.begin();
 
-    album.edit(&trx1)?.name().replace("Name-B")?;
-    album.edit(&trx2)?.year().replace("2025")?;
+    album.edit(&trx1)?.name()?.replace("Name-B")?;
+    album.edit(&trx2)?.year()?.replace("2025")?;
 
     trx1.commit().await?;
     trx2.commit().await?;
@@ -101,7 +101,7 @@ async fn test_causal_notification_order() -> Result<()> {
     for name in &names {
         let album = server_ctx.get::<AlbumView>(album_id).await?;
         let trx = server_ctx.begin();
-        album.edit(&trx)?.name().replace(*name)?;
+        album.edit(&trx)?.name()?.replace(*name)?;
         trx.commit().await?;
 
         // Wait for this notification before proceeding
@@ -174,7 +174,7 @@ async fn test_multi_subscriber_consistency() -> Result<()> {
     {
         let album = server_ctx.get::<AlbumView>(album_id).await?;
         let trx = server_ctx.begin();
-        album.edit(&trx)?.name().replace("Updated Name")?;
+        album.edit(&trx)?.name()?.replace("Updated Name")?;
         trx.commit().await?;
     }
 

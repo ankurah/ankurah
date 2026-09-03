@@ -30,7 +30,7 @@ async fn repeatable_read() -> Result<()> {
     {
         let trx = ctx.begin();
         let album_rw = trx.create(&Album { name: "I love cats".into() }).await?;
-        assert_eq!(album_rw.name().value(), Some("I love cats".to_string()));
+        assert_eq!(album_rw.name()?.value(), Some("I love cats".to_string()));
         id = album_rw.id();
 
         trx.commit().await?;
@@ -46,15 +46,15 @@ async fn repeatable_read() -> Result<()> {
     let album_rw3 = album_ro.edit(&trx3)?;
 
     // tx2 cats -> tofu
-    album_rw2.name().delete(7, 4)?;
-    album_rw2.name().insert(7, "tofu")?;
-    assert_eq!(album_rw2.name().value(), Some("I love tofu".to_string()));
+    album_rw2.name()?.delete(7, 4)?;
+    album_rw2.name()?.insert(7, "tofu")?;
+    assert_eq!(album_rw2.name()?.value(), Some("I love tofu".to_string()));
 
     // tx3 love -> devour
-    album_rw3.name().delete(2, 4)?;
-    album_rw3.name().insert(2, "devour")?;
+    album_rw3.name()?.delete(2, 4)?;
+    album_rw3.name()?.insert(2, "devour")?;
     // a modest proposal
-    assert_eq!(album_rw3.name().value(), Some("I devour cats".to_string()));
+    assert_eq!(album_rw3.name()?.value(), Some("I devour cats".to_string()));
 
     // trx2 and 3 are uncommited, so the value should not be updated
     assert_eq!(album_ro.name().unwrap(), "I love cats");

@@ -203,9 +203,10 @@ async fn catalog_values(
     use ankurah::core::property::backend::{LWWBackend, PropertyBackend};
     let state = node.collections.get(&proto::CollectionId::fixed_name(collection)).await?.get_state(id).await?;
     let buffer = state.payload.state.state_buffers.0.get("lww").expect("catalog entities are LWW").clone();
-    // Catalog collections are name-keyed at the backend layer (the bootstrap
-    // exemption), so the values are already keyed by their registered names.
-    Ok(LWWBackend::from_state_buffer(&buffer)?.property_values())
+    // Catalog fields are closed system properties; their id renderings ARE
+    // their registered names, so rendering the keys gives the name map the
+    // assertions read.
+    Ok(LWWBackend::from_state_buffer(&buffer)?.property_values().into_iter().map(|(k, v)| (k.to_string(), v)).collect())
 }
 
 /// Build a RegisterSchema request from `Model::descriptor()` via
@@ -222,17 +223,18 @@ async fn register_from_model_schema_end_to_end() -> anyhow::Result<()> {
 
     // The whole point: the request is built from the compiled schema, no
     // hand-written descriptors.
-    let request = proto::NodeRequestBody::RegisterSchema { models: vec![proto::RegisterModel::from(DescAllTypes::descriptor())] };
+    let request = proto::NodeRequestBody::RegisterSchema { model: proto::RegisterModel::from(DescAllTypes::descriptor()) };
 
     let reg_models = match client.request(server.id, &DEFAULT_CONTEXT, request).await? {
-        proto::NodeResponseBody::SchemaRegistered { models } => models,
+        proto::NodeResponseBody::SchemaRegistered { model } => model,
         other => panic!("expected SchemaRegistered, got {other}"),
     };
 
     // The allocator resolved the ids; the response nests them by model.
-    let registered = reg_models.iter().find(|m| m.label == "descalltypes").expect("model returned");
+    let registered = &reg_models;
+    assert_eq!(registered.label, "descalltypes");
     let model_id = registered.id;
-    let artist_model_id = reg_models.iter().find(|m| m.label == "descartist").expect("reference target model returned").id;
+    let artist_model_id = registered.properties.iter().find_map(|p| p.target_model).expect("reference target resolved via the property");
     let property_ids: BTreeMap<String, EntityId> = registered.properties.iter().map(|p| (p.name.clone(), p.id)).collect();
 
     // The model entity exists with its collection + display name.

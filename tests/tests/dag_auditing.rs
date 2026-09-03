@@ -23,7 +23,7 @@ async fn test_linear_history_structure() -> Result<()> {
     for i in 1..=3 {
         let album = ctx.get::<AlbumView>(album_id).await?;
         let trx = ctx.begin();
-        album.edit(&trx)?.year().replace(&format!("{}", 2020 + i))?;
+        album.edit(&trx)?.year()?.replace(&format!("{}", 2020 + i))?;
         dag.enumerate(trx.commit_and_return_events().await?); // B, C, D
     }
 
@@ -69,8 +69,8 @@ async fn test_simple_diamond_structure() -> Result<()> {
     let trx1 = ctx.begin();
     let trx2 = ctx.begin();
 
-    album.edit(&trx1)?.name().replace("Name B")?;
-    album.edit(&trx2)?.year().replace("2021")?;
+    album.edit(&trx1)?.name()?.replace("Name B")?;
+    album.edit(&trx2)?.year()?.replace("2021")?;
 
     dag.enumerate(trx1.commit_and_return_events().await?); // B
     dag.enumerate(trx2.commit_and_return_events().await?); // C
@@ -119,8 +119,8 @@ async fn test_diamond_with_merge_structure() -> Result<()> {
     let trx1 = ctx.begin();
     let trx2 = ctx.begin();
 
-    album.edit(&trx1)?.name().replace("Name B")?;
-    album.edit(&trx2)?.year().replace("2021")?;
+    album.edit(&trx1)?.name()?.replace("Name B")?;
+    album.edit(&trx2)?.year()?.replace("2021")?;
 
     dag.enumerate(trx1.commit_and_return_events().await?); // B
     dag.enumerate(trx2.commit_and_return_events().await?); // C
@@ -128,7 +128,7 @@ async fn test_diamond_with_merge_structure() -> Result<()> {
     // Now create a merge event - edit from current state which has both B and C
     let album = ctx.get::<AlbumView>(album_id).await?;
     let trx3 = ctx.begin();
-    album.edit(&trx3)?.name().replace("Merged Name")?;
+    album.edit(&trx3)?.name()?.replace("Merged Name")?;
     dag.enumerate(trx3.commit_and_return_events().await?); // D
 
     let collection = ctx.collection(&Album::collection()).await?;
@@ -179,9 +179,9 @@ async fn test_complex_multi_merge_structure() -> Result<()> {
     let trx2 = ctx.begin();
     let trx3 = ctx.begin();
 
-    album.edit(&trx1)?.name().replace("Name B")?;
-    album.edit(&trx2)?.year().replace("2021")?;
-    album.edit(&trx3)?.name().replace("Name D")?;
+    album.edit(&trx1)?.name()?.replace("Name B")?;
+    album.edit(&trx2)?.year()?.replace("2021")?;
+    album.edit(&trx3)?.name()?.replace("Name D")?;
 
     dag.enumerate(trx1.commit_and_return_events().await?); // B
     dag.enumerate(trx2.commit_and_return_events().await?); // C
@@ -205,7 +205,7 @@ async fn test_complex_multi_merge_structure() -> Result<()> {
     // Now do a final merge by editing from current state
     let album = ctx.get::<AlbumView>(album_id).await?;
     let trx = ctx.begin();
-    album.edit(&trx)?.name().replace("Final Merge")?;
+    album.edit(&trx)?.name()?.replace("Final Merge")?;
     dag.enumerate(trx.commit_and_return_events().await?); // E
 
     let events = collection.dump_entity_events(album_id).await?;
@@ -257,7 +257,7 @@ async fn test_head_evolution() -> Result<()> {
     let album = ctx.get::<AlbumView>(album_id).await?;
     {
         let trx = ctx.begin();
-        album.edit(&trx)?.name().replace("Name B")?;
+        album.edit(&trx)?.name()?.replace("Name B")?;
         dag.enumerate(trx.commit_and_return_events().await?); // B
     }
 
@@ -279,8 +279,8 @@ async fn test_head_evolution() -> Result<()> {
     let trx_c = ctx.begin();
     let trx_d = ctx.begin();
 
-    album.edit(&trx_c)?.year().replace("2021")?;
-    album.edit(&trx_d)?.name().replace("Name D")?;
+    album.edit(&trx_c)?.year()?.replace("2021")?;
+    album.edit(&trx_d)?.name()?.replace("Name D")?;
 
     dag.enumerate(trx_c.commit_and_return_events().await?); // C
     dag.enumerate(trx_d.commit_and_return_events().await?); // D
@@ -293,7 +293,7 @@ async fn test_head_evolution() -> Result<()> {
     let album = ctx.get::<AlbumView>(album_id).await?;
     {
         let trx = ctx.begin();
-        album.edit(&trx)?.year().replace("2022")?;
+        album.edit(&trx)?.year()?.replace("2022")?;
         dag.enumerate(trx.commit_and_return_events().await?); // E
     }
 
@@ -332,7 +332,7 @@ async fn test_event_count_verification() -> Result<()> {
     for i in 1..=10 {
         let album = ctx.get::<AlbumView>(album_id).await?;
         let trx = ctx.begin();
-        album.edit(&trx)?.year().replace(&format!("{}", i))?;
+        album.edit(&trx)?.year()?.replace(&format!("{}", i))?;
         dag.enumerate(trx.commit_and_return_events().await?);
     }
 

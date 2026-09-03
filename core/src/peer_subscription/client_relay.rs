@@ -1,73 +1,80 @@
 // TODO: Rename this module from client_relay to remote_subscription for clarity
-use ankurah_proto::{self as proto, CollectionId};
+use crate::internal::prelude::*;
+use ankql::ast::Resolved;
 use anyhow::anyhow;
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, OnceLock,
+};
 use tracing::{debug, warn};
 
-use crate::error::{RequestError, RetrievalError};
+use crate::error::RequestError;
 use crate::node::ContextData;
-use crate::session::SessionSet;
-use crate::util::safeset::SafeSet;
+use crate::util::safemap::SafeMap;
 
-/// Trait for query initialization that can be driven by SubscriptionRelay
-/// Abstracts the relay's interaction with LiveQuery
+/// Query lifecycle callbacks used by [`SubscriptionRelay`].
 #[async_trait::async_trait]
 pub trait RemoteQuerySubscriber: Clone + Send + Sync + 'static {
-    /// Called after remote subscription deltas have been applied
-    /// Dispatches to initialize (version 1) or update_selection_init (version >1) internally
-    /// Handles marking initialization as complete and setting last_error on failure
+    /// Called after remote subscription deltas have been applied.
     async fn subscription_established(&self, version: u32);
 
-    /// Set the last error for this subscription
-    fn set_last_error(&self, error: RetrievalError);
+    /// Record a permanent failure for this subscription version.
+    fn set_last_error(&self, version: u32, error: RetrievalError);
 }
 
 #[derive(Debug, Clone)]
-pub enum Status {
-    PendingRemote,
-    Requested(proto::EntityId, u32),     // peer_id, version
-    Established(proto::EntityId, u32),   // peer_id, version
-    PendingUpdate(proto::EntityId, u32), // peer_id, version
-    /// Non-retryable
+enum Status {
+    PendingRemote(Option<proto::EntityId>),
+    Requested(proto::EntityId, Arc<AtomicBool>),
+    Established(proto::EntityId),
+    Suspended(Option<proto::EntityId>),
     Failed,
 }
 
-#[derive(Debug)]
-pub struct Content<CD: ContextData> {
-    pub query_id: proto::QueryId,
-    pub collection_id: CollectionId,
-    pub selection: ankql::ast::Selection,
-    /// The live credential source, read at each attempt's start, so a
-    /// reconnect re-registration after a refresh carries the fresh
-    /// values. A set-backed query sends every live credential.
-    pub sessions: SessionSet<CD>,
-    pub version: u32,
+impl Status {
+    fn cancel_attempt(&self) {
+        if let Self::Requested(_, active) = self {
+            active.store(false, Ordering::Release);
+        }
+    }
+
+    fn peer(&self) -> Option<proto::EntityId> {
+        match self {
+            Self::PendingRemote(peer) | Self::Suspended(peer) => *peer,
+            Self::Requested(peer, _) | Self::Established(peer) => Some(*peer),
+            Self::Failed => None,
+        }
+    }
 }
 
-pub struct RemoteQueryState<CD: ContextData, Q: RemoteQuerySubscriber> {
-    pub content: Arc<Content<CD>>,
-    pub status: Status,
-    pub livequery: Q,
+#[derive(Debug)]
+struct Content<CD: ContextData> {
+    query_id: proto::QueryId,
+    collection_id: CollectionId,
+    selection: ankql::ast::Selection<Resolved>,
+    /// Read at each attempt so reconnects carry refreshed credentials.
+    sessions: SessionSet<CD>,
+    version: u32,
+}
+
+struct RemoteQueryState<CD: ContextData, Q: RemoteQuerySubscriber> {
+    content: Arc<Content<CD>>,
+    status: Status,
+    livequery: Q,
+    seq: u64,
 }
 
 struct SubscriptionRelayInner<CD: ContextData, Q: RemoteQuerySubscriber> {
-    // All subscription information in one place
     subscriptions: std::sync::Mutex<HashMap<proto::QueryId, RemoteQueryState<CD, Q>>>,
-    // Track connected durable peers
-    connected_peers: SafeSet<proto::EntityId>,
-    // Node for communicating with remote peers
+    next_seq: std::sync::atomic::AtomicU64,
+    dispatch: tokio::sync::Mutex<()>,
+    connected_peers: SafeMap<proto::EntityId, u64>,
     node: OnceLock<Arc<dyn TNode<CD>>>,
-    // Shutdown signal for retry task - when dropped, the task will stop
-    _shutdown_tx: tokio::sync::mpsc::Sender<()>,
 }
 
-/// Keeps this node's queries registered on remote durable peers across
-/// peer availability: it registers on connect, re-registers on
-/// reconnect, retries failures, and tears down removals — each attempt
-/// reading the query's live credential source, so re-registrations
-/// carry refreshed values.
+/// Keeps local queries registered on available durable peers.
 #[derive(Clone)]
 pub struct SubscriptionRelay<CD: ContextData, Q: RemoteQuerySubscriber> {
     inner: Arc<SubscriptionRelayInner<CD, Q>>,
@@ -79,161 +86,101 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> Default for SubscriptionRelay<CD
 
 impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
     pub fn new() -> Self {
-        let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
-
         let relay = Self {
             inner: Arc::new(SubscriptionRelayInner {
                 subscriptions: std::sync::Mutex::new(HashMap::new()),
-                connected_peers: SafeSet::new(),
+                next_seq: std::sync::atomic::AtomicU64::new(0),
+                dispatch: tokio::sync::Mutex::new(()),
+                connected_peers: SafeMap::new(),
                 node: OnceLock::new(),
-                _shutdown_tx: shutdown_tx,
             }),
         };
 
-        // Start background retry task
-        relay.start_retry_task(shutdown_rx);
+        relay.start_retry_task();
 
         relay
     }
 
-    /// Inject the node (typically a WeakNode for production)
-    ///
-    /// This should be called once during initialization. Returns an error if
-    /// the node has already been set.
     pub fn set_node(&self, node: Arc<dyn TNode<CD>>) -> Result<(), ()> { self.inner.node.set(node).map_err(|_| ()) }
 
-    /// Notify the relay that a new predicate needs to be registered on remote peer subscriptions
-    ///
-    /// This should be called whenever a local subscription is established. The relay will
-    /// track this predicate and automatically attempt to register it with available durable peers.
     pub fn subscribe_query(
         &self,
         query_id: proto::QueryId,
         collection_id: CollectionId,
-        selection: ankql::ast::Selection,
+        selection: ankql::ast::Selection<Resolved>,
         sessions: SessionSet<CD>,
         version: u32,
         livequery: Q,
     ) {
-        debug!("SubscriptionRelay.subscribe_predicate() - New predicate {} needs remote registration", query_id);
-        {
-            self.inner.subscriptions.lock().expect("poisoned lock").insert(
-                query_id,
-                RemoteQueryState {
-                    content: Arc::new(Content { collection_id, selection, sessions, query_id, version }),
-                    status: Status::PendingRemote,
-                    livequery,
-                },
-            );
+        debug!("SubscriptionRelay.subscribe_query() - New query {} needs remote registration", query_id);
+        let mut subscriptions = self.inner.subscriptions.lock().expect("poisoned lock");
+        let seq = subscriptions
+            .get(&query_id)
+            .map(|state| state.seq)
+            .unwrap_or_else(|| self.inner.next_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        let peer = subscriptions.get(&query_id).and_then(|state| state.status.peer());
+        let replaced = subscriptions.insert(
+            query_id,
+            RemoteQueryState {
+                content: Arc::new(Content { collection_id, selection, sessions, query_id, version }),
+                status: Status::PendingRemote(peer),
+                livequery,
+                seq,
+            },
+        );
+        if let Some(replaced) = replaced {
+            replaced.status.cancel_attempt();
         }
+        drop(subscriptions);
 
-        // Immediately attempt setup with available peers
         if !self.inner.connected_peers.is_empty() {
             self.setup_remote_subscriptions()
         }
     }
-    pub fn update_query(&self, query_id: proto::QueryId, selection: ankql::ast::Selection, version: u32) -> Result<(), anyhow::Error> {
+    pub fn update_query(
+        &self,
+        query_id: proto::QueryId,
+        selection: ankql::ast::Selection<Resolved>,
+        version: u32,
+    ) -> Result<(), anyhow::Error> {
         debug!("SubscriptionRelay.update_query() - New query {} needs remote registration", query_id);
 
-        let update = {
+        {
             let mut subscriptions = self.inner.subscriptions.lock().expect("poisoned lock");
             match subscriptions.get_mut(&query_id) {
                 Some(state) => {
-                    // Update the content with new predicate and version
+                    let peer = state.status.peer();
+                    state.status.cancel_attempt();
                     let old_content = &state.content;
                     state.content = Arc::new(Content {
                         collection_id: old_content.collection_id.clone(),
-                        selection: selection.clone(),
+                        selection,
                         sessions: old_content.sessions.clone(),
                         query_id: old_content.query_id,
                         version,
                     });
-
-                    match state.status {
-                        Status::Established(peer_id, _old_version) => {
-                            // Update to new version, mark as requested for this peer
-                            state.status = Status::Requested(peer_id, version);
-                            Some((peer_id, state.content.collection_id.clone(), state.content.sessions.clone()))
-                            // Return the peer_id to send update to
-                        }
-                        _ => {
-                            // Not established yet, just update to PendingRemote and setup
-                            state.status = Status::PendingRemote;
-                            None
-                        }
-                    }
+                    state.status = Status::PendingRemote(peer);
                 }
                 None => return Err(anyhow!("Predicate {} not found", query_id)),
             }
-        };
-
-        match update {
-            Some((peer_id, collection_id, sessions)) => {
-                self.update_query_on_peer(peer_id, query_id, collection_id, selection, version, sessions);
-            }
-            None => {
-                // Not established yet - use setup_remote_subscriptions for initial setup
-                self.setup_remote_subscriptions();
-            }
-        };
+        }
+        self.setup_remote_subscriptions();
 
         Ok(())
     }
 
-    fn update_query_on_peer(
-        &self,
-        peer_id: proto::EntityId,
-        query_id: proto::QueryId,
-        collection_id: CollectionId,
-        selection: ankql::ast::Selection,
-        version: u32,
-        sessions: SessionSet<CD>,
-    ) {
-        let me = self.clone();
-        crate::task::spawn(async move {
-            if let Some(node) = me.inner.node.get() {
-                // Get the livequery for error handling
-                let livequery = {
-                    me.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner()).get(&query_id).map(|state| state.livequery.clone())
-                };
-
-                // Send the updated predicate to the peer, under the
-                // credentials current at send time.
-                match node.remote_subscribe(peer_id, query_id, collection_id, selection, sessions.current(), version).await {
-                    Ok(()) => {
-                        // Deltas applied successfully, now activate the livequery
-                        if let Some(lq) = livequery {
-                            lq.subscription_established(version).await;
-                        }
-
-                        // Mark as established - subscription succeeded even if livequery activation had issues
-                        let mut subscriptions = me.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
-                        if let Some(info) = subscriptions.get_mut(&query_id) {
-                            info.status = Status::Established(peer_id, version);
-                        }
-                        debug!("Successfully updated predicate {} on peer {} subscription", query_id, peer_id);
-                    }
-                    Err(e) => {
-                        // Handle error with retry logic
-                        me.handle_error(query_id, peer_id, e, livequery).await;
-                    }
-                }
-            }
-        });
-    }
-
-    /// Notify the relay that a predicate should be removed from remote peer subscriptions
-    ///
-    /// This will clean up all tracking state and send unsubscribe requests to any
-    /// remote peers that have this predicate registered.
     pub fn unsubscribe_predicate(&self, query_id: proto::QueryId) {
         debug!("Unregistering predicate {}", query_id);
 
-        // If subscription was established with a peer, send unsubscribe request
         {
             let mut subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(info) = subscriptions.remove(&query_id) {
-                if let Status::Established(peer_id, _version) = &info.status {
+                info.status.cancel_attempt();
+                if let Status::Established(peer_id)
+                | Status::Requested(peer_id, _)
+                | Status::Suspended(Some(peer_id))
+                | Status::PendingRemote(Some(peer_id)) = &info.status
+                {
                     let node = self.inner.node.get();
                     if let Some(node) = node {
                         let node = node.clone();
@@ -251,60 +198,83 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         }
     }
 
-    /// Handle peer disconnection - mark all predicates for that peer as needing re-registration
-    ///
-    /// This should be called when a durable peer disconnects. All predicates registered
-    /// with that peer will be marked as pending and will be automatically re-registered
-    /// when the peer reconnects or another suitable peer becomes available.
+    pub fn suspend_query(&self, query_id: proto::QueryId) {
+        if let Some(state) = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&query_id) {
+            state.status.cancel_attempt();
+            let peer = match &state.status {
+                Status::Established(peer) | Status::Requested(peer, _) => Some(*peer),
+                Status::Suspended(peer) => *peer,
+                Status::PendingRemote(peer) => *peer,
+                Status::Failed => None,
+            };
+            state.status = Status::Suspended(peer);
+        }
+    }
+
     pub fn notify_peer_disconnected(&self, peer_id: proto::EntityId) {
+        self.inner.connected_peers.remove(&peer_id);
+        self.peer_disconnected(peer_id);
+    }
+
+    pub(crate) fn notify_peer_disconnected_generation(&self, peer_id: proto::EntityId, generation: u64) {
+        if self.inner.connected_peers.remove_if(&peer_id, |current| *current == generation).is_some() {
+            self.peer_disconnected(peer_id);
+        }
+    }
+
+    fn peer_disconnected(&self, peer_id: proto::EntityId) {
         debug!("Peer {} disconnected, orphaning predicate registrations", peer_id);
 
-        // Remove from connected peers
-        self.inner.connected_peers.remove(&peer_id);
-
         for info in self.inner.subscriptions.lock().expect("poisoned lock").values_mut() {
-            if let Status::Established(established_peer_id, _) | Status::Requested(established_peer_id, _) = &info.status {
+            if let Status::Established(established_peer_id) | Status::Requested(established_peer_id, _) = &info.status {
                 if *established_peer_id == peer_id {
-                    // Update state to pending
-                    info.status = Status::PendingRemote;
+                    info.status.cancel_attempt();
+                    info.status = Status::PendingRemote(None);
                     warn!("Predicate {} orphaned due to peer {} disconnect", info.content.query_id, peer_id);
                 }
+            } else if matches!(info.status, Status::PendingRemote(Some(pending_peer)) if pending_peer == peer_id) {
+                info.status = Status::PendingRemote(None);
+            } else if matches!(info.status, Status::Suspended(Some(suspended_peer)) if suspended_peer == peer_id) {
+                info.status = Status::Suspended(None);
             }
         }
 
-        // Resubscribe any orphaned subscriptions
         self.setup_remote_subscriptions();
     }
 
-    /// Handle peer connection - trigger predicate registration on the new peer subscription
-    ///
-    /// This should be called when a new durable peer connects. The relay will automatically
-    /// attempt to register any pending predicates on the newly connected peer's subscription.
-    pub fn notify_peer_connected(&self, peer_id: proto::EntityId) {
+    pub fn notify_peer_connected(&self, peer_id: proto::EntityId) { self.notify_peer_connected_generation(peer_id, 0); }
+
+    pub(crate) fn notify_peer_connected_generation(&self, peer_id: proto::EntityId, generation: u64) {
         debug!("SubscriptionRelay.notify_peer_connected() - Peer {} connected, registering predicates on peer subscription", peer_id);
 
-        // Add to connected peers
-        self.inner.connected_peers.insert(peer_id);
-
-        // Trigger setup with all connected peers
+        self.inner.connected_peers.insert(peer_id, generation);
         self.setup_remote_subscriptions();
     }
 
     /// Get the current state of a predicate registration
-    pub fn get_status(&self, query_id: proto::QueryId) -> Option<Status> {
+    #[cfg(test)]
+    fn get_status(&self, query_id: proto::QueryId) -> Option<Status> {
         let subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
         subscriptions.get(&query_id).map(|info| info.status.clone())
     }
 
-    /// Get all unique contexts for predicates established or requested with a specific peer
-    /// TODO: update the data structure to do this via a direct lookup rather than having to scan the entire map
+    /// Whether a query is established with, or being sent to, this peer.
+    pub fn has_subscription_with_peer(&self, peer_id: &proto::EntityId) -> bool {
+        let subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
+        subscriptions.values().any(|state| match &state.status {
+            Status::Established(established_peer) | Status::Requested(established_peer, _) => established_peer == peer_id,
+            _ => false,
+        })
+    }
+
+    /// Return the live credentials used by queries assigned to this peer.
     pub fn get_contexts_for_peer(&self, peer_id: &proto::EntityId) -> std::collections::HashSet<CD> {
         let subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
         let mut contexts = std::collections::HashSet::new();
 
         for (_, state) in subscriptions.iter() {
             match &state.status {
-                Status::Established(established_peer, _) | Status::Requested(established_peer, _) => {
+                Status::Established(established_peer) | Status::Requested(established_peer, _) => {
                     if established_peer == peer_id {
                         contexts.extend(state.content.sessions.current());
                     }
@@ -316,41 +286,29 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         contexts
     }
 
-    /// Register predicates on available durable peer subscriptions
     fn setup_remote_subscriptions(&self) {
-        let node = match self.inner.node.get() {
-            Some(node) => node,
-            None => {
-                warn!("No node configured for remote subscription setup");
-                return;
-            }
-        };
+        let me = self.clone();
+        crate::task::spawn(async move { me.flush_pending().await });
+    }
 
-        // For now, use the first available peer (could be made smarter)
-        let connected_peers = self.inner.connected_peers.to_vec();
-        if connected_peers.is_empty() {
-            warn!("No durable peers available for remote subscription setup");
-            return;
-        }
-
-        let target_peer = connected_peers[0];
-
-        // Atomically get pending subscriptions and mark them as requested
+    async fn flush_pending(&self) {
+        let _dispatch = self.inner.dispatch.lock().await;
+        let Some(node) = self.inner.node.get().cloned() else { return };
+        let Some(default_peer) = self.inner.connected_peers.keys().into_iter().min() else { return };
         let pending: Vec<_> = {
-            self.inner
+            let mut pending: Vec<_> = self
+                .inner
                 .subscriptions
                 .lock()
                 .expect("poisoned lock")
-                .values_mut()
-                .filter_map(|info| {
-                    if let Status::PendingRemote = info.status {
-                        info.status = Status::Requested(target_peer, info.content.version);
-                        Some(info.content.clone())
-                    } else {
-                        None
-                    }
+                .values()
+                .filter_map(|info| match info.status {
+                    Status::PendingRemote(peer) => Some((info.seq, info.content.clone(), peer)),
+                    _ => None,
                 })
-                .collect()
+                .collect();
+            pending.sort_by_key(|(seq, _, _)| *seq);
+            pending
         };
 
         if pending.is_empty() {
@@ -359,128 +317,153 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
 
         debug!("Registering {} predicates on {} peer subscriptions", pending.len(), self.inner.connected_peers.len());
 
-        for content in pending {
-            crate::task::spawn(self.clone().attempt_subscribe(node.clone(), target_peer, content));
+        for (_, content, preferred_peer) in pending {
+            let target_peer = preferred_peer.filter(|peer| self.inner.connected_peers.contains_key(peer)).unwrap_or(default_peer);
+            let attempt = Arc::new(AtomicBool::new(true));
+            let requested = {
+                let mut subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
+                subscriptions
+                    .get_mut(&content.query_id)
+                    .filter(|info| Arc::ptr_eq(&info.content, &content) && matches!(info.status, Status::PendingRemote(_)))
+                    .is_some_and(|info| {
+                        info.status = Status::Requested(target_peer, attempt.clone());
+                        true
+                    })
+            };
+            if !requested {
+                continue;
+            }
+
+            let (dispatched, dispatched_rx) = tokio::sync::oneshot::channel();
+            let me = self.clone();
+            let node = node.clone();
+            crate::task::spawn(async move { me.attempt_subscribe(node, target_peer, content, attempt, dispatched).await });
+            let _ = dispatched_rx.await;
         }
     }
 
-    async fn attempt_subscribe(self, node: Arc<dyn TNode<CD>>, target_peer: proto::EntityId, content: Arc<Content<CD>>) {
+    async fn attempt_subscribe(
+        &self,
+        node: Arc<dyn TNode<CD>>,
+        target_peer: proto::EntityId,
+        content: Arc<Content<CD>>,
+        attempt: Arc<AtomicBool>,
+        dispatched: tokio::sync::oneshot::Sender<()>,
+    ) {
         let query_id = content.query_id;
         let predicate = content.selection.clone();
-        // Credentials read at send time from the live source.
         let cdatas = content.sessions.current();
         let version = content.version;
 
-        // Get the livequery for error handling
-        let livequery =
-            { self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner()).get(&query_id).map(|state| state.livequery.clone()) };
-
-        // Call remote_subscribe which fetches known matches, subscribes, applies deltas, and stores events
-        match node.remote_subscribe(target_peer, query_id, content.collection_id.clone(), predicate, cdatas, version).await {
+        match node
+            .remote_subscribe(target_peer, query_id, content.collection_id.clone(), predicate, cdatas, version, attempt.clone(), dispatched)
+            .await
+        {
             Ok(()) => {
-                // Deltas applied successfully, now activate the livequery
-                // The livequery handles its own errors internally
-                if let Some(lq) = livequery {
-                    lq.subscription_established(version).await;
-                }
-
-                // Mark as established - subscription succeeded even if livequery activation had issues
+                let Some(livequery) = self.current_livequery(target_peer, &content, &attempt) else { return };
+                livequery.subscription_established(version).await;
                 let mut subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(info) = subscriptions.get_mut(&query_id) {
-                    info.status = Status::Established(target_peer, version);
+                if let Some(info) = subscriptions.get_mut(&query_id).filter(|info| {
+                    Arc::ptr_eq(&info.content, &content)
+                        && matches!(&info.status, Status::Requested(peer, active) if *peer == target_peer && Arc::ptr_eq(active, &attempt))
+                }) {
+                    info.status = Status::Established(target_peer);
                 }
                 debug!("Successfully registered predicate {} on peer {} subscription", query_id, target_peer);
             }
             Err(e) => {
-                // Handle error with retry logic
-                self.handle_error(query_id, target_peer, e, livequery).await;
+                self.handle_error(target_peer, &content, &attempt, e);
             }
         }
     }
 
-    /// Start background task that periodically retries pending subscriptions
-    fn start_retry_task(&self, mut shutdown_rx: tokio::sync::mpsc::Receiver<()>) {
-        let me = self.clone();
+    fn current_livequery(&self, peer: proto::EntityId, content: &Arc<Content<CD>>, attempt: &Arc<AtomicBool>) -> Option<Q> {
+        self.inner
+            .subscriptions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&content.query_id)
+            .filter(|state| {
+                Arc::ptr_eq(&state.content, content)
+                    && matches!(&state.status, Status::Requested(requested_peer, active) if *requested_peer == peer && Arc::ptr_eq(active, attempt))
+            })
+            .map(|state| state.livequery.clone())
+    }
+
+    fn start_retry_task(&self) {
+        let weak = Arc::downgrade(&self.inner);
         crate::task::spawn(async move {
             loop {
-                let delay = futures_timer::Delay::new(std::time::Duration::from_secs(5));
-                tokio::select! {
-                    _ = delay => {
-                        // Attempt to setup any pending subscriptions
-                        me.setup_remote_subscriptions();
-                    }
-                    _ = shutdown_rx.recv() => {
-                        debug!("Retry task shutting down - SubscriptionRelay dropped");
-                        break;
-                    }
-                }
+                futures_timer::Delay::new(std::time::Duration::from_secs(5)).await;
+                let Some(inner) = weak.upgrade() else { break };
+                SubscriptionRelay { inner }.flush_pending().await;
             }
         });
     }
 
-    /// Handle errors with retry logic
-    async fn handle_error(&self, query_id: proto::QueryId, target_peer: proto::EntityId, error: RetrievalError, livequery: Option<Q>) {
+    fn handle_error(&self, target_peer: proto::EntityId, content: &Arc<Content<CD>>, attempt: &Arc<AtomicBool>, error: RetrievalError) {
+        let query_id = content.query_id;
         let error_msg = error.to_string();
 
-        // Evaluate retriability at failure time
-        let is_retryable = match &error {
-            // Retrieval errors from fetching are generally not retryable
-            RetrievalError::RequestError(req_err) => match req_err {
-                RequestError::PeerNotConnected => true,
-                RequestError::ConnectionLost => true,
-                RequestError::SendError(_) => true,
-                RequestError::InternalChannelClosed => true,
-                RequestError::ServerError(_) => false,
-                RequestError::UnexpectedResponse(_) => false,
-                RequestError::AccessDenied(_) => false,
-            },
-            // Other retrieval errors are not retryable
-            _ => false,
-        };
+        let is_retryable = matches!(
+            &error,
+            RetrievalError::RequestError(
+                RequestError::PeerNotConnected
+                    | RequestError::ConnectionLost
+                    | RequestError::SystemNotReady
+                    | RequestError::SendError(_)
+                    | RequestError::InternalChannelClosed
+            )
+        );
 
-        // Update state based on retriability
-        let mut subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(info) = subscriptions.get_mut(&query_id) {
-            if is_retryable {
-                // Retryable errors go back to pending for retry by background task
-                info.status = Status::PendingRemote;
-                warn!("Retryable failure for predicate {} with peer {}: {} - will retry", query_id, target_peer, error_msg);
-            } else {
-                // Non-retryable errors are permanently failed
-                info.status = Status::Failed;
-                tracing::error!("Permanent failure for predicate {} with peer {}: {} - no retry", query_id, target_peer, error_msg);
-
-                // Set error on livequery
-                if let Some(lq) = livequery {
-                    lq.set_last_error(error);
+        let failed_query = {
+            let mut subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
+            let current = subscriptions.get_mut(&query_id).filter(|info| {
+                Arc::ptr_eq(&info.content, content)
+                    && matches!(&info.status, Status::Requested(peer, active) if *peer == target_peer && Arc::ptr_eq(active, attempt))
+            });
+            match current {
+                Some(info) if is_retryable => {
+                    info.status.cancel_attempt();
+                    info.status = Status::PendingRemote(Some(target_peer));
+                    warn!("Retryable failure for predicate {} with peer {}: {} - will retry", query_id, target_peer, error_msg);
+                    None
                 }
+                Some(info) => {
+                    info.status.cancel_attempt();
+                    info.status = Status::Failed;
+                    tracing::error!("Permanent failure for predicate {} with peer {}: {} - no retry", query_id, target_peer, error_msg);
+                    Some(info.livequery.clone())
+                }
+                None => None,
             }
+        };
+        if let Some(query) = failed_query {
+            query.set_last_error(content.version, error);
         }
     }
 }
 
-/// Trait for communicating with remote peers (abstraction over WeakNode for testing)
+/// Remote-subscription operations supplied by a node.
 #[async_trait]
 pub trait TNode<CD: ContextData>: Send + Sync {
-    /// Send a predicate registration request to a remote peer, fetch known matches,
-    /// apply received deltas, and store used events.
-    /// Returns Ok(()) if subscription was established and deltas applied successfully.
+    /// Establish the query and apply its initial deltas.
     async fn remote_subscribe(
         &self,
         peer_id: proto::EntityId,
         query_id: proto::QueryId,
         collection_id: CollectionId,
-        selection: ankql::ast::Selection,
+        selection: ankql::ast::Selection<Resolved>,
         context_data: Vec<CD>,
         version: u32,
+        attempt: Arc<AtomicBool>,
+        dispatched: tokio::sync::oneshot::Sender<()>,
     ) -> Result<(), RetrievalError>;
 
-    /// Send a predicate unregistration message to a remote peer
-    /// This is a one-way message, no response expected
+    /// Send a one-way unsubscription.
     async fn peer_unsubscribe(&self, peer_id: proto::EntityId, query_id: proto::QueryId) -> Result<(), anyhow::Error>;
 }
 
-/// Implementation of TNode for WeakNode
 #[async_trait]
 impl<SE, PA> TNode<PA::ContextData> for crate::node::WeakNode<SE, PA>
 where
@@ -492,13 +475,20 @@ where
         peer_id: proto::EntityId,
         query_id: proto::QueryId,
         collection_id: CollectionId,
-        selection: ankql::ast::Selection,
+        selection: ankql::ast::Selection<Resolved>,
         context_data: Vec<PA::ContextData>,
         version: u32,
+        attempt: Arc<std::sync::atomic::AtomicBool>,
+        dispatched: tokio::sync::oneshot::Sender<()>,
     ) -> Result<(), RetrievalError> {
         let node = self.upgrade().ok_or_else(|| RetrievalError::Other("Node has been dropped".to_string()))?;
+        let epoch = node.system.schema_epoch().ok_or(RequestError::SystemNotReady)?;
 
-        // 1. Pre-fetch known_matches from local storage
+        if !attempt.load(Ordering::Acquire) {
+            let _ = dispatched.send(());
+            return Ok(());
+        }
+
         let known_matches: Vec<ankurah_proto::KnownEntity> = node
             .fetch_entities_from_local(&collection_id, &selection)
             .await?
@@ -506,9 +496,13 @@ where
             .map(|entity| ankurah_proto::KnownEntity { entity_id: entity.id(), head: entity.head() })
             .collect();
 
-        // 2. Send subscribe request with known_matches
-        let deltas = match node
-            .request(
+        if !attempt.load(Ordering::Acquire) {
+            let _ = dispatched.send(());
+            return Ok(());
+        }
+
+        let response = node
+            .begin_request(
                 peer_id,
                 &context_data,
                 ankurah_proto::NodeRequestBody::SubscribeQuery {
@@ -519,9 +513,11 @@ where
                     known_matches,
                 },
             )
-            .await
-            .map_err(|e| RetrievalError::RequestError(e))?
-        {
+            .map_err(RetrievalError::RequestError)?;
+        let _ = dispatched.send(());
+        let response = response.await.map_err(|_| RetrievalError::RequestError(RequestError::InternalChannelClosed))??;
+
+        let deltas = match response {
             ankurah_proto::NodeResponseBody::QuerySubscribed { query_id: _response_query_id, deltas } => deltas,
             ankurah_proto::NodeResponseBody::Error(e) => return Err(RetrievalError::RequestError(RequestError::ServerError(e))),
             other => return Err(RetrievalError::RequestError(RequestError::UnexpectedResponse(other))),
@@ -533,11 +529,20 @@ where
             collection_id,
             deltas.len()
         );
-        // 3. Apply deltas to local node using NodeApplier
+        if !attempt.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let _root_state = node.system.lock_root_state().await;
+        if !attempt.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if node.system.schema_epoch() != Some(epoch) {
+            return Err(RequestError::SystemNotReady.into());
+        }
         let collection = node.collections.get(&collection_id).await?;
         let event_getter = crate::retrieval::CachedEventGetter::new(collection_id, collection.clone(), &node, &context_data);
         let state_getter = crate::retrieval::LocalStateGetter::new(collection);
-        crate::node_applier::NodeApplier::apply_deltas(&node, &peer_id, deltas, &event_getter, &state_getter).await?;
+        crate::node::applier::NodeApplier::apply_deltas(&node, &peer_id, deltas, &event_getter, &state_getter).await?;
 
         Ok(())
     }
@@ -545,7 +550,6 @@ where
     async fn peer_unsubscribe(&self, peer_id: proto::EntityId, query_id: proto::QueryId) -> Result<(), anyhow::Error> {
         let node = self.upgrade().ok_or_else(|| anyhow!("Node has been dropped"))?;
 
-        // Use the existing request_remote_unsubscribe method
         node.request_remote_unsubscribe(query_id, vec![peer_id]).await?;
 
         Ok(())
@@ -555,26 +559,18 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ankql::ast::Predicate;
     use ankurah_proto::EntityId;
     use std::sync::{Arc, Mutex};
 
-    // Note: Some tests call setup_remote_subscriptions() directly to test the core
-    // subscription setup logic in isolation, while others use notify_peer_connected()
-    // to test the full event-driven flow. Both approaches are valuable:
-    // - Direct calls test the setup mechanism itself (error handling, state transitions)
-    // - Event-driven calls test the integration and user-facing API
-
-    // For testing, we'll use CollectionId as our ContextData
     impl ContextData for CollectionId {}
 
-    /// Mock message sender for testing
     #[derive(Debug)]
     struct MockMessageSender<CD: ContextData> {
         next_error: Arc<Mutex<Option<RequestError>>>,
-        sent_requests: Arc<Mutex<Vec<(EntityId, proto::QueryId, CollectionId, ankql::ast::Selection)>>>,
-        should_fail: Arc<Mutex<bool>>,
-        failure_message: Arc<Mutex<String>>,
+        sent_requests: Arc<Mutex<Vec<(EntityId, proto::QueryId, CollectionId, ankql::ast::Selection<Resolved>)>>>,
+        pause_next: std::sync::atomic::AtomicBool,
+        paused: tokio::sync::Semaphore,
+        resume: tokio::sync::Semaphore,
         _phantom: std::marker::PhantomData<CD>,
     }
 
@@ -583,19 +579,26 @@ mod tests {
             Self {
                 sent_requests: Arc::new(Mutex::new(Vec::new())),
                 next_error: Arc::new(Mutex::new(None)),
-                should_fail: Arc::new(Mutex::new(false)),
-                failure_message: Arc::new(Mutex::new(String::new())),
+                pause_next: std::sync::atomic::AtomicBool::new(false),
+                paused: tokio::sync::Semaphore::new(0),
+                resume: tokio::sync::Semaphore::new(0),
                 _phantom: std::marker::PhantomData,
             }
         }
 
         fn set_fail_next(&self, error: RequestError) { *self.next_error.lock().unwrap() = Some(error); }
 
-        fn get_sent_requests(&self) -> Vec<(EntityId, proto::QueryId, CollectionId, ankql::ast::Selection)> {
+        fn get_sent_requests(&self) -> Vec<(EntityId, proto::QueryId, CollectionId, ankql::ast::Selection<Resolved>)> {
             self.sent_requests.lock().unwrap().clone()
         }
 
         fn clear_sent_requests(&self) { self.sent_requests.lock().unwrap().clear(); }
+
+        fn pause_one(&self) { self.pause_next.store(true, std::sync::atomic::Ordering::Release) }
+
+        async fn wait_paused(&self) { self.paused.acquire().await.unwrap().forget() }
+
+        fn resume(&self) { self.resume.add_permits(1) }
     }
 
     #[async_trait]
@@ -605,17 +608,22 @@ mod tests {
             peer_id: EntityId,
             query_id: proto::QueryId,
             collection_id: CollectionId,
-            selection: ankql::ast::Selection,
+            selection: ankql::ast::Selection<Resolved>,
             _context_data: Vec<CD>,
             _version: u32,
+            _attempt: Arc<AtomicBool>,
+            dispatched: tokio::sync::oneshot::Sender<()>,
         ) -> Result<(), RetrievalError> {
             self.sent_requests.lock().unwrap().push((peer_id, query_id, collection_id.clone(), selection.clone()));
+            let _ = dispatched.send(());
+            if self.pause_next.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                self.paused.add_permits(1);
+                self.resume.acquire().await.unwrap().forget();
+            }
 
-            // Check if there's an error to fail with
             if let Some(error) = self.next_error.lock().unwrap().take() {
                 Err(RetrievalError::RequestError(error))
             } else {
-                // Mock successful subscription (fetch, subscribe, apply, store all succeeded)
                 Ok(())
             }
         }
@@ -628,7 +636,6 @@ mod tests {
                 ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None },
             ));
 
-            // Check if there's an error to fail with
             if let Some(error) = self.next_error.lock().unwrap().take() {
                 Err(anyhow!(error.to_string()))
             } else {
@@ -637,27 +644,38 @@ mod tests {
         }
     }
 
-    // Mock implementation of RemoteQuerySubscriber for tests
     #[derive(Clone)]
     struct MockLiveQuery;
 
     #[async_trait::async_trait]
     impl RemoteQuerySubscriber for MockLiveQuery {
-        async fn subscription_established(&self, _version: u32) {
-            // Mock - no-op
-        }
+        async fn subscription_established(&self, _version: u32) {}
 
-        fn set_last_error(&self, _error: RetrievalError) {
-            // For tests, we don't track errors
-        }
+        fn set_last_error(&self, _version: u32, _error: RetrievalError) {}
     }
 
-    fn create_test_selection() -> ankql::ast::Selection {
-        // Create a simple test predicate
+    #[derive(Clone, Default)]
+    struct TrackedLiveQuery(Arc<Mutex<Vec<u32>>>);
+
+    #[async_trait::async_trait]
+    impl RemoteQuerySubscriber for TrackedLiveQuery {
+        async fn subscription_established(&self, version: u32) { self.0.lock().unwrap().push(version) }
+        fn set_last_error(&self, _version: u32, _error: RetrievalError) {}
+    }
+
+    fn create_test_selection() -> ankql::ast::Selection<Resolved> {
         ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None }
     }
 
     fn create_test_collection_id() -> CollectionId { CollectionId::from("test_collection") }
+
+    #[tokio::test]
+    async fn retry_task_does_not_keep_relay_alive() {
+        let relay: SubscriptionRelay<CollectionId, MockLiveQuery> = SubscriptionRelay::new();
+        let inner = Arc::downgrade(&relay.inner);
+        drop(relay);
+        assert!(inner.upgrade().is_none());
+    }
 
     #[tokio::test]
     async fn test_new_subscription_setup() {
@@ -676,8 +694,7 @@ mod tests {
         // Notify of new subscription
         relay.subscribe_query(query_id, collection_id.clone(), predicate.clone(), collection_id.clone().into(), 0, MockLiveQuery);
 
-        // Check initial state - subscription should immediately go to Requested state since peer is connected
-        assert!(matches!(relay.get_status(query_id), Some(Status::Requested(_, _))));
+        assert!(matches!(relay.get_status(query_id), Some(Status::PendingRemote(_) | Status::Requested(..))));
 
         // Give async task time to complete (setup should happen automatically)
         futures_timer::Delay::new(std::time::Duration::from_millis(10)).await;
@@ -690,7 +707,143 @@ mod tests {
         assert_eq!(sent_requests[0].2, collection_id);
 
         // Verify subscription is marked as established
-        assert!(matches!(relay.get_status(query_id), Some(Status::Established(established_peer_id, _)) if established_peer_id == peer_id));
+        assert!(matches!(relay.get_status(query_id), Some(Status::Established(established_peer_id)) if established_peer_id == peer_id));
+    }
+
+    #[tokio::test]
+    async fn stale_attempt_cannot_establish_a_replaced_query() {
+        let relay = SubscriptionRelay::new();
+        let node = Arc::new(MockMessageSender::<CollectionId>::new());
+        relay.set_node(node.clone()).unwrap();
+        let query_id = proto::QueryId::new();
+        let peer_id = EntityId::random();
+        let livequery = TrackedLiveQuery::default();
+
+        node.pause_one();
+        relay.notify_peer_connected(peer_id);
+        relay.subscribe_query(
+            query_id,
+            create_test_collection_id(),
+            create_test_selection(),
+            create_test_collection_id().into(),
+            1,
+            livequery.clone(),
+        );
+        node.wait_paused().await;
+        relay.update_query(query_id, create_test_selection(), 2).unwrap();
+        node.resume();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if matches!(relay.get_status(query_id), Some(Status::Established(_))) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(*livequery.0.lock().unwrap(), vec![2]);
+    }
+
+    #[tokio::test]
+    async fn independent_queries_do_not_block_each_other() {
+        let relay = SubscriptionRelay::new();
+        let node = Arc::new(MockMessageSender::<CollectionId>::new());
+        relay.set_node(node.clone()).unwrap();
+        let first = proto::QueryId::new();
+        let second = proto::QueryId::new();
+        let peer = EntityId::random();
+
+        for query_id in [first, second] {
+            relay.subscribe_query(
+                query_id,
+                create_test_collection_id(),
+                create_test_selection(),
+                create_test_collection_id().into(),
+                0,
+                MockLiveQuery,
+            );
+        }
+
+        node.pause_one();
+        relay.notify_peer_connected(peer);
+        node.wait_paused().await;
+        assert_eq!(node.get_sent_requests()[0].1, first);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !matches!(relay.get_status(second), Some(Status::Established(_))) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(relay.get_status(first), Some(Status::Requested(..))));
+
+        node.resume();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !matches!(relay.get_status(first), Some(Status::Established(_)))
+                || !matches!(relay.get_status(second), Some(Status::Established(_)))
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_disconnect_keeps_the_replacement_connection() {
+        let relay: SubscriptionRelay<CollectionId, MockLiveQuery> = SubscriptionRelay::new();
+        let peer = EntityId::random();
+
+        relay.notify_peer_connected_generation(peer, 1);
+        relay.notify_peer_connected_generation(peer, 2);
+        relay.notify_peer_disconnected_generation(peer, 1);
+        assert!(relay.inner.connected_peers.contains_key(&peer));
+
+        relay.notify_peer_disconnected_generation(peer, 2);
+        assert!(!relay.inner.connected_peers.contains_key(&peer));
+    }
+
+    #[tokio::test]
+    async fn update_stays_with_its_established_peer() {
+        let relay = SubscriptionRelay::new();
+        let node = Arc::new(MockMessageSender::<CollectionId>::new());
+        relay.set_node(node.clone()).unwrap();
+        let query_id = proto::QueryId::new();
+        let lower_peer = EntityId::from_bytes([1; 32]);
+        let established_peer = EntityId::from_bytes([2; 32]);
+
+        relay.notify_peer_connected(established_peer);
+        relay.subscribe_query(
+            query_id,
+            create_test_collection_id(),
+            create_test_selection(),
+            create_test_collection_id().into(),
+            1,
+            MockLiveQuery,
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !matches!(relay.get_status(query_id), Some(Status::Established(_))) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        relay.notify_peer_connected(lower_peer);
+        node.clear_sent_requests();
+        relay.update_query(query_id, create_test_selection(), 2).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while node.get_sent_requests().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(node.get_sent_requests()[0].0, established_peer);
     }
 
     #[tokio::test]
@@ -714,13 +867,47 @@ mod tests {
         // Give async task time to complete
         futures_timer::Delay::new(std::time::Duration::from_millis(10)).await;
 
-        assert!(matches!(relay.get_status(query_id), Some(Status::Established(established_peer_id, _)) if established_peer_id == peer_id));
+        assert!(matches!(relay.get_status(query_id), Some(Status::Established(established_peer_id)) if established_peer_id == peer_id));
 
         // Simulate peer disconnection
         relay.notify_peer_disconnected(peer_id);
 
         // Verify subscription is marked as pending again
-        assert!(matches!(relay.get_status(query_id), Some(Status::PendingRemote)));
+        assert!(matches!(relay.get_status(query_id), Some(Status::PendingRemote(_))));
+    }
+
+    #[tokio::test]
+    async fn suspended_query_rejects_pushes_and_does_not_retry() {
+        let relay = SubscriptionRelay::new();
+        let node = Arc::new(MockMessageSender::<CollectionId>::new());
+        relay.set_node(node.clone()).unwrap();
+        let query_id = proto::QueryId::new();
+        let peer = EntityId::random();
+
+        relay.notify_peer_connected(peer);
+        relay.subscribe_query(
+            query_id,
+            create_test_collection_id(),
+            create_test_selection(),
+            create_test_collection_id().into(),
+            1,
+            MockLiveQuery,
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !matches!(relay.get_status(query_id), Some(Status::Established(_))) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        node.clear_sent_requests();
+        relay.suspend_query(query_id);
+        assert!(matches!(relay.get_status(query_id), Some(Status::Suspended(Some(found))) if found == peer));
+        assert!(!relay.has_subscription_with_peer(&peer));
+        relay.setup_remote_subscriptions();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(node.get_sent_requests().is_empty());
     }
 
     #[tokio::test]
@@ -736,7 +923,7 @@ mod tests {
 
         // Add pending subscription (no peers connected yet)
         relay.subscribe_query(query_id, collection_id.clone(), predicate.clone(), collection_id.clone().into(), 0, MockLiveQuery);
-        assert!(matches!(relay.get_status(query_id), Some(Status::PendingRemote)));
+        assert!(matches!(relay.get_status(query_id), Some(Status::PendingRemote(_))));
 
         // Clear any previous requests
         mock_sender.clear_sent_requests();
@@ -754,7 +941,7 @@ mod tests {
         assert_eq!(sent_requests[0].1, query_id);
 
         // Verify subscription is established
-        assert!(matches!(relay.get_status(query_id), Some(Status::Established(established_peer_id, _)) if established_peer_id == peer_id));
+        assert!(matches!(relay.get_status(query_id), Some(Status::Established(established_peer_id)) if established_peer_id == peer_id));
     }
 
     #[tokio::test]
@@ -776,14 +963,14 @@ mod tests {
         futures_timer::Delay::new(std::time::Duration::from_millis(10)).await;
 
         // Verify subscription is marked as established (since no error was set)
-        assert!(matches!(relay.get_status(query_id), Some(Status::Established(established_peer_id, _)) if established_peer_id == peer_id));
+        assert!(matches!(relay.get_status(query_id), Some(Status::Established(established_peer_id)) if established_peer_id == peer_id));
 
         // Now test the retry behavior by disconnecting the peer (puts subscription back to PendingRemote)
         // then setting up the mock to fail, and reconnecting to trigger the retry
         relay.notify_peer_disconnected(peer_id);
 
         // Verify subscription is now in pending state
-        assert!(matches!(relay.get_status(query_id), Some(Status::PendingRemote)));
+        assert!(matches!(relay.get_status(query_id), Some(Status::PendingRemote(_))));
 
         // Clear requests and set up mock to fail on the next call
         mock_sender.clear_sent_requests();
@@ -830,7 +1017,7 @@ mod tests {
         {
             let mut subscriptions = relay.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(info) = subscriptions.get_mut(&retryable_query_id) {
-                info.status = Status::PendingRemote; // Retryable errors go back to pending
+                info.status = Status::PendingRemote(None);
             }
             if let Some(info) = subscriptions.get_mut(&non_retryable_query_id) {
                 info.status = Status::Failed; // Non-retryable errors stay failed
@@ -850,7 +1037,7 @@ mod tests {
 
         // Verify states
         assert!(
-            matches!(relay.get_status(retryable_query_id), Some(Status::Established(established_peer_id, _)) if established_peer_id == peer_id)
+            matches!(relay.get_status(retryable_query_id), Some(Status::Established(established_peer_id)) if established_peer_id == peer_id)
         );
         assert!(matches!(relay.get_status(non_retryable_query_id), Some(Status::Failed)));
     }
@@ -873,7 +1060,7 @@ mod tests {
         // Give async task time to complete
         futures_timer::Delay::new(std::time::Duration::from_millis(10)).await;
 
-        assert!(matches!(relay.get_status(query_id), Some(Status::Established(established_peer_id, _)) if established_peer_id == peer_id));
+        assert!(matches!(relay.get_status(query_id), Some(Status::Established(established_peer_id)) if established_peer_id == peer_id));
 
         // Clear previous requests to focus on unsubscribe
         mock_sender.clear_sent_requests();
@@ -895,6 +1082,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_update_unsubscribes_the_established_peer() {
+        let relay = SubscriptionRelay::new();
+        let node = Arc::new(MockMessageSender::<CollectionId>::new());
+        relay.set_node(node.clone()).unwrap();
+        let query_id = proto::QueryId::new();
+        let peer = EntityId::random();
+
+        relay.notify_peer_connected(peer);
+        relay.subscribe_query(
+            query_id,
+            create_test_collection_id(),
+            create_test_selection(),
+            create_test_collection_id().into(),
+            1,
+            MockLiveQuery,
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !matches!(relay.get_status(query_id), Some(Status::Established(_))) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let dispatch = relay.inner.dispatch.lock().await;
+        node.clear_sent_requests();
+        relay.update_query(query_id, create_test_selection(), 2).unwrap();
+        assert!(matches!(relay.get_status(query_id), Some(Status::PendingRemote(Some(current))) if current == peer));
+        relay.unsubscribe_predicate(query_id);
+        drop(dispatch);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while node.get_sent_requests().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(node.get_sent_requests()[0].2, CollectionId::from("unsubscribe"));
+    }
+
+    #[tokio::test]
     async fn test_edge_cases() {
         let relay = SubscriptionRelay::new();
         let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
@@ -909,14 +1138,14 @@ mod tests {
         futures_timer::Delay::new(std::time::Duration::from_millis(10)).await;
 
         // Should still be pending since no sender
-        assert!(matches!(relay.get_status(query_id), Some(Status::PendingRemote)));
+        assert!(matches!(relay.get_status(query_id), Some(Status::PendingRemote(_))));
 
         // Now set sender and test with no connected peers
         relay.set_node(mock_sender.clone()).expect("Failed to set message sender");
         futures_timer::Delay::new(std::time::Duration::from_millis(10)).await;
 
         // Should still be pending since no peers available
-        assert!(matches!(relay.get_status(query_id), Some(Status::PendingRemote)));
+        assert!(matches!(relay.get_status(query_id), Some(Status::PendingRemote(_))));
 
         // Verify no requests were sent
         assert_eq!(mock_sender.get_sent_requests().len(), 0);
@@ -926,7 +1155,7 @@ mod tests {
         futures_timer::Delay::new(std::time::Duration::from_millis(10)).await;
 
         // Should now be established
-        assert!(matches!(relay.get_status(query_id), Some(Status::Established(established_peer_id, _)) if established_peer_id == peer_id));
+        assert!(matches!(relay.get_status(query_id), Some(Status::Established(established_peer_id)) if established_peer_id == peer_id));
         assert_eq!(mock_sender.get_sent_requests().len(), 1);
     }
 
@@ -942,7 +1171,7 @@ mod tests {
 
         // Add subscription but don't establish it
         relay.subscribe_query(query_id, collection_id.clone(), predicate, collection_id.clone().into(), 0, MockLiveQuery);
-        assert!(matches!(relay.get_status(query_id), Some(Status::PendingRemote)));
+        assert!(matches!(relay.get_status(query_id), Some(Status::PendingRemote(_))));
 
         // Unsubscribe from pending subscription
         relay.unsubscribe_predicate(query_id);

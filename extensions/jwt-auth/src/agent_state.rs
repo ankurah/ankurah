@@ -1,5 +1,5 @@
 use crate::{JwtContext, JwtKeys, PolicyConfig};
-use ankurah_core::{livequery::EntityLiveQuery, resultset::EntityResultSet, storage::StorageEngine, Node};
+use ankurah_core::{livequery::EntityLiveQuery, resultset::EntityResultSet, storage::StorageEngine, Model, Node};
 use ankurah_proto as proto;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -63,14 +63,20 @@ pub(crate) fn start_ephemeral_policy_sync<SE, PA>(
     SE: StorageEngine + Send + Sync + 'static,
     PA: ankurah_core::policy::PolicyAgent<ContextData = JwtContext> + Send + Sync + 'static,
 {
-    let args: ankurah_core::node::MatchArgs = match "true".try_into() {
+    let args: ankurah_core::node::MatchArgs<ankql::ast::Parsed> = match "true".try_into() {
         Ok(a) => a,
         Err(e) => {
             tracing::error!("on_node_ready: failed to parse selection: {}", e);
             return;
         }
     };
-    let lq = match EntityLiveQuery::new_weak_node(node, proto::CollectionId::from("jwtpolicy"), args, JwtContext::NoUser) {
+    let lq = match EntityLiveQuery::new_weak_node(
+        node,
+        Some(crate::JwtPolicy::descriptor()),
+        proto::CollectionId::from("jwtpolicy"),
+        args,
+        JwtContext::NoUser,
+    ) {
         Ok(lq) => lq,
         Err(e) => {
             tracing::error!("on_node_ready: failed to create policy livequery: {}", e);
@@ -82,7 +88,10 @@ pub(crate) fn start_ephemeral_policy_sync<SE, PA>(
     *policy_livequery.lock().unwrap_or_else(|e| e.into_inner()) = Some(lq);
 
     ankurah_core::task::spawn(async move {
-        lq_clone.wait_initialized().await;
+        if let Err(error) = lq_clone.wait_initialized().await {
+            tracing::error!("ephemeral policy sync: the policy livequery never initialized, so no policy will be applied: {error}");
+            return;
+        }
 
         apply_policy_from_resultset(&lq_clone.resultset(), &state_handle);
 

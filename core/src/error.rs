@@ -1,9 +1,11 @@
-use std::{collections::BTreeSet, convert::Infallible};
+use crate::internal::prelude::*;
+use std::{collections::BTreeSet, convert::Infallible, sync::Arc};
 
-use ankurah_proto::{CollectionId, DecodeError, EntityId, EventId};
+use ankurah_proto::{DecodeError, EntityId, EventId};
 use thiserror::Error;
 
-use crate::{connector::SendError, policy::AccessDenied};
+use crate::connector::SendError;
+pub use crate::node::event_admissibility::InadmissibleEvent;
 
 #[derive(Error, Debug)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Error))]
@@ -49,6 +51,12 @@ pub enum RetrievalError {
     RequestError(RequestError),
     #[error("Apply error: {0}")]
     ApplyError(ApplyError),
+    #[error(transparent)]
+    Shared(Arc<RetrievalError>),
+    #[error(
+        "model '{label}' is not registered in this system, or its registered shape differs from this binary's declaration; a typed read cannot resolve it"
+    )]
+    UnboundDeclaration { label: String },
 }
 
 impl From<RequestError> for RetrievalError {
@@ -69,6 +77,19 @@ impl From<MutationError> for RetrievalError {
 
 impl RetrievalError {
     pub fn storage(err: impl std::error::Error + Send + Sync + 'static) -> Self { RetrievalError::StorageError(Box::new(err)) }
+}
+
+#[cfg(test)]
+mod retrieval_error_tests {
+    use super::*;
+
+    #[test]
+    fn shared_error_retains_the_original_variant() {
+        let error = RetrievalError::Shared(Arc::new(RetrievalError::RequestError(RequestError::ServerError("refused".into()))));
+        assert!(
+            matches!(error, RetrievalError::Shared(inner) if matches!(inner.as_ref(), RetrievalError::RequestError(RequestError::ServerError(message)) if message == "refused"))
+        );
+    }
 }
 
 impl From<bincode::Error> for RetrievalError {
@@ -93,6 +114,8 @@ pub enum RequestError {
     PeerNotConnected,
     #[error("Connection lost")]
     ConnectionLost,
+    #[error("System not ready")]
+    SystemNotReady,
     #[error("Server error: {0}")]
     ServerError(String),
     #[error("Send error: {0}")]
@@ -159,6 +182,8 @@ pub enum MutationError {
     InvalidEvent,
     #[error("malformed event: {0}")]
     EventStructure(ankurah_proto::EventStructureError),
+    #[error("inadmissible event: {0}")]
+    InadmissibleEvent(InadmissibleEvent),
     /// The node does not know its system root, so it cannot derive an entity
     /// id: a non-root genesis binds the root into its own id. A caller that
     /// reaches this on an ephemeral node can retry once the handshake with a
@@ -191,6 +216,10 @@ pub enum MutationError {
 
 impl From<ankurah_proto::EventStructureError> for MutationError {
     fn from(err: ankurah_proto::EventStructureError) -> Self { MutationError::EventStructure(err) }
+}
+
+impl From<InadmissibleEvent> for MutationError {
+    fn from(err: InadmissibleEvent) -> Self { MutationError::InadmissibleEvent(err) }
 }
 
 impl From<tokio::task::JoinError> for MutationError {

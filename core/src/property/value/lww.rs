@@ -5,7 +5,7 @@ use crate::{
     property::{
         backend::{LWWBackend, PropertyBackend},
         traits::{FromActiveType, FromEntity, PropertyError},
-        InitializeWith, Property, PropertyName, Value,
+        InitializeWith, Property, PropertyId, Value,
     },
 };
 
@@ -16,16 +16,14 @@ use ankurah_signals::{
 
 #[derive(Clone)]
 pub struct LWW<T: Property> {
-    pub property_name: PropertyName,
+    pub property: PropertyId,
     pub backend: Arc<LWWBackend>,
     pub entity: Entity,
     phantom: PhantomData<T>,
 }
 
 impl<T: Property> std::fmt::Debug for LWW<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LWW").field("property_name", &self.property_name).finish()
-    }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.debug_struct("LWW").field("property", &self.property).finish() }
 }
 
 impl<T: Property> LWW<T> {
@@ -34,7 +32,7 @@ impl<T: Property> LWW<T> {
             return Err(PropertyError::TransactionClosed);
         }
         let value = value.into_value()?;
-        self.backend.set(self.property_name.clone(), value);
+        self.backend.set(self.property.clone(), value);
         Ok(())
     }
 
@@ -43,7 +41,7 @@ impl<T: Property> LWW<T> {
         T::from_value(value)
     }
 
-    pub fn get_value(&self) -> Option<Value> { self.backend.get(&self.property_name) }
+    pub fn get_value(&self) -> Option<Value> { self.backend.get(&self.property) }
 }
 
 impl<T: Property> crate::property::traits::ActiveType for LWW<T> {
@@ -51,9 +49,9 @@ impl<T: Property> crate::property::traits::ActiveType for LWW<T> {
 }
 
 impl<T: Property> FromEntity for LWW<T> {
-    fn from_entity(property_name: PropertyName, entity: &Entity) -> Self {
+    fn from_entity(property: PropertyId, entity: &Entity) -> Self {
         let backend = entity.get_backend::<LWWBackend>().expect("LWW Backend should exist");
-        Self { property_name, backend, entity: entity.clone(), phantom: PhantomData }
+        Self { property, backend, entity: entity.clone(), phantom: PhantomData }
     }
 }
 
@@ -65,16 +63,16 @@ impl<T: Property> FromActiveType<LWW<T>> for T {
 }
 
 impl<T: Property> InitializeWith<T> for LWW<T> {
-    fn initialize_with(provisional: &mut ProvisionalEntity, property_name: PropertyName, value: &T) {
+    fn initialize_with(provisional: &mut ProvisionalEntity, property: PropertyId, value: &T) {
         let backend = provisional.get_backend::<LWWBackend>().expect("LWW Backend should exist");
-        backend.set(property_name, value.into_value().unwrap());
+        backend.set(property, value.into_value().unwrap());
     }
 }
 
 impl<T: Property> ankurah_signals::Signal for LWW<T> {
-    fn listen(&self, listener: Listener) -> ListenerGuard { self.backend.listen_field(&self.property_name, listener) }
+    fn listen(&self, listener: Listener) -> ListenerGuard { self.backend.listen_field(&self.property, listener) }
 
-    fn broadcast_id(&self) -> ankurah_signals::broadcast::BroadcastId { self.backend.field_broadcast_id(&self.property_name) }
+    fn broadcast_id(&self) -> ankurah_signals::broadcast::BroadcastId { self.backend.field_broadcast_id(&self.property) }
 }
 
 impl<T: Property> ankurah_signals::Subscribe<T> for LWW<T>

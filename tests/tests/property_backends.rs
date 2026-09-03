@@ -48,8 +48,8 @@ async fn property_backends() -> Result<()> {
         .await?;
 
     let id = cat_video.id();
-    cat_video.visibility().set(&Visibility::Unlisted)?;
-    cat_video.title().insert(15, " (Very cute)")?;
+    cat_video.visibility()?.set(&Visibility::Unlisted)?;
+    cat_video.title()?.insert(15, " (Very cute)")?;
     trx.commit().await?;
 
     let video = ctx.get::<VideoView>(id).await?;

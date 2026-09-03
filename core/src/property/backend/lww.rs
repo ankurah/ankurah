@@ -5,41 +5,22 @@ use std::{
     sync::{Arc, Mutex, RwLock},
 };
 
-use ankurah_proto::{BackendOperation as Operation, EventId};
+use ankurah_proto::{BackendOperation as Operation, EventId, PropertyId};
 use ankurah_signals::signal::Listener;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     error::{MutationError, StateError},
     event_dag::{CausalRelation, EventLayer},
-    property::{backend::PropertyBackend, PropertyName, Value},
+    property::{backend::PropertyBackend, Value},
 };
 
-const LWW_DIFF_VERSION: u8 = 1;
+const LWW_DIFF_VERSION: u8 = 2;
 
-/// Version header for serialized LWW state buffers: the first byte of every
-/// buffer identifies its encoding, and deserialization refuses buffers whose
-/// version it does not know rather than guessing.
-///
-/// Versions are offset high because unversioned pre-0.9 buffers were raw
-/// bincode maps whose first byte is the low byte of the property count -- a
-/// small number. Keeping versions at 0xA1+ makes the two ranges disjoint, so
-/// one byte classifies any buffer without parse-probing. (A legacy entity
-/// would need 160+ properties to be misclassified, and would then fail
-/// loudly during deserialization, never silently misparse.)
+// 0xA1 was name-keyed; 0xA2 is PropertyId-keyed. Older formats are refused.
 const LWW_STATE_VERSION_BASE: u8 = 0xA0;
 const LWW_STATE_VERSION_1: u8 = LWW_STATE_VERSION_BASE + 1;
-
-/// Provenance stamp for values loaded from unversioned (pre-0.9) state
-/// buffers, which recorded no per-property event id. All-zeros is not a
-/// reachable content hash, so it is never found in an accumulated DAG and
-/// merge resolution treats such values as older-than-meet: any event that
-/// writes the property wins. For pre-0.9 stores this reproduces the true
-/// outcome exactly -- their histories are linear, so a real per-property
-/// stamp would also lose to every later write -- and unlike stamping with
-/// the local head it yields the same election result on every replica,
-/// including replicas that rebuilt provenance by replaying events.
-const LEGACY_EVENT_ID: [u8; 32] = [0; 32];
+const LWW_STATE_VERSION_2: u8 = LWW_STATE_VERSION_BASE + 2;
 
 #[derive(Clone, Debug)]
 enum ValueEntry {
@@ -65,11 +46,12 @@ impl ValueEntry {
     }
 }
 
+/// A last-write-wins store keyed by durable property identity.
 #[derive(Debug)]
 pub struct LWWBackend {
     // TODO - can this be safely combined with the values map?
-    values: RwLock<BTreeMap<PropertyName, ValueEntry>>,
-    field_broadcasts: Mutex<BTreeMap<PropertyName, ankurah_signals::broadcast::Broadcast>>,
+    values: RwLock<BTreeMap<PropertyId, ValueEntry>>,
+    field_broadcasts: Mutex<BTreeMap<PropertyId, ankurah_signals::broadcast::Broadcast>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -84,6 +66,18 @@ struct CommittedEntry {
     event_id: EventId,
 }
 
+fn decode_changes(operation: &Operation) -> Result<BTreeMap<PropertyId, Option<Value>>, MutationError> {
+    let LWWDiff { version, data } = bincode::deserialize(&operation.diff)?;
+    if version != LWW_DIFF_VERSION {
+        return Err(MutationError::UpdateFailed(anyhow::anyhow!("Unknown LWW operation version: {:?}", version).into()));
+    }
+    let mut changes = bincode::deserialize::<BTreeMap<PropertyId, Option<Value>>>(&data)?;
+    if changes.remove(&PropertyId::Id).is_some() {
+        tracing::warn!("skipping id pseudo-property key in LWW diff");
+    }
+    Ok(changes)
+}
+
 impl Default for LWWBackend {
     fn default() -> Self { Self::new() }
 }
@@ -91,14 +85,18 @@ impl Default for LWWBackend {
 impl LWWBackend {
     pub fn new() -> LWWBackend { Self { values: RwLock::new(BTreeMap::default()), field_broadcasts: Mutex::new(BTreeMap::new()) } }
 
-    pub fn set(&self, property_name: PropertyName, value: Option<Value>) {
+    pub fn set(&self, property: PropertyId, value: Option<Value>) {
+        if property == PropertyId::Id {
+            tracing::warn!("skipping id pseudo-property write to LWW backend");
+            return;
+        }
         let mut values = self.values.write().unwrap();
-        values.insert(property_name, ValueEntry::Uncommitted { value });
+        values.insert(property, ValueEntry::Uncommitted { value });
     }
 
-    pub fn get(&self, property_name: &PropertyName) -> Option<Value> {
+    pub fn get(&self, property: &PropertyId) -> Option<Value> {
         let values = self.values.read().unwrap();
-        values.get(property_name).and_then(|entry| entry.value())
+        values.get(property).and_then(|entry| entry.value())
     }
 }
 
@@ -112,21 +110,17 @@ impl PropertyBackend for LWWBackend {
         let cloned = (*values).clone();
         drop(values);
 
-        Arc::new(Self {
-            values: RwLock::new(cloned),
-            // Create fresh broadcasts (don't clone the existing ones for transaction isolation)
-            field_broadcasts: Mutex::new(BTreeMap::new()),
-        })
+        Arc::new(Self { values: RwLock::new(cloned), field_broadcasts: Mutex::new(BTreeMap::new()) })
     }
 
-    fn properties(&self) -> Vec<PropertyName> {
+    fn properties(&self) -> Vec<PropertyId> {
         let values = self.values.read().unwrap();
-        values.keys().cloned().collect::<Vec<PropertyName>>()
+        values.keys().cloned().collect::<Vec<PropertyId>>()
     }
 
-    fn property_value(&self, property_name: &PropertyName) -> Option<Value> { self.get(property_name) }
+    fn property_value(&self, property: &PropertyId) -> Option<Value> { self.get(property) }
 
-    fn property_values(&self) -> BTreeMap<PropertyName, Option<Value>> {
+    fn property_values(&self) -> BTreeMap<PropertyId, Option<Value>> {
         let values = self.values.read().unwrap();
         values.iter().map(|(k, v)| (k.clone(), v.value())).collect()
     }
@@ -134,19 +128,18 @@ impl PropertyBackend for LWWBackend {
     fn property_backend_name() -> &'static str { "lww" }
 
     fn to_state_buffer(&self) -> Result<Vec<u8>, StateError> {
-        // Serialize with required event_id for per-property conflict resolution after loading.
         let values = self.values.read().unwrap();
-        let mut serializable: BTreeMap<PropertyName, CommittedEntry> = BTreeMap::new();
-        for (name, entry) in values.iter() {
+        let mut serializable: BTreeMap<PropertyId, CommittedEntry> = BTreeMap::new();
+        for (property, entry) in values.iter() {
             let Some(event_id) = entry.event_id() else {
                 return Err(StateError::SerializationError(Box::new(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("LWW state requires event_id for property {}", name),
+                    format!("LWW state requires event_id for property {}", property),
                 ))));
             };
-            serializable.insert(name.clone(), CommittedEntry { value: entry.value(), event_id });
+            serializable.insert(property.clone(), CommittedEntry { value: entry.value(), event_id });
         }
-        let mut state_buffer = vec![LWW_STATE_VERSION_1];
+        let mut state_buffer = vec![LWW_STATE_VERSION_2];
         bincode::serialize_into(&mut state_buffer, &serializable)?;
         Ok(state_buffer)
     }
@@ -158,29 +151,33 @@ impl PropertyBackend for LWWBackend {
             None => return Err(crate::error::RetrievalError::Other("empty LWW state buffer".to_string())),
         };
         if version < LWW_STATE_VERSION_BASE {
-            // Unversioned pre-0.9 buffer: raw bincode of property -> value,
-            // no header byte and no per-property provenance. The version
-            // ranges are disjoint by construction, so this is a dispatch on
-            // the same single byte, not a parse probe: a failure below means
-            // a corrupt buffer, not format ambiguity. Loaded values carry
-            // LEGACY_EVENT_ID, and the next to_state_buffer rewrites the
-            // entity in the current versioned format.
-            let legacy_map = bincode::deserialize::<BTreeMap<PropertyName, Option<Value>>>(state_buffer)
-                .map_err(|e| crate::error::RetrievalError::Other(format!("failed to parse pre-0.9 legacy LWW state buffer: {e}")))?;
-            let map = legacy_map
-                .into_iter()
-                .map(|(k, value)| (k, ValueEntry::Committed { value, event_id: EventId::from_bytes(LEGACY_EVENT_ID) }))
-                .collect();
-            return Ok(Self { values: RwLock::new(map), field_broadcasts: Mutex::new(BTreeMap::new()) });
+            return Err(crate::error::RetrievalError::Other(
+                "unversioned pre-0.9 LWW state buffer is name-keyed and not readable by this binary".to_string(),
+            ));
         }
-        if version != LWW_STATE_VERSION_1 {
+        if version == LWW_STATE_VERSION_1 {
             return Err(crate::error::RetrievalError::Other(format!(
-                "unknown LWW state buffer version {version:#04x} (this binary supports {LWW_STATE_VERSION_1:#04x})"
+                "LWW state buffer version {LWW_STATE_VERSION_1:#04x} is the name-keyed 0.9 encoding; this binary reads only {LWW_STATE_VERSION_2:#04x}"
             )));
         }
-        let raw_map = bincode::deserialize::<BTreeMap<PropertyName, CommittedEntry>>(payload)?;
-        let map =
-            raw_map.into_iter().map(|(k, entry)| (k, ValueEntry::Committed { value: entry.value, event_id: entry.event_id })).collect();
+        if version != LWW_STATE_VERSION_2 {
+            return Err(crate::error::RetrievalError::Other(format!(
+                "unknown LWW state buffer version {version:#04x} (this binary supports {LWW_STATE_VERSION_2:#04x})"
+            )));
+        }
+        let raw_map = bincode::deserialize::<BTreeMap<PropertyId, CommittedEntry>>(payload)?;
+        // `id` is computed from the entity, never stored.
+        let map = raw_map
+            .into_iter()
+            .filter(|(k, _)| {
+                if matches!(k, PropertyId::Id) {
+                    tracing::warn!("skipping id pseudo-property key in LWW state buffer");
+                    return false;
+                }
+                true
+            })
+            .map(|(k, entry)| (k, ValueEntry::Committed { value: entry.value, event_id: entry.event_id }))
+            .collect();
         Ok(Self { values: RwLock::new(map), field_broadcasts: Mutex::new(BTreeMap::new()) })
     }
 
@@ -188,12 +185,12 @@ impl PropertyBackend for LWWBackend {
         let mut values = self.values.write().unwrap();
         let mut changed_values = BTreeMap::new();
 
-        for (name, entry) in values.iter_mut() {
+        for (property, entry) in values.iter_mut() {
             let ValueEntry::Uncommitted { value } = entry else {
                 continue;
             };
             let value = value.clone();
-            changed_values.insert(name.clone(), value.clone());
+            changed_values.insert(property.clone(), value.clone());
             *entry = ValueEntry::Pending { value };
         }
 
@@ -206,13 +203,9 @@ impl PropertyBackend for LWWBackend {
         }]))
     }
 
-    fn apply_operations(&self, operations: &[Operation]) -> Result<(), MutationError> {
-        // No event tracking - used when loading from state buffer
-        self.apply_operations_internal(operations, None)
-    }
+    fn apply_operations(&self, operations: &[Operation]) -> Result<(), MutationError> { self.apply_operations_internal(operations, None) }
 
     fn apply_operations_with_event(&self, operations: &[Operation], event_id: EventId) -> Result<(), MutationError> {
-        // Track which event set each property - used for all event applications
         self.apply_operations_internal(operations, Some(event_id))
     }
 
@@ -225,9 +218,10 @@ impl PropertyBackend for LWWBackend {
             older_than_meet: bool,
         }
 
-        let mut winners: BTreeMap<PropertyName, Candidate> = BTreeMap::new();
+        let mut winners: BTreeMap<PropertyId, Candidate> = BTreeMap::new();
 
-        // Seed with stored last-write candidates (required event_id).
+        // Stored values outside the accumulated DAG precede the meet, so any
+        // layer candidate for that property wins.
         {
             let values = self.values.read().unwrap();
             for (prop, entry) in values.iter() {
@@ -237,141 +231,106 @@ impl PropertyBackend for LWWBackend {
                     ));
                 };
 
-                // KEY RULE: If stored event_id is NOT in the accumulated DAG,
-                // it is strictly older than the meet. Any layer candidate wins.
-                // We still seed it so it participates if no layer event touches
-                // this property, but mark it as auto-losable.
                 let known_in_dag = layer.dag_contains(&event_id);
-                winners.insert(
-                    prop.clone(),
-                    Candidate { value: entry.value(), event_id, from_to_apply: false, older_than_meet: !known_in_dag },
-                );
+                winners.insert(*prop, Candidate { value: entry.value(), event_id, from_to_apply: false, older_than_meet: !known_in_dag });
             }
         }
 
-        // Add candidates from events in this layer.
         for (event, from_to_apply) in layer.already_applied.iter().map(|e| (e, false)).chain(layer.to_apply.iter().map(|e| (e, true))) {
-            {
-                for operation in event.operations().backend_operations(Self::property_backend_name()) {
-                    let LWWDiff { version, data } = bincode::deserialize(&operation.diff)?;
-                    match version {
-                        1 => {
-                            let changes: BTreeMap<PropertyName, Option<Value>> = bincode::deserialize(&data)?;
-                            for (prop, value) in changes {
-                                let candidate = Candidate { value, event_id: event.id(), from_to_apply, older_than_meet: false };
-                                if let Some(current) = winners.get_mut(&prop) {
-                                    if current.older_than_meet {
-                                        // Stored value is below meet -- any layer candidate wins
-                                        *current = candidate;
-                                    } else {
-                                        // Both in accumulated set -- use causal comparison (infallible)
-                                        let relation = layer.compare(&candidate.event_id, &current.event_id);
-                                        match relation {
-                                            CausalRelation::Descends => {
-                                                *current = candidate;
-                                            }
-                                            CausalRelation::Ascends => {}
-                                            CausalRelation::Concurrent => {
-                                                if candidate.event_id > current.event_id {
-                                                    *current = candidate;
-                                                }
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    winners.insert(prop, candidate);
-                                }
+            for operation in event.operations().backend_operations(Self::property_backend_name()) {
+                for (prop, value) in decode_changes(operation)? {
+                    let candidate = Candidate { value, event_id: event.id(), from_to_apply, older_than_meet: false };
+                    if let Some(current) = winners.get_mut(&prop) {
+                        if current.older_than_meet {
+                            *current = candidate;
+                        } else {
+                            match layer.compare(&candidate.event_id, &current.event_id) {
+                                CausalRelation::Descends => *current = candidate,
+                                CausalRelation::Ascends => {}
+                                CausalRelation::Concurrent if candidate.event_id > current.event_id => *current = candidate,
+                                CausalRelation::Concurrent => {}
                             }
                         }
-                        version => {
-                            return Err(MutationError::UpdateFailed(anyhow::anyhow!("Unknown LWW operation version: {:?}", version).into()))
-                        }
+                    } else {
+                        winners.insert(prop, candidate);
                     }
                 }
             }
         }
 
-        // Apply winning values that come from to_apply events.
         let mut changed_fields = Vec::new();
         {
             let mut values = self.values.write().unwrap();
             for (prop, candidate) in winners {
                 if candidate.from_to_apply {
-                    values.insert(prop.clone(), ValueEntry::Committed { value: candidate.value, event_id: candidate.event_id });
+                    values.insert(prop, ValueEntry::Committed { value: candidate.value, event_id: candidate.event_id });
                     changed_fields.push(prop);
                 }
             }
         }
 
-        // Notify subscribers for changed fields
         super::notify_changed_fields(&self.field_broadcasts, changed_fields.iter());
 
         Ok(())
     }
 
-    fn listen_field(&self, field_name: &PropertyName, listener: Listener) -> ankurah_signals::signal::ListenerGuard {
-        // Get or create the broadcast for this field
+    fn listen_field(&self, property: &PropertyId, listener: Listener) -> ankurah_signals::signal::ListenerGuard {
         let mut field_broadcasts = self.field_broadcasts.lock().expect("other thread panicked, panic here too");
-        let broadcast = field_broadcasts.entry(field_name.clone()).or_default();
-
-        // Subscribe to the broadcast and return the guard
+        let broadcast = field_broadcasts.entry(*property).or_default();
         broadcast.reference().listen(listener).into()
     }
 }
 
 impl LWWBackend {
     /// Get the broadcast ID for a specific field, creating the broadcast if necessary
-    pub fn field_broadcast_id(&self, field_name: &PropertyName) -> ankurah_signals::broadcast::BroadcastId {
+    pub fn field_broadcast_id(&self, property: &PropertyId) -> ankurah_signals::broadcast::BroadcastId {
         let mut field_broadcasts = self.field_broadcasts.lock().expect("other thread panicked, panic here too");
-        let broadcast = field_broadcasts.entry(field_name.clone()).or_default();
+        let broadcast = field_broadcasts.entry(property.clone()).or_default();
         broadcast.id()
     }
 
     /// Get the event_id that last wrote a property value (if tracked).
-    pub fn get_event_id(&self, property_name: &PropertyName) -> Option<EventId> {
+    pub fn get_event_id(&self, property: &PropertyId) -> Option<EventId> {
         let values = self.values.read().unwrap();
-        values.get(property_name).and_then(|entry| entry.event_id())
+        values.get(property).and_then(|entry| entry.event_id())
     }
     /// Internal implementation that handles both tracked and untracked operations.
     fn apply_operations_internal(&self, operations: &[Operation], event_id: Option<EventId>) -> Result<(), MutationError> {
         let mut changed_fields = Vec::new();
 
         for operation in operations {
-            let LWWDiff { version, data } = bincode::deserialize(&operation.diff)?;
-            match version {
-                1 => {
-                    let changes: BTreeMap<PropertyName, Option<Value>> = bincode::deserialize(&data)?;
-
-                    let mut values = self.values.write().unwrap();
-                    for (property_name, new_value) in changes {
-                        let entry = match event_id.clone() {
-                            Some(event_id) => ValueEntry::Committed { value: new_value, event_id },
-                            None => ValueEntry::Pending { value: new_value },
-                        };
-                        values.insert(property_name.clone(), entry);
-                        changed_fields.push(property_name);
-                    }
-                }
-                version => return Err(MutationError::UpdateFailed(anyhow::anyhow!("Unknown LWW operation version: {:?}", version).into())),
+            let changes = decode_changes(operation)?;
+            let mut values = self.values.write().unwrap();
+            for (property, new_value) in changes {
+                let entry = match event_id.clone() {
+                    Some(event_id) => ValueEntry::Committed { value: new_value, event_id },
+                    None => ValueEntry::Pending { value: new_value },
+                };
+                values.insert(property.clone(), entry);
+                changed_fields.push(property);
             }
         }
 
-        // Notify field subscribers for changed fields only
         super::notify_changed_fields(&self.field_broadcasts, changed_fields.iter());
 
         Ok(())
     }
 }
 
-// Need ID based happens-before determination to resolve conflicts
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ankurah_proto::{EntityId, SystemProperty};
+
+    fn title() -> PropertyId {
+        let mut bytes = [0u8; EntityId::BYTE_LEN];
+        bytes[0] = 0x71;
+        PropertyId::EntityId(EntityId::from_bytes(bytes))
+    }
 
     fn committed_backend(event_id: EventId) -> LWWBackend {
         let backend = LWWBackend::new();
-        backend.set("title".into(), Some(Value::String("alpha".into())));
+        backend.set(title(), Some(Value::String("alpha".into())));
         let ops = backend.to_operations().unwrap().expect("pending write should yield operations");
         backend.apply_operations_with_event(&ops, event_id).unwrap();
         backend
@@ -383,52 +342,63 @@ mod tests {
         let backend = committed_backend(event_id.clone());
 
         let buffer = backend.to_state_buffer().unwrap();
-        assert_eq!(buffer[0], LWW_STATE_VERSION_1, "first byte is the state version header");
+        assert_eq!(buffer[0], LWW_STATE_VERSION_2, "first byte is the state version header");
 
         let restored = LWWBackend::from_state_buffer(&buffer).unwrap();
-        assert_eq!(restored.get(&"title".to_string()), Some(Value::String("alpha".into())));
-        assert_eq!(restored.get_event_id(&"title".to_string()), Some(event_id));
+        assert_eq!(restored.get(&title()), Some(Value::String("alpha".into())));
+        assert_eq!(restored.get_event_id(&title()), Some(event_id));
     }
 
     #[test]
-    fn unversioned_pre_09_buffer_loads_via_fallback_and_upgrades_on_save() {
-        // Simulate a pre-0.9 buffer: raw bincode of property -> Option<Value>,
-        // no header. Its first byte is the map length's low byte (here 0x01).
-        let legacy: BTreeMap<PropertyName, Option<Value>> =
-            [("title".to_string(), Some(Value::String("alpha".into())))].into_iter().collect();
+    fn stored_property_id_arms_round_trip() {
+        let event_id = EventId::from_bytes([9; 32]);
+        let backend = LWWBackend::new();
+        backend.set(title(), Some(Value::String("registered".into())));
+        backend.set(PropertyId::System(SystemProperty::Label), Some(Value::String("system".into())));
+        let ops = backend.to_operations().unwrap().expect("pending writes should yield operations");
+        backend.apply_operations_with_event(&ops, event_id).unwrap();
+
+        let restored = LWWBackend::from_state_buffer(&backend.to_state_buffer().unwrap()).unwrap();
+        assert_eq!(restored.get(&title()), Some(Value::String("registered".into())));
+        assert_eq!(restored.get(&PropertyId::System(SystemProperty::Label)), Some(Value::String("system".into())));
+    }
+
+    #[test]
+    fn operation_decoder_skips_id() {
+        let data = bincode::serialize(&BTreeMap::from([
+            (PropertyId::Id, Some(Value::EntityId(EntityId::from_bytes([1; 32])))),
+            (title(), Some(Value::String("kept".into()))),
+        ]))
+        .unwrap();
+        let operation = Operation { diff: bincode::serialize(&LWWDiff { version: LWW_DIFF_VERSION, data }).unwrap() };
+
+        assert_eq!(decode_changes(&operation).unwrap(), BTreeMap::from([(title(), Some(Value::String("kept".into())))]));
+    }
+
+    #[test]
+    fn set_skips_id() {
+        let backend = LWWBackend::new();
+        backend.set(PropertyId::Id, Some(Value::EntityId(EntityId::from_bytes([1; 32]))));
+
+        assert_eq!(backend.get(&PropertyId::Id), None);
+        assert!(backend.to_operations().unwrap().is_none());
+    }
+
+    #[test]
+    fn name_keyed_09_buffer_is_refused() {
+        let buffer = vec![LWW_STATE_VERSION_1, 0xde, 0xad];
+        let err = LWWBackend::from_state_buffer(&buffer).unwrap_err();
+        assert!(err.to_string().contains("name-keyed 0.9 encoding"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn unversioned_pre_09_buffer_is_refused() {
+        let legacy: BTreeMap<String, Option<Value>> = [("title".to_string(), Some(Value::String("alpha".into())))].into_iter().collect();
         let legacy_buffer = bincode::serialize(&legacy).unwrap();
         assert!(legacy_buffer[0] < LWW_STATE_VERSION_BASE);
 
-        let restored = LWWBackend::from_state_buffer(&legacy_buffer).unwrap();
-        assert_eq!(restored.get(&"title".to_string()), Some(Value::String("alpha".into())));
-        assert_eq!(restored.get_event_id(&"title".to_string()), Some(EventId::from_bytes(LEGACY_EVENT_ID)));
-
-        // Re-serialization writes the current versioned format: lazy upgrade.
-        let upgraded = restored.to_state_buffer().unwrap();
-        assert_eq!(upgraded[0], LWW_STATE_VERSION_1);
-        let round_tripped = LWWBackend::from_state_buffer(&upgraded).unwrap();
-        assert_eq!(round_tripped.get(&"title".to_string()), Some(Value::String("alpha".into())));
-        assert_eq!(round_tripped.get_event_id(&"title".to_string()), Some(EventId::from_bytes(LEGACY_EVENT_ID)));
-    }
-
-    #[test]
-    fn empty_legacy_buffer_loads_as_empty() {
-        // A pre-0.9 zero-property buffer is eight zero bytes; first byte 0x00.
-        let legacy: BTreeMap<PropertyName, Option<Value>> = BTreeMap::new();
-        let legacy_buffer = bincode::serialize(&legacy).unwrap();
-        assert_eq!(legacy_buffer[0], 0x00);
-
-        let restored = LWWBackend::from_state_buffer(&legacy_buffer).unwrap();
-        assert!(restored.properties().is_empty());
-    }
-
-    #[test]
-    fn corrupt_legacy_buffer_errors_clearly() {
-        // Low first byte dispatches to the legacy parser; garbage after that
-        // is corruption, and the error should say which parser rejected it.
-        let garbage = vec![0x03, 0xde, 0xad, 0xbe, 0xef];
-        let err = LWWBackend::from_state_buffer(&garbage).unwrap_err();
-        assert!(err.to_string().contains("legacy LWW state buffer"), "unexpected error: {err}");
+        let err = LWWBackend::from_state_buffer(&legacy_buffer).unwrap_err();
+        assert!(err.to_string().contains("pre-0.9"), "unexpected error: {err}");
     }
 
     #[test]

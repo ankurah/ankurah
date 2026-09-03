@@ -56,7 +56,7 @@ async fn test_sled() -> Result<()> {
     let trx2 = context.begin();
     let album_mut2 = album.edit(&trx2)?;
 
-    album_mut2.name().delete(16, 1)?; // remove the "typo" b from bowl
+    album_mut2.name()?.delete(16, 1)?; // remove the "typo" b from bowl
 
     // we haven't committed the transaction yet - neither watcher should have received any changes
     assert_eq!(view_watcher.quiesce().await, 0);
@@ -71,7 +71,7 @@ async fn test_sled() -> Result<()> {
 
     let trx3 = context.begin();
     let album_mut3 = album.edit(&trx3)?;
-    album_mut3.year().replace("2025")?;
+    album_mut3.year()?.replace("2025")?;
     trx3.commit().await?;
 
     assert_eq!(view_watcher.take_one().await, (album.clone(), "The rest of the owl".to_owned(), "2025".to_owned())); // AlbumView changed

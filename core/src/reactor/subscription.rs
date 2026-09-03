@@ -3,6 +3,7 @@ use crate::{
     reactor::{AbstractEntity, Reactor, ReactorUpdate},
     selection::filter::Filterable,
 };
+use ankql::ast::Resolved;
 
 use ankurah_proto::{self as proto};
 use ankurah_signals::{
@@ -78,42 +79,36 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
 
 // Entity-specific methods for remote subscriptions
 impl ReactorSubscription<crate::entity::Entity, ankurah_proto::Attested<ankurah_proto::Event>> {
-    /// Add or update a query for a remote subscriber (server-side):
-    /// register if new, installing the caller's gap fetcher, then run
-    /// the caller-fetched entities through the versioned update flow
-    /// and fill gaps. Idempotent per query id. The reactor holds no
-    /// node or credential access here: fetching current matches and
-    /// wiring a fetcher to a session source are the caller's jobs.
+    /// Install or replace a remote subscriber's versioned query.
     pub async fn upsert_query(
         &self,
         query_id: proto::QueryId,
         collection_id: proto::CollectionId,
-        selection: ankql::ast::Selection,
+        selection: ankql::ast::Selection<Resolved>,
         included_entities: Vec<crate::entity::Entity>,
         gap_fetcher: std::sync::Arc<dyn crate::reactor::fetch_gap::GapFetcher<crate::entity::Entity>>,
         version: u32,
     ) -> anyhow::Result<Vec<crate::entity::Entity>> {
+        let notify = self.0.reactor.0.notify_lock.clone().lock_owned().await;
         let subscription = self
             .0
             .reactor
             .subscription(self.0.subscription_id)
             .ok_or_else(|| anyhow::anyhow!("Subscription {:?} not found", self.0.subscription_id))?;
 
-        // Register if new or get the existing resultset.
-        let resultset = subscription.register_or_get_query(query_id, collection_id.clone(), gap_fetcher);
+        let resultset = subscription.register_or_get_query(query_id, collection_id.clone(), gap_fetcher, version)?;
 
-        // Update query - watcher management is handled internally
         let mut all_entities =
             subscription.update_query(query_id, collection_id.clone(), selection.clone(), included_entities, version, &mut ())?;
 
-        // Fill gaps if needed for this specific query (also registers entity watchers)
-        // FIXME: Same follow-up — we should confirm whether edit-driven gaps can occur between the
-        // storage fetch and notify_change handling, which would make this gap fill mandatory.
-        subscription.fill_gaps_for_query_entities(query_id, &mut all_entities).await;
+        let gap_fill = subscription.take_gap_fill(query_id)?;
+        drop(notify);
+        let (_notify, gap_entities) = subscription.finish_gap_fill(gap_fill).await;
+        let gap_entities = gap_entities.ok_or_else(|| anyhow::anyhow!("query {query_id} changed while filling its initial result set"))?;
+        all_entities.extend(gap_entities);
 
         resultset.set_loaded(true);
 
-        // Return all entities (newly added + gap-filled)
         Ok(all_entities)
     }
 }

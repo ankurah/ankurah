@@ -379,40 +379,68 @@ where
     F: for<'w, 'b> FnOnce(&'b mut Workload<'w>) -> ScenarioFut<'b>,
     C: for<'a> FnOnce(&'a [SimNode], &'a [super::recorder::SubscriptionRecorder]) -> CheckFut<'a>,
 {
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("current-thread runtime builds");
+    // One long-lived blocking lane keeps sled completions deterministic.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .thread_keep_alive(std::time::Duration::from_secs(24 * 60 * 60))
+        .enable_all()
+        .build()
+        .expect("current-thread runtime builds");
 
     runtime.block_on(async move {
         let mut rng = SimRng::new(seed);
         let captured = Captured::new();
         let nodes = build_nodes(node_count, captured.clone()).await.expect("nodes build");
 
-        // Full mesh: every node knows every other. Ephemeral nodes join node 0's
-        // system as a side effect of registering it as a durable peer.
-        for a in &nodes {
-            for b in &nodes {
-                if a.index != b.index {
-                    a.connect_to(b);
-                }
-            }
-        }
+        let durable = nodes.iter().find(|node| node.durable).expect("the simulation has a durable node");
 
         let node_ids: Vec<proto::EntityId> = nodes.iter().map(|n| n.id()).collect();
         let mut scheduler = Scheduler::new(captured.clone(), faults, node_ids);
         let mut trace = Trace::new();
 
-        // Let the system settle (ephemeral nodes join node 0). This runs under
-        // the *actual* fault config; even join traffic is subject to the
-        // schedule, matching a real cold start. Ephemeral nodes join from the
-        // durable node's system root carried in their Presence, which is a local
-        // operation on a spawned task; awaiting readiness drives that task to
-        // completion deterministically, interleaved with draining any traffic it
-        // produces.
+        // Bring ephemerals up serially so startup scheduling cannot change the trace.
         for node in &nodes {
             if !node.durable {
-                node.node.system.wait_system_ready().await;
+                node.connect_to(durable);
+                durable.connect_to(node);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+                let ready = node.node.system.wait_system_ready();
+                tokio::pin!(ready);
+                while !futures_util::poll!(ready.as_mut()).is_ready() {
+                    scheduler.drain(&nodes, &mut rng, &mut trace).await;
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "node {} never became ready (system_ready={}, catalog_counts={:?})",
+                        node.index,
+                        node.node.system.is_system_ready(),
+                        node.node.catalog.counts()
+                    );
+                }
+                super::node::seed_sim_schema(node).expect("sim schema seeds on a ready node");
+                let synced = node.node.catalog.wait_synced();
+                tokio::pin!(synced);
+                loop {
+                    match futures_util::poll!(synced.as_mut()) {
+                        std::task::Poll::Ready(answered) => {
+                            answered.expect("the durable peer must answer this node's catalog projection");
+                            break;
+                        }
+                        std::task::Poll::Pending => scheduler.drain(&nodes, &mut rng, &mut trace).await,
+                    }
+                    assert!(std::time::Instant::now() < deadline, "node {}'s catalog projection was never answered", node.index);
+                }
             }
             scheduler.run_to_quiescence(&nodes, &mut rng, &mut trace).await;
         }
+
+        for a in &nodes {
+            for b in &nodes {
+                if a.index != b.index && !a.durable && !b.durable {
+                    a.connect_to(b);
+                }
+            }
+        }
+        scheduler.run_to_quiescence(&nodes, &mut rng, &mut trace).await;
 
         // Run the workload in an inner scope so its mutable borrows of the
         // scheduler/rng/trace end before the quiescence barrier reuses them.

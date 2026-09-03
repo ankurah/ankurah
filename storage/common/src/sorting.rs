@@ -1,4 +1,4 @@
-use ankurah_core::selection::filter::Filterable;
+use ankurah_core::selection::filter::PathLookup;
 use ankurah_core::value::Value;
 use futures::Stream;
 use std::cmp::Ordering;
@@ -6,16 +6,14 @@ use std::collections::BinaryHeap;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use crate::OrderByComponents;
+use crate::{EngineColumns, OrderByComponents};
 
 /// Helper function to sort items by ORDER BY clauses
-fn sort_items_by_order<T: Filterable>(items: &mut [T], order_by: &[ankql::ast::OrderByItem]) {
+fn sort_items_by_order<T: PathLookup<EngineColumns>>(items: &mut [T], order_by: &[ankql::ast::OrderByItem<EngineColumns>]) {
     items.sort_by(|a, b| {
         for order_item in order_by {
-            let property_name = order_item.path.property();
-
-            let a_val = a.value(property_name);
-            let b_val = b.value(property_name);
+            let a_val = a.value_at(&order_item.path);
+            let b_val = b.value_at(&order_item.path);
 
             // Handle None values: None sorts before Some
             let cmp = match (a_val, b_val, &order_item.direction) {
@@ -35,8 +33,8 @@ fn sort_items_by_order<T: Filterable>(items: &mut [T], order_by: &[ankql::ast::O
 }
 
 /// Extract partition key (presort column values) from an item
-fn extract_partition_key<T: Filterable>(item: &T, presort: &[ankql::ast::OrderByItem]) -> Vec<Option<Value>> {
-    presort.iter().map(|p| item.value(p.path.property())).collect()
+fn extract_partition_key<T: PathLookup<EngineColumns>>(item: &T, presort: &[ankql::ast::OrderByItem<EngineColumns>]) -> Vec<Option<Value>> {
+    presort.iter().map(|p| item.value_at(&p.path)).collect()
 }
 
 /// Sorted stream with partition-aware support.
@@ -74,7 +72,7 @@ where S: Stream
 impl<S> Stream for SortedStream<S>
 where
     S: Stream + Unpin,
-    S::Item: Filterable,
+    S::Item: PathLookup<EngineColumns>,
 {
     type Item = S::Item;
 
@@ -223,20 +221,20 @@ where S: Stream + Unpin
 /// Wrapper for heap-ordered items to enable custom comparison
 struct HeapItem<T> {
     item: T,
-    order_by: Vec<ankql::ast::OrderByItem>,
+    order_by: Vec<ankql::ast::OrderByItem<EngineColumns>>,
 }
 
-impl<T: Filterable> PartialEq for HeapItem<T> {
+impl<T: PathLookup<EngineColumns>> PartialEq for HeapItem<T> {
     fn eq(&self, other: &Self) -> bool { self.cmp(other) == Ordering::Equal }
 }
 
-impl<T: Filterable> Eq for HeapItem<T> {}
+impl<T: PathLookup<EngineColumns>> Eq for HeapItem<T> {}
 
-impl<T: Filterable> PartialOrd for HeapItem<T> {
+impl<T: PathLookup<EngineColumns>> PartialOrd for HeapItem<T> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) }
 }
 
-impl<T: Filterable> Ord for HeapItem<T> {
+impl<T: PathLookup<EngineColumns>> Ord for HeapItem<T> {
     fn cmp(&self, other: &Self) -> Ordering {
         // TopK algorithm: keep K items that would appear first in the final sorted output.
         // We use a bounded heap and replace the "worst" candidate when a "better" one arrives.
@@ -249,10 +247,8 @@ impl<T: Filterable> Ord for HeapItem<T> {
         //   - When new item > top, kick out top (it's worse than new).
         //   - Reversed comparison: smaller values are "greater" so BinaryHeap puts them at top.
         for order_item in &self.order_by {
-            let property_name = order_item.path.property();
-
-            let self_val = self.item.value(property_name);
-            let other_val = other.item.value(property_name);
+            let self_val = self.item.value_at(&order_item.path);
+            let other_val = other.item.value_at(&order_item.path);
 
             // Handle None values: None is "worst" for the heap (will be kicked out first)
             // For ASC: None is smallest, so it should be "least" (kept longer in max-heap)
@@ -314,7 +310,7 @@ where S: Stream
 impl<S> Stream for TopKStream<S>
 where
     S: Stream + Unpin,
-    S::Item: Filterable,
+    S::Item: PathLookup<EngineColumns>,
 {
     type Item = S::Item;
 
@@ -451,7 +447,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ankql::ast::{OrderByItem, OrderDirection, PathExpr};
+    use ankql::ast::{OrderByItem, OrderDirection};
     use futures::StreamExt;
     use std::collections::HashMap;
 
@@ -461,13 +457,16 @@ mod tests {
     /// Helper to wrap items in a stream for testing
     fn stream_from<T>(items: Vec<T>) -> futures::stream::Iter<std::vec::IntoIter<T>> { futures::stream::iter(items) }
 
-    /// Test item that implements Filterable for unit testing
+    /// Test item standing in for an engine's projected entity: values keyed
+    /// by column name, which is what a lowered sort key names.
     #[derive(Debug, Clone, PartialEq)]
     struct TestItem {
         values: HashMap<String, Value>,
     }
 
     impl TestItem {
+        fn value(&self, name: &str) -> Option<Value> { self.values.get(name).cloned() }
+
         fn new(pairs: &[(&str, Value)]) -> Self {
             let mut values = HashMap::new();
             for (k, v) in pairs {
@@ -493,32 +492,18 @@ mod tests {
         }
 
         fn mixed(cat: &str, name: &str) -> Self {
-            let mut values = HashMap::new();
-            values.insert("cat".to_string(), Value::String(cat.to_string()));
-            values.insert("name".to_string(), Value::String(name.to_string()));
-            Self { values }
+            Self::new(&[("cat", Value::String(cat.to_string())), ("name", Value::String(name.to_string()))])
         }
 
-        fn cat_val(cat: &str, val: i32) -> Self {
-            let mut values = HashMap::new();
-            values.insert("cat".to_string(), Value::String(cat.to_string()));
-            values.insert("val".to_string(), Value::I32(val));
-            Self { values }
-        }
+        fn cat_val(cat: &str, val: i32) -> Self { Self::new(&[("cat", Value::String(cat.to_string())), ("val", Value::I32(val))]) }
 
         fn cat_subcat_val(cat: &str, subcat: &str, val: i32) -> Self {
-            let mut values = HashMap::new();
-            values.insert("cat".to_string(), Value::String(cat.to_string()));
-            values.insert("subcat".to_string(), Value::String(subcat.to_string()));
-            values.insert("val".to_string(), Value::I32(val));
-            Self { values }
+            Self::new(&[("cat", Value::String(cat.to_string())), ("subcat", Value::String(subcat.to_string())), ("val", Value::I32(val))])
         }
     }
 
-    impl Filterable for TestItem {
-        fn collection(&self) -> &str { "test" }
-
-        fn value(&self, property: &str) -> Option<Value> { self.values.get(property).cloned() }
+    impl PathLookup<EngineColumns> for TestItem {
+        fn value_at(&self, path: &crate::ColumnPath) -> Option<Value> { self.values.get(&path.column).cloned() }
     }
 
     /// Helper to extract i32 from Value
@@ -537,11 +522,13 @@ mod tests {
         }
     }
 
-    fn oby(col: &str, dir: OrderDirection) -> OrderByItem { OrderByItem { path: PathExpr::simple(col), direction: dir } }
+    fn oby(col: &str, dir: OrderDirection) -> OrderByItem<EngineColumns> {
+        OrderByItem { path: crate::ColumnPath::simple(col), direction: dir }
+    }
 
-    fn oby_asc(col: &str) -> OrderByItem { oby(col, OrderDirection::Asc) }
+    fn oby_asc(col: &str) -> OrderByItem<EngineColumns> { oby(col, OrderDirection::Asc) }
 
-    fn oby_desc(col: &str) -> OrderByItem { oby(col, OrderDirection::Desc) }
+    fn oby_desc(col: &str) -> OrderByItem<EngineColumns> { oby(col, OrderDirection::Desc) }
 
     // ============================================================================
     // LimitedStream Tests

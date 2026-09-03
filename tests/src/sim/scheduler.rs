@@ -45,6 +45,8 @@ struct InFlight {
     /// drop fault; load-bearing propagation may only be delayed, never lost, so
     /// quiescence can still converge. This flag marks the droppable ones.
     droppable: bool,
+    /// Whether the fault model may duplicate this connection-oriented message.
+    duplicable: bool,
     /// For load-bearing single-event propagation, the (entity, event) the
     /// receiver must end up holding for the delivery to count as accepted. If
     /// absent after delivery, the message is redelivered. `None` for advisory
@@ -86,11 +88,21 @@ pub struct Scheduler {
     /// starving a load-bearing message) surfaces as a loud failure rather than
     /// an infinite loop.
     max_rounds: usize,
+    /// Load-bearing request ids whose responses carry no collection.
+    catalog_requests: std::collections::BTreeSet<proto::RequestId>,
 }
 
 impl Scheduler {
     pub fn new(captured: Captured, faults: FaultConfig, node_ids: Vec<proto::EntityId>) -> Self {
-        Self { inflight: Vec::new(), partitions: std::collections::BTreeSet::new(), captured, faults, node_ids, max_rounds: 100_000 }
+        Self {
+            inflight: Vec::new(),
+            partitions: std::collections::BTreeSet::new(),
+            captured,
+            faults,
+            node_ids,
+            max_rounds: 100_000,
+            catalog_requests: std::collections::BTreeSet::new(),
+        }
     }
 
     fn node_count(&self) -> usize { self.node_ids.len() }
@@ -104,7 +116,7 @@ impl Scheduler {
     /// the receiver holds `event`. Never dropped outright.
     pub fn enqueue_event(&mut self, src: usize, dst: usize, entity: proto::EntityId, event: proto::EventId, message: proto::NodeMessage) {
         let digest = message_digest(&message);
-        self.inflight.push(InFlight { src, dst, message, digest, droppable: false, accept: Some((entity, event)) });
+        self.inflight.push(InFlight { src, dst, message, digest, droppable: false, duplicable: true, accept: Some((entity, event)) });
     }
 
     /// Enqueue a load-bearing message with no single acceptance target (e.g. a
@@ -112,19 +124,49 @@ impl Scheduler {
     /// dropped, not acceptance-retried; may be reordered/delayed/duplicated.
     pub fn enqueue(&mut self, src: usize, dst: usize, message: proto::NodeMessage) {
         let digest = message_digest(&message);
-        self.inflight.push(InFlight { src, dst, message, digest, droppable: false, accept: None });
+        self.inflight.push(InFlight { src, dst, message, digest, droppable: false, duplicable: true, accept: None });
     }
 
     fn link_up(&self, a: usize, b: usize) -> bool { !self.partitions.contains(&pair(a, b)) }
 
-    /// Pull everything nodes have emitted since the last pump into the in-flight
-    /// queue. Node-emitted messages (acks, responses, relay traffic) are
-    /// droppable; losing one only costs a retry, never convergence.
+    /// Move captured traffic into the fault scheduler.
+    /// Readiness traffic is load-bearing; other node traffic may rely on retries.
     fn absorb_captured(&mut self) {
         for out in self.captured.drain() {
             let Some(dst) = recipient_id(&out.message).and_then(|id| self.index_of(&id)) else { continue };
             let digest = message_digest(&out.message);
-            self.inflight.push(InFlight { src: out.src, dst, message: out.message, digest, droppable: true, accept: None });
+            let catalog_read = self.is_catalog_read(&out.message);
+            self.inflight.push(InFlight {
+                src: out.src,
+                dst,
+                message: out.message,
+                digest,
+                droppable: !catalog_read,
+                duplicable: !catalog_read,
+                accept: None,
+            });
+        }
+    }
+
+    /// Whether this message is readiness traffic or its response.
+    fn is_catalog_read(&mut self, message: &proto::NodeMessage) -> bool {
+        match message {
+            proto::NodeMessage::Request { request, .. } => {
+                let protected = match &request.body {
+                    proto::NodeRequestBody::Fetch { collection, .. }
+                    | proto::NodeRequestBody::Get { collection, .. }
+                    | proto::NodeRequestBody::GetEvents { collection, .. } => ankurah::core::schema::reads_bypass_policy(collection),
+                    proto::NodeRequestBody::SubscribeQuery { .. } => true,
+                    _ => return false,
+                };
+                if !protected {
+                    return false;
+                }
+                self.catalog_requests.insert(request.id.clone());
+                true
+            }
+            proto::NodeMessage::Response(response) => self.catalog_requests.contains(&response.request_id),
+            _ => false,
         }
     }
 
@@ -172,14 +214,39 @@ impl Scheduler {
     /// to deliver and every acceptance target is satisfied. Faults apply to
     /// every round before the final heal-and-flush.
     pub async fn run_to_quiescence(&mut self, nodes: &[SimNode], rng: &mut SimRng, trace: &mut Trace) {
+        self.quiesce(nodes, rng, trace, true).await;
+    }
+
+    /// Deliver to quiescence without recording scheduler-dependent round counts.
+    pub async fn drain(&mut self, nodes: &[SimNode], rng: &mut SimRng, trace: &mut Trace) { self.quiesce(nodes, rng, trace, false).await; }
+
+    async fn quiesce(&mut self, nodes: &[SimNode], rng: &mut SimRng, trace: &mut Trace, record_rounds: bool) {
         let mut rounds = 0;
         loop {
             rounds += 1;
-            assert!(
-                rounds <= self.max_rounds,
-                "scheduler exceeded {} rounds without quiescing (harness bug or non-convergence)",
-                self.max_rounds
-            );
+            if rounds > self.max_rounds {
+                let mut histogram: std::collections::BTreeMap<(usize, usize, String), usize> = std::collections::BTreeMap::new();
+                for message in &self.inflight {
+                    *histogram.entry((message.src, message.dst, super::transport::semantic_descriptor(&message.message))).or_default() += 1;
+                }
+                let tail: Vec<String> = trace.events().iter().rev().take(8).map(|event| event.canonical()).collect();
+                let node_states: Vec<String> = nodes
+                    .iter()
+                    .map(|n| {
+                        format!(
+                            "n{}: system_ready={} catalog_counts={:?}",
+                            n.index,
+                            n.node.system.is_system_ready(),
+                            n.node.catalog.counts()
+                        )
+                    })
+                    .collect();
+                panic!(
+                    "scheduler exceeded {} rounds without quiescing (harness bug or non-convergence)\n\
+                     inflight now: {histogram:?}\ntrace tail (newest first): {tail:#?}\nnodes: {node_states:#?}",
+                    self.max_rounds
+                );
+            }
 
             self.absorb_captured();
 
@@ -248,8 +315,7 @@ impl Scheduler {
                     requeue.push(item);
                     continue;
                 }
-                // Deliver, optionally an extra time (duplication).
-                let dup = self.faults.duplicate && rng.chance(self.faults.duplicate_p);
+                let dup = item.duplicable && self.faults.duplicate && rng.chance(self.faults.duplicate_p);
                 let accepted = self.deliver(&item, nodes, trace, false).await;
                 if dup {
                     let _ = self.deliver(&item, nodes, trace, true).await;
@@ -270,7 +336,9 @@ impl Scheduler {
             // partition (handled above) or genuine non-convergence (caught by
             // max_rounds). Delay is probabilistic so it cannot livelock alone.
         }
-        trace.record(TraceEvent::Quiesced { rounds });
+        if record_rounds {
+            trace.record(TraceEvent::Quiesced { rounds });
+        }
     }
 }
 

@@ -3,7 +3,7 @@ use std::sync::atomic::AtomicUsize;
 use ankurah_core::{
     action_debug,
     error::{MutationError, RetrievalError},
-    selection::filter::{evaluate_predicate, Filterable},
+    selection::filter::{evaluate_predicate, PathLookup},
     storage::StorageCollection,
 };
 use ankurah_proto::{self as proto, Attested, EntityState, EventId, State};
@@ -16,7 +16,7 @@ use crate::{
     statics::*,
     util::{cb_future::cb_future, cb_stream::cb_stream, object::Object, require::WBGRequire},
 };
-use ankurah_storage_common::{filtering::ValueSetStream, OrderByComponents, Plan};
+use ankurah_storage_common::{filtering::ValueSetStream, EngineColumns, OrderByComponents, Plan};
 
 /// Memberships cross the JS boundary as a bincode Uint8Array, like the other
 /// binary state fields; BTreeSet<ModelId> is foreign to proto, so the
@@ -145,12 +145,16 @@ impl StorageCollection for IndexedDBBucket {
         .await
     }
 
-    async fn fetch_states(&self, selection: &ankql::ast::Selection) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+    async fn fetch_states(
+        &self,
+        selection: &ankql::ast::Selection<ankql::ast::Resolved>,
+    ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         let _invocation = self.invocation_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let _lock = self.mutex.lock().await; // TODO why are we locking here?
 
-        // Step 1: Amend predicate with __collection comparison
-        let amended_selection = add_collection(selection, &self.collection_id);
+        // Step 1: Bind the resolved properties to this engine's fields, and
+        // scope the scan to this collection
+        let amended_selection = crate::lower::lower(selection, &self.collection_id);
 
         // Step 2: Use planner to generate query plans
         let planner = ankurah_storage_common::planner::Planner::new(ankurah_storage_common::planner::PlannerConfig::indexeddb());
@@ -353,7 +357,7 @@ impl IndexedDBBucket {
         &self,
         index: &web_sys::IdbIndex,
         key_range: Option<web_sys::IdbKeyRange>,
-        predicate: &ankql::ast::Predicate,
+        predicate: &ankql::ast::Predicate<EngineColumns>,
         cursor_direction: web_sys::IdbCursorDirection,
         limit: Option<u64>,
         collection_id: &ankurah_proto::CollectionId,
@@ -447,7 +451,8 @@ impl IndexedDBBucket {
 /// A record from the IndexedDB entities store.
 ///
 /// Wraps the raw JS object with lazy extraction for filtering and sorting.
-/// Implements `Filterable` and `HasEntityId` for use with stream combinators.
+/// Answers column lookups and carries an entity id, for use with the stream
+/// combinators.
 struct IdbRecord {
     id: ankurah_proto::EntityId,
     object: Object,
@@ -470,13 +475,17 @@ impl IdbRecord {
     }
 }
 
-impl Filterable for IdbRecord {
-    fn collection(&self) -> &str { self.collection_id.as_str() }
-
-    fn value(&self, name: &str) -> Option<ankurah_core::value::Value> {
-        // Lazy extraction from JS object
-        let idb_val: crate::idb_value::IdbValue = self.object.get_opt(&name.into()).ok()??;
-        Some(idb_val.into_value())
+impl PathLookup<EngineColumns> for IdbRecord {
+    fn value_at(&self, path: &ankurah_storage_common::ColumnPath) -> Option<ankurah_core::value::Value> {
+        // Lazy extraction from the JS object: its fields are named by the
+        // lowering, so a column is a direct read.
+        let idb_val: crate::idb_value::IdbValue = self.object.get_opt(&path.column.as_str().into()).ok()??;
+        let value = idb_val.into_value();
+        if path.subpath.is_empty() {
+            Some(value)
+        } else {
+            value.extract_at_path(&path.subpath)
+        }
     }
 }
 
@@ -491,16 +500,10 @@ fn extract_sort_properties(
 ) -> std::collections::BTreeMap<String, ankurah_core::value::Value> {
     let mut map = std::collections::BTreeMap::new();
     // Extract all ORDER BY columns - presort for partition detection, spill for sorting
-    for item in &order_by.presort {
-        let property_name = item.path.property();
-        if let Ok(Some(idb_val)) = entity_obj.get_opt::<crate::idb_value::IdbValue>(&property_name.into()) {
-            map.insert(property_name.to_string(), idb_val.into_value());
-        }
-    }
-    for item in &order_by.spill {
-        let property_name = item.path.property();
-        if let Ok(Some(idb_val)) = entity_obj.get_opt::<crate::idb_value::IdbValue>(&property_name.into()) {
-            map.insert(property_name.to_string(), idb_val.into_value());
+    for item in order_by.presort.iter().chain(order_by.spill.iter()) {
+        let column = &item.path.column;
+        if let Ok(Some(idb_val)) = entity_obj.get_opt::<crate::idb_value::IdbValue>(&column.as_str().into()) {
+            map.insert(column.clone(), idb_val.into_value());
         }
     }
     map
@@ -544,11 +547,13 @@ fn extract_all_fields(entity_obj: &Object, entity_state: &EntityState) -> Result
     for (backend_name, state_buffer) in entity_state.state.state_buffers.iter() {
         let backend = backend_from_string(backend_name, Some(state_buffer)).map_err(|e| MutationError::General(Box::new(e)))?;
 
-        for (field_name, value) in backend.property_values() {
-            // Use first occurrence (like Postgres) to handle field name collisions
-            if !seen_fields.insert(field_name.clone()) {
+        for (property, value) in backend.property_values() {
+            // Use first occurrence (like Postgres) to handle collisions.
+            // Fields are keyed by the property id's rendering.
+            if !seen_fields.insert(property.clone()) {
                 continue;
             }
+            let field_name = property.to_string();
 
             // Set field directly on entity object (no prefix - they become the primary fields)
             // Use IdbValue encoding to ensure fields are IndexedDB-key-compatible (bool as 0/1, etc.)
@@ -561,22 +566,4 @@ fn extract_all_fields(entity_obj: &Object, entity_state: &EntityState) -> Result
     }
 
     Ok(())
-}
-
-/// Amend a selection with __collection = 'value' comparison
-pub fn add_collection(selection: &ankql::ast::Selection, collection_id: &ankurah_proto::CollectionId) -> ankql::ast::Selection {
-    use ankql::ast::{ComparisonOperator, Expr, PathExpr, Predicate};
-    use ankurah_core_types::Value;
-
-    let collection_comparison = Predicate::Comparison {
-        left: Box::new(Expr::Path(PathExpr::simple("__collection"))),
-        operator: ComparisonOperator::Equal,
-        right: Box::new(Expr::Literal(Value::String(collection_id.to_string()))),
-    };
-
-    ankql::ast::Selection {
-        predicate: Predicate::And(Box::new(collection_comparison), Box::new(selection.predicate.clone())),
-        order_by: selection.order_by.clone(),
-        limit: selection.limit,
-    }
 }

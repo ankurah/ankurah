@@ -65,11 +65,11 @@ async fn typed_ref_literal_receives_live_updates() -> Result<()> {
     let room_a = create_room(&ctx, "a").await?;
     let room_b = create_room(&ctx, "b").await?;
 
-    let mut selection: ankurah::ankql::ast::Selection = "room = ?".try_into()?;
+    let mut selection: ankurah::ankql::ast::Selection<ankurah::ankql::ast::Parsed> = "room = ?".try_into()?;
     selection.predicate = selection.predicate.populate([ankurah::ankql::ast::Expr::Literal(Value::EntityId(room_a))])?;
 
     let lq = ctx.query::<RefPredMessageView>(selection)?;
-    lq.wait_initialized().await;
+    lq.wait_initialized().await?;
     assert_eq!(lq.ids().len(), 0, "no messages yet");
 
     create_message(&ctx, room_a, "in room a").await?;
@@ -92,10 +92,11 @@ async fn string_ref_literal_receives_live_updates() -> Result<()> {
     let ctx = setup().await?;
     let room_a = create_room(&ctx, "a").await?;
 
-    let selection: ankurah::ankql::ast::Selection = format!("room = '{}'", room_a.to_base64()).as_str().try_into()?;
+    let selection: ankurah::ankql::ast::Selection<ankurah::ankql::ast::Parsed> =
+        format!("room = '{}'", room_a.to_base64()).as_str().try_into()?;
 
     let lq = ctx.query::<RefPredMessageView>(selection)?;
-    lq.wait_initialized().await;
+    lq.wait_initialized().await?;
 
     create_message(&ctx, room_a, "in room a").await?;
     assert!(eventually(|| lq.ids().len() == 1).await, "string Ref literal should receive the live update for a matching commit");

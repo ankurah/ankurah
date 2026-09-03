@@ -1,16 +1,12 @@
+use crate::internal::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use ankurah_proto::{self as proto, EntityId};
+use ankurah_proto::EntityId;
 
-use crate::error::RetrievalError;
-use crate::policy::AccessDenied;
-use crate::{
-    context::TContext,
-    entity::{Entity, ProvisionalEntity},
-    error::MutationError,
-    model::{Model, MutableBorrow},
-};
+use crate::context::TContext;
+use crate::entity::ProvisionalEntity;
+use crate::model::{Model, MutableBorrow};
 
 use append_only_vec::AppendOnlyVec;
 
@@ -27,11 +23,9 @@ pub struct Transaction {
     pub(crate) id: proto::TransactionId,
     pub(crate) entities: AppendOnlyVec<Entity>,
     pub(crate) alive: Arc<AtomicBool>,
-    /// Each `create()`'s minted genesis, by entity id -- the only copy until
-    /// commit persists it; the entity cannot regenerate it. The entity itself
-    /// contributes at most one Update to the commit: the edits made after
-    /// `create()`, if any.
-    pub(crate) genesis_events: std::sync::RwLock<std::collections::BTreeMap<EntityId, proto::Event>>,
+    /// Each created entity's frozen genesis and compiled model declaration.
+    pub(crate) genesis_events:
+        std::sync::RwLock<std::collections::BTreeMap<EntityId, (proto::Event, &'static crate::schema::ModelStructDescriptor)>>,
 }
 
 #[cfg(feature = "wasm")]
@@ -60,36 +54,22 @@ impl Transaction {
         &self.entities[index]
     }
 
-    /// Mint an entity from `model`'s initial values and return it under the id
-    /// its own genesis event derives.
-    ///
-    /// An entity cannot be created before the node knows its system root: the
-    /// genesis binds the root into the id, so there is no id to hand back until
-    /// the root exists. On a node that has neither created nor joined a system
-    /// this refuses with [`MutationError::SystemNotReady`], which a caller can
-    /// retry once the handshake with a durable peer has established the system.
+    /// Mint an entity after registering its model in the current system epoch.
     pub async fn create<'rec, 'trx: 'rec, M: Model>(&'trx self, model: &M) -> Result<MutableBorrow<'rec, M::Mutable>, MutationError> {
-        // First-use registration: the new entity's membership asserts the
-        // model's durable identity, so it must exist before the entity does.
-        let model_id = self.dyncontext.ensure_registered(M::descriptor()).await?;
+        let (model_id, epoch) = self.dyncontext.ensure_registered(M::descriptor()).await?;
 
-        // The initial values are staged in a vessel that has no identity of its
-        // own: the entity id does not exist until these operations have been
-        // frozen into the genesis preimage.
         let mut provisional = ProvisionalEntity::new();
-        model.initialize_new_entity(&mut provisional, model_id);
+        model.initialize_new_entity(&mut provisional, model_id, epoch)?;
         let system = self.dyncontext.system_id().ok_or(MutationError::SystemNotReady)?;
+        if self.dyncontext.schema_epoch() != Some(epoch) {
+            return Err(crate::schema::registration::RegistrationError::SystemChanged.into());
+        }
         let genesis = proto::Event::genesis(M::collection(), Some(system), proto::AuthorId::Unknown, provisional.extract_operations()?);
 
-        // Insert the resident primary under the derived id, and take the
-        // transaction entity whose baseline is that genesis, so later edits
-        // parent onto it and are extracted separately.
-        let entity = self.dyncontext.create_transaction_entity(M::collection(), &genesis, self.alive.clone())?;
+        let entity = self.dyncontext.create_transaction_entity(M::collection(), &genesis, epoch, self.alive.clone())?;
         self.dyncontext.check_write(&entity)?;
 
-        // Store the already-extracted genesis exactly once. Commit must never
-        // ask this entity to reconstruct those operations.
-        if self.genesis_events.write().unwrap().insert(entity.id, genesis).is_some() {
+        if self.genesis_events.write().unwrap().insert(entity.id, (genesis, M::descriptor())).is_some() {
             return Err(MutationError::AlreadyExists);
         }
 
@@ -98,16 +78,20 @@ impl Transaction {
     }
     fn get_trx_entity(&self, id: &EntityId) -> Option<&Entity> { self.entities.iter().find(|e| e.id == *id) }
     pub async fn get<'rec, 'trx: 'rec, M: Model>(&'trx self, id: &EntityId) -> Result<MutableBorrow<'rec, M::Mutable>, RetrievalError> {
+        let (_, epoch) = self.dyncontext.ensure_registered(M::descriptor()).await?;
         match self.get_trx_entity(id) {
-            Some(entity) => Ok(MutableBorrow::new(entity)),
+            Some(entity) if entity.schema_epoch() == epoch => Ok(MutableBorrow::new(entity)),
+            Some(_) => Err(crate::schema::registration::RegistrationError::SystemChanged.into()),
             None => {
-                // go fetch the entity from the context
-                let retrieved_entity = self.dyncontext.get_entity(*id, &M::collection(), false).await?;
-                // double check to make sure somebody didn't add the entity to the trx during the await
-                // because we're forking the entity, we need to make sure we aren't adding the same entity twice
+                let retrieved_entity = self.dyncontext.get_entity(&M::collection(), *id, false).await?;
+                if retrieved_entity.schema_epoch() != epoch {
+                    return Err(crate::schema::registration::RegistrationError::SystemChanged.into());
+                }
+                // Reuse an entity inserted while the fetch was in flight.
                 if let Some(entity) = self.get_trx_entity(&retrieved_entity.id) {
-                    // if this happens, I don't think we want to refresh the entity, because it's already snapshotted in the trx
-                    // and we should leave it that way to honor the consistency model
+                    if entity.schema_epoch() != epoch {
+                        return Err(crate::schema::registration::RegistrationError::SystemChanged.into());
+                    }
                     Ok(MutableBorrow::new(entity))
                 } else {
                     Ok(MutableBorrow::new(self.add_entity(retrieved_entity.snapshot(self.alive.clone()))))
@@ -115,11 +99,12 @@ impl Transaction {
             }
         }
     }
-    pub fn edit<'rec, 'trx: 'rec, M: Model>(&'trx self, entity: &Entity) -> Result<MutableBorrow<'rec, M::Mutable>, AccessDenied> {
+    pub fn edit<'rec, 'trx: 'rec, M: Model>(&'trx self, entity: &Entity) -> Result<MutableBorrow<'rec, M::Mutable>, RetrievalError> {
+        self.dyncontext.bind_descriptor(M::descriptor(), entity.schema_epoch())?;
         if let Some(entity) = self.get_trx_entity(&entity.id) {
             return Ok(MutableBorrow::new(entity));
         }
-        self.dyncontext.check_write(entity)?;
+        self.dyncontext.check_write(entity).map_err(RetrievalError::AccessDenied)?;
 
         Ok(MutableBorrow::new(self.add_entity(entity.snapshot(self.alive.clone()))))
     }

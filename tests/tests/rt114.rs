@@ -56,7 +56,7 @@ async fn rt114() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Album2: change to 2019 (no longer matches year >= 2020)
     {
         let trx = server_ctx.begin();
-        server_album2.edit(&trx)?.year().overwrite(0, 4, "2019")?;
+        server_album2.edit(&trx)?.year()?.overwrite(0, 4, "2019")?;
         trx.commit().await?;
     }
 
@@ -128,7 +128,7 @@ async fn rt114_b() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Album2: change to 2019 (no longer matches year >= 2020)
     {
         let trx = server_ctx.begin();
-        server_album2.edit(&trx)?.year().overwrite(0, 4, "2019")?;
+        server_album2.edit(&trx)?.year()?.overwrite(0, 4, "2019")?;
         trx.commit().await?;
     }
 

@@ -187,9 +187,32 @@ fn test_json_path_planner_generates_sub_path() {
     use ankurah_storage_common::planner::{Planner, PlannerConfig};
     use ankurah_storage_common::Plan;
 
+    /// Binds every name to one fixture identity, so the planner sees the
+    /// bound selection an engine actually receives.
+    use ankurah::core::schema::resolver::{resolve_selection, ModelResolutionError, ModelResolver, ResolvedProperty};
+    struct FixtureResolver(ankql::ast::PropertyId);
+    impl ModelResolver for FixtureResolver {
+        fn resolve_property(
+            &self,
+            _model: &ankurah::proto::ModelId,
+            _name: &str,
+        ) -> Result<Option<ResolvedProperty>, ModelResolutionError> {
+            Ok(Some(ResolvedProperty { id: self.0, value_type: ankurah::core::value::ValueType::Json }))
+        }
+    }
+
+    let licensing = ankql::ast::PropertyId::EntityId(ankurah::proto::EntityId::from_bytes([0x4C; 32]));
+    let model = ankurah::proto::ModelId::EntityId(ankurah::proto::EntityId::from_bytes([0x77; 32]));
     let planner = Planner::new(PlannerConfig::full_support());
-    let selection = ankql::parser::parse_selection("licensing.territory = 'US'").expect("parse selection");
-    let plans = planner.plan(&selection, "id");
+    let selection = resolve_selection(
+        &model,
+        &FixtureResolver(licensing),
+        ankql::parser::parse_selection("licensing.territory = 'US'").expect("parse selection"),
+    )
+    .expect("resolve selection");
+    // The planner only ever sees lowered selections; sled's own lowering is
+    // what renders the bound property id to the column it materializes.
+    let plans = planner.plan(&ankurah_storage_sled::lower::lower(&selection), "id");
 
     // Find the index plan
     let index_plan = plans.iter().find(|p| matches!(p, Plan::Index { .. }));
@@ -199,9 +222,9 @@ fn test_json_path_planner_generates_sub_path() {
         // Verify keypart has sub_path
         assert!(!index_spec.keyparts.is_empty(), "Should have at least one keypart");
         let keypart = &index_spec.keyparts[0];
-        assert_eq!(keypart.column, "licensing", "Column should be 'licensing'");
+        assert_eq!(keypart.key, licensing.to_string(), "the keypart keys on the property id's rendering");
         assert_eq!(keypart.sub_path, Some(vec!["territory".to_string()]), "sub_path should be ['territory']");
-        assert_eq!(keypart.full_path(), "licensing.territory", "full_path should be 'licensing.territory'");
+        assert_eq!(keypart.full_path(), format!("{licensing}.territory"), "full_path is the rendering plus the sub path");
 
         // Verify full pushdown (remaining predicate should be True)
         assert!(

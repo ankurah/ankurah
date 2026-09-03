@@ -19,10 +19,12 @@ async fn get_nonexistent_entity_errors() -> anyhow::Result<()> {
 async fn local_rejects_phantom_commit() -> anyhow::Result<()> {
     let node = durable_sled_setup().await?;
     let ctx = node.context(DEFAULT_CONTEXT)?;
+    // Register Album so the commit reaches the phantom-baseline check.
+    ctx.register_model::<Album>().await?;
 
     let phantom = AlbumView::from_entity(node.conjure_evil_phantom(EntityId::random(), Album::collection()));
     let trx = ctx.begin();
-    phantom.edit(&trx)?.name().replace("inside your mind")?;
+    phantom.edit(&trx)?.name()?.replace("inside your mind")?;
 
     assert!(trx.commit().await.is_err());
     Ok(())

@@ -12,20 +12,42 @@
 //! This enables using JSONB functions (`jsonb()`, `->`, `->>`) for efficient path queries.
 //! SQLite 3.45.0+ is required for JSONB support.
 
+use ankurah::core::schema::resolver::{resolve_selection, ModelResolutionError, ModelResolver, ResolvedProperty};
 use ankurah::property::Json;
-use ankurah::{policy::DEFAULT_CONTEXT as c, Model, Node, PermissiveAgent};
+use ankurah::{policy::DEFAULT_CONTEXT as c, EntityId, Model, ModelId, Node, PermissiveAgent, PropertyId, ValueType};
 use ankurah_storage_sqlite::sql_builder::{split_predicate_for_sqlite, SplitPredicate};
 use ankurah_storage_sqlite::SqliteStorageEngine;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+/// Resolves fixture names to deterministic property ids.
+struct FixtureResolver;
+
+impl ModelResolver for FixtureResolver {
+    fn resolve_property(&self, _model: &ModelId, name: &str) -> Result<Option<ResolvedProperty>, ModelResolutionError> {
+        let mut bytes = [0u8; 32];
+        for (i, byte) in name.bytes().take(32).enumerate() {
+            bytes[i] = byte;
+        }
+        let value_type = if name == "licensing" { ValueType::Json } else { ValueType::String };
+        Ok(Some(ResolvedProperty { id: PropertyId::EntityId(EntityId::from_bytes(bytes)), value_type }))
+    }
+}
+
+/// Parse and resolve a query the way the fetch path would before the engine
+/// sees it.
+fn resolve(query: &str) -> ankql::ast::Selection<ankql::ast::Resolved> {
+    let selection = ankql::parser::parse_selection(query).expect("Failed to parse query");
+    let model = ModelId::EntityId(EntityId::from_bytes([0x77; 32]));
+    resolve_selection(&model, &FixtureResolver, selection).expect("Failed to resolve query")
+}
+
 /// Assert that a query predicate fully pushes down to SQLite (no post-filtering required).
 /// This catches bugs where queries unexpectedly spill to Rust-side filtering.
 #[allow(dead_code)]
 fn assert_fully_pushes_down(query: &str) {
-    let selection = ankql::parser::parse_selection(query).expect("Failed to parse query");
-    let split = split_predicate_for_sqlite(&selection.predicate);
+    let split = split_predicate_for_sqlite(&resolve(query).predicate);
     assert!(
         !split.needs_post_filter(),
         "Query '{}' should fully push down to SQLite, but remaining predicate is: {:?}",
@@ -36,10 +58,7 @@ fn assert_fully_pushes_down(query: &str) {
 
 /// Get the split predicate for a query (for tests that need to inspect the split).
 #[allow(dead_code)]
-fn get_predicate_split(query: &str) -> SplitPredicate {
-    let selection = ankql::parser::parse_selection(query).expect("Failed to parse query");
-    split_predicate_for_sqlite(&selection.predicate)
-}
+fn get_predicate_split(query: &str) -> SplitPredicate { split_predicate_for_sqlite(&resolve(query).predicate) }
 
 /// A model with a Json property for testing JSON query pushdown
 #[derive(Model, Debug, Serialize, Deserialize, Clone)]

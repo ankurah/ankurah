@@ -1,13 +1,7 @@
-use crate::{
-    changes::EntityChange,
-    error::{ApplyError, ApplyErrorItem, MutationError},
-    node::Node,
-    policy::PolicyAgent,
-    retrieval::{CachedEventGetter, GetState, LocalStateGetter, SuspenseEvents},
-    storage::StorageEngine,
-    util::ready_chunks::ReadyChunks,
-};
-use ankurah_proto::{self as proto};
+use crate::error::{ApplyError, ApplyErrorItem};
+use crate::internal::prelude::*;
+use crate::retrieval::{CachedEventGetter, GetState, LocalStateGetter, SuspenseEvents};
+use crate::util::ready_chunks::ReadyChunks;
 use futures::stream::StreamExt;
 use proto::Attested;
 
@@ -34,10 +28,12 @@ impl NodeApplier {
         let Some(relay) = &node.subscription_relay else {
             return Err(MutationError::InvalidUpdate("Should not be receiving updates without a subscription relay").into());
         };
-        let cdata = relay.get_contexts_for_peer(from_peer_id);
-        if cdata.is_empty() {
-            return Err(MutationError::InvalidUpdate("Should not be receiving updates without at least predicate context").into());
+        // A peer may push only what we asked it for, so a push is admissible
+        // only against a standing query of ours with that peer.
+        if !relay.has_subscription_with_peer(from_peer_id) {
+            return Err(MutationError::InvalidUpdate("Should not be receiving updates from a peer we hold no subscription with").into());
         }
+        let cdata = relay.get_contexts_for_peer(from_peer_id);
 
         // Apply all updates. One bad item must not poison the batch: failures
         // are collected per item, the remaining items still apply, and the
@@ -48,6 +44,11 @@ impl NodeApplier {
             let entity_id = update.entity_id;
             let item_collection = update.collection.clone();
             let result = async {
+                // Catalog projection queries are deliberately credentialless.
+                // Every other pushed update needs a principal.
+                if cdata.is_empty() && !crate::schema::reads_bypass_policy(&update.collection) {
+                    return Err(MutationError::InvalidUpdate("Should not be receiving updates without at least predicate context"));
+                }
                 let collection = node.collections.get(&update.collection).await?;
                 let event_getter = CachedEventGetter::new(update.collection.clone(), collection.clone(), node, &cdata);
                 let state_getter = LocalStateGetter::new(collection);

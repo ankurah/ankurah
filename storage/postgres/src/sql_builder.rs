@@ -1,6 +1,7 @@
-use ankql::ast::{ComparisonOperator, Expr, OrderByItem, OrderDirection, Predicate, Selection};
+use ankql::ast::{ComparisonOperator, Expr, OrderByItem, OrderDirection, Predicate, Resolved, Selection};
 use ankurah_core::error::RetrievalError;
 use ankurah_core_types::Value;
+use ankurah_storage_common::EngineColumns;
 use thiserror::Error;
 use tokio_postgres::types::ToSql;
 
@@ -25,9 +26,9 @@ pub enum SqlGenerationError {
 #[derive(Debug, Clone)]
 pub struct SplitPredicate {
     /// Predicate that can be pushed down to PostgreSQL WHERE clause
-    pub sql_predicate: Predicate,
+    pub sql_predicate: Predicate<Resolved>,
     /// Predicate that must be evaluated in Rust after fetching (Predicate::True if nothing remains)
-    pub remaining_predicate: Predicate,
+    pub remaining_predicate: Predicate<Resolved>,
 }
 
 impl SplitPredicate {
@@ -45,7 +46,7 @@ impl SplitPredicate {
 ///
 /// **Requires post-filtering** (evaluated in Rust):
 /// - Future: Ref traversals, complex expressions
-pub fn split_predicate_for_postgres(predicate: &Predicate) -> SplitPredicate {
+pub fn split_predicate_for_postgres(predicate: &Predicate<Resolved>) -> SplitPredicate {
     // Walk the predicate tree and classify each leaf comparison.
     // If ANY part of an OR branch can't be pushed down, the whole OR must be post-filtered.
     // For AND, we can split: pushdown what we can, post-filter the rest.
@@ -56,7 +57,7 @@ pub fn split_predicate_for_postgres(predicate: &Predicate) -> SplitPredicate {
 }
 
 /// Recursively split a predicate into (pushdown, remaining) parts.
-fn split_predicate_recursive(predicate: &Predicate) -> (Predicate, Predicate) {
+fn split_predicate_recursive(predicate: &Predicate<Resolved>) -> (Predicate<Resolved>, Predicate<Resolved>) {
     match predicate {
         // Leaf predicates - check if they support pushdown
         Predicate::Comparison { left, operator: _, right } => {
@@ -139,42 +140,14 @@ fn split_predicate_recursive(predicate: &Predicate) -> (Predicate, Predicate) {
 }
 
 /// Check if a comparison can be pushed down to PostgreSQL.
-fn can_pushdown_comparison(left: &Expr, right: &Expr) -> bool { can_pushdown_expr(left) && can_pushdown_expr(right) }
+fn can_pushdown_comparison(left: &Expr<Resolved>, right: &Expr<Resolved>) -> bool { can_pushdown_expr(left) && can_pushdown_expr(right) }
 
-/// Check if an expression can be pushed down to PostgreSQL SQL.
-///
-/// Returns true if the expression can be translated to valid PostgreSQL syntax.
-/// Currently supports:
-/// - Literals (strings, numbers, booleans, etc.)
-/// - Simple column paths (`name`) - regular column reference
-/// - Multi-step paths (`data.field`) - JSONB traversal via `->` and `->>`
-/// - Expression lists (for IN clauses)
-///
-/// NOT pushdown-capable (will be post-filtered in Rust):
-/// - Nested predicates as expressions
-/// - Infix expressions (not yet implemented)
-/// - Placeholders (should be replaced before we get here)
-///
-/// HACK: We currently infer "JSON property" from multi-step paths. This works for Phase 1
-/// where only Json properties support nested traversal.
-///
-/// TODO(Phase 3 - Schema Registry): Once we have property type metadata, we can:
-/// 1. Know definitively if a path traverses a Json property vs Ref<T>
-/// 2. Ref<T> traversal will NOT be pushable (requires entity joins)
-/// 3. Distinguish Json traversal from Ref<T> traversal based on schema
-fn can_pushdown_expr(expr: &Expr) -> bool {
+/// Whether the resolved expression has a direct PostgreSQL representation.
+/// Name resolution has already rejected subpaths on non-JSON properties.
+fn can_pushdown_expr(expr: &Expr<Resolved>) -> bool {
     match expr {
         Expr::Literal(_) => true,
-        Expr::Path(path) => {
-            // All paths are currently pushdown-capable:
-            // - Single-step: regular column reference
-            // - Multi-step: JSONB traversal (inferred as Json property for now)
-            //
-            // HACK: We assume multi-step paths are Json properties.
-            // TODO(Phase 3 - Schema Registry): Check property type to distinguish
-            // Json traversal (pushable) from Ref<T> traversal (not pushable).
-            !path.steps.is_empty()
-        }
+        Expr::Path(_) => true,
         Expr::ExprList(exprs) => exprs.iter().all(can_pushdown_expr),
         Expr::Predicate(_) => false,     // Nested predicates - not supported in SQL expressions
         Expr::InfixExpr { .. } => false, // Not yet supported
@@ -275,7 +248,7 @@ impl SqlBuilder {
     }
 
     // --- AST flattening ---
-    pub fn expr(&mut self, expr: &Expr) -> Result<(), SqlGenerationError> {
+    pub fn expr(&mut self, expr: &Expr<EngineColumns>) -> Result<(), SqlGenerationError> {
         match expr {
             Expr::Placeholder => return Err(SqlGenerationError::PlaceholderFound),
             Expr::Literal(lit) => match lit {
@@ -291,22 +264,15 @@ impl SqlBuilder {
                 Value::Json(json) => self.arg(json.clone()),
             },
             Expr::Path(path) => {
-                if path.is_simple() {
-                    // Single-step path: regular column reference "column_name"
-                    let escaped = path.first().replace('"', "\"\"");
-                    self.sql(format!(r#""{}""#, escaped));
-                } else {
-                    // Multi-step path: JSONB traversal "column"->'nested'->'path'
-                    // Use -> for ALL steps to preserve JSONB type for proper comparison semantics.
-                    // The comparison will use ::jsonb cast on literals to ensure type-aware comparison.
-                    let first = path.first().replace('"', "\"\"");
-                    self.sql(format!(r#""{}""#, first));
-
-                    for step in path.steps.iter().skip(1) {
-                        let escaped = step.replace('\'', "''");
-                        // Always use -> to keep as JSONB (not ->> which extracts as text)
-                        self.sql(format!("->'{}'", escaped));
-                    }
+                // Column names are always quoted (a property id's rendering is
+                // URL-safe base64, which contains '-' and '_').
+                let column = path.column.replace('"', "\"\"");
+                self.sql(format!(r#""{}""#, column));
+                // Use -> for every subpath step so both sides stay jsonb.
+                for step in &path.subpath {
+                    let escaped = step.replace('\'', "''");
+                    // Always use -> to keep as JSONB (not ->> which extracts as text)
+                    self.sql(format!("->'{}'", escaped));
                 }
             }
             Expr::ExprList(exprs) => {
@@ -343,71 +309,21 @@ impl SqlBuilder {
         Ok(())
     }
 
-    /// Emit a literal expression with ::jsonb cast for proper JSONB comparison semantics.
-    /// This ensures that comparisons like `"data"->'count' > '10'::jsonb` work correctly
-    /// with PostgreSQL's type-aware JSONB comparison (numeric vs lexicographic).
-    pub fn expr_as_jsonb(&mut self, expr: &Expr) -> Result<(), SqlGenerationError> {
-        match expr {
-            Expr::Literal(lit) => {
-                // For literals, we need to cast to jsonb
-                // PostgreSQL will compare jsonb values with proper type semantics
-                match lit {
-                    Value::String(s) => {
-                        // String literals need to be JSON strings: '"value"'::jsonb
-                        // Escape for JSON (backslash and quote) then for SQL (single quotes)
-                        let json_escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
-                        let sql_escaped = format!("\"{}\"", json_escaped).replace('\'', "''");
-                        self.sql(format!("'{}'::jsonb", sql_escaped));
-                    }
-                    Value::I64(n) => self.sql(format!("'{}'::jsonb", n)),
-                    Value::F64(n) => self.sql(format!("'{}'::jsonb", n)),
-                    Value::Bool(b) => self.sql(format!("'{}'::jsonb", b)),
-                    Value::I16(n) => self.sql(format!("'{}'::jsonb", n)),
-                    Value::I32(n) => self.sql(format!("'{}'::jsonb", n)),
-                    // EntityId and binary types don't make sense as JSONB
-                    Value::EntityId(_) | Value::Object(_) | Value::Binary(_) => {
-                        // Fall back to regular expression (will likely fail comparison, but that's correct)
-                        self.expr(expr)?;
-                    }
-                    // JSON literal is already properly typed
-                    Value::Json(json) => self.sql(format!("'{}'::jsonb", json)),
-                }
-                Ok(())
-            }
-            // For non-literals, just emit normally (they're already JSONB paths or complex expressions)
-            _ => self.expr(expr),
-        }
-    }
-
     pub fn comparison_op(&mut self, op: &ComparisonOperator) -> Result<(), SqlGenerationError> {
         self.sql(comparison_op_to_sql(op)?);
         Ok(())
     }
 
-    pub fn predicate(&mut self, predicate: &Predicate) -> Result<(), SqlGenerationError> {
+    pub fn predicate(&mut self, predicate: &Predicate<EngineColumns>) -> Result<(), SqlGenerationError> {
         match predicate {
             Predicate::Comparison { left, operator, right } => {
-                // Check if either side is a JSONB path (multi-step path)
-                // TODO: Replace path depth heuristic with schema metadata when available.
-                // We infer JSON type from !is_simple(), but with a schema registry we could
-                // look up the actual field type. See phase-3-schema.md for details.
-                let left_is_jsonb = matches!(left.as_ref(), Expr::Path(p) if !p.is_simple());
-                let right_is_jsonb = matches!(right.as_ref(), Expr::Path(p) if !p.is_simple());
-
+                // Resolution casts JSON-subpath literals to Value::Json;
+                // bound Json arguments already have PostgreSQL's jsonb type.
                 self.expr(left)?;
                 self.sql(" ");
                 self.comparison_op(operator)?;
                 self.sql(" ");
-
-                if left_is_jsonb && matches!(right.as_ref(), Expr::Literal(_)) {
-                    // Comparing JSONB path to literal: cast literal to jsonb
-                    self.expr_as_jsonb(right)?;
-                } else if right_is_jsonb && matches!(left.as_ref(), Expr::Literal(_)) {
-                    // Comparing literal to JSONB path: cast literal to jsonb
-                    self.expr_as_jsonb(right)?;
-                } else {
-                    self.expr(right)?;
-                }
+                self.expr(right)?;
             }
             Predicate::And(left, right) => {
                 self.predicate(left)?;
@@ -443,7 +359,7 @@ impl SqlBuilder {
         Ok(())
     }
 
-    pub fn selection(&mut self, selection: &Selection) -> Result<(), SqlGenerationError> {
+    pub fn selection(&mut self, selection: &Selection<EngineColumns>) -> Result<(), SqlGenerationError> {
         // Add the predicate (WHERE clause)
         self.predicate(&selection.predicate)?;
 
@@ -467,15 +383,14 @@ impl SqlBuilder {
         Ok(())
     }
 
-    pub fn order_by_item(&mut self, order_by: &OrderByItem) -> Result<(), SqlGenerationError> {
-        // Generate the path expression
-        for (i, step) in order_by.path.steps.iter().enumerate() {
-            if i > 0 {
-                self.sql(".");
-            }
-            // Escape any existing quotes in the step by doubling them
+    pub fn order_by_item(&mut self, order_by: &OrderByItem<EngineColumns>) -> Result<(), SqlGenerationError> {
+        // The sort column is quoted; sub-path steps address into a JSONB
+        // column.
+        let column = order_by.path.column.replace('"', "\"\"");
+        self.sql(format!(r#""{}""#, column));
+        for step in &order_by.path.subpath {
             let escaped_step = step.replace('"', "\"\"");
-            self.sql(format!(r#""{}""#, escaped_step));
+            self.sql(format!(r#"."{}""#, escaped_step));
         }
 
         // Add the direction
@@ -505,7 +420,47 @@ fn comparison_op_to_sql(op: &ComparisonOperator) -> Result<&'static str, SqlGene
 mod tests {
     use super::*;
     use ankql::parser::parse_selection;
+    use ankurah_core::schema::resolver::{resolve_selection, ModelResolutionError, ModelResolver, ResolvedProperty};
+    use ankurah_proto::{EntityId, ModelId, PropertyId};
     use anyhow::Result;
+
+    /// Resolves fixture names to deterministic property ids.
+    struct FixtureResolver;
+
+    fn pid(name: &str) -> PropertyId {
+        let mut bytes = [0u8; 32];
+        for (i, byte) in name.bytes().take(32).enumerate() {
+            bytes[i] = byte;
+        }
+        PropertyId::EntityId(EntityId::from_bytes(bytes))
+    }
+
+    fn col(name: &str) -> String { pid(name).to_string() }
+
+    impl ModelResolver for FixtureResolver {
+        fn resolve_property(&self, _model: &ModelId, name: &str) -> Result<Option<ResolvedProperty>, ModelResolutionError> {
+            let value_type = match name {
+                "age" => ankurah_core::value::ValueType::I64,
+                "person" | "licensing" | "data" | "a" => ankurah_core::value::ValueType::Json,
+                _ => ankurah_core::value::ValueType::String,
+            };
+            Ok(Some(ResolvedProperty { id: pid(name), value_type }))
+        }
+    }
+
+    /// Bind a query's names, as the query boundary does before an engine
+    /// sees it. This is the stage the predicate split reads.
+    fn resolved(query: &str) -> ankql::ast::Selection<Resolved> {
+        let model = ModelId::EntityId(EntityId::from_bytes([0x77; 32]));
+        resolve_selection(&model, &FixtureResolver, parse_selection(query).unwrap()).unwrap()
+    }
+
+    /// Resolve a query and lower it into this engine's columns, the way
+    /// `fetch_states` does before it builds SQL.
+    fn lowered(query: &str) -> ankql::ast::Selection<EngineColumns> { crate::lower::lower(&resolved(query)) }
+
+    /// The column a test name is stored under, as a whole-column path.
+    fn cpath(name: &str) -> ankurah_storage_common::ColumnPath { ankurah_storage_common::ColumnPath::simple(col(name)) }
 
     fn assert_args<'a, 'b>(args: &Vec<Box<dyn ToSql + Send + Sync>>, expected: &Vec<Box<dyn ToSql + Send + Sync>>) {
         // TODO: Maybe actually encoding these and comparing bytes?
@@ -514,12 +469,12 @@ mod tests {
 
     #[test]
     fn test_simple_equality() -> Result<()> {
-        let selection = parse_selection("name = 'Alice'").unwrap();
+        let selection = lowered("name = 'Alice'");
         let mut sql = SqlBuilder::new();
         sql.selection(&selection)?;
 
         let (sql_string, args) = sql.build_where_clause();
-        assert_eq!(sql_string, r#""name" = $1"#);
+        assert_eq!(sql_string, format!(r#""{}" = $1"#, col("name")));
         let expected: Vec<Box<dyn ToSql + Send + Sync>> = vec![Box::new("Alice")];
         assert_args(&args, &expected);
         Ok(())
@@ -527,13 +482,16 @@ mod tests {
 
     #[test]
     fn test_and_condition() -> Result<()> {
-        let selection = parse_selection("name = 'Alice' AND age = 30").unwrap();
+        let selection = lowered("name = 'Alice' AND age = 30");
         let mut sql = SqlBuilder::with_fields(vec!["id", "name", "age"]);
         sql.table_name("users");
         sql.selection(&selection)?;
         let (sql_string, args) = sql.build()?;
 
-        assert_eq!(sql_string, r#"SELECT "id", "name", "age" FROM "users" WHERE "name" = $1 AND "age" = $2"#);
+        assert_eq!(
+            sql_string,
+            format!(r#"SELECT "id", "name", "age" FROM "users" WHERE "{}" = $1 AND "{}" = $2"#, col("name"), col("age"))
+        );
         let expected: Vec<Box<dyn ToSql + Send + Sync>> = vec![Box::new("Alice"), Box::new(30)];
         assert_args(&args, &expected);
         Ok(())
@@ -541,7 +499,7 @@ mod tests {
 
     #[test]
     fn test_complex_condition() -> Result<()> {
-        let selection = parse_selection("(name = 'Alice' OR name = 'Charlie') AND age >= 30 AND age <= 40").unwrap();
+        let selection = lowered("(name = 'Alice' OR name = 'Charlie') AND age >= 30 AND age <= 40");
 
         let mut sql = SqlBuilder::with_fields(vec!["id", "name", "age"]);
         sql.table_name("users");
@@ -550,7 +508,11 @@ mod tests {
 
         assert_eq!(
             sql_string,
-            r#"SELECT "id", "name", "age" FROM "users" WHERE ("name" = $1 OR "name" = $2) AND "age" >= $3 AND "age" <= $4"#
+            format!(
+                r#"SELECT "id", "name", "age" FROM "users" WHERE ("{n}" = $1 OR "{n}" = $2) AND "{a}" >= $3 AND "{a}" <= $4"#,
+                n = col("name"),
+                a = col("age")
+            )
         );
         let expected: Vec<Box<dyn ToSql + Send + Sync>> = vec![Box::new("Alice"), Box::new("Charlie"), Box::new(30), Box::new(40)];
         assert_args(&args, &expected);
@@ -558,22 +520,18 @@ mod tests {
     }
 
     #[test]
-    fn test_including_collection_identifier() -> Result<()> {
-        // Tests multi-step path SQL generation using JSONB operators.
-        // HACK: We infer "JSON property" from multi-step paths (e.g., `person.name`).
-        // TODO(Phase 3 - Schema Registry): With property metadata, we can distinguish
-        // Json traversal from Ref<T> traversal and generate appropriate SQL.
-        let selection = parse_selection("person.name = 'Alice'").unwrap();
+    fn test_json_subpath() -> Result<()> {
+        let selection = lowered("person.name = 'Alice'");
 
         let mut sql = SqlBuilder::with_fields(vec!["id", "name"]);
         sql.table_name("people");
         sql.selection(&selection)?;
         let (sql_string, args) = sql.build()?;
 
-        // Multi-step paths generate JSONB syntax: -> with ::jsonb cast for proper comparison
-        assert_eq!(sql_string, r#"SELECT "id", "name" FROM "people" WHERE "person"->'name' = '"Alice"'::jsonb"#);
-        // No args - the value is inlined as ::jsonb cast
-        let expected: Vec<Box<dyn ToSql + Send + Sync>> = vec![];
+        // Multi-step paths generate JSONB syntax: -> traversal with the
+        // canonicalized Json literal bound as a jsonb parameter.
+        assert_eq!(sql_string, format!(r#"SELECT "id", "name" FROM "people" WHERE "{}"->'name' = $1"#, col("person")));
+        let expected: Vec<Box<dyn ToSql + Send + Sync>> = vec![Box::new(serde_json::json!("Alice"))];
         assert_args(&args, &expected);
         Ok(())
     }
@@ -593,13 +551,13 @@ mod tests {
 
     #[test]
     fn test_in_operator() -> Result<()> {
-        let selection = parse_selection("name IN ('Alice', 'Bob', 'Charlie')").unwrap();
+        let selection = lowered("name IN ('Alice', 'Bob', 'Charlie')");
         let mut sql = SqlBuilder::with_fields(vec!["id", "name"]);
         sql.table_name("users");
         sql.selection(&selection)?;
         let (sql_string, args) = sql.build()?;
 
-        assert_eq!(sql_string, r#"SELECT "id", "name" FROM "users" WHERE "name" IN ($1, $2, $3)"#);
+        assert_eq!(sql_string, format!(r#"SELECT "id", "name" FROM "users" WHERE "{}" IN ($1, $2, $3)"#, col("name")));
         let expected: Vec<Box<dyn ToSql + Send + Sync>> = vec![Box::new("Alice"), Box::new("Bob"), Box::new("Charlie")];
         assert_args(&args, &expected);
         Ok(())
@@ -615,12 +573,13 @@ mod tests {
 
     #[test]
     fn test_selection_with_order_by() -> Result<()> {
-        use ankql::ast::{OrderByItem, OrderDirection, PathExpr, Selection};
+        use ankql::ast::{OrderByItem, OrderDirection, Selection};
 
-        let base_selection = ankql::parser::parse_selection("name = 'Alice'").unwrap();
+        let base_selection = lowered("name = 'Alice'");
+        // ORDER BY keys reach the builder in this engine's columns, like every other path.
         let selection = Selection {
             predicate: base_selection.predicate,
-            order_by: Some(vec![OrderByItem { path: PathExpr::simple("created_at"), direction: OrderDirection::Desc }]),
+            order_by: Some(vec![OrderByItem { path: cpath("created_at"), direction: OrderDirection::Desc }]),
             limit: None,
         };
 
@@ -629,7 +588,10 @@ mod tests {
         sql.selection(&selection)?;
         let (sql_string, args) = sql.build()?;
 
-        assert_eq!(sql_string, r#"SELECT "id", "name", "created_at" FROM "users" WHERE "name" = $1 ORDER BY "created_at" DESC"#);
+        assert_eq!(
+            sql_string,
+            format!(r#"SELECT "id", "name", "created_at" FROM "users" WHERE "{}" = $1 ORDER BY "{}" DESC"#, col("name"), col("created_at"))
+        );
         let expected: Vec<Box<dyn ToSql + Send + Sync>> = vec![Box::new("Alice")];
         assert_args(&args, &expected);
         Ok(())
@@ -637,7 +599,7 @@ mod tests {
 
     #[test]
     fn test_selection_with_limit() -> Result<()> {
-        let base_selection = ankql::parser::parse_selection("age > 18").unwrap();
+        let base_selection = lowered("age > 18");
         let selection = Selection { predicate: base_selection.predicate, order_by: None, limit: Some(10) };
 
         let mut sql = SqlBuilder::with_fields(vec!["id", "name", "age"]);
@@ -645,7 +607,7 @@ mod tests {
         sql.selection(&selection)?;
         let (sql_string, args) = sql.build()?;
 
-        assert_eq!(sql_string, r#"SELECT "id", "name", "age" FROM "users" WHERE "age" > $1 LIMIT $2"#);
+        assert_eq!(sql_string, format!(r#"SELECT "id", "name", "age" FROM "users" WHERE "{}" > $1 LIMIT $2"#, col("age")));
         let expected: Vec<Box<dyn ToSql + Send + Sync>> = vec![Box::new(18i64), Box::new(10i64)];
         assert_args(&args, &expected);
         Ok(())
@@ -653,14 +615,15 @@ mod tests {
 
     #[test]
     fn test_selection_with_order_by_and_limit() -> Result<()> {
-        use ankql::ast::{OrderByItem, OrderDirection, PathExpr, Selection};
+        use ankql::ast::{OrderByItem, OrderDirection, Selection};
 
-        let base_selection = ankql::parser::parse_selection("status = 'active'").unwrap();
+        let base_selection = lowered("status = 'active'");
+        // ORDER BY keys reach the builder in this engine's columns, like every other path.
         let selection = Selection {
             predicate: base_selection.predicate,
             order_by: Some(vec![
-                OrderByItem { path: PathExpr::simple("priority"), direction: OrderDirection::Desc },
-                OrderByItem { path: PathExpr::simple("created_at"), direction: OrderDirection::Asc },
+                OrderByItem { path: cpath("priority"), direction: OrderDirection::Desc },
+                OrderByItem { path: cpath("created_at"), direction: OrderDirection::Asc },
             ]),
             limit: Some(5),
         };
@@ -672,7 +635,12 @@ mod tests {
 
         assert_eq!(
             sql_string,
-            r#"SELECT "id", "status", "priority", "created_at" FROM "tasks" WHERE "status" = $1 ORDER BY "priority" DESC, "created_at" ASC LIMIT $2"#
+            format!(
+                r#"SELECT "id", "status", "priority", "created_at" FROM "tasks" WHERE "{}" = $1 ORDER BY "{}" DESC, "{}" ASC LIMIT $2"#,
+                col("status"),
+                col("priority"),
+                col("created_at")
+            )
         );
         let expected: Vec<Box<dyn ToSql + Send + Sync>> = vec![Box::new("active"), Box::new(5i64)];
         assert_args(&args, &expected);
@@ -683,49 +651,48 @@ mod tests {
     // JSONB SQL Generation Tests
     // These verify that multi-step paths generate correct PostgreSQL JSONB syntax.
     //
-    // Key design decision: Use -> (not ->>) with ::jsonb cast on literals.
-    // This ensures PostgreSQL's type-aware JSONB comparison:
+    // Key design decision: use -> (not ->>) and bind canonicalized Json literals.
+    // This preserves PostgreSQL's type-aware JSONB comparison:
     // - Numeric comparisons are numeric (not lexicographic)
     // - Cross-type comparisons return false (e.g., 9::jsonb != '"9"'::jsonb)
     // ============================================================================
     mod jsonb_sql_tests {
         use super::*;
-        use ankql::ast::PathExpr;
 
         #[test]
         fn test_two_step_json_path() -> Result<()> {
-            // licensing.territory = 'US' should use -> and ::jsonb cast
-            let selection = parse_selection("licensing.territory = 'US'").unwrap();
+            // licensing.territory = 'US' should use ->.
+            let selection = lowered("licensing.territory = 'US'");
             let mut sql = SqlBuilder::new();
             sql.selection(&selection)?;
             let (sql_string, _) = sql.build_where_clause();
 
-            // String literal becomes '"US"'::jsonb (JSON string)
-            assert_eq!(sql_string, r#""licensing"->'territory' = '"US"'::jsonb"#);
+            // The canonicalized JSON string binds as a jsonb parameter
+            assert_eq!(sql_string, format!(r#""{}"->'territory' = $1"#, col("licensing")));
             Ok(())
         }
 
         #[test]
         fn test_three_step_json_path() -> Result<()> {
             // licensing.rights.holder should become "licensing"->'rights'->'holder'
-            let selection = parse_selection("licensing.rights.holder = 'Label'").unwrap();
+            let selection = lowered("licensing.rights.holder = 'Label'");
             let mut sql = SqlBuilder::new();
             sql.selection(&selection)?;
             let (sql_string, _) = sql.build_where_clause();
 
-            assert_eq!(sql_string, r#""licensing"->'rights'->'holder' = '"Label"'::jsonb"#);
+            assert_eq!(sql_string, format!(r#""{}"->'rights'->'holder' = $1"#, col("licensing")));
             Ok(())
         }
 
         #[test]
         fn test_four_step_json_path() -> Result<()> {
             // a.b.c.d should become "a"->'b'->'c'->'d'
-            let selection = parse_selection("a.b.c.d = 'value'").unwrap();
+            let selection = lowered("a.b.c.d = 'value'");
             let mut sql = SqlBuilder::new();
             sql.selection(&selection)?;
             let (sql_string, _) = sql.build_where_clause();
 
-            assert_eq!(sql_string, r#""a"->'b'->'c'->'d' = '"value"'::jsonb"#);
+            assert_eq!(sql_string, format!(r#""{}"->'b'->'c'->'d' = $1"#, col("a")));
             Ok(())
         }
 
@@ -735,25 +702,25 @@ mod tests {
             // - "data"->'count' returns JSONB number
             // - '10'::jsonb is JSONB number
             // - JSONB numeric comparison is numeric (9 < 10), not lexicographic ("9" > "10")
-            let selection = parse_selection("data.count > 10").unwrap();
+            let selection = lowered("data.count > 10");
             let mut sql = SqlBuilder::new();
             sql.selection(&selection)?;
             let (sql_string, _) = sql.build_where_clause();
 
-            assert_eq!(sql_string, r#""data"->'count' > '10'::jsonb"#);
+            assert_eq!(sql_string, format!(r#""{}"->'count' > $1"#, col("data")));
             Ok(())
         }
 
         #[test]
         fn test_mixed_simple_and_json_paths() -> Result<()> {
             // name = 'test' AND data.status = 'active'
-            // Simple path uses $1, JSON path uses ::jsonb cast
-            let selection = parse_selection("name = 'test' AND data.status = 'active'").unwrap();
+            // Simple and JSON paths use ordinary bound arguments.
+            let selection = lowered("name = 'test' AND data.status = 'active'");
             let mut sql = SqlBuilder::new();
             sql.selection(&selection)?;
             let (sql_string, _) = sql.build_where_clause();
 
-            assert_eq!(sql_string, r#""name" = $1 AND "data"->'status' = '"active"'::jsonb"#);
+            assert_eq!(sql_string, format!(r#""{}" = $1 AND "{}"->'status' = $2"#, col("name"), col("data")));
             Ok(())
         }
 
@@ -762,35 +729,35 @@ mod tests {
             // Field with quote in path step - should escape properly
             // Note: This tests the SQL escaping, not JSON key escaping
             let mut sql = SqlBuilder::new();
-            let path = PathExpr { steps: vec!["data".to_string(), "it's".to_string()] };
+            let path = ankurah_storage_common::ColumnPath::new(col("data"), vec!["it's".to_string()]);
             sql.expr(&Expr::Path(path))?;
             let (sql_string, _) = sql.build_where_clause();
 
             // Just the path, no comparison - still uses ->
-            assert_eq!(sql_string, r#""data"->'it''s'"#);
+            assert_eq!(sql_string, format!(r#""{}"->'it''s'"#, col("data")));
             Ok(())
         }
 
         #[test]
         fn test_json_path_with_boolean() -> Result<()> {
-            let selection = parse_selection("data.active = true").unwrap();
+            let selection = lowered("data.active = true");
             let mut sql = SqlBuilder::new();
             sql.selection(&selection)?;
             let (sql_string, _) = sql.build_where_clause();
 
-            assert_eq!(sql_string, r#""data"->'active' = 'true'::jsonb"#);
+            assert_eq!(sql_string, format!(r#""{}"->'active' = $1"#, col("data")));
             Ok(())
         }
 
         #[test]
         fn test_json_path_with_float() -> Result<()> {
             // Note: AnkQL parser may parse this as i64, but the principle stands
-            let selection = parse_selection("data.score >= 95").unwrap();
+            let selection = lowered("data.score >= 95");
             let mut sql = SqlBuilder::new();
             sql.selection(&selection)?;
             let (sql_string, _) = sql.build_where_clause();
 
-            assert_eq!(sql_string, r#""data"->'score' >= '95'::jsonb"#);
+            assert_eq!(sql_string, format!(r#""{}"->'score' >= $1"#, col("data")));
             Ok(())
         }
     }
@@ -804,7 +771,7 @@ mod tests {
 
         #[test]
         fn test_simple_predicate_fully_pushable() {
-            let selection = parse_selection("name = 'Alice'").unwrap();
+            let selection = resolved("name = 'Alice'");
             let split = split_predicate_for_postgres(&selection.predicate);
 
             // Simple predicate should be fully pushable
@@ -814,11 +781,8 @@ mod tests {
 
         #[test]
         fn test_json_path_predicate_pushable() {
-            // Multi-step paths ARE pushed down using JSONB operators.
-            // HACK: We infer "JSON property" from multi-step paths.
-            // TODO(Phase 3 - Schema Registry): Once we have property metadata,
-            // we can distinguish Json traversal (pushable) from Ref<T> (not pushable).
-            let selection = parse_selection("licensing.territory = 'US'").unwrap();
+            // Resolution has already verified that this is a JSON subpath.
+            let selection = resolved("licensing.territory = 'US'");
             let split = split_predicate_for_postgres(&selection.predicate);
 
             // JSON path IS pushable via JSONB syntax
@@ -827,7 +791,7 @@ mod tests {
 
         #[test]
         fn test_and_with_all_pushable() {
-            let selection = parse_selection("name = 'test' AND licensing.status = 'active'").unwrap();
+            let selection = resolved("name = 'test' AND licensing.status = 'active'");
             let split = split_predicate_for_postgres(&selection.predicate);
 
             // Both parts pushable (simple path + JSON path) = whole thing pushable
@@ -836,7 +800,7 @@ mod tests {
 
         #[test]
         fn test_or_with_all_pushable() {
-            let selection = parse_selection("name = 'a' OR name = 'b'").unwrap();
+            let selection = resolved("name = 'a' OR name = 'b'");
             let split = split_predicate_for_postgres(&selection.predicate);
 
             // Both branches pushable = whole OR pushable
@@ -845,7 +809,7 @@ mod tests {
 
         #[test]
         fn test_complex_nested_predicate() {
-            let selection = parse_selection("(name = 'test' OR data.type = 'special') AND status = 'active'").unwrap();
+            let selection = resolved("(name = 'test' OR data.type = 'special') AND status = 'active'");
             let split = split_predicate_for_postgres(&selection.predicate);
 
             // All parts are pushable (simple paths + JSON paths)
@@ -854,7 +818,7 @@ mod tests {
 
         #[test]
         fn test_not_predicate_pushable() {
-            let selection = parse_selection("NOT (status = 'deleted')").unwrap();
+            let selection = resolved("NOT (status = 'deleted')");
             let split = split_predicate_for_postgres(&selection.predicate);
 
             assert!(!split.needs_post_filter());
@@ -862,7 +826,7 @@ mod tests {
 
         #[test]
         fn test_is_null_pushable() {
-            let selection = parse_selection("name IS NULL").unwrap();
+            let selection = resolved("name IS NULL");
             let split = split_predicate_for_postgres(&selection.predicate);
 
             assert!(!split.needs_post_filter());
@@ -872,7 +836,7 @@ mod tests {
         // #[test]
         // fn test_unpushable_predicate_goes_to_remaining() {
         //     // When we add Ref traversal, this test would verify:
-        //     // let selection = parse_selection("artist.name = 'Radiohead'").unwrap();
+        //     // let selection = resolved("artist.name = 'Radiohead'");
         //     // let split = split_predicate_for_postgres(&selection.predicate);
         //     // assert!(split.needs_post_filter());
         //     // assert!(matches!(split.sql_predicate, Predicate::True));

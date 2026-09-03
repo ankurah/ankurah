@@ -17,10 +17,10 @@ pub mod event_dag;
 #[cfg(feature = "bench-internals")]
 pub mod bench_support;
 pub mod indexing;
+pub(crate) mod internal;
 pub mod livequery;
 pub mod model;
 pub mod node;
-pub mod node_applier;
 pub mod peer_subscription;
 pub mod policy;
 pub mod property;
@@ -33,8 +33,9 @@ pub mod session;
 pub mod storage;
 pub mod system;
 pub mod task;
+#[cfg(feature = "test-helpers")]
+pub mod test_helpers;
 pub mod transaction;
-pub mod type_resolver;
 pub mod util;
 pub mod value;
 
@@ -47,7 +48,14 @@ pub use model::Model;
 pub use node::Node;
 pub use property::Json;
 pub use query_value::QueryValue;
-pub use type_resolver::TypeResolver;
+pub use schema::resolver::{ModelResolutionError, ModelResolver, ResolvedProperty};
 
 pub use ankurah_proto as proto;
 pub use ankurah_proto::{EntityId, ModelId};
+
+// Derived code reaches dependencies through its configured base path. These
+// re-exports let core's catalog models use `base = "crate"`.
+#[doc(hidden)]
+pub use ankql;
+#[doc(hidden)]
+pub use ankurah_signals as signals;

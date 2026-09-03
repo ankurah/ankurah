@@ -23,8 +23,16 @@ impl<T: 'static> Mut<T> {
 
     pub fn set(&self, value: T) {
         self.value.set(value);
-        // Notify all listeners
         self.broadcast.send(());
+    }
+
+    /// Sets the value, runs `before_notify`, then notifies listeners.
+    /// This lets callers release coordination locks before callbacks run.
+    pub fn set_before_notify<R>(&self, value: T, before_notify: impl FnOnce() -> R) -> R {
+        self.value.set(value);
+        let result = before_notify();
+        self.broadcast.send(());
+        result
     }
 
     /// Mutates the value in place and notifies listeners.
@@ -125,5 +133,18 @@ mod tests {
         assert_eq!(signal.value(), vec![1, 2, 3]);
         // Fired exactly once, and the listener observed the updated value
         assert_eq!(*seen.lock().unwrap(), vec![vec![1, 2, 3]]);
+    }
+
+    #[test]
+    fn set_before_notify_runs_hook_before_listener() {
+        let signal = Mut::new(1);
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let listener_ready = ready.clone();
+        let _guard = signal.listen(Arc::new(move |_| {
+            assert!(listener_ready.load(std::sync::atomic::Ordering::Acquire));
+        }));
+
+        signal.set_before_notify(2, || ready.store(true, std::sync::atomic::Ordering::Release));
+        assert_eq!(signal.value(), 2);
     }
 }

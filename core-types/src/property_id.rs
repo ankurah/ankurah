@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
-use crate::{DecodeError, EntityId};
+use crate::{property_path::PropertyPath, DecodeError, EntityId};
 
 /// A built-in property's logical identity. Variant order is part of the
 /// bincode contract; append variants, never reorder them without a protocol
@@ -48,6 +48,23 @@ impl SystemProperty {
         }
     }
 
+    /// Rust variant spelling used by the derive macro when pinning system
+    /// fields.
+    pub const fn variant_name(self) -> &'static str {
+        match self {
+            Self::Item => "Item",
+            Self::Label => "Label",
+            Self::Name => "Name",
+            Self::MintedFor => "MintedFor",
+            Self::Backend => "Backend",
+            Self::ValueType => "ValueType",
+            Self::TargetModel => "TargetModel",
+            Self::Model => "Model",
+            Self::Property => "Property",
+            Self::Optional => "Optional",
+        }
+    }
+
     /// Parse a canonical system-property name.
     pub fn from_name(name: &str) -> Option<Self> {
         Some(match name {
@@ -82,6 +99,22 @@ pub enum PropertyId {
     System(SystemProperty),
 }
 
+impl PropertyId {
+    /// Build a resolved path from this durable identity. Registered ids use
+    /// their own rendering as display fallback because no source label is
+    /// available here.
+    pub fn path(&self, subpath: &[String]) -> PropertyPath {
+        match self {
+            Self::Id => {
+                assert!(subpath.is_empty(), "the id pseudo-property has no subpath");
+                PropertyPath::id()
+            }
+            Self::EntityId(id) => PropertyPath::registered(*id, id.to_string(), subpath.to_vec()),
+            Self::System(property) => PropertyPath::system(*property, subpath.to_vec()),
+        }
+    }
+}
+
 impl fmt::Display for PropertyId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -92,10 +125,8 @@ impl fmt::Display for PropertyId {
     }
 }
 
-/// The exact inverse of [`Display`](fmt::Display): every variant parses back
-/// to itself. The arms cannot collide -- `"id"` is not a system name, and no
-/// system name decodes to the 32 bytes an entity id requires (the longest,
-/// `target_model`, is 12 characters and decodes to 9).
+/// The exact inverse of [`Display`](fmt::Display). The reserved names cannot
+/// decode as 32-byte entity ids, so the arms do not collide.
 impl FromStr for PropertyId {
     type Err = DecodeError;
 

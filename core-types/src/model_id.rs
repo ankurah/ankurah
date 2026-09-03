@@ -17,6 +17,29 @@ pub enum SystemModel {
     ModelProperty,
 }
 
+impl SystemModel {
+    /// The Rust variant spelling consumed and emitted by `#[derive(Model)]`.
+    pub const fn variant_name(self) -> &'static str {
+        match self {
+            Self::System => "System",
+            Self::Model => "Model",
+            Self::Property => "Property",
+            Self::ModelProperty => "ModelProperty",
+        }
+    }
+
+    /// Parse a variant identifier, the form [`Self::variant_name`] renders.
+    pub fn from_variant_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "System" => Self::System,
+            "Model" => Self::Model,
+            "Property" => Self::Property,
+            "ModelProperty" => Self::ModelProperty,
+            _ => return None,
+        })
+    }
+}
+
 impl fmt::Display for SystemModel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {

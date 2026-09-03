@@ -1,0 +1,5 @@
+error: duplicate property name 'name' after normalization
+ --> tests/compile_fail/duplicate_normalized_property.rs:8:9
+  |
+8 |     pub Name: String,
+  |         ^^^^

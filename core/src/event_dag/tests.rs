@@ -7,6 +7,14 @@ use crate::property::backend::PropertyBackend;
 use crate::retrieval::GetEvents;
 use crate::value::Value;
 
+fn prop(name: &str) -> ankurah_proto::PropertyId {
+    let mut bytes = [0u8; 32];
+    let n = name.as_bytes();
+    let len = n.len().min(32);
+    bytes[..len].copy_from_slice(&n[..len]);
+    ankurah_proto::PropertyId::EntityId(EntityId::from_bytes(bytes))
+}
+
 use super::comparison::compare;
 use super::relation::AbstractCausalRelation;
 use ankurah_proto::{Clock, EntityId, Event, EventId, OperationSet};
@@ -99,7 +107,7 @@ fn make_lww_event(seed: u8, properties: Vec<(&str, &str)>) -> Event {
 
     let backend = LWWBackend::new();
     for (name, value) in properties {
-        backend.set(name.into(), Some(Value::String(value.into())));
+        backend.set(prop(name), Some(Value::String(value.into())));
     }
     let ops = backend.to_operations().unwrap().unwrap();
     let parent = Clock::default();
@@ -1138,7 +1146,7 @@ mod lww_layer_tests {
         backend.apply_layer(&layer_from_refs(&already_applied, &to_apply)).unwrap();
 
         // Higher event_id should win
-        assert_eq!(backend.get(&"x".into()), Some(Value::String(winner_value.into())));
+        assert_eq!(backend.get(&prop("x")), Some(Value::String(winner_value.into())));
     }
 
     #[test]
@@ -1161,7 +1169,7 @@ mod lww_layer_tests {
 
         // Nothing should be set because winner is in already_applied
         // (already_applied values are already in state, we don't mutate for them)
-        assert_eq!(backend.get(&"x".into()), None);
+        assert_eq!(backend.get(&prop("x")), None);
     }
 
     #[test]
@@ -1183,7 +1191,7 @@ mod lww_layer_tests {
         backend.apply_layer(&layer_from_refs(&already_applied, &to_apply)).unwrap();
 
         // to_apply event should win and be applied
-        assert_eq!(backend.get(&"x".into()), Some(Value::String(winner_value.into())));
+        assert_eq!(backend.get(&prop("x")), Some(Value::String(winner_value.into())));
     }
 
     #[test]
@@ -1203,10 +1211,10 @@ mod lww_layer_tests {
 
         // x: winner is determined by higher event ID
         let expected_x = if event_a.id() > event_b.id() { "x_from_a" } else { "x_from_b" };
-        assert_eq!(backend.get(&"x".into()), Some(Value::String(expected_x.into())));
+        assert_eq!(backend.get(&prop("x")), Some(Value::String(expected_x.into())));
 
         // y: only event_b sets it, so it wins
-        assert_eq!(backend.get(&"y".into()), Some(Value::String("y_from_b".into())));
+        assert_eq!(backend.get(&prop("y")), Some(Value::String("y_from_b".into())));
     }
 
     #[test]
@@ -1234,10 +1242,10 @@ mod lww_layer_tests {
             // Actually no, the other events should compete and the highest among to_apply wins
             // Let's verify: winner among all is in already_applied, so among to_apply, the higher one wins
             let _to_apply_winner_value = if event_b.id() > event_c.id() { "value_b" } else { "value_c" };
-            assert_eq!(backend.get(&"x".into()), None);
+            assert_eq!(backend.get(&prop("x")), None);
         } else {
             // Winner is in to_apply - that value should win
-            assert_eq!(backend.get(&"x".into()), Some(Value::String((*winner_value).into())));
+            assert_eq!(backend.get(&prop("x")), Some(Value::String((*winner_value).into())));
         }
     }
 
@@ -1303,7 +1311,7 @@ mod lww_layer_tests {
         backend_local.apply_layer(&layer1()).unwrap();
         backend_local.apply_layer(&layer2()).unwrap();
         assert_eq!(
-            backend_local.get(&"x".into()),
+            backend_local.get(&prop("x")),
             Some(Value::String("value_from_A".into())),
             "reachable state: stored entry reflects already_applied A, so A must survive B"
         );
@@ -1314,7 +1322,7 @@ mod lww_layer_tests {
         backend_remote.apply_layer(&layer1_a_fresh()).unwrap();
         backend_remote.apply_layer(&layer2()).unwrap();
         assert_eq!(
-            backend_remote.get(&"x".into()),
+            backend_remote.get(&prop("x")),
             Some(Value::String("value_from_A".into())),
             "replica receiving A via to_apply must converge to A's value"
         );
@@ -1325,7 +1333,7 @@ mod lww_layer_tests {
         backend_stale.apply_operations_with_event(z_ops, event_z.id()).unwrap();
         backend_stale.apply_layer(&layer1()).unwrap();
         assert_eq!(
-            backend_stale.get_event_id(&"x".into()),
+            backend_stale.get_event_id(&prop("x")),
             Some(event_z.id()),
             "already_applied winner A is not written back; stored entry still stamped with Z"
         );
@@ -1334,11 +1342,11 @@ mod lww_layer_tests {
         // here to be purely mechanical: the precondition is unreachable via entity.rs.
         backend_stale.apply_layer(&layer2()).unwrap();
         assert_eq!(
-            backend_stale.get(&"x".into()),
+            backend_stale.get(&prop("x")),
             Some(Value::String("value_from_B".into())),
             "stale-seed mechanics: with an (entity-unreachable) below-meet stored entry, B beats A"
         );
-        assert_eq!(backend_stale.get_event_id(&"x".into()), Some(event_b.id()));
+        assert_eq!(backend_stale.get_event_id(&prop("x")), Some(event_b.id()));
     }
 }
 
@@ -1354,12 +1362,13 @@ mod yrs_layer_tests {
     /// Create a test event with Yrs text operations.
     /// Each text operation inserts the given string at position 0.
     fn make_yrs_event(seed: u8, text_field: &str, insert_text: &str) -> Event {
+        let text_field = prop(text_field);
         let mut entity_id_bytes = [0u8; 32];
         entity_id_bytes[0] = seed;
         let entity_id = EntityId::from_bytes(entity_id_bytes);
 
         let backend = YrsBackend::new();
-        backend.insert(text_field, 0, insert_text).unwrap();
+        backend.insert(&text_field, 0, insert_text).unwrap();
         let ops = backend.to_operations().unwrap().unwrap();
 
         let parent = Clock::default();
@@ -1385,7 +1394,7 @@ mod yrs_layer_tests {
         backend.apply_layer(&layer_from_refs(&already_applied, &to_apply)).unwrap();
 
         // Both inserts should be applied (Yrs CRDT merges them)
-        let result = backend.get_string("text").unwrap();
+        let result = backend.get_string(&prop("text")).unwrap();
         // Order depends on Yrs internal logic, but both should be present
         assert!(result.contains("hello") || result.contains("world"), "Expected at least one insert to be present, got: {}", result);
     }
@@ -1400,7 +1409,7 @@ mod yrs_layer_tests {
         let to_apply: Vec<&Event> = vec![&event_a];
         backend.apply_layer(&layer_from_refs(&already_applied, &to_apply)).unwrap();
 
-        let initial_text = backend.get_string("text").unwrap();
+        let initial_text = backend.get_string(&prop("text")).unwrap();
         assert_eq!(initial_text, "hello");
 
         // Now apply with event_a in already_applied and event_b in to_apply
@@ -1411,7 +1420,7 @@ mod yrs_layer_tests {
 
         // Only event_b should be applied again (if it wasn't already)
         // The text should contain "world" from event_b
-        let final_text = backend.get_string("text").unwrap();
+        let final_text = backend.get_string(&prop("text")).unwrap();
         assert!(final_text.contains("world"), "Expected 'world' to be in text, got: {}", final_text);
     }
 
@@ -1427,21 +1436,21 @@ mod yrs_layer_tests {
         backend1.apply_layer(&layer_from_refs(&[], &[&event_a])).unwrap();
         backend1.apply_layer(&layer_from_refs(&[], &[&event_b])).unwrap();
         backend1.apply_layer(&layer_from_refs(&[], &[&event_c])).unwrap();
-        let result1 = backend1.get_string("text").unwrap();
+        let result1 = backend1.get_string(&prop("text")).unwrap();
 
         // Order 2: C, A, B
         let backend2 = YrsBackend::new();
         backend2.apply_layer(&layer_from_refs(&[], &[&event_c])).unwrap();
         backend2.apply_layer(&layer_from_refs(&[], &[&event_a])).unwrap();
         backend2.apply_layer(&layer_from_refs(&[], &[&event_b])).unwrap();
-        let result2 = backend2.get_string("text").unwrap();
+        let result2 = backend2.get_string(&prop("text")).unwrap();
 
         // Order 3: B, C, A
         let backend3 = YrsBackend::new();
         backend3.apply_layer(&layer_from_refs(&[], &[&event_b])).unwrap();
         backend3.apply_layer(&layer_from_refs(&[], &[&event_c])).unwrap();
         backend3.apply_layer(&layer_from_refs(&[], &[&event_a])).unwrap();
-        let result3 = backend3.get_string("text").unwrap();
+        let result3 = backend3.get_string(&prop("text")).unwrap();
 
         // All results should be identical (CRDT convergence)
         assert_eq!(result1, result2, "Order 1 vs Order 2 should produce same result");
@@ -1451,7 +1460,7 @@ mod yrs_layer_tests {
     #[test]
     fn test_yrs_apply_layer_empty_to_apply() {
         let backend = YrsBackend::new();
-        backend.insert("text", 0, "initial").unwrap();
+        backend.insert(&prop("text"), 0, "initial").unwrap();
 
         let event_a = make_yrs_event(1, "text", "hello");
 
@@ -1462,7 +1471,7 @@ mod yrs_layer_tests {
         backend.apply_layer(&layer_from_refs(&already_applied, &to_apply)).unwrap();
 
         // Text should be unchanged (only "initial")
-        let result = backend.get_string("text").unwrap();
+        let result = backend.get_string(&prop("text")).unwrap();
         assert_eq!(result, "initial");
     }
 }
@@ -1484,12 +1493,12 @@ mod determinism_tests {
         // Order 1: Apply A then B
         let backend1 = LWWBackend::new();
         backend1.apply_layer(&layer_from_refs(&[], &[&event_a, &event_b])).unwrap();
-        let result1 = backend1.get(&"x".into());
+        let result1 = backend1.get(&prop("x"));
 
         // Order 2: Apply B then A (as a single layer - order within layer shouldn't matter)
         let backend2 = LWWBackend::new();
         backend2.apply_layer(&layer_from_refs(&[], &[&event_b, &event_a])).unwrap();
-        let result2 = backend2.get(&"x".into());
+        let result2 = backend2.get(&prop("x"));
 
         // Both should produce same result (lexicographic winner)
         assert_eq!(result1, result2, "Different orderings should produce same result");
@@ -1515,7 +1524,7 @@ mod determinism_tests {
         for perm in &permutations {
             let backend = LWWBackend::new();
             backend.apply_layer(&layer_from_refs(&[], perm)).unwrap();
-            results.push(backend.get(&"x".into()));
+            results.push(backend.get(&prop("x")));
         }
 
         // All results should be identical
@@ -1540,9 +1549,9 @@ mod determinism_tests {
         backend2.apply_layer(&layer_from_refs(&[], &[&event_c, &event_b, &event_a])).unwrap();
 
         // Same final state for all properties
-        assert_eq!(backend1.get(&"x".into()), backend2.get(&"x".into()));
-        assert_eq!(backend1.get(&"y".into()), backend2.get(&"y".into()));
-        assert_eq!(backend1.get(&"z".into()), backend2.get(&"z".into()));
+        assert_eq!(backend1.get(&prop("x")), backend2.get(&prop("x")));
+        assert_eq!(backend1.get(&prop("y")), backend2.get(&prop("y")));
+        assert_eq!(backend1.get(&prop("z")), backend2.get(&prop("z")));
     }
 
     #[test]
@@ -1564,7 +1573,7 @@ mod determinism_tests {
         backend2.apply_layer(&layer_from_refs(&[&event_b, &event_a], &[&event_d, &event_c])).unwrap();
 
         // Final state should be the same
-        assert_eq!(backend1.get(&"x".into()), backend2.get(&"x".into()));
+        assert_eq!(backend1.get(&prop("x")), backend2.get(&prop("x")));
     }
 }
 
@@ -1588,7 +1597,7 @@ mod edge_case_tests {
         backend.apply_layer(&empty_layer()).unwrap();
 
         // State should be unchanged
-        assert_eq!(backend.get(&"x".into()), Some(Value::String("initial".into())));
+        assert_eq!(backend.get(&prop("x")), Some(Value::String("initial".into())));
     }
 
     #[test]
@@ -1613,7 +1622,7 @@ mod edge_case_tests {
         backend.apply_layer(&layer_from_refs_with_context(&already_applied, &to_apply, &[&init_event])).unwrap();
 
         // State should be unchanged
-        assert_eq!(backend.get(&"x".into()), Some(Value::String("initial".into())));
+        assert_eq!(backend.get(&prop("x")), Some(Value::String("initial".into())));
     }
 
     #[test]
@@ -1631,7 +1640,7 @@ mod edge_case_tests {
         backend.apply_layer(&layer_from_refs(&already_applied, &to_apply)).unwrap();
 
         // Event should be applied once (its value should be set)
-        assert_eq!(backend.get(&"x".into()), Some(Value::String("value_a".into())));
+        assert_eq!(backend.get(&prop("x")), Some(Value::String("value_a".into())));
     }
 
     #[test]
@@ -1649,7 +1658,7 @@ mod edge_case_tests {
         let winner_idx = events.iter().enumerate().max_by_key(|(_, e)| e.id()).map(|(i, _)| i).unwrap();
 
         let expected = format!("value_{}", winner_idx);
-        assert_eq!(backend.get(&"x".into()), Some(Value::String(expected)));
+        assert_eq!(backend.get(&prop("x")), Some(Value::String(expected)));
     }
 
     #[test]
@@ -1664,7 +1673,7 @@ mod edge_case_tests {
         let entity_id = EntityId::from_bytes(entity_id_bytes);
 
         let delete_backend = LWWBackend::new();
-        delete_backend.set("x".into(), None); // Delete
+        delete_backend.set(prop("x"), None); // Delete
         let ops = delete_backend.to_operations().unwrap().unwrap();
         let parent = Clock::default();
         let delete_event = Event {
@@ -1677,7 +1686,7 @@ mod edge_case_tests {
         backend.apply_layer(&layer_from_refs_with_context(&[], &[&delete_event], &[&init_event])).unwrap();
 
         let expected = if delete_event.id() > init_event.id() { None } else { Some(Value::String("initial".into())) };
-        assert_eq!(backend.get(&"x".into()), expected);
+        assert_eq!(backend.get(&prop("x")), expected);
     }
 
     #[test]
@@ -1694,7 +1703,7 @@ mod edge_case_tests {
         } else {
             Some(Value::String("initial".into()))
         };
-        assert_eq!(backend.get(&"x".into()), expected);
+        assert_eq!(backend.get(&prop("x")), expected);
     }
 
     #[test]
@@ -1706,7 +1715,7 @@ mod edge_case_tests {
         backend.apply_layer(&layer_from_refs(&[], &[&event_a])).unwrap();
 
         // The event_id should be tracked
-        let tracked_id = backend.get_event_id(&"x".into());
+        let tracked_id = backend.get_event_id(&prop("x"));
         assert!(tracked_id.is_some());
         assert_eq!(tracked_id.unwrap(), event_a.id());
     }
@@ -1741,8 +1750,8 @@ mod phase4_stored_below_meet {
         }
 
         // Verify old value is stored
-        assert_eq!(backend.get(&"x".into()), Some(Value::String("old_value".into())));
-        assert_eq!(backend.get_event_id(&"x".into()), Some(old_event_id.clone()));
+        assert_eq!(backend.get(&prop("x")), Some(Value::String("old_value".into())));
+        assert_eq!(backend.get_event_id(&prop("x")), Some(old_event_id.clone()));
 
         // Step 2: Create a new layer candidate event. Build the DAG WITHOUT the
         // old_event_id. This simulates the case where the stored value's event_id
@@ -1760,11 +1769,11 @@ mod phase4_stored_below_meet {
         // The new event should always win because the stored value is older_than_meet,
         // regardless of event_id ordering.
         assert_eq!(
-            backend.get(&"x".into()),
+            backend.get(&prop("x")),
             Some(Value::String("new_value".into())),
             "Layer candidate must beat stored value whose event_id is below the meet"
         );
-        assert_eq!(backend.get_event_id(&"x".into()), Some(new_event_id), "Winning event_id must be the new event");
+        assert_eq!(backend.get_event_id(&prop("x")), Some(new_event_id), "Winning event_id must be the new event");
     }
 }
 
@@ -1837,7 +1846,7 @@ mod phase4_duplicate_creation {
         // Use LWW operations with distinct values to produce different event IDs.
         // Without differing content, identical events would produce the same EventId.
         let backend = LWWBackend::new();
-        backend.set("x".into(), Some(Value::String(format!("value_{}", seed))));
+        backend.set(prop("x"), Some(Value::String(format!("value_{}", seed))));
         let ops = backend.to_operations().unwrap().unwrap();
 
         let parent = Clock::default(); // no parent = genesis
@@ -1854,7 +1863,7 @@ mod phase4_duplicate_creation {
         let mut entity_id_bytes = [0u8; 32];
         entity_id_bytes[0] = 42;
         let entity_id = EntityId::from_bytes(entity_id_bytes);
-        let entity = Entity::create(entity_id, "test".into());
+        let entity = Entity::create(entity_id, "test".into(), crate::schema::SchemaEpoch::BOOTSTRAP);
 
         let mut retriever = MockRetriever::new();
 
@@ -1885,7 +1894,7 @@ mod phase4_duplicate_creation {
         let mut entity_id_bytes = [0u8; 32];
         entity_id_bytes[0] = 42;
         let entity_id = EntityId::from_bytes(entity_id_bytes);
-        let entity = Entity::create(entity_id, "test".into());
+        let entity = Entity::create(entity_id, "test".into(), crate::schema::SchemaEpoch::BOOTSTRAP);
 
         let mut retriever = MockRetriever::new();
 
@@ -2647,11 +2656,11 @@ mod strict_descends_gap_jump {
     use ankurah_proto::Attested;
 
     /// Read a committed LWW property value out of the entity's serialized state.
-    fn read_lww(entity: &Entity, prop: &str) -> Option<Value> {
+    fn read_lww(entity: &Entity, name: &str) -> Option<Value> {
         let state = entity.to_state().unwrap();
         let buf = state.state_buffers.0.get("lww")?;
         let backend = LWWBackend::from_state_buffer(buf).unwrap();
-        backend.get(&prop.into())
+        backend.get(&super::prop(name))
     }
 
     /// A bridge delivering [B, X] child-first must not lose X's operations.
@@ -2667,7 +2676,7 @@ mod strict_descends_gap_jump {
         let mut entity_id_bytes = [0u8; 32];
         entity_id_bytes[0] = 42;
         let entity_id = EntityId::from_bytes(entity_id_bytes);
-        let entity = Entity::create(entity_id, "test".into());
+        let entity = Entity::create(entity_id, "test".into(), crate::schema::SchemaEpoch::BOOTSTRAP);
 
         let mut retriever = MockRetriever::new();
 
@@ -2978,7 +2987,7 @@ mod entity_change_batches {
     fn lww_event_for(entity_id: EntityId, properties: Vec<(&str, &str)>, parent_ids: &[EventId]) -> Event {
         let backend = LWWBackend::new();
         for (name, value) in properties {
-            backend.set(name.into(), Some(Value::String(value.into())));
+            backend.set(prop(name), Some(Value::String(value.into())));
         }
         let ops = backend.to_operations().unwrap().unwrap();
         let parent = Clock::from(parent_ids.to_vec());
@@ -3003,7 +3012,7 @@ mod entity_change_batches {
         let mut entity_id_bytes = [0u8; 32];
         entity_id_bytes[0] = 77;
         let entity_id = EntityId::from_bytes(entity_id_bytes);
-        let entity = Entity::create(entity_id, "test".into());
+        let entity = Entity::create(entity_id, "test".into(), crate::schema::SchemaEpoch::BOOTSTRAP);
 
         let mut retriever = MockRetriever::new();
 

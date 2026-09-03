@@ -42,12 +42,19 @@ pub trait Model: Sized {
 
     /// Stage everything a new entity starts life with: its membership in
     /// `model_id` (this model's registered identity) and the struct's initial
-    /// field values in their property backends.
+    /// field values in their property backends, each staged under the durable
+    /// property identity its descriptor cell resolved for `epoch`.
     ///
     /// The receiver has no identity yet because these values are exactly what
     /// the id is derived FROM: `Transaction::create` freezes them into the
-    /// genesis event and takes the entity's id from it.
-    fn initialize_new_entity(&self, provisional: &mut ProvisionalEntity, model_id: ModelId);
+    /// genesis event and takes the entity's id from it. Fallible only when a
+    /// field's cell has no entry for `epoch` (a reset raced the create).
+    fn initialize_new_entity(
+        &self,
+        provisional: &mut ProvisionalEntity,
+        model_id: ModelId,
+        epoch: crate::schema::SchemaEpoch,
+    ) -> Result<(), PropertyError>;
 }
 
 /// A read only view of an Entity which offers typed accessors
@@ -199,9 +206,9 @@ pub fn js_preprocess_ref_field(obj: &wasm_bindgen::JsValue, field_name: &str) ->
 #[doc(hidden)]
 #[cfg(feature = "wasm")]
 pub fn js_populate_predicate(
-    predicate: ankql::ast::Predicate,
+    predicate: ankql::ast::Predicate<ankql::ast::Parsed>,
     substitution_values: &wasm_bindgen::JsValue,
-) -> Result<ankql::ast::Predicate, wasm_bindgen::JsValue> {
+) -> Result<ankql::ast::Predicate<ankql::ast::Parsed>, wasm_bindgen::JsValue> {
     let args_array: js_sys::Array =
         substitution_values.clone().try_into().map_err(|_| wasm_bindgen::JsValue::from_str("Invalid arguments array"))?;
 

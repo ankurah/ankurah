@@ -28,47 +28,58 @@ use crate::models::{Album, AlbumView};
 /// Type alias for the crash-wrapped durable node used across scenarios.
 type CrashNode = Node<CrashStorageEngine<SledStorageEngine>, PermissiveAgent>;
 
-/// Build a durable node on a real on-disk sled directory wrapped in the
-/// crash-injecting engine, create the system, then arm the crash hook so
-/// subsequent operation counts start from zero (bootstrap writes are excluded).
-/// Seed a deterministic Album catalog identity on `node` and latch the
-/// compiled binding, so every node in a scenario (the armed child, the
-/// batch-generating helper, reopened nodes) agrees on the model id each
-/// creation event's membership asserts -- without spending crash-countable
-/// storage writes on registration. Registration is bootstrap here, not
-/// workload.
+/// The deterministic Album catalog shared by every crash-test node.
+fn album_forge() -> &'static ankurah_tests::catalog_forge::ForgedCatalog {
+    static FORGED: std::sync::OnceLock<ankurah_tests::catalog_forge::ForgedCatalog> = std::sync::OnceLock::new();
+    FORGED.get_or_init(|| {
+        ankurah_tests::catalog_forge::forge_catalog(
+            Album::descriptor().label,
+            "Album",
+            &[("name", "yrs", "string"), ("year", "yrs", "string")],
+            b"crash-album",
+        )
+    })
+}
+
+/// Bind `node`'s compiled Album declaration to the forged identities.
 fn seed_album_catalog<SE: StorageEngine + Send + Sync + 'static>(node: &Node<SE, PermissiveAgent>) -> Result<()> {
-    let model_id = proto::EntityId::from_bytes([0x6A; 32]);
+    let forged = album_forge();
     let model = proto::RegisteredModel {
-        id: model_id,
+        id: forged.model,
         label: Album::descriptor().label.to_owned(),
         name: "Album".to_owned(),
         properties: ["name", "year"]
             .iter()
             .enumerate()
             .map(|(i, field)| proto::RegisteredProperty {
-                id: proto::EntityId::from_bytes([0x6B + i as u8; 32]),
-                membership_id: proto::EntityId::from_bytes([0x6D + i as u8; 32]),
+                build_id: Album::descriptor().field_by_name(field).expect("Album declares this field").build_id,
+                id: forged.properties[i],
+                membership_id: forged.memberships[i],
                 name: (*field).to_owned(),
                 backend: "yrs".to_owned(),
                 value_type: "string".to_owned(),
                 target_model: None,
-                minted_for: Some(model_id),
+                minted_for: Some(forged.model),
                 optional: false,
             })
             .collect(),
     };
-    node.catalog.seed_registered_schema(Album::descriptor(), std::slice::from_ref(&model))?;
+    ankurah::core::test_helpers::seed_registered_schema(node, Album::descriptor(), &model)?;
     Ok(())
 }
 
 async fn armed_child_node(crash: CrashPoint) -> Result<(CrashNode, Arc<CrashStorageEngine<SledStorageEngine>>)> {
     let dir = child_sled_dir().expect("child must have a sled dir");
     let sled = Arc::new(SledStorageEngine::with_path(dir)?);
+    // The forged catalog rows go in BEFORE the node exists (its projection
+    // reads them at startup) and before the crash hook is armed: bootstrap,
+    // not workload.
+    ankurah_tests::catalog_forge::plant(&*sled, album_forge()).await?;
     let engine = Arc::new(CrashStorageEngine::new(sled, Some(crash)));
     let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
     node.system.create().await?;
     seed_album_catalog(&node)?;
+    node.catalog.wait_ready().await?;
     // Bootstrap complete: from here on, operations are the workload under test.
     engine.arm();
     Ok((node, engine))
@@ -79,9 +90,12 @@ async fn armed_child_node(crash: CrashPoint) -> Result<(CrashNode, Arc<CrashStor
 /// event (empty parent). Returned in commit order as attested events, ready to
 /// feed to `commit_remote_transaction` on the node under test.
 async fn generate_creation_batch(n: usize) -> Result<Vec<Attested<proto::Event>>> {
-    let helper = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    let helper_engine = Arc::new(SledStorageEngine::new_test()?);
+    ankurah_tests::catalog_forge::plant(&*helper_engine, album_forge()).await?;
+    let helper = Node::new_durable(helper_engine, PermissiveAgent::new());
     helper.system.create().await?;
     seed_album_catalog(&helper)?;
+    helper.catalog.wait_ready().await?;
     let ctx = helper.context(c)?;
     let trx = ctx.begin();
     for i in 0..n {
@@ -245,13 +259,18 @@ async fn scenario_2_mid_batch() -> Result<()> {
     // Reconvergence: reopen the node under test and re-deliver the whole batch,
     // exactly as the sending peer would on retry. Everything must converge.
     let node = Node::new_durable(Arc::new(engine), PermissiveAgent::new());
-    seed_album_catalog(&node)?;
     // The system root persisted before the workload, so the reopened durable
-    // node loads it and becomes ready on its own (no create/join). Awaiting a
-    // collection drives the async catalog load first.
-    let collection2 = node.system.collection(&Album::collection()).await?;
+    // node loads it and becomes ready on its own (no create/join). Seeding
+    // must wait for that readiness: the seeded binding resolves under the
+    // node's schema epoch, which exists only once the system is ready.
     node.system.wait_system_ready().await;
     assert!(node.system.is_system_ready(), "reopened durable node must load its persisted system root");
+    seed_album_catalog(&node)?;
+    // The gate on redelivered events consults the catalog, which the
+    // reopened projection refills from the planted rows: wait for its
+    // first read.
+    node.catalog.wait_ready().await?;
+    let collection2 = node.system.collection(&Album::collection()).await?;
     redeliver(&node, events.clone()).await?;
 
     assert_state_heads_resolvable(&collection2, &entity_ids).await?;
@@ -291,10 +310,12 @@ async fn child_mid_merge() -> Result<()> {
     // Build the pre-merge state with the crash hook NOT yet armed.
     let dir = child_sled_dir().expect("child must have a sled dir");
     let sled = Arc::new(SledStorageEngine::with_path(dir)?);
+    ankurah_tests::catalog_forge::plant(&*sled, album_forge()).await?;
     let engine = Arc::new(CrashStorageEngine::new(sled, Some(crash)));
     let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
     node.system.create().await?;
     seed_album_catalog(&node)?;
+    node.catalog.wait_ready().await?;
     let ctx = node.context(c)?;
 
     // A: create.
@@ -310,7 +331,7 @@ async fn child_mid_merge() -> Result<()> {
     // B: first edit (parent A). Head becomes {B}.
     let a_view = ctx.get::<AlbumView>(album).await?;
     let t1 = ctx.begin();
-    a_view.edit(&t1)?.name().overwrite(0, 5, "Merge-B")?;
+    a_view.edit(&t1)?.name()?.overwrite(0, 5, "Merge-B")?;
     t1.commit().await?;
 
     // Record the pre-merge head (should be {B}) so the parent can compare.
@@ -323,7 +344,7 @@ async fn child_mid_merge() -> Result<()> {
     // taking a fresh transaction on the pre-B view snapshot). Committing C merges
     // B and C. Arm the crash so the merged set_state aborts.
     let t2 = ctx.begin();
-    a_view.edit(&t2)?.year().overwrite(0, 4, "2099")?;
+    a_view.edit(&t2)?.year()?.overwrite(0, 4, "2099")?;
     engine.arm();
     t2.commit().await?;
 
@@ -420,10 +441,16 @@ async fn scenario_4_entity_creation() -> Result<()> {
 
     // Reconvergence via re-delivery of the identical creation event.
     let node = Node::new_durable(Arc::new(engine), PermissiveAgent::new());
-    seed_album_catalog(&node)?;
-    let collection2 = node.system.collection(&Album::collection()).await?;
+    // Seeding resolves the compiled binding under the node's schema epoch,
+    // which exists only once the reopened system is ready.
     node.system.wait_system_ready().await;
     assert!(node.system.is_system_ready(), "reopened durable node must be system-ready");
+    seed_album_catalog(&node)?;
+    // The gate on redelivered events consults the catalog, which the
+    // reopened projection refills from the planted rows: wait for its
+    // first read.
+    node.catalog.wait_ready().await?;
+    let collection2 = node.system.collection(&Album::collection()).await?;
     redeliver(&node, events.clone()).await?;
 
     assert_state_heads_resolvable(&collection2, &[entity_id]).await?;
@@ -435,6 +462,8 @@ async fn scenario_4_entity_creation() -> Result<()> {
     let peer = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
     let _conn = LocalProcessConnection::new(&peer, &node).await?;
     peer.system.wait_system_ready().await;
+    // Bind the peer to the same forged identities used by the child.
+    seed_album_catalog(&peer)?;
     let peer_ctx = peer.context(c)?;
     let query = format!("id = '{}'", entity_id.to_base64());
     let fetched = peer_ctx.fetch::<AlbumView>(query.as_str()).await?;

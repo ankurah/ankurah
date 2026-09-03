@@ -5,6 +5,7 @@ use std::{
     time::Duration,
 };
 
+use ankql::ast::Resolved;
 use ankurah_core::{
     error::{MutationError, RetrievalError, StateError},
     property::backend::backend_from_string,
@@ -14,6 +15,7 @@ use ankurah_proto::{Attestation, AttestationSet, Attested, EntityState, EventBod
 
 use futures_util::{pin_mut, TryStreamExt};
 
+pub mod lower;
 pub mod sql_builder;
 pub mod value;
 
@@ -58,7 +60,9 @@ impl Postgres {
             match char {
                 char if char.is_alphanumeric() => {}
                 char if char.is_numeric() => {}
-                '_' | '.' | ':' => {}
+                // '-' appears in property-id renderings (URL-safe base64),
+                // which name materialized columns; always emitted quoted.
+                '_' | '.' | ':' | '-' => {}
                 _ => return false,
             }
         }
@@ -184,7 +188,7 @@ pub struct PostgresBucket {
     columns: Arc<RwLock<Vec<PostgresColumn>>>,
     /// Tracks the last predicate that spilled to post-filtering (debug builds only)
     #[cfg(debug_assertions)]
-    last_spilled_predicate: Arc<RwLock<Option<ankql::ast::Predicate>>>,
+    last_spilled_predicate: Arc<RwLock<Option<ankql::ast::Predicate<Resolved>>>>,
 }
 
 impl PostgresBucket {
@@ -200,7 +204,7 @@ impl PostgresBucket {
     /// assert!(spilled.is_none(), "Expected full pushdown, but got spill: {:?}", spilled);
     /// ```
     #[cfg(debug_assertions)]
-    pub fn last_spilled_predicate(&self) -> Option<ankql::ast::Predicate> { self.last_spilled_predicate.read().unwrap().clone() }
+    pub fn last_spilled_predicate(&self) -> Option<ankql::ast::Predicate<Resolved>> { self.last_spilled_predicate.read().unwrap().clone() }
 
     /// Rebuild the cache of columns in the table.
     pub async fn rebuild_columns_cache(&self, client: &mut tokio_postgres::Client) -> Result<(), StateError> {
@@ -367,11 +371,12 @@ impl StorageCollection for PostgresBucket {
         let mut materialized: Vec<(String, Option<PGValue>)> = Vec::new();
         let mut seen_properties = std::collections::HashSet::new();
 
-        // Process property values directly from state buffers
+        // Property ids are the temporary physical column names in this cut.
         for (name, state_buffer) in state.payload.state.state_buffers.iter() {
             let backend = backend_from_string(name, Some(state_buffer))?;
-            for (column, value) in backend.property_values() {
-                if !seen_properties.insert(column.clone()) {
+            for (property, value) in backend.property_values() {
+                let column = property.to_string();
+                if !seen_properties.insert(property.clone()) {
                     // Skip if property already seen in another backend
                     // TODO: this should cause all (or subsequent?) fields with the same name
                     // to be suffixed with the property id when we have property ids
@@ -525,7 +530,7 @@ impl StorageCollection for PostgresBucket {
         })
     }
 
-    async fn fetch_states(&self, selection: &ankql::ast::Selection) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+    async fn fetch_states(&self, selection: &ankql::ast::Selection<Resolved>) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         debug!("fetch_states: {:?}", selection);
         let mut client = self.pool.get().await.map_err(|err| RetrievalError::StorageError(Box::new(err)))?;
 
@@ -533,9 +538,10 @@ impl StorageCollection for PostgresBucket {
         // If we see columns not in our cache, refresh it first (they might have been added).
         // TODO: Once property metadata is in the system catalog, we can create missing columns
         // on-demand here instead of refreshing the cache each time we see unknown columns.
-        let referenced = selection.referenced_columns();
+        let referenced: Vec<(ankql::ast::PropertyId, String)> =
+            selection.referenced_properties().into_iter().map(|p| (p, p.to_string())).collect();
         let cached = self.existing_columns();
-        let unknown_to_cache: Vec<&String> = referenced.iter().filter(|col| !cached.contains(col)).collect();
+        let unknown_to_cache: Vec<&String> = referenced.iter().map(|(_, col)| col).filter(|col| !cached.contains(*col)).collect();
 
         // Refresh cache if we see columns we haven't seen before
         if !unknown_to_cache.is_empty() {
@@ -545,7 +551,8 @@ impl StorageCollection for PostgresBucket {
 
         // Now check with (possibly refreshed) cache - columns still missing truly don't exist
         let existing = self.existing_columns();
-        let missing: Vec<String> = referenced.into_iter().filter(|col| !existing.contains(col)).collect();
+        let missing: Vec<ankql::ast::PropertyId> =
+            referenced.into_iter().filter(|(_, col)| !existing.contains(col)).map(|(p, _)| p).collect();
 
         let effective_selection = if missing.is_empty() {
             selection.clone()
@@ -566,19 +573,12 @@ impl StorageCollection for PostgresBucket {
         // Track spilled predicate for test assertions (debug builds only)
         #[cfg(debug_assertions)]
         {
-            let mut spilled = self.last_spilled_predicate.write().unwrap();
-            *spilled = if needs_post_filter { Some(remaining_predicate.clone()) } else { None };
-        }
-
-        // Track spilled predicate for test assertions (debug builds only)
-        #[cfg(debug_assertions)]
-        {
             let spilled = if needs_post_filter { Some(remaining_predicate.clone()) } else { None };
             *self.last_spilled_predicate.write().unwrap() = spilled;
         }
 
-        // Build SQL with only the pushdown-capable predicate
-        let sql_selection = ankql::ast::Selection {
+        // Lower only the SQL half; Rust evaluates the remainder by property id.
+        let sql_selection = crate::lower::lower(&ankql::ast::Selection {
             predicate: split.sql_predicate,
             order_by: effective_selection.order_by.clone(),
             limit: if needs_post_filter {
@@ -586,7 +586,7 @@ impl StorageCollection for PostgresBucket {
             } else {
                 effective_selection.limit
             },
-        };
+        });
 
         let mut results = Vec::new();
         let mut builder = SqlBuilder::with_fields(vec!["id", "state_buffer", "memberships", "head", "attestations"]);
@@ -865,7 +865,7 @@ use crate::sql_builder::SqlBuilder;
 /// such as complex JSON traversals or future features like Ref traversal.
 fn post_filter_states(
     states: &[Attested<EntityState>],
-    predicate: &ankql::ast::Predicate,
+    predicate: &ankql::ast::Predicate<Resolved>,
     collection_id: &CollectionId,
 ) -> Vec<Attested<EntityState>> {
     use ankurah_core::entity::TemporaryEntity;

@@ -3,8 +3,9 @@
 //! Converts AnkQL predicates to SQLite-compatible SQL WHERE clauses.
 
 use crate::error::SqliteError;
-use ankql::ast::{ComparisonOperator, Expr, OrderByItem, OrderDirection, Predicate, Selection};
+use ankql::ast::{ComparisonOperator, Expr, OrderByItem, OrderDirection, Predicate, Resolved, Selection};
 use ankurah_core_types::Value;
+use ankurah_storage_common::EngineColumns;
 use thiserror::Error;
 
 #[derive(Debug, Error, Clone)]
@@ -25,9 +26,9 @@ impl From<SqlGenerationError> for SqliteError {
 #[derive(Debug, Clone)]
 pub struct SplitPredicate {
     /// Predicate that can be pushed down to SQLite WHERE clause
-    pub sql_predicate: Predicate,
+    pub sql_predicate: Predicate<Resolved>,
     /// Predicate that must be evaluated in Rust after fetching (Predicate::True if nothing remains)
-    pub remaining_predicate: Predicate,
+    pub remaining_predicate: Predicate<Resolved>,
 }
 
 impl SplitPredicate {
@@ -36,12 +37,12 @@ impl SplitPredicate {
 }
 
 /// Split a predicate into parts that can be pushed down to SQLite vs evaluated post-fetch.
-pub fn split_predicate_for_sqlite(predicate: &Predicate) -> SplitPredicate {
+pub fn split_predicate_for_sqlite(predicate: &Predicate<Resolved>) -> SplitPredicate {
     let (sql_pred, remaining_pred) = split_predicate_recursive(predicate);
     SplitPredicate { sql_predicate: sql_pred, remaining_predicate: remaining_pred }
 }
 
-fn split_predicate_recursive(predicate: &Predicate) -> (Predicate, Predicate) {
+fn split_predicate_recursive(predicate: &Predicate<Resolved>) -> (Predicate<Resolved>, Predicate<Resolved>) {
     match predicate {
         Predicate::Comparison { left, operator: _, right } => {
             if can_pushdown_comparison(left, right) {
@@ -112,12 +113,12 @@ fn split_predicate_recursive(predicate: &Predicate) -> (Predicate, Predicate) {
     }
 }
 
-fn can_pushdown_comparison(left: &Expr, right: &Expr) -> bool { can_pushdown_expr(left) && can_pushdown_expr(right) }
+fn can_pushdown_comparison(left: &Expr<Resolved>, right: &Expr<Resolved>) -> bool { can_pushdown_expr(left) && can_pushdown_expr(right) }
 
-fn can_pushdown_expr(expr: &Expr) -> bool {
+fn can_pushdown_expr(expr: &Expr<Resolved>) -> bool {
     match expr {
         Expr::Literal(_) => true,
-        Expr::Path(path) => !path.steps.is_empty(),
+        Expr::Path(_) => true,
         Expr::ExprList(exprs) => exprs.iter().all(can_pushdown_expr),
         Expr::Predicate(_) => false,
         Expr::InfixExpr { .. } => false,
@@ -172,27 +173,22 @@ impl SqlBuilder {
     #[allow(dead_code)]
     pub fn build_where_clause(self) -> (String, Vec<rusqlite::types::Value>) { (self.sql, self.params) }
 
-    pub fn expr(&mut self, expr: &Expr) -> Result<(), SqlGenerationError> {
+    pub fn expr(&mut self, expr: &Expr<EngineColumns>) -> Result<(), SqlGenerationError> {
         match expr {
             Expr::Placeholder => return Err(SqlGenerationError::PlaceholderFound),
             Expr::Literal(lit) => self.literal(lit),
             Expr::Path(path) => {
+                // Column names are always quoted (a property id's rendering is
+                // URL-safe base64, which contains '-' and '_').
+                let column = path.column.replace('"', "\"\"");
                 if path.is_simple() {
-                    // Single-step path: regular column reference
-                    let escaped = path.first().replace('"', "\"\"");
-                    self.push_sql(&format!(r#""{}""#, escaped));
+                    self.push_sql(&format!(r#""{}""#, column));
                 } else {
-                    // Multi-step path: JSONB traversal
-                    // SQLite's -> operator returns JSONB, but for comparisons we need to extract the value.
-                    // Use json_extract() with the full JSON path for reliable comparisons.
-                    let first = path.first().replace('"', "\"\"");
-                    // Build JSON path: $.step1.step2.step3
-                    let json_path = if path.steps.len() == 2 {
-                        format!("$.{}", path.steps[1].replace('\'', "''"))
-                    } else {
-                        format!("$.{}", path.steps.iter().skip(1).map(|s| s.replace('\'', "''")).collect::<Vec<_>>().join("."))
-                    };
-                    self.push_sql(&format!(r#"json_extract("{}", '{}')"#, first, json_path));
+                    // Sub-path: JSONB traversal. SQLite's -> operator returns
+                    // JSONB, but for comparisons we need to extract the value;
+                    // use json_extract() with the full JSON path.
+                    let json_path = format!("$.{}", path.subpath.iter().map(|s| s.replace('\'', "''")).collect::<Vec<_>>().join("."));
+                    self.push_sql(&format!(r#"json_extract("{}", '{}')"#, column, json_path));
                 }
             }
             Expr::ExprList(exprs) => {
@@ -248,7 +244,7 @@ impl SqlBuilder {
         Ok(())
     }
 
-    pub fn predicate(&mut self, predicate: &Predicate) -> Result<(), SqlGenerationError> {
+    pub fn predicate(&mut self, predicate: &Predicate<EngineColumns>) -> Result<(), SqlGenerationError> {
         match predicate {
             Predicate::Comparison { left, operator, right } => {
                 // Emit: left op right
@@ -293,7 +289,7 @@ impl SqlBuilder {
         Ok(())
     }
 
-    pub fn selection(&mut self, selection: &Selection) -> Result<(), SqlGenerationError> {
+    pub fn selection(&mut self, selection: &Selection<EngineColumns>) -> Result<(), SqlGenerationError> {
         self.predicate(&selection.predicate)?;
 
         if let Some(order_by_items) = &selection.order_by {
@@ -313,22 +309,14 @@ impl SqlBuilder {
         Ok(())
     }
 
-    pub fn order_by_item(&mut self, order_by: &OrderByItem) -> Result<(), SqlGenerationError> {
-        // Handle JSON paths the same way as in expr() - use -> operator for multi-step paths
-        if order_by.path.is_simple() {
-            // Single-step path: regular column reference
-            let escaped = order_by.path.first().replace('"', "\"\"");
-            self.push_sql(&format!(r#""{}""#, escaped));
-        } else {
-            // Multi-step path: JSONB traversal using -> operator
-            let first = order_by.path.first().replace('"', "\"\"");
-            self.push_sql(&format!(r#""{}""#, first));
-
-            for step in order_by.path.steps.iter().skip(1) {
-                let escaped = step.replace('\'', "''");
-                // Use -> to keep as JSONB (not ->> which extracts as text)
-                self.push_sql(&format!("->'{}'", escaped));
-            }
+    pub fn order_by_item(&mut self, order_by: &OrderByItem<EngineColumns>) -> Result<(), SqlGenerationError> {
+        // The sort column is quoted; sub-path steps traverse into a JSONB
+        // column with -> (not ->> which extracts as text).
+        let column = order_by.path.column.replace('"', "\"\"");
+        self.push_sql(&format!(r#""{}""#, column));
+        for step in &order_by.path.subpath {
+            let escaped = step.replace('\'', "''");
+            self.push_sql(&format!("->'{}'", escaped));
         }
 
         match order_by.direction {
@@ -357,71 +345,100 @@ fn comparison_op_to_sql(op: &ComparisonOperator) -> Result<&'static str, SqlGene
 mod tests {
     use super::*;
     use ankql::parser::parse_selection;
+    use ankurah_core::schema::resolver::{resolve_selection, ModelResolutionError, ModelResolver, ResolvedProperty};
+    use ankurah_proto::{EntityId, ModelId, PropertyId};
+
+    /// Resolves fixture names to deterministic property ids.
+    struct FixtureResolver;
+
+    fn pid(name: &str) -> PropertyId {
+        let mut bytes = [0u8; 32];
+        for (i, byte) in name.bytes().take(32).enumerate() {
+            bytes[i] = byte;
+        }
+        PropertyId::EntityId(EntityId::from_bytes(bytes))
+    }
+
+    fn col(name: &str) -> String { pid(name).to_string() }
+
+    impl ModelResolver for FixtureResolver {
+        fn resolve_property(&self, _model: &ModelId, name: &str) -> Result<Option<ResolvedProperty>, ModelResolutionError> {
+            let value_type = if name == "data" { ankurah_core::value::ValueType::Json } else { ankurah_core::value::ValueType::String };
+            Ok(Some(ResolvedProperty { id: pid(name), value_type }))
+        }
+    }
+
+    /// Resolve a query and lower it into this engine's columns, the way
+    /// `fetch_states` does before it builds SQL.
+    fn lowered(query: &str) -> ankql::ast::Selection<EngineColumns> {
+        let model = ModelId::EntityId(EntityId::from_bytes([0x77; 32]));
+        crate::lower::lower(&resolve_selection(&model, &FixtureResolver, parse_selection(query).unwrap()).unwrap())
+    }
 
     #[test]
     fn test_simple_equality() {
-        let selection = parse_selection("name = 'Alice'").unwrap();
+        let selection = lowered("name = 'Alice'");
         let mut sql = SqlBuilder::new();
         sql.selection(&selection).unwrap();
         let (sql_string, params) = sql.build_where_clause();
 
-        assert_eq!(sql_string, r#""name" = ?"#);
+        assert_eq!(sql_string, format!(r#""{}" = ?"#, col("name")));
         assert_eq!(params.len(), 1);
     }
 
     #[test]
     fn test_and_condition() {
-        let selection = parse_selection("name = 'Alice' AND age = 30").unwrap();
+        let selection = lowered("name = 'Alice' AND age = 30");
         let mut sql = SqlBuilder::with_fields(vec!["id", "name", "age"]);
         sql.table_name("users");
         sql.selection(&selection).unwrap();
         let (sql_string, params) = sql.build().unwrap();
 
-        assert_eq!(sql_string, r#"SELECT "id", "name", "age" FROM "users" WHERE "name" = ? AND "age" = ?"#);
+        assert_eq!(sql_string, format!(r#"SELECT "id", "name", "age" FROM "users" WHERE "{}" = ? AND "{}" = ?"#, col("name"), col("age")));
         assert_eq!(params.len(), 2);
     }
 
     #[test]
     fn test_json_path() {
-        let selection = parse_selection("data.status = 'active'").unwrap();
+        let selection = lowered("data.status = 'active'");
         let mut sql = SqlBuilder::new();
         sql.selection(&selection).unwrap();
         let (sql_string, _) = sql.build_where_clause();
 
         // Uses json_extract() for reliable comparisons with BLOB JSONB columns
-        assert_eq!(sql_string, r#"json_extract("data", '$.status') = ?"#);
+        assert_eq!(sql_string, format!(r#"json_extract("{}", '$.status') = ?"#, col("data")));
     }
 
     #[test]
     fn test_json_nested_path() {
-        let selection = parse_selection("data.user.name = 'Alice'").unwrap();
+        let selection = lowered("data.user.name = 'Alice'");
         let mut sql = SqlBuilder::new();
         sql.selection(&selection).unwrap();
         let (sql_string, _) = sql.build_where_clause();
 
         // Uses json_extract() with nested path for reliable comparisons
-        assert_eq!(sql_string, r#"json_extract("data", '$.user.name') = ?"#);
+        assert_eq!(sql_string, format!(r#"json_extract("{}", '$.user.name') = ?"#, col("data")));
     }
 
     #[test]
     fn test_json_numeric_comparison() {
-        let selection = parse_selection("data.count > 10").unwrap();
+        let selection = lowered("data.count > 10");
         let mut sql = SqlBuilder::new();
         sql.selection(&selection).unwrap();
         let (sql_string, _) = sql.build_where_clause();
 
         // Numeric comparison with json_extract() - SQLite handles numeric comparison correctly
-        assert_eq!(sql_string, r#"json_extract("data", '$.count') > ?"#);
+        assert_eq!(sql_string, format!(r#"json_extract("{}", '$.count') > ?"#, col("data")));
     }
 
     #[test]
     fn test_in_operator() {
-        let selection = parse_selection("name IN ('Alice', 'Bob')").unwrap();
+        let selection = lowered("name IN ('Alice', 'Bob')");
         let mut sql = SqlBuilder::new();
         sql.selection(&selection).unwrap();
         let (sql_string, params) = sql.build_where_clause();
 
-        assert_eq!(sql_string, r#""name" IN (?, ?)"#);
+        assert_eq!(sql_string, format!(r#""{}" IN (?, ?)"#, col("name")));
         assert_eq!(params.len(), 2);
     }
 }

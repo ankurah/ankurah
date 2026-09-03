@@ -229,13 +229,6 @@ impl<CD: ContextData> SessionSet<CD> {
     /// session backing a context. A no-op for self-attachment (the
     /// registry backing a context is its own source); an attach
     /// that would form a cycle is refused, warned and ignored.
-    ///
-    /// Whether two handles name the same set. Identity, not content:
-    /// the error paths that must decide "is this map entry still the
-    /// set I created" cannot use value equality, which two distinct
-    /// sets can satisfy.
-    pub(crate) fn ptr_eq(&self, other: &SessionSet<CD>) -> bool { Arc::ptr_eq(&self.0, &other.0) }
-
     /// Attach is the only operation that creates an edge, and it holds
     /// the module's topology lock across both the reachability check
     /// and the install, so each refusal is decided against the graph

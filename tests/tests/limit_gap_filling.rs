@@ -22,7 +22,7 @@ async fn test_single_node_gap_filling() -> Result<(), Box<dyn std::error::Error 
     // Update the middle album (2021) to no longer match - this should trigger gap filling
     {
         let trx = ctx.begin();
-        trx.get::<Album>(&ids[1]).await?.year().replace("1999")?; // no longer matches year >= '2020'
+        trx.get::<Album>(&ids[1]).await?.year()?.replace("1999")?; // no longer matches year >= '2020'
         trx.commit().await?;
     }
 
@@ -52,8 +52,8 @@ async fn test_single_node_multiple_gap_filling() -> Result<(), Box<dyn std::erro
 
     // Update two albums (2021 and 2023) to no longer match - this should trigger gap filling for both
     let trx = ctx.begin();
-    trx.get::<Album>(&ids[1]).await?.year().replace("1999")?;
-    trx.get::<Album>(&ids[3]).await?.year().replace("1999")?;
+    trx.get::<Album>(&ids[1]).await?.year()?.replace("1999")?;
+    trx.get::<Album>(&ids[3]).await?.year()?.replace("1999")?;
     trx.commit().await?;
 
     // Wait for consolidated gap filling update: 2 removes + 2 adds in one update
@@ -93,7 +93,7 @@ async fn test_inter_node_gap_filling() -> Result<(), Box<dyn std::error::Error +
     assert_eq!(years(&query), vec!["2020", "2021", "2022"]);
 
     let trx = server.begin();
-    trx.get::<Album>(&ids[1]).await?.year().replace("1999")?; // no longer matches year >= '2020'
+    trx.get::<Album>(&ids[1]).await?.year()?.replace("1999")?; // no longer matches year >= '2020'
     trx.commit().await?;
 
     assert_eq!(watcher.take_one().await, vec![(ids[1], ChangeKind::Remove), (ids[3], ChangeKind::Add)]);
@@ -123,8 +123,8 @@ async fn test_inter_node_gap_filling_desc() -> Result<(), Box<dyn std::error::Er
     assert_eq!(years(&query), vec!["2027", "2026", "2025", "2024"]);
 
     let trx = server.begin();
-    trx.get::<Album>(&ids[4]).await?.year().replace("1999")?;
-    trx.get::<Album>(&ids[6]).await?.year().replace("1999")?;
+    trx.get::<Album>(&ids[4]).await?.year()?.replace("1999")?;
+    trx.get::<Album>(&ids[6]).await?.year()?.replace("1999")?;
     trx.commit().await?;
 
     assert_eq!(

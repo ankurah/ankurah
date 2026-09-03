@@ -1,3 +1,5 @@
+use crate::EngineColumns;
+use ankql::ast::{OrderByItem, Predicate};
 use ankurah_core::value::{Value, ValueType};
 
 use ankurah_core::indexing::KeySpec;
@@ -29,15 +31,15 @@ pub struct OrderByComponents {
     /// These define "partition boundaries" - when these values change,
     /// we're in a new partition that needs independent sorting.
     /// Empty if the entire ORDER BY must be spilled (global sort).
-    pub presort: Vec<ankql::ast::OrderByItem>,
+    pub presort: Vec<OrderByItem<EngineColumns>>,
 
     /// ORDER BY columns requiring in-memory sort.
     /// Empty if the index fully satisfies the ORDER BY.
-    pub spill: Vec<ankql::ast::OrderByItem>,
+    pub spill: Vec<OrderByItem<EngineColumns>>,
 }
 
 impl OrderByComponents {
-    pub fn new(presort: Vec<ankql::ast::OrderByItem>, spill: Vec<ankql::ast::OrderByItem>) -> Self { Self { presort, spill } }
+    pub fn new(presort: Vec<OrderByItem<EngineColumns>>, spill: Vec<OrderByItem<EngineColumns>>) -> Self { Self { presort, spill } }
 
     /// Returns true if no sorting is needed (index satisfies entire ORDER BY)
     pub fn is_satisfied(&self) -> bool { self.spill.is_empty() }
@@ -50,17 +52,17 @@ impl OrderByComponents {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Plan {
     Index {
-        index_spec: KeySpec,                        // key order (ASC/DESC per part)
-        scan_direction: ScanDirection,              // engine scan direction
-        bounds: KeyBounds,                          // per-column bounds (planner IR)
-        remaining_predicate: ankql::ast::Predicate, // residual quals
-        order_by_spill: OrderByComponents,          // spill sorting needed (presort for partitions, spill for sort)
+        index_spec: KeySpec<String>,                   // key order (ASC/DESC per part)
+        scan_direction: ScanDirection,                 // engine scan direction
+        bounds: KeyBounds,                             // per-column bounds (planner IR)
+        remaining_predicate: Predicate<EngineColumns>, // residual quals
+        order_by_spill: OrderByComponents,             // spill sorting needed (presort for partitions, spill for sort)
     },
     TableScan {
-        bounds: KeyBounds,                          // primary key bounds (empty if no constraints).
-        scan_direction: ScanDirection,              // forward/reverse based on primary key ORDER BY
-        remaining_predicate: ankql::ast::Predicate, // all predicates (no index to satisfy any)
-        order_by_spill: OrderByComponents,          // spill sorting needed (presort for partitions, spill for sort)
+        bounds: KeyBounds,                             // primary key bounds (empty if no constraints).
+        scan_direction: ScanDirection,                 // forward/reverse based on primary key ORDER BY
+        remaining_predicate: Predicate<EngineColumns>, // all predicates (no index to satisfy any)
+        order_by_spill: OrderByComponents,             // spill sorting needed (presort for partitions, spill for sort)
     },
     EmptyScan, // "scan" over an emptyset - the query can never match anything
 }

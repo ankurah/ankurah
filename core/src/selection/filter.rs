@@ -2,7 +2,7 @@
 //! which has not been pre-filtered by an index search - or to supplement/validate an index search with additional filtering.
 
 use crate::value::Value;
-use ankql::ast::{ComparisonOperator, Expr, Predicate};
+use ankql::ast::{ComparisonOperator, Expr, Predicate, PropertyId, PropertyPath, Resolved, Stage};
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq)]
@@ -44,51 +44,33 @@ impl ExprOutput<Value> {
     fn is_none(&self) -> bool { matches!(self, ExprOutput::None) }
 }
 
-/// Trait for items that can be filtered by predicate evaluation
-///
-/// Returns typed Values to enable proper comparison with casting
+/// An item whose properties can be evaluated by identity.
 pub trait Filterable {
     fn collection(&self) -> &str;
-    fn value(&self, name: &str) -> Option<Value>;
+    fn value(&self, property: &PropertyId) -> Option<Value>;
 }
 
-fn evaluate_expr<I: Filterable>(item: &I, expr: &Expr) -> Result<ExprOutput<Value>, Error> {
+/// Looks up paths for one selection stage.
+pub trait PathLookup<S: Stage> {
+    fn value_at(&self, path: &S::Path) -> Option<Value>;
+}
+
+impl<T: Filterable> PathLookup<Resolved> for T {
+    fn value_at(&self, path: &PropertyPath) -> Option<Value> {
+        let value = self.value(&path.property_id())?;
+        if path.subpath.is_empty() {
+            Some(value)
+        } else {
+            value.extract_at_path(&path.subpath)
+        }
+    }
+}
+
+fn evaluate_expr<S: Stage, I: PathLookup<S>>(item: &I, expr: &Expr<S>) -> Result<ExprOutput<Value>, Error> {
     match expr {
         Expr::Placeholder => Err(Error::PropertyNotFound("Placeholder values must be replaced before filtering".to_string())),
         Expr::Literal(lit) => Ok(ExprOutput::Value(lit.clone())),
-        Expr::Path(path) => {
-            // For simple paths, use the first step as the property name
-            if path.is_simple() {
-                let name = path.first();
-                Ok(ExprOutput::Value(item.value(name).ok_or_else(|| Error::PropertyNotFound(name.to_string()))?))
-            } else {
-                // Multi-step path - could be:
-                // 1. Collection.property (legacy, check if first step matches collection)
-                // 2. property.nested.path (JSON traversal)
-
-                let first = path.first();
-
-                // First, check if it's a collection-qualified path
-                if first == item.collection() {
-                    // Treat remaining path as property access
-                    let remaining = &path.steps[1..];
-                    if remaining.len() == 1 {
-                        // Simple collection.property
-                        let name = &remaining[0];
-                        return Ok(ExprOutput::Value(item.value(name).ok_or_else(|| Error::PropertyNotFound(name.to_string()))?));
-                    }
-                    // collection.property.nested... - get property and traverse sub-path
-                    let property_name = &remaining[0];
-                    let sub_path = &remaining[1..];
-                    return evaluate_sub_path(item, property_name, sub_path);
-                }
-
-                // Not a collection qualifier - treat first step as property, rest as sub-path
-                let property_name = first;
-                let sub_path: Vec<&str> = path.steps[1..].iter().map(|s| s.as_str()).collect();
-                evaluate_sub_path(item, property_name, &sub_path)
-            }
-        }
+        Expr::Path(path) => Ok(ExprOutput::Value(item.value_at(path).ok_or_else(|| Error::PropertyNotFound(path.to_string()))?)),
         Expr::ExprList(exprs) => {
             let mut result = Vec::new();
             for expr in exprs {
@@ -96,52 +78,29 @@ fn evaluate_expr<I: Filterable>(item: &I, expr: &Expr) -> Result<ExprOutput<Valu
             }
             Ok(ExprOutput::List(result))
         }
-        _ => Err(Error::UnsupportedExpression("Only literal, path, and list expressions are supported")),
+        _ => Err(Error::UnsupportedExpression("Only literal, property, and list expressions are supported")),
     }
 }
 
-/// Evaluate a sub-path traversal: get property value, extract nested value at path
-/// Delegates to Value::extract_at_path for the actual traversal.
-fn evaluate_sub_path<I: Filterable>(item: &I, property_name: &str, sub_path: &[impl AsRef<str>]) -> Result<ExprOutput<Value>, Error> {
-    let property_value = item.value(property_name).ok_or_else(|| Error::PropertyNotFound(property_name.to_string()))?;
-
-    // Convert sub_path to Vec<String> for extract_at_path
-    let path: Vec<String> = sub_path.iter().map(|s| s.as_ref().to_string()).collect();
-
-    property_value.extract_at_path(&path).map(ExprOutput::Value).ok_or_else(|| {
-        Error::PropertyNotFound(format!(
-            "Sub-path '{}' not found in property '{}'",
-            sub_path.iter().map(|s| s.as_ref()).collect::<Vec<_>>().join("."),
-            property_name
-        ))
-    })
-}
-
-/// Compare two values with automatic casting (for regular schema-typed fields).
-/// If types don't match, attempts to cast right to left's type, then left to right's type.
 fn compare_values_with_cast(left: &Value, right: &Value, op: impl Fn(&Value, &Value) -> bool) -> bool {
     use crate::value::ValueType;
 
-    // If types match, compare directly
     if ValueType::of(left) == ValueType::of(right) {
         return op(left, right);
     }
 
-    // Try casting right to left's type
     if let Ok(casted_right) = right.cast_to(ValueType::of(left)) {
         return op(left, &casted_right);
     }
 
-    // Try casting left to right's type
     if let Ok(casted_left) = left.cast_to(ValueType::of(right)) {
         return op(&casted_left, right);
     }
 
-    // No valid cast, types incompatible
     false
 }
 
-pub fn evaluate_predicate<I: Filterable>(item: &I, predicate: &Predicate) -> Result<bool, Error> {
+pub fn evaluate_predicate<S: Stage, I: PathLookup<S>>(item: &I, predicate: &Predicate<S>) -> Result<bool, Error> {
     match predicate {
         Predicate::Comparison { left, operator, right } => {
             let left_val = evaluate_expr(item, left)?;
@@ -193,7 +152,6 @@ pub fn evaluate_predicate<I: Filterable>(item: &I, predicate: &Predicate) -> Res
         Predicate::IsNull(expr) => Ok(evaluate_expr(item, expr)?.is_none()),
         Predicate::True => Ok(true),
         Predicate::False => Ok(false),
-        // Placeholder should be transformed to a comparison before filtering
         Predicate::Placeholder => Err(Error::PropertyNotFound("Placeholder must be transformed before filtering".to_string())),
     }
 }
@@ -207,7 +165,7 @@ pub enum FilterResult<R> {
 
 pub struct FilterIterator<I> {
     iter: I,
-    predicate: Predicate,
+    predicate: Predicate<Resolved>,
 }
 
 impl<I, R> FilterIterator<I>
@@ -215,7 +173,7 @@ where
     I: Iterator<Item = R>,
     R: Filterable,
 {
-    pub fn new(iter: I, predicate: Predicate) -> Self { Self { iter, predicate } }
+    pub fn new(iter: I, predicate: Predicate<Resolved>) -> Self { Self { iter, predicate } }
 }
 
 impl<I, R> Iterator for FilterIterator<I>
@@ -237,7 +195,39 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::resolver::{resolve_selection, ModelResolutionError, ModelResolver, ResolvedProperty};
+    use crate::value::ValueType;
+    use ankql::ast::{Resolved, Selection, SystemProperty};
     use ankql::parser::parse_selection;
+    use ankurah_proto::EntityId;
+    use ankurah_proto::ModelId;
+
+    fn prop_id(name: &str) -> PropertyId {
+        let mut bytes = [0u8; 32];
+        let n = name.as_bytes();
+        let len = n.len().min(32);
+        bytes[..len].copy_from_slice(&n[..len]);
+        PropertyId::EntityId(EntityId::from_bytes(bytes))
+    }
+
+    fn model() -> ModelId { ModelId::EntityId(EntityId::from_bytes([0x77; 32])) }
+
+    struct FixtureResolver(&'static [(&'static str, ValueType)]);
+
+    impl ModelResolver for FixtureResolver {
+        fn resolve_model(&self, name: &str) -> Result<Option<ModelId>, ModelResolutionError> { Ok((name == "tracks").then(model)) }
+
+        fn resolve_property(&self, _model: &ModelId, name: &str) -> Result<Option<ResolvedProperty>, ModelResolutionError> {
+            let Some((field, value_type)) = self.0.iter().find(|(field, _)| *field == name) else { return Ok(None) };
+            Ok(Some(ResolvedProperty { id: prop_id(field), value_type: *value_type }))
+        }
+    }
+
+    fn resolve(query: &str, fields: &'static [(&'static str, ValueType)]) -> Selection<Resolved> {
+        resolve_selection(&model(), &FixtureResolver(fields), parse_selection(query).unwrap()).unwrap()
+    }
+
+    const PEOPLE: &[(&str, ValueType)] = &[("name", ValueType::String), ("age", ValueType::String)];
 
     #[derive(Debug, Clone, PartialEq)]
     struct TestItem {
@@ -248,11 +238,13 @@ mod tests {
     impl Filterable for TestItem {
         fn collection(&self) -> &str { "users" }
 
-        fn value(&self, name: &str) -> Option<Value> {
-            match name {
-                "name" => Some(Value::String(self.name.clone())),
-                "age" => Some(Value::String(self.age.clone())),
-                _ => None,
+        fn value(&self, property: &PropertyId) -> Option<Value> {
+            if *property == prop_id("name") {
+                Some(Value::String(self.name.clone()))
+            } else if *property == prop_id("age") {
+                Some(Value::String(self.age.clone()))
+            } else {
+                None
             }
         }
     }
@@ -265,7 +257,7 @@ mod tests {
     fn test_simple_equality() {
         let items = vec![TestItem::new("Alice", "30"), TestItem::new("Bob", "25"), TestItem::new("Charlie", "35")];
 
-        let selection = parse_selection("name = 'Alice'").unwrap();
+        let selection = resolve("name = 'Alice'", PEOPLE);
         let results: Vec<_> = FilterIterator::new(items.into_iter(), selection.predicate).collect();
 
         assert_eq!(
@@ -282,7 +274,7 @@ mod tests {
     fn test_and_condition() {
         let items = vec![TestItem::new("Alice", "30"), TestItem::new("Bob", "30"), TestItem::new("Charlie", "35")];
 
-        let selection = parse_selection("name = 'Alice' AND age = '30'").unwrap();
+        let selection = resolve("name = 'Alice' AND age = '30'", PEOPLE);
         let results: Vec<_> = FilterIterator::new(items.into_iter(), selection.predicate).collect();
 
         assert_eq!(
@@ -305,7 +297,7 @@ mod tests {
             TestItem::new("Eve", "40"),
         ];
 
-        let selection = parse_selection("(name = 'Alice' OR name = 'Charlie') AND age >= '30' AND age <= '40'").unwrap();
+        let selection = resolve("(name = 'Alice' OR name = 'Charlie') AND age >= '30' AND age <= '40'", PEOPLE);
         let results: Vec<_> = FilterIterator::new(items.into_iter(), selection.predicate).collect();
 
         assert_eq!(
@@ -331,7 +323,7 @@ mod tests {
         ];
 
         // Test IN with names
-        let selection = parse_selection("name IN ('Alice', 'Charlie', 'Eve')").unwrap();
+        let selection = resolve("name IN ('Alice', 'Charlie', 'Eve')", PEOPLE);
         let results: Vec<_> = FilterIterator::new(items.clone().into_iter(), selection.predicate).collect();
 
         assert_eq!(
@@ -346,7 +338,7 @@ mod tests {
         );
 
         // Test IN with ages
-        let selection = parse_selection("age IN ('20', '30', '40')").unwrap();
+        let selection = resolve("age IN ('20', '30', '40')", PEOPLE);
         let results: Vec<_> = FilterIterator::new(items.into_iter(), selection.predicate).collect();
 
         assert_eq!(
@@ -369,55 +361,84 @@ mod tests {
         owner: ankurah_proto::EntityId,
     }
 
+    const RECORDS: &[(&str, ValueType)] = &[("owner", ValueType::EntityId)];
+
     impl Filterable for OwnedItem {
         fn collection(&self) -> &str { "records" }
 
-        fn value(&self, name: &str) -> Option<Value> {
-            match name {
-                "owner" => Some(Value::EntityId(self.owner)),
-                _ => None,
+        fn value(&self, property: &PropertyId) -> Option<Value> {
+            if *property == prop_id("owner") {
+                Some(Value::EntityId(self.owner))
+            } else {
+                None
             }
         }
     }
 
-    /// An EntityId-typed field compared against a string that is not an id
-    /// answers false, and never an error. `evaluate_predicate` propagates an
-    /// error out of the whole predicate, so an erroring comparison here would
-    /// fail the caller's entire query — including the arms of an OR that would
-    /// otherwise have admitted rows — where false merely denies this row.
-    ///
-    /// This is the row-side half of what a scope rule like `owner = $jwt.sub`
-    /// does when the subject is a distinguished literal rather than a user's
-    /// id: ankurah-jwt-auth substitutes such a subject as a String literal
-    /// (its `variables::typed_expr`), and it arrives here.
+    /// A non-id string compared with an EntityId field fails canonicalization.
     #[test]
-    fn test_entity_id_field_never_equals_a_non_id_string() {
+    fn test_entity_id_field_against_a_non_id_string_is_a_type_error() {
         let row = OwnedItem { owner: ankurah_proto::EntityId::random() };
 
-        // 'guest' does not parse as an EntityId, so the cast toward the field's
-        // type fails and the surviving comparison is the row's id rendered as
-        // a string — which no non-id value equals.
-        let selection = parse_selection("owner = 'guest'").unwrap();
-        assert_eq!(evaluate_predicate(&row, &selection.predicate), Ok(false), "a subject that is not an id must deny the row, not error");
+        let error = resolve_selection(&model(), &FixtureResolver(RECORDS), parse_selection("owner = 'guest'").unwrap()).unwrap_err();
+        assert!(
+            matches!(error, ModelResolutionError::Canonicalization { .. }),
+            "a subject that is not an id must fail resolution as a type error, got {error:?}"
+        );
 
-        // The control that keeps the false above honest: the comparator does
-        // cross this type pair, so the false is a comparison that answered no
-        // and not a comparator that refuses EntityId-against-String outright —
-        // which would answer false for every string, including the right one.
-        let selection = parse_selection(&format!("owner = '{}'", row.owner.to_base64())).unwrap();
-        assert_eq!(evaluate_predicate(&row, &selection.predicate), Ok(true), "the row's own id, as a string, must still match");
+        let query = format!("owner = '{}'", row.owner.to_base64());
+        let selection = resolve_selection(&model(), &FixtureResolver(RECORDS), parse_selection(&query).unwrap()).unwrap();
+        assert_eq!(evaluate_predicate(&row, &selection.predicate), Ok(true), "the row's own id, as a string literal, must still match");
+    }
+
+    #[test]
+    fn id_pseudo_property_resolves_and_answers_the_entity_id() {
+        // `id` resolves to PropertyId::Id, and Filterable implementors answer
+        // it with the row's own identity.
+        struct Row(EntityId);
+        impl Filterable for Row {
+            fn collection(&self) -> &str { "rows" }
+            fn value(&self, property: &PropertyId) -> Option<Value> { (*property == PropertyId::Id).then(|| Value::EntityId(self.0)) }
+        }
+        let row = Row(EntityId::from_bytes([9u8; 32]));
+        let query = format!("id = '{}'", row.0.to_base64());
+        let selection = resolve(Box::leak(query.into_boxed_str()), &[]);
+        assert_eq!(evaluate_predicate(&row, &selection.predicate), Ok(true));
+    }
+
+    #[test]
+    fn system_property_resolves_by_closed_name() {
+        // On a system model there is no catalog row to resolve against; the
+        // closed SystemProperty vocabulary is the identity.
+        struct SysRow;
+        impl Filterable for SysRow {
+            fn collection(&self) -> &str { "_ankurah_property" }
+            fn value(&self, property: &PropertyId) -> Option<Value> {
+                (*property == PropertyId::System(SystemProperty::Label)).then(|| Value::String("album".into()))
+            }
+        }
+        struct SystemResolver;
+        impl ModelResolver for SystemResolver {
+            fn resolve_property(&self, _model: &ModelId, name: &str) -> Result<Option<ResolvedProperty>, ModelResolutionError> {
+                Ok(SystemProperty::from_name(name)
+                    .map(|system| ResolvedProperty { id: PropertyId::System(system), value_type: ValueType::String }))
+            }
+        }
+        let selection = resolve_selection(&model(), &SystemResolver, parse_selection("label = 'album'").unwrap()).unwrap();
+        assert_eq!(evaluate_predicate(&SysRow, &selection.predicate), Ok(true));
     }
 
     // JSON path traversal tests
     mod json_tests {
         use super::*;
-        use crate::type_resolver::TypeResolver;
+
+        const TRACKS: &[(&str, ValueType)] = &[("name", ValueType::String), ("licensing", ValueType::Json)];
 
         /// Test item with a JSON property for testing nested path queries
         #[derive(Debug, Clone, PartialEq)]
         struct TrackItem {
             name: String,
-            licensing: Vec<u8>, // JSON stored as bytes
+            licensing: Vec<u8>, // JSON stored as binary
         }
 
         impl TrackItem {
@@ -429,19 +450,15 @@ mod tests {
         impl Filterable for TrackItem {
             fn collection(&self) -> &str { "tracks" }
 
-            fn value(&self, name: &str) -> Option<Value> {
-                match name {
-                    "name" => Some(Value::String(self.name.clone())),
-                    "licensing" => Some(Value::Binary(self.licensing.clone())),
-                    _ => None,
+            fn value(&self, property: &PropertyId) -> Option<Value> {
+                if *property == prop_id("name") {
+                    Some(Value::String(self.name.clone()))
+                } else if *property == prop_id("licensing") {
+                    Some(Value::Binary(self.licensing.clone()))
+                } else {
+                    None
                 }
             }
-        }
-
-        /// Helper to parse and resolve types for JSON path queries
-        fn parse_with_types(query: &str) -> ankql::ast::Selection {
-            let selection = parse_selection(query).unwrap();
-            TypeResolver::new().resolve_selection_types(selection)
         }
 
         #[test]
@@ -471,7 +488,7 @@ mod tests {
             ];
 
             // Query: licensing.territory = 'US'
-            let selection = parse_selection("licensing.territory = 'US'").unwrap();
+            let selection = resolve("licensing.territory = 'US'", TRACKS);
             let results: Vec<_> = FilterIterator::new(items.into_iter(), selection.predicate).collect();
 
             assert!(matches!(results[0], FilterResult::Pass(_)));
@@ -503,7 +520,7 @@ mod tests {
             ];
 
             // Query: licensing.rights.holder = 'Label A'
-            let selection = parse_selection("licensing.rights.holder = 'Label A'").unwrap();
+            let selection = resolve("licensing.rights.holder = 'Label A'", TRACKS);
             let results: Vec<_> = FilterIterator::new(items.into_iter(), selection.predicate).collect();
 
             assert!(matches!(results[0], FilterResult::Pass(_)));
@@ -530,7 +547,7 @@ mod tests {
             ];
 
             // Query: licensing.duration > 200
-            let selection = parse_selection("licensing.duration > 200").unwrap();
+            let selection = resolve("licensing.duration > 200", TRACKS);
             let results: Vec<_> = FilterIterator::new(items.into_iter(), selection.predicate).collect();
 
             assert!(matches!(results[0], FilterResult::Skip(_)));
@@ -555,7 +572,7 @@ mod tests {
             ];
 
             // Query: licensing.active = true
-            let selection = parse_selection("licensing.active = true").unwrap();
+            let selection = resolve("licensing.active = true", TRACKS);
             let results: Vec<_> = FilterIterator::new(items.into_iter(), selection.predicate).collect();
 
             assert!(matches!(results[0], FilterResult::Pass(_)));
@@ -572,7 +589,7 @@ mod tests {
             )];
 
             // Query for non-existent path
-            let selection = parse_selection("licensing.nonexistent = 'value'").unwrap();
+            let selection = resolve("licensing.nonexistent = 'value'", TRACKS);
             let results: Vec<_> = FilterIterator::new(items.into_iter(), selection.predicate).collect();
 
             assert!(matches!(results[0], FilterResult::Error(_, _)));
@@ -602,7 +619,7 @@ mod tests {
             ];
 
             // Query: name = 'Track A' AND licensing.territory = 'US'
-            let selection = parse_selection("name = 'Track A' AND licensing.territory = 'US'").unwrap();
+            let selection = resolve("name = 'Track A' AND licensing.territory = 'US'", TRACKS);
             let results: Vec<_> = FilterIterator::new(items.into_iter(), selection.predicate).collect();
 
             assert!(matches!(results[0], FilterResult::Pass(_)));
@@ -611,14 +628,10 @@ mod tests {
         }
 
         #[test]
-        fn test_traverse_into_non_json_property_errors() {
-            let items = vec![TestItem::new("Alice", "30")];
-
-            // Try to traverse into a non-JSON property
-            let selection = parse_selection("name.nested = 'value'").unwrap();
-            let results: Vec<_> = FilterIterator::new(items.into_iter(), selection.predicate).collect();
-
-            assert!(matches!(results[0], FilterResult::Error(_, Error::PropertyNotFound(_))));
+        fn resolution_rejects_subpaths_on_non_json_properties() {
+            let error =
+                resolve_selection(&model(), &FixtureResolver(PEOPLE), parse_selection("name.nested = 'value'").unwrap()).unwrap_err();
+            assert!(matches!(error, ModelResolutionError::UnsupportedSubpath { .. }));
         }
 
         #[test]
@@ -630,7 +643,7 @@ mod tests {
             ];
 
             // Query: licensing.status = 'active' OR licensing.region = 'UK'
-            let selection = parse_selection("licensing.status = 'active' OR licensing.region = 'UK'").unwrap();
+            let selection = resolve("licensing.status = 'active' OR licensing.region = 'UK'", TRACKS);
             let results: Vec<_> = FilterIterator::new(items.into_iter(), selection.predicate).collect();
 
             assert!(matches!(results[0], FilterResult::Pass(_))); // active
@@ -647,7 +660,7 @@ mod tests {
             ];
 
             // Query: licensing.status IN ('active', 'pending')
-            let selection = parse_selection("licensing.status IN ('active', 'pending')").unwrap();
+            let selection = resolve("licensing.status IN ('active', 'pending')", TRACKS);
             let results: Vec<_> = FilterIterator::new(items.into_iter(), selection.predicate).collect();
 
             assert!(matches!(results[0], FilterResult::Pass(_)));
@@ -657,25 +670,23 @@ mod tests {
 
         #[test]
         fn test_collection_qualified_json_path() {
-            // Test: tracks.licensing.territory where "tracks" is the collection name
-            // This tests the collection-qualified path handling in evaluate_expr
+            // Test: tracks.licensing.territory where "tracks" is a model
+            // qualifier the resolver recognizes; resolution strips it and
+            // binds the remaining path.
             let items = vec![
                 TrackItem::new("Track A", serde_json::json!({ "territory": "US" })),
                 TrackItem::new("Track B", serde_json::json!({ "territory": "UK" })),
             ];
 
             // Query with collection prefix: tracks.licensing.territory = 'US'
-            let selection = parse_selection("tracks.licensing.territory = 'US'").unwrap();
+            let selection = resolve("tracks.licensing.territory = 'US'", TRACKS);
             let results: Vec<_> = FilterIterator::new(items.into_iter(), selection.predicate).collect();
 
             assert!(matches!(results[0], FilterResult::Pass(_)));
             assert!(matches!(results[1], FilterResult::Skip(_)));
         }
 
-        /// Tests for JSON-aware type casting behavior.
-        ///
-        /// HACK: We infer "JSON semantics" from multi-step paths.
-        /// TODO(Phase 3 - Schema Registry): Replace with proper property type lookup.
+        /// JSON comparisons are canonicalized during resolution and cast by the evaluator.
         mod json_type_casting {
             use super::*;
 
@@ -684,7 +695,7 @@ mod tests {
                 // JSON numbers matching literal numbers should work
                 let items = vec![TrackItem::new("Track A", serde_json::json!({ "count": 42 }))];
 
-                let selection = parse_selection("licensing.count = 42").unwrap();
+                let selection = resolve("licensing.count = 42", TRACKS);
                 let results: Vec<_> = FilterIterator::new(items.into_iter(), selection.predicate).collect();
 
                 assert!(matches!(results[0], FilterResult::Pass(_)));
@@ -699,7 +710,7 @@ mod tests {
                 )];
 
                 // Query with integer - should match via numeric casting
-                let selection = parse_selection("licensing.count > 42").unwrap();
+                let selection = resolve("licensing.count > 42", TRACKS);
                 let results: Vec<_> = FilterIterator::new(items.into_iter(), selection.predicate).collect();
 
                 assert!(matches!(results[0], FilterResult::Pass(_))); // 42.5 > 42
@@ -714,8 +725,8 @@ mod tests {
                     serde_json::json!({ "count": "42" }), // String, not number
                 )];
 
-                // Type resolver converts literal 42 to Json(42) for JSON path comparison
-                let selection = parse_with_types("licensing.count = 42");
+                // Canonicalization converts literal 42 to Json(42) for the sub-path comparison
+                let selection = resolve("licensing.count = 42", TRACKS);
                 let results: Vec<_> = FilterIterator::new(items.into_iter(), selection.predicate).collect();
 
                 // Should NOT pass - no string->number casting for JSON
@@ -730,8 +741,8 @@ mod tests {
                     serde_json::json!({ "count": 42 }), // Number, not string
                 )];
 
-                // Type resolver converts literal '42' to Json("42") for JSON path comparison
-                let selection = parse_with_types("licensing.count = '42'");
+                // Canonicalization converts literal '42' to Json("42") for the sub-path comparison
+                let selection = resolve("licensing.count = '42'", TRACKS);
                 let results: Vec<_> = FilterIterator::new(items.into_iter(), selection.predicate).collect();
 
                 // Should NOT pass - no number->string casting for JSON
@@ -743,8 +754,8 @@ mod tests {
                 // JSON string matching string literal should work
                 let items = vec![TrackItem::new("Track A", serde_json::json!({ "status": "active" }))];
 
-                // Type resolver converts literal to Json for JSON path comparison
-                let selection = parse_with_types("licensing.status = 'active'");
+                // Canonicalization converts the literal to Json for the sub-path comparison
+                let selection = resolve("licensing.status = 'active'", TRACKS);
                 let results: Vec<_> = FilterIterator::new(items.into_iter(), selection.predicate).collect();
 
                 assert!(matches!(results[0], FilterResult::Pass(_)));
@@ -759,22 +770,22 @@ mod tests {
                     TrackItem::new("C", serde_json::json!({ "score": 150 })),
                 ];
 
-                // > operator (type resolver converts literals to Json)
-                let selection = parse_with_types("licensing.score > 100");
+                // > operator (canonicalization converts literals to Json)
+                let selection = resolve("licensing.score > 100", TRACKS);
                 let results: Vec<_> = FilterIterator::new(items.clone().into_iter(), selection.predicate).collect();
                 assert!(matches!(results[0], FilterResult::Skip(_)));
                 assert!(matches!(results[1], FilterResult::Skip(_)));
                 assert!(matches!(results[2], FilterResult::Pass(_)));
 
                 // >= operator
-                let selection = parse_with_types("licensing.score >= 100");
+                let selection = resolve("licensing.score >= 100", TRACKS);
                 let results: Vec<_> = FilterIterator::new(items.clone().into_iter(), selection.predicate).collect();
                 assert!(matches!(results[0], FilterResult::Skip(_)));
                 assert!(matches!(results[1], FilterResult::Pass(_)));
                 assert!(matches!(results[2], FilterResult::Pass(_)));
 
                 // < operator
-                let selection = parse_with_types("licensing.score < 100");
+                let selection = resolve("licensing.score < 100", TRACKS);
                 let results: Vec<_> = FilterIterator::new(items.clone().into_iter(), selection.predicate).collect();
                 assert!(matches!(results[0], FilterResult::Pass(_)));
                 assert!(matches!(results[1], FilterResult::Skip(_)));
@@ -792,7 +803,7 @@ mod tests {
                 let items = vec![TestItem::new("Alice", "30")];
 
                 // Regular field with string value, queried with number
-                let selection = parse_selection("age = 30").unwrap();
+                let selection = resolve("age = 30", PEOPLE);
                 let results: Vec<_> = FilterIterator::new(items.into_iter(), selection.predicate).collect();
 
                 // Should pass - general casting allows string '30' to match integer 30

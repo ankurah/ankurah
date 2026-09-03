@@ -34,10 +34,10 @@ async fn test_deeper_branch_wins() -> Result<()> {
     let trx_deep1 = ctx.begin();
 
     // Shallow branch: B sets title at depth 1
-    record.edit(&trx_shallow)?.title().set(&"Shallow".to_owned())?;
+    record.edit(&trx_shallow)?.title()?.set(&"Shallow".to_owned())?;
 
     // Deep branch first event: C sets title at depth 1
-    record.edit(&trx_deep1)?.title().set(&"Deep-1".to_owned())?;
+    record.edit(&trx_deep1)?.title()?.set(&"Deep-1".to_owned())?;
 
     // Commit both - they're concurrent from A
     dag.enumerate(trx_shallow.commit_and_return_events().await?); // B
@@ -47,7 +47,7 @@ async fn test_deeper_branch_wins() -> Result<()> {
     // We need to get a fresh view that sees C
     let record = ctx.get::<RecordView>(record_id).await?;
     let trx_deep2 = ctx.begin();
-    record.edit(&trx_deep2)?.title().set(&"Deep-2".to_owned())?;
+    record.edit(&trx_deep2)?.title()?.set(&"Deep-2".to_owned())?;
     dag.enumerate(trx_deep2.commit_and_return_events().await?); // D
 
     // Verify DAG structure
@@ -96,21 +96,21 @@ async fn test_sequential_writes_last_wins() -> Result<()> {
     let record = ctx.get::<RecordView>(record_id).await?;
     {
         let trx = ctx.begin();
-        record.edit(&trx)?.title().set(&"Title-B".to_owned())?; // B
+        record.edit(&trx)?.title()?.set(&"Title-B".to_owned())?; // B
         dag.enumerate(trx.commit_and_return_events().await?);
     }
 
     let record = ctx.get::<RecordView>(record_id).await?;
     {
         let trx = ctx.begin();
-        record.edit(&trx)?.artist().set(&"Artist-C".to_owned())?; // C (different property)
+        record.edit(&trx)?.artist()?.set(&"Artist-C".to_owned())?; // C (different property)
         dag.enumerate(trx.commit_and_return_events().await?);
     }
 
     let record = ctx.get::<RecordView>(record_id).await?;
     {
         let trx = ctx.begin();
-        record.edit(&trx)?.title().set(&"Title-D".to_owned())?; // D
+        record.edit(&trx)?.title()?.set(&"Title-D".to_owned())?; // D
         dag.enumerate(trx.commit_and_return_events().await?);
     }
 
@@ -154,8 +154,8 @@ async fn test_lexicographic_tiebreak() -> Result<()> {
     let trx1 = ctx.begin();
     let trx2 = ctx.begin();
 
-    record.edit(&trx1)?.title().set(&"Title-B".to_owned())?;
-    record.edit(&trx2)?.title().set(&"Title-C".to_owned())?;
+    record.edit(&trx1)?.title()?.set(&"Title-B".to_owned())?;
+    record.edit(&trx2)?.title()?.set(&"Title-C".to_owned())?;
 
     dag.enumerate(trx1.commit_and_return_events().await?); // B
     dag.enumerate(trx2.commit_and_return_events().await?); // C
@@ -210,10 +210,10 @@ async fn test_per_property_concurrent_writes() -> Result<()> {
     let trx2 = ctx.begin();
 
     // Branch 1: sets title
-    record.edit(&trx1)?.title().set(&"Branch1-Title".to_owned())?;
+    record.edit(&trx1)?.title()?.set(&"Branch1-Title".to_owned())?;
 
     // Branch 2: sets artist
-    record.edit(&trx2)?.artist().set(&"Branch2-Artist".to_owned())?;
+    record.edit(&trx2)?.artist()?.set(&"Branch2-Artist".to_owned())?;
 
     // Now commit both - they're concurrent
     dag.enumerate(trx1.commit_and_return_events().await?); // B
@@ -241,7 +241,7 @@ async fn test_per_property_concurrent_writes() -> Result<()> {
     // Now create a merge event D
     let record = ctx.get::<RecordView>(record_id).await?;
     let trx = ctx.begin();
-    record.edit(&trx)?.title().set(&"Merged-Title".to_owned())?;
+    record.edit(&trx)?.title()?.set(&"Merged-Title".to_owned())?;
     dag.enumerate(trx.commit_and_return_events().await?); // D
 
     let events = collection.dump_entity_events(record_id).await?;
@@ -290,8 +290,8 @@ async fn test_lww_order_independence() -> Result<()> {
         let trx1 = ctx.begin();
         let trx2 = ctx.begin();
 
-        record.edit(&trx1)?.title().set(&"Value1".to_owned())?;
-        record.edit(&trx2)?.title().set(&"Value2".to_owned())?;
+        record.edit(&trx1)?.title()?.set(&"Value1".to_owned())?;
+        record.edit(&trx2)?.title()?.set(&"Value2".to_owned())?;
 
         dag.enumerate(trx1.commit_and_return_events().await?);
         dag.enumerate(trx2.commit_and_return_events().await?);

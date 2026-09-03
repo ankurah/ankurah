@@ -1,18 +1,18 @@
 use ankql::ast::Predicate;
-use ankurah_core::selection::filter::{Filterable, evaluate_predicate};
+use ankurah_core::selection::filter::{PathLookup, evaluate_predicate};
 use futures::Stream;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use crate::OrderByComponents;
 use crate::sorting::{LimitedStream, SortedStream, TopKStream};
+use crate::{EngineColumns, OrderByComponents};
 
 /// Stream of items that can provide property values for filtering, sorting, and limiting
 pub trait ValueSetStream: Stream + Unpin + Sized
-where Self::Item: Filterable
+where Self::Item: PathLookup<EngineColumns>
 {
     /// Filter stream items using a predicate
-    fn filter_predicate(self, predicate: &Predicate) -> FilteredStream<Self> { FilteredStream::new(self, predicate.clone()) }
+    fn filter_predicate(self, predicate: &Predicate<EngineColumns>) -> FilteredStream<Self> { FilteredStream::new(self, predicate.clone()) }
 
     /// Sort all items by OrderByComponents (partition-aware when presort is non-empty)
     fn sort_by(self, order_by: OrderByComponents) -> SortedStream<Self> { SortedStream::new(self, order_by) }
@@ -32,11 +32,11 @@ where Self::Item: Filterable
 /// Wrapper for filtered streams - passes through items matching a predicate
 pub struct FilteredStream<I> {
     pub inner: I,
-    pub predicate: Predicate,
+    pub predicate: Predicate<EngineColumns>,
 }
 
 impl<I> FilteredStream<I> {
-    pub fn new(inner: I, predicate: Predicate) -> Self { Self { inner, predicate } }
+    pub fn new(inner: I, predicate: Predicate<EngineColumns>) -> Self { Self { inner, predicate } }
 }
 
 impl<S: Unpin> Unpin for FilteredStream<S> {}
@@ -44,7 +44,7 @@ impl<S: Unpin> Unpin for FilteredStream<S> {}
 impl<S> Stream for FilteredStream<S>
 where
     S: Stream + Unpin,
-    S::Item: Filterable,
+    S::Item: PathLookup<EngineColumns>,
 {
     type Item = S::Item;
 
@@ -97,10 +97,10 @@ pub trait HasEntityId {
 
 // ExtractIdsStream implements EntityIdStream (via blanket impl) since it yields Result<EntityId, RetrievalError>
 
-// Blanket implementation for any Stream with Filterable items
+// Blanket implementation for any Stream whose items answer column lookups
 impl<S> ValueSetStream for S
 where
     S: Stream + Unpin,
-    S::Item: Filterable,
+    S::Item: PathLookup<EngineColumns>,
 {
 }

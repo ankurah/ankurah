@@ -38,15 +38,17 @@ impl SimNode {
     /// would, including the durable-peer bookkeeping that drives system join.
     pub fn connect_to(&self, peer: &SimNode) {
         let sender = SimSender::new(self.index, peer.id(), self.captured.clone());
-        self.node.register_peer(
-            proto::Presence {
-                node_id: peer.id(),
-                durable: peer.durable,
-                system_root: peer.node.system.root(),
-                protocol_version: proto::PROTOCOL_VERSION,
-            },
-            Box::new(sender),
-        );
+        self.node
+            .register_peer(
+                proto::Presence {
+                    node_id: peer.id(),
+                    durable: peer.durable,
+                    system_root: peer.node.system.root(),
+                    protocol_version: proto::PROTOCOL_VERSION,
+                },
+                Box::new(sender),
+            )
+            .expect("sim peers share this build's protocol version");
     }
 
     /// Ingest a forged batch of events directly through the production remote
@@ -131,9 +133,12 @@ pub async fn build_nodes(n: usize, captured: Captured) -> anyhow::Result<Vec<Sim
     assert!(n >= 1, "need at least one node");
     let mut nodes = Vec::with_capacity(n);
 
-    // Node 0: durable, creates the system.
-    let durable = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    // Plant the deterministic catalog before the durable node starts.
+    let durable_engine = Arc::new(SledStorageEngine::new_test()?);
+    crate::catalog_forge::plant(&*durable_engine, super::model::forged_catalog_rows()).await?;
+    let durable = Node::new_durable(durable_engine, PermissiveAgent::new());
     durable.system.create().await?;
+    durable.catalog.wait_ready().await?;
     nodes.push(SimNode { index: 0, durable: true, node: durable, captured: captured.clone() });
 
     // Nodes 1..n: ephemeral.
@@ -142,19 +147,33 @@ pub async fn build_nodes(n: usize, captured: Captured) -> anyhow::Result<Vec<Sim
         nodes.push(SimNode { index, durable: false, node, captured: captured.clone() });
     }
 
-    // The harness forges events and states directly, bypassing schema
-    // registration and the catalog relay. Seed and explicitly admit a complete
-    // deterministic `SimRecord` catalog on every node so commit admissibility
-    // can route each forged creation event's membership and the compiled
-    // binding is provably complete. The test-helper path keeps every id byte-identical
-    // across nodes and runs; hard_reset is not part of these scenarios.
-    let sim_model = proto::RegisteredModel {
+    // Ephemeral descriptors are seeded after those nodes become ready.
+    seed_sim_schema(&nodes[0])?;
+
+    Ok(nodes)
+}
+
+/// Seed and bind the deterministic `SimRecord` catalog on one node. The
+/// node's system must be READY (the seeded binding resolves under its
+/// schema epoch).
+pub fn seed_sim_schema(node: &SimNode) -> anyhow::Result<()> {
+    ankurah::core::test_helpers::seed_registered_schema(&node.node, SimRecord::descriptor(), &sim_model_definition())?;
+    Ok(())
+}
+
+/// Binds the deterministic `SimRecord` schema into one node's descriptor.
+fn sim_model_definition() -> proto::RegisteredModel {
+    proto::RegisteredModel {
         id: super::model::sim_model_id(),
         label: SimRecord::descriptor().label.to_owned(),
         name: "SimRecord".to_string(),
         properties: [Field::Title, Field::Body]
             .into_iter()
             .map(|field| proto::RegisteredProperty {
+                // The build_id echo is the correlator seeding binds each
+                // resolution onto its compiled field with, so the forged
+                // definition must carry the descriptor's real per-build ids.
+                build_id: SimRecord::descriptor().field_by_name(field.name()).expect("SimRecord declares this field").build_id,
                 id: super::model::sim_property_id(field),
                 membership_id: super::model::sim_membership_id(field),
                 name: field.name().to_string(),
@@ -165,10 +184,5 @@ pub async fn build_nodes(n: usize, captured: Captured) -> anyhow::Result<Vec<Sim
                 optional: false,
             })
             .collect(),
-    };
-    for node in &nodes {
-        node.node.catalog.seed_registered_schema(SimRecord::descriptor(), std::slice::from_ref(&sim_model))?;
     }
-
-    Ok(nodes)
 }

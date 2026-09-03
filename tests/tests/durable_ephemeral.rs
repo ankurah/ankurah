@@ -41,8 +41,8 @@ async fn test_ephemeral_writes_durable_receives() -> Result<()> {
     let trx1 = ctx_e.begin();
     let trx2 = ctx_e.begin();
 
-    album_e.edit(&trx1)?.name().replace("Name-E1")?;
-    album_e.edit(&trx2)?.year().replace("2025")?;
+    album_e.edit(&trx1)?.name()?.replace("Name-E1")?;
+    album_e.edit(&trx2)?.year()?.replace("2025")?;
     dag.enumerate(trx1.commit_and_return_events().await?); // B
     dag.enumerate(trx2.commit_and_return_events().await?); // C
 
@@ -100,8 +100,8 @@ async fn test_durable_writes_ephemeral_observes() -> Result<()> {
     let trx1 = ctx_d.begin();
     let trx2 = ctx_d.begin();
 
-    album_d.edit(&trx1)?.name().replace("Name-D1")?;
-    album_d.edit(&trx2)?.name().replace("Name-D2")?;
+    album_d.edit(&trx1)?.name()?.replace("Name-D1")?;
+    album_d.edit(&trx2)?.name()?.replace("Name-D2")?;
 
     dag.enumerate(trx1.commit_and_return_events().await?); // B
     dag.enumerate(trx2.commit_and_return_events().await?); // C
@@ -157,8 +157,8 @@ async fn test_durable_vs_ephemeral_concurrent_write() -> Result<()> {
     let trx_e = ctx_e.begin();
 
     // Different properties to avoid conflict - each node sets one
-    album_d.edit(&trx_d)?.name().replace("Name-from-D")?;
-    album_e.edit(&trx_e)?.year().replace("2025")?;
+    album_d.edit(&trx_d)?.name()?.replace("Name-from-D")?;
+    album_e.edit(&trx_e)?.year()?.replace("2025")?;
 
     // Commit both
     dag.enumerate(trx_d.commit_and_return_events().await?); // B
@@ -223,7 +223,7 @@ async fn test_late_arriving_branch() -> Result<()> {
     for i in 1..=20 {
         let album = ctx_d.get::<AlbumView>(album_id).await?;
         let trx = ctx_d.begin();
-        album.edit(&trx)?.year().replace(&format!("{}", i))?;
+        album.edit(&trx)?.year()?.replace(&format!("{}", i))?;
         trx.commit().await?;
     }
 
@@ -238,7 +238,7 @@ async fn test_late_arriving_branch() -> Result<()> {
     // This simulates a "late-arriving branch" - ephemeral's update will fork from
     // its current head (which includes all 20 events)
     let trx_e = ctx_e.begin();
-    album_e.edit(&trx_e)?.name().replace("Late-Branch")?;
+    album_e.edit(&trx_e)?.name()?.replace("Late-Branch")?;
     trx_e.commit().await?;
 
     // Wait for propagation
