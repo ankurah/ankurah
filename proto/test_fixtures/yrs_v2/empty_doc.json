@@ -1,0 +1,10 @@
+{
+  "applies_on_top_of": null,
+  "encoding": "yrs 0.24.0 update, lib0 v2 encoding (encode_state_as_update_v2 / encode_diff_v2)",
+  "fixture": "empty_doc.bin",
+  "note": "A doc with no roots and no edits. Full-state encoding of nothing.",
+  "offset_kind": "Bytes (yrs Options default): Text insert/remove indices are UTF-8 byte offsets, not UTF-16 code units and not Unicode scalar counts",
+  "state_vector": {},
+  "text_fields": {},
+  "total_len": 13
+}

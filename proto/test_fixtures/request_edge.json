@@ -1,0 +1,265 @@
+{
+  "encoding": "bincode 1.3 `serialize` defaults: fixed-width integers, little-endian, u64 sequence/string length prefixes, u32 enum variant tags, 1-byte Option tag, no length prefix on fixed-size arrays",
+  "fixture": "request_edge.bin",
+  "items": [
+    {
+      "json": {
+        "CommitTransaction": {
+          "events": [],
+          "id": "00000000000000000000000009"
+        }
+      },
+      "label": "commit_transaction_no_events",
+      "len": 46,
+      "offset": 0,
+      "type": "NodeRequestBody"
+    },
+    {
+      "json": {
+        "CommitTransaction": {
+          "events": [
+            {
+              "attestations": [
+                [
+                  66,
+                  67
+                ],
+                [
+                  68,
+                  69,
+                  70
+                ]
+              ],
+              "payload": {
+                "collection": "test_collection",
+                "entity_id": "AAECAwQFBgcICQoLDA0ODw",
+                "operations": {
+                  "backend_a": [
+                    {
+                      "diff": [
+                        170,
+                        187
+                      ]
+                    },
+                    {
+                      "diff": [
+                        204
+                      ]
+                    }
+                  ],
+                  "backend_b": [
+                    {
+                      "diff": [
+                        221,
+                        238,
+                        255
+                      ]
+                    }
+                  ]
+                },
+                "parent": [
+                  "EBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8"
+                ]
+              }
+            },
+            {
+              "attestations": [],
+              "payload": {
+                "collection": "日本語",
+                "entity_id": "ERITFBUWFxgZGhscHR4fIA",
+                "operations": {},
+                "parent": []
+              }
+            }
+          ],
+          "id": "00000000000000000000000010"
+        }
+      },
+      "label": "commit_transaction_two_events",
+      "len": 299,
+      "offset": 46,
+      "type": "NodeRequestBody"
+    },
+    {
+      "json": {
+        "Get": {
+          "collection": "",
+          "ids": []
+        }
+      },
+      "label": "get_no_ids",
+      "len": 20,
+      "offset": 345,
+      "type": "NodeRequestBody"
+    },
+    {
+      "json": {
+        "GetEvents": {
+          "collection": "🚀🌍",
+          "event_ids": []
+        }
+      },
+      "label": "get_events_no_ids",
+      "len": 28,
+      "offset": 365,
+      "type": "NodeRequestBody"
+    },
+    {
+      "json": {
+        "Fetch": {
+          "collection": "users",
+          "known_matches": [],
+          "selection": {
+            "limit": 4294967296,
+            "order_by": [
+              {
+                "direction": "Desc",
+                "path": {
+                  "steps": [
+                    "score"
+                  ]
+                }
+              }
+            ],
+            "predicate": {
+              "And": [
+                {
+                  "Comparison": {
+                    "left": {
+                      "Path": {
+                        "steps": [
+                          "status"
+                        ]
+                      }
+                    },
+                    "operator": "Equal",
+                    "right": {
+                      "Literal": {
+                        "String": "active"
+                      }
+                    }
+                  }
+                },
+                {
+                  "Comparison": {
+                    "left": {
+                      "Path": {
+                        "steps": [
+                          "score"
+                        ]
+                      }
+                    },
+                    "operator": "GreaterThanOrEqual",
+                    "right": {
+                      "Literal": {
+                        "F64": 1.5
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "label": "fetch_rich_selection_no_known_matches",
+      "len": 177,
+      "offset": 393,
+      "type": "NodeRequestBody"
+    },
+    {
+      "json": {
+        "SubscribeQuery": {
+          "collection": "users",
+          "known_matches": [
+            {
+              "entity_id": "ICEiIyQlJicoKSorLC0uLw",
+              "head": [
+                "EBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8"
+              ]
+            },
+            {
+              "entity_id": "mZqbnJ2en6ChoqOkpaanqA",
+              "head": []
+            }
+          ],
+          "query_id": "7ZZZZZZZZZ0000000000000000",
+          "selection": {
+            "limit": 4294967296,
+            "order_by": [
+              {
+                "direction": "Desc",
+                "path": {
+                  "steps": [
+                    "score"
+                  ]
+                }
+              }
+            ],
+            "predicate": {
+              "And": [
+                {
+                  "Comparison": {
+                    "left": {
+                      "Path": {
+                        "steps": [
+                          "status"
+                        ]
+                      }
+                    },
+                    "operator": "Equal",
+                    "right": {
+                      "Literal": {
+                        "String": "active"
+                      }
+                    }
+                  }
+                },
+                {
+                  "Comparison": {
+                    "left": {
+                      "Path": {
+                        "steps": [
+                          "score"
+                        ]
+                      }
+                    },
+                    "operator": "GreaterThanOrEqual",
+                    "right": {
+                      "Literal": {
+                        "F64": 1.5
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          },
+          "version": 4294967295
+        }
+      },
+      "label": "subscribe_query_max_version_two_known",
+      "len": 295,
+      "offset": 570,
+      "type": "NodeRequestBody"
+    },
+    {
+      "json": {
+        "body": {
+          "Get": {
+            "collection": "",
+            "ids": []
+          }
+        },
+        "from": "AAECAwQFBgcICQoLDA0ODw",
+        "id": "00000000000000000000000000",
+        "to": "AAECAwQFBgcICQoLDA0ODw"
+      },
+      "label": "node_request_all_zero_ids",
+      "len": 86,
+      "offset": 865,
+      "type": "NodeRequest"
+    }
+  ],
+  "total_len": 951
+}

@@ -1,0 +1,37 @@
+{
+  "encoding": "bincode 1.3 `serialize` defaults: fixed-width integers, little-endian, u64 sequence/string length prefixes, u32 enum variant tags, 1-byte Option tag, no length prefix on fixed-size arrays",
+  "fixture": "causal_assertion.bin",
+  "items": [
+    {
+      "json": {
+        "entity_id": "EBESExQVFhcYGRobHB0eHw",
+        "other": [
+          "EBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8",
+          "MDEyMzQ1Njc4OTo7PD0-P0BBQkNERUZHSElKS0xNTk8",
+          "UFFSU1RVVldYWVpbXF1eX2BhYmNkZWZnaGlqa2xtbm8"
+        ],
+        "relation": "StrictDescends",
+        "subject": [
+          "EBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8"
+        ]
+      },
+      "label": "strict_descends",
+      "len": 164,
+      "offset": 0,
+      "type": "CausalAssertion"
+    },
+    {
+      "json": {
+        "entity_id": "ICEiIyQlJicoKSorLC0uLw",
+        "other": [],
+        "relation": "Equal",
+        "subject": []
+      },
+      "label": "equal",
+      "len": 36,
+      "offset": 164,
+      "type": "CausalAssertion"
+    }
+  ],
+  "total_len": 200
+}

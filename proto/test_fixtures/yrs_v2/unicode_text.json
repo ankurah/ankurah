@@ -1,0 +1,14 @@
+{
+  "applies_on_top_of": null,
+  "encoding": "yrs 0.24.0 update, lib0 v2 encoding (encode_state_as_update_v2 / encode_diff_v2)",
+  "fixture": "unicode_text.bin",
+  "note": "Inserts and a delete positioned by UTF-8 byte offset across 2-, 3- and 4-byte sequences. The final string is 'café 日本 🚀'; a UTF-16-indexed port computes different positions and produces different text.",
+  "offset_kind": "Bytes (yrs Options default): Text insert/remove indices are UTF-8 byte offsets, not UTF-16 code units and not Unicode scalar counts",
+  "state_vector": {
+    "6": 11
+  },
+  "text_fields": {
+    "content": "café 日本 🚀"
+  },
+  "total_len": 57
+}

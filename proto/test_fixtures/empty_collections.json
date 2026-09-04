@@ -1,0 +1,141 @@
+{
+  "encoding": "bincode 1.3 `serialize` defaults: fixed-width integers, little-endian, u64 sequence/string length prefixes, u32 enum variant tags, 1-byte Option tag, no length prefix on fixed-size arrays",
+  "fixture": "empty_collections.bin",
+  "items": [
+    {
+      "json": [],
+      "label": "clock_empty",
+      "len": 8,
+      "offset": 0,
+      "type": "Clock"
+    },
+    {
+      "json": {
+        "diff": []
+      },
+      "label": "operation_empty_diff",
+      "len": 8,
+      "offset": 8,
+      "type": "Operation"
+    },
+    {
+      "json": {},
+      "label": "operation_set_empty",
+      "len": 8,
+      "offset": 16,
+      "type": "OperationSet"
+    },
+    {
+      "json": {
+        "empty_list": [],
+        "one_empty_diff": [
+          {
+            "diff": []
+          }
+        ]
+      },
+      "label": "operation_set_empty_inner",
+      "len": 72,
+      "offset": 24,
+      "type": "OperationSet"
+    },
+    {
+      "json": {},
+      "label": "state_buffers_empty",
+      "len": 8,
+      "offset": 96,
+      "type": "StateBuffers"
+    },
+    {
+      "json": {
+        "zero_len": []
+      },
+      "label": "state_buffers_empty_inner",
+      "len": 32,
+      "offset": 104,
+      "type": "StateBuffers"
+    },
+    {
+      "json": {
+        "head": [],
+        "state_buffers": {}
+      },
+      "label": "state_empty",
+      "len": 16,
+      "offset": 136,
+      "type": "State"
+    },
+    {
+      "json": [],
+      "label": "attestation_zero_length",
+      "len": 8,
+      "offset": 152,
+      "type": "Attestation"
+    },
+    {
+      "json": [
+        []
+      ],
+      "label": "attestation_set_one_empty",
+      "len": 16,
+      "offset": 160,
+      "type": "AttestationSet"
+    },
+    {
+      "json": {
+        "attestations": [],
+        "operations": {},
+        "parent": []
+      },
+      "label": "event_fragment_empty",
+      "len": 24,
+      "offset": 176,
+      "type": "EventFragment"
+    },
+    {
+      "json": {
+        "attestations": [],
+        "state": {
+          "head": [],
+          "state_buffers": {}
+        }
+      },
+      "label": "state_fragment_empty",
+      "len": 24,
+      "offset": 200,
+      "type": "StateFragment"
+    },
+    {
+      "json": {
+        "collection": "",
+        "entity_id": "AAECAwQFBgcICQoLDA0ODw",
+        "state": {
+          "head": [],
+          "state_buffers": {}
+        }
+      },
+      "label": "entity_state_empty",
+      "len": 40,
+      "offset": 224,
+      "type": "EntityState"
+    },
+    {
+      "json": {
+        "attestations": [],
+        "payload": {
+          "collection": "",
+          "entity_id": "AAECAwQFBgcICQoLDA0ODw",
+          "state": {
+            "head": [],
+            "state_buffers": {}
+          }
+        }
+      },
+      "label": "attested_entity_state_empty",
+      "len": 48,
+      "offset": 264,
+      "type": "Attested<EntityState>"
+    }
+  ],
+  "total_len": 312
+}

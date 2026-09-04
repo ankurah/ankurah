@@ -1,0 +1,15 @@
+{
+  "applies_on_top_of": null,
+  "encoding": "yrs 0.24.0 update, lib0 v2 encoding (encode_state_as_update_v2 / encode_diff_v2)",
+  "fixture": "concurrent_merge.bin",
+  "note": "Clients 10 and 20 both insert at index 0 without seeing each other. The merged order is decided by client id, so the resulting string pins the conflict-resolution rule, not just the byte layout.",
+  "offset_kind": "Bytes (yrs Options default): Text insert/remove indices are UTF-8 byte offsets, not UTF-16 code units and not Unicode scalar counts",
+  "state_vector": {
+    "10": 5,
+    "20": 5
+  },
+  "text_fields": {
+    "content": "HelloWorld"
+  },
+  "total_len": 49
+}

@@ -1,0 +1,166 @@
+{
+  "encoding": "bincode 1.3 `serialize` defaults: fixed-width integers, little-endian, u64 sequence/string length prefixes, u32 enum variant tags, 1-byte Option tag, no length prefix on fixed-size arrays",
+  "fixture": "unicode.bin",
+  "items": [
+    {
+      "json": "café",
+      "label": "collection_id_2byte",
+      "len": 13,
+      "offset": 0,
+      "type": "CollectionId"
+    },
+    {
+      "json": "日本語",
+      "label": "collection_id_3byte",
+      "len": 17,
+      "offset": 13,
+      "type": "CollectionId"
+    },
+    {
+      "json": "🚀🌍",
+      "label": "collection_id_4byte_surrogate_pair",
+      "len": 16,
+      "offset": 30,
+      "type": "CollectionId"
+    },
+    {
+      "json": "café",
+      "label": "collection_id_combining_mark",
+      "len": 14,
+      "offset": 46,
+      "type": "CollectionId"
+    },
+    {
+      "json": "مرحبا",
+      "label": "collection_id_rtl",
+      "len": 18,
+      "offset": 60,
+      "type": "CollectionId"
+    },
+    {
+      "json": "a\u0000b",
+      "label": "collection_id_interior_nul",
+      "len": 11,
+      "offset": 78,
+      "type": "CollectionId"
+    },
+    {
+      "json": "",
+      "label": "collection_id_empty",
+      "len": 8,
+      "offset": 89,
+      "type": "CollectionId"
+    },
+    {
+      "json": {
+        "日本語": [
+          {
+            "diff": [
+              1,
+              2
+            ]
+          }
+        ],
+        "🚀🌍": [
+          {
+            "diff": [
+              3
+            ]
+          }
+        ]
+      },
+      "label": "operation_set_non_ascii_keys",
+      "len": 76,
+      "offset": 97,
+      "type": "OperationSet"
+    },
+    {
+      "json": {
+        "a\u0000b": [],
+        "café": [
+          10,
+          11
+        ],
+        "مرحبا": [
+          12
+        ]
+      },
+      "label": "state_buffers_non_ascii_keys",
+      "len": 77,
+      "offset": 173,
+      "type": "StateBuffers"
+    },
+    {
+      "json": {
+        "collection": "café 日本語 🚀 مرحبا",
+        "entity_id": "d3h5ent8fX5_gIGCg4SFhg",
+        "state": {
+          "head": [
+            "EBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8"
+          ],
+          "state_buffers": {
+            "a\u0000b": [],
+            "café": [
+              10,
+              11
+            ],
+            "مرحبا": [
+              12
+            ]
+          }
+        }
+      },
+      "label": "entity_state_non_ascii",
+      "len": 172,
+      "offset": 250,
+      "type": "EntityState"
+    },
+    {
+      "json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "日本語",
+                  "🚀🌍"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "String": "café 日本語 🚀 مرحبا"
+              }
+            }
+          }
+        }
+      },
+      "label": "selection_non_ascii",
+      "len": 102,
+      "offset": 422,
+      "type": "ankql::ast::Selection"
+    },
+    {
+      "json": {
+        "Error": "café 日本語 🚀 مرحبا"
+      },
+      "label": "response_error_non_ascii",
+      "len": 43,
+      "offset": 524,
+      "type": "NodeResponseBody::Error"
+    },
+    {
+      "json": {
+        "Error": ""
+      },
+      "label": "update_ack_error_empty",
+      "len": 12,
+      "offset": 567,
+      "type": "NodeUpdateAckBody::Error"
+    }
+  ],
+  "total_len": 579
+}

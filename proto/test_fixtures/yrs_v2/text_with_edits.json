@@ -1,0 +1,14 @@
+{
+  "applies_on_top_of": null,
+  "encoding": "yrs 0.24.0 update, lib0 v2 encoding (encode_state_as_update_v2 / encode_diff_v2)",
+  "fixture": "text_with_edits.bin",
+  "note": "Three transactions including a delete, so the encoding carries a delete set and split blocks - the rendered string is shorter than the block content.",
+  "offset_kind": "Bytes (yrs Options default): Text insert/remove indices are UTF-8 byte offsets, not UTF-16 code units and not Unicode scalar counts",
+  "state_vector": {
+    "3": 14
+  },
+  "text_fields": {
+    "content": "Hello, World!"
+  },
+  "total_len": 62
+}

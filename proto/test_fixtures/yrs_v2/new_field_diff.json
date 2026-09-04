@@ -1,0 +1,15 @@
+{
+  "applies_on_top_of": "new_field_base.bin",
+  "encoding": "yrs 0.24.0 update, lib0 v2 encoding (encode_state_as_update_v2 / encode_diff_v2)",
+  "fixture": "new_field_diff.bin",
+  "note": "Diff that introduces a root field absent from the base. text_fields and state_vector describe the doc after applying this on top of new_field_base.bin.",
+  "offset_kind": "Bytes (yrs Options default): Text insert/remove indices are UTF-8 byte offsets, not UTF-16 code units and not Unicode scalar counts",
+  "state_vector": {
+    "7": 19
+  },
+  "text_fields": {
+    "body": "Added later",
+    "title": "Original"
+  },
+  "total_len": 35
+}

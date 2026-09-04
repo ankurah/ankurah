@@ -1,0 +1,112 @@
+{
+  "decoded": {
+    "collection": "album",
+    "entity_id": "QkNERUZHSElKS0xNTk9QUQ",
+    "operations": {
+      "lww": [
+        {
+          "diff": [
+            1,
+            62,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            2,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            4,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            110,
+            97,
+            109,
+            101,
+            1,
+            5,
+            0,
+            0,
+            0,
+            8,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            73,
+            99,
+            101,
+            32,
+            78,
+            105,
+            110,
+            101,
+            4,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            121,
+            101,
+            97,
+            114,
+            1,
+            1,
+            0,
+            0,
+            0,
+            201,
+            7,
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    "parent": []
+  },
+  "encoding": "bincode 1.3 `serialize` defaults: fixed-width integers, little-endian, u64 sequence/string length prefixes, u32 enum variant tags, 1-byte Option tag, no length prefix on fixed-size arrays",
+  "event_id_base64": "oZnHWa3KeMaKkzniRS_Dg-FcDTa3BTjmD-pmnyXe47Y",
+  "fixture": "event.bin",
+  "note": "`event_id_base64` is EventId::from_parts(entity_id, operations, parent), a SHA-256 over the three bincode encodings in that order. Matching it proves the port encoded all three identically at once; collection is deliberately not part of the hash.",
+  "operations_decoded": {
+    "lww": [
+      {
+        "name": {
+          "String": "Ice Nine"
+        },
+        "year": {
+          "I32": 1993
+        }
+      }
+    ]
+  },
+  "produced_by": "bincode::serialize(&Event) assembled from LWWBackend::to_operations()",
+  "scenario": [
+    "Entity::create(entity_id(0x42), CollectionId::from(\"album\"))",
+    "get_backend::<LWWBackend>()",
+    "set(\"name\", Some(String(\"Ice Nine\")))",
+    "set(\"year\", Some(I32(1993)))",
+    "OperationSet({ \"lww\": to_operations() })",
+    "parent = entity.head()  // empty: this is a create"
+  ],
+  "total_len": 143
+}

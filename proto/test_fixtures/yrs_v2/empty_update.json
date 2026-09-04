@@ -1,0 +1,23 @@
+{
+  "applies_on_top_of": null,
+  "bytes": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    1,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+  ],
+  "encoding": "yrs 0.24.0 update, lib0 v2 encoding (encode_state_as_update_v2 / encode_diff_v2)",
+  "fixture": "empty_update.bin",
+  "note": "yrs::Update::EMPTY_V2 - the sentinel YrsBackend::to_operations compares against to decide a backend produced no operations. Applying it is a no-op.",
+  "offset_kind": "Bytes (yrs Options default): Text insert/remove indices are UTF-8 byte offsets, not UTF-16 code units and not Unicode scalar counts",
+  "total_len": 13
+}

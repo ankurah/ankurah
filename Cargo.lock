@@ -38,6 +38,7 @@ version = "0.7.21"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "bincode",
  "env_logger",
  "log",
  "pest",
@@ -247,6 +248,7 @@ dependencies = [
  "futures",
  "indexmap 2.12.1",
  "serde",
+ "serde_json",
  "tracing",
 ]
 

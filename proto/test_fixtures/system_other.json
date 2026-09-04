@@ -1,0 +1,36 @@
+{
+  "encoding": "bincode 1.3 `serialize` defaults: fixed-width integers, little-endian, u64 sequence/string length prefixes, u32 enum variant tags, 1-byte Option tag, no length prefix on fixed-size arrays",
+  "fixture": "system_other.bin",
+  "items": [
+    {
+      "json": "Other",
+      "label": "other",
+      "len": 4,
+      "offset": 0,
+      "type": "sys::Item"
+    },
+    {
+      "json": {
+        "Collection": {
+          "name": "café 日本語 🚀 مرحبا"
+        }
+      },
+      "label": "collection_non_ascii",
+      "len": 43,
+      "offset": 4,
+      "type": "sys::Item"
+    },
+    {
+      "json": {
+        "Collection": {
+          "name": ""
+        }
+      },
+      "label": "collection_empty_name",
+      "len": 12,
+      "offset": 47,
+      "type": "sys::Item"
+    }
+  ],
+  "total_len": 59
+}

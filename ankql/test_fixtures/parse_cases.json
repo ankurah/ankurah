@@ -1,0 +1,2630 @@
+{
+  "accept": [
+    {
+      "ast_bincode_hex": "0000000001000000010000000000000004000000000000006e616d650000000000000000050000000400000000000000746573740000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "name"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "String": "test"
+              }
+            }
+          }
+        }
+      },
+      "note": "baseline equality",
+      "predicate_sql": "\"name\" = 'test'",
+      "predicate_sql_error": null,
+      "query": "name = 'test'",
+      "roundtrip_sql": "\"name\" = 'test'"
+    },
+    {
+      "ast_bincode_hex": "0000000001000000010000000000000004000000000000006e616d650100000000000000050000000400000000000000746573740000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "name"
+                ]
+              }
+            },
+            "operator": "NotEqual",
+            "right": {
+              "Literal": {
+                "String": "test"
+              }
+            }
+          }
+        }
+      },
+      "note": "not-equal, SQL spelling",
+      "predicate_sql": "\"name\" <> 'test'",
+      "predicate_sql_error": null,
+      "query": "name <> 'test'",
+      "roundtrip_sql": "\"name\" <> 'test'"
+    },
+    {
+      "ast_bincode_hex": "0000000001000000010000000000000004000000000000006e616d650100000000000000050000000400000000000000746573740000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "name"
+                ]
+              }
+            },
+            "operator": "NotEqual",
+            "right": {
+              "Literal": {
+                "String": "test"
+              }
+            }
+          }
+        }
+      },
+      "note": "not-equal, C spelling - must produce the identical AST to the <> case",
+      "predicate_sql": "\"name\" <> 'test'",
+      "predicate_sql_error": null,
+      "query": "name != 'test'",
+      "roundtrip_sql": "\"name\" <> 'test'"
+    },
+    {
+      "ast_bincode_hex": "00000000010000000100000000000000050000000000000073636f7265020000000000000001000000050000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "score"
+                ]
+              }
+            },
+            "operator": "GreaterThan",
+            "right": {
+              "Literal": {
+                "I32": 5
+              }
+            }
+          }
+        }
+      },
+      "note": "greater than",
+      "predicate_sql": "\"score\" > 5",
+      "predicate_sql_error": null,
+      "query": "score > 5",
+      "roundtrip_sql": "\"score\" > 5"
+    },
+    {
+      "ast_bincode_hex": "00000000010000000100000000000000050000000000000073636f7265030000000000000001000000050000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "score"
+                ]
+              }
+            },
+            "operator": "GreaterThanOrEqual",
+            "right": {
+              "Literal": {
+                "I32": 5
+              }
+            }
+          }
+        }
+      },
+      "note": "greater or equal - the grammar tries GtEq before Gt, so this is one operator, not '>' followed by '='",
+      "predicate_sql": "\"score\" >= 5",
+      "predicate_sql_error": null,
+      "query": "score >= 5",
+      "roundtrip_sql": "\"score\" >= 5"
+    },
+    {
+      "ast_bincode_hex": "00000000010000000100000000000000050000000000000073636f7265040000000000000001000000050000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "score"
+                ]
+              }
+            },
+            "operator": "LessThan",
+            "right": {
+              "Literal": {
+                "I32": 5
+              }
+            }
+          }
+        }
+      },
+      "note": "less than",
+      "predicate_sql": "\"score\" < 5",
+      "predicate_sql_error": null,
+      "query": "score < 5",
+      "roundtrip_sql": "\"score\" < 5"
+    },
+    {
+      "ast_bincode_hex": "00000000010000000100000000000000050000000000000073636f7265050000000000000001000000050000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "score"
+                ]
+              }
+            },
+            "operator": "LessThanOrEqual",
+            "right": {
+              "Literal": {
+                "I32": 5
+              }
+            }
+          }
+        }
+      },
+      "note": "less or equal",
+      "predicate_sql": "\"score\" <= 5",
+      "predicate_sql_error": null,
+      "query": "score <= 5",
+      "roundtrip_sql": "\"score\" <= 5"
+    },
+    {
+      "ast_bincode_hex": "00000000010000000100000000000000060000000000000073746174757306000000040000000200000000000000000000000500000001000000000000006100000000050000000100000000000000620000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "status"
+                ]
+              }
+            },
+            "operator": "In",
+            "right": {
+              "ExprList": [
+                {
+                  "Literal": {
+                    "String": "a"
+                  }
+                },
+                {
+                  "Literal": {
+                    "String": "b"
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "note": "IN with a two-element row",
+      "predicate_sql": "\"status\" IN ('a', 'b')",
+      "predicate_sql_error": null,
+      "query": "status IN ('a', 'b')",
+      "roundtrip_sql": "\"status\" IN ('a', 'b')"
+    },
+    {
+      "ast_bincode_hex": "00000000010000000100000000000000060000000000000073746174757306000000040000000200000000000000000000000500000001000000000000006100000000050000000100000000000000620000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "status"
+                ]
+              }
+            },
+            "operator": "In",
+            "right": {
+              "ExprList": [
+                {
+                  "Literal": {
+                    "String": "a"
+                  }
+                },
+                {
+                  "Literal": {
+                    "String": "b"
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "note": "NOT IN - the grammar's In rule swallows an optional leading NOT, so watch which operator comes out",
+      "predicate_sql": "\"status\" IN ('a', 'b')",
+      "predicate_sql_error": null,
+      "query": "status NOT IN ('a', 'b')",
+      "roundtrip_sql": "\"status\" IN ('a', 'b')"
+    },
+    {
+      "ast_bincode_hex": "0000000001000000010000000000000001000000000000006e000000000000000001000000000000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "n"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "I32": 0
+              }
+            }
+          }
+        }
+      },
+      "note": "zero",
+      "predicate_sql": "\"n\" = 0",
+      "predicate_sql_error": null,
+      "query": "n = 0",
+      "roundtrip_sql": "\"n\" = 0"
+    },
+    {
+      "ast_bincode_hex": "0000000001000000010000000000000001000000000000006e000000000000000001000000010000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "n"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "I32": 1
+              }
+            }
+          }
+        }
+      },
+      "note": "one",
+      "predicate_sql": "\"n\" = 1",
+      "predicate_sql_error": null,
+      "query": "n = 1",
+      "roundtrip_sql": "\"n\" = 1"
+    },
+    {
+      "ast_bincode_hex": "0000000001000000010000000000000001000000000000006e000000000000000001000000ff7f00000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "n"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "I32": 32767
+              }
+            }
+          }
+        }
+      },
+      "note": "i16::MAX - does the parser ever emit Literal::I16?",
+      "predicate_sql": "\"n\" = 32767",
+      "predicate_sql_error": null,
+      "query": "n = 32767",
+      "roundtrip_sql": "\"n\" = 32767"
+    },
+    {
+      "ast_bincode_hex": "0000000001000000010000000000000001000000000000006e000000000000000001000000008000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "n"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "I32": 32768
+              }
+            }
+          }
+        }
+      },
+      "note": "i16::MAX + 1",
+      "predicate_sql": "\"n\" = 32768",
+      "predicate_sql_error": null,
+      "query": "n = 32768",
+      "roundtrip_sql": "\"n\" = 32768"
+    },
+    {
+      "ast_bincode_hex": "0000000001000000010000000000000001000000000000006e000000000000000001000000feffff7f0000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "n"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "I32": 2147483646
+              }
+            }
+          }
+        }
+      },
+      "note": "i32::MAX - 1",
+      "predicate_sql": "\"n\" = 2147483646",
+      "predicate_sql_error": null,
+      "query": "n = 2147483646",
+      "roundtrip_sql": "\"n\" = 2147483646"
+    },
+    {
+      "ast_bincode_hex": "0000000001000000010000000000000001000000000000006e000000000000000002000000ffffff7f000000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "n"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "I64": 2147483647
+              }
+            }
+          }
+        }
+      },
+      "note": "i32::MAX exactly - parse_number's bound is a strict <, so this is the boundary that decides I32 vs I64",
+      "predicate_sql": "\"n\" = 2147483647",
+      "predicate_sql_error": null,
+      "query": "n = 2147483647",
+      "roundtrip_sql": "\"n\" = 2147483647"
+    },
+    {
+      "ast_bincode_hex": "0000000001000000010000000000000001000000000000006e00000000000000000200000000000080000000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "n"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "I64": 2147483648
+              }
+            }
+          }
+        }
+      },
+      "note": "i32::MAX + 1",
+      "predicate_sql": "\"n\" = 2147483648",
+      "predicate_sql_error": null,
+      "query": "n = 2147483648",
+      "roundtrip_sql": "\"n\" = 2147483648"
+    },
+    {
+      "ast_bincode_hex": "0000000001000000010000000000000001000000000000006e00000000000000000200000001000000000020000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "n"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "I64": 9007199254740993
+              }
+            }
+          }
+        }
+      },
+      "note": "2^53 + 1 - the first integer a JS number cannot hold exactly",
+      "predicate_sql": "\"n\" = 9007199254740993",
+      "predicate_sql_error": null,
+      "query": "n = 9007199254740993",
+      "roundtrip_sql": "\"n\" = 9007199254740993"
+    },
+    {
+      "ast_bincode_hex": "0000000001000000010000000000000001000000000000006e000000000000000002000000ffffffffffffff7f0000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "n"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "I64": 9223372036854775807
+              }
+            }
+          }
+        }
+      },
+      "note": "i64::MAX",
+      "predicate_sql": "\"n\" = 9223372036854775807",
+      "predicate_sql_error": null,
+      "query": "n = 9223372036854775807",
+      "roundtrip_sql": "\"n\" = 9223372036854775807"
+    },
+    {
+      "ast_bincode_hex": "050000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": "True"
+      },
+      "note": "bare TRUE as the whole predicate",
+      "predicate_sql": "TRUE",
+      "predicate_sql_error": null,
+      "query": "TRUE",
+      "roundtrip_sql": "TRUE"
+    },
+    {
+      "ast_bincode_hex": "050000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": "True"
+      },
+      "note": "lowercase true",
+      "predicate_sql": "TRUE",
+      "predicate_sql_error": null,
+      "query": "true",
+      "roundtrip_sql": "TRUE"
+    },
+    {
+      "ast_bincode_hex": "060000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": "False"
+      },
+      "note": "bare FALSE",
+      "predicate_sql": "FALSE",
+      "predicate_sql_error": null,
+      "query": "FALSE",
+      "roundtrip_sql": "FALSE"
+    },
+    {
+      "ast_bincode_hex": "000000000100000001000000000000000400000000000000666c6167000000000000000004000000010000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "flag"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "Bool": true
+              }
+            }
+          }
+        }
+      },
+      "note": "true on the right of a comparison",
+      "predicate_sql": "\"flag\" = true",
+      "predicate_sql_error": null,
+      "query": "flag = true",
+      "roundtrip_sql": "\"flag\" = true"
+    },
+    {
+      "ast_bincode_hex": "0000000001000000010000000000000004000000000000006e616d65000000000000000005000000050000000000000068656c6c6f0000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "name"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "String": "hello"
+              }
+            }
+          }
+        }
+      },
+      "note": "plain string",
+      "predicate_sql": "\"name\" = 'hello'",
+      "predicate_sql_error": null,
+      "query": "name = 'hello'",
+      "roundtrip_sql": "\"name\" = 'hello'"
+    },
+    {
+      "ast_bincode_hex": "0000000001000000010000000000000004000000000000006e616d65000000000000000005000000020000000000000027270000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "name"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "String": "''"
+              }
+            }
+          }
+        }
+      },
+      "note": "four quote characters - OnlyQuotesSequence is tried before AnythingButQuotesSequence, so record what content this yields and how it renders back to SQL",
+      "predicate_sql": "\"name\" = ''''''",
+      "predicate_sql_error": null,
+      "query": "name = ''''",
+      "roundtrip_sql": "\"name\" = ''''''"
+    },
+    {
+      "ast_bincode_hex": "0000000001000000010000000000000004000000000000006e616d6500000000000000000500000000000000000000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "name"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "String": ""
+              }
+            }
+          }
+        }
+      },
+      "note": "empty string",
+      "predicate_sql": "\"name\" = ''",
+      "predicate_sql_error": null,
+      "query": "name = ''",
+      "roundtrip_sql": "\"name\" = ''"
+    },
+    {
+      "ast_bincode_hex": "0000000001000000010000000000000004000000000000006e616d650000000000000000050000001f00000000000000636166c3a920e697a5e69cace8aa9e20f09f9a8020d985d8b1d8add8a8d8a70000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "name"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "String": "café 日本語 🚀 مرحبا"
+              }
+            }
+          }
+        }
+      },
+      "note": "non-ASCII string contents: 2-, 3- and 4-byte UTF-8 and RTL script",
+      "predicate_sql": "\"name\" = 'café 日本語 🚀 مرحبا'",
+      "predicate_sql_error": null,
+      "query": "name = 'café 日本語 🚀 مرحبا'",
+      "roundtrip_sql": "\"name\" = 'café 日本語 🚀 مرحبا'"
+    },
+    {
+      "ast_bincode_hex": "0000000001000000010000000000000004000000000000006e616d6500000000000000000500000006000000000000006120622020630000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "name"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "String": "a b  c"
+              }
+            }
+          }
+        }
+      },
+      "note": "interior whitespace inside a string must survive",
+      "predicate_sql": "\"name\" = 'a b  c'",
+      "predicate_sql_error": null,
+      "query": "name = 'a b  c'",
+      "roundtrip_sql": "\"name\" = 'a b  c'"
+    },
+    {
+      "ast_bincode_hex": "0000000001000000010000000000000004000000000000006e616d6500000000000000000500000008000000000000004f524445522042590000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "name"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "String": "ORDER BY"
+              }
+            }
+          }
+        }
+      },
+      "note": "a reserved word inside a string is just text",
+      "predicate_sql": "\"name\" = 'ORDER BY'",
+      "predicate_sql_error": null,
+      "query": "name = 'ORDER BY'",
+      "roundtrip_sql": "\"name\" = 'ORDER BY'"
+    },
+    {
+      "ast_bincode_hex": "0000000001000000020000000000000009000000000000006c6963656e73696e6709000000000000007465727269746f7279000000000000000005000000020000000000000055530000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "licensing",
+                  "territory"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "String": "US"
+              }
+            }
+          }
+        }
+      },
+      "note": "two-step dotted path in the predicate",
+      "predicate_sql": "\"licensing\".\"territory\" = 'US'",
+      "predicate_sql_error": null,
+      "query": "licensing.territory = 'US'",
+      "roundtrip_sql": "\"licensing\".\"territory\" = 'US'"
+    },
+    {
+      "ast_bincode_hex": "00000000010000000300000000000000010000000000000061010000000000000062010000000000000063000000000000000001000000010000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "a",
+                  "b",
+                  "c"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "I32": 1
+              }
+            }
+          }
+        }
+      },
+      "note": "three-step dotted path",
+      "predicate_sql": "\"a\".\"b\".\"c\" = 1",
+      "predicate_sql_error": null,
+      "query": "a.b.c = 1",
+      "roundtrip_sql": "\"a\".\"b\".\"c\" = 1"
+    },
+    {
+      "ast_bincode_hex": "0000000001000000010000000000000008000000000000002271756f74656422000000000000000001000000010000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "\"quoted\""
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "I32": 1
+              }
+            }
+          }
+        }
+      },
+      "note": "double-quoted identifier",
+      "predicate_sql": "\"\"quoted\"\" = 1",
+      "predicate_sql_error": null,
+      "query": "\"quoted\" = 1",
+      "roundtrip_sql": "\"\"quoted\"\" = 1"
+    },
+    {
+      "ast_bincode_hex": "0000000001000000010000000000000009000000000000004d6978656443617365000000000000000001000000010000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "MixedCase"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "I32": 1
+              }
+            }
+          }
+        }
+      },
+      "note": "identifier case must be preserved verbatim",
+      "predicate_sql": "\"MixedCase\" = 1",
+      "predicate_sql_error": null,
+      "query": "MixedCase = 1",
+      "roundtrip_sql": "\"MixedCase\" = 1"
+    },
+    {
+      "ast_bincode_hex": "000000000100000001000000000000000a00000000000000736e616b655f63617365000000000000000001000000010000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "snake_case"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "I32": 1
+              }
+            }
+          }
+        }
+      },
+      "note": "underscore in an identifier",
+      "predicate_sql": "\"snake_case\" = 1",
+      "predicate_sql_error": null,
+      "query": "snake_case = 1",
+      "roundtrip_sql": "\"snake_case\" = 1"
+    },
+    {
+      "ast_bincode_hex": "000000000100000001000000000000000a000000000000006b656261622d63617365000000000000000001000000010000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "kebab-case"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "I32": 1
+              }
+            }
+          }
+        }
+      },
+      "note": "hyphen in an identifier - the grammar's IdentifierNonDigit includes '-', so this is one name, not a subtraction",
+      "predicate_sql": "\"kebab-case\" = 1",
+      "predicate_sql_error": null,
+      "query": "kebab-case = 1",
+      "roundtrip_sql": "\"kebab-case\" = 1"
+    },
+    {
+      "ast_bincode_hex": "000000000100000001000000000000000600000000000000d0b8d0bcd18f000000000000000001000000010000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "имя"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "I32": 1
+              }
+            }
+          }
+        }
+      },
+      "note": "Cyrillic identifier - the grammar explicitly admits the Cyrillic ranges",
+      "predicate_sql": "\"имя\" = 1",
+      "predicate_sql_error": null,
+      "query": "имя = 1",
+      "roundtrip_sql": "\"имя\" = 1"
+    },
+    {
+      "ast_bincode_hex": "0000000001000000010000000000000008000000000000006f7074696f6e616c000000000000000001000000010000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "optional"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "I32": 1
+              }
+            }
+          }
+        }
+      },
+      "note": "a column name that merely starts with the reserved word option - the lookahead should not fire, because the next character is not one of those boundaries",
+      "predicate_sql": "\"optional\" = 1",
+      "predicate_sql_error": null,
+      "query": "optional = 1",
+      "roundtrip_sql": "\"optional\" = 1"
+    },
+    {
+      "ast_bincode_hex": "0000000001000000010000000000000007000000000000006c656674697368000000000000000001000000010000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "leftish"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "I32": 1
+              }
+            }
+          }
+        }
+      },
+      "note": "the same, extending the reserved word left",
+      "predicate_sql": "\"leftish\" = 1",
+      "predicate_sql_error": null,
+      "query": "leftish = 1",
+      "roundtrip_sql": "\"leftish\" = 1"
+    },
+    {
+      "ast_bincode_hex": "0000000001000000010000000000000005000000000000006c696d6974000000000000000001000000010000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "limit"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "I32": 1
+              }
+            }
+          }
+        }
+      },
+      "note": "limit reaches Reserved only through the whole LimitClause rule, which also requires a value, so a bare limit as a column name may be fine",
+      "predicate_sql": "\"limit\" = 1",
+      "predicate_sql_error": null,
+      "query": "limit = 1",
+      "roundtrip_sql": "\"limit\" = 1"
+    },
+    {
+      "ast_bincode_hex": "0000000001000000010000000000000005000000000000006f72646572000000000000000001000000010000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "order"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "I32": 1
+              }
+            }
+          }
+        }
+      },
+      "note": "the same for order, which reaches Reserved via OrderByClause",
+      "predicate_sql": "\"order\" = 1",
+      "predicate_sql_error": null,
+      "query": "order = 1",
+      "roundtrip_sql": "\"order\" = 1"
+    },
+    {
+      "ast_bincode_hex": "02000000000000000100000001000000000000000100000000000000610000000000000000010000000100000000000000010000000100000000000000010000000000000062000000000000000001000000020000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "And": [
+            {
+              "Comparison": {
+                "left": {
+                  "Path": {
+                    "steps": [
+                      "a"
+                    ]
+                  }
+                },
+                "operator": "Equal",
+                "right": {
+                  "Literal": {
+                    "I32": 1
+                  }
+                }
+              }
+            },
+            {
+              "Comparison": {
+                "left": {
+                  "Path": {
+                    "steps": [
+                      "b"
+                    ]
+                  }
+                },
+                "operator": "Equal",
+                "right": {
+                  "Literal": {
+                    "I32": 2
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "note": "single AND",
+      "predicate_sql": "\"a\" = 1 AND \"b\" = 2",
+      "predicate_sql_error": null,
+      "query": "a = 1 AND b = 2",
+      "roundtrip_sql": "\"a\" = 1 AND \"b\" = 2"
+    },
+    {
+      "ast_bincode_hex": "03000000000000000100000001000000000000000100000000000000610000000000000000010000000100000000000000010000000100000000000000010000000000000062000000000000000001000000020000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Or": [
+            {
+              "Comparison": {
+                "left": {
+                  "Path": {
+                    "steps": [
+                      "a"
+                    ]
+                  }
+                },
+                "operator": "Equal",
+                "right": {
+                  "Literal": {
+                    "I32": 1
+                  }
+                }
+              }
+            },
+            {
+              "Comparison": {
+                "left": {
+                  "Path": {
+                    "steps": [
+                      "b"
+                    ]
+                  }
+                },
+                "operator": "Equal",
+                "right": {
+                  "Literal": {
+                    "I32": 2
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "note": "single OR",
+      "predicate_sql": "(\"a\" = 1 OR \"b\" = 2)",
+      "predicate_sql_error": null,
+      "query": "a = 1 OR b = 2",
+      "roundtrip_sql": "(\"a\" = 1 OR \"b\" = 2)"
+    },
+    {
+      "ast_bincode_hex": "02000000030000000000000001000000010000000000000001000000000000006100000000000000000100000001000000000000000100000001000000000000000100000000000000620000000000000000010000000200000000000000010000000100000000000000010000000000000063000000000000000001000000030000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "And": [
+            {
+              "Or": [
+                {
+                  "Comparison": {
+                    "left": {
+                      "Path": {
+                        "steps": [
+                          "a"
+                        ]
+                      }
+                    },
+                    "operator": "Equal",
+                    "right": {
+                      "Literal": {
+                        "I32": 1
+                      }
+                    }
+                  }
+                },
+                {
+                  "Comparison": {
+                    "left": {
+                      "Path": {
+                        "steps": [
+                          "b"
+                        ]
+                      }
+                    },
+                    "operator": "Equal",
+                    "right": {
+                      "Literal": {
+                        "I32": 2
+                      }
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "Comparison": {
+                "left": {
+                  "Path": {
+                    "steps": [
+                      "c"
+                    ]
+                  }
+                },
+                "operator": "Equal",
+                "right": {
+                  "Literal": {
+                    "I32": 3
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "note": "unparenthesized OR then AND - in SQL, AND binds tighter; record what this parser does",
+      "predicate_sql": "(\"a\" = 1 OR \"b\" = 2) AND \"c\" = 3",
+      "predicate_sql_error": null,
+      "query": "a = 1 OR b = 2 AND c = 3",
+      "roundtrip_sql": "(\"a\" = 1 OR \"b\" = 2) AND \"c\" = 3"
+    },
+    {
+      "ast_bincode_hex": "03000000020000000000000001000000010000000000000001000000000000006100000000000000000100000001000000000000000100000001000000000000000100000000000000620000000000000000010000000200000000000000010000000100000000000000010000000000000063000000000000000001000000030000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Or": [
+            {
+              "And": [
+                {
+                  "Comparison": {
+                    "left": {
+                      "Path": {
+                        "steps": [
+                          "a"
+                        ]
+                      }
+                    },
+                    "operator": "Equal",
+                    "right": {
+                      "Literal": {
+                        "I32": 1
+                      }
+                    }
+                  }
+                },
+                {
+                  "Comparison": {
+                    "left": {
+                      "Path": {
+                        "steps": [
+                          "b"
+                        ]
+                      }
+                    },
+                    "operator": "Equal",
+                    "right": {
+                      "Literal": {
+                        "I32": 2
+                      }
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "Comparison": {
+                "left": {
+                  "Path": {
+                    "steps": [
+                      "c"
+                    ]
+                  }
+                },
+                "operator": "Equal",
+                "right": {
+                  "Literal": {
+                    "I32": 3
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "note": "unparenthesized AND then OR - the mirror of the case above",
+      "predicate_sql": "(\"a\" = 1 AND \"b\" = 2 OR \"c\" = 3)",
+      "predicate_sql_error": null,
+      "query": "a = 1 AND b = 2 OR c = 3",
+      "roundtrip_sql": "(\"a\" = 1 AND \"b\" = 2 OR \"c\" = 3)"
+    },
+    {
+      "ast_bincode_hex": "02000000030000000000000001000000010000000000000001000000000000006100000000000000000100000001000000000000000100000001000000000000000100000000000000620000000000000000010000000200000000000000010000000100000000000000010000000000000063000000000000000001000000030000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "And": [
+            {
+              "Or": [
+                {
+                  "Comparison": {
+                    "left": {
+                      "Path": {
+                        "steps": [
+                          "a"
+                        ]
+                      }
+                    },
+                    "operator": "Equal",
+                    "right": {
+                      "Literal": {
+                        "I32": 1
+                      }
+                    }
+                  }
+                },
+                {
+                  "Comparison": {
+                    "left": {
+                      "Path": {
+                        "steps": [
+                          "b"
+                        ]
+                      }
+                    },
+                    "operator": "Equal",
+                    "right": {
+                      "Literal": {
+                        "I32": 2
+                      }
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "Comparison": {
+                "left": {
+                  "Path": {
+                    "steps": [
+                      "c"
+                    ]
+                  }
+                },
+                "operator": "Equal",
+                "right": {
+                  "Literal": {
+                    "I32": 3
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "note": "explicit parentheses around the OR",
+      "predicate_sql": "(\"a\" = 1 OR \"b\" = 2) AND \"c\" = 3",
+      "predicate_sql_error": null,
+      "query": "(a = 1 OR b = 2) AND c = 3",
+      "roundtrip_sql": "(\"a\" = 1 OR \"b\" = 2) AND \"c\" = 3"
+    },
+    {
+      "ast_bincode_hex": "02000000000000000100000001000000000000000100000000000000610000000000000000010000000100000003000000000000000100000001000000000000000100000000000000620000000000000000010000000200000000000000010000000100000000000000010000000000000063000000000000000001000000030000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "And": [
+            {
+              "Comparison": {
+                "left": {
+                  "Path": {
+                    "steps": [
+                      "a"
+                    ]
+                  }
+                },
+                "operator": "Equal",
+                "right": {
+                  "Literal": {
+                    "I32": 1
+                  }
+                }
+              }
+            },
+            {
+              "Or": [
+                {
+                  "Comparison": {
+                    "left": {
+                      "Path": {
+                        "steps": [
+                          "b"
+                        ]
+                      }
+                    },
+                    "operator": "Equal",
+                    "right": {
+                      "Literal": {
+                        "I32": 2
+                      }
+                    }
+                  }
+                },
+                {
+                  "Comparison": {
+                    "left": {
+                      "Path": {
+                        "steps": [
+                          "c"
+                        ]
+                      }
+                    },
+                    "operator": "Equal",
+                    "right": {
+                      "Literal": {
+                        "I32": 3
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "note": "explicit parentheses around the right operand",
+      "predicate_sql": "\"a\" = 1 AND (\"b\" = 2 OR \"c\" = 3)",
+      "predicate_sql_error": null,
+      "query": "a = 1 AND (b = 2 OR c = 3)",
+      "roundtrip_sql": "\"a\" = 1 AND (\"b\" = 2 OR \"c\" = 3)"
+    },
+    {
+      "ast_bincode_hex": "02000000020000000000000001000000010000000000000001000000000000006100000000000000000100000001000000000000000100000001000000000000000100000000000000620000000000000000010000000200000000000000010000000100000000000000010000000000000063000000000000000001000000030000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "And": [
+            {
+              "And": [
+                {
+                  "Comparison": {
+                    "left": {
+                      "Path": {
+                        "steps": [
+                          "a"
+                        ]
+                      }
+                    },
+                    "operator": "Equal",
+                    "right": {
+                      "Literal": {
+                        "I32": 1
+                      }
+                    }
+                  }
+                },
+                {
+                  "Comparison": {
+                    "left": {
+                      "Path": {
+                        "steps": [
+                          "b"
+                        ]
+                      }
+                    },
+                    "operator": "Equal",
+                    "right": {
+                      "Literal": {
+                        "I32": 2
+                      }
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "Comparison": {
+                "left": {
+                  "Path": {
+                    "steps": [
+                      "c"
+                    ]
+                  }
+                },
+                "operator": "Equal",
+                "right": {
+                  "Literal": {
+                    "I32": 3
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "note": "three-term AND chain - which way does it associate?",
+      "predicate_sql": "\"a\" = 1 AND \"b\" = 2 AND \"c\" = 3",
+      "predicate_sql_error": null,
+      "query": "a = 1 AND b = 2 AND c = 3",
+      "roundtrip_sql": "\"a\" = 1 AND \"b\" = 2 AND \"c\" = 3"
+    },
+    {
+      "ast_bincode_hex": "03000000030000000000000001000000010000000000000001000000000000006100000000000000000100000001000000000000000100000001000000000000000100000000000000620000000000000000010000000200000000000000010000000100000000000000010000000000000063000000000000000001000000030000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Or": [
+            {
+              "Or": [
+                {
+                  "Comparison": {
+                    "left": {
+                      "Path": {
+                        "steps": [
+                          "a"
+                        ]
+                      }
+                    },
+                    "operator": "Equal",
+                    "right": {
+                      "Literal": {
+                        "I32": 1
+                      }
+                    }
+                  }
+                },
+                {
+                  "Comparison": {
+                    "left": {
+                      "Path": {
+                        "steps": [
+                          "b"
+                        ]
+                      }
+                    },
+                    "operator": "Equal",
+                    "right": {
+                      "Literal": {
+                        "I32": 2
+                      }
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "Comparison": {
+                "left": {
+                  "Path": {
+                    "steps": [
+                      "c"
+                    ]
+                  }
+                },
+                "operator": "Equal",
+                "right": {
+                  "Literal": {
+                    "I32": 3
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "note": "three-term OR chain",
+      "predicate_sql": "((\"a\" = 1 OR \"b\" = 2) OR \"c\" = 3)",
+      "predicate_sql_error": null,
+      "query": "a = 1 OR b = 2 OR c = 3",
+      "roundtrip_sql": "((\"a\" = 1 OR \"b\" = 2) OR \"c\" = 3)"
+    },
+    {
+      "ast_bincode_hex": "000000000100000001000000000000000900000000000000616e645f6669656c64000000000000000001000000010000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "and_field"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "I32": 1
+              }
+            }
+          }
+        }
+      },
+      "note": "an identifier that merely starts with 'and' is not the AND operator",
+      "predicate_sql": "\"and_field\" = 1",
+      "predicate_sql_error": null,
+      "query": "and_field = 1",
+      "roundtrip_sql": "\"and_field\" = 1"
+    },
+    {
+      "ast_bincode_hex": "0400000000000000010000000100000000000000010000000000000061000000000000000001000000010000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Not": {
+            "Comparison": {
+              "left": {
+                "Path": {
+                  "steps": [
+                    "a"
+                  ]
+                }
+              },
+              "operator": "Equal",
+              "right": {
+                "Literal": {
+                  "I32": 1
+                }
+              }
+            }
+          }
+        }
+      },
+      "note": "unary NOT over a parenthesized expression",
+      "predicate_sql": "NOT (\"a\" = 1)",
+      "predicate_sql_error": null,
+      "query": "NOT (a = 1)",
+      "roundtrip_sql": "NOT (\"a\" = 1)"
+    },
+    {
+      "ast_bincode_hex": "0400000000000000010000000100000000000000010000000000000061000000000000000001000000010000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Not": {
+            "Comparison": {
+              "left": {
+                "Path": {
+                  "steps": [
+                    "a"
+                  ]
+                }
+              },
+              "operator": "Equal",
+              "right": {
+                "Literal": {
+                  "I32": 1
+                }
+              }
+            }
+          }
+        }
+      },
+      "note": "NOT with more expression after it - parse_expr's UnaryNot branch returns as soon as it has the negated operand, so check whether the trailing conjunct survives",
+      "predicate_sql": "NOT (\"a\" = 1)",
+      "predicate_sql_error": null,
+      "query": "NOT (a = 1) AND b = 2",
+      "roundtrip_sql": "NOT (\"a\" = 1)"
+    },
+    {
+      "ast_bincode_hex": "010000000100000001000000000000000100000000000000610000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "IsNull": {
+            "Path": {
+              "steps": [
+                "a"
+              ]
+            }
+          }
+        }
+      },
+      "note": "IS NULL postfix",
+      "predicate_sql": "\"a\" IS NULL",
+      "predicate_sql_error": null,
+      "query": "a IS NULL",
+      "roundtrip_sql": "\"a\" IS NULL"
+    },
+    {
+      "ast_bincode_hex": "04000000010000000100000001000000000000000100000000000000610000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Not": {
+            "IsNull": {
+              "Path": {
+                "steps": [
+                  "a"
+                ]
+              }
+            }
+          }
+        }
+      },
+      "note": "IS NOT NULL postfix",
+      "predicate_sql": "NOT (\"a\" IS NULL)",
+      "predicate_sql_error": null,
+      "query": "a IS NOT NULL",
+      "roundtrip_sql": "NOT (\"a\" IS NULL)"
+    },
+    {
+      "ast_bincode_hex": "010000000100000001000000000000000100000000000000610000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "IsNull": {
+            "Path": {
+              "steps": [
+                "a"
+              ]
+            }
+          }
+        }
+      },
+      "note": "IS and NULL with no space between them - IsNullPostfix is an ordinary rule, not an atomic one, so pest skips implicit whitespace between its parts, including none",
+      "predicate_sql": "\"a\" IS NULL",
+      "predicate_sql_error": null,
+      "query": "a isnull",
+      "roundtrip_sql": "\"a\" IS NULL"
+    },
+    {
+      "ast_bincode_hex": "0100000001000000020000000000000009000000000000006c6963656e73696e6709000000000000007465727269746f72790000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "IsNull": {
+            "Path": {
+              "steps": [
+                "licensing",
+                "territory"
+              ]
+            }
+          }
+        }
+      },
+      "note": "IS NULL on a dotted path",
+      "predicate_sql": "\"licensing\".\"territory\" IS NULL",
+      "predicate_sql_error": null,
+      "query": "licensing.territory IS NULL",
+      "roundtrip_sql": "\"licensing\".\"territory\" IS NULL"
+    },
+    {
+      "ast_bincode_hex": "020000000100000001000000010000000000000001000000000000006100000000010000000100000000000000010000000000000062000000000000000001000000010000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "And": [
+            {
+              "IsNull": {
+                "Path": {
+                  "steps": [
+                    "a"
+                  ]
+                }
+              }
+            },
+            {
+              "Comparison": {
+                "left": {
+                  "Path": {
+                    "steps": [
+                      "b"
+                    ]
+                  }
+                },
+                "operator": "Equal",
+                "right": {
+                  "Literal": {
+                    "I32": 1
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "note": "IS NULL combined with AND",
+      "predicate_sql": "\"a\" IS NULL AND \"b\" = 1",
+      "predicate_sql_error": null,
+      "query": "a IS NULL AND b = 1",
+      "roundtrip_sql": "\"a\" IS NULL AND \"b\" = 1"
+    },
+    {
+      "ast_bincode_hex": "070000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": "Placeholder"
+      },
+      "note": "a bare placeholder as the whole predicate",
+      "predicate_sql": null,
+      "predicate_sql_error": "Invalid expression: Placeholder must be transformed before SQL generation",
+      "query": "?",
+      "roundtrip_sql": "SQL Error: Invalid expression: Placeholder must be transformed before SQL generation"
+    },
+    {
+      "ast_bincode_hex": "0000000001000000010000000000000001000000000000006100000000050000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "a"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": "Placeholder"
+          }
+        }
+      },
+      "note": "placeholder on the right of a comparison",
+      "predicate_sql": "\"a\" = ?",
+      "predicate_sql_error": null,
+      "query": "a = ?",
+      "roundtrip_sql": "\"a\" = ?"
+    },
+    {
+      "ast_bincode_hex": "020000000000000001000000010000000000000001000000000000006100000000050000000000000001000000010000000000000001000000000000006200000000050000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "And": [
+            {
+              "Comparison": {
+                "left": {
+                  "Path": {
+                    "steps": [
+                      "a"
+                    ]
+                  }
+                },
+                "operator": "Equal",
+                "right": "Placeholder"
+              }
+            },
+            {
+              "Comparison": {
+                "left": {
+                  "Path": {
+                    "steps": [
+                      "b"
+                    ]
+                  }
+                },
+                "operator": "Equal",
+                "right": "Placeholder"
+              }
+            }
+          ]
+        }
+      },
+      "note": "two placeholders",
+      "predicate_sql": "\"a\" = ? AND \"b\" = ?",
+      "predicate_sql_error": null,
+      "query": "a = ? AND b = ?",
+      "roundtrip_sql": "\"a\" = ? AND \"b\" = ?"
+    },
+    {
+      "ast_bincode_hex": "000000000100000001000000000000000100000000000000610000000000000000010000000100000001010000000000000001000000000000000a00000000000000637265617465645f61740000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": [
+          {
+            "direction": "Asc",
+            "path": {
+              "steps": [
+                "created_at"
+              ]
+            }
+          }
+        ],
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "a"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "I32": 1
+              }
+            }
+          }
+        }
+      },
+      "note": "ORDER BY with the direction omitted",
+      "predicate_sql": "\"a\" = 1",
+      "predicate_sql_error": null,
+      "query": "a = 1 ORDER BY created_at",
+      "roundtrip_sql": "\"a\" = 1 ORDER BY created_at ASC"
+    },
+    {
+      "ast_bincode_hex": "000000000100000001000000000000000100000000000000610000000000000000010000000100000001010000000000000001000000000000000a00000000000000637265617465645f61740100000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": [
+          {
+            "direction": "Desc",
+            "path": {
+              "steps": [
+                "created_at"
+              ]
+            }
+          }
+        ],
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "a"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "I32": 1
+              }
+            }
+          }
+        }
+      },
+      "note": "explicit DESC",
+      "predicate_sql": "\"a\" = 1",
+      "predicate_sql_error": null,
+      "query": "a = 1 ORDER BY created_at DESC",
+      "roundtrip_sql": "\"a\" = 1 ORDER BY created_at DESC"
+    },
+    {
+      "ast_bincode_hex": "000000000100000001000000000000000100000000000000610000000000000000010000000100000001010000000000000001000000000000000a00000000000000637265617465645f61740000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": [
+          {
+            "direction": "Asc",
+            "path": {
+              "steps": [
+                "created_at"
+              ]
+            }
+          }
+        ],
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "a"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "I32": 1
+              }
+            }
+          }
+        }
+      },
+      "note": "explicit ASC",
+      "predicate_sql": "\"a\" = 1",
+      "predicate_sql_error": null,
+      "query": "a = 1 ORDER BY created_at ASC",
+      "roundtrip_sql": "\"a\" = 1 ORDER BY created_at ASC"
+    },
+    {
+      "ast_bincode_hex": "000000000100000001000000000000000100000000000000610000000000000000010000000100000001010000000000000001000000000000000a00000000000000637265617465645f61740100000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": [
+          {
+            "direction": "Desc",
+            "path": {
+              "steps": [
+                "created_at"
+              ]
+            }
+          }
+        ],
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "a"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "I32": 1
+              }
+            }
+          }
+        }
+      },
+      "note": "lowercase direction keyword",
+      "predicate_sql": "\"a\" = 1",
+      "predicate_sql_error": null,
+      "query": "a = 1 ORDER BY created_at desc",
+      "roundtrip_sql": "\"a\" = 1 ORDER BY created_at DESC"
+    },
+    {
+      "ast_bincode_hex": "000000000100000001000000000000000100000000000000610000000000000000010000000100000001020000000000000001000000000000000100000000000000780000000001000000000000000100000000000000790100000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": [
+          {
+            "direction": "Asc",
+            "path": {
+              "steps": [
+                "x"
+              ]
+            }
+          },
+          {
+            "direction": "Desc",
+            "path": {
+              "steps": [
+                "y"
+              ]
+            }
+          }
+        ],
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "a"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "I32": 1
+              }
+            }
+          }
+        }
+      },
+      "note": "two ORDER BY items with different directions",
+      "predicate_sql": "\"a\" = 1",
+      "predicate_sql_error": null,
+      "query": "a = 1 ORDER BY x ASC, y DESC",
+      "roundtrip_sql": "\"a\" = 1 ORDER BY x ASC, y DESC"
+    },
+    {
+      "ast_bincode_hex": "000000000100000001000000000000000100000000000000610000000000000000010000000100000001010000000000000001000000000000000100000000000000780000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": [
+          {
+            "direction": "Asc",
+            "path": {
+              "steps": [
+                "x"
+              ]
+            }
+          }
+        ],
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "a"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "I32": 1
+              }
+            }
+          }
+        }
+      },
+      "note": "lowercase ORDER BY keyword",
+      "predicate_sql": "\"a\" = 1",
+      "predicate_sql_error": null,
+      "query": "a = 1 order by x",
+      "roundtrip_sql": "\"a\" = 1 ORDER BY x ASC"
+    },
+    {
+      "ast_bincode_hex": "000000000100000001000000000000000100000000000000610000000000000000010000000100000000010000000000000000",
+      "ast_json": {
+        "limit": 0,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "a"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "I32": 1
+              }
+            }
+          }
+        }
+      },
+      "note": "limit zero, which is not the same as no limit",
+      "predicate_sql": "\"a\" = 1",
+      "predicate_sql_error": null,
+      "query": "a = 1 LIMIT 0",
+      "roundtrip_sql": "\"a\" = 1 LIMIT 0"
+    },
+    {
+      "ast_bincode_hex": "000000000100000001000000000000000100000000000000610000000000000000010000000100000000010a00000000000000",
+      "ast_json": {
+        "limit": 10,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "a"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "I32": 1
+              }
+            }
+          }
+        }
+      },
+      "note": "ordinary limit",
+      "predicate_sql": "\"a\" = 1",
+      "predicate_sql_error": null,
+      "query": "a = 1 LIMIT 10",
+      "roundtrip_sql": "\"a\" = 1 LIMIT 10"
+    },
+    {
+      "ast_bincode_hex": "000000000100000001000000000000000100000000000000610000000000000000010000000100000000010000000001000000",
+      "ast_json": {
+        "limit": 4294967296,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "a"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "I32": 1
+              }
+            }
+          }
+        }
+      },
+      "note": "limit above u32::MAX - the field is u64",
+      "predicate_sql": "\"a\" = 1",
+      "predicate_sql_error": null,
+      "query": "a = 1 LIMIT 4294967296",
+      "roundtrip_sql": "\"a\" = 1 LIMIT 4294967296"
+    },
+    {
+      "ast_bincode_hex": "00000000010000000100000000000000010000000000000061000000000000000001000000010000000001ffffffffffffffff",
+      "ast_json": {
+        "limit": 18446744073709551615,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "a"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "I32": 1
+              }
+            }
+          }
+        }
+      },
+      "note": "u64::MAX",
+      "predicate_sql": "\"a\" = 1",
+      "predicate_sql_error": null,
+      "query": "a = 1 LIMIT 18446744073709551615",
+      "roundtrip_sql": "\"a\" = 1 LIMIT 18446744073709551615"
+    },
+    {
+      "ast_bincode_hex": "0000000001000000010000000000000001000000000000006100000000000000000100000001000000010100000000000000010000000000000001000000000000007801000000010500000000000000",
+      "ast_json": {
+        "limit": 5,
+        "order_by": [
+          {
+            "direction": "Desc",
+            "path": {
+              "steps": [
+                "x"
+              ]
+            }
+          }
+        ],
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "a"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "I32": 1
+              }
+            }
+          }
+        }
+      },
+      "note": "both clauses, in the grammar's order",
+      "predicate_sql": "\"a\" = 1",
+      "predicate_sql_error": null,
+      "query": "a = 1 ORDER BY x DESC LIMIT 5",
+      "roundtrip_sql": "\"a\" = 1 ORDER BY x DESC LIMIT 5"
+    },
+    {
+      "ast_bincode_hex": "050000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": "True"
+      },
+      "note": "empty input - parse_selection short-circuits before touching the grammar",
+      "predicate_sql": "TRUE",
+      "predicate_sql_error": null,
+      "query": "",
+      "roundtrip_sql": "TRUE"
+    },
+    {
+      "ast_bincode_hex": "050000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": "True"
+      },
+      "note": "whitespace-only input",
+      "predicate_sql": "TRUE",
+      "predicate_sql_error": null,
+      "query": "   ",
+      "roundtrip_sql": "TRUE"
+    },
+    {
+      "ast_bincode_hex": "00000000010000000100000000000000010000000000000061000000000000000001000000010000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "a"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "I32": 1
+              }
+            }
+          }
+        }
+      },
+      "note": "newlines between tokens",
+      "predicate_sql": "\"a\" = 1",
+      "predicate_sql_error": null,
+      "query": "a\n=\n1",
+      "roundtrip_sql": "\"a\" = 1"
+    },
+    {
+      "ast_bincode_hex": "00000000010000000100000000000000010000000000000061000000000000000001000000010000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "a"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "I32": 1
+              }
+            }
+          }
+        }
+      },
+      "note": "CRLF line endings - the WHITESPACE rule lists the two-character CRLF sequence",
+      "predicate_sql": "\"a\" = 1",
+      "predicate_sql_error": null,
+      "query": "a\r\n=\r\n1",
+      "roundtrip_sql": "\"a\" = 1"
+    },
+    {
+      "ast_bincode_hex": "00000000010000000100000000000000010000000000000061000000000000000001000000010000000000",
+      "ast_json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "a"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "I32": 1
+              }
+            }
+          }
+        }
+      },
+      "note": "extra spaces between tokens",
+      "predicate_sql": "\"a\" = 1",
+      "predicate_sql_error": null,
+      "query": "a  =  1",
+      "roundtrip_sql": "\"a\" = 1"
+    }
+  ],
+  "accept_count": 74,
+  "encoding": "bincode 1.3 `serialize` defaults: fixed-width integers, little-endian, u64 sequence/string length prefixes, u32 enum variant tags, 1-byte Option tag, no length prefix on fixed-size arrays",
+  "fixture": "parse_cases.json",
+  "produced_by": "ankql::parser::parse_selection, ankql::selection::sql::generate_selection_sql, and Display for ankql::ast::Selection",
+  "reject": [
+    {
+      "error_message": "Invalid predicate: Expression is not a predicate",
+      "error_variant": "InvalidPredicate",
+      "note": "IN with a one-element row",
+      "query": "status IN ('a')"
+    },
+    {
+      "error_message": "Expected comparison operator, And, or Or, got Between",
+      "error_variant": "UnexpectedRule",
+      "note": "BETWEEN - present in the grammar and in ComparisonOperator; check whether the parser builds it",
+      "query": "score BETWEEN 1 AND 10"
+    },
+    {
+      "error_message": "Invalid predicate: Failed to parse number: number too large to fit in target type",
+      "error_variant": "InvalidPredicate",
+      "note": "i64::MAX + 1 - beyond what parse::<i64>() accepts",
+      "query": "n = 9223372036854775808"
+    },
+    {
+      "error_message": "Expected atomic expression, got Integer",
+      "error_variant": "UnexpectedRule",
+      "note": "negative integer",
+      "query": "n = -1"
+    },
+    {
+      "error_message": "Expected atomic expression, got Integer",
+      "error_variant": "UnexpectedRule",
+      "note": "explicitly signed positive integer",
+      "query": "n = +1"
+    },
+    {
+      "error_message": "Expected atomic expression, got Decimal",
+      "error_variant": "UnexpectedRule",
+      "note": "decimal",
+      "query": "n = 1.5"
+    },
+    {
+      "error_message": "Expected atomic expression, got Double",
+      "error_variant": "UnexpectedRule",
+      "note": "scientific notation",
+      "query": "n = 1e3"
+    },
+    {
+      "error_message": "Expected atomic expression, got Null",
+      "error_variant": "UnexpectedRule",
+      "note": "NULL literal - present in the grammar; is it in the AST?",
+      "query": "flag = NULL"
+    },
+    {
+      "error_message": null,
+      "error_variant": "SyntaxError",
+      "note": "SQL-style doubled quote as an escape - check whether the grammar treats it as one literal",
+      "query": "name = 'it''s'"
+    },
+    {
+      "error_message": null,
+      "error_variant": "SyntaxError",
+      "note": "CJK identifier - not in any of the grammar's identifier ranges",
+      "query": "名前 = 1"
+    },
+    {
+      "error_message": null,
+      "error_variant": "SyntaxError",
+      "note": "a Reserved word as a column name - IdentifierInner's negative lookahead fires when a reserved word is followed by an open paren, whitespace, a comma or end of input",
+      "query": "option = 1"
+    },
+    {
+      "error_message": null,
+      "error_variant": "SyntaxError",
+      "note": "another Reserved word as a column name",
+      "query": "left = 1"
+    },
+    {
+      "error_message": "Expected ExpressionInParentheses, got PathExpr",
+      "error_variant": "UnexpectedRule",
+      "note": "unary NOT over a bare comparison",
+      "query": "NOT a = 1"
+    },
+    {
+      "error_message": "Expected atomic expression, got UnaryNot",
+      "error_variant": "UnexpectedRule",
+      "note": "NOT in the right-hand position rather than the leading one - only the leading UnaryNot of ExprAtomValue is reached by that branch",
+      "query": "a = 1 AND NOT (b = 2)"
+    },
+    {
+      "error_message": "Expected ExpressionInParentheses, got PathExpr",
+      "error_variant": "UnexpectedRule",
+      "note": "an identifier that merely starts with the letters n-o-t - NotFlag carries no IDENT_CONT word-boundary guard, unlike And and Or",
+      "query": "nothing = 1"
+    },
+    {
+      "error_message": "Expected ExpressionInParentheses, got PathExpr",
+      "error_variant": "UnexpectedRule",
+      "note": "the same, with an underscore right after those letters",
+      "query": "not_field = 1"
+    },
+    {
+      "error_message": "Expected comparison operator, And, or Or, got Multiply",
+      "error_variant": "UnexpectedRule",
+      "note": "multiplication inside a comparison - the grammar has ArithInfixOp; does the AST builder?",
+      "query": "qty * 3 = 9"
+    },
+    {
+      "error_message": "Expected comparison operator, And, or Or, got Add",
+      "error_variant": "UnexpectedRule",
+      "note": "addition inside a comparison",
+      "query": "a + 1 = 2"
+    },
+    {
+      "error_message": "Expected comparison operator, And, or Or, got Subtract",
+      "error_variant": "UnexpectedRule",
+      "note": "subtraction - note this competes with '-' being legal inside identifiers",
+      "query": "a - 1 = 2"
+    },
+    {
+      "error_message": null,
+      "error_variant": "SyntaxError",
+      "note": "dotted path in ORDER BY - the grammar's OrderByItem takes an Identifier, not a PathExpr",
+      "query": "a = 1 ORDER BY licensing.territory"
+    },
+    {
+      "error_message": "Invalid predicate: Failed to parse limit: number too large to fit in target type",
+      "error_variant": "InvalidPredicate",
+      "note": "u64::MAX + 1",
+      "query": "a = 1 LIMIT 18446744073709551616"
+    },
+    {
+      "error_message": null,
+      "error_variant": "SyntaxError",
+      "note": "negative limit - LimitClause takes Unsigned",
+      "query": "a = 1 LIMIT -1"
+    },
+    {
+      "error_message": null,
+      "error_variant": "SyntaxError",
+      "note": "both clauses in the wrong order",
+      "query": "a = 1 LIMIT 5 ORDER BY x"
+    },
+    {
+      "error_message": null,
+      "error_variant": "SyntaxError",
+      "note": "a lone CR - WHITESPACE lists space, tab, LF and CRLF, but not a bare CR",
+      "query": "a\r=\r1"
+    },
+    {
+      "error_message": null,
+      "error_variant": "SyntaxError",
+      "note": "trailing semicolon",
+      "query": "a = 1;"
+    },
+    {
+      "error_message": null,
+      "error_variant": "SyntaxError",
+      "note": "trailing operator with no right operand",
+      "query": "name = "
+    },
+    {
+      "error_message": null,
+      "error_variant": "SyntaxError",
+      "note": "leading operator with no left operand",
+      "query": "= 1"
+    },
+    {
+      "error_message": null,
+      "error_variant": "SyntaxError",
+      "note": "unbalanced open parenthesis",
+      "query": "(a = 1"
+    },
+    {
+      "error_message": null,
+      "error_variant": "SyntaxError",
+      "note": "unbalanced close parenthesis",
+      "query": "a = 1)"
+    },
+    {
+      "error_message": null,
+      "error_variant": "SyntaxError",
+      "note": "unterminated string literal",
+      "query": "name = 'unterminated"
+    },
+    {
+      "error_message": null,
+      "error_variant": "SyntaxError",
+      "note": "an operator that does not exist",
+      "query": "a === 1"
+    }
+  ],
+  "reject_count": 31
+}

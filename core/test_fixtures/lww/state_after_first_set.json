@@ -1,0 +1,19 @@
+{
+  "decoded": {
+    "count": {
+      "I32": 1
+    },
+    "name": {
+      "String": "Alice"
+    }
+  },
+  "encoding": "bincode 1.3 `serialize` defaults: fixed-width integers, little-endian, u64 sequence/string length prefixes, u32 enum variant tags, 1-byte Option tag, no length prefix on fixed-size arrays",
+  "fixture": "lww/state_after_first_set.bin",
+  "produced_by": "LWWBackend::to_state_buffer()",
+  "scenario": [
+    "LWWBackend::new()",
+    "set(\"name\", Some(String(\"Alice\")))",
+    "set(\"count\", Some(I32(1)))"
+  ],
+  "total_len": 60
+}

@@ -1,0 +1,34 @@
+{
+  "encoding": "bincode 1.3 `serialize` defaults: fixed-width integers, little-endian, u64 sequence/string length prefixes, u32 enum variant tags, 1-byte Option tag, no length prefix on fixed-size arrays",
+  "fixture": "clock.bin",
+  "items": [
+    {
+      "json": [],
+      "label": "empty",
+      "len": 8,
+      "offset": 0,
+      "type": "Clock"
+    },
+    {
+      "json": [
+        "EBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8"
+      ],
+      "label": "single",
+      "len": 40,
+      "offset": 8,
+      "type": "Clock"
+    },
+    {
+      "json": [
+        "EBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8",
+        "MDEyMzQ1Njc4OTo7PD0-P0BBQkNERUZHSElKS0xNTk8",
+        "UFFSU1RVVldYWVpbXF1eX2BhYmNkZWZnaGlqa2xtbm8"
+      ],
+      "label": "multi",
+      "len": 104,
+      "offset": 48,
+      "type": "Clock"
+    }
+  ],
+  "total_len": 152
+}

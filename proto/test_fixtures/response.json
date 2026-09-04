@@ -1,0 +1,223 @@
+{
+  "encoding": "bincode 1.3 `serialize` defaults: fixed-width integers, little-endian, u64 sequence/string length prefixes, u32 enum variant tags, 1-byte Option tag, no length prefix on fixed-size arrays",
+  "fixture": "response.bin",
+  "items": [
+    {
+      "json": {
+        "body": "Success",
+        "from": "EBESExQVFhcYGRobHB0eHw",
+        "request_id": "00000000000000000000000001",
+        "to": "ICEiIyQlJicoKSorLC0uLw"
+      },
+      "label": "node_response",
+      "len": 70,
+      "offset": 0,
+      "type": "NodeResponse"
+    },
+    {
+      "json": {
+        "CommitComplete": {
+          "id": "00000000000000000000000002"
+        }
+      },
+      "label": "commit_complete",
+      "len": 38,
+      "offset": 70,
+      "type": "NodeResponseBody"
+    },
+    {
+      "json": {
+        "Fetch": [
+          {
+            "collection": "users",
+            "content": {
+              "StateSnapshot": {
+                "state": {
+                  "attestations": [
+                    [
+                      66,
+                      67
+                    ],
+                    [
+                      68,
+                      69,
+                      70
+                    ]
+                  ],
+                  "state": {
+                    "head": [
+                      "EBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8"
+                    ],
+                    "state_buffers": {
+                      "buf_alpha": [
+                        1,
+                        2,
+                        3
+                      ],
+                      "buf_beta": [
+                        4,
+                        5
+                      ]
+                    }
+                  }
+                }
+              }
+            },
+            "entity_id": "MDEyMzQ1Njc4OTo7PD0-Pw"
+          }
+        ]
+      },
+      "label": "fetch",
+      "len": 176,
+      "offset": 108,
+      "type": "NodeResponseBody"
+    },
+    {
+      "json": {
+        "Get": [
+          {
+            "attestations": [],
+            "payload": {
+              "collection": "test_collection",
+              "entity_id": "AAECAwQFBgcICQoLDA0ODw",
+              "state": {
+                "head": [
+                  "EBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8"
+                ],
+                "state_buffers": {
+                  "buf_alpha": [
+                    1,
+                    2,
+                    3
+                  ],
+                  "buf_beta": [
+                    4,
+                    5
+                  ]
+                }
+              }
+            }
+          }
+        ]
+      },
+      "label": "get",
+      "len": 161,
+      "offset": 284,
+      "type": "NodeResponseBody"
+    },
+    {
+      "json": {
+        "GetEvents": [
+          {
+            "attestations": [],
+            "payload": {
+              "collection": "test_collection",
+              "entity_id": "AAECAwQFBgcICQoLDA0ODw",
+              "operations": {
+                "backend_a": [
+                  {
+                    "diff": [
+                      170,
+                      187
+                    ]
+                  },
+                  {
+                    "diff": [
+                      204
+                    ]
+                  }
+                ],
+                "backend_b": [
+                  {
+                    "diff": [
+                      221,
+                      238,
+                      255
+                    ]
+                  }
+                ]
+              },
+              "parent": [
+                "EBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8"
+              ]
+            }
+          }
+        ]
+      },
+      "label": "get_events",
+      "len": 187,
+      "offset": 445,
+      "type": "NodeResponseBody"
+    },
+    {
+      "json": {
+        "QuerySubscribed": {
+          "deltas": [
+            {
+              "collection": "posts",
+              "content": {
+                "EventBridge": {
+                  "events": [
+                    {
+                      "attestations": [],
+                      "operations": {
+                        "backend_a": [
+                          {
+                            "diff": [
+                              170,
+                              187
+                            ]
+                          },
+                          {
+                            "diff": [
+                              204
+                            ]
+                          }
+                        ],
+                        "backend_b": [
+                          {
+                            "diff": [
+                              221,
+                              238,
+                              255
+                            ]
+                          }
+                        ]
+                      },
+                      "parent": [
+                        "EBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8"
+                      ]
+                    }
+                  ]
+                }
+              },
+              "entity_id": "QEFCQ0RFRkdISUpLTE1OTw"
+            }
+          ],
+          "query_id": "000000001A0000000000000000"
+        }
+      },
+      "label": "query_subscribed",
+      "len": 223,
+      "offset": 632,
+      "type": "NodeResponseBody"
+    },
+    {
+      "json": "Success",
+      "label": "success",
+      "len": 4,
+      "offset": 855,
+      "type": "NodeResponseBody"
+    },
+    {
+      "json": {
+        "Error": "something went wrong"
+      },
+      "label": "error",
+      "len": 32,
+      "offset": 859,
+      "type": "NodeResponseBody"
+    }
+  ],
+  "total_len": 891
+}

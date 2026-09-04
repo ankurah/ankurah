@@ -1,0 +1,108 @@
+{
+  "decoded": {
+    "v_binary": {
+      "Binary": [
+        0,
+        255
+      ]
+    },
+    "v_bool_false": {
+      "Bool": false
+    },
+    "v_bool_true": {
+      "Bool": true
+    },
+    "v_entity_id": {
+      "EntityId": "AAECAwQFBgcICQoLDA0ODw"
+    },
+    "v_f64_fraction": {
+      "F64": 0.30000000000000004
+    },
+    "v_f64_max": {
+      "F64": 1.7976931348623157e308
+    },
+    "v_f64_min": {
+      "F64": -1.7976931348623157e308
+    },
+    "v_f64_neg_zero": {
+      "F64": -0.0
+    },
+    "v_f64_zero": {
+      "F64": 0.0
+    },
+    "v_i16_max": {
+      "I16": 32767
+    },
+    "v_i16_min": {
+      "I16": -32768
+    },
+    "v_i32_max": {
+      "I32": 2147483647
+    },
+    "v_i32_min": {
+      "I32": -2147483648
+    },
+    "v_i64_beyond_js_safe": {
+      "I64": 9007199254740993
+    },
+    "v_i64_max": {
+      "I64": 9223372036854775807
+    },
+    "v_i64_min": {
+      "I64": -9223372036854775808
+    },
+    "v_json": {
+      "Json": [
+        123,
+        34,
+        97,
+        34,
+        58,
+        49,
+        44,
+        34,
+        98,
+        34,
+        58,
+        91,
+        116,
+        114,
+        117,
+        101,
+        44,
+        110,
+        117,
+        108,
+        108,
+        93,
+        125
+      ]
+    },
+    "v_none": null,
+    "v_object": {
+      "Object": [
+        222,
+        173,
+        190,
+        239
+      ]
+    },
+    "v_object_empty": {
+      "Object": []
+    },
+    "v_string": {
+      "String": "hello"
+    },
+    "v_string_empty": {
+      "String": ""
+    }
+  },
+  "encoding": "bincode 1.3 `serialize` defaults: fixed-width integers, little-endian, u64 sequence/string length prefixes, u32 enum variant tags, 1-byte Option tag, no length prefix on fixed-size arrays",
+  "fixture": "lww/all_value_types.bin",
+  "note": "Keys are emitted in BTreeMap (byte-lexicographic) order, not insertion order. `v_json` decodes to the UTF-8 bytes of its JSON document because Value::Json is serialized through `json_as_bytes`; `v_none` is a present key whose value is absent, which is not the same as the key being missing.",
+  "produced_by": "LWWBackend::to_state_buffer()",
+  "scenario": [
+    "one set() per Value variant, plus one set(_, None)"
+  ],
+  "total_len": 694
+}

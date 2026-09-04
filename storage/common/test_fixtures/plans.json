@@ -1,0 +1,4097 @@
+{
+  "bounds_case_count": 10,
+  "bounds_cases": [
+    {
+      "bounds": [],
+      "label": "empty",
+      "normalized": {
+        "canonical_range": {
+          "lower": null,
+          "upper": null
+        },
+        "eq_prefix_len": 0,
+        "eq_prefix_values": []
+      },
+      "note": "no keyparts at all"
+    },
+    {
+      "bounds": [
+        {
+          "column": "status",
+          "high": {
+            "datum": {
+              "kind": "Val",
+              "value": {
+                "String": "active"
+              }
+            },
+            "inclusive": true,
+            "kind": "Value"
+          },
+          "low": {
+            "datum": {
+              "kind": "Val",
+              "value": {
+                "String": "active"
+              }
+            },
+            "inclusive": true,
+            "kind": "Value"
+          }
+        }
+      ],
+      "label": "single_keypart_equality",
+      "normalized": {
+        "canonical_range": {
+          "lower": {
+            "open": false,
+            "tuple": [
+              {
+                "String": "active"
+              }
+            ]
+          },
+          "upper": null
+        },
+        "eq_prefix_len": 1,
+        "eq_prefix_values": [
+          {
+            "String": "active"
+          }
+        ]
+      },
+      "note": "one keypart, low == high, both inclusive. normalize() has an explicit special case for exactly this shape at the end of the function - it returns an open-ended range rather than a closed one"
+    },
+    {
+      "bounds": [
+        {
+          "column": "status",
+          "high": {
+            "datum": {
+              "kind": "Val",
+              "value": {
+                "String": "active"
+              }
+            },
+            "inclusive": true,
+            "kind": "Value"
+          },
+          "low": {
+            "datum": {
+              "kind": "Val",
+              "value": {
+                "String": "active"
+              }
+            },
+            "inclusive": true,
+            "kind": "Value"
+          }
+        },
+        {
+          "column": "kind",
+          "high": {
+            "datum": {
+              "kind": "Val",
+              "value": {
+                "String": "album"
+              }
+            },
+            "inclusive": true,
+            "kind": "Value"
+          },
+          "low": {
+            "datum": {
+              "kind": "Val",
+              "value": {
+                "String": "album"
+              }
+            },
+            "inclusive": true,
+            "kind": "Value"
+          }
+        }
+      ],
+      "label": "two_keypart_equality",
+      "normalized": {
+        "canonical_range": {
+          "lower": {
+            "open": false,
+            "tuple": [
+              {
+                "String": "active"
+              },
+              {
+                "String": "album"
+              }
+            ]
+          },
+          "upper": {
+            "open": false,
+            "tuple": [
+              {
+                "String": "active"
+              },
+              {
+                "String": "album"
+              }
+            ]
+          }
+        },
+        "eq_prefix_len": 2,
+        "eq_prefix_values": [
+          {
+            "String": "active"
+          },
+          {
+            "String": "album"
+          }
+        ]
+      },
+      "note": "two equality keyparts - the equality prefix should absorb both"
+    },
+    {
+      "bounds": [
+        {
+          "column": "status",
+          "high": {
+            "datum": {
+              "kind": "Val",
+              "value": {
+                "String": "active"
+              }
+            },
+            "inclusive": true,
+            "kind": "Value"
+          },
+          "low": {
+            "datum": {
+              "kind": "Val",
+              "value": {
+                "String": "active"
+              }
+            },
+            "inclusive": true,
+            "kind": "Value"
+          }
+        },
+        {
+          "column": "score",
+          "high": {
+            "datum": {
+              "kind": "Val",
+              "value": {
+                "I32": 10
+              }
+            },
+            "inclusive": true,
+            "kind": "Value"
+          },
+          "low": {
+            "datum": {
+              "kind": "Val",
+              "value": {
+                "I32": 5
+              }
+            },
+            "inclusive": true,
+            "kind": "Value"
+          }
+        }
+      ],
+      "label": "equality_prefix_then_closed_range",
+      "normalized": {
+        "canonical_range": {
+          "lower": {
+            "open": false,
+            "tuple": [
+              {
+                "String": "active"
+              },
+              {
+                "I32": 5
+              }
+            ]
+          },
+          "upper": {
+            "open": false,
+            "tuple": [
+              {
+                "String": "active"
+              },
+              {
+                "I32": 10
+              }
+            ]
+          }
+        },
+        "eq_prefix_len": 1,
+        "eq_prefix_values": [
+          {
+            "String": "active"
+          }
+        ]
+      },
+      "note": "one equality then a bounded range - the prefix is collapsed and the range materializes on both sides"
+    },
+    {
+      "bounds": [
+        {
+          "column": "status",
+          "high": {
+            "datum": {
+              "kind": "Val",
+              "value": {
+                "String": "active"
+              }
+            },
+            "inclusive": true,
+            "kind": "Value"
+          },
+          "low": {
+            "datum": {
+              "kind": "Val",
+              "value": {
+                "String": "active"
+              }
+            },
+            "inclusive": true,
+            "kind": "Value"
+          }
+        },
+        {
+          "column": "score",
+          "high": {
+            "datum": {
+              "kind": "Val",
+              "value": {
+                "I32": 10
+              }
+            },
+            "inclusive": false,
+            "kind": "Value"
+          },
+          "low": {
+            "datum": {
+              "kind": "Val",
+              "value": {
+                "I32": 5
+              }
+            },
+            "inclusive": false,
+            "kind": "Value"
+          }
+        }
+      ],
+      "label": "equality_prefix_then_open_range",
+      "normalized": {
+        "canonical_range": {
+          "lower": {
+            "open": true,
+            "tuple": [
+              {
+                "String": "active"
+              },
+              {
+                "I32": 5
+              }
+            ]
+          },
+          "upper": {
+            "open": true,
+            "tuple": [
+              {
+                "String": "active"
+              },
+              {
+                "I32": 10
+              }
+            ]
+          }
+        },
+        "eq_prefix_len": 1,
+        "eq_prefix_values": [
+          {
+            "String": "active"
+          }
+        ]
+      },
+      "note": "same, but the range endpoints are exclusive - watch the open flags"
+    },
+    {
+      "bounds": [
+        {
+          "column": "score",
+          "high": {
+            "kind": "UnboundedHigh",
+            "value_type": "I32"
+          },
+          "low": {
+            "datum": {
+              "kind": "Val",
+              "value": {
+                "I32": 5
+              }
+            },
+            "inclusive": true,
+            "kind": "Value"
+          }
+        }
+      ],
+      "label": "unbounded_high",
+      "normalized": {
+        "canonical_range": {
+          "lower": {
+            "open": false,
+            "tuple": [
+              {
+                "I32": 5
+              }
+            ]
+          },
+          "upper": null
+        },
+        "eq_prefix_len": 0,
+        "eq_prefix_values": []
+      },
+      "note": "a range with no upper endpoint - normalize returns early with upper: None"
+    },
+    {
+      "bounds": [
+        {
+          "column": "score",
+          "high": {
+            "datum": {
+              "kind": "Val",
+              "value": {
+                "I32": 10
+              }
+            },
+            "inclusive": true,
+            "kind": "Value"
+          },
+          "low": {
+            "kind": "UnboundedLow",
+            "value_type": "I32"
+          }
+        }
+      ],
+      "label": "unbounded_low",
+      "normalized": {
+        "canonical_range": {
+          "lower": null,
+          "upper": {
+            "open": false,
+            "tuple": [
+              {
+                "I32": 10
+              }
+            ]
+          }
+        },
+        "eq_prefix_len": 0,
+        "eq_prefix_values": []
+      },
+      "note": "a range with no lower endpoint - the lower tuple stays short"
+    },
+    {
+      "bounds": [
+        {
+          "column": "status",
+          "high": {
+            "datum": {
+              "kind": "Val",
+              "value": {
+                "String": "active"
+              }
+            },
+            "inclusive": true,
+            "kind": "Value"
+          },
+          "low": {
+            "datum": {
+              "kind": "Val",
+              "value": {
+                "String": "active"
+              }
+            },
+            "inclusive": true,
+            "kind": "Value"
+          }
+        },
+        {
+          "column": "score",
+          "high": {
+            "kind": "UnboundedHigh",
+            "value_type": "I32"
+          },
+          "low": {
+            "datum": {
+              "kind": "Val",
+              "value": {
+                "I32": 5
+              }
+            },
+            "inclusive": true,
+            "kind": "Value"
+          }
+        }
+      ],
+      "label": "equality_prefix_then_unbounded_high",
+      "normalized": {
+        "canonical_range": {
+          "lower": {
+            "open": false,
+            "tuple": [
+              {
+                "String": "active"
+              },
+              {
+                "I32": 5
+              }
+            ]
+          },
+          "upper": null
+        },
+        "eq_prefix_len": 1,
+        "eq_prefix_values": [
+          {
+            "String": "active"
+          }
+        ]
+      },
+      "note": "equality prefix followed by a half-open range"
+    },
+    {
+      "bounds": [
+        {
+          "column": "score",
+          "high": {
+            "kind": "UnboundedHigh",
+            "value_type": "I32"
+          },
+          "low": {
+            "kind": "UnboundedLow",
+            "value_type": "I32"
+          }
+        }
+      ],
+      "label": "both_unbounded",
+      "normalized": {
+        "canonical_range": {
+          "lower": {
+            "open": false,
+            "tuple": []
+          },
+          "upper": null
+        },
+        "eq_prefix_len": 0,
+        "eq_prefix_values": []
+      },
+      "note": "a keypart with no endpoints on either side"
+    },
+    {
+      "bounds": [
+        {
+          "column": "score",
+          "high": {
+            "datum": {
+              "kind": "PosInfinity",
+              "value_type": "I32"
+            },
+            "inclusive": true,
+            "kind": "Value"
+          },
+          "low": {
+            "datum": {
+              "kind": "NegInfinity",
+              "value_type": "I32"
+            },
+            "inclusive": true,
+            "kind": "Value"
+          }
+        }
+      ],
+      "label": "infinity_datum",
+      "normalized": {
+        "canonical_range": {
+          "lower": null,
+          "upper": null
+        },
+        "eq_prefix_len": 0,
+        "eq_prefix_values": []
+      },
+      "note": "a KeyDatum sentinel rather than an Endpoint sentinel - normalize's match arms do not treat KeyDatum::PosInfinity as a value, so this exits early"
+    }
+  ],
+  "fixture": "plans.json",
+  "plan_case_count": 26,
+  "plan_cases": [
+    {
+      "config": {
+        "name": "indexeddb",
+        "supports_desc_indexes": false
+      },
+      "note": "equality-only, single column",
+      "plan_count": 2,
+      "plans": [
+        {
+          "bounds": [
+            {
+              "column": "status",
+              "high": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "String": "active"
+                  }
+                },
+                "inclusive": true,
+                "kind": "Value"
+              },
+              "low": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "String": "active"
+                  }
+                },
+                "inclusive": true,
+                "kind": "Value"
+              }
+            }
+          ],
+          "index_spec": [
+            {
+              "collation": null,
+              "column": "status",
+              "direction": "Asc",
+              "nulls": null,
+              "sub_path": null,
+              "value_type": "String"
+            }
+          ],
+          "kind": "Index",
+          "order_by_spill": {
+            "is_global_spill": false,
+            "is_satisfied": true,
+            "presort": [],
+            "spill": []
+          },
+          "remaining_predicate": "True",
+          "scan_direction": "Forward"
+        },
+        {
+          "bounds": [],
+          "kind": "TableScan",
+          "order_by_spill": {
+            "is_global_spill": false,
+            "is_satisfied": true,
+            "presort": [],
+            "spill": []
+          },
+          "remaining_predicate": {
+            "Comparison": {
+              "left": {
+                "Path": {
+                  "steps": [
+                    "status"
+                  ]
+                }
+              },
+              "operator": "Equal",
+              "right": {
+                "Literal": {
+                  "String": "active"
+                }
+              }
+            }
+          },
+          "scan_direction": "Forward"
+        }
+      ],
+      "primary_key": "id",
+      "query": "status = 'active'",
+      "selection_ast": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "status"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "String": "active"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "config": {
+        "name": "indexeddb",
+        "supports_desc_indexes": false
+      },
+      "note": "equality-only, composite - keypart order follows conjunct order, not name order",
+      "plan_count": 2,
+      "plans": [
+        {
+          "bounds": [
+            {
+              "column": "status",
+              "high": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "String": "active"
+                  }
+                },
+                "inclusive": true,
+                "kind": "Value"
+              },
+              "low": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "String": "active"
+                  }
+                },
+                "inclusive": true,
+                "kind": "Value"
+              }
+            },
+            {
+              "column": "kind",
+              "high": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "String": "album"
+                  }
+                },
+                "inclusive": true,
+                "kind": "Value"
+              },
+              "low": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "String": "album"
+                  }
+                },
+                "inclusive": true,
+                "kind": "Value"
+              }
+            }
+          ],
+          "index_spec": [
+            {
+              "collation": null,
+              "column": "status",
+              "direction": "Asc",
+              "nulls": null,
+              "sub_path": null,
+              "value_type": "String"
+            },
+            {
+              "collation": null,
+              "column": "kind",
+              "direction": "Asc",
+              "nulls": null,
+              "sub_path": null,
+              "value_type": "String"
+            }
+          ],
+          "kind": "Index",
+          "order_by_spill": {
+            "is_global_spill": false,
+            "is_satisfied": true,
+            "presort": [],
+            "spill": []
+          },
+          "remaining_predicate": "True",
+          "scan_direction": "Forward"
+        },
+        {
+          "bounds": [],
+          "kind": "TableScan",
+          "order_by_spill": {
+            "is_global_spill": false,
+            "is_satisfied": true,
+            "presort": [],
+            "spill": []
+          },
+          "remaining_predicate": {
+            "And": [
+              {
+                "Comparison": {
+                  "left": {
+                    "Path": {
+                      "steps": [
+                        "status"
+                      ]
+                    }
+                  },
+                  "operator": "Equal",
+                  "right": {
+                    "Literal": {
+                      "String": "active"
+                    }
+                  }
+                }
+              },
+              {
+                "Comparison": {
+                  "left": {
+                    "Path": {
+                      "steps": [
+                        "kind"
+                      ]
+                    }
+                  },
+                  "operator": "Equal",
+                  "right": {
+                    "Literal": {
+                      "String": "album"
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          "scan_direction": "Forward"
+        }
+      ],
+      "primary_key": "id",
+      "query": "status = 'active' AND kind = 'album'",
+      "selection_ast": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "And": [
+            {
+              "Comparison": {
+                "left": {
+                  "Path": {
+                    "steps": [
+                      "status"
+                    ]
+                  }
+                },
+                "operator": "Equal",
+                "right": {
+                  "Literal": {
+                    "String": "active"
+                  }
+                }
+              }
+            },
+            {
+              "Comparison": {
+                "left": {
+                  "Path": {
+                    "steps": [
+                      "kind"
+                    ]
+                  }
+                },
+                "operator": "Equal",
+                "right": {
+                  "Literal": {
+                    "String": "album"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "config": {
+        "name": "indexeddb",
+        "supports_desc_indexes": false
+      },
+      "note": "one inequality, no ORDER BY",
+      "plan_count": 2,
+      "plans": [
+        {
+          "bounds": [
+            {
+              "column": "score",
+              "high": {
+                "kind": "UnboundedHigh",
+                "value_type": "I32"
+              },
+              "low": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "I32": 5
+                  }
+                },
+                "inclusive": false,
+                "kind": "Value"
+              }
+            }
+          ],
+          "index_spec": [
+            {
+              "collation": null,
+              "column": "score",
+              "direction": "Asc",
+              "nulls": null,
+              "sub_path": null,
+              "value_type": "I32"
+            }
+          ],
+          "kind": "Index",
+          "order_by_spill": {
+            "is_global_spill": false,
+            "is_satisfied": true,
+            "presort": [],
+            "spill": []
+          },
+          "remaining_predicate": "True",
+          "scan_direction": "Forward"
+        },
+        {
+          "bounds": [],
+          "kind": "TableScan",
+          "order_by_spill": {
+            "is_global_spill": false,
+            "is_satisfied": true,
+            "presort": [],
+            "spill": []
+          },
+          "remaining_predicate": {
+            "Comparison": {
+              "left": {
+                "Path": {
+                  "steps": [
+                    "score"
+                  ]
+                }
+              },
+              "operator": "GreaterThan",
+              "right": {
+                "Literal": {
+                  "I32": 5
+                }
+              }
+            }
+          },
+          "scan_direction": "Forward"
+        }
+      ],
+      "primary_key": "id",
+      "query": "score > 5",
+      "selection_ast": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "score"
+                ]
+              }
+            },
+            "operator": "GreaterThan",
+            "right": {
+              "Literal": {
+                "I32": 5
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "config": {
+        "name": "indexeddb",
+        "supports_desc_indexes": false
+      },
+      "note": "two inequalities on different fields - one index plan per inequality field",
+      "plan_count": 3,
+      "plans": [
+        {
+          "bounds": [
+            {
+              "column": "score",
+              "high": {
+                "kind": "UnboundedHigh",
+                "value_type": "I32"
+              },
+              "low": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "I32": 5
+                  }
+                },
+                "inclusive": false,
+                "kind": "Value"
+              }
+            }
+          ],
+          "index_spec": [
+            {
+              "collation": null,
+              "column": "score",
+              "direction": "Asc",
+              "nulls": null,
+              "sub_path": null,
+              "value_type": "I32"
+            }
+          ],
+          "kind": "Index",
+          "order_by_spill": {
+            "is_global_spill": false,
+            "is_satisfied": true,
+            "presort": [],
+            "spill": []
+          },
+          "remaining_predicate": {
+            "Comparison": {
+              "left": {
+                "Path": {
+                  "steps": [
+                    "rank"
+                  ]
+                }
+              },
+              "operator": "LessThan",
+              "right": {
+                "Literal": {
+                  "I32": 10
+                }
+              }
+            }
+          },
+          "scan_direction": "Forward"
+        },
+        {
+          "bounds": [
+            {
+              "column": "rank",
+              "high": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "I32": 10
+                  }
+                },
+                "inclusive": false,
+                "kind": "Value"
+              },
+              "low": {
+                "kind": "UnboundedLow",
+                "value_type": "I32"
+              }
+            }
+          ],
+          "index_spec": [
+            {
+              "collation": null,
+              "column": "rank",
+              "direction": "Asc",
+              "nulls": null,
+              "sub_path": null,
+              "value_type": "I32"
+            }
+          ],
+          "kind": "Index",
+          "order_by_spill": {
+            "is_global_spill": false,
+            "is_satisfied": true,
+            "presort": [],
+            "spill": []
+          },
+          "remaining_predicate": {
+            "Comparison": {
+              "left": {
+                "Path": {
+                  "steps": [
+                    "score"
+                  ]
+                }
+              },
+              "operator": "GreaterThan",
+              "right": {
+                "Literal": {
+                  "I32": 5
+                }
+              }
+            }
+          },
+          "scan_direction": "Forward"
+        },
+        {
+          "bounds": [],
+          "kind": "TableScan",
+          "order_by_spill": {
+            "is_global_spill": false,
+            "is_satisfied": true,
+            "presort": [],
+            "spill": []
+          },
+          "remaining_predicate": {
+            "And": [
+              {
+                "Comparison": {
+                  "left": {
+                    "Path": {
+                      "steps": [
+                        "score"
+                      ]
+                    }
+                  },
+                  "operator": "GreaterThan",
+                  "right": {
+                    "Literal": {
+                      "I32": 5
+                    }
+                  }
+                }
+              },
+              {
+                "Comparison": {
+                  "left": {
+                    "Path": {
+                      "steps": [
+                        "rank"
+                      ]
+                    }
+                  },
+                  "operator": "LessThan",
+                  "right": {
+                    "Literal": {
+                      "I32": 10
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          "scan_direction": "Forward"
+        }
+      ],
+      "primary_key": "id",
+      "query": "score > 5 AND rank < 10",
+      "selection_ast": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "And": [
+            {
+              "Comparison": {
+                "left": {
+                  "Path": {
+                    "steps": [
+                      "score"
+                    ]
+                  }
+                },
+                "operator": "GreaterThan",
+                "right": {
+                  "Literal": {
+                    "I32": 5
+                  }
+                }
+              }
+            },
+            {
+              "Comparison": {
+                "left": {
+                  "Path": {
+                    "steps": [
+                      "rank"
+                    ]
+                  }
+                },
+                "operator": "LessThan",
+                "right": {
+                  "Literal": {
+                    "I32": 10
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "config": {
+        "name": "indexeddb",
+        "supports_desc_indexes": false
+      },
+      "note": "two inequalities on the SAME field - one bounded range, not two plans",
+      "plan_count": 2,
+      "plans": [
+        {
+          "bounds": [
+            {
+              "column": "score",
+              "high": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "I32": 10
+                  }
+                },
+                "inclusive": false,
+                "kind": "Value"
+              },
+              "low": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "I32": 5
+                  }
+                },
+                "inclusive": false,
+                "kind": "Value"
+              }
+            }
+          ],
+          "index_spec": [
+            {
+              "collation": null,
+              "column": "score",
+              "direction": "Asc",
+              "nulls": null,
+              "sub_path": null,
+              "value_type": "I32"
+            }
+          ],
+          "kind": "Index",
+          "order_by_spill": {
+            "is_global_spill": false,
+            "is_satisfied": true,
+            "presort": [],
+            "spill": []
+          },
+          "remaining_predicate": "True",
+          "scan_direction": "Forward"
+        },
+        {
+          "bounds": [],
+          "kind": "TableScan",
+          "order_by_spill": {
+            "is_global_spill": false,
+            "is_satisfied": true,
+            "presort": [],
+            "spill": []
+          },
+          "remaining_predicate": {
+            "And": [
+              {
+                "Comparison": {
+                  "left": {
+                    "Path": {
+                      "steps": [
+                        "score"
+                      ]
+                    }
+                  },
+                  "operator": "GreaterThan",
+                  "right": {
+                    "Literal": {
+                      "I32": 5
+                    }
+                  }
+                }
+              },
+              {
+                "Comparison": {
+                  "left": {
+                    "Path": {
+                      "steps": [
+                        "score"
+                      ]
+                    }
+                  },
+                  "operator": "LessThan",
+                  "right": {
+                    "Literal": {
+                      "I32": 10
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          "scan_direction": "Forward"
+        }
+      ],
+      "primary_key": "id",
+      "query": "score > 5 AND score < 10",
+      "selection_ast": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "And": [
+            {
+              "Comparison": {
+                "left": {
+                  "Path": {
+                    "steps": [
+                      "score"
+                    ]
+                  }
+                },
+                "operator": "GreaterThan",
+                "right": {
+                  "Literal": {
+                    "I32": 5
+                  }
+                }
+              }
+            },
+            {
+              "Comparison": {
+                "left": {
+                  "Path": {
+                    "steps": [
+                      "score"
+                    ]
+                  }
+                },
+                "operator": "LessThan",
+                "right": {
+                  "Literal": {
+                    "I32": 10
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "config": {
+        "name": "indexeddb",
+        "supports_desc_indexes": false
+      },
+      "note": "equality prefix plus a range on the next keypart",
+      "plan_count": 2,
+      "plans": [
+        {
+          "bounds": [
+            {
+              "column": "status",
+              "high": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "String": "active"
+                  }
+                },
+                "inclusive": true,
+                "kind": "Value"
+              },
+              "low": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "String": "active"
+                  }
+                },
+                "inclusive": true,
+                "kind": "Value"
+              }
+            },
+            {
+              "column": "score",
+              "high": {
+                "kind": "UnboundedHigh",
+                "value_type": "I32"
+              },
+              "low": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "I32": 5
+                  }
+                },
+                "inclusive": false,
+                "kind": "Value"
+              }
+            }
+          ],
+          "index_spec": [
+            {
+              "collation": null,
+              "column": "status",
+              "direction": "Asc",
+              "nulls": null,
+              "sub_path": null,
+              "value_type": "String"
+            },
+            {
+              "collation": null,
+              "column": "score",
+              "direction": "Asc",
+              "nulls": null,
+              "sub_path": null,
+              "value_type": "I32"
+            }
+          ],
+          "kind": "Index",
+          "order_by_spill": {
+            "is_global_spill": false,
+            "is_satisfied": true,
+            "presort": [],
+            "spill": []
+          },
+          "remaining_predicate": "True",
+          "scan_direction": "Forward"
+        },
+        {
+          "bounds": [],
+          "kind": "TableScan",
+          "order_by_spill": {
+            "is_global_spill": false,
+            "is_satisfied": true,
+            "presort": [],
+            "spill": []
+          },
+          "remaining_predicate": {
+            "And": [
+              {
+                "Comparison": {
+                  "left": {
+                    "Path": {
+                      "steps": [
+                        "status"
+                      ]
+                    }
+                  },
+                  "operator": "Equal",
+                  "right": {
+                    "Literal": {
+                      "String": "active"
+                    }
+                  }
+                }
+              },
+              {
+                "Comparison": {
+                  "left": {
+                    "Path": {
+                      "steps": [
+                        "score"
+                      ]
+                    }
+                  },
+                  "operator": "GreaterThan",
+                  "right": {
+                    "Literal": {
+                      "I32": 5
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          "scan_direction": "Forward"
+        }
+      ],
+      "primary_key": "id",
+      "query": "status = 'active' AND score > 5",
+      "selection_ast": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "And": [
+            {
+              "Comparison": {
+                "left": {
+                  "Path": {
+                    "steps": [
+                      "status"
+                    ]
+                  }
+                },
+                "operator": "Equal",
+                "right": {
+                  "Literal": {
+                    "String": "active"
+                  }
+                }
+              }
+            },
+            {
+              "Comparison": {
+                "left": {
+                  "Path": {
+                    "steps": [
+                      "score"
+                    ]
+                  }
+                },
+                "operator": "GreaterThan",
+                "right": {
+                  "Literal": {
+                    "I32": 5
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "config": {
+        "name": "indexeddb",
+        "supports_desc_indexes": false
+      },
+      "note": "ORDER-FIRST with a single DESC key. Under indexeddb the index is ASC-only and the scan reverses; under full_support the keypart itself is DESC",
+      "plan_count": 2,
+      "plans": [
+        {
+          "bounds": [
+            {
+              "column": "status",
+              "high": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "String": "active"
+                  }
+                },
+                "inclusive": true,
+                "kind": "Value"
+              },
+              "low": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "String": "active"
+                  }
+                },
+                "inclusive": true,
+                "kind": "Value"
+              }
+            }
+          ],
+          "index_spec": [
+            {
+              "collation": null,
+              "column": "status",
+              "direction": "Asc",
+              "nulls": null,
+              "sub_path": null,
+              "value_type": "String"
+            },
+            {
+              "collation": null,
+              "column": "score",
+              "direction": "Asc",
+              "nulls": null,
+              "sub_path": null,
+              "value_type": "String"
+            }
+          ],
+          "kind": "Index",
+          "order_by_spill": {
+            "is_global_spill": false,
+            "is_satisfied": true,
+            "presort": [
+              {
+                "direction": "Desc",
+                "path": {
+                  "steps": [
+                    "score"
+                  ]
+                }
+              }
+            ],
+            "spill": []
+          },
+          "remaining_predicate": "True",
+          "scan_direction": "Reverse"
+        },
+        {
+          "bounds": [],
+          "kind": "TableScan",
+          "order_by_spill": {
+            "is_global_spill": true,
+            "is_satisfied": false,
+            "presort": [],
+            "spill": [
+              {
+                "direction": "Desc",
+                "path": {
+                  "steps": [
+                    "score"
+                  ]
+                }
+              }
+            ]
+          },
+          "remaining_predicate": {
+            "Comparison": {
+              "left": {
+                "Path": {
+                  "steps": [
+                    "status"
+                  ]
+                }
+              },
+              "operator": "Equal",
+              "right": {
+                "Literal": {
+                  "String": "active"
+                }
+              }
+            }
+          },
+          "scan_direction": "Forward"
+        }
+      ],
+      "primary_key": "id",
+      "query": "status = 'active' ORDER BY score DESC",
+      "selection_ast": {
+        "limit": null,
+        "order_by": [
+          {
+            "direction": "Desc",
+            "path": {
+              "steps": [
+                "score"
+              ]
+            }
+          }
+        ],
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "status"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "String": "active"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "config": {
+        "name": "full_support",
+        "supports_desc_indexes": true
+      },
+      "note": "ORDER-FIRST with a single DESC key. Under indexeddb the index is ASC-only and the scan reverses; under full_support the keypart itself is DESC",
+      "plan_count": 2,
+      "plans": [
+        {
+          "bounds": [
+            {
+              "column": "status",
+              "high": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "String": "active"
+                  }
+                },
+                "inclusive": true,
+                "kind": "Value"
+              },
+              "low": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "String": "active"
+                  }
+                },
+                "inclusive": true,
+                "kind": "Value"
+              }
+            }
+          ],
+          "index_spec": [
+            {
+              "collation": null,
+              "column": "status",
+              "direction": "Asc",
+              "nulls": null,
+              "sub_path": null,
+              "value_type": "String"
+            },
+            {
+              "collation": null,
+              "column": "score",
+              "direction": "Desc",
+              "nulls": null,
+              "sub_path": null,
+              "value_type": "String"
+            }
+          ],
+          "kind": "Index",
+          "order_by_spill": {
+            "is_global_spill": false,
+            "is_satisfied": true,
+            "presort": [
+              {
+                "direction": "Desc",
+                "path": {
+                  "steps": [
+                    "score"
+                  ]
+                }
+              }
+            ],
+            "spill": []
+          },
+          "remaining_predicate": "True",
+          "scan_direction": "Forward"
+        },
+        {
+          "bounds": [],
+          "kind": "TableScan",
+          "order_by_spill": {
+            "is_global_spill": true,
+            "is_satisfied": false,
+            "presort": [],
+            "spill": [
+              {
+                "direction": "Desc",
+                "path": {
+                  "steps": [
+                    "score"
+                  ]
+                }
+              }
+            ]
+          },
+          "remaining_predicate": {
+            "Comparison": {
+              "left": {
+                "Path": {
+                  "steps": [
+                    "status"
+                  ]
+                }
+              },
+              "operator": "Equal",
+              "right": {
+                "Literal": {
+                  "String": "active"
+                }
+              }
+            }
+          },
+          "scan_direction": "Forward"
+        }
+      ],
+      "primary_key": "id",
+      "query": "status = 'active' ORDER BY score DESC",
+      "selection_ast": {
+        "limit": null,
+        "order_by": [
+          {
+            "direction": "Desc",
+            "path": {
+              "steps": [
+                "score"
+              ]
+            }
+          }
+        ],
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "status"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "String": "active"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "config": {
+        "name": "indexeddb",
+        "supports_desc_indexes": false
+      },
+      "note": "mixed-direction ORDER BY - the case the two configs disagree on. indexeddb keeps the longest same-direction prefix and spills the rest; full_support satisfies the whole ordering in the index",
+      "plan_count": 2,
+      "plans": [
+        {
+          "bounds": [
+            {
+              "column": "status",
+              "high": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "String": "active"
+                  }
+                },
+                "inclusive": true,
+                "kind": "Value"
+              },
+              "low": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "String": "active"
+                  }
+                },
+                "inclusive": true,
+                "kind": "Value"
+              }
+            }
+          ],
+          "index_spec": [
+            {
+              "collation": null,
+              "column": "status",
+              "direction": "Asc",
+              "nulls": null,
+              "sub_path": null,
+              "value_type": "String"
+            },
+            {
+              "collation": null,
+              "column": "a",
+              "direction": "Asc",
+              "nulls": null,
+              "sub_path": null,
+              "value_type": "String"
+            }
+          ],
+          "kind": "Index",
+          "order_by_spill": {
+            "is_global_spill": false,
+            "is_satisfied": false,
+            "presort": [
+              {
+                "direction": "Asc",
+                "path": {
+                  "steps": [
+                    "a"
+                  ]
+                }
+              }
+            ],
+            "spill": [
+              {
+                "direction": "Desc",
+                "path": {
+                  "steps": [
+                    "b"
+                  ]
+                }
+              }
+            ]
+          },
+          "remaining_predicate": "True",
+          "scan_direction": "Forward"
+        },
+        {
+          "bounds": [],
+          "kind": "TableScan",
+          "order_by_spill": {
+            "is_global_spill": true,
+            "is_satisfied": false,
+            "presort": [],
+            "spill": [
+              {
+                "direction": "Asc",
+                "path": {
+                  "steps": [
+                    "a"
+                  ]
+                }
+              },
+              {
+                "direction": "Desc",
+                "path": {
+                  "steps": [
+                    "b"
+                  ]
+                }
+              }
+            ]
+          },
+          "remaining_predicate": {
+            "Comparison": {
+              "left": {
+                "Path": {
+                  "steps": [
+                    "status"
+                  ]
+                }
+              },
+              "operator": "Equal",
+              "right": {
+                "Literal": {
+                  "String": "active"
+                }
+              }
+            }
+          },
+          "scan_direction": "Forward"
+        }
+      ],
+      "primary_key": "id",
+      "query": "status = 'active' ORDER BY a ASC, b DESC",
+      "selection_ast": {
+        "limit": null,
+        "order_by": [
+          {
+            "direction": "Asc",
+            "path": {
+              "steps": [
+                "a"
+              ]
+            }
+          },
+          {
+            "direction": "Desc",
+            "path": {
+              "steps": [
+                "b"
+              ]
+            }
+          }
+        ],
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "status"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "String": "active"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "config": {
+        "name": "full_support",
+        "supports_desc_indexes": true
+      },
+      "note": "mixed-direction ORDER BY - the case the two configs disagree on. indexeddb keeps the longest same-direction prefix and spills the rest; full_support satisfies the whole ordering in the index",
+      "plan_count": 2,
+      "plans": [
+        {
+          "bounds": [
+            {
+              "column": "status",
+              "high": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "String": "active"
+                  }
+                },
+                "inclusive": true,
+                "kind": "Value"
+              },
+              "low": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "String": "active"
+                  }
+                },
+                "inclusive": true,
+                "kind": "Value"
+              }
+            }
+          ],
+          "index_spec": [
+            {
+              "collation": null,
+              "column": "status",
+              "direction": "Asc",
+              "nulls": null,
+              "sub_path": null,
+              "value_type": "String"
+            },
+            {
+              "collation": null,
+              "column": "a",
+              "direction": "Asc",
+              "nulls": null,
+              "sub_path": null,
+              "value_type": "String"
+            },
+            {
+              "collation": null,
+              "column": "b",
+              "direction": "Desc",
+              "nulls": null,
+              "sub_path": null,
+              "value_type": "String"
+            }
+          ],
+          "kind": "Index",
+          "order_by_spill": {
+            "is_global_spill": false,
+            "is_satisfied": true,
+            "presort": [
+              {
+                "direction": "Asc",
+                "path": {
+                  "steps": [
+                    "a"
+                  ]
+                }
+              },
+              {
+                "direction": "Desc",
+                "path": {
+                  "steps": [
+                    "b"
+                  ]
+                }
+              }
+            ],
+            "spill": []
+          },
+          "remaining_predicate": "True",
+          "scan_direction": "Forward"
+        },
+        {
+          "bounds": [],
+          "kind": "TableScan",
+          "order_by_spill": {
+            "is_global_spill": true,
+            "is_satisfied": false,
+            "presort": [],
+            "spill": [
+              {
+                "direction": "Asc",
+                "path": {
+                  "steps": [
+                    "a"
+                  ]
+                }
+              },
+              {
+                "direction": "Desc",
+                "path": {
+                  "steps": [
+                    "b"
+                  ]
+                }
+              }
+            ]
+          },
+          "remaining_predicate": {
+            "Comparison": {
+              "left": {
+                "Path": {
+                  "steps": [
+                    "status"
+                  ]
+                }
+              },
+              "operator": "Equal",
+              "right": {
+                "Literal": {
+                  "String": "active"
+                }
+              }
+            }
+          },
+          "scan_direction": "Forward"
+        }
+      ],
+      "primary_key": "id",
+      "query": "status = 'active' ORDER BY a ASC, b DESC",
+      "selection_ast": {
+        "limit": null,
+        "order_by": [
+          {
+            "direction": "Asc",
+            "path": {
+              "steps": [
+                "a"
+              ]
+            }
+          },
+          {
+            "direction": "Desc",
+            "path": {
+              "steps": [
+                "b"
+              ]
+            }
+          }
+        ],
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "status"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "String": "active"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "config": {
+        "name": "indexeddb",
+        "supports_desc_indexes": false
+      },
+      "note": "uniform DESC ORDER BY - indexeddb can serve it all by reversing the scan, so nothing spills even without DESC index support",
+      "plan_count": 2,
+      "plans": [
+        {
+          "bounds": [
+            {
+              "column": "status",
+              "high": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "String": "active"
+                  }
+                },
+                "inclusive": true,
+                "kind": "Value"
+              },
+              "low": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "String": "active"
+                  }
+                },
+                "inclusive": true,
+                "kind": "Value"
+              }
+            }
+          ],
+          "index_spec": [
+            {
+              "collation": null,
+              "column": "status",
+              "direction": "Asc",
+              "nulls": null,
+              "sub_path": null,
+              "value_type": "String"
+            },
+            {
+              "collation": null,
+              "column": "a",
+              "direction": "Asc",
+              "nulls": null,
+              "sub_path": null,
+              "value_type": "String"
+            },
+            {
+              "collation": null,
+              "column": "b",
+              "direction": "Asc",
+              "nulls": null,
+              "sub_path": null,
+              "value_type": "String"
+            }
+          ],
+          "kind": "Index",
+          "order_by_spill": {
+            "is_global_spill": false,
+            "is_satisfied": true,
+            "presort": [
+              {
+                "direction": "Desc",
+                "path": {
+                  "steps": [
+                    "a"
+                  ]
+                }
+              },
+              {
+                "direction": "Desc",
+                "path": {
+                  "steps": [
+                    "b"
+                  ]
+                }
+              }
+            ],
+            "spill": []
+          },
+          "remaining_predicate": "True",
+          "scan_direction": "Reverse"
+        },
+        {
+          "bounds": [],
+          "kind": "TableScan",
+          "order_by_spill": {
+            "is_global_spill": true,
+            "is_satisfied": false,
+            "presort": [],
+            "spill": [
+              {
+                "direction": "Desc",
+                "path": {
+                  "steps": [
+                    "a"
+                  ]
+                }
+              },
+              {
+                "direction": "Desc",
+                "path": {
+                  "steps": [
+                    "b"
+                  ]
+                }
+              }
+            ]
+          },
+          "remaining_predicate": {
+            "Comparison": {
+              "left": {
+                "Path": {
+                  "steps": [
+                    "status"
+                  ]
+                }
+              },
+              "operator": "Equal",
+              "right": {
+                "Literal": {
+                  "String": "active"
+                }
+              }
+            }
+          },
+          "scan_direction": "Forward"
+        }
+      ],
+      "primary_key": "id",
+      "query": "status = 'active' ORDER BY a DESC, b DESC",
+      "selection_ast": {
+        "limit": null,
+        "order_by": [
+          {
+            "direction": "Desc",
+            "path": {
+              "steps": [
+                "a"
+              ]
+            }
+          },
+          {
+            "direction": "Desc",
+            "path": {
+              "steps": [
+                "b"
+              ]
+            }
+          }
+        ],
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "status"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "String": "active"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "config": {
+        "name": "full_support",
+        "supports_desc_indexes": true
+      },
+      "note": "uniform DESC ORDER BY - indexeddb can serve it all by reversing the scan, so nothing spills even without DESC index support",
+      "plan_count": 2,
+      "plans": [
+        {
+          "bounds": [
+            {
+              "column": "status",
+              "high": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "String": "active"
+                  }
+                },
+                "inclusive": true,
+                "kind": "Value"
+              },
+              "low": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "String": "active"
+                  }
+                },
+                "inclusive": true,
+                "kind": "Value"
+              }
+            }
+          ],
+          "index_spec": [
+            {
+              "collation": null,
+              "column": "status",
+              "direction": "Asc",
+              "nulls": null,
+              "sub_path": null,
+              "value_type": "String"
+            },
+            {
+              "collation": null,
+              "column": "a",
+              "direction": "Desc",
+              "nulls": null,
+              "sub_path": null,
+              "value_type": "String"
+            },
+            {
+              "collation": null,
+              "column": "b",
+              "direction": "Desc",
+              "nulls": null,
+              "sub_path": null,
+              "value_type": "String"
+            }
+          ],
+          "kind": "Index",
+          "order_by_spill": {
+            "is_global_spill": false,
+            "is_satisfied": true,
+            "presort": [
+              {
+                "direction": "Desc",
+                "path": {
+                  "steps": [
+                    "a"
+                  ]
+                }
+              },
+              {
+                "direction": "Desc",
+                "path": {
+                  "steps": [
+                    "b"
+                  ]
+                }
+              }
+            ],
+            "spill": []
+          },
+          "remaining_predicate": "True",
+          "scan_direction": "Forward"
+        },
+        {
+          "bounds": [],
+          "kind": "TableScan",
+          "order_by_spill": {
+            "is_global_spill": true,
+            "is_satisfied": false,
+            "presort": [],
+            "spill": [
+              {
+                "direction": "Desc",
+                "path": {
+                  "steps": [
+                    "a"
+                  ]
+                }
+              },
+              {
+                "direction": "Desc",
+                "path": {
+                  "steps": [
+                    "b"
+                  ]
+                }
+              }
+            ]
+          },
+          "remaining_predicate": {
+            "Comparison": {
+              "left": {
+                "Path": {
+                  "steps": [
+                    "status"
+                  ]
+                }
+              },
+              "operator": "Equal",
+              "right": {
+                "Literal": {
+                  "String": "active"
+                }
+              }
+            }
+          },
+          "scan_direction": "Forward"
+        }
+      ],
+      "primary_key": "id",
+      "query": "status = 'active' ORDER BY a DESC, b DESC",
+      "selection_ast": {
+        "limit": null,
+        "order_by": [
+          {
+            "direction": "Desc",
+            "path": {
+              "steps": [
+                "a"
+              ]
+            }
+          },
+          {
+            "direction": "Desc",
+            "path": {
+              "steps": [
+                "b"
+              ]
+            }
+          }
+        ],
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "status"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "String": "active"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "config": {
+        "name": "indexeddb",
+        "supports_desc_indexes": false
+      },
+      "note": "covered inequality: the ORDER BY field is the one with the range, so INEQ-FIRST is deliberately suppressed and only ORDER-FIRST is emitted",
+      "plan_count": 2,
+      "plans": [
+        {
+          "bounds": [
+            {
+              "column": "score",
+              "high": {
+                "kind": "UnboundedHigh",
+                "value_type": "I32"
+              },
+              "low": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "I32": 5
+                  }
+                },
+                "inclusive": false,
+                "kind": "Value"
+              }
+            }
+          ],
+          "index_spec": [
+            {
+              "collation": null,
+              "column": "score",
+              "direction": "Asc",
+              "nulls": null,
+              "sub_path": null,
+              "value_type": "String"
+            }
+          ],
+          "kind": "Index",
+          "order_by_spill": {
+            "is_global_spill": false,
+            "is_satisfied": true,
+            "presort": [
+              {
+                "direction": "Desc",
+                "path": {
+                  "steps": [
+                    "score"
+                  ]
+                }
+              }
+            ],
+            "spill": []
+          },
+          "remaining_predicate": "True",
+          "scan_direction": "Reverse"
+        },
+        {
+          "bounds": [],
+          "kind": "TableScan",
+          "order_by_spill": {
+            "is_global_spill": true,
+            "is_satisfied": false,
+            "presort": [],
+            "spill": [
+              {
+                "direction": "Desc",
+                "path": {
+                  "steps": [
+                    "score"
+                  ]
+                }
+              }
+            ]
+          },
+          "remaining_predicate": {
+            "Comparison": {
+              "left": {
+                "Path": {
+                  "steps": [
+                    "score"
+                  ]
+                }
+              },
+              "operator": "GreaterThan",
+              "right": {
+                "Literal": {
+                  "I32": 5
+                }
+              }
+            }
+          },
+          "scan_direction": "Forward"
+        }
+      ],
+      "primary_key": "id",
+      "query": "score > 5 ORDER BY score DESC",
+      "selection_ast": {
+        "limit": null,
+        "order_by": [
+          {
+            "direction": "Desc",
+            "path": {
+              "steps": [
+                "score"
+              ]
+            }
+          }
+        ],
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "score"
+                ]
+              }
+            },
+            "operator": "GreaterThan",
+            "right": {
+              "Literal": {
+                "I32": 5
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "config": {
+        "name": "indexeddb",
+        "supports_desc_indexes": false
+      },
+      "note": "uncovered inequality: the ORDER BY field has no range, so both ORDER-FIRST and INEQ-FIRST are emitted",
+      "plan_count": 3,
+      "plans": [
+        {
+          "bounds": [],
+          "index_spec": [
+            {
+              "collation": null,
+              "column": "name",
+              "direction": "Asc",
+              "nulls": null,
+              "sub_path": null,
+              "value_type": "String"
+            }
+          ],
+          "kind": "Index",
+          "order_by_spill": {
+            "is_global_spill": false,
+            "is_satisfied": true,
+            "presort": [
+              {
+                "direction": "Asc",
+                "path": {
+                  "steps": [
+                    "name"
+                  ]
+                }
+              }
+            ],
+            "spill": []
+          },
+          "remaining_predicate": {
+            "Comparison": {
+              "left": {
+                "Path": {
+                  "steps": [
+                    "score"
+                  ]
+                }
+              },
+              "operator": "GreaterThan",
+              "right": {
+                "Literal": {
+                  "I32": 5
+                }
+              }
+            }
+          },
+          "scan_direction": "Forward"
+        },
+        {
+          "bounds": [
+            {
+              "column": "score",
+              "high": {
+                "kind": "UnboundedHigh",
+                "value_type": "I32"
+              },
+              "low": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "I32": 5
+                  }
+                },
+                "inclusive": false,
+                "kind": "Value"
+              }
+            }
+          ],
+          "index_spec": [
+            {
+              "collation": null,
+              "column": "score",
+              "direction": "Asc",
+              "nulls": null,
+              "sub_path": null,
+              "value_type": "I32"
+            }
+          ],
+          "kind": "Index",
+          "order_by_spill": {
+            "is_global_spill": true,
+            "is_satisfied": false,
+            "presort": [],
+            "spill": [
+              {
+                "direction": "Asc",
+                "path": {
+                  "steps": [
+                    "name"
+                  ]
+                }
+              }
+            ]
+          },
+          "remaining_predicate": "True",
+          "scan_direction": "Forward"
+        },
+        {
+          "bounds": [],
+          "kind": "TableScan",
+          "order_by_spill": {
+            "is_global_spill": true,
+            "is_satisfied": false,
+            "presort": [],
+            "spill": [
+              {
+                "direction": "Asc",
+                "path": {
+                  "steps": [
+                    "name"
+                  ]
+                }
+              }
+            ]
+          },
+          "remaining_predicate": {
+            "Comparison": {
+              "left": {
+                "Path": {
+                  "steps": [
+                    "score"
+                  ]
+                }
+              },
+              "operator": "GreaterThan",
+              "right": {
+                "Literal": {
+                  "I32": 5
+                }
+              }
+            }
+          },
+          "scan_direction": "Forward"
+        }
+      ],
+      "primary_key": "id",
+      "query": "score > 5 ORDER BY name ASC",
+      "selection_ast": {
+        "limit": null,
+        "order_by": [
+          {
+            "direction": "Asc",
+            "path": {
+              "steps": [
+                "name"
+              ]
+            }
+          }
+        ],
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "score"
+                ]
+              }
+            },
+            "operator": "GreaterThan",
+            "right": {
+              "Literal": {
+                "I32": 5
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "config": {
+        "name": "indexeddb",
+        "supports_desc_indexes": false
+      },
+      "note": "equality plus an uncovered inequality plus an unrelated ORDER BY",
+      "plan_count": 3,
+      "plans": [
+        {
+          "bounds": [
+            {
+              "column": "status",
+              "high": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "String": "active"
+                  }
+                },
+                "inclusive": true,
+                "kind": "Value"
+              },
+              "low": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "String": "active"
+                  }
+                },
+                "inclusive": true,
+                "kind": "Value"
+              }
+            }
+          ],
+          "index_spec": [
+            {
+              "collation": null,
+              "column": "status",
+              "direction": "Asc",
+              "nulls": null,
+              "sub_path": null,
+              "value_type": "String"
+            },
+            {
+              "collation": null,
+              "column": "name",
+              "direction": "Asc",
+              "nulls": null,
+              "sub_path": null,
+              "value_type": "String"
+            }
+          ],
+          "kind": "Index",
+          "order_by_spill": {
+            "is_global_spill": false,
+            "is_satisfied": true,
+            "presort": [
+              {
+                "direction": "Asc",
+                "path": {
+                  "steps": [
+                    "name"
+                  ]
+                }
+              }
+            ],
+            "spill": []
+          },
+          "remaining_predicate": {
+            "Comparison": {
+              "left": {
+                "Path": {
+                  "steps": [
+                    "score"
+                  ]
+                }
+              },
+              "operator": "GreaterThan",
+              "right": {
+                "Literal": {
+                  "I32": 5
+                }
+              }
+            }
+          },
+          "scan_direction": "Forward"
+        },
+        {
+          "bounds": [
+            {
+              "column": "status",
+              "high": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "String": "active"
+                  }
+                },
+                "inclusive": true,
+                "kind": "Value"
+              },
+              "low": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "String": "active"
+                  }
+                },
+                "inclusive": true,
+                "kind": "Value"
+              }
+            },
+            {
+              "column": "score",
+              "high": {
+                "kind": "UnboundedHigh",
+                "value_type": "I32"
+              },
+              "low": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "I32": 5
+                  }
+                },
+                "inclusive": false,
+                "kind": "Value"
+              }
+            }
+          ],
+          "index_spec": [
+            {
+              "collation": null,
+              "column": "status",
+              "direction": "Asc",
+              "nulls": null,
+              "sub_path": null,
+              "value_type": "String"
+            },
+            {
+              "collation": null,
+              "column": "score",
+              "direction": "Asc",
+              "nulls": null,
+              "sub_path": null,
+              "value_type": "I32"
+            }
+          ],
+          "kind": "Index",
+          "order_by_spill": {
+            "is_global_spill": true,
+            "is_satisfied": false,
+            "presort": [],
+            "spill": [
+              {
+                "direction": "Asc",
+                "path": {
+                  "steps": [
+                    "name"
+                  ]
+                }
+              }
+            ]
+          },
+          "remaining_predicate": "True",
+          "scan_direction": "Forward"
+        },
+        {
+          "bounds": [],
+          "kind": "TableScan",
+          "order_by_spill": {
+            "is_global_spill": true,
+            "is_satisfied": false,
+            "presort": [],
+            "spill": [
+              {
+                "direction": "Asc",
+                "path": {
+                  "steps": [
+                    "name"
+                  ]
+                }
+              }
+            ]
+          },
+          "remaining_predicate": {
+            "And": [
+              {
+                "Comparison": {
+                  "left": {
+                    "Path": {
+                      "steps": [
+                        "status"
+                      ]
+                    }
+                  },
+                  "operator": "Equal",
+                  "right": {
+                    "Literal": {
+                      "String": "active"
+                    }
+                  }
+                }
+              },
+              {
+                "Comparison": {
+                  "left": {
+                    "Path": {
+                      "steps": [
+                        "score"
+                      ]
+                    }
+                  },
+                  "operator": "GreaterThan",
+                  "right": {
+                    "Literal": {
+                      "I32": 5
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          "scan_direction": "Forward"
+        }
+      ],
+      "primary_key": "id",
+      "query": "status = 'active' AND score > 5 ORDER BY name ASC",
+      "selection_ast": {
+        "limit": null,
+        "order_by": [
+          {
+            "direction": "Asc",
+            "path": {
+              "steps": [
+                "name"
+              ]
+            }
+          }
+        ],
+        "predicate": {
+          "And": [
+            {
+              "Comparison": {
+                "left": {
+                  "Path": {
+                    "steps": [
+                      "status"
+                    ]
+                  }
+                },
+                "operator": "Equal",
+                "right": {
+                  "Literal": {
+                    "String": "active"
+                  }
+                }
+              }
+            },
+            {
+              "Comparison": {
+                "left": {
+                  "Path": {
+                    "steps": [
+                      "score"
+                    ]
+                  }
+                },
+                "operator": "GreaterThan",
+                "right": {
+                  "Literal": {
+                    "I32": 5
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "config": {
+        "name": "indexeddb",
+        "supports_desc_indexes": false
+      },
+      "note": "primary-key equality only - index generation is skipped and a table scan is returned directly",
+      "plan_count": 1,
+      "plans": [
+        {
+          "bounds": [
+            {
+              "column": "id",
+              "high": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "String": "x"
+                  }
+                },
+                "inclusive": true,
+                "kind": "Value"
+              },
+              "low": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "String": "x"
+                  }
+                },
+                "inclusive": true,
+                "kind": "Value"
+              }
+            }
+          ],
+          "kind": "TableScan",
+          "order_by_spill": {
+            "is_global_spill": false,
+            "is_satisfied": true,
+            "presort": [],
+            "spill": []
+          },
+          "remaining_predicate": {
+            "Comparison": {
+              "left": {
+                "Path": {
+                  "steps": [
+                    "id"
+                  ]
+                }
+              },
+              "operator": "Equal",
+              "right": {
+                "Literal": {
+                  "String": "x"
+                }
+              }
+            }
+          },
+          "scan_direction": "Forward"
+        }
+      ],
+      "primary_key": "id",
+      "query": "id = 'x'",
+      "selection_ast": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "id"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "String": "x"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "config": {
+        "name": "indexeddb",
+        "supports_desc_indexes": false
+      },
+      "note": "primary-key range only - short-circuits to a single table scan with primary key bounds",
+      "plan_count": 1,
+      "plans": [
+        {
+          "bounds": [
+            {
+              "column": "id",
+              "high": {
+                "kind": "UnboundedHigh",
+                "value_type": "I32"
+              },
+              "low": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "I32": 5
+                  }
+                },
+                "inclusive": false,
+                "kind": "Value"
+              }
+            }
+          ],
+          "kind": "TableScan",
+          "order_by_spill": {
+            "is_global_spill": false,
+            "is_satisfied": true,
+            "presort": [],
+            "spill": []
+          },
+          "remaining_predicate": {
+            "Comparison": {
+              "left": {
+                "Path": {
+                  "steps": [
+                    "id"
+                  ]
+                }
+              },
+              "operator": "GreaterThan",
+              "right": {
+                "Literal": {
+                  "I32": 5
+                }
+              }
+            }
+          },
+          "scan_direction": "Forward"
+        }
+      ],
+      "primary_key": "id",
+      "query": "id > 5",
+      "selection_ast": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "id"
+                ]
+              }
+            },
+            "operator": "GreaterThan",
+            "right": {
+              "Literal": {
+                "I32": 5
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "config": {
+        "name": "indexeddb",
+        "supports_desc_indexes": false
+      },
+      "note": "primary-key range plus primary-key ORDER BY - short-circuits, and the scan direction comes from the ORDER BY",
+      "plan_count": 1,
+      "plans": [
+        {
+          "bounds": [
+            {
+              "column": "id",
+              "high": {
+                "kind": "UnboundedHigh",
+                "value_type": "I32"
+              },
+              "low": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "I32": 5
+                  }
+                },
+                "inclusive": false,
+                "kind": "Value"
+              }
+            }
+          ],
+          "kind": "TableScan",
+          "order_by_spill": {
+            "is_global_spill": false,
+            "is_satisfied": true,
+            "presort": [
+              {
+                "direction": "Desc",
+                "path": {
+                  "steps": [
+                    "id"
+                  ]
+                }
+              }
+            ],
+            "spill": []
+          },
+          "remaining_predicate": {
+            "Comparison": {
+              "left": {
+                "Path": {
+                  "steps": [
+                    "id"
+                  ]
+                }
+              },
+              "operator": "GreaterThan",
+              "right": {
+                "Literal": {
+                  "I32": 5
+                }
+              }
+            }
+          },
+          "scan_direction": "Reverse"
+        }
+      ],
+      "primary_key": "id",
+      "query": "id > 5 ORDER BY id DESC",
+      "selection_ast": {
+        "limit": null,
+        "order_by": [
+          {
+            "direction": "Desc",
+            "path": {
+              "steps": [
+                "id"
+              ]
+            }
+          }
+        ],
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "id"
+                ]
+              }
+            },
+            "operator": "GreaterThan",
+            "right": {
+              "Literal": {
+                "I32": 5
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "config": {
+        "name": "indexeddb",
+        "supports_desc_indexes": false
+      },
+      "note": "primary-key ORDER BY alongside a non-primary predicate - the short-circuit does NOT apply because there is another meaningful predicate",
+      "plan_count": 2,
+      "plans": [
+        {
+          "bounds": [
+            {
+              "column": "status",
+              "high": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "String": "active"
+                  }
+                },
+                "inclusive": true,
+                "kind": "Value"
+              },
+              "low": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "String": "active"
+                  }
+                },
+                "inclusive": true,
+                "kind": "Value"
+              }
+            }
+          ],
+          "index_spec": [
+            {
+              "collation": null,
+              "column": "status",
+              "direction": "Asc",
+              "nulls": null,
+              "sub_path": null,
+              "value_type": "String"
+            },
+            {
+              "collation": null,
+              "column": "id",
+              "direction": "Asc",
+              "nulls": null,
+              "sub_path": null,
+              "value_type": "String"
+            }
+          ],
+          "kind": "Index",
+          "order_by_spill": {
+            "is_global_spill": false,
+            "is_satisfied": true,
+            "presort": [
+              {
+                "direction": "Desc",
+                "path": {
+                  "steps": [
+                    "id"
+                  ]
+                }
+              }
+            ],
+            "spill": []
+          },
+          "remaining_predicate": "True",
+          "scan_direction": "Reverse"
+        },
+        {
+          "bounds": [],
+          "kind": "TableScan",
+          "order_by_spill": {
+            "is_global_spill": false,
+            "is_satisfied": true,
+            "presort": [
+              {
+                "direction": "Desc",
+                "path": {
+                  "steps": [
+                    "id"
+                  ]
+                }
+              }
+            ],
+            "spill": []
+          },
+          "remaining_predicate": {
+            "Comparison": {
+              "left": {
+                "Path": {
+                  "steps": [
+                    "status"
+                  ]
+                }
+              },
+              "operator": "Equal",
+              "right": {
+                "Literal": {
+                  "String": "active"
+                }
+              }
+            }
+          },
+          "scan_direction": "Reverse"
+        }
+      ],
+      "primary_key": "id",
+      "query": "status = 'active' ORDER BY id DESC",
+      "selection_ast": {
+        "limit": null,
+        "order_by": [
+          {
+            "direction": "Desc",
+            "path": {
+              "steps": [
+                "id"
+              ]
+            }
+          }
+        ],
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "status"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "String": "active"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "config": {
+        "name": "indexeddb",
+        "supports_desc_indexes": false
+      },
+      "note": "contradictory range on one field - the bounds are empty, so EmptyScan, and no table-scan fallback is appended",
+      "plan_count": 1,
+      "plans": [
+        {
+          "kind": "EmptyScan"
+        }
+      ],
+      "primary_key": "id",
+      "query": "score > 10 AND score < 5",
+      "selection_ast": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "And": [
+            {
+              "Comparison": {
+                "left": {
+                  "Path": {
+                    "steps": [
+                      "score"
+                    ]
+                  }
+                },
+                "operator": "GreaterThan",
+                "right": {
+                  "Literal": {
+                    "I32": 10
+                  }
+                }
+              }
+            },
+            {
+              "Comparison": {
+                "left": {
+                  "Path": {
+                    "steps": [
+                      "score"
+                    ]
+                  }
+                },
+                "operator": "LessThan",
+                "right": {
+                  "Literal": {
+                    "I32": 5
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "config": {
+        "name": "indexeddb",
+        "supports_desc_indexes": false
+      },
+      "note": "OR breaks the conjunct chain: ConjunctFinder yields the whole OR as one opaque conjunct, so no index is usable and the whole predicate is residual",
+      "plan_count": 1,
+      "plans": [
+        {
+          "bounds": [],
+          "kind": "TableScan",
+          "order_by_spill": {
+            "is_global_spill": false,
+            "is_satisfied": true,
+            "presort": [],
+            "spill": []
+          },
+          "remaining_predicate": {
+            "Or": [
+              {
+                "Comparison": {
+                  "left": {
+                    "Path": {
+                      "steps": [
+                        "status"
+                      ]
+                    }
+                  },
+                  "operator": "Equal",
+                  "right": {
+                    "Literal": {
+                      "String": "a"
+                    }
+                  }
+                }
+              },
+              {
+                "Comparison": {
+                  "left": {
+                    "Path": {
+                      "steps": [
+                        "status"
+                      ]
+                    }
+                  },
+                  "operator": "Equal",
+                  "right": {
+                    "Literal": {
+                      "String": "b"
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          "scan_direction": "Forward"
+        }
+      ],
+      "primary_key": "id",
+      "query": "status = 'a' OR status = 'b'",
+      "selection_ast": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Or": [
+            {
+              "Comparison": {
+                "left": {
+                  "Path": {
+                    "steps": [
+                      "status"
+                    ]
+                  }
+                },
+                "operator": "Equal",
+                "right": {
+                  "Literal": {
+                    "String": "a"
+                  }
+                }
+              }
+            },
+            {
+              "Comparison": {
+                "left": {
+                  "Path": {
+                    "steps": [
+                      "status"
+                    ]
+                  }
+                },
+                "operator": "Equal",
+                "right": {
+                  "Literal": {
+                    "String": "b"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "config": {
+        "name": "indexeddb",
+        "supports_desc_indexes": false
+      },
+      "note": "an OR nested inside an AND - the equality is still indexable, the OR stays in remaining_predicate",
+      "plan_count": 2,
+      "plans": [
+        {
+          "bounds": [
+            {
+              "column": "status",
+              "high": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "String": "active"
+                  }
+                },
+                "inclusive": true,
+                "kind": "Value"
+              },
+              "low": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "String": "active"
+                  }
+                },
+                "inclusive": true,
+                "kind": "Value"
+              }
+            }
+          ],
+          "index_spec": [
+            {
+              "collation": null,
+              "column": "status",
+              "direction": "Asc",
+              "nulls": null,
+              "sub_path": null,
+              "value_type": "String"
+            }
+          ],
+          "kind": "Index",
+          "order_by_spill": {
+            "is_global_spill": false,
+            "is_satisfied": true,
+            "presort": [],
+            "spill": []
+          },
+          "remaining_predicate": {
+            "Or": [
+              {
+                "Comparison": {
+                  "left": {
+                    "Path": {
+                      "steps": [
+                        "a"
+                      ]
+                    }
+                  },
+                  "operator": "Equal",
+                  "right": {
+                    "Literal": {
+                      "I32": 1
+                    }
+                  }
+                }
+              },
+              {
+                "Comparison": {
+                  "left": {
+                    "Path": {
+                      "steps": [
+                        "b"
+                      ]
+                    }
+                  },
+                  "operator": "Equal",
+                  "right": {
+                    "Literal": {
+                      "I32": 2
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          "scan_direction": "Forward"
+        },
+        {
+          "bounds": [],
+          "kind": "TableScan",
+          "order_by_spill": {
+            "is_global_spill": false,
+            "is_satisfied": true,
+            "presort": [],
+            "spill": []
+          },
+          "remaining_predicate": {
+            "And": [
+              {
+                "Comparison": {
+                  "left": {
+                    "Path": {
+                      "steps": [
+                        "status"
+                      ]
+                    }
+                  },
+                  "operator": "Equal",
+                  "right": {
+                    "Literal": {
+                      "String": "active"
+                    }
+                  }
+                }
+              },
+              {
+                "Or": [
+                  {
+                    "Comparison": {
+                      "left": {
+                        "Path": {
+                          "steps": [
+                            "a"
+                          ]
+                        }
+                      },
+                      "operator": "Equal",
+                      "right": {
+                        "Literal": {
+                          "I32": 1
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "Comparison": {
+                      "left": {
+                        "Path": {
+                          "steps": [
+                            "b"
+                          ]
+                        }
+                      },
+                      "operator": "Equal",
+                      "right": {
+                        "Literal": {
+                          "I32": 2
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "scan_direction": "Forward"
+        }
+      ],
+      "primary_key": "id",
+      "query": "status = 'active' AND (a = 1 OR b = 2)",
+      "selection_ast": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "And": [
+            {
+              "Comparison": {
+                "left": {
+                  "Path": {
+                    "steps": [
+                      "status"
+                    ]
+                  }
+                },
+                "operator": "Equal",
+                "right": {
+                  "Literal": {
+                    "String": "active"
+                  }
+                }
+              }
+            },
+            {
+              "Or": [
+                {
+                  "Comparison": {
+                    "left": {
+                      "Path": {
+                        "steps": [
+                          "a"
+                        ]
+                      }
+                    },
+                    "operator": "Equal",
+                    "right": {
+                      "Literal": {
+                        "I32": 1
+                      }
+                    }
+                  }
+                },
+                {
+                  "Comparison": {
+                    "left": {
+                      "Path": {
+                        "steps": [
+                          "b"
+                        ]
+                      }
+                    },
+                    "operator": "Equal",
+                    "right": {
+                      "Literal": {
+                        "I32": 2
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "config": {
+        "name": "indexeddb",
+        "supports_desc_indexes": false
+      },
+      "note": "IS NULL is not an equality or a range, so it cannot drive an index",
+      "plan_count": 1,
+      "plans": [
+        {
+          "bounds": [],
+          "kind": "TableScan",
+          "order_by_spill": {
+            "is_global_spill": false,
+            "is_satisfied": true,
+            "presort": [],
+            "spill": []
+          },
+          "remaining_predicate": {
+            "IsNull": {
+              "Path": {
+                "steps": [
+                  "status"
+                ]
+              }
+            }
+          },
+          "scan_direction": "Forward"
+        }
+      ],
+      "primary_key": "id",
+      "query": "status IS NULL",
+      "selection_ast": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "IsNull": {
+            "Path": {
+              "steps": [
+                "status"
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "config": {
+        "name": "indexeddb",
+        "supports_desc_indexes": false
+      },
+      "note": "empty query - the parser yields Predicate::True, which is not indexable; expect a bare table scan",
+      "plan_count": 1,
+      "plans": [
+        {
+          "bounds": [],
+          "kind": "TableScan",
+          "order_by_spill": {
+            "is_global_spill": false,
+            "is_satisfied": true,
+            "presort": [],
+            "spill": []
+          },
+          "remaining_predicate": "True",
+          "scan_direction": "Forward"
+        }
+      ],
+      "primary_key": "id",
+      "query": "",
+      "selection_ast": {
+        "limit": null,
+        "order_by": null,
+        "predicate": "True"
+      }
+    },
+    {
+      "config": {
+        "name": "indexeddb",
+        "supports_desc_indexes": false
+      },
+      "note": "LIMIT is carried on the Selection but the planner ignores it - the plans must be identical to the bare equality case",
+      "plan_count": 2,
+      "plans": [
+        {
+          "bounds": [
+            {
+              "column": "status",
+              "high": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "String": "active"
+                  }
+                },
+                "inclusive": true,
+                "kind": "Value"
+              },
+              "low": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "String": "active"
+                  }
+                },
+                "inclusive": true,
+                "kind": "Value"
+              }
+            }
+          ],
+          "index_spec": [
+            {
+              "collation": null,
+              "column": "status",
+              "direction": "Asc",
+              "nulls": null,
+              "sub_path": null,
+              "value_type": "String"
+            }
+          ],
+          "kind": "Index",
+          "order_by_spill": {
+            "is_global_spill": false,
+            "is_satisfied": true,
+            "presort": [],
+            "spill": []
+          },
+          "remaining_predicate": "True",
+          "scan_direction": "Forward"
+        },
+        {
+          "bounds": [],
+          "kind": "TableScan",
+          "order_by_spill": {
+            "is_global_spill": false,
+            "is_satisfied": true,
+            "presort": [],
+            "spill": []
+          },
+          "remaining_predicate": {
+            "Comparison": {
+              "left": {
+                "Path": {
+                  "steps": [
+                    "status"
+                  ]
+                }
+              },
+              "operator": "Equal",
+              "right": {
+                "Literal": {
+                  "String": "active"
+                }
+              }
+            }
+          },
+          "scan_direction": "Forward"
+        }
+      ],
+      "primary_key": "id",
+      "query": "status = 'active' LIMIT 10",
+      "selection_ast": {
+        "limit": 10,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "status"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "String": "active"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "config": {
+        "name": "indexeddb",
+        "supports_desc_indexes": false
+      },
+      "note": "a dotted path as the indexed column - watch whether sub_path is populated",
+      "plan_count": 2,
+      "plans": [
+        {
+          "bounds": [
+            {
+              "column": "licensing.territory",
+              "high": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "String": "US"
+                  }
+                },
+                "inclusive": true,
+                "kind": "Value"
+              },
+              "low": {
+                "datum": {
+                  "kind": "Val",
+                  "value": {
+                    "String": "US"
+                  }
+                },
+                "inclusive": true,
+                "kind": "Value"
+              }
+            }
+          ],
+          "index_spec": [
+            {
+              "collation": null,
+              "column": "licensing",
+              "direction": "Asc",
+              "nulls": null,
+              "sub_path": [
+                "territory"
+              ],
+              "value_type": "String"
+            }
+          ],
+          "kind": "Index",
+          "order_by_spill": {
+            "is_global_spill": false,
+            "is_satisfied": true,
+            "presort": [],
+            "spill": []
+          },
+          "remaining_predicate": "True",
+          "scan_direction": "Forward"
+        },
+        {
+          "bounds": [],
+          "kind": "TableScan",
+          "order_by_spill": {
+            "is_global_spill": false,
+            "is_satisfied": true,
+            "presort": [],
+            "spill": []
+          },
+          "remaining_predicate": {
+            "Comparison": {
+              "left": {
+                "Path": {
+                  "steps": [
+                    "licensing",
+                    "territory"
+                  ]
+                }
+              },
+              "operator": "Equal",
+              "right": {
+                "Literal": {
+                  "String": "US"
+                }
+              }
+            }
+          },
+          "scan_direction": "Forward"
+        }
+      ],
+      "primary_key": "id",
+      "query": "licensing.territory = 'US'",
+      "selection_ast": {
+        "limit": null,
+        "order_by": null,
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "licensing",
+                  "territory"
+                ]
+              }
+            },
+            "operator": "Equal",
+            "right": {
+              "Literal": {
+                "String": "US"
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "produced_by": "ankurah_storage_common::Planner::plan and ankurah_storage_common::bounds::normalize",
+  "schema": "hand-written projection defined in storage/common/tests/planner_fixtures.rs; documented field by field in storage/common/test_fixtures/README.md"
+}

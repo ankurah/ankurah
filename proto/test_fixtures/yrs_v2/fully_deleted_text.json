@@ -1,0 +1,14 @@
+{
+  "applies_on_top_of": null,
+  "encoding": "yrs 0.24.0 update, lib0 v2 encoding (encode_state_as_update_v2 / encode_diff_v2)",
+  "fixture": "fully_deleted_text.bin",
+  "note": "All content deleted. The root field still exists and the delete set is non-empty, so the bytes are far from the empty-doc encoding even though the rendered string is ''.",
+  "offset_kind": "Bytes (yrs Options default): Text insert/remove indices are UTF-8 byte offsets, not UTF-16 code units and not Unicode scalar counts",
+  "state_vector": {
+    "8": 9
+  },
+  "text_fields": {
+    "content": ""
+  },
+  "total_len": 31
+}

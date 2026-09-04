@@ -1,0 +1,25 @@
+{
+  "encoding": "bincode 1.3 `serialize` defaults: fixed-width integers, little-endian, u64 sequence/string length prefixes, u32 enum variant tags, 1-byte Option tag, no length prefix on fixed-size arrays",
+  "fixture": "system.bin",
+  "items": [
+    {
+      "json": "SysRoot",
+      "label": "sys_root",
+      "len": 4,
+      "offset": 0,
+      "type": "sys::Item"
+    },
+    {
+      "json": {
+        "Collection": {
+          "name": "users"
+        }
+      },
+      "label": "collection",
+      "len": 17,
+      "offset": 4,
+      "type": "sys::Item"
+    }
+  ],
+  "total_len": 21
+}

@@ -1,0 +1,14 @@
+{
+  "applies_on_top_of": "incremental_base.bin",
+  "encoding": "yrs 0.24.0 update, lib0 v2 encoding (encode_state_as_update_v2 / encode_diff_v2)",
+  "fixture": "incremental_diff.bin",
+  "note": "Diff only: the bytes carry the appended \", World!\" and nothing else. text_fields and state_vector describe the doc AFTER applying this on top of incremental_base.bin. This is the shape YrsBackend::to_operations emits.",
+  "offset_kind": "Bytes (yrs Options default): Text insert/remove indices are UTF-8 byte offsets, not UTF-16 code units and not Unicode scalar counts",
+  "state_vector": {
+    "4": 13
+  },
+  "text_fields": {
+    "content": "Hello, World!"
+  },
+  "total_len": 28
+}

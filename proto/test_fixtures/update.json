@@ -1,0 +1,313 @@
+{
+  "encoding": "bincode 1.3 `serialize` defaults: fixed-width integers, little-endian, u64 sequence/string length prefixes, u32 enum variant tags, 1-byte Option tag, no length prefix on fixed-size arrays",
+  "fixture": "update.bin",
+  "items": [
+    {
+      "json": {
+        "body": {
+          "SubscriptionUpdate": {
+            "items": [
+              {
+                "collection": "users",
+                "content": {
+                  "EventOnly": [
+                    {
+                      "attestations": [],
+                      "operations": {
+                        "backend_a": [
+                          {
+                            "diff": [
+                              170,
+                              187
+                            ]
+                          },
+                          {
+                            "diff": [
+                              204
+                            ]
+                          }
+                        ],
+                        "backend_b": [
+                          {
+                            "diff": [
+                              221,
+                              238,
+                              255
+                            ]
+                          }
+                        ]
+                      },
+                      "parent": [
+                        "EBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8"
+                      ]
+                    }
+                  ]
+                },
+                "entity_id": "MDEyMzQ1Njc4OTo7PD0-Pw",
+                "predicate_relevance": [
+                  [
+                    "00000000010000000000000000",
+                    "Initial"
+                  ]
+                ]
+              }
+            ]
+          }
+        },
+        "from": "EBESExQVFhcYGRobHB0eHw",
+        "id": "00000000000000000000000001",
+        "to": "ICEiIyQlJicoKSorLC0uLw"
+      },
+      "label": "node_update",
+      "len": 301,
+      "offset": 0,
+      "type": "NodeUpdate"
+    },
+    {
+      "json": {
+        "collection": "posts",
+        "content": {
+          "StateAndEvent": [
+            {
+              "attestations": [
+                [
+                  66,
+                  67
+                ],
+                [
+                  68,
+                  69,
+                  70
+                ]
+              ],
+              "state": {
+                "head": [
+                  "EBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8"
+                ],
+                "state_buffers": {
+                  "buf_alpha": [
+                    1,
+                    2,
+                    3
+                  ],
+                  "buf_beta": [
+                    4,
+                    5
+                  ]
+                }
+              }
+            },
+            [
+              {
+                "attestations": [],
+                "operations": {
+                  "backend_a": [
+                    {
+                      "diff": [
+                        170,
+                        187
+                      ]
+                    },
+                    {
+                      "diff": [
+                        204
+                      ]
+                    }
+                  ],
+                  "backend_b": [
+                    {
+                      "diff": [
+                        221,
+                        238,
+                        255
+                      ]
+                    }
+                  ]
+                },
+                "parent": [
+                  "EBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8"
+                ]
+              }
+            ]
+          ]
+        },
+        "entity_id": "QEFCQ0RFRkdISUpLTE1OTw",
+        "predicate_relevance": [
+          [
+            "00000000020000000000000000",
+            "Add"
+          ],
+          [
+            "00000000030000000000000000",
+            "Remove"
+          ]
+        ]
+      },
+      "label": "subscription_update_item",
+      "len": 392,
+      "offset": 301,
+      "type": "SubscriptionUpdateItem"
+    },
+    {
+      "json": {
+        "EventOnly": [
+          {
+            "attestations": [],
+            "operations": {
+              "backend_a": [
+                {
+                  "diff": [
+                    170,
+                    187
+                  ]
+                },
+                {
+                  "diff": [
+                    204
+                  ]
+                }
+              ],
+              "backend_b": [
+                {
+                  "diff": [
+                    221,
+                    238,
+                    255
+                  ]
+                }
+              ]
+            },
+            "parent": [
+              "EBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8"
+            ]
+          }
+        ]
+      },
+      "label": "event_only",
+      "len": 148,
+      "offset": 693,
+      "type": "UpdateContent"
+    },
+    {
+      "json": {
+        "StateAndEvent": [
+          {
+            "attestations": [
+              [
+                66,
+                67
+              ],
+              [
+                68,
+                69,
+                70
+              ]
+            ],
+            "state": {
+              "head": [
+                "EBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8"
+              ],
+              "state_buffers": {
+                "buf_alpha": [
+                  1,
+                  2,
+                  3
+                ],
+                "buf_beta": [
+                  4,
+                  5
+                ]
+              }
+            }
+          },
+          [
+            {
+              "attestations": [],
+              "operations": {
+                "backend_a": [
+                  {
+                    "diff": [
+                      170,
+                      187
+                    ]
+                  },
+                  {
+                    "diff": [
+                      204
+                    ]
+                  }
+                ],
+                "backend_b": [
+                  {
+                    "diff": [
+                      221,
+                      238,
+                      255
+                    ]
+                  }
+                ]
+              },
+              "parent": [
+                "EBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8"
+              ]
+            }
+          ]
+        ]
+      },
+      "label": "state_and_event",
+      "len": 279,
+      "offset": 841,
+      "type": "UpdateContent"
+    },
+    {
+      "json": "Initial",
+      "label": "membership_initial",
+      "len": 4,
+      "offset": 1120,
+      "type": "MembershipChange"
+    },
+    {
+      "json": "Add",
+      "label": "membership_add",
+      "len": 4,
+      "offset": 1124,
+      "type": "MembershipChange"
+    },
+    {
+      "json": "Remove",
+      "label": "membership_remove",
+      "len": 4,
+      "offset": 1128,
+      "type": "MembershipChange"
+    },
+    {
+      "json": {
+        "body": "Success",
+        "from": "UFFSU1RVVldYWVpbXF1eXw",
+        "id": "00000000000000000000000002",
+        "to": "YGFiY2RlZmdoaWprbG1ubw"
+      },
+      "label": "node_update_ack",
+      "len": 70,
+      "offset": 1132,
+      "type": "NodeUpdateAck"
+    },
+    {
+      "json": "Success",
+      "label": "ack_success",
+      "len": 4,
+      "offset": 1202,
+      "type": "NodeUpdateAckBody"
+    },
+    {
+      "json": {
+        "Error": "update failed"
+      },
+      "label": "ack_error",
+      "len": 25,
+      "offset": 1206,
+      "type": "NodeUpdateAckBody"
+    }
+  ],
+  "total_len": 1231
+}

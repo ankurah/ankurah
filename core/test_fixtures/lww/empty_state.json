@@ -1,0 +1,10 @@
+{
+  "decoded": {},
+  "encoding": "bincode 1.3 `serialize` defaults: fixed-width integers, little-endian, u64 sequence/string length prefixes, u32 enum variant tags, 1-byte Option tag, no length prefix on fixed-size arrays",
+  "fixture": "lww/empty_state.bin",
+  "produced_by": "LWWBackend::to_state_buffer()",
+  "scenario": [
+    "LWWBackend::new()"
+  ],
+  "total_len": 8
+}

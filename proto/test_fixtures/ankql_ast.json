@@ -1,0 +1,811 @@
+{
+  "encoding": "bincode 1.3 `serialize` defaults: fixed-width integers, little-endian, u64 sequence/string length prefixes, u32 enum variant tags, 1-byte Option tag, no length prefix on fixed-size arrays",
+  "fixture": "ankql_ast.bin",
+  "items": [
+    {
+      "json": {
+        "I16": -12345
+      },
+      "label": "literal_i16",
+      "len": 6,
+      "offset": 0,
+      "type": "Literal"
+    },
+    {
+      "json": {
+        "I32": -1234567890
+      },
+      "label": "literal_i32",
+      "len": 8,
+      "offset": 6,
+      "type": "Literal"
+    },
+    {
+      "json": {
+        "I64": -1234567890123456789
+      },
+      "label": "literal_i64",
+      "len": 12,
+      "offset": 14,
+      "type": "Literal"
+    },
+    {
+      "json": {
+        "F64": 0.0
+      },
+      "label": "literal_f64_zero",
+      "len": 12,
+      "offset": 26,
+      "type": "Literal"
+    },
+    {
+      "json": {
+        "F64": -0.0
+      },
+      "label": "literal_f64_neg_zero",
+      "len": 12,
+      "offset": 38,
+      "type": "Literal"
+    },
+    {
+      "json": {
+        "F64": 0.30000000000000004
+      },
+      "label": "literal_f64_fraction",
+      "len": 12,
+      "offset": 50,
+      "type": "Literal"
+    },
+    {
+      "json": {
+        "F64": -1.7976931348623157e308
+      },
+      "label": "literal_f64_min",
+      "len": 12,
+      "offset": 62,
+      "type": "Literal"
+    },
+    {
+      "json": {
+        "F64": 1.7976931348623157e308
+      },
+      "label": "literal_f64_max",
+      "len": 12,
+      "offset": 74,
+      "type": "Literal"
+    },
+    {
+      "json": {
+        "F64": 2.220446049250313e-16
+      },
+      "label": "literal_f64_epsilon",
+      "len": 12,
+      "offset": 86,
+      "type": "Literal"
+    },
+    {
+      "debug": "F64(NaN)",
+      "label": "literal_f64_nan",
+      "len": 12,
+      "offset": 98,
+      "type": "Literal"
+    },
+    {
+      "debug": "F64(inf)",
+      "label": "literal_f64_inf",
+      "len": 12,
+      "offset": 110,
+      "type": "Literal"
+    },
+    {
+      "debug": "F64(-inf)",
+      "label": "literal_f64_neg_inf",
+      "len": 12,
+      "offset": 122,
+      "type": "Literal"
+    },
+    {
+      "json": {
+        "Bool": true
+      },
+      "label": "literal_bool_true",
+      "len": 5,
+      "offset": 134,
+      "type": "Literal"
+    },
+    {
+      "json": {
+        "Bool": false
+      },
+      "label": "literal_bool_false",
+      "len": 5,
+      "offset": 139,
+      "type": "Literal"
+    },
+    {
+      "json": {
+        "String": "hello"
+      },
+      "label": "literal_string",
+      "len": 17,
+      "offset": 144,
+      "type": "Literal"
+    },
+    {
+      "json": {
+        "String": ""
+      },
+      "label": "literal_string_empty",
+      "len": 12,
+      "offset": 161,
+      "type": "Literal"
+    },
+    {
+      "json": {
+        "String": "café 日本語 🚀 مرحبا"
+      },
+      "label": "literal_string_non_ascii",
+      "len": 43,
+      "offset": 173,
+      "type": "Literal"
+    },
+    {
+      "json": {
+        "EntityId": "00041061050R3GG28A1C60T3GF"
+      },
+      "label": "literal_entity_id_ulid_as_string",
+      "len": 38,
+      "offset": 216,
+      "type": "Literal"
+    },
+    {
+      "json": {
+        "Object": [
+          222,
+          173,
+          190,
+          239
+        ]
+      },
+      "label": "literal_object",
+      "len": 16,
+      "offset": 254,
+      "type": "Literal"
+    },
+    {
+      "json": {
+        "Object": []
+      },
+      "label": "literal_object_empty",
+      "len": 12,
+      "offset": 270,
+      "type": "Literal"
+    },
+    {
+      "json": {
+        "Binary": [
+          0,
+          255
+        ]
+      },
+      "label": "literal_binary",
+      "len": 14,
+      "offset": 282,
+      "type": "Literal"
+    },
+    {
+      "json": {
+        "Json": [
+          123,
+          34,
+          97,
+          34,
+          58,
+          49,
+          44,
+          34,
+          98,
+          34,
+          58,
+          91,
+          116,
+          114,
+          117,
+          101,
+          44,
+          110,
+          117,
+          108,
+          108,
+          93,
+          125
+        ]
+      },
+      "label": "literal_json_object",
+      "len": 35,
+      "offset": 296,
+      "type": "Literal (json_as_bytes)"
+    },
+    {
+      "json": {
+        "Json": [
+          110,
+          117,
+          108,
+          108
+        ]
+      },
+      "label": "literal_json_null",
+      "len": 16,
+      "offset": 331,
+      "type": "Literal (json_as_bytes)"
+    },
+    {
+      "json": {
+        "steps": [
+          "name"
+        ]
+      },
+      "label": "path_simple",
+      "len": 20,
+      "offset": 347,
+      "type": "PathExpr"
+    },
+    {
+      "json": {
+        "steps": [
+          "licensing",
+          "territory",
+          "code"
+        ]
+      },
+      "label": "path_multi_step",
+      "len": 54,
+      "offset": 367,
+      "type": "PathExpr"
+    },
+    {
+      "json": {
+        "Literal": {
+          "I32": 7
+        }
+      },
+      "label": "expr_literal",
+      "len": 12,
+      "offset": 421,
+      "type": "Expr"
+    },
+    {
+      "json": {
+        "Path": {
+          "steps": [
+            "name"
+          ]
+        }
+      },
+      "label": "expr_path",
+      "len": 24,
+      "offset": 433,
+      "type": "Expr"
+    },
+    {
+      "json": {
+        "Predicate": "True"
+      },
+      "label": "expr_predicate",
+      "len": 8,
+      "offset": 457,
+      "type": "Expr"
+    },
+    {
+      "json": {
+        "InfixExpr": {
+          "left": {
+            "Path": {
+              "steps": [
+                "qty"
+              ]
+            }
+          },
+          "operator": "Multiply",
+          "right": {
+            "Literal": {
+              "I64": 3
+            }
+          }
+        }
+      },
+      "label": "expr_infix",
+      "len": 47,
+      "offset": 465,
+      "type": "Expr"
+    },
+    {
+      "json": {
+        "ExprList": [
+          {
+            "Literal": {
+              "I32": 1
+            }
+          },
+          {
+            "Literal": {
+              "I32": 2
+            }
+          },
+          {
+            "Literal": {
+              "I32": 3
+            }
+          }
+        ]
+      },
+      "label": "expr_list",
+      "len": 48,
+      "offset": 512,
+      "type": "Expr"
+    },
+    {
+      "json": {
+        "ExprList": []
+      },
+      "label": "expr_list_empty",
+      "len": 12,
+      "offset": 560,
+      "type": "Expr"
+    },
+    {
+      "json": "Placeholder",
+      "label": "expr_placeholder",
+      "len": 4,
+      "offset": 572,
+      "type": "Expr"
+    },
+    {
+      "json": "Add",
+      "label": "infix_add",
+      "len": 4,
+      "offset": 576,
+      "type": "InfixOperator"
+    },
+    {
+      "json": "Subtract",
+      "label": "infix_subtract",
+      "len": 4,
+      "offset": 580,
+      "type": "InfixOperator"
+    },
+    {
+      "json": "Multiply",
+      "label": "infix_multiply",
+      "len": 4,
+      "offset": 584,
+      "type": "InfixOperator"
+    },
+    {
+      "json": "Divide",
+      "label": "infix_divide",
+      "len": 4,
+      "offset": 588,
+      "type": "InfixOperator"
+    },
+    {
+      "json": {
+        "Comparison": {
+          "left": {
+            "Path": {
+              "steps": [
+                "n"
+              ]
+            }
+          },
+          "operator": "Equal",
+          "right": {
+            "Literal": {
+              "I32": 1
+            }
+          }
+        }
+      },
+      "label": "cmp_equal",
+      "len": 41,
+      "offset": 592,
+      "type": "Predicate::Comparison"
+    },
+    {
+      "json": {
+        "Comparison": {
+          "left": {
+            "Path": {
+              "steps": [
+                "n"
+              ]
+            }
+          },
+          "operator": "NotEqual",
+          "right": {
+            "Literal": {
+              "I32": 1
+            }
+          }
+        }
+      },
+      "label": "cmp_not_equal",
+      "len": 41,
+      "offset": 633,
+      "type": "Predicate::Comparison"
+    },
+    {
+      "json": {
+        "Comparison": {
+          "left": {
+            "Path": {
+              "steps": [
+                "n"
+              ]
+            }
+          },
+          "operator": "GreaterThan",
+          "right": {
+            "Literal": {
+              "I32": 1
+            }
+          }
+        }
+      },
+      "label": "cmp_greater_than",
+      "len": 41,
+      "offset": 674,
+      "type": "Predicate::Comparison"
+    },
+    {
+      "json": {
+        "Comparison": {
+          "left": {
+            "Path": {
+              "steps": [
+                "n"
+              ]
+            }
+          },
+          "operator": "GreaterThanOrEqual",
+          "right": {
+            "Literal": {
+              "I32": 1
+            }
+          }
+        }
+      },
+      "label": "cmp_greater_than_or_equal",
+      "len": 41,
+      "offset": 715,
+      "type": "Predicate::Comparison"
+    },
+    {
+      "json": {
+        "Comparison": {
+          "left": {
+            "Path": {
+              "steps": [
+                "n"
+              ]
+            }
+          },
+          "operator": "LessThan",
+          "right": {
+            "Literal": {
+              "I32": 1
+            }
+          }
+        }
+      },
+      "label": "cmp_less_than",
+      "len": 41,
+      "offset": 756,
+      "type": "Predicate::Comparison"
+    },
+    {
+      "json": {
+        "Comparison": {
+          "left": {
+            "Path": {
+              "steps": [
+                "n"
+              ]
+            }
+          },
+          "operator": "LessThanOrEqual",
+          "right": {
+            "Literal": {
+              "I32": 1
+            }
+          }
+        }
+      },
+      "label": "cmp_less_than_or_equal",
+      "len": 41,
+      "offset": 797,
+      "type": "Predicate::Comparison"
+    },
+    {
+      "json": {
+        "Comparison": {
+          "left": {
+            "Path": {
+              "steps": [
+                "n"
+              ]
+            }
+          },
+          "operator": "In",
+          "right": {
+            "Literal": {
+              "I32": 1
+            }
+          }
+        }
+      },
+      "label": "cmp_in",
+      "len": 41,
+      "offset": 838,
+      "type": "Predicate::Comparison"
+    },
+    {
+      "json": {
+        "Comparison": {
+          "left": {
+            "Path": {
+              "steps": [
+                "n"
+              ]
+            }
+          },
+          "operator": "Between",
+          "right": {
+            "Literal": {
+              "I32": 1
+            }
+          }
+        }
+      },
+      "label": "cmp_between",
+      "len": 41,
+      "offset": 879,
+      "type": "Predicate::Comparison"
+    },
+    {
+      "json": "True",
+      "label": "predicate_true",
+      "len": 4,
+      "offset": 920,
+      "type": "Predicate"
+    },
+    {
+      "json": "False",
+      "label": "predicate_false",
+      "len": 4,
+      "offset": 924,
+      "type": "Predicate"
+    },
+    {
+      "json": "Placeholder",
+      "label": "predicate_placeholder",
+      "len": 4,
+      "offset": 928,
+      "type": "Predicate"
+    },
+    {
+      "json": {
+        "IsNull": {
+          "Path": {
+            "steps": [
+              "deleted_at"
+            ]
+          }
+        }
+      },
+      "label": "predicate_is_null",
+      "len": 34,
+      "offset": 932,
+      "type": "Predicate"
+    },
+    {
+      "json": {
+        "Not": "True"
+      },
+      "label": "predicate_not",
+      "len": 8,
+      "offset": 966,
+      "type": "Predicate"
+    },
+    {
+      "json": {
+        "And": [
+          "True",
+          "False"
+        ]
+      },
+      "label": "predicate_and",
+      "len": 12,
+      "offset": 974,
+      "type": "Predicate"
+    },
+    {
+      "json": {
+        "Or": [
+          "False",
+          "True"
+        ]
+      },
+      "label": "predicate_or",
+      "len": 12,
+      "offset": 986,
+      "type": "Predicate"
+    },
+    {
+      "json": {
+        "And": [
+          {
+            "Or": [
+              {
+                "Comparison": {
+                  "left": {
+                    "Path": {
+                      "steps": [
+                        "status"
+                      ]
+                    }
+                  },
+                  "operator": "Equal",
+                  "right": {
+                    "Literal": {
+                      "String": "active"
+                    }
+                  }
+                }
+              },
+              {
+                "IsNull": {
+                  "Path": {
+                    "steps": [
+                      "status"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "Not": {
+              "Comparison": {
+                "left": {
+                  "Path": {
+                    "steps": [
+                      "licensing",
+                      "territory"
+                    ]
+                  }
+                },
+                "operator": "In",
+                "right": {
+                  "ExprList": [
+                    {
+                      "Literal": {
+                        "String": "US"
+                      }
+                    },
+                    {
+                      "Literal": {
+                        "String": "CA"
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        ]
+      },
+      "label": "predicate_nested",
+      "len": 200,
+      "offset": 998,
+      "type": "Predicate"
+    },
+    {
+      "json": "Asc",
+      "label": "order_asc",
+      "len": 4,
+      "offset": 1198,
+      "type": "OrderDirection"
+    },
+    {
+      "json": "Desc",
+      "label": "order_desc",
+      "len": 4,
+      "offset": 1202,
+      "type": "OrderDirection"
+    },
+    {
+      "json": {
+        "direction": "Desc",
+        "path": {
+          "steps": [
+            "created_at"
+          ]
+        }
+      },
+      "label": "order_by_item",
+      "len": 30,
+      "offset": 1206,
+      "type": "OrderByItem"
+    },
+    {
+      "json": {
+        "limit": null,
+        "order_by": null,
+        "predicate": "True"
+      },
+      "label": "selection_bare",
+      "len": 6,
+      "offset": 1236,
+      "type": "Selection"
+    },
+    {
+      "json": {
+        "limit": null,
+        "order_by": [],
+        "predicate": "True"
+      },
+      "label": "selection_order_by_empty_vec",
+      "len": 14,
+      "offset": 1242,
+      "type": "Selection"
+    },
+    {
+      "json": {
+        "limit": 100,
+        "order_by": [
+          {
+            "direction": "Desc",
+            "path": {
+              "steps": [
+                "created_at"
+              ]
+            }
+          },
+          {
+            "direction": "Asc",
+            "path": {
+              "steps": [
+                "licensing",
+                "territory"
+              ]
+            }
+          }
+        ],
+        "predicate": {
+          "Comparison": {
+            "left": {
+              "Path": {
+                "steps": [
+                  "name"
+                ]
+              }
+            },
+            "operator": "NotEqual",
+            "right": {
+              "Literal": {
+                "String": "café 日本語 🚀 مرحبا"
+              }
+            }
+          }
+        }
+      },
+      "label": "selection_full",
+      "len": 173,
+      "offset": 1256,
+      "type": "Selection"
+    }
+  ],
+  "total_len": 1429
+}

@@ -1,0 +1,61 @@
+{
+  "encoding": "bincode 1.3 `serialize` defaults: fixed-width integers, little-endian, u64 sequence/string length prefixes, u32 enum variant tags, 1-byte Option tag, no length prefix on fixed-size arrays",
+  "fixture": "presence.bin",
+  "items": [
+    {
+      "json": {
+        "durable": true,
+        "node_id": "AQIDBAUGBwgJCgsMDQ4PEA",
+        "system_root": null
+      },
+      "label": "presence_durable_no_root",
+      "len": 18,
+      "offset": 0,
+      "type": "Presence"
+    },
+    {
+      "json": {
+        "durable": false,
+        "node_id": "AgMEBQYHCAkKCwwNDg8QEQ",
+        "system_root": {
+          "attestations": [
+            [
+              66,
+              67
+            ],
+            [
+              68,
+              69,
+              70
+            ]
+          ],
+          "payload": {
+            "collection": "test_collection",
+            "entity_id": "AAECAwQFBgcICQoLDA0ODw",
+            "state": {
+              "head": [
+                "EBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8"
+              ],
+              "state_buffers": {
+                "buf_alpha": [
+                  1,
+                  2,
+                  3
+                ],
+                "buf_beta": [
+                  4,
+                  5
+                ]
+              }
+            }
+          }
+        }
+      },
+      "label": "presence_ephemeral_with_root",
+      "len": 188,
+      "offset": 18,
+      "type": "Presence"
+    }
+  ],
+  "total_len": 206
+}

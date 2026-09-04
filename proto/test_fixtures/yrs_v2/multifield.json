@@ -1,0 +1,15 @@
+{
+  "applies_on_top_of": null,
+  "encoding": "yrs 0.24.0 update, lib0 v2 encoding (encode_state_as_update_v2 / encode_diff_v2)",
+  "fixture": "multifield.bin",
+  "note": "Two root texts written in one transaction. Root order in the encoding is insertion order, not alphabetical.",
+  "offset_kind": "Bytes (yrs Options default): Text insert/remove indices are UTF-8 byte offsets, not UTF-16 code units and not Unicode scalar counts",
+  "state_vector": {
+    "2": 37
+  },
+  "text_fields": {
+    "description": "Very cute cats playing",
+    "title": "Cat video #2918"
+  },
+  "total_len": 75
+}

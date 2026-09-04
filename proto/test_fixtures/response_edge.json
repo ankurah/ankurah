@@ -1,0 +1,170 @@
+{
+  "encoding": "bincode 1.3 `serialize` defaults: fixed-width integers, little-endian, u64 sequence/string length prefixes, u32 enum variant tags, 1-byte Option tag, no length prefix on fixed-size arrays",
+  "fixture": "response_edge.bin",
+  "items": [
+    {
+      "json": {
+        "Fetch": []
+      },
+      "label": "fetch_empty",
+      "len": 12,
+      "offset": 0,
+      "type": "NodeResponseBody"
+    },
+    {
+      "json": {
+        "Get": []
+      },
+      "label": "get_empty",
+      "len": 12,
+      "offset": 12,
+      "type": "NodeResponseBody"
+    },
+    {
+      "json": {
+        "GetEvents": []
+      },
+      "label": "get_events_empty",
+      "len": 12,
+      "offset": 24,
+      "type": "NodeResponseBody"
+    },
+    {
+      "json": {
+        "QuerySubscribed": {
+          "deltas": [],
+          "query_id": "00000000000000000000000000"
+        }
+      },
+      "label": "query_subscribed_empty",
+      "len": 46,
+      "offset": 36,
+      "type": "NodeResponseBody"
+    },
+    {
+      "json": {
+        "QuerySubscribed": {
+          "deltas": [
+            {
+              "collection": "a",
+              "content": {
+                "StateSnapshot": {
+                  "state": {
+                    "attestations": [
+                      [
+                        66,
+                        67
+                      ],
+                      [
+                        68,
+                        69,
+                        70
+                      ]
+                    ],
+                    "state": {
+                      "head": [
+                        "EBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8"
+                      ],
+                      "state_buffers": {
+                        "buf_alpha": [
+                          1,
+                          2,
+                          3
+                        ],
+                        "buf_beta": [
+                          4,
+                          5
+                        ]
+                      }
+                    }
+                  }
+                }
+              },
+              "entity_id": "AQIDBAUGBwgJCgsMDQ4PEA"
+            },
+            {
+              "collection": "café",
+              "content": {
+                "EventBridge": {
+                  "events": []
+                }
+              },
+              "entity_id": "AgMEBQYHCAkKCwwNDg8QEQ"
+            },
+            {
+              "collection": "c",
+              "content": {
+                "StateAndRelation": {
+                  "relation": {
+                    "attestations": [],
+                    "relation": {
+                      "Disjoint": {
+                        "gca": null,
+                        "other_root": "AgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fICE",
+                        "subject_root": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA"
+                      }
+                    }
+                  },
+                  "state": {
+                    "attestations": [
+                      [
+                        66,
+                        67
+                      ],
+                      [
+                        68,
+                        69,
+                        70
+                      ]
+                    ],
+                    "state": {
+                      "head": [
+                        "EBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8"
+                      ],
+                      "state_buffers": {
+                        "buf_alpha": [
+                          1,
+                          2,
+                          3
+                        ],
+                        "buf_beta": [
+                          4,
+                          5
+                        ]
+                      }
+                    }
+                  }
+                }
+              },
+              "entity_id": "AwQFBgcICQoLDA0ODxAREg"
+            }
+          ],
+          "query_id": "00000000070000000000000000"
+        }
+      },
+      "label": "query_subscribed_three_deltas",
+      "len": 484,
+      "offset": 82,
+      "type": "NodeResponseBody"
+    },
+    {
+      "json": {
+        "Error": ""
+      },
+      "label": "error_empty_string",
+      "len": 12,
+      "offset": 566,
+      "type": "NodeResponseBody"
+    },
+    {
+      "json": {
+        "Error": "café 日本語 🚀 مرحبا"
+      },
+      "label": "error_non_ascii",
+      "len": 43,
+      "offset": 578,
+      "type": "NodeResponseBody"
+    }
+  ],
+  "total_len": 621
+}

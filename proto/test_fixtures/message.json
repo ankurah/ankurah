@@ -1,0 +1,131 @@
+{
+  "encoding": "bincode 1.3 `serialize` defaults: fixed-width integers, little-endian, u64 sequence/string length prefixes, u32 enum variant tags, 1-byte Option tag, no length prefix on fixed-size arrays",
+  "fixture": "message.bin",
+  "items": [
+    {
+      "json": {
+        "Presence": {
+          "durable": true,
+          "node_id": "AQIDBAUGBwgJCgsMDQ4PEA",
+          "system_root": null
+        }
+      },
+      "label": "message_presence",
+      "len": 22,
+      "offset": 0,
+      "type": "Message"
+    },
+    {
+      "json": {
+        "PeerMessage": {
+          "Request": {
+            "auth": [
+              [
+                170,
+                187
+              ]
+            ],
+            "request": {
+              "body": {
+                "Get": {
+                  "collection": "users",
+                  "ids": [
+                    "QEFCQ0RFRkdISUpLTE1OTw"
+                  ]
+                }
+              },
+              "from": "MDEyMzQ1Njc4OTo7PD0-Pw",
+              "id": "00000000000000000000000016",
+              "to": "ICEiIyQlJicoKSorLC0uLw"
+            }
+          }
+        }
+      },
+      "label": "message_peer_request",
+      "len": 133,
+      "offset": 22,
+      "type": "Message"
+    },
+    {
+      "json": {
+        "Request": {
+          "auth": [],
+          "request": {
+            "body": {
+              "Get": {
+                "collection": "items",
+                "ids": []
+              }
+            },
+            "from": "cHFyc3R1dnd4eXp7fH1-fw",
+            "id": "00000000000000000000000080",
+            "to": "YGFiY2RlZmdoaWprbG1ubw"
+          }
+        }
+      },
+      "label": "node_message_request",
+      "len": 103,
+      "offset": 155,
+      "type": "NodeMessage"
+    },
+    {
+      "json": {
+        "Response": {
+          "body": "Success",
+          "from": "kJGSk5SVlpeYmZqbnJ2enw",
+          "request_id": "00000000000000000000000128",
+          "to": "oKGio6SlpqeoqaqrrK2urw"
+        }
+      },
+      "label": "node_message_response",
+      "len": 74,
+      "offset": 258,
+      "type": "NodeMessage"
+    },
+    {
+      "json": {
+        "Update": {
+          "body": {
+            "SubscriptionUpdate": {
+              "items": []
+            }
+          },
+          "from": "sLGys7S1tre4ubq7vL2-vw",
+          "id": "00000000000000000000000001",
+          "to": "wMHCw8TFxsfIycrLzM3Ozw"
+        }
+      },
+      "label": "node_message_update",
+      "len": 82,
+      "offset": 332,
+      "type": "NodeMessage"
+    },
+    {
+      "json": {
+        "UpdateAck": {
+          "body": "Success",
+          "from": "0NHS09TV1tfY2drb3N3e3w",
+          "id": "00000000000000000000000002",
+          "to": "4OHi4-Tl5ufo6err7O3u7w"
+        }
+      },
+      "label": "node_message_update_ack",
+      "len": 74,
+      "offset": 414,
+      "type": "NodeMessage"
+    },
+    {
+      "json": {
+        "UnsubscribeQuery": {
+          "from": "8PHy8_T19vf4-fr7_P3-_w",
+          "query_id": "000000002D0000000000000000"
+        }
+      },
+      "label": "node_message_unsubscribe_query",
+      "len": 54,
+      "offset": 488,
+      "type": "NodeMessage"
+    }
+  ],
+  "total_len": 542
+}

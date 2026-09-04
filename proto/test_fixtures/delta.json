@@ -1,0 +1,299 @@
+{
+  "encoding": "bincode 1.3 `serialize` defaults: fixed-width integers, little-endian, u64 sequence/string length prefixes, u32 enum variant tags, 1-byte Option tag, no length prefix on fixed-size arrays",
+  "fixture": "delta.bin",
+  "items": [
+    {
+      "json": {
+        "StateSnapshot": {
+          "state": {
+            "attestations": [
+              [
+                66,
+                67
+              ],
+              [
+                68,
+                69,
+                70
+              ]
+            ],
+            "state": {
+              "head": [
+                "EBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8"
+              ],
+              "state_buffers": {
+                "buf_alpha": [
+                  1,
+                  2,
+                  3
+                ],
+                "buf_beta": [
+                  4,
+                  5
+                ]
+              }
+            }
+          }
+        }
+      },
+      "label": "state_snapshot",
+      "len": 135,
+      "offset": 0,
+      "type": "DeltaContent"
+    },
+    {
+      "json": {
+        "EventBridge": {
+          "events": [
+            {
+              "attestations": [],
+              "operations": {
+                "backend_a": [
+                  {
+                    "diff": [
+                      170,
+                      187
+                    ]
+                  },
+                  {
+                    "diff": [
+                      204
+                    ]
+                  }
+                ],
+                "backend_b": [
+                  {
+                    "diff": [
+                      221,
+                      238,
+                      255
+                    ]
+                  }
+                ]
+              },
+              "parent": [
+                "EBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8"
+              ]
+            }
+          ]
+        }
+      },
+      "label": "event_bridge",
+      "len": 148,
+      "offset": 135,
+      "type": "DeltaContent"
+    },
+    {
+      "json": {
+        "StateAndRelation": {
+          "relation": {
+            "attestations": [
+              [
+                66,
+                67
+              ],
+              [
+                68,
+                69,
+                70
+              ]
+            ],
+            "relation": "Equal"
+          },
+          "state": {
+            "attestations": [
+              [
+                66,
+                67
+              ],
+              [
+                68,
+                69,
+                70
+              ]
+            ],
+            "state": {
+              "head": [
+                "EBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8"
+              ],
+              "state_buffers": {
+                "buf_alpha": [
+                  1,
+                  2,
+                  3
+                ],
+                "buf_beta": [
+                  4,
+                  5
+                ]
+              }
+            }
+          }
+        }
+      },
+      "label": "state_and_relation",
+      "len": 168,
+      "offset": 283,
+      "type": "DeltaContent"
+    },
+    {
+      "json": {
+        "collection": "test_collection",
+        "content": {
+          "StateSnapshot": {
+            "state": {
+              "attestations": [
+                [
+                  66,
+                  67
+                ],
+                [
+                  68,
+                  69,
+                  70
+                ]
+              ],
+              "state": {
+                "head": [
+                  "EBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8"
+                ],
+                "state_buffers": {
+                  "buf_alpha": [
+                    1,
+                    2,
+                    3
+                  ],
+                  "buf_beta": [
+                    4,
+                    5
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "entity_id": "EBESExQVFhcYGRobHB0eHw"
+      },
+      "label": "entity_delta_state_snapshot",
+      "len": 174,
+      "offset": 451,
+      "type": "EntityDelta"
+    },
+    {
+      "json": {
+        "collection": "test_collection",
+        "content": {
+          "EventBridge": {
+            "events": [
+              {
+                "attestations": [],
+                "operations": {
+                  "backend_a": [
+                    {
+                      "diff": [
+                        170,
+                        187
+                      ]
+                    },
+                    {
+                      "diff": [
+                        204
+                      ]
+                    }
+                  ],
+                  "backend_b": [
+                    {
+                      "diff": [
+                        221,
+                        238,
+                        255
+                      ]
+                    }
+                  ]
+                },
+                "parent": [
+                  "EBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8"
+                ]
+              }
+            ]
+          }
+        },
+        "entity_id": "ICEiIyQlJicoKSorLC0uLw"
+      },
+      "label": "entity_delta_event_bridge",
+      "len": 187,
+      "offset": 625,
+      "type": "EntityDelta"
+    },
+    {
+      "json": {
+        "collection": "test_collection",
+        "content": {
+          "StateAndRelation": {
+            "relation": {
+              "attestations": [
+                [
+                  66,
+                  67
+                ],
+                [
+                  68,
+                  69,
+                  70
+                ]
+              ],
+              "relation": "Equal"
+            },
+            "state": {
+              "attestations": [
+                [
+                  66,
+                  67
+                ],
+                [
+                  68,
+                  69,
+                  70
+                ]
+              ],
+              "state": {
+                "head": [
+                  "EBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8"
+                ],
+                "state_buffers": {
+                  "buf_alpha": [
+                    1,
+                    2,
+                    3
+                  ],
+                  "buf_beta": [
+                    4,
+                    5
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "entity_id": "MDEyMzQ1Njc4OTo7PD0-Pw"
+      },
+      "label": "entity_delta_state_and_relation",
+      "len": 207,
+      "offset": 812,
+      "type": "EntityDelta"
+    },
+    {
+      "json": {
+        "entity_id": "ICEiIyQlJicoKSorLC0uLw",
+        "head": [
+          "EBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8"
+        ]
+      },
+      "label": "known_entity",
+      "len": 56,
+      "offset": 1019,
+      "type": "KnownEntity"
+    }
+  ],
+  "total_len": 1075
+}

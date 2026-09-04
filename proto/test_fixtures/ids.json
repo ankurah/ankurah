@@ -1,0 +1,56 @@
+{
+  "encoding": "bincode 1.3 `serialize` defaults: fixed-width integers, little-endian, u64 sequence/string length prefixes, u32 enum variant tags, 1-byte Option tag, no length prefix on fixed-size arrays",
+  "fixture": "ids.bin",
+  "items": [
+    {
+      "json": "AAECAwQFBgcICQoLDA0ODw",
+      "label": "entity_id",
+      "len": 16,
+      "offset": 0,
+      "type": "EntityId"
+    },
+    {
+      "json": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+      "label": "event_id",
+      "len": 32,
+      "offset": 16,
+      "type": "EventId"
+    },
+    {
+      "json": "00000000000000000000000016",
+      "label": "transaction_id",
+      "len": 34,
+      "offset": 48,
+      "type": "TransactionId"
+    },
+    {
+      "json": "00000000000000000000000032",
+      "label": "request_id",
+      "len": 34,
+      "offset": 82,
+      "type": "RequestId"
+    },
+    {
+      "json": "000000001A0000000000000000",
+      "label": "query_id",
+      "len": 34,
+      "offset": 116,
+      "type": "QueryId"
+    },
+    {
+      "json": "00000000000000000000000048",
+      "label": "update_id",
+      "len": 34,
+      "offset": 150,
+      "type": "UpdateId"
+    },
+    {
+      "json": "test_collection",
+      "label": "collection_id",
+      "len": 23,
+      "offset": 184,
+      "type": "CollectionId"
+    }
+  ],
+  "total_len": 207
+}
