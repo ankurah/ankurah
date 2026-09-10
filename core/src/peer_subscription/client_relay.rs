@@ -2,13 +2,15 @@
 use ankurah_proto::{self as proto, CollectionId};
 use anyhow::anyhow;
 use async_trait::async_trait;
+use proto::EntityId;
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use tracing::{debug, warn};
 
 use crate::error::{RequestError, RetrievalError};
 use crate::node::ContextData;
 use crate::session::SessionSet;
+use crate::util::cancel_flag::CancelFlag;
 use crate::util::safeset::SafeSet;
 
 /// Trait for query initialization that can be driven by SubscriptionRelay
@@ -50,6 +52,7 @@ pub struct RemoteQueryState<CD: ContextData, Q: RemoteQuerySubscriber> {
     pub content: Arc<Content<CD>>,
     pub status: Status,
     pub livequery: Q,
+    cancel: CancelFlag,
 }
 
 struct SubscriptionRelayInner<CD: ContextData, Q: RemoteQuerySubscriber> {
@@ -71,6 +74,12 @@ struct SubscriptionRelayInner<CD: ContextData, Q: RemoteQuerySubscriber> {
 #[derive(Clone)]
 pub struct SubscriptionRelay<CD: ContextData, Q: RemoteQuerySubscriber> {
     inner: Arc<SubscriptionRelayInner<CD, Q>>,
+}
+
+struct WeakSubscriptionRelay<CD: ContextData, Q: RemoteQuerySubscriber>(Weak<SubscriptionRelayInner<CD, Q>>);
+
+impl<CD: ContextData, Q: RemoteQuerySubscriber> WeakSubscriptionRelay<CD, Q> {
+    fn upgrade(&self) -> Option<SubscriptionRelay<CD, Q>> { self.0.upgrade().map(|inner| SubscriptionRelay { inner }) }
 }
 
 impl<CD: ContextData, Q: RemoteQuerySubscriber> Default for SubscriptionRelay<CD, Q> {
@@ -95,6 +104,8 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
 
         relay
     }
+
+    fn weak(&self) -> WeakSubscriptionRelay<CD, Q> { WeakSubscriptionRelay(Arc::downgrade(&self.inner)) }
 
     /// Inject the node (typically a WeakNode for production)
     ///
@@ -123,6 +134,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                     content: Arc::new(Content { collection_id, selection, sessions, query_id, version }),
                     status: Status::PendingRemote,
                     livequery,
+                    cancel: CancelFlag::default(),
                 },
             );
         }
@@ -150,10 +162,11 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                     });
 
                     match state.status {
-                        Status::Established(peer_id, _old_version) => {
+                        Status::Established(peer_id, _) | Status::Requested(peer_id, _) => {
                             // Update to new version, mark as requested for this peer
                             state.status = Status::Requested(peer_id, version);
-                            Some((peer_id, state.content.collection_id.clone(), state.content.sessions.clone()))
+                            state.cancel.cancel_and_swap();
+                            Some((peer_id, state.content.collection_id.clone(), state.content.sessions.clone(), state.cancel.clone()))
                             // Return the peer_id to send update to
                         }
                         _ => {
@@ -168,8 +181,8 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         };
 
         match update {
-            Some((peer_id, collection_id, sessions)) => {
-                self.update_query_on_peer(peer_id, query_id, collection_id, selection, version, sessions);
+            Some((peer_id, collection_id, sessions, cancel)) => {
+                self.update_query_on_peer(peer_id, query_id, collection_id, selection, version, sessions, cancel);
             }
             None => {
                 // Not established yet - use setup_remote_subscriptions for initial setup
@@ -188,6 +201,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         selection: ankql::ast::Selection,
         version: u32,
         sessions: SessionSet<CD>,
+        cancel: CancelFlag,
     ) {
         let me = self.clone();
         crate::task::spawn(async move {
@@ -200,6 +214,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                 // Send the updated predicate to the peer, under the
                 // credentials current at send time.
                 match node.remote_subscribe(peer_id, query_id, collection_id, selection, sessions.current(), version).await {
+                    _ if cancel.canceled() => debug!("Ignoring superseded reply for predicate {}", query_id),
                     Ok(()) => {
                         // Deltas applied successfully, now activate the livequery
                         if let Some(lq) = livequery {
@@ -208,14 +223,16 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
 
                         // Mark as established - subscription succeeded even if livequery activation had issues
                         let mut subscriptions = me.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
-                        if let Some(info) = subscriptions.get_mut(&query_id) {
-                            info.status = Status::Established(peer_id, version);
+                        if !cancel.canceled() {
+                            if let Some(info) = subscriptions.get_mut(&query_id) {
+                                info.status = Status::Established(peer_id, version);
+                            }
                         }
                         debug!("Successfully updated predicate {} on peer {} subscription", query_id, peer_id);
                     }
                     Err(e) => {
                         // Handle error with retry logic
-                        me.handle_error(query_id, peer_id, e, livequery).await;
+                        me.handle_error(query_id, peer_id, e, &cancel);
                     }
                 }
             }
@@ -233,7 +250,8 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         {
             let mut subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(info) = subscriptions.remove(&query_id) {
-                if let Status::Established(peer_id, _version) = &info.status {
+                info.cancel.cancel();
+                if let Status::Established(peer_id, _) | Status::Requested(peer_id, _) = &info.status {
                     let node = self.inner.node.get();
                     if let Some(node) = node {
                         let node = node.clone();
@@ -267,6 +285,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                 if *established_peer_id == peer_id {
                     // Update state to pending
                     info.status = Status::PendingRemote;
+                    info.cancel.cancel();
                     warn!("Predicate {} orphaned due to peer {} disconnect", info.content.query_id, peer_id);
                 }
             }
@@ -345,7 +364,8 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                 .filter_map(|info| {
                     if let Status::PendingRemote = info.status {
                         info.status = Status::Requested(target_peer, info.content.version);
-                        Some(info.content.clone())
+                        info.cancel.cancel_and_swap();
+                        Some((info.content.clone(), info.cancel.clone()))
                     } else {
                         None
                     }
@@ -359,12 +379,12 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
 
         debug!("Registering {} predicates on {} peer subscriptions", pending.len(), self.inner.connected_peers.len());
 
-        for content in pending {
-            crate::task::spawn(self.clone().attempt_subscribe(node.clone(), target_peer, content));
+        for (content, cancel) in pending {
+            crate::task::spawn(self.clone().attempt_subscribe(node.clone(), target_peer, content, cancel));
         }
     }
 
-    async fn attempt_subscribe(self, node: Arc<dyn TNode<CD>>, target_peer: proto::EntityId, content: Arc<Content<CD>>) {
+    async fn attempt_subscribe(self, node: Arc<dyn TNode<CD>>, target_peer: EntityId, content: Arc<Content<CD>>, cancel: CancelFlag) {
         let query_id = content.query_id;
         let predicate = content.selection.clone();
         // Credentials read at send time from the live source.
@@ -377,6 +397,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
 
         // Call remote_subscribe which fetches known matches, subscribes, applies deltas, and stores events
         match node.remote_subscribe(target_peer, query_id, content.collection_id.clone(), predicate, cdatas, version).await {
+            _ if cancel.canceled() => debug!("Ignoring superseded reply for predicate {}", query_id),
             Ok(()) => {
                 // Deltas applied successfully, now activate the livequery
                 // The livequery handles its own errors internally
@@ -386,28 +407,31 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
 
                 // Mark as established - subscription succeeded even if livequery activation had issues
                 let mut subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(info) = subscriptions.get_mut(&query_id) {
-                    info.status = Status::Established(target_peer, version);
+                if !cancel.canceled() {
+                    if let Some(info) = subscriptions.get_mut(&query_id) {
+                        info.status = Status::Established(target_peer, version);
+                    }
                 }
                 debug!("Successfully registered predicate {} on peer {} subscription", query_id, target_peer);
             }
             Err(e) => {
                 // Handle error with retry logic
-                self.handle_error(query_id, target_peer, e, livequery).await;
+                self.handle_error(query_id, target_peer, e, &cancel);
             }
         }
     }
 
     /// Start background task that periodically retries pending subscriptions
     fn start_retry_task(&self, mut shutdown_rx: tokio::sync::mpsc::Receiver<()>) {
-        let me = self.clone();
+        let me = self.weak();
         crate::task::spawn(async move {
             loop {
                 let delay = futures_timer::Delay::new(std::time::Duration::from_secs(5));
                 tokio::select! {
                     _ = delay => {
                         // Attempt to setup any pending subscriptions
-                        me.setup_remote_subscriptions();
+                        let Some(relay) = me.upgrade() else { break };
+                        relay.setup_remote_subscriptions();
                     }
                     _ = shutdown_rx.recv() => {
                         debug!("Retry task shutting down - SubscriptionRelay dropped");
@@ -419,7 +443,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
     }
 
     /// Handle errors with retry logic
-    async fn handle_error(&self, query_id: proto::QueryId, target_peer: proto::EntityId, error: RetrievalError, livequery: Option<Q>) {
+    fn handle_error(&self, query_id: proto::QueryId, target_peer: proto::EntityId, error: RetrievalError, cancel: &CancelFlag) {
         let error_msg = error.to_string();
 
         // Evaluate retriability at failure time
@@ -440,19 +464,19 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
 
         // Update state based on retriability
         let mut subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(info) = subscriptions.get_mut(&query_id) {
-            if is_retryable {
-                // Retryable errors go back to pending for retry by background task
-                info.status = Status::PendingRemote;
-                warn!("Retryable failure for predicate {} with peer {}: {} - will retry", query_id, target_peer, error_msg);
-            } else {
-                // Non-retryable errors are permanently failed
-                info.status = Status::Failed;
-                tracing::error!("Permanent failure for predicate {} with peer {}: {} - no retry", query_id, target_peer, error_msg);
+        if !cancel.canceled() {
+            if let Some(info) = subscriptions.get_mut(&query_id) {
+                if is_retryable {
+                    // Retryable errors go back to pending for retry by background task
+                    info.status = Status::PendingRemote;
+                    warn!("Retryable failure for predicate {} with peer {}: {} - will retry", query_id, target_peer, error_msg);
+                } else {
+                    // Non-retryable errors are permanently failed
+                    info.status = Status::Failed;
+                    tracing::error!("Permanent failure for predicate {} with peer {}: {} - no retry", query_id, target_peer, error_msg);
 
-                // Set error on livequery
-                if let Some(lq) = livequery {
-                    lq.set_last_error(error);
+                    // Set error on livequery
+                    info.livequery.set_last_error(error);
                 }
             }
         }
@@ -575,6 +599,7 @@ mod tests {
         sent_requests: Arc<Mutex<Vec<(EntityId, proto::QueryId, CollectionId, ankql::ast::Selection)>>>,
         should_fail: Arc<Mutex<bool>>,
         failure_message: Arc<Mutex<String>>,
+        held_reply: Mutex<Option<tokio::sync::oneshot::Receiver<Result<(), RequestError>>>>,
         _phantom: std::marker::PhantomData<CD>,
     }
 
@@ -585,6 +610,7 @@ mod tests {
                 next_error: Arc::new(Mutex::new(None)),
                 should_fail: Arc::new(Mutex::new(false)),
                 failure_message: Arc::new(Mutex::new(String::new())),
+                held_reply: Mutex::new(None),
                 _phantom: std::marker::PhantomData,
             }
         }
@@ -596,6 +622,13 @@ mod tests {
         }
 
         fn clear_sent_requests(&self) { self.sent_requests.lock().unwrap().clear(); }
+
+        /// Parks the next remote_subscribe until the returned sender delivers its reply.
+        fn hold_next_reply(&self) -> tokio::sync::oneshot::Sender<Result<(), RequestError>> {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            *self.held_reply.lock().unwrap() = Some(rx);
+            tx
+        }
     }
 
     #[async_trait]
@@ -611,6 +644,10 @@ mod tests {
         ) -> Result<(), RetrievalError> {
             self.sent_requests.lock().unwrap().push((peer_id, query_id, collection_id.clone(), selection.clone()));
 
+            let held = self.held_reply.lock().unwrap().take();
+            if let Some(reply) = held {
+                return reply.await.expect("held reply dropped").map_err(RetrievalError::RequestError);
+            }
             // Check if there's an error to fail with
             if let Some(error) = self.next_error.lock().unwrap().take() {
                 Err(RetrievalError::RequestError(error))
@@ -641,11 +678,14 @@ mod tests {
     #[derive(Clone)]
     struct MockLiveQuery;
 
+    thread_local! {
+        /// Versions handed to `subscription_established` on this thread; the test runtime is current-thread.
+        static ESTABLISHED: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
     #[async_trait::async_trait]
     impl RemoteQuerySubscriber for MockLiveQuery {
-        async fn subscription_established(&self, _version: u32) {
-            // Mock - no-op
-        }
+        async fn subscription_established(&self, version: u32) { ESTABLISHED.with(|e| e.borrow_mut().push(version)) }
 
         fn set_last_error(&self, _error: RetrievalError) {
             // For tests, we don't track errors
@@ -658,6 +698,28 @@ mod tests {
     }
 
     fn create_test_collection_id() -> CollectionId { CollectionId::from("test_collection") }
+
+    fn connected_relay() -> (SubscriptionRelay<CollectionId, MockLiveQuery>, Arc<MockMessageSender<CollectionId>>, EntityId) {
+        let relay = SubscriptionRelay::new();
+        let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
+        relay.set_node(mock_sender.clone()).expect("Failed to set message sender");
+        let peer_id = EntityId::random();
+        relay.notify_peer_connected(peer_id);
+        (relay, mock_sender, peer_id)
+    }
+
+    fn subscribe(relay: &SubscriptionRelay<CollectionId, MockLiveQuery>, query_id: proto::QueryId) {
+        let collection_id = create_test_collection_id();
+        relay.subscribe_query(query_id, collection_id.clone(), create_test_selection(), collection_id.into(), 1, MockLiveQuery);
+    }
+
+    /// Gives the relay's spawned tasks scheduler turns before the next assertion. The tests use the
+    /// current-thread runtime and mocks that never suspend.
+    async fn settle() {
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+    }
 
     #[tokio::test]
     async fn test_new_subscription_setup() {
@@ -956,5 +1018,84 @@ mod tests {
 
         // Verify subscription is gone
         assert!(matches!(relay.get_status(query_id), None));
+    }
+
+    /// A version-1 reply that arrives after version 2 was requested must not overwrite version 2's state,
+    /// whether the late reply is a success or a permanent failure.
+    #[tokio::test]
+    async fn stale_reply_does_not_overwrite_newer_version() {
+        for stale_reply in [Ok(()), Err(RequestError::ServerError("rejected".into()))] {
+            let (relay, mock_sender, peer_id) = connected_relay();
+            let query_id = proto::QueryId::new();
+            let stale = mock_sender.hold_next_reply();
+            subscribe(&relay, query_id);
+            settle().await;
+            assert!(matches!(relay.get_status(query_id), Some(Status::Requested(_, 1))));
+
+            relay.update_query(query_id, create_test_selection(), 2).unwrap();
+            settle().await;
+            assert!(matches!(relay.get_status(query_id), Some(Status::Established(p, 2)) if p == peer_id));
+
+            ESTABLISHED.take();
+            stale.send(stale_reply).unwrap();
+            settle().await;
+            assert!(matches!(relay.get_status(query_id), Some(Status::Established(_, 2))), "{:?}", relay.get_status(query_id));
+            assert_eq!(ESTABLISHED.take(), Vec::<u32>::new(), "a superseded reply must not activate the livequery");
+        }
+    }
+
+    /// After a disconnect and reconnect, the reply to the pre-disconnect request must not disturb the
+    /// re-registration, even though both carry the same version.
+    #[tokio::test]
+    async fn stale_reply_after_reconnect_is_ignored() {
+        let (relay, mock_sender, peer_id) = connected_relay();
+        let query_id = proto::QueryId::new();
+        let stale = mock_sender.hold_next_reply();
+        subscribe(&relay, query_id);
+        settle().await;
+
+        relay.notify_peer_disconnected(peer_id);
+        relay.notify_peer_connected(peer_id);
+        settle().await;
+        assert!(matches!(relay.get_status(query_id), Some(Status::Established(p, 1)) if p == peer_id));
+
+        stale.send(Err(RequestError::ConnectionLost)).unwrap();
+        settle().await;
+        assert!(matches!(relay.get_status(query_id), Some(Status::Established(_, 1))), "{:?}", relay.get_status(query_id));
+    }
+
+    /// While a registration request is in flight on a peer, an update and an unsubscribe go to that peer
+    /// rather than to whichever peer the generic setup path would pick.
+    #[tokio::test]
+    async fn update_and_unsubscribe_while_requested_use_the_recorded_peer() {
+        let (relay, mock_sender, peer_id) = connected_relay();
+        let query_id = proto::QueryId::new();
+        let _first_in_flight = mock_sender.hold_next_reply();
+        subscribe(&relay, query_id);
+        settle().await;
+        // Leave only another peer in the connected set, so the generic setup path would not pick the recorded one
+        relay.inner.connected_peers.remove(&peer_id);
+        relay.notify_peer_connected(EntityId::random());
+
+        let _second_in_flight = mock_sender.hold_next_reply();
+        relay.update_query(query_id, create_test_selection(), 2).unwrap();
+        settle().await;
+        assert!(matches!(relay.get_status(query_id), Some(Status::Requested(p, 2)) if p == peer_id), "{:?}", relay.get_status(query_id));
+
+        relay.unsubscribe_predicate(query_id);
+        settle().await;
+        let sent = mock_sender.get_sent_requests();
+        assert_eq!(sent.len(), 3, "{sent:?}");
+        assert!(sent.iter().all(|(peer, _, _, _)| *peer == peer_id), "{sent:?}");
+        assert_eq!(sent[2].2, CollectionId::from("unsubscribe"));
+    }
+
+    /// The retry task must not own the relay, or dropping the last handle could never stop it.
+    #[tokio::test]
+    async fn retry_task_does_not_keep_relay_alive() {
+        let relay = SubscriptionRelay::<CollectionId, MockLiveQuery>::new();
+        let weak = relay.weak();
+        drop(relay);
+        assert!(weak.upgrade().is_none());
     }
 }
