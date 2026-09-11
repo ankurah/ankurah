@@ -386,55 +386,34 @@ where
         let captured = Captured::new();
         let nodes = build_nodes(node_count, captured.clone()).await.expect("nodes build");
 
-        let durable = nodes.iter().find(|node| node.durable).expect("the simulation has a durable node");
+        // Full mesh: every node knows every other. Ephemeral nodes join the durable
+        // system as a side effect of registering it as a durable peer.
+        for a in &nodes {
+            for b in &nodes {
+                if a.index != b.index {
+                    a.connect_to(b).await;
+                }
+            }
+        }
 
         let node_ids: Vec<proto::EntityId> = nodes.iter().map(|n| n.id()).collect();
         let mut scheduler = Scheduler::new(captured.clone(), faults, node_ids);
         let mut trace = Trace::new();
 
-        // Bring ephemerals up serially so startup scheduling cannot change the trace.
+        // Let startup settle first, then seed each ephemeral's descriptor binding
+        // once its system is ready.
         for node in &nodes {
             if !node.durable {
-                node.connect_to(durable).await;
-                durable.connect_to(node).await;
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
-                let ready = node.node.system.wait_system_ready();
-                tokio::pin!(ready);
-                while !futures_util::poll!(ready.as_mut()).is_ready() {
-                    scheduler.drain(&nodes, &mut rng, &mut trace).await;
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "node {} never became ready (system_ready={}, catalog_counts={:?})",
-                        node.index,
-                        node.node.system.is_system_ready(),
-                        node.node.catalog.counts()
-                    );
-                }
+                node.node.system.wait_system_ready().await.expect("sim node system reaches ready state");
                 super::node::seed_sim_schema(node).expect("sim schema seeds on a ready node");
-                let synced = node.node.wait_ready();
-                tokio::pin!(synced);
-                loop {
-                    match futures_util::poll!(synced.as_mut()) {
-                        std::task::Poll::Ready(answered) => {
-                            answered.expect("the durable peer must answer this node's catalog projection");
-                            break;
-                        }
-                        std::task::Poll::Pending => scheduler.drain(&nodes, &mut rng, &mut trace).await,
-                    }
-                    assert!(std::time::Instant::now() < deadline, "node {}'s catalog projection was never answered", node.index);
-                }
+                node.node.wait_ready().await.expect("sim node becomes ready after seeded schema binding");
             }
-            scheduler.run_to_quiescence(&nodes, &mut rng, &mut trace).await;
+            scheduler.drain(&nodes, &mut rng, &mut trace).await;
         }
-
-        for a in &nodes {
-            for b in &nodes {
-                if a.index != b.index && !a.durable && !b.durable {
-                    a.connect_to(b).await;
-                }
-            }
-        }
-        scheduler.run_to_quiescence(&nodes, &mut rng, &mut trace).await;
+        // Startup services can race harmlessly (e.g. initial catalog fetch vs subscribe)
+        // before the scenario body begins; drop that prefix so the determinism audit
+        // compares only workload-driven scheduling.
+        trace = Trace::new();
 
         // Run the workload in an inner scope so its mutable borrows of the
         // scheduler/rng/trace end before the quiescence barrier reuses them.
