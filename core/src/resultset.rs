@@ -1,5 +1,7 @@
 use crate::indexing::{encode_tuple_values_with_key_spec, KeySpec};
-use crate::{entity::Entity, model::View, reactor::AbstractEntity};
+use crate::internal::prelude::*;
+use crate::reactor::AbstractEntity;
+use ankql::ast::PropertyId;
 use ankurah_proto as proto;
 use ankurah_signals::{
     broadcast::{Broadcast, BroadcastId},
@@ -70,8 +72,7 @@ struct Inner<E: AbstractEntity> {
 struct State<E: AbstractEntity> {
     order: Vec<EntityEntry<E>>,
     index: HashMap<proto::EntityId, usize>,
-    // Ordering configuration
-    key_spec: Option<KeySpec>,
+    key_spec: Option<KeySpec<PropertyId>>,
     limit: Option<usize>,
     gap_dirty: bool, // Set when we remove entities and go from =LIMIT to < LIMIT
 }
@@ -305,12 +306,12 @@ impl<'a, E: AbstractEntity> ResultSetWrite<'a, E> {
     }
 
     /// Compute sort key for an entity using the current key spec
-    fn compute_sort_key(entity: &E, key_spec: &KeySpec) -> IVec {
+    fn compute_sort_key(entity: &E, key_spec: &KeySpec<PropertyId>) -> IVec {
         let mut values = Vec::new();
 
         // Extract values for each key part
         for keypart in &key_spec.keyparts {
-            let value = AbstractEntity::value(entity, &keypart.column);
+            let value = AbstractEntity::value(entity, &keypart.key);
             // TODO: Handle NULLs properly - for now we'll get encoding errors on NULLs
             // which will cause unwrap_or_default() to return empty key (sorts first)
             if let Some(v) = value {
@@ -471,7 +472,7 @@ impl<E: AbstractEntity> EntityResultSet<E> {
     }
 
     /// Configure ordering for this result set
-    pub(crate) fn order_by(&self, key_spec: Option<KeySpec>) {
+    pub(crate) fn order_by(&self, key_spec: Option<KeySpec<PropertyId>>) {
         let mut st = self.0.state.lock().unwrap();
 
         // Check if the key spec actually changed
@@ -558,18 +559,28 @@ mod tests {
     use super::*;
     use crate::indexing::{IndexDirection, IndexKeyPart, KeySpec, NullsOrder};
     use crate::value::{Value, ValueType};
+    use ankql::ast::PropertyId;
     use ankurah_proto as proto;
     use std::collections::HashMap;
+
+    /// A deterministic durable identity for a fixture field name.
+    fn prop(name: &str) -> ankurah_proto::PropertyId {
+        let mut bytes = [0u8; 32];
+        let n = name.as_bytes();
+        let len = n.len().min(32);
+        bytes[..len].copy_from_slice(&n[..len]);
+        ankurah_proto::PropertyId::EntityId(ankurah_proto::EntityId::from_bytes(bytes))
+    }
 
     #[derive(Debug, Clone)]
     struct TestEntity {
         id: proto::EntityId,
         collection: proto::CollectionId,
-        properties: HashMap<String, Value>,
+        properties: HashMap<PropertyId, Value>,
     }
 
     impl TestEntity {
-        fn new(id: u8, properties: HashMap<String, Value>) -> Self {
+        fn new(id: u8, properties: HashMap<PropertyId, Value>) -> Self {
             let mut id_bytes = [0u8; 32];
             id_bytes[15] = id;
             Self { id: proto::EntityId::from_bytes(id_bytes), collection: proto::CollectionId::fixed_name("test"), properties }
@@ -581,11 +592,11 @@ mod tests {
 
         fn id(&self) -> &proto::EntityId { &self.id }
 
-        fn value(&self, field: &str) -> Option<Value> {
-            if field == "id" {
+        fn value(&self, property: &PropertyId) -> Option<Value> {
+            if *property == PropertyId::Id {
                 Some(Value::EntityId(self.id.clone()))
             } else {
-                self.properties.get(field).cloned()
+                self.properties.get(property).cloned()
             }
         }
     }
@@ -622,21 +633,21 @@ mod tests {
 
         // Create entities with same name but different IDs
         let mut props1 = HashMap::new();
-        props1.insert("name".to_string(), Value::String("Alice".to_string()));
+        props1.insert(prop("name"), Value::String("Alice".to_string()));
         let entity1 = TestEntity::new(1, props1);
 
         let mut props2 = HashMap::new();
-        props2.insert("name".to_string(), Value::String("Alice".to_string()));
+        props2.insert(prop("name"), Value::String("Alice".to_string()));
         let entity2 = TestEntity::new(2, props2);
 
         let mut props3 = HashMap::new();
-        props3.insert("name".to_string(), Value::String("Bob".to_string()));
+        props3.insert(prop("name"), Value::String("Bob".to_string()));
         let entity3 = TestEntity::new(3, props3);
 
         // Set up ordering by name
         let key_spec = KeySpec {
             keyparts: vec![IndexKeyPart {
-                column: "name".to_string(),
+                key: prop("name"),
                 sub_path: None,
                 direction: IndexDirection::Asc,
                 nulls: Some(NullsOrder::Last),
@@ -670,7 +681,7 @@ mod tests {
         let mut write = resultset.write();
         for i in 0..5u8 {
             let mut props = HashMap::new();
-            props.insert("value".to_string(), Value::I32(i as i32));
+            props.insert(prop("value"), Value::I32(i as i32));
             let entity = TestEntity::new(i, props);
             write.add(entity);
         }
@@ -692,11 +703,11 @@ mod tests {
         let resultset = EntityResultSet::empty();
 
         let mut props = HashMap::new();
-        props.insert("active".to_string(), Value::Bool(true));
+        props.insert(prop("active"), Value::Bool(true));
         let entity1 = TestEntity::new(1, props);
 
         let mut props = HashMap::new();
-        props.insert("active".to_string(), Value::Bool(false));
+        props.insert(prop("active"), Value::Bool(false));
         let entity2 = TestEntity::new(2, props);
 
         let mut write = resultset.write();
@@ -707,7 +718,7 @@ mod tests {
         write.mark_all_dirty();
 
         // Retain only active entities
-        let removed = write.retain_dirty(|entity| entity.value("active") == Some(Value::Bool(true)));
+        let removed = write.retain_dirty(|entity| entity.value(&prop("active")) == Some(Value::Bool(true)));
 
         drop(write);
 

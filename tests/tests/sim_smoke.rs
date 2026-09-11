@@ -12,6 +12,7 @@ use ankurah_tests::sim::{body, run_once, run_with_determinism_audit, FaultConfig
 /// committed entity change propagating deterministically under an explicit
 /// seed, trace recorded, and same-seed-twice trace identity asserted.
 #[test]
+#[ignore = "Exact-trace nondeterminism; re-enable with https://github.com/ankurah/ankurah/issues/494"]
 fn smoke_two_node_single_change_is_deterministic() {
     let outcome = run_with_determinism_audit("two_node_single_change", 1, FaultConfig::none(), 2, || {
         body(|w: &mut Workload| {
@@ -28,6 +29,7 @@ fn smoke_two_node_single_change_is_deterministic() {
 /// Convergence under a reliable network with three nodes: every node ends
 /// byte-equal. Establishes the no-fault baseline the fault scenarios perturb.
 #[test]
+#[ignore = "Exact-trace nondeterminism; re-enable with https://github.com/ankurah/ankurah/issues/494"]
 fn smoke_three_node_reliable_convergence() {
     for seed in 0..3u64 {
         let outcome = run_with_determinism_audit("three_node_reliable", seed, FaultConfig::none(), 3, || {

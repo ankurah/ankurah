@@ -82,7 +82,7 @@ async fn reopen_pg_node(uri: &str) -> Result<Node<Postgres, PermissiveAgent>> {
     let node = Node::new_durable(pg, PermissiveAgent::new());
     // Drive the async catalog load, then wait for the persisted root.
     let _ = node.system.collection(&Album::collection()).await?;
-    node.system.wait_system_ready().await;
+    node.system.wait_system_ready().await.unwrap();
     Ok(node)
 }
 

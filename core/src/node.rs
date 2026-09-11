@@ -1,7 +1,9 @@
-use crate::selection::filter::Filterable;
-use crate::{schema::catalog::CatalogManager, session::SessionSet};
-use ankurah_proto::{self as proto, Attested, CollectionId, EntityState};
+use crate::{internal::prelude::*, schema::registration::RegistrationError};
+use ankql::ast::{Parsed, Resolved, Stage};
+use ankurah_proto::{Attested, EntityState};
+use ankurah_signals::{Calculated, Get, Mut, Wait};
 use anyhow::anyhow;
+use futures::TryFutureExt;
 
 use rand::prelude::*;
 use rand::rngs::SmallRng;
@@ -12,77 +14,83 @@ use std::{
 };
 use tokio::sync::oneshot;
 
-use crate::{
-    action_error, action_info,
-    changes::EntityChange,
-    collectionset::CollectionSet,
-    connector::{PeerSender, SendError},
-    context::Context,
-    entity::{Entity, WeakEntitySet},
-    error::{MutationError, RequestError, RetrievalError},
-    notice_info,
-    peer_subscription::{SubscriptionHandler, SubscriptionRelay},
-    policy::{AccessDenied, PolicyAgent},
-    reactor::{AbstractEntity, Reactor},
-    retrieval::{LocalEventGetter, LocalStateGetter, SuspenseEvents},
-    storage::StorageEngine,
-    system::SystemManager,
-    util::{safemap::SafeMap, safeset::SafeSet, Iterable},
-};
+use crate::collectionset::CollectionSet;
+use crate::connector::{PeerConnectionError, PeerSender};
+use crate::context::{Context, ContextAuth, ContextInner};
+use crate::entity::WeakEntitySet;
+use crate::error::{NodeHaltReason, NodeReadinessError, RequestError};
+use crate::peer_subscription::{SubscriptionHandler, SubscriptionRelay};
+use crate::policy::ReadPolicy;
+use crate::reactor::Reactor;
+use crate::retrieval::{CachedEventGetter, LocalEventGetter, LocalStateGetter, SuspenseEvents};
+use crate::schema::catalog::register::RegistrationAuth;
+use crate::system::SystemManager;
+use crate::util::safemap::SafeMap;
+use crate::util::safeset::SafeSet;
+use crate::util::Iterable;
+use crate::{action_info, notice_info};
 use itertools::Itertools;
 #[cfg(feature = "instrument")]
 use tracing::instrument;
 
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
-pub struct PeerState<CD: ContextData> {
-    sender: Box<dyn PeerSender>,
-    _durable: bool,
-    subscription_handler: SubscriptionHandler<CD>,
-    pending_requests: SafeMap<proto::RequestId, oneshot::Sender<Result<proto::NodeResponseBody, RequestError>>>,
-    pending_updates: SafeMap<proto::UpdateId, oneshot::Sender<Result<proto::NodeResponseBody, RequestError>>>,
-}
+pub mod applier;
+pub(crate) mod event_admissibility;
+pub mod handles;
+mod peer_state;
+mod schema_registration;
+mod state;
+#[cfg(test)]
+mod tests;
 
-impl<CD: ContextData> PeerState<CD> {
-    pub fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError> { self.sender.send_message(message) }
-}
+pub use handles::{NodeHandle, NodeRef};
+pub use peer_state::PeerState;
+use schema_registration::WireRegistrant;
+pub use state::NodeState;
 
-pub struct MatchArgs {
-    pub selection: ankql::ast::Selection,
+/// A staged selection and its local-cache preference.
+pub struct MatchArgs<S: Stage> {
+    pub selection: ankql::ast::Selection<S>,
     pub cached: bool,
 }
 
-impl TryInto<MatchArgs> for &str {
+impl TryInto<MatchArgs<Parsed>> for &str {
     type Error = ankql::error::ParseError;
-    fn try_into(self) -> Result<MatchArgs, Self::Error> { Ok(MatchArgs { selection: ankql::parser::parse_selection(self)?, cached: true }) }
+    fn try_into(self) -> Result<MatchArgs<Parsed>, Self::Error> {
+        Ok(MatchArgs { selection: ankql::parser::parse_selection(self)?, cached: true })
+    }
 }
-impl TryInto<MatchArgs> for String {
+impl TryInto<MatchArgs<Parsed>> for String {
     type Error = ankql::error::ParseError;
-    fn try_into(self) -> Result<MatchArgs, Self::Error> {
+    fn try_into(self) -> Result<MatchArgs<Parsed>, Self::Error> {
         Ok(MatchArgs { selection: ankql::parser::parse_selection(&self)?, cached: true })
     }
 }
 
-impl From<ankql::ast::Predicate> for MatchArgs {
-    fn from(val: ankql::ast::Predicate) -> Self {
+impl<S: Stage> From<ankql::ast::Predicate<S>> for MatchArgs<S> {
+    fn from(val: ankql::ast::Predicate<S>) -> Self {
         MatchArgs { selection: ankql::ast::Selection { predicate: val, order_by: None, limit: None }, cached: true }
     }
 }
 
-impl From<ankql::ast::Selection> for MatchArgs {
-    fn from(val: ankql::ast::Selection) -> Self { MatchArgs { selection: val, cached: true } }
+impl<S: Stage> From<ankql::ast::Selection<S>> for MatchArgs<S> {
+    fn from(val: ankql::ast::Selection<S>) -> Self { MatchArgs { selection: val, cached: true } }
 }
 
 impl From<ankql::error::ParseError> for RetrievalError {
     fn from(e: ankql::error::ParseError) -> Self { RetrievalError::ParseError(e) }
 }
 
-pub fn nocache<T: TryInto<ankql::ast::Selection, Error = ankql::error::ParseError>>(s: T) -> Result<MatchArgs, ankql::error::ParseError> {
+pub fn nocache<T: TryInto<ankql::ast::Selection<Parsed>, Error = ankql::error::ParseError>>(
+    s: T,
+) -> Result<MatchArgs<Parsed>, ankql::error::ParseError> {
     MatchArgs::nocache(s)
 }
-impl MatchArgs {
+
+impl MatchArgs<Parsed> {
     pub fn nocache<T>(s: T) -> Result<Self, ankql::error::ParseError>
-    where T: TryInto<ankql::ast::Selection, Error = ankql::error::ParseError> {
+    where T: TryInto<ankql::ast::Selection<Parsed>, Error = ankql::error::ParseError> {
         Ok(Self { selection: s.try_into()?, cached: false })
     }
 }
@@ -97,18 +105,23 @@ where PA: PolicyAgent
     fn clone(&self) -> Self { Self(self.0.clone()) }
 }
 
-pub struct WeakNode<SE, PA>(Weak<NodeInner<SE, PA>>)
-where PA: PolicyAgent;
+pub struct WeakNode<SE, PA>
+where PA: PolicyAgent
+{
+    node: Weak<NodeInner<SE, PA>>,
+    node_id: proto::EntityId,
+}
 impl<SE, PA> Clone for WeakNode<SE, PA>
 where PA: PolicyAgent
 {
-    fn clone(&self) -> Self { Self(self.0.clone()) }
+    fn clone(&self) -> Self { Self { node: self.node.clone(), node_id: self.node_id } }
 }
 
 impl<SE, PA> WeakNode<SE, PA>
 where PA: PolicyAgent
 {
-    pub fn upgrade(&self) -> Option<Node<SE, PA>> { self.0.upgrade().map(Node) }
+    pub fn upgrade(&self) -> Option<Node<SE, PA>> { self.node.upgrade().map(Node) }
+    pub fn node_id(&self) -> proto::EntityId { self.node_id }
 }
 
 impl<SE, PA> Deref for Node<SE, PA>
@@ -146,16 +159,17 @@ where PA: PolicyAgent
     /// The reactor for handling subscriptions
     pub(crate) reactor: Reactor,
     pub(crate) policy_agent: PA,
-    pub system: SystemManager<SE, PA>,
+    pub system: SystemManager<SE>,
 
-    /// The metadata catalog map (write-only in this phase: registration
-    /// maintains it; nothing resolves through it yet).
-    pub catalog: CatalogManager<SE, PA>,
+    pub catalog: Arc<CatalogManager>,
+    alive: Mut<bool>,
+    /// Services may run during startup, but stop on halt or node drop.
+    pub(crate) run: Calculated<bool>,
+
+    /// Weak bookkeeping for this node's live queries.
+    pub(crate) live_queries: crate::livequery::LiveQueryRegistry,
 
     pub(crate) subscription_relay: Option<SubscriptionRelay<PA::ContextData, crate::livequery::WeakEntityLiveQuery>>,
-
-    /// Type resolver for AST preparation (temporary heuristic until Phase 3 schema)
-    pub(crate) type_resolver: crate::TypeResolver,
 }
 
 impl<SE, PA> Node<SE, PA>
@@ -165,6 +179,29 @@ where
 {
     pub fn new(engine: Arc<SE>, policy_agent: PA) -> Self { Self::build(engine, policy_agent, false, SmallRng::from_entropy()) }
     pub fn new_durable(engine: Arc<SE>, policy_agent: PA) -> Self { Self::build(engine, policy_agent, true, SmallRng::from_entropy()) }
+
+    /// Wipe local storage when a different system is offered, so a new node can adopt it.
+    /// Disabled by default. A different system always halts this node; it never recovers in place.
+    pub fn set_allow_system_replacement(&self, allow: bool) { self.system.set_allow_system_replacement(allow); }
+
+    /// Initialization and terminal halt state; independent of peer connectivity.
+    pub fn state(&self) -> ankurah_signals::Read<NodeState> { self.system.node_state() }
+
+    /// Require completed system and catalog initialization, or return why the node is unavailable.
+    pub fn check_ready(&self) -> Result<(), NodeReadinessError> { self.state().value().check_ready() }
+
+    /// Wait for system and catalog initialization without retaining the node; return an error if it halts.
+    pub fn wait_ready(&self) -> impl std::future::Future<Output = Result<(), NodeReadinessError>> + Send + 'static {
+        let state = self.state();
+        async move {
+            state
+                .wait_for(|state| match state.check_ready() {
+                    Err(NodeReadinessError::NotReady) => None,
+                    result => Some(result),
+                })
+                .await
+        }
+    }
 
     /// Construct an ephemeral node whose peer-selection RNG is seeded explicitly.
     /// Intended for the simulation harness and deterministic tests; production paths use [`Node::new`].
@@ -180,16 +217,23 @@ where
 
     fn build(engine: Arc<SE>, policy_agent: PA, durable: bool, rng: SmallRng) -> Self {
         let collections = CollectionSet::new(engine.clone());
-        let entityset: WeakEntitySet = Default::default();
+        let entityset = WeakEntitySet::new(SystemEpoch::allocate());
         let id = proto::EntityId::random();
-        let reactor = Reactor::new();
+        let system_manager = SystemManager::new(collections.clone(), entityset.clone(), durable);
+        let alive = Mut::new(true);
+        let state = system_manager.node_state();
+        let run = {
+            let alive = alive.read();
+            let state = state.clone();
+            Calculated::new(move || alive.get() && !matches!(state.get(), NodeState::Halted(_)))
+        };
+        let reactor = Reactor::new(run.clone());
         notice_info!("Node {id:#} created as {}", if durable { "durable" } else { "ephemeral" });
 
-        let system_manager = SystemManager::new(collections.clone(), entityset.clone(), reactor.clone(), durable);
-        let catalog = CatalogManager::new(engine, durable);
+        let live_queries = crate::livequery::LiveQueryRegistry::new();
 
         // Only ephemeral nodes relay subscriptions upstream to a durable peer.
-        let subscription_relay = if durable { None } else { Some(SubscriptionRelay::new()) };
+        let subscription_relay = if durable { None } else { Some(SubscriptionRelay::new(&run)) };
 
         let node = Node(Arc::new(NodeInner {
             id,
@@ -202,13 +246,14 @@ where
             durable,
             policy_agent,
             system: system_manager,
-            catalog: catalog.clone(),
+            catalog: Arc::new(CatalogManager::default()),
+            alive,
+            run,
             sessions: SessionSet::new(),
+            live_queries,
             subscription_relay,
-            type_resolver: crate::TypeResolver::new(),
         }));
 
-        // Set up the message sender for the subscription relay
         if let Some(ref relay) = node.subscription_relay {
             let weak_node = node.weak();
             if relay.set_node(Arc::new(weak_node)).is_err() {
@@ -217,61 +262,66 @@ where
         }
 
         node.policy_agent.on_node_ready(node.weak());
-        node.catalog.start(node.weak());
+
+        let catalog = node.catalog.clone();
+        let weak_node = node.weak();
+        let system = node.system.clone();
+        let run = node.run.clone();
+        crate::task::spawn(async move {
+            let initialized = futures::future::try_join(
+                system.wait_system_ready(),
+                catalog.start(weak_node).map_err(|error| NodeHaltReason::CatalogLoad(error.to_string())),
+            );
+            tokio::select! {
+                biased;
+                _ = run.wait_value(false) => {},
+                result = initialized => match result {
+                    Ok(_) => system.mark_running(),
+                    Err(reason) => { system.halt(reason); }
+                },
+            }
+        });
 
         node
     }
-    pub fn weak(&self) -> WeakNode<SE, PA> { WeakNode(Arc::downgrade(&self.0)) }
+    pub fn weak(&self) -> WeakNode<SE, PA> { WeakNode { node: Arc::downgrade(&self.0), node_id: self.0.id } }
+
+    /// Build our handshake identity after local system storage loads; an unadopted node has no root.
+    pub async fn presence(&self) -> Result<proto::Presence, NodeHaltReason> {
+        self.system.wait_loaded().await?;
+        Ok(proto::Presence {
+            node_id: self.id,
+            durable: self.durable,
+            system_root: self.system.root(),
+            protocol_version: proto::PROTOCOL_VERSION,
+        })
+    }
 
     /// Register a peer connection after its Presence handshake.
-    ///
-    /// Refuses (without registering anything) when the peer's protocol
-    /// version is incompatible; the connector should relay the returned
-    /// rejection best-effort and close the connection. Enforced here, not
-    /// in connectors, so every transport inherits it.
     #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(node_id = %presence.node_id.to_base64_short(), durable = %presence.durable)))]
-    pub fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) -> Result<(), proto::PresenceRejection> {
+    pub async fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) -> Result<(), PeerConnectionError> {
         action_info!(self, "register_peer", "{}", &presence);
 
         if !proto::protocol_compatible(presence.protocol_version) {
             let rejection = proto::PresenceRejection { expected: proto::PROTOCOL_VERSION, received: presence.protocol_version };
             warn!("Node({}) refusing peer {}: {}", self.id, presence.node_id, rejection);
-            return Err(rejection);
+            return Err(rejection.into());
         }
 
+        self.system.wait_loaded().await?;
+        if presence.durable && !self.durable {
+            self.system.adopt_system(presence.system_root.clone().ok_or(PeerConnectionError::MissingSystem)?).await?;
+        } else if let (Some(current), Some(offered)) = (self.system.root_id(), &presence.system_root) {
+            if current != offered.payload.entity_id {
+                return Err(PeerConnectionError::SystemMismatch { current, offered: offered.payload.entity_id });
+            }
+        }
         let subscription_handler = SubscriptionHandler::new(presence.node_id, self);
-        self.peer_connections.insert(
-            presence.node_id,
-            Arc::new(PeerState {
-                sender,
-                _durable: presence.durable,
-                subscription_handler,
-                pending_requests: SafeMap::new(),
-                pending_updates: SafeMap::new(),
-            }),
-        );
+        self.peer_connections.insert(presence.node_id, Arc::new(PeerState::new(sender, presence.durable, subscription_handler)));
         if presence.durable {
             self.durable_peers.insert(presence.node_id);
-
-            // Notify subscription relay of new durable peer connection
             if let Some(ref relay) = self.subscription_relay {
                 relay.notify_peer_connected(presence.node_id);
-            }
-
-            if !self.durable {
-                if let Some(system_root) = presence.system_root {
-                    action_info!(self, "received system root", "{}", &system_root.payload);
-                    let me = self.clone();
-                    crate::task::spawn(async move {
-                        if let Err(e) = me.system.join_system(system_root).await {
-                            action_error!(me, "failed to join system", "{}", &e);
-                        } else {
-                            action_info!(me, "successfully joined system");
-                        }
-                    });
-                } else {
-                    error!("Node({}) durable peer {} has no system root", self.id, presence.node_id);
-                }
             }
         }
         // TODO send hello message to the peer, including present head state for all relevant collections
@@ -293,6 +343,7 @@ where
             relay.notify_peer_disconnected(node_id);
         }
     }
+    /// Send a request to a connected peer and wait for its response.
     #[cfg_attr(feature = "instrument", instrument(skip_all, fields(node_id = %node_id, request_body = %request_body)))]
     pub async fn request<'a, C>(
         &self,
@@ -303,24 +354,34 @@ where
     where
         C: Iterable<PA::ContextData>,
     {
+        self.system.check_not_halted()?;
         let (response_tx, response_rx) = oneshot::channel::<Result<proto::NodeResponseBody, RequestError>>();
         let request_id = proto::RequestId::new();
 
         let request = proto::NodeRequest { id: request_id.clone(), to: node_id, from: self.id, body: request_body };
-        let auth = self.policy_agent.sign_request(self, cdata, &request)?;
 
-        // Get the peer connection
-        let connection = self.peer_connections.get(&node_id).ok_or(RequestError::PeerNotConnected)?;
+        // Temporary credentialless catalog reads. Remove this bypass when the #425 catalog
+        // follow-on uses #426's node session union for catalog queries.
+        let auth = if crate::schema::request_bypasses_policy(&request.body) {
+            Vec::new()
+        } else {
+            self.policy_agent.sign_request(self, cdata, &request)?
+        };
 
-        connection.pending_requests.insert(request_id, response_tx);
-        connection.send_message(proto::NodeMessage::Request { auth, request })?;
+        {
+            let connection = self.peer_connections.get(&node_id).ok_or(RequestError::PeerNotConnected)?;
+            connection.pending_requests.insert(request_id, response_tx);
+            connection.send_message(proto::NodeMessage::Request { auth, request })?;
+        }
 
-        // Wait for response
         response_rx.await.map_err(|_| RequestError::InternalChannelClosed)?
     }
 
     // TODO LATER: rework this to be retried in the background some number of times
     pub fn send_update(&self, node_id: proto::EntityId, notification: proto::NodeUpdateBody) {
+        if self.system.check_not_halted().is_err() {
+            return;
+        }
         // same as request, minus cdata and the sign_request step
         debug!("{self}.send_update({node_id:#}, {notification})");
         let (response_tx, _response_rx) = oneshot::channel::<Result<proto::NodeResponseBody, RequestError>>();
@@ -352,6 +413,7 @@ where
     // Not if its signed by a node key.
     #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(message = %message)))]
     pub async fn handle_message(&self, message: proto::NodeMessage) -> anyhow::Result<()> {
+        self.system.check_not_halted()?;
         match message {
             proto::NodeMessage::Update(update) => {
                 debug!("Node({}) received update {}", self.id, update);
@@ -401,8 +463,14 @@ where
                         return Ok(());
                     }
 
-                    // Validate the request auth first, converting errors to error responses
-                    let body = match self.policy_agent.check_request(self, &auth, &request).await {
+                    // Temporary credentialless catalog reads. Remove this bypass when the #425 catalog
+                    // follow-on uses #426's node session union for catalog queries.
+                    let cdata = if crate::schema::request_bypasses_policy(&request.body) {
+                        Ok(Vec::new())
+                    } else {
+                        self.policy_agent.check_request(self, &auth, &request).await
+                    };
+                    let body = match cdata {
                         Ok(cdata) => match self.handle_request(&cdata, request).await {
                             Ok(result) => result,
                             Err(e) => proto::NodeResponseBody::Error(e.to_string()),
@@ -427,7 +495,7 @@ where
             proto::NodeMessage::UnsubscribeQuery { from, query_id } => {
                 // Remove predicate from the peer's subscription
                 if let Some(peer_state) = self.peer_connections.get(&from) {
-                    peer_state.subscription_handler.remove_predicate(query_id)?;
+                    peer_state.subscription_handler.remove_predicate(query_id).await?;
                 }
             }
         }
@@ -439,44 +507,31 @@ where
     where C: Iterable<PA::ContextData> {
         match request.body {
             proto::NodeRequestBody::CommitTransaction { id, events } => {
-                // Protected collections (the system collection and the
-                // metadata catalog) are not mutable through ordinary
-                // transactions; the catalog's only mutation path is the
-                // registration operation. Registration writes the catalog
-                // through a direct commit_remote_transaction call that
-                // bypasses this guard.
-                for event in &events {
-                    let collection = event.payload.collection.as_str();
-                    if collection.starts_with(crate::schema::RESERVED_COLLECTION_PREFIX) {
-                        return Ok(proto::NodeResponseBody::Error(format!(
-                            "collection '{collection}' is protected and not writable by transactions"
-                        )));
-                    }
-                }
-                // TODO - relay to peers in a gossipy/resource-available manner, so as to improve propagation
-                // With moderate potential for duplication, while not creating message loops
-                // Doing so would be a secondary/tertiary/etc hop for this message
                 let cdata = cdata.iterable().exactly_one().map_err(|_| anyhow!("Only one cdata is permitted for CommitTransaction"))?;
                 match self.commit_remote_transaction(cdata, id.clone(), events).await {
                     Ok(_) => Ok(proto::NodeResponseBody::CommitComplete { id }),
                     Err(e) => Ok(proto::NodeResponseBody::Error(e.to_string())),
                 }
             }
-            proto::NodeRequestBody::RegisterSchema { models } => {
+            proto::NodeRequestBody::RegisterSchema { model } => {
                 let cdata = cdata.iterable().exactly_one().map_err(|_| anyhow!("Only one cdata is permitted for RegisterSchema"))?;
-                match self.catalog.register_schema(cdata, models).await {
-                    // The resolved definitions ARE the response: the
-                    // requester folds them into its catalog map on ack.
-                    Ok(models) => Ok(proto::NodeResponseBody::SchemaRegistered { models }),
+                if !self.durable {
+                    return Ok(proto::NodeResponseBody::Error(RegistrationError::NotDurable.to_string()));
+                }
+                let mut registrant = WireRegistrant::new(model);
+                match self.catalog.resolve_or_register(self, &mut registrant, RegistrationAuth::Credential(cdata.clone())).await {
+                    Ok(()) => Ok(proto::NodeResponseBody::SchemaRegistered {
+                        model: registrant.into_response().expect("successful registration must bind its response"),
+                    }),
                     Err(e) => Ok(proto::NodeResponseBody::Error(e.to_string())),
                 }
             }
             proto::NodeRequestBody::Fetch { collection, mut selection, known_matches } => {
-                self.policy_agent.can_access_collection(cdata, &collection)?;
+                let policy = ReadPolicy::new(&self.policy_agent, cdata, &collection);
+                policy.check_collection()?;
                 let storage_collection = self.collections.get(&collection).await?;
-                selection.predicate = self.policy_agent.filter_predicate(cdata, &collection, selection.predicate)?;
+                selection.predicate = policy.filter_predicate(selection.predicate)?;
 
-                // Expand initial_states to include entities from known_matches that weren't in the predicate results
                 let expanded_states = crate::util::expand_states::expand_states(
                     storage_collection.fetch_states(&selection).await?,
                     known_matches.iter().map(|k| k.entity_id).collect::<Vec<_>>(),
@@ -488,12 +543,10 @@ where
 
                 let mut deltas = Vec::new();
                 for state in expanded_states {
-                    if self.policy_agent.check_read(cdata, &state.payload.entity_id, &collection, &state.payload.state).is_err() {
+                    if policy.check_read(&state.payload.entity_id, &state.payload.state).is_err() {
                         continue;
                     }
 
-                    // Generate delta based on known_matches (returns None if heads are equal)
-                    // No need to reconstruct Entity - work directly with EntityState
                     if let Some(delta) = self.generate_entity_delta(&known_map, state, &storage_collection, cdata).await? {
                         deltas.push(delta);
                     }
@@ -501,16 +554,15 @@ where
                 Ok(proto::NodeResponseBody::Fetch(deltas))
             }
             proto::NodeRequestBody::Get { collection, ids } => {
-                self.policy_agent.can_access_collection(cdata, &collection)?;
+                let policy = ReadPolicy::new(&self.policy_agent, cdata, &collection);
+                policy.check_collection()?;
                 let storage_collection = self.collections.get(&collection).await?;
 
-                // filter out any that the policy agent says we don't have access to
                 let mut states = Vec::new();
                 for state in storage_collection.get_states(ids).await? {
-                    match self.policy_agent.check_read(cdata, &state.payload.entity_id, &collection, &state.payload.state) {
+                    match policy.check_read(&state.payload.entity_id, &state.payload.state) {
                         Ok(_) => states.push(state),
                         Err(AccessDenied::ByPolicy(_)) => {}
-                        // TODO: we need to have a cleaner delineation between actual access denied versus processing errors
                         Err(e) => return Err(anyhow!("Error from peer get: {}", e)),
                     }
                 }
@@ -518,16 +570,15 @@ where
                 Ok(proto::NodeResponseBody::Get(states))
             }
             proto::NodeRequestBody::GetEvents { collection, event_ids } => {
-                self.policy_agent.can_access_collection(cdata, &collection)?;
+                let policy = ReadPolicy::new(&self.policy_agent, cdata, &collection);
+                policy.check_collection()?;
                 let storage_collection = self.collections.get(&collection).await?;
 
-                // filter out any that the policy agent says we don't have access to
                 let mut events = Vec::new();
                 for event in storage_collection.get_events(event_ids).await? {
-                    match self.policy_agent.check_read_event(cdata, &event) {
+                    match policy.check_read_event(&event) {
                         Ok(_) => events.push(event),
                         Err(AccessDenied::ByPolicy(_)) => {}
-                        // TODO: we need to have a cleaner delineation between actual access denied versus processing errors
                         Err(e) => return Err(anyhow!("Error from peer subscription: {}", e)),
                     }
                 }
@@ -536,15 +587,15 @@ where
             }
             proto::NodeRequestBody::SubscribeQuery { query_id, collection, selection, version, known_matches } => {
                 let peer_state = self.peer_connections.get(&request.from).ok_or_else(|| anyhow!("Peer {} not connected", request.from))?;
-                // Reads may act under many credentials (the union), and a
-                // context can already hold several: what is missing is
-                // this server accepting them, so a subscribe carries
-                // exactly one and a plural one is refused here. Admitting
-                // several — and with them the empty and union verdicts —
-                // stays fenced: https://github.com/ankurah/ankurah/issues/432
-                let cdata = cdata.iterable().exactly_one().map_err(|_| {
-                    anyhow!("SubscribeQuery currently requires exactly one cdata (this server does not yet accept several per subscribe)")
-                })?;
+                // Catalog subscriptions carry no credential; others carry exactly one.
+                let cdata = match cdata.iterable().at_most_one() {
+                    Ok(cdata) => cdata,
+                    Err(_) => {
+                        return Err(anyhow!(
+                            "SubscribeQuery currently requires at most one cdata (this server does not yet accept several per subscribe)"
+                        ));
+                    }
+                };
                 peer_state.subscription_handler.subscribe_query(self, query_id, collection, selection, cdata, version, known_matches).await
             }
         }
@@ -558,7 +609,8 @@ where
         match notification.body {
             proto::NodeUpdateBody::SubscriptionUpdate { items } => {
                 tracing::debug!("Node({}) received subscription update from peer {}", self.id, notification.from);
-                crate::node_applier::NodeApplier::apply_updates(self, &notification.from, items).await?;
+                self.system.require_system_ready()?;
+                crate::node::applier::NodeApplier::apply_updates(self, &notification.from, items).await?;
                 Ok(())
             }
         }
@@ -576,6 +628,7 @@ where
             match self.request(peer_id, cdata, proto::NodeRequestBody::CommitTransaction { id: id.clone(), events: events.to_vec() }).await
             {
                 Ok(proto::NodeResponseBody::CommitComplete { .. }) => (),
+                Err(error) => return Err(RetrievalError::from(error).into()),
                 Ok(proto::NodeResponseBody::Error(e)) => {
                     return Err(MutationError::General(Box::new(std::io::Error::other(format!("Peer {} rejected: {}", peer_id, e)))));
                 }
@@ -590,57 +643,17 @@ where
         Ok(())
     }
 
-    /// Does all the things necessary to commit a remote transaction
-    /// Commit-path admissibility for membership operations: the protocol
-    /// gate beside the PolicyAgent's policy gate (`check_event`). Membership
-    /// operations are ordinary operations on any event; what is restricted
-    /// today is emission: an entity's first event must carry exactly one
-    /// Membership::Add -- asserting the same model fact the event's
-    /// collection field materializes (the built-in mapping for system
-    /// collections, the registered model for app collections) -- and no
-    /// membership mutations are admitted on later events yet. Application
-    /// (`Entity::apply_event`) is deliberately unchecked: the attested event
-    /// stream is the membership authority, and this gate controls only what
-    /// may be EMITTED into it today.
-    pub(crate) fn check_membership_admissibility(&self, event: &proto::Event) -> Result<(), MutationError> {
-        let memberships: Vec<proto::ModelId> = event
-            .operations()
-            .memberships()
-            .map(|membership| match membership {
-                proto::Membership::Add(model) => *model,
-            })
-            .collect();
-        if !event.is_entity_create() {
-            return if memberships.is_empty() {
-                Ok(())
-            } else {
-                Err(MutationError::InvalidUpdate("membership changes after an entity's first event are not admissible yet"))
-            };
-        }
-        let model = match memberships.as_slice() {
-            [model] => *model,
-            [] => return Err(MutationError::InvalidUpdate("an entity's first event must add exactly one membership")),
-            _ => return Err(MutationError::InvalidUpdate("an entity's first event cannot add more than one membership")),
-        };
-        let expected =
-            crate::schema::system_model_id(event.collection.as_str()).or_else(|| self.catalog.model_id_for(event.collection.as_str()));
-        match expected {
-            Some(expected) if expected == model => Ok(()),
-            Some(_) => Err(MutationError::General(
-                format!("membership asserts model {model} but the event routes to collection '{}'", event.collection).into(),
-            )),
-            None => Err(MutationError::General(
-                format!("membership asserts model {model} but collection '{}' has no registered model", event.collection).into(),
-            )),
-        }
-    }
-
     pub async fn commit_remote_transaction(
         &self,
         cdata: &PA::ContextData,
         id: proto::TransactionId,
         mut events: Vec<Attested<proto::Event>>,
     ) -> Result<(), MutationError> {
+        for event in &events {
+            event_admissibility::check_unprivileged_write(&event.payload.collection)?;
+        }
+        self.system.require_system_ready()?;
+
         debug!("{self} commiting transaction {id} with {} events", events.len());
         let mut changes = Vec::new();
 
@@ -650,7 +663,7 @@ where
             // derive, or a parent clock that disagrees with the body -- is
             // refused before anything stages or stores it.
             event.payload.validate_structure()?;
-            self.check_membership_admissibility(&event.payload)?;
+            event_admissibility::check_membership(self, None, &event.payload)?;
             let collection = self.collections.get(&event.payload.collection).await?;
 
             // When applying an event, we should only look at the local storage for the lineage
@@ -731,7 +744,8 @@ where
             }
 
             // Case 2: Heads differ → try to build EventBridge (cheaper than full state) ✓
-            match self.collect_event_bridge(storage_collection, known_head, current_head, cdata).await {
+            let policy = ReadPolicy::new(&self.policy_agent, cdata, &collection);
+            match self.collect_event_bridge(storage_collection, known_head, current_head, &policy).await {
                 Ok(attested_events) if !attested_events.is_empty() => {
                     // Convert Attested<Event> to EventFragments (strips entity_id and collection)
                     let event_fragments: Vec<proto::EventFragment> = attested_events.into_iter().map(|e| e.into()).collect();
@@ -760,7 +774,7 @@ where
         storage_collection: &crate::storage::StorageCollectionWrapper,
         known_head: &proto::Clock,
         current_head: &proto::Clock,
-        cdata: &C,
+        policy: &ReadPolicy<'_, PA, C>,
     ) -> anyhow::Result<Vec<proto::Attested<proto::Event>>>
     where
         SE: StorageEngine + Send + Sync + 'static,
@@ -813,7 +827,7 @@ where
                 // entirely and let the caller fall back to a state snapshot,
                 // which passes its own read check.
                 for event in &events {
-                    match self.policy_agent.check_read_event(cdata, event) {
+                    match policy.check_read_event(event) {
                         Ok(()) => {}
                         Err(AccessDenied::ByPolicy(_)) => return Ok(vec![]),
                         Err(e) => return Err(anyhow!("check_read_event failed while building event bridge: {}", e)),
@@ -854,35 +868,38 @@ where
     ///
     /// [`SessionSet`]: crate::session::SessionSet
     pub fn context(&self, sessions: impl Into<SessionSet<PA::ContextData>>) -> Result<Context, anyhow::Error> {
-        if !self.system.is_system_ready() {
+        self.system.check_not_halted()?;
+        if self.system.system_epoch().is_none() {
             return Err(anyhow!("System is not ready"));
         }
         Ok(Context::new(Node::clone(self), sessions))
     }
 
-    pub async fn context_async(&self, sessions: impl Into<SessionSet<PA::ContextData>>) -> Context {
-        self.system.wait_system_ready().await;
-        Context::new(Node::clone(self), sessions)
+    pub async fn context_async(&self, sessions: impl Into<SessionSet<PA::ContextData>>) -> Result<Context, NodeHaltReason> {
+        self.system.wait_system_ready().await?;
+        Ok(Context::new(Node::clone(self), sessions))
     }
 
+    /// An uncredentialed context for local system work.
+    pub(crate) fn privileged_context(&self) -> Context {
+        Context(Arc::new(ContextInner { node: NodeHandle::Strong(Node::clone(self)), auth: ContextAuth::Privileged }))
+    }
+
+    /// Retrieve peer states and persist them in this node.
     pub(crate) async fn get_from_peer(
         &self,
         collection_id: &CollectionId,
         ids: Vec<proto::EntityId>,
         cdata: &Vec<PA::ContextData>,
     ) -> Result<(), RetrievalError> {
+        self.system.require_system_ready().map_err(MutationError::from)?;
         let peer_id = self.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
 
-        match self
-            .request(peer_id, cdata, proto::NodeRequestBody::Get { collection: collection_id.clone(), ids })
-            .await
-            .map_err(|e| RetrievalError::Other(format!("{:?}", e)))?
-        {
+        match self.request(peer_id, cdata, proto::NodeRequestBody::Get { collection: collection_id.clone(), ids }).await? {
             proto::NodeResponseBody::Get(states) => {
                 let collection = self.collections.get(collection_id).await?;
 
-                // do we have the ability to merge states?
-                // because that's what we have to do I think
+                // TODO: merge received states with local state instead of replacing it.
                 for state in states {
                     self.policy_agent.validate_received_state(self, &peer_id, &state)?;
                     collection.set_state(state).await.map_err(|e| RetrievalError::Other(format!("{:?}", e)))?;
@@ -895,6 +912,50 @@ where
             }
             _ => {
                 debug!("Unexpected response type from peer get");
+                Err(RetrievalError::Other("Unexpected response type".to_string()))
+            }
+        }
+    }
+
+    /// Fetch matching entities from a durable peer using local heads as known matches.
+    /// Apply its deltas locally before returning.
+    pub(crate) async fn fetch_from_peer(
+        &self,
+        collection_id: &CollectionId,
+        selection: ankql::ast::Selection<Resolved>,
+        cdata: &Vec<PA::ContextData>,
+    ) -> Result<Vec<Entity>, RetrievalError> {
+        self.system.require_system_ready().map_err(MutationError::from)?;
+        let peer_id = self.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
+
+        let known_matched_entities = self.fetch_entities_from_local(collection_id, &selection).await?;
+
+        let known_matches = known_matched_entities
+            .iter()
+            .map(|entity| proto::KnownEntity { entity_id: entity.id(), head: entity.head().clone() })
+            .collect();
+
+        let selection_clone = selection.clone();
+        match self
+            .request(peer_id, cdata, proto::NodeRequestBody::Fetch { collection: collection_id.clone(), selection, known_matches })
+            .await?
+        {
+            proto::NodeResponseBody::Fetch(deltas) => {
+                let collection = self.collections.get(collection_id).await?;
+                let event_getter = CachedEventGetter::new(collection_id.clone(), collection.clone(), self, cdata);
+                let state_getter = LocalStateGetter::new(collection);
+
+                applier::NodeApplier::apply_deltas(self, &peer_id, deltas, &event_getter, &state_getter).await?;
+                // ARCHITECTURAL QUESTION: Optimize in-place mutation vs re-fetching for remote-peer-assisted operations https://github.com/ankurah/ankurah/issues/145
+
+                self.fetch_entities_from_local(collection_id, &selection_clone).await
+            }
+            proto::NodeResponseBody::Error(e) => {
+                debug!("Error from peer fetch: {}", e);
+                Err(RetrievalError::Other(format!("{:?}", e)))
+            }
+            _ => {
+                debug!("Unexpected response type from peer fetch");
                 Err(RetrievalError::Other("Unexpected response type".to_string()))
             }
         }
@@ -965,7 +1026,7 @@ where
     pub async fn request_remote_unsubscribe(&self, query_id: proto::QueryId, peers: Vec<proto::EntityId>) -> anyhow::Result<()> {
         for (peer_id, item) in self.peer_connections.get_list(peers) {
             if let Some(connection) = item {
-                connection.send_message(proto::NodeMessage::UnsubscribeQuery { from: peer_id, query_id })?;
+                connection.send_message(proto::NodeMessage::UnsubscribeQuery { from: self.id, query_id })?;
             } else {
                 warn!("Peer {} not connected", peer_id);
             }
@@ -979,6 +1040,7 @@ impl<SE, PA> Drop for NodeInner<SE, PA>
 where PA: PolicyAgent
 {
     fn drop(&mut self) {
+        self.alive.set(false);
         notice_info!("Node({}) dropped", self.id);
     }
 }
@@ -992,23 +1054,23 @@ where
         &self,
         query_id: proto::QueryId,
         collection_id: CollectionId,
-        selection: ankql::ast::Selection,
+        selection: ankql::ast::Selection<Resolved>,
         sessions: SessionSet<PA::ContextData>,
         version: u32,
         livequery: crate::livequery::WeakEntityLiveQuery,
     ) {
         if let Some(ref relay) = self.subscription_relay {
-            // Resolve types in the AST (converts literals for JSON path comparisons)
-            let selection = self.type_resolver.resolve_selection_types(selection);
             relay.subscribe_query(query_id, collection_id, selection, sessions, version, livequery);
         }
     }
 
+    /// Load matching states from local storage into resident entities; does not apply read policy.
     pub async fn fetch_entities_from_local(
         &self,
         collection_id: &CollectionId,
-        selection: &ankql::ast::Selection,
+        selection: &ankql::ast::Selection<Resolved>,
     ) -> Result<Vec<Entity>, RetrievalError> {
+        self.system.check_not_halted()?;
         let storage_collection = self.collections.get(collection_id).await?;
         let initial_states = storage_collection.fetch_states(selection).await?;
         let state_getter = LocalStateGetter::new(storage_collection.clone());
@@ -1024,54 +1086,6 @@ where
         Ok(entities)
     }
 }
-#[async_trait::async_trait]
-pub trait TNodeErased<E: AbstractEntity + Filterable + Send + 'static = Entity>: Send + Sync + 'static {
-    fn unsubscribe_remote_predicate(&self, query_id: proto::QueryId);
-    fn update_remote_query(&self, query_id: proto::QueryId, selection: ankql::ast::Selection, version: u32) -> Result<(), anyhow::Error>;
-    async fn fetch_entities_from_local(
-        &self,
-        collection_id: &CollectionId,
-        selection: &ankql::ast::Selection,
-    ) -> Result<Vec<E>, RetrievalError>;
-    fn reactor(&self) -> &Reactor<E>;
-    fn has_subscription_relay(&self) -> bool;
-}
-
-#[async_trait::async_trait]
-impl<SE, PA> TNodeErased<Entity> for Node<SE, PA>
-where
-    SE: StorageEngine + Send + Sync + 'static,
-    PA: PolicyAgent + Send + Sync + 'static,
-{
-    fn unsubscribe_remote_predicate(&self, query_id: proto::QueryId) {
-        // Notify subscription relay for remote cleanup
-        if let Some(ref relay) = self.subscription_relay {
-            relay.unsubscribe_predicate(query_id);
-        }
-    }
-
-    fn update_remote_query(&self, query_id: proto::QueryId, selection: ankql::ast::Selection, version: u32) -> Result<(), anyhow::Error> {
-        if let Some(ref relay) = self.subscription_relay {
-            // Resolve types in the AST (converts literals for JSON path comparisons)
-            let selection = self.type_resolver.resolve_selection_types(selection);
-            relay.update_query(query_id, selection, version)?;
-        }
-        Ok(())
-    }
-
-    async fn fetch_entities_from_local(
-        &self,
-        collection_id: &CollectionId,
-        selection: &ankql::ast::Selection,
-    ) -> Result<Vec<Entity>, RetrievalError> {
-        Node::fetch_entities_from_local(self, collection_id, selection).await
-    }
-
-    fn reactor(&self) -> &Reactor<Entity> { &self.0.reactor }
-
-    fn has_subscription_relay(&self) -> bool { self.subscription_relay.is_some() }
-}
-
 impl<SE, PA> fmt::Display for Node<SE, PA>
 where PA: PolicyAgent
 {

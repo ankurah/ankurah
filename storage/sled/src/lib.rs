@@ -5,6 +5,7 @@ pub mod engine;
 pub mod entity;
 pub mod error;
 pub mod index;
+pub mod lower;
 pub mod materialization;
 pub mod planner_integration;
 pub mod property;

@@ -101,8 +101,8 @@ impl PolicyAgent for RejectingAgent {
         &self,
         _data: &C,
         _collection: &proto::CollectionId,
-        predicate: Predicate,
-    ) -> std::result::Result<Predicate, AccessDenied>
+        predicate: Predicate<ankql::ast::Resolved>,
+    ) -> std::result::Result<Predicate<ankql::ast::Resolved>, AccessDenied>
     where
         C: Iterable<Self::ContextData>,
     {
@@ -159,7 +159,7 @@ async fn check_request_error_returns_to_client() -> Result<()> {
 
     // Connect client to server
     let _conn = LocalProcessConnection::new(&server, &client).await?;
-    client.system.wait_system_ready().await;
+    client.system.wait_system_ready().await.unwrap();
 
     let client_ctx = client.context(DEFAULT_CONTEXT)?;
 

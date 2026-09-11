@@ -78,7 +78,9 @@ pub fn wasm_impl(input: &syn::DeriveInput, model: &crate::model::description::Mo
     let changeset_wrapper = wasm_changeset_wrapper(&model.changeset_name(), &model.view_name(), &model.resultset_name());
     let livequery_wrapper =
         wasm_livequery_wrapper(&model.livequery_name(), &model.view_name(), &model.resultset_name(), &model.changeset_name());
-    let ref_wrapper = wasm_ref_wrapper(&model.ref_name(), model.name(), &model.view_name());
+    let model_name = model.name();
+    let ref_name = model.ref_name();
+    let ref_wrapper = wasm_ref_wrapper(&ref_name, model_name, &model.view_name());
 
     quote! {
         #tsify_impl
@@ -86,6 +88,10 @@ pub fn wasm_impl(input: &syn::DeriveInput, model: &crate::model::description::Mo
         // RefModel wrapper at module level (accessible for trait associated type).
         // Uses short wasm_bindgen path from module-level import in lib.rs
         #ref_wrapper
+
+        impl ::ankurah::model::wasm::WasmModel for #model_name {
+            type RefWrapper = #ref_name;
+        }
 
         // Generate ResultSet wrapper (at module level for re-export)
         #resultset_wrapper
@@ -277,11 +283,11 @@ pub fn wasm_livequery_wrapper(livequery_name: &Ident, view_name: &Ident, results
 
             }
 
-            /// Get the current selection as a string, tracked by the observer
+            /// The tracked installed selection, or empty before initial resolution.
             #[wasm_bindgen(getter, js_name = currentSelection)]
             pub fn current_selection(&self) -> String {
                 use ::ankurah::signals::With;
-                self.0.selection().with(|(sel, _version)| sel.to_string())
+                self.0.selection().with(|resolved| resolved.as_ref().map(|(sel, _version)| sel.to_string()).unwrap_or_default())
             }
 
             #[wasm_bindgen(skip_typescript)]

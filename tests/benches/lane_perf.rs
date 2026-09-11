@@ -154,7 +154,7 @@ fn bench_commit_to_subscriber_latency(c: &mut Criterion) {
                 server.system.create().await.unwrap();
                 let client = ephemeral();
                 let _conn = LocalProcessConnection::new(&client, &server).await.unwrap();
-                client.system.wait_system_ready().await;
+                client.system.wait_system_ready().await.unwrap();
 
                 let server_ctx = server.context(CTX).unwrap();
                 let client_ctx = client.context(CTX).unwrap();
@@ -272,7 +272,7 @@ fn bench_fresh_fetch_snapshot(c: &mut Criterion) {
                         // Fresh client, connected but holding nothing.
                         let client = ephemeral();
                         let _conn = LocalProcessConnection::new(&client, &server).await.unwrap();
-                        client.system.wait_system_ready().await;
+                        client.system.wait_system_ready().await.unwrap();
                         let client_ctx = client.context(CTX).unwrap();
 
                         // --- Measured: the first fetch (StateSnapshot served). ---
@@ -349,7 +349,7 @@ fn bench_bridge_catchup(c: &mut Criterion) {
 
                         let client = ephemeral();
                         let conn = LocalProcessConnection::new(&client, &server).await.unwrap();
-                        client.system.wait_system_ready().await;
+                        client.system.wait_system_ready().await.unwrap();
                         let client_ctx = client.context(CTX).unwrap();
 
                         // First fetch: persists the entity locally at the current
@@ -431,7 +431,7 @@ fn bench_subscription_establishment(c: &mut Criterion) {
 
                         let client = ephemeral();
                         let _conn = LocalProcessConnection::new(&client, &server).await.unwrap();
-                        client.system.wait_system_ready().await;
+                        client.system.wait_system_ready().await.unwrap();
                         let client_ctx = client.context(CTX).unwrap();
 
                         // --- Measured: establish + initialize a broad live query. ---

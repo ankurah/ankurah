@@ -5,14 +5,17 @@ use std::sync::Arc;
 pub struct ValueCell<T>(Arc<std::sync::RwLock<T>>);
 
 /// A read-only value container that shares storage with Value<T>
-pub struct ReadValueCell<T>(Arc<std::sync::RwLock<T>>);
+pub struct ReadValueCell<T> {
+    value: Arc<std::sync::RwLock<T>>,
+    before_read: Option<Arc<dyn Fn() + Send + Sync>>,
+}
 
 impl<T> Clone for ValueCell<T> {
     fn clone(&self) -> Self { Self(self.0.clone()) }
 }
 
 impl<T> Clone for ReadValueCell<T> {
-    fn clone(&self) -> Self { Self(self.0.clone()) }
+    fn clone(&self) -> Self { Self { value: self.value.clone(), before_read: self.before_read.clone() } }
 }
 
 impl<T> ValueCell<T> {
@@ -40,7 +43,11 @@ impl<T> ValueCell<T> {
     }
 
     /// Create a read-only view of this value
-    pub fn readvalue(&self) -> ReadValueCell<T> { ReadValueCell(self.0.clone()) }
+    pub fn readvalue(&self) -> ReadValueCell<T> { ReadValueCell { value: self.0.clone(), before_read: None } }
+
+    pub(crate) fn readvalue_with_before_read(&self, before_read: impl Fn() + Send + Sync + 'static) -> ReadValueCell<T> {
+        ReadValueCell { value: self.0.clone(), before_read: Some(Arc::new(before_read)) }
+    }
 }
 
 impl<T: Clone> ValueCell<T> {
@@ -49,11 +56,14 @@ impl<T: Clone> ValueCell<T> {
 
 impl<T> ReadValueCell<T> {
     pub fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
-        let guard = self.0.read().unwrap();
+        if let Some(before_read) = &self.before_read {
+            before_read();
+        }
+        let guard = self.value.read().unwrap();
         f(&*guard)
     }
 }
 
 impl<T: Clone> ReadValueCell<T> {
-    pub fn value(&self) -> T { self.0.read().unwrap().clone() }
+    pub fn value(&self) -> T { self.with(Clone::clone) }
 }

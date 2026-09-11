@@ -15,11 +15,11 @@ use syn::Type;
 
 // --- Type string helpers for Ref<T> handling ---
 
-/// Rewrite `Ref<Model>` → `<Model as Model>::RefWrapper` for proper TS typing.
+/// Rewrite `Ref<Model>` to its associated WASM reference wrapper.
 fn convert_ref_to_wrapper(type_str: &str) -> String {
     Regex::new(r"Ref<(\w+)>")
         .unwrap()
-        .replace_all(type_str, |caps: &regex::Captures| format!("<{} as ::ankurah::model::Model>::RefWrapper", &caps[1]))
+        .replace_all(type_str, |caps: &regex::Captures| format!("<{} as ::ankurah::model::wasm::WasmModel>::RefWrapper", &caps[1]))
         .to_string()
 }
 

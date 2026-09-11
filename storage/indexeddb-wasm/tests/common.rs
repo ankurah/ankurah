@@ -83,7 +83,7 @@ pub async fn setup_context() -> Result<(Context, String), anyhow::Error> {
     let storage_engine = IndexedDBStorageEngine::open(&db_name).await?;
     let node = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new());
     node.system.create().await?;
-    Ok((node.context_async(DEFAULT_CONTEXT).await, db_name))
+    Ok((node.context_async(DEFAULT_CONTEXT).await.unwrap(), db_name))
 }
 
 #[allow(unused)]

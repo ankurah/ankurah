@@ -74,5 +74,5 @@ impl From<TakeError> for wasm_bindgen::JsValue {
 }
 
 impl From<TakeError> for RetrievalError {
-    fn from(val: TakeError) -> Self { RetrievalError::StorageError(Box::new(val)) }
+    fn from(val: TakeError) -> Self { RetrievalError::storage(val) }
 }

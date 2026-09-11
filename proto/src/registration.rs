@@ -26,6 +26,8 @@ pub struct RegisterModel {
     /// looking one up by label. Never mints; hard-fails if absent or if the
     /// bound entity's label differs.
     pub explicit_id: Option<EntityId>,
+    /// Per-build correlator for this compiled declaration.
+    pub build_id: [u8; 16],
     /// The model's properties, in declaration order. Each entry asserts a
     /// model-property membership; an entry with an explicit id references an
     /// existing (possibly shared) property and never mints.
@@ -58,6 +60,8 @@ pub struct RegisterProperty {
     /// Explicit binding: reference an EXISTING property entity instead of
     /// looking one up by name. Never mints; hard-fails if absent.
     pub explicit_id: Option<EntityId>,
+    /// Per-build correlator echoed by [`RegisteredProperty::build_id`].
+    pub build_id: [u8; 16],
     /// Whether entities of this model may omit the property. Per membership:
     /// the same property may be required in one model and optional in
     /// another.
@@ -83,6 +87,10 @@ pub struct RegisteredModel {
 /// A resolved property within a [`RegisteredModel`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisteredProperty {
+    /// Echo of the request entry's `build_id`: the correlator that binds
+    /// this resolution back onto the requester's compiled field, immune to
+    /// display-name drift.
+    pub build_id: [u8; 16],
     /// The property's allocated or previously registered catalog entity id.
     pub id: EntityId,
     /// The membership entity binding this property to the parent model.

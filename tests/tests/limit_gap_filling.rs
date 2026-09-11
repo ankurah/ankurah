@@ -7,7 +7,7 @@ use common::*;
 /// the gaps are automatically filled by fetching additional entities from local storage.
 #[tokio::test]
 async fn test_single_node_gap_filling() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let ctx = durable_sled_setup().await?.context_async(DEFAULT_CONTEXT).await;
+    let ctx = durable_sled_setup().await?.context_async(DEFAULT_CONTEXT).await.unwrap();
     let ids = create_albums(&ctx, 2020..=2024).await?;
 
     let watcher = TestWatcher::changeset();
@@ -22,7 +22,7 @@ async fn test_single_node_gap_filling() -> Result<(), Box<dyn std::error::Error 
     // Update the middle album (2021) to no longer match - this should trigger gap filling
     {
         let trx = ctx.begin();
-        trx.get::<Album>(&ids[1]).await?.year().replace("1999")?; // no longer matches year >= '2020'
+        trx.get::<Album>(&ids[1]).await?.year()?.replace("1999")?; // no longer matches year >= '2020'
         trx.commit().await?;
     }
 
@@ -41,7 +41,7 @@ async fn test_single_node_gap_filling() -> Result<(), Box<dyn std::error::Error 
 /// requiring multiple entities to be fetched to fill the gaps.
 #[tokio::test]
 async fn test_single_node_multiple_gap_filling() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let ctx = durable_sled_setup().await?.context_async(DEFAULT_CONTEXT).await;
+    let ctx = durable_sled_setup().await?.context_async(DEFAULT_CONTEXT).await.unwrap();
     let ids = create_albums(&ctx, 2020..=2030).await?;
     let watcher = TestWatcher::changeset();
     let query = ctx.query_wait::<AlbumView>("year >= '2020' ORDER BY year ASC LIMIT 5").await?;
@@ -52,8 +52,8 @@ async fn test_single_node_multiple_gap_filling() -> Result<(), Box<dyn std::erro
 
     // Update two albums (2021 and 2023) to no longer match - this should trigger gap filling for both
     let trx = ctx.begin();
-    trx.get::<Album>(&ids[1]).await?.year().replace("1999")?;
-    trx.get::<Album>(&ids[3]).await?.year().replace("1999")?;
+    trx.get::<Album>(&ids[1]).await?.year()?.replace("1999")?;
+    trx.get::<Album>(&ids[3]).await?.year()?.replace("1999")?;
     trx.commit().await?;
 
     // Wait for consolidated gap filling update: 2 removes + 2 adds in one update
@@ -80,8 +80,8 @@ async fn test_inter_node_gap_filling() -> Result<(), Box<dyn std::error::Error +
     let server = durable_sled_setup().await?;
     let client = ephemeral_sled_setup().await?;
     let _conn = LocalProcessConnection::new(&server, &client).await?;
-    let server = server.context_async(DEFAULT_CONTEXT).await;
-    let client = client.context_async(DEFAULT_CONTEXT).await;
+    let server = server.context_async(DEFAULT_CONTEXT).await.unwrap();
+    let client = client.context_async(DEFAULT_CONTEXT).await.unwrap();
     let ids = create_albums(&server, 2020..=2025).await?;
 
     let watcher = TestWatcher::changeset();
@@ -93,7 +93,7 @@ async fn test_inter_node_gap_filling() -> Result<(), Box<dyn std::error::Error +
     assert_eq!(years(&query), vec!["2020", "2021", "2022"]);
 
     let trx = server.begin();
-    trx.get::<Album>(&ids[1]).await?.year().replace("1999")?; // no longer matches year >= '2020'
+    trx.get::<Album>(&ids[1]).await?.year()?.replace("1999")?; // no longer matches year >= '2020'
     trx.commit().await?;
 
     assert_eq!(watcher.take_one().await, vec![(ids[1], ChangeKind::Remove), (ids[3], ChangeKind::Add)]);
@@ -111,8 +111,8 @@ async fn test_inter_node_gap_filling_desc() -> Result<(), Box<dyn std::error::Er
     let server = durable_sled_setup().await?;
     let client = ephemeral_sled_setup().await?;
     let _conn = LocalProcessConnection::new(&server, &client).await?;
-    let server = server.context_async(DEFAULT_CONTEXT).await;
-    let client = client.context_async(DEFAULT_CONTEXT).await;
+    let server = server.context_async(DEFAULT_CONTEXT).await.unwrap();
+    let client = client.context_async(DEFAULT_CONTEXT).await.unwrap();
     let ids = create_albums(&server, 2020..=2027).await?;
 
     let watcher = TestWatcher::changeset();
@@ -123,8 +123,8 @@ async fn test_inter_node_gap_filling_desc() -> Result<(), Box<dyn std::error::Er
     assert_eq!(years(&query), vec!["2027", "2026", "2025", "2024"]);
 
     let trx = server.begin();
-    trx.get::<Album>(&ids[4]).await?.year().replace("1999")?;
-    trx.get::<Album>(&ids[6]).await?.year().replace("1999")?;
+    trx.get::<Album>(&ids[4]).await?.year()?.replace("1999")?;
+    trx.get::<Album>(&ids[6]).await?.year()?.replace("1999")?;
     trx.commit().await?;
 
     assert_eq!(

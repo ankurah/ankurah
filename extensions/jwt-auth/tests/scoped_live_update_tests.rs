@@ -89,7 +89,7 @@ async fn ref_scope_rule_receives_live_updates() -> anyhow::Result<()> {
 
     let query = format!("owner = '{}'", owner_id.to_base64());
     let lq = member_ctx.query::<ScopeItemView>(query.as_str())?;
-    lq.wait_initialized().await;
+    lq.wait_initialized().await?;
     assert_eq!(lq.ids().len(), 0, "no items yet");
 
     // Committed after the subscription: must arrive as a live update.

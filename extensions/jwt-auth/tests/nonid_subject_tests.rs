@@ -22,8 +22,10 @@ mod common;
 use ankql::ast::Predicate;
 use ankurah::{Model, Node, Ref};
 use ankurah_core::{
-    policy::PolicyAgent,
+    error::RetrievalError,
+    policy::{AccessDenied, PolicyAgent},
     selection::filter::{evaluate_predicate, Filterable},
+    session::{Session, SessionSet},
     value::Value,
 };
 use ankurah_jwt_auth::{JwtAgent, JwtContext, JwtKeys, PolicyConfig, SigningKeys};
@@ -38,10 +40,50 @@ fn context(keys: &SigningKeys, sub: &str, role: &str) -> JwtContext {
     JwtContext::from_claims(claims, token)
 }
 
+/// A deterministic durable identity for a fixture field name.
+fn prop(name: &str) -> ankql::ast::PropertyId {
+    let mut bytes = [0u8; 32];
+    let n = name.as_bytes();
+    let len = n.len().min(32);
+    bytes[..len].copy_from_slice(&n[..len]);
+    ankql::ast::PropertyId::EntityId(EntityId::from_bytes(bytes))
+}
+
+/// Bind a rule predicate's names to the fixture identities, the way node
+/// attach binds them through the catalog.
+fn try_resolve_fixture(
+    predicate: Predicate<ankql::ast::Parsed>,
+) -> Result<Predicate<ankql::ast::Resolved>, ankurah_core::ModelResolutionError> {
+    use ankurah_core::schema::resolver::{resolve_selection, ModelResolutionError, ModelResolver, ResolvedProperty};
+    struct FixtureResolver;
+    impl ModelResolver for FixtureResolver {
+        fn resolve_property(&self, _model: &ankurah_proto::ModelId, name: &str) -> Result<Option<ResolvedProperty>, ModelResolutionError> {
+            let id = prop(name);
+            let value_type = if id == prop("owner") || id == prop("reviewer") {
+                ankurah_core::value::ValueType::EntityId
+            } else {
+                ankurah_core::value::ValueType::String
+            };
+            Ok(Some(ResolvedProperty { id, value_type }))
+        }
+    }
+    let model = ankurah_proto::ModelId::EntityId(EntityId::from_bytes([0x77; 32]));
+    Ok(resolve_selection(&model, &FixtureResolver, predicate.into())?.predicate)
+}
+
+fn resolve_fixture(predicate: Predicate<ankql::ast::Parsed>) -> Predicate<ankql::ast::Resolved> {
+    try_resolve_fixture(predicate).expect("fixture rule predicates resolve")
+}
+
 fn agent_with(config_json: &str, keys: &SigningKeys) -> JwtAgent {
     let agent = JwtAgent::new_ephemeral();
     agent.update_config(serde_json::from_str::<PolicyConfig>(config_json).expect("test policy must parse"));
     agent.set_keys(JwtKeys::Signing(keys.clone()));
+    // What node attach installs from the node's catalog: scope rules are
+    // authored in names and everything that consumes one addresses ids.
+    agent.set_selection_resolver(std::sync::Arc::new(|_collection, predicate| {
+        try_resolve_fixture(predicate).map_err(|error| error.to_string())
+    }));
     agent
 }
 
@@ -61,12 +103,15 @@ struct NoteRow {
 impl Filterable for NoteRow {
     fn collection(&self) -> &str { "note" }
 
-    fn value(&self, name: &str) -> Option<Value> {
-        match name {
-            "owner" => Some(Value::EntityId(self.owner)),
-            "reviewer" => Some(Value::EntityId(self.reviewer)),
-            "visibility" => Some(Value::String(self.visibility.to_string())),
-            _ => None,
+    fn value(&self, property: &ankql::ast::PropertyId) -> Option<Value> {
+        if *property == prop("owner") {
+            Some(Value::EntityId(self.owner))
+        } else if *property == prop("reviewer") {
+            Some(Value::EntityId(self.reviewer))
+        } else if *property == prop("visibility") {
+            Some(Value::String(self.visibility.to_string()))
+        } else {
+            None
         }
     }
 }
@@ -82,14 +127,10 @@ const OR_SCOPE_CONFIG: &str = r#"{
     }
 }"#;
 
-/// A subject that is not an entity id makes each `$jwt.sub` clause answer
-/// false, and a false clause is only a false clause: it denies the rows no
-/// other clause admits, and admits the rows another clause does. An error in
-/// one clause would instead escape the whole OR — the row-by-row half via
-/// `enforce_read_scope`, which turns any evaluation error into a refusal, and
-/// the query half by failing the caller's fetch outright.
+/// A non-id subject makes the id-comparing rule fail canonicalization. The
+/// whole credential then fails closed; mixed subject types remain issue #472.
 #[test]
-fn test_or_composed_scope_denies_the_row_without_erroring() {
+fn test_or_composed_scope_with_a_non_id_subject_is_a_type_error() {
     let keys = common::test_keys();
     let agent = agent_with(OR_SCOPE_CONFIG, &keys);
     let collection = CollectionId::from("note");
@@ -97,25 +138,36 @@ fn test_or_composed_scope_denies_the_row_without_erroring() {
     let owner = EntityId::random();
     let reviewer = EntityId::random();
     let private = NoteRow { owner, reviewer, visibility: "private" };
-    let shared = NoteRow { owner, reviewer, visibility: "shared" };
+
+    // The rule binding itself is what refuses the guest's subject: naming it
+    // here pins that the refusal below is that type error and not some other
+    // denial.
+    let guest_rule = ankql::parser::parse_selection(&format!("owner = 'guest' OR reviewer = 'guest' OR visibility = 'shared'"))
+        .expect("the rule text parses")
+        .predicate;
+    let error = try_resolve_fixture(guest_rule).expect_err("a subject that is not an id must fail binding as a type error");
+    assert!(
+        matches!(error, ankurah_core::ModelResolutionError::Canonicalization { .. }),
+        "expected a canonicalization type error, got {error:?}"
+    );
 
     // The caller asks for everything, so the scope rule is the only thing
-    // narrowing the query.
+    // narrowing the query -- and its slice cannot bind, so this lone
+    // credential leaves nothing to read by.
     let guest = context(&keys, "guest", "reader");
-    let filtered = agent.filter_predicate(&guest, &collection, Predicate::True).expect("a subject that is not an id must still filter");
+    let refused = agent.filter_predicate(&guest, &collection, Predicate::True);
+    assert!(
+        matches!(refused, Err(AccessDenied::ByPolicy("No authorized context for row filtering"))),
+        "a credential whose scope cannot bind leaves nothing to read by, got: {refused:?}"
+    );
 
-    let admits = |row: NoteRow| evaluate_predicate(&row, &filtered).expect("the filtered predicate must evaluate, not error");
-    assert!(!admits(private), "neither id clause can match a subject that is not an id, so the row is denied");
-    assert!(admits(shared), "the clause that does not read the subject still admits its rows");
-
-    // The control that keeps the denial honest: the same clauses admit the
-    // owner's own row when the subject is that owner's id, so the false above
-    // is a comparison that answered no rather than a clause that never matches.
+    // The control that keeps the refusal honest: a subject that IS an id
+    // binds, and the same clauses admit that owner's own row.
     let member = context(&keys, &owner.to_base64(), "reader");
     let filtered = agent.filter_predicate(&member, &collection, Predicate::True).expect("a member's subject filters too");
     assert!(
-        evaluate_predicate(&private, &filtered).expect("the filtered predicate must evaluate, not error"),
-        "the owner's own row must pass the same clause that denied the guest"
+        evaluate_predicate(&private, &filtered).expect("the bound predicate must evaluate"),
+        "the owner's own row must pass the clauses that refused the guest's credential"
     );
 }
 
@@ -145,26 +197,10 @@ const OWNER_SCOPE_CONFIG: &str = r#"{
     }
 }"#;
 
-/// The whole posture, against a real node: a caller whose subject is not an
-/// entity id reaches the collection — its role grants that — and the row-local
-/// scope rule then leaves it nothing, on both paths a reader can take. The
-/// owner's own credential takes both paths successfully over the same row, so
-/// what the other caller is denied is its subject and not the fixture.
-///
-/// The claim under test is that no row reaches such a caller, which is why the
-/// query half asserts that and not a particular refusal: the two paths refuse
-/// differently, and the query path's refusal depends on the scoped column's
-/// type. Read by id, the scope is evaluated against the row and denies it.
-/// Queried over the `Ref` column here, the storage planner cannot encode a
-/// string that is not an id into an index key over EntityIds, so the fetch
-/// fails outright rather than answering with nothing — fail-closed, but an
-/// error rather than an empty result. (Scope the same rule on a String column
-/// instead and the comparison is representable, so the fetch simply returns no
-/// rows.) A change that turned the middle case into an empty answer would be an
-/// improvement and must not fail this test; a change that handed over a row
-/// must fail it.
+/// Invalid EntityId subjects contribute no access, but cannot veto another
+/// credential's access through either the direct-read or query path.
 #[tokio::test]
-async fn test_non_id_subject_reaches_no_row_on_either_path() -> anyhow::Result<()> {
+async fn test_non_id_subject_does_not_authorize_or_block_other_credentials() -> anyhow::Result<()> {
     let keys = common::test_keys();
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent_with(OWNER_SCOPE_CONFIG, &keys));
     node.system.create().await?;
@@ -179,17 +215,44 @@ async fn test_non_id_subject_reaches_no_row_on_either_path() -> anyhow::Result<(
         ids
     };
 
-    let member = node.context(context(&keys, &person_id.to_base64(), "user"))?;
+    let member_credential = context(&keys, &person_id.to_base64(), "user");
+    let member = node.context(member_credential.clone())?;
     assert_eq!(member.fetch::<DocView>("body = 'hello'").await?.len(), 1, "the owner's query returns the owner's row");
     assert!(member.get::<DocView>(doc_id).await.is_ok(), "the owner may read its own row by id");
 
-    let guest = node.context(context(&keys, "guest", "guest"))?;
-    // A refused query and an empty one are both fail-closed; a returned row is
-    // not. See the note above on why this path refuses rather than empties.
+    let guest_credential = context(&keys, "guest", "guest");
+    let guest = node.context(guest_credential.clone())?;
+    // A lone malformed subject still fails closed.
     if let Ok(rows) = guest.fetch::<DocView>("body = 'hello'").await {
         assert!(rows.is_empty(), "a subject that is not an id owns no row, but the query handed over {}", rows.len());
     }
-    assert!(guest.get::<DocView>(doc_id).await.is_err(), "the same row read by id is refused rather than handed over");
+    assert!(matches!(
+        guest.get::<DocView>(doc_id).await,
+        Err(RetrievalError::AccessDenied(AccessDenied::ByPolicy("Read scope predicate could not be resolved")))
+    ));
+
+    for credentials in [vec![guest_credential.clone(), member_credential.clone()], vec![member_credential, guest_credential.clone()]] {
+        let sessions = SessionSet::new();
+        for credential in credentials {
+            sessions.own(&Session::new(credential));
+        }
+        let combined = node.context(sessions)?;
+        assert_eq!(combined.get::<DocView>(doc_id).await?.id(), doc_id, "a malformed subject must not block an authorized owner");
+        let rows = combined.fetch::<DocView>("body = 'hello'").await?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id(), doc_id);
+    }
+
+    let outsider = context(&keys, &EntityId::random().to_base64(), "user");
+    for credentials in [vec![guest_credential.clone(), outsider.clone()], vec![outsider, guest_credential]] {
+        let sessions = SessionSet::new();
+        for credential in credentials {
+            sessions.own(&Session::new(credential));
+        }
+        let combined = node.context(sessions)?;
+        assert!(combined.get::<DocView>(doc_id).await.is_err(), "neither credential owns this row");
+        assert!(combined.fetch::<DocView>("body = 'hello'").await?.is_empty());
+    }
 
     Ok(())
 }

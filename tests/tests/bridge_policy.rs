@@ -4,7 +4,7 @@ use ankql::ast::Predicate;
 use ankurah::core::{
     entity::Entity,
     error::ValidationError,
-    node::{Node as NodeAlias, NodeInner, WeakNode},
+    node::{Node as NodeAlias, NodeInner},
     policy::{AccessDenied, DefaultContext, PolicyAgent, DEFAULT_CONTEXT},
     storage::StorageEngine,
     util::Iterable,
@@ -16,22 +16,35 @@ use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use common::{Pet, PetView};
 
-/// Permissive agent with two observation/override points for bridge policy
-/// tests: counts validate_received_event calls, and denies check_read_event
-/// for ids in the deny set.
+/// Counts received-event validation and allows tests to deny all reads or selected events.
 #[derive(Clone)]
 struct BridgePolicyAgent {
     validate_calls: Arc<AtomicUsize>,
     deny_read_events: Arc<Mutex<HashSet<EventId>>>,
+    deny_reads: Arc<AtomicBool>,
 }
 
 impl BridgePolicyAgent {
-    fn new() -> Self { Self { validate_calls: Arc::new(AtomicUsize::new(0)), deny_read_events: Arc::new(Mutex::new(HashSet::new())) } }
+    fn new() -> Self {
+        Self {
+            validate_calls: Arc::new(AtomicUsize::new(0)),
+            deny_read_events: Arc::new(Mutex::new(HashSet::new())),
+            deny_reads: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn check_read_access(&self) -> Result<(), AccessDenied> {
+        if self.deny_reads.load(Ordering::SeqCst) {
+            Err(AccessDenied::ByPolicy("all reads denied by test agent"))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[async_trait]
@@ -98,11 +111,19 @@ impl PolicyAgent for BridgePolicyAgent {
 
     fn can_access_collection<C>(&self, _data: &C, _collection: &proto::CollectionId) -> Result<(), AccessDenied>
     where C: Iterable<Self::ContextData> {
-        Ok(())
+        self.check_read_access()
     }
 
-    fn filter_predicate<C>(&self, _data: &C, _collection: &proto::CollectionId, predicate: Predicate) -> Result<Predicate, AccessDenied>
-    where C: Iterable<Self::ContextData> {
+    fn filter_predicate<C>(
+        &self,
+        _data: &C,
+        _collection: &proto::CollectionId,
+        predicate: Predicate<ankql::ast::Resolved>,
+    ) -> Result<Predicate<ankql::ast::Resolved>, AccessDenied>
+    where
+        C: Iterable<Self::ContextData>,
+    {
+        self.check_read_access()?;
         Ok(predicate)
     }
 
@@ -116,11 +137,12 @@ impl PolicyAgent for BridgePolicyAgent {
     where
         C: Iterable<Self::ContextData>,
     {
-        Ok(())
+        self.check_read_access()
     }
 
     fn check_read_event<C>(&self, _data: &C, event: &Attested<proto::Event>) -> Result<(), AccessDenied>
     where C: Iterable<Self::ContextData> {
+        self.check_read_access()?;
         if self.deny_read_events.lock().unwrap().contains(&event.payload.id()) {
             return Err(AccessDenied::ByPolicy("event read denied by test agent"));
         }
@@ -139,6 +161,92 @@ impl PolicyAgent for BridgePolicyAgent {
     }
 }
 
+#[tokio::test]
+async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
+    use ankurah::core::schema::{MODEL_COLLECTION_ID, MODEL_PROPERTY_COLLECTION_ID, PROPERTY_COLLECTION_ID};
+
+    let agent = BridgePolicyAgent::new();
+    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
+    server.system.create().await?;
+    let context = server.context(DEFAULT_CONTEXT)?;
+    context.register_model::<Pet>().await?;
+    agent.deny_reads.store(true, Ordering::SeqCst);
+
+    let client = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    let _conn = LocalProcessConnection::new(&client, &server).await?;
+    client.system.wait_system_ready().await.unwrap();
+    let credentials = Vec::<&'static DefaultContext>::new();
+
+    for label in [MODEL_COLLECTION_ID, PROPERTY_COLLECTION_ID, MODEL_PROPERTY_COLLECTION_ID] {
+        let collection = proto::CollectionId::fixed_name(label);
+        let storage = context.collection(&collection).await?;
+        let states = storage.fetch_states(&Predicate::True.into()).await?;
+        assert!(!states.is_empty(), "registration must populate {label}");
+        let mut state = states[0].clone();
+        let entity_id = state.payload.entity_id;
+        let known_head = state.payload.state.head.clone();
+        // Advance the stored row with an idempotent membership event to exercise a real bridge.
+        let update = proto::Event::update(
+            collection.clone(),
+            entity_id,
+            known_head.clone(),
+            proto::AuthorId::Unknown,
+            proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(
+                ankurah::core::schema::system_model_id(label).unwrap(),
+            ))]),
+        );
+        let update_id = update.id();
+        storage.add_event(&Attested::opt(update, None)).await?;
+        state.payload.state.head = update_id.clone().into();
+        storage.set_state(state).await?;
+        let events = storage.dump_entity_events(entity_id).await?;
+        assert!(!events.is_empty());
+
+        let requests = [
+            proto::NodeRequestBody::Get { collection: collection.clone(), ids: vec![entity_id] },
+            proto::NodeRequestBody::GetEvents {
+                collection: collection.clone(),
+                event_ids: events.iter().map(|event| event.payload.id()).collect(),
+            },
+            proto::NodeRequestBody::Fetch {
+                collection: collection.clone(),
+                selection: Predicate::True.into(),
+                known_matches: vec![proto::KnownEntity { entity_id, head: known_head.clone() }],
+            },
+            proto::NodeRequestBody::SubscribeQuery {
+                query_id: proto::QueryId::new(),
+                collection,
+                selection: Predicate::True.into(),
+                version: 1,
+                known_matches: vec![proto::KnownEntity { entity_id, head: known_head }],
+            },
+        ];
+        for request in requests {
+            match client.request(server.id, &credentials, request).await? {
+                proto::NodeResponseBody::Get(states) => assert_eq!(states.len(), 1),
+                proto::NodeResponseBody::GetEvents(received) => assert_eq!(received.len(), events.len()),
+                proto::NodeResponseBody::Fetch(deltas) | proto::NodeResponseBody::QuerySubscribed { deltas, .. } => {
+                    let delta = deltas.iter().find(|delta| delta.entity_id == entity_id).expect("catalog row must be readable");
+                    assert!(matches!(&delta.content, proto::DeltaContent::EventBridge { events } if events.len() == 1), "{delta:?}");
+                }
+                response => panic!("catalog read failed for {label}: {response:?}"),
+            }
+        }
+    }
+
+    for label in ["pet", "_ankurah_system", "_ankurah_future"] {
+        let response = client
+            .request(
+                server.id,
+                &DEFAULT_CONTEXT,
+                proto::NodeRequestBody::Fetch { collection: label.into(), selection: Predicate::True.into(), known_matches: vec![] },
+            )
+            .await?;
+        assert!(matches!(response, proto::NodeResponseBody::Error(message) if message.contains("all reads denied")));
+    }
+    Ok(())
+}
+
 /// Receive side: EventBridge events must pass validate_received_event like
 /// every other transport path; transport must not decide trust.
 #[tokio::test]
@@ -149,7 +257,7 @@ async fn test_event_bridge_events_are_policy_validated_on_receive() -> Result<()
     let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), client_agent.clone());
 
     let _conn = LocalProcessConnection::new(&client, &server).await?;
-    client.system.wait_system_ready().await;
+    client.system.wait_system_ready().await.unwrap();
 
     let ctx_s = server.context(DEFAULT_CONTEXT)?;
     let ctx_c = client.context(DEFAULT_CONTEXT)?;
@@ -171,7 +279,7 @@ async fn test_event_bridge_events_are_policy_validated_on_receive() -> Result<()
     // Server advances two events; the client's re-fetch is served by a bridge.
     for age in ["2", "3"] {
         let trx = ctx_s.begin();
-        ctx_s.get::<PetView>(pet_id).await?.edit(&trx)?.age().replace(age)?;
+        ctx_s.get::<PetView>(pet_id).await?.edit(&trx)?.age()?.replace(age)?;
         trx.commit().await?;
     }
     let results = ctx_c.fetch::<PetView>(query.as_str()).await?;
@@ -201,7 +309,7 @@ async fn test_event_bridge_respects_read_policy_on_send() -> Result<()> {
     let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
 
     let _conn = LocalProcessConnection::new(&client, &server).await?;
-    client.system.wait_system_ready().await;
+    client.system.wait_system_ready().await.unwrap();
 
     let ctx_s = server.context(DEFAULT_CONTEXT)?;
     let ctx_c = client.context(DEFAULT_CONTEXT)?;
@@ -221,13 +329,13 @@ async fn test_event_bridge_respects_read_policy_on_send() -> Result<()> {
     // Two more server events; the first one is read-denied for peers.
     let denied_id = {
         let trx = ctx_s.begin();
-        ctx_s.get::<PetView>(pet_id).await?.edit(&trx)?.age().replace("2")?;
+        ctx_s.get::<PetView>(pet_id).await?.edit(&trx)?.age()?.replace("2")?;
         trx.commit_and_return_events().await?[0].id()
     };
     server_agent.deny_read_events.lock().unwrap().insert(denied_id.clone());
     let open_id = {
         let trx = ctx_s.begin();
-        ctx_s.get::<PetView>(pet_id).await?.edit(&trx)?.age().replace("3")?;
+        ctx_s.get::<PetView>(pet_id).await?.edit(&trx)?.age()?.replace("3")?;
         trx.commit_and_return_events().await?[0].id()
     };
 

@@ -1,80 +1,56 @@
-//! The schema catalog: what the system knows about models and properties.
+//! Durable model and property identities.
 //!
-//! Ankurah stores schema as DATA. Every model and every property is an
-//! ordinary entity in one of three reserved collections (`_ankurah_model`,
-//! `_ankurah_property`, `_ankurah_model_property` for the property-to-model
-//! memberships), with a durable id minted by the system's one durable
-//! allocator. Those entities replicate, persist, and survive renames like
-//! any other data, which is the point: a property's identity is its entity
-//! id, not its current display name, so renaming a field someday does not
-//! orphan the data written under it.
-//!
-//! A Rust struct with `#[derive(Model)]` is not the schema; it is one
-//! binary's DECLARATION of a schema, compiled into a static
-//! ([`ModelStructDescriptor`], in [`compiled`]). The first time a binary uses a model --
-//! explicitly via `Context::register`, or implicitly on create/fetch -- that
-//! declaration is sent to the durable node, whose registration executor
-//! ([`registration`]) looks each piece up, allocates ids for anything new,
-//! checks that a re-declaration is compatible with what the catalog already
-//! holds, and returns the resolved ids. Two binaries with the same struct
-//! get the same ids; a binary whose declaration conflicts is refused.
-//!
-//! Each node keeps an in-memory index of the catalog entities
-//! ([`catalog::CatalogManager`]) so lookups don't touch storage: parsed into
-//! `ModelDef`/`PropertyDef`/`ModelPropertyMembershipDef`, warmed from local storage on
-//! durable nodes and from registration responses on ephemeral ones. The
-//! wire request/response types live in ankurah-proto. The full design
-//! record lives with the design documents for this subsystem.
+//! Catalog entities persist the schema; compiled descriptors cache its IDs
+//! per system epoch so names are resolved before storage or evaluation.
 
 pub mod catalog;
+pub mod cell;
 pub mod compiled;
 pub mod registration;
+pub use catalog::resolver;
 
+pub use cell::{PerSystemOnceCell, SystemEpoch};
 pub use compiled::{ModelStructDescriptor, StructProperty};
 
 use ankurah_proto::{ModelId, SystemModel};
 
-use crate::property::PropertyError;
-use crate::value::ValueType;
-use ankql::ast::PathExpr;
-
-/// Trait for providing schema information about collections
-pub trait CollectionSchema {
-    /// Get the ValueType for a given field path
-    fn field_type(&self, path: &PathExpr) -> Result<ValueType, PropertyError>;
-}
-
-/// The metadata catalog collections. Catalog entities are SYSTEM MODELS: raw Entity/backend
-/// access only, like SysRoot; deriving a Model for one of these is the
-/// self-description ouroboros: the catalog must never need itself to
-/// describe itself.
 pub const MODEL_COLLECTION_ID: &str = "_ankurah_model";
 pub const PROPERTY_COLLECTION_ID: &str = "_ankurah_property";
 pub const MODEL_PROPERTY_COLLECTION_ID: &str = "_ankurah_model_property";
 
-/// Labels reserved for built-in models: user models may not use this prefix
-/// (enforced at derive time and at schema registration).
 pub const RESERVED_COLLECTION_PREFIX: &str = "_ankurah_";
 
 pub const fn model_collection() -> ModelId { ModelId::System(SystemModel::Model) }
 pub const fn property_collection() -> ModelId { ModelId::System(SystemModel::Property) }
 pub const fn model_property_collection() -> ModelId { ModelId::System(SystemModel::ModelProperty) }
 
-/// Whether `id` is one of the three metadata catalog collections (NOT the
-/// system collection, which replicates via the Presence handshake and has
-/// its own trust story).
 pub fn is_catalog_collection(id: &ModelId) -> bool {
     matches!(id, ModelId::System(SystemModel::Model | SystemModel::Property | SystemModel::ModelProperty))
 }
 
-/// Whether `id` names one of Ankurah's built-in collections. Built-ins are
-/// the only collections permitted under [`RESERVED_COLLECTION_PREFIX`] and
-/// cannot be mutated through ordinary user transactions.
+/// Catalog reads bypass policy so nodes can resolve names before authorization.
+pub fn reads_bypass_policy(collection: &ankurah_proto::CollectionId) -> bool {
+    matches!(collection.as_str(), MODEL_COLLECTION_ID | PROPERTY_COLLECTION_ID | MODEL_PROPERTY_COLLECTION_ID)
+}
+
+/// Whether this request is a policy-exempt catalog read.
+pub(crate) fn request_bypasses_policy(request: &ankurah_proto::NodeRequestBody) -> bool {
+    use ankurah_proto::NodeRequestBody;
+    match request {
+        NodeRequestBody::Fetch { collection, .. }
+        | NodeRequestBody::Get { collection, .. }
+        | NodeRequestBody::GetEvents { collection, .. }
+        | NodeRequestBody::SubscribeQuery { collection, .. } => reads_bypass_policy(collection),
+        NodeRequestBody::CommitTransaction { .. } | NodeRequestBody::RegisterSchema { .. } => false,
+    }
+}
+
 pub fn is_protected_collection(id: &ModelId) -> bool { matches!(id, ModelId::System(_)) }
 
-/// The logical protocol model for today's built-in storage key. This mapping
-/// is deliberately core-local: protocol identity must not depend on the
-/// current materialization name.
+pub fn is_reserved_collection(collection: &ankurah_proto::CollectionId) -> bool {
+    collection.as_str().starts_with(RESERVED_COLLECTION_PREFIX)
+}
+
 pub fn system_model_id(collection: &str) -> Option<ModelId> {
     let model = match collection {
         crate::system::SYSTEM_COLLECTION_ID => SystemModel::System,
@@ -86,8 +62,6 @@ pub fn system_model_id(collection: &str) -> Option<ModelId> {
     Some(ModelId::System(model))
 }
 
-/// Today's declared collection label for a built-in model. This is schema and
-/// query-qualifier metadata only; storage engines assign private names.
 pub const fn system_collection_label(model: SystemModel) -> &'static str {
     match model {
         SystemModel::System => crate::system::SYSTEM_COLLECTION_ID,
@@ -115,5 +89,51 @@ mod model_mapping_tests {
             assert_eq!(system_model_id(collection), Some(model));
         }
         assert_eq!(system_model_id("albums"), None);
+    }
+}
+
+#[cfg(test)]
+mod request_policy_tests {
+    use super::*;
+    use ankql::ast::Predicate;
+    use ankurah_proto::{CollectionId, NodeRequestBody, QueryId, RegisterModel, TransactionId};
+
+    #[test]
+    fn only_catalog_reads_bypass_policy() {
+        for (label, exempt) in [
+            (MODEL_COLLECTION_ID, true),
+            (PROPERTY_COLLECTION_ID, true),
+            (MODEL_PROPERTY_COLLECTION_ID, true),
+            (crate::system::SYSTEM_COLLECTION_ID, false),
+            ("_ankurah_other", false),
+            ("albums", false),
+        ] {
+            let collection = CollectionId::fixed_name(label);
+            let requests = [
+                NodeRequestBody::Get { collection: collection.clone(), ids: Vec::new() },
+                NodeRequestBody::GetEvents { collection: collection.clone(), event_ids: Vec::new() },
+                NodeRequestBody::Fetch { collection: collection.clone(), selection: Predicate::True.into(), known_matches: Vec::new() },
+                NodeRequestBody::SubscribeQuery {
+                    query_id: QueryId::new(),
+                    collection,
+                    selection: Predicate::True.into(),
+                    version: 1,
+                    known_matches: Vec::new(),
+                },
+            ];
+            for request in requests {
+                assert_eq!(request_bypasses_policy(&request), exempt, "{request:?}");
+            }
+        }
+        assert!(!request_bypasses_policy(&NodeRequestBody::CommitTransaction { id: TransactionId::new(), events: Vec::new() }));
+        assert!(!request_bypasses_policy(&NodeRequestBody::RegisterSchema {
+            model: RegisterModel {
+                label: MODEL_COLLECTION_ID.into(),
+                name: "Model".into(),
+                explicit_id: None,
+                build_id: [0; 16],
+                properties: Vec::new(),
+            },
+        }));
     }
 }

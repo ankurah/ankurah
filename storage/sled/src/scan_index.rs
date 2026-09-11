@@ -98,7 +98,7 @@ impl Stream for SledIndexScanner<'_> {
         loop {
             let (key_bytes, _value_bytes) = match self.iter.next() {
                 Some(Ok(kv)) => kv,
-                Some(Err(e)) => return Poll::Ready(Some(Err(RetrievalError::StorageError(e.to_string().into())))),
+                Some(Err(e)) => return Poll::Ready(Some(Err(RetrievalError::storage(e.to_string())))),
                 None => return Poll::Ready(None),
             };
 
@@ -123,9 +123,9 @@ impl Stream for SledIndexScanner<'_> {
 /// Decode the EntityId that an index key carries as its fixed-width suffix.
 pub fn decode_entity_id_from_index_key(key: &[u8]) -> Result<EntityId, RetrievalError> {
     if key.len() < 1 + EntityId::BYTE_LEN {
-        return Err(RetrievalError::StorageError("index key too short".into()));
+        return Err(RetrievalError::storage("index key too short"));
     }
     let eid_bytes: [u8; EntityId::BYTE_LEN] =
-        key[key.len() - EntityId::BYTE_LEN..].try_into().map_err(|_| RetrievalError::StorageError("invalid entity id suffix".into()))?;
+        key[key.len() - EntityId::BYTE_LEN..].try_into().map_err(|_| RetrievalError::storage("invalid entity id suffix"))?;
     Ok(EntityId::from_bytes(eid_bytes))
 }

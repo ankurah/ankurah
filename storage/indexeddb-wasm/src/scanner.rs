@@ -63,7 +63,7 @@ impl IdbIndexScanner {
 
                     let cursor_request = match cursor_request {
                         Ok(req) => req,
-                        Err(e) => return Some((Err(RetrievalError::StorageError(format!("Failed to open cursor: {:?}", e).into())), None)),
+                        Err(e) => return Some((Err(RetrievalError::storage(format!("Failed to open cursor: {:?}", e))), None)),
                     };
 
                     let stream = cb_stream(&cursor_request, "success", "error");
@@ -97,7 +97,7 @@ async fn get_next_record(state: ScanState) -> Option<(Result<Object, RetrievalEr
 
     let cursor_result = match result {
         Ok(val) => val,
-        Err(e) => return Some((Err(RetrievalError::StorageError(format!("Cursor error: {:?}", e).into())), None)),
+        Err(e) => return Some((Err(RetrievalError::storage(format!("Cursor error: {:?}", e))), None)),
     };
 
     // Check for end of cursor
@@ -107,7 +107,7 @@ async fn get_next_record(state: ScanState) -> Option<(Result<Object, RetrievalEr
 
     let cursor: web_sys::IdbCursorWithValue = match cursor_result.dyn_into() {
         Ok(c) => c,
-        Err(e) => return Some((Err(RetrievalError::StorageError(format!("Failed to cast cursor: {:?}", e).into())), None)),
+        Err(e) => return Some((Err(RetrievalError::storage(format!("Failed to cast cursor: {:?}", e))), None)),
     };
 
     // Apply prefix guard if needed
@@ -130,14 +130,14 @@ async fn get_next_record(state: ScanState) -> Option<(Result<Object, RetrievalEr
     // Get the record value
     let value = match cursor.value() {
         Ok(v) => v,
-        Err(e) => return Some((Err(RetrievalError::StorageError(format!("Failed to get cursor value: {:?}", e).into())), None)),
+        Err(e) => return Some((Err(RetrievalError::storage(format!("Failed to get cursor value: {:?}", e))), None)),
     };
 
     let entity_obj = Object::new(value);
 
     // Advance cursor for next iteration
     if let Err(e) = cursor.continue_() {
-        return Some((Err(RetrievalError::StorageError(format!("Failed to advance cursor: {:?}", e).into())), None));
+        return Some((Err(RetrievalError::storage(format!("Failed to advance cursor: {:?}", e))), None));
     }
 
     // Return the record and continue scanning

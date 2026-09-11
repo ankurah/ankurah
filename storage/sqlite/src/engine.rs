@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use ankql::ast::{PropertyId, Resolved};
 use ankurah_core::entity::TemporaryEntity;
 use ankurah_core::error::{MutationError, RetrievalError};
 use ankurah_core::property::backend::backend_from_string;
@@ -51,7 +52,9 @@ impl SqliteStorageEngine {
         for char in collection.chars() {
             match char {
                 c if c.is_alphanumeric() => {}
-                '_' | '.' | ':' => {}
+                // '-' appears in property-id renderings (URL-safe base64),
+                // which name materialized columns; always emitted quoted.
+                '_' | '.' | ':' | '-' => {}
                 _ => return false,
             }
         }
@@ -275,10 +278,12 @@ impl StorageCollection for SqliteBucket {
         let mut materialized: Vec<(String, Option<SqliteValue>, bool)> = Vec::new(); // (name, value, is_jsonb)
         let mut seen_properties = std::collections::HashSet::new();
 
+        // Materialized columns use the same property-ID rendering as query lowering.
         for (name, state_buffer) in state.payload.state.state_buffers.iter() {
             let backend = backend_from_string(name, Some(state_buffer))?;
-            for (column, value) in backend.property_values() {
-                if !seen_properties.insert(column.clone()) {
+            for (property, value) in backend.property_values() {
+                let column = property.to_string();
+                if !seen_properties.insert(property.clone()) {
                     continue;
                 }
 
@@ -432,22 +437,22 @@ impl StorageCollection for SqliteBucket {
             .await
             .map_err(|e| match e {
                 SqliteError::Rusqlite(rusqlite::Error::QueryReturnedNoRows) => RetrievalError::EntityNotFound(id),
-                _ => RetrievalError::StorageError(Box::new(e)),
+                _ => RetrievalError::storage(e),
             })?;
 
         Ok(result)
     }
 
-    async fn fetch_states(&self, selection: &ankql::ast::Selection) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+    async fn fetch_states(&self, selection: &ankql::ast::Selection<Resolved>) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         debug!("SqliteBucket({}).fetch_states: {:?}", self.collection_id, selection);
 
         let conn = self.pool.get().await.map_err(|e| SqliteError::Pool(e.to_string()))?;
 
         // Pre-filter selection based on cached schema to avoid undefined column errors.
         // If we see columns not in our cache, refresh it first (they might have been added).
-        let referenced = selection.referenced_columns();
+        let referenced: Vec<(PropertyId, String)> = selection.referenced_properties().into_iter().map(|p| (p, p.to_string())).collect();
         let cached = self.existing_columns();
-        let unknown_to_cache: Vec<&String> = referenced.iter().filter(|col| !cached.contains(col)).collect();
+        let unknown_to_cache: Vec<&String> = referenced.iter().map(|(_, col)| col).filter(|col| !cached.contains(*col)).collect();
 
         // Refresh cache if we see columns we haven't seen before
         if !unknown_to_cache.is_empty() {
@@ -457,19 +462,13 @@ impl StorageCollection for SqliteBucket {
 
         // Now check with (possibly refreshed) cache - columns still missing truly don't exist
         let existing = self.existing_columns();
-        let missing: Vec<String> = referenced.into_iter().filter(|col| !existing.contains(col)).collect();
+        let missing: Vec<PropertyId> = referenced.into_iter().filter(|(_, col)| !existing.contains(col)).map(|(p, _)| p).collect();
 
         let effective_selection = if missing.is_empty() {
             selection.clone()
         } else {
             debug!("SqliteBucket({}).fetch_states: Columns {:?} don't exist, treating as NULL", self.collection_id, missing);
-            // Note: assume_null() has a limitation with JSON paths - it checks path.property()
-            // (last step) instead of path.first() (column name). This means for paths like
-            // "licensing.territory", if "licensing" is missing, assume_null() won't match
-            // because it checks "territory". However, this should be rare since columns
-            // are created on-demand during set_state. If it happens, assume_null() will
-            // leave the predicate unchanged, which may cause the query to fail.
-            // TODO: Fix assume_null() in ankql to check path.first() for multi-step paths.
+            // A missing property column also makes its subpaths absent.
             selection.assume_null(&missing)
         };
 
@@ -478,12 +477,12 @@ impl StorageCollection for SqliteBucket {
         let needs_post_filter = split.needs_post_filter();
         let remaining_predicate = split.remaining_predicate.clone();
 
-        // Build SQL
-        let sql_selection = ankql::ast::Selection {
+        // Lower only the SQL predicate; Rust post-filtering uses property IDs.
+        let sql_selection = crate::lower::lower(&ankql::ast::Selection {
             predicate: split.sql_predicate,
             order_by: effective_selection.order_by.clone(),
             limit: if needs_post_filter { None } else { effective_selection.limit },
-        };
+        });
 
         let mut builder = SqlBuilder::with_fields(vec!["id", "state_buffer", "memberships", "head", "attestations"]);
         builder.table_name(self.state_table());
@@ -631,7 +630,7 @@ impl StorageCollection for SqliteBucket {
             Ok(events)
         })
         .await
-        .map_err(|e| RetrievalError::StorageError(Box::new(e)))
+        .map_err(RetrievalError::storage)
     }
 
     async fn dump_entity_events(&self, entity_id: EntityId) -> Result<Vec<Attested<Event>>, RetrievalError> {
@@ -673,14 +672,14 @@ impl StorageCollection for SqliteBucket {
             Ok(events)
         })
         .await
-        .map_err(|e| RetrievalError::StorageError(Box::new(e)))
+        .map_err(RetrievalError::storage)
     }
 }
 
 /// Post-filter EntityStates using a predicate that couldn't be pushed to SQL.
 fn post_filter_states(
     states: &[Attested<EntityState>],
-    predicate: &ankql::ast::Predicate,
+    predicate: &ankql::ast::Predicate<Resolved>,
     collection_id: &CollectionId,
 ) -> Vec<Attested<EntityState>> {
     states
@@ -788,6 +787,9 @@ mod tests {
 
         // Test that the SQL builder generates correct JSONB syntax
         let selection = parse_selection(r#"data.status = 'active'"#).expect("Failed to parse query");
+        let selection = ankurah_storage_common::lower_selection(&selection, &|path| {
+            ankurah_storage_common::ColumnPath::new(path.first(), path.steps[1..].to_vec())
+        });
         let mut builder = SqlBuilder::with_fields(vec!["id", "state_buffer"]);
         builder.table_name("test_table");
         builder.selection(&selection).map_err(|e| SqliteError::SqlGeneration(e.to_string()))?;

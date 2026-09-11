@@ -1,7 +1,12 @@
 use crate::sender::WebsocketPeerSender;
-use ankurah_core::{connector::PeerSender, policy::PolicyAgent, storage::StorageEngine, Node};
+use ankurah_core::{
+    connector::{PeerConnectionError, PeerSender},
+    policy::PolicyAgent,
+    storage::StorageEngine,
+    Node, NodeState,
+};
 use ankurah_proto as proto;
-use ankurah_signals::{Mut, Read, Wait};
+use ankurah_signals::{Calculated, Get, Mut, Peek, Read, Wait};
 use anyhow::{anyhow, Result};
 use futures_util::{SinkExt, StreamExt};
 use std::{
@@ -13,7 +18,7 @@ use std::{
 };
 use strum::Display;
 use thiserror::Error;
-use tokio::{select, sync::Notify, task::JoinHandle, time::sleep};
+use tokio::{select, task::JoinHandle, time::sleep};
 use tokio_tungstenite::{
     connect_async_tls_with_config,
     tungstenite::{client::IntoClientRequest, protocol::WebSocketConfig, Message},
@@ -90,6 +95,8 @@ pub enum ConnectionState {
 
 #[derive(Debug, Clone, PartialEq, Error)]
 pub enum ConnectionError {
+    #[error("{0}")]
+    Peer(#[from] PeerConnectionError),
     #[error("General connection error: {0}")]
     General(String),
 }
@@ -109,8 +116,8 @@ where
     connector: Option<Connector>,
     connection_state: Mut<ConnectionState>,
     connected: AtomicBool,
-    shutdown: Notify,
-    shutdown_requested: AtomicBool,
+    shutdown_requested: Mut<bool>,
+    run: Calculated<bool>,
 }
 
 /// A WebSocket client for connecting Ankurah nodes
@@ -148,6 +155,9 @@ where
         let ws_url = Self::normalize_url(server_url);
         info!("Creating WebSocket client for {}", ws_url);
 
+        let node_state = node.state();
+        let shutdown_requested = Mut::new(false);
+        let shutdown = shutdown_requested.read();
         let inner = Arc::new(Inner {
             node,
             server_url: ws_url,
@@ -156,8 +166,8 @@ where
             connector,
             connection_state: Mut::new(ConnectionState::Disconnected),
             connected: AtomicBool::new(false),
-            shutdown: Notify::new(),
-            shutdown_requested: AtomicBool::new(false),
+            shutdown_requested,
+            run: Calculated::new(move || !shutdown.get() && !matches!(node_state.get(), NodeState::Halted(_))),
         });
 
         let task = tokio::spawn(Self::run_connection_loop(inner.clone()));
@@ -184,8 +194,7 @@ where
         info!("Shutting down WebSocket client");
 
         if let Some(task) = self.task.lock().unwrap().take() {
-            self.inner.shutdown_requested.store(true, Ordering::Release);
-            self.inner.shutdown.notify_waiters();
+            self.inner.shutdown_requested.set(true);
 
             match task.await {
                 Ok(()) => info!("WebSocket client shutdown completed"),
@@ -211,7 +220,6 @@ where
 
     /// Get the node ID of the connected server (if connected)
     pub fn server_node_id(&self) -> Option<proto::EntityId> {
-        use ankurah_signals::Get;
         match self.state().get() {
             ConnectionState::Connected { server_presence, .. } => Some(server_presence.node_id),
             _ => None,
@@ -223,93 +231,85 @@ where
         let mut backoff = INITIAL_BACKOFF;
         info!("Starting websocket connection loop to {}", inner.server_url);
 
-        loop {
-            select! {
-                _ = inner.shutdown.notified() => {
-                    info!("Websocket connection shutting down");
-                    break;
-                }
-                result = Self::connect_once(&inner) => {
-                    match result {
-                        Ok(()) => {
-                            info!("Connection to {} completed normally", inner.server_url);
-                            backoff = INITIAL_BACKOFF;
-                            if inner.shutdown_requested.load(Ordering::Acquire) {
-                                info!("Shutdown requested, stopping reconnection attempts");
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            error!("Connection to {} failed: {}", inner.server_url, e);
-                            inner.connection_state.set(ConnectionState::Error(ConnectionError::General(e.to_string())));
-                            inner.connected.store(false, Ordering::Release);
-
-                            info!("Retrying connection in {:?}", backoff);
-                            select! {
-                                _ = inner.shutdown.notified() => break,
-                                _ = sleep(backoff) => {}
-                            }
-                            backoff = (backoff * 2).min(MAX_BACKOFF);
-                        }
-                    }
-                }
+        while inner.run.peek() {
+            let result = Self::connect_once(&inner).await;
+            if !inner.run.peek() {
+                break;
             }
+            let error = match result {
+                Ok(()) => {
+                    backoff = INITIAL_BACKOFF;
+                    ConnectionError::General("Connection closed".into())
+                }
+                Err(error) => error
+                    .downcast_ref::<PeerConnectionError>()
+                    .cloned()
+                    .map(ConnectionError::Peer)
+                    .unwrap_or_else(|| ConnectionError::General(error.to_string())),
+            };
+            error!("Connection to {} failed: {}", inner.server_url, error);
+            inner.connection_state.set(ConnectionState::Error(error));
+
+            select! {
+                _ = inner.run.wait_value(false) => break,
+                _ = sleep(backoff) => {}
+            }
+            backoff = (backoff * 2).min(MAX_BACKOFF);
         }
 
-        inner.connection_state.set(ConnectionState::Disconnected);
         inner.connected.store(false, Ordering::Release);
+        let state = match inner.node.state().value() {
+            NodeState::Halted(reason) if !inner.shutdown_requested.value() => ConnectionState::Error(ConnectionError::Peer(reason.into())),
+            _ => ConnectionState::Disconnected,
+        };
+        inner.connection_state.set(state);
     }
 
     /// Attempt a single connection
     async fn connect_once(inner: &Arc<Inner<SE, PA>>) -> Result<()> {
         info!("Attempting to connect to {}", inner.server_url);
-        inner.connection_state.set(ConnectionState::Connecting { url: inner.server_url.clone() });
-
-        let request = inner.server_url.as_str().into_client_request()?;
-        let (ws_stream, _) = connect_async_tls_with_config(request, inner.config, inner.disable_nagle, inner.connector.clone()).await?;
-        info!("WebSocket handshake completed with {}", inner.server_url);
-
-        let (mut sink, mut stream) = ws_stream.split();
-        debug!("Starting connection handling");
-
-        // Send our presence immediately
-        let presence = proto::Message::Presence(proto::Presence {
-            node_id: inner.node.id,
-            durable: inner.node.durable,
-            system_root: inner.node.system.root(),
-            protocol_version: proto::PROTOCOL_VERSION,
-        });
-
-        sink.send(Message::Binary(bincode::serialize(&presence)?.into())).await?;
-        debug!("Sent client presence");
+        // Retain the last connection error throughout retries, until admission succeeds.
+        if !matches!(inner.connection_state.value(), ConnectionState::Error(_)) {
+            inner.connection_state.set(ConnectionState::Connecting { url: inner.server_url.clone() });
+        }
 
         let mut peer_sender: Option<WebsocketPeerSender> = None;
         let mut outgoing_rx: Option<tokio::sync::mpsc::UnboundedReceiver<proto::NodeMessage>> = None;
+        let connection = async {
+            let request = inner.server_url.as_str().into_client_request()?;
+            let (ws_stream, _) = connect_async_tls_with_config(request, inner.config, inner.disable_nagle, inner.connector.clone()).await?;
+            info!("WebSocket handshake completed with {}", inner.server_url);
 
-        loop {
-            select! {
-                _ = inner.shutdown.notified() => {
-                    debug!("Connection received shutdown signal");
-                    break;
-                }
-                msg = async {
-                    match &mut outgoing_rx {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending().await,
+            let (mut sink, mut stream) = ws_stream.split();
+            debug!("Starting connection handling");
+
+            loop {
+                select! {
+                    msg = async {
+                        match &mut outgoing_rx {
+                            Some(rx) => rx.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        if Self::handle_outgoing_message(&mut sink, msg).await.is_err() {
+                            break;
+                        }
                     }
-                } => {
-                    if Self::handle_outgoing_message(&mut sink, msg).await.is_err() {
-                        break;
-                    }
-                }
-                msg = stream.next() => {
-                    match Self::handle_incoming_message(inner, msg, &mut peer_sender, &mut outgoing_rx, &mut sink).await? {
-                        MessageResult::Continue => continue,
-                        MessageResult::Break => break,
+                    msg = stream.next() => {
+                        match Self::handle_incoming_message(inner, msg, &mut peer_sender, &mut outgoing_rx, &mut sink).await? {
+                            MessageResult::Continue => continue,
+                            MessageResult::Break => break,
+                        }
                     }
                 }
             }
-        }
+            Ok(())
+        };
+        let result = select! {
+            biased;
+            _ = inner.run.wait_value(false) => Ok(()),
+            result = connection => result,
+        };
 
         // Cleanup
         inner.connected.store(false, Ordering::Release);
@@ -317,7 +317,7 @@ where
             inner.node.deregister_peer(sender.recipient_node_id());
             debug!("Deregistered peer {}", sender.recipient_node_id());
         }
-        Ok(())
+        result
     }
 
     async fn handle_outgoing_message(
@@ -352,24 +352,21 @@ where
         match msg {
             Some(Ok(Message::Binary(data))) => match bincode::deserialize(&data) {
                 Ok(proto::Message::Presence(server_presence)) => {
-                    match Self::handle_server_presence(inner, server_presence, peer_sender, outgoing_rx).await {
+                    match Self::handle_server_presence(inner, server_presence, peer_sender, outgoing_rx, sink).await {
                         Ok(()) => Ok(MessageResult::Continue),
                         Err(rejection) => {
-                            // register_peer is the enforcement point. The connector's
-                            // only extra job is to explain the refusal while its raw
-                            // transport sink is still available.
-                            let reason = rejection.to_string();
+                            // Only protocol mismatches have a wire rejection.
                             error!("Refusing server {}: {}", inner.server_url, rejection);
-                            if let Ok(bytes) = bincode::serialize(&proto::Message::PresenceRejected(rejection)) {
-                                let _ = sink.send(Message::Binary(bytes.into())).await;
+                            if let Some(PeerConnectionError::Protocol(protocol)) = rejection.downcast_ref::<PeerConnectionError>() {
+                                if let Ok(bytes) = bincode::serialize(&proto::Message::PresenceRejected(protocol.clone())) {
+                                    let _ = sink.send(Message::Binary(bytes.into())).await;
+                                }
                             }
-                            Err(anyhow!("server {} refused connection: {}", inner.server_url, reason))
+                            Err(rejection)
                         }
                     }
                 }
-                Ok(proto::Message::PresenceRejected(rejection)) => {
-                    Err(anyhow!("server {} refused connection: {}", inner.server_url, rejection))
-                }
+                Ok(proto::Message::PresenceRejected(rejection)) => Err(PeerConnectionError::Protocol(rejection).into()),
                 Ok(proto::Message::PeerMessage(node_msg)) => {
                     if peer_sender.is_none() {
                         // Application traffic before a compatible Presence:
@@ -434,17 +431,30 @@ where
         server_presence: proto::Presence,
         peer_sender: &mut Option<WebsocketPeerSender>,
         outgoing_rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<proto::NodeMessage>>,
-    ) -> std::result::Result<(), proto::PresenceRejection> {
+        sink: &mut futures_util::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+            Message,
+        >,
+    ) -> Result<()> {
         info!("Received server presence: {}", server_presence.node_id);
 
+        if peer_sender.is_some() {
+            warn!("Ignoring duplicate server presence");
+            return Ok(());
+        }
+
         let (sender, rx) = WebsocketPeerSender::new(server_presence.node_id);
-        inner.node.register_peer(server_presence.clone(), Box::new(sender.clone()))?;
+        inner.node.register_peer(server_presence.clone(), Box::new(sender.clone())).await?;
 
         *outgoing_rx = Some(rx);
         *peer_sender = Some(sender);
 
-        inner.connection_state.set(ConnectionState::Connected { url: inner.server_url.to_string(), server_presence });
+        // Advertise our system only after admission, so an old cached root cannot preempt adoption.
+        let presence = proto::Message::Presence(inner.node.presence().await.map_err(PeerConnectionError::from)?);
+        sink.send(Message::Binary(bincode::serialize(&presence)?.into())).await?;
+
         inner.connected.store(true, Ordering::Release);
+        inner.connection_state.set(ConnectionState::Connected { url: inner.server_url.to_string(), server_presence });
         info!("Successfully connected to server {}", inner.server_url);
         Ok(())
     }
@@ -474,8 +484,7 @@ where
     fn drop(&mut self) {
         if let Some(task) = self.task.lock().unwrap().take() {
             debug!("WebSocket client dropped, requesting shutdown");
-            self.inner.shutdown_requested.store(true, Ordering::Release);
-            self.inner.shutdown.notify_waiters();
+            self.inner.shutdown_requested.set(true);
             task.abort();
         }
     }

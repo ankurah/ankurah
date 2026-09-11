@@ -32,7 +32,7 @@ async fn test_server_rejects_wrongly_signed_token() -> anyhow::Result<()> {
 
     let node2 = Node::new(Arc::new(SledStorageEngine::new_test()?), agent.clone());
     let _conn = LocalProcessConnection::new(&node1, &node2).await?;
-    node2.system.wait_system_ready().await;
+    node2.system.wait_system_ready().await.unwrap();
 
     let claims = JwtClaims {
         sub: "attacker-1".into(),
@@ -97,7 +97,7 @@ async fn test_server_rejects_garbage_auth_data() -> anyhow::Result<()> {
         from: ankurah_proto::EntityId::random(),
         body: ankurah_proto::NodeRequestBody::Fetch {
             collection: ankurah_proto::CollectionId::from("post"),
-            selection: "1 = 1".try_into().unwrap(),
+            selection: ankql::ast::Predicate::True.into(),
             known_matches: vec![],
         },
     };

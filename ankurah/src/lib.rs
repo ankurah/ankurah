@@ -150,7 +150,7 @@ pub use ankurah_core::{
     model,
     model::View,
     model::{Model, Mutable},
-    node::{MatchArgs, Node},
+    node::{MatchArgs, Node, NodeState},
     policy::{self, PermissiveAgent},
     property::{self, Property, Ref},
     query_value::QueryValue,

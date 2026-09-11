@@ -21,7 +21,7 @@ async fn test_sqlite_create_and_query() -> Result<()> {
     let storage = SqliteStorageEngine::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
-    let ctx = node.context_async(c).await;
+    let ctx = node.context_async(c).await.unwrap();
 
     // Create some albums
     let trx = ctx.begin();
@@ -44,7 +44,7 @@ async fn test_sqlite_update_entity() -> Result<()> {
     let storage = SqliteStorageEngine::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
-    let ctx = node.context_async(c).await;
+    let ctx = node.context_async(c).await.unwrap();
 
     // Create an album
     let album: AlbumView = {
@@ -57,7 +57,7 @@ async fn test_sqlite_update_entity() -> Result<()> {
     // Update the album
     {
         let trx = ctx.begin();
-        album.edit(&trx).unwrap().name().overwrite(0, 13, "Updated Name")?;
+        album.edit(&trx).unwrap().name()?.overwrite(0, 13, "Updated Name")?;
         trx.commit().await?;
     }
 
@@ -75,7 +75,7 @@ async fn test_sqlite_state_change_detection() -> Result<()> {
     let storage = SqliteStorageEngine::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
-    let ctx = node.context_async(c).await;
+    let ctx = node.context_async(c).await.unwrap();
 
     // Create an album
     let album: AlbumView = {
@@ -88,7 +88,7 @@ async fn test_sqlite_state_change_detection() -> Result<()> {
     // First update should return true (state changed)
     {
         let trx = ctx.begin();
-        album.edit(&trx).unwrap().name().overwrite(0, 10, "Updated")?;
+        album.edit(&trx).unwrap().name()?.overwrite(0, 10, "Updated")?;
         trx.commit().await?;
     }
 
@@ -104,7 +104,7 @@ async fn test_sqlite_multiple_updates() -> Result<()> {
     let storage = SqliteStorageEngine::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
-    let ctx = node.context_async(c).await;
+    let ctx = node.context_async(c).await.unwrap();
 
     // Create multiple albums
     let (album1, album2) = {
@@ -118,8 +118,8 @@ async fn test_sqlite_multiple_updates() -> Result<()> {
     // Update both albums
     {
         let trx = ctx.begin();
-        album1.edit(&trx).unwrap().name().overwrite(0, 7, "Updated 1")?;
-        album2.edit(&trx).unwrap().name().overwrite(0, 7, "Updated 2")?;
+        album1.edit(&trx).unwrap().name()?.overwrite(0, 7, "Updated 1")?;
+        album2.edit(&trx).unwrap().name()?.overwrite(0, 7, "Updated 2")?;
         trx.commit().await?;
     }
 
@@ -137,7 +137,7 @@ async fn test_sqlite_query_with_subscription() -> Result<()> {
     let storage = SqliteStorageEngine::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
-    let ctx = node.context_async(c).await;
+    let ctx = node.context_async(c).await.unwrap();
 
     let watcher = TestWatcher::changeset();
     let query: ankurah::LiveQuery<AlbumView> = ctx.query_wait::<AlbumView>("year > '2020'").await?;

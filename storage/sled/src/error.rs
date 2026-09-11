@@ -20,10 +20,10 @@ impl From<sled::Error> for SledRetrievalError {
 impl From<SledRetrievalError> for RetrievalError {
     fn from(err: SledRetrievalError) -> Self {
         match err {
-            SledRetrievalError::StorageError(e) => RetrievalError::StorageError(Box::new(e)),
+            SledRetrievalError::StorageError(e) => RetrievalError::storage(e),
             SledRetrievalError::EntityNotFound(id) => RetrievalError::EntityNotFound(id),
             SledRetrievalError::EventNotFound(id) => RetrievalError::EventNotFound(id),
-            SledRetrievalError::Other(e) => RetrievalError::StorageError(e),
+            SledRetrievalError::Other(e) => RetrievalError::storage(e),
         }
     }
 }
@@ -45,7 +45,7 @@ pub enum IndexError {
 }
 
 impl From<IndexError> for RetrievalError {
-    fn from(err: IndexError) -> Self { RetrievalError::StorageError(Box::new(err)) }
+    fn from(err: IndexError) -> Self { RetrievalError::storage(err) }
 }
 
 impl From<IndexError> for MutationError {

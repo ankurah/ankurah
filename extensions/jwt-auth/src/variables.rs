@@ -1,4 +1,4 @@
-use ankql::ast::{Expr, Predicate};
+use ankql::ast::{Expr, Parsed, Predicate};
 use ankurah_core::policy::AccessDenied;
 use ankurah_core_types::Value;
 use ankurah_proto::EntityId;
@@ -36,7 +36,7 @@ fn resolve_variable<'a>(var: &str, claims: &'a JwtClaims) -> Result<String, Acce
 /// as an EntityId will collate as EntityId and stop matching (fails closed).
 /// Once #259 is fixed at the watcher index, this can return plain String
 /// literals unconditionally.
-fn typed_expr(value: String) -> Expr {
+fn typed_expr(value: String) -> Expr<Parsed> {
     match EntityId::from_base64(&value) {
         Ok(id) => Expr::from(&id),
         Err(_) => Expr::Literal(Value::String(value)),
@@ -57,7 +57,7 @@ fn typed_expr(value: String) -> Expr {
 ///
 /// Example: `"technician = $jwt.sub"` parses as `technician = ?` and is
 /// populated with `claims.sub`, typed per [`typed_expr`].
-pub fn parse_and_substitute(filter_str: &str, claims: &JwtClaims) -> Result<Predicate, AccessDenied> {
+pub fn parse_and_substitute(filter_str: &str, claims: &JwtClaims) -> Result<Predicate<Parsed>, AccessDenied> {
     let mut values = Vec::new();
     let mut query = String::with_capacity(filter_str.len());
     let mut rest = filter_str;
@@ -112,7 +112,7 @@ mod tests {
     }
 
     /// Extract the right-hand literal of a single comparison predicate.
-    fn rhs_literal(predicate: &Predicate) -> &Value {
+    fn rhs_literal(predicate: &Predicate<Parsed>) -> &Value {
         match predicate {
             Predicate::Comparison { right, .. } => match right.as_ref() {
                 Expr::Literal(lit) => lit,

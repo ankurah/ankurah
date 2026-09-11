@@ -1,34 +1,45 @@
+use crate::error::{NodeDropped, ValidationError};
+use crate::internal::prelude::*;
 use crate::util::Iterable;
 use crate::{
-    entity::Entity,
-    error::ValidationError,
-    node::{ContextData, Node, NodeInner, WeakNode},
+    node::{ContextData, NodeInner},
     property::PropertyError,
-    proto::{self},
-    storage::StorageEngine,
 };
-use ankql::{ast::Predicate, error::ParseError};
+use ankql::{
+    ast::{Predicate, Resolved},
+    error::ParseError,
+};
 use ankurah_proto::Attested;
 use async_trait::async_trait;
 use thiserror::Error;
 use tracing::debug;
+
+mod read;
+pub(crate) use read::ReadPolicy;
+
 /// The result of a policy check. Currently just Allow/Deny, but will support Trace in the future
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Clone)]
 pub enum AccessDenied {
     #[error("Access denied by policy: {0}")]
     ByPolicy(&'static str),
     #[error("Access denied by collection: {0}")]
     CollectionDenied(proto::CollectionId),
     #[error("Access denied by property error: {0}")]
-    PropertyError(Box<PropertyError>),
+    PropertyError(std::sync::Arc<PropertyError>),
     #[error("Access denied by parse error: {0}")]
     ParseError(ParseError),
     #[error("Insufficient attestation")]
     InsufficientAttestation,
+    #[error("Node has been dropped")]
+    NodeDropped,
+}
+
+impl From<NodeDropped> for AccessDenied {
+    fn from(_: NodeDropped) -> Self { Self::NodeDropped }
 }
 
 impl From<PropertyError> for AccessDenied {
-    fn from(error: PropertyError) -> Self { AccessDenied::PropertyError(Box::new(error)) }
+    fn from(error: PropertyError) -> Self { AccessDenied::PropertyError(std::sync::Arc::new(error)) }
 }
 impl From<ParseError> for AccessDenied {
     fn from(error: ParseError) -> Self { AccessDenied::ParseError(error) }
@@ -104,26 +115,8 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
         Self: Sized,
         A: Iterable<proto::AuthData> + Send + Sync;
 
-    /// Check the event and optionally return an attestation
-    /// This could be used to attest that the event has passed the policy check for a given context
-    /// or you could just return None if you don't want to attest to the event
-    /// entity_before: Entity state before the event is applied
-    /// entity_after: Entity state after the event has been applied (allows inspection of resulting state)
-    /// Gate a schema registration on its resolved effect. Called by
-    /// the registration executor after its lookup
-    /// phase and before any event is emitted, still under the allocation
-    /// mutex, with the request's actual consequences: what will be created,
-    /// what will be updated, what already exists. Agents may discriminate
-    /// on the principal (`cdata`: who may define schema) or on the object
-    /// (the planned definitions themselves); both styles are first-class.
-    /// Refusal fails the whole registration before anything is emitted.
-    /// Every emitted event still passes [`Self::check_event`] afterwards,
-    /// INDIVIDUALLY: the commit batch is not transactional, so an agent
-    /// that allows the plan but denies a constituent event aborts the
-    /// remainder and leaves earlier catalog events durable (accepted by
-    /// maintainer ruling 2026-07-06; the allocator's storage-checked
-    /// lookups keep identity convergent across such partials, and #313
-    /// tracks the transactional upgrade). The default allows.
+    /// Check whether this registration plan is allowed -- the agent's only
+    /// voice on catalog writes (the executor commits privileged).
     fn check_schema_registration<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
@@ -133,6 +126,8 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
         Ok(())
     }
 
+    /// Judge an event under this credential, seeing the entity state both
+    /// before and after it applies; optionally return an attestation.
     fn check_event<SE: StorageEngine>(
         &self,
         node: &Node<SE, Self>,
@@ -167,8 +162,14 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
 
     /// Filter a predicate based on the context data
     /// An implementation may refuse a caller holding no authorized context, so callers gate on can_access_collection first.
-    fn filter_predicate<C>(&self, data: &C, collection: &proto::CollectionId, predicate: Predicate) -> Result<Predicate, AccessDenied>
-    where C: Iterable<Self::ContextData>;
+    fn filter_predicate<C>(
+        &self,
+        data: &C,
+        collection: &proto::CollectionId,
+        predicate: Predicate<Resolved>,
+    ) -> Result<Predicate<Resolved>, AccessDenied>
+    where
+        C: Iterable<Self::ContextData>;
 
     /// Check if a context can read an entity
     /// If the policy agent wants to inspect the entity state, it can do so with either TemporaryEntity::new or entityset.with_state
@@ -332,8 +333,15 @@ impl PolicyAgent for PermissiveAgent {
         Ok(())
     }
 
-    fn filter_predicate<C>(&self, _data: &C, _collection: &proto::CollectionId, predicate: Predicate) -> Result<Predicate, AccessDenied>
-    where C: Iterable<Self::ContextData> {
+    fn filter_predicate<C>(
+        &self,
+        _data: &C,
+        _collection: &proto::CollectionId,
+        predicate: Predicate<Resolved>,
+    ) -> Result<Predicate<Resolved>, AccessDenied>
+    where
+        C: Iterable<Self::ContextData>,
+    {
         // PermissiveAgent allows regardless of which credentials are supplied, including none
         Ok(predicate)
     }

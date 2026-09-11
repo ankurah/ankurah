@@ -4,7 +4,7 @@
 //! server against version-0 and mismatched handshakes, and the websocket
 //! client against a mismatched server.
 
-use ankurah::core::connector::{PeerSender, SendError};
+use ankurah::core::connector::{PeerConnectionError, PeerSender, SendError};
 use ankurah::{Node, PermissiveAgent};
 use ankurah_storage_sled::SledStorageEngine;
 use ankurah_websocket_client::WebsocketClient;
@@ -40,13 +40,16 @@ async fn register_peer_refuses_incompatible_version() -> Result<()> {
     for bad_version in [0, proto::PROTOCOL_VERSION + 1] {
         let p = presence(bad_version);
         let peer_id = p.node_id;
-        let err = node.register_peer(p, Box::new(NullSender(peer_id))).expect_err("must refuse");
-        assert_eq!(err, proto::PresenceRejection { expected: proto::PROTOCOL_VERSION, received: bad_version });
+        let err = node.register_peer(p, Box::new(NullSender(peer_id))).await.expect_err("must refuse");
+        assert_eq!(
+            err,
+            PeerConnectionError::Protocol(proto::PresenceRejection { expected: proto::PROTOCOL_VERSION, received: bad_version })
+        );
     }
 
     let p = presence(proto::PROTOCOL_VERSION);
     let peer_id = p.node_id;
-    node.register_peer(p, Box::new(NullSender(peer_id))).expect("current version must be accepted");
+    node.register_peer(p, Box::new(NullSender(peer_id))).await.expect("current version must be accepted");
     Ok(())
 }
 

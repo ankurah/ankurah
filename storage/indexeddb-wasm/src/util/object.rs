@@ -15,22 +15,22 @@ impl Object {
     pub fn new(obj: JsValue) -> Self { Self { obj: SendWrapper::new(obj) } }
     pub fn get<T: TryFrom<JsValue>>(&self, key: &JsValue) -> Result<T, RetrievalError> {
         let v = js_sys::Reflect::get(&self.obj, key)
-            .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get {}", key.as_string().unwrap_or_default()).into()))?;
+            .map_err(|_e| RetrievalError::storage(anyhow::anyhow!("Failed to get {}", key.as_string().unwrap_or_default())))?;
         // if v.is_null() || v.is_undefined() {
         //     return Err(RetrievalError::StorageError(anyhow::anyhow!("Failed to get {}", key).into()));
         // }
-        v.try_into()
-            .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to convert {}", key.as_string().unwrap_or_default()).into()))
+        v.try_into().map_err(|_e| RetrievalError::storage(anyhow::anyhow!("Failed to convert {}", key.as_string().unwrap_or_default())))
     }
     pub fn get_opt<T: TryFrom<JsValue>>(&self, key: &JsValue) -> Result<Option<T>, RetrievalError> {
         let v = js_sys::Reflect::get(&self.obj, key)
-            .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get {}", key.as_string().unwrap_or_default()).into()))?;
+            .map_err(|_e| RetrievalError::storage(anyhow::anyhow!("Failed to get {}", key.as_string().unwrap_or_default())))?;
         if v.is_null() || v.is_undefined() {
             return Ok(None);
         }
-        Ok(Some(v.try_into().map_err(|_e| {
-            RetrievalError::StorageError(anyhow::anyhow!("Failed to convert {}", key.as_string().unwrap_or_default()).into())
-        })?))
+        Ok(Some(
+            v.try_into()
+                .map_err(|_e| RetrievalError::storage(anyhow::anyhow!("Failed to convert {}", key.as_string().unwrap_or_default())))?,
+        ))
     }
 
     pub fn set<K, V>(&self, key: K, value: V) -> Result<bool, MutationError>

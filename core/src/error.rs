@@ -1,14 +1,46 @@
-use std::{collections::BTreeSet, convert::Infallible};
+use crate::internal::prelude::*;
+use std::{collections::BTreeSet, convert::Infallible, sync::Arc};
 
-use ankurah_proto::{CollectionId, DecodeError, EntityId, EventId};
+use ankurah_proto::{DecodeError, EntityId, EventId};
 use thiserror::Error;
 
-use crate::{connector::SendError, policy::AccessDenied};
+use crate::connector::SendError;
+pub use crate::node::event_admissibility::InadmissibleEvent;
 
-#[derive(Error, Debug)]
+/// Why this node permanently stopped accepting work, not a rejected connection or operation.
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+pub enum NodeHaltReason {
+    #[error("failed to reconstruct the local system: {0}")]
+    SystemLoad(String),
+    #[error("failed to reconstruct the local catalog: {0}")]
+    CatalogLoad(String),
+    #[error("system replacement requires a new node (current {current}, proposed {proposed})")]
+    SystemReplacement { current: EntityId, proposed: EntityId },
+}
+
+/// Why the node cannot accept work requiring completed initialization.
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+pub enum NodeReadinessError {
+    #[error("node initialization is not complete")]
+    NotReady,
+    #[error("node halted: {0}")]
+    Halted(#[from] NodeHaltReason),
+}
+
+#[derive(Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[error("Node has been dropped")]
+pub struct NodeDropped;
+
+#[derive(Error, Debug, Clone)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Error))]
 #[cfg_attr(feature = "uniffi", uniffi(flat_error))]
 pub enum RetrievalError {
+    #[error(transparent)]
+    NodeDropped(#[from] NodeDropped),
+    #[error("node initialization is not complete")]
+    NodeNotReady,
+    #[error("node halted: {0}")]
+    NodeHalted(#[from] NodeHaltReason),
     #[error("access denied")]
     AccessDenied(AccessDenied),
     #[error("Parse error: {0}")]
@@ -18,13 +50,13 @@ pub enum RetrievalError {
     #[error("Event not found: {0:?}")]
     EventNotFound(EventId),
     #[error("Storage error: {0}")]
-    StorageError(Box<dyn std::error::Error + Send + Sync + 'static>),
+    StorageError(Arc<dyn std::error::Error + Send + Sync + 'static>),
     #[error("Collection not found: {0}")]
     CollectionNotFound(CollectionId),
     #[error("Update failed: {0}")]
-    FailedUpdate(Box<dyn std::error::Error + Send + Sync + 'static>),
+    FailedUpdate(Arc<dyn std::error::Error + Send + Sync + 'static>),
     #[error("Deserialization error: {0}")]
-    DeserializationError(bincode::Error),
+    DeserializationError(Arc<bincode::ErrorKind>),
     #[error("No durable peers available for fetch operation")]
     NoDurablePeers,
     #[error("Other error: {0}")]
@@ -34,21 +66,34 @@ pub enum RetrievalError {
     #[error("ankql filter: {0}")]
     AnkqlFilter(crate::selection::filter::Error),
     #[error("Future join: {0}")]
-    FutureJoin(tokio::task::JoinError),
+    FutureJoin(Arc<tokio::task::JoinError>),
     #[error("{0}")]
-    Anyhow(anyhow::Error),
+    Anyhow(Arc<anyhow::Error>),
     #[error("Decode error: {0}")]
-    DecodeError(DecodeError),
+    DecodeError(Arc<DecodeError>),
+    #[error("invalid stored state: {0}")]
+    InvalidState(String),
     #[error("State error: {0}")]
-    StateError(StateError),
+    StateError(Arc<StateError>),
     #[error("Mutation error: {0}")]
-    MutationError(Box<MutationError>),
+    MutationError(Arc<MutationError>),
     #[error("Property error: {0}")]
-    PropertyError(Box<crate::property::PropertyError>),
+    PropertyError(Arc<crate::property::PropertyError>),
     #[error("Request error: {0}")]
     RequestError(RequestError),
     #[error("Apply error: {0}")]
-    ApplyError(ApplyError),
+    ApplyError(Arc<ApplyError>),
+    #[error("model '{label}' has no complete compatible binding in the local catalog; schema synchronization or registration is required")]
+    UnboundDeclaration { label: String },
+}
+
+impl From<NodeReadinessError> for RetrievalError {
+    fn from(error: NodeReadinessError) -> Self {
+        match error {
+            NodeReadinessError::NotReady => Self::NodeNotReady,
+            NodeReadinessError::Halted(reason) => Self::NodeHalted(reason),
+        }
+    }
 }
 
 impl From<RequestError> for RetrievalError {
@@ -56,23 +101,25 @@ impl From<RequestError> for RetrievalError {
 }
 
 impl From<crate::property::PropertyError> for RetrievalError {
-    fn from(err: crate::property::PropertyError) -> Self { RetrievalError::PropertyError(Box::new(err)) }
+    fn from(err: crate::property::PropertyError) -> Self { RetrievalError::PropertyError(Arc::new(err)) }
 }
 
 impl From<tokio::task::JoinError> for RetrievalError {
-    fn from(err: tokio::task::JoinError) -> Self { RetrievalError::FutureJoin(err) }
+    fn from(err: tokio::task::JoinError) -> Self { RetrievalError::FutureJoin(Arc::new(err)) }
 }
 
 impl From<MutationError> for RetrievalError {
-    fn from(err: MutationError) -> Self { RetrievalError::MutationError(Box::new(err)) }
+    fn from(err: MutationError) -> Self { RetrievalError::MutationError(Arc::new(err)) }
 }
 
 impl RetrievalError {
-    pub fn storage(err: impl std::error::Error + Send + Sync + 'static) -> Self { RetrievalError::StorageError(Box::new(err)) }
+    pub fn storage(err: impl Into<Box<dyn std::error::Error + Send + Sync + 'static>>) -> Self {
+        RetrievalError::StorageError(Arc::from(err.into()))
+    }
 }
 
 impl From<bincode::Error> for RetrievalError {
-    fn from(e: bincode::Error) -> Self { RetrievalError::DeserializationError(e) }
+    fn from(e: bincode::Error) -> Self { RetrievalError::DeserializationError(e.into()) }
 }
 
 impl From<crate::selection::filter::Error> for RetrievalError {
@@ -80,19 +127,25 @@ impl From<crate::selection::filter::Error> for RetrievalError {
 }
 
 impl From<anyhow::Error> for RetrievalError {
-    fn from(err: anyhow::Error) -> Self { RetrievalError::Anyhow(err) }
+    fn from(err: anyhow::Error) -> Self { RetrievalError::Anyhow(Arc::new(err)) }
 }
 
 impl From<Infallible> for RetrievalError {
     fn from(_: Infallible) -> Self { unreachable!("Infallible can never be constructed") }
 }
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone)]
 pub enum RequestError {
+    #[error("node initialization is not complete")]
+    NodeNotReady,
+    #[error("node halted: {0}")]
+    NodeHalted(#[from] NodeHaltReason),
     #[error("Peer not connected")]
     PeerNotConnected,
     #[error("Connection lost")]
     ConnectionLost,
+    #[error("System not ready")]
+    SystemNotReady,
     #[error("Server error: {0}")]
     ServerError(String),
     #[error("Send error: {0}")]
@@ -103,6 +156,15 @@ pub enum RequestError {
     UnexpectedResponse(ankurah_proto::NodeResponseBody),
     #[error("Access denied: {0}")]
     AccessDenied(AccessDenied),
+}
+
+impl From<NodeReadinessError> for RequestError {
+    fn from(error: NodeReadinessError) -> Self {
+        match error {
+            NodeReadinessError::NotReady => Self::NodeNotReady,
+            NodeReadinessError::Halted(reason) => Self::NodeHalted(reason),
+        }
+    }
 }
 
 impl From<AccessDenied> for RequestError {
@@ -124,13 +186,21 @@ pub enum SubscriptionError {
 }
 
 impl From<DecodeError> for RetrievalError {
-    fn from(err: DecodeError) -> Self { RetrievalError::DecodeError(err) }
+    fn from(err: DecodeError) -> Self { RetrievalError::DecodeError(Arc::new(err)) }
 }
 
 #[derive(Error, Debug)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Error))]
 #[cfg_attr(feature = "uniffi", uniffi(flat_error))]
 pub enum MutationError {
+    #[error(transparent)]
+    NodeDropped(#[from] NodeDropped),
+    #[error("node initialization is not complete")]
+    NodeNotReady,
+    #[error("the entity belongs to another node's system epoch")]
+    ForeignEntity,
+    #[error("node halted: {0}")]
+    NodeHalted(#[from] NodeHaltReason),
     #[error("access denied")]
     AccessDenied(AccessDenied),
     #[error("already exists")]
@@ -159,6 +229,8 @@ pub enum MutationError {
     InvalidEvent,
     #[error("malformed event: {0}")]
     EventStructure(ankurah_proto::EventStructureError),
+    #[error("inadmissible event: {0}")]
+    InadmissibleEvent(InadmissibleEvent),
     /// The node does not know its system root, so it cannot derive an entity
     /// id: a non-root genesis binds the root into its own id. A caller that
     /// reaches this on an ephemeral node can retry once the handshake with a
@@ -189,8 +261,21 @@ pub enum MutationError {
     TOCTOUAttemptsExhausted,
 }
 
+impl From<NodeReadinessError> for MutationError {
+    fn from(error: NodeReadinessError) -> Self {
+        match error {
+            NodeReadinessError::NotReady => Self::NodeNotReady,
+            NodeReadinessError::Halted(reason) => Self::NodeHalted(reason),
+        }
+    }
+}
+
 impl From<ankurah_proto::EventStructureError> for MutationError {
     fn from(err: ankurah_proto::EventStructureError) -> Self { MutationError::EventStructure(err) }
+}
+
+impl From<InadmissibleEvent> for MutationError {
+    fn from(err: InadmissibleEvent) -> Self { MutationError::InadmissibleEvent(err) }
 }
 
 impl From<tokio::task::JoinError> for MutationError {
@@ -252,6 +337,9 @@ impl From<bincode::Error> for MutationError {
 impl From<RetrievalError> for MutationError {
     fn from(err: RetrievalError) -> Self {
         match err {
+            RetrievalError::NodeDropped(error) => MutationError::NodeDropped(error),
+            RetrievalError::NodeNotReady => MutationError::NodeNotReady,
+            RetrievalError::NodeHalted(error) => MutationError::NodeHalted(error),
             RetrievalError::AccessDenied(a) => MutationError::AccessDenied(a),
             _ => MutationError::RetrievalError(err),
         }
@@ -262,7 +350,7 @@ impl From<AccessDenied> for RetrievalError {
 }
 
 impl From<SubscriptionError> for RetrievalError {
-    fn from(err: SubscriptionError) -> Self { RetrievalError::Anyhow(anyhow::anyhow!("Subscription error: {:?}", err)) }
+    fn from(err: SubscriptionError) -> Self { anyhow::anyhow!("Subscription error: {:?}", err).into() }
 }
 
 #[derive(Error, Debug)]
@@ -288,7 +376,7 @@ impl From<crate::property::PropertyError> for MutationError {
 }
 
 impl From<StateError> for RetrievalError {
-    fn from(err: StateError) -> Self { RetrievalError::StateError(err) }
+    fn from(err: StateError) -> Self { RetrievalError::StateError(Arc::new(err)) }
 }
 
 #[derive(Error, Debug)]
@@ -362,5 +450,5 @@ impl From<MutationError> for ApplyError {
 }
 
 impl From<ApplyError> for RetrievalError {
-    fn from(err: ApplyError) -> Self { RetrievalError::ApplyError(err) }
+    fn from(err: ApplyError) -> Self { RetrievalError::ApplyError(Arc::new(err)) }
 }

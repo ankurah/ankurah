@@ -1,5 +1,7 @@
 use ankurah_core::policy::PolicyAgent;
+use ankurah_core::signals::{Read, Wait};
 use ankurah_core::storage::StorageEngine;
+use ankurah_core::NodeState;
 use ankurah_proto as proto;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
@@ -54,47 +56,58 @@ where
         let (node1_tx, node1_rx) = mpsc::channel(1024);
         let (node2_tx, node2_rx) = mpsc::channel(1024);
 
-        // we have to register the senders with the nodes
-        node1.register_peer(
-            proto::Presence {
-                node_id: node2.id,
-                durable: node2.durable,
-                system_root: node2.system.root(),
-                protocol_version: proto::PROTOCOL_VERSION,
-            },
-            Box::new(LocalProcessSender { sender: node2_tx, node_id: node2.id }),
-        )?;
-        if let Err(rejection) = node2.register_peer(
-            proto::Presence {
-                node_id: node1.id,
-                durable: node1.durable,
-                system_root: node1.system.root(),
-                protocol_version: proto::PROTOCOL_VERSION,
-            },
-            Box::new(LocalProcessSender { sender: node1_tx, node_id: node1.id }),
-        ) {
-            node1.deregister_peer(node2.id);
-            return Err(rejection.into());
+        let register_node1 = async {
+            node1.register_peer(node2.presence().await?, Box::new(LocalProcessSender { sender: node2_tx, node_id: node2.id })).await
+        };
+        let register_node2 = async {
+            node2.register_peer(node1.presence().await?, Box::new(LocalProcessSender { sender: node1_tx, node_id: node1.id })).await
+        };
+        // Let an ephemeral node adopt before advertising its own system to the durable node.
+        if node1.durable && !node2.durable {
+            register_node2.await?;
+            if let Err(error) = register_node1.await {
+                node2.deregister_peer(node1.id);
+                return Err(error.into());
+            }
+        } else {
+            register_node1.await?;
+            if let Err(error) = register_node2.await {
+                node1.deregister_peer(node2.id);
+                return Err(error.into());
+            }
         }
 
-        let receiver1_task = Self::setup_receiver(node1.clone(), node1_rx);
-        let receiver2_task = Self::setup_receiver(node2.clone(), node2_rx);
+        let receiver1_task = Self::setup_receiver(node1.clone(), node2.id, node2.state(), node1_rx);
+        let receiver2_task = Self::setup_receiver(node2.clone(), node1.id, node1.state(), node2_rx);
 
         Ok(Self { node1: node1.weak(), node2: node2.weak(), node1_id: node1.id, node2_id: node2.id, receiver1_task, receiver2_task })
     }
 
-    fn setup_receiver<SE, PA>(node: Node<SE, PA>, mut rx: mpsc::Receiver<proto::NodeMessage>) -> tokio::task::JoinHandle<()>
+    fn setup_receiver<SE, PA>(
+        node: Node<SE, PA>,
+        peer_id: proto::EntityId,
+        peer_state: Read<NodeState>,
+        mut rx: mpsc::Receiver<proto::NodeMessage>,
+    ) -> tokio::task::JoinHandle<()>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
         tokio::spawn(async move {
-            while let Some(message) = rx.recv().await {
+            let node_state = node.state();
+            loop {
+                let message = tokio::select! {
+                    biased;
+                    _ = node_state.wait_for(|state| state.halt_reason().is_some()) => break,
+                    _ = peer_state.wait_for(|state| state.halt_reason().is_some()) => break,
+                    message = rx.recv() => match message { Some(message) => message, None => break },
+                };
                 let node = node.clone();
                 tokio::spawn(async move {
                     let _ = node.handle_message(message).await;
                 });
             }
+            node.deregister_peer(peer_id);
         })
     }
 }

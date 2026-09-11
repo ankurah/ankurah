@@ -17,7 +17,7 @@ pub use ankurah::{
         broadcast::{BroadcastListener, IntoBroadcastListener},
         subscribe::IntoSubscribeListener,
     },
-    Context, EntityId, LiveQuery, Model, Node, PermissiveAgent,
+    Context, EntityId, LiveQuery, Model, Node, NodeState, PermissiveAgent,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -137,7 +137,7 @@ pub struct GatedConnection {
 
 impl GatedConnection {
     /// `other` <-> `gated`. Only messages arriving at `gated` are subject to the gate.
-    pub fn new<SE1, PA1, SE2, PA2>(
+    pub async fn new<SE1, PA1, SE2, PA2>(
         other: &Node<SE1, PA1>,
         gated: &Node<SE2, PA2>,
         filter: impl Fn(&proto::NodeMessage) -> bool + Send + Sync + 'static,
@@ -150,29 +150,43 @@ impl GatedConnection {
     {
         let (other_tx, mut other_rx) = mpsc::channel(1024);
         let (gated_tx, mut gated_rx) = mpsc::channel(1024);
-
-        other
-            .register_peer(
-                proto::Presence {
-                    node_id: gated.id,
-                    durable: gated.durable,
-                    system_root: gated.system.root(),
-                    protocol_version: proto::PROTOCOL_VERSION,
-                },
-                Box::new(GatedSender { sender: gated_tx, node_id: gated.id }),
-            )
-            .expect("gated peers use the current protocol version");
-        gated
-            .register_peer(
-                proto::Presence {
-                    node_id: other.id,
-                    durable: other.durable,
-                    system_root: other.system.root(),
-                    protocol_version: proto::PROTOCOL_VERSION,
-                },
-                Box::new(GatedSender { sender: other_tx, node_id: other.id }),
-            )
-            .expect("gated peers use the current protocol version");
+        other.system.wait_loaded().await.unwrap();
+        gated.system.wait_loaded().await.unwrap();
+        let register_other = async {
+            other
+                .register_peer(
+                    proto::Presence {
+                        node_id: gated.id,
+                        durable: gated.durable,
+                        system_root: gated.system.root(),
+                        protocol_version: proto::PROTOCOL_VERSION,
+                    },
+                    Box::new(GatedSender { sender: gated_tx, node_id: gated.id }),
+                )
+                .await
+                .expect("gated peers use the current protocol version");
+        };
+        let register_gated = async {
+            gated
+                .register_peer(
+                    proto::Presence {
+                        node_id: other.id,
+                        durable: other.durable,
+                        system_root: other.system.root(),
+                        protocol_version: proto::PROTOCOL_VERSION,
+                    },
+                    Box::new(GatedSender { sender: other_tx, node_id: other.id }),
+                )
+                .await
+                .expect("gated peers use the current protocol version");
+        };
+        if other.durable && !gated.durable {
+            register_gated.await;
+            register_other.await;
+        } else {
+            register_other.await;
+            register_gated.await;
+        }
 
         let gate = MessageGate { filter: Arc::new(filter), held: Arc::new(Mutex::new(Vec::new())) };
 
@@ -692,4 +706,21 @@ pub async fn start_test_server() -> anyhow::Result<(Node<SledStorageEngine, Perm
     }
 
     Err(anyhow::anyhow!("Failed to start test server after {} attempts. Last error: {:?}", MAX_PORT_RETRIES, last_error))
+}
+
+/// The durable identity `name` resolved to on `node`: the descriptor-cell
+/// read under the node's current epoch. Forging tests use this so raw
+/// operations they write land under the identity typed accessors read back.
+#[allow(dead_code)]
+pub fn resolved_prop<SE, PA>(
+    node: &ankurah::Node<SE, PA>,
+    schema: &'static ankurah::core::schema::ModelStructDescriptor,
+    name: &str,
+) -> ankurah::proto::PropertyId
+where
+    SE: ankurah::storage::StorageEngine + Send + Sync + 'static,
+    PA: ankurah::policy::PolicyAgent + Send + Sync + 'static,
+{
+    let epoch = node.system.system_epoch().expect("a ready system");
+    schema.field_by_name(name).expect("a compiled field").resolved.get(epoch).expect("field resolved under the current epoch")
 }

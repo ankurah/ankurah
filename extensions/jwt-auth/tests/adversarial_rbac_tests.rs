@@ -31,7 +31,7 @@ async fn test_reader_cannot_write_post_via_ephemeral() -> anyhow::Result<()> {
 
     let node2 = Node::new(Arc::new(SledStorageEngine::new_test()?), agent.clone());
     let _conn = LocalProcessConnection::new(&node1, &node2).await?;
-    node2.system.wait_system_ready().await;
+    node2.system.wait_system_ready().await.unwrap();
 
     let reader_claims = make_claims("reader-adversarial", &["Reader"], "reader@adversarial.com");
     let reader_token = sign_token(&keys, &reader_claims);
@@ -111,7 +111,7 @@ async fn test_root_context_cannot_be_sent_over_wire() -> anyhow::Result<()> {
 
     let node2 = Node::new(Arc::new(SledStorageEngine::new_test()?), agent.clone());
     let _conn = LocalProcessConnection::new(&node1, &node2).await?;
-    node2.system.wait_system_ready().await;
+    node2.system.wait_system_ready().await.unwrap();
 
     let root_ctx = JwtContext::system();
 

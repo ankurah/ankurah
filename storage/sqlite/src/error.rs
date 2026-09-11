@@ -30,7 +30,7 @@ pub enum SqliteError {
 }
 
 impl From<SqliteError> for ankurah_core::error::RetrievalError {
-    fn from(err: SqliteError) -> Self { ankurah_core::error::RetrievalError::StorageError(Box::new(err)) }
+    fn from(err: SqliteError) -> Self { ankurah_core::error::RetrievalError::storage(err) }
 }
 
 impl From<SqliteError> for ankurah_core::error::MutationError {

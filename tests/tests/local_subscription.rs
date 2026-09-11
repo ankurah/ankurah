@@ -48,7 +48,7 @@ async fn basic_local_subscription() -> Result<(), Box<dyn std::error::Error + Se
         let trx = ctx.begin();
         let albums: Vec<AlbumView> = ctx.fetch("name = 'Ice on the Dune'").await?;
         let album = albums[0].edit(&trx)?;
-        album.year().overwrite(0, 4, "2020")?;
+        album.year()?.overwrite(0, 4, "2020")?;
         trx.commit().await?;
     }
 
@@ -99,7 +99,7 @@ async fn complex_local_subscription() -> Result<(), Box<dyn std::error::Error + 
     {
         // Update Rex's age to 7
         let trx = ctx.begin();
-        rex.edit(&trx).unwrap().age().overwrite(0, 1, "7")?;
+        rex.edit(&trx).unwrap().age()?.overwrite(0, 1, "7")?;
         trx.commit().await.unwrap();
     }
 
@@ -109,7 +109,7 @@ async fn complex_local_subscription() -> Result<(), Box<dyn std::error::Error + 
     {
         // Update Snuffy's age to 3
         let trx = ctx.begin();
-        snuffy.edit(&trx).unwrap().age().overwrite(0, 1, "3")?;
+        snuffy.edit(&trx).unwrap().age()?.overwrite(0, 1, "3")?;
         trx.commit().await.unwrap();
     }
 
@@ -119,7 +119,7 @@ async fn complex_local_subscription() -> Result<(), Box<dyn std::error::Error + 
     // Update Jasper's age to 4
     {
         let trx = ctx.begin();
-        jasper.edit(&trx).unwrap().age().overwrite(0, 1, "4")?;
+        jasper.edit(&trx).unwrap().age()?.overwrite(0, 1, "4")?;
         trx.commit().await.unwrap();
     }
 
@@ -129,9 +129,9 @@ async fn complex_local_subscription() -> Result<(), Box<dyn std::error::Error + 
     // Update Snuffy and Jasper to ages outside the range
     let trx = ctx.begin();
     let snuffy_edit = snuffy.edit(&trx).unwrap();
-    snuffy_edit.age().overwrite(0, 1, "5")?;
+    snuffy_edit.age()?.overwrite(0, 1, "5")?;
     let jasper_edit = jasper.edit(&trx).unwrap();
-    jasper_edit.age().overwrite(0, 1, "6")?;
+    jasper_edit.age()?.overwrite(0, 1, "6")?;
     trx.commit().await.unwrap();
 
     // Verify both updates were received as removals
@@ -141,7 +141,7 @@ async fn complex_local_subscription() -> Result<(), Box<dyn std::error::Error + 
     // This should still trigger a ChangeKind::Remove since it no longer matches
     let trx = ctx.begin();
     let rex_edit = rex.edit(&trx).unwrap();
-    rex_edit.name().overwrite(0, 3, "NotRex")?;
+    rex_edit.name()?.overwrite(0, 3, "NotRex")?;
     trx.commit().await.unwrap();
 
     // Verify Rex's "removal" was received
@@ -194,7 +194,7 @@ async fn resultset_vs_livequery_signal_semantics() -> Result<(), Box<dyn std::er
     {
         let trx = ctx.begin();
         let album = album_a.edit(&trx)?;
-        album.name().overwrite(0, 7, "Album A Updated")?;
+        album.name()?.overwrite(0, 7, "Album A Updated")?;
         trx.commit().await?;
     }
 
@@ -207,7 +207,7 @@ async fn resultset_vs_livequery_signal_semantics() -> Result<(), Box<dyn std::er
     {
         let trx = ctx.begin();
         let album = album_b.edit(&trx)?;
-        album.year().overwrite(0, 4, "2021")?; // Now year >= 2020, so it enters the query
+        album.year()?.overwrite(0, 4, "2021")?; // Now year >= 2020, so it enters the query
         trx.commit().await?;
     }
 
@@ -221,7 +221,7 @@ async fn resultset_vs_livequery_signal_semantics() -> Result<(), Box<dyn std::er
     {
         let trx = ctx.begin();
         let album = album_a.edit(&trx)?;
-        album.name().overwrite(0, 15, "Album A Changed Again")?;
+        album.name()?.overwrite(0, 15, "Album A Changed Again")?;
         trx.commit().await?;
     }
 

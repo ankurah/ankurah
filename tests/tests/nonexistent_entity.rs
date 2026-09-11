@@ -19,10 +19,12 @@ async fn get_nonexistent_entity_errors() -> anyhow::Result<()> {
 async fn local_rejects_phantom_commit() -> anyhow::Result<()> {
     let node = durable_sled_setup().await?;
     let ctx = node.context(DEFAULT_CONTEXT)?;
+    // Register Album so the commit reaches the phantom-baseline check.
+    ctx.register_model::<Album>().await?;
 
     let phantom = AlbumView::from_entity(node.conjure_evil_phantom(EntityId::random(), Album::collection()));
     let trx = ctx.begin();
-    phantom.edit(&trx)?.name().replace("inside your mind")?;
+    phantom.edit(&trx)?.name()?.replace("inside your mind")?;
 
     assert!(trx.commit().await.is_err());
     Ok(())
@@ -35,7 +37,7 @@ async fn server_rejects_update_for_nonexistent() -> anyhow::Result<()> {
     let client = ephemeral_sled_setup().await?;
     let _conn: LocalProcessConnection<SledStorageEngine, PermissiveAgent, SledStorageEngine, PermissiveAgent> =
         LocalProcessConnection::new(&server, &client).await?;
-    client.system.wait_system_ready().await;
+    client.system.wait_system_ready().await.unwrap();
 
     let fake_update = proto::Event::update(
         Album::collection(),
@@ -71,7 +73,7 @@ async fn server_refuses_a_genesis_whose_content_derives_a_different_id() -> anyh
     let server = durable_sled_setup().await?;
     let client = ephemeral_sled_setup().await?;
     let _conn = LocalProcessConnection::new(&server, &client).await?;
-    client.system.wait_system_ready().await;
+    client.system.wait_system_ready().await.unwrap();
 
     // Create an entity on the server first
     let ctx = server.context(DEFAULT_CONTEXT)?;

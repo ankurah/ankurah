@@ -1,7 +1,8 @@
 use crate::reactor::candidate_changes::CandidateChanges;
 use crate::reactor::comparison_index::ComparisonIndex;
-use crate::reactor::property_path::PropertyPath;
 use crate::reactor::{AbstractEntity, ReactorSubscriptionId};
+use crate::util::property_path::PropertyPathExt;
+use ankql::ast::{PropertyPath, Resolved};
 use ankurah_proto as proto;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -32,7 +33,6 @@ impl WatcherSet {
         // Find subscriptions interested based on index watchers
         for ((collection_id, property_path), index_ref) in &self.index_watchers {
             if *collection_id == AbstractEntity::collection(entity) {
-                // Extract value at the property path (handles both simple fields and JSON paths)
                 if let Some(value) = property_path.extract_value(entity) {
                     for (subscription_id, query_id) in index_ref.find_matching(value) {
                         candidates_by_sub
@@ -107,19 +107,20 @@ impl WatcherSet {
         }
     }
 
-    /// Remove all entity subscription watchers for multiple entities
-    pub fn remove_entity_subscriptions(
-        &mut self,
-        subscription_id: ReactorSubscriptionId,
-        entity_ids: impl IntoIterator<Item = proto::EntityId>,
-    ) {
-        for entity_id in entity_ids {
-            self.remove_entity_subscription(subscription_id, entity_id);
-        }
+    /// Remove all of a dropped subscription's entity watches, including rows no longer in any result set.
+    pub(crate) fn remove_subscription_entity_watchers(&mut self, subscription_id: ReactorSubscriptionId) {
+        self.entity_watchers.retain(|_, watchers| {
+            watchers.retain(|watcher| watcher.subscription_id() != subscription_id);
+            !watchers.is_empty()
+        });
     }
 
-    /// Clear all entity watchers
-    pub fn clear_entity_watchers(&mut self) { self.entity_watchers.clear(); }
+    /// Clear all query and entity watchers when the reactor closes.
+    pub fn clear(&mut self) {
+        self.index_watchers.clear();
+        self.wildcard_watchers.clear();
+        self.entity_watchers.clear();
+    }
 
     /// Get references to internal data for debugging
     pub fn debug_data(
@@ -161,7 +162,7 @@ impl WatcherSet {
     pub fn recurse_predicate_watchers(
         &mut self,
         collection_id: &proto::CollectionId,
-        predicate: &ankql::ast::Predicate,
+        predicate: &ankql::ast::Predicate<Resolved>,
         watcher_id: (ReactorSubscriptionId, proto::QueryId), // Should this be a tuple of (subscription_id, query_id) or just subscription_id?
         op: WatcherOp,
     ) {
@@ -169,12 +170,7 @@ impl WatcherSet {
         match predicate {
             Predicate::Comparison { left, operator, right } => {
                 if let (Expr::Path(path), Expr::Literal(literal)) | (Expr::Literal(literal), Expr::Path(path)) = (&**left, &**right) {
-                    // Use the full path for indexing.
-                    // For simple paths like `name`, this is just "name".
-                    // For JSON paths like `context.task_id`, this is "context.task_id".
-                    // accumulate_interested_watchers will extract the value at this path.
-                    let property_path = PropertyPath::from_path(path);
-                    let index = self.index_watchers.entry((collection_id.clone(), property_path)).or_default();
+                    let index = self.index_watchers.entry((collection_id.clone(), path.clone())).or_default();
 
                     match op {
                         WatcherOp::Add => {
@@ -267,5 +263,44 @@ impl WatcherChange {
     /// Create a watcher change for removing an entity watcher
     pub fn remove(entity_id: proto::EntityId, subscription_id: ReactorSubscriptionId, query_id: proto::QueryId) -> Self {
         Self::Remove { entity_id, subscription_id, query_id }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{entity::Entity, property::backend::lww::LWWBackend, schema::SystemEpoch, selection::filter::evaluate_predicate};
+    use ankql::ast::{ComparisonOperator, Expr, Predicate};
+    use ankurah_core_types::Value;
+
+    #[test]
+    fn json_subpaths_use_the_same_index_key_as_resolved_literals() -> anyhow::Result<()> {
+        let property = proto::EntityId::from_bytes([2; 32]);
+        let path = PropertyPath::registered(property, "data", vec!["nested".into(), "key".into()]);
+        let collection = proto::CollectionId::fixed_name("test");
+        let entity = Entity::create(proto::EntityId::from_bytes([1; 32]), collection.clone(), SystemEpoch::allocate());
+        let backend = entity.get_backend::<LWWBackend>()?;
+        let subscription = ReactorSubscriptionId::new();
+        let query = proto::QueryId::new();
+        let changes = Arc::new(vec![entity.clone()]);
+
+        for leaf in [serde_json::json!("active"), serde_json::json!(true), serde_json::json!(u64::MAX)] {
+            let json = serde_json::json!({ "nested": { "key": leaf } });
+            let predicate = Predicate::Comparison {
+                left: Box::new(Expr::Path(path.clone())),
+                operator: ComparisonOperator::Equal,
+                right: Box::new(Expr::Literal(Value::Json(leaf.clone()))),
+            };
+            let mut watchers = WatcherSet::new();
+            watchers.recurse_predicate_watchers(&collection, &predicate, (subscription, query), WatcherOp::Add);
+            for value in [Value::Json(json.clone()), Value::Binary(serde_json::to_vec(&json)?)] {
+                backend.set(proto::PropertyId::EntityId(property), Some(value));
+                assert!(evaluate_predicate(&entity, &predicate)?);
+                let mut candidates = BTreeMap::new();
+                watchers.accumulate_interested_watchers(&entity, 0, &changes, &mut candidates);
+                assert_eq!(candidates[&subscription].query_iter().map(|candidate| *candidate.query_id).collect::<Vec<_>>(), vec![query]);
+            }
+        }
+        Ok(())
     }
 }

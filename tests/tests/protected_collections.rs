@@ -3,6 +3,7 @@
 //! prefix is reserved.
 
 mod common;
+use ankurah::core::error::{InadmissibleEvent, RetrievalError};
 use common::*;
 
 const PROTECTED: [&str; 4] = ["_ankurah_system", "_ankurah_model", "_ankurah_property", "_ankurah_model_property"];
@@ -14,7 +15,7 @@ async fn server_refuses_commits_into_protected_collections() -> anyhow::Result<(
     let server = durable_sled_setup().await?;
     let client = ephemeral_sled_setup().await?;
     let _conn = LocalProcessConnection::new(&server, &client).await?;
-    client.system.wait_system_ready().await;
+    client.system.wait_system_ready().await.unwrap();
 
     for collection in PROTECTED {
         let model = ankurah::core::schema::system_model_id(collection).expect("protected collection has a system model");
@@ -44,14 +45,53 @@ async fn server_refuses_commits_into_protected_collections() -> anyhow::Result<(
     Ok(())
 }
 
-// NOTE: the local-transaction path into a protected collection (the
-// `commit_local_trx` guard, core/src/context.rs) is no longer reachable
-// through the public API: a user model whose collection carries the
-// reserved `_ankurah_` prefix is now REFUSED at derive time, so a struct
-// like `_ankurah_model` cannot be defined at all. That compile-time
-// rejection is exercised by the trybuild fixture
-// `tests/tests/compile_fail/reserved_collection_prefix.rs`
-// (see `derive_compile_fail.rs`). The runtime `commit_local_trx` guard
-// remains in place as structural defense-in-depth; the receiver-side guard
-// for all four protected collections is exercised by
-// `server_refuses_commits_into_protected_collections` above.
+#[tokio::test]
+async fn direct_remote_commit_refuses_a_protected_batch_before_writing_any_event() -> anyhow::Result<()> {
+    let server = durable_sled_setup().await?;
+    let context = server.context(DEFAULT_CONTEXT)?;
+    let model = context.register_model::<Album>().await?;
+    let ordinary = proto::Event::genesis(
+        Album::collection(),
+        server.system.root_id(),
+        proto::AuthorId::Unknown,
+        proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(model))]),
+    );
+    let collection = context.collection(&Album::collection()).await?;
+
+    for protected in PROTECTED.into_iter().chain(["_ankurah_future"]) {
+        let protected_collection = proto::CollectionId::fixed_name(protected);
+        let protected_event = proto::Event::genesis(
+            protected_collection.clone(),
+            server.system.root_id(),
+            proto::AuthorId::Unknown,
+            proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(
+                ankurah::core::schema::system_model_id(protected).unwrap_or_else(|| EntityId::random().into()),
+            ))]),
+        );
+        let protected_id = protected_event.entity_id;
+        let error = server
+            .commit_remote_transaction(
+                &DEFAULT_CONTEXT,
+                proto::TransactionId::new(),
+                vec![proto::Attested::opt(ordinary.clone(), None), proto::Attested::opt(protected_event, None)],
+            )
+            .await
+            .expect_err("direct callers must not bypass collection protection");
+        assert!(matches!(
+            error,
+            MutationError::InadmissibleEvent(InadmissibleEvent::ProtectedCollection(id)) if id == protected_collection
+        ));
+        assert!(collection.dump_entity_events(ordinary.entity_id).await?.is_empty());
+        assert!(matches!(collection.get_state(ordinary.entity_id).await, Err(RetrievalError::EntityNotFound(_))));
+        assert!(server.get_resident_entity(ordinary.entity_id).is_none());
+        let protected_storage = context.collection(&protected_collection).await?;
+        assert!(protected_storage.dump_entity_events(protected_id).await?.is_empty());
+        assert!(matches!(protected_storage.get_state(protected_id).await, Err(RetrievalError::EntityNotFound(_))));
+    }
+
+    server
+        .commit_remote_transaction(&DEFAULT_CONTEXT, proto::TransactionId::new(), vec![proto::Attested::opt(ordinary.clone(), None)])
+        .await?;
+    assert_eq!(collection.dump_entity_events(ordinary.entity_id).await?.len(), 1, "the ordinary event is valid on its own");
+    Ok(())
+}

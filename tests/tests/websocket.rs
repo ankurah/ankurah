@@ -82,7 +82,7 @@ async fn test_websocket_client_create_propagation() -> Result<()> {
     client.wait_connected().await?;
 
     // Wait for system synchronization
-    client_node.system.wait_system_ready().await;
+    client_node.system.wait_system_ready().await.unwrap();
 
     let server_ctx = server_node.context(c)?;
     let client_ctx = client_node.context(c)?;
@@ -123,7 +123,7 @@ async fn test_websocket_subscription_propagation() -> Result<()> {
     client.wait_connected().await?;
 
     // Wait for system synchronization
-    client_node.system.wait_system_ready().await;
+    client_node.system.wait_system_ready().await.unwrap();
 
     let server_ctx = server_node.context(c)?;
     let client_ctx = client_node.context(c)?;
@@ -182,7 +182,7 @@ async fn test_websocket_bidirectional_subscription_impl() -> Result<()> {
     client.wait_connected().await?;
 
     // Wait for system synchronization
-    client_node.system.wait_system_ready().await;
+    client_node.system.wait_system_ready().await.unwrap();
 
     let server_ctx = server_node.context(c)?;
     let client_ctx = client_node.context(c)?;

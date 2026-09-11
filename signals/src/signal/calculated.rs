@@ -1,5 +1,8 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicBool, Ordering},
+};
 
 use crate::{
     Observer, Peek,
@@ -18,22 +21,25 @@ struct SubscriptionEntry {
 struct Inner<T> {
     /// The compute function
     compute: Box<dyn Fn() -> T + Send + Sync>,
-    /// Cached computed value
-    value: ValueCell<Option<T>>,
+    /// Initialized after the observer exists so the first calculation can track its dependencies.
+    value: OnceLock<ValueCell<T>>,
+    dirty: AtomicBool,
     /// Broadcast for notifying downstream observers (fires AFTER context cleanup)
     broadcast: Broadcast<()>,
     /// Subscriptions to upstream signals, mapped by broadcast ID for mark-and-sweep
     entries: std::sync::RwLock<HashMap<BroadcastId, SubscriptionEntry>>,
 }
 
-/// A calculated/derived signal that computes its value from other signals.
+impl<T> Inner<T> {
+    fn value(&self) -> &ValueCell<T> { self.value.get().expect("Calculated value not initialized") }
+}
+
+/// A calculated signal that caches a value derived from other signals.
 ///
 /// Automatically tracks which signals are accessed during computation.
-/// When any upstream signal changes, the computed value is recalculated
-/// and downstream observers are notified.
-///
-/// The compute function can close over arbitrary state, allowing for stateful
-/// computations (e.g., maintaining display order stability).
+/// Upstream changes invalidate the cached value and notify downstream;
+/// the next read recomputes it.
+/// The computation must be free of externally observable side effects.
 ///
 /// # Example
 /// ```ignore
@@ -61,27 +67,37 @@ impl<T> Clone for Calculated<T> {
 impl<T: Send + Sync + 'static> Calculated<T> {
     /// Create a new calculated signal from a compute function.
     ///
-    /// The compute function will be called immediately to get the initial value,
-    /// and will be called again whenever any signal accessed during computation
-    /// changes.
+    /// The compute function is called immediately to establish dependencies and
+    /// thereafter on the first read following an upstream change.
     pub fn new<F>(compute: F) -> Self
     where F: Fn() -> T + Send + Sync + 'static {
         let inner = Arc::new(Inner {
             compute: Box::new(compute),
-            value: ValueCell::new(None),
+            value: OnceLock::new(),
+            dirty: AtomicBool::new(false),
             broadcast: Broadcast::new(),
             entries: std::sync::RwLock::new(HashMap::new()),
         });
 
-        // Trigger initial computation to establish subscriptions and compute initial value
-        trigger(&inner);
+        inner.value.get_or_init(|| ValueCell::new(recompute(&inner)));
+        ensure_current(&inner);
 
         Self(inner)
     }
 }
 
-/// Trigger recomputation with dependency tracking, then notify downstream
-fn trigger<T: Send + Sync + 'static>(inner: &Arc<Inner<T>>) {
+fn ensure_current<T: Send + Sync + 'static>(inner: &Arc<Inner<T>>) {
+    if !inner.dirty.load(Ordering::Acquire) {
+        return;
+    }
+    inner.value().with_mut(|value| {
+        while inner.dirty.swap(false, Ordering::AcqRel) {
+            *value = recompute(inner);
+        }
+    });
+}
+
+fn recompute<T: Send + Sync + 'static>(inner: &Arc<Inner<T>>) -> T {
     // Mark-and-sweep: mark all existing subscriptions for removal
     {
         let mut entries = inner.entries.write().expect("entries lock poisoned");
@@ -93,7 +109,6 @@ fn trigger<T: Send + Sync + 'static>(inner: &Arc<Inner<T>>) {
     // Set ourselves as the current observer and run compute
     CurrentObserver::set(Arc::clone(inner));
     let new_value = (inner.compute)();
-    inner.value.set(Some(new_value));
     CurrentObserver::remove(&*inner);
 
     // Sweep away any subscriptions that weren't accessed during compute
@@ -101,31 +116,56 @@ fn trigger<T: Send + Sync + 'static>(inner: &Arc<Inner<T>>) {
         let mut entries = inner.entries.write().expect("entries lock poisoned");
         entries.retain(|_, entry| !entry.marked_for_removal);
     }
-
-    // NOW it's safe to broadcast - no observer context is active
-    inner.broadcast.send(());
+    new_value
 }
 
-impl<T: Clone + 'static> Get<T> for Calculated<T> {
+fn invalidate<T>(inner: &Arc<Inner<T>>) {
+    if !inner.dirty.swap(true, Ordering::AcqRel) {
+        inner.broadcast.send(());
+    }
+}
+
+impl<T: Send + Sync + 'static> Calculated<T> {
+    /// Lend the current value, registering nothing. The untracked partner of
+    /// [`With::with`], for readers resolving mid-work that must not subscribe.
+    pub fn peek_with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        ensure_current(&self.0);
+        self.0.value().with(f)
+    }
+}
+
+impl<T: Clone + Send + Sync + 'static> Get<T> for Calculated<T> {
     fn get(&self) -> T {
         CurrentObserver::track(self);
-        self.0.value.with(|opt| opt.as_ref().expect("Calculated value not initialized").clone())
+        ensure_current(&self.0);
+        self.0.value().value()
     }
 }
 
-impl<T: Clone + 'static> Peek<T> for Calculated<T> {
-    fn peek(&self) -> T { self.0.value.with(|opt| opt.as_ref().expect("Calculated value not initialized").clone()) }
+impl<T: Clone + Send + Sync + 'static> Peek<T> for Calculated<T> {
+    fn peek(&self) -> T {
+        ensure_current(&self.0);
+        self.0.value().value()
+    }
 }
 
-impl<T: 'static> With<T> for Calculated<T> {
+impl<T: Send + Sync + 'static> With<T> for Calculated<T> {
     fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
         CurrentObserver::track(self);
-        self.0.value.with(|opt| f(opt.as_ref().expect("Calculated value not initialized")))
+        ensure_current(&self.0);
+        self.0.value().with(f)
     }
 }
 
-impl<T: 'static> GetReadCell<Option<T>> for Calculated<T> {
-    fn get_readcell(&self) -> ReadValueCell<Option<T>> { self.0.value.readvalue() }
+impl<T: Send + Sync + 'static> GetReadCell<T> for Calculated<T> {
+    fn get_readcell(&self) -> ReadValueCell<T> {
+        let weak = Arc::downgrade(&self.0);
+        self.0.value().readvalue_with_before_read(move || {
+            if let Some(inner) = weak.upgrade() {
+                ensure_current(&inner);
+            }
+        })
+    }
 }
 
 impl<T> Signal for Calculated<T> {
@@ -148,11 +188,11 @@ impl<T: Send + Sync + 'static> Observer for Arc<Inner<T>> {
         }
         // Lock released before calling listen() to avoid recursive lock
 
-        // Create new subscription - when upstream changes, trigger recomputation
+        // Create new subscription - when upstream changes, invalidate the cache
         let weak = Arc::downgrade(self);
         let guard = signal.listen(Arc::new(move |_| {
             if let Some(inner) = weak.upgrade() {
-                trigger(&inner);
+                invalidate(&inner);
             }
         }));
 
@@ -172,10 +212,9 @@ where T: Clone + Send + Sync + 'static
     fn subscribe<F>(&self, listener: F) -> SubscriptionGuard
     where F: IntoSubscribeListener<T> {
         let listener = listener.into_subscribe_listener();
-        let ro_value = self.0.value.readvalue();
+        let ro_value = self.get_readcell();
         let subscription = self.listen(Arc::new(move |_| {
-            let current = ro_value.with(|opt| opt.as_ref().expect("Calculated value not initialized").clone());
-            listener(current);
+            listener(ro_value.value());
         }));
         SubscriptionGuard::new(subscription)
     }
@@ -207,6 +246,63 @@ mod tests {
     }
 
     #[test]
+    fn invalidation_notifies_immediately_and_recomputes_once_on_read() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let source = Mut::new(1);
+        let computes = Arc::new(AtomicUsize::new(0));
+        let calculated = Calculated::new({
+            let source = source.read();
+            let computes = computes.clone();
+            move || {
+                computes.fetch_add(1, Ordering::SeqCst);
+                source.get() * 2
+            }
+        });
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let listener_notifications = notifications.clone();
+        let _listener = calculated.listen(Arc::new(move |_| {
+            listener_notifications.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        source.set(2);
+        source.set(3);
+        assert_eq!(notifications.load(Ordering::SeqCst), 1);
+        assert_eq!(computes.load(Ordering::SeqCst), 1);
+        assert_eq!(calculated.get(), 6);
+        assert_eq!(computes.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn read_cell_recomputes_an_invalidated_value() {
+        let source = Mut::new(1);
+        let calculated = Calculated::new({
+            let source = source.read();
+            move || source.get() * 2
+        });
+        let read = calculated.get_readcell();
+
+        source.set(4);
+        assert_eq!(read.value(), 8);
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn wait_observes_an_invalidated_value() {
+        use crate::Wait;
+
+        let source = Mut::new(1);
+        let calculated = Calculated::new({
+            let source = source.read();
+            move || source.get() > 0
+        });
+        let mut wait = tokio_test::task::spawn(calculated.wait_value(false));
+        tokio_test::assert_pending!(wait.poll());
+        source.set(0);
+        tokio_test::assert_ready!(wait.poll());
+    }
+
+    #[test]
     fn test_two_independent_inputs() {
         // Tests that a calculated signal properly tracks two independent input signals
         // and recomputes when either one changes
@@ -233,28 +329,6 @@ mod tests {
         first_name.set("Carol".to_string());
         last_name.set("Williams".to_string());
         assert_eq!(full_name.get(), "Carol Williams");
-    }
-
-    #[test]
-    fn test_calculated_with_closed_over_state() {
-        let trigger = Mut::new(0);
-
-        let counter = Calculated::new({
-            let trigger = trigger.read();
-            let count = Arc::new(std::sync::atomic::AtomicUsize::new(0)); // closed-over mutable state
-            move || {
-                let _ = trigger.get(); // track the trigger
-                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
-            }
-        });
-
-        assert_eq!(counter.get(), 1);
-
-        trigger.set(1);
-        assert_eq!(counter.get(), 2);
-
-        trigger.set(2);
-        assert_eq!(counter.get(), 3);
     }
 
     #[test]

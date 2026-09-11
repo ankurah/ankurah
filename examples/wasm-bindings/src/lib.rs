@@ -34,7 +34,7 @@ pub async fn start() -> Result<(), JsValue> {
     let storage_engine = IndexedDBStorageEngine::open("ankurah_example_app").await.map_err(|e| JsValue::from_str(&e.to_string()))?;
     let node = Node::new(Arc::new(storage_engine), PermissiveAgent::new());
     let connector = WebsocketClient::new(node.clone(), "ws://127.0.0.1:9797").map_err(|e| JsValue::from_str(&e.to_string()))?;
-    node.system.wait_system_ready().await;
+    node.system.wait_system_ready().await.map_err(|e| JsValue::from_str(&e.to_string()))?;
     if let Err(_) = NODE.set(node) {
         error!("Failed to set node");
     }

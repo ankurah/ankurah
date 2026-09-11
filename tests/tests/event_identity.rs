@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 async fn durable_node() -> Result<ankurah::Context> {
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
     node.system.create().await?;
-    Ok(node.context_async(c).await)
+    Ok(node.context_async(c).await.unwrap())
 }
 
 async fn entity_events(ctx: &ankurah::Context, id: proto::EntityId) -> Result<Vec<proto::Event>> {
@@ -99,7 +99,7 @@ async fn an_edit_after_create_becomes_an_update_on_the_frozen_genesis() -> Resul
     let id = {
         let album = trx.create(&Album { name: "Giant Steps".to_owned(), year: "1959".to_owned() }).await?;
         let id = album.id();
-        album.year().overwrite(0, 4, "1960")?;
+        album.year()?.overwrite(0, 4, "1960")?;
         assert_eq!(album.id(), id, "the id did not move when the entity was edited");
         id
     };
@@ -119,9 +119,9 @@ async fn an_edit_after_create_becomes_an_update_on_the_frozen_genesis() -> Resul
 }
 
 /// The genesis carries exactly one `Membership::Add`, which is what
-/// `check_membership_admissibility` requires of an entity's first event. The
-/// membership is one of the frozen initial operations, so it is inside the
-/// hash that derives the id.
+/// `event_admissibility::check_membership` requires of an entity's first
+/// event. The membership is one of the frozen initial operations, so it is
+/// inside the hash that derives the id.
 #[tokio::test]
 async fn the_genesis_carries_exactly_one_membership() -> Result<()> {
     let ctx = durable_node().await?;
@@ -168,9 +168,10 @@ async fn a_relayed_genesis_is_the_one_create_minted() -> Result<()> {
             }
             false
         })
+        .await
     };
-    client.system.wait_system_ready().await;
-    let client_ctx = client.context_async(c).await;
+    client.system.wait_system_ready().await.unwrap();
+    let client_ctx = client.context_async(c).await.unwrap();
 
     let trx = client_ctx.begin();
     let id = trx.create(&Album { name: "A Love Supreme".to_owned(), year: "1965".to_owned() }).await?.id();
@@ -185,7 +186,7 @@ async fn a_relayed_genesis_is_the_one_create_minted() -> Result<()> {
         .expect("the client relayed the album's genesis to its durable peer");
     assert_eq!(proto::EntityId::from(relayed_genesis.id()), id, "the relayed genesis is the one create() returned an id for");
 
-    let server_ctx = server.context_async(c).await;
+    let server_ctx = server.context_async(c).await.unwrap();
     let stored_genesis = entity_events(&server_ctx, id).await?.into_iter().find(|e| e.is_entity_create()).expect("the peer stored it");
     assert_eq!(stored_genesis.id(), relayed_genesis.id(), "the peer stored the relayed genesis rather than deriving its own");
     assert_eq!(stored_genesis.nonce(), relayed_genesis.nonce(), "same nonce: the mint happened once, at create()");
@@ -200,7 +201,7 @@ async fn the_root_binds_no_system_and_everything_else_binds_the_root() -> Result
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
     node.system.create().await?;
     let root_id = node.system.root_id().expect("the system root exists after create");
-    let ctx = node.context_async(c).await;
+    let ctx = node.context_async(c).await.unwrap();
 
     let trx = ctx.begin();
     let id = trx.create(&Album { name: "Ascension".to_owned(), year: "1966".to_owned() }).await?.id();

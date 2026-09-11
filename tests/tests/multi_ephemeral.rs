@@ -21,8 +21,8 @@ async fn test_two_ephemeral_independent_writes() -> Result<()> {
     let _conn1 = LocalProcessConnection::new(&ephemeral1, &durable).await?;
     let _conn2 = LocalProcessConnection::new(&ephemeral2, &durable).await?;
 
-    ephemeral1.system.wait_system_ready().await;
-    ephemeral2.system.wait_system_ready().await;
+    ephemeral1.system.wait_system_ready().await.unwrap();
+    ephemeral2.system.wait_system_ready().await.unwrap();
 
     let ctx_d = durable.context(DEFAULT_CONTEXT)?;
     let ctx_e1 = ephemeral1.context(DEFAULT_CONTEXT)?;
@@ -52,8 +52,8 @@ async fn test_two_ephemeral_independent_writes() -> Result<()> {
     let trx_e1 = ctx_e1.begin();
     let trx_e2 = ctx_e2.begin();
 
-    album_e1.edit(&trx_e1)?.name().replace("From-E1")?;
-    album_e2.edit(&trx_e2)?.year().replace("2025")?;
+    album_e1.edit(&trx_e1)?.name()?.replace("From-E1")?;
+    album_e2.edit(&trx_e2)?.year()?.replace("2025")?;
 
     dag.enumerate(trx_e1.commit_and_return_events().await?); // B
     dag.enumerate(trx_e2.commit_and_return_events().await?); // C
@@ -102,8 +102,8 @@ async fn test_two_ephemeral_same_property_conflict() -> Result<()> {
     let _conn1 = LocalProcessConnection::new(&ephemeral1, &durable).await?;
     let _conn2 = LocalProcessConnection::new(&ephemeral2, &durable).await?;
 
-    ephemeral1.system.wait_system_ready().await;
-    ephemeral2.system.wait_system_ready().await;
+    ephemeral1.system.wait_system_ready().await.unwrap();
+    ephemeral2.system.wait_system_ready().await.unwrap();
 
     let ctx_d = durable.context(DEFAULT_CONTEXT)?;
     let ctx_e1 = ephemeral1.context(DEFAULT_CONTEXT)?;
@@ -132,8 +132,8 @@ async fn test_two_ephemeral_same_property_conflict() -> Result<()> {
     let trx_e1 = ctx_e1.begin();
     let trx_e2 = ctx_e2.begin();
 
-    album_e1.edit(&trx_e1)?.name().replace("From-E1")?;
-    album_e2.edit(&trx_e2)?.name().replace("From-E2")?;
+    album_e1.edit(&trx_e1)?.name()?.replace("From-E1")?;
+    album_e2.edit(&trx_e2)?.name()?.replace("From-E2")?;
 
     dag.enumerate(trx_e1.commit_and_return_events().await?); // B
     dag.enumerate(trx_e2.commit_and_return_events().await?); // C
@@ -172,9 +172,9 @@ async fn test_three_ephemeral_three_way_race() -> Result<()> {
     let _conn2 = LocalProcessConnection::new(&ephemeral2, &durable).await?;
     let _conn3 = LocalProcessConnection::new(&ephemeral3, &durable).await?;
 
-    ephemeral1.system.wait_system_ready().await;
-    ephemeral2.system.wait_system_ready().await;
-    ephemeral3.system.wait_system_ready().await;
+    ephemeral1.system.wait_system_ready().await.unwrap();
+    ephemeral2.system.wait_system_ready().await.unwrap();
+    ephemeral3.system.wait_system_ready().await.unwrap();
 
     let ctx_d = durable.context(DEFAULT_CONTEXT)?;
     let ctx_e1 = ephemeral1.context(DEFAULT_CONTEXT)?;
@@ -208,9 +208,9 @@ async fn test_three_ephemeral_three_way_race() -> Result<()> {
     let trx_e2 = ctx_e2.begin();
     let trx_e3 = ctx_e3.begin();
 
-    album_e1.edit(&trx_e1)?.name().replace("From-E1")?;
-    album_e2.edit(&trx_e2)?.year().replace("2025")?;
-    album_e3.edit(&trx_e3)?.name().replace("From-E3")?;
+    album_e1.edit(&trx_e1)?.name()?.replace("From-E1")?;
+    album_e2.edit(&trx_e2)?.year()?.replace("2025")?;
+    album_e3.edit(&trx_e3)?.name()?.replace("From-E3")?;
 
     dag.enumerate(trx_e1.commit_and_return_events().await?); // B
     dag.enumerate(trx_e2.commit_and_return_events().await?); // C

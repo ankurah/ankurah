@@ -88,30 +88,35 @@ fn content_nonce(mint_seq: u64, parts: &[&[u8]]) -> [u8; 32] {
 /// The `SimRecord` collection id.
 pub fn sim_collection() -> proto::CollectionId { SimRecord::collection() }
 
-/// The deterministic model-entity id the sim seeds into every node's catalog
-/// and asserts in every forged creation event's membership Add. Constant, so
-/// it is identical across every node in a run and across the two
-/// determinism-audit runs.
-pub fn sim_model_id() -> proto::EntityId { proto::EntityId::from_bytes([0x5B; 32]) }
+/// The deterministic model id shared by every simulated node.
+pub fn sim_model_id() -> proto::EntityId { forged_catalog_rows().model }
 
-/// Stable seeded catalog identity for each simulated property.
+/// The catalog identity of each simulated property, derived like
+/// [`sim_model_id`].
 pub fn sim_property_id(field: Field) -> proto::EntityId {
-    let mut bytes = [0x5C; 32];
-    bytes[31] = match field {
-        Field::Title => 1,
-        Field::Body => 2,
-    };
-    proto::EntityId::from_bytes(bytes)
+    let rows = forged_catalog_rows();
+    match field {
+        Field::Title => rows.properties[0],
+        Field::Body => rows.properties[1],
+    }
 }
 
-/// Stable seeded membership identity for each simulated property.
+/// The membership identity binding each simulated property to the model,
+/// derived like [`sim_model_id`].
 pub fn sim_membership_id(field: Field) -> proto::EntityId {
-    let mut bytes = [0x5D; 32];
-    bytes[31] = match field {
-        Field::Title => 1,
-        Field::Body => 2,
-    };
-    proto::EntityId::from_bytes(bytes)
+    let rows = forged_catalog_rows();
+    match field {
+        Field::Title => rows.memberships[0],
+        Field::Body => rows.memberships[1],
+    }
+}
+
+/// Deterministic catalog rows planted before the simulated node starts.
+pub fn forged_catalog_rows() -> &'static crate::catalog_forge::ForgedCatalog {
+    static FORGED: std::sync::OnceLock<crate::catalog_forge::ForgedCatalog> = std::sync::OnceLock::new();
+    FORGED.get_or_init(|| {
+        crate::catalog_forge::forge_catalog("simrecord", "SimRecord", &[("title", "lww", "string"), ("body", "lww", "string")], b"sim")
+    })
 }
 
 /// Decode the `(title, body)` LWW field values from a materialized `proto::State`
@@ -123,11 +128,11 @@ pub fn sim_membership_id(field: Field) -> proto::EntityId {
 pub fn field_values(state: &proto::State) -> (Option<String>, Option<String>) {
     let Some(buffer) = state.state_buffers.0.get("lww") else { return (None, None) };
     let Ok(backend) = LWWBackend::from_state_buffer(buffer) else { return (None, None) };
-    let read = |name: &str| match backend.get(&name.to_string()) {
+    let read = |field: Field| match backend.get(&field.property_id()) {
         Some(Value::String(s)) => Some(s),
         _ => None,
     };
-    (read("title"), read("body"))
+    (read(Field::Title), read(Field::Body))
 }
 
 /// Which LWW field a write targets.
@@ -144,12 +149,17 @@ impl Field {
             Field::Body => "body",
         }
     }
+
+    /// The forged durable identity this field writes under: the same seeded
+    /// id `seed_registered_schema` binds into every node's catalog, so
+    /// harness writes and the compiled binding address one identity.
+    pub fn property_id(self) -> proto::PropertyId { proto::PropertyId::EntityId(sim_property_id(self)) }
 }
 
 /// Build the LWW `OperationSet` for setting one field to a value.
 fn lww_ops(field: Field, value: &str) -> proto::OperationSet {
     let backend = LWWBackend::new();
-    backend.set(field.name().into(), Some(Value::String(value.to_owned())));
+    backend.set(field.property_id(), Some(Value::String(value.to_owned())));
     let ops = backend.to_operations().unwrap().expect("a written LWW backend yields operations");
     proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)]))
 }

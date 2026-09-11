@@ -5,17 +5,12 @@
 //! where incoming events are temporarily staged for BFS discovery before being committed
 //! to permanent storage.
 
+use crate::internal::prelude::*;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use crate::{
-    error::{MutationError, RetrievalError},
-    policy::PolicyAgent,
-    storage::{StorageCollectionWrapper, StorageEngine},
-    util::Iterable,
-    Node,
-};
-use ankurah_proto::{self as proto, Attested, EntityId, Event, EventId};
+use crate::util::Iterable;
+use ankurah_proto::{Attested, EntityId, Event, EventId};
 use async_trait::async_trait;
 
 // ============================================================================
@@ -224,8 +219,8 @@ where
                 self.collection.add_event(&event).await?;
                 Ok(event.payload)
             }
-            proto::NodeResponseBody::Error(e) => Err(RetrievalError::StorageError(format!("Error from peer: {}", e).into())),
-            _ => Err(RetrievalError::StorageError("Unexpected response type from peer".into())),
+            proto::NodeResponseBody::Error(e) => Err(RetrievalError::storage(format!("Error from peer: {}", e))),
+            _ => Err(RetrievalError::storage("Unexpected response type from peer")),
         }
     }
 
@@ -282,6 +277,7 @@ impl GetState for LocalStateGetter {
 mod tests {
     use super::*;
     use crate::storage::{StorageCollection, StorageCollectionWrapper};
+    use ankql::ast::Resolved;
     use ankurah_proto::{AttestationSet, Attested, Clock, EntityId, EntityState, Event, EventId, OperationSet};
     use async_trait::async_trait;
     use std::collections::{BTreeMap, HashMap};
@@ -304,7 +300,7 @@ mod tests {
 
         async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError> { Err(RetrievalError::EntityNotFound(id)) }
 
-        async fn fetch_states(&self, _selection: &ankql::ast::Selection) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+        async fn fetch_states(&self, _selection: &ankql::ast::Selection<Resolved>) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
             Ok(vec![])
         }
 
