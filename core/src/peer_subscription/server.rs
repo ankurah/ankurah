@@ -1,3 +1,4 @@
+use ankql::ast::Resolved;
 use ankurah_proto::{self as proto, Attested};
 use tracing::warn;
 
@@ -5,7 +6,7 @@ use crate::{
     entity::Entity,
     error::SubscriptionError,
     node::Node,
-    policy::PolicyAgent,
+    policy::{PolicyAgent, ReadPolicy},
     reactor::{
         fetch_gap::{GapFetcher, QueryGapFetcher},
         ReactorSubscription, ReactorUpdate,
@@ -15,22 +16,22 @@ use crate::{
 };
 use ankurah_signals::{Subscribe, SubscriptionGuard};
 use std::collections::HashMap;
-use std::sync::Mutex;
 
-/// Manages a peer's subscription to this node's reactor.
-///
-/// This handler owns both the ReactorSubscription and the SubscriptionGuard
-/// for listening to changes on that subscription — and each standing
-/// query's subscriber session, the typed owner of credential state the
-/// reactor reads but does not manage.
+/// Owns one peer's reactor subscription and per-query credential sources.
 pub struct SubscriptionHandler<CD: ContextData> {
     _peer_id: proto::EntityId,
     subscription: ReactorSubscription,
     _guard: SubscriptionGuard,
-    /// Each standing query's credential source, shared with its gap
-    /// fetcher and dropped with the handler, so a disconnect releases
-    /// them all.
-    queries: Mutex<HashMap<proto::QueryId, SessionSet<CD>>>,
+    /// Tracks each standing query's collection and version, plus the credential source shared with its gap fetcher.
+    /// The mutex serializes this peer's query installation, failure cleanup, and removal.
+    queries: tokio::sync::Mutex<HashMap<proto::QueryId, StandingQuery<CD>>>,
+}
+
+struct StandingQuery<CD: ContextData> {
+    collection: proto::CollectionId,
+    /// Initial credential snapshot; peer session updates are not synchronized yet (#484).
+    sessions: SessionSet<CD>,
+    version: u32,
 }
 
 impl<CD: ContextData> SubscriptionHandler<CD> {
@@ -42,7 +43,6 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         let subscription = node.reactor.subscribe();
         let weak_node = node.weak();
 
-        // Subscribe to changes on this subscription
         let guard = subscription.subscribe(move |update: ReactorUpdate| {
             tracing::info!("SubscriptionHandler[{}] received reactor update with {} items", peer_id, update.items.len());
 
@@ -57,7 +57,7 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
             }
         });
 
-        Self { _peer_id: peer_id, subscription, _guard: guard, queries: Mutex::new(HashMap::new()) }
+        Self { _peer_id: peer_id, subscription, _guard: guard, queries: tokio::sync::Mutex::new(HashMap::new()) }
     }
 
     /// Get the subscription ID for this peer.
@@ -66,45 +66,14 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
     /// Get a reference to the subscription for adding/removing predicates.
     pub fn subscription(&self) -> &ReactorSubscription { &self.subscription }
 
-    /// Remove a predicate from this peer's subscription, releasing the
-    /// query's session with it. The release does not wait on the
-    /// reactor's verdict: this teardown is also the subscribe error
-    /// path's rollback, and an unsubscribe must leave nothing behind
-    /// even when the reactor never learned of the query, so refusing to
-    /// drop the credential on a reactor error would strand it until the
-    /// peer disconnects.
-    pub fn remove_predicate(&self, query_id: proto::QueryId) -> Result<(), SubscriptionError> {
+    /// Remove a query and its credential source even if reactor cleanup fails.
+    pub async fn remove_predicate(&self, query_id: proto::QueryId) -> Result<(), SubscriptionError> {
+        // A selection update must not reinstall the query between reactor and credential removal.
+        // Reactor removal is synchronous and does not call back into this handler.
+        let mut queries = self.queries.lock().await;
         let removed = self.subscription.remove_predicate(query_id);
-        self.queries.lock().unwrap_or_else(|e| e.into_inner()).remove(&query_id);
+        queries.remove(&query_id);
         removed
-    }
-
-    /// Synchronize the query's standing session with the credential the
-    /// peer conveyed. The client-side session is the original; this entry
-    /// is its local reconstitution — created at first sight, updated in
-    /// place thereafter (the equality gate makes an identical conveyance a
-    /// no-op), and shared with the query's gap fetcher. Conveyance is bare
-    /// context data piggybacked on SubscribeQuery for now; a dedicated
-    /// session-synchronization vocabulary is future wire work (see the
-    /// TODO at the call site). The flag reports whether this call created
-    /// the reconstitution — the subscribe error path may only discard one
-    /// it created, never one an earlier subscribe established. The
-    /// per-query set owns exactly one session by construction; the loop is
-    /// just how that member is reached.
-    fn sync_session(&self, query_id: proto::QueryId, cdata: &CD) -> (SessionSet<CD>, bool) {
-        use std::collections::hash_map::Entry;
-        let mut queries = self.queries.lock().unwrap_or_else(|e| e.into_inner());
-        match queries.entry(query_id) {
-            Entry::Occupied(o) => {
-                let sessions = o.get().clone();
-                debug_assert_eq!(sessions.sessions().len(), 1, "the per-query set owns exactly one session");
-                for session in sessions.sessions() {
-                    session.update(cdata.clone());
-                }
-                (sessions, false)
-            }
-            Entry::Vacant(v) => (v.insert(cdata.clone().into()).clone(), true),
-        }
     }
 
     /// Handle a subscription request for this peer.
@@ -113,8 +82,8 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         node: &Node<SE, PA>,
         query_id: proto::QueryId,
         collection_id: proto::CollectionId,
-        mut selection: ankql::ast::Selection,
-        cdata: &PA::ContextData,
+        mut selection: ankql::ast::Selection<Resolved>,
+        cdata: Option<&PA::ContextData>,
         version: u32,
         known_matches: Vec<proto::KnownEntity>,
     ) -> anyhow::Result<proto::NodeResponseBody>
@@ -122,70 +91,61 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
     {
+        let mut queries = self.queries.lock().await;
         if version == 0 {
             return Err(anyhow::anyhow!("Invalid version 0 for subscription"));
         }
-        // Re-subscribes re-validate under the peer's current credentials
-        // and refresh the query's standing session below. Denial does
-        // not yet tear down a standing registration — the claw-back
-        // arrives with the re-permission PR:
-        // https://github.com/ankurah/ankurah/pull/426
-        node.policy_agent.can_access_collection(cdata, &collection_id)?;
-        selection.predicate = node.policy_agent.filter_predicate(cdata, &collection_id, selection.predicate)?;
+        if cdata.is_none() && !crate::schema::reads_bypass_policy(&collection_id) {
+            return Err(anyhow::anyhow!("subscribe to '{collection_id}' requires a credential"));
+        }
+        let credentials: Vec<CD> = cdata.cloned().into_iter().collect();
+        let policy = ReadPolicy::new(&node.policy_agent, &credentials, &collection_id);
+        // Re-subscribes revalidate; #426 owns denied-update claw-back.
+        policy.check_collection()?;
+        selection.predicate = policy.filter_predicate(selection.predicate)?;
 
-        // TODO: consider separating session updating from SubscribeQuery,
-        // reserving that request for actual subscription (selection)
-        // updates and carrying credential refresh on its own wire
-        // message once the protocol grows a session-update vocabulary.
-        let (sessions, session_created) = self.sync_session(query_id, cdata);
-
-        // Everything past the session sync funnels through one fallible
-        // call so the cleanup below has a single exit to guard. A failed
-        // first subscribe tears back down everything it registered — the
-        // map entry and the reactor query — so the peer holds no
-        // subscription and no credential outlives the attempt that
-        // created it. A failed re-subscribe leaves the standing query in
-        // place (the claw-back work in #426 owns that seam).
-        let response = self.subscribe_query_inner(node, query_id, collection_id, selection, &sessions, cdata, version, known_matches).await;
-
-        if response.is_err() && session_created {
-            let mut queries = self.queries.lock().unwrap_or_else(|e| e.into_inner());
-            // Identity, not a flag: only take back the entry if it is
-            // still the set this call created. A concurrent subscribe may
-            // have re-created it after an interleaved removal, and its
-            // registration is not ours to tear down. (Two in-flight
-            // subscribes for the SAME id can still interleave so that
-            // this teardown removes an adopter's success; the
-            // generation-guarded fix rides the claw-back work in #426.)
-            if queries.get(&query_id).is_some_and(|entry| entry.ptr_eq(&sessions)) {
-                queries.remove(&query_id);
-                drop(queries);
-                // The reactor may already hold the query from an upsert
-                // that succeeded before the failure; tear it down too,
-                // or its gap fetcher keeps authorizing reads under the
-                // failed attempt's credential forever. Tolerates the
-                // query never having been installed.
-                let _ = self.subscription.remove_predicate(query_id);
+        use std::collections::hash_map::Entry;
+        let (sessions, query_created) = match queries.entry(query_id) {
+            Entry::Occupied(mut o) => {
+                let standing = o.get_mut();
+                if standing.collection != collection_id {
+                    anyhow::bail!("query {query_id} is already bound to collection '{}'", standing.collection);
+                }
+                if version < standing.version {
+                    anyhow::bail!("stale subscription version {version} for query {query_id}; current version is {}", standing.version);
+                }
+                standing.version = version;
+                (standing.sessions.clone(), false)
             }
+            Entry::Vacant(v) => {
+                let sessions = match cdata {
+                    Some(cdata) => cdata.clone().into(),
+                    None => SessionSet::new(),
+                };
+                v.insert(StandingQuery { collection: collection_id.clone(), sessions: sessions.clone(), version });
+                (sessions, true)
+            }
+        };
+
+        let response =
+            self.subscribe_query_inner(node, query_id, collection_id, selection, &sessions, &credentials, version, known_matches).await;
+
+        if response.is_err() && query_created {
+            queries.remove(&query_id);
+            let _ = self.subscription.remove_predicate(query_id);
         }
         response
     }
 
-    /// Register the query and build its QuerySubscribed response: fetch
-    /// the storage collection, install the gap fetcher over the query's
-    /// session, run the versioned update flow, attest and expand the
-    /// initial states, and generate deltas against the peer's known
-    /// matches. Split from subscribe_query so every fallible step
-    /// funnels to one exit: the caller discards the reconstitution it
-    /// created before propagating an error.
+    /// Install the query and build its versioned initial delta response.
     async fn subscribe_query_inner<SE, PA>(
         &self,
         node: &Node<SE, PA>,
         query_id: proto::QueryId,
         collection_id: proto::CollectionId,
-        selection: ankql::ast::Selection,
+        selection: ankql::ast::Selection<Resolved>,
         sessions: &SessionSet<CD>,
-        cdata: &PA::ContextData,
+        credentials: &Vec<CD>,
         version: u32,
         known_matches: Vec<proto::KnownEntity>,
     ) -> anyhow::Result<proto::NodeResponseBody>
@@ -195,9 +155,9 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
     {
         let storage_collection = node.collections.get(&collection_id).await?;
 
-        let gap_fetcher: std::sync::Arc<dyn GapFetcher<Entity>> = std::sync::Arc::new(QueryGapFetcher::new(node, sessions.clone()));
+        let context = crate::context::Context::new_weak(node, sessions.clone());
+        let gap_fetcher: std::sync::Arc<dyn GapFetcher<Entity>> = std::sync::Arc::new(QueryGapFetcher::new(context));
 
-        // Add or update the query - idempotent, works whether query exists or not
         let included_entities = node.fetch_entities_from_local(&collection_id, &selection).await?;
         let matching_entities = self
             .subscription
@@ -207,7 +167,6 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         // TASK: Audit SubscriptionUpdate vs QuerySubscribed sequencing https://github.com/ankurah/ankurah/issues/147
 
         // TASK: Optimize to avoid re-attesting entities fetched from storage https://github.com/ankurah/ankurah/issues/148
-        // Convert matching entities to Attested<EntityState>
         let initial_states: Vec<_> = matching_entities
             .into_iter()
             .filter_map(|e| {
@@ -217,7 +176,6 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
             })
             .collect();
 
-        // Expand initial_states to include entities from known_matches that weren't in the predicate results
         let expanded_states = crate::util::expand_states::expand_states(
             initial_states,
             known_matches.iter().map(|k| k.entity_id).collect::<Vec<_>>(),
@@ -227,21 +185,15 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
 
         let known_map: std::collections::HashMap<_, _> = known_matches.into_iter().map(|k| (k.entity_id, k.head)).collect();
 
-        // Generate deltas based on known_matches - use expanded states
+        let policy = ReadPolicy::new(&node.policy_agent, credentials, &collection_id);
         let mut deltas = Vec::with_capacity(expanded_states.len());
         for state in expanded_states {
-            // Row-level read policy: the query predicate was already narrowed by
-            // filter_predicate above, but expand_states can resurface entities from
-            // known_matches that the subscriber can no longer read, and scope rules
-            // are evaluated against entity state, not just the predicate. Skip
-            // unreadable entities silently (mirroring the Fetch/Get handlers) so one
-            // out-of-scope entity doesn't fail the whole subscription.
-            if node.policy_agent.check_read(cdata, &state.payload.entity_id, &collection_id, &state.payload.state).is_err() {
+            // `known_matches` may resurface rows outside the current policy.
+            if policy.check_read(&state.payload.entity_id, &state.payload.state).is_err() {
                 continue;
             }
 
-            // Only include delta if heads differ (None means heads are equal)
-            if let Some(delta) = node.generate_entity_delta(&known_map, state, &storage_collection, cdata).await? {
+            if let Some(delta) = node.generate_entity_delta(&known_map, state, &storage_collection, credentials).await? {
                 deltas.push(delta);
             }
         }

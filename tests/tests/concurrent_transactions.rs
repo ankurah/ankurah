@@ -10,7 +10,7 @@ use common::*;
 /// 4. Second transaction should handle the concurrent update correctly
 #[tokio::test]
 async fn test_concurrent_transactions_same_entity() -> Result<()> {
-    let context = durable_sled_setup().await?.context_async(DEFAULT_CONTEXT).await;
+    let context = durable_sled_setup().await?.context_async(DEFAULT_CONTEXT).await.unwrap();
     let mut dag = TestDag::new();
 
     // Create initial entity
@@ -34,8 +34,8 @@ async fn test_concurrent_transactions_same_entity() -> Result<()> {
     let album_mut2 = album.edit(&trx2)?;
 
     // Make different changes
-    album_mut1.name().replace("Updated by Trx1")?;
-    album_mut2.year().replace("2025")?;
+    album_mut1.name()?.replace("Updated by Trx1")?;
+    album_mut2.year()?.replace("2025")?;
 
     // Commit first transaction - this should succeed
     dag.enumerate(trx1.commit_and_return_events().await?); // B = first concurrent update
@@ -90,7 +90,7 @@ async fn test_concurrent_transactions_same_entity() -> Result<()> {
 /// Test rapid concurrent transactions to stress test the system
 #[tokio::test]
 async fn test_many_concurrent_transactions() -> Result<()> {
-    let context = durable_sled_setup().await?.context_async(DEFAULT_CONTEXT).await;
+    let context = durable_sled_setup().await?.context_async(DEFAULT_CONTEXT).await.unwrap();
 
     // Create initial entity
     let album_id = {
@@ -113,7 +113,7 @@ async fn test_many_concurrent_transactions() -> Result<()> {
             let trx = ctx.begin();
             let album_mut = album.edit(&trx)?;
             // Each transaction updates the year field to a different value
-            album_mut.year().replace(&format!("{}", i))?;
+            album_mut.year()?.replace(&format!("{}", i))?;
             trx.commit().await
         });
         handles.push(handle);
@@ -148,7 +148,7 @@ async fn test_many_concurrent_transactions() -> Result<()> {
 /// This should reproduce the BudgetExceeded issue
 #[tokio::test]
 async fn test_concurrent_transactions_long_lineage() -> Result<()> {
-    let context = durable_sled_setup().await?.context_async(DEFAULT_CONTEXT).await;
+    let context = durable_sled_setup().await?.context_async(DEFAULT_CONTEXT).await.unwrap();
 
     // Create initial entity and build up a long lineage
     let album_id = {
@@ -164,7 +164,7 @@ async fn test_concurrent_transactions_long_lineage() -> Result<()> {
         let album = context.get::<AlbumView>(album_id).await?;
         let trx = context.begin();
         let album_mut = album.edit(&trx)?;
-        album_mut.year().replace(&format!("{}", i))?;
+        album_mut.year()?.replace(&format!("{}", i))?;
         trx.commit().await?;
     }
 
@@ -177,8 +177,8 @@ async fn test_concurrent_transactions_long_lineage() -> Result<()> {
     let album_mut1 = album.edit(&trx1)?;
     let album_mut2 = album.edit(&trx2)?;
 
-    album_mut1.name().replace("Updated by Trx1")?;
-    album_mut2.name().replace("Updated by Trx2")?;
+    album_mut1.name()?.replace("Updated by Trx1")?;
+    album_mut2.name()?.replace("Updated by Trx2")?;
 
     // Commit first transaction
     trx1.commit().await?;

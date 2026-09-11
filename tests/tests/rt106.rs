@@ -15,7 +15,7 @@ async fn rt106() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client_storage = Arc::new(SledStorageEngine::new_test().unwrap());
     let client = Node::new(client_storage.clone(), PermissiveAgent::new());
     let _conn = LocalProcessConnection::new(&server, &client).await?;
-    client.system.wait_system_ready().await;
+    client.system.wait_system_ready().await.unwrap();
 
     let server_ctx = server.context(c)?;
     let client_ctx = client.context(c)?;
@@ -52,12 +52,12 @@ async fn rt106() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Make two changes on the server while client is unsubscribed
     {
         let trx = server_ctx.begin();
-        server_album.edit(&trx)?.year().overwrite(0, 4, "2021")?;
+        server_album.edit(&trx)?.year()?.overwrite(0, 4, "2021")?;
         trx.commit().await?;
     }
     {
         let trx = server_ctx.begin();
-        server_album.edit(&trx)?.year().overwrite(0, 4, "2022")?;
+        server_album.edit(&trx)?.year()?.overwrite(0, 4, "2022")?;
         trx.commit().await?;
     }
 

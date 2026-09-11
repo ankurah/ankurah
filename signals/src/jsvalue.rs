@@ -123,7 +123,8 @@ impl Clone for JsValueRead {
 /// A calculated signal for JavaScript that computes its value from a JS closure.
 ///
 /// The closure can access other signals (via their .get() methods), and the
-/// calculated signal will automatically recompute when any accessed signal changes.
+/// calculated signal will recompute on the next read after an accessed signal changes.
+/// The closure must be free of externally observable side effects.
 #[wasm_bindgen(skip_typescript)]
 pub struct JsValueCalculated(Calculated<SendWrapper<JsValue>>);
 
@@ -144,8 +145,8 @@ export class JsValueCalculated<T = any> {
 impl JsValueCalculated {
     /// Create a new calculated signal from a JavaScript function.
     ///
-    /// The function will be called immediately to compute the initial value,
-    /// and will be called again whenever any signal accessed during computation changes.
+    /// The function is called immediately to establish dependencies and thereafter
+    /// when the value is first read after a dependency changes.
     #[wasm_bindgen(constructor)]
     pub fn new(compute: js_sys::Function) -> Self {
         let compute = SendWrapper::new(compute);

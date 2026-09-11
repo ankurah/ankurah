@@ -39,7 +39,7 @@ impl WebSocketClientSender {
     #[tracing::instrument(skip(self, message), fields(recipient = %self.inner.recipient_node_id, msg = %message))]
     pub fn send_message(&self, message: proto::Message) -> Result<(), SendError> {
         debug!("Serializing message");
-        let data = bincode::serialize(&message).map_err(|e| SendError::Other(anyhow::anyhow!("Serialization error: {}", e)))?;
+        let data = bincode::serialize(&message).map_err(|e| SendError::from(anyhow::anyhow!("Serialization error: {}", e)))?;
 
         debug!(bytes = data.len(), "Sending message through channel");
         self.tx.try_send(axum::extract::ws::Message::Binary(data.into())).map_err(|_| SendError::Unknown)?;

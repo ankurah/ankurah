@@ -5,7 +5,7 @@ use crate::EntityId;
 
 /// A built-in model's logical identity. Variant order is part of the bincode
 /// contract; append variants, never reorder them without a protocol bump.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, strum::IntoStaticStr)]
 pub enum SystemModel {
     /// The singleton system-configuration model.
     System,
@@ -15,6 +15,19 @@ pub enum SystemModel {
     Property,
     /// Catalog entities that associate properties with models.
     ModelProperty,
+}
+
+impl SystemModel {
+    /// Parse a Rust variant identifier.
+    pub fn from_variant_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "System" => Self::System,
+            "Model" => Self::Model,
+            "Property" => Self::Property,
+            "ModelProperty" => Self::ModelProperty,
+            _ => return None,
+        })
+    }
 }
 
 impl fmt::Display for SystemModel {

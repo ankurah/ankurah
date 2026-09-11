@@ -1,6 +1,8 @@
 mod collatable;
+mod ext;
 
 pub use ankurah_core_types::{CastError, Value, ValueParseError, ValueType};
+pub use ext::ValueExt;
 
 impl From<CastError> for crate::property::PropertyError {
     fn from(error: CastError) -> Self { Self::CastError(error) }

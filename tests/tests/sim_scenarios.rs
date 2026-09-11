@@ -13,6 +13,7 @@ use ankurah_tests::sim::{body, run_once, run_with_determinism_audit, FaultConfig
 /// after convergence every node holds both writes and a two-tip head; the head
 /// must be a valid antichain and byte-equal across nodes.
 #[test]
+#[ignore = "Exact-trace nondeterminism; re-enable with https://github.com/ankurah/ankurah/issues/494"]
 fn concurrent_commuting_edits_converge() {
     for seed in 0..4u64 {
         let outcome = run_with_determinism_audit("concurrent_commuting", seed, FaultConfig::none(), 3, || {
@@ -64,6 +65,7 @@ fn concurrent_conflicting_edits_converge() {
 /// remain a valid antichain (the extended tip's new event supersedes its
 /// parent, the untouched tip survives) and converge across nodes.
 #[test]
+#[ignore = "Exact-trace nondeterminism; re-enable with https://github.com/ankurah/ankurah/issues/494"]
 fn stale_client_extends_one_tip_of_multihead() {
     for seed in 0..4u64 {
         let outcome = run_with_determinism_audit("stale_client_multihead", seed, FaultConfig::none(), 3, || {

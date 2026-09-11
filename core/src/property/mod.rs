@@ -9,7 +9,7 @@ pub use value::{Json, Ref, YrsString};
 
 use crate::value::Value;
 
-pub type PropertyName = String;
+pub use ankurah_proto::PropertyId;
 
 pub trait Property: Sized {
     /// The catalog value type this Rust type serializes to: the name of the

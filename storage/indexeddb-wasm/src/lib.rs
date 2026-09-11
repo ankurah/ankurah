@@ -3,6 +3,7 @@ pub mod database;
 mod engine;
 pub(crate) mod error;
 pub mod idb_value;
+pub mod lower;
 mod planner_integration;
 mod scanner;
 mod statics;

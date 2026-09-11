@@ -14,7 +14,7 @@ async fn test_postgres() -> Result<()> {
     node.system.create().await?;
 
     // Get context after system is ready
-    let context = node.context_async(c).await;
+    let context = node.context_async(c).await.unwrap();
 
     let trx = context.begin();
     let _album = trx.create(&Album { name: "The rest of the owl".to_owned(), year: "2024".to_owned() }).await?;

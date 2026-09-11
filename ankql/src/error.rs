@@ -6,7 +6,7 @@ use thiserror::Error;
 use wasm_bindgen;
 
 /// Custom error type for parsing errors
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Clone)]
 pub enum ParseError {
     #[error("Syntax error: {0}")]
     SyntaxError(String),

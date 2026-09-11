@@ -254,7 +254,7 @@ async fn test_jwt_agent_durable_ephemeral_pair() -> anyhow::Result<()> {
 
     node1.system.create().await?;
     let _conn = LocalProcessConnection::new(&node1, &node2).await?;
-    node2.system.wait_system_ready().await;
+    node2.system.wait_system_ready().await.unwrap();
 
     let editor_claims = make_claims("editor-1", &["Editor"], "editor@blog.com");
     let editor_token = sign_token(&keys, &editor_claims);
@@ -295,7 +295,7 @@ async fn test_jwt_check_request_roundtrip() -> anyhow::Result<()> {
 
     node1.system.create().await?;
     let _conn = LocalProcessConnection::new(&node1, &node2).await?;
-    node2.system.wait_system_ready().await;
+    node2.system.wait_system_ready().await.unwrap();
 
     let claims = make_claims("editor-2", &["Editor"], "ed2@blog.com");
     let token = sign_token(&keys, &claims);

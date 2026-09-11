@@ -172,7 +172,7 @@ Starts with deny-all config and no keys. Policy and keys arrive via LiveQuery.
 Called after the `Node` is fully constructed.
 
 - **Durable mode:** Spawns a `PolicyWatcher` that monitors the config file for changes using filesystem notifications (`notify` crate). The watcher runs under a `Root` context.
-- **Ephemeral mode:** Creates a weak-node LiveQuery (`EntityLiveQuery::new_weak_node`) on the `jwtpolicy` collection with `NoUser` context. Subscribes to changes and updates config + keys when policy entities arrive.
+- **Ephemeral mode:** Creates a weak-node LiveQuery (`EntityLiveQuery::new_with_weak_node`) on the `jwtpolicy` collection with `NoUser` context. Subscribes to changes and updates config + keys when policy entities arrive.
 
 #### `sign_request`
 
@@ -248,7 +248,7 @@ The `JwtPolicy` entity serves as the bridge to ephemeral nodes -- changes propag
 
 ### Ephemeral Side: LiveQuery
 
-On `on_node_ready`, the ephemeral agent creates a weak-node LiveQuery via `EntityLiveQuery::new_weak_node` (does not prevent the node from being dropped) on the `jwtpolicy` collection using `NoUser` context.
+On `on_node_ready`, the ephemeral agent creates a weak-node LiveQuery via `EntityLiveQuery::new_with_weak_node` (does not prevent the node from being dropped) on the `jwtpolicy` collection using `NoUser` context.
 
 The `can_access_collection` method has a hardcoded carveout allowing any context to read `jwtpolicy`, enabling the bootstrap flow.
 

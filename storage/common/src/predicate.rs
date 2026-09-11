@@ -15,14 +15,14 @@ pub struct ConjunctFinder;
 impl ConjunctFinder {
     /// Extract all top-level conjuncts from a predicate tree.
     /// Returns owned predicates in order of appearance.
-    pub fn find(predicate: &ankql::ast::Predicate) -> Vec<ankql::ast::Predicate> {
+    pub fn find<S: ankql::ast::Stage>(predicate: &ankql::ast::Predicate<S>) -> Vec<ankql::ast::Predicate<S>> {
         let mut conjuncts = Vec::new();
         Self::extract_conjuncts(predicate, &mut conjuncts);
         conjuncts
     }
 
     /// Recursively extract conjuncts, stopping at OR boundaries
-    fn extract_conjuncts(predicate: &ankql::ast::Predicate, conjuncts: &mut Vec<ankql::ast::Predicate>) {
+    fn extract_conjuncts<S: ankql::ast::Stage>(predicate: &ankql::ast::Predicate<S>, conjuncts: &mut Vec<ankql::ast::Predicate<S>>) {
         match predicate {
             ankql::ast::Predicate::And(left, right) => {
                 // Recursively extract from both sides of AND
@@ -126,11 +126,13 @@ mod tests {
     #[test]
     fn test_true_false_predicates() {
         // Test with Predicate::True and Predicate::False
-        let conjuncts = ConjunctFinder::find(&ankql::ast::Predicate::True);
+        let truth: ankql::ast::Predicate<ankql::ast::Parsed> = ankql::ast::Predicate::True;
+        let conjuncts = ConjunctFinder::find(&truth);
         assert_eq!(conjuncts.len(), 1);
         assert_eq!(conjuncts[0], ankql::ast::Predicate::True);
 
-        let conjuncts = ConjunctFinder::find(&ankql::ast::Predicate::False);
+        let falsehood: ankql::ast::Predicate<ankql::ast::Parsed> = ankql::ast::Predicate::False;
+        let conjuncts = ConjunctFinder::find(&falsehood);
         assert_eq!(conjuncts.len(), 1);
         assert_eq!(conjuncts[0], ankql::ast::Predicate::False);
     }

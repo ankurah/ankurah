@@ -1,310 +1,211 @@
 mod common;
-use ankurah::{policy::DEFAULT_CONTEXT, proto::CollectionId, Node, PermissiveAgent};
-use ankurah_connector_local_process::LocalProcessConnection;
-use ankurah_storage_sled::SledStorageEngine;
-use anyhow::Result;
-use common::{Album, Pet};
-use std::sync::Arc;
+
+use ankurah::core::{connector::PeerConnectionError, error::NodeHaltReason, storage::StorageEngine};
+use common::*;
+use std::{sync::Arc, time::Duration};
 
 #[tokio::test]
-async fn test_system() -> Result<()> {
-    let engine = Arc::new(SledStorageEngine::new_test().unwrap());
-    {
-        let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
+async fn test_system() -> anyhow::Result<()> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let engine = Arc::new(SledStorageEngine::new_test()?);
+        let (root, epoch) = {
+            let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
+            node.system.create().await?;
+            let root = node.system.root().expect("created root");
+            assert_eq!(root.payload.state.head.len(), 1);
+            assert_eq!(node.system.items().len(), 1);
+            (root, node.system.system_epoch())
+        };
 
-        node.system.create().await?;
-
-        let root = node.system.root();
-        assert_eq!(root.expect("Should have root").payload.state.head.len(), 1);
-
-        let items = node.system.items();
-        assert_eq!(items.len(), 1);
-    }
-
-    {
         let node = Node::new_durable(engine, PermissiveAgent::new());
-
-        // assert that this fails because the system already exists
-        assert!(node.system.create().await.is_err());
-
-        let root = node.system.root();
-        assert_eq!(root.expect("Should have root").payload.state.head.len(), 1);
-
-        let items = node.system.items();
-        assert_eq!(items.len(), 1);
-    }
-    Ok(())
+        node.system.wait_loaded().await?;
+        assert!(node.system.create().await.is_err(), "a persisted system cannot be created twice");
+        assert_eq!(node.system.root(), Some(root));
+        assert_eq!(node.system.items().len(), 1);
+        assert_ne!(node.system.system_epoch(), epoch, "each Node owns its own epoch");
+        Ok(())
+    })
+    .await?
 }
 
 #[tokio::test]
-async fn test_system_ready_behavior() -> Result<()> {
-    let engine = Arc::new(SledStorageEngine::new_test().unwrap());
+async fn persisted_root_restores_the_system_before_ephemeral_catalog_readiness() -> anyhow::Result<()> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let engine = Arc::new(SledStorageEngine::new_test()?);
+        let root = {
+            let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
+            node.system.create().await?;
+            node.system.root().expect("persisted root")
+        };
 
-    // First create and initialize with a durable node
-    {
-        let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
-        assert!(!node.system.is_system_ready()); // Not ready before initialize
+        for durable in [true, false] {
+            let node = if durable {
+                Node::new_durable(engine.clone(), PermissiveAgent::new())
+            } else {
+                Node::new(engine.clone(), PermissiveAgent::new())
+            };
+            node.system.wait_loaded().await?;
+            node.system.wait_system_ready().await?;
+            if durable {
+                node.wait_ready().await?;
+            } else {
+                let mut ready = Box::pin(node.wait_ready());
+                assert!(futures_util::poll!(&mut ready).is_pending());
+                assert_eq!(node.state().peek(), NodeState::Startup);
+            }
+            assert!(node.system.is_system_ready());
+            assert_eq!(node.system.root(), Some(root.clone()));
+            assert!(node.system.system_epoch().is_some());
+            assert!(node.get_durable_peers().is_empty());
+            assert!(node.state().peek().halt_reason().is_none());
+            node.context_async(DEFAULT_CONTEXT).await?;
+        }
+        Ok(())
+    })
+    .await?
+}
 
-        node.system.create().await?;
-        assert!(node.system.is_system_ready()); // Ready after initialize
+#[tokio::test]
+async fn adopted_root_persists_and_reconnecting_keeps_the_epoch() -> anyhow::Result<()> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let server = durable_sled_setup().await?;
+        let root = server.system.root().expect("durable root");
+        let engine = Arc::new(SledStorageEngine::new_test()?);
+        let epoch = {
+            let node = Node::new(engine.clone(), PermissiveAgent::new());
+            node.system.wait_loaded().await?;
+            assert!(!node.system.is_system_ready());
+            assert!(node.system.system_epoch().is_none());
+            assert_eq!(node.state().peek(), NodeState::Uninitialized);
+            node.system.adopt_system(root.clone()).await?;
+            node.system.wait_system_ready().await?;
+            let _connection = LocalProcessConnection::new(&server, &node).await?;
+            node.wait_ready().await?;
+            let epoch = node.system.system_epoch();
+            assert!(epoch.is_some());
+            node.system.adopt_system(root.clone()).await?;
+            assert_eq!(node.state().peek(), NodeState::Running);
+            assert_eq!(node.system.system_epoch(), epoch);
+            assert_eq!(node.system.root(), Some(root.clone()));
+            epoch
+        };
 
-        let root = node.system.root();
-        assert_eq!(root.expect("Should have root").payload.state.head.len(), 1);
-    }
-
-    // Create another durable node - should be ready after loading since system exists
-    {
-        let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
-        assert!(!node.system.is_system_ready()); // Not ready immediately
-
-        // Wait for load
-        node.system.wait_loaded().await;
-        assert!(node.system.is_system_ready()); // Ready after load since we're durable
-
-        let root = node.system.root();
-        assert_eq!(root.expect("Should have root").payload.state.head.len(), 1);
-    }
-
-    // Create an ephemeral node - should NOT be ready even after loading
-    {
         let node = Node::new(engine.clone(), PermissiveAgent::new());
-        assert!(!node.system.is_system_ready()); // Not ready immediately
-
-        // Wait for load
-        node.system.wait_loaded().await;
-        assert!(!node.system.is_system_ready()); // Still not ready after load
-
-        let root = node.system.root();
-        assert_eq!(root.expect("Should have root").payload.state.head.len(), 1);
-    }
-
-    Ok(())
+        node.system.wait_loaded().await?;
+        node.system.wait_system_ready().await?;
+        assert_eq!(node.system.root(), Some(root.clone()));
+        assert_ne!(node.system.system_epoch(), epoch);
+        assert!(node.get_durable_peers().is_empty());
+        let roots = engine.collection(&root.payload.collection).await?;
+        let selection = ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None };
+        assert_eq!(roots.fetch_states(&selection).await?, vec![root]);
+        Ok(())
+    })
+    .await?
 }
 
 #[tokio::test]
-async fn test_system_persistence_across_reconstruction() -> Result<()> {
-    // Create separate storage engines for durable and ephemeral nodes
-    let durable_engine = Arc::new(SledStorageEngine::new_test().unwrap());
-    let ephemeral_engine = Arc::new(SledStorageEngine::new_test().unwrap());
+async fn different_system_halts_by_default_without_wiping_storage() -> anyhow::Result<()> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let server = durable_sled_setup().await?;
+        let server_context = server.context(DEFAULT_CONTEXT)?;
+        let transaction = server_context.begin();
+        let id = transaction.create(&Pet { name: "Fido".into(), age: "3".into() }).await?.id();
+        transaction.commit().await?;
 
-    // First setup: Create both durable and ephemeral nodes
-    let root_state = {
-        // Create and initialize durable node
-        let durable_node = Node::new_durable(durable_engine.clone(), PermissiveAgent::new());
-        durable_node.system.create().await?;
-        assert!(durable_node.system.is_system_ready());
+        let engine = Arc::new(SledStorageEngine::new_test()?);
+        let client = Node::new(engine.clone(), PermissiveAgent::new());
+        let _connection = LocalProcessConnection::new(&server, &client).await?;
+        let context = client.context_async(DEFAULT_CONTEXT).await?;
+        let query = context.query_wait::<PetView>("true").await?;
+        query.wait_durable_answered().await?;
+        let retained = context.get::<PetView>(id).await?;
+        let root = client.system.root().expect("adopted root");
+        let epoch = client.system.system_epoch();
+        let selection = query.selection().peek();
+        let collection = engine.collection(&Pet::collection()).await?;
+        let state = collection.get_state(id).await?;
+        let collections = engine.list_collections()?;
 
-        // Get root state for later comparison
-        let root_state = durable_node.system.root().expect("Should have root state");
-        assert_eq!(root_state.payload.state.head.len(), 1);
+        let other = durable_sled_setup().await?;
+        let proposed = other.system.root().expect("different root");
+        assert_ne!(root.payload.entity_id, proposed.payload.entity_id);
+        let reason = NodeHaltReason::SystemReplacement { current: root.payload.entity_id, proposed: proposed.payload.entity_id };
+        assert_eq!(client.system.adopt_system(proposed.clone()).await, Err(PeerConnectionError::NodeHalted(reason.clone())));
 
-        // Create ephemeral node
-        let ephemeral_node = Node::new(ephemeral_engine.clone(), PermissiveAgent::new());
-        ephemeral_node.system.wait_loaded().await;
-        assert!(!ephemeral_node.system.is_system_ready());
+        assert_eq!(client.state().peek(), NodeState::Halted(reason));
+        assert!(!client.system.is_system_ready());
+        assert_eq!(client.system.root(), Some(root.clone()));
+        assert_eq!(client.system.system_epoch(), epoch);
+        assert_eq!(engine.list_collections()?, collections);
+        assert_eq!(collection.get_state(id).await?, state);
+        assert_eq!(query.selection().peek(), selection);
+        assert_eq!(retained.name()?, "Fido");
 
-        // Connect nodes using LocalProcessConnection
-        let _conn = LocalProcessConnection::new(&durable_node, &ephemeral_node).await?;
+        let transaction = context.begin();
+        retained.edit(&transaction)?.age()?.replace("4")?;
+        assert!(transaction.commit().await.is_err());
 
-        // Wait for ephemeral node to be ready
-        ephemeral_node.system.wait_system_ready().await;
-        assert!(ephemeral_node.system.is_system_ready());
-
-        // Verify both nodes match the root state
-        assert_eq!(durable_node.system.root(), Some(root_state.clone()), "durable root should match");
-        assert_eq!(ephemeral_node.system.root(), Some(root_state.clone()), "ephemeral root should match");
-
-        // Return root state for later comparison
-        root_state
-    }; // Both nodes and connection are dropped here
-
-    // Second setup: Reconstruct both nodes with their respective storage engines
-    {
-        // Create new durable node - should automatically load existing system
-        let durable_node = Node::new_durable(durable_engine.clone(), PermissiveAgent::new());
-        durable_node.system.wait_loaded().await;
-        assert!(durable_node.system.is_system_ready(), "Durable node should be ready after loading existing system");
-
-        // Verify root state persisted in durable storage
-        assert_eq!(
-            durable_node.system.root().expect("Should have root").payload.state.head,
-            root_state.payload.state.head,
-            "Durable node should have same root state after reconstruction"
-        );
-
-        // Create new ephemeral node
-        let ephemeral_node = Node::new(ephemeral_engine.clone(), PermissiveAgent::new());
-        ephemeral_node.system.wait_loaded().await;
-        assert!(!ephemeral_node.system.is_system_ready(), "Ephemeral node should not be ready before connection");
-
-        // Connect nodes using LocalProcessConnection
-        let _conn = LocalProcessConnection::new(&durable_node, &ephemeral_node).await?;
-
-        // Wait for ephemeral node to be ready
-        ephemeral_node.system.wait_system_ready().await;
-        assert!(ephemeral_node.system.is_system_ready(), "Ephemeral node should be ready after connection");
-
-        // Verify all roots match
-        assert_eq!(
-            durable_node.system.root().expect("Should have root"),
-            ephemeral_node.system.root().expect("Should have root"),
-            "Both nodes should have same root after reconstruction"
-        );
-        assert_eq!(
-            ephemeral_node.system.root().expect("Should have root"),
-            root_state,
-            "Reconstructed nodes should have same root as original"
-        );
-    }
-
-    Ok(())
-}
-
-/// The three catalog collections the durable warm opens at startup, in
-/// sorted order for census comparisons.
-fn with_catalog(mut others: Vec<CollectionId>) -> Vec<CollectionId> {
-    others.extend(["_ankurah_model", "_ankurah_model_property", "_ankurah_property"].map(CollectionId::fixed_name));
-    others.sort();
-    others
-}
-
-fn sorted(mut v: Vec<CollectionId>) -> Vec<CollectionId> {
-    v.sort();
-    v
+        let reopened = Node::new(engine, PermissiveAgent::new());
+        reopened.system.wait_system_ready().await?;
+        let _reconnection = LocalProcessConnection::new(&server, &reopened).await?;
+        reopened.wait_ready().await?;
+        assert_eq!(reopened.system.root(), Some(root));
+        assert_eq!(reopened.context(DEFAULT_CONTEXT)?.get_cached::<PetView>(id).await?.age()?, "3");
+        Ok(())
+    })
+    .await?
 }
 
 #[tokio::test]
-async fn test_system_root_change_behavior() -> Result<()> {
-    // Create separate storage engines for durable and ephemeral nodes
-    let durable_engine = Arc::new(SledStorageEngine::new_test().unwrap());
-    let ephemeral_engine = Arc::new(SledStorageEngine::new_test().unwrap());
+async fn enabled_replacement_wipes_storage_for_the_next_node() -> anyhow::Result<()> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let server = durable_sled_setup().await?;
+        let transaction = server.context(DEFAULT_CONTEXT)?.begin();
+        let id = transaction.create(&Pet { name: "preserved".into(), age: "3".into() }).await?.id();
+        transaction.commit().await?;
 
-    // Get initial root state
-    let initial_root = {
-        // Create and initialize durable node
-        let durable_node = Node::new_durable(durable_engine.clone(), PermissiveAgent::new());
-        durable_node.system.create().await?;
-        assert!(durable_node.system.is_system_ready());
+        let engine = Arc::new(SledStorageEngine::new_test()?);
+        let client = Node::new(engine.clone(), PermissiveAgent::new());
+        let _connection = LocalProcessConnection::new(&server, &client).await?;
+        let context = client.context_async(DEFAULT_CONTEXT).await?;
+        context.get::<PetView>(id).await?;
+        client.wait_ready().await?;
+        let root = client.system.root().expect("original root");
+        let collection = engine.collection(&Pet::collection()).await?;
+        assert!(collection.get_state(id).await.is_ok());
+        let roots = engine.collection(&root.payload.collection).await?;
+        assert!(roots.get_state(root.payload.entity_id).await.is_ok());
+        let node_state = client.state();
+        assert!(node_state.peek().halt_reason().is_none());
 
-        // Create ephemeral node
-        let ephemeral_node = Node::new(ephemeral_engine.clone(), PermissiveAgent::new());
-        ephemeral_node.system.wait_loaded().await;
+        let other = durable_sled_setup().await?;
+        let proposed = other.system.root().expect("replacement root");
+        let halt_reason = NodeHaltReason::SystemReplacement { current: root.payload.entity_id, proposed: proposed.payload.entity_id };
+        client.set_allow_system_replacement(true);
+        assert_eq!(client.system.adopt_system(proposed.clone()).await, Err(PeerConnectionError::NodeHalted(halt_reason.clone())));
+        assert_eq!(node_state.peek(), NodeState::Halted(halt_reason.clone()));
+        assert!(!client.system.is_system_ready());
+        assert!(client.system.root().is_none());
+        assert!(client.system.system_epoch().is_none());
+        assert!(client.system.items().is_empty());
+        assert!(engine.list_collections()?.is_empty());
 
-        // Not ready because we haven't joined the system
-        assert!(!ephemeral_node.system.is_system_ready());
+        client.set_allow_system_replacement(false);
+        assert_eq!(client.system.adopt_system(root.clone()).await, Err(PeerConnectionError::NodeHalted(halt_reason.clone())));
+        assert_eq!(client.system.wait_loaded().await, Err(halt_reason.clone()));
+        assert_eq!(client.system.wait_system_ready().await, Err(halt_reason));
 
-        // Connect nodes
-        let _conn = LocalProcessConnection::new(&durable_node, &ephemeral_node).await?;
-
-        // Wait for ephemeral node to be ready
-        ephemeral_node.system.wait_system_ready().await;
-
-        // now we should be ready because we joined the system
-        assert!(ephemeral_node.system.is_system_ready());
-
-        // Store initial root state for comparison
-        let initial_root = durable_node.system.root().expect("Should have root state");
-
-        // Verify both nodes have same root
-        assert_eq!(
-            durable_node.system.root().expect("Should have root").payload.state.head,
-            ephemeral_node.system.root().expect("Should have root").payload.state.head,
-            "Both nodes should have same root state after initial setup"
-        );
-
-        let trx = ephemeral_node.context(DEFAULT_CONTEXT)?.begin();
-        trx.create(&Pet { name: "Fido".into(), age: "3".to_string() }).await?;
-        trx.commit().await?;
-
-        assert_eq!(
-            ephemeral_engine.list_collections()?,
-            vec![CollectionId::fixed_name("_ankurah_system"), CollectionId::fixed_name("pet")]
-        );
-
-        durable_node.catalog.wait_catalog_ready().await;
-        assert_eq!(
-            sorted(durable_engine.list_collections()?),
-            with_catalog(vec![CollectionId::fixed_name("_ankurah_system"), CollectionId::fixed_name("pet")])
-        );
-
-        initial_root
-    }; // Both nodes and connection are dropped here
-
-    // Reset durable node's system (creating new root) but NOT ephemeral node
-    let second_root = {
-        let durable_node = Node::new_durable(durable_engine.clone(), PermissiveAgent::new());
-        durable_node.system.wait_loaded().await;
-
-        // should be ready because we previously initialized a system
-        assert!(durable_node.system.is_system_ready());
-
-        durable_node.catalog.wait_catalog_ready().await;
-        assert_eq!(
-            sorted(durable_engine.list_collections()?),
-            with_catalog(vec![CollectionId::fixed_name("_ankurah_system"), CollectionId::fixed_name("pet")])
-        );
-
-        // Reset storage and reinitialize
-        durable_node.system.hard_reset().await?;
-
-        assert_eq!(durable_engine.list_collections()?, Vec::<CollectionId>::new());
-
-        assert!(!durable_node.system.is_system_ready());
-
-        durable_node.system.create().await?;
-
-        durable_node.catalog.wait_catalog_ready().await;
-        assert_eq!(sorted(durable_engine.list_collections()?), with_catalog(vec![CollectionId::fixed_name("_ankurah_system")]));
-
-        // Verify root has changed
-        let second_root = durable_node.system.root().expect("Should have new root state");
-        assert_ne!(second_root.payload.state.head, initial_root.payload.state.head, "Root state should be different after reset");
-
-        assert_eq!(second_root.payload.state.head.len(), 1);
-
-        let trx = durable_node.context(DEFAULT_CONTEXT)?.begin();
-        trx.create(&Album { name: "Leonard Skynyrd".into(), year: "1973".to_string() }).await?;
-        trx.commit().await?;
-
-        assert_eq!(
-            sorted(durable_engine.list_collections()?),
-            with_catalog(vec![CollectionId::fixed_name("_ankurah_system"), CollectionId::fixed_name("album")])
-        );
-
-        second_root
-    }; // Drop durable node
-
-    // Ephemeral node joins the new system and resets everything
-    {
-        let durable_node = Node::new_durable(durable_engine.clone(), PermissiveAgent::new());
-        durable_node.system.wait_loaded().await;
-        assert!(durable_node.system.is_system_ready()); // should be ready when loaded
-        assert_eq!(durable_node.system.root(), Some(second_root.clone()));
-        durable_node.catalog.wait_catalog_ready().await;
-        assert_eq!(
-            sorted(durable_engine.list_collections()?),
-            with_catalog(vec![CollectionId::fixed_name("_ankurah_system"), CollectionId::fixed_name("album")])
-        );
-
-        let ephemeral_node = Node::new(ephemeral_engine.clone(), PermissiveAgent::new());
-        ephemeral_node.system.wait_loaded().await;
-        assert!(!ephemeral_node.system.is_system_ready()); // should not be ready before joining
-        assert_eq!(ephemeral_node.system.root(), Some(initial_root), "Ephemeral node should have old root prior to joining");
-        assert_eq!(
-            ephemeral_engine.list_collections()?,
-            vec![CollectionId::fixed_name("_ankurah_system"), CollectionId::fixed_name("pet")]
-        );
-
-        // Connect nodes
-        let _conn = LocalProcessConnection::new(&durable_node, &ephemeral_node).await?;
-
-        // Wait for ephemeral node to be ready
-        ephemeral_node.system.wait_system_ready().await;
-
-        assert_eq!(ephemeral_node.system.root(), Some(second_root), "Ephemeral node should have new root after joining");
-
-        assert_eq!(ephemeral_engine.list_collections()?, vec![CollectionId::fixed_name("_ankurah_system")]);
-    }
-
-    Ok(())
+        let reopened = Node::new(engine.clone(), PermissiveAgent::new());
+        reopened.system.wait_loaded().await?;
+        assert!(reopened.state().peek().halt_reason().is_none(), "the halt reason belongs to the old Node, not its store");
+        assert!(reopened.system.root().is_none());
+        let collection = engine.collection(&Pet::collection()).await?;
+        assert!(collection.get_state(id).await.is_err());
+        assert!(collection.dump_entity_events(id).await?.is_empty());
+        reopened.system.adopt_system(proposed.clone()).await?;
+        assert_eq!(reopened.system.root(), Some(proposed));
+        Ok(())
+    })
+    .await?
 }

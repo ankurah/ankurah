@@ -17,7 +17,7 @@ async fn main() -> Result<()> {
     let storage = SledStorageEngine::with_homedir_folder(".ankurah_example")?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
 
-    node.system.wait_loaded().await;
+    node.system.wait_loaded().await?;
     if node.system.root().is_none() {
         node.system.create().await?;
     }
@@ -40,7 +40,7 @@ async fn main() -> Result<()> {
 }
 
 async fn log_generation_task(node: Node<SledStorageEngine, PermissiveAgent>) -> Result<()> {
-    let context = node.context_async(c).await;
+    let context = node.context_async(c).await?;
 
     // Subscribe to flags changes
     let flags_query = context.query_wait::<FlagsView>("name = 'generate_logs'").await?;

@@ -24,12 +24,39 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+/// Bind a parsed query's names the way the query boundary does, minting each
+/// name's id from its own bytes: the split classifies by the shape of a
+/// property reference, so which id a name binds to does not matter here.
+fn resolve(query: &str) -> ankql::ast::Predicate<ankql::ast::Resolved> {
+    use ankurah::core::schema::resolver::{resolve_selection, ModelResolutionError, ModelResolver, ResolvedProperty};
+    struct Fixture;
+    impl ModelResolver for Fixture {
+        fn resolve_property(&self, _model: &ankurah::proto::ModelId, name: &str) -> Result<Option<ResolvedProperty>, ModelResolutionError> {
+            let mut bytes = [0u8; 32];
+            for (i, byte) in name.bytes().take(32).enumerate() {
+                bytes[i] = byte;
+            }
+            Ok(Some(ResolvedProperty {
+                id: ankql::ast::PropertyId::EntityId(ankurah::proto::EntityId::from_bytes(bytes)),
+                value_type: if name == "licensing" {
+                    ankurah::core::value::ValueType::Json
+                } else {
+                    ankurah::core::value::ValueType::String
+                },
+            }))
+        }
+    }
+
+    let selection = ankql::parser::parse_selection(query).expect("Failed to parse query");
+    let model = ankurah::proto::ModelId::EntityId(ankurah::proto::EntityId::from_bytes([0x77; 32]));
+    resolve_selection(&model, &Fixture, selection).expect("Failed to resolve query").predicate
+}
+
 /// Assert that a query predicate fully pushes down to PostgreSQL (no post-filtering required).
 /// This catches bugs where queries unexpectedly spill to Rust-side filtering.
 #[allow(dead_code)]
 fn assert_fully_pushes_down(query: &str) {
-    let selection = ankql::parser::parse_selection(query).expect("Failed to parse query");
-    let split = split_predicate_for_postgres(&selection.predicate);
+    let split = split_predicate_for_postgres(&resolve(query));
     assert!(
         !split.needs_post_filter(),
         "Query '{}' should fully push down to PostgreSQL, but remaining predicate is: {:?}",
@@ -40,10 +67,7 @@ fn assert_fully_pushes_down(query: &str) {
 
 /// Get the split predicate for a query (for tests that need to inspect the split).
 #[allow(dead_code)]
-fn get_predicate_split(query: &str) -> SplitPredicate {
-    let selection = ankql::parser::parse_selection(query).expect("Failed to parse query");
-    split_predicate_for_postgres(&selection.predicate)
-}
+fn get_predicate_split(query: &str) -> SplitPredicate { split_predicate_for_postgres(&resolve(query)) }
 
 /// A model with a Json property for testing JSON query pushdown
 #[derive(Model, Debug, Serialize, Deserialize, Clone)]
@@ -57,7 +81,7 @@ async fn test_json_property_storage_and_simple_query() -> Result<()> {
     let (_container, storage) = common::create_postgres_container().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
-    let ctx = node.context_async(c).await;
+    let ctx = node.context_async(c).await.unwrap();
 
     // Create a track with JSON licensing data
     {
@@ -163,7 +187,7 @@ async fn test_json_path_query_string_equality() -> Result<()> {
     let (container, storage) = common::create_postgres_container().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
-    let ctx = node.context_async(c).await;
+    let ctx = node.context_async(c).await.unwrap();
 
     // Create tracks with different licensing territories
     {
@@ -223,7 +247,7 @@ async fn test_json_path_query_numeric_comparison() -> Result<()> {
     let (_container, storage) = common::create_postgres_container().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
-    let ctx = node.context_async(c).await;
+    let ctx = node.context_async(c).await.unwrap();
 
     {
         let trx = ctx.begin();
@@ -254,7 +278,7 @@ async fn test_json_path_nested_query() -> Result<()> {
     let (_container, storage) = common::create_postgres_container().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
-    let ctx = node.context_async(c).await;
+    let ctx = node.context_async(c).await.unwrap();
 
     {
         let trx = ctx.begin();
@@ -295,7 +319,7 @@ async fn test_json_path_combined_with_regular_field() -> Result<()> {
     let (_container, storage) = common::create_postgres_container().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
-    let ctx = node.context_async(c).await;
+    let ctx = node.context_async(c).await.unwrap();
 
     {
         let trx = ctx.begin();

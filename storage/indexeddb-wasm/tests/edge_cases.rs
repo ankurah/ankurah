@@ -81,7 +81,7 @@ pub async fn test_prefix_guard_collection_boundary() -> Result<(), anyhow::Error
     let storage_engine = Arc::new(IndexedDBStorageEngine::open(&db_name).await?);
     let node = Node::new_durable(storage_engine.clone(), PermissiveAgent::new());
     node.system.create().await?;
-    let ctx = node.context_async(DEFAULT_CONTEXT).await;
+    let ctx = node.context_async(DEFAULT_CONTEXT).await.unwrap();
 
     // Insert albums and books with overlapping names to ensure sorted adjacency
     create_albums(

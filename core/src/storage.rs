@@ -1,11 +1,12 @@
+use crate::internal::prelude::*;
+use ankql::ast::Resolved;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::Stream;
 use tracing::warn;
 
-use crate::error::{MutationError, RetrievalError};
-use ankurah_proto::{Attested, CollectionId, EntityId, EntityState, Event, EventId};
+use ankurah_proto::{Attested, EntityId, EntityState, Event, EventId};
 
 /// One raw logical record emitted by a storage dump.
 #[derive(Debug)]
@@ -45,7 +46,7 @@ pub trait StorageCollection: Send + Sync {
     async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError>;
 
     // Fetch raw entity states matching a selection (predicate + order by + limit)
-    async fn fetch_states(&self, selection: &ankql::ast::Selection) -> Result<Vec<Attested<EntityState>>, RetrievalError>;
+    async fn fetch_states(&self, selection: &ankql::ast::Selection<Resolved>) -> Result<Vec<Attested<EntityState>>, RetrievalError>;
 
     async fn set_states(&self, states: Vec<Attested<EntityState>>) -> Result<(), MutationError> {
         for state in states {

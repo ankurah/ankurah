@@ -45,7 +45,7 @@ async fn test_ephemeral_receives_policy_via_livequery() -> anyhow::Result<()> {
 
     // Connect and wait for system ready
     let _conn = LocalProcessConnection::new(&node1, &node2).await?;
-    node2.system.wait_system_ready().await;
+    node2.system.wait_system_ready().await.unwrap();
 
     // Wait for the ephemeral agent to receive policy via LiveQuery
     let mut synced = false;

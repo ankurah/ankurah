@@ -1,7 +1,6 @@
 mod candidate_changes;
 mod comparison_index;
 pub mod fetch_gap;
-mod property_path;
 mod subscription;
 mod subscription_state;
 mod update;
@@ -19,15 +18,16 @@ pub(crate) use self::fetch_gap::GapFetcher;
 
 use crate::{
     entity::Entity,
-    error::SubscriptionError,
+    error::{RetrievalError, SubscriptionError},
     indexing::{IndexDirection, IndexKeyPart, KeySpec, NullsOrder},
     reactor::{subscription::ReactorSubInner, subscription_state::Subscription, watcherset::WatcherOp},
     resultset::EntityResultSet,
     selection::filter::Filterable,
     value::{Value, ValueType},
 };
+use ankql::ast::Resolved;
 use ankurah_proto::{self as proto};
-use futures::future::join_all;
+use ankurah_signals::Wait;
 use std::{
     collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex},
@@ -37,7 +37,17 @@ use std::{
 pub trait AbstractEntity: Clone + std::fmt::Debug {
     fn collection(&self) -> proto::CollectionId;
     fn id(&self) -> &proto::EntityId;
-    fn value(&self, field: &str) -> Option<Value>;
+    fn value(&self, property: &ankql::ast::PropertyId) -> Option<Value>;
+}
+
+/// Local entity retrieval for already policy-scoped selections; does not apply read policy.
+#[async_trait::async_trait]
+pub trait LocalEntitySource<E: AbstractEntity + Filterable + Send + 'static = Entity>: Send + Sync + 'static {
+    async fn fetch_entities_from_local(
+        &self,
+        collection_id: &proto::CollectionId,
+        selection: &ankql::ast::Selection<Resolved>,
+    ) -> Result<Vec<E>, RetrievalError>;
 }
 
 /// Trait for types that can be used in notify_change
@@ -52,6 +62,7 @@ pub trait ChangeNotification: std::fmt::Debug + std::fmt::Display {
 
 /// Hook trait for performing actions before notification is sent
 pub trait PreNotifyHook {
+    fn is_current(&self, _version: u32) -> bool { true }
     fn pre_notify(&self, version: u32);
 }
 
@@ -70,25 +81,64 @@ struct ReactorInner<E: AbstractEntity + Filterable, Ev> {
     subscriptions: std::sync::Mutex<HashMap<ReactorSubscriptionId, Subscription<E, Ev>>>,
     // Shared with all subscriptions to allow them to manage their own watchers
     watcher_set: Arc<std::sync::Mutex<WatcherSet>>,
-    /// Serializes notify_change invocations to ensure consistent watcher state
+    /// Coordinates query installation, change dispatch, and clearing; never held across fetch I/O.
     notify_lock: tokio::sync::Mutex<()>,
+    #[cfg(test)]
+    publication_pause: Mutex<Option<(proto::CollectionId, tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)>>,
 }
 // don't require Clone SE or PA, because we have an Arc
 impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static> Clone for Reactor<E, Ev> {
     fn clone(&self) -> Self { Self(self.0.clone()) }
 }
 
-impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static> Default for Reactor<E, Ev> {
-    fn default() -> Self { Self::new() }
-}
-
 impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static> Reactor<E, Ev> {
-    pub fn new() -> Self {
-        Self(Arc::new(ReactorInner {
+    #[cfg(test)]
+    fn new_test() -> Self { Self::new(ankurah_signals::Mut::new(true)) }
+
+    /// Clear subscriptions when the owner stops running, without retaining the reactor while waiting.
+    pub(crate) fn new(run: impl Wait<bool> + Send + Sync + 'static) -> Self {
+        let reactor = Self(Arc::new(ReactorInner {
             subscriptions: Mutex::new(HashMap::new()),
             watcher_set: Arc::new(Mutex::new(WatcherSet::new())),
             notify_lock: tokio::sync::Mutex::new(()),
-        }))
+            #[cfg(test)]
+            publication_pause: Mutex::new(None),
+        }));
+        let weak = Arc::downgrade(&reactor.0);
+        crate::task::spawn(async move {
+            run.wait_value(false).await;
+            if let Some(inner) = weak.upgrade() {
+                Self(inner).close().await;
+            }
+        });
+        reactor
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_publication(
+        &self,
+        collection: proto::CollectionId,
+    ) -> (tokio::sync::oneshot::Receiver<()>, tokio::sync::oneshot::Sender<()>) {
+        let (entered, observed) = tokio::sync::oneshot::channel();
+        let (release, resume) = tokio::sync::oneshot::channel();
+        assert!(self.0.publication_pause.lock().unwrap().replace((collection, entered, resume)).is_none());
+        (observed, release)
+    }
+
+    #[cfg(test)]
+    async fn pause_publication_if_requested(&self, collection_id: &proto::CollectionId) {
+        let pause = {
+            let mut pause = self.0.publication_pause.lock().unwrap();
+            if pause.as_ref().is_some_and(|(collection, _, _)| collection == collection_id) {
+                pause.take()
+            } else {
+                None
+            }
+        };
+        if let Some((_, entered, resume)) = pause {
+            let _ = entered.send(());
+            let _ = resume.await;
+        }
     }
 
     /// Create a new subscription container
@@ -122,20 +172,13 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
                     WatcherOp::Remove,
                 );
             }
-
-            // Remove from entity watchers using predicate's matching entities
-            let entity_ids: Vec<_> = query_state.resultset.keys().collect();
-            watcher_set.remove_entity_subscriptions(sub_id, entity_ids);
         }
+        watcher_set.remove_subscription_entity_watchers(sub_id);
 
         Ok(())
     }
 
-    /// The subscription registered under `id`, cloned out of the map so
-    /// this module's children work off a handle rather than reaching
-    /// through the reactor into its lock. Private, which reaches every
-    /// descendant module: `Subscription` itself is no more visible than
-    /// that.
+    /// Clone the private subscription registered under `id`.
     fn subscription(&self, id: ReactorSubscriptionId) -> Option<Subscription<E, Ev>> {
         self.0.subscriptions.lock().unwrap().get(&id).cloned()
     }
@@ -202,114 +245,64 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
 
 /// Build KeySpec from Selection's ORDER BY clause with type inference from sample entities
 pub(crate) fn build_key_spec_from_selection<E: AbstractEntity>(
-    order_by: &[ankql::ast::OrderByItem],
+    order_by: &[ankql::ast::OrderByItem<Resolved>],
     resultset: &EntityResultSet<E>,
-) -> anyhow::Result<KeySpec> {
+) -> anyhow::Result<KeySpec<ankql::ast::PropertyId>> {
     let mut keyparts = Vec::new();
 
     let read = resultset.read();
     for item in order_by {
-        // Use the property name from the path (currently only simple paths are supported in ORDER BY)
-        let column = item.path.property().to_string();
+        // A resolved sort key names one property by its durable identity,
+        // which is what the reactor's in-memory ordering keys on.
+        let key = item.path.property_id();
 
         // Infer type from first non-null value in resultset entities
-        let value_type = read.iter_entities().find_map(|(_, e)| e.value(&column).map(|v| ValueType::of(&v))).unwrap_or(ValueType::String); // TODO: Get type from system catalog instead of defaulting to String
+        let value_type = read.iter_entities().find_map(|(_, e)| e.value(&key).map(|v| ValueType::of(&v))).unwrap_or(ValueType::String); // TODO: Get type from system catalog instead of defaulting to String
 
         let direction: IndexDirection = match item.direction {
             ankql::ast::OrderDirection::Asc => IndexDirection::Asc,
             ankql::ast::OrderDirection::Desc => IndexDirection::Desc,
         };
 
-        keyparts.push(IndexKeyPart { column, sub_path: None, direction, value_type, nulls: Some(NullsOrder::Last), collation: None });
+        keyparts.push(IndexKeyPart { key, sub_path: None, direction, value_type, nulls: Some(NullsOrder::Last), collation: None });
     }
 
     Ok(KeySpec { keyparts })
 }
 
 impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static> Reactor<E, Ev> {
-    /// Add a new predicate to a subscription (initial subscription only)
-    /// Fails if query_id already exists - use update_query for updates
-    ///
-    /// Add a query and send initialization notification (for local subscriptions)
-    /// Collects ReactorUpdateItems and sends them
-    /// pre_notify_hook is called before sending notification (e.g., to mark LiveQuery initialized)
-    pub async fn add_query_and_notify<H: PreNotifyHook>(
+    /// Install or update a local query, notifying its owner before listeners.
+    pub async fn upsert_query_and_notify<H: PreNotifyHook>(
         &self,
         subscription_id: ReactorSubscriptionId,
         query_id: proto::QueryId,
         collection_id: proto::CollectionId,
-        selection: ankql::ast::Selection,
-        node: &dyn crate::node::TNodeErased<E>,
+        selection: ankql::ast::Selection<Resolved>,
+        node: &dyn LocalEntitySource<E>,
         resultset: EntityResultSet<E>,
         gap_fetcher: std::sync::Arc<dyn GapFetcher<E>>,
-        pre_notify_hook: H,
-    ) -> anyhow::Result<()> {
-        // Get subscription reference
-        let subscription = {
-            let subscriptions = self.0.subscriptions.lock().unwrap();
-            subscriptions.get(&subscription_id).cloned().ok_or_else(|| anyhow::anyhow!("Subscription {:?} not found", subscription_id))?
-        };
-
-        // Fetch initial entities from local storage (do this first to avoid holding locks across await)
-        let included_entities = node.fetch_entities_from_local(&collection_id, &selection).await?;
-
-        // Register empty query state with subscription (will be populated by update_query)
-        subscription.register_query(query_id, collection_id.clone(), resultset.clone(), gap_fetcher)?;
-
-        // Populate the resultset and collect ReactorUpdateItems
-        // update_query now handles all watcher management internally (predicate + entity)
-        let mut reactor_update_items = Vec::new();
-        let _newly_added = subscription.update_query(
-            query_id,
-            collection_id.clone(),
-            selection.clone(),
-            included_entities,
-            1, // version 1 for initial add
-            &mut reactor_update_items,
-        )?;
-
-        // Fill gaps if needed for this specific query
-        // FIXME: Open question — is there a window where entity edits land between the local fetch
-        // above and downstream notification handling (reactor.notify_change + evaluate_changes)
-        // such that we need this gap fill to catch the missed edit-driven gap?
-        subscription.fill_gaps_for_query(query_id, &mut reactor_update_items).await;
-
-        // Mark as loaded
-        resultset.set_loaded(true);
-
-        // Call pre-notify hook (e.g., mark LiveQuery as initialized) with version 1
-        pre_notify_hook.pre_notify(1);
-
-        // Send the notification with collected items. We always notify because we're initializing the query.
-        subscription.send_update(reactor_update_items);
-
-        Ok(())
-    }
-
-    /// Update an existing predicate (v>0) and send notifications
-    /// Does diffing against the current resultset
-    /// Used by local LiveQuery updates
-    /// pre_notify_hook is called before sending notification (e.g., to mark LiveQuery initialized)
-    pub async fn update_query_and_notify<H: PreNotifyHook>(
-        &self,
-        subscription_id: ReactorSubscriptionId,
-        query_id: proto::QueryId,
-        collection_id: proto::CollectionId,
-        selection: ankql::ast::Selection,
-        node: &dyn crate::node::TNodeErased<E>,
         version: u32,
         pre_notify_hook: H,
     ) -> anyhow::Result<()> {
         let included_entities = node.fetch_entities_from_local(&collection_id, &selection).await?;
+        if !pre_notify_hook.is_current(version) {
+            return Ok(());
+        }
 
+        let notify = self.0.notify_lock.lock().await;
         let subscription = {
             let subscriptions = self.0.subscriptions.lock().unwrap();
             subscriptions.get(&subscription_id).cloned().ok_or_else(|| anyhow::anyhow!("Subscription {:?} not found", subscription_id))?
         };
 
+        if !pre_notify_hook.is_current(version) {
+            return Ok(());
+        }
+
+        let is_new = subscription.ensure_query_registered(query_id, collection_id.clone(), resultset.clone(), gap_fetcher);
+
         let mut reactor_update_items = Vec::new();
-        // Update query - watcher management is handled internally
-        let _newly_added = subscription.update_query(
+        subscription.update_query(
             query_id,
             collection_id.clone(),
             selection.clone(),
@@ -318,16 +311,18 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
             &mut reactor_update_items,
         )?;
 
-        // Fill gaps if needed for this specific query
-        // FIXME: Same open question as add_query_and_notify — do edits that slip in between the
-        // storage fetch and subsequent notify_change path require this gap fill to keep limits tight?
+        drop(notify);
         subscription.fill_gaps_for_query(query_id, &mut reactor_update_items).await;
+        let _notify = self.0.notify_lock.lock().await;
+        if !pre_notify_hook.is_current(version) {
+            return Ok(());
+        }
 
-        // Call pre-notify hook (e.g., mark LiveQuery as initialized)
+        resultset.set_loaded(true);
         pre_notify_hook.pre_notify(version);
-
-        // Send reactor update
-        if !reactor_update_items.is_empty() {
+        #[cfg(test)]
+        self.pause_publication_if_requested(&collection_id).await;
+        if is_new || !reactor_update_items.is_empty() {
             subscription.send_update(reactor_update_items);
         }
 
@@ -335,19 +330,13 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
     }
 
     /// Notify subscriptions about an entity change
-    pub async fn notify_change<C: ChangeNotification<Entity = E, Event = Ev> + Clone>(&self, changes: Vec<C>) {
-        // Serialize notify_change invocations
+    pub async fn notify_change<C: ChangeNotification<Entity = E, Event = Ev>>(&self, changes: Vec<C>) {
         let _notify_guard = self.0.notify_lock.lock().await;
-
-        // Wrap changes in Arc for sharing across subscriptions
         let changes: Arc<Vec<C>> = Arc::from(changes);
 
         tracing::debug!("Reactor.notify_change({} changes)", changes.len());
 
-        // Build per-subscription candidate accumulators (first lock of watcher_set).
-        // BTreeMap (not HashMap) so that emission across subscriptions follows a stable,
-        // ReactorSubscriptionId-sorted order. Any order is semantically legal, but the C1
-        // simulation audit requires the same seed to reproduce an identical emission trace.
+        // Stable subscription order keeps seeded simulations reproducible.
         let mut candidates_by_sub: BTreeMap<ReactorSubscriptionId, CandidateChanges<C>> = BTreeMap::new();
         {
             let watcher_set = self.0.watcher_set.lock().unwrap();
@@ -356,22 +345,16 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
             }
         }
 
-        // Parallelize evaluate_changes calls across subscriptions
-        // First, collect all the evaluation futures while holding the lock
         let evaluations = {
             let subscriptions = self.0.subscriptions.lock().unwrap();
             candidates_by_sub
                 .into_iter()
-                .filter_map(|(sub_id, candidates)| {
-                    subscriptions.get(&sub_id).map(|subscription| subscription.clone().evaluate_changes(candidates))
-                })
+                .filter_map(|(sub_id, candidates)| subscriptions.get(&sub_id).map(|subscription| (subscription.clone(), candidates)))
                 .collect::<Vec<_>>()
         };
 
-        // Now await all evaluations (lock is dropped)
-        let all_watcher_changes: Vec<WatcherChange> = join_all(evaluations).await.into_iter().flatten().collect();
-
-        // Apply all watcher changes to watcher_set (second lock of watcher_set)
+        let all_watcher_changes: Vec<_> =
+            evaluations.into_iter().flat_map(|(subscription, candidates)| subscription.evaluate_changes(candidates)).collect();
 
         let mut watcher_set = self.0.watcher_set.lock().unwrap();
         for change in all_watcher_changes {
@@ -379,18 +362,17 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         }
     }
 
-    /// Notify all subscriptions that their entities have been removed but do not remove the subscriptions
-    pub fn system_reset(&self) {
-        // Clear entity watchers first - no entities are being watched after reset, because any previously existing entities "stopped existing"
-        // as part of the system reset.
+    /// Clear current subscription results and watchers when the owner stops running.
+    pub(crate) async fn close(&self) {
+        let _notify = self.0.notify_lock.lock().await;
         {
             let mut watcher_set = self.0.watcher_set.lock().unwrap();
-            watcher_set.clear_entity_watchers();
+            watcher_set.clear();
         }
 
-        let subscriptions = self.0.subscriptions.lock().unwrap();
-        for subscription in subscriptions.values() {
-            subscription.system_reset();
+        let subscriptions: Vec<_> = self.0.subscriptions.lock().unwrap().values().cloned().collect();
+        for subscription in subscriptions {
+            subscription.close();
         }
     }
 }
@@ -416,11 +398,64 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn node_halt_does_not_wait_for_result_clearing() {
+        use crate::{
+            node::Node,
+            policy::{PermissiveAgent, DEFAULT_CONTEXT},
+            test_utils::TestStorage,
+        };
+        let node = Node::new_durable(std::sync::Arc::new(TestStorage::default()), PermissiveAgent::new());
+        node.system.create().await.unwrap();
+        let query = node.context(DEFAULT_CONTEXT).unwrap().query_wait::<crate::schema::catalog::SysModelRowView>("true").await.unwrap();
+        assert!(query.loaded());
+
+        let notify = node.reactor.0.notify_lock.lock().await;
+        node.system.halt(crate::error::NodeHaltReason::SystemLoad("fixture".into()));
+        assert!(node.state().value().halt_reason().is_some());
+        assert!(node.check_ready().is_err());
+        assert!(query.loaded(), "clearing must wait for the publication lock");
+        drop(notify);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while query.loaded() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
     use super::*;
     use crate::selection::filter::Filterable;
     use ankurah_signals::Subscribe;
     use proto::{CollectionId, QueryId};
     use std::sync::Arc;
+
+    /// A deterministic durable identity for a fixture field name.
+    fn prop(name: &str) -> ankql::ast::PropertyId {
+        let mut bytes = [0u8; 32];
+        let n = name.as_bytes();
+        let len = n.len().min(32);
+        bytes[..len].copy_from_slice(&n[..len]);
+        ankql::ast::PropertyId::EntityId(proto::EntityId::from_bytes(bytes))
+    }
+
+    /// Bind a parsed selection's names to the fixture identities.
+    fn resolve_fixture(selection: ankql::ast::Selection<ankql::ast::Parsed>) -> ankql::ast::Selection<Resolved> {
+        use crate::schema::resolver::{resolve_selection, ModelResolutionError, ModelResolver, ResolvedProperty};
+        struct FixtureResolver;
+        impl ModelResolver for FixtureResolver {
+            fn resolve_property(&self, _model: &proto::ModelId, name: &str) -> Result<Option<ResolvedProperty>, ModelResolutionError> {
+                Ok(Some(ResolvedProperty { id: prop(name), value_type: crate::value::ValueType::String }))
+            }
+        }
+        let model = proto::ModelId::EntityId(proto::EntityId::from_bytes([0x77; 32]));
+        resolve_selection(&model, &FixtureResolver, selection).unwrap()
+    }
+
+    /// Parse a fixture query and bind it, in one step.
+    fn sel(query: &str) -> ankql::ast::Selection<Resolved> { resolve_fixture(ankql::parser::parse_selection(query).unwrap()) }
 
     pub fn watcher<T: Clone + Send + 'static>() -> (Box<dyn Fn(T) + Send + Sync>, Box<dyn Fn() -> Vec<T> + Send + Sync>) {
         let values = Arc::new(Mutex::new(Vec::new()));
@@ -440,7 +475,7 @@ mod tests {
     struct TestEntity {
         id: proto::EntityId,
         collection: proto::CollectionId,
-        state: Arc<Mutex<HashMap<String, String>>>,
+        state: Arc<Mutex<HashMap<ankql::ast::PropertyId, String>>>,
     }
     impl Eq for TestEntity {}
     impl PartialEq for TestEntity {
@@ -460,24 +495,21 @@ mod tests {
             Self {
                 id: proto::EntityId::random(),
                 collection: proto::CollectionId::fixed_name("album"),
-                state: Arc::new(Mutex::new(HashMap::from([
-                    ("name".to_string(), name.to_string()),
-                    ("status".to_string(), status.to_string()),
-                ]))),
+                state: Arc::new(Mutex::new(HashMap::from([(prop("name"), name.to_string()), (prop("status"), status.to_string())]))),
             }
         }
     }
     impl Filterable for TestEntity {
         fn collection(&self) -> &str { self.collection.as_str() }
-        fn value(&self, field: &str) -> Option<crate::value::Value> {
-            self.state.lock().unwrap().get(field).cloned().map(crate::value::Value::String)
+        fn value(&self, property: &ankql::ast::PropertyId) -> Option<crate::value::Value> {
+            self.state.lock().unwrap().get(property).cloned().map(crate::value::Value::String)
         }
     }
     impl AbstractEntity for TestEntity {
         fn collection(&self) -> proto::CollectionId { self.collection.clone() }
         fn id(&self) -> &proto::EntityId { &self.id }
-        fn value(&self, field: &str) -> Option<crate::value::Value> {
-            self.state.lock().unwrap().get(field).cloned().map(crate::value::Value::String)
+        fn value(&self, property: &ankql::ast::PropertyId) -> Option<crate::value::Value> {
+            self.state.lock().unwrap().get(property).cloned().map(crate::value::Value::String)
         }
     }
 
@@ -488,8 +520,6 @@ mod tests {
 
     impl MockGapFetcher {
         fn new() -> Self { Self { entities: Vec::new() } }
-
-        fn with_entities(entities: Vec<TestEntity>) -> Self { Self { entities } }
     }
 
     #[async_trait::async_trait]
@@ -497,11 +527,30 @@ mod tests {
         async fn fetch_gap(
             &self,
             _collection_id: &proto::CollectionId,
-            _selection: &ankql::ast::Selection,
+            _selection: &ankql::ast::Selection<Resolved>,
             _last_entity: Option<&TestEntity>,
             _gap_size: usize,
         ) -> Result<Vec<TestEntity>, crate::error::RetrievalError> {
             // For testing, just return the pre-configured entities
+            Ok(self.entities.clone())
+        }
+    }
+
+    struct ReentrantGapFetcher {
+        reactor: Reactor<TestEntity, TestEvent>,
+        entities: Vec<TestEntity>,
+    }
+
+    #[async_trait::async_trait]
+    impl GapFetcher<TestEntity> for ReentrantGapFetcher {
+        async fn fetch_gap(
+            &self,
+            _collection_id: &proto::CollectionId,
+            _selection: &ankql::ast::Selection<Resolved>,
+            _last_entity: Option<&TestEntity>,
+            _gap_size: usize,
+        ) -> Result<Vec<TestEntity>, crate::error::RetrievalError> {
+            self.reactor.notify_change(Vec::<TestChange>::new()).await;
             Ok(self.entities.clone())
         }
     }
@@ -512,32 +561,19 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl crate::node::TNodeErased<TestEntity> for MockNode {
-        fn unsubscribe_remote_predicate(&self, _query_id: proto::QueryId) {}
-        fn update_remote_query(
-            &self,
-            _query_id: proto::QueryId,
-            _selection: ankql::ast::Selection,
-            _version: u32,
-        ) -> Result<(), anyhow::Error> {
-            Ok(())
-        }
+    impl LocalEntitySource<TestEntity> for MockNode {
         async fn fetch_entities_from_local(
             &self,
             _collection_id: &proto::CollectionId,
-            _selection: &ankql::ast::Selection,
+            _selection: &ankql::ast::Selection<Resolved>,
         ) -> Result<Vec<TestEntity>, crate::error::RetrievalError> {
             Ok(self.entities.clone())
         }
-        fn reactor(&self) -> &Reactor<TestEntity> { panic!("MockNode::reactor() should not be called in this test") }
-        fn has_subscription_relay(&self) -> bool { false }
     }
 
-    /// Test that once a predicate matches an entity, that entity continues to be watched
-    /// by the ReactorSubscriptionId until the user explicitly unwatches it
     #[tokio::test]
-    async fn test_entity_remains_watched_after_predicate_stops_matching() {
-        let reactor = Reactor::<TestEntity, TestEvent>::new();
+    async fn test_initial_query_notification() {
+        let reactor = Reactor::<TestEntity, TestEvent>::new_test();
 
         // Set up a subscription with a predicate that matches status="pending"
         let rsub = reactor.subscribe();
@@ -546,7 +582,7 @@ mod tests {
 
         let query_id = QueryId::new();
         let collection_id = CollectionId::fixed_name("album");
-        let selection: ankql::ast::Selection = "status = 'pending'".try_into().unwrap();
+        let selection: ankql::ast::Selection<Resolved> = sel("status = 'pending'");
         let entity1 = TestEntity::new("Test Album", "pending");
         let resultset: EntityResultSet<TestEntity> = EntityResultSet::empty();
         let mock_gap_fetcher = Arc::new(MockGapFetcher::new());
@@ -554,7 +590,7 @@ mod tests {
 
         // Add query using the reactor - this should send Initial notification
         reactor
-            .add_query_and_notify(rsub.id(), query_id, collection_id, selection, &mock_node, resultset, mock_gap_fetcher, ())
+            .upsert_query_and_notify(rsub.id(), query_id, collection_id, selection, &mock_node, resultset, mock_gap_fetcher, 1, ())
             .await
             .unwrap();
 
@@ -569,15 +605,138 @@ mod tests {
                 }],
             }]
         );
+    }
 
-        // TODO: For now, this test validates the setup. The actual notify_change test
-        // will require fixing the remaining compilation issues with Entity creation
-        // and the generic type constraints.
+    #[tokio::test]
+    async fn gap_fetch_can_reenter_the_reactor() {
+        let reactor = Reactor::<TestEntity, TestEvent>::new_test();
+        let subscription = reactor.subscribe();
+        let query_id = QueryId::new();
+        let collection = CollectionId::fixed_name("album");
+        let selected = TestEntity::new("Selected", "pending");
+        let replacement = TestEntity::new("Replacement", "pending");
+        let resultset = EntityResultSet::empty();
+        let node = MockNode { entities: vec![selected.clone()] };
+        let gap_fetcher = Arc::new(ReentrantGapFetcher { reactor: reactor.clone(), entities: vec![replacement.clone()] });
 
-        // The key behavior we want to test:
-        // 1. When notify_change is called with an entity that no longer matches the predicate
-        // 2. The Predicate watcher should be removed (entity no longer matches)
-        // 3. The Subscription watcher should remain (entity should stay watched)
+        reactor
+            .upsert_query_and_notify(
+                subscription.id(),
+                query_id,
+                collection,
+                sel("status = 'pending' LIMIT 1"),
+                &node,
+                resultset.clone(),
+                gap_fetcher,
+                1,
+                (),
+            )
+            .await
+            .unwrap();
+
+        selected.state.lock().unwrap().insert(prop("status"), "done".to_owned());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            reactor.notify_change(vec![TestChange { entity: selected, events: vec![] }]),
+        )
+        .await
+        .expect("gap fetching must not hold the reactor gate");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !resultset.contains_key(&replacement.id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the reentrant gap fill should complete");
+    }
+
+    #[test]
+    fn change_listener_can_create_and_drop_a_subscription() {
+        let (finished, received) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+                let reactor = Reactor::<TestEntity, TestEvent>::new_test();
+                let subscription = reactor.subscribe();
+                let entity = TestEntity::new("Album", "pending");
+                reactor
+                    .upsert_query_and_notify(
+                        subscription.id(),
+                        QueryId::new(),
+                        entity.collection.clone(),
+                        sel("status = 'pending'"),
+                        &MockNode { entities: vec![entity.clone()] },
+                        EntityResultSet::empty(),
+                        Arc::new(MockGapFetcher::new()),
+                        1,
+                        (),
+                    )
+                    .await
+                    .unwrap();
+                let callback_reactor = reactor.clone();
+                let _listener = subscription.subscribe(move |_update: ReactorUpdate<TestEntity, TestEvent>| {
+                    drop(callback_reactor.subscribe());
+                    finished.send(()).unwrap();
+                });
+                reactor.notify_change(vec![TestChange { entity, events: vec![] }]).await;
+            });
+        });
+        received.recv_timeout(std::time::Duration::from_secs(2)).expect("query callbacks must not hold the subscriptions mutex");
+    }
+
+    #[tokio::test]
+    async fn local_upsert_preserves_results_and_reports_membership_changes() {
+        let reactor = Reactor::<TestEntity, TestEvent>::new_test();
+        let subscription = reactor.subscribe();
+        let query = QueryId::new();
+        let pending = TestEntity::new("Pending", "pending");
+        let done = TestEntity::new("Done", "done");
+        let resultset = EntityResultSet::empty();
+        let node = MockNode { entities: vec![pending.clone(), done.clone()] };
+        let (listener, changes) = watcher::<ReactorUpdate<TestEntity, TestEvent>>();
+        let _guard = subscription.subscribe(listener);
+        let install = |selection, version| {
+            reactor.upsert_query_and_notify(
+                subscription.id(),
+                query,
+                pending.collection.clone(),
+                selection,
+                &node,
+                resultset.clone(),
+                Arc::new(MockGapFetcher::new()),
+                version,
+                (),
+            )
+        };
+
+        install(sel("status = 'pending'"), 1).await.unwrap();
+        assert!(resultset.contains_key(&pending.id));
+        assert_eq!(changes().len(), 1);
+        install(sel("status = 'pending'"), 1).await.unwrap();
+        assert!(changes().is_empty(), "re-activation must not reset an unchanged baseline");
+
+        install(sel("status = 'done'"), 2).await.unwrap();
+        assert!(!resultset.contains_key(&pending.id));
+        assert!(resultset.contains_key(&done.id));
+        let updates = changes();
+        assert_eq!(updates.len(), 1);
+        assert!(updates[0]
+            .items
+            .iter()
+            .any(|item| { item.entity.id == pending.id && item.predicate_relevance == vec![(query, MembershipChange::Remove)] }));
+        assert!(updates[0]
+            .items
+            .iter()
+            .any(|item| { item.entity.id == done.id && item.predicate_relevance == vec![(query, MembershipChange::Initial)] }));
+
+        reactor.close().await;
+        assert_eq!(resultset.len(), 0);
+        assert!(!resultset.is_loaded());
+        changes();
+        install(sel("status = 'done'"), 3).await.unwrap();
+        assert_eq!(reactor.subscription(subscription.id()).unwrap().queries_len(), 1);
+        assert!(resultset.contains_key(&done.id));
+        assert_eq!(changes().len(), 1);
     }
 
     // TODO: Add more test cases:
@@ -622,7 +781,7 @@ mod tests {
         // returning (no gap fill for entity subscriptions), the push order equals the
         // candidates_by_sub iteration order.
         async fn run_once(shared_entity: &TestEntity) -> Vec<ReactorSubscriptionId> {
-            let reactor = Reactor::<TestEntity, TestEvent>::new();
+            let reactor = Reactor::<TestEntity, TestEvent>::new_test();
             let emission_order = Arc::new(Mutex::new(Vec::<ReactorSubscriptionId>::new()));
 
             // Several subscriptions, all watching the same entity by id. Both the ReactorSubscription

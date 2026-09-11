@@ -45,7 +45,7 @@ pub mod client;
 pub mod sender;
 
 // Re-export the main types for easy use
-pub use client::{ConnectionState, WebsocketClient, WebsocketClientBuilder};
+pub use client::{ConnectionError, ConnectionState, WebsocketClient, WebsocketClientBuilder};
 pub use sender::WebsocketPeerSender;
 
 // Re-export common types for convenience

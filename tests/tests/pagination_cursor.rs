@@ -154,7 +154,7 @@ async fn test_pagination_inter_node() -> Result<()> {
     let client = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
 
     let _conn = LocalProcessConnection::new(&server, &client).await?;
-    client.system.wait_system_ready().await;
+    client.system.wait_system_ready().await.unwrap();
 
     let server_ctx = server.context(DEFAULT_CONTEXT)?;
     let client_ctx = client.context(DEFAULT_CONTEXT)?;

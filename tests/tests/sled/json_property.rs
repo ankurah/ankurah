@@ -23,7 +23,7 @@ async fn setup_track_context() -> Result<ankurah::Context> {
     let storage_engine = SledStorageEngine::new_test()?;
     let node = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new());
     node.system.create().await?;
-    Ok(node.context_async(DEFAULT_CONTEXT).await)
+    Ok(node.context_async(DEFAULT_CONTEXT).await.unwrap())
 }
 
 #[tokio::test]
@@ -185,10 +185,11 @@ async fn test_json_path_missing_field() -> Result<()> {
 #[test]
 fn test_json_path_planner_generates_sub_path() {
     use ankurah_storage_common::planner::{Planner, PlannerConfig};
-    use ankurah_storage_common::Plan;
+    use ankurah_storage_common::{lower_selection, ColumnPath, Plan};
 
     let planner = Planner::new(PlannerConfig::full_support());
     let selection = ankql::parser::parse_selection("licensing.territory = 'US'").expect("parse selection");
+    let selection = lower_selection(&selection, &|path| ColumnPath::new(path.first(), path.steps[1..].to_vec()));
     let plans = planner.plan(&selection, "id");
 
     // Find the index plan
@@ -199,7 +200,7 @@ fn test_json_path_planner_generates_sub_path() {
         // Verify keypart has sub_path
         assert!(!index_spec.keyparts.is_empty(), "Should have at least one keypart");
         let keypart = &index_spec.keyparts[0];
-        assert_eq!(keypart.column, "licensing", "Column should be 'licensing'");
+        assert_eq!(keypart.key, "licensing", "Column should be 'licensing'");
         assert_eq!(keypart.sub_path, Some(vec!["territory".to_string()]), "sub_path should be ['territory']");
         assert_eq!(keypart.full_path(), "licensing.territory", "full_path should be 'licensing.territory'");
 

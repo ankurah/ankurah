@@ -15,7 +15,7 @@ async fn rt114() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client_storage = Arc::new(SledStorageEngine::new_test().unwrap());
     let client = Node::new(client_storage.clone(), PermissiveAgent::new());
     let _conn = LocalProcessConnection::new(&server, &client).await?;
-    client.system.wait_system_ready().await;
+    client.system.wait_system_ready().await.unwrap();
 
     let server_ctx = server.context(c)?;
     let client_ctx = client.context(c)?;
@@ -56,7 +56,7 @@ async fn rt114() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Album2: change to 2019 (no longer matches year >= 2020)
     {
         let trx = server_ctx.begin();
-        server_album2.edit(&trx)?.year().overwrite(0, 4, "2019")?;
+        server_album2.edit(&trx)?.year()?.overwrite(0, 4, "2019")?;
         trx.commit().await?;
     }
 
@@ -93,7 +93,7 @@ async fn rt114_b() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client_storage = Arc::new(SledStorageEngine::new_test().unwrap());
     let client = Node::new(client_storage.clone(), PermissiveAgent::new());
     let _conn = LocalProcessConnection::new(&server, &client).await?;
-    client.system.wait_system_ready().await;
+    client.system.wait_system_ready().await.unwrap();
 
     let server_ctx = server.context(c)?;
     let client_ctx = client.context(c)?;
@@ -128,7 +128,7 @@ async fn rt114_b() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Album2: change to 2019 (no longer matches year >= 2020)
     {
         let trx = server_ctx.begin();
-        server_album2.edit(&trx)?.year().overwrite(0, 4, "2019")?;
+        server_album2.edit(&trx)?.year()?.overwrite(0, 4, "2019")?;
         trx.commit().await?;
     }
 

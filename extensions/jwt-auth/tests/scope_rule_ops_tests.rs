@@ -65,7 +65,7 @@ async fn write_only_scope_rule_gates_writes_not_reads() -> anyhow::Result<()> {
 
     let node2 = Node::new(Arc::new(SledStorageEngine::new_test()?), agent.clone());
     let _conn = LocalProcessConnection::new(&node1, &node2).await?;
-    node2.system.wait_system_ready().await;
+    node2.system.wait_system_ready().await.unwrap();
 
     let admin_claims = make_claims("admin-1", &["Administrator"], "admin@scope.test");
     let admin_token = sign_token(&keys, &admin_claims);
@@ -94,7 +94,7 @@ async fn write_only_scope_rule_gates_writes_not_reads() -> anyhow::Result<()> {
     let trx = admin_ctx.begin();
     let update_denied = match owner_view.edit(&trx) {
         Err(_) => true,
-        Ok(owner_mut) => match owner_mut.label().set(&"tampered".to_string()) {
+        Ok(owner_mut) => match owner_mut.label().and_then(|label| label.set(&"tampered".to_string())) {
             Err(_) => true,
             Ok(()) => trx.commit().await.is_err(),
         },

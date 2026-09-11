@@ -12,7 +12,7 @@ async fn test_predicate_update() -> Result<()> {
     node.system.create().await?;
 
     // Get context after system is ready
-    let context = node.context_async(DEFAULT_CONTEXT).await;
+    let context = node.context_async(DEFAULT_CONTEXT).await.unwrap();
 
     // Create some test albums
     let trx = context.begin();
@@ -58,7 +58,7 @@ async fn test_predicate_update_inter_node() -> Result<()> {
 
     // Connect the nodes
     let _conn = LocalProcessConnection::new(&server, &client).await?;
-    client.system.wait_system_ready().await;
+    client.system.wait_system_ready().await.unwrap();
 
     let server_ctx = server.context(DEFAULT_CONTEXT)?;
     let client_ctx = client.context(DEFAULT_CONTEXT)?;

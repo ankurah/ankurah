@@ -132,8 +132,8 @@ fn request_descriptor(body: &proto::NodeRequestBody) -> String {
         }
         proto::NodeRequestBody::Fetch { collection, .. } => format!("fetch {}", collection),
         proto::NodeRequestBody::SubscribeQuery { collection, .. } => format!("subscribe {}", collection),
-        proto::NodeRequestBody::RegisterSchema { models } => {
-            format!("registerschema {}m {}p", models.len(), models.iter().map(|m| m.properties.len()).sum::<usize>())
+        proto::NodeRequestBody::RegisterSchema { model } => {
+            format!("registerschema {} {}p", model.label, model.properties.len())
         }
     }
 }
@@ -141,8 +141,8 @@ fn request_descriptor(body: &proto::NodeRequestBody) -> String {
 fn response_descriptor(body: &proto::NodeResponseBody) -> String {
     match body {
         proto::NodeResponseBody::CommitComplete { .. } => "commitcomplete".to_string(),
-        proto::NodeResponseBody::SchemaRegistered { models } => {
-            format!("schemaregistered {}m {}p", models.len(), models.iter().map(|m| m.properties.len()).sum::<usize>())
+        proto::NodeResponseBody::SchemaRegistered { model } => {
+            format!("schemaregistered {} {}p", model.label, model.properties.len())
         }
         proto::NodeResponseBody::Fetch(deltas) => format!("fetch {}", deltas.len()),
         proto::NodeResponseBody::Get(states) => {

@@ -1,17 +1,15 @@
 use ankurah::policy::PolicyAgent;
 use ankurah::storage::StorageEngine;
-use ankurah_core::connector::NodeComms;
-use ankurah_core::{action_info, notice_info, Node};
+use ankurah_core::connector::{NodeComms, PeerConnectionError};
+use ankurah_core::{action_info, notice_info, Node, NodeState};
 
 use crate::connection_state::*;
-use ankurah::signals::{Mut, Read};
+use ankurah::signals::{Calculated, Get, Mut, Read, Wait};
+use futures::FutureExt;
 use gloo_timers::future::sleep;
 use std::cell::RefCell;
 use std::fmt;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use tracing::info;
@@ -21,6 +19,9 @@ use crate::connection::Connection;
 use wasm_bindgen_futures::spawn_local;
 
 const MAX_RECONNECT_DELAY: u64 = 10000;
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod tests;
 
 #[derive(Clone)]
 #[wasm_bindgen]
@@ -33,12 +34,9 @@ pub(crate) struct ClientInner {
     connection: RefCell<Option<Connection>>,
     state: Mut<ConnectionState>,
     node: Box<dyn NodeComms>,
+    run: Calculated<bool>,
     reconnect_delay: RefCell<u64>,
-    pending_ready_wakers: RefCell<Vec<Waker>>,
 }
-
-// FIXME2: ready_or_error that ignores certain types of errors, but bails on others.
-// should we add an error signal?
 
 /// Client provides a primary handle to speak to the server
 impl WebsocketClient {
@@ -48,13 +46,14 @@ impl WebsocketClient {
         PA: PolicyAgent + Send + Sync + 'static,
     {
         notice_info!("Created new websocket client");
+        let state = node.state();
         let inner = Arc::new(ClientInner {
             server_url: server_url.to_string(),
             node: Box::new(node),
+            run: Calculated::new(move || !matches!(state.get(), NodeState::Halted(_))),
             connection: RefCell::new(None),
             state: Mut::new(ConnectionState::None),
             reconnect_delay: RefCell::new(0),
-            pending_ready_wakers: RefCell::new(Vec::new()),
         });
 
         inner.connect()?;
@@ -67,10 +66,17 @@ impl WebsocketClient {
 
 #[wasm_bindgen]
 impl WebsocketClient {
-    // resolves when we have a connected state
+    /// Wait through transport retries; return on successful connection, explicit refusal, or node halt.
     pub async fn ready(&self) -> Result<(), String> {
-        // If we're already connected, the future will resolve immediately
-        ReadyFuture { client: self.inner.clone() }.await.map_err(|_| "unreachable".to_string())
+        self.inner
+            .state
+            .read()
+            .wait_for(|state| match state {
+                ConnectionState::Connected { .. } => Some(Ok(())),
+                ConnectionState::Error { message, cause: Some(_) } => Some(Err(message.clone())),
+                _ => None,
+            })
+            .await
     }
 
     #[wasm_bindgen(getter, js_name = "connection_state")]
@@ -86,18 +92,13 @@ impl fmt::Display for ClientInner {
 }
 
 impl ClientInner {
+    pub(crate) fn owns(&self, connection: &Connection) -> bool {
+        self.connection.borrow().as_ref().is_some_and(|current| current == connection)
+    }
+
     pub(crate) fn handle_state_change(self: &Arc<Self>, connection: &Connection, new_state: ConnectionState) -> bool {
-        // we are only interested in state changes for the current connection
-        {
-            let c = self.connection.borrow();
-            let Some(existing_connection) = c.as_ref() else {
-                return false;
-            };
-            if connection != existing_connection {
-                // This is a stale state change, ignore it.
-                // Not sure if this is possible, but lets not find out.
-                return false;
-            }
+        if !self.owns(connection) || self.stop_if_node_halted() {
+            return false;
         }
 
         self.state.set(new_state.clone());
@@ -106,16 +107,9 @@ impl ClientInner {
         match new_state {
             ConnectionState::Connected { .. } => {
                 *self.reconnect_delay.borrow_mut() = 0;
-                // Wake all pending futures
-                let wakers = std::mem::take(&mut *self.pending_ready_wakers.borrow_mut());
-                for waker in wakers {
-                    waker.wake();
-                }
             }
             ConnectionState::Connecting { .. } => (),
-            ConnectionState::None => {
-                // self.connect().expect("Failed to connect");
-            }
+            ConnectionState::None => (),
             ConnectionState::Closed | ConnectionState::Error { .. } => {
                 // Clear the existing connection before attempting to reconnect
                 {
@@ -131,12 +125,18 @@ impl ClientInner {
     }
 
     pub fn connect(self: &Arc<Self>) -> anyhow::Result<()> {
-        let connection =
-            Connection::new(self.node.cloned(), self.server_url.clone(), Arc::downgrade(self)).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        if self.stop_if_node_halted() {
+            return Ok(());
+        }
+        let connection = Connection::new(self.node.cloned(), self.server_url.clone(), Arc::downgrade(self), self.run.clone())
+            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
 
         action_info!(self, "connecting to", "{}", &self.server_url);
         *self.connection.borrow_mut() = Some(connection);
-        self.state.set(ConnectionState::Connecting { url: self.server_url.clone() });
+        // Keep the last refusal visible during retries; successful admission clears it.
+        if !matches!(self.state.value(), ConnectionState::Error { .. }) {
+            self.state.set(ConnectionState::Connecting { url: self.server_url.clone() });
+        }
 
         Ok(())
     }
@@ -144,35 +144,40 @@ impl ClientInner {
     pub fn reconnect(self: &Arc<Self>, delay: u64) {
         info!("reconnect: removing old connection with delay {}ms", delay);
 
-        let self2 = self.clone();
+        let weak = Arc::downgrade(self);
+        let run = self.run.clone();
         spawn_local(async move {
             info!("reconnect: sleeping for {}ms", delay);
-            sleep(Duration::from_millis(delay)).await;
+            futures::select_biased! {
+                _ = run.wait_value(false).fuse() => {},
+                _ = sleep(Duration::from_millis(delay)).fuse() => {},
+            }
             info!("reconnect: reconnecting");
-            self2.connect().expect("Failed to reconnect");
+            let Some(client) = weak.upgrade() else { return };
+            if let Err(error) = client.connect() {
+                client.state.set(ConnectionState::Error { message: error.to_string(), cause: None });
+                client.reconnect(MAX_RECONNECT_DELAY);
+            }
         });
+    }
+
+    pub(crate) fn stop_if_node_halted(&self) -> bool {
+        let NodeState::Halted(halt_reason) = self.node.state().value() else { return false };
+        let connection = self.connection.borrow_mut().take();
+        if let Some(connection) = connection {
+            connection.disconnect();
+        }
+        self.state
+            .set(ConnectionState::Error { message: halt_reason.to_string(), cause: Some(PeerConnectionError::NodeHalted(halt_reason)) });
+        true
     }
 }
 
 impl std::ops::Drop for ClientInner {
     fn drop(&mut self) {
-        info!("Websocket client inner dropped for node {}", self.node.id());
-    }
-}
-
-pub struct ReadyFuture {
-    pub(crate) client: Arc<ClientInner>,
-}
-
-impl Future for ReadyFuture {
-    type Output = Result<(), ()>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if let ConnectionState::Connected { .. } = self.client.state.value() {
-            Poll::Ready(Ok(()))
-        } else {
-            self.client.pending_ready_wakers.borrow_mut().push(cx.waker().clone());
-            Poll::Pending
+        if let Some(connection) = self.connection.get_mut().take() {
+            connection.disconnect();
         }
+        info!("Websocket client inner dropped for node {}", self.node.id());
     }
 }

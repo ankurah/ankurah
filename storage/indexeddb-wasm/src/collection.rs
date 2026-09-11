@@ -3,7 +3,7 @@ use std::sync::atomic::AtomicUsize;
 use ankurah_core::{
     action_debug,
     error::{MutationError, RetrievalError},
-    selection::filter::{evaluate_predicate, Filterable},
+    selection::filter::{evaluate_predicate, ValueLookup},
     storage::StorageCollection,
 };
 use ankurah_proto::{self as proto, Attested, EntityState, EventId, State};
@@ -16,7 +16,7 @@ use crate::{
     statics::*,
     util::{cb_future::cb_future, cb_stream::cb_stream, object::Object, require::WBGRequire},
 };
-use ankurah_storage_common::{filtering::ValueSetStream, OrderByComponents, Plan};
+use ankurah_storage_common::{filtering::ValueSetStream, EngineColumns, OrderByComponents, Plan};
 
 /// Memberships cross the JS boundary as a bincode Uint8Array, like the other
 /// binary state fields; BTreeSet<ModelId> is foreign to proto, so the
@@ -30,10 +30,10 @@ fn memberships_to_js(memberships: &std::collections::BTreeSet<proto::ModelId>) -
 
 fn memberships_from_js(value: JsValue) -> Result<std::collections::BTreeSet<proto::ModelId>, RetrievalError> {
     let array: js_sys::Uint8Array =
-        value.dyn_into().map_err(|_| RetrievalError::StorageError(anyhow::anyhow!("memberships field is not a Uint8Array").into()))?;
+        value.dyn_into().map_err(|_| RetrievalError::storage(anyhow::anyhow!("memberships field is not a Uint8Array")))?;
     let mut buffer = vec![0; array.length() as usize];
     array.copy_to(&mut buffer);
-    bincode::deserialize(&buffer).map_err(|e| RetrievalError::StorageError(Box::new(e)))
+    bincode::deserialize(&buffer).map_err(RetrievalError::storage)
 }
 // Import tracing for debug macro and futures for StreamExt
 use futures::StreamExt;
@@ -128,6 +128,9 @@ impl StorageCollection for IndexedDBBucket {
             }
 
             let entity = Object::new(result);
+            if entity.get_opt::<String>(&COLLECTION_KEY)?.as_deref() != Some(self.collection_id.as_str()) {
+                return Err(RetrievalError::EntityNotFound(id));
+            }
 
             Ok(Attested {
                 payload: EntityState {
@@ -145,19 +148,22 @@ impl StorageCollection for IndexedDBBucket {
         .await
     }
 
-    async fn fetch_states(&self, selection: &ankql::ast::Selection) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+    async fn fetch_states(
+        &self,
+        selection: &ankql::ast::Selection<ankql::ast::Resolved>,
+    ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         let _invocation = self.invocation_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let _lock = self.mutex.lock().await; // TODO why are we locking here?
 
-        // Step 1: Amend predicate with __collection comparison
-        let amended_selection = add_collection(selection, &self.collection_id);
+        // Step 1: Lower property IDs to fields and scope the scan to this collection
+        let amended_selection = crate::lower::lower(selection, &self.collection_id);
 
         // Step 2: Use planner to generate query plans
         let planner = ankurah_storage_common::planner::Planner::new(ankurah_storage_common::planner::PlannerConfig::indexeddb());
         let plans = planner.plan(&amended_selection, "id");
 
         // Step 3: Pick the first plan (always)
-        let plan = plans.first().ok_or_else(|| RetrievalError::StorageError("No plan generated".into()))?;
+        let plan = plans.first().ok_or_else(|| RetrievalError::storage("No plan generated"))?;
 
         // Handle Plan enum
         match plan {
@@ -170,7 +176,7 @@ impl StorageCollection for IndexedDBBucket {
                 self.db
                     .assure_index_exists(index_spec)
                     .await
-                    .map_err(|e| RetrievalError::StorageError(format!("ensure index exists: {}", e).into()))?;
+                    .map_err(|e| RetrievalError::storage(format!("ensure index exists: {}", e)))?;
 
                 // Step 6: Execute the query using the plan
                 let db_connection = self.db.get_connection().await;
@@ -187,7 +193,7 @@ impl StorageCollection for IndexedDBBucket {
                     // Convert plan bounds to IndexedDB key range using new pipeline
                     let (key_range, upper_open_ended, eq_prefix_len, eq_prefix_values) =
                         crate::planner_integration::plan_bounds_to_idb_range(bounds, scan_direction)
-                            .map_err(|e| RetrievalError::StorageError(format!("bounds conversion: {}", e).into()))?;
+                            .map_err(|e| RetrievalError::storage(format!("bounds conversion: {}", e)))?;
                     // Convert scan direction to cursor direction
                     let cursor_direction = crate::planner_integration::scan_direction_to_cursor_direction(scan_direction);
 
@@ -353,7 +359,7 @@ impl IndexedDBBucket {
         &self,
         index: &web_sys::IdbIndex,
         key_range: Option<web_sys::IdbKeyRange>,
-        predicate: &ankql::ast::Predicate,
+        predicate: &ankql::ast::Predicate<EngineColumns>,
         cursor_direction: web_sys::IdbCursorDirection,
         limit: Option<u64>,
         collection_id: &ankurah_proto::CollectionId,
@@ -394,9 +400,7 @@ impl IndexedDBBucket {
             };
 
             // Apply predicate filtering (uses lazy extraction from IdbRecord)
-            if evaluate_predicate(&record, predicate)
-                .map_err(|e| RetrievalError::StorageError(format!("Predicate evaluation failed: {}", e).into()))?
-            {
+            if evaluate_predicate(&record, predicate).map_err(|e| RetrievalError::storage(format!("Predicate evaluation failed: {}", e)))? {
                 if needs_spill_sort {
                     // Collect for sorting
                     rows.push(record);
@@ -447,7 +451,7 @@ impl IndexedDBBucket {
 /// A record from the IndexedDB entities store.
 ///
 /// Wraps the raw JS object with lazy extraction for filtering and sorting.
-/// Implements `Filterable` and `HasEntityId` for use with stream combinators.
+/// Implements `ValueLookup` and `HasEntityId` for use with stream combinators.
 struct IdbRecord {
     id: ankurah_proto::EntityId,
     object: Object,
@@ -470,13 +474,16 @@ impl IdbRecord {
     }
 }
 
-impl Filterable for IdbRecord {
-    fn collection(&self) -> &str { self.collection_id.as_str() }
-
-    fn value(&self, name: &str) -> Option<ankurah_core::value::Value> {
+impl ValueLookup<EngineColumns> for IdbRecord {
+    fn value_at(&self, path: &ankurah_storage_common::ColumnPath) -> Option<ankurah_core::value::Value> {
         // Lazy extraction from JS object
-        let idb_val: crate::idb_value::IdbValue = self.object.get_opt(&name.into()).ok()??;
-        Some(idb_val.into_value())
+        let idb_val: crate::idb_value::IdbValue = self.object.get_opt(&path.column.as_str().into()).ok()??;
+        let value = idb_val.into_value();
+        if path.subpath.is_empty() {
+            Some(value)
+        } else {
+            value.extract_at_path(&path.subpath)
+        }
     }
 }
 
@@ -492,13 +499,13 @@ fn extract_sort_properties(
     let mut map = std::collections::BTreeMap::new();
     // Extract all ORDER BY columns - presort for partition detection, spill for sorting
     for item in &order_by.presort {
-        let property_name = item.path.property();
+        let property_name = item.path.column.as_str();
         if let Ok(Some(idb_val)) = entity_obj.get_opt::<crate::idb_value::IdbValue>(&property_name.into()) {
             map.insert(property_name.to_string(), idb_val.into_value());
         }
     }
     for item in &order_by.spill {
-        let property_name = item.path.property();
+        let property_name = item.path.column.as_str();
         if let Ok(Some(idb_val)) = entity_obj.get_opt::<crate::idb_value::IdbValue>(&property_name.into()) {
             map.insert(property_name.to_string(), idb_val.into_value());
         }
@@ -544,13 +551,15 @@ fn extract_all_fields(entity_obj: &Object, entity_state: &EntityState) -> Result
     for (backend_name, state_buffer) in entity_state.state.state_buffers.iter() {
         let backend = backend_from_string(backend_name, Some(state_buffer)).map_err(|e| MutationError::General(Box::new(e)))?;
 
-        for (field_name, value) in backend.property_values() {
+        for (property, value) in backend.property_values() {
             // Use first occurrence (like Postgres) to handle field name collisions
-            if !seen_fields.insert(field_name.clone()) {
+            if !seen_fields.insert(property.clone()) {
                 continue;
             }
+            // Use the same physical column encoding as query lowering.
+            let field_name = crate::lower::property_column(property);
 
-            // Set field directly on entity object (no prefix - they become the primary fields)
+            // Set the physical field directly on the entity object.
             // Use IdbValue encoding to ensure fields are IndexedDB-key-compatible (bool as 0/1, etc.)
             let js_value = match value {
                 Some(ref prop_value) => crate::idb_value::IdbValue::from(prop_value).into(),
@@ -561,22 +570,4 @@ fn extract_all_fields(entity_obj: &Object, entity_state: &EntityState) -> Result
     }
 
     Ok(())
-}
-
-/// Amend a selection with __collection = 'value' comparison
-pub fn add_collection(selection: &ankql::ast::Selection, collection_id: &ankurah_proto::CollectionId) -> ankql::ast::Selection {
-    use ankql::ast::{ComparisonOperator, Expr, PathExpr, Predicate};
-    use ankurah_core_types::Value;
-
-    let collection_comparison = Predicate::Comparison {
-        left: Box::new(Expr::Path(PathExpr::simple("__collection"))),
-        operator: ComparisonOperator::Equal,
-        right: Box::new(Expr::Literal(Value::String(collection_id.to_string()))),
-    };
-
-    ankql::ast::Selection {
-        predicate: Predicate::And(Box::new(collection_comparison), Box::new(selection.predicate.clone())),
-        order_by: selection.order_by.clone(),
-        limit: selection.limit,
-    }
 }

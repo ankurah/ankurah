@@ -12,6 +12,8 @@ impl<T: Hash + Eq> SafeSet<T> {
 
     pub fn remove(&self, value: &T) -> bool { self.0.write().expect("Failed to lock the set").remove(value) }
 
+    pub fn clear(&self) { self.0.write().expect("Failed to lock the set").clear(); }
+
     pub fn contains(&self, value: &T) -> bool { self.0.read().expect("Failed to lock the set").contains(value) }
 
     pub fn is_empty(&self) -> bool { self.0.read().expect("Failed to lock the set").is_empty() }

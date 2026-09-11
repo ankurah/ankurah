@@ -7,7 +7,7 @@ use crate::{DecodeError, EntityId};
 /// A built-in property's logical identity. Variant order is part of the
 /// bincode contract; append variants, never reorder them without a protocol
 /// bump.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, strum::IntoStaticStr)]
 pub enum SystemProperty {
     /// The system configuration item key.
     Item,

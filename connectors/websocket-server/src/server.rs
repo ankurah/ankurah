@@ -1,4 +1,5 @@
 use ankurah_core::storage::StorageEngine;
+use ankurah_core::{connector::PeerConnectionError, signals::Wait};
 use ankurah_proto as proto;
 use anyhow::Result;
 use axum::{
@@ -117,46 +118,54 @@ where
 {
     info!("Websocket server connected to {}", client_ip);
 
+    let presence = match node.presence().await {
+        Ok(presence) => presence,
+        Err(error) => {
+            warn!("Cannot admit websocket peer at {client_ip}: {error}");
+            return;
+        }
+    };
+
     let (sender, mut receiver) = socket.split();
     let mut conn = Connection::Initial(Some(sender));
     let initial_presence_deadline = tokio::time::Instant::now() + INITIAL_PRESENCE_TIMEOUT;
 
     // Immediately send server presence after connection
-    if let Err(e) = conn
-        .send(proto::Message::Presence(proto::Presence {
-            node_id: node.id,
-            durable: node.durable,
-            system_root: node.system.root(),
-            protocol_version: proto::PROTOCOL_VERSION,
-        }))
-        .await
-    {
+    if let Err(e) = conn.send(proto::Message::Presence(presence)).await {
         debug!("Error sending presence to {client_ip}: {:?}", e);
         return;
     }
 
-    loop {
-        let next = if matches!(conn, Connection::Initial(_)) {
-            match tokio::time::timeout_at(initial_presence_deadline, receiver.next()).await {
-                Ok(next) => next,
-                Err(_) => {
-                    warn!("Peer at {client_ip} did not send presence within {INITIAL_PRESENCE_TIMEOUT:?}; closing");
+    let node_state = node.state();
+    let receive = async {
+        loop {
+            let next = if matches!(conn, Connection::Initial(_)) {
+                match tokio::time::timeout_at(initial_presence_deadline, receiver.next()).await {
+                    Ok(next) => next,
+                    Err(_) => {
+                        warn!("Peer at {client_ip} did not send presence within {INITIAL_PRESENCE_TIMEOUT:?}; closing");
+                        break;
+                    }
+                }
+            } else {
+                receiver.next().await
+            };
+            let Some(msg) = next else { break };
+
+            if let Ok(msg) = msg {
+                if process_message(msg, client_ip, &mut conn, node.clone()).await.is_break() {
                     break;
                 }
-            }
-        } else {
-            receiver.next().await
-        };
-        let Some(msg) = next else { break };
-
-        if let Ok(msg) = msg {
-            if process_message(msg, client_ip, &mut conn, node.clone()).await.is_break() {
+            } else {
+                debug!("client {client_ip} abruptly disconnected");
                 break;
             }
-        } else {
-            debug!("client {client_ip} abruptly disconnected");
-            break;
         }
+    };
+    tokio::select! {
+        biased;
+        _ = node_state.wait_for(|state| state.halt_reason().is_some()) => {}
+        _ = receive => {}
     }
 
     // Clean up peer registration if we had registered one
@@ -205,11 +214,13 @@ where
                                     // Register peer sender for this client
                                     let sender = WebSocketClientSender::new(presence.node_id, sender);
 
-                                    match node.register_peer(presence, Box::new(sender.clone())) {
+                                    match node.register_peer(presence, Box::new(sender.clone())).await {
                                         Ok(()) => *state = Connection::Established(sender),
                                         Err(rejection) => {
                                             warn!("Refusing peer at {client_ip}: {rejection}");
-                                            let _ = sender.send_message(proto::Message::PresenceRejected(rejection));
+                                            if let PeerConnectionError::Protocol(rejection) = rejection {
+                                                let _ = sender.send_message(proto::Message::PresenceRejected(rejection));
+                                            }
                                             return ControlFlow::Break(());
                                         }
                                     }

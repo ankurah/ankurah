@@ -28,7 +28,7 @@ fn debug_print_pairs(pairs: Pairs<grammar::Rule>) {
 
 /// Parse a selection expression into a Selection AST.
 /// The selection includes a predicate and optional ORDER BY and LIMIT clauses.
-pub fn parse_selection(input: &str) -> Result<ast::Selection, ParseError> {
+pub fn parse_selection(input: &str) -> Result<ast::Selection<ast::Parsed>, ParseError> {
     // TODO: Improve grammar to handle these cases more elegantly
     if input.trim().is_empty() {
         return Ok(ast::Selection { predicate: ast::Predicate::True, order_by: None, limit: None });
@@ -67,7 +67,7 @@ pub fn parse_selection(input: &str) -> Result<ast::Selection, ParseError> {
 }
 
 /// Parse a boolean expression, which can be a comparison, AND, or OR expression
-fn parse_expr(pair: Pair<grammar::Rule>) -> Result<ast::Predicate, ParseError> {
+fn parse_expr(pair: Pair<grammar::Rule>) -> Result<ast::Predicate<ast::Parsed>, ParseError> {
     assert_eq!(pair.as_rule(), grammar::Rule::Expr, "Expected Expr rule");
     let mut pairs = pair.into_inner();
 
@@ -126,8 +126,21 @@ fn parse_expr(pair: Pair<grammar::Rule>) -> Result<ast::Predicate, ParseError> {
 }
 
 /// Create a comparison predicate from a left expression and a right pair
-fn create_comparison(left: ast::Expr, op: grammar::Rule, right: Pair<grammar::Rule>) -> Result<ast::Expr, ParseError> {
-    let right_expr = parse_atomic_expr(right)?;
+fn create_comparison(
+    left: ast::Expr<ast::Parsed>,
+    op: grammar::Rule,
+    right: Pair<grammar::Rule>,
+) -> Result<ast::Expr<ast::Parsed>, ParseError> {
+    let right_expr = if op == grammar::Rule::In && right.as_rule() == grammar::Rule::ExpressionInParentheses {
+        let mut values = right.into_inner().next().ok_or(ParseError::EmptyExpression)?.into_inner();
+        let value = parse_atomic_expr(values.next().ok_or(ParseError::EmptyExpression)?)?;
+        if values.next().is_some() {
+            return Err(ParseError::InvalidPredicate("Expected a value in IN list".into()));
+        }
+        ast::Expr::ExprList(vec![value])
+    } else {
+        parse_atomic_expr(right)?
+    };
     let operator = match op {
         grammar::Rule::Eq => ast::ComparisonOperator::Equal,
         grammar::Rule::GtEq => ast::ComparisonOperator::GreaterThanOrEqual,
@@ -146,15 +159,16 @@ fn create_comparison(left: ast::Expr, op: grammar::Rule, right: Pair<grammar::Ru
 /// Create a logical operation (AND/OR) from a left expression and a right pair
 fn create_logical_op(
     op: grammar::Rule,
-    left: ast::Expr,
+    left: ast::Expr<ast::Parsed>,
     right: Pair<grammar::Rule>,
     rest: &mut Pairs<grammar::Rule>,
-) -> Result<ast::Expr, ParseError> {
+) -> Result<ast::Expr<ast::Parsed>, ParseError> {
     let left_pred = left.try_into()?;
 
     // Parse the right side, which might be part of a comparison
     let right_expr = parse_atomic_expr(right)?;
-    let right_pred = if let Some(next_op) = rest.next() {
+    let right_pred = if let Some(next_op) = rest.peek().filter(|op| !matches!(op.as_rule(), grammar::Rule::And | grammar::Rule::Or)) {
+        rest.next();
         match next_op.as_rule() {
             grammar::Rule::Eq
             | grammar::Rule::GtEq
@@ -164,21 +178,7 @@ fn create_logical_op(
             | grammar::Rule::NotEq
             | grammar::Rule::In => {
                 let next_right = rest.next().ok_or(ParseError::MissingOperand("comparison right"))?;
-                let next_right_expr = parse_atomic_expr(next_right)?;
-                ast::Predicate::Comparison {
-                    left: Box::new(right_expr),
-                    operator: match next_op.as_rule() {
-                        grammar::Rule::Eq => ast::ComparisonOperator::Equal,
-                        grammar::Rule::GtEq => ast::ComparisonOperator::GreaterThanOrEqual,
-                        grammar::Rule::Gt => ast::ComparisonOperator::GreaterThan,
-                        grammar::Rule::LtEq => ast::ComparisonOperator::LessThanOrEqual,
-                        grammar::Rule::Lt => ast::ComparisonOperator::LessThan,
-                        grammar::Rule::NotEq => ast::ComparisonOperator::NotEqual,
-                        grammar::Rule::In => ast::ComparisonOperator::In,
-                        _ => unimplemented!("rule not implemented: {:?}", next_op.as_rule()),
-                    },
-                    right: Box::new(next_right_expr),
-                }
+                create_comparison(right_expr, next_op.as_rule(), next_right)?.try_into()?
             }
             _ => {
                 return Err(ParseError::UnexpectedRule { expected: "comparison operator", got: next_op.as_rule() });
@@ -196,13 +196,13 @@ fn create_logical_op(
 }
 
 /// Parse an atomic expression, which can be a path, literal, or parenthesized expression
-fn parse_atomic_expr(pair: Pair<grammar::Rule>) -> Result<ast::Expr, ParseError> {
+fn parse_atomic_expr(pair: Pair<grammar::Rule>) -> Result<ast::Expr<ast::Parsed>, ParseError> {
     match pair.as_rule() {
         grammar::Rule::PathExpr => parse_path_expr(pair),
         grammar::Rule::SingleQuotedString => parse_string_literal(pair),
         grammar::Rule::True => Ok(ast::Expr::Literal(Value::Bool(true))),
         grammar::Rule::False => Ok(ast::Expr::Literal(Value::Bool(false))),
-        grammar::Rule::Unsigned => parse_number(pair),
+        grammar::Rule::Unsigned | grammar::Rule::Integer | grammar::Rule::Decimal | grammar::Rule::Double => parse_number(pair),
         grammar::Rule::QuestionParameter => Ok(ast::Expr::Placeholder),
         grammar::Rule::ExpressionInParentheses => {
             let inner = pair.into_inner().next().ok_or(ParseError::EmptyExpression)?;
@@ -226,13 +226,13 @@ fn parse_atomic_expr(pair: Pair<grammar::Rule>) -> Result<ast::Expr, ParseError>
 }
 
 /// Parse a path expression (dot-separated identifiers like `name` or `licensing.territory`)
-fn parse_path_expr(pair: Pair<grammar::Rule>) -> Result<ast::Expr, ParseError> {
+fn parse_path_expr(pair: Pair<grammar::Rule>) -> Result<ast::Expr<ast::Parsed>, ParseError> {
     if pair.as_rule() != grammar::Rule::PathExpr {
         return Err(ParseError::UnexpectedRule { expected: "PathExpr", got: pair.as_rule() });
     }
 
     let steps: Vec<String> =
-        pair.into_inner().filter(|p| p.as_rule() == grammar::Rule::Identifier).map(|p| p.as_str().trim().to_string()).collect();
+        pair.into_inner().filter(|p| p.as_rule() == grammar::Rule::Identifier).map(|p| parse_identifier(p.as_str())).collect();
 
     if steps.is_empty() {
         return Err(ParseError::InvalidPredicate("Empty path expression".into()));
@@ -241,8 +241,15 @@ fn parse_path_expr(pair: Pair<grammar::Rule>) -> Result<ast::Expr, ParseError> {
     Ok(ast::Expr::Path(ast::PathExpr { steps }))
 }
 
+fn parse_identifier(text: &str) -> String {
+    match text.strip_prefix('"').and_then(|text| text.strip_suffix('"')) {
+        Some(quoted) => quoted.replace("\"\"", "\""),
+        None => text.to_string(),
+    }
+}
+
 /// Parse a string literal, removing the surrounding quotes
-fn parse_string_literal(pair: Pair<grammar::Rule>) -> Result<ast::Expr, ParseError> {
+fn parse_string_literal(pair: Pair<grammar::Rule>) -> Result<ast::Expr<ast::Parsed>, ParseError> {
     if pair.as_rule() != grammar::Rule::SingleQuotedString {
         return Err(ParseError::UnexpectedRule { expected: "SingleQuotedString", got: pair.as_rule() });
     }
@@ -253,13 +260,17 @@ fn parse_string_literal(pair: Pair<grammar::Rule>) -> Result<ast::Expr, ParseErr
     }
     let s = &s[1..s.len() - 1];
 
-    Ok(ast::Expr::Literal(Value::String(s.to_string())))
+    Ok(ast::Expr::Literal(Value::String(s.replace("''", "'"))))
 }
 
 /// Parse a number literal
-fn parse_number(pair: Pair<grammar::Rule>) -> Result<ast::Expr, ParseError> {
-    if pair.as_rule() != grammar::Rule::Unsigned {
-        return Err(ParseError::UnexpectedRule { expected: "Unsigned", got: pair.as_rule() });
+fn parse_number(pair: Pair<grammar::Rule>) -> Result<ast::Expr<ast::Parsed>, ParseError> {
+    if matches!(pair.as_rule(), grammar::Rule::Decimal | grammar::Rule::Double) {
+        let num = pair.as_str().parse::<f64>().map_err(|e| ParseError::InvalidPredicate(format!("Failed to parse number: {}", e)))?;
+        if !num.is_finite() {
+            return Err(ParseError::InvalidPredicate("Number must be finite".into()));
+        }
+        return Ok(ast::Expr::Literal(Value::F64(num)));
     }
 
     let num = pair.as_str().trim().parse::<i64>().map_err(|e| ParseError::InvalidPredicate(format!("Failed to parse number: {}", e)))?;
@@ -289,7 +300,7 @@ fn parse_limit_clause(pair: Pair<grammar::Rule>) -> Result<u64, ParseError> {
     Ok(limit)
 }
 
-fn parse_order_by_clause(pair: Pair<grammar::Rule>) -> Result<Vec<ast::OrderByItem>, ParseError> {
+fn parse_order_by_clause(pair: Pair<grammar::Rule>) -> Result<Vec<ast::OrderByItem<ast::Parsed>>, ParseError> {
     if pair.as_rule() != grammar::Rule::OrderByClause {
         return Err(ParseError::UnexpectedRule { expected: "OrderByClause", got: pair.as_rule() });
     }
@@ -311,7 +322,7 @@ fn parse_order_by_clause(pair: Pair<grammar::Rule>) -> Result<Vec<ast::OrderByIt
     Ok(order_by_items)
 }
 
-fn parse_order_by_item(pair: Pair<grammar::Rule>) -> Result<ast::OrderByItem, ParseError> {
+fn parse_order_by_item(pair: Pair<grammar::Rule>) -> Result<ast::OrderByItem<ast::Parsed>, ParseError> {
     if pair.as_rule() != grammar::Rule::OrderByItem {
         return Err(ParseError::UnexpectedRule { expected: "OrderByItem", got: pair.as_rule() });
     }
@@ -321,16 +332,9 @@ fn parse_order_by_item(pair: Pair<grammar::Rule>) -> Result<ast::OrderByItem, Pa
     let identifier_pair = inner_pairs
         .iter()
         .find(|p| p.as_rule() == grammar::Rule::Identifier)
-        .ok_or(ParseError::InvalidPredicate("Missing column name in ORDER BY item".into()))?;
+        .ok_or(ParseError::InvalidPredicate("Missing property name in ORDER BY item".into()))?;
 
-    let identifier_str = identifier_pair.as_str().trim();
-
-    // Only simple identifiers are supported in ORDER BY (no dotted identifiers)
-    if identifier_str.contains('.') {
-        return Err(ParseError::InvalidPredicate("Dotted identifiers are not supported in ORDER BY clauses".into()));
-    }
-
-    let path = ast::PathExpr::simple(identifier_str);
+    let path = ast::PathExpr::simple(parse_identifier(identifier_pair.as_str()));
 
     let direction = inner_pairs
         .iter()

@@ -1,279 +1,22 @@
-use crate::retrieval::{CachedEventGetter, SuspenseEvents};
-use crate::{
-    changes::EntityChange,
-    entity::Entity,
-    error::{MutationError, RetrievalError},
-    livequery::{EntityLiveQuery, LiveQuery},
-    model::View,
-    node::{MatchArgs, Node},
-    policy::{AccessDenied, PolicyAgent},
-    storage::{StorageCollectionWrapper, StorageEngine},
-    transaction::Transaction,
-};
-use ankurah_proto::{self as proto, Attested, Clock, CollectionId, EntityState, Event};
-use async_trait::async_trait;
-use std::sync::{atomic::AtomicBool, Arc};
-use tracing::debug;
+use crate::internal::prelude::*;
+use ankql::ast::Parsed;
+use std::sync::Arc;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
-/// A local scope for fetching, subscribing, and transacting, backed by a
-/// live credential source: operations read the source's current state
-/// (one snapshot per operation), so a session refresh reaches every
-/// later operation without rebuilding the Context.
+mod erased;
+mod inner;
+mod schema_resolver;
+
+pub(crate) use erased::DynContextInner;
+pub(crate) use inner::{ContextAuth, ContextInner};
+pub(crate) use schema_resolver::SchemaResolver;
+
+/// A local scope for reads and writes backed by a live credential source.
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
-pub struct Context(Arc<dyn TContext + Send + Sync + 'static>);
-impl Clone for Context {
-    fn clone(&self) -> Self { Self(self.0.clone()) }
-}
-
-pub struct NodeAndContext<SE, PA: PolicyAgent>
-where
-    SE: StorageEngine + Send + Sync + 'static,
-    PA: PolicyAgent + Send + Sync + 'static,
-{
-    pub node: Node<SE, PA>,
-    /// The credential source for this context. Typically this is only one session
-    /// except for system queries, which need a node's aggregate permissions
-    pub sessions: crate::session::SessionSet<PA::ContextData>,
-}
-
-#[async_trait]
-pub trait TContext {
-    /// Ensure the compiled schema is registered and return the model's
-    /// durable identity: registers the model, its properties, and its
-    /// model-property memberships with the durable allocator (executed
-    /// locally on a durable node, forwarded as a RegisterSchema request on
-    /// an ephemeral one). Idempotent and latched; with no reachable peer it
-    /// may proceed only from a binding proven against locally held,
-    /// allocator-derived catalog rows. Every registration path funnels
-    /// here -- typed first use (create/fetch/get/query_wait) and the
-    /// explicit [`Context::register_model`] alike; callers convert the
-    /// typed error at their boundary (From impls into RetrievalError and
-    /// MutationError).
-    async fn ensure_registered(
-        &self,
-        schema: &'static crate::schema::ModelStructDescriptor,
-    ) -> Result<proto::ModelId, crate::schema::registration::RegistrationError>;
-
-    fn node_id(&self) -> proto::EntityId;
-    /// This node's system root entity id, which every non-root genesis binds
-    /// into its own id. `None` before the node has created or joined a system.
-    fn system_id(&self) -> Option<proto::EntityId>;
-    /// Insert the resident (still empty) entity under the id `genesis`
-    /// derived, and return the transaction entity whose baseline is that
-    /// genesis. This is what makes the id available when `create()` returns.
-    fn create_transaction_entity(
-        &self,
-        collection: proto::CollectionId,
-        genesis: &Event,
-        trx_alive: Arc<AtomicBool>,
-    ) -> Result<Entity, MutationError>;
-    fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied>;
-    async fn get_entity(&self, id: proto::EntityId, collection: &proto::CollectionId, cached: bool) -> Result<Entity, RetrievalError>;
-    fn get_resident_entity(&self, id: proto::EntityId) -> Option<Entity>;
-    async fn fetch_entities(&self, collection: &proto::CollectionId, args: MatchArgs) -> Result<Vec<Entity>, RetrievalError>;
-    async fn commit_local_trx(&self, trx: &Transaction) -> Result<Vec<Event>, MutationError>;
-    fn query(&self, collection_id: proto::CollectionId, args: MatchArgs) -> Result<EntityLiveQuery, RetrievalError>;
-    async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError>;
-}
-
-#[async_trait]
-impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> TContext for NodeAndContext<SE, PA> {
-    async fn ensure_registered(
-        &self,
-        schema: &'static crate::schema::ModelStructDescriptor,
-    ) -> Result<proto::ModelId, crate::schema::registration::RegistrationError> {
-        // Registration acts as one principal, like every write path.
-        self.node.catalog.ensure_schema_for_use(&self.sessions.write_credential()?, schema).await
-    }
-
-    fn node_id(&self) -> proto::EntityId { self.node.id }
-    fn system_id(&self) -> Option<proto::EntityId> { self.node.system.root_id() }
-    fn create_transaction_entity(
-        &self,
-        collection: proto::CollectionId,
-        genesis: &Event,
-        trx_alive: Arc<AtomicBool>,
-    ) -> Result<Entity, MutationError> {
-        self.node.entities.create_transaction_entity(collection, genesis, trx_alive)
-    }
-    fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied> {
-        self.node.policy_agent.check_write(&self.sessions.write_credential()?, entity, None)
-    }
-    async fn get_entity(&self, id: proto::EntityId, collection: &proto::CollectionId, cached: bool) -> Result<Entity, RetrievalError> {
-        self.get_entity(collection, id, cached).await
-    }
-    fn get_resident_entity(&self, id: proto::EntityId) -> Option<Entity> { self.node.entities.get(&id) }
-    async fn fetch_entities(&self, collection: &proto::CollectionId, args: MatchArgs) -> Result<Vec<Entity>, RetrievalError> {
-        self.fetch_entities(collection, args).await
-    }
-    async fn commit_local_trx(&self, trx: &Transaction) -> Result<Vec<Event>, MutationError> {
-        use std::sync::atomic::Ordering;
-
-        // Atomically mark transaction as no longer alive, preventing double-commit.
-        // compare_exchange returns Err if the value was already false (already committed/rolled back).
-        if trx.alive.compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire).is_err() {
-            return Err(MutationError::General("Transaction already committed or rolled back".into()));
-        }
-
-        // One credential snapshot for the whole commit: a session update
-        // mid-commit must not mix credentials across its phases.
-        let cdata = self.sessions.write_credential()?;
-
-        // Generate the causally ordered event sequence for each transaction
-        // entity. A created entity contributes its already-frozen genesis
-        // first, then at most one update for edits made after create()
-        // returned.
-        let trx_id = trx.id.clone();
-        let genesis_events = trx.genesis_events.read().unwrap().clone();
-
-        let mut entity_events = Vec::new();
-        let mut seen_created = std::collections::HashSet::new();
-        for entity in trx.entities.iter() {
-            let mut events = Vec::with_capacity(2);
-            if let Some(genesis) = genesis_events.get(&entity.id) {
-                // The genesis is this node's own mint, but it passed through
-                // the transaction between minting and here; re-check the
-                // whole of what makes it admissible rather than trusting it,
-                // one condition at a time so a failure says which.
-                if !seen_created.insert(entity.id) {
-                    return Err(MutationError::CommitInvariant("two transaction entities claim the same frozen genesis"));
-                }
-                if genesis.entity_id != entity.id {
-                    return Err(MutationError::CommitInvariant("the frozen genesis names an entity other than the one holding it"));
-                }
-                if !genesis.is_entity_create() {
-                    return Err(MutationError::CommitInvariant("the event frozen by create() is not a genesis"));
-                }
-                genesis.validate_structure()?;
-                if entity.head() != Clock::new([genesis.id()]) {
-                    return Err(MutationError::CommitInvariant("the created entity's head is not exactly its frozen genesis"));
-                }
-                events.push(genesis.clone());
-            }
-
-            // An entity with an empty head and no frozen genesis is a
-            // phantom: never created here, so it has nothing to extend.
-            if let Some(event) = entity.generate_commit_event(proto::AuthorId::Unknown)? {
-                events.push(event);
-            }
-
-            // Membership admissibility is a commit-path gate, mirrored on
-            // the remote funnel (commit_remote_transaction).
-            for event in &events {
-                self.node.check_membership_admissibility(event)?;
-            }
-
-            if !events.is_empty() {
-                entity_events.push((entity.clone(), events));
-            }
-        }
-        // seen_created only ever holds genesis_events keys and refuses
-        // duplicates, so length equality is set equality.
-        if seen_created.len() != genesis_events.len() {
-            return Err(MutationError::CommitInvariant("an entity create() recorded is absent from the transaction's entities"));
-        }
-
-        // Now commit the events
-        let mut attested_events = Vec::new();
-        let mut entity_attested_events = Vec::new();
-
-        // Phase 1: check policy and collect attestations for EVERY event
-        // before persisting ANY of them, so a later denial leaves nothing
-        // durable (failure atomicity, V7). A created entity walks its states
-        // in order: empty, then genesis, then the optional update.
-        for (entity, events) in entity_events {
-            use std::sync::atomic::AtomicBool;
-            let validation_alive = Arc::new(AtomicBool::new(true));
-
-            // Get the canonical (upstream) entity for before state
-            let mut entity_before = match &entity.kind {
-                crate::entity::EntityKind::Transacted { upstream, .. } => upstream.clone(),
-                crate::entity::EntityKind::Primary => entity.clone(),
-            };
-            let collection = self.node.collections.get(entity.collection()).await?;
-            let event_getter = crate::retrieval::LocalEventGetter::new(collection, self.node.durable);
-            let mut entity_attested = Vec::with_capacity(events.len());
-
-            for event in events {
-                // Stage event and apply to a fork for the after state (no
-                // commit_event call here)
-                event_getter.stage_event(event.clone());
-                let entity_after = entity_before.snapshot(validation_alive.clone());
-                entity_after.apply_event(&event_getter, &event).await?;
-
-                let attestation = self.node.policy_agent.check_event(&self.node, &cdata, &entity_before, &entity_after, &event)?;
-                let attested = Attested::opt(event, attestation);
-
-                attested_events.push(attested.clone());
-                entity_attested.push(attested);
-                entity_before = entity_after;
-            }
-            entity_attested_events.push((entity, entity_attested));
-        }
-
-        // Phase 2: all events attested; persist them.
-        for (entity, events) in &entity_attested_events {
-            let collection = self.node.collections.get(entity.collection()).await?;
-            let event_getter = crate::retrieval::LocalEventGetter::new(collection, self.node.durable);
-            for attested in events {
-                event_getter.commit_event(attested).await?;
-            }
-        }
-
-        // Update heads BEFORE relaying (makes entities visible to server echo)
-        for (entity, events) in &entity_attested_events {
-            if let Some(last) = events.last() {
-                entity.commit_head(Clock::new([last.payload.id()]));
-            }
-        }
-        // Relay to peers and wait for confirmation
-        self.node.relay_to_required_peers(&cdata, trx_id, &attested_events).await?;
-
-        // All peers confirmed, persist state to storage
-        let mut changes: Vec<EntityChange> = Vec::new();
-        for (entity, events) in entity_attested_events {
-            let collection = self.node.collections.get(entity.collection()).await?;
-
-            // Persist canonical entity (upstream for transactional forks, entity itself for primary)
-            let canonical_entity = match &entity.kind {
-                crate::entity::EntityKind::Transacted { upstream, .. } => {
-                    // Events are now in storage; apply the whole ordered
-                    // sequence to the canonical entity, which for a creation
-                    // is still empty.
-                    let event_getter = crate::retrieval::LocalEventGetter::new(collection.clone(), self.node.durable);
-                    for attested in &events {
-                        upstream.apply_event(&event_getter, &attested.payload).await?;
-                    }
-                    upstream.clone()
-                }
-                crate::entity::EntityKind::Primary => entity,
-            };
-
-            let state = canonical_entity.to_state()?;
-
-            let entity_state = EntityState { entity_id: canonical_entity.id(), collection: canonical_entity.collection().clone(), state };
-            let attestation = self.node.policy_agent.attest_state(&self.node, &entity_state);
-            let attested = Attested::opt(entity_state, attestation);
-            collection.set_state(attested).await?;
-
-            changes.push(EntityChange::new(canonical_entity, events)?);
-        }
-
-        // Notify reactor of ALL changes
-        self.node.reactor.notify_change(changes).await;
-
-        Ok(attested_events.into_iter().map(|a| a.payload).collect())
-    }
-    fn query(&self, collection_id: proto::CollectionId, args: MatchArgs) -> Result<EntityLiveQuery, RetrievalError> {
-        EntityLiveQuery::new(&self.node, collection_id, args, self.sessions.clone())
-    }
-    async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
-        self.node.system.collection(id).await
-    }
-}
+#[derive(Clone)]
+pub struct Context(pub(crate) Arc<dyn DynContextInner + Send + Sync + 'static>);
 
 // This whole impl is conditionalized by the wasm feature flag
 #[cfg(feature = "wasm")]
@@ -286,14 +29,9 @@ impl Context {
 // Generic methods cannot cross the wasm_bindgen boundary; they live in this
 // plain impl and remain host-and-wasm callable from Rust.
 impl Context {
-    /// Explicitly register `M`'s model, properties, and model-property
-    /// memberships with the durable allocator, propagating any error, and
-    /// return the model's allocated identity
-    ///. Useful at startup so the catalog holds `M`'s definitions
-    /// before anything else runs. A second call for the same compiled shape
-    /// is a no-op.
+    /// Register `M` and return its durable model id. Repeated calls are no-ops.
     pub async fn register_model<M: crate::model::Model>(&self) -> Result<proto::ModelId, crate::schema::registration::RegistrationError> {
-        self.0.ensure_registered(M::descriptor()).await
+        self.0.schema_resolver().ensure_registered(M::descriptor()).await.map(|(model, _epoch)| model)
     }
 }
 
@@ -316,49 +54,49 @@ impl Context {
         // it the continuous superset of every session backing a context
         // (a no-op when the source IS the registry).
         node.sessions.attach(&sessions);
-        Self(Arc::new(NodeAndContext { node, sessions }))
+        Self(Arc::new(ContextInner { node: NodeHandle::Strong(node), auth: ContextAuth::Sessions(sessions) }))
+    }
+
+    /// A context that does NOT keep the node alive, for node-owned machinery
+    /// (the catalog projection) whose strong context would cycle.
+    pub(crate) fn new_weak<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static>(
+        node: &Node<SE, PA>,
+        sessions: impl Into<crate::session::SessionSet<PA::ContextData>>,
+    ) -> Self {
+        let sessions = sessions.into();
+        node.sessions.attach(&sessions);
+        Self(Arc::new(ContextInner { node: NodeHandle::Weak(node.weak()), auth: ContextAuth::Sessions(sessions) }))
     }
 
     pub fn node_id(&self) -> proto::EntityId { self.0.node_id() }
 
-    // TODO: Fix this - arghhh async lifetimes
-    // pub async fn trx<T, F, Fut>(self: &Arc<Self>, f: F) -> anyhow::Result<T>
-    // where
-    //     F: for<'a> FnOnce(&'a Transaction) -> Fut,
-    //     Fut: std::future::Future<Output = anyhow::Result<T>>,
-    // {
-    //     let trx = self.begin();
-    //     let result = f(&trx).await?;
-    //     trx.commit().await?;
-    //     Ok(result)
-    // }
-
     pub async fn get<R: View>(&self, id: proto::EntityId) -> Result<R, RetrievalError> {
         use crate::model::Model;
-        // A typed direct get is a schema-dependent use: admit the exact
-        // compiled schema (first-use registration) before decoding.
-        self.0.ensure_registered(R::Model::descriptor()).await?;
-        let entity = self.0.get_entity(id, &R::collection(), false).await?;
+        self.0.schema_resolver().ensure_registered(R::Model::descriptor()).await?;
+        let entity = self.0.get_entity(&R::collection(), id, false).await?;
         Ok(R::from_entity(entity))
     }
 
-    /// Get an entity, but its ok to return early if the entity is already in the local node storage
+    /// Get an entity, allowing a local result when no durable peer is connected.
     pub async fn get_cached<R: View>(&self, id: proto::EntityId) -> Result<R, RetrievalError> {
         use crate::model::Model;
-        self.0.ensure_registered(R::Model::descriptor()).await?;
-        let entity = self.0.get_entity(id, &R::collection(), true).await?;
+        self.0.schema_resolver().ensure_registered(R::Model::descriptor()).await?;
+        let entity = self.0.get_entity(&R::collection(), id, true).await?;
         Ok(R::from_entity(entity))
     }
 
-    pub async fn fetch<R: View>(&self, args: impl TryInto<MatchArgs, Error = impl Into<RetrievalError>>) -> Result<Vec<R>, RetrievalError> {
-        let args: MatchArgs = args.try_into().map_err(|e| e.into())?;
+    pub async fn fetch<R: View>(
+        &self,
+        args: impl TryInto<MatchArgs<Parsed>, Error = impl Into<RetrievalError>>,
+    ) -> Result<Vec<R>, RetrievalError> {
+        let args: MatchArgs<Parsed> = args.try_into().map_err(|e| e.into())?;
         use crate::model::Model;
-        // Typed predicate reads register at first use, so the fetch runs
-        // against authoritative catalog rows instead of failing loud as
-        // unregistered (and offline with no peer, it fails loud instead of
-        // answering empty).
-        self.0.ensure_registered(R::Model::descriptor()).await?;
+        self.0.schema_resolver().ensure_registered(R::Model::descriptor()).await?;
         let collection_id = R::Model::collection();
+        let args = MatchArgs {
+            selection: self.0.schema_resolver().resolve_selection_with_descriptor(R::Model::descriptor(), args.selection)?,
+            cached: args.cached,
+        };
 
         let entities = self.0.fetch_entities(&collection_id, args).await?;
 
@@ -367,176 +105,42 @@ impl Context {
 
     pub async fn fetch_one<R: View + Clone + 'static>(
         &self,
-        args: impl TryInto<MatchArgs, Error = impl Into<RetrievalError>>,
+        args: impl TryInto<MatchArgs<Parsed>, Error = impl Into<RetrievalError>>,
     ) -> Result<Option<R>, RetrievalError> {
         let views = self.fetch::<R>(args).await?;
         Ok(views.into_iter().next())
     }
-    /// Subscribe to changes in entities matching a selection
-    pub fn query<R>(&self, args: impl TryInto<MatchArgs, Error = impl Into<RetrievalError>>) -> Result<LiveQuery<R>, RetrievalError>
-    where R: View {
-        let args: MatchArgs = args.try_into().map_err(|e| e.into())?;
+    /// Subscribe to a typed selection, rejecting unknown fields immediately.
+    /// When registration is needed, initialization failures appear in the query's
+    /// error signal and are returned by `wait_initialized`.
+    pub fn query<R>(
+        &self,
+        args: impl TryInto<MatchArgs<Parsed>, Error = impl Into<RetrievalError>>,
+    ) -> Result<LiveQuery<R>, RetrievalError>
+    where
+        R: View,
+    {
+        let args: MatchArgs<Parsed> = args.try_into().map_err(|e| e.into())?;
         use crate::model::Model;
-        Ok(self.0.query(R::Model::collection(), args)?.map::<R>())
+        Ok(self.0.clone().query(Some(R::Model::descriptor()), R::Model::collection(), args)?.map::<R>())
     }
 
     /// Subscribe to changes in entities matching a selection and wait for initialization
     pub async fn query_wait<R>(
         &self,
-        args: impl TryInto<MatchArgs, Error = impl Into<RetrievalError>>,
+        args: impl TryInto<MatchArgs<Parsed>, Error = impl Into<RetrievalError>>,
     ) -> Result<LiveQuery<R>, RetrievalError>
     where
         R: View,
     {
-        use crate::model::Model;
-        // The synchronous `query` cannot await first-use registration (its
-        // initialization pipeline takes that over with the
-        // propertyid-resolution PR); the awaited form registers here.
-        self.0.ensure_registered(R::Model::descriptor()).await?;
         let livequery = self.query::<R>(args)?;
-        livequery.wait_initialized().await;
+        livequery.wait_initialized().await?;
         Ok(livequery)
     }
+
+    /// Open a storage collection for tests, bypassing context policy checks.
+    #[cfg(feature = "test-helpers")]
     pub async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
         self.0.collection(id).await
-    }
-}
-
-impl<SE, PA> NodeAndContext<SE, PA>
-where
-    SE: StorageEngine + Send + Sync + 'static,
-    PA: PolicyAgent + Send + Sync + 'static,
-{
-    /// Retrieve a single entity, either by cloning the resident Entity from the Node's WeakEntitySet or fetching from storage
-    pub(crate) async fn get_entity(
-        &self,
-        collection_id: &CollectionId,
-        id: proto::EntityId,
-        cached: bool,
-    ) -> Result<Entity, RetrievalError> {
-        debug!("Node({}).get_entity {:?}-{:?}", self.node.id, id, collection_id);
-        let cdata = self.sessions.current();
-
-        if !self.node.durable {
-            // Fetch from peers and commit first response
-            match self.node.get_from_peer(collection_id, vec![id], &cdata).await {
-                Ok(_) => (),
-                Err(RetrievalError::NoDurablePeers) if cached => (),
-                Err(e) => {
-                    return Err(e);
-                }
-            }
-        }
-
-        if let Some(local) = self.node.entities.get(&id) {
-            debug!("Node({}).get_entity found local entity - returning", self.node.id);
-            let state = local.to_state()?;
-            let entity_id = local.id();
-            self.node.policy_agent.check_read(&cdata, &entity_id, collection_id, &state)?;
-            return Ok(local);
-        }
-        debug!("{}.get_entity fetching from storage", self.node);
-
-        let collection = self.node.collections.get(collection_id).await?;
-        match collection.get_state(id).await {
-            Ok(entity_state) => {
-                self.node.policy_agent.check_read(&cdata, &entity_state.payload.entity_id, collection_id, &entity_state.payload.state)?;
-                let state_getter = crate::retrieval::LocalStateGetter::new(collection.clone());
-                let event_getter = CachedEventGetter::new(collection_id.clone(), collection, &self.node, &cdata);
-                let (_changed, entity) = self
-                    .node
-                    .entities
-                    .with_state(&state_getter, &event_getter, id, collection_id.clone(), entity_state.payload.state)
-                    .await?;
-                Ok(entity)
-            }
-            Err(e) => Err(e),
-        }
-    }
-    /// Fetch a list of entities based on a selection
-    pub async fn fetch_entities(&self, collection_id: &CollectionId, mut args: MatchArgs) -> Result<Vec<Entity>, RetrievalError> {
-        // One credential snapshot for the whole operation: the composed
-        // checks (collection gate, predicate narrowing) must come from
-        // one policy world, or a mid-operation refresh yields a
-        // composite no single credential authorized.
-        let cdata = self.sessions.current();
-        self.node.policy_agent.can_access_collection(&cdata, collection_id)?;
-        // Fetch raw states from storage
-
-        args.selection.predicate = self.node.policy_agent.filter_predicate(&cdata, collection_id, args.selection.predicate)?;
-
-        // Resolve types in the AST (converts literals for JSON path comparisons)
-        args.selection = self.node.type_resolver.resolve_selection_types(args.selection);
-
-        // TODO implement cached: true
-        if !self.node.durable {
-            // Fetch from peers and commit first response, under this
-            // operation's one credential snapshot.
-            Ok(self.fetch_from_peer(collection_id, args.selection, &cdata).await?)
-        } else {
-            let storage_collection = self.node.collections.get(collection_id).await?;
-            let states = storage_collection.fetch_states(&args.selection).await?;
-
-            // Convert states to entities
-            let mut entities = Vec::new();
-            let state_getter = crate::retrieval::LocalStateGetter::new(storage_collection.clone());
-            let event_getter = CachedEventGetter::new(collection_id.clone(), storage_collection, &self.node, &cdata);
-            for state in states {
-                let (_, entity) = self
-                    .node
-                    .entities
-                    .with_state(&state_getter, &event_getter, state.payload.entity_id, collection_id.clone(), state.payload.state)
-                    .await?;
-                entities.push(entity);
-            }
-            Ok(entities)
-        }
-    }
-
-    /// Fetch entities from the first available durable peer with known_matches support
-    async fn fetch_from_peer(
-        &self,
-        collection_id: &proto::CollectionId,
-        selection: ankql::ast::Selection,
-        cdata: &Vec<PA::ContextData>,
-    ) -> Result<Vec<crate::entity::Entity>, RetrievalError> {
-        let peer_id = self.node.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
-
-        // 1. Pre-fetch known_matches from local storage
-        let known_matched_entities = self.node.fetch_entities_from_local(collection_id, &selection).await?;
-
-        let known_matches = known_matched_entities
-            .iter()
-            .map(|entity| proto::KnownEntity { entity_id: entity.id(), head: entity.head().clone() })
-            .collect();
-
-        // 2. Send fetch request with known_matches
-        let selection_clone = selection.clone();
-        match self
-            .node
-            .request(peer_id, cdata, proto::NodeRequestBody::Fetch { collection: collection_id.clone(), selection, known_matches })
-            .await?
-        {
-            proto::NodeResponseBody::Fetch(deltas) => {
-                let collection = self.node.collections.get(collection_id).await?;
-                let event_getter = CachedEventGetter::new(collection_id.clone(), collection.clone(), &self.node, cdata);
-                let state_getter = crate::retrieval::LocalStateGetter::new(collection);
-
-                // 3. Apply deltas to local storage using NodeApplier
-                crate::node_applier::NodeApplier::apply_deltas(&self.node, &peer_id, deltas, &event_getter, &state_getter).await?;
-                // ARCHITECTURAL QUESTION: Optimize in-place mutation vs re-fetching for remote-peer-assisted operations https://github.com/ankurah/ankurah/issues/145
-
-                // 4. Re-fetch entities from local storage after applying deltas
-                self.node.fetch_entities_from_local(collection_id, &selection_clone).await
-            }
-            proto::NodeResponseBody::Error(e) => {
-                tracing::debug!("Error from peer fetch: {}", e);
-                Err(RetrievalError::Other(format!("{:?}", e)))
-            }
-            _ => {
-                tracing::debug!("Unexpected response type from peer fetch");
-                Err(RetrievalError::Other("Unexpected response type".to_string()))
-            }
-        }
     }
 }
