@@ -4,13 +4,13 @@ use crate::selection::filter::Filterable;
 use crate::{
     error::{LineageError, MutationError, RetrievalError, StateError},
     event_dag::AbstractCausalRelation,
-    model::View,
+    model::{Model, View},
     property::backend::{backend_from_string, PropertyBackend},
     reactor::AbstractEntity,
     value::Value,
 };
 use ankql::ast::PropertyId;
-use ankurah_proto::{AuthorId, Clock, CollectionId, EntityId, EntityState, Event, EventId, ModelId, OperationSet, State};
+use ankurah_proto::{AuthorId, Clock, EntityId, EntityState, Event, EventId, ModelId, OperationSet, State};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
@@ -28,7 +28,7 @@ pub enum StateApplyResult {
     Older,
 }
 
-/// An entity represents a unique thing within a collection. Entity can only be constructed via a WeakEntitySet
+/// A model-independent entity. Entity can only be constructed via a WeakEntitySet
 /// which provides duplication guarantees.
 #[derive(Debug, Clone)]
 pub struct Entity(Arc<EntityInner>);
@@ -159,7 +159,6 @@ impl EntityInnerState {
 #[derive(Debug)]
 pub struct EntityInner {
     pub id: EntityId,
-    pub collection: CollectionId,
     /// Combined state RwLock for atomic head/backends updates
     state: std::sync::RwLock<EntityInnerState>,
     pub(crate) kind: EntityKind,
@@ -215,13 +214,9 @@ impl Entity {
     // This is intentionally private - only WeakEntitySet should be constructing Entities
     fn weak(&self) -> WeakEntity { WeakEntity(Arc::downgrade(&self.0)) }
 
-    pub fn collection(&self) -> &CollectionId { &self.collection }
-
     pub fn head(&self) -> Clock { self.state.read().unwrap().head.clone() }
 
-    /// Durable model-backed memberships accumulated by this entity's event
-    /// history (exactly one for any created entity under the current
-    /// emission rules).
+    /// Model memberships established by this entity's causal history.
     pub fn memberships(&self) -> BTreeSet<ModelId> { self.state.read().unwrap().memberships.applied() }
 
     /// Whether this entity's causal history established membership in `model`.
@@ -254,18 +249,15 @@ impl Entity {
 
     pub fn to_entity_state(&self) -> Result<EntityState, StateError> {
         let state = self.to_state()?;
-        Ok(EntityState { entity_id: self.id(), collection: self.collection.clone(), state })
+        Ok(EntityState { entity_id: self.id(), state })
     }
 
     #[cfg(test)]
-    pub(crate) fn create(id: EntityId, collection: CollectionId, system_epoch: crate::schema::SystemEpoch) -> Self {
-        Self::new(id, collection, system_epoch)
-    }
+    pub(crate) fn create(id: EntityId, system_epoch: crate::schema::SystemEpoch) -> Self { Self::new(id, system_epoch) }
 
-    fn new(id: EntityId, collection: CollectionId, system_epoch: crate::schema::SystemEpoch) -> Self {
+    fn new(id: EntityId, system_epoch: crate::schema::SystemEpoch) -> Self {
         Self(Arc::new(EntityInner {
             id,
-            collection,
             state: std::sync::RwLock::new(EntityInnerState {
                 head: Clock::default(),
                 memberships: MembershipSet::default(),
@@ -278,12 +270,7 @@ impl Entity {
     }
 
     /// This must remain private - ONLY WeakEntitySet should be constructing Entities
-    fn from_state(
-        id: EntityId,
-        collection: CollectionId,
-        state: &State,
-        system_epoch: crate::schema::SystemEpoch,
-    ) -> Result<Self, RetrievalError> {
+    fn from_state(id: EntityId, state: &State, system_epoch: crate::schema::SystemEpoch) -> Result<Self, RetrievalError> {
         let mut backends = BTreeMap::new();
         for (name, state_buffer) in state.state_buffers.iter() {
             let backend = backend_from_string(name, Some(state_buffer))?;
@@ -292,7 +279,6 @@ impl Entity {
 
         Ok(Self(Arc::new(EntityInner {
             id,
-            collection,
             state: std::sync::RwLock::new(EntityInnerState {
                 head: state.head.clone(),
                 memberships: MembershipSet::from_applied(&state.memberships),
@@ -341,7 +327,7 @@ impl Entity {
         if operations.is_empty() {
             return Ok(None);
         }
-        Ok(Some(Event::update(self.collection.clone(), self.id, parent, author, operations)))
+        Ok(Some(Event::update(self.id, parent, author, operations)))
     }
 
     /// Updates the head of the entity to the given clock, which should come exclusively from generate_commit_event
@@ -371,11 +357,8 @@ impl Entity {
     }
 
     pub fn view<V: View>(&self) -> Option<V> {
-        if self.collection() != &V::collection() {
-            None
-        } else {
-            Some(V::from_entity(self.clone()))
-        }
+        let model = V::Model::descriptor().resolved.get(self.system_epoch)?;
+        self.has_membership(&model).then(|| V::from_entity(self.clone()))
     }
 
     /// Attempt to apply an event to the entity
@@ -388,9 +371,8 @@ impl Entity {
         // - Event already in head -> Equal -> no-op (Ok(false))
         // - Event is ancestor of head -> StrictAscends -> no-op (Ok(false))
         // - Event re-delivered but already integrated -> BFS finds it -> StrictAscends
-        // An explicit event_stored() check is not used here because callers
-        // (node/applier.rs, system.rs) store events to storage BEFORE calling
-        // apply_event (so BFS can find them), which would cause false positives.
+        // Persistence is not application: an event may already be stored but
+        // still need to be applied to this entity.
 
         // Creation event on entity with non-empty head: either re-delivery or attack.
         // On durable nodes (definitive storage), we can cheaply distinguish:
@@ -661,7 +643,6 @@ impl Entity {
 
         Ok(Self(Arc::new(EntityInner {
             id: self.id,
-            collection: self.collection.clone(),
             state: std::sync::RwLock::new(EntityInnerState { head: event_id.into(), memberships, backends }),
             kind: EntityKind::Transacted { trx_alive, upstream: self.clone() },
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
@@ -681,7 +662,6 @@ impl Entity {
 
         Self(Arc::new(EntityInner {
             id: self.id,
-            collection: self.collection.clone(),
             state: std::sync::RwLock::new(EntityInnerState {
                 head: state.head.clone(),
                 memberships: state.memberships.clone(),
@@ -720,7 +700,7 @@ impl Entity {
 
 // Implement AbstractEntity for Entity (used by reactor)
 impl AbstractEntity for Entity {
-    fn collection(&self) -> ankurah_proto::CollectionId { self.collection.clone() }
+    fn memberships(&self) -> BTreeSet<ModelId> { Entity::memberships(self) }
 
     fn id(&self) -> &ankurah_proto::EntityId { &self.id }
 
@@ -737,12 +717,12 @@ impl AbstractEntity for Entity {
 
 impl std::fmt::Display for Entity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Entity({}/{} {:#})", self.collection, self.id.to_base64_short(), self.head())
+        write!(f, "Entity({} {:#})", self.id.to_base64_short(), self.head())
     }
 }
 
 impl Filterable for Entity {
-    fn collection(&self) -> &str { self.collection.as_str() }
+    fn is_member_of(&self, model: &ModelId) -> Result<bool, crate::selection::filter::Error> { Ok(self.has_membership(model)) }
 
     fn value(&self, property: &PropertyId) -> Option<Value> {
         if *property == PropertyId::Id {
@@ -756,7 +736,7 @@ impl Filterable for Entity {
 }
 
 impl TemporaryEntity {
-    pub fn new(id: EntityId, collection: CollectionId, state: &State) -> Result<Self, RetrievalError> {
+    pub fn new(id: EntityId, state: &State) -> Result<Self, RetrievalError> {
         // Inline from_state_buffers logic
         let mut backends = BTreeMap::new();
         for (name, state_buffer) in state.state_buffers.iter() {
@@ -766,7 +746,6 @@ impl TemporaryEntity {
 
         Ok(Self(Arc::new(EntityInner {
             id,
-            collection,
             state: std::sync::RwLock::new(EntityInnerState {
                 head: state.head.clone(),
                 memberships: MembershipSet::from_applied(&state.memberships),
@@ -787,7 +766,9 @@ impl TemporaryEntity {
 
 // TODO - clean this up and consolidate with Entity somehow, while still preventing anyone from creating unregistered (non-temporary) Entities
 impl Filterable for TemporaryEntity {
-    fn collection(&self) -> &str { self.0.collection.as_str() }
+    fn is_member_of(&self, model: &ModelId) -> Result<bool, crate::selection::filter::Error> {
+        Ok(self.0.state.read().expect("other thread panicked, panic here too").memberships.is_applied(model))
+    }
 
     fn value(&self, property: &PropertyId) -> Option<Value> {
         if *property == PropertyId::Id {
@@ -802,7 +783,7 @@ impl Filterable for TemporaryEntity {
 
 impl std::fmt::Display for TemporaryEntity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "TemporaryEntity({}/{}) = {}", &self.collection, self.id, self.0.state.read().unwrap().head)
+        write!(f, "TemporaryEntity({}) = {}", self.id, self.0.state.read().unwrap().head)
     }
 }
 
@@ -822,13 +803,7 @@ impl WeakEntitySet {
 
     pub fn get(&self, id: &EntityId) -> Option<Entity> { self.entities.read().unwrap().get(id)?.upgrade() }
 
-    pub async fn get_or_retrieve<S, E>(
-        &self,
-        state_getter: &S,
-        event_getter: &E,
-        collection_id: &CollectionId,
-        id: &EntityId,
-    ) -> Result<Option<Entity>, RetrievalError>
+    pub async fn get_or_retrieve<S, E>(&self, state_getter: &S, event_getter: &E, id: &EntityId) -> Result<Option<Entity>, RetrievalError>
     where
         S: GetState + Send + Sync,
         E: GetEvents + Send + Sync,
@@ -838,8 +813,7 @@ impl WeakEntitySet {
             None => match state_getter.get_state(*id).await? {
                 None => Ok(None),
                 Some(state) => {
-                    let (_, entity) =
-                        self.with_state(state_getter, event_getter, *id, collection_id.to_owned(), state.payload.state).await?;
+                    let (_, entity) = self.with_state(state_getter, event_getter, *id, state.payload.state).await?;
                     Ok(Some(entity))
                 }
             },
@@ -847,41 +821,30 @@ impl WeakEntitySet {
     }
     /// Return a resident entity, load its stored state, or insert an empty instance for this id.
     /// The empty instance awaits incoming state or events; this does not mint a genesis event.
-    pub async fn get_retrieve_or_create<S, E>(
-        &self,
-        state_getter: &S,
-        event_getter: &E,
-        collection_id: &CollectionId,
-        id: &EntityId,
-    ) -> Result<Entity, RetrievalError>
+    pub async fn get_retrieve_or_create<S, E>(&self, state_getter: &S, event_getter: &E, id: &EntityId) -> Result<Entity, RetrievalError>
     where
         S: GetState + Send + Sync,
         E: GetEvents + Send + Sync,
     {
-        match self.get_or_retrieve(state_getter, event_getter, collection_id, id).await? {
+        match self.get_or_retrieve(state_getter, event_getter, id).await? {
             Some(entity) => Ok(entity),
-            None => Ok(self.get_or_insert_state(*id, collection_id, &State::default())?.1),
+            None => Ok(self.get_or_insert_state(*id, &State::default())?.1),
         }
     }
     /// Insert the empty resident primary for the system root, whose genesis
     /// `SystemManager::create` applies to it directly instead of through a
     /// transaction.
-    pub(crate) fn create_root(&self, collection: CollectionId, id: EntityId) -> Entity {
+    pub(crate) fn create_root(&self, id: EntityId) -> Entity {
         let mut entities = self.entities.write().unwrap();
-        let entity = Entity::new(id, collection, self.system_epoch);
+        let entity = Entity::new(id, self.system_epoch);
         entities.insert(id, entity.weak());
         entity
     }
 
     /// Create an entity from its genesis event, returning its transaction-local state.
     /// The resident primary stays empty until commit.
-    pub(crate) fn create_entity(
-        &self,
-        collection: CollectionId,
-        genesis: &Event,
-        trx_alive: Arc<AtomicBool>,
-    ) -> Result<Entity, MutationError> {
-        let primary = Entity::new(genesis.entity_id, collection, self.system_epoch);
+    pub(crate) fn create_entity(&self, genesis: &Event, trx_alive: Arc<AtomicBool>) -> Result<Entity, MutationError> {
+        let primary = Entity::new(genesis.entity_id, self.system_epoch);
         let transaction_entity = primary.snapshot_after_genesis(genesis, trx_alive)?;
         let mut entities = self.entities.write().unwrap();
         if entities.get(&primary.id).and_then(|weak| weak.upgrade()).is_some() {
@@ -922,15 +885,16 @@ impl WeakEntitySet {
     ///
     /// Requires the `test-helpers` feature to be enabled.
     #[cfg(feature = "test-helpers")]
-    pub fn conjure_evil_phantom(&self, id: EntityId, collection: CollectionId) -> Entity {
+    pub fn conjure_evil_phantom(&self, id: EntityId, model: ModelId) -> Entity {
         let mut entities = self.entities.write().unwrap();
-        let entity = Entity::new(id, collection, self.system_epoch);
+        let entity = Entity::new(id, self.system_epoch);
+entity.state.write().unwrap().memberships.apply(model);
         entities.insert(id, entity.weak());
         entity
     }
 
     /// Returns `(existed, entity)`, retaining any resident instance created during retrieval.
-    fn get_or_insert_state(&self, id: EntityId, collection_id: &CollectionId, state: &State) -> Result<(bool, Entity), RetrievalError> {
+    fn get_or_insert_state(&self, id: EntityId, state: &State) -> Result<(bool, Entity), RetrievalError> {
         let mut entities = self.entities.write().unwrap();
         if let Some(existing_weak) = entities.get(&id) {
             if let Some(existing_entity) = existing_weak.upgrade() {
@@ -938,7 +902,7 @@ impl WeakEntitySet {
                 return Ok((true, existing_entity));
             }
         }
-        let entity = Entity::from_state(id, collection_id.to_owned(), state, self.system_epoch)?;
+        let entity = Entity::from_state(id, state, self.system_epoch)?;
         entities.insert(id, entity.weak());
         Ok((false, entity))
     }
@@ -950,7 +914,6 @@ impl WeakEntitySet {
         state_getter: &S,
         event_getter: &E,
         id: EntityId,
-        collection_id: CollectionId,
         state: State,
     ) -> Result<(Option<bool>, Entity), RetrievalError>
     where
@@ -961,9 +924,9 @@ impl WeakEntitySet {
             Some(entity) => entity,
             None => {
                 if let Some(stored_state) = state_getter.get_state(id).await? {
-                    self.get_or_insert_state(id, &collection_id, &stored_state.payload.state)?.1
+                    self.get_or_insert_state(id, &stored_state.payload.state)?.1
                 } else {
-                    match self.get_or_insert_state(id, &collection_id, &state)? {
+                    match self.get_or_insert_state(id, &state)? {
                         (true, entity) => entity,
                         (false, entity) => return Ok((None, entity)),
                     }
@@ -984,7 +947,7 @@ mod value_tests {
 
     #[test]
     fn resident_and_temporary_values_preserve_property_ids_and_missing_values() -> anyhow::Result<()> {
-        let entity = Entity::create(EntityId::from_bytes([1; 32]), CollectionId::fixed_name("test"), SystemEpoch::allocate());
+        let entity = Entity::create(EntityId::from_bytes([1; 32]), SystemEpoch::allocate());
         let backend = entity.get_backend::<LWWBackend>()?;
         let expected = BTreeMap::from([
             (PropertyId::EntityId(EntityId::from_bytes([2; 32])), Some(Value::String("value".into()))),
@@ -995,7 +958,7 @@ mod value_tests {
         }
         assert_eq!(entity.values(), expected.into_iter().collect::<Vec<_>>());
         backend.apply_operations_with_event(&backend.to_operations()?.unwrap(), EventId::from_bytes([3; 32]))?;
-        let temporary = TemporaryEntity::new(entity.id(), entity.collection().clone(), &entity.to_state()?)?;
+        let temporary = TemporaryEntity::new(entity.id(), &entity.to_state()?)?;
         assert_eq!(temporary.values(), entity.values());
         Ok(())
     }
@@ -1011,9 +974,8 @@ mod epoch_tests {
         let original = WeakEntitySet::new(SystemEpoch::allocate());
         let replacement = WeakEntitySet::new(SystemEpoch::allocate());
         let id = EntityId::from_bytes([1; 32]);
-        let collection = CollectionId::fixed_name("test");
-        let (_, retained) = original.get_or_insert_state(id, &collection, &State::default())?;
-        let (_, fresh) = replacement.get_or_insert_state(id, &collection, &State::default())?;
+        let (_, retained) = original.get_or_insert_state(id, &State::default())?;
+        let (_, fresh) = replacement.get_or_insert_state(id, &State::default())?;
         assert_ne!(retained, fresh);
         assert_ne!(retained.system_epoch(), fresh.system_epoch());
         assert_eq!(original.get(&id), Some(retained));

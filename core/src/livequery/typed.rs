@@ -1,5 +1,6 @@
 use super::EntityLiveQuery;
 use crate::internal::prelude::*;
+use crate::model::Model;
 use crate::reactor::ReactorUpdate;
 use crate::resultset::ResultSet;
 use ankurah_signals::{
@@ -12,6 +13,10 @@ use std::marker::PhantomData;
 
 #[derive(Clone)]
 pub struct LiveQuery<R: View>(pub(super) EntityLiveQuery, pub(super) PhantomData<R>);
+
+impl<R: View> From<LiveQuery<R>> for EntityLiveQuery {
+    fn from(query: LiveQuery<R>) -> Self { query.0 }
+}
 
 impl<R: View> std::ops::Deref for LiveQuery<R> {
     type Target = EntityLiveQuery;

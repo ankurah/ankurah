@@ -54,7 +54,8 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
             ContextAuth::Sessions(sessions) => sessions.clone(),
             ContextAuth::Privileged => return Err(RetrievalError::Other("the privileged context does not query".into())),
         };
-        node.subscribe_remote_query(query.query_id(), query.collection_id().clone(), selection, sessions, version, query.weak());
+        let model = query.model_descriptor().model_id(node.entities.system_epoch())?;
+        node.subscribe_remote_query(query.query_id(), model, selection, sessions, version, query.weak());
         Ok(true)
     }
 
@@ -72,8 +73,8 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     fn system_id(&self) -> Option<proto::EntityId> { self.node.upgrade().ok().and_then(|node| node.system.root_id()) }
 
     /// Create an entity from its genesis event, returning its transaction-local state.
-    fn create_entity(&self, collection: proto::CollectionId, genesis: &Event, trx_alive: Arc<AtomicBool>) -> Result<Entity, MutationError> {
-        self.node.upgrade()?.entities.create_entity(collection, genesis, trx_alive)
+    fn create_entity(&self, genesis: &Event, trx_alive: Arc<AtomicBool>) -> Result<Entity, MutationError> {
+        self.node.upgrade()?.entities.create_entity(genesis, trx_alive)
     }
 
     /// Check whether this context may write the entity.

@@ -1,4 +1,9 @@
-use crate::{entity::Entity, error::MutationError, model::View, reactor::ChangeNotification};
+use crate::{
+    entity::Entity,
+    error::MutationError,
+    model::{Model, View},
+    reactor::ChangeNotification,
+};
 use ankurah_proto::{Attested, Event};
 
 #[derive(Debug, Clone)]
@@ -80,25 +85,23 @@ where I: View
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ItemChange::Initial { item } => {
-                write!(f, "Initial {}/{}", I::collection(), item.id())
+                write!(f, "Initial {}/{}", I::Model::descriptor().label, item.id())
             }
             ItemChange::Add { item, .. } => {
-                write!(f, "Add {}/{}", I::collection(), item.id())
+                write!(f, "Add {}/{}", I::Model::descriptor().label, item.id())
             }
             ItemChange::Update { item, .. } => {
-                write!(f, "Update {}/{}", I::collection(), item.id())
+                write!(f, "Update {}/{}", I::Model::descriptor().label, item.id())
             }
             ItemChange::Remove { item, .. } => {
-                write!(f, "Remove {}/{}", I::collection(), item.id())
+                write!(f, "Remove {}/{}", I::Model::descriptor().label, item.id())
             }
         }
     }
 }
 
 impl std::fmt::Display for EntityChange {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "EntityChange {}/{}", self.entity.collection(), self.entity.id())
-    }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "EntityChange {}", self.entity.id()) }
 }
 
 use crate::resultset::ResultSet;

@@ -41,7 +41,6 @@ pub mod transaction;
 pub mod util;
 pub mod value;
 
-pub mod collectionset;
 pub mod schema;
 
 #[cfg(feature = "uniffi")]

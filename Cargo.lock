@@ -301,6 +301,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
+ "futures",
  "jwt-simple",
  "notify",
  "serde",
@@ -368,6 +369,7 @@ dependencies = [
  "futures",
  "indexmap 2.12.1",
  "serde",
+ "thiserror 2.0.17",
  "tracing",
 ]
 
@@ -457,6 +459,7 @@ dependencies = [
  "futures",
  "serde",
  "sled",
+ "tempfile",
  "thiserror 2.0.17",
  "tokio",
  "tracing",
@@ -482,6 +485,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.17",
  "tokio",
  "tracing",

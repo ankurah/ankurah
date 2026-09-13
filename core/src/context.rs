@@ -29,8 +29,14 @@ impl Context {
 // Generic methods cannot cross the wasm_bindgen boundary; they live in this
 // plain impl and remain host-and-wasm callable from Rust.
 impl Context {
-    /// Register `M` and return its durable model id. Repeated calls are no-ops.
-    pub async fn register_model<M: crate::model::Model>(&self) -> Result<proto::ModelId, crate::schema::registration::RegistrationError> {
+    /// Return `M`'s identity using only this context's local schema bindings.
+    /// Fails if the node is not ready or the declaration cannot be bound locally.
+    pub fn model_id_of<M: crate::model::Model>(&self) -> Result<proto::ModelId, RetrievalError> {
+        self.0.schema_resolver().model_id(M::descriptor())
+    }
+
+    /// Resolve `M`'s identity, registering missing declarations locally or through a durable peer.
+    pub async fn resolve_model_id<M: crate::model::Model>(&self) -> Result<proto::ModelId, crate::schema::registration::RegistrationError> {
         self.0.schema_resolver().ensure_registered(M::descriptor()).await.map(|(model, _epoch)| model)
     }
 }
@@ -92,13 +98,12 @@ impl Context {
         let args: MatchArgs<Parsed> = args.try_into().map_err(|e| e.into())?;
         use crate::model::Model;
         self.0.schema_resolver().ensure_registered(R::Model::descriptor()).await?;
-        let collection_id = R::Model::collection();
         let args = MatchArgs {
             selection: self.0.schema_resolver().resolve_selection_with_descriptor(R::Model::descriptor(), args.selection)?,
-            cached: args.cached,
+            cache_policy: args.cache_policy,
         };
 
-        let entities = self.0.fetch_entities(&collection_id, args).await?;
+        let entities = self.0.fetch_entities(args).await?;
 
         Ok(entities.into_iter().map(|e| R::from_entity(e)).collect())
     }
@@ -122,7 +127,7 @@ impl Context {
     {
         let args: MatchArgs<Parsed> = args.try_into().map_err(|e| e.into())?;
         use crate::model::Model;
-        Ok(self.0.clone().query(Some(R::Model::descriptor()), R::Model::collection(), args)?.map::<R>())
+        Ok(self.0.clone().query(R::Model::descriptor(), args)?.map::<R>())
     }
 
     /// Subscribe to changes in entities matching a selection and wait for initialization
@@ -136,11 +141,5 @@ impl Context {
         let livequery = self.query::<R>(args)?;
         livequery.wait_initialized().await?;
         Ok(livequery)
-    }
-
-    /// Open a storage collection for tests, bypassing context policy checks.
-    #[cfg(feature = "test-helpers")]
-    pub async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
-        self.0.collection(id).await
     }
 }

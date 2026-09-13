@@ -1,6 +1,7 @@
 use crate::error::{ApplyError, ApplyErrorItem};
 use crate::internal::prelude::*;
 use crate::retrieval::{CachedEventGetter, GetState, LocalStateGetter, SuspenseEvents};
+use crate::storage::{EntityWrite, StorageTransaction};
 use crate::util::ready_chunks::ReadyChunks;
 use futures::stream::StreamExt;
 use proto::Attested;

@@ -51,8 +51,8 @@ pub enum RetrievalError {
     EventNotFound(EventId),
     #[error("Storage error: {0}")]
     StorageError(Arc<dyn std::error::Error + Send + Sync + 'static>),
-    #[error("Collection not found: {0}")]
-    CollectionNotFound(CollectionId),
+    #[error("Model not found: {0}")]
+    ModelNotFound(ModelId),
     #[error("Update failed: {0}")]
     FailedUpdate(Arc<dyn std::error::Error + Send + Sync + 'static>),
     #[error("Deserialization error: {0}")]
@@ -395,7 +395,7 @@ pub enum ValidationError {
 #[derive(Debug)]
 pub enum ApplyError {
     Items(Vec<ApplyErrorItem>),
-    CollectionNotFound(CollectionId),
+    ModelNotFound(ModelId),
     RetrievalError(Box<RetrievalError>),
     MutationError(Box<MutationError>),
 }
@@ -410,7 +410,7 @@ impl std::fmt::Display for ApplyError {
                 }
                 Ok(())
             }
-            ApplyError::CollectionNotFound(id) => write!(f, "Collection not found: {}", id),
+            ApplyError::ModelNotFound(id) => write!(f, "Model not found: {}", id),
             ApplyError::RetrievalError(e) => write!(f, "Retrieval error: {}", e),
             ApplyError::MutationError(e) => write!(f, "Mutation error: {}", e),
         }
@@ -431,13 +431,12 @@ impl std::error::Error for ApplyError {
 #[derive(Debug)]
 pub struct ApplyErrorItem {
     pub entity_id: EntityId,
-    pub collection: CollectionId,
     pub cause: MutationError,
 }
 
 impl std::fmt::Display for ApplyErrorItem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Failed to apply delta for entity {} in collection {}: {}", self.entity_id.to_base64_short(), self.collection, self.cause)
+        write!(f, "Failed to apply delta for entity {}: {}", self.entity_id.to_base64_short(), self.cause)
     }
 }
 

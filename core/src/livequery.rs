@@ -1,6 +1,6 @@
 use crate::context::{Context, DynContextInner};
 use crate::internal::prelude::*;
-use ankql::ast::{Parsed, Resolved, Selection, Stage};
+use ankql::ast::{Resolved, Selection};
 use ankurah_signals::Read;
 use futures::FutureExt;
 use std::{
@@ -26,9 +26,7 @@ pub struct EntityLiveQuery(Arc<LiveQueryInner>);
 impl EntityLiveQuery {
     pub fn new<SE, PA>(
         node: &Node<SE, PA>,
-        schema: Option<&'static crate::schema::ModelStructDescriptor>,
-        collection_id: CollectionId,
-        args: MatchArgs<Parsed>,
+        args: MatchArgs<Resolved>,
         sessions: impl Into<SessionSet<PA::ContextData>>,
     ) -> Result<Self, RetrievalError>
     where
@@ -186,7 +184,6 @@ impl EntityLiveQuery {
     /// The current version's initialization error, cleared when a new version starts.
     pub fn error(&self) -> Read<Option<Arc<RetrievalError>>> { self.0.error.read() }
     pub fn query_id(&self) -> proto::QueryId { self.0.query_id }
-    pub(crate) fn collection_id(&self) -> &CollectionId { &self.0.collection_id }
     /// The latest installed selection and version; `None` until initial resolution.
     pub fn selection(&self) -> Read<Option<(ankql::ast::Selection<Resolved>, u32)>> { self.0.selection.read() }
     pub fn resultset(&self) -> EntityResultSet { self.0.resultset.clone() }

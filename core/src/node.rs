@@ -1,6 +1,6 @@
 use crate::{internal::prelude::*, schema::registration::RegistrationError};
-use ankql::ast::{Parsed, Resolved, Stage};
-use ankurah_proto::{Attested, EntityState};
+use ankql::ast::Resolved;
+use ankurah_proto::Attested;
 use ankurah_signals::{Calculated, Get, Mut, Wait};
 use anyhow::anyhow;
 use futures::TryFutureExt;
@@ -14,7 +14,6 @@ use std::{
 };
 use tokio::sync::oneshot;
 
-use crate::collectionset::CollectionSet;
 use crate::connector::{PeerConnectionError, PeerSender};
 use crate::context::{Context, ContextAuth, ContextInner};
 use crate::entity::WeakEntitySet;
@@ -24,6 +23,7 @@ use crate::policy::ReadPolicy;
 use crate::reactor::Reactor;
 use crate::retrieval::{CachedEventGetter, LocalEventGetter, LocalStateGetter, SuspenseEvents};
 use crate::schema::catalog::register::RegistrationAuth;
+use crate::storage::{EntityCommit, EntityWrite};
 use crate::system::SystemManager;
 use crate::util::safemap::SafeMap;
 use crate::util::safeset::SafeSet;
@@ -45,6 +45,7 @@ mod state;
 mod tests;
 
 pub use handles::{NodeHandle, NodeRef};
+pub use match_args::{nocache, CachePolicy, MatchArgs};
 pub use peer_state::PeerState;
 use schema_registration::WireRegistrant;
 pub use state::NodeState;
@@ -138,7 +139,7 @@ where PA: PolicyAgent
 {
     pub id: proto::EntityId,
     pub durable: bool,
-    pub collections: CollectionSet<SE>,
+    pub storage: Arc<SE>,
 
     pub(crate) entities: WeakEntitySet,
     peer_connections: SafeMap<proto::EntityId, Arc<PeerState<PA::ContextData>>>,
@@ -187,10 +188,10 @@ where
     /// Initialization and terminal halt state; independent of peer connectivity.
     pub fn state(&self) -> ankurah_signals::Read<NodeState> { self.system.node_state() }
 
-    /// Require completed system and catalog initialization, or return why the node is unavailable.
+    /// Require completed system, catalog, and policy initialization, or return why the node is unavailable.
     pub fn check_ready(&self) -> Result<(), NodeReadinessError> { self.state().value().check_ready() }
 
-    /// Wait for system and catalog initialization without retaining the node; return an error if it halts.
+    /// Wait for system, catalog, and policy initialization without retaining the node; return an error if it halts.
     pub fn wait_ready(&self) -> impl std::future::Future<Output = Result<(), NodeReadinessError>> + Send + 'static {
         let state = self.state();
         async move {
@@ -216,10 +217,9 @@ where
     }
 
     fn build(engine: Arc<SE>, policy_agent: PA, durable: bool, rng: SmallRng) -> Self {
-        let collections = CollectionSet::new(engine.clone());
         let entityset = WeakEntitySet::new(SystemEpoch::allocate());
         let id = proto::EntityId::random();
-        let system_manager = SystemManager::new(collections.clone(), entityset.clone(), durable);
+        let system_manager = SystemManager::new(engine.clone(), entityset.clone(), durable);
         let alive = Mut::new(true);
         let state = system_manager.node_state();
         let run = {
@@ -237,7 +237,7 @@ where
 
         let node = Node(Arc::new(NodeInner {
             id,
-            collections,
+            storage: engine,
             entities: entityset,
             peer_connections: SafeMap::new(),
             durable_peers: SafeSet::new(),
@@ -526,16 +526,14 @@ where
                     Err(e) => Ok(proto::NodeResponseBody::Error(e.to_string())),
                 }
             }
-            proto::NodeRequestBody::Fetch { collection, mut selection, known_matches } => {
-                let policy = ReadPolicy::new(&self.policy_agent, cdata, &collection);
-                policy.check_collection()?;
-                let storage_collection = self.collections.get(&collection).await?;
+            proto::NodeRequestBody::Fetch { mut selection, known_matches } => {
+                let policy = ReadPolicy::new(&self.policy_agent, cdata);
                 selection.predicate = policy.filter_predicate(selection.predicate)?;
 
                 let expanded_states = crate::util::expand_states::expand_states(
-                    storage_collection.fetch_states(&selection).await?,
+                    self.storage.fetch_states(&selection).await?,
                     known_matches.iter().map(|k| k.entity_id).collect::<Vec<_>>(),
-                    &storage_collection,
+                    self.storage.as_ref(),
                 )
                 .await?;
 
@@ -547,19 +545,17 @@ where
                         continue;
                     }
 
-                    if let Some(delta) = self.generate_entity_delta(&known_map, state, &storage_collection, cdata).await? {
+                    if let Some(delta) = self.generate_entity_delta(&known_map, state, cdata).await? {
                         deltas.push(delta);
                     }
                 }
                 Ok(proto::NodeResponseBody::Fetch(deltas))
             }
-            proto::NodeRequestBody::Get { collection, ids } => {
-                let policy = ReadPolicy::new(&self.policy_agent, cdata, &collection);
-                policy.check_collection()?;
-                let storage_collection = self.collections.get(&collection).await?;
+            proto::NodeRequestBody::Get { ids } => {
+                let policy = ReadPolicy::new(&self.policy_agent, cdata);
 
                 let mut states = Vec::new();
-                for state in storage_collection.get_states(ids).await? {
+                for state in self.storage.get_states(ids).await? {
                     match policy.check_read(&state.payload.entity_id, &state.payload.state) {
                         Ok(_) => states.push(state),
                         Err(AccessDenied::ByPolicy(_)) => {}
@@ -569,10 +565,8 @@ where
 
                 Ok(proto::NodeResponseBody::Get(states))
             }
-            proto::NodeRequestBody::GetEvents { collection, event_ids } => {
-                let policy = ReadPolicy::new(&self.policy_agent, cdata, &collection);
-                policy.check_collection()?;
-                let storage_collection = self.collections.get(&collection).await?;
+            proto::NodeRequestBody::GetEvents { event_ids } => {
+                let policy = ReadPolicy::new(&self.policy_agent, cdata);
 
                 let mut events = Vec::new();
                 for event in storage_collection.get_events(event_ids).await? {
@@ -585,7 +579,7 @@ where
 
                 Ok(proto::NodeResponseBody::GetEvents(events))
             }
-            proto::NodeRequestBody::SubscribeQuery { query_id, collection, selection, version, known_matches } => {
+            proto::NodeRequestBody::SubscribeQuery { query_id, selection, version, known_matches } => {
                 let peer_state = self.peer_connections.get(&request.from).ok_or_else(|| anyhow!("Peer {} not connected", request.from))?;
                 // Catalog subscriptions carry no credential; others carry exactly one.
                 let cdata = match cdata.iterable().at_most_one() {
@@ -596,7 +590,7 @@ where
                         ));
                     }
                 };
-                peer_state.subscription_handler.subscribe_query(self, query_id, collection, selection, cdata, version, known_matches).await
+                peer_state.subscription_handler.subscribe_query(self, query_id, selection, cdata, version, known_matches).await
             }
         }
     }
@@ -625,7 +619,13 @@ where
         // TODO determine how many durable peers need to respond before we can proceed. The others should continue in the background.
         // as of this writing, we only have one durable peer, so we can just await the response from "all" of them
         for peer_id in self.get_durable_peers() {
-            match self.request(peer_id, cdata, proto::NodeRequestBody::CommitTransaction { id: id.clone(), events: events.to_vec() }).await
+            match self
+                .request(
+                    peer_id,
+                    cdata,
+                    proto::NodeRequestBody::CommitTransaction { id: id.clone(), events: events.to_vec() },
+                )
+                .await
             {
                 Ok(proto::NodeResponseBody::CommitComplete { .. }) => (),
                 Err(error) => return Err(RetrievalError::from(error).into()),

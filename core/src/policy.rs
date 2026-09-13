@@ -22,8 +22,8 @@ pub(crate) use read::ReadPolicy;
 pub enum AccessDenied {
     #[error("Access denied by policy: {0}")]
     ByPolicy(&'static str),
-    #[error("Access denied by collection: {0}")]
-    CollectionDenied(proto::CollectionId),
+    #[error("Access denied by model: {0}")]
+    ModelDenied(proto::ModelId),
     #[error("Access denied by property error: {0}")]
     PropertyError(std::sync::Arc<PropertyError>),
     #[error("Access denied by parse error: {0}")]
@@ -63,32 +63,29 @@ pub use crate::schema::registration::{PlannedModelPropertyMembership, PlannedUpd
 /// - attesting events for requests that were approved
 /// - validating attestations for events
 ///
-/// The four checks that take a credential collection
-/// ([`Self::can_access_collection`], [`Self::filter_predicate`],
-/// [`Self::check_read`], [`Self::check_read_event`]) can be handed
-/// several credentials, one, or none. An implementation must decide the
-/// empty case deliberately instead of inheriting whatever its loops
-/// happen to do with it: with no credential there is no principal to
-/// attribute the access to, so fail closed unless permissiveness is the
-/// point. The JWT agent in extensions/jwt-auth denies it wherever
-/// admission is decided — `can_access_collection`, and `check_read` and
-/// `check_read_event` which both reach that check (the first as its
-/// opening step, the second after the privileged short-circuit) — carving out only
-/// the policy collection, which is granted before any credential is
-/// consulted. (Its `filter_predicate` does return the predicate
-/// unnarrowed when the collection has no scope rules, which admits
-/// nobody: every caller passes `can_access_collection` before it.)
-/// [`PermissiveAgent`] allows the empty collection, that being the whole
-/// of what it is for.
+/// Read checks may receive several credentials, one, or none. Implementations
+/// must decide the empty case explicitly and authorize actual entity memberships,
+/// not a model supplied by the caller. `PermissiveAgent` allows all credentials.
 #[async_trait]
 pub trait PolicyAgent: Clone + Send + Sync + 'static {
     /// The context type that will be used for all resource requests.
     /// This will typically represent a user or service account.
     type ContextData: ContextData;
 
-    /// Called after the Node is fully constructed, giving the PolicyAgent a weak reference to its owning node.
-    /// Use this to start background tasks (file watchers, policy subscriptions) that need the node.
-    fn on_node_ready<SE: StorageEngine + Send + Sync + 'static>(&self, _node: WeakNode<SE, Self>) {}
+    /// Initialize policy after the system and catalog load, before ordinary contexts are issued.
+    /// Load existing policy; installing or updating shared policy is a separate bootstrap operation.
+    /// Bootstrap work must not wait for the node to finish this startup step.
+    async fn start<SE: StorageEngine + Send + Sync + 'static>(&self, _node: WeakNode<SE, Self>) -> anyhow::Result<()> { Ok(()) }
+
+    /// Load policy bindings for a registered model before synchronous access checks.
+    /// This prepares policy data; it neither resolves names nor grants access.
+    async fn preflight<SE: StorageEngine + Send + Sync + 'static>(
+        &self,
+        _node: &Node<SE, Self>,
+        _model: proto::ModelId,
+    ) -> Result<(), RetrievalError> {
+        Ok(())
+    }
 
     /// Create relevant auth data for a given request
     /// This could be a JWT or a cryptographic signature, or some other arbitrary method of authentication as defined by the PolicyAgent
@@ -115,8 +112,7 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
         Self: Sized,
         A: Iterable<proto::AuthData> + Send + Sync;
 
-    /// Check whether this registration plan is allowed -- the agent's only
-    /// voice on catalog writes (the executor commits privileged).
+    /// Authorize the complete registration plan; the executor commits privileged.
     fn check_schema_registration<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
@@ -124,6 +120,18 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
         _plan: &RegistrationPlan,
     ) -> Result<(), AccessDenied> {
         Ok(())
+    }
+
+    /// Stage policy bindings alongside an authorized schema registration, before its transaction commits.
+    /// Replicas apply the committed records; they do not run this hook.
+    /// The executor retains any returned authoring guard through the commit.
+    async fn schema_registered<SE: StorageEngine + Send + Sync + 'static>(
+        &self,
+        _node: &Node<SE, Self>,
+        _transaction: &Transaction,
+        _plan: &RegistrationPlan,
+    ) -> anyhow::Result<Option<tokio::sync::OwnedMutexGuard<()>>> {
+        Ok(None)
     }
 
     /// Judge an event under this credential, seeing the entity state both

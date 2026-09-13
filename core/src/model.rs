@@ -4,7 +4,7 @@ pub mod wasm;
 
 use std::sync::Arc;
 
-use ankurah_proto::{CollectionId, EntityId, ModelId, State};
+use ankurah_proto::{EntityId, ModelId, State};
 
 use crate::entity::{Entity, ProvisionalEntity};
 use crate::error::StateError;
@@ -20,13 +20,14 @@ use wasm_bindgen;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::JsCast;
 
-/// A model is a struct that represents the present values for a given entity
-/// Schema is defined primarily by the Model object, and the View is derived from that via macro.
+/// A concrete, typed representation of a model's properties for one entity.
+/// Its descriptor binds the struct and its fields to catalog model and property identities.
 pub trait Model: Sized {
     type View: View;
     type Mutable: Mutable;
 
-    fn collection() -> CollectionId;
+    /// Catalog label used to register this model struct and references to it.
+    const LABEL: &'static str;
 
     /// The local compiled schema: the names and types a binary registers and
     /// binds against the catalog (ids exist only there) and the
@@ -52,7 +53,6 @@ pub trait View {
     type Mutable: Mutable;
     fn id(&self) -> EntityId { self.entity().id() }
 
-    fn collection() -> CollectionId { <Self::Model as Model>::collection() }
     fn entity(&self) -> &Entity;
     fn from_entity(inner: Entity) -> Self;
     fn to_model(&self) -> Result<Self::Model, PropertyError>;
@@ -87,7 +87,6 @@ pub trait Mutable {
     type Model: Model;
     type View: View;
     fn id(&self) -> EntityId { self.entity().id() }
-    fn collection() -> CollectionId { <Self::Model as Model>::collection() }
 
     fn entity(&self) -> &Entity;
     fn new(entity: Entity) -> Self

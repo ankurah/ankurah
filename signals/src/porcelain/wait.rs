@@ -41,7 +41,7 @@ impl<T> WaitResult for Option<T> {
 impl<T, S> Wait<T> for S
 where
     S: Signal + GetReadCell<T> + Sync,
-    T: Clone + Send + Sync + 'static,
+    T: Send + Sync + 'static,
 {
     async fn wait_value(&self, target_value: T)
     where T: PartialEq + Clone + Send + Sync {

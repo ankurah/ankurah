@@ -40,17 +40,17 @@ mod tests {
     use super::*;
     use crate::{
         context::Context,
-        node::Node,
+        node::{CachePolicy, Node},
         policy::{PermissiveAgent, DEFAULT_CONTEXT},
         test_utils::TestStorage,
     };
-    use ankql::ast::{Parsed, Predicate};
 
     #[tokio::test]
     async fn clones_share_one_registration_until_the_last_handle_drops() {
         let node = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
         let context = Context::new(node.clone(), DEFAULT_CONTEXT);
-        let query = EntityLiveQuery::new_with_context(&node, context.0, None, "test".into(), Predicate::<Parsed>::True.into()).unwrap();
+        let query =
+            EntityLiveQuery::new_with_context(&node, context.0, CachePolicy::Durable, super::super::QueryResolution::Pending(Box::pin(futures::future::pending()))).unwrap();
         let address = Arc::as_ptr(&query.0) as usize;
         let clone = query.clone();
         node.live_queries.insert(&clone);

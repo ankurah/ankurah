@@ -46,7 +46,6 @@ impl ExprOutput<Value> {
 
 /// An item whose properties can be evaluated by identity.
 pub trait Filterable {
-    fn collection(&self) -> &str;
     fn value(&self, property: &PropertyId) -> Option<Value>;
 }
 
@@ -236,8 +235,6 @@ mod tests {
     }
 
     impl Filterable for TestItem {
-        fn collection(&self) -> &str { "users" }
-
         fn value(&self, property: &PropertyId) -> Option<Value> {
             if *property == prop_id("name") {
                 Some(Value::String(self.name.clone()))
@@ -364,8 +361,6 @@ mod tests {
     const RECORDS: &[(&str, ValueType)] = &[("owner", ValueType::EntityId)];
 
     impl Filterable for OwnedItem {
-        fn collection(&self) -> &str { "records" }
-
         fn value(&self, property: &PropertyId) -> Option<Value> {
             if *property == prop_id("owner") {
                 Some(Value::EntityId(self.owner))
@@ -397,7 +392,6 @@ mod tests {
         // it with the row's own identity.
         struct Row(EntityId);
         impl Filterable for Row {
-            fn collection(&self) -> &str { "rows" }
             fn value(&self, property: &PropertyId) -> Option<Value> { (*property == PropertyId::Id).then(|| Value::EntityId(self.0)) }
         }
         let row = Row(EntityId::from_bytes([9u8; 32]));
@@ -412,7 +406,6 @@ mod tests {
         // closed SystemProperty vocabulary is the identity.
         struct SysRow;
         impl Filterable for SysRow {
-            fn collection(&self) -> &str { "_ankurah_property" }
             fn value(&self, property: &PropertyId) -> Option<Value> {
                 (*property == PropertyId::System(SystemProperty::Label)).then(|| Value::String("album".into()))
             }
@@ -448,8 +441,6 @@ mod tests {
         }
 
         impl Filterable for TrackItem {
-            fn collection(&self) -> &str { "tracks" }
-
             fn value(&self, property: &PropertyId) -> Option<Value> {
                 if *property == prop_id("name") {
                     Some(Value::String(self.name.clone()))

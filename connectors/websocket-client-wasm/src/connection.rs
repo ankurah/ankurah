@@ -278,11 +278,7 @@ impl Connection {
             if connecting {
                 // A handshake we cannot read will never establish; close instead
                 // of idling on a dead connection.
-                let message = if proto::is_version0_presence(&data) {
-                    format!("Server {} speaks a pre-versioning (0.9.x or older) protocol; refusing", self.url)
-                } else {
-                    format!("Failed to deserialize handshake message from {}; closing", self.url)
-                };
+                let message = format!("Failed to deserialize handshake message from {}; closing", self.url);
                 error!("{}", message);
                 self.disconnect();
                 self.set_state(ConnectionState::Error { message, cause: None });

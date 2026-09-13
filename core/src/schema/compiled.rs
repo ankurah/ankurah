@@ -11,7 +11,7 @@ use ankurah_proto::{EntityId, ModelId, PropertyId, RegisterModel, RegisterProper
 
 use crate::error::RetrievalError;
 
-/// One model's registration metadata and resolved identities.
+/// A compiled Model struct's field declarations and per-system catalog bindings.
 #[derive(Debug)]
 pub struct ModelStructDescriptor {
     /// Source-level registration label, currently the lowercased struct name.
@@ -74,6 +74,11 @@ impl RegistrantProperty for StructProperty {
 }
 
 impl ModelStructDescriptor {
+    /// Return this struct's bound model identity for `epoch`.
+    pub(crate) fn model_id(&self, epoch: SystemEpoch) -> Result<ModelId, RetrievalError> {
+        self.resolved.get(epoch).ok_or_else(|| RetrievalError::UnboundDeclaration { label: self.label.into() })
+    }
+
     pub(crate) fn registrant(&'static self, epoch: SystemEpoch) -> DescriptorRegistrant {
         DescriptorRegistrant { schema: self, epoch, model: None, properties: vec![None; self.properties.len()] }
     }

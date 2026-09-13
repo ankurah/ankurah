@@ -381,12 +381,8 @@ where
                     if peer_sender.is_none() {
                         // A handshake we cannot read will never establish; close
                         // instead of idling on a dead connection.
-                        if proto::is_version0_presence(&data) {
-                            return Err(anyhow!("server {} speaks a pre-versioning (0.9.x or older) protocol", inner.server_url));
-                        } else {
                             return Err(anyhow!("failed to deserialize handshake message from {}: {}", inner.server_url, e));
                         }
-                    }
                     warn!("Failed to deserialize message: {}", e);
                     Ok(MessageResult::Continue)
                 }

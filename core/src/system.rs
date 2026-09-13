@@ -10,10 +10,10 @@ use std::sync::{
 };
 use tokio::sync::Notify;
 
-use crate::collectionset::CollectionSet;
 use crate::entity::WeakEntitySet;
 use crate::property::{Property, PropertyError};
 use crate::retrieval::{LocalEventGetter, LocalStateGetter, SuspenseEvents};
+use crate::storage::{StorageCommitOutcome, StorageTransaction};
 use crate::{property::backend::LWWBackend, value::Value};
 pub const SYSTEM_COLLECTION_ID: &str = "_ankurah_system";
 pub const PROTECTED_COLLECTIONS: &[&str] = &[SYSTEM_COLLECTION_ID];
@@ -42,7 +42,7 @@ impl From<SystemEpochError> for MutationError {
 }
 
 struct Inner<SE> {
-    collectionset: CollectionSet<SE>,
+    storage: Arc<SE>,
     entities: WeakEntitySet,
     durable: bool,
     root: RwLock<Option<Attested<EntityState>>>,
@@ -59,9 +59,9 @@ struct Inner<SE> {
 impl<SE> SystemManager<SE>
 where SE: StorageEngine + Send + Sync + 'static
 {
-    pub(crate) fn new(collections: CollectionSet<SE>, entities: WeakEntitySet, durable: bool) -> Self {
+    pub(crate) fn new(storage: Arc<SE>, entities: WeakEntitySet, durable: bool) -> Self {
         let me = Self(Arc::new(Inner {
-            collectionset: collections,
+            storage,
             entities,
             durable,
             items: RwLock::new(Vec::new()),
@@ -91,13 +91,6 @@ where SE: StorageEngine + Send + Sync + 'static
     pub fn root_id(&self) -> Option<proto::EntityId> { self.0.root.read().unwrap().as_ref().map(|r| r.payload.entity_id) }
 
     pub fn items(&self) -> Vec<Entity> { self.0.items.read().unwrap().clone() }
-
-    /// Get a storage collection after local system metadata loads.
-    pub async fn collection(&self, id: &CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
-        self.wait_loaded().await?;
-        // TODO - update the system catalog to create an entity for this collection
-        self.0.collectionset.get(id).await
-    }
 
     /// Whether a system is initialized and the node has not halted.
     pub fn is_system_ready(&self) -> bool { self.check_not_halted().is_ok() && *self.0.system_ready.read().unwrap() }
@@ -181,8 +174,7 @@ where SE: StorageEngine + Send + Sync + 'static
         }
 
         // TODO - see if we can use the Model derive macro for a SysCatalogItem model rather than doing this manually
-        let collection_id = CollectionId::fixed_name(SYSTEM_COLLECTION_ID);
-        let storage = self.0.collectionset.get(&collection_id).await?;
+        let storage = self.0.storage.clone();
 
         // The root genesis alone has no parent system to bind.
         let mut provisional = crate::entity::ProvisionalEntity::new();
@@ -190,8 +182,8 @@ where SE: StorageEngine + Send + Sync + 'static
         let lww_backend = provisional.get_backend::<LWWBackend>().expect("LWW Backend should exist");
         lww_backend.set(PropertyId::System(proto::SystemProperty::Item), proto::sys::Item::SysRoot.into_value()?);
 
-        let event = proto::Event::genesis(collection_id.clone(), None, proto::AuthorId::Unknown, provisional.extract_operations()?);
-        let system_entity = self.0.entities.create_root(collection_id.clone(), event.entity_id);
+        let event = proto::Event::genesis(None, proto::AuthorId::Unknown, provisional.extract_operations()?);
+        let system_entity = self.0.entities.create_root(event.entity_id);
 
         let event_getter = LocalEventGetter::new(storage.clone(), true);
         event_getter.stage_event(event.clone());

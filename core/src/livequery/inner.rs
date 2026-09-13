@@ -29,9 +29,7 @@ pub(super) struct LiveQueryInner {
     pub(super) current_version: AtomicU32,
     /// Resolved, policy-scoped intent; absent while initial resolution waits.
     pub(super) selection: Mut<Option<(ankql::ast::Selection<Resolved>, u32)>>,
-    pub(super) collection_id: CollectionId,
     gap_fetcher: Arc<dyn GapFetcher<Entity>>,
-    pub(super) schema: Option<&'static crate::schema::ModelStructDescriptor>,
     pub(super) cached: bool,
     registry: Weak<registry::RegistryInner>,
     pub(super) resolution_task: std::sync::Mutex<Option<RemoteHandle<()>>>,
@@ -44,9 +42,7 @@ impl LiveQueryInner {
     pub(super) fn new<SE, PA>(
         node: &Node<SE, PA>,
         context: Arc<dyn DynContextInner>,
-        schema: Option<&'static crate::schema::ModelStructDescriptor>,
         cached: bool,
-        collection_id: CollectionId,
     ) -> Self
     where
         SE: StorageEngine + Send + Sync + 'static,
@@ -70,9 +66,7 @@ impl LiveQueryInner {
             durable_notify: tokio::sync::Notify::new(),
             current_version: AtomicU32::new(1),
             selection: Mut::new(None),
-            collection_id,
             gap_fetcher,
-            schema,
             cached,
             registry: node.live_queries.downgrade(),
             resolution_task: std::sync::Mutex::new(None),
@@ -187,7 +181,6 @@ impl LiveQueryInner {
             .upsert_query_and_notify(
                 self.subscription.id(),
                 self.query_id,
-                self.collection_id.clone(),
                 selection,
                 self.context.as_ref(),
                 self.resultset.clone(),
@@ -245,7 +238,7 @@ mod tests {
     fn query() -> EntityLiveQuery {
         let node = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
         let context = Context::new(node.clone(), DEFAULT_CONTEXT);
-        crate::livequery::EntityLiveQuery(Arc::new(LiveQueryInner::new(&node, context.0, None, false, "test".into())))
+        crate::livequery::EntityLiveQuery(Arc::new(LiveQueryInner::new(&node, context.0, false)))
     }
 
     #[tokio::test]
@@ -332,7 +325,7 @@ mod tests {
 
     #[tokio::test]
     async fn selection_parse_errors_keep_their_variant() {
-        let query = query();
+        let query = query().map::<crate::schema::catalog::SysModelRowView>();
         assert!(matches!(query.update_selection("("), Err(RetrievalError::ParseError(_))));
     }
 }

@@ -32,31 +32,22 @@ pub(crate) trait DynContextInner: LocalEntitySource {
     fn system_id(&self) -> Option<proto::EntityId>;
 
     /// Create an entity from its genesis event, returning its transaction-local state.
-    fn create_entity(&self, collection: proto::CollectionId, genesis: &Event, trx_alive: Arc<AtomicBool>) -> Result<Entity, MutationError>;
+    fn create_entity(&self, genesis: &Event, trx_alive: Arc<AtomicBool>) -> Result<Entity, MutationError>;
 
     /// Check whether this context may write the entity.
     fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied>;
 
     /// Retrieve an entity and enforce this context's read policy.
-    async fn get_entity(&self, collection: &proto::CollectionId, id: proto::EntityId, cached: bool) -> Result<Entity, RetrievalError>;
+    async fn get_entity(&self, id: proto::EntityId, cached: bool) -> Result<Entity, RetrievalError>;
 
     /// Fetch a resolved selection with this context's read restrictions.
     /// Shared by `Context::fetch` and livequery gap filling.
-    async fn fetch_entities(&self, collection: &proto::CollectionId, args: MatchArgs<Resolved>) -> Result<Vec<Entity>, RetrievalError>;
+    async fn fetch_entities(&self, args: MatchArgs<Resolved>) -> Result<Vec<Entity>, RetrievalError>;
 
     /// Validate and commit the transaction, then publish its entity changes.
     /// Privileged contexts bypass policy, not epoch or event-validity checks.
     async fn commit_local_trx(&self, trx: &Transaction) -> Result<Vec<Event>, MutationError>;
 
     /// Construct a livequery, resolving its selection now or scheduling asynchronous resolution.
-    fn query(
-        self: Arc<Self>,
-        schema: Option<&'static ModelStructDescriptor>,
-        collection_id: proto::CollectionId,
-        args: MatchArgs<Parsed>,
-    ) -> Result<EntityLiveQuery, RetrievalError>;
-
-    /// Open a storage collection for tests, bypassing context policy checks.
-    #[cfg(feature = "test-helpers")]
-    async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError>;
+    fn query(self: Arc<Self>, schema: &'static ModelStructDescriptor, args: MatchArgs<Parsed>) -> Result<EntityLiveQuery, RetrievalError>;
 }

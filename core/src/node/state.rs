@@ -5,9 +5,9 @@ use crate::error::{NodeHaltReason, NodeReadinessError};
 pub enum NodeState {
     /// No system has been created, adopted, or restored yet; connections are allowed.
     Uninitialized,
-    /// The system is established; the catalog is awaiting its initial durable answers.
+    /// The system is established; catalog or policy initialization is still in progress.
     Startup,
-    /// System and catalog initialization are complete; ongoing connectivity is independent.
+    /// System, catalog, and policy initialization are complete; connectivity is independent.
     Running,
     /// Permanently stopped accepting new work. Discard this node and its contexts and queries.
     Halted(NodeHaltReason),

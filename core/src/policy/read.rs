@@ -6,7 +6,6 @@ use ankurah_proto::{Attested, CollectionId, EntityId, Event, State};
 /// Read checks for one collection, with catalog exemptions applied consistently.
 pub(crate) struct ReadPolicy<'a, PA, C> {
     agent: Option<(&'a PA, &'a C)>,
-    collection: &'a CollectionId,
 }
 
 impl<'a, PA: PolicyAgent, C: Iterable<PA::ContextData>> ReadPolicy<'a, PA, C> {

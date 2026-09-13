@@ -8,16 +8,20 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use ankql::ast::{Parsed, Predicate, Resolved, Selection};
-use ankurah_proto::{self as proto, CollectionId, EntityId, PropertyId};
-use ankurah_signals::signal::{Calculated, Get};
+use ankurah_proto::{self as proto, EntityId, ModelId, PropertyId};
+use ankurah_signals::{
+    signal::{Calculated, Get, Map, Mut},
+    Subscribe, SubscriptionGuard,
+    Wait,
+};
 use futures::FutureExt;
 
 use crate::{
     context::Context,
     error::{NodeDropped, RetrievalError},
     livequery::LiveQuery,
-    model::View,
-    node::{MatchArgs, WeakNode},
+    model::{Model, View},
+    node::{CachePolicy, MatchArgs, WeakNode},
     policy::PolicyAgent,
     session::SessionSet,
     storage::StorageEngine,
@@ -25,7 +29,7 @@ use crate::{
 };
 
 const CACHED_TRUE: MatchArgs<Parsed> =
-    MatchArgs { selection: Selection { predicate: Predicate::True, order_by: None, limit: None }, cached: true };
+    MatchArgs { selection: Selection { predicate: Predicate::True, order_by: None, limit: None }, cache_policy: CachePolicy::Local };
 
 #[derive(Clone, Copy)]
 enum NameSlot {
