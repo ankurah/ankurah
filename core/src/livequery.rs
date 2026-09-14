@@ -23,19 +23,15 @@ pub use typed::LiveQuery;
 pub struct EntityLiveQuery(Arc<LiveQueryInner>);
 
 impl EntityLiveQuery {
-    pub(crate) fn new<SE, PA>(
-        node: &Node<SE, PA>,
+    pub(crate) fn new(
         context: Arc<dyn DynContextInner>,
         cache_policy: CachePolicy,
         resolution: QueryResolution,
-    ) -> Result<Self, RetrievalError>
-    where
-        SE: StorageEngine + Send + Sync + 'static,
-        PA: PolicyAgent + Send + Sync + 'static,
-    {
-        node.system.check_not_halted()?;
-        let me = Self(Arc::new(LiveQueryInner::new(node, context, cache_policy)));
-        node.live_queries.insert(&me);
+    ) -> Result<Self, RetrievalError> {
+        let node = context.node()?;
+        node.check_not_halted()?;
+        let me = Self(Arc::new(LiveQueryInner::new(context, node.reactor().subscribe(), cache_policy)));
+        node.live_queries().insert(&me);
         me.apply_resolution(resolution, 1)?;
         Ok(me)
     }
@@ -115,6 +111,8 @@ impl EntityLiveQuery {
         self.update_resolution(QueryResolution::Resolved(self.0.context.filter_selection(selection)?))
     }
 
+    /// Shared replacement path for typed and already-resolved selection updates:
+    /// advance the version, cancel pending resolution, and restart initialization.
     fn update_resolution(&self, resolution: QueryResolution) -> Result<(), RetrievalError> {
         let version = self.0.advance_version();
         self.0.resultset.set_loaded(false);
@@ -125,6 +123,8 @@ impl EntityLiveQuery {
         Ok(())
     }
 
+    /// Replace the selection and await initialization, propagating update or initialization errors.
+    /// If superseded by another update, wait for the newer version instead.
     pub async fn update_selection_wait(&self, selection: Selection<Resolved>) -> Result<(), RetrievalError> {
         self.update_selection(selection)?;
         self.wait_initialized().await

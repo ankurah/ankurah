@@ -1,4 +1,3 @@
-use super::registry;
 use crate::context::{Context, DynContextInner};
 use crate::internal::prelude::*;
 use crate::reactor::fetch_gap::{GapFetcher, QueryGapFetcher};
@@ -8,14 +7,14 @@ use ankurah_signals::Mut;
 use futures::future::RemoteHandle;
 use std::sync::{
     atomic::{AtomicU32, Ordering},
-    Arc, Weak,
+    Arc,
 };
 use tracing::{debug, warn};
 
 /// Shared query state; versions identify selection attempts, not system epochs.
 pub(super) struct LiveQueryInner {
     pub(super) query_id: proto::QueryId,
-    // Must drop before context; cleanup uses the context's reactor.
+    // Must drop before context, which may hold the node's last strong reference.
     pub(super) subscription: ReactorSubscription,
     pub(super) context: Arc<dyn DynContextInner>,
     pub(super) resultset: EntityResultSet,
@@ -31,7 +30,6 @@ pub(super) struct LiveQueryInner {
     pub(super) selection: Mut<Option<(ankql::ast::Selection<Resolved>, u32)>>,
     gap_fetcher: Arc<dyn GapFetcher<Entity>>,
     pub(super) cached: bool,
-    registry: Weak<registry::RegistryInner>,
     pub(super) resolution_task: std::sync::Mutex<Option<RemoteHandle<()>>>,
     #[cfg(test)]
     before_wait: std::sync::Mutex<Option<Box<dyn FnOnce(&Self) + Send>>>,
@@ -39,17 +37,11 @@ pub(super) struct LiveQueryInner {
 
 impl LiveQueryInner {
     /// Create the shared inner before its resolved selection is installed.
-    pub(super) fn new<SE, PA>(
-        node: &Node<SE, PA>,
+    pub(super) fn new(
         context: Arc<dyn DynContextInner>,
+        subscription: ReactorSubscription,
         cached: bool,
-    ) -> Self
-    where
-        SE: StorageEngine + Send + Sync + 'static,
-        PA: PolicyAgent + Send + Sync + 'static,
-    {
-        let subscription = node.reactor.subscribe();
-
+    ) -> Self {
         let query_id = proto::QueryId::new();
         let gap_fetcher: Arc<dyn GapFetcher<Entity>> = Arc::new(QueryGapFetcher::new(Context(context.clone())));
 
@@ -68,7 +60,6 @@ impl LiveQueryInner {
             selection: Mut::new(None),
             gap_fetcher,
             cached,
-            registry: node.live_queries.downgrade(),
             resolution_task: std::sync::Mutex::new(None),
             #[cfg(test)]
             before_wait: std::sync::Mutex::new(None),
@@ -175,7 +166,7 @@ impl LiveQueryInner {
 
         debug!("LiveQuery.activate() for predicate {} (version {})", self.query_id, version);
 
-        let reactor = self.context.reactor().ok_or_else(|| RetrievalError::Other("Node has been dropped".into()))?;
+        let reactor = self.context.node()?.reactor().clone();
 
         reactor
             .upsert_query_and_notify(
@@ -220,9 +211,9 @@ impl crate::reactor::PreNotifyHook for &LiveQueryInner {
 
 impl Drop for LiveQueryInner {
     fn drop(&mut self) {
-        self.context.unsubscribe_remote_query(self.query_id);
-        if let Some(registry) = self.registry.upgrade() {
-            registry.unregister(self);
+        if let Ok(node) = self.context.node() {
+            node.unsubscribe_remote_query(self.query_id);
+            node.live_queries().unregister(self);
         }
     }
 }
@@ -238,7 +229,7 @@ mod tests {
     fn query() -> EntityLiveQuery {
         let node = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
         let context = Context::new(node.clone(), DEFAULT_CONTEXT);
-        crate::livequery::EntityLiveQuery(Arc::new(LiveQueryInner::new(&node, context.0, false)))
+        crate::livequery::EntityLiveQuery(Arc::new(LiveQueryInner::new(context.0, node.reactor.subscribe(), false)))
     }
 
     #[tokio::test]

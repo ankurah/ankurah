@@ -36,6 +36,7 @@ use tracing::instrument;
 use tracing::{debug, warn};
 
 pub mod applier;
+mod erased;
 pub(crate) mod event_admissibility;
 pub mod handles;
 mod match_args;
@@ -45,6 +46,7 @@ mod state;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use erased::NodeErased;
 pub use handles::{NodeHandle, NodeRef};
 pub use match_args::{nocache, CachePolicy, MatchArgs};
 pub use peer_state::PeerState;
@@ -126,6 +128,23 @@ where PA: PolicyAgent
     pub(crate) live_queries: crate::livequery::LiveQueryRegistry,
 
     pub(crate) subscription_relay: Option<SubscriptionRelay<PA::ContextData, crate::livequery::WeakEntityLiveQuery>>,
+}
+
+impl<SE, PA> NodeErased for NodeInner<SE, PA>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    fn check_not_halted(&self) -> Result<(), NodeHaltReason> { self.system.check_not_halted() }
+
+    fn reactor(&self) -> &Reactor { &self.reactor }
+    fn live_queries(&self) -> &crate::livequery::LiveQueryRegistry { &self.live_queries }
+
+    fn unsubscribe_remote_query(&self, query_id: proto::QueryId) {
+        if let Some(relay) = &self.subscription_relay {
+            relay.unsubscribe_predicate(query_id);
+        }
+    }
 }
 
 impl<SE, PA> Node<SE, PA>

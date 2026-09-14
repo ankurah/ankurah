@@ -29,6 +29,10 @@ At every stage, two things determine what happens next:
 Head and [backend](property-backends.md) state are bundled under a single lock
 so they are always updated atomically.
 
+Every `Entity` is a resident of a `WeakEntitySet`, or a transaction fork retaining
+its resident through its upstream chain. Detached state uses `DetachedEntity`:
+it shares the state-application code, but cannot produce an `Entity` or typed view.
+
 
 ## Creation
 

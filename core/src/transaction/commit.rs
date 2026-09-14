@@ -1,12 +1,10 @@
 use crate::context::ContextAuth;
+use crate::entity::DetachedEntity;
 use crate::internal::prelude::*;
 use crate::node::event_admissibility::{check_membership, check_unprivileged_write};
 use crate::retrieval::SuspenseEvents;
-use ankurah_proto::{Attested, Clock, EntityState, Event};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use ankurah_proto::{Attested, Clock, EntityState, Event, State};
+use std::sync::atomic::Ordering;
 
 use super::PendingGenesis;
 
