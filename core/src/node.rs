@@ -38,6 +38,7 @@ use tracing::{debug, warn};
 pub mod applier;
 pub(crate) mod event_admissibility;
 pub mod handles;
+mod match_args;
 mod peer_state;
 mod schema_registration;
 mod state;
@@ -49,52 +50,6 @@ pub use match_args::{nocache, CachePolicy, MatchArgs};
 pub use peer_state::PeerState;
 use schema_registration::WireRegistrant;
 pub use state::NodeState;
-
-/// A staged selection and its local-cache preference.
-pub struct MatchArgs<S: Stage> {
-    pub selection: ankql::ast::Selection<S>,
-    pub cached: bool,
-}
-
-impl TryInto<MatchArgs<Parsed>> for &str {
-    type Error = ankql::error::ParseError;
-    fn try_into(self) -> Result<MatchArgs<Parsed>, Self::Error> {
-        Ok(MatchArgs { selection: ankql::parser::parse_selection(self)?, cached: true })
-    }
-}
-impl TryInto<MatchArgs<Parsed>> for String {
-    type Error = ankql::error::ParseError;
-    fn try_into(self) -> Result<MatchArgs<Parsed>, Self::Error> {
-        Ok(MatchArgs { selection: ankql::parser::parse_selection(&self)?, cached: true })
-    }
-}
-
-impl<S: Stage> From<ankql::ast::Predicate<S>> for MatchArgs<S> {
-    fn from(val: ankql::ast::Predicate<S>) -> Self {
-        MatchArgs { selection: ankql::ast::Selection { predicate: val, order_by: None, limit: None }, cached: true }
-    }
-}
-
-impl<S: Stage> From<ankql::ast::Selection<S>> for MatchArgs<S> {
-    fn from(val: ankql::ast::Selection<S>) -> Self { MatchArgs { selection: val, cached: true } }
-}
-
-impl From<ankql::error::ParseError> for RetrievalError {
-    fn from(e: ankql::error::ParseError) -> Self { RetrievalError::ParseError(e) }
-}
-
-pub fn nocache<T: TryInto<ankql::ast::Selection<Parsed>, Error = ankql::error::ParseError>>(
-    s: T,
-) -> Result<MatchArgs<Parsed>, ankql::error::ParseError> {
-    MatchArgs::nocache(s)
-}
-
-impl MatchArgs<Parsed> {
-    pub fn nocache<T>(s: T) -> Result<Self, ankql::error::ParseError>
-    where T: TryInto<ankql::ast::Selection<Parsed>, Error = ankql::error::ParseError> {
-        Ok(Self { selection: s.try_into()?, cached: false })
-    }
-}
 
 /// A participant in the Ankurah network, and primary place where queries are initiated
 
@@ -254,14 +209,15 @@ where
             subscription_relay,
         }));
 
+        let resolver: Arc<dyn crate::storage::CatalogResolver> = node.catalog.clone();
+        node.storage.set_catalog_resolver(Arc::downgrade(&resolver));
+
         if let Some(ref relay) = node.subscription_relay {
             let weak_node = node.weak();
             if relay.set_node(Arc::new(weak_node)).is_err() {
                 warn!("Failed to set message sender for subscription relay");
             }
         }
-
-        node.policy_agent.on_node_ready(node.weak());
 
         let catalog = node.catalog.clone();
         let weak_node = node.weak();
@@ -562,8 +518,7 @@ where
                         Err(e) => return Err(anyhow!("Error from peer get: {}", e)),
                     }
                 }
-
-                Ok(proto::NodeResponseBody::Get(states))
+                Ok(proto::NodeResponseBody::Get(results))
             }
             proto::NodeRequestBody::GetEvents { event_ids } => {
                 let policy = ReadPolicy::new(&self.policy_agent, cdata);
@@ -848,18 +803,7 @@ where
         }
     }
 
-    /// The currently-resident (in-memory) entity for `id`, if one is held.
-    ///
-    /// The resident entity carries the authoritative materialized state, which
-    /// can be ahead of the persisted state buffer: the EventOnly apply path
-    /// commits events and advances the in-memory entity but does not rewrite the
-    /// state buffer in storage (state is a rebuildable cache of the event log).
-    /// A test or tool that must observe a node's true materialized state
-    /// (e.g. the phase 2 simulation harness checking cross-node convergence)
-    /// needs this resident view; reading the storage state buffer alone
-    /// under-reports EventOnly progress. Returns `None` if no strong reference
-    /// keeps the entity resident, in which case the caller falls back to the
-    /// persisted state.
+    /// Return the resident entity if a live handle keeps it in memory.
     pub fn get_resident_entity(&self, id: proto::EntityId) -> Option<crate::entity::Entity> { self.entities.get(&id) }
 
     /// Build a context over its credential source: bare ContextData, an
@@ -868,15 +812,12 @@ where
     ///
     /// [`SessionSet`]: crate::session::SessionSet
     pub fn context(&self, sessions: impl Into<SessionSet<PA::ContextData>>) -> Result<Context, anyhow::Error> {
-        self.system.check_not_halted()?;
-        if self.system.system_epoch().is_none() {
-            return Err(anyhow!("System is not ready"));
-        }
+        self.check_ready()?;
         Ok(Context::new(Node::clone(self), sessions))
     }
 
-    pub async fn context_async(&self, sessions: impl Into<SessionSet<PA::ContextData>>) -> Result<Context, NodeHaltReason> {
-        self.system.wait_system_ready().await?;
+    pub async fn context_async(&self, sessions: impl Into<SessionSet<PA::ContextData>>) -> Result<Context, NodeReadinessError> {
+        self.wait_ready().await?;
         Ok(Context::new(Node::clone(self), sessions))
     }
 
@@ -888,7 +829,6 @@ where
     /// Retrieve peer states and persist them in this node.
     pub(crate) async fn get_from_peer(
         &self,
-        collection_id: &CollectionId,
         ids: Vec<proto::EntityId>,
         cdata: &Vec<PA::ContextData>,
     ) -> Result<(), RetrievalError> {
@@ -921,14 +861,13 @@ where
     /// Apply its deltas locally before returning.
     pub(crate) async fn fetch_from_peer(
         &self,
-        collection_id: &CollectionId,
         selection: ankql::ast::Selection<Resolved>,
         cdata: &Vec<PA::ContextData>,
     ) -> Result<Vec<Entity>, RetrievalError> {
         self.system.require_system_ready().map_err(MutationError::from)?;
         let peer_id = self.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
 
-        let known_matched_entities = self.fetch_entities_from_local(collection_id, &selection).await?;
+        let known_matched_entities = self.fetch_entities_from_local(&selection).await?;
 
         let known_matches = known_matched_entities
             .iter()
@@ -936,19 +875,15 @@ where
             .collect();
 
         let selection_clone = selection.clone();
-        match self
-            .request(peer_id, cdata, proto::NodeRequestBody::Fetch { collection: collection_id.clone(), selection, known_matches })
-            .await?
-        {
+        match self.request(peer_id, cdata, proto::NodeRequestBody::Fetch { selection, known_matches }).await? {
             proto::NodeResponseBody::Fetch(deltas) => {
-                let collection = self.collections.get(collection_id).await?;
-                let event_getter = CachedEventGetter::new(collection_id.clone(), collection.clone(), self, cdata);
-                let state_getter = LocalStateGetter::new(collection);
+                let event_getter = CachedEventGetter::new(self, cdata);
+                let state_getter = LocalStateGetter::new(self.storage.clone());
 
                 applier::NodeApplier::apply_deltas(self, &peer_id, deltas, &event_getter, &state_getter).await?;
                 // ARCHITECTURAL QUESTION: Optimize in-place mutation vs re-fetching for remote-peer-assisted operations https://github.com/ankurah/ankurah/issues/145
 
-                self.fetch_entities_from_local(collection_id, &selection_clone).await
+                self.fetch_entities_from_local(&selection_clone).await
             }
             proto::NodeResponseBody::Error(e) => {
                 debug!("Error from peer fetch: {}", e);
@@ -1053,21 +988,19 @@ where
     pub(crate) fn subscribe_remote_query(
         &self,
         query_id: proto::QueryId,
-        collection_id: CollectionId,
         selection: ankql::ast::Selection<Resolved>,
         sessions: SessionSet<PA::ContextData>,
         version: u32,
         livequery: crate::livequery::WeakEntityLiveQuery,
     ) {
         if let Some(ref relay) = self.subscription_relay {
-            relay.subscribe_query(query_id, collection_id, selection, sessions, version, livequery);
+            relay.subscribe_query(query_id, selection, sessions, version, livequery);
         }
     }
 
     /// Load matching states from local storage into resident entities; does not apply read policy.
     pub async fn fetch_entities_from_local(
         &self,
-        collection_id: &CollectionId,
         selection: &ankql::ast::Selection<Resolved>,
     ) -> Result<Vec<Entity>, RetrievalError> {
         self.system.check_not_halted()?;

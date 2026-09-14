@@ -1,13 +1,13 @@
-use ankurah_core::error::{MutationError, RetrievalError};
+use ankurah_core::error::RetrievalError;
 use ankurah_core::indexing::IndexSpecMatch;
-use ankurah_proto::EntityId;
+use ankurah_proto::{EntityId, ModelId};
 use serde::{Deserialize, Serialize};
 use sled::{Db, Tree};
 use std::collections::HashMap;
 // use std::ops::Deref;
 use std::sync::{Arc, Mutex, RwLock};
 
-use crate::{error::IndexError, planner_integration::encode_tuple_values_with_key_spec, property::PropertyManager};
+use crate::{error::IndexError, planner_integration::encode_tuple_values_with_key_spec, property::slot_from_planner_column};
 
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq)]
 pub enum BuildStatus {
@@ -19,7 +19,6 @@ pub enum BuildStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IndexRecord {
     pub id: u32,
-    pub collection: String,
     pub name: String,
     pub spec: ankurah_core::indexing::KeySpec<String>,
     pub created_at_unix_ms: i64,
@@ -32,7 +31,6 @@ pub struct Index(Arc<IndexInner>);
 // Do not expose IndexInner via Deref to avoid leaking private type
 struct IndexInner {
     pub id: u32,
-    pub collection: String,
     pub name: String,
     pub spec: ankurah_core::indexing::KeySpec<String>,
     pub created_at_unix_ms: i64,
@@ -40,7 +38,6 @@ struct IndexInner {
     pub build_lock: Mutex<()>,
     pub tree: Tree,
     pub index_config_tree: Tree,
-    pub property_manager: PropertyManager,
 }
 
 pub struct IndexManager {

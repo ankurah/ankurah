@@ -83,7 +83,6 @@ impl ReactorSubscription<crate::entity::Entity, ankurah_proto::Attested<ankurah_
     pub async fn upsert_query(
         &self,
         query_id: proto::QueryId,
-        collection_id: proto::CollectionId,
         selection: ankql::ast::Selection<Resolved>,
         included_entities: Vec<crate::entity::Entity>,
         gap_fetcher: std::sync::Arc<dyn crate::reactor::fetch_gap::GapFetcher<crate::entity::Entity>>,

@@ -43,11 +43,13 @@ impl fmt::Display for SystemModel {
 
 /// The durable address of a model. Registered models use their real catalog
 /// entity id; built-ins use a closed logical identity, never a magic id.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, strum::Display)]
 pub enum ModelId {
     /// A user-registered model, identified by its catalog entity.
+    #[strum(transparent)]
     EntityId(EntityId),
     /// A built-in model with a closed logical identity.
+    #[strum(to_string = "system:{0}")]
     System(SystemModel),
 }
 
@@ -78,12 +80,17 @@ impl From<EntityId> for ModelId {
     fn from(id: EntityId) -> Self { Self::EntityId(id) }
 }
 
-impl fmt::Display for ModelId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EntityId(id) => fmt::Display::fmt(id, f),
-            Self::System(model) => fmt::Display::fmt(model, f),
-        }
+impl std::str::FromStr for ModelId {
+    type Err = crate::DecodeError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(match value {
+            "system:system" => Self::System(SystemModel::System),
+            "system:model" => Self::System(SystemModel::Model),
+            "system:property" => Self::System(SystemModel::Property),
+            "system:model-property" => Self::System(SystemModel::ModelProperty),
+            _ => Self::EntityId(value.parse()?),
+        })
     }
 }
 

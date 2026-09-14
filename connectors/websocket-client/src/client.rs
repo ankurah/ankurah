@@ -381,8 +381,8 @@ where
                     if peer_sender.is_none() {
                         // A handshake we cannot read will never establish; close
                         // instead of idling on a dead connection.
-                            return Err(anyhow!("failed to deserialize handshake message from {}: {}", inner.server_url, e));
-                        }
+                        return Err(anyhow!("failed to deserialize handshake message from {}: {}", inner.server_url, e));
+                    }
                     warn!("Failed to deserialize message: {}", e);
                     Ok(MessageResult::Continue)
                 }

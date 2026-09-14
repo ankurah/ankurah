@@ -50,7 +50,7 @@ mod tests {
         let node = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
         let context = Context::new(node.clone(), DEFAULT_CONTEXT);
         let query =
-            EntityLiveQuery::new_with_context(&node, context.0, CachePolicy::Durable, super::super::QueryResolution::Pending(Box::pin(futures::future::pending()))).unwrap();
+            EntityLiveQuery::new(&node, context.0, CachePolicy::Durable, super::super::QueryResolution::Pending(Box::pin(futures::future::pending()))).unwrap();
         let address = Arc::as_ptr(&query.0) as usize;
         let clone = query.clone();
         node.live_queries.insert(&clone);

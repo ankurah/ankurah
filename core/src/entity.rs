@@ -53,8 +53,7 @@ use membership::MembershipSet;
 /// reconstituted for evaluation.
 #[derive(Debug, Default)]
 pub struct ProvisionalEntity {
-    /// Memberships staged for the genesis; an entity's first event carries
-    /// exactly one.
+    /// Memberships staged for the genesis.
     memberships: MembershipSet,
     backends: BTreeMap<String, Arc<dyn PropertyBackend>>,
 }
@@ -222,11 +221,15 @@ impl Entity {
     /// Whether this entity's causal history established membership in `model`.
     pub fn has_membership(&self, model: &ModelId) -> bool { self.state.read().unwrap().memberships.is_applied(model) }
 
-    /// Stage this entity's membership in `model` to ride the next event it
-    /// records. The membership becomes canonical only when that event
-    /// applies; under the current protocol the commit funnels admit
-    /// membership operations only on an entity's first event.
-    pub fn add_membership(&self, model: ModelId) { self.state.write().unwrap().memberships.add(model); }
+    /// Stage a membership on a writable transaction snapshot.
+    /// It becomes canonical when the transaction's event applies.
+    pub fn add_membership(&self, model: ModelId) -> Result<(), crate::property::PropertyError> {
+        if !self.is_writable() {
+            return Err(crate::property::PropertyError::TransactionClosed);
+        }
+        self.state.write().unwrap().memberships.add(model);
+        Ok(())
+    }
 
     /// Check if this entity is writable (i.e., it's a transaction fork that's still alive)
     pub fn is_writable(&self) -> bool {

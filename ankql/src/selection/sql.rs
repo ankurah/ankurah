@@ -173,6 +173,11 @@ fn generate_selection_sql_inner<S: Stage>(
             generate_expr_sql(expr, placeholder_count, found_placeholders, buffer)?;
             buffer.push_str(" IS NULL)");
         }
+        Predicate::MemberOf(model) => {
+            buffer.push_str("MEMBEROF(");
+            write_string(&model.to_string(), buffer);
+            buffer.push(')');
+        }
         Predicate::True => buffer.push_str("TRUE"),
         Predicate::False => buffer.push_str("FALSE"),
         // Placeholder should be transformed to a comparison before SQL generation

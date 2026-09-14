@@ -14,8 +14,22 @@ pub enum NodeHaltReason {
     SystemLoad(String),
     #[error("failed to reconstruct the local catalog: {0}")]
     CatalogLoad(String),
+    #[error("failed to initialize policy: {0}")]
+    PolicyAgentStartFailed(String),
     #[error("system replacement requires a new node (current {current}, proposed {proposed})")]
     SystemReplacement { current: EntityId, proposed: EntityId },
+}
+
+#[derive(Error, Debug)]
+#[error(transparent)]
+pub(crate) struct CatalogStartError(#[from] RetrievalError);
+
+impl From<NodeDropped> for CatalogStartError {
+    fn from(error: NodeDropped) -> Self { Self(error.into()) }
+}
+
+impl From<CatalogStartError> for NodeHaltReason {
+    fn from(error: CatalogStartError) -> Self { Self::CatalogLoad(error.to_string()) }
 }
 
 /// Why the node cannot accept work requiring completed initialization.
@@ -47,6 +61,8 @@ pub enum RetrievalError {
     ParseError(ankql::error::ParseError),
     #[error("Entity not found: {0:?}")]
     EntityNotFound(EntityId),
+    #[error("Entity {entity_id} does not have component {model_id}")]
+    MissingComponent { entity_id: EntityId, model_id: ModelId },
     #[error("Event not found: {0:?}")]
     EventNotFound(EventId),
     #[error("Storage error: {0}")]

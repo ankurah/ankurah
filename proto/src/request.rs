@@ -122,7 +122,7 @@ pub enum NodeRequestBody {
         id: TransactionId,
         events: Vec<Attested<Event>>,
     },
-    // Request to fetch entities matching a predicate
+    // Request entities by identity, distinguishing missing from denied reads.
     Get {
         ids: Vec<EntityId>,
     },
@@ -169,7 +169,8 @@ pub enum NodeResponseBody {
         id: TransactionId,
     },
     Fetch(Vec<EntityDelta>),
-    Get(Vec<Attested<EntityState>>),
+    /// One outcome per requested identity, in request order.
+    Get(Vec<GetResult>),
     GetEvents(Vec<Attested<Event>>),
     QuerySubscribed {
         query_id: QueryId,

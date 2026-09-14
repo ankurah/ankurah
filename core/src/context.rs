@@ -64,8 +64,8 @@ impl Context {
     }
 
     /// A context that does NOT keep the node alive, for node-owned machinery
-    /// (the catalog projection) whose strong context would cycle.
-    pub(crate) fn new_weak<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static>(
+    /// whose strong context would cycle.
+    pub fn new_weak<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static>(
         node: &Node<SE, PA>,
         sessions: impl Into<crate::session::SessionSet<PA::ContextData>>,
     ) -> Self {
@@ -78,16 +78,22 @@ impl Context {
 
     pub async fn get<R: View>(&self, id: proto::EntityId) -> Result<R, RetrievalError> {
         use crate::model::Model;
-        self.0.schema_resolver().ensure_registered(R::Model::descriptor()).await?;
-        let entity = self.0.get_entity(&R::collection(), id, false).await?;
+        let (model, _) = self.0.schema_resolver().ensure_registered(R::Model::descriptor()).await?;
+        let entity = self.0.get_entity(id, false).await?;
+        if !entity.has_membership(&model) {
+            return Err(RetrievalError::MissingComponent { entity_id: id, model_id: model });
+        }
         Ok(R::from_entity(entity))
     }
 
     /// Get an entity, allowing a local result when no durable peer is connected.
     pub async fn get_cached<R: View>(&self, id: proto::EntityId) -> Result<R, RetrievalError> {
         use crate::model::Model;
-        self.0.schema_resolver().ensure_registered(R::Model::descriptor()).await?;
-        let entity = self.0.get_entity(&R::collection(), id, true).await?;
+        let (model, _) = self.0.schema_resolver().ensure_registered(R::Model::descriptor()).await?;
+        let entity = self.0.get_entity(id, true).await?;
+        if !entity.has_membership(&model) {
+            return Err(RetrievalError::MissingComponent { entity_id: id, model_id: model });
+        }
         Ok(R::from_entity(entity))
     }
 

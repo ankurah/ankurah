@@ -12,10 +12,13 @@ book wins.
 
 The nouns you will reach for most. These match the README.
 
-- **Model**: a struct describing the fields and types for entities in a
-  collection.
-- **Collection**: a group of entities of the same type, like a database table.
-- **Entity**: a discrete identity in a collection, with a dynamic schema.
+- **Component**: an entity-membership set with an associated property schema.
+  An entity can have multiple components. Existing APIs still call this `Model`
+  and identify it with `ModelId`; the code rename is deferred.
+- **Model struct**: a concrete, typed representation of a component's properties
+  for one entity.
+- **Entity**: one canonical identity and state, with a dynamic schema and a set
+  of component memberships.
 - **View**: a read-only, typed representation of an entity.
 - **Mutable**: a mutable, typed representation of an entity's state.
 - **Event**: an atomic change, used for synchronization and as an audit trail.

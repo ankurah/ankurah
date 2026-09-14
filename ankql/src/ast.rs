@@ -4,12 +4,12 @@ pub use ankurah_core_types::{EntityId, ModelId, PropertyId, PropertyPath, System
 use serde::{Deserialize, Serialize};
 
 mod stage;
-pub use stage::{Parsed, Resolved, Stage};
+pub use stage::{ModelRef, Parsed, Resolved, Stage};
 
-/// An expression whose paths use stage `S`'s representation.
+/// An expression whose references use stage `S`'s representations.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 // Serde impls shouldn't require Serialize on all Expr impls. Only Resolved needs it
-#[serde(bound(serialize = "S::Path: Serialize", deserialize = "S::Path: Deserialize<'de>"))]
+#[serde(bound(serialize = "S::Path: Serialize, S::ModelId: Serialize", deserialize = "S::Path: Deserialize<'de>, S::ModelId: Deserialize<'de>"))]
 pub enum Expr<S: Stage> {
     Literal(Value),
     Path(S::Path),
@@ -45,7 +45,7 @@ impl ankurah_core_types::Path for PathExpr {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 // Serde impls shouldn't require Serialize on all Expr impls. Only Resolved needs it
-#[serde(bound(serialize = "S::Path: Serialize", deserialize = "S::Path: Deserialize<'de>"))]
+#[serde(bound(serialize = "S::Path: Serialize, S::ModelId: Serialize", deserialize = "S::Path: Deserialize<'de>, S::ModelId: Deserialize<'de>"))]
 pub struct Selection<S: Stage> {
     pub predicate: Predicate<S>,
     pub order_by: Option<Vec<OrderByItem<S>>>,
@@ -107,7 +107,7 @@ impl<S: Stage> From<Predicate<S>> for Selection<S> {
 
 impl<S: Stage> Selection<S> {
     /// Require this membership as well as the existing predicate, preserving order and limit.
-    pub fn and_member_of(mut self, model: ModelId) -> Self {
+    pub fn and_member_of(mut self, model: S::ModelId) -> Self {
         self.predicate = Predicate::And(Box::new(Predicate::MemberOf(model)), Box::new(self.predicate));
         self
     }
@@ -115,7 +115,7 @@ impl<S: Stage> Selection<S> {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 // Serde impls shouldn't require Serialize on all Expr impls. Only Resolved needs it
-#[serde(bound(serialize = "S::Path: Serialize", deserialize = "S::Path: Deserialize<'de>"))]
+#[serde(bound(serialize = "S::Path: Serialize, S::ModelId: Serialize", deserialize = "S::Path: Deserialize<'de>, S::ModelId: Deserialize<'de>"))]
 pub enum Predicate<S: Stage> {
     Comparison { left: Box<Expr<S>>, operator: ComparisonOperator, right: Box<Expr<S>> },
     IsNull(Box<Expr<S>>),
@@ -126,7 +126,7 @@ pub enum Predicate<S: Stage> {
     False,
     Placeholder,
     /// Whether the entity belongs to this model, independently of its property values.
-    MemberOf(ModelId),
+    MemberOf(S::ModelId),
 }
 
 impl<S: Stage> std::fmt::Display for Predicate<S> {
@@ -202,6 +202,14 @@ impl Expr<Resolved> {
 }
 
 impl<S: Stage> Predicate<S> {
+    /// Model references mentioned by membership predicates, regardless of AND/OR/NOT.
+    pub fn referenced_models(&self) -> std::collections::BTreeSet<S::ModelId> {
+        self.walk(std::collections::BTreeSet::new(), &mut |mut models, predicate| {
+            if let Self::MemberOf(model) = predicate { models.insert(model.clone()); }
+            models
+        })
+    }
+
     pub fn walk<T, F>(&self, accumulator: T, visitor: &mut F) -> T
     where F: FnMut(T, &Predicate<S>) -> T {
         let accumulator = visitor(accumulator, self);

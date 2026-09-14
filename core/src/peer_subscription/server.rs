@@ -22,13 +22,12 @@ pub struct SubscriptionHandler<CD: ContextData> {
     _peer_id: proto::EntityId,
     subscription: ReactorSubscription,
     _guard: SubscriptionGuard,
-    /// Tracks each standing query's collection and version, plus the credential source shared with its gap fetcher.
+    /// Tracks each standing query's version and the credential source shared with its gap fetcher.
     /// The mutex serializes this peer's query installation, failure cleanup, and removal.
     queries: tokio::sync::Mutex<HashMap<proto::QueryId, StandingQuery<CD>>>,
 }
 
 struct StandingQuery<CD: ContextData> {
-    collection: proto::CollectionId,
     /// Initial credential snapshot; peer session updates are not synchronized yet (#484).
     sessions: SessionSet<CD>,
     version: u32,

@@ -29,15 +29,7 @@ pub struct Transaction {
     snapshot_creation_lock: Mutex<()>,
     pub(crate) alive: Arc<AtomicBool>,
     /// Each created entity's genesis.
-    pub(crate) genesis_events: std::sync::RwLock<std::collections::BTreeMap<EntityId, PendingGenesis>>,
-}
-
-#[derive(Clone)]
-pub(crate) struct PendingGenesis {
-    pub(crate) event: proto::Event,
-    /// Supplies the expected model id for commit-time membership checks,
-    /// even when remote registration has completed before the local catalog catches up.
-    pub(crate) schema: &'static ModelStructDescriptor,
+    pub(crate) genesis_events: std::sync::RwLock<std::collections::BTreeMap<EntityId, proto::Event>>,
 }
 
 #[cfg(feature = "wasm")]
@@ -74,12 +66,12 @@ impl Transaction {
         let mut provisional = ProvisionalEntity::new();
         model.initialize_new_entity(&mut provisional, model_id, epoch)?;
         let system = self.dyncontext.system_id().ok_or(MutationError::SystemNotReady)?;
-        let genesis = proto::Event::genesis(M::collection(), Some(system), proto::AuthorId::Unknown, provisional.extract_operations()?);
+        let genesis = proto::Event::genesis(Some(system), proto::AuthorId::Unknown, provisional.extract_operations()?);
 
-        let entity = self.dyncontext.create_entity(M::collection(), &genesis, self.alive.clone())?;
+        let entity = self.dyncontext.create_entity(&genesis, self.alive.clone())?;
         self.dyncontext.check_write(&entity)?;
 
-        if self.genesis_events.write().unwrap().insert(entity.id, PendingGenesis { event: genesis, schema: M::descriptor() }).is_some() {
+        if self.genesis_events.write().unwrap().insert(entity.id, genesis).is_some() {
             return Err(MutationError::AlreadyExists);
         }
 

@@ -54,8 +54,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
             ContextAuth::Sessions(sessions) => sessions.clone(),
             ContextAuth::Privileged => return Err(RetrievalError::Other("the privileged context does not query".into())),
         };
-        let model = query.model_descriptor().model_id(node.entities.system_epoch())?;
-        node.subscribe_remote_query(query.query_id(), model, selection, sessions, version, query.weak());
+        node.subscribe_remote_query(query.query_id(), selection, sessions, version, query.weak());
         Ok(true)
     }
 
@@ -91,10 +90,10 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     }
 
     /// Retrieve an entity and enforce this context's read policy.
-    async fn get_entity(&self, collection_id: &CollectionId, id: proto::EntityId, cached: bool) -> Result<Entity, RetrievalError> {
+    async fn get_entity(&self, id: proto::EntityId, cached: bool) -> Result<Entity, RetrievalError> {
         let node = self.node.upgrade()?;
         node.system.check_not_halted()?;
-        debug!("Node({}).get_entity {:?}-{:?}", node.id, id, collection_id);
+        debug!("Node({}).get_entity {:?}", node.id, id);
         let cdata = match &self.auth {
             ContextAuth::Sessions(sessions) => sessions.current(),
             ContextAuth::Privileged => Vec::new(),
@@ -102,7 +101,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
 
         if !node.durable {
             // Fetch from peers and commit first response
-            match node.get_from_peer(collection_id, vec![id], &cdata).await {
+            match node.get_from_peer(vec![id], &cdata).await {
                 Ok(_) => (),
                 Err(RetrievalError::NoDurablePeers) if cached => (),
                 Err(e) => {
@@ -117,9 +116,6 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         };
 
         if let Some(local) = node.entities.get(&id) {
-            if local.collection() != collection_id {
-                return Err(RetrievalError::EntityNotFound(id));
-            }
             debug!("Node({}).get_entity found local entity - returning", node.id);
             let state = local.to_state()?;
             let entity_id = local.id();
@@ -147,7 +143,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
 
     /// Fetch a resolved selection with this context's read restrictions.
     /// Shared by `Context::fetch` and livequery gap filling.
-    async fn fetch_entities(&self, collection_id: &CollectionId, mut args: MatchArgs<Resolved>) -> Result<Vec<Entity>, RetrievalError> {
+    async fn fetch_entities(&self, mut args: MatchArgs<Resolved>) -> Result<Vec<Entity>, RetrievalError> {
         let node = self.node.upgrade()?;
         node.system.check_not_halted()?;
         let cdata = match &self.auth {

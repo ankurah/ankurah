@@ -1,4 +1,4 @@
-use crate::context::{Context, DynContextInner};
+use crate::context::DynContextInner;
 use crate::internal::prelude::*;
 use ankql::ast::{Resolved, Selection};
 use ankurah_signals::Read;
@@ -15,8 +15,7 @@ mod typed;
 
 use inner::LiveQueryInner;
 pub(crate) use registry::LiveQueryRegistry;
-use resolve::QueryResolutionError;
-pub(crate) use resolve::ResolveQuery;
+pub(crate) use resolve::QueryResolution;
 pub use typed::LiveQuery;
 
 /// A type-erased local query, including remote subscription cleanup.
@@ -24,72 +23,43 @@ pub use typed::LiveQuery;
 pub struct EntityLiveQuery(Arc<LiveQueryInner>);
 
 impl EntityLiveQuery {
-    pub fn new<SE, PA>(
-        node: &Node<SE, PA>,
-        args: MatchArgs<Resolved>,
-        sessions: impl Into<SessionSet<PA::ContextData>>,
-    ) -> Result<Self, RetrievalError>
-    where
-        SE: StorageEngine + Send + Sync + 'static,
-        PA: PolicyAgent + Send + Sync + 'static,
-    {
-        Context::new(node.clone(), sessions).0.query(schema, collection_id, args)
-    }
-
-    /// Create a node-owned query without forming a node/query reference cycle.
-    pub fn new_with_weak_node<SE, PA>(
-        node: &Node<SE, PA>,
-        schema: Option<&'static crate::schema::ModelStructDescriptor>,
-        collection_id: CollectionId,
-        args: MatchArgs<Parsed>,
-        sessions: impl Into<SessionSet<PA::ContextData>>,
-    ) -> Result<Self, RetrievalError>
-    where
-        SE: StorageEngine + Send + Sync + 'static,
-        PA: PolicyAgent + Send + Sync + 'static,
-    {
-        Context::new_weak(node, sessions).0.query(schema, collection_id, args)
-    }
-
-    /// Create a query, returning locally detectable resolution errors immediately.
-    /// Missing readiness or declaration bindings resolve in the background; failures appear in `error()`.
-    pub(crate) fn new_with_context<SE, PA, S: Stage>(
+    pub(crate) fn new<SE, PA>(
         node: &Node<SE, PA>,
         context: Arc<dyn DynContextInner>,
-        schema: Option<&'static crate::schema::ModelStructDescriptor>,
-        collection_id: CollectionId,
-        args: MatchArgs<S>,
+        cache_policy: CachePolicy,
+        resolution: QueryResolution,
     ) -> Result<Self, RetrievalError>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
-        MatchArgs<S>: ResolveQuery,
     {
         node.system.check_not_halted()?;
-        let cached = args.cached;
-        let resolution = match args.resolve(context.schema_resolver(), schema, &collection_id) {
-            Ok(args) => Ok(args.selection),
-            Err(QueryResolutionError { error: RetrievalError::NodeNotReady, selection }) => Err(selection),
-            Err(QueryResolutionError { error: RetrievalError::UnboundDeclaration { .. }, selection }) if schema.is_some() => Err(selection),
-            Err(QueryResolutionError { error, .. }) => return Err(error),
-        };
-        let me = Self(Arc::new(LiveQueryInner::new(node, context, schema, cached, collection_id)));
+        let me = Self(Arc::new(LiveQueryInner::new(node, context, cache_policy)));
         node.live_queries.insert(&me);
-        match resolution {
-            Ok(selection) => me.install_resolved(selection, 1)?,
-            Err(selection) => me.spawn_query_resolution(selection, 1),
-        }
+        me.apply_resolution(resolution, 1)?;
         Ok(me)
     }
 
-    /// Resolve in the background; query drop or a newer selection cancels the task.
-    pub(crate) fn spawn_query_resolution(&self, selection: Selection<Parsed>, version: u32) {
+    fn apply_resolution(&self, resolution: QueryResolution, version: u32) -> Result<(), RetrievalError> {
+        match resolution {
+            QueryResolution::Resolved(selection) => self.install_resolved(selection, version),
+            QueryResolution::Pending(resolution) => {
+                self.spawn_query_resolution(resolution, version);
+                Ok(())
+            }
+        }
+    }
+
+    /// Query drop or a newer selection cancels pending resolution.
+    fn spawn_query_resolution(
+        &self,
+        resolution: futures::future::BoxFuture<'static, Result<Selection<Resolved>, RetrievalError>>,
+        version: u32,
+    ) {
         let state = self.0.version_lock.lock().unwrap_or_else(|error| error.into_inner());
         if self.0.current_version.load(Ordering::Acquire) != version {
             return;
         }
-        let resolution =
-            self.0.context.schema_resolver().resolve_query_selection_when_ready(self.0.schema, self.0.collection_id.clone(), selection);
         let query = self.weak();
         let (task, handle) = async move {
             let resolved = resolution.await;
@@ -115,7 +85,7 @@ impl EntityLiveQuery {
         if self.0.current_version.load(Ordering::Acquire) != version {
             return Ok(());
         }
-        let cached = self.0.cached && self.0.selection.with(Option::is_none);
+        let cached = self.0.cache_policy == CachePolicy::Local && self.0.selection.with(Option::is_none);
         self.0.selection.set_before_notify(Some((selection.clone(), version)), || {
             let has_relay = self.0.context.subscribe_remote_query(self, selection, version)?;
             if cached || !has_relay {
@@ -140,45 +110,24 @@ impl EntityLiveQuery {
     /// A peer's answer includes applying its initial rows; without a relay, local storage answers.
     pub async fn wait_durable_answered(&self) -> Result<(), RetrievalError> { self.0.wait_durable_answered().await }
 
-    /// Accept a new selection, returning errors detectable from local bindings immediately.
-    /// Registration and initialization may finish later; failures appear in `error()`.
-    pub fn update_selection(
-        &self,
-        new_selection: impl TryInto<ankql::ast::Selection<Parsed>, Error = impl Into<RetrievalError>>,
-    ) -> Result<(), RetrievalError> {
-        let new_selection = new_selection.try_into().map_err(|e| e.into())?;
-        let resolved =
-            self.0.context.schema_resolver().resolve_query_selection(self.0.schema, &self.0.collection_id, new_selection.clone());
-        let resolved = match resolved {
-            Ok(selection) => Some(selection),
-            Err(RetrievalError::NodeNotReady) => None,
-            Err(RetrievalError::UnboundDeclaration { .. }) if self.0.schema.is_some() => None,
-            Err(error) => return Err(error),
-        };
-        let new_version = self.0.advance_version();
-        self.0.resultset.set_loaded(false);
-        match resolved {
-            Some(resolved) => match self.install_resolved(resolved, new_version) {
-                Ok(()) => Ok(()),
-                Err(error) => {
-                    self.0.fail_initialization(new_version, error.clone());
-                    Err(error)
-                }
-            },
-            None => {
-                self.spawn_query_resolution(new_selection, new_version);
-                Ok(())
-            }
-        }
+    /// Replace the resolved selection and start a new subscription version.
+    pub fn update_selection(&self, selection: Selection<Resolved>) -> Result<(), RetrievalError> {
+        self.update_resolution(QueryResolution::Resolved(self.0.context.filter_selection(selection)?))
     }
 
-    /// Update the selection and wait for the current version to initialize, returning any failure.
-    pub async fn update_selection_wait(
-        &self,
-        new_selection: impl TryInto<ankql::ast::Selection<Parsed>, Error = impl Into<RetrievalError>>,
-    ) -> Result<(), RetrievalError> {
-        self.update_selection(new_selection)?;
-        self.0.wait_initialized().await
+    fn update_resolution(&self, resolution: QueryResolution) -> Result<(), RetrievalError> {
+        let version = self.0.advance_version();
+        self.0.resultset.set_loaded(false);
+        if let Err(error) = self.apply_resolution(resolution, version) {
+            self.0.fail_initialization(version, error.clone());
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub async fn update_selection_wait(&self, selection: Selection<Resolved>) -> Result<(), RetrievalError> {
+        self.update_selection(selection)?;
+        self.wait_initialized().await
     }
 
     /// The current version's initialization error, cleared when a new version starts.

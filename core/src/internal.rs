@@ -11,7 +11,7 @@ pub(crate) mod prelude {
     pub(crate) use crate::error::{MutationError, RetrievalError};
     pub(crate) use crate::livequery::{EntityLiveQuery, LiveQuery, WeakEntityLiveQuery};
     pub(crate) use crate::model::View;
-    pub(crate) use crate::node::{MatchArgs, Node, NodeHandle, NodeRef, NodeState, WeakNode};
+    pub(crate) use crate::node::{CachePolicy, MatchArgs, Node, NodeHandle, NodeRef, NodeState, WeakNode};
     pub(crate) use crate::policy::{AccessDenied, PolicyAgent};
     pub(crate) use crate::resultset::EntityResultSet;
     pub(crate) use crate::schema::catalog::CatalogManager;

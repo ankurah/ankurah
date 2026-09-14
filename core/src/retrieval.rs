@@ -1,7 +1,7 @@
 //! Implements event and state retrieval from local and remote sources.
 //!
 //! Split into separate traits for event retrieval (`GetEvents`), state retrieval (`GetState`),
-//! and event staging/commit (`SuspenseEvents`). This separation enables the staging pattern
+//! and event staging (`SuspenseEvents`). This separation enables the staging pattern
 //! where incoming events are temporarily staged for BFS discovery before being committed
 //! to permanent storage.
 

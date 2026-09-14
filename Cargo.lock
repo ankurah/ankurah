@@ -112,6 +112,7 @@ dependencies = [
  "pest_derive",
  "serde",
  "serde_json",
+ "strum 0.27.2",
  "thiserror 2.0.17",
  "wasm-bindgen",
 ]
@@ -296,6 +297,7 @@ dependencies = [
  "ankurah-connector-local-process",
  "ankurah-core",
  "ankurah-core-types",
+ "ankurah-jwt-auth",
  "ankurah-proto",
  "ankurah-storage-sled",
  "anyhow",
@@ -334,6 +336,7 @@ dependencies = [
  "serde-wasm-bindgen",
  "serde_json",
  "sha2",
+ "strum 0.27.2",
  "thiserror 1.0.69",
  "ulid",
  "uniffi",
