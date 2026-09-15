@@ -5,6 +5,7 @@ pub mod iterable;
 pub mod ivec;
 pub(crate) mod property_path;
 pub mod ready_chunks;
+pub(crate) mod retry;
 pub mod safemap;
 pub mod safeset;
 pub use iterable::Iterable;

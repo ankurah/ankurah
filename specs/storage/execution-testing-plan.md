@@ -326,7 +326,7 @@ Filter by column A, sort by column B. Tests remaining_predicate handling.
 
 ### ~~P0: IndexedDB order_by_spill~~ ✅ COMPLETED (2026-01-15)
 
-**File**: `storage/indexeddb-wasm/src/collection.rs`
+**File**: `storage/indexeddb-wasm/src/bucket.rs`
 
 **Implementation**: Uses `SortedStream` and `TopKStream` from `storage/common/src/sorting.rs` via the `ValueSetStream` trait. This provides partition-aware sorting (sorts within presort partitions, not globally).
 

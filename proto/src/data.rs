@@ -434,9 +434,6 @@ pub enum Operation {
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 pub enum Membership {
     /// Add the model-backed membership.
-    ///
-    /// An ordinary operation on any event; the commit funnels currently
-    /// admit it only on an entity's first event, exactly one there.
     Add(ModelId),
 }
 

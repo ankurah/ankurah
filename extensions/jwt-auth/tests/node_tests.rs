@@ -4,11 +4,9 @@ use ankurah::{Model, Node, Ref};
 use ankurah_core::model::Mutable;
 use ankurah_core::policy::PolicyAgent;
 use ankurah_jwt_auth::{JwtAgent, JwtClaims, JwtContext, JwtKeys, PolicyConfig};
-use ankurah_proto::{Clock, Event, OperationSet};
 use ankurah_storage_sled::SledStorageEngine;
 use common::{blog_config_path, make_claims, sign_token};
 use jwt_simple::prelude::Duration;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 #[derive(Model, Debug, serde::Serialize, serde::Deserialize)]
@@ -36,13 +34,14 @@ async fn test_jwt_agent_single_durable_node() -> anyhow::Result<()> {
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path())?;
 
     let storage = SledStorageEngine::new_test()?;
-    let node = Node::new_durable(Arc::new(storage), agent);
+    let node = Node::new_durable(Arc::new(storage), agent.clone());
     node.system.create().await?;
+    agent.set_policy(&node, &agent.config()).await?;
 
     let claims = make_claims("editor-1", &["Editor"], "editor@blog.com");
     let token = sign_token(&keys, &claims);
     let ctx = JwtContext::from_claims(claims, token);
-    let context = node.context(ctx)?;
+    let context = node.context_async(ctx).await?;
 
     let trx = context.begin();
     let _post = trx.create(&Post { title: "Hello World".into(), body: "First post!".into() }).await?;
@@ -60,13 +59,14 @@ async fn test_jwt_agent_reader_cannot_write_post() -> anyhow::Result<()> {
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path())?;
 
     let storage = SledStorageEngine::new_test()?;
-    let node = Node::new_durable(Arc::new(storage), agent);
+    let node = Node::new_durable(Arc::new(storage), agent.clone());
     node.system.create().await?;
+    agent.set_policy(&node, &agent.config()).await?;
 
     let claims = make_claims("reader-1", &["Reader"], "reader@blog.com");
     let token = sign_token(&keys, &claims);
     let ctx = JwtContext::from_claims(claims, token);
-    let context = node.context(ctx)?;
+    let context = node.context_async(ctx).await?;
 
     let trx = context.begin();
     let result = trx.create(&Post { title: "Sneaky Post".into(), body: "Should fail".into() }).await;
@@ -98,10 +98,11 @@ async fn test_write_scope_allows_matching_ref_and_denies_other_ref() -> anyhow::
     agent.set_keys(JwtKeys::Signing(keys.clone()));
 
     let storage = SledStorageEngine::new_test()?;
-    let node = Node::new_durable(Arc::new(storage), agent);
+    let node = Node::new_durable(Arc::new(storage), agent.clone());
     node.system.create().await?;
+    agent.set_policy(&node, &agent.config()).await?;
 
-    let root = node.context(JwtContext::system())?;
+    let root = node.context_async(JwtContext::system()).await?;
     let (allowed_account_id, denied_account_id) = {
         let trx = root.begin();
         let allowed_account = trx.create(&Account { name: "Allowed".into() }).await?;
@@ -116,7 +117,7 @@ async fn test_write_scope_allows_matching_ref_and_denies_other_ref() -> anyhow::
     let claims =
         JwtClaims { sub: "writer-1".into(), roles: vec!["AccountWriter".into()], email: "writer@example.com".into(), name: None, custom };
     let token = keys.sign(&claims, Duration::from_hours(1))?;
-    let context = node.context(JwtContext::from_claims(claims, token))?;
+    let context = node.context_async(JwtContext::from_claims(claims, token)).await?;
 
     let trx = context.begin();
     trx.create(&ScopedRecord { account: allowed_account_id.clone().into(), label: "allowed".into() }).await?;
@@ -152,10 +153,11 @@ async fn test_read_scope_denies_direct_get_for_out_of_scope_resident_entity() ->
     agent.set_keys(JwtKeys::Signing(keys.clone()));
 
     let storage = SledStorageEngine::new_test()?;
-    let node = Node::new_durable(Arc::new(storage), agent);
+    let node = Node::new_durable(Arc::new(storage), agent.clone());
     node.system.create().await?;
+    agent.set_policy(&node, &agent.config()).await?;
 
-    let root = node.context(JwtContext::system())?;
+    let root = node.context_async(JwtContext::system()).await?;
     let (allowed_record_id, denied_record_id, allowed_account_id) = {
         let trx = root.begin();
         let allowed_account = trx.create(&Account { name: "Allowed".into() }).await?;
@@ -172,7 +174,7 @@ async fn test_read_scope_denies_direct_get_for_out_of_scope_resident_entity() ->
     let claims =
         JwtClaims { sub: "reader-1".into(), roles: vec!["AccountReader".into()], email: "reader@example.com".into(), name: None, custom };
     let token = keys.sign(&claims, Duration::from_hours(1))?;
-    let context = node.context(JwtContext::from_claims(claims, token))?;
+    let context = node.context_async(JwtContext::from_claims(claims, token)).await?;
 
     let allowed = context.get::<ScopedRecordView>(allowed_record_id).await?;
     assert_eq!(allowed.label().unwrap(), "allowed");
@@ -208,8 +210,9 @@ async fn test_update_scope_requires_before_and_after_state() -> anyhow::Result<(
     let storage = SledStorageEngine::new_test()?;
     let node = Node::new_durable(Arc::new(storage), agent.clone());
     node.system.create().await?;
+    agent.set_policy(&node, &agent.config()).await?;
 
-    let root = node.context(JwtContext::system())?;
+    let root = node.context_async(JwtContext::system()).await?;
     let (allowed_account_id, denied_record, allowed_record) = {
         let trx = root.begin();
         let allowed_account = trx.create(&Account { name: "Allowed".into() }).await?;
@@ -228,15 +231,7 @@ async fn test_update_scope_requires_before_and_after_state() -> anyhow::Result<(
     let token = keys.sign(&claims, Duration::from_hours(1))?;
     let context = JwtContext::from_claims(claims, token);
 
-    let retag_event = Event::update(
-        denied_record.collection().clone(),
-        denied_record.id(),
-        Clock::new(denied_record.head().to_vec()),
-        ankurah::proto::AuthorId::Unknown,
-        OperationSet::from_backends(BTreeMap::new()),
-    );
-
-    let result = agent.check_event(&node, &context, &denied_record, &allowed_record, &retag_event);
+    let result = agent.check_state(&node, &context, Some(&denied_record), &allowed_record);
     assert!(result.is_err(), "updates must not retag an out-of-scope row into the caller's scope");
 
     Ok(())
@@ -250,20 +245,22 @@ async fn test_jwt_agent_durable_ephemeral_pair() -> anyhow::Result<()> {
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path())?;
 
     let node1 = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
-    let node2 = Node::new(Arc::new(SledStorageEngine::new_test()?), agent.clone());
+    let node2 = Node::new(Arc::new(SledStorageEngine::new_test()?), JwtAgent::new_ephemeral());
 
     node1.system.create().await?;
+    agent.set_policy(&node1, &agent.config()).await?;
     let _conn = LocalProcessConnection::new(&node1, &node2).await?;
     node2.system.wait_system_ready().await.unwrap();
 
     let editor_claims = make_claims("editor-1", &["Editor"], "editor@blog.com");
     let editor_token = sign_token(&keys, &editor_claims);
     let editor_ctx = JwtContext::from_claims(editor_claims, editor_token);
-    let ctx1 = node1.context(editor_ctx)?;
+    let ctx1 = node1.context_async(editor_ctx).await?;
 
     let post_id = {
         let trx = ctx1.begin();
-        let post = trx.create(&Post { title: "Cross-Node Post".into(), body: "Created on node1".into() }).await?;
+        let post = trx.create(&Post { title: "Cross-Node Post".into(), body: "Created on node1".into() }).await
+            .map_err(|error| anyhow::anyhow!("durable first create: {error:?}"))?;
         let id = post.id();
         trx.commit().await?;
         id
@@ -272,9 +269,9 @@ async fn test_jwt_agent_durable_ephemeral_pair() -> anyhow::Result<()> {
     let editor_claims2 = make_claims("editor-1", &["Editor"], "editor@blog.com");
     let editor_token2 = sign_token(&keys, &editor_claims2);
     let editor_ctx2 = JwtContext::from_claims(editor_claims2, editor_token2);
-    let ctx2 = node2.context(editor_ctx2)?;
+    let ctx2 = node2.context_async(editor_ctx2).await?;
 
-    let results = ctx2.fetch::<PostView>("title = 'Cross-Node Post'").await?;
+    let results = ctx2.fetch::<PostView>("title = 'Cross-Node Post'").await.map_err(|error| anyhow::anyhow!("first fetch: {error:?}"))?;
     assert_eq!(results.len(), 1);
 
     let fetched = &results[0];
@@ -291,19 +288,21 @@ async fn test_jwt_check_request_roundtrip() -> anyhow::Result<()> {
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path())?;
 
     let node1 = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
-    let node2 = Node::new(Arc::new(SledStorageEngine::new_test()?), agent.clone());
+    let node2 = Node::new(Arc::new(SledStorageEngine::new_test()?), JwtAgent::new_ephemeral());
 
     node1.system.create().await?;
+    agent.set_policy(&node1, &agent.config()).await?;
     let _conn = LocalProcessConnection::new(&node1, &node2).await?;
     node2.system.wait_system_ready().await.unwrap();
 
     let claims = make_claims("editor-2", &["Editor"], "ed2@blog.com");
     let token = sign_token(&keys, &claims);
     let ctx = JwtContext::from_claims(claims, token);
-    let ctx2 = node2.context(ctx)?;
+    let ctx2 = node2.context_async(ctx).await?;
 
     let trx = ctx2.begin();
-    let _post = trx.create(&Post { title: "From Ephemeral".into(), body: "Sent via JWT auth".into() }).await?;
+    let _post = trx.create(&Post { title: "From Ephemeral".into(), body: "Sent via JWT auth".into() }).await
+        .map_err(|error| anyhow::anyhow!("ephemeral first create: {error:?}"))?;
     trx.commit().await?;
 
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -311,7 +310,7 @@ async fn test_jwt_check_request_roundtrip() -> anyhow::Result<()> {
     let editor_claims_n1 = make_claims("editor-2", &["Editor"], "ed2@blog.com");
     let token_n1 = sign_token(&keys, &editor_claims_n1);
     let ctx_n1 = JwtContext::from_claims(editor_claims_n1, token_n1);
-    let ctx1 = node1.context(ctx_n1)?;
+    let ctx1 = node1.context_async(ctx_n1).await?;
 
     let results = ctx1.fetch::<PostView>("title = 'From Ephemeral'").await?;
     assert_eq!(results.len(), 1);
@@ -324,14 +323,15 @@ async fn test_jwtpolicy_collection_always_accessible() -> anyhow::Result<()> {
     let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path())?;
 
-    let collection = ankurah_proto::CollectionId::from("jwtpolicy");
+    let models = common::policy_models(&agent, &["jwtagent_verification_key"]);
+    let collection = models.id("jwtagent_verification_key");
 
     let claims = make_claims("reader-1", &["Reader"], "reader@blog.com");
     let token = sign_token(&keys, &claims);
     let ctx = JwtContext::from_claims(claims, token);
 
     use ankurah_core::policy::PolicyAgent;
-    let result = agent.can_access_collection(&ctx, &collection);
+    let result = agent.can_access_model(&ctx, &collection);
     assert!(result.is_ok(), "jwtpolicy collection should always be accessible");
 
     Ok(())
@@ -342,14 +342,15 @@ async fn test_jwt_agent_collection_access_denied() -> anyhow::Result<()> {
     let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path())?;
 
-    let collection = ankurah_proto::CollectionId::from("post");
+    let models = common::policy_models(&agent, &["post"]);
+    let collection = models.id("post");
 
     let claims = make_claims("reader-1", &["Reader"], "reader@blog.com");
     let token = sign_token(&keys, &claims);
     let ctx = JwtContext::from_claims(claims, token);
 
     use ankurah_core::policy::PolicyAgent;
-    let result = agent.can_access_collection(&ctx, &collection);
+    let result = agent.can_access_model(&ctx, &collection);
     assert!(result.is_err(), "Reader should not be able to access post collection");
 
     Ok(())
@@ -361,11 +362,12 @@ async fn test_root_context_bypasses_all_policy_checks() -> anyhow::Result<()> {
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path())?;
 
     let storage = SledStorageEngine::new_test()?;
-    let node = Node::new_durable(Arc::new(storage), agent);
+    let node = Node::new_durable(Arc::new(storage), agent.clone());
     node.system.create().await?;
+    agent.set_policy(&node, &agent.config()).await?;
 
     let root_ctx = JwtContext::system();
-    let context = node.context(root_ctx)?;
+    let context = node.context_async(root_ctx).await?;
 
     let trx = context.begin();
     let _post = trx.create(&Post { title: "Root Post".into(), body: "Created by root".into() }).await?;
@@ -385,10 +387,11 @@ async fn test_root_bypasses_collection_access() -> anyhow::Result<()> {
     use ankurah_core::policy::PolicyAgent;
     let root = JwtContext::system();
 
-    let post = ankurah_proto::CollectionId::from("post");
-    let secret = ankurah_proto::CollectionId::from("secret_stuff");
-    assert!(agent.can_access_collection(&root, &post).is_ok());
-    assert!(agent.can_access_collection(&root, &secret).is_ok());
+    let models = common::policy_models(&agent, &["post", "secret_stuff"]);
+    let post = models.id("post");
+    let secret = models.id("secret_stuff");
+    assert!(agent.can_access_model(&root, &post).is_ok());
+    assert!(agent.can_access_model(&root, &secret).is_ok());
 
     Ok(())
 }

@@ -20,13 +20,13 @@ pub struct KnownEntity {
 
 pub enum NodeRequestBody {
     Fetch {
-        collection: CollectionId,
+        model: ModelId,
         selection: ast::Selection,
         known_matches: Vec<KnownEntity>,
     },
     SubscribeQuery {
         query_id: QueryId,
-        collection: CollectionId,
+        model: ModelId,
         selection: ast::Selection,
         version: u32,
         known_matches: Vec<KnownEntity>,
@@ -63,7 +63,7 @@ pub struct EntityHeadRelationFragment {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct EntityDeltaState {
     pub entity_id: EntityId,
-    pub collection: CollectionId,
+    pub model: ModelId,
     pub content: DeltaContent,
 }
 

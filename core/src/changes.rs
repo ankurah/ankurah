@@ -45,6 +45,16 @@ impl EntityChange {
         }
         Ok(Self { entity, events })
     }
+
+    /// Record an event immediately after application, before another event can supersede its head.
+    pub(crate) fn push_event(&mut self, event: Attested<Event>) -> Result<(), MutationError> {
+        if event.payload.entity_id != self.entity.id() || !self.entity.head().contains(&event.payload.id()) {
+            return Err(MutationError::InvalidEvent);
+        }
+        self.events.push(event);
+        Ok(())
+    }
+
     pub fn into_parts(self) -> (Entity, Vec<Attested<Event>>) { (self.entity, self.events) }
 }
 

@@ -1,6 +1,6 @@
 //! Resolves property names to durable identities and canonical values.
 
-use ankql::ast::{Expr, OrderByItem, Parsed, PathExpr, Predicate, PropertyPath, Resolved, Selection};
+use ankql::ast::{Expr, ModelRef, OrderByItem, Parsed, PathExpr, Predicate, PropertyPath, Resolved, Selection};
 use ankurah_proto::{ModelId, PropertyId, SystemModel, SystemProperty};
 use thiserror::Error;
 
@@ -17,6 +17,8 @@ pub struct ResolvedProperty {
 pub enum ModelResolutionError {
     #[error(transparent)]
     Catalog(#[from] RetrievalError),
+    #[error("unknown model '{0}'")]
+    UnknownModel(String),
     #[error("property lookup for '{name}' in model '{model}' failed: {message}")]
     Lookup { model: ModelId, name: String, message: String },
     #[error("unknown property '{name}' in model '{model}'")]
@@ -39,7 +41,7 @@ impl From<ModelResolutionError> for RetrievalError {
 }
 
 pub trait ModelResolver {
-    /// Look up a model qualifier in a path such as `album.name`.
+    /// Look up a model label for membership or a path qualifier such as `album.name`.
     fn resolve_model(&self, _name: &str) -> Result<Option<ModelId>, ModelResolutionError> { Ok(None) }
 
     fn resolve_property(&self, model: &ModelId, name: &str) -> Result<Option<ResolvedProperty>, ModelResolutionError>;
@@ -99,7 +101,7 @@ pub(crate) struct DescriptorResolver<'a> {
 impl ModelResolver for DescriptorResolver<'_> {
     fn resolve_model(&self, name: &str) -> Result<Option<ModelId>, ModelResolutionError> {
         if name == self.schema.label {
-            if let Some(model) = self.schema.resolved.get(self.epoch) {
+            if let Ok(model) = self.schema.resolved.get(self.epoch) {
                 return Ok(Some(model));
             }
         }
@@ -108,7 +110,7 @@ impl ModelResolver for DescriptorResolver<'_> {
 
     fn resolve_property(&self, model: &ModelId, name: &str) -> Result<Option<ResolvedProperty>, ModelResolutionError> {
         let Some(field) = self.schema.field_by_name(name) else { return Ok(None) };
-        if let Some(id) = field.resolved.get(self.epoch) {
+        if let Ok(id) = field.resolved.get(self.epoch) {
             let value_type = ValueType::from_property_str(field.value_type).ok_or_else(|| ModelResolutionError::ValueTypeLookup {
                 model: *model,
                 property: id,

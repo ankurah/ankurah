@@ -30,8 +30,8 @@ Head and [backend](property-backends.md) state are bundled under a single lock
 so they are always updated atomically.
 
 Every `Entity` is a resident of a `WeakEntitySet`, or a transaction fork retaining
-its resident through its upstream chain. Detached state uses `DetachedEntity`:
-it shares the state-application code, but cannot produce an `Entity` or typed view.
+its resident through its upstream chain. Detached state uses `TemporaryEntity`:
+it is used for query evaluation and cannot produce an `Entity` or typed view.
 
 
 ## Creation
@@ -68,23 +68,26 @@ pending operations are skipped. A validation check ensures creation events can
 only come from entities that were actually created through the transaction --
 preventing "phantom entities."
 
-**2. Fork-based validation.** For each entity/event pair, a second fork is
-created as a validation sandbox. The event is
-[staged](event-dag.md#the-staging-pattern), applied to the sandbox, and the
-resulting before/after state is passed to the policy agent for attestation.
-Attested events are committed to storage.
+**2. Fork-based validation.** Preserve an original snapshot and a working fork
+per entity. Events are individually authorized/attested, applied in order, retained
+by the working fork, and written to the storage transaction. After
+each event, check the entity's original-to-current state and write it through the
+same storage transaction. Any rejection drops the transaction without committing
+its writes or changing residents.
 
-**3. Update heads.** Heads on the transacted entities are updated to include the
-new event ID. This happens *before* relaying to peers -- so if a peer echoes the
-event back, the local entity already recognizes it as already-integrated.
-
-**4. Relay to peers.** Attested events are sent to
+**3. Relay to peers.** Attested events are sent to
 [durable peers](node-architecture.md#durable-vs-ephemeral-nodes). The commit
 waits for peer confirmation.
 
-**5. Persist state.** The event is applied to the upstream primary entity (via
-`apply_event`), bringing it up to date. The entity's state is serialized and
-persisted to storage. Change notifications are emitted to the reactor.
+**4. Persist.** Events and prepared states are persisted atomically, provided
+storage still matches the heads from which the forks were made. A conflict
+discards the attempt's forks and repeats validation from the residents.
+
+**5. Publish.** After storage commits, consume each working fork to apply its
+retained events to its immediate upstream resident and emit change notifications.
+The node serializes storage commit and resident publication; a losing writer
+cannot retry its commit before the winner publishes. Peer waits and reactor
+notification happen outside that lock.
 
 
 ## Remote Event Application
@@ -217,16 +220,17 @@ exactly. Head collapses back to `[D]`.
 
 ## Persistence Ordering
 
-State persistence follows a strict ordering invariant: **commit events to
-storage before persisting state** (see
+Events become durable together with the canonical state referencing them (see
 [The Staging Pattern](event-dag.md#the-staging-pattern) and
-[Crash Safety](retrieval.md#crash-safety)).
+[Crash Safety](retrieval.md#crash-safety)). Events, canonical state,
+entity-model associations, and every affected model projection commit in one
+exact-head storage batch. Event insertion is content-addressed and idempotent.
 
 This gives clean crash recovery semantics:
-- Crash after `commit_event` but before `set_state`: recovery loads the old
-  state and the event is re-applied on next delivery.
-- Crash before `commit_event`: neither event nor updated state is persisted --
-  a clean rollback.
+
+- A failed or conflicting `StorageTransaction::commit` exposes none of its new events,
+  canonical states, associations, projections, or index changes.
+- A successful `StorageTransaction::commit` exposes all of those changes together.
 
 
 ## Key Invariants
@@ -243,9 +247,9 @@ This gives clean crash recovery semantics:
 4. **Transaction snapshot isolation.** The primary entity is not modified until
    commit phase 5.
 
-5. **Staging before comparison; commit before persistence.** Events must be
-   staged (discoverable by BFS) before `apply_event` is called. Events must be
-   committed to storage before entity state referencing them is persisted.
+5. **Discoverable history; atomic event/state persistence.** During application,
+   BFS can read the incoming event, retained fork events, and stored history.
+   Events must be durable with the state whose head references them.
 
 6. **StateAndEvent divergence fallback.** When `apply_state` does not apply
    the incoming state (divergence, or the state is older than what the

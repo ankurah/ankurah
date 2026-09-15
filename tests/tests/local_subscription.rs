@@ -11,7 +11,7 @@ use crate::common::TestWatcher;
 async fn basic_local_subscription() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     node.system.create().await?;
-    let ctx = node.context(c)?;
+    let ctx = node.context_async(c).await?;
 
     // Create some initial entities
     let (two_vines, ask_that_god, ice_on_the_dune) = {
@@ -71,7 +71,7 @@ async fn complex_local_subscription() -> Result<(), Box<dyn std::error::Error + 
     // Create a new node
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     node.system.create().await?;
-    let ctx = node.context(c)?;
+    let ctx = node.context_async(c).await?;
 
     let watcher = TestWatcher::changeset();
 
@@ -156,7 +156,7 @@ async fn complex_local_subscription() -> Result<(), Box<dyn std::error::Error + 
 async fn resultset_vs_livequery_signal_semantics() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     node.system.create().await?;
-    let ctx = node.context(c)?;
+    let ctx = node.context_async(c).await?;
 
     // Create initial entities
     let (album_a, album_b) = {

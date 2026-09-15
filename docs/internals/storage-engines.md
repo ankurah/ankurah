@@ -1,240 +1,230 @@
-# Storage Engine Layer
+# Storage Engines
 
-The storage engine layer is the bottom of the Ankurah stack -- the only part
-that actually touches a disk, a browser database, or a SQL server. Everything
-above it (the [event retrieval and staging layer](retrieval.md), entity
-persistence, the [replication protocol](node-architecture.md#the-replication-protocol))
-is written against two traits and never names a concrete backend. Swapping
-sled for Postgres changes where bytes land; it does not change a line of the
-node, the applier, or the [compare-apply cycle](compare-apply-cycle.md).
+Ankurah's storage boundary persists three different kinds of truth:
+
+1. immutable, model-independent events;
+2. one canonical state and causal head per entity; and
+3. model-specific materializations used for querying and indexing.
+
+The boundary is the single `StorageEngine` trait in `core/src/storage.rs`.
+Physical tables, object stores, trees, index structures, name registries, and
+entity-to-model association layouts are private to each engine.
 
 ```text
-        Node / Context / Reactor
-                  |
-     Event retrieval & staging  (retrieval.md)
-        LocalEventGetter / CachedEventGetter
-                  |
-     StorageCollectionWrapper  (Arc<dyn StorageCollection>)
-                  |
-   +--------+-----+------+-----------------+
-   |        |            |                 |
-  sled   postgres   indexeddb-wasm      sqlite      <- engines
-   |        |            |                 |
-  disk    SQL server   browser IDB      single file
+                   Node / Context / Reactor
+                              |
+                 event validation and replay
+                              |
+                     StorageEngine
+                    /     |      \
+          canonical      durable     per-model
+        entities/events  associations materializations
+                    \     |      /
+                 engine-private layout
 ```
 
-The traits live in `core/src/storage.rs`; the engines are separate crates
-under `storage/`. A large body of shared query machinery lives in
-`storage/common`, so engines implement placement and I/O, not query planning
-from scratch.
+An entity does not belong to one model. Its canonical state carries a set of
+explicit, event-derived model memberships; its events carry no singular model
+identity. A request's model says which projection is being used, but it never
+creates membership implicitly. The engine durably indexes the canonical
+membership set and refreshes all of those materializations whenever canonical
+state changes.
 
+## The `StorageEngine` contract
 
-## The Two Traits
+The trait groups operations by semantic responsibility:
 
-`StorageEngine` is the collection factory and lifecycle handle. It is small:
+| Method | Contract |
+|---|---|
+| `append_events` | Blindly and idempotently append validated, attested events by `EventId`; preserve input order in the inserted/not-inserted result |
+| `transaction` | Return an engine-owned handle for one atomic storage transaction |
+| `get_state` / `get_states` | Read canonical state by `EntityId`, independent of model |
+| `fetch_states` | Query one model's materialized view and return the corresponding canonical states |
+| `get_events` / `dump_entity_events` | Read model-independent event history |
+| `list_materializations` | List already-created model materializations without creating new ones |
+| `delete_all` | Delete only engine-owned data while retaining compatibility metadata |
+| `set_catalog_resolver` | Inject the catalog name source once the node has constructed its catalog |
 
-- `collection(&CollectionId) -> Arc<dyn StorageCollection>` -- open or create
-  the storage for one collection. This is where an engine does per-collection
-  setup: sled opens a tree, Postgres and SQLite run `CREATE TABLE IF NOT
-  EXISTS` for the state and event tables under a DDL lock, IndexedDB hands back
-  a bucket bound to the shared object stores.
-- `delete_all_collections()` -- drop everything (used by tests and resets).
-- an associated `Value` type -- the engine's native value representation
-  (`Vec<u8>` for sled, `PGValue` for Postgres, `SqliteValue`, `JsValue`).
+`StorageTransaction::set_state` borrows the expected head and proposed attested
+state. Successive calls for an entity replace its state within the transaction;
+the expected head must match that preceding state, or storage on the first call.
+Engines may execute writes immediately inside their transaction or buffer them
+until commit. The complete model set is in the state's memberships, with no
+separate association instruction. `add_events` writes events in the same transaction.
 
-`StorageCollection` is the real contract -- the interface the rest of the
-system depends on. Grouped by responsibility rather than method-by-method:
+`StorageTransaction::commit` commits the native data transaction and returns one of:
 
-| Responsibility | Methods | Notes |
-|----------------|---------|-------|
-| Entity state, by id | `set_state`, `get_state`, `set_states`, `get_states` | `set_states`/`get_states` have default loop implementations over the singular forms |
-| Entity state, by query | `fetch_states(&Selection)` | The predicate path -- see below |
-| Events, write | `add_event` | Append one attested event |
-| Events, read | `get_events(Vec<EventId>)`, `dump_entity_events(EntityId)` | Point lookups and a per-entity dump |
+- `Committed(StorageCommitResult)`, identifying which entity heads changed; or
+- `Conflict { observed }`, containing the canonical state (or absence) observed
+  for every entity while checking the batch. A conflict commits nothing.
 
-`StorageCollectionWrapper` (`core/src/storage.rs`) is a thin `Deref` newtype
-around `Arc<dyn StorageCollection>` that the retrieval layer holds; it adds no
-behavior, only a stable handle to clone.
+The observed states are part of the concurrency protocol, not diagnostics.
+Core uses them to rebuild a monotonic candidate and retry from the exact head
+the engine saw.
 
+## Write and retry flow
 
-## One Collection, Two Stores
+Events are validated and attested before storage, then included in the same
+batch as the candidate states. Duplicate content-addressed `EventId`s are
+harmless. Separately cached lineage may already be durable without a canonical
+head referencing it.
 
-Every collection persists two kinds of data, and the split mirrors the
-event-sourcing model directly:
+Local and remote commits validate events on resident-backed forks and write
+each event and resulting state directly to a storage transaction. Residents
+receive the transaction's events only after storage succeeds. The node serializes
+storage commit and resident publication. On conflict, a new attempt forks the
+residents and repeats validation; the winner alone publishes its changes.
 
-- **Entity state snapshots** -- the materialized current view of each entity.
-  A snapshot carries the serialized property state plus the entity's **head
-  clock** (the set of event ids that produced it). This is what `get_state`
-  and `fetch_states` return, and what queries run against.
-- **Events** -- the immutable history. Each event names its parent clock and
-  the operations it applied. This is what `add_event`/`get_events` persist and
-  the [event DAG](event-dag.md) walks during comparison.
+State-only replication merges its validated snapshot with the current state
+and writes through a storage transaction too. On conflict it reforks the resident
+and retries the merge; only success publishes the merged state to the resident.
 
-State is derived; events are authoritative. State exists so that reads and
-predicate queries do not have to replay history, and the head clock on each
-snapshot is the join point back to the DAG.
+Within a successful storage commit, the following are one engine transaction:
 
-Physically, engines keep the two stores in separate namespaces, but the naming
-is engine-specific -- there is no single scheme enforced across the layer:
+- every staged event;
+- every canonical entity replacement;
+- every newly accepted entity/model association;
+- every projection for the entity's complete associated model set; and
+- the affected secondary-index maintenance.
 
-- **Postgres / SQLite** give each collection two tables: the state table is
-  named for the collection itself (bare `{collection}`) and the event table is
-  `{collection}_event`.
-- **Sled / IndexedDB** use two shared stores for *all* collections -- an
-  `entities` tree/object-store and an `events` tree/object-store -- plus a
-  *per-collection* `collection_{id}` tree (sled) or index object stores
-  (IndexedDB) holding the materialized, indexable projection used for queries.
+A stale head on one entity rejects the entire batch. Consequently, readers can
+never observe a new canonical head with an old projection, or half of a
+multi-entity application transaction.
 
-`core/src/storage.rs` defines helper functions `state_name()` and
-`event_name()` that produce `{collection}_state` / `{collection}_event`, but
-note that the current engines do not route through them (Postgres/SQLite build
-their own names, and the KV engines use fixed shared-store names); treat those
-helpers as a naming convention rather than the authoritative source of table
-names.
+## Associations and materializations
 
-**Write ordering.** The state snapshot and its events are written by different
-calls, and the order matters. The invariant enforced one layer up is: commit
-the events to permanent storage *before* persisting the entity state that
-references them (see [event retrieval and staging](retrieval.md#the-event-lifecycle-stage-apply-commit-persist)
-and [entity lifecycle -> persistence ordering](entity-lifecycle.md#persistence-ordering)).
-A crash between the two leaves events on disk with a stale head, which the next
-delivery heals via BFS -- never state pointing at events that were never
-stored. The storage layer itself does not span the two writes in a
-transaction; the ordering discipline lives in the caller.
+The engine chooses how to represent the durable set
+`(EntityId, ModelId)`. Before writing, it compares its stored associations with
+the complete membership set in the proposed canonical state, inserts any new
+memberships, rejects removals in this revision, and refreshes every member
+model's materialization.
 
+This distinction matters in two cases:
 
-## The Predicate Fetch Path
+- Editing an entity through model A must also update its previously associated
+  model B projection.
+- Merely using or requesting an entity through model B cannot add an
+  association. A future add-to-existing operation must change the canonical
+  membership set explicitly before model B is materialized.
 
-`fetch_states` is the one method that takes a query rather than an id. Its
-argument is an `ankql::ast::Selection` -- a predicate plus optional `ORDER BY`
-and `LIMIT`. Turning that into an engine operation is where most of the
-per-engine complexity would be, so it is deliberately factored into
-`storage/common` and shared:
+Queries do not create associations merely by scanning a materialization:
+anything returned by that materialization is already associated. In the
+current protocol, only a genesis event's attested `Membership::Add` operation
+creates an association; add-to-existing is deferred.
 
-- **`Planner`** (`storage/common/src/planner.rs`) takes the `Selection` and the
-  primary-key field name and enumerates candidate `Plan`s: `Index { .. }`
-  scans, a `TableScan` fallback, or `EmptyScan` when the predicate can never
-  match. It splits the predicate into conjuncts (`predicate.rs`), separates
-  equalities from inequalities, chooses index key parts, and computes how much
-  of the `ORDER BY` a scan direction can satisfy versus what must be sorted
-  in memory (the `OrderByComponents` presort/spill split in `types.rs`). It is
-  capability-aware via `PlannerConfig`: `supports_desc_indexes` is `true` for
-  engines with real descending indexes and `false` for IndexedDB, which only
-  has ascending index parts.
-- **`bounds.rs`** normalizes per-column index bounds into a single canonical
-  lexicographic range that each KV engine lowers to its own cursor range.
-- **`filtering.rs` / `sorting.rs`** provide streaming combinators
-  (`filter_predicate`, `sort_by`, `top_k`, `limit`) over any stream of
-  `Filterable` items. Residual predicates the index could not satisfy are
-  evaluated here in Rust via `core`'s `evaluate_predicate`, so no engine
-  reimplements predicate evaluation.
+## Catalog resolver and physical names
 
-What differs between engines is **how much of the query is pushed down** to the
-backend versus evaluated with the shared Rust combinators:
+The node injects a weak `CatalogResolver` into the storage engine during node
+construction. The engine decides when and where to use it. SQL and IndexedDB
+engines consult it only when a durable physical-name lookup misses:
 
-- **Postgres and SQLite push the predicate into SQL.** Each has a
-  `split_predicate_for_*` pass (`sql_builder.rs`) that partitions the predicate
-  into a `sql_predicate` (translated into a `WHERE` clause) and a
-  `remaining_predicate` that SQL cannot express. The pushable part becomes a
-  real query; the residual is post-filtered in Rust. When a residual exists,
-  `LIMIT` is *dropped* from the SQL and re-applied after post-filtering, so the
-  database is never allowed to truncate rows that the residual might have kept.
-  Debug builds record the spilled predicate so tests can assert full pushdown.
-- **Sled and IndexedDB run the `Planner` and then scan.** They pick the first
-  viable plan, open an index cursor (or a full collection scan for a
-  `TableScan`), materialize candidate rows, and run the residual predicate,
-  sort, and limit through the shared `filtering`/`sorting` streams. Sled reads
-  ids from an index tree and does a secondary lookup into the shared
-  `entities` tree to hydrate each state; IndexedDB drives IDB index cursors.
+- `ModelId -> materialization name`, seeded from the registered model name;
+- `(ModelId, PropertyId) -> physical field`, seeded from the registered
+  property name.
 
+The engine's durable map is authoritative after assignment. A catalog rename
+does not move a table or column. Labels are sanitized to lower case and
+deduplicated by durable identity. SQL engines also treat every existing
+application table as occupying its name, so a model cannot accidentally claim
+or overwrite a neighboring table in a shared database.
 
-## Engine Matrix
+Sled does not need human-readable model-name assignments: its tree names encode
+`ModelId` reversibly (`modelid-...` or `system-...`). It still keeps a durable
+`PropertyId <-> u32` map for compact projected keys.
 
-Only claims verified against the code in each crate.
+## Engine layouts
 
-| Engine | Platform / context | State layout | Event layout | Predicate handling | Durability |
-|--------|--------------------|--------------|--------------|--------------------|------------|
-| **sled** (`storage/sled`) | Native, embedded KV; the default for servers and dev | Canonical state in a shared `entities` tree; a per-collection `collection_{id}` tree holds the materialized property projection that indexes and scans use | Shared `events` tree keyed by event id | Shared `Planner` picks index vs. table scan; residual predicate/sort/limit via shared streams; sled ops run on `spawn_blocking` | On-disk sled db; `new()` under `~/.ankurah`, plus a temporary in-memory mode for tests |
-| **postgres** (`storage/postgres`) | Native, production server backend | One table per collection (bare `{collection}`); columns added on demand as properties appear; each row carries `state_buffer`, `head`, `attestations` | `{collection}_event` table keyed by `id`, with an `entity_id` column | Predicate split into pushdown `WHERE` + Rust post-filter; `LIMIT` deferred past post-filter; DDL serialized with advisory locks | Full SQL server; connection pooled via `bb8` |
-| **indexeddb-wasm** (`storage/indexeddb-wasm`) | Browser (WASM) client storage | Shared `entities` object store; per-collection index object stores for queries | Shared `events` object store with a `by_entity_id` index | Shared `Planner` in `PlannerConfig::indexeddb()` mode (ascending-only indexes); IDB index cursors + residual filter/sort in Rust | Browser IndexedDB; `!Send`, wrapped in `SendWrapper` |
-| **sqlite** (`storage/sqlite`) | Embedded single-file SQL; native incl. mobile (iOS/Android) | One table per collection (bare `{collection}`), columns added on demand; row carries `state_buffer`, `head`, `attestations` | `{collection}_event` table with an explicit `entity_id` index for `dump_entity_events` | Same pushdown/post-filter split as Postgres, using SQLite JSON/JSONB operators for JSON paths | Single-file (or in-memory) SQLite via `rusqlite` "bundled"; pooled via `bb8` |
+Only the semantic responsibilities above are public. Current private layouts
+are:
 
-Two notes the code makes explicit. SQLite positions itself in its crate docs as
-sitting "between Sled (pure KV) and Postgres (full SQL server)" and requires
-SQLite 3.45+ for JSONB; its implementation is a full pushdown engine, not a
-stub. On the KV side, `dump_entity_events` is a full scan of the shared events
-tree in sled (flagged as acceptable only because it is test-facing), whereas
-SQLite and IndexedDB index events by `entity_id` for that lookup.
+| Engine | Canonical entity/event storage | Associations | Model materializations and property addressing |
+|---|---|---|---|
+| PostgreSQL | `_ankurah_entity` and `_ankurah_event` | `_ankurah_entity_model` | One projected table per model; `_ankurah_postgres_model_map` assigns table names and `_ankurah_postgres_column_map` assigns columns |
+| SQLite | `_ankurah_entity` and `_ankurah_event` | `_ankurah_entity_model` | One projected table per model; `_ankurah_sqlite_model_map` assigns table names and `_ankurah_sqlite_column_map` assigns columns |
+| IndexedDB | `entities` and `events` object stores | `entity_models` object store | Shared `materializations` store scoped by durable materialization name; `model_registrations` and `property_columns` store assignments |
+| sled | Shared `entities` and `events` trees | `_ankurah_sled_entity_models` tree | One reversible identity-named tree per model; `_ankurah_sled_property_map` assigns numeric property slots |
 
+PostgreSQL serializes competing entity inserts and updates with transaction
+advisory locks before comparing heads. SQLite uses `BEGIN IMMEDIATE`. Sled uses
+one multi-tree transaction. IndexedDB uses one read-write transaction spanning
+the canonical entity, association, and materialization stores.
 
-## Index Maintenance
+## Query execution
 
-For the KV engines, secondary indexes are a real subsystem, not a free
-byproduct of the store. Sled's `IndexManager` (`storage/sled/src/index.rs`)
-maintains per-collection index trees: `set_state` calls
-`update_indexes_for_entity` with the old and new materialized property tuples
-so index entries stay consistent with state, and `fetch_states` calls
-`assure_index_exists` to create an index on demand when a plan needs one. The
-key encoding these indexes share -- ordered, typed, multi-column keys -- lives
-in `core/src/indexing` (`KeySpec`, `IndexKeyPart`, and the tuple encoder),
-which is also what the `storage/common` planner reasons about when it decides
-which index a query can use. IndexedDB follows the same shape using native IDB
-indexes. The SQL engines lean on the database's own indexing and add columns
-lazily as properties appear.
+`fetch_states(model, selection)` queries the model's materialized surface but
+returns canonical attested states. Model projections contain the fields and
+indexes needed to select entity ids; canonical buffers, heads, and
+attestations remain in the shared entity store.
 
+`storage/common` carries the shared planning and residual-evaluation machinery:
 
-## How Event Retrieval Layers On Top
+- `Planner` enumerates index, table-scan, and empty plans and accounts for
+  engine capabilities such as descending indexes.
+- Bounds and key encoding provide the common lexicographic model used by the
+  key/value engines.
+- Filtering and sorting streams evaluate residual predicates, ordering, and
+  limits after a scan.
 
-The [event retrieval and staging layer](retrieval.md) is the immediate
-consumer of `StorageCollection`. Its concrete getters call straight into these
-methods:
+PostgreSQL and SQLite split predicates into a SQL-pushable portion and a Rust
+residual. If a residual remains, SQL `LIMIT` is deferred until after
+post-filtering. Sled and IndexedDB use the shared planner to choose native
+indexes or scans, then apply residual filtering/sorting in Rust.
 
-- **`LocalEventGetter`** (durable path) checks an in-memory staging map, then
-  falls back to `collection.get_events(..)`; `commit_event` calls
-  `add_event`. Its `storage_is_definitive()` returns the `durable` flag it was
-  constructed with.
-- **`CachedEventGetter`** (ephemeral path) adds a third tier: staging, then
-  `get_events`, then a request to a durable peer whose response it writes back
-  via `add_event`. Its `storage_is_definitive()` is always `false`.
+Property references in the AST stay logical `PropertyId`s. Each engine resolves
+that identity to its private physical column, object field, or numeric slot
+only when planning or emitting the operation.
 
-That `storage_is_definitive` bit is exactly the durable/ephemeral distinction
-surfacing at the storage boundary. On a
-[durable node](node-architecture.md#durable-vs-ephemeral-nodes) the local store
-holds every event, so `event_stored() == false` is conclusive and enables cheap
-guards without a DAG walk; on an
-[ephemeral node](node-architecture.md#durable-vs-ephemeral-nodes) the same
-store is a cache, a miss means "not here yet," and the getter must go to a peer.
-The two lookup strategies are covered in
-[retrieval -> durable vs ephemeral lookup](retrieval.md#durable-vs-ephemeral-lookup-strategies).
+## Event retrieval and staging
 
+The retrieval layer remains separate from physical storage. `GetEvents`
+supports causal DAG walks, while `SuspenseEvents` adds an in-memory staging map
+so an incoming event is discoverable before an in-memory head references it.
 
-## Writing a New Engine
+Transaction events, canonical states, and materializations persist atomically
+through `StorageTransaction::commit`. Standalone `StorageEngine::append_events` remains for
+caching retrieved lineage without changing canonical state.
+The durable/ephemeral distinction is exposed by
+`storage_is_definitive()`:
 
-The contract is small and the shared code carries the hard parts:
+- a durable node's event miss is authoritative;
+- an ephemeral node may fetch the missing event from a durable peer and cache
+  it locally.
 
-1. **Implement `StorageEngine`** -- a `collection()` factory that opens/creates
-   the state and event stores for a collection, and `delete_all_collections()`.
-2. **Implement `StorageCollection`** -- the state (`set_state`/`get_state`/
-   `fetch_states`), and event (`add_event`/`get_events`/`dump_entity_events`)
-   methods. `set_states`/`get_states` come for free from the defaults.
-3. **Use `storage/common`** -- run the `Planner` (with the right
-   `PlannerConfig` for your index capabilities), lower `bounds` to your native
-   ranges, and evaluate residual predicates/sorts/limits through the
-   `filtering`/`sorting` streams. Do not hand-roll predicate evaluation. If the
-   backend speaks SQL, follow the Postgres/SQLite pattern: split the predicate,
-   push what you can, post-filter the rest, and defer `LIMIT` when a residual
-   exists.
-4. **Preserve the write-ordering contract** -- `add_event` and `set_state` may
-   be separate writes, but the state you persist must reference a head whose
-   events are already durable (the caller guarantees the ordering; your engine
-   just must not reorder or lose the event write).
+See [Event Retrieval and Staging](retrieval.md) and
+[The Event DAG](event-dag.md) for the causal comparison protocol.
 
-Conformance is checked by exercising each engine through the same
-model/query API rather than a single generic trait-test macro. The
-crate-independent behavioral tests live in the workspace `tests/` crate (which
-runs against sled), and each SQL/IDB engine carries a parallel suite under its
-own `tests/` directory (for example `storage/postgres/tests`,
-`storage/sqlite/tests`, `storage/indexeddb-wasm/tests`) covering predicate
-checks, ordering, JSON semantics, and undefined-column handling. A new engine is
-expected to pass the equivalent behavioral tests for its platform. See the
-[Testing Strategy](testing.md) chapter for how these fit together.
+## Lifecycle operations
+
+The protocol-version record is checked on every engine open. A recognizable
+Ankurah store without a version record is refused, as is a store written by a
+different protocol version. Unrelated tables in a shared SQL database do not
+make that database an Ankurah store.
+
+`delete_all` is an Ankurah reset, not a database reset. PostgreSQL and SQLite
+delete their fixed internal tables plus dynamic tables recorded in their model
+registries; unrelated application tables survive. Engine compatibility
+metadata remains so the emptied store can reopen under the same protocol
+version.
+
+`list_materializations` is deliberately non-creating: inspection does not
+create new model materializations.
+
+## Implementing another engine
+
+An implementation must:
+
+1. provide model-independent canonical entity and event storage;
+2. durably represent entity/model associations;
+3. maintain a query materialization for every associated model;
+4. implement exact-head, all-or-nothing storage commit semantics and return
+   complete observed states on conflict;
+5. keep event append idempotent by `EventId`;
+6. keep physical names private and stable by durable identity;
+7. resolve logical `PropertyId`s only at the engine boundary;
+8. preserve unrelated embedding-application data during initialization and
+   `delete_all`; and
+9. exercise the same query, collision, reopen, atomicity, and concurrent-writer
+   scenarios as the existing engine suites.
+
+The normative storage contract and required cross-engine scenarios are in
+`specs/storage/architecture.md`.

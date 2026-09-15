@@ -80,7 +80,6 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         &self,
         node: &Node<SE, PA>,
         query_id: proto::QueryId,
-        collection_id: proto::CollectionId,
         mut selection: ankql::ast::Selection<Resolved>,
         cdata: Option<&PA::ContextData>,
         version: u32,
@@ -141,7 +140,6 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         &self,
         node: &Node<SE, PA>,
         query_id: proto::QueryId,
-        collection_id: proto::CollectionId,
         selection: ankql::ast::Selection<Resolved>,
         sessions: &SessionSet<CD>,
         credentials: &Vec<CD>,
@@ -178,13 +176,13 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         let expanded_states = crate::util::expand_states::expand_states(
             initial_states,
             known_matches.iter().map(|k| k.entity_id).collect::<Vec<_>>(),
-            &storage_collection,
+            node.storage.as_ref(),
         )
         .await?;
 
         let known_map: std::collections::HashMap<_, _> = known_matches.into_iter().map(|k| (k.entity_id, k.head)).collect();
 
-        let policy = ReadPolicy::new(&node.policy_agent, credentials, &collection_id);
+        let policy = ReadPolicy::new(&node.policy_agent, credentials);
         let mut deltas = Vec::with_capacity(expanded_states.len());
         for state in expanded_states {
             // `known_matches` may resurface rows outside the current policy.
@@ -192,7 +190,7 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
                 continue;
             }
 
-            if let Some(delta) = node.generate_entity_delta(&known_map, state, &storage_collection, credentials).await? {
+            if let Some(delta) = node.generate_entity_delta(&known_map, state, credentials).await? {
                 deltas.push(delta);
             }
         }

@@ -52,8 +52,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ankurah::core::node::nocache;
+use ankurah::core::storage::StorageEngine;
 use ankurah::signals::Subscribe;
-use ankurah::{policy::DEFAULT_CONTEXT as CTX, Model, Mutable, Node, PermissiveAgent};
+use ankurah::{policy::DEFAULT_CONTEXT as CTX, Mutable, Node, PermissiveAgent};
 use ankurah_connector_local_process::LocalProcessConnection;
 use ankurah_storage_sled::SledStorageEngine;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
@@ -286,7 +287,7 @@ fn bench_fresh_fetch_snapshot(c: &mut Criterion) {
                         // Lane guard: snapshot-served means no events were
                         // committed on the client. If this ever fails, the fetch
                         // lane changed and this bench's meaning must be re-audited.
-                        let stored = client_ctx.collection(&Doc::collection()).await.unwrap().dump_entity_events(doc_id).await.unwrap();
+                        let stored = client.storage.dump_entity_events(doc_id).await.unwrap();
                         assert!(stored.is_empty(), "fresh fetch must be snapshot-served; found {} locally committed events", stored.len());
                     }
                     total
@@ -380,7 +381,7 @@ fn bench_bridge_catchup(c: &mut Criterion) {
                         // event; the snapshot arm commits none). If the server
                         // fell back to a snapshot, this count stays 0 and the
                         // bench is measuring the wrong lane.
-                        let stored = client_ctx.collection(&Doc::collection()).await.unwrap().dump_entity_events(doc_id).await.unwrap();
+                        let stored = client.storage.dump_entity_events(doc_id).await.unwrap();
                         assert!(
                             stored.len() >= gap,
                             "stale re-fetch must be bridge-served: expected >= {gap} locally committed events, found {}",

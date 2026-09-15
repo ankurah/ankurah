@@ -177,20 +177,20 @@ staging key on, and a mismatched declared id is inert.
 Status: enforced. Content addressing gives inherent identity and tamper-evidence,
 not authorship (Finding 6; see C4-20).
 
-**C4-02. Collection is excluded from event identity.**
-Invariant: two events differing only in `collection` hash to the same `EventId`;
-identity is `(entity_id, operations, parent)` only.
-Trust tier: Byzantine-safe as a hashing fact; collection *attribution* is
-trusted-peer.
-Enforcing seam: `proto/src/data.rs` `EventId::from_parts` hashes entity_id,
-operations, parent, deliberately omitting collection; `From<(EntityId, CollectionId,
-EventFragment)>` supplies collection from the receiving envelope, not the event body.
-Falsifying attack (T1): deliver an event for entity E under collection X in the
-envelope while identical content belongs to Y; both produce one id, so the envelope
-decides which collection's storage receives it.
-Planned test arm: cross-collection id-collision arm asserting no cross-contamination
-and that policy is checked against the envelope-supplied collection.
-Status: enforced as a hashing fact; collection attribution is gap G-2.
+**C4-02. Model projection is excluded from event identity.**
+Invariant: canonical events are Model-independent. A boundary request or delta
+may project an event through any Model in the entity's canonical membership set
+without changing its `EventId`.
+Trust tier: Byzantine-safe as a hashing fact; the receiver validates the carried
+Model projection against canonical membership before using it for policy.
+Enforcing seam: `proto/src/data.rs` hashes the event body itself; it contains no
+Model field. `EntityDelta`, `SubscriptionUpdateItem`, and commit requests carry
+their `ModelId` projection separately.
+Falsifying attack (T1): deliver an event for entity E through Model X when E is
+not a member of X, hoping policy evaluates it under the forged projection.
+Planned test arm: cross-Model projection rejection plus a plural-membership arm
+showing that either legitimate projection preserves one canonical event id.
+Status: enforced at request and update ingress.
 
 **C4-03. Clock deserialization normalizes to sorted, deduplicated order.**
 Invariant: any `Clock` reconstructed from the wire is sorted and deduplicated before
@@ -368,22 +368,20 @@ reported per item.
 Status: enforced. Closes V6: the per-item error collection replaces the old `?` that
 aborted remaining items.
 
-**C4-12. A failed apply does not leave a phantom empty entity resident.**
-Invariant: if `get_retrieve_or_create` speculatively materializes an empty-head
-entity for an update that then fails, the phantom is evicted so the entity does not
-appear to exist with no state.
+**C4-12. A failed apply does not persist phantom state or detach a live entity.**
+Invariant: if `get_retrieve_or_create` inserts an empty-head resident for an
+update that then fails, no state is persisted. The weak entry expires when its
+last owner drops; a retained instance stays attached, preserving uniqueness.
 Trust tier: Byzantine-safe (local invariant).
-Enforcing seam: `node_applier.rs` `apply_update` (EventOnly arm) calls
-`remove_if_phantom(&entity_id)` on failure; `entity.rs`
-`WeakEntitySet::remove_if_phantom` removes only an empty-head resident (a real entity
-is never evicted). The guard `!event.is_entity_create() && self.head().is_empty()`
-in `apply_event` (returns `MutationError::InvalidEvent`) makes such an apply fail.
+Enforcing seam: `node/applier.rs` prepares changes in `TemporaryEntity` and commits
+only accepted events. The guard `!event.is_entity_create() && self.head().is_empty()`
+in `apply_event` returns `MutationError::InvalidEvent`. `WeakEntitySet` never evicts
+or replaces a still-live instance.
 Falsifying attack (T1): a non-creation `EventOnly` for an entity never materialized,
 hoping to leak a phantom empty entity into the `WeakEntitySet` and queries.
-Planned test arm: phantom-eviction arm asserting no resident survives and no phantom
-appears in queries.
-Status: enforced. Peer-state recovery is a documented follow-up (applier comment),
-not yet implemented; reject-and-evict is safe.
+Planned test arm: failed-apply arm asserting no state persists or appears in queries,
+and a retained resident is not detached.
+Status: enforced. Peer-state recovery remains follow-up work.
 
 **C4-13. Head mutation is atomic under a TOCTOU retry.**
 Invariant: comparison and the head/backends mutation stay consistent under

@@ -87,7 +87,11 @@ The policy is a JSON file with two top-level fields: `roles` and `collections`.
 
 Type: `Map<String, Vec<String>>`
 
-Maps each role name to its list of privilege strings. A role with `["*"]` is granted all privileges (wildcard).
+Maps each role name to its list of privilege strings. A role with `["*"]`
+satisfies every named privilege requirement, but still needs an explicit
+collection operation rule. Unconfigured collections and absent operation grants
+confer no access. Unconditional row scopes still apply; a scope with
+`unless_privilege` is skipped when that named privilege is satisfied.
 
 ### `collections`
 
@@ -193,39 +197,47 @@ Deserializes `AuthData` back into `JwtContext`:
 - `Root` context bypasses all checks.
 - Otherwise checks if any of the user's roles have a privilege matching the collection's `read` or `write` requirement.
 
-#### `filter_predicate`
+#### `query_predicate` / `retrieval_predicate`
 
-Narrows a query so storage returns only rows the caller may read. A caller may present several credentials (its context set) and may read any row that any one of them admits, so the query narrows to the union of per-credential scope slices -- the same any-of admission `check_read` applies row by row.
+Return the entities these credentials may access, independently of the caller's
+selection or where core evaluates the predicate. Query grants require a named
+`read` or `write` privilege; known-ID retrieval also accepts `retrieve`.
 
-- `Root` anywhere in the context set: returns the predicate unchanged.
-- No scope rules for the collection: returns the predicate unchanged. This check runs first, so an unscoped collection requires no authorized credential.
-- Otherwise walks every credential in the context set. A credential contributes nothing if it is `NoUser`, if its roles cannot access the collection, or if its scope variables cannot resolve (its filter names a claim the token does not carry -- skipped with a `tracing::warn`).
-- Each surviving credential contributes one slice: its read-applicable scope rules (`applies_to` covering reads), minus any whose `unless_privilege` it holds, `$jwt.*`-substituted from its own claims and AND-ed together. Equal slices deduplicate. A credential no rule constrains may read every row the caller asked for, so the union collapses: the caller's predicate is returned unchanged.
-- The query becomes `P AND (s1 OR s2 OR ...)` -- the caller's predicate stays factored in front of the union, where a storage planner reads indexable terms off the top-level conjunction.
-- No credential contributed a slice (none authorized, or none resolvable): the query is refused with `AccessDenied`.
+- `Root` returns `True`. Policy-record memberships remain readable for bootstrap.
+- Each configured component contributes `MemberOf(id) AND scope`, where scope is
+  the union of its authorized credentials' slices. One actual membership granting
+  access is sufficient; an unconfigured membership contributes nothing.
+- A credential's applicable scope rules are AND-ed after substituting its claims.
+  A satisfied `unless_privilege` skips that rule. Missing or invalid claims and
+  unresolved restrictions contribute no grant, without invalidating other grants.
+- Core's `ReadPolicy` intersects the query predicate with the caller's selection.
+  A successful composition does not imply any matching rows or usable grants for
+  that selection. Known-ID reads use the retrieval predicate in storage, or
+  against a resident entity. Both local and peer Get distinguish missing from
+  denied entities; denied state is not returned. A peer denial does not fall
+  back to cached state. Ordinary fetches continue filtering unauthorized rows.
 
-#### `check_event` / `check_write`
+#### `check_state` / `check_write`
 
-The row-level half of write scoping: a non-privileged writer may only touch rows inside its write scope. `check_write` gates a local write against the entity's current state; `check_event` gates an applied event against both the entity as it stood before (when it has history) and as the event leaves it, so an update can neither start from nor produce a row outside the writer's scope.
+The row-level half of write scoping: `check_write` gates local create/edit against
+the current state. After each event is applied, `check_state` checks the transaction's
+original state and the resulting entity state; creation has no original state.
+An existing membership must authorize both states, so a newly added membership
+cannot authorize its own addition. JWT adds no event-specific check or attestation
+in `check_event`; other agents may do so. Any event or state rejection rolls
+back the storage transaction.
 
 - `Root` context: always allowed.
-- `jwtpolicy` collection: only `Root` can write.
-- Catalog collections (`check_event` only): `NoUser` is refused; any authenticated caller passes, because core admits catalog writes only through the schema-registration executor, whose policy check already ran.
+- JWT policy entities: only privileged JWT contexts can write.
+- Catalog entities: core permits only its internal privileged context to write them; schema-registration permissions are checked before that context is used.
 - `NoUser`: all writes denied.
 - Otherwise requires `can_write_collection` for the writer's roles, then evaluates the write-applicable scope rules (`applies_to` covering writes, minus any whose `unless_privilege` the writer holds), `$jwt.*`-substituted from the writer's claims, against the entity: every predicate must hold, or the write is refused.
 - Asymmetry with the read side, on purpose: a write-scope filter naming a claim the token does not carry refuses the write rather than skipping the credential. On reads a skipped credential merely contributes nothing to the union; on writes skipping would drop the constraint and fail open.
 
-#### `check_read`
-
-The row-level half of read scoping: admits or refuses one entity by its serialized state, where `filter_predicate` narrows the query up front.
-
-- Requires `can_access_collection`. `Root` passes unconditionally.
-- No scope rules for the collection: allowed.
-- Otherwise materializes the state into a `TemporaryEntity` (a state that cannot be evaluated is refused) and walks the caller's credentials: a credential admits the row when every one of its read-applicable, substituted scope predicates evaluates true, and the first admitting credential allows the read. Unauthorized and unresolvable credentials are skipped exactly as in `filter_predicate` (logged at `debug` -- the query half already warned once per query), so credential order cannot change the answer. A credential no rule constrains admits every row. A scope predicate that fails to evaluate against the row refuses the read; so does running out of credentials.
-
 #### `check_read_event`
 
-`Root` passes; otherwise delegates to `can_access_collection` for the event's collection.
+Core first applies the retrieval predicate to the event's entity. PolicyAgent
+may then impose additional event-specific restrictions; JwtAgent adds none.
 
 #### `validate_received_event` / `validate_received_state` / `attest_state` / `validate_causal_assertion`
 

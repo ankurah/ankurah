@@ -76,7 +76,7 @@ impl RegistrantProperty for StructProperty {
 impl ModelStructDescriptor {
     /// Return this struct's bound model identity for `epoch`.
     pub(crate) fn model_id(&self, epoch: SystemEpoch) -> Result<ModelId, RetrievalError> {
-        self.resolved.get(epoch).ok_or_else(|| RetrievalError::UnboundDeclaration { label: self.label.into() })
+        self.resolved.get(epoch).map_err(|_| RetrievalError::UnboundDeclaration { label: self.label.into() })
     }
 
     pub(crate) fn registrant(&'static self, epoch: SystemEpoch) -> DescriptorRegistrant {
@@ -97,11 +97,11 @@ impl ModelStructDescriptor {
         let model = match self.system {
             Some(system) => ModelId::System(system),
             None => {
-                if self.resolved.get(epoch).is_none() {
+                if self.resolved.get(epoch).is_err() {
                     let mut registrant = self.registrant(epoch);
                     catalog.resolve_local(&mut registrant)?;
                 }
-                self.resolved.get(epoch).ok_or_else(|| RetrievalError::UnboundDeclaration { label: self.label.to_string() })?
+                self.model_id(epoch)?
             }
         };
         let resolver = DescriptorResolver { schema: self, epoch, catalog };
@@ -123,7 +123,7 @@ impl ModelStructDescriptor {
     /// Look up a field's binding in `epoch`; this does not check whether that epoch is still current.
     pub fn resolved_field_at(&'static self, index: usize, epoch: super::SystemEpoch) -> Result<PropertyId, crate::property::PropertyError> {
         let field = &self.properties[index];
-        field.resolved.get(epoch).ok_or(crate::property::PropertyError::Unresolved { model: self.label, field: field.field })
+        field.resolved.get(epoch).map_err(|_| crate::property::PropertyError::Unresolved { model: self.label, field: field.field })
     }
 }
 
@@ -259,7 +259,7 @@ mod tests {
             } else {
                 assert!(matches!(error, RegistrationError::ReservedCollection(found) if found == label));
             }
-            assert!(schema.resolved.get(epoch).is_none());
+            assert!(schema.resolved.get(epoch).is_err());
         }
         assert_eq!(catalog.counts(), (0, 0, 0));
     }

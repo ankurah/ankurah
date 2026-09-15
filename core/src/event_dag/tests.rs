@@ -19,6 +19,7 @@ use super::comparison::compare;
 use super::relation::AbstractCausalRelation;
 use ankurah_proto::{Clock, EntityId, Event, EventId, OperationSet};
 use async_trait::async_trait;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
@@ -77,7 +78,7 @@ fn make_test_event(seed: u8, parent_ids: &[EventId]) -> Event {
     let entity_id = EntityId::from_bytes(entity_id_bytes);
 
     let parent = Clock::from(parent_ids.to_vec());
-    Event { entity_id, collection: "test".into(), body: fixture_body(&[seed], &parent, OperationSet::default()), parent }
+    Event { entity_id, body: fixture_body(&[seed], &parent, OperationSet::default()), parent }
 }
 
 /// Like make_test_event but with a two-byte seed, for tests that need a wide
@@ -87,7 +88,7 @@ fn make_test_event_u16(seed: u16, parent_ids: &[EventId]) -> Event {
     entity_id_bytes[0..2].copy_from_slice(&seed.to_be_bytes());
     let entity_id = EntityId::from_bytes(entity_id_bytes);
     let parent = Clock::from(parent_ids.to_vec());
-    Event { entity_id, collection: "test".into(), body: fixture_body(&seed.to_be_bytes(), &parent, OperationSet::default()), parent }
+    Event { entity_id, body: fixture_body(&seed.to_be_bytes(), &parent, OperationSet::default()), parent }
 }
 
 /// Create a Clock from EventIds without consuming them.
@@ -113,7 +114,6 @@ fn make_lww_event(seed: u8, properties: Vec<(&str, &str)>) -> Event {
     let parent = Clock::default();
     Event {
         entity_id,
-        collection: "test".into(),
         body: fixture_body(&[seed], &parent, OperationSet::from_backends(BTreeMap::from([("lww".to_string(), ops)]))),
         parent,
     }
@@ -1374,7 +1374,6 @@ mod yrs_layer_tests {
         let parent = Clock::default();
         Event {
             entity_id,
-            collection: "test".into(),
             body: fixture_body(&[seed], &parent, OperationSet::from_backends(BTreeMap::from([("yrs".to_string(), ops)]))),
             parent,
         }
@@ -1611,7 +1610,6 @@ mod edge_case_tests {
         let parent = Clock::default();
         let empty_event = Event {
             entity_id,
-            collection: "test".into(),
             body: fixture_body(&[99], &parent, OperationSet::default()), // No operations
             parent,
         };
@@ -1678,7 +1676,6 @@ mod edge_case_tests {
         let parent = Clock::default();
         let delete_event = Event {
             entity_id,
-            collection: "test".into(),
             body: fixture_body(&[2], &parent, OperationSet::from_backends(BTreeMap::from([("lww".to_string(), ops)]))),
             parent,
         };
@@ -1835,7 +1832,6 @@ mod phase4_idempotency {
 #[cfg(test)]
 mod phase4_duplicate_creation {
     use super::*;
-    use crate::entity::Entity;
     use crate::error::MutationError;
 
     fn make_creation_event(seed: u8) -> Event {
@@ -1852,7 +1848,6 @@ mod phase4_duplicate_creation {
         let parent = Clock::default(); // no parent = genesis
         Event {
             entity_id,
-            collection: "test".into(),
             body: fixture_body(&[seed], &parent, OperationSet::from_backends(BTreeMap::from([("lww".to_string(), ops)]))),
             parent,
         }
@@ -1863,7 +1858,8 @@ mod phase4_duplicate_creation {
         let mut entity_id_bytes = [0u8; 32];
         entity_id_bytes[0] = 42;
         let entity_id = EntityId::from_bytes(entity_id_bytes);
-        let entity = Entity::create(entity_id, "test".into(), crate::schema::SystemEpoch::BOOTSTRAP);
+        let entities = crate::entity::WeakEntitySet::new(crate::schema::SystemEpoch::BOOTSTRAP);
+        let entity = entities.create_root(entity_id);
 
         let mut retriever = MockRetriever::new();
 
@@ -1871,7 +1867,7 @@ mod phase4_duplicate_creation {
         let creation_event_1 = make_creation_event(1);
         retriever.add_event(creation_event_1.clone());
 
-        let result = entity.apply_event(&retriever, &creation_event_1).await;
+        let result = entity.apply_event(&retriever, Cow::Owned(creation_event_1.into())).await;
         assert!(result.is_ok(), "First creation event should succeed");
         assert!(result.unwrap(), "First creation event should return true (applied)");
 
@@ -1882,7 +1878,7 @@ mod phase4_duplicate_creation {
         // BFS detects two different roots -> Disjoint -> LineageError::Disjoint
         let creation_event_2 = make_creation_event(2);
         retriever.add_event(creation_event_2.clone());
-        let result = entity.apply_event(&retriever, &creation_event_2).await;
+        let result = entity.apply_event(&retriever, Cow::Owned(creation_event_2.into())).await;
 
         assert!(result.is_err(), "Second creation event should fail");
         let err = result.unwrap_err();
@@ -1894,7 +1890,8 @@ mod phase4_duplicate_creation {
         let mut entity_id_bytes = [0u8; 32];
         entity_id_bytes[0] = 42;
         let entity_id = EntityId::from_bytes(entity_id_bytes);
-        let entity = Entity::create(entity_id, "test".into(), crate::schema::SystemEpoch::BOOTSTRAP);
+        let entities = crate::entity::WeakEntitySet::new(crate::schema::SystemEpoch::BOOTSTRAP);
+        let entity = entities.create_root(entity_id);
 
         let mut retriever = MockRetriever::new();
 
@@ -1902,12 +1899,12 @@ mod phase4_duplicate_creation {
         let creation_event = make_creation_event(1);
         retriever.add_event(creation_event.clone());
 
-        let result = entity.apply_event(&retriever, &creation_event).await;
+        let result = entity.apply_event(&retriever, Cow::Owned(creation_event.clone().into())).await;
         assert!(result.is_ok() && result.unwrap(), "First apply should succeed");
 
         // Re-deliver the SAME creation event (same content, same id)
         // Since event_stored returns false but event is at head, comparison returns Equal -> no-op
-        let result = entity.apply_event(&retriever, &creation_event).await;
+        let result = entity.apply_event(&retriever, Cow::Owned(creation_event.into())).await;
         assert!(result.is_ok(), "Re-delivery of same creation event should not error");
         assert!(!result.unwrap(), "Re-delivery should return false (no-op)");
     }
@@ -2676,7 +2673,8 @@ mod strict_descends_gap_jump {
         let mut entity_id_bytes = [0u8; 32];
         entity_id_bytes[0] = 42;
         let entity_id = EntityId::from_bytes(entity_id_bytes);
-        let entity = Entity::create(entity_id, "test".into(), crate::schema::SystemEpoch::BOOTSTRAP);
+        let entities = crate::entity::WeakEntitySet::new(crate::schema::SystemEpoch::BOOTSTRAP);
+        let entity = entities.create_root(entity_id);
 
         let mut retriever = MockRetriever::new();
 
@@ -2697,7 +2695,7 @@ mod strict_descends_gap_jump {
         retriever.add_event(ev_b.clone());
 
         // Establish local head = {A}.
-        assert!(entity.apply_event(&retriever, &ev_a).await.unwrap(), "A should apply");
+        assert!(entity.apply_event(&retriever, Cow::Owned(ev_a.into())).await.unwrap(), "A should apply");
         assert_eq!(entity.head(), Clock::from(vec![id_a.clone()]));
         assert_eq!(read_lww(&entity, "p0"), Some(Value::String("genesis".into())));
 
@@ -2708,7 +2706,7 @@ mod strict_descends_gap_jump {
         assert_eq!(sorted_ids, vec![id_x.clone(), id_b.clone()], "sort must place parent X before child B");
 
         for event in &sorted {
-            assert!(entity.apply_event(&retriever, &event.payload).await.unwrap(), "each event applies in causal order");
+            assert!(entity.apply_event(&retriever, Cow::Borrowed(event)).await.unwrap(), "each event applies in causal order");
         }
 
         assert_eq!(entity.head(), Clock::from(vec![id_b.clone()]), "head advanced to B");
@@ -2975,7 +2973,6 @@ mod comparison_property {
 mod entity_change_batches {
     use super::*;
     use crate::changes::EntityChange;
-    use crate::entity::Entity;
     use crate::property::backend::lww::LWWBackend;
     use crate::property::backend::PropertyBackend;
     use ankurah_proto::Attested;
@@ -2993,7 +2990,6 @@ mod entity_change_batches {
         let parent = Clock::from(parent_ids.to_vec());
         Event {
             entity_id,
-            collection: "test".into(),
             body: fixture_body(
                 entity_id.to_bytes().as_slice(),
                 &parent,
@@ -3012,7 +3008,8 @@ mod entity_change_batches {
         let mut entity_id_bytes = [0u8; 32];
         entity_id_bytes[0] = 77;
         let entity_id = EntityId::from_bytes(entity_id_bytes);
-        let entity = Entity::create(entity_id, "test".into(), crate::schema::SystemEpoch::BOOTSTRAP);
+        let entities = crate::entity::WeakEntitySet::new(crate::schema::SystemEpoch::BOOTSTRAP);
+        let entity = entities.create_root(entity_id);
 
         let mut retriever = MockRetriever::new();
 
@@ -3023,9 +3020,9 @@ mod entity_change_batches {
         let ev_b = lww_event_for(entity_id, vec![("p2", "from_b")], &[ev_x.id()]);
         retriever.add_event(ev_b.clone());
 
-        assert!(entity.apply_event(&retriever, &ev_a).await.unwrap());
-        assert!(entity.apply_event(&retriever, &ev_x).await.unwrap());
-        assert!(entity.apply_event(&retriever, &ev_b).await.unwrap());
+        assert!(entity.apply_event(&retriever, Cow::Owned(ev_a.clone().into())).await.unwrap());
+        assert!(entity.apply_event(&retriever, Cow::Owned(ev_x.clone().into())).await.unwrap());
+        assert!(entity.apply_event(&retriever, Cow::Owned(ev_b.clone().into())).await.unwrap());
         assert_eq!(entity.head(), Clock::from(vec![ev_b.id()]));
 
         let batch = vec![Attested::opt(ev_x.clone(), None), Attested::opt(ev_b.clone(), None)];

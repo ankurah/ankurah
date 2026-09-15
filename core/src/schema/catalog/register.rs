@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use ankurah_core_types::Value;
-use ankurah_proto::{self as proto, EntityId, PropertyId};
+use ankurah_proto::{self as proto, EntityId, ModelId, PropertyId, SystemModel};
 
 use super::{CatalogManager, SysModelPropertyRow, SysModelRow, SysPropertyRow};
 use crate::error::RetrievalError;
@@ -69,7 +69,7 @@ pub(crate) trait Registrant {
 }
 
 /// Populate from the local catalog, registering here or through a durable peer when needed.
-/// Wait for node readiness; registration authority is needed only if local resolution cannot satisfy the declaration.
+/// Wait for the catalog; registration authority is needed only if local resolution cannot satisfy the declaration.
 pub(super) async fn resolve_or_register<SE, PA, R>(
     catalog: &CatalogManager,
     node: &Node<SE, PA>,
@@ -155,7 +155,7 @@ where
                 if row.name == name {
                     plan.existing.push(id);
                 } else {
-                    plan.updates.push(planned(model_collection(), id, "name", string(&row.name), string(&name)));
+                    plan.updates.push(planned(ModelId::System(SystemModel::Model), id, "name", string(&row.name), string(&name)));
                     transaction.get::<SysModelRow>(&id).await?.name()?.set(&name)?;
                     row.name = name.clone();
                 }
@@ -216,13 +216,19 @@ where
                                 let mutable = transaction.get::<SysPropertyRow>(&id).await?;
                                 if rename {
                                     let name = property.name().to_string();
-                                    plan.updates.push(planned(property_collection(), id, "name", string(&row.name), string(&name)));
+                                    plan.updates.push(planned(
+                                        ModelId::System(SystemModel::Property),
+                                        id,
+                                        "name",
+                                        string(&row.name),
+                                        string(&name),
+                                    ));
                                     mutable.name()?.set(&name)?;
                                     row.name = name;
                                 }
                                 if retarget {
                                     plan.updates.push(planned(
-                                        property_collection(),
+                                        ModelId::System(SystemModel::Property),
                                         id,
                                         "target_model",
                                         entity(row.target_model),
@@ -268,6 +274,7 @@ where
                 .check_schema_registration(node, principal, &plan)
                 .map_err(|source| RegistrationError::PolicyDenied { collection: label.clone(), source })?;
         }
+        let _authoring = node.policy_agent.schema_registered(node, &transaction, &plan).await.map_err(crate::error::MutationError::from)?;
         transaction.commit().await?;
     }
     populate(registrant, model_id, model_row, registered_properties)
@@ -514,7 +521,7 @@ async fn set_membership_optional(
         plan.existing.push(membership);
     } else {
         plan.updates.push(planned(
-            model_property_collection(),
+            ModelId::System(SystemModel::ModelProperty),
             membership,
             "optional",
             Some(Value::Bool(current)),

@@ -1,8 +1,15 @@
+// I'm skeptical that this recursion limit is right - most likely it
+// got bumped up during a feature unification problem, and never reduced back
 #![recursion_limit = "1024"]
 
 mod agent;
 mod agent_state;
+mod authoring;
 mod claims;
+mod catalog;
+mod bound_predicate;
+mod bound_policy;
+mod graph;
 mod config;
 mod context;
 mod error;
@@ -15,7 +22,8 @@ mod watcher;
 #[cfg(feature = "uniffi")]
 uniffi::setup_scaffolding!();
 
-pub use agent::{AgentState, JwtAgent, ModelLabelResolver, SelectionResolver};
+pub use agent::{AgentState, JwtAgent};
+pub use catalog::PolicyCatalog;
 pub use claims::{parse_claims_unverified, JwtClaims};
 pub use config::{PolicyConfig, ScopeRule, ScopeRuleOp};
 pub use context::JwtContext;

@@ -21,8 +21,8 @@ async fn test_two_ephemeral_independent_writes() -> Result<()> {
     let _conn1 = LocalProcessConnection::new(&ephemeral1, &durable).await?;
     let _conn2 = LocalProcessConnection::new(&ephemeral2, &durable).await?;
 
-    ephemeral1.system.wait_system_ready().await.unwrap();
-    ephemeral2.system.wait_system_ready().await.unwrap();
+    ephemeral1.wait_ready().await?;
+    ephemeral2.wait_ready().await?;
 
     let ctx_d = durable.context(DEFAULT_CONTEXT)?;
     let ctx_e1 = ephemeral1.context(DEFAULT_CONTEXT)?;
@@ -77,8 +77,7 @@ async fn test_two_ephemeral_independent_writes() -> Result<()> {
     assert_eq!(results_e2[0].year().unwrap(), "2025");
 
     // Verify DAG structure on D
-    let collection_d = ctx_d.collection(&Album::collection()).await?;
-    let events = collection_d.dump_entity_events(album_id).await?;
+    let events = durable.storage.dump_entity_events(album_id).await?;
 
     assert_dag!(dag, events, {
         A => [],
@@ -102,8 +101,8 @@ async fn test_two_ephemeral_same_property_conflict() -> Result<()> {
     let _conn1 = LocalProcessConnection::new(&ephemeral1, &durable).await?;
     let _conn2 = LocalProcessConnection::new(&ephemeral2, &durable).await?;
 
-    ephemeral1.system.wait_system_ready().await.unwrap();
-    ephemeral2.system.wait_system_ready().await.unwrap();
+    ephemeral1.wait_ready().await?;
+    ephemeral2.wait_ready().await?;
 
     let ctx_d = durable.context(DEFAULT_CONTEXT)?;
     let ctx_e1 = ephemeral1.context(DEFAULT_CONTEXT)?;
@@ -172,9 +171,9 @@ async fn test_three_ephemeral_three_way_race() -> Result<()> {
     let _conn2 = LocalProcessConnection::new(&ephemeral2, &durable).await?;
     let _conn3 = LocalProcessConnection::new(&ephemeral3, &durable).await?;
 
-    ephemeral1.system.wait_system_ready().await.unwrap();
-    ephemeral2.system.wait_system_ready().await.unwrap();
-    ephemeral3.system.wait_system_ready().await.unwrap();
+    ephemeral1.wait_ready().await?;
+    ephemeral2.wait_ready().await?;
+    ephemeral3.wait_ready().await?;
 
     let ctx_d = durable.context(DEFAULT_CONTEXT)?;
     let ctx_e1 = ephemeral1.context(DEFAULT_CONTEXT)?;
@@ -220,8 +219,7 @@ async fn test_three_ephemeral_three_way_race() -> Result<()> {
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
 
     // Verify DAG structure on D - all three concurrent from A
-    let collection_d = ctx_d.collection(&Album::collection()).await?;
-    let events = collection_d.dump_entity_events(album_id).await?;
+    let events = durable.storage.dump_entity_events(album_id).await?;
 
     assert_dag!(dag, events, {
         A => [],

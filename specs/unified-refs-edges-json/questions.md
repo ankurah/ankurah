@@ -21,9 +21,9 @@
 2. Know which collection to fetch from (e.g., "artist")
 3. Fetch that entity and continue
 
-Currently, **EntityId does not encode collection**. `get_entity()` requires both:
+Currently, **EntityId does not encode a Model projection**. `get_entity()` requires both:
 ```rust
-async fn get_entity(&self, id: proto::EntityId, collection: &proto::CollectionId, cached: bool)
+async fn get_entity(&self, id: proto::EntityId, model: &proto::ModelId, cached: bool)
 ```
 
 **Options**:
@@ -39,7 +39,7 @@ async fn get_entity(&self, id: proto::EntityId, collection: &proto::CollectionId
 ```rust
 impl AlbumView {
     pub fn ref_targets() -> &'static [(&'static str, &'static str)] {
-        &[("artist", "artist")]  // (field_name, collection_id)
+        &[("artist", "artist")]  // (field_name, model label)
     }
 }
 ```
@@ -250,4 +250,3 @@ If needed in future, ALL should be a **modifier on the traversal filter**, not a
 - Q11: ALL semantics — ANY is default; ALL would be a traversal filter modifier if ever added
 - Q12: Compile-time IDs — Non-goal for this project
 - Q13: Schema evolution — Omitted
-

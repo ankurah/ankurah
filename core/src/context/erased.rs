@@ -1,4 +1,5 @@
 use crate::internal::prelude::*;
+use crate::{error::NodeDropped, node::NodeErased};
 use crate::reactor::LocalEntitySource;
 use ankql::ast::{Parsed, Resolved, Selection};
 use ankurah_proto::Event;
@@ -10,8 +11,8 @@ use super::SchemaResolver;
 /// Type-erased operations on a context's node and auth state.
 #[async_trait]
 pub(crate) trait DynContextInner: LocalEntitySource {
-    /// Remove the remote subscription when the livequery is dropped.
-    fn unsubscribe_remote_query(&self, query_id: proto::QueryId);
+    /// Access the node, retaining it for the caller; fail if a weak handle has expired.
+    fn node(&self) -> Result<Arc<dyn NodeErased>, NodeDropped>;
 
     /// Subscribe or update a resolved livequery using this context's sessions.
     /// Return `false` if the node has no relay.

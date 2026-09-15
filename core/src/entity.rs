@@ -2,15 +2,15 @@ use crate::event_dag::DEFAULT_BUDGET;
 use crate::retrieval::{GetEvents, GetState};
 use crate::selection::filter::Filterable;
 use crate::{
+    changes::EntityChange,
     error::{LineageError, MutationError, RetrievalError, StateError},
     event_dag::AbstractCausalRelation,
-    model::{Model, View},
     property::backend::{backend_from_string, PropertyBackend},
-    reactor::AbstractEntity,
+    reactor::{AbstractEntity, ChangeNotification},
     value::Value,
 };
 use ankql::ast::PropertyId;
-use ankurah_proto::{AuthorId, Clock, EntityId, EntityState, Event, EventId, ModelId, OperationSet, State};
+use ankurah_proto::{Attested, AuthorId, Clock, EntityId, EntityState, Event, EventId, ModelId, OperationSet, State};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
@@ -28,8 +28,10 @@ pub enum StateApplyResult {
     Older,
 }
 
-/// A model-independent entity. Entity can only be constructed via a WeakEntitySet
-/// which provides duplication guarantees.
+/// A uniquely identified entity with properties and model memberships.
+/// Use it directly for dynamic access, or through typed model views.
+///
+/// A resident of a [`WeakEntitySet`], or a transaction fork retaining that resident.
 #[derive(Debug, Clone)]
 pub struct Entity(Arc<EntityInner>);
 
@@ -37,7 +39,9 @@ pub struct Entity(Arc<EntityInner>);
 /// Used only for reconstituting state to filter database results. No duplication guarantees are provided
 pub struct TemporaryEntity(Arc<EntityInner>);
 
+mod event_getter;
 mod membership;
+use event_getter::TransactionEventGetter;
 use membership::MembershipSet;
 
 /// Where a model writes its initial values before the entity they describe has
@@ -169,8 +173,13 @@ pub struct EntityInner {
 
 #[derive(Debug)]
 pub enum EntityKind {
-    Primary,                                                     // New or resident entity - TODO delineate these
-    Transacted { trx_alive: Arc<AtomicBool>, upstream: Entity }, // Transaction fork with liveness tracking
+    Primary, // New or resident entity - TODO delineate these
+    Transacted {
+        trx_alive: Arc<AtomicBool>,
+        upstream: Entity,
+        /// Applied events retained for publication after admission and storage commit.
+        events: std::sync::Mutex<Vec<Attested<Event>>>,
+    },
 }
 
 impl std::ops::Deref for Entity {
@@ -255,9 +264,6 @@ impl Entity {
         Ok(EntityState { entity_id: self.id(), state })
     }
 
-    #[cfg(test)]
-    pub(crate) fn create(id: EntityId, system_epoch: crate::schema::SystemEpoch) -> Self { Self::new(id, system_epoch) }
-
     fn new(id: EntityId, system_epoch: crate::schema::SystemEpoch) -> Self {
         Self(Arc::new(EntityInner {
             id,
@@ -340,6 +346,26 @@ impl Entity {
         self.state.write().unwrap().head = new_head;
     }
 
+    /// Publish this fork's events to its immediate upstream, returning the resulting change.
+    /// A primary entity is a no-op; storage must commit first.
+    pub(crate) async fn commit<E>(self, getter: &E) -> Result<Option<EntityChange>, MutationError>
+    where E: GetEvents + Send + Sync {
+        let EntityKind::Transacted { upstream, events, .. } = &self.kind else { return Ok(None) };
+        let events = std::mem::take(&mut *events.lock().unwrap());
+        let mut resident = upstream;
+        while let EntityKind::Transacted { upstream, .. } = &resident.kind {
+            resident = upstream;
+        }
+        let mut change = EntityChange::new(resident.clone(), Vec::new())?;
+        for event in events {
+            let getter = TransactionEventGetter::committing(change.events(), &event.payload, getter);
+            if resident.apply_event_inner(&getter, &event.payload).await? {
+                change.push_event(event)?;
+            }
+        }
+        Ok((!change.events().is_empty()).then_some(change))
+    }
+
     /// Attempts to mutate the entity state if the head matches the expected value.
     ///
     /// This provides TOCTOU protection: grabs the write lock, checks that `state.head == expected_head`,
@@ -359,12 +385,21 @@ impl Entity {
         Ok(true)
     }
 
-    pub fn view<V: View>(&self) -> Option<V> {
-        let model = V::Model::descriptor().resolved.get(self.system_epoch)?;
-        self.has_membership(&model).then(|| V::from_entity(self.clone()))
+    /// Apply an event, retaining it on transaction forks for publication by `commit`.
+    /// The current event and pending fork events are available to causal lookup without staging.
+    pub async fn apply_event<E>(&self, getter: &E, event: impl Into<Attested<Event>>) -> Result<bool, MutationError>
+    where E: GetEvents + Send + Sync {
+        let event = event.into();
+        let getter = TransactionEventGetter::applying(&self.kind, &event.payload, getter);
+        let applied = self.apply_event_inner(&getter, &event.payload).await?;
+        if applied {
+            if let EntityKind::Transacted { events, .. } = &self.kind {
+                events.lock().unwrap().push(event);
+            }
+        }
+        Ok(applied)
     }
 
-    /// Attempt to apply an event to the entity
     #[cfg_attr(feature = "instrument", tracing::instrument(level="debug", skip_all, fields(entity = %self, event = %event)))]
     pub async fn apply_event<E>(&self, getter: &E, event: &Event) -> Result<bool, MutationError>
     where E: GetEvents + Send + Sync {
@@ -374,8 +409,8 @@ impl Entity {
         // - Event already in head -> Equal -> no-op (Ok(false))
         // - Event is ancestor of head -> StrictAscends -> no-op (Ok(false))
         // - Event re-delivered but already integrated -> BFS finds it -> StrictAscends
-        // Persistence is not application: an event may already be stored but
-        // still need to be applied to this entity.
+        // Storage presence alone does not prove application: callers can persist
+        // events before applying them to a resident.
 
         // Creation event on entity with non-empty head: either re-delivery or attack.
         // On durable nodes (definitive storage), we can cheaply distinguish:
@@ -647,14 +682,14 @@ impl Entity {
         Ok(Self(Arc::new(EntityInner {
             id: self.id,
             state: std::sync::RwLock::new(EntityInnerState { head: event_id.into(), memberships, backends }),
-            kind: EntityKind::Transacted { trx_alive, upstream: self.clone() },
+            kind: EntityKind::Transacted { trx_alive, upstream: self.clone(), events: Default::default() },
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
             system_epoch: self.system_epoch,
         })))
     }
 
-    /// Create a snapshot of the Entity which is detached from this one, and will not receive the updates this one does
-    /// The trx_alive parameter tracks whether the transaction that owns this snapshot is still alive
+    /// Fork transaction-local state, retaining the upstream entity but not observing its updates.
+    /// The trx_alive parameter tracks whether the transaction that owns this snapshot is still alive.
     pub fn snapshot(&self, trx_alive: Arc<AtomicBool>) -> Self {
         // Inline fork logic
         let state = self.state.read().expect("other thread panicked, panic here too");
@@ -670,7 +705,7 @@ impl Entity {
                 memberships: state.memberships.clone(),
                 backends: forked,
             }),
-            kind: EntityKind::Transacted { trx_alive, upstream: self.clone() },
+            kind: EntityKind::Transacted { trx_alive, upstream: self.clone(), events: Default::default() },
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
             system_epoch: self.system_epoch,
         }))
@@ -703,7 +738,7 @@ impl Entity {
 
 // Implement AbstractEntity for Entity (used by reactor)
 impl AbstractEntity for Entity {
-    fn memberships(&self) -> BTreeSet<ModelId> { Entity::memberships(self) }
+    fn memberships(&self) -> BTreeSet<ModelId> { self.memberships() }
 
     fn id(&self) -> &ankurah_proto::EntityId { &self.id }
 
@@ -770,7 +805,7 @@ impl TemporaryEntity {
 // TODO - clean this up and consolidate with Entity somehow, while still preventing anyone from creating unregistered (non-temporary) Entities
 impl Filterable for TemporaryEntity {
     fn is_member_of(&self, model: &ModelId) -> Result<bool, crate::selection::filter::Error> {
-        Ok(self.0.state.read().expect("other thread panicked, panic here too").memberships.is_applied(model))
+        Ok(self.0.state.read().unwrap().memberships.is_applied(model))
     }
 
     fn value(&self, property: &PropertyId) -> Option<Value> {
@@ -806,7 +841,12 @@ impl WeakEntitySet {
 
     pub fn get(&self, id: &EntityId) -> Option<Entity> { self.entities.read().unwrap().get(id)?.upgrade() }
 
-    pub async fn get_or_retrieve<S, E>(&self, state_getter: &S, event_getter: &E, id: &EntityId) -> Result<Option<Entity>, RetrievalError>
+    pub async fn get_or_retrieve<S, E>(
+        &self,
+        state_getter: &S,
+        event_getter: &E,
+        id: &EntityId,
+    ) -> Result<Option<Entity>, RetrievalError>
     where
         S: GetState + Send + Sync,
         E: GetEvents + Send + Sync,
@@ -824,7 +864,12 @@ impl WeakEntitySet {
     }
     /// Return a resident entity, load its stored state, or insert an empty instance for this id.
     /// The empty instance awaits incoming state or events; this does not mint a genesis event.
-    pub async fn get_retrieve_or_create<S, E>(&self, state_getter: &S, event_getter: &E, id: &EntityId) -> Result<Entity, RetrievalError>
+    pub async fn get_retrieve_or_create<S, E>(
+        &self,
+        state_getter: &S,
+        event_getter: &E,
+        id: &EntityId,
+    ) -> Result<Entity, RetrievalError>
     where
         S: GetState + Send + Sync,
         E: GetEvents + Send + Sync,
@@ -846,7 +891,11 @@ impl WeakEntitySet {
 
     /// Create an entity from its genesis event, returning its transaction-local state.
     /// The resident primary stays empty until commit.
-    pub(crate) fn create_entity(&self, genesis: &Event, trx_alive: Arc<AtomicBool>) -> Result<Entity, MutationError> {
+    pub(crate) fn create_entity(
+        &self,
+        genesis: &Event,
+        trx_alive: Arc<AtomicBool>,
+    ) -> Result<Entity, MutationError> {
         let primary = Entity::new(genesis.entity_id, self.system_epoch);
         let transaction_entity = primary.snapshot_after_genesis(genesis, trx_alive)?;
         let mut entities = self.entities.write().unwrap();
@@ -856,25 +905,6 @@ impl WeakEntitySet {
         }
         entities.insert(primary.id, primary.weak());
         Ok(transaction_entity)
-    }
-
-    /// Evict an entity from the set only if it is absent from storage-backed
-    /// life: resident with an empty head (or already dead). An empty-head
-    /// resident is a phantom, materialized speculatively for an incoming
-    /// update that then failed to apply; leaving it resident makes the entity
-    /// appear to exist with no state. Returns true if an entry was removed.
-    pub fn remove_if_phantom(&self, id: &EntityId) -> bool {
-        let mut entities = self.entities.write().unwrap();
-        if let Some(weak) = entities.get(id) {
-            if let Some(entity) = weak.upgrade() {
-                if !entity.head().is_empty() {
-                    return false;
-                }
-            }
-            entities.remove(id);
-            return true;
-        }
-        false
     }
 
     /// TEST ONLY: Create a phantom entity with a specific ID.
@@ -889,10 +919,8 @@ impl WeakEntitySet {
     /// Requires the `test-helpers` feature to be enabled.
     #[cfg(feature = "test-helpers")]
     pub fn conjure_evil_phantom(&self, id: EntityId, model: ModelId) -> Entity {
-        let mut entities = self.entities.write().unwrap();
-        let entity = Entity::new(id, self.system_epoch);
-entity.state.write().unwrap().memberships.apply(model);
-        entities.insert(id, entity.weak());
+        let entity = self.create_root(id);
+        entity.state.write().unwrap().memberships.apply(model);
         entity
     }
 
@@ -950,7 +978,8 @@ mod value_tests {
 
     #[test]
     fn resident_and_temporary_values_preserve_property_ids_and_missing_values() -> anyhow::Result<()> {
-        let entity = Entity::create(EntityId::from_bytes([1; 32]), SystemEpoch::allocate());
+        let entities = WeakEntitySet::new(SystemEpoch::allocate());
+        let entity = entities.create_root(EntityId::from_bytes([1; 32]));
         let backend = entity.get_backend::<LWWBackend>()?;
         let expected = BTreeMap::from([
             (PropertyId::EntityId(EntityId::from_bytes([2; 32])), Some(Value::String("value".into()))),
@@ -971,6 +1000,22 @@ mod value_tests {
 mod epoch_tests {
     use super::*;
     use crate::schema::SystemEpoch;
+
+    #[test]
+    fn transaction_forks_retain_the_same_resident() {
+        let entities = WeakEntitySet::new(SystemEpoch::allocate());
+        let id = EntityId::from_bytes([1; 32]);
+        let resident = entities.create_root(id);
+        let weak = resident.weak();
+        let fork = resident.snapshot(Arc::new(AtomicBool::new(true)));
+        let second_fork = fork.snapshot(Arc::new(AtomicBool::new(true)));
+        drop(resident);
+        drop(fork);
+        assert!(weak.upgrade().is_some());
+        assert_eq!(entities.get(&id), weak.upgrade());
+        drop(second_fork);
+        assert!(entities.get(&id).is_none());
+    }
 
     #[test]
     fn nodes_keep_independent_instances_and_bindings_for_the_same_entity() -> anyhow::Result<()> {

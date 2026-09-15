@@ -15,7 +15,7 @@ async fn test_one_notification_per_change() -> Result<()> {
     let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
 
     let _conn = LocalProcessConnection::new(&client, &server).await?;
-    client.system.wait_system_ready().await.unwrap();
+    client.wait_ready().await?;
 
     let server_ctx = server.context(DEFAULT_CONTEXT)?;
     let client_ctx = client.context(DEFAULT_CONTEXT)?;
@@ -73,7 +73,7 @@ async fn test_causal_notification_order() -> Result<()> {
     let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
 
     let _conn = LocalProcessConnection::new(&client, &server).await?;
-    client.system.wait_system_ready().await.unwrap();
+    client.wait_ready().await?;
 
     let server_ctx = server.context(DEFAULT_CONTEXT)?;
     let client_ctx = client.context(DEFAULT_CONTEXT)?;
@@ -138,9 +138,9 @@ async fn test_multi_subscriber_consistency() -> Result<()> {
     let _conn2 = LocalProcessConnection::new(&client2, &server).await?;
     let _conn3 = LocalProcessConnection::new(&client3, &server).await?;
 
-    client1.system.wait_system_ready().await.unwrap();
-    client2.system.wait_system_ready().await.unwrap();
-    client3.system.wait_system_ready().await.unwrap();
+    client1.wait_ready().await?;
+    client2.wait_ready().await?;
+    client3.wait_ready().await?;
 
     let server_ctx = server.context(DEFAULT_CONTEXT)?;
     let client1_ctx = client1.context(DEFAULT_CONTEXT)?;
@@ -213,7 +213,7 @@ async fn test_subscription_add_notification() -> Result<()> {
     let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
 
     let _conn = LocalProcessConnection::new(&client, &server).await?;
-    client.system.wait_system_ready().await.unwrap();
+    client.wait_ready().await?;
 
     let server_ctx = server.context(DEFAULT_CONTEXT)?;
     let client_ctx = client.context(DEFAULT_CONTEXT)?;

@@ -241,6 +241,8 @@ pub enum MutationError {
     LineageError(LineageError),
     #[error("peer rejected transaction")]
     PeerRejected,
+    #[error("transaction cannot continue after a failed operation")]
+    TransactionFailed,
     #[error("invalid event")]
     InvalidEvent,
     #[error("malformed event: {0}")]
@@ -275,6 +277,8 @@ pub enum MutationError {
     Anyhow(anyhow::Error),
     #[error("TOCTOU attempts exhausted")]
     TOCTOUAttemptsExhausted,
+    #[error("entity state changed before storage commit")]
+    WriteConflict,
 }
 
 impl From<NodeReadinessError> for MutationError {

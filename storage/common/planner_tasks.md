@@ -1,5 +1,9 @@
 # Planner Implementation Tasks
 
+> Historical planner task list. Backend discriminator examples such as
+> `__collection` are not part of the current `StorageEngine` contract; current
+> engines supply model/materialization scope privately.
+
 ## Overview
 
 The Planner generates all possible index scan plans for a query. Each plan represents a single index scan with a range that guarantees all matching records are included. The executor will apply the residual predicate to filter results.

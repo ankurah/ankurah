@@ -29,7 +29,7 @@ pub(super) struct LiveQueryInner {
     /// Resolved, policy-scoped intent; absent while initial resolution waits.
     pub(super) selection: Mut<Option<(ankql::ast::Selection<Resolved>, u32)>>,
     gap_fetcher: Arc<dyn GapFetcher<Entity>>,
-    pub(super) cached: bool,
+    pub(super) cache_policy: CachePolicy,
     pub(super) resolution_task: std::sync::Mutex<Option<RemoteHandle<()>>>,
     #[cfg(test)]
     before_wait: std::sync::Mutex<Option<Box<dyn FnOnce(&Self) + Send>>>,
@@ -40,7 +40,7 @@ impl LiveQueryInner {
     pub(super) fn new(
         context: Arc<dyn DynContextInner>,
         subscription: ReactorSubscription,
-        cached: bool,
+        cache_policy: CachePolicy,
     ) -> Self {
         let query_id = proto::QueryId::new();
         let gap_fetcher: Arc<dyn GapFetcher<Entity>> = Arc::new(QueryGapFetcher::new(Context(context.clone())));
@@ -59,7 +59,7 @@ impl LiveQueryInner {
             current_version: AtomicU32::new(1),
             selection: Mut::new(None),
             gap_fetcher,
-            cached,
+            cache_policy,
             resolution_task: std::sync::Mutex::new(None),
             #[cfg(test)]
             before_wait: std::sync::Mutex::new(None),
@@ -173,7 +173,7 @@ impl LiveQueryInner {
                 self.subscription.id(),
                 self.query_id,
                 selection,
-                self.context.as_ref(),
+                self.context.clone(),
                 self.resultset.clone(),
                 self.gap_fetcher.clone(),
                 version,
@@ -229,7 +229,7 @@ mod tests {
     fn query() -> EntityLiveQuery {
         let node = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
         let context = Context::new(node.clone(), DEFAULT_CONTEXT);
-        crate::livequery::EntityLiveQuery(Arc::new(LiveQueryInner::new(context.0, node.reactor.subscribe(), false)))
+        crate::livequery::EntityLiveQuery(Arc::new(LiveQueryInner::new(context.0, node.reactor.subscribe(), CachePolicy::Durable)))
     }
 
     #[tokio::test]

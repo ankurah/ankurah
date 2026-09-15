@@ -80,7 +80,7 @@ async fn server_edits_subscription() -> Result<()> {
 
     // Connect the nodes
     let _conn = LocalProcessConnection::new(&server, &client).await?;
-    client.system.wait_system_ready().await.unwrap();
+    client.wait_ready().await?;
 
     let server = server.context(c)?;
     let client = client.context(c)?;

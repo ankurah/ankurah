@@ -26,6 +26,7 @@ pub mod policy;
 pub mod property;
 pub mod query_value;
 pub mod reactor;
+pub(crate) mod remote_transaction;
 pub mod resultset;
 pub mod retrieval;
 pub mod selection;

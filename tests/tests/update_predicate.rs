@@ -58,7 +58,7 @@ async fn test_predicate_update_inter_node() -> Result<()> {
 
     // Connect the nodes
     let _conn = LocalProcessConnection::new(&server, &client).await?;
-    client.system.wait_system_ready().await.unwrap();
+    client.wait_ready().await?;
 
     let server_ctx = server.context(DEFAULT_CONTEXT)?;
     let client_ctx = client.context(DEFAULT_CONTEXT)?;

@@ -14,8 +14,8 @@ use async_trait::async_trait;
 use thiserror::Error;
 use tracing::debug;
 
-mod read;
-pub(crate) use read::ReadPolicy;
+mod context;
+pub use context::ContextPolicy;
 
 /// The result of a policy check. Currently just Allow/Deny, but will support Trace in the future
 #[derive(Debug, Error, Clone)]
@@ -100,7 +100,7 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
 
     /// Reverse of sign_request. This will typically parse + validate the auth data and return a ContextData if valid
     /// optionally, the PolicyAgent may introspect the request directly for signature validation, or other policy checks
-    /// Note that check_read and check_write will be called with the ContextData as well if the request is approved
+    /// Read predicates and check_write will use the ContextData as well if the request is approved
     /// Meaning that the PolicyAgent need not necessarily introspect the request directly here if it doesn't want to.
     async fn check_request<SE: StorageEngine, A>(
         &self,

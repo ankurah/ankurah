@@ -128,7 +128,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
     async fn pause_publication_if_requested(&self, selection: &ankql::ast::Selection<Resolved>) {
         let pause = {
             let mut pause = self.0.publication_pause.lock().unwrap();
-            if pause.as_ref().is_some_and(|(model, _, _)| selection.predicate.required_memberships().contains(model)) {
+            if pause.as_ref().is_some_and(|(model, _, _)| selection.predicate.referenced_models().contains(model)) {
                 pause.take()
             } else {
                 None
@@ -393,7 +393,7 @@ mod tests {
         };
         let node = Node::new_durable(std::sync::Arc::new(TestStorage::default()), PermissiveAgent::new());
         node.system.create().await.unwrap();
-        let query = node.context(DEFAULT_CONTEXT).unwrap().query_wait::<crate::schema::catalog::SysModelRowView>("true").await.unwrap();
+        let query = node.context_async(DEFAULT_CONTEXT).await.unwrap().query_wait::<crate::schema::catalog::SysModelRowView>("true").await.unwrap();
         assert!(query.loaded());
 
         let notify = node.reactor.0.notify_lock.lock().await;
@@ -569,7 +569,7 @@ mod tests {
         for (query, model) in queries {
             reactor.upsert_query_and_notify(
                 subscription.id(), query, ankql::ast::Predicate::MemberOf(model).into(),
-                &MockNode { entities: vec![] }, EntityResultSet::empty(), Arc::new(MockGapFetcher::new()), 1, (),
+                Arc::new(MockNode { entities: vec![] }), EntityResultSet::empty(), Arc::new(MockGapFetcher::new()), 1, (),
             ).await.unwrap();
         }
         changes();
@@ -605,7 +605,7 @@ mod tests {
 
         // Add query using the reactor - this should send Initial notification
         reactor
-            .upsert_query_and_notify(rsub.id(), query_id, selection, &mock_node, resultset, mock_gap_fetcher, 1, ())
+            .upsert_query_and_notify(rsub.id(), query_id, selection, Arc::new(mock_node), resultset, mock_gap_fetcher, 1, ())
             .await
             .unwrap();
 
@@ -638,7 +638,7 @@ mod tests {
                 subscription.id(),
                 query_id,
                 sel("status = 'pending' LIMIT 1"),
-                &node,
+                Arc::new(node),
                 resultset.clone(),
                 gap_fetcher,
                 1,
@@ -677,7 +677,7 @@ mod tests {
                         subscription.id(),
                         QueryId::new(),
                         sel("status = 'pending'"),
-                        &MockNode { entities: vec![entity.clone()] },
+                        Arc::new(MockNode { entities: vec![entity.clone()] }),
                         EntityResultSet::empty(),
                         Arc::new(MockGapFetcher::new()),
                         1,
@@ -704,7 +704,7 @@ mod tests {
         let pending = TestEntity::new("Pending", "pending");
         let done = TestEntity::new("Done", "done");
         let resultset = EntityResultSet::empty();
-        let node = MockNode { entities: vec![pending.clone(), done.clone()] };
+        let node = Arc::new(MockNode { entities: vec![pending.clone(), done.clone()] });
         let (listener, changes) = watcher::<ReactorUpdate<TestEntity, TestEvent>>();
         let _guard = subscription.subscribe(listener);
         let install = |selection, version| {
@@ -712,7 +712,7 @@ mod tests {
                 subscription.id(),
                 query,
                 selection,
-                &node,
+                node.clone(),
                 resultset.clone(),
                 Arc::new(MockGapFetcher::new()),
                 version,
