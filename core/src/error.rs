@@ -375,6 +375,8 @@ impl From<SubscriptionError> for RetrievalError {
 
 #[derive(Error, Debug)]
 pub enum StateError {
+    #[error("transaction was rolled back")]
+    TransactionClosed,
     #[error("serialization error: {0}")]
     SerializationError(Box<dyn std::error::Error + Send + Sync + 'static>),
     #[error("DDL error: {0}")]

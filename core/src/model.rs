@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use ankurah_proto::{EntityId, ModelId, State};
 
-use crate::entity::{Entity, ProvisionalEntity};
+use crate::entity::{Entity, LocalTrxEntity};
 use crate::error::StateError;
 
 use crate::property::PropertyError;
@@ -38,10 +38,10 @@ pub trait Model: Sized {
     fn descriptor() -> &'static crate::schema::ModelStructDescriptor;
 
     /// Stage membership in `model_id` and the initial field values using this epoch's property bindings.
-    /// `Transaction::create` freezes these into the genesis event, which determines the entity's id.
+    /// The first id demand or commit preparation freezes these into the genesis event.
     fn initialize_new_entity(
         &self,
-        provisional: &mut ProvisionalEntity,
+        entity: &LocalTrxEntity,
         model_id: ModelId,
         epoch: crate::schema::SystemEpoch,
     ) -> Result<(), PropertyError>;
@@ -62,11 +62,11 @@ pub trait View {
 #[derive(Debug)]
 pub struct MutableBorrow<'rec, T: Mutable> {
     mutable: T,
-    _entity_ref: &'rec Entity,
+    _entity_ref: &'rec LocalTrxEntity,
 }
 
 impl<'rec, T: Mutable> MutableBorrow<'rec, T> {
-    pub fn new(entity_ref: &'rec Entity) -> Self { Self { mutable: T::new(entity_ref.clone()), _entity_ref: entity_ref } }
+    pub fn new(entity_ref: &'rec LocalTrxEntity) -> Self { Self { mutable: T::new(entity_ref.clone()), _entity_ref: entity_ref } }
 
     /// Extract the core mutable (for WASM usage)
     pub fn into_core(self) -> T { self.mutable }
@@ -88,24 +88,13 @@ pub trait Mutable {
     type View: View;
     fn id(&self) -> EntityId { self.entity().id() }
 
-    fn entity(&self) -> &Entity;
-    fn new(entity: Entity) -> Self
+    fn entity(&self) -> &LocalTrxEntity;
+    fn new(entity: LocalTrxEntity) -> Self
     where Self: Sized;
 
     fn state(&self) -> Result<State, StateError> { self.entity().to_state() }
 
-    fn read(&self) -> Self::View {
-        let inner = self.entity();
-
-        let new_inner = match &inner.kind {
-            // If there is an upstream, use it
-            crate::entity::EntityKind::Transacted { upstream, .. } => upstream.clone(),
-            // Else we're a new Entity, and we have to rely on the commit to add this to the node
-            crate::entity::EntityKind::Primary => inner.clone(),
-        };
-
-        Self::View::from_entity(new_inner)
-    }
+    fn read(&self) -> Self::View { Self::View::from_entity(self.entity().read()) }
 }
 
 // Helper function to convert Result<T, PropertyError> to Result<T, JsValue> with context for generated WASM accessors

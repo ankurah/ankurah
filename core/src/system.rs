@@ -12,7 +12,7 @@ use tokio::sync::Notify;
 
 use crate::entity::WeakEntitySet;
 use crate::property::{Property, PropertyError};
-use crate::retrieval::{LocalEventGetter, LocalStateGetter, SuspenseEvents};
+use crate::retrieval::{LocalEventGetter, LocalStateGetter};
 use crate::storage::{StorageCommitOutcome, StorageTransaction};
 use crate::{property::backend::LWWBackend, value::Value};
 pub const SYSTEM_COLLECTION_ID: &str = "_ankurah_system";

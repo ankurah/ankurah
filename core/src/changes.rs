@@ -33,7 +33,7 @@ impl EntityChange {
         // after both events applied.
         let head = entity.head();
         for (i, event) in events.iter().enumerate() {
-            if event.payload.entity_id != entity.id {
+            if event.payload.entity_id != entity.id() {
                 return Err(MutationError::InvalidEvent);
             }
             let id = event.payload.id();
