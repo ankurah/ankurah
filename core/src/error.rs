@@ -369,6 +369,15 @@ impl From<AccessDenied> for RetrievalError {
     fn from(err: AccessDenied) -> Self { RetrievalError::AccessDenied(err) }
 }
 
+impl From<ankurah_proto::GetFailure> for RetrievalError {
+    fn from(error: ankurah_proto::GetFailure) -> Self {
+        match error {
+            ankurah_proto::GetFailure::NotFound(id) => Self::EntityNotFound(id),
+            ankurah_proto::GetFailure::AccessDenied(_) => AccessDenied::ByPolicy("Peer denied entity retrieval").into(),
+        }
+    }
+}
+
 impl From<SubscriptionError> for RetrievalError {
     fn from(err: SubscriptionError) -> Self { anyhow::anyhow!("Subscription error: {:?}", err).into() }
 }

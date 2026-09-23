@@ -1,19 +1,19 @@
 use crate::internal::prelude::*;
-use crate::policy::ReadPolicy;
+use crate::{error::NodeDropped, node::NodeErased};
+use crate::policy::ContextPolicy;
 use crate::reactor::LocalEntitySource;
 use crate::retrieval::CachedEventGetter;
 use ankql::ast::{Parsed, Resolved};
 use ankurah_proto::Event;
 use async_trait::async_trait;
-use std::sync::{atomic::AtomicBool, Arc};
+use std::sync::Arc;
 use tracing::debug;
 
 use super::{DynContextInner, SchemaResolver};
 
-pub(crate) enum ContextAuth<PA>
-where PA: PolicyAgent
-{
-    Sessions(crate::session::SessionSet<PA::ContextData>),
+#[derive(Clone)]
+pub(crate) enum ContextAuth<C> {
+    Sessions(C),
     /// Local authority for system/catalog writes; never user-constructible.
     Privileged,
 }
@@ -24,7 +24,7 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     pub node: NodeHandle<SE, PA>,
-    pub auth: ContextAuth<PA>,
+    pub auth: ContextAuth<SessionSet<PA::ContextData>>,
 }
 
 #[async_trait]

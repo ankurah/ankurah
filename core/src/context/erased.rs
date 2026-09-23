@@ -4,7 +4,7 @@ use crate::reactor::LocalEntitySource;
 use ankql::ast::{Parsed, Resolved, Selection};
 use ankurah_proto::Event;
 use async_trait::async_trait;
-use std::sync::{atomic::AtomicBool, Arc};
+use std::sync::Arc;
 
 use super::SchemaResolver;
 

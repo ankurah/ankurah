@@ -36,13 +36,18 @@ use std::{
 /// Trait for entities that can be used in reactor notifications
 pub trait AbstractEntity: Clone + std::fmt::Debug {
     fn memberships(&self) -> std::collections::BTreeSet<proto::ModelId>;
-    fn id(&self) -> &proto::EntityId;
+    fn id(&self) -> proto::EntityId;
     fn value(&self, property: &ankql::ast::PropertyId) -> Option<Value>;
 }
 
-/// Local entity retrieval for already policy-scoped selections; does not apply read policy.
+/// Local retrieval and read checks for a query's credential source.
+// TODO: This is basically a thinner DynContextInner which we have to make tests simpler
+// I'm not sure it's pulling weight. Consider renaming to QueryReadSource; this also enforces per-query read policy.
 #[async_trait::async_trait]
 pub trait LocalEntitySource<E: AbstractEntity + Filterable + Send + 'static = Entity>: Send + Sync + 'static {
+    /// Recheck an entity before publishing it, including changes arriving after the initial fetch.
+    fn can_read(&self, _entity: &E) -> bool { true }
+
     async fn fetch_entities_from_local(
         &self,
         selection: &ankql::ast::Selection<Resolved>,
@@ -76,7 +81,7 @@ pub struct Reactor<
     Ev: Clone + Send + 'static = ankurah_proto::Attested<ankurah_proto::Event>,
 >(Arc<ReactorInner<E, Ev>>);
 
-struct ReactorInner<E: AbstractEntity + Filterable, Ev> {
+struct ReactorInner<E: AbstractEntity + Filterable + Send + 'static, Ev> {
     subscriptions: std::sync::Mutex<HashMap<ReactorSubscriptionId, Subscription<E, Ev>>>,
     // Shared with all subscriptions to allow them to manage their own watchers
     watcher_set: Arc<std::sync::Mutex<WatcherSet>>,

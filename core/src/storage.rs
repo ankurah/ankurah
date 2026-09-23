@@ -1,9 +1,8 @@
-use ankql::ast::Resolved;
+use ankql::ast::{Predicate, Resolved};
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 use futures::Stream;
-use tracing::warn;
 
 use crate::error::{MutationError, RetrievalError};
 use ankurah_proto::{Attested, Clock, EntityId, EntityState, Event, EventId, ModelId};
@@ -27,9 +26,29 @@ pub trait StorageDump: StorageEngine {
     async fn dump(&self) -> Result<Self::DumpStream, RetrievalError>;
 }
 
-pub fn state_name(name: &str) -> String { format!("{}_state", name) }
+mod catalog;
+pub use catalog::CatalogResolver;
 
-pub fn event_name(name: &str) -> String { format!("{}_event", name) }
+mod read;
+pub use read::{filter_events, GetStateResult};
+
+/// One atomic storage transaction. Engines may execute writes as they arrive or buffer them until commit.
+/// Dropping the handle without committing must leave its writes uncommitted.
+#[async_trait]
+pub trait StorageTransaction: Send {
+    /// Write validated events with this transaction's states.
+    async fn add_events(&mut self, events: &[Attested<Event>]) -> Result<(), MutationError>;
+
+    /// Replace an entity's state, including its memberships and materializations.
+    /// `expected_head` is the state this update was derived from, including prior writes in this transaction.
+    /// A missing entity has an empty head. Repeated calls for an entity replace its preceding state.
+    async fn set_state(&mut self, expected_head: &Clock, state: &Attested<EntityState>) -> Result<(), MutationError>;
+
+    /// Compare every expected head, then atomically persist events, canonical
+    /// states, memberships, and materializations. Any conflict publishes none
+    /// of those records and returns the observed stored states.
+    async fn commit(self) -> Result<StorageCommitOutcome, MutationError>;
+}
 
 #[async_trait]
 pub trait StorageEngine: Send + Sync {

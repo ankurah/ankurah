@@ -99,6 +99,10 @@ where PA: PolicyAgent
     pub storage: Arc<SE>,
 
     pub(crate) entities: WeakEntitySet,
+    /// Hold across storage commit and WeakEntitySet publication: register a new Primary
+    /// or update one already registered there. Otherwise a competing writer could retry
+    /// from stale in-memory state after storage advances. Reactor notification follows later.
+    pub(crate) commit_publication_lock: tokio::sync::Mutex<()>,
     peer_connections: SafeMap<proto::EntityId, Arc<PeerState<PA::ContextData>>>,
     durable_peers: SafeSet<proto::EntityId>,
 
@@ -213,6 +217,7 @@ where
             id,
             storage: engine,
             entities: entityset,
+            commit_publication_lock: tokio::sync::Mutex::new(()),
             peer_connections: SafeMap::new(),
             durable_peers: SafeSet::new(),
             rng: Mutex::new(rng),
@@ -248,7 +253,7 @@ where
                 system.wait_system_ready(),
                 catalog.start(weak_node.clone()).err_into(),
             );
-let initialized = async move {
+            let initialized = async move {
                 initialized.await?;
                 agent.start(weak_node).await.map_err(|error| NodeHaltReason::PolicyAgentStartFailed(error.to_string()))
             };
@@ -528,7 +533,7 @@ let initialized = async move {
             proto::NodeRequestBody::Get { ids } => {
                 let policy = ContextPolicy::from_credentials(&self.policy_agent, cdata);
                 let mut results: Vec<_> =
-self.storage.get_states(ids, &policy.retrieval_predicate()).await?.into_iter().map(Into::into).collect();
+                    self.storage.get_states(ids, &policy.retrieval_predicate()).await?.into_iter().map(Into::into).collect();
                 policy.check_reads(&mut results);
                 Ok(proto::NodeResponseBody::Get(results))
             }
@@ -656,7 +661,7 @@ self.storage.get_states(ids, &policy.retrieval_predicate()).await?.into_iter().m
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
-        C: crate::util::Iterable<PA::ContextData>,
+        C: ankurah_signals::Signal + ankurah_signals::Peek<Vec<PA::ContextData>>,
     {
         use crate::event_dag::{compare, AbstractCausalRelation};
         use crate::retrieval::LocalEventGetter;
@@ -704,7 +709,14 @@ self.storage.get_states(ids, &policy.retrieval_predicate()).await?.into_iter().m
                 // entirely and let the caller fall back to a state snapshot,
                 // which passes its own read check.
                 for event in &events {
-                    match policy.check_read_event(event) {
+                    // FIXME: should we really pass state here? Ideally we'd pass the Entity
+                    // but we don't necessarily have it here. It's possible the PolicyAgent
+                    // could fetch the Entity itself for a given clock (though this might require)
+                    // checkpointing. I think we're not even using this anyway
+                    // in favor of PolicyAgent-generated predicates anyway. If that's the case
+                    // maybe we omit state here and handwave about future specific-clock (snapshot) retrievals
+                    // as a way to discharge this theoretical requirement in the future?
+                    match policy.check_read_event(event, state) {
                         Ok(()) => {}
                         Err(AccessDenied::ByPolicy(_)) => return Ok(vec![]),
                         Err(e) => return Err(anyhow!("check_read_event failed while building event bridge: {}", e)),
@@ -757,15 +769,14 @@ self.storage.get_states(ids, &policy.retrieval_predicate()).await?.into_iter().m
         self.system.require_system_ready().map_err(MutationError::from)?;
         let peer_id = self.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
 
-        match self.request(peer_id, cdata, proto::NodeRequestBody::Get { collection: collection_id.clone(), ids }).await? {
-            proto::NodeResponseBody::Get(states) => {
-                let collection = self.collections.get(collection_id).await?;
-
-                // TODO: merge received states with local state instead of replacing it.
-                for state in states {
-                    self.policy_agent.validate_received_state(self, &peer_id, &state)?;
-                    collection.set_state(state).await.map_err(|e| RetrievalError::Other(format!("{:?}", e)))?;
+        match self.request(peer_id, cdata, proto::NodeRequestBody::Get { ids: ids.clone() }).await? {
+            proto::NodeResponseBody::Get(results) => {
+                if results.len() != ids.len() || results.iter().zip(&ids).any(|(result, id)| result.entity_id() != *id) {
+                    return Err(RetrievalError::Other("Peer Get did not answer the requested identities".into()));
                 }
+                let deltas = results.into_iter().map(proto::EntityDelta::try_from).collect::<Result<Vec<_>, _>>()?;
+                let event_getter = CachedEventGetter::new(self, cdata);
+                applier::NodeApplier::apply_deltas(self, &peer_id, deltas, &event_getter, self.storage.as_ref()).await?;
                 Ok(())
             }
             proto::NodeResponseBody::Error(e) => {
