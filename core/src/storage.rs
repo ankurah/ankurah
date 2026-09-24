@@ -108,6 +108,19 @@ pub trait StorageEngine: Send + Sync {
     /// Retrieve canonical state by entity identity.
     async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError>;
 
+    /// Keep existing identities whose stored entities match the predicate.
+    /// SQL engines can test materializations without decoding entity state.
+    async fn filter_entity_ids(&self, ids: &[EntityId], predicate: &Predicate<Resolved>) -> Result<Vec<EntityId>, RetrievalError> {
+        let mut matches = Vec::new();
+        let ids = ids.iter().copied().collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+        for result in self.get_states(ids, predicate).await? {
+            if let GetStateResult::Found(state) = result {
+                matches.push(state.payload.entity_id);
+            }
+        }
+        Ok(matches)
+    }
+
     /// Fetch entities matching the selection, including its model-membership predicates.
     async fn fetch_states(
         &self,
@@ -139,7 +152,7 @@ pub trait StorageEngine: Send + Sync {
     /// and physical-name data while retaining engine compatibility metadata.
     async fn delete_all(&self) -> Result<bool, MutationError>;
 
-/// List existing model materializations without creating any.
+    /// List existing model materializations without creating any.
     async fn list_materializations(&self) -> Result<Vec<ModelId>, RetrievalError> { Ok(Vec::new()) }
 
     /// Supply optional labels for engines to seed their own persistent physical names.

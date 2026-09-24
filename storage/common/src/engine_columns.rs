@@ -1,6 +1,6 @@
 //! Storage-engine column paths and query lowering.
 
-use ankql::ast::{ModelId, Selection, Stage};
+use ankql::ast::{ModelId, Stage};
 
 /// A selection an engine can read: every path is one of its own columns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,12 +41,4 @@ impl ankurah_core_types::Path for ColumnPath {
     fn display_steps(&self) -> impl Iterator<Item = &str> {
         std::iter::once(self.column.as_str()).chain(self.subpath.iter().map(String::as_str))
     }
-}
-
-/// Map paths to physical columns without resolving names or applying policy.
-pub fn lower_selection<S: Stage<ModelId = ModelId>>(
-    selection: &Selection<S>,
-    column: &impl Fn(&S::Path) -> ColumnPath,
-) -> Selection<EngineColumns> {
-    ankql::selection::map_references(selection, column, &|model| *model)
 }

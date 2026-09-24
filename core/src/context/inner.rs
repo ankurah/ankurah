@@ -73,10 +73,8 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         let node = self.node.upgrade()?;
         node.system.check_not_halted()?;
         debug!("Node({}).get_entity {:?}", node.id, id);
-        let cdata = match &self.auth {
-            ContextAuth::Sessions(sessions) => sessions.current(),
-            ContextAuth::Privileged => Vec::new(),
-        };
+        let policy = ContextPolicy::new(&node.policy_agent, self.auth.clone());
+        let cdata = policy.credentials();
 
         if !node.durable {
             // Fetch from peers and commit first response
@@ -89,11 +87,6 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
             }
         }
 
-        let policy = match &self.auth {
-            ContextAuth::Privileged => ReadPolicy::privileged(collection_id),
-            ContextAuth::Sessions(_) => ReadPolicy::new(&node.policy_agent, &cdata, collection_id),
-        };
-
         if let Some(local) = node.entities.get(&id) {
             debug!("Node({}).get_entity found local entity - returning", node.id);
             let state = local.to_state()?;
@@ -103,21 +96,13 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         }
         debug!("{}.get_entity fetching from storage", node.as_ref());
 
-        let collection = node.collections.get(collection_id).await?;
-        match collection.get_state(id).await {
-            Ok(entity_state) => {
-                if &entity_state.payload.collection != collection_id {
-                    return Err(RetrievalError::EntityNotFound(id));
-                }
-                policy.check_read(&entity_state.payload.entity_id, &entity_state.payload.state)?;
-                let state_getter = crate::retrieval::LocalStateGetter::new(collection.clone());
-                let event_getter = CachedEventGetter::new(collection_id.clone(), collection, node.as_ref(), &cdata);
-                let (_changed, entity) =
-                    node.entities.with_state(&state_getter, &event_getter, id, collection_id.clone(), entity_state.payload.state).await?;
-                Ok(entity)
-            }
-            Err(e) => Err(e),
-        }
+        let entity_state: proto::Attested<proto::EntityState> = node.storage.get_states(vec![id], &policy.retrieval_predicate()).await?
+            .into_iter().next().ok_or(RetrievalError::EntityNotFound(id))?.try_into()?;
+        policy.check_read_state(&id, &entity_state.payload.state)?;
+        let state_getter = crate::retrieval::LocalStateGetter::new(node.storage.clone());
+        let event_getter = CachedEventGetter::new(node.as_ref(), &cdata);
+        let (_changed, entity) = node.entities.with_state(&state_getter, &event_getter, id, entity_state.payload.state).await?;
+        Ok(entity)
     }
 
     /// Fetch a resolved selection with this context's read restrictions.
@@ -125,36 +110,27 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     async fn fetch_entities(&self, mut args: MatchArgs<Resolved>) -> Result<Vec<Entity>, RetrievalError> {
         let node = self.node.upgrade()?;
         node.system.check_not_halted()?;
-        let cdata = match &self.auth {
-            ContextAuth::Sessions(sessions) => sessions.current(),
-            ContextAuth::Privileged => Vec::new(),
-        };
-        let policy = match &self.auth {
-            ContextAuth::Privileged => ReadPolicy::privileged(collection_id),
-            ContextAuth::Sessions(_) => ReadPolicy::new(&node.policy_agent, &cdata, collection_id),
-        };
-        policy.check_collection()?;
+        let policy = ContextPolicy::new(&node.policy_agent, self.auth.clone());
+        let cdata = policy.credentials();
         args.selection.predicate = policy.filter_predicate(args.selection.predicate)?;
 
-        // TODO implement cached: true
-        if !node.durable {
-            node.fetch_from_peer(collection_id, args.selection, &cdata).await
+        // TODO honor CachePolicy::Local for fetch; Tracked currently behaves like Durable.
+        let entities = if !node.durable {
+            node.fetch_from_peer(args.selection, &cdata).await
         } else {
-            let storage_collection = node.collections.get(collection_id).await?;
-            let states = storage_collection.fetch_states(&args.selection).await?;
+            let states = node.storage.fetch_states(&args.selection).await?;
 
             let mut entities = Vec::new();
-            let state_getter = crate::retrieval::LocalStateGetter::new(storage_collection.clone());
-            let event_getter = CachedEventGetter::new(collection_id.clone(), storage_collection, node.as_ref(), &cdata);
+            let state_getter = crate::retrieval::LocalStateGetter::new(node.storage.clone());
+            let event_getter = CachedEventGetter::new(node.as_ref(), &cdata);
             for state in states {
-                let (_, entity) = node
-                    .entities
-                    .with_state(&state_getter, &event_getter, state.payload.entity_id, collection_id.clone(), state.payload.state)
-                    .await?;
+                let (_, entity) =
+                    node.entities.with_state(&state_getter, &event_getter, state.payload.entity_id, state.payload.state).await?;
                 entities.push(entity);
             }
             Ok(entities)
-        }
+        }?;
+        Ok(entities.into_iter().filter(|entity| policy.can_read(entity)).collect())
     }
 
     /// Validate and commit the transaction, then publish its entity changes.
@@ -165,23 +141,12 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     }
 
     /// Construct a livequery, resolving its selection now or scheduling asynchronous resolution.
-    fn query(
-        self: Arc<Self>,
-        schema: Option<&'static crate::schema::ModelStructDescriptor>,
-        collection_id: proto::CollectionId,
-        args: MatchArgs<Parsed>,
-    ) -> Result<EntityLiveQuery, RetrievalError> {
+    fn query(self: Arc<Self>, schema: &'static ModelStructDescriptor, args: MatchArgs<Parsed>) -> Result<EntityLiveQuery, RetrievalError> {
         if matches!(&self.auth, ContextAuth::Privileged) {
             return Err(RetrievalError::Other("the privileged context does not query".into()));
         }
-        let node = self.node.upgrade()?;
-        EntityLiveQuery::new_with_context(node.as_ref(), self.clone(), schema, collection_id, args)
-    }
-
-    /// Open a storage collection for tests, bypassing context policy checks.
-    #[cfg(feature = "test-helpers")]
-    async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
-        self.node.upgrade()?.system.collection(id).await
+        let resolution = crate::livequery::QueryResolution::prepare(self.schema_resolver(), schema, args.selection)?;
+        EntityLiveQuery::new(self, args.cache_policy, resolution)
     }
 }
 

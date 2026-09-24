@@ -416,7 +416,7 @@ fn uniffi_ops_wrapper(ops_name: &Ident, model_name: &Ident, view_name: &Ident, l
             ) -> Result<#livequery_name, ::ankurah::core::error::RetrievalError> {
                 let mut selection = ::ankurah::ankql::parser::parse_selection(&selection)?;
                 selection.predicate = selection.predicate.populate(values)?;
-                let args = ::ankurah::MatchArgs { selection, cached: false };
+                let args = ::ankurah::MatchArgs { selection, cache_policy: ::ankurah::CachePolicy::Durable };
                 let lq = ctx.query::<#view_name>(args)?;
                 Ok(#livequery_name::from(lq))
             }
@@ -433,7 +433,7 @@ fn uniffi_ops_wrapper(ops_name: &Ident, model_name: &Ident, view_name: &Ident, l
                 let model: #model_name = input.try_into()
                     .map_err(|e: ::ankurah::proto::IdParseError| ::ankurah::core::error::MutationError::General(Box::new(e)))?;
                 let mutable = trx.create(&model).await?;
-                Ok(mutable.read())
+                Ok(mutable.read()?)
             }
 
             /// Create a new entity with an auto-committed transaction
@@ -449,7 +449,7 @@ fn uniffi_ops_wrapper(ops_name: &Ident, model_name: &Ident, view_name: &Ident, l
                     .map_err(|e: ::ankurah::proto::IdParseError| ::ankurah::core::error::MutationError::General(Box::new(e)))?;
                 let tx = ctx.begin();
                 let mutable = tx.create(&model).await?;
-                let view = mutable.read();
+                let view = mutable.read()?;
                 tx.commit().await?;
                 Ok(view)
             }

@@ -1,4 +1,4 @@
-mod collection;
+mod bucket;
 pub mod database;
 mod engine;
 pub(crate) mod error;
@@ -9,5 +9,5 @@ mod scanner;
 mod statics;
 mod util;
 
-pub use collection::IndexedDBBucket;
-pub use engine::IndexedDBStorageEngine;
+pub use bucket::IndexedDBBucket;
+pub use engine::{IndexedDBStorageEngine, IndexedDbTransaction};

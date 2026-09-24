@@ -1,33 +1,38 @@
+use ankql::ast::Resolved;
+use ankurah_core::util::safemap::SafeMap;
+use ankurah_storage_common::naming;
 use std::{
-    collections::{hash_map::DefaultHasher, BTreeMap},
+    collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet},
     hash::{Hash, Hasher},
     sync::{Arc, RwLock},
     time::Duration,
 };
 
-use ankql::ast::Resolved;
 use ankurah_core::{
     error::{MutationError, RetrievalError, StateError},
-    property::backend::backend_from_string,
-    storage::{StorageCollection, StorageEngine},
+    schema::CatalogResolver,
+    storage::{CommittedEntityWrite, StorageCommitOutcome, StorageCommitResult, StorageEngine, StorageTransaction},
 };
-use ankurah_proto::{Attestation, AttestationSet, Attested, EntityState, EventBody, EventId, State, StateBuffers};
+use ankurah_proto::{Attestation, AttestationSet, Attested, EntityState, EventBody, EventId, State, StateBuffers, PROTOCOL_VERSION};
+use ankurah_proto::{ModelId, SystemModel};
 
-use futures_util::{pin_mut, TryStreamExt};
-
-pub mod lower;
 pub mod sql_builder;
 pub mod value;
 
 use value::PGValue;
 
-use ankurah_proto::{Clock, CollectionId, EntityId, Event};
+use ankurah_proto::{Clock, EntityId, Event};
 use async_trait::async_trait;
 use bb8_postgres::{tokio_postgres::NoTls, PostgresConnectionManager};
-use tokio_postgres::{error::SqlState, types::ToSql};
-use tracing::{debug, error, info, warn};
+use tokio_postgres::{error::SqlState, GenericClient};
+use tracing::{debug, error};
 
 mod dump;
+mod materialization;
+mod query;
+mod transaction;
+pub use transaction::PostgresTransaction;
+use materialization::{Materialization, PreparedMaterialization};
 
 /// Default connection pool size for `Postgres::open()`.
 /// Production applications should configure their own pool via `Postgres::new()`.
@@ -36,13 +41,62 @@ pub const DEFAULT_POOL_SIZE: u32 = 15;
 /// Default connection timeout in seconds
 pub const DEFAULT_CONNECTION_TIMEOUT_SECS: u64 = 30;
 
+/// Engine-level key/value metadata for the store itself (currently just the
+/// 'protocol_version' record). Not application data: it survives
+/// [`StorageEngine::delete_all`], because wiping the record would make the store
+/// read as unversioned and refuse its own reopen.
+const META_TABLE: &str = "_ankurah_meta";
+const MODEL_REGISTRATION_TABLE: &str = "_ankurah_postgres_model_map";
+const COLUMN_MAP_TABLE: &str = "_ankurah_postgres_column_map";
+const ENTITY_TABLE: &str = "_ankurah_entity";
+const EVENT_TABLE: &str = "_ankurah_event";
+const ENTITY_MODEL_TABLE: &str = "_ankurah_entity_model";
+const IDENTIFIER_MAX_BYTES: usize = 63;
+const FIXED_STORAGE_TABLES: &[&str] =
+    &[META_TABLE, MODEL_REGISTRATION_TABLE, COLUMN_MAP_TABLE, ENTITY_TABLE, EVENT_TABLE, ENTITY_MODEL_TABLE];
+
+fn quote_identifier(identifier: &str) -> String { format!(r#""{}""#, identifier.replace('"', "\"\"")) }
+
+fn system_label(model: SystemModel) -> &'static str {
+    match model {
+        SystemModel::System => "_ankurah_system",
+        SystemModel::Model => "_ankurah_model",
+        SystemModel::Property => "_ankurah_property",
+        SystemModel::ModelProperty => "_ankurah_model_property",
+    }
+}
+
+/// Built-in materialization names are reserved even before their rows are
+/// inserted, so assignment order cannot let an ordinary model steal one.
+fn reserved_system_table_names() -> Vec<String> {
+    [SystemModel::System, SystemModel::Model, SystemModel::Property, SystemModel::ModelProperty]
+        .into_iter()
+        .map(|model| naming::sanitize(system_label(model)))
+        .collect()
+}
+
+/// PostgreSQL implementation of the model-independent storage contract.
 pub struct Postgres {
+    /// One shared schema and physical-name map per materialization.
+    materializations: SafeMap<ModelId, Arc<tokio::sync::OnceCell<Arc<Materialization>>>>,
     pool: bb8::Pool<PostgresConnectionManager<NoTls>>,
+    /// Optional labels for first-use physical name assignment.
+    resolver: Arc<RwLock<Option<std::sync::Weak<dyn CatalogResolver>>>>,
 }
 
 impl Postgres {
-    pub fn new(pool: bb8::Pool<PostgresConnectionManager<NoTls>>) -> anyhow::Result<Self> { Ok(Self { pool }) }
+    /// Create a new storage engine with an existing pool.
+    ///
+    /// Records or checks the store's protocol version (see
+    /// `check_protocol_version`) so every construction path verifies
+    /// the store it is about to serve.
+    pub async fn new(pool: bb8::Pool<PostgresConnectionManager<NoTls>>) -> anyhow::Result<Self> {
+        let engine = Self { pool, materializations: SafeMap::new(), resolver: Arc::new(RwLock::new(None)) };
+        engine.check_protocol_version().await?;
+        Ok(engine)
+    }
 
+    /// Open a pooled PostgreSQL storage engine from a connection URI.
     pub async fn open(uri: &str) -> anyhow::Result<Self> {
         let manager = PostgresConnectionManager::new_from_stringlike(uri, NoTls)?;
         let pool = bb8::Pool::builder()
@@ -50,24 +104,275 @@ impl Postgres {
             .connection_timeout(Duration::from_secs(DEFAULT_CONNECTION_TIMEOUT_SECS))
             .build(manager)
             .await?;
-        Self::new(pool)
+        Self::new(pool).await
     }
 
-    // TODO: newtype this to `BucketName(&str)` with a constructor that
-    // only accepts a subset of characters.
-    pub fn sane_name(collection: &str) -> bool {
-        for char in collection.chars() {
+    /// Check whether a physical PostgreSQL name uses only the supported
+    /// characters.
+    ///
+    /// TODO: newtype this to `BucketName(&str)` with a constructor that only
+    /// accepts this subset.
+    pub fn sane_name(name: &str) -> bool {
+        if name.len() > IDENTIFIER_MAX_BYTES {
+            return false;
+        }
+        for char in name.chars() {
             match char {
                 char if char.is_alphanumeric() => {}
                 char if char.is_numeric() => {}
-                // '-' appears in property-id renderings (URL-safe base64),
-                // which name materialized columns; always emitted quoted.
-                '_' | '.' | ':' | '-' => {}
+                '_' | '.' | ':' => {}
                 _ => return false,
             }
         }
 
         true
+    }
+
+    async fn catalog_registered_label(&self, model_id: &ModelId) -> Option<String> {
+        if let ModelId::System(system) = model_id {
+            return Some(system_label(*system).to_owned());
+        }
+        let resolver = self.resolver.read().unwrap().as_ref().and_then(std::sync::Weak::upgrade)?;
+        resolver.get_model_label(model_id).await
+    }
+
+    async fn registered_table_name(client: &tokio_postgres::Client, model_key: &[u8]) -> Result<Option<String>, RetrievalError> {
+        let row = client
+            .query_opt(
+                &format!(r#"SELECT "materialization_table_name" FROM "{MODEL_REGISTRATION_TABLE}" WHERE "model_key" = $1"#),
+                &[&model_key],
+            )
+            .await
+            .map_err(RetrievalError::storage)?;
+        Ok(row.map(|row| row.get("materialization_table_name")))
+    }
+
+    /// Return the immutable physical table registration for `model_id`,
+    /// assigning it on first use. The Postgres-private table is authoritative:
+    /// the catalog is consulted only after a durable lookup misses.
+    async fn table_for_model(&self, model_id: &ModelId) -> Result<String, RetrievalError> {
+        let client = self.pool.get().await.map_err(RetrievalError::storage)?;
+        self.ensure_shared_tables(&client).await.map_err(RetrievalError::storage)?;
+        let model_key = bincode::serialize(model_id).map_err(RetrievalError::storage)?;
+        if let Some(name) = Self::registered_table_name(&client, &model_key).await? {
+            return Ok(name);
+        }
+        drop(client);
+        let registered_label = self.catalog_registered_label(model_id).await;
+        let client = self.pool.get().await.map_err(RetrievalError::storage)?;
+        let lock_key = acquire_ddl_lock(&client, MODEL_REGISTRATION_TABLE).await?;
+        let result = async {
+            if let Some(name) = Self::registered_table_name(&client, &model_key).await? {
+                return Ok(name);
+            }
+
+            let desired = registered_label.as_deref().map(naming::sanitize);
+            let rows = client
+                .query(&format!(r#"SELECT "materialization_table_name" FROM "{MODEL_REGISTRATION_TABLE}""#), &[])
+                .await
+                .map_err(RetrievalError::storage)?;
+            let mut taken = std::collections::HashSet::new();
+            for row in rows {
+                taken.insert(row.get::<_, String>("materialization_table_name"));
+            }
+            let physical_rows = client
+                .query("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'", &[])
+                .await
+                .map_err(RetrievalError::storage)?;
+            taken.extend(physical_rows.into_iter().map(|row| row.get::<_, String>("table_name")));
+            taken.extend(FIXED_STORAGE_TABLES.iter().map(|name| (*name).to_owned()));
+
+            let is_taken =
+                |candidate: &str| taken.contains(candidate) || reserved_system_table_names().iter().any(|reserved| reserved == candidate);
+            let materialization_table_name = match model_id {
+                ModelId::EntityId(id) => match desired.as_deref() {
+                    Some(label) => naming::dedupe_bounded(label, id, IDENTIFIER_MAX_BYTES, is_taken),
+                    None => naming::fallback("m", id, is_taken),
+                }
+                .map_err(|error| RetrievalError::Other(error.to_string()))?,
+                ModelId::System(system) => {
+                    let fixed = naming::sanitize(system_label(*system));
+                    if taken.contains(&fixed) {
+                        return Err(RetrievalError::Other(format!(
+                            "reserved system model {model_id} cannot claim its physical table name {fixed:?}"
+                        )));
+                    }
+                    fixed
+                }
+            };
+
+            client
+                .execute(
+                    &format!(r#"INSERT INTO "{MODEL_REGISTRATION_TABLE}" ("model_key", "materialization_table_name") VALUES ($1, $2)"#),
+                    &[&model_key, &materialization_table_name],
+                )
+                .await
+                .map_err(RetrievalError::storage)?;
+            Ok(materialization_table_name)
+        }
+        .await;
+        release_ddl_lock(&client, lock_key).await?;
+        result
+    }
+
+    /// Ensure the model-independent canonical tables and the private
+    /// entity-to-model association table exist.
+    async fn ensure_shared_tables(&self, client: &tokio_postgres::Client) -> Result<(), StateError> {
+        let lock_key = acquire_ddl_lock(client, "ankurah_shared_tables").await?;
+        let result = async {
+            client
+                .execute(
+                    &format!(
+                        r#"CREATE TABLE IF NOT EXISTS "{MODEL_REGISTRATION_TABLE}" (
+                            "model_key" bytea PRIMARY KEY,
+                            "materialization_table_name" text NOT NULL UNIQUE
+                        )"#
+                    ),
+                    &[],
+                )
+                .await
+                .map_err(|error| StateError::DDLError(Box::new(error)))?;
+
+            client
+                .execute(
+                    &format!(
+                        r#"CREATE TABLE IF NOT EXISTS "{ENTITY_TABLE}" (
+                            "id" character(43) PRIMARY KEY,
+                            "state_buffer" bytea NOT NULL,
+                            "head" character(43)[] NOT NULL,
+                            "attestations" bytea[] NOT NULL
+                        )"#
+                    ),
+                    &[],
+                )
+                .await
+                .map_err(|error| StateError::DDLError(Box::new(error)))?;
+            client
+                .execute(
+                    &format!(
+                        r#"CREATE TABLE IF NOT EXISTS "{EVENT_TABLE}" (
+                            "id" character(43) PRIMARY KEY,
+                            "entity_id" character(43) NOT NULL,
+                            "body" bytea NOT NULL,
+                            "parent" character(43)[] NOT NULL,
+                            "attestations" bytea NOT NULL
+                        )"#
+                    ),
+                    &[],
+                )
+                .await
+                .map_err(|error| StateError::DDLError(Box::new(error)))?;
+            client
+                .execute(
+                    &format!(
+                        r#"CREATE TABLE IF NOT EXISTS "{ENTITY_MODEL_TABLE}" (
+                            "entity_id" character(43) NOT NULL,
+                            "model_key" bytea NOT NULL,
+                            PRIMARY KEY ("entity_id", "model_key")
+                        )"#
+                    ),
+                    &[],
+                )
+                .await
+                .map_err(|error| StateError::DDLError(Box::new(error)))?;
+            Ok(())
+        }
+        .await;
+        release_ddl_lock(client, lock_key).await?;
+        result
+    }
+
+    /// Open or create the private query surface for a model.
+    async fn materialization(&self, model_id: &ModelId) -> Result<Arc<Materialization>, RetrievalError> {
+        self.materializations
+            .get_or_default(*model_id)
+            .get_or_try_init(|| async { Ok(Arc::new(Materialization::open(self, model_id).await?)) })
+            .await
+            .cloned()
+    }
+
+    async fn associated_models<C>(&self, client: &C, entity_id: EntityId) -> Result<Vec<ModelId>, RetrievalError>
+    where C: GenericClient + Sync {
+        let rows = client
+            .query(&format!(r#"SELECT "model_key" FROM "{ENTITY_MODEL_TABLE}" WHERE "entity_id" = $1"#), &[&entity_id])
+            .await
+            .map_err(RetrievalError::storage)?;
+        let mut models = rows
+            .into_iter()
+            .map(|row| {
+                let bytes: Vec<u8> = row.get("model_key");
+                bincode::deserialize(&bytes).map_err(RetrievalError::storage)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        models.sort();
+        Ok(models)
+    }
+
+    /// Check the store against [`ankurah_proto::PROTOCOL_VERSION`]:
+    ///
+    /// - fresh store (no record, no ankurah tables): write the record, proceed
+    /// - record present and equal: proceed
+    /// - record present and different: refuse
+    /// - ankurah tables present but no record: refuse as an unversioned store
+    async fn check_protocol_version(&self) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        let rows = client.query("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'", &[]).await?;
+        let tables: Vec<String> = rows.iter().map(|row| row.get("table_name")).collect();
+        let has_ankurah_tables = tables.iter().any(|table| FIXED_STORAGE_TABLES.contains(&table.as_str()));
+
+        let recorded: Option<String> = if tables.iter().any(|t| t == META_TABLE) {
+            client
+                .query_opt(&format!(r#"SELECT "value" FROM "{META_TABLE}" WHERE "key" = 'protocol_version'"#), &[])
+                .await?
+                .map(|row| row.get(0))
+        } else {
+            None
+        };
+
+        let expected = PROTOCOL_VERSION.to_string();
+        match recorded {
+            Some(found) if found == expected => Ok(()),
+            Some(found) => anyhow::bail!(
+                "incompatible store protocol version: found {found}, required {PROTOCOL_VERSION}; reset your development database (or migrate the store) before opening it with this binary"
+            ),
+            None if has_ankurah_tables => anyhow::bail!(
+                "store has existing ankurah tables but no recorded protocol version (pre-{PROTOCOL_VERSION} store); reset your development database (or migrate the store) before opening it with this binary"
+            ),
+            None => {
+                // Fresh store: claim the record, serializing concurrent first
+                // opens the same way other engine DDL is serialized.
+                let lock_key = acquire_ddl_lock(&client, META_TABLE).await?;
+                let result = async {
+                    client
+                        .execute(&format!(r#"CREATE TABLE IF NOT EXISTS "{META_TABLE}" ("key" TEXT PRIMARY KEY, "value" TEXT)"#), &[])
+                        .await?;
+                    client
+                        .execute(
+                            &format!(
+                                r#"INSERT INTO "{META_TABLE}" ("key", "value") VALUES ('protocol_version', $1) ON CONFLICT ("key") DO NOTHING"#
+                            ),
+                            &[&expected],
+                        )
+                        .await?;
+                    // Re-read: if another process recorded between our scan and
+                    // our insert, the store must still match this binary.
+                    let reread: String = client
+                        .query_one(&format!(r#"SELECT "value" FROM "{META_TABLE}" WHERE "key" = 'protocol_version'"#), &[])
+                        .await?
+                        .get(0);
+                    if reread == expected {
+                        Ok(())
+                    } else {
+                        anyhow::bail!(
+                            "incompatible store protocol version: found {reread}, required {PROTOCOL_VERSION}; reset your development database (or migrate the store) before opening it with this binary"
+                        )
+                    }
+                }
+                .await;
+                release_ddl_lock(&client, lock_key).await?;
+                result
+            }
+        }
     }
 }
 
@@ -78,12 +383,13 @@ fn advisory_lock_key(identifier: &str) -> i64 {
     hasher.finish() as i64
 }
 
-/// Acquire a PostgreSQL advisory lock for DDL operations on a collection
-async fn acquire_ddl_lock(client: &tokio_postgres::Client, collection_id: &str) -> Result<i64, StateError> {
-    let lock_key = advisory_lock_key(&format!("ankurah_ddl:{}", collection_id));
-    debug!("Acquiring advisory lock {} for collection {}", lock_key, collection_id);
+/// Acquire a PostgreSQL advisory lock for DDL operations on an engine-owned
+/// physical structure.
+async fn acquire_ddl_lock(client: &tokio_postgres::Client, physical_name: &str) -> Result<i64, StateError> {
+    let lock_key = advisory_lock_key(&format!("ankurah_ddl:{}", physical_name));
+    debug!("Acquiring advisory lock {} for {}", lock_key, physical_name);
     client.execute("SELECT pg_advisory_lock($1)", &[&lock_key]).await.map_err(|err| {
-        error!("Failed to acquire advisory lock for {}: {:?}", collection_id, err);
+        error!("Failed to acquire advisory lock for {}: {:?}", physical_name, err);
         StateError::DDLError(Box::new(err))
     })?;
     Ok(lock_key)
@@ -102,58 +408,100 @@ async fn release_ddl_lock(client: &tokio_postgres::Client, lock_key: i64) -> Res
 #[async_trait]
 impl StorageEngine for Postgres {
     type Value = PGValue;
+    type Transaction<'a> = PostgresTransaction<'a>;
 
-    async fn collection(&self, collection_id: &CollectionId) -> Result<std::sync::Arc<dyn StorageCollection>, RetrievalError> {
-        if !Postgres::sane_name(collection_id.as_str()) {
-            return Err(RetrievalError::InvalidBucketName);
-        }
+    fn transaction(&self) -> Self::Transaction<'_> { PostgresTransaction::new(self) }
 
+    async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError> {
         let mut client = self.pool.get().await.map_err(RetrievalError::storage)?;
-
-        // get the current schema from the database
-        let schema = client.query_one("SELECT current_database()", &[]).await.map_err(RetrievalError::storage)?;
-        let schema = schema.get("current_database");
-
-        let bucket = PostgresBucket {
-            pool: self.pool.clone(),
-            schema,
-            collection_id: collection_id.clone(),
-            columns: Arc::new(RwLock::new(Vec::new())),
-            #[cfg(debug_assertions)]
-            last_spilled_predicate: Arc::new(RwLock::new(None)),
-        };
-
-        // Acquire advisory lock to serialize DDL operations for this collection
-        let lock_key = acquire_ddl_lock(&client, collection_id.as_str()).await?;
-
-        // Create tables if they don't exist (protected by advisory lock)
-        let result = async {
-            bucket.create_state_table(&mut client).await?;
-            bucket.create_event_table(&mut client).await?;
-            bucket.rebuild_columns_cache(&mut client).await?;
-            Ok::<_, StateError>(())
-        }
-        .await;
-
-        // Always release the lock, even if DDL failed
-        release_ddl_lock(&client, lock_key).await?;
-
-        result?;
-        Ok(Arc::new(bucket))
+        self.ensure_shared_tables(&client).await.map_err(RetrievalError::storage)?;
+        let snapshot = read_snapshot(&mut client).await?;
+        load_states(&snapshot, &[id]).await?.into_iter().next().ok_or(RetrievalError::EntityNotFound(id))
     }
 
-    async fn delete_all_collections(&self) -> Result<bool, MutationError> {
+    async fn fetch_states(
+        &self,
+        selection: &ankql::ast::Selection<Resolved>,
+    ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+        query::Query::prepare(self, selection).await?.states(self).await
+    }
+
+    async fn filter_entity_ids(&self, ids: &[EntityId], predicate: &ankql::ast::Predicate<Resolved>) -> Result<Vec<EntityId>, RetrievalError> {
+        if ids.is_empty() { return Ok(Vec::new()); }
+        let selection = ankurah_storage_common::selection::for_entity_ids(ids, predicate);
+        query::Query::prepare(self, &selection).await?.ids(self).await
+    }
+
+    async fn get_events(&self, event_ids: Vec<EventId>, predicate: &ankql::ast::Predicate<Resolved>) -> Result<Vec<Attested<Event>>, RetrievalError> {
+        if event_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let client = self.pool.get().await.map_err(RetrievalError::storage)?;
+        self.ensure_shared_tables(&client).await.map_err(RetrievalError::storage)?;
+        let rows = client
+            .query(
+                &format!(
+                    r#"SELECT "entity_id", "body", "parent", "attestations"
+                       FROM "{EVENT_TABLE}" WHERE "id" = ANY($1)"#
+                ),
+                &[&event_ids],
+            )
+            .await
+            .map_err(RetrievalError::storage)?;
+        let events = rows.into_iter().map(event_from_row).collect::<Result<_, _>>()?;
+        drop(client);
+        ankurah_core::storage::filter_events(self, events, predicate).await
+    }
+
+    async fn dump_entity_events(&self, entity_id: EntityId) -> Result<Vec<Attested<Event>>, RetrievalError> {
+        let client = self.pool.get().await.map_err(RetrievalError::storage)?;
+        self.ensure_shared_tables(&client).await.map_err(RetrievalError::storage)?;
+        client
+            .query(
+                &format!(
+                    r#"SELECT "entity_id", "body", "parent", "attestations"
+                       FROM "{EVENT_TABLE}" WHERE "entity_id" = $1"#
+                ),
+                &[&entity_id],
+            )
+            .await
+            .map_err(RetrievalError::storage)?
+            .into_iter()
+            .map(event_from_row)
+            .collect()
+    }
+
+    fn set_catalog_resolver(&self, resolver: std::sync::Weak<dyn CatalogResolver>) { *self.resolver.write().unwrap() = Some(resolver); }
+
+    async fn delete_all(&self) -> Result<bool, MutationError> {
+        self.materializations.clear();
         let mut client = self.pool.get().await.map_err(|err| MutationError::General(Box::new(err)))?;
 
-        // Get all tables in the public schema
-        let query = r#"
-            SELECT table_name 
-            FROM information_schema.tables 
-            WHERE table_schema = 'public'
-        "#;
+        let rows = client
+            .query("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'", &[])
+            .await
+            .map_err(|err| MutationError::General(Box::new(err)))?;
+        let existing: BTreeSet<String> = rows.into_iter().map(|row| row.get("table_name")).collect();
 
-        let rows = client.query(query, &[]).await.map_err(|err| MutationError::General(Box::new(err)))?;
-        if rows.is_empty() {
+        // Dynamic materialization names are engine-owned only when recorded in
+        // the durable model map. Never infer ownership from an arbitrary table
+        // in the shared schema.
+        let mut owned: BTreeSet<String> = FIXED_STORAGE_TABLES
+            .iter()
+            .copied()
+            .filter(|name| *name != META_TABLE && existing.contains(*name))
+            .map(str::to_owned)
+            .collect();
+        if existing.contains(MODEL_REGISTRATION_TABLE) {
+            let rows = client
+                .query(&format!(r#"SELECT "materialization_table_name" FROM "{MODEL_REGISTRATION_TABLE}""#), &[])
+                .await
+                .map_err(|err| MutationError::General(Box::new(err)))?;
+            owned.extend(
+                rows.into_iter().map(|row| row.get::<_, String>("materialization_table_name")).filter(|name| existing.contains(name)),
+            );
+        }
+        if owned.is_empty() {
             return Ok(false);
         }
 
@@ -161,9 +509,8 @@ impl StorageEngine for Postgres {
         let transaction = client.transaction().await.map_err(|err| MutationError::General(Box::new(err)))?;
 
         // Drop each table
-        for row in rows {
-            let table_name: String = row.get("table_name");
-            let drop_query = format!(r#"DROP TABLE IF EXISTS "{}""#, table_name);
+        for table_name in owned {
+            let drop_query = format!("DROP TABLE IF EXISTS {}", quote_identifier(&table_name));
             transaction.execute(&drop_query, &[]).await.map_err(|err| MutationError::General(Box::new(err)))?;
         }
 
@@ -172,604 +519,106 @@ impl StorageEngine for Postgres {
 
         Ok(true)
     }
-}
 
-#[derive(Clone, Debug)]
-pub struct PostgresColumn {
-    pub name: String,
-    pub is_nullable: bool,
-    pub data_type: String,
-}
-
-pub struct PostgresBucket {
-    pool: bb8::Pool<PostgresConnectionManager<NoTls>>,
-    collection_id: CollectionId,
-    schema: String,
-    columns: Arc<RwLock<Vec<PostgresColumn>>>,
-    /// Tracks the last predicate that spilled to post-filtering (debug builds only)
-    #[cfg(debug_assertions)]
-    last_spilled_predicate: Arc<RwLock<Option<ankql::ast::Predicate<Resolved>>>>,
-}
-
-impl PostgresBucket {
-    fn state_table(&self) -> String { self.collection_id.as_str().to_string() }
-
-    pub fn event_table(&self) -> String { format!("{}_event", self.collection_id.as_str()) }
-
-    /// Returns the last predicate that spilled to post-filtering (debug builds only).
-    ///
-    /// Use this in tests to verify queries are fully pushed down to PostgreSQL:
-    /// ```rust,ignore
-    /// let spilled = bucket.last_spilled_predicate();
-    /// assert!(spilled.is_none(), "Expected full pushdown, but got spill: {:?}", spilled);
-    /// ```
-    #[cfg(debug_assertions)]
-    pub fn last_spilled_predicate(&self) -> Option<ankql::ast::Predicate<Resolved>> { self.last_spilled_predicate.read().unwrap().clone() }
-
-    /// Rebuild the cache of columns in the table.
-    pub async fn rebuild_columns_cache(&self, client: &mut tokio_postgres::Client) -> Result<(), StateError> {
-        debug!("PostgresBucket({}).rebuild_columns_cache", self.collection_id);
-        let column_query =
-            r#"SELECT column_name, is_nullable, data_type FROM information_schema.columns WHERE table_catalog = $1 AND table_name = $2;"#
-                .to_string();
-        let mut new_columns = Vec::new();
-        debug!("Querying existing columns: {:?}, [{:?}, {:?}]", column_query, &self.schema, &self.collection_id.as_str());
-        let rows = client
-            .query(&column_query, &[&self.schema, &self.collection_id.as_str()])
-            .await
-            .map_err(|err| StateError::DDLError(Box::new(err)))?;
-        for row in rows {
-            let is_nullable: String = row.get("is_nullable");
-            new_columns.push(PostgresColumn {
-                name: row.get("column_name"),
-                is_nullable: is_nullable.eq("YES"),
-                data_type: row.get("data_type"),
-            })
-        }
-
-        let mut columns = self.columns.write().unwrap();
-        *columns = new_columns;
-        drop(columns);
-
-        Ok(())
-    }
-
-    pub fn existing_columns(&self) -> Vec<String> {
-        let columns = self.columns.read().unwrap();
-        columns.iter().map(|column| column.name.clone()).collect()
-    }
-
-    pub fn column(&self, column_name: &String) -> Option<PostgresColumn> {
-        let columns = self.columns.read().unwrap();
-        columns.iter().find(|column| column.name == *column_name).cloned()
-    }
-
-    pub fn has_column(&self, column_name: &String) -> bool { self.column(column_name).is_some() }
-
-    pub async fn create_event_table(&self, client: &mut tokio_postgres::Client) -> Result<(), StateError> {
-        let create_query = format!(
-            r#"CREATE TABLE IF NOT EXISTS "{}"(
-                "id" character(43) PRIMARY KEY,
-                "entity_id" character(43),
-                "body" bytea,
-                "parent" character(43)[],
-                "attestations" bytea
-            )"#,
-            self.event_table()
-        );
-
-        debug!("{create_query}");
-        client.execute(&create_query, &[]).await.map_err(|e| StateError::DDLError(Box::new(e)))?;
-        Ok(())
-    }
-
-    pub async fn create_state_table(&self, client: &mut tokio_postgres::Client) -> Result<(), StateError> {
-        let create_query = format!(
-            r#"CREATE TABLE IF NOT EXISTS "{}"(
-                "id" character(43) PRIMARY KEY,
-                "state_buffer" BYTEA,
-                "memberships" BYTEA,
-                "head" character(43)[],
-                "attestations" BYTEA[]
-            )"#,
-            self.state_table()
-        );
-
-        debug!("{create_query}");
-        match client.execute(&create_query, &[]).await {
-            Ok(_) => Ok(()),
-            Err(err) => {
-                // Log full error details for debugging
-                if let Some(db_err) = err.as_db_error() {
-                    error!("PostgresBucket({}).create_state_table error: {} (code: {:?})", self.collection_id, db_err, db_err.code());
-                } else {
-                    error!("PostgresBucket({}).create_state_table error: {:?}", self.collection_id, err);
-                }
-                Err(StateError::DDLError(Box::new(err)))
-            }
-        }
-    }
-
-    pub async fn add_missing_columns(
-        &self,
-        client: &mut tokio_postgres::Client,
-        missing: Vec<(String, &'static str)>, // column name, datatype
-    ) -> Result<(), StateError> {
-        if missing.is_empty() {
-            return Ok(());
-        }
-
-        // Acquire advisory lock to serialize DDL operations for this collection
-        let lock_key = acquire_ddl_lock(client, self.collection_id.as_str()).await?;
-
-        let result = async {
-            // Re-check columns after acquiring lock (another session may have added them)
-            self.rebuild_columns_cache(client).await?;
-
-            for (column, datatype) in missing {
-                if Postgres::sane_name(&column) && !self.has_column(&column) {
-                    let alter_query = format!(r#"ALTER TABLE "{}" ADD COLUMN "{}" {}"#, self.state_table(), column, datatype);
-                    info!("PostgresBucket({}).add_missing_columns: {}", self.collection_id, alter_query);
-                    match client.execute(&alter_query, &[]).await {
-                        Ok(_) => {}
-                        Err(err) => {
-                            // Log full error details for debugging
-                            if let Some(db_err) = err.as_db_error() {
-                                warn!(
-                                    "Error adding column {} to table {}: {} (code: {:?})",
-                                    column,
-                                    self.state_table(),
-                                    db_err,
-                                    db_err.code()
-                                );
-                            } else {
-                                warn!("Error adding column {} to table {}: {:?}", column, self.state_table(), err);
-                            }
-                            self.rebuild_columns_cache(client).await?;
-                            return Err(StateError::DDLError(Box::new(err)));
-                        }
-                    }
-                }
-            }
-
-            self.rebuild_columns_cache(client).await?;
-            Ok(())
-        }
-        .await;
-
-        // Always release the lock
-        release_ddl_lock(client, lock_key).await?;
-
-        result
-    }
-}
-
-#[async_trait]
-impl StorageCollection for PostgresBucket {
-    async fn set_state(&self, state: Attested<EntityState>) -> Result<bool, MutationError> {
-        let state_buffers = bincode::serialize(&state.payload.state.state_buffers)?;
-        let memberships = bincode::serialize(&state.payload.state.memberships)?;
-        let attestations: Vec<Vec<u8>> = state.attestations.iter().map(bincode::serialize).collect::<Result<Vec<_>, _>>()?;
-        let id = state.payload.entity_id;
-
-        // Ensure head is not empty for new records
-        if state.payload.state.head.is_empty() {
-            warn!("Warning: Empty head detected for entity {}", id);
-        }
-
-        let mut client = self.pool.get().await.map_err(|err| MutationError::General(err.into()))?;
-
-        let mut columns: Vec<String> =
-            vec!["id".to_owned(), "state_buffer".to_owned(), "memberships".to_owned(), "head".to_owned(), "attestations".to_owned()];
-        let mut params: Vec<&(dyn ToSql + Sync)> = Vec::new();
-        params.push(&id);
-        params.push(&state_buffers);
-        params.push(&memberships);
-        params.push(&state.payload.state.head);
-        params.push(&attestations);
-
-        let mut materialized: Vec<(String, Option<PGValue>)> = Vec::new();
-        let mut seen_properties = std::collections::HashSet::new();
-
-        // Property ids are the temporary physical column names in this cut.
-        for (name, state_buffer) in state.payload.state.state_buffers.iter() {
-            let backend = backend_from_string(name, Some(state_buffer))?;
-            for (property, value) in backend.property_values() {
-                let column = property.to_string();
-                if !seen_properties.insert(property.clone()) {
-                    // Skip if property already seen in another backend
-                    // TODO: this should cause all (or subsequent?) fields with the same name
-                    // to be suffixed with the property id when we have property ids
-                    // requires some thought (and field metadata) on how to do this right
-                    continue;
-                }
-
-                let pg_value: Option<PGValue> = value.map(|value| value.into());
-                if !self.has_column(&column) {
-                    // We don't have the column yet and we know the type.
-                    if let Some(ref pg_value) = pg_value {
-                        self.add_missing_columns(&mut client, vec![(column.clone(), pg_value.postgres_type())]).await?;
-                    } else {
-                        // The column doesn't exist yet and we don't have a value.
-                        // This means the entire column is already null/none so we
-                        // don't need to set anything.
-                        continue;
-                    }
-                }
-
-                materialized.push((column.clone(), pg_value));
-            }
-        }
-
-        for (name, parameter) in &materialized {
-            columns.push(name.clone());
-
-            match &parameter {
-                Some(value) => match value {
-                    PGValue::CharacterVarying(string) => params.push(string),
-                    PGValue::SmallInt(number) => params.push(number),
-                    PGValue::Integer(number) => params.push(number),
-                    PGValue::BigInt(number) => params.push(number),
-                    PGValue::DoublePrecision(float) => params.push(float),
-                    PGValue::Bytea(bytes) => params.push(bytes),
-                    PGValue::Boolean(bool) => params.push(bool),
-                    PGValue::Jsonb(json_val) => params.push(json_val),
-                },
-                None => params.push(&UntypedNull),
-            }
-        }
-        let columns_str = columns.iter().map(|name| format!("\"{}\"", name)).collect::<Vec<String>>().join(", ");
-        let values_str = params.iter().enumerate().map(|(index, _)| format!("${}", index + 1)).collect::<Vec<String>>().join(", ");
-        let columns_update_str = columns
-            .iter()
-            .enumerate()
-            .skip(1) // Skip "id"
-            .map(|(index, name)| format!("\"{}\" = ${}", name, index + 1))
-            .collect::<Vec<String>>()
-            .join(", ");
-
-        // be careful with sql injection via bucket name
-        let query = format!(
-            r#"WITH old_state AS (
-                SELECT "head" FROM "{0}" WHERE "id" = $1
+    /// Non-creating durable materialization discovery. Physical table names
+    /// are deliberately not reverse-resolved; the private registration table
+    /// stores the logical model identities directly.
+    async fn list_materializations(&self) -> Result<Vec<ModelId>, RetrievalError> {
+        let client = self.pool.get().await.map_err(RetrievalError::storage)?;
+        let exists = client
+            .query_opt(
+                "SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = $1",
+                &[&MODEL_REGISTRATION_TABLE],
             )
-            INSERT INTO "{0}"({1}) VALUES({2})
-            ON CONFLICT("id") DO UPDATE SET {3}
-            RETURNING (SELECT "head" FROM old_state) as old_head"#,
-            self.state_table(),
-            columns_str,
-            values_str,
-            columns_update_str
-        );
-
-        debug!("PostgresBucket({}).set_state: {}", self.collection_id, query);
-        let mut created_table = false;
-        let row = loop {
-            match client.query_one(&query, params.as_slice()).await {
-                Ok(row) => break row,
-                Err(err) => {
-                    let kind = error_kind(&err);
-                    if let ErrorKind::UndefinedTable { table } = kind {
-                        if table == self.state_table() && !created_table {
-                            self.create_state_table(&mut client).await?;
-                            created_table = true;
-                            continue; // retry exactly once
-                        }
-                    }
-                    return Err(StateError::DDLError(Box::new(err)).into());
-                }
-            }
-        };
-
-        // If this is a new entity (no old_head), or if the heads are different, return true
-        let old_head: Option<Clock> = row.get("old_head");
-        let changed = match old_head {
-            None => true, // New entity
-            Some(old_head) => old_head != state.payload.state.head,
-        };
-
-        debug!("PostgresBucket({}).set_state: Changed: {}", self.collection_id, changed);
-        Ok(changed)
-    }
-
-    async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError> {
-        // be careful with sql injection via bucket name
-        let query =
-            format!(r#"SELECT "id", "state_buffer", "memberships", "head", "attestations" FROM "{}" WHERE "id" = $1"#, self.state_table());
-
-        let mut client = match self.pool.get().await {
-            Ok(client) => client,
-            Err(err) => {
-                return Err(RetrievalError::storage(err));
-            }
-        };
-
-        debug!("PostgresBucket({}).get_state: {}", self.collection_id, query);
-        let rows = match client.query(&query, &[&id]).await {
-            Ok(rows) => rows,
-            Err(err) => {
-                let kind = error_kind(&err);
-                if let ErrorKind::UndefinedTable { table } = kind {
-                    if table == self.state_table() {
-                        self.create_state_table(&mut client).await.map_err(RetrievalError::storage)?;
-                        return Err(RetrievalError::EntityNotFound(id));
-                    }
-                }
-                return Err(RetrievalError::storage(err));
-            }
-        };
-
-        let row = match rows.into_iter().next() {
-            Some(row) => row,
-            None => return Err(RetrievalError::EntityNotFound(id)),
-        };
-
-        debug!("PostgresBucket({}).get_state: Row: {:?}", self.collection_id, row);
-        let row_id: EntityId = row.try_get("id").map_err(RetrievalError::storage)?;
-        assert_eq!(row_id, id);
-
-        let serialized_buffers: Vec<u8> = row.try_get("state_buffer").map_err(RetrievalError::storage)?;
-        let state_buffers: BTreeMap<String, Vec<u8>> = bincode::deserialize(&serialized_buffers).map_err(RetrievalError::storage)?;
-        let membership_bytes: Vec<u8> = row.try_get("memberships").map_err(RetrievalError::storage)?;
-        let memberships = bincode::deserialize(&membership_bytes).map_err(RetrievalError::storage)?;
-        let head: Clock = row.try_get("head").map_err(RetrievalError::storage)?;
-        let attestation_bytes: Vec<Vec<u8>> = row.try_get("attestations").map_err(RetrievalError::storage)?;
-        let attestations = attestation_bytes
-            .into_iter()
-            .map(|bytes| bincode::deserialize(&bytes))
-            .collect::<Result<Vec<Attestation>, _>>()
-            .map_err(RetrievalError::storage)?;
-
-        Ok(Attested {
-            payload: EntityState {
-                entity_id: id,
-                collection: self.collection_id.clone(),
-                state: State { state_buffers: StateBuffers(state_buffers), memberships, head },
-            },
-            attestations: AttestationSet(attestations),
-        })
-    }
-
-    async fn fetch_states(&self, selection: &ankql::ast::Selection<Resolved>) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
-        debug!("fetch_states: {:?}", selection);
-        let mut client = self.pool.get().await.map_err(|err| RetrievalError::storage(err))?;
-
-        // Pre-filter selection based on cached schema to avoid undefined column errors.
-        // If we see columns not in our cache, refresh it first (they might have been added).
-        // TODO: Once property metadata is in the system catalog, we can create missing columns
-        // on-demand here instead of refreshing the cache each time we see unknown columns.
-        let referenced: Vec<(ankql::ast::PropertyId, String)> =
-            selection.referenced_properties().into_iter().map(|p| (p, p.to_string())).collect();
-        let cached = self.existing_columns();
-        let unknown_to_cache: Vec<&String> = referenced.iter().map(|(_, col)| col).filter(|col| !cached.contains(*col)).collect();
-
-        // Refresh cache if we see columns we haven't seen before
-        if !unknown_to_cache.is_empty() {
-            debug!("PostgresBucket({}).fetch_states: Unknown columns {:?}, refreshing schema cache", self.collection_id, unknown_to_cache);
-            self.rebuild_columns_cache(&mut client).await.map_err(RetrievalError::storage)?;
-        }
-
-        // Now check with (possibly refreshed) cache - columns still missing truly don't exist
-        let existing = self.existing_columns();
-        let missing: Vec<ankql::ast::PropertyId> =
-            referenced.into_iter().filter(|(_, col)| !existing.contains(col)).map(|(p, _)| p).collect();
-
-        let effective_selection = if missing.is_empty() {
-            selection.clone()
-        } else {
-            debug!("PostgresBucket({}).fetch_states: Columns {:?} don't exist, treating as NULL", self.collection_id, missing);
-            selection.assume_null(&missing)
-        };
-
-        // Split predicate into parts we can pushdown to PostgreSQL vs post-filter in Rust
-        let split = sql_builder::split_predicate_for_postgres(&effective_selection.predicate);
-        let needs_post_filter = split.needs_post_filter();
-        let remaining_predicate = split.remaining_predicate; // Cache before moving sql_predicate
-        debug!(
-            "PostgresBucket({}).fetch_states: SQL predicate: {:?}, remaining: {:?}, needs_post_filter: {}",
-            self.collection_id, split.sql_predicate, remaining_predicate, needs_post_filter
-        );
-
-        // Track spilled predicate for test assertions (debug builds only)
-        #[cfg(debug_assertions)]
-        {
-            let spilled = if needs_post_filter { Some(remaining_predicate.clone()) } else { None };
-            *self.last_spilled_predicate.write().unwrap() = spilled;
-        }
-
-        // Lower only the SQL half; Rust evaluates the remainder by property id.
-        let sql_selection = crate::lower::lower(&ankql::ast::Selection {
-            predicate: split.sql_predicate,
-            order_by: effective_selection.order_by.clone(),
-            limit: if needs_post_filter {
-                None // Can't limit in SQL if we need to post-filter (would drop valid results)
-            } else {
-                effective_selection.limit
-            },
-        });
-
-        let mut results = Vec::new();
-        let mut builder = SqlBuilder::with_fields(vec!["id", "state_buffer", "memberships", "head", "attestations"]);
-        builder.table_name(self.state_table());
-        builder.selection(&sql_selection)?;
-
-        let (sql, args) = builder.build()?;
-        debug!("PostgresBucket({}).fetch_states: SQL: {} with args: {:?}", self.collection_id, sql, args);
-
-        let stream = match client.query_raw(&sql, args).await {
-            Ok(stream) => stream,
-            Err(err) => {
-                let kind = error_kind(&err);
-                if let ErrorKind::UndefinedTable { table } = kind {
-                    if table == self.state_table() {
-                        // Table doesn't exist yet, return empty results
-                        return Ok(Vec::new());
-                    }
-                }
-                return Err(RetrievalError::storage(err));
-            }
-        };
-        pin_mut!(stream);
-
-        while let Some(row) = stream.try_next().await.map_err(RetrievalError::storage)? {
-            let id: EntityId = row.try_get(0).map_err(RetrievalError::storage)?;
-            let state_buffer: Vec<u8> = row.try_get(1).map_err(RetrievalError::storage)?;
-            let state_buffers: BTreeMap<String, Vec<u8>> = bincode::deserialize(&state_buffer).map_err(RetrievalError::storage)?;
-            let membership_bytes: Vec<u8> = row.try_get("memberships").map_err(RetrievalError::storage)?;
-            let memberships = bincode::deserialize(&membership_bytes).map_err(RetrievalError::storage)?;
-            let head: Clock = row.try_get("head").map_err(RetrievalError::storage)?;
-            let attestation_bytes: Vec<Vec<u8>> = row.try_get("attestations").map_err(RetrievalError::storage)?;
-            let attestations = attestation_bytes
-                .into_iter()
-                .map(|bytes| bincode::deserialize(&bytes))
-                .collect::<Result<Vec<Attestation>, _>>()
-                .map_err(RetrievalError::storage)?;
-
-            results.push(Attested {
-                payload: EntityState {
-                    entity_id: id,
-                    collection: self.collection_id.clone(),
-                    state: State { state_buffers: StateBuffers(state_buffers), memberships, head },
-                },
-                attestations: AttestationSet(attestations),
-            });
-        }
-
-        // Post-filter results if we have remaining predicate that couldn't be pushed down
-        let results = if needs_post_filter {
-            debug!(
-                "PostgresBucket({}).fetch_states: Post-filtering {} results with remaining predicate",
-                self.collection_id,
-                results.len()
-            );
-            let filtered = post_filter_states(&results, &remaining_predicate, &self.collection_id);
-
-            // Apply limit after post-filter if needed
-            if let Some(limit) = effective_selection.limit {
-                filtered.into_iter().take(limit as usize).collect()
-            } else {
-                filtered
-            }
-        } else {
-            results
-        };
-
-        Ok(results)
-    }
-
-    async fn add_event(&self, entity_event: &Attested<Event>) -> Result<bool, MutationError> {
-        let body = bincode::serialize(&entity_event.payload.body)?;
-        let attestations = bincode::serialize(&entity_event.attestations)?;
-
-        let query = format!(
-            r#"INSERT INTO "{0}"("id", "entity_id", "body", "parent", "attestations") VALUES($1, $2, $3, $4, $5)
-               ON CONFLICT ("id") DO NOTHING"#,
-            self.event_table(),
-        );
-
-        let mut client = self.pool.get().await.map_err(|err| MutationError::General(err.into()))?;
-        debug!("PostgresBucket({}).add_event: {}", self.collection_id, query);
-        let mut created_table = false;
-        let affected = loop {
-            match client
-                .execute(
-                    &query,
-                    &[&entity_event.payload.id(), &entity_event.payload.entity_id, &body, &entity_event.payload.parent, &attestations],
-                )
-                .await
-            {
-                Ok(affected) => break affected,
-                Err(err) => {
-                    let kind = error_kind(&err);
-                    if let ErrorKind::UndefinedTable { table } = kind {
-                        if table == self.event_table() && !created_table {
-                            self.create_event_table(&mut client).await?;
-                            created_table = true;
-                            continue; // retry exactly once
-                        }
-                    }
-                    error!("PostgresBucket({}).add_event: Error: {:?}", self.collection_id, err);
-                    return Err(StateError::DMLError(Box::new(err)).into());
-                }
-            }
-        };
-
-        Ok(affected > 0)
-    }
-
-    async fn get_events(&self, event_ids: Vec<EventId>) -> Result<Vec<Attested<Event>>, RetrievalError> {
-        if event_ids.is_empty() {
+            .await
+            .map_err(RetrievalError::storage)?
+            .is_some();
+        if !exists {
             return Ok(Vec::new());
         }
-
-        let query =
-            format!(r#"SELECT "id", "entity_id", "body", "parent", "attestations" FROM "{0}" WHERE "id" = ANY($1)"#, self.event_table(),);
-
-        let client = self.pool.get().await.map_err(RetrievalError::storage)?;
-        let rows = match client.query(&query, &[&event_ids]).await {
-            Ok(rows) => rows,
-            Err(err) => {
-                let kind = error_kind(&err);
-                match kind {
-                    ErrorKind::UndefinedTable { table } if table == self.event_table() => return Ok(Vec::new()),
-                    _ => return Err(RetrievalError::storage(err)),
-                }
-            }
-        };
-
-        let mut events = Vec::new();
-        for row in rows {
-            let entity_id: EntityId = row.try_get("entity_id").map_err(RetrievalError::storage)?;
-            let body: EventBody = row.try_get("body").map_err(RetrievalError::storage)?;
-            let parent: Clock = row.try_get("parent").map_err(RetrievalError::storage)?;
-            let attestations_binary: Vec<u8> = row.try_get("attestations").map_err(RetrievalError::storage)?;
-            let attestations: Vec<Attestation> = bincode::deserialize(&attestations_binary).map_err(RetrievalError::storage)?;
-
-            let event = Attested {
-                payload: Event { collection: self.collection_id.clone(), entity_id, body, parent },
-                attestations: AttestationSet(attestations),
-            };
-            events.push(event);
-        }
-        Ok(events)
+        client
+            .query(&format!(r#"SELECT "model_key" FROM "{MODEL_REGISTRATION_TABLE}""#), &[])
+            .await
+            .map_err(RetrievalError::storage)?
+            .into_iter()
+            .map(|row| {
+                let bytes: Vec<u8> = row.get("model_key");
+                bincode::deserialize(&bytes).map_err(RetrievalError::storage)
+            })
+            .collect()
     }
+}
 
-    async fn dump_entity_events(&self, entity_id: EntityId) -> Result<Vec<Attested<Event>>, ankurah_core::error::RetrievalError> {
-        let query = format!(r#"SELECT "id", "body", "parent", "attestations" FROM "{0}" WHERE "entity_id" = $1"#, self.event_table(),);
+fn state_from_row(row: &tokio_postgres::Row, memberships: BTreeSet<ModelId>) -> Result<Attested<EntityState>, RetrievalError> {
+    let entity_id: EntityId = row.try_get("id").map_err(RetrievalError::storage)?;
+    let serialized_buffers: Vec<u8> = row.try_get("state_buffer").map_err(RetrievalError::storage)?;
+    let state_buffers: BTreeMap<String, Vec<u8>> = bincode::deserialize(&serialized_buffers).map_err(RetrievalError::storage)?;
+    let head: Clock = row.try_get("head").map_err(RetrievalError::storage)?;
+    let attestation_bytes: Vec<Vec<u8>> = row.try_get("attestations").map_err(RetrievalError::storage)?;
+    let attestations = attestation_bytes
+        .into_iter()
+        .map(|bytes| bincode::deserialize(&bytes))
+        .collect::<Result<Vec<Attestation>, _>>()
+        .map_err(RetrievalError::storage)?;
+    Ok(Attested {
+        payload: EntityState { entity_id, state: State { state_buffers: StateBuffers(state_buffers), memberships, head } },
+        attestations: AttestationSet(attestations),
+    })
+}
 
-        let client = self.pool.get().await.map_err(RetrievalError::storage)?;
-        debug!("PostgresBucket({}).get_events: {}", self.collection_id, query);
-        let rows = match client.query(&query, &[&entity_id]).await {
-            Ok(rows) => rows,
-            Err(err) => {
-                let kind = error_kind(&err);
-                if let ErrorKind::UndefinedTable { table } = kind {
-                    if table == self.event_table() {
-                        return Ok(Vec::new());
-                    }
-                }
+/// Keep canonical state and membership reads on the same committed version.
+async fn read_snapshot(client: &mut tokio_postgres::Client) -> Result<tokio_postgres::Transaction<'_>, RetrievalError> {
+    client
+        .build_transaction()
+        .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+        .read_only(true)
+        .start()
+        .await
+        .map_err(RetrievalError::storage)
+}
 
-                return Err(RetrievalError::storage(err));
-            }
-        };
-
-        let mut events = Vec::new();
-        for row in rows {
-            // let event_id: EventId = row.try_get("id").map_err(|err| RetrievalError::storage(err))?;
-            let body_binary: Vec<u8> = row.try_get("body").map_err(RetrievalError::storage)?;
-            let body: EventBody = bincode::deserialize(&body_binary).map_err(RetrievalError::storage)?;
-            let parent: Clock = row.try_get("parent").map_err(RetrievalError::storage)?;
-            let attestations_binary: Vec<u8> = row.try_get("attestations").map_err(RetrievalError::storage)?;
-            let attestations: Vec<Attestation> = bincode::deserialize(&attestations_binary).map_err(RetrievalError::storage)?;
-
-            events.push(Attested {
-                payload: Event { collection: self.collection_id.clone(), entity_id, body, parent },
-                attestations: AttestationSet(attestations),
-            });
-        }
-
-        Ok(events)
+async fn load_states(client: &tokio_postgres::Transaction<'_>, ids: &[EntityId]) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
     }
+    let ids_param = ids.to_vec();
+    let rows = client
+        .query(
+            &format!(
+                r#"SELECT "id", "state_buffer", "head", "attestations"
+                   FROM "{ENTITY_TABLE}" WHERE "id" = ANY($1)"#
+            ),
+            &[&ids_param],
+        )
+        .await
+        .map_err(RetrievalError::storage)?;
+    let mut by_id = BTreeMap::new();
+    for row in rows {
+        let entity_id: EntityId = row.try_get("id").map_err(RetrievalError::storage)?;
+        let memberships = client
+            .query(&format!(r#"SELECT "model_key" FROM "{ENTITY_MODEL_TABLE}" WHERE "entity_id" = $1"#), &[&entity_id])
+            .await
+            .map_err(RetrievalError::storage)?
+            .into_iter()
+            .map(|row| {
+                let bytes: Vec<u8> = row.get("model_key");
+                bincode::deserialize(&bytes).map_err(RetrievalError::storage)
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let state = state_from_row(&row, memberships)?;
+        by_id.insert(state.payload.entity_id, state);
+    }
+    Ok(ids.iter().filter_map(|id| by_id.remove(id)).collect())
+}
+
+fn event_from_row(row: tokio_postgres::Row) -> Result<Attested<Event>, RetrievalError> {
+    let entity_id: EntityId = row.try_get("entity_id").map_err(RetrievalError::storage)?;
+    let body_bytes: Vec<u8> = row.try_get("body").map_err(RetrievalError::storage)?;
+    let body: EventBody = bincode::deserialize(&body_bytes).map_err(RetrievalError::storage)?;
+    let parent: Clock = row.try_get("parent").map_err(RetrievalError::storage)?;
+    let attestations_bytes: Vec<u8> = row.try_get("attestations").map_err(RetrievalError::storage)?;
+    let attestations: AttestationSet = bincode::deserialize(&attestations_bytes).map_err(RetrievalError::storage)?;
+    Ok(Attested { payload: Event { entity_id, body, parent }, attestations })
 }
 
 // Some hacky shit because rust-postgres doesn't let us ask for the error kind
@@ -780,6 +629,7 @@ pub enum ErrorKind {
     RowCount,
     UndefinedTable { table: String },
     UndefinedColumn { table: Option<String>, column: String },
+    UniqueViolation,
     Unknown,
     PostgresError(String),
 }
@@ -845,6 +695,7 @@ pub fn error_kind(err: &tokio_postgres::Error) -> ErrorKind {
                 ErrorKind::PostgresError(string.clone())
             }
         }
+        Some(SqlState::UNIQUE_VIOLATION) => ErrorKind::UniqueViolation,
         _ => ErrorKind::Unknown,
     }
 }
@@ -854,58 +705,51 @@ pub struct MissingMaterialized {
     pub name: String,
 }
 
-use bytes::BytesMut;
-use tokio_postgres::types::{to_sql_checked, IsNull, Type};
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use testcontainers_modules::{postgres, testcontainers::runners::AsyncRunner};
 
-use crate::sql_builder::SqlBuilder;
+    #[tokio::test]
+    async fn selected_entities_keep_their_state_and_memberships_from_one_snapshot() -> anyhow::Result<()> {
+        let container = postgres::Postgres::default().with_init_sql(include_bytes!("../tests/pg_init.sql").to_vec()).start().await?;
+        let uri = format!(
+            "host={} port={} user=postgres password=postgres dbname=postgres",
+            container.get_host().await?,
+            container.get_host_port_ipv4(5432).await?,
+        );
+        let engine = Postgres::open(&uri).await?;
+        let id = EntityId::from_bytes([0xd2; EntityId::BYTE_LEN]);
+        let before = Attested::opt(
+            EntityState {
+                entity_id: id,
+                state: State {
+                    state_buffers: StateBuffers::default(),
+                    memberships: [ModelId::System(SystemModel::Model)].into(),
+                    head: Clock::from(vec![EventId::from_bytes([1; 32])]),
+                },
+            },
+            None,
+        );
+        let mut transaction = engine.transaction();
+        transaction.set_state(&Clock::default(), &before).await?;
+        let result = transaction.commit().await?;
+        assert!(matches!(result, StorageCommitOutcome::Committed(_)));
 
-/// Post-filter EntityStates using a predicate that couldn't be pushed to SQL.
-///
-/// This is the escape hatch for predicates that PostgreSQL can't handle natively,
-/// such as complex JSON traversals or future features like Ref traversal.
-fn post_filter_states(
-    states: &[Attested<EntityState>],
-    predicate: &ankql::ast::Predicate<Resolved>,
-    collection_id: &CollectionId,
-) -> Vec<Attested<EntityState>> {
-    use ankurah_core::entity::TemporaryEntity;
-    use ankurah_core::selection::filter::evaluate_predicate;
+        let mut reader = engine.pool.get().await?;
+        let snapshot = read_snapshot(&mut reader).await?;
+        let selected = snapshot.query_one("SELECT id FROM _ankurah_model", &[]).await?.get(0);
+        let mut after = before.clone();
+        after.payload.state.head = Clock::from(vec![EventId::from_bytes([2; 32])]);
+        after.payload.state.memberships.insert(ModelId::System(SystemModel::Property));
+        let mut transaction = engine.transaction();
+        transaction.set_state(&before.payload.state.head, &after).await?;
+        let result = transaction.commit().await?;
+        assert!(matches!(result, StorageCommitOutcome::Committed(_)));
 
-    states
-        .iter()
-        .filter(|attested| {
-            // Create a TemporaryEntity for filtering (implements Filterable)
-            match TemporaryEntity::new(attested.payload.entity_id, collection_id.clone(), &attested.payload.state) {
-                Ok(temp_entity) => {
-                    // Evaluate the predicate
-                    match evaluate_predicate(&temp_entity, predicate) {
-                        Ok(true) => true,
-                        Ok(false) => false,
-                        Err(e) => {
-                            warn!("Post-filter evaluation error for entity {}: {}", attested.payload.entity_id, e);
-                            false // Exclude entities that fail evaluation
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to create TemporaryEntity for post-filtering {}: {}", attested.payload.entity_id, e);
-                    false // Exclude entities we can't evaluate
-                }
-            }
-        })
-        .cloned()
-        .collect()
-}
-
-#[derive(Debug)]
-struct UntypedNull;
-
-impl ToSql for UntypedNull {
-    fn to_sql(&self, _ty: &Type, _out: &mut BytesMut) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> { Ok(IsNull::Yes) }
-
-    fn accepts(_ty: &Type) -> bool {
-        true // Accept all types
+        assert_eq!(load_states(&snapshot, &[selected]).await?, vec![before]);
+        drop(snapshot);
+        assert_eq!(engine.get_state(id).await?, after);
+        Ok(())
     }
-
-    to_sql_checked!();
 }

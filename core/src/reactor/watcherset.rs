@@ -9,9 +9,10 @@ use std::sync::Arc;
 
 pub struct WatcherSet {
     /// Each property path has a ComparisonIndex so we can quickly find all subscriptions that care if a given value CHANGES (creation and deletion also count as change)
-    index_watchers: HashMap<(proto::CollectionId, PropertyPath), ComparisonIndex<(ReactorSubscriptionId, proto::QueryId)>>,
-    /// The set of watchers who want to be notified of any changes to a given collection
-    wildcard_watchers: HashMap<proto::CollectionId, HashSet<(ReactorSubscriptionId, proto::QueryId)>>,
+    index_watchers: HashMap<PropertyPath, ComparisonIndex<(ReactorSubscriptionId, proto::QueryId)>>,
+    /// Membership predicates are indexed independently of property comparisons.
+    membership_watchers: HashMap<proto::ModelId, HashSet<(ReactorSubscriptionId, proto::QueryId)>>,
+    wildcard_watchers: HashSet<(ReactorSubscriptionId, proto::QueryId)>,
     /// Index of subscriptions that presently match each entity, either by predicate or by entity subscription.
     /// This is used to quickly find all subscriptions that need to be notified when an entity changes.
     /// We have to maintain this to add and remove subscriptions when their matching state changes.
@@ -19,7 +20,7 @@ pub struct WatcherSet {
 }
 
 impl WatcherSet {
-    pub fn new() -> Self { Self { index_watchers: HashMap::new(), wildcard_watchers: HashMap::new(), entity_watchers: HashMap::new() } }
+    pub fn new() -> Self { Self { index_watchers: HashMap::new(), membership_watchers: HashMap::new(), wildcard_watchers: HashSet::new(), entity_watchers: HashMap::new() } }
     /// Accumulate interested watchers for an entity change into CandidateChanges
     pub fn accumulate_interested_watchers<E: AbstractEntity, C>(
         &self,
@@ -29,10 +30,10 @@ impl WatcherSet {
         candidates_by_sub: &mut BTreeMap<ReactorSubscriptionId, CandidateChanges<C>>,
     ) {
         let entity_id = AbstractEntity::id(entity);
+        let memberships = AbstractEntity::memberships(entity);
 
         // Find subscriptions interested based on index watchers
-        for ((collection_id, property_path), index_ref) in &self.index_watchers {
-            if *collection_id == AbstractEntity::collection(entity) {
+        for (property_path, index_ref) in &self.index_watchers {
                 if let Some(value) = property_path.extract_value(entity) {
                     for (subscription_id, query_id) in index_ref.find_matching(value) {
                         candidates_by_sub
@@ -41,21 +42,28 @@ impl WatcherSet {
                             .add_query(query_id, offset);
                     }
                 }
-            }
         }
 
-        // Check wildcard watchers for this collection
-        if let Some(watchers) = self.wildcard_watchers.get(&AbstractEntity::collection(entity)) {
-            for (subscription_id, query_id) in watchers.iter() {
-                candidates_by_sub
-                    .entry(*subscription_id)
-                    .or_insert_with(|| CandidateChanges::new(changes_arc.clone()))
-                    .add_query(*query_id, offset);
+        for (subscription_id, query_id) in &self.wildcard_watchers {
+            candidates_by_sub.entry(*subscription_id)
+                .or_insert_with(|| CandidateChanges::new(changes_arc.clone()))
+                .add_query(*query_id, offset);
+        }
+
+        // One entity change can affect queries through several memberships.
+        for model in &memberships {
+            if let Some(watchers) = self.membership_watchers.get(model) {
+                for (subscription_id, query_id) in watchers.iter() {
+                    candidates_by_sub
+                        .entry(*subscription_id)
+                        .or_insert_with(|| CandidateChanges::new(changes_arc.clone()))
+                        .add_query(*query_id, offset);
+                }
             }
         }
 
         // Check entity watchers
-        if let Some(subscription_ids) = self.entity_watchers.get(entity_id) {
+        if let Some(subscription_ids) = self.entity_watchers.get(&entity_id) {
             for sub_id in subscription_ids.iter() {
                 match sub_id {
                     EntityWatcherId::Predicate(subscription_id, query_id) => {
@@ -119,6 +127,7 @@ impl WatcherSet {
     pub fn clear(&mut self) {
         self.index_watchers.clear();
         self.wildcard_watchers.clear();
+        self.membership_watchers.clear();
         self.entity_watchers.clear();
     }
 
@@ -126,8 +135,8 @@ impl WatcherSet {
     pub fn debug_data(
         &self,
     ) -> (
-        &HashMap<(proto::CollectionId, PropertyPath), ComparisonIndex<(ReactorSubscriptionId, proto::QueryId)>>,
-        &HashMap<proto::CollectionId, HashSet<(ReactorSubscriptionId, proto::QueryId)>>,
+        &HashMap<PropertyPath, ComparisonIndex<(ReactorSubscriptionId, proto::QueryId)>>,
+        &HashSet<(ReactorSubscriptionId, proto::QueryId)>,
         &HashMap<ankurah_proto::EntityId, HashSet<EntityWatcherId>>,
     ) {
         (&self.index_watchers, &self.wildcard_watchers, &self.entity_watchers)
@@ -161,7 +170,6 @@ impl WatcherSet {
     }
     pub fn recurse_predicate_watchers(
         &mut self,
-        collection_id: &proto::CollectionId,
         predicate: &ankql::ast::Predicate<Resolved>,
         watcher_id: (ReactorSubscriptionId, proto::QueryId), // Should this be a tuple of (subscription_id, query_id) or just subscription_id?
         op: WatcherOp,
@@ -170,7 +178,7 @@ impl WatcherSet {
         match predicate {
             Predicate::Comparison { left, operator, right } => {
                 if let (Expr::Path(path), Expr::Literal(literal)) | (Expr::Literal(literal), Expr::Path(path)) = (&**left, &**right) {
-                    let index = self.index_watchers.entry((collection_id.clone(), path.clone())).or_default();
+                    let index = self.index_watchers.entry(path.clone()).or_default();
 
                     match op {
                         WatcherOp::Add => {
@@ -185,17 +193,28 @@ impl WatcherSet {
                 }
             }
             Predicate::And(left, right) | Predicate::Or(left, right) => {
-                self.recurse_predicate_watchers(collection_id, left, watcher_id, op);
-                self.recurse_predicate_watchers(collection_id, right, watcher_id, op);
+                self.recurse_predicate_watchers(left, watcher_id, op);
+                self.recurse_predicate_watchers(right, watcher_id, op);
             }
             Predicate::Not(pred) => {
-                self.recurse_predicate_watchers(collection_id, pred, watcher_id, op);
+                if pred.walk(false, &mut |found, p| found || matches!(p, Predicate::MemberOf(_))) {
+                    self.recurse_predicate_watchers(&Predicate::True, watcher_id, op);
+                } else {
+                    self.recurse_predicate_watchers(pred, watcher_id, op);
+                }
             }
             Predicate::IsNull(_) => {
                 unimplemented!("Not sure how to implement this")
             }
+            Predicate::MemberOf(model) => {
+                let set = self.membership_watchers.entry(*model).or_default();
+                match op {
+                    WatcherOp::Add => { set.insert(watcher_id); }
+                    WatcherOp::Remove => { set.remove(&watcher_id); }
+                }
+            }
             Predicate::True => {
-                let set = self.wildcard_watchers.entry(collection_id.clone()).or_default();
+                let set = &mut self.wildcard_watchers;
 
                 match op {
                     WatcherOp::Add => {
@@ -269,7 +288,7 @@ impl WatcherChange {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{entity::Entity, property::backend::lww::LWWBackend, schema::SystemEpoch, selection::filter::evaluate_predicate};
+    use crate::{entity::LocalTrxEntity, property::backend::lww::LWWBackend, schema::SystemEpoch, selection::filter::evaluate_predicate};
     use ankql::ast::{ComparisonOperator, Expr, Predicate};
     use ankurah_core_types::Value;
 
@@ -277,9 +296,11 @@ mod tests {
     fn json_subpaths_use_the_same_index_key_as_resolved_literals() -> anyhow::Result<()> {
         let property = proto::EntityId::from_bytes([2; 32]);
         let path = PropertyPath::registered(property, "data", vec!["nested".into(), "key".into()]);
-        let collection = proto::CollectionId::fixed_name("test");
-        let entity = Entity::create(proto::EntityId::from_bytes([1; 32]), collection.clone(), SystemEpoch::allocate());
-        let backend = entity.get_backend::<LWWBackend>()?;
+        let model = proto::ModelId::EntityId(proto::EntityId::from_bytes([3; 32]));
+        let pending = LocalTrxEntity::new(None, proto::AuthorId::Unknown, SystemEpoch::allocate(), Arc::new(std::sync::atomic::AtomicBool::new(true)));
+        pending.add_membership(model)?;
+        let backend = pending.get_backend::<LWWBackend>()?;
+        let entity = pending.read();
         let subscription = ReactorSubscriptionId::new();
         let query = proto::QueryId::new();
         let changes = Arc::new(vec![entity.clone()]);
@@ -292,7 +313,7 @@ mod tests {
                 right: Box::new(Expr::Literal(Value::Json(leaf.clone()))),
             };
             let mut watchers = WatcherSet::new();
-            watchers.recurse_predicate_watchers(&collection, &predicate, (subscription, query), WatcherOp::Add);
+            watchers.recurse_predicate_watchers(&predicate, (subscription, query), WatcherOp::Add);
             for value in [Value::Json(json.clone()), Value::Binary(serde_json::to_vec(&json)?)] {
                 backend.set(proto::PropertyId::EntityId(property), Some(value));
                 assert!(evaluate_predicate(&entity, &predicate)?);

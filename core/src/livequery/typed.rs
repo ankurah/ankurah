@@ -24,6 +24,27 @@ impl<R: View> std::ops::Deref for LiveQuery<R> {
 }
 
 impl<R: View> LiveQuery<R> {
+    /// Resolve typed field names now; defer missing bindings or readiness.
+    pub fn update_selection(
+        &self,
+        selection: impl TryInto<ankql::ast::Selection<ankql::ast::Parsed>, Error = impl Into<RetrievalError>>,
+    ) -> Result<(), RetrievalError> {
+        let resolution = super::QueryResolution::prepare(
+            self.0.0.context.schema_resolver(), R::Model::descriptor(), selection.try_into().map_err(Into::into)?,
+        )?;
+        self.0.update_resolution(resolution)
+    }
+
+    /// Replace the selection and await initialization, propagating update or initialization errors.
+    /// If superseded by another update, wait for the newer version instead.
+    pub async fn update_selection_wait(
+        &self,
+        selection: impl TryInto<ankql::ast::Selection<ankql::ast::Parsed>, Error = impl Into<RetrievalError>>,
+    ) -> Result<(), RetrievalError> {
+        self.update_selection(selection)?;
+        self.wait_initialized().await
+    }
+
     /// Wait for initialization or its terminal error.
     pub async fn wait_initialized(&self) -> Result<(), RetrievalError> { self.0.wait_initialized().await }
 

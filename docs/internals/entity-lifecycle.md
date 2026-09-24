@@ -1,98 +1,159 @@
 # Entity Lifecycle
 
-## Mental Model
+> **0.10 preview.** This chapter describes the pending StorageEngine and entity
+> changes. The type split below is not the released 0.9 implementation.
 
-An entity in ankurah is a **replicated, convergent data object**. Its lifecycle
-follows four phases:
+## Views, Mutables, and Entities
 
-```mermaid
-flowchart LR
-    creation["Creation"]
-    mutation["Local Mutation<br/>(transaction)"]
-    commit["Commit<br/>(validate, relay, persist)"]
-    persisted["Persisted<br/>(stored state)"]
-    remote["Remote Events<br/>(apply or merge)"]
-    others["other nodes"]
+An entity is one replicated object with an identity, properties, and a set of
+model memberships. A model struct describes a particular set of properties;
+its generated View and Mutable expose those properties with typed accessors.
+Two Views of different models can therefore read the same entity.
 
-    creation --> mutation --> commit --> persisted
-    persisted --> remote
-    others --> remote
-```
+| Handle | Holds | Purpose |
+|---|---|---|
+| `AlbumView` (implements `View`) | `Entity` | Read an entity through Album's typed accessors. |
+| `AlbumMut` (implements `Mutable`) | `LocalTrxEntity` | Edit Album's properties inside a transaction. |
+| `Entity` | `Resident` or `Proxy` | Read properties and memberships without choosing a model struct. |
 
-At every stage, two things determine what happens next:
+These types separate read access from the two ways of producing a change:
+local property mutations and application of existing events.
 
-- The **head clock** -- a set of event IDs recording which events have been
-  integrated into the entity's current state.
-- The **[event DAG](event-dag.md)** -- which determines whether an incoming
-  update extends, duplicates, or conflicts with that state.
+<iframe src="figures/entity-handles.html" title="Entity handles and their permitted operations" style="width: 100%; height: 580px; border: 0;"></iframe>
 
-Head and [backend](property-backends.md) state are bundled under a single lock
-so they are always updated atomically.
+[Open the diagram at full width](figures/entity-handles.html).
 
-Every `Entity` is a resident of a `WeakEntitySet`, or a transaction fork retaining
-its resident through its upstream chain. Detached state uses `TemporaryEntity`:
-it is used for query evaluation and cannot produce an `Entity` or typed view.
+## The Type Boundaries
+
+`Entity::Resident` holds an `Arc<EntityInner>`: the node's committed, in-memory
+instance of that entity. Only `WeakEntitySet` can construct it. The set keeps a
+weak reference, and `EntityInner` retains its registry. This enforces one live
+resident entity per ID within that set, without keeping unused entities alive forever.
+
+`Entity::Proxy` is a readable handle whose target can change. A View obtained
+from a Mutable reads the transaction's working state through this proxy. When
+the transaction finishes, the proxy follows its outcome. Ordinary Views fetched
+from the context read the resident entity directly.
+
+The two transaction types have different capabilities:
+
+| Type | Creation | Editing | Accepts |
+|---|---|---|---|
+| `LocalTrxEntity` | `Pending`: identity is initially unset | `Mut`: retains and forks the resident entity | Property mutations, later frozen into events |
+| `RemoteTrxEntity` | `New`: identity comes from the received genesis | `Mut`: retains and forks the resident entity | Existing events and state snapshots |
+
+Their private `TrxEntityData` holds the common machinery: working state,
+retained events, the transaction's alive flag, system epoch, and coordination
+with its readable proxy. Each transaction entity owns its own data; sharing the
+implementation does not share working state between transactions.
+
+This structure enforces three boundaries:
+
+- A readable `Entity` exposes neither property mutation nor event application.
+- A `LocalTrxEntity` exposes mutation; a `RemoteTrxEntity` exposes application.
+  Callers cannot switch modes on one transaction entity.
+- Pending creations stay outside `WeakEntitySet`. Obtaining an ID does not
+  publish a resident entity. Storage must commit before a transaction publishes one.
+
+Detached state used for query evaluation has a separate type,
+`TemporaryEntity`. It does not masquerade as a registered resident entity.
+
+## What a Transaction View Reads
+
+While a transaction is open, `mutable.read()` creates a View backed by its
+proxy. That View can survive the transaction and follow later updates to the resident entity.
+
+| Outcome | View of an edited entity | View of a new entity |
+|---|---|---|
+| Transaction open | Reads the working fork, including local edits | Reads the pending creation |
+| Commit succeeds | Follows the updated resident entity | Follows the newly published resident entity |
+| Rollback or drop | Returns to the current resident entity | Property reads and `mutable.read()` fail with `TransactionClosed` |
+
+For example, an existing resident entity has `points = 1`. A transaction changes it to
+`2`, and a View obtained from that Mutable reads `2` while an ordinary View of
+the resident entity still reads `1`. After commit both read the resident entity's value.
+After rollback the transaction View returns to the resident entity's value, including any changes
+committed by other transactions in the meantime.
+
+The proxy changes its target; the transaction entity never changes its kind.
+Mutable handles stop accepting writes when their transaction closes. A
+rolled-back creation reports an empty head and no memberships.
 
 
 ## Creation
 
-An entity comes into existence through `Transaction::create()`. This does two
-things:
+`Transaction::create()` builds a pending `LocalTrxEntity`, initializing its
+membership and properties without assigning an ID or registering a resident entity.
+The first identity request freezes the mutations so far into a genesis event;
+that event determines the entity ID. An explicit `id()` call or construction of
+a `Ref` can make that request. If nothing asks for the ID, commit preparation
+generates a single genesis containing all mutations. Mutations after an early
+ID demand become a later update event.
 
-1. **Mints a primary entity** with an empty head and empty backends, registered
-   in a node-wide weak set (which guarantees at most one live instance per
-   entity ID).
-2. **Forks a transactional snapshot** by cloning every
-   [backend](property-backends.md#the-propertybackend-trait) and the current
-   head. The snapshot is `Transacted` -- it holds a back-pointer to its primary
-   but is the only copy the user mutates.
+| Before commit | Generated events |
+|---|---|
+| Create, edit, commit without demanding an ID | One genesis containing the final values |
+| Create, demand ID, edit, commit | The retained genesis plus an update for later mutations |
+| Create, demand ID, commit without further edits | The retained genesis alone |
 
-This snapshot isolation means the primary entity stays read-only until commit.
-User mutations (setting properties) go through the snapshot's backends, which
-accumulate pending operations.
+Editing a committed entity forks its [backends](property-backends.md#the-propertybackend-trait),
+memberships, and head into a `LocalTrxEntity` retaining the resident entity. New creations have no
+upstream entity to fork.
 
-> **System root entities** follow a different path: they are created outside a
-> transaction, have their properties set directly, and produce a creation event
-> that is immediately applied and persisted. This is the only code path where
-> a creation event is applied to the same entity that generated it.
+System roots use the same preparation and publication machinery without a
+user transaction. They are registered only after their genesis and state persist.
 
 
 ## Local Transaction Commit
 
-When a transaction commits, five phases execute in order:
+Local mutations first become events, then use the same event-application type
+as remote writes: `RemoteTrxEntity`. Here, "remote" describes the input mode
+(existing events); local commit uses it too. The current implementation builds
+a fresh application fork for validation and retries. Reusing the local working
+fork is a follow-up tracked in
+[#509](https://github.com/ankurah/ankurah/issues/509).
 
-**1. Generate events.** Each entity's backends are asked for pending operations
-(via [`to_operations()`](property-backends.md#the-propertybackend-trait)). These become
-an `Event` whose parent is the snapshot's current head. Entities with no
-pending operations are skipped. A validation check ensures creation events can
-only come from entities that were actually created through the transaction --
-preventing "phantom entities."
+Five phases execute in order:
 
-**2. Fork-based validation.** Preserve an original snapshot and a working fork
-per entity. Events are individually authorized/attested, applied in order, retained
-by the working fork, and written to the storage transaction. After
-each event, check the entity's original-to-current state and write it through the
-same storage transaction. Any rejection drops the transaction without committing
-its writes or changing residents.
+**1. Generate events.** Each entity's pending property operations (via
+[`to_operations()`](property-backends.md#the-propertybackend-trait)) and
+membership additions become an event. A creation whose ID was never demanded
+gets a single genesis containing all of them. Otherwise they form an update
+whose parent is the current head, retained alongside any genesis frozen earlier.
+Unchanged edits are skipped, and their views return to the resident entity.
+
+**2. Apply and authorize.** Preserve an original snapshot and a working
+`RemoteTrxEntity` per entity. Apply each event and authorize its
+original-to-current state transition. Retain the admitted events and write
+them, with the resulting state, through one `StorageTransaction`. A rejection
+discards the attempt without committing its writes or changing resident entities.
 
 **3. Relay to peers.** Attested events are sent to
 [durable peers](node-architecture.md#durable-vs-ephemeral-nodes). The commit
-waits for peer confirmation.
+waits for peer confirmation. A storage retry does not relay them again.
 
 **4. Persist.** Events and prepared states are persisted atomically, provided
 storage still matches the heads from which the forks were made. A conflict
-discards the attempt's forks and repeats validation from the residents.
+discards the attempt's application forks and repeats validation from the resident entities.
 
 **5. Publish.** After storage commits, consume each working fork to apply its
-retained events to its immediate upstream resident and emit change notifications.
-The node serializes storage commit and resident publication; a losing writer
+retained events to its upstream resident entity. A creation instead transfers its
+prepared state into a newly registered resident entity. Redirect transaction views and
+emit change notifications.
+The node serializes storage commit and WeakEntitySet publication; a losing writer
 cannot retry its commit before the winner publishes. Peer waits and reactor
 notification happen outside that lock.
+
+An incoming `RemoteTransaction` starts at phase 2 with events already supplied
+by the sender and does not relay them back for approval. The enclosing
+`Transaction` or `RemoteTransaction` owns persistence;
+`RemoteTrxEntity::commit()` performs the in-memory publication after storage
+has committed.
 
 
 ## Remote Event Application
 
-Remote events arrive via `NodeApplier` through two delivery mechanisms (see
+Replication updates arrive via `NodeApplier` through two delivery mechanisms (see
 [Node Architecture and Replication](node-architecture.md) for the full
 protocol):
 
@@ -118,8 +179,13 @@ operations would then be silently dropped as `StrictAscends`.
 
 ## How Events Are Applied
 
-`apply_event` is the central integration point, used by both local commit and
-remote delivery. It works in two stages: guard checks, then a retry loop.
+The private shared state implementation's `apply_event` is the central
+integration point, used by both local commit and remote delivery. Readable
+`Entity` handles do not expose it. It works in two stages: guard checks, then a retry loop.
+
+The head clock records the event IDs at the frontier of the entity's applied
+history. Comparing those heads through the [event DAG](event-dag.md) determines
+whether an incoming event extends, duplicates, or diverges from that history.
 
 ### Guard Ordering
 
@@ -152,7 +218,7 @@ and acts on the [`causal relation`](event-dag.md#key-concepts):
 | `Equal` | Already integrated -- no-op |
 | `StrictDescends` | Direct descendant -- apply operations, advance head |
 | `StrictAscends` | Event is older than current state -- no-op |
-| `DivergedSince` | True concurrency -- compute [event layers](event-dag.md#key-concepts) from the meet point, merge per-backend via [`apply_layer`](property-backends.md#the-propertybackend-trait), update head (remove meet ancestors, insert the event id) so it reflects both tips |
+| `DivergedSince` | True concurrency -- compute [event layers](event-dag.md#key-concepts) from the meet point, merge per-backend via [`apply_layer`](property-backends.md#the-propertybackend-trait), add the layers' membership additions, update head (remove meet ancestors, insert the event id) so it reflects both tips |
 | `Disjoint` | Different lineage -- error |
 | `BudgetExceeded` | DAG traversal too deep -- error |
 
@@ -170,7 +236,7 @@ state** -- merging requires the per-operation detail that only events carry
 | Relation | Result |
 |----------|--------|
 | `Equal` | `AlreadyApplied` |
-| `StrictDescends` | Replace all backends from snapshot -- `Applied` |
+| `StrictDescends` | Load the snapshot's backends and memberships, advance the head -- `Applied` |
 | `StrictAscends` | `Older` |
 | `DivergedSince` | `DivergedRequiresEvents` -- caller must fall back to event-by-event application |
 | `Disjoint` / `BudgetExceeded` | Error |
@@ -187,7 +253,7 @@ comparison and mutation. The `try_mutate` helper serializes this:
 
 ```rust
 fn try_mutate(&self, expected_head: &mut Clock, body: F) -> Result<bool, E> {
-    let mut state = self.state.write().unwrap();
+    let mut state = self.inner.write().unwrap();
     if &state.head != expected_head {
         *expected_head = state.head.clone();
         return Ok(false);  // head moved -- caller should retry
@@ -235,8 +301,8 @@ This gives clean crash recovery semantics:
 
 ## Key Invariants
 
-1. **Atomic head + backend updates.** Both live under a single `RwLock` and are
-   always updated together.
+1. **Atomic head, membership, and backend updates.** All three live under a
+   single `RwLock` and are always updated together.
 
 2. **TOCTOU protection on every mutation path.** Compare-then-mutate is
    serialized with bounded retries (5 attempts).
@@ -244,7 +310,7 @@ This gives clean crash recovery semantics:
 3. **Creation event idempotency.** Re-delivery is detected by the durable fast
    path or by BFS (`StrictAscends`). Neither corrupts state.
 
-4. **Transaction snapshot isolation.** The primary entity is not modified until
+4. **Transaction snapshot isolation.** The resident entity is not modified until
    commit phase 5.
 
 5. **Discoverable history; atomic event/state persistence.** During application,

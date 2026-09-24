@@ -39,3 +39,29 @@ where
     })?;
     Ok(NodeResponseBody::CommitComplete { id })
 }
+
+/// Retrieve visible events, then apply event-specific checks without blocking catalog bootstrap reads.
+pub(super) async fn get_events<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent, C: Iterable<PA::ContextData>>(
+    node: &Node<SE, PA>,
+    credentials: &C,
+    event_ids: Vec<EventId>,
+) -> Result<NodeResponseBody, RetrievalError> {
+    let policy = ContextPolicy::from_credentials(&node.policy_agent, credentials);
+    let events = node.storage.get_events(event_ids, &policy.retrieval_predicate()).await?;
+    let ids = events.iter().map(|event| event.payload.entity_id).collect::<BTreeSet<_>>();
+    let catalog = crate::schema::CATALOG_MODELS.into_iter().map(Predicate::MemberOf)
+        .reduce(|left, right| Predicate::Or(Box::new(left), Box::new(right))).unwrap();
+    let exempt: BTreeSet<_> = node.storage.filter_entity_ids(&ids.into_iter().collect::<Vec<_>>(), &catalog).await?.into_iter().collect();
+    let mut accepted = Vec::new();
+    for event in events {
+        if !exempt.contains(&event.payload.entity_id) {
+            match node.policy_agent.check_read_event(credentials, &event) {
+                Ok(()) => {}
+                Err(AccessDenied::ByPolicy(_) | AccessDenied::ModelDenied(_)) => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        accepted.push(event);
+    }
+    Ok(NodeResponseBody::GetEvents(accepted))
+}

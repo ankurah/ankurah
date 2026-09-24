@@ -59,7 +59,7 @@ async fn registration_fills_pending_bindings_and_restart_does_not_rebind() -> an
     let reader = JwtContext::from_claims(claims.clone(), common::sign_token(&keys, &claims));
     let selection = ankql::ast::Predicate::MemberOf(model);
     let transaction = root.begin();
-    let document = transaction.create(&Document { owner: "alice".into() }).await?.read();
+    let document = transaction.create(&Document { owner: "alice".into() }).await?.read()?;
     transaction.commit().await?;
     assert!(ContextPolicy::from_credentials(&agent, &reader).check_read(&document.id(), &document.entity().to_state()?).is_err(),
         "an unresolved restriction cannot become an unrestricted grant");
@@ -70,7 +70,7 @@ async fn registration_fills_pending_bindings_and_restart_does_not_rebind() -> an
     assert!(node.catalog.property_by_name(&match model { ankurah::proto::ModelId::EntityId(id) => id, _ => unreachable!() }, "embargo")?.is_none());
     assert_eq!(root.resolve_model_id::<DocumentWithEmbargo>().await?, model);
     let transaction = root.begin();
-    let document = transaction.create(&DocumentWithEmbargo { owner: "alice".into(), embargo: false }).await?.read();
+    let document = transaction.create(&DocumentWithEmbargo { owner: "alice".into(), embargo: false }).await?.read()?;
     transaction.commit().await?;
     let id = document.id();
     let state = document.entity().to_state()?;

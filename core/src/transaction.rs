@@ -73,36 +73,47 @@ impl Transaction {
     /// Retrieve an entity for editing, registering the model locally or remotely if needed.
     /// Reuses this transaction's existing snapshot when present.
     pub async fn get<'rec, 'trx: 'rec, M: Model>(&'trx self, id: &EntityId) -> Result<MutableBorrow<'rec, M::Mutable>, RetrievalError> {
-        self.dyncontext.schema_resolver().ensure_registered(M::descriptor()).await?;
-        let entity = match self.get_trx_entity(id) {
-            Some(entity) => entity,
-            None => {
-                let retrieved_entity = self.dyncontext.get_entity(&M::collection(), *id, false).await?;
-                if let Some(entity) = self.get_trx_entity(id) {
-                    entity
-                } else {
-                    self.dyncontext.check_write(&retrieved_entity).map_err(RetrievalError::AccessDenied)?;
-                    let _guard = self.snapshot_creation_lock.lock().unwrap();
-                    self.get_trx_entity(id).unwrap_or_else(|| self.add_entity(retrieved_entity.snapshot(self.alive.clone())))
-                }
+        let (model, _) = self.dyncontext.schema_resolver().ensure_registered(M::descriptor()).await?;
+        let source = match self.get_trx_entity(id) {
+            Some(entity) => entity.read(),
+            None => self.dyncontext.get_entity(*id, false).await?,
+        };
+        self.authorize_edit(&model, &source)?;
+        let entity = {
+            let _guard = self.snapshot_creation_lock.lock().unwrap();
+            match self.get_trx_entity(id) {
+                Some(entity) => entity,
+                None => self.add_entity(LocalTrxEntity::edit(&source, proto::AuthorId::Unknown, self.alive.clone())?),
             }
         };
-        Ok(MutableBorrow::new(entity))
+        MutableBorrow::new(entity)
     }
 
     /// Edit an entity using local model bindings; fails if registration is needed.
     /// Reuses this transaction's existing snapshot when present.
     /// Local edits may outlive node halt; committing them cannot.
     pub fn edit<'rec, 'trx: 'rec, M: Model>(&'trx self, source: &Entity) -> Result<MutableBorrow<'rec, M::Mutable>, RetrievalError> {
-        self.dyncontext.schema_resolver().bind_descriptor_local(M::descriptor(), source)?;
-        let entity = if let Some(entity) = self.get_trx_entity(&source.id) {
+        let model = self.dyncontext.schema_resolver().bind_descriptor_local(M::descriptor(), source)?;
+        self.authorize_edit(&model, source)?;
+        let entity = if let Some(entity) = self.get_trx_entity(&source.id()) {
             entity
         } else {
-            self.dyncontext.check_write(source).map_err(RetrievalError::AccessDenied)?;
             let _guard = self.snapshot_creation_lock.lock().unwrap();
-            self.get_trx_entity(&source.id).unwrap_or_else(|| self.add_entity(source.snapshot(self.alive.clone())))
+            match self.get_trx_entity(&source.id()) {
+                Some(entity) => entity,
+                None => self.add_entity(LocalTrxEntity::edit(source, proto::AuthorId::Unknown, self.alive.clone())?),
+            }
         };
-        Ok(MutableBorrow::new(entity))
+        MutableBorrow::new(entity)
+    }
+
+    /// Check that the typed view applies and this context may edit the entity.
+    fn authorize_edit(&self, model: &ModelId, entity: &Entity) -> Result<(), RetrievalError> {
+        if !entity.has_membership(model) {
+            return Err(RetrievalError::MissingComponent { entity_id: entity.id(), model_id: *model });
+        }
+        self.dyncontext.check_write(entity)?;
+        Ok(())
     }
 
     #[must_use]
@@ -145,7 +156,7 @@ impl Drop for Transaction {
     fn drop(&mut self) {
         // Mark transaction as no longer alive when dropped
         self.alive.store(false, Ordering::Release);
-        // how do we want to do the rollback?
+        for entity in self.entities.iter() { entity.rollback(); }
     }
 }
 
@@ -162,5 +173,8 @@ impl Transaction {
 
     /// Rollback the transaction (UniFFI version)
     #[uniffi::method(name = "rollback")]
-    pub fn uniffi_rollback(&self) { self.alive.store(false, Ordering::Release); }
+    pub fn uniffi_rollback(&self) {
+        self.alive.store(false, Ordering::Release);
+        for entity in self.entities.iter() { entity.rollback(); }
+    }
 }

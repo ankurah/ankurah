@@ -5,6 +5,17 @@ use syn::{parse_macro_input, DeriveInput};
 pub fn derive_property_impl(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let name = input.ident.clone();
+    let mut no_ffi = false;
+    for attr in input.attrs.iter().filter(|attr| attr.path().is_ident("property")) {
+        if let Err(error) = attr.parse_nested_meta(|meta| {
+            if !meta.path.is_ident("no_ffi") { return Err(meta.error("expected `no_ffi`")); }
+            if no_ffi { return Err(meta.error("duplicate `no_ffi`")); }
+            no_ffi = true;
+            Ok(())
+        }) {
+            return error.to_compile_error().into();
+        }
+    }
 
     // Generate the Property trait implementation
     let property_impl = quote! {
@@ -43,12 +54,16 @@ pub fn derive_property_impl(input: TokenStream) -> TokenStream {
     };
 
     // Generate WASM wrapper types for this custom type
-    let wrapper_impl = match crate::wrapper_macros::impl_wrapper_type_impl(&syn::Type::Path(syn::TypePath {
-        qself: None,
-        path: syn::Path::from(name.clone()),
-    })) {
-        Ok(tokens) => tokens,
-        Err(_) => quote! {}, // If wrapper generation fails, just skip it
+    let wrapper_impl = if no_ffi {
+        quote! {}
+    } else {
+        match crate::wrapper_macros::impl_wrapper_type_impl(&syn::Type::Path(syn::TypePath {
+            qself: None,
+            path: syn::Path::from(name.clone()),
+        })) {
+            Ok(tokens) => tokens,
+            Err(_) => quote! {}, // If wrapper generation fails, just skip it
+        }
     };
 
     let expanded: proc_macro::TokenStream = quote! {

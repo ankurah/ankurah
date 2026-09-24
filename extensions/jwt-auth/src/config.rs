@@ -7,7 +7,8 @@ use std::collections::HashMap;
 /// that map privileges to collection operations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyConfig {
-    /// Role name → list of privilege names
+    /// Role name → list of privilege names. `"*"` satisfies any named privilege;
+    /// it does not grant entity access without a configured operation rule.
     pub roles: HashMap<String, Vec<String>>,
 
     /// Collection access rules keyed by collection name
@@ -34,7 +35,8 @@ pub struct ScopeRule {
 }
 
 /// The operations a [`ScopeRule`] applies to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(ankurah::Property, Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[property(no_ffi)]
 #[serde(rename_all = "snake_case")]
 pub enum ScopeRuleOp {
     /// Applies to reads and writes (the default, and the pre-existing behavior).
@@ -84,44 +86,13 @@ pub struct CollectionRules {
 }
 
 impl PolicyConfig {
-    /// The collection admission gate: true when any role holds `read`,
-    /// `write`, or `retrieve` privilege. Deliberately the WIDEST read
-    /// admission — it is what admits a retrieval-tier caller's `Ref`
-    /// follow: the by-id wire path checks only this gate plus per-row
-    /// `check_read`. Scans are refused downstream in `filter_predicate`,
-    /// which composes to `False` for callers this gate admitted without
-    /// scan privilege. Use [`Self::can_scan_collection`] where only
-    /// scan-privileged credentials may count.
-    pub fn can_access_collection(&self, roles: &[String], collection: &CollectionId) -> bool {
-        for role in roles {
-            if self.role_has_wildcard(role) {
-                return true;
-            }
-        }
-
-        let collection_name = collection.as_str();
-        if let Some(rules) = self.collections.get(collection_name) {
-            for role in roles {
-                let privileges = self.privileges_for_role(role);
-                if let Some(ref read_priv) = rules.read {
-                    if privileges.contains(&read_priv.as_str()) {
-                        return true;
-                    }
-                }
-                if let Some(ref write_priv) = rules.write {
-                    if privileges.contains(&write_priv.as_str()) {
-                        return true;
-                    }
-                }
-                if let Some(ref retrieve_priv) = rules.retrieve {
-                    if privileges.contains(&retrieve_priv.as_str()) {
-                        return true;
-                    }
-                }
-            }
-        }
-
-        false
+    /// Whether any role holds a configured `read`, `write`, or `retrieve` privilege.
+    /// Row scopes still apply. Use [`Self::can_scan_collection`] to exclude retrieval-only grants.
+    pub fn can_access_collection(&self, roles: &[String], collection_name: &str) -> bool {
+        self.collections.get(collection_name).is_some_and(|rules| {
+            [&rules.read, &rules.write, &rules.retrieve].into_iter().flatten()
+                .any(|privilege| self.roles_have_privilege(roles, privilege))
+        })
     }
 
     /// True when any role may run a SCAN — a predicate query, subscription,
@@ -129,54 +100,17 @@ impl PolicyConfig {
     /// (exactly what [`Self::can_access_collection`] meant before
     /// `retrieve` existed). `retrieve` deliberately does not count here:
     /// naming rows is the whole of what it grants.
-    pub fn can_scan_collection(&self, roles: &[String], collection: &CollectionId) -> bool {
-        for role in roles {
-            if self.role_has_wildcard(role) {
-                return true;
-            }
-        }
-
-        let collection_name = collection.as_str();
-        if let Some(rules) = self.collections.get(collection_name) {
-            for role in roles {
-                let privileges = self.privileges_for_role(role);
-                if let Some(ref read_priv) = rules.read {
-                    if privileges.contains(&read_priv.as_str()) {
-                        return true;
-                    }
-                }
-                if let Some(ref write_priv) = rules.write {
-                    if privileges.contains(&write_priv.as_str()) {
-                        return true;
-                    }
-                }
-            }
-        }
-
-        false
+    pub fn can_scan_collection(&self, roles: &[String], collection_name: &str) -> bool {
+        self.collections.get(collection_name).is_some_and(|rules| {
+            [&rules.read, &rules.write].into_iter().flatten()
+                .any(|privilege| self.roles_have_privilege(roles, privilege))
+        })
     }
 
     /// Check if any of the given roles can write to a collection.
-    pub fn can_write_collection(&self, roles: &[String], collection: &CollectionId) -> bool {
-        for role in roles {
-            if self.role_has_wildcard(role) {
-                return true;
-            }
-        }
-
-        let collection_name = collection.as_str();
-        if let Some(rules) = self.collections.get(collection_name) {
-            for role in roles {
-                let privileges = self.privileges_for_role(role);
-                if let Some(ref write_priv) = rules.write {
-                    if privileges.contains(&write_priv.as_str()) {
-                        return true;
-                    }
-                }
-            }
-        }
-
-        false
+    pub fn can_write_collection(&self, roles: &[String], collection_name: &str) -> bool {
+        self.collections.get(collection_name).and_then(|rules| rules.write.as_ref())
+            .is_some_and(|privilege| self.roles_have_privilege(roles, privilege))
     }
 
     /// Returns the scope rules for a given collection, or an empty slice if none.
@@ -198,7 +132,7 @@ impl PolicyConfig {
         false
     }
 
-    /// Check if a role has the wildcard privilege ("*"), granting full access.
+    /// Whether this role satisfies every named privilege requirement.
     fn role_has_wildcard(&self, role: &str) -> bool { self.roles.get(role).map_or(false, |privs| privs.iter().any(|p| p == "*")) }
 
     /// Resolve a role to its set of privileges.

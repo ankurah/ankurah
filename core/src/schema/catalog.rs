@@ -18,7 +18,7 @@ use futures::FutureExt;
 
 use crate::{
     context::Context,
-    error::{NodeDropped, RetrievalError},
+    error::{CatalogStartError, NodeDropped, RetrievalError},
     livequery::LiveQuery,
     model::{Model, View},
     node::{CachePolicy, MatchArgs, WeakNode},
@@ -61,17 +61,25 @@ struct CatalogIndex {
     names: HashMap<EntityId, HashMap<String, NameSlot>>,
 }
 
-#[derive(Default)]
 pub struct CatalogManager {
     index: OnceLock<Calculated<CatalogIndex>>,
+    ready: Mut<bool>,
+    /// Hold declaration lookup through commit so concurrent registrations reuse identities
+    /// rather than both seeing a missing declaration and allocating different IDs.
     pub(crate) allocator: tokio::sync::Mutex<()>,
+}
+
+impl Default for CatalogManager {
+    fn default() -> Self {
+        Self { index: OnceLock::new(), ready: Mut::new(false), allocator: tokio::sync::Mutex::new(()) }
+    }
 }
 
 fn rows<R: View + Clone + 'static>(query: &LiveQuery<R>) -> Vec<(EntityId, R::Model)> {
     // Resultset changes precede readiness; the query notification may follow it.
     ankurah_signals::CurrentObserver::track(&query.resultset());
     if let Some(error) = query.error().get().filter(|error| !query.resultset().is_loaded() || local_read_failure(error)) {
-        tracing::warn!("cannot read {} catalog rows: {error}", R::collection());
+        tracing::warn!("cannot read {} catalog rows: {error}", R::Model::descriptor().label);
         return Vec::new();
     }
     query
@@ -80,7 +88,7 @@ fn rows<R: View + Clone + 'static>(query: &LiveQuery<R>) -> Vec<(EntityId, R::Mo
         .filter_map(|row| match row.to_model() {
             Ok(model) => Some((row.id(), model)),
             Err(error) => {
-                tracing::warn!("skipping unreadable {} row {}: {error}", R::collection(), row.id());
+                tracing::warn!("skipping unreadable {} row {}: {error}", R::Model::descriptor().label, row.id());
                 None
             }
         })
@@ -88,6 +96,32 @@ fn rows<R: View + Clone + 'static>(query: &LiveQuery<R>) -> Vec<(EntityId, R::Mo
 }
 
 impl CatalogManager {
+    /// Initial catalog loading, independent of policy startup.
+    pub(crate) fn is_ready(&self) -> bool { self.ready.value() }
+
+    pub(crate) async fn wait_ready(&self) { self.ready.wait_value(true).await; }
+
+    /// Observe catalog changes without copying catalog rows into the notification.
+    pub fn subscribe_changes(&self, listener: impl Fn() + Send + Sync + 'static) -> Option<SubscriptionGuard> {
+        let changes = Map::new(self.index.get()?.clone(), |_: &CatalogIndex| ());
+        Some(changes.subscribe(move |()| listener()))
+    }
+
+    /// Give catalog delivery one second before storage falls back to an ID-derived name.
+    async fn wait_for_label(&self, find: impl Fn(&CatalogIndex) -> Option<String> + Send + Sync + 'static) -> Option<String> {
+        let index = self.index.get()?;
+        if let Some(label) = index.peek_with(&find) {
+            return Some(label);
+        }
+        let label = index.wait_for(find).fuse();
+        let timeout = futures_timer::Delay::new(std::time::Duration::from_secs(1)).fuse();
+        futures::pin_mut!(label, timeout);
+        futures::select_biased! {
+            label = label => Some(label),
+            _ = timeout => None,
+        }
+    }
+
     /// Resolve the complete declaration, registering locally or through a durable peer when needed.
     /// Registration authority is checked only when local resolution cannot satisfy the declaration.
     pub(crate) async fn resolve_or_register<SE, PA, R>(
@@ -114,19 +148,15 @@ impl CatalogManager {
         register::resolve_local(self, registrant)
     }
 
-    pub fn resolve_selection(
-        &self,
-        collection: &CollectionId,
-        selection: Selection<Parsed>,
-    ) -> Result<Selection<Resolved>, RetrievalError> {
-        let model = self
-            .model_id_for(collection.as_str())?
-            .ok_or_else(|| RetrievalError::Other(format!("collection '{collection}' is not a registered model")))?;
-        resolver::resolve_selection(&model, self, selection).map_err(Into::into)
+    pub fn resolve_selection(&self, model: &ModelId, selection: Selection<Parsed>) -> Result<Selection<Resolved>, RetrievalError> {
+        if let ModelId::EntityId(id) = model {
+            self.model_by_id(id)?.ok_or(RetrievalError::ModelNotFound(*model))?;
+        }
+        resolver::resolve_selection(model, self, selection).map_err(Into::into)
     }
 
     /// Initialize the index and wait for all three catalog queries' durable answers.
-    pub(crate) async fn start<SE, PA>(&self, node: WeakNode<SE, PA>) -> Result<(), RetrievalError>
+    pub(crate) async fn start<SE, PA>(&self, node: WeakNode<SE, PA>) -> Result<(), CatalogStartError>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
@@ -179,6 +209,7 @@ impl CatalogManager {
         self.index.set(index).map_err(|_| RetrievalError::Other("catalog already initialized".into()))?;
         drop(node);
         ready.await?;
+        self.ready.set(true);
         Ok(())
     }
 
@@ -203,7 +234,7 @@ impl CatalogManager {
         })
     }
 
-    fn registered_value_type(&self, model: &proto::ModelId, property: &PropertyId) -> Result<ValueType, ModelResolutionError> {
+    pub fn registered_value_type(&self, model: &proto::ModelId, property: &PropertyId) -> Result<ValueType, ModelResolutionError> {
         let lookup_failed =
             |message: &str| ModelResolutionError::ValueTypeLookup { model: *model, property: *property, message: message.into() };
         match property {
@@ -237,6 +268,13 @@ impl CatalogManager {
         Ok(index.peek_with(|index| index.models_by_label.get(label).cloned()))
     }
 
+    /// Registered model identities and labels, including models that share a label.
+    pub fn model_labels(&self) -> Vec<(ModelId, String)> {
+        self.index.get().map_or_else(Vec::new, |index| {
+            index.peek_with(|index| index.models_by_id.iter().map(|(id, row)| (ModelId::EntityId(*id), row.label.clone())).collect())
+        })
+    }
+
     pub fn model_by_id(&self, id: &EntityId) -> Result<Option<SysModelRow>, RetrievalError> {
         let Some(index) = self.index.get() else { return Ok(None) };
         Ok(index.peek_with(|index| index.models_by_id.get(id).cloned()))
@@ -245,6 +283,11 @@ impl CatalogManager {
     pub fn membership(&self, model: &EntityId, property: &EntityId) -> Result<Option<(EntityId, SysModelPropertyRow)>, RetrievalError> {
         let Some(index) = self.index.get() else { return Ok(None) };
         Ok(index.peek_with(|index| index.memberships.get(&(*model, *property)).cloned()))
+    }
+
+    pub fn membership_by_id(&self, id: &EntityId) -> Result<Option<SysModelPropertyRow>, RetrievalError> {
+        let Some(index) = self.index.get() else { return Ok(None) };
+        Ok(index.peek_with(|index| index.memberships.values().find(|(entity, _)| entity == id).map(|(_, row)| row.clone())))
     }
 
     pub fn model_id_for(&self, label: &str) -> Result<Option<proto::ModelId>, RetrievalError> {
@@ -264,6 +307,24 @@ impl CatalogManager {
     }
 }
 
+#[async_trait::async_trait]
+impl crate::storage::CatalogResolver for CatalogManager {
+    async fn get_model_label(&self, model: &ModelId) -> Option<String> {
+        match *model {
+            ModelId::System(system) => Some(super::system_model_label(system).into()),
+            ModelId::EntityId(id) => self.wait_for_label(move |index| index.models_by_id.get(&id).map(|row| row.name.clone())).await,
+        }
+    }
+
+    async fn get_property_label(&self, property: &PropertyId) -> Option<String> {
+        match *property {
+            PropertyId::Id => Some("id".into()),
+            PropertyId::System(system) => Some(system.as_str().into()),
+            PropertyId::EntityId(id) => self.wait_for_label(move |index| index.properties.get(&id).map(|row| row.name.clone())).await,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,7 +332,7 @@ mod tests {
         model::Model,
         node::Node,
         policy::{PermissiveAgent, DEFAULT_CONTEXT},
-        storage::StorageCollection,
+        storage::StorageEngine,
         test_utils::TestStorage,
     };
     use std::{sync::Arc, time::Duration};
@@ -304,9 +365,9 @@ mod tests {
             let storage = Arc::new(TestStorage::default());
             let mut node = Node::new_durable(storage.clone(), PermissiveAgent::new());
             node.system.create().await?;
-            let context = node.context(DEFAULT_CONTEXT)?;
-            context.register_model::<PublicationModel>().await?;
-            let healthy = context.register_model::<MissingPublicationModel>().await?;
+            let context = node.context_async(DEFAULT_CONTEXT).await?;
+            context.resolve_model_id::<PublicationModel>().await?;
+            let healthy = context.resolve_model_id::<MissingPublicationModel>().await?;
             let (model, _) = node.catalog.model_by_label(PublicationModel::descriptor().label)?.unwrap();
             let (property, _) = node.catalog.property_by_name(&model, "title")?.unwrap();
             let (membership, _) = node.catalog.membership(&model, &property)?.unwrap();
@@ -342,7 +403,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn catalog_load_failure_fails_startup_and_pending_queries() -> anyhow::Result<()> {
+    async fn catalog_load_failure_fails_startup() -> anyhow::Result<()> {
         for (backend, buffer, expected) in [
             ("lww", vec![0xff], "LWW state buffer"),
             ("lww", vec![], "empty LWW state buffer"),
@@ -353,26 +414,17 @@ mod tests {
             let model = {
                 let seed = Node::new_durable(storage.clone(), PermissiveAgent::new());
                 seed.system.create().await?;
-                seed.context(DEFAULT_CONTEXT)?.register_model::<PublicationModel>().await?;
+                seed.context_async(DEFAULT_CONTEXT).await?.resolve_model_id::<PublicationModel>().await?;
                 seed.catalog.model_by_label(PublicationModel::descriptor().label)?.unwrap().0
             };
-            let table = storage.table(&SysModelRow::collection());
-            let mut state = table.get_state(model).await?;
+            let mut state = storage.get_state(model).await?;
             state.payload.state.state_buffers.0.insert(backend.into(), buffer);
-            table.set_state(state).await?;
-            let (entered, entered_rx) = tokio::sync::oneshot::channel();
-            let (release, release_rx) = tokio::sync::oneshot::channel();
-            *table.hold_fetch.lock().unwrap() = Some((entered, release_rx));
-            let node = Node::new_durable(storage, PermissiveAgent::new());
-            node.system.wait_system_ready().await?;
-            let query = node.context(DEFAULT_CONTEXT)?.query::<PublicationModelView>("true")?;
-            entered_rx.await?;
-            release.send(()).unwrap();
+            storage.set_state(state);
+            let node = Node::new_durable(storage.clone(), PermissiveAgent::new());
 
             let error = tokio::time::timeout(Duration::from_secs(2), node.wait_ready()).await?.unwrap_err();
             assert!(error.to_string().contains(expected), "{error}");
-            let error = tokio::time::timeout(Duration::from_secs(2), query.wait_initialized()).await?.unwrap_err();
-            assert!(error.to_string().contains(expected), "{error}");
+            assert!(node.context(DEFAULT_CONTEXT).is_err());
             assert!(matches!(node.state().value(), crate::NodeState::Halted(crate::error::NodeHaltReason::CatalogLoad(_))));
         }
         Ok(())
@@ -385,7 +437,7 @@ mod tests {
             let original = {
                 let seed = Node::new_durable(storage.clone(), PermissiveAgent::new());
                 seed.system.create().await?;
-                seed.context(DEFAULT_CONTEXT)?.register_model::<PublicationModel>().await?
+                seed.context_async(DEFAULT_CONTEXT).await?.resolve_model_id::<PublicationModel>().await?
             };
             let node = Node::new(storage, PermissiveAgent::new());
             node.system.wait_system_ready().await?;
@@ -398,7 +450,7 @@ mod tests {
             assert_eq!(node.state().value(), crate::NodeState::Startup);
             assert!(node.get_durable_peers().is_empty());
 
-            let query = node.context(DEFAULT_CONTEXT)?.query::<PublicationModelView>(CACHED_TRUE)?;
+            let query = Context::new(node.clone(), DEFAULT_CONTEXT).query::<PublicationModelView>(CACHED_TRUE)?;
             let mut initialized = Box::pin(query.wait_initialized());
             assert!(futures::poll!(&mut initialized).is_pending());
             assert!(query.selection().value().is_none());
@@ -414,14 +466,14 @@ mod tests {
             let original = {
                 let seed = Node::new_durable(storage.clone(), PermissiveAgent::new());
                 seed.system.create().await?;
-                seed.context(DEFAULT_CONTEXT)?.register_model::<PublicationModel>().await?
+                seed.context_async(DEFAULT_CONTEXT).await?.resolve_model_id::<PublicationModel>().await?
             };
-            let models = storage.table(&SysModelRow::collection());
             let (fetch_entered, fetch_observed) = tokio::sync::oneshot::channel();
             let (release_fetch, resume_fetch) = tokio::sync::oneshot::channel();
-            *models.hold_fetch.lock().unwrap() = Some((fetch_entered, resume_fetch));
-            let node = Node::new_durable(storage, PermissiveAgent::new());
-            let (publication_observed, release_publication) = node.reactor.pause_next_publication(SysModelRow::collection());
+            storage.hold_fetch.lock().unwrap().insert(ModelId::System(proto::SystemModel::Model), (fetch_entered, resume_fetch));
+            let node = Node::new_durable(storage.clone(), PermissiveAgent::new());
+            let (publication_observed, release_publication) =
+                node.reactor.pause_next_publication(ModelId::System(proto::SystemModel::Model));
             fetch_observed.await?;
 
             while node.catalog.counts() != (0, 1, 1) {
@@ -435,17 +487,17 @@ mod tests {
 
             let mut ready = Box::pin(node.wait_ready());
             assert!(futures::poll!(&mut ready).is_pending());
-            let context = node.context(DEFAULT_CONTEXT)?;
-            let mut registration = Box::pin(context.register_model::<PublicationModel>());
+            let context = Context::new(node.clone(), DEFAULT_CONTEXT);
+            let mut registration = Box::pin(context.resolve_model_id::<PublicationModel>());
             assert!(futures::poll!(&mut registration).is_pending());
-            let selection = Selection { predicate: Predicate::True, order_by: None, limit: None };
-            assert_eq!(models.fetch_states(&selection).await?.len(), 1);
+            let selection = Selection { predicate: Predicate::MemberOf(ModelId::System(proto::SystemModel::Model)), order_by: None, limit: None };
+            assert_eq!(storage.fetch_states(&selection).await?.len(), 1);
             release_publication.send(()).unwrap();
 
             ready.await?;
             assert_eq!(registration.await?, original, "startup must not permit allocation from a stale index");
             assert_eq!(node.catalog.model_id_for(label)?, Some(original));
-            assert_eq!(models.fetch_states(&selection).await?.len(), 1);
+            assert_eq!(storage.fetch_states(&selection).await?.len(), 1);
             Ok(())
         })
         .await?

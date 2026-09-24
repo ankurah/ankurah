@@ -58,35 +58,40 @@ where
             return Ok((proto::ModelId::System(system), node.entities.system_epoch()));
         }
         let epoch = node.system.system_epoch().ok_or(RegistrationError::SystemNotReady)?;
-        let mut registrant = schema.registrant(epoch);
-        let auth = match &self.auth {
-            ContextAuth::Sessions(sessions) => match sessions.write_credential() {
-                Ok(credential) => RegistrationAuth::Credential(credential),
-                Err(error) => RegistrationAuth::Unavailable(error),
-            },
-            ContextAuth::Privileged => RegistrationAuth::Privileged,
-        };
-        node.catalog.resolve_or_register(node.as_ref(), &mut registrant, auth).await?;
-        let model = schema.resolved.get(epoch).ok_or_else(|| {
+        if schema.resolved.get(epoch).is_err() {
+            let mut registrant = schema.registrant(epoch);
+            let auth = match &self.auth {
+                ContextAuth::Sessions(sessions) => match sessions.write_credential() {
+                    Ok(credential) => RegistrationAuth::Credential(credential),
+                    Err(error) => RegistrationAuth::Unavailable(error),
+                },
+                ContextAuth::Privileged => RegistrationAuth::Privileged,
+            };
+            node.catalog.resolve_or_register(node.as_ref(), &mut registrant, auth).await?;
+        }
+        let model = schema.resolved.get(epoch).map_err(|_| {
             RegistrationError::Retrieval(RetrievalError::Other(format!(
                 "binding of '{}' did not retain its exact model identity",
                 schema.label
             )))
         })?;
+        if !matches!(&self.auth, ContextAuth::Privileged) {
+            node.policy_agent.preflight(node.as_ref(), model).await?;
+        }
         Ok((model, epoch))
     }
 
     /// Check entity ownership and bind the given descriptor locally, without registration or network access.
     /// Used by synchronous `Transaction::edit`.
-    fn bind_descriptor_local(&self, schema: &'static ModelStructDescriptor, entity: &Entity) -> Result<(), RetrievalError> {
+    fn bind_descriptor_local(&self, schema: &'static ModelStructDescriptor, entity: &Entity) -> Result<ModelId, RetrievalError> {
         let node = self.node.upgrade()?;
         let epoch = node.entities.system_epoch();
         entity.check_epoch(epoch)?;
-        if schema.system.is_some() || schema.resolved.get(epoch).is_some() {
-            return Ok(());
+        let model = schema.bind_local(&node.catalog, epoch)?;
+        if !entity.has_membership(&model) {
+            return Err(RetrievalError::MissingComponent { entity_id: entity.id(), model_id: model });
         }
-        let mut registrant = schema.registrant(epoch);
-        node.catalog.resolve_local(&mut registrant).map_err(Into::into)
+        Ok(model)
     }
 
     /// Resolve names and literal types for `Context::fetch` after schema registration.
@@ -104,30 +109,28 @@ where
     /// Missing bindings/readiness return errors; the caller decides whether to resolve asynchronously.
     fn resolve_query_selection(
         &self,
-        schema: Option<&'static ModelStructDescriptor>,
-        collection_id: &CollectionId,
+        schema: &'static ModelStructDescriptor,
         selection: Selection<Parsed>,
     ) -> Result<Selection<Resolved>, RetrievalError> {
         let node = self.node.upgrade()?;
         node.system.check_not_halted()?;
-        if let Some(schema) = schema {
-            crate::schema::resolver::validate_selection_names(schema, &selection)?;
-        }
+        crate::schema::resolver::validate_selection_names(schema, &selection)?;
         if node.system.system_epoch().is_none() {
             return Err(RetrievalError::NodeNotReady);
         }
-        if !schema.is_some_and(|schema| schema.system.is_some()) {
-            node.check_ready()?;
+        if schema.system.is_none() {
+            if !node.catalog.is_ready() {
+                return Err(RetrievalError::NodeNotReady);
+            }
         }
-        resolve_and_scope(self, schema, collection_id, selection)
+        resolve_and_scope(self, schema, selection)
     }
 
     /// Wait for the required catalog state, register missing declarations, and resolve with read policy.
     /// The returned future owns a weak context; the caller controls execution and cancellation.
     fn resolve_query_selection_when_ready(
         &self,
-        schema: Option<&'static ModelStructDescriptor>,
-        collection_id: CollectionId,
+        schema: &'static ModelStructDescriptor,
         selection: Selection<Parsed>,
     ) -> BoxFuture<'static, Result<Selection<Resolved>, RetrievalError>> {
         let sessions = match &self.auth {
@@ -142,19 +145,14 @@ where
         };
         let context = ContextInner { node: NodeHandle::Weak(node.weak()), auth: ContextAuth::Sessions(sessions) };
         let system = node.system.clone();
-        let ready = node.wait_ready();
 
         Box::pin(async move {
             if system.system_epoch().is_none() {
                 system.wait_system_ready().await?;
             }
 
-            if let Some(schema) = schema {
-                context.ensure_registered(schema).await?;
-            } else {
-                ready.await?;
-            }
-            resolve_and_scope(&context, schema, &collection_id, selection)
+            context.ensure_registered(schema).await?;
+            resolve_and_scope(&context, schema, selection)
         })
     }
 }
@@ -170,17 +168,11 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     let node = context.node.upgrade()?;
-    let sessions = match &context.auth {
-        ContextAuth::Sessions(sessions) => sessions,
-        ContextAuth::Privileged => return Err(RetrievalError::Other("the privileged context does not query".into())),
-    };
-    let credentials = sessions.current();
-    let policy = crate::policy::ReadPolicy::new(&node.policy_agent, &credentials, collection_id);
-    policy.check_collection()?;
-    let mut selection = match schema {
-        Some(schema) => schema.resolve_selection(&node.catalog, node.system.system_epoch(), selection)?,
-        None => node.catalog.resolve_selection(collection_id, selection)?,
-    };
+    if matches!(&context.auth, ContextAuth::Privileged) {
+        return Err(RetrievalError::Other("the privileged context does not query".into()));
+    }
+    let mut selection = context.resolve_selection_with_descriptor(schema, selection)?;
+    let policy = crate::policy::ContextPolicy::new(&node.policy_agent, context.auth.clone());
     selection.predicate = policy.filter_predicate(selection.predicate)?;
     Ok(selection)
 }

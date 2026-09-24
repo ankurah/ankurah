@@ -184,6 +184,54 @@ pub enum NodeResponseBody {
     Error(String),
 }
 
+/// A known-ID read reports denial separately from absence, without returning denied state.
+#[derive(Debug, Serialize, Deserialize, Clone, strum::Display)]
+pub enum GetResult {
+    #[strum(transparent)]
+    Found(Attested<EntityState>),
+    #[strum(to_string = "{0}: not found")]
+    NotFound(EntityId),
+    #[strum(to_string = "{0}: access denied")]
+    AccessDenied(EntityId),
+}
+
+impl GetResult {
+    pub fn entity_id(&self) -> EntityId {
+        match self {
+            Self::Found(state) => state.payload.entity_id,
+            Self::NotFound(id) | Self::AccessDenied(id) => *id,
+        }
+    }
+}
+
+/// Failed known-ID read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GetFailure {
+    NotFound(EntityId),
+    AccessDenied(EntityId),
+}
+
+impl TryFrom<GetResult> for Attested<EntityState> {
+    type Error = GetFailure;
+
+    fn try_from(result: GetResult) -> Result<Self, Self::Error> {
+        match result {
+            GetResult::Found(state) => Ok(state),
+            GetResult::NotFound(id) => Err(GetFailure::NotFound(id)),
+            GetResult::AccessDenied(id) => Err(GetFailure::AccessDenied(id)),
+        }
+    }
+}
+
+impl TryFrom<GetResult> for EntityDelta {
+    type Error = GetFailure;
+
+    fn try_from(result: GetResult) -> Result<Self, Self::Error> {
+        let state = Attested::<EntityState>::try_from(result)?;
+        Ok(Self { entity_id: state.payload.entity_id, content: DeltaContent::StateSnapshot { state: state.into() } })
+    }
+}
+
 impl std::fmt::Display for NodeRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Request {} from {}->{}: {}", self.id, self.from, self.to, self.body)

@@ -217,14 +217,14 @@ selection or where core evaluates the predicate. Query grants require a named
   denied entities; denied state is not returned. A peer denial does not fall
   back to cached state. Ordinary fetches continue filtering unauthorized rows.
 
-#### `check_state` / `check_write`
+#### `check_write_event` / `check_write`
 
 The row-level half of write scoping: `check_write` gates local create/edit against
-the current state. After each event is applied, `check_state` checks the transaction's
-original state and the resulting entity state; creation has no original state.
+the current state. After each event is applied, `check_write_event` receives the event,
+the transaction's original state, and the resulting entity state; creation has an empty original head.
 An existing membership must authorize both states, so a newly added membership
-cannot authorize its own addition. JWT adds no event-specific check or attestation
-in `check_event`; other agents may do so. Any event or state rejection rolls
+cannot authorize its own addition. JWT adds no event-specific check or attestation;
+other agents may do so in the same hook. Any event or state rejection rolls
 back the storage transaction.
 
 - `Root` context: always allowed.

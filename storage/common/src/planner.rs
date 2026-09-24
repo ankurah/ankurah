@@ -948,9 +948,11 @@ mod tests {
     // These fixtures name physical columns, not catalog properties.
     macro_rules! selection {
         ($($selection:tt)*) => {
-            crate::lower_selection(&ankurah_derive::selection!($($selection)*), &|path| {
-                ColumnPath::new(path.first(), path.steps[1..].to_vec())
-            })
+            ankql::selection::map_references(
+                &ankurah_derive::selection!($($selection)*),
+                &|path| ColumnPath::new(path.first(), path.steps[1..].to_vec()),
+                &|model| *model.as_id().expect("model ID in physical-column fixture"),
+            )
         };
     }
 

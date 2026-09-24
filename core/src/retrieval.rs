@@ -41,15 +41,10 @@ pub trait GetState {
     async fn get_state(&self, entity_id: EntityId) -> Result<Option<Attested<proto::EntityState>>, RetrievalError>;
 }
 
-/// Extends GetEvents with staging (interior-mutable) and commit capabilities.
-/// The caller stages events before comparison, then commits them after policy checks pass.
-#[async_trait]
+/// Extends GetEvents with temporary staging for causal comparison.
 pub trait SuspenseEvents: GetEvents {
     /// Stage an event for BFS discovery. `get_event` will find staged events.
     fn stage_event(&self, event: Event);
-
-    /// Commit a staged event to permanent storage and remove from staging.
-    async fn commit_event(&self, attested: &Attested<Event>) -> Result<(), MutationError>;
 }
 
 // ============================================================================
@@ -66,9 +61,13 @@ impl<R: GetEvents + Send + Sync + ?Sized> GetEvents for &R {
 }
 
 #[async_trait]
-impl<R: GetState + Send + Sync + ?Sized> GetState for &R {
+impl<SE: StorageEngine> GetState for SE {
     async fn get_state(&self, entity_id: EntityId) -> Result<Option<Attested<proto::EntityState>>, RetrievalError> {
-        (*self).get_state(entity_id).await
+        match StorageEngine::get_state(self, entity_id).await {
+            Ok(state) => Ok(Some(state)),
+            Err(RetrievalError::EntityNotFound(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -79,21 +78,18 @@ impl<R: GetState + Send + Sync + ?Sized> GetState for &R {
 /// Local event getter with staging support. Used by durable nodes.
 /// `get_event` checks staging first, then permanent storage.
 /// `event_stored` checks permanent storage only.
-/// `commit_event` persists to storage and removes from staging.
-pub struct LocalEventGetter {
-    collection: StorageCollectionWrapper,
+pub struct LocalEventGetter<SE: StorageEngine> {
+    storage: Arc<SE>,
     durable: bool,
     staging: Arc<RwLock<HashMap<EventId, Event>>>,
 }
 
-impl LocalEventGetter {
-    pub fn new(collection: StorageCollectionWrapper, durable: bool) -> Self {
-        Self { collection, durable, staging: Arc::new(RwLock::new(HashMap::new())) }
-    }
+impl<SE: StorageEngine> LocalEventGetter<SE> {
+    pub fn new(storage: Arc<SE>, durable: bool) -> Self { Self { storage, durable, staging: Arc::new(RwLock::new(HashMap::new())) } }
 }
 
 #[async_trait]
-impl GetEvents for LocalEventGetter {
+impl<SE: StorageEngine> GetEvents for LocalEventGetter<SE> {
     async fn get_event(&self, event_id: &EventId) -> Result<Event, RetrievalError> {
         // Check staging first
         {
@@ -103,31 +99,23 @@ impl GetEvents for LocalEventGetter {
             }
         }
         // Fall back to permanent storage
-        let events = self.collection.get_events(vec![event_id.clone()]).await?;
+        let events = self.storage.get_events(vec![event_id.clone()], &ankql::ast::Predicate::True).await?;
         events.into_iter().next().map(|e| e.payload).ok_or_else(|| RetrievalError::EventNotFound(event_id.clone()))
     }
 
     async fn event_stored(&self, event_id: &EventId) -> Result<bool, RetrievalError> {
         // Check permanent storage only (not staging)
-        let events = self.collection.get_events(vec![event_id.clone()]).await?;
+        let events = self.storage.get_events(vec![event_id.clone()], &ankql::ast::Predicate::True).await?;
         Ok(events.into_iter().next().is_some())
     }
 
     fn storage_is_definitive(&self) -> bool { self.durable }
 }
 
-#[async_trait]
-impl SuspenseEvents for LocalEventGetter {
+impl<SE: StorageEngine> SuspenseEvents for LocalEventGetter<SE> {
     fn stage_event(&self, event: Event) {
         let mut staging = self.staging.write().unwrap_or_else(|e| e.into_inner());
         staging.insert(event.id(), event);
-    }
-
-    async fn commit_event(&self, attested: &Attested<Event>) -> Result<(), MutationError> {
-        self.collection.add_event(attested).await?;
-        let mut staging = self.staging.write().unwrap_or_else(|e| e.into_inner());
-        staging.remove(&attested.payload.id());
-        Ok(())
     }
 }
 
@@ -201,11 +189,7 @@ where
 
         match self
             .node
-            .request(
-                peer_id,
-                self.cdata,
-                proto::NodeRequestBody::GetEvents { collection: self.collection_id.clone(), event_ids: vec![event_id.clone()] },
-            )
+            .request(peer_id, self.cdata, proto::NodeRequestBody::GetEvents { event_ids: vec![event_id.clone()] })
             .await?
         {
             proto::NodeResponseBody::GetEvents(peer_events) => {
@@ -216,7 +200,9 @@ where
                 // tests/tests/adversarial_wire.rs, and membership
                 // admissibility at BFS time is identity-02's.
                 let event = answering_event(peer_events, event_id).ok_or_else(|| RetrievalError::EventNotFound(event_id.clone()))?;
-                self.collection.add_event(&event).await?;
+                let mut transaction = self.node.storage.transaction();
+                transaction.add_events(std::slice::from_ref(&event)).await?;
+                transaction.commit().await?.committed()?;
                 Ok(event.payload)
             }
             proto::NodeResponseBody::Error(e) => Err(RetrievalError::storage(format!("Error from peer: {}", e))),
@@ -226,12 +212,11 @@ where
 
     async fn event_stored(&self, event_id: &EventId) -> Result<bool, RetrievalError> {
         // Check permanent storage only (not staging)
-        let events = self.collection.get_events(vec![event_id.clone()]).await?;
+        let events = self.node.storage.get_events(vec![event_id.clone()], &ankql::ast::Predicate::True).await?;
         Ok(events.into_iter().next().is_some())
     }
 }
 
-#[async_trait]
 impl<'a, SE, PA, C> SuspenseEvents for CachedEventGetter<'a, SE, PA, C>
 where
     SE: StorageEngine + Send + Sync + 'static,
@@ -242,81 +227,32 @@ where
         let mut staging = self.staging.write().unwrap_or_else(|e| e.into_inner());
         staging.insert(event.id(), event);
     }
-
-    async fn commit_event(&self, attested: &Attested<Event>) -> Result<(), MutationError> {
-        self.collection.add_event(attested).await?;
-        let mut staging = self.staging.write().unwrap_or_else(|e| e.into_inner());
-        staging.remove(&attested.payload.id());
-        Ok(())
-    }
 }
 
 /// Local state getter. Retrieves entity states from local storage.
 /// Reused by both durable and ephemeral paths.
 #[derive(Clone)]
-pub struct LocalStateGetter {
-    collection: StorageCollectionWrapper,
+pub struct LocalStateGetter<SE: StorageEngine> {
+    storage: Arc<SE>,
 }
 
-impl LocalStateGetter {
-    pub fn new(collection: StorageCollectionWrapper) -> Self { Self { collection } }
+impl<SE: StorageEngine> LocalStateGetter<SE> {
+    pub fn new(storage: Arc<SE>) -> Self { Self { storage } }
 }
 
 #[async_trait]
-impl GetState for LocalStateGetter {
+impl<SE: StorageEngine> GetState for LocalStateGetter<SE> {
     async fn get_state(&self, entity_id: EntityId) -> Result<Option<Attested<proto::EntityState>>, RetrievalError> {
-        match self.collection.get_state(entity_id).await {
-            Ok(state) => Ok(Some(state)),
-            Err(RetrievalError::EntityNotFound(_)) => Ok(None),
-            Err(e) => Err(e),
-        }
+        GetState::get_state(self.storage.as_ref(), entity_id).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{StorageCollection, StorageCollectionWrapper};
-    use ankql::ast::Resolved;
-    use ankurah_proto::{AttestationSet, Attested, Clock, EntityId, EntityState, Event, EventId, OperationSet};
-    use async_trait::async_trait;
-    use std::collections::{BTreeMap, HashMap};
-    use std::sync::{Arc, Mutex};
-
-    /// Minimal in-memory storage collection for testing the staging lifecycle.
-    /// Only implements `add_event` and `get_events`; other methods panic or
-    /// return not-found since they are not exercised by these tests.
-    struct MockStorageCollection {
-        events: Mutex<HashMap<EventId, Attested<Event>>>,
-    }
-
-    impl MockStorageCollection {
-        fn new() -> Self { Self { events: Mutex::new(HashMap::new()) } }
-    }
-
-    #[async_trait]
-    impl StorageCollection for MockStorageCollection {
-        async fn set_state(&self, _state: Attested<EntityState>) -> Result<bool, MutationError> { Ok(true) }
-
-        async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError> { Err(RetrievalError::EntityNotFound(id)) }
-
-        async fn fetch_states(&self, _selection: &ankql::ast::Selection<Resolved>) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
-            Ok(vec![])
-        }
-
-        async fn add_event(&self, entity_event: &Attested<Event>) -> Result<bool, MutationError> {
-            let mut events = self.events.lock().unwrap();
-            events.insert(entity_event.payload.id(), entity_event.clone());
-            Ok(true)
-        }
-
-        async fn get_events(&self, event_ids: Vec<EventId>) -> Result<Vec<Attested<Event>>, RetrievalError> {
-            let events = self.events.lock().unwrap();
-            Ok(event_ids.into_iter().filter_map(|id| events.get(&id).cloned()).collect())
-        }
-
-        async fn dump_entity_events(&self, _id: EntityId) -> Result<Vec<Attested<Event>>, RetrievalError> { Ok(vec![]) }
-    }
+    use crate::test_utils::TestStorage;
+    use ankurah_proto::{AttestationSet, Attested, Clock, EntityId, Event, EventId, OperationSet};
+    use std::sync::Arc;
 
     /// Create a test event with a deterministic content-hashed ID.
     ///
@@ -342,7 +278,7 @@ mod tests {
         } else {
             (EntityId::from_bytes(entity_id_bytes), ankurah_proto::EventBody::Update { nonce, timestamp: 0, author, operations })
         };
-        Event { entity_id, collection: "test".into(), body, parent }
+        Event { entity_id, body, parent }
     }
 
     // ====================================================================
@@ -356,7 +292,7 @@ mod tests {
     /// during DAG comparison).
     #[tokio::test]
     async fn test_stage_then_get_event() {
-        let collection = StorageCollectionWrapper::new(Arc::new(MockStorageCollection::new()));
+        let collection = Arc::new(TestStorage::default());
         let getter = LocalEventGetter::new(collection, true);
 
         let event = make_test_event(1, &[]);
@@ -383,7 +319,7 @@ mod tests {
     /// staged should not be considered "already stored".
     #[tokio::test]
     async fn test_stage_does_not_affect_event_stored() {
-        let collection = StorageCollectionWrapper::new(Arc::new(MockStorageCollection::new()));
+        let collection = Arc::new(TestStorage::default());
         let getter = LocalEventGetter::new(collection, true);
 
         let event = make_test_event(2, &[]);
@@ -400,46 +336,28 @@ mod tests {
         assert!(!getter.event_stored(&event_id).await.unwrap(), "event_stored must return false for staged-but-not-committed events");
     }
 
-    /// Stage an event, commit it, then verify `event_stored` returns true
-    /// and the event is no longer in the staging area (but still retrievable
-    /// from permanent storage).
-    ///
-    /// This exercises the full staging lifecycle:
-    /// 1. stage_event → discoverable by BFS (get_event) but not "stored"
-    /// 2. commit_event → moved to permanent storage, removed from staging
-    /// 3. event_stored → now returns true
-    /// 4. get_event → still works (now from permanent storage)
     #[tokio::test]
-    async fn test_commit_makes_event_stored_true() {
-        let collection = StorageCollectionWrapper::new(Arc::new(MockStorageCollection::new()));
-        let getter = LocalEventGetter::new(collection, true);
-
+    async fn event_stored_observes_storage_not_staging() {
+        let storage = Arc::new(TestStorage::default());
+        let getter = LocalEventGetter::new(storage.clone(), true);
         let event = make_test_event(3, &[]);
         let event_id = event.id();
-
-        // Stage the event
         getter.stage_event(event.clone());
+        assert!(!getter.event_stored(&event_id).await.unwrap());
 
-        // Verify staged state: get_event finds it, event_stored does not
-        assert!(getter.get_event(&event_id).await.is_ok(), "Staged event should be retrievable");
-        assert!(!getter.event_stored(&event_id).await.unwrap(), "event_stored should be false while staged");
-
-        // Commit the event (wrap in Attested for the commit interface)
         let attested = Attested { payload: event, attestations: AttestationSet::default() };
-        getter.commit_event(&attested).await.expect("commit_event should succeed");
-
-        // After commit: event_stored should now return true
-        assert!(getter.event_stored(&event_id).await.unwrap(), "event_stored must return true after commit_event");
-
-        // get_event should still work (now from permanent storage, not staging)
-        let retrieved = getter.get_event(&event_id).await.expect("Event should be retrievable from permanent storage after commit");
-        assert_eq!(retrieved.id(), event_id);
+        let mut transaction = storage.transaction();
+        transaction.add_events(&[attested]).await.unwrap();
+        transaction.commit().await.unwrap().committed().unwrap();
+        assert!(getter.event_stored(&event_id).await.unwrap());
+        let fresh_getter = LocalEventGetter::new(storage, true);
+        assert_eq!(fresh_getter.get_event(&event_id).await.unwrap().id(), event_id);
     }
 
     /// Verify that `storage_is_definitive` reflects the durable flag.
     #[tokio::test]
     async fn test_storage_is_definitive_reflects_durable_flag() {
-        let collection = StorageCollectionWrapper::new(Arc::new(MockStorageCollection::new()));
+        let collection = Arc::new(TestStorage::default());
 
         let durable_getter = LocalEventGetter::new(collection.clone(), true);
         assert!(durable_getter.storage_is_definitive(), "Durable getter should report storage as definitive");

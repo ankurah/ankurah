@@ -62,12 +62,12 @@ pub fn mutable_impl(model: &crate::model::description::ModelDescription) -> Toke
                 &self.entity
             }
 
-            fn new(entity: #base::entity::LocalTrxEntity) -> Self {
-                let model = <#name as #base::model::Model>::descriptor().resolved.get(entity.system_epoch())
-                    .expect("model must be bound before constructing a mutable view");
-                // FIXME: Should be Result (maybe), definitely not assert 
-                assert!(entity.has_membership(&model));
-                Self { entity }
+            fn new(entity: #base::entity::LocalTrxEntity) -> Result<Self, #base::error::RetrievalError> {
+                let model = __ANKURAH_MODEL_SCHEMA.model_id(entity.system_epoch())?;
+                if !entity.has_membership(&model) {
+                    return Err(#base::error::RetrievalError::MissingComponent { entity_id: entity.id(), model_id: model });
+                }
+                Ok(Self { entity })
             }
         }
 
@@ -79,8 +79,9 @@ pub fn mutable_impl(model: &crate::model::description::ModelDescription) -> Toke
             #(
                 pub fn #active_field_names(&self) -> Result<#active_field_types, #base::property::PropertyError> {
                     use #base::property::FromLocalTrxEntity;
-                    let property = <#name as #base::model::Model>::descriptor().resolved_field_at(#active_field_indices, self.entity.system_epoch())?;
-                    <#active_field_types>::from_local_entity(property, &self.entity)
+                    const PROPERTY: &#base::schema::StructProperty = &__ANKURAH_MODEL_PROPERTIES[#active_field_indices];
+                    let property_id = PROPERTY.resolved_id(self.entity.system_epoch())?;
+                    <#active_field_types>::from_local_entity(property_id, &self.entity)
                 }
             )*
         }

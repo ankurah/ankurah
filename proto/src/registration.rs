@@ -52,11 +52,6 @@ pub struct RegisterProperty {
     pub backend: String,
     /// Language-agnostic value type, e.g. "string", "i64".
     pub value_type: String,
-    /// For reference-typed properties: the target model, named by its
-    /// registration label. The executor resolves it against the catalog,
-    /// allocating the target model entity on miss. Mutable metadata, not
-    /// identity.
-    pub target_label: Option<String>,
     /// Explicit binding: reference an EXISTING property entity instead of
     /// looking one up by name. Never mints; hard-fails if absent.
     pub explicit_id: Option<EntityId>,
@@ -79,8 +74,7 @@ pub struct RegisteredModel {
     pub label: String,
     /// The model's current registered display name.
     pub name: String,
-    /// The resolved properties this request asserted for the model. May be
-    /// empty for models the executor allocated as reference targets.
+    /// The resolved properties this request asserted for the model.
     pub properties: Vec<RegisteredProperty>,
 }
 
@@ -101,7 +95,7 @@ pub struct RegisteredProperty {
     pub backend: String,
     /// The property's canonical logical value-type spelling.
     pub value_type: String,
-    /// Resolved target model id for reference-typed properties.
+    /// Stored reference-target metadata, if any; registration does not infer it.
     pub target_model: Option<EntityId>,
     /// Provenance: the model in whose scope the property was originally
     /// minted. Differs from the parent model when the entry shares an

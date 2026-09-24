@@ -86,6 +86,7 @@ impl ReactorSubscription<crate::entity::Entity, ankurah_proto::Attested<ankurah_
         selection: ankql::ast::Selection<Resolved>,
         included_entities: Vec<crate::entity::Entity>,
         gap_fetcher: std::sync::Arc<dyn crate::reactor::fetch_gap::GapFetcher<crate::entity::Entity>>,
+        source: Arc<dyn crate::reactor::LocalEntitySource>,
         version: u32,
     ) -> anyhow::Result<Vec<crate::entity::Entity>> {
         let subscription = self
@@ -94,10 +95,10 @@ impl ReactorSubscription<crate::entity::Entity, ankurah_proto::Attested<ankurah_
             .subscription(self.0.subscription_id)
             .ok_or_else(|| anyhow::anyhow!("Subscription {:?} not found", self.0.subscription_id))?;
 
-        let resultset = subscription.register_or_get_query(query_id, collection_id.clone(), gap_fetcher);
+        let resultset = subscription.register_or_get_query(query_id, gap_fetcher, source);
 
         let mut all_entities =
-            subscription.update_query(query_id, collection_id.clone(), selection.clone(), included_entities, version, &mut ())?;
+            subscription.update_query(query_id, selection.clone(), included_entities, version, &mut ())?;
 
         subscription.fill_gaps_for_query_entities(query_id, &mut all_entities).await;
 

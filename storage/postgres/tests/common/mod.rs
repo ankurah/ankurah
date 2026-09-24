@@ -13,6 +13,10 @@ use tracing::Level;
 // Re-export proto for tests that need Attested, Event, etc.
 pub use ankurah::proto;
 
+/// PostgreSQL connection pool retained by inspection-oriented integration
+/// tests.
+pub type TestPool = bb8::Pool<PostgresConnectionManager<tokio_postgres::NoTls>>;
+
 /// Album model used by multiple postgres tests
 #[derive(Model, Debug, Serialize, Deserialize)]
 pub struct Album {
@@ -31,6 +35,13 @@ fn init_tracing() {
 }
 
 pub async fn create_postgres_container() -> Result<(ContainerAsync<postgres::Postgres>, Postgres)> {
+    let (container, storage_engine, _pool) = create_postgres_container_with_pool().await?;
+    Ok((container, storage_engine))
+}
+
+/// Start a test PostgreSQL server and retain a pool for inspecting the
+/// engine-private physical schema.
+pub async fn create_postgres_container_with_pool() -> Result<(ContainerAsync<postgres::Postgres>, Postgres, TestPool)> {
     let container: ContainerAsync<postgres::Postgres> = postgres::Postgres::default()
         .with_db_name("ankurah")
         .with_user("postgres")
@@ -48,7 +59,7 @@ pub async fn create_postgres_container() -> Result<(ContainerAsync<postgres::Pos
     )?;
     let pool = bb8::Pool::builder().build(manager).await?;
 
-    let storage_engine = Postgres::new(pool)?;
+    let storage_engine = Postgres::new(pool.clone()).await?;
 
-    Ok((container, storage_engine))
+    Ok((container, storage_engine, pool))
 }

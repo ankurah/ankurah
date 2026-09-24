@@ -99,9 +99,6 @@ pub trait StorageEngine: Send + Sync {
 
     fn set_catalog_resolver(&self, resolver: Weak<dyn CatalogResolver>);
 
-    async fn append_events(&self, events: &[Attested<Event>])
-        -> Result<Vec<bool>, MutationError>;
-
     async fn get_state(&self, id: EntityId)
         -> Result<Attested<EntityState>, RetrievalError>;
     async fn get_states(&self, ids: Vec<EntityId>)
@@ -127,13 +124,13 @@ Engines may use private bucket, transaction, table, tree, or materialization
 handles internally. Their construction arguments and resolver propagation are
 implementation details.
 
-### 2.1 Blind event append
+### 2.1 Event-only transactions
 
 Validated and attested events are immutable, content-addressed, and
-model-independent. `append_events` inserts them idempotently without comparing
-an entity head. An event being present does not make it part of canonical
-entity state; only a canonical head does that. Standalone append is for event
-caching and lineage retrieval, not transaction commits.
+model-independent. An event-only `StorageTransaction` inserts them idempotently
+without comparing an entity head. An event being present does not make it part
+of canonical entity state; only a canonical head does that. Event-only commits
+support caching retrieved lineage.
 
 Events needed by a proposed state must either be durable already or included
 in its batch. A failed batch publishes neither its new events nor its states.
@@ -260,7 +257,7 @@ state.
 
 ### 4.3 Writes
 
-`append_events` persists model-independent events exactly once.
+`StorageTransaction::add_events` persists model-independent events on commit.
 Model-specific authorization is complete before the storage call.
 
 `StorageTransaction::commit` is the only storage operation that changes canonical state or

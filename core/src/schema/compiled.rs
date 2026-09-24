@@ -80,7 +80,7 @@ impl RegistrantProperty for StructProperty {
 
 impl ModelStructDescriptor {
     /// Return this struct's bound model identity for `epoch`.
-    pub(crate) fn model_id(&self, epoch: SystemEpoch) -> Result<ModelId, RetrievalError> {
+    pub fn model_id(&self, epoch: SystemEpoch) -> Result<ModelId, RetrievalError> {
         self.resolved.get(epoch).map_err(|_| RetrievalError::UnboundDeclaration { label: self.label.into() })
     }
 
@@ -100,6 +100,7 @@ impl ModelStructDescriptor {
         self.model_id(epoch)
     }
 
+    /// Resolve names and literal types against this model, restricting the selection to its members.
     pub(crate) fn resolve_selection(
         &'static self,
         catalog: &CatalogManager,
@@ -113,7 +114,7 @@ impl ModelStructDescriptor {
         };
         let model = self.bind_local(catalog, epoch)?;
         let resolver = DescriptorResolver { schema: self, epoch, catalog };
-        Ok(resolve_selection(&model, &resolver, selection)?)
+        Ok(resolve_selection(&model, &resolver, selection)?.and_member_of(model))
     }
 
     /// The active field whose display name is `name`, if any.

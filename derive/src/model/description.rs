@@ -1,4 +1,5 @@
 use ankurah_core_types::SystemModel;
+#[cfg(any(feature = "wasm", feature = "uniffi"))]
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::{meta::ParseNestedMeta, Data, DeriveInput, Fields, Ident, LitStr, Type, Visibility};

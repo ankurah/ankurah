@@ -19,6 +19,9 @@ pub(super) struct LiveQueryInner {
     pub(super) context: Arc<dyn DynContextInner>,
     pub(super) resultset: EntityResultSet,
     pub(super) error: Mut<Option<Arc<RetrievalError>>>,
+    /// Keep the version check and selection/error publication together: an old resolution
+    /// must not overwrite a newer selection. Release before notifying signal listeners,
+    /// which may update the query again.
     pub(super) version_lock: std::sync::Mutex<()>,
     initialized_notify: tokio::sync::Notify,
     initialized_version: AtomicU32,
@@ -30,6 +33,8 @@ pub(super) struct LiveQueryInner {
     pub(super) selection: Mut<Option<(ankql::ast::Selection<Resolved>, u32)>>,
     gap_fetcher: Arc<dyn GapFetcher<Entity>>,
     pub(super) cache_policy: CachePolicy,
+    /// Dropping this handle cancels pending resolution on replacement or query drop.
+    /// The task holds only a weak query reference, so it cannot keep its owner alive.
     pub(super) resolution_task: std::sync::Mutex<Option<RemoteHandle<()>>>,
     #[cfg(test)]
     before_wait: std::sync::Mutex<Option<Box<dyn FnOnce(&Self) + Send>>>,

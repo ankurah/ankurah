@@ -47,14 +47,22 @@ impl ExprOutput<Value> {
 /// An item whose properties can be evaluated by identity.
 pub trait Filterable {
     fn value(&self, property: &PropertyId) -> Option<Value>;
+    fn is_member_of(&self, _model: &ankurah_proto::ModelId) -> Result<bool, Error> {
+        Err(Error::UnsupportedExpression("model membership is unavailable"))
+    }
 }
 
 /// Supplies values at a selection stage's paths, for predicate evaluation and sorting.
 pub trait ValueLookup<S: Stage> {
     fn value_at(&self, path: &S::Path) -> Option<Value>;
+    fn is_member_of(&self, _model: &S::ModelId) -> Result<bool, Error> {
+        Err(Error::UnsupportedExpression("model membership is unavailable"))
+    }
 }
 
 impl<T: Filterable> ValueLookup<Resolved> for T {
+    fn is_member_of(&self, model: &ankurah_proto::ModelId) -> Result<bool, Error> { Filterable::is_member_of(self, model) }
+
     fn value_at(&self, path: &PropertyPath) -> Option<Value> {
         let value = self.value(&path.property_id())?;
         if path.subpath.is_empty() {
@@ -146,9 +154,17 @@ pub fn evaluate_predicate<S: Stage, I: ValueLookup<S>>(item: &I, predicate: &Pre
             })
         }
         Predicate::And(left, right) => Ok(evaluate_predicate(item, left)? && evaluate_predicate(item, right)?),
-        Predicate::Or(left, right) => Ok(evaluate_predicate(item, left)? || evaluate_predicate(item, right)?),
+        // A true branch decides OR even when the other branch cannot be evaluated.
+        Predicate::Or(left, right) => match evaluate_predicate(item, left) {
+            Ok(true) => Ok(true),
+            left => match evaluate_predicate(item, right) {
+                Ok(true) => Ok(true),
+                right => Ok(left? || right?),
+            },
+        },
         Predicate::Not(pred) => Ok(!evaluate_predicate(item, pred)?),
         Predicate::IsNull(expr) => Ok(evaluate_expr(item, expr)?.is_none()),
+        Predicate::MemberOf(model) => item.is_member_of(model),
         Predicate::True => Ok(true),
         Predicate::False => Ok(false),
         Predicate::Placeholder => Err(Error::PropertyNotFound("Placeholder must be transformed before filtering".to_string())),

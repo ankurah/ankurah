@@ -9,7 +9,7 @@ pub fn model_impl(model: &crate::model::description::ModelDescription) -> TokenS
     let mutable_name = model.mutable_name();
     let active_field_names = model.active_field_names();
     let active_field_indices: Vec<syn::Index> = (0..active_field_names.len()).map(syn::Index::from).collect();
-    let active_field_types_turbofish = match model.active_field_types_turbofish() {
+    let active_field_types = match model.active_field_types() {
         Ok(types) => types,
         Err(e) => return e.into_compile_error(),
     };
@@ -21,22 +21,26 @@ pub fn model_impl(model: &crate::model::description::ModelDescription) -> TokenS
     };
 
     quote! {
+        #schema
+
         impl #base::model::Model for #name {
             type View = #view_name;
             type Mutable = #mutable_name;
-            #schema_method
+
+            fn descriptor() -> &'static #base::schema::ModelStructDescriptor { &__ANKURAH_MODEL_SCHEMA }
+
             fn initialize_new_entity(
                 &self,
-                provisional: &mut #base::entity::ProvisionalEntity,
+                entity: &#base::entity::LocalTrxEntity,
                 model_id: #base::proto::ModelId,
                 epoch: #base::schema::SystemEpoch,
             ) -> Result<(), #base::property::PropertyError> {
-                provisional.add_membership(model_id);
+                entity.add_membership(model_id)?;
                 use #base::property::InitializeWith;
                 #(
-                    #active_field_types_turbofish::initialize_with(
-                        &mut *provisional,
-                        <Self as #base::model::Model>::descriptor().resolved_field_at(#active_field_indices, epoch)?,
+                    <#active_field_types>::initialize_with(
+                        entity,
+                        __ANKURAH_MODEL_PROPERTIES[#active_field_indices].resolved_id(epoch)?,
                         &self.#active_field_names,
                     );
                 )*

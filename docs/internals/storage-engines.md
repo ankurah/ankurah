@@ -36,7 +36,6 @@ The trait groups operations by semantic responsibility:
 
 | Method | Contract |
 |---|---|
-| `append_events` | Blindly and idempotently append validated, attested events by `EventId`; preserve input order in the inserted/not-inserted result |
 | `transaction` | Return an engine-owned handle for one atomic storage transaction |
 | `get_state` / `get_states` | Read canonical state by `EntityId`, independent of model |
 | `fetch_states` | Query one model's materialized view and return the corresponding canonical states |
@@ -181,8 +180,8 @@ supports causal DAG walks, while `SuspenseEvents` adds an in-memory staging map
 so an incoming event is discoverable before an in-memory head references it.
 
 Transaction events, canonical states, and materializations persist atomically
-through `StorageTransaction::commit`. Standalone `StorageEngine::append_events` remains for
-caching retrieved lineage without changing canonical state.
+through `StorageTransaction::commit`. Event-only transactions can cache retrieved
+lineage without changing canonical state.
 The durable/ephemeral distinction is exposed by
 `storage_is_definitive()`:
 

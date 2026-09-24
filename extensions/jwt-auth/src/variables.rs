@@ -1,4 +1,4 @@
-use ankql::ast::{Expr, Parsed, Predicate};
+use ankql::ast::{Expr, Parsed, Predicate, Stage};
 use ankurah_core::policy::AccessDenied;
 use ankurah_core_types::Value;
 use ankurah_proto::EntityId;
@@ -6,7 +6,7 @@ use ankurah_proto::EntityId;
 use crate::claims::JwtClaims;
 
 /// Resolve a `$jwt.*` variable reference to its string value from the claims.
-fn resolve_variable<'a>(var: &str, claims: &'a JwtClaims) -> Result<String, AccessDenied> {
+pub(crate) fn resolve_variable<'a>(var: &str, claims: &'a JwtClaims) -> Result<String, AccessDenied> {
     match var {
         "$jwt.sub" => Ok(claims.sub.clone()),
         "$jwt.email" => Ok(claims.email.clone()),
@@ -36,7 +36,7 @@ fn resolve_variable<'a>(var: &str, claims: &'a JwtClaims) -> Result<String, Acce
 /// as an EntityId will collate as EntityId and stop matching (fails closed).
 /// Once #259 is fixed at the watcher index, this can return plain String
 /// literals unconditionally.
-fn typed_expr(value: String) -> Expr<Parsed> {
+pub(crate) fn typed_expr<S: Stage>(value: String) -> Expr<S> {
     match EntityId::from_base64(&value) {
         Ok(id) => Expr::from(&id),
         Err(_) => Expr::Literal(Value::String(value)),
@@ -58,31 +58,31 @@ fn typed_expr(value: String) -> Expr<Parsed> {
 /// Example: `"technician = $jwt.sub"` parses as `technician = ?` and is
 /// populated with `claims.sub`, typed per [`typed_expr`].
 pub fn parse_and_substitute(filter_str: &str, claims: &JwtClaims) -> Result<Predicate<Parsed>, AccessDenied> {
-    let mut values = Vec::new();
+    let (predicate, variables) = parse_template(filter_str)?;
+    let values = variables.iter().map(|variable| resolve_variable(variable, claims).map(typed_expr)).collect::<Result<Vec<_>, _>>()?;
+    predicate.populate(values).map_err(AccessDenied::ParseError)
+}
+
+/// Parse once, retaining claim references as ordered parameters rather than query text.
+pub(crate) fn parse_template(filter_str: &str) -> Result<(Predicate<Parsed>, Vec<String>), AccessDenied> {
+    let mut variables = Vec::new();
     let mut query = String::with_capacity(filter_str.len());
     let mut rest = filter_str;
-
-    // Find each "$jwt." occurrence and extract the full variable token
-    // (alphanumeric + dots + underscores after the initial '$').
     while let Some(start) = rest.find("$jwt.") {
         query.push_str(&rest[..start]);
         let tail = &rest[start..];
-        let token_len = tail
-            .char_indices()
-            .skip(1) // skip the '$'
+        let token_len = tail.char_indices().skip(1)
             .find(|(_, c)| !c.is_alphanumeric() && *c != '.' && *c != '_')
-            .map(|(i, _)| i)
-            .unwrap_or(tail.len());
-
-        values.push(resolve_variable(&tail[..token_len], claims)?);
+            .map(|(i, _)| i).unwrap_or(tail.len());
+        variables.push(tail[..token_len].to_owned());
         query.push('?');
         rest = &tail[token_len..];
     }
     query.push_str(rest);
-
-    let selection = ankql::parser::parse_selection(&query).map_err(AccessDenied::ParseError)?;
-
-    selection.predicate.populate(values.into_iter().map(typed_expr)).map_err(AccessDenied::ParseError)
+    let predicate = ankql::parser::parse_selection(&query).map_err(AccessDenied::ParseError)?.predicate;
+    // Reject literal placeholders that have no corresponding claim parameter.
+    predicate.clone().populate(variables.iter().map(|_| Expr::Literal(Value::String(String::new()))))?;
+    Ok((predicate, variables))
 }
 
 #[cfg(test)]

@@ -33,8 +33,7 @@ The split enforces staging discipline at the type level:
 
 - **`SuspenseEvents`** -- Extends `GetEvents` with `stage_event`. Only the
   outermost caller (e.g., `NodeApplier`) holds this; it is deliberately *not*
-  passed into `apply_event`. Durable append remains an explicit
-  `StorageEngine::append_events` operation.
+  passed into `apply_event`. Durable event writes go through `StorageTransaction`.
 
 
 ## Staging vs Permanent Storage
@@ -87,7 +86,7 @@ historical events. `storage_is_definitive` is always `false`.
 entity state snapshots, translating "not found" into `Ok(None)`.
 
 
-## The Event Lifecycle: Stage, Apply, Append, Commit
+## The Event Lifecycle: Stage, Apply, Commit
 
 A typical flow in [`NodeApplier::apply_update`](node-architecture.md#streaming-updates-updatecontent)
 for `EventOnly` content:
@@ -98,14 +97,16 @@ for each event:
     event_getter.stage_event(event)            // (1) stage
 
 events = topological_sort(events)
-storage.append_events(events)                  // (2) durable history
 entity = get_or_create(...)
 
 for each attested_event:
-    entity.apply_event(event_getter, &event)   // (3) compare + apply
+    entity.apply_event(event_getter, &event)   // (2) compare + apply
 
-commit_resident_writes(entity, events)         // (4) exact-head retry +
-                                               //     atomic projections
+storage_trx = storage.transaction()
+storage_trx.add_events(events)
+storage_trx.set_state(expected_head, entity_state)
+storage_trx.commit()                           // (3) atomic history and state
+publish(entity)
 ```
 
 For `StateAndEvent` content, the flow first tries

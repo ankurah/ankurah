@@ -1,16 +1,17 @@
 use crate::context::ContextAuth;
-use crate::entity::DetachedEntity;
+use crate::entity::RemoteTrxEntity;
 use crate::internal::prelude::*;
-use crate::node::event_admissibility::{check_membership, check_unprivileged_write};
-use crate::retrieval::SuspenseEvents;
-use ankurah_proto::{Attested, Clock, EntityState, Event, State};
+use crate::node::event_admissibility::check_genesis_membership;
+use crate::policy::ContextPolicy;
+use crate::reactor::ChangeNotification;
+use crate::retrieval::{LocalEventGetter, LocalStateGetter};
+use crate::storage::StorageTransaction;
+use crate::util::retry::retry_on;
+use ankurah_proto::{Attested, EntityState, Event};
 use std::sync::atomic::Ordering;
-
-use super::PendingGenesis;
-
 /// Validate and commit the transaction, then publish its entity changes.
 /// Privileged contexts bypass policy, not epoch or event-validity checks.
-pub(crate) async fn commit<SE, PA>(node: &Node<SE, PA>, auth: &ContextAuth<PA>, trx: &Transaction) -> Result<Vec<Event>, MutationError>
+pub(crate) async fn commit<SE, PA>(node: &Node<SE, PA>, auth: &ContextAuth<SessionSet<PA::ContextData>>, trx: &Transaction) -> Result<Vec<Event>, MutationError>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
@@ -21,131 +22,71 @@ where
         return Err(MutationError::General("Transaction already committed or rolled back".into()));
     }
 
-    let cdata = match auth {
-        ContextAuth::Sessions(sessions) => Some(sessions.write_credential()?),
-        ContextAuth::Privileged => None,
-    };
-
-    let trx_id = trx.id.clone();
-    let genesis_events = trx.genesis_events.read().unwrap().clone();
+    let policy = ContextPolicy::new(&node.policy_agent, auth.clone());
 
     let mut entity_events = Vec::new();
-    let mut seen_created = std::collections::HashSet::new();
     for entity in trx.entities.iter() {
-        entity.check_epoch(epoch)?;
-        let mut events = Vec::with_capacity(2);
-        if let Some(PendingGenesis { event: genesis, schema }) = genesis_events.get(&entity.id) {
-            if !seen_created.insert(entity.id) {
-                return Err(MutationError::CommitInvariant("two transaction entities claim the same frozen genesis"));
-            }
-            if genesis.entity_id != entity.id {
-                return Err(MutationError::CommitInvariant("the frozen genesis names an entity other than the one holding it"));
-            }
-            if !genesis.is_entity_create() {
-                return Err(MutationError::CommitInvariant("the event frozen by create() is not a genesis"));
-            }
-            genesis.validate_structure()?;
-            if entity.head() != Clock::new([genesis.id()]) {
-                return Err(MutationError::CommitInvariant("the created entity's head is not exactly its frozen genesis"));
-            }
-            check_membership(node, Some(schema), genesis)?;
-            events.push(genesis.clone());
+        if entity.system_epoch() != epoch { return Err(MutationError::ForeignEntity); }
+        let events = entity.prepare_events()?;
+        for event in &events {
+            event.payload.validate_structure()?;
+            check_genesis_membership(&event.payload)?;
         }
-
-        if let Some(event) = entity.generate_commit_event(proto::AuthorId::Unknown)? {
-            check_membership(node, None, &event)?;
-            events.push(event);
-        }
-
         if !events.is_empty() {
-            entity_events.push((entity.clone(), events));
-        }
-    }
-    if seen_created.len() != genesis_events.len() {
-        return Err(MutationError::CommitInvariant("an entity create() recorded is absent from the transaction's entities"));
-    }
-
-    let mut attested_events = Vec::new();
-    let mut entity_attested_events = Vec::new();
-
-    for (entity, events) in entity_events {
-        if matches!(auth, ContextAuth::Sessions(_)) {
-            check_unprivileged_write(entity.collection())?;
-        }
-        let validation_alive = Arc::new(AtomicBool::new(true));
-
-        let mut entity_before = match &entity.kind {
-            crate::entity::EntityKind::Transacted { upstream, .. } => upstream.clone(),
-            crate::entity::EntityKind::Primary => entity.clone(),
-        };
-        let collection = node.collections.get(entity.collection()).await?;
-        let event_getter = crate::retrieval::LocalEventGetter::new(collection, node.durable);
-        let mut entity_attested = Vec::with_capacity(events.len());
-
-        for event in events {
-            event_getter.stage_event(event.clone());
-            let entity_after = entity_before.snapshot(validation_alive.clone());
-            entity_after.apply_event(&event_getter, &event).await?;
-
-            let attestation = match &cdata {
-                Some(cdata) => node.policy_agent.check_event(node, cdata, &entity_before, &entity_after, &event)?,
-                None => None,
-            };
-            let attested = Attested::opt(event, attestation);
-
-            attested_events.push(attested.clone());
-            entity_attested.push(attested);
-            entity_before = entity_after;
-        }
-        entity_attested_events.push((entity, entity_attested));
-    }
-
-    for (entity, events) in &entity_attested_events {
-        let collection = node.collections.get(entity.collection()).await?;
-        let event_getter = crate::retrieval::LocalEventGetter::new(collection, node.durable);
-        for attested in events {
-            event_getter.commit_event(attested).await?;
+            entity_events.push((entity, events));
+        } else {
+            // An unchanged edit still returns its views to the resident entity.
+            entity.rollback();
         }
     }
 
-    for (entity, events) in &entity_attested_events {
-        if let Some(last) = events.last() {
-            entity.commit_head(Clock::new([last.payload.id()]));
-        }
-    }
-    if let Some(cdata) = &cdata {
-        node.relay_to_required_peers(cdata, trx_id, &attested_events).await?;
-    }
+    let event_getter = LocalEventGetter::new(node.storage.clone(), node.durable);
+    let state_getter = LocalStateGetter::new(node.storage.clone());
+    let mut relayed = false;
+    retry_on!(MutationError::WriteConflict, {
+        let mut storage_trx = node.storage.transaction();
+        let mut attested_events = Vec::new();
+        let mut forks = Vec::new();
+        for (entity, events) in &entity_events {
+            // TODO(#509): Finalize the existing transaction fork; rebase it only on write conflicts.
+            // A subscription echo may already have committed this creation locally.
+            let entity_after = RemoteTrxEntity::for_event(
+                &node.entities, &state_getter, &event_getter, &events[0].payload, trx.alive.clone(),
+            ).await?;
+            let entity_before = entity_after.snapshot();
+            let after = entity_after.read();
+            for event in events {
+                let expected_head = entity_after.head();
+                let mut attested = event.clone();
+                entity_after.apply_event(&event_getter, &mut attested, |event| {
+                    policy.check_write_event(node, &entity_before, &after, event)
+                }).await?;
+                storage_trx.add_events(std::slice::from_ref(&attested)).await?;
+                let state = EntityState { entity_id: entity.id(), state: entity_after.to_state()? };
+                let attestation = policy.attest_state(node, &state);
+                storage_trx.set_state(&expected_head, &Attested::opt(state, attestation)).await?;
 
-    let mut changes: Vec<EntityChange> = Vec::new();
-    for (entity, events) in entity_attested_events {
-        let collection = node.collections.get(entity.collection()).await?;
-
-        let canonical_entity = match &entity.kind {
-            crate::entity::EntityKind::Transacted { upstream, .. } => {
-                let event_getter = crate::retrieval::LocalEventGetter::new(collection.clone(), node.durable);
-                for attested in &events {
-                    upstream.apply_event(&event_getter, &attested.payload).await?;
-                }
-                upstream.clone()
+                attested_events.push(attested);
             }
-            crate::entity::EntityKind::Primary => entity,
-        };
+            forks.push((entity, entity_after));
+        }
 
-        let state = canonical_entity.to_state()?;
-
-        let entity_state = EntityState { entity_id: canonical_entity.id(), collection: canonical_entity.collection().clone(), state };
-        let attestation = match auth {
-            ContextAuth::Sessions(_) => node.policy_agent.attest_state(node, &entity_state),
-            ContextAuth::Privileged => None,
-        };
-        let attested = Attested::opt(entity_state, attestation);
-        collection.set_state(attested).await?;
-
-        changes.push(EntityChange::new(canonical_entity, events)?);
-    }
-
-    node.reactor.notify_change(changes).await;
-
-    Ok(attested_events.into_iter().map(|a| a.payload).collect())
+        if !relayed {
+            if let ContextAuth::Sessions(sessions) = auth {
+                node.relay_to_required_peers(&sessions.write_credential()?, trx.id.clone(), &attested_events).await?;
+            }
+            relayed = true;
+        }
+        let publication = node.commit_publication_lock.lock().await;
+        storage_trx.commit().await?.committed()?;
+        let mut changes = Vec::new();
+        for (entity, fork) in forks {
+            let change = fork.commit(&node.entities, &event_getter).await?;
+            entity.committed(change.entity())?;
+            if !change.events().is_empty() { changes.push(change); }
+        }
+        drop(publication);
+        node.reactor.notify_change(changes).await;
+        Ok(attested_events.into_iter().map(|event| event.payload).collect())
+    })
 }

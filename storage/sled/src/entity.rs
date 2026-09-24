@@ -1,5 +1,4 @@
 use ankurah_core::selection::filter::ValueLookup;
-use ankurah_proto::CollectionId;
 use ankurah_storage_common::filtering::{HasEntityId, ValueSetStream};
 use ankurah_storage_common::traits::EntityIdStream;
 use ankurah_storage_common::EngineColumns;
@@ -10,14 +9,11 @@ use std::task::{Context, Poll};
 /// Sled-specific entity state lookup that hydrates EntityIds into full EntityStates
 pub struct SledEntityLookup<S> {
     pub entities_tree: sled::Tree,
-    pub collection_id: CollectionId,
     pub stream: S,
 }
 
 impl<S: EntityIdStream> SledEntityLookup<S> {
-    pub fn new(entities_tree: &sled::Tree, collection_id: &CollectionId, stream: S) -> Self {
-        Self { entities_tree: entities_tree.clone(), collection_id: collection_id.clone(), stream }
-    }
+    pub fn new(entities_tree: &sled::Tree, stream: S) -> Self { Self { entities_tree: entities_tree.clone(), stream } }
 }
 
 impl<S: Unpin> Unpin for SledEntityLookup<S> {}
@@ -38,19 +34,16 @@ impl<S: EntityIdStream> Stream for SledEntityLookup<S> {
         let key = entity_id.to_bytes();
         let value_bytes = match self.entities_tree.get(key) {
             Ok(Some(bytes)) => bytes,
-            Ok(None) => return Poll::Ready(Some(Err(ankurah_core::error::RetrievalError::storage("Entity not found".to_string())))),
-            Err(e) => return Poll::Ready(Some(Err(ankurah_core::error::RetrievalError::storage(e.to_string())))),
+            Ok(None) => return Poll::Ready(Some(Err(ankurah_core::error::RetrievalError::EntityNotFound(entity_id)))),
+            Err(e) => return Poll::Ready(Some(Err(ankurah_core::error::RetrievalError::storage(e)))),
         };
 
-        // Decode StateFragment
         let state_fragment: ankurah_proto::StateFragment = match bincode::deserialize(&value_bytes) {
             Ok(fragment) => fragment,
-            Err(e) => return Poll::Ready(Some(Err(ankurah_core::error::RetrievalError::storage(e.to_string())))),
+            Err(e) => return Poll::Ready(Some(Err(ankurah_core::error::RetrievalError::storage(e)))),
         };
 
-        // Create Attested<EntityState> from parts
-        let attested =
-            ankurah_proto::Attested::<ankurah_proto::EntityState>::from_parts(entity_id, self.collection_id.clone(), state_fragment);
+        let attested = ankurah_proto::Attested::<ankurah_proto::EntityState>::from_parts(entity_id, state_fragment);
 
         Poll::Ready(Some(Ok(attested)))
     }
@@ -60,27 +53,25 @@ impl<S: EntityIdStream> Stream for SledEntityLookup<S> {
 
 /// Trait that provides a convenient `.entities()` combinator for EntityId streams
 pub trait SledEntityExt: EntityIdStream + Sized {
-    /// Hydrate EntityIds into EntityStates using the sled entities tree
-    fn entities(self, entities_tree: &sled::Tree, collection_id: &CollectionId) -> SledEntityLookup<Self> {
-        SledEntityLookup::new(entities_tree, collection_id, self)
-    }
+    /// Hydrate EntityIds into EntityStates using the sled entities tree.
+    fn entities(self, entities_tree: &sled::Tree) -> SledEntityLookup<Self> { SledEntityLookup::new(entities_tree, self) }
 }
 
 /// Trait that provides a convenient `.entities()` combinator for materialized value streams
 pub trait SledEntityExtFromMats: ValueSetStream + Sized
 where Self::Item: HasEntityId + ValueLookup<EngineColumns>
 {
-    /// Extract EntityIds and hydrate into EntityStates using the sled entities tree
-    fn entities(self, entities_tree: &sled::Tree, collection_id: &CollectionId) -> SledEntityLookup<impl EntityIdStream> {
+    /// Extract EntityIds and hydrate into EntityStates using the sled entities tree.
+    fn entities(self, entities_tree: &sled::Tree) -> SledEntityLookup<impl EntityIdStream> {
         let ids = self.extract_ids();
-        SledEntityLookup::new(entities_tree, collection_id, ids)
+        SledEntityLookup::new(entities_tree, ids)
     }
 }
 
 // Blanket implementation for all EntityId streams
 impl<S: EntityIdStream> SledEntityExt for S {}
 
-// Blanket implementation for all streams with HasEntityId + column-lookup items
+// Blanket implementation for all streams with HasEntityId + ValueLookup<EngineColumns> items
 impl<S> SledEntityExtFromMats for S
 where
     S: Stream + Unpin + ValueSetStream,

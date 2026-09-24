@@ -135,7 +135,8 @@ fn split_predicate_recursive(predicate: &Predicate<Resolved>) -> (Predicate<Reso
 
         Predicate::True => (Predicate::True, Predicate::True),
         Predicate::False => (Predicate::False, Predicate::True),
-        Predicate::Placeholder => (Predicate::True, predicate.clone()), // Shouldn't happen, but be safe
+        Predicate::MemberOf(_) => (predicate.clone(), Predicate::True),
+        Predicate::Placeholder => (Predicate::True, predicate.clone()),
     }
 }
 
@@ -352,6 +353,10 @@ impl SqlBuilder {
             Predicate::False => {
                 self.sql("FALSE");
             }
+            Predicate::MemberOf(model) => {
+                let column = ankurah_storage_common::materialization_join::membership_column(model);
+                self.sql(format!("\"{}\"", column.replace('"', "\"\"")));
+            }
             Predicate::Placeholder => {
                 return Err(SqlGenerationError::PlaceholderFound);
             }
@@ -417,9 +422,10 @@ fn comparison_op_to_sql(op: &ComparisonOperator) -> Result<&'static str, SqlGene
 mod tests {
     use super::*;
     use ankql::parser::parse_selection;
+    use ankql::selection::map_references;
     use ankurah_core::schema::resolver::{resolve_selection, ModelResolutionError, ModelResolver, ResolvedProperty};
     use ankurah_proto::{EntityId, ModelId, PropertyId};
-    use ankurah_storage_common::{lower_selection, ColumnPath};
+    use ankurah_storage_common::ColumnPath;
     use anyhow::Result;
 
     /// Resolves fixture names to deterministic property ids.
@@ -453,7 +459,7 @@ mod tests {
 
     // Keep readable fixture column names; resolution still supplies the canonical literal types.
     fn lowered(query: &str) -> ankql::ast::Selection<EngineColumns> {
-        lower_selection(&resolved(query), &|path| ColumnPath::new(path.label(), path.subpath.clone()))
+        map_references(&resolved(query), &|path| ColumnPath::new(path.label(), path.subpath.clone()), &|model| *model)
     }
 
     fn assert_args<'a, 'b>(args: &Vec<Box<dyn ToSql + Send + Sync>>, expected: &Vec<Box<dyn ToSql + Send + Sync>>) {

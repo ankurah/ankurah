@@ -1,165 +1,90 @@
-use crate::{JwtContext, JwtKeys, PolicyConfig};
-use ankurah_core::{livequery::EntityLiveQuery, resultset::EntityResultSet, storage::StorageEngine, Model, Node};
-use ankurah_proto as proto;
-use std::sync::{Arc, Mutex, RwLock};
+use std::{collections::BTreeSet, sync::Arc};
 
-/// Combined policy config and verification keys, always updated atomically.
+use ankurah::{Context, proto::ModelId, signals::{Mut, Wait}};
+use ankurah_core::{node::WeakNode, storage::StorageEngine};
+
+use crate::{JwtAgent, JwtContext, JwtKeys, PolicyConfig, bound_policy::BoundPolicy, graph::{self, PolicyQueries}};
+
+/// The locally loaded policy and verification keys. Private signing material stays local.
 #[derive(Clone)]
 pub struct AgentState {
-    pub config: PolicyConfig,
+    pub config: Arc<PolicyConfig>,
     pub keys: Option<JwtKeys>,
+    pub(crate) config_loaded: bool,
+    pub(crate) policy: Option<Arc<BoundPolicy>>,
+    pub(crate) policy_models: BTreeSet<ModelId>,
 }
 
-/// A read guard that exposes config fields from the combined AgentState.
-pub struct AgentStateReadGuard<'a> {
-    guard: std::sync::RwLockReadGuard<'a, AgentState>,
-}
-
-impl<'a> AgentStateReadGuard<'a> {
-    pub(crate) fn new(guard: std::sync::RwLockReadGuard<'a, AgentState>) -> Self { Self { guard } }
-}
-
-impl<'a> std::ops::Deref for AgentStateReadGuard<'a> {
-    type Target = PolicyConfig;
-    fn deref(&self) -> &PolicyConfig { &self.guard.config }
-}
-
-/// Start durable policy watcher: spawns a background task that watches the policy file
-/// and syncs it to the node.
-#[cfg(feature = "watcher")]
-pub(crate) fn start_durable_policy_watcher<SE, PA>(
-    node: ankurah_core::node::WeakNode<SE, PA>,
-    policy_path: std::path::PathBuf,
-    state_handle: Arc<RwLock<AgentState>>,
-) where
-    SE: StorageEngine + Send + Sync + 'static,
-    PA: ankurah_core::policy::PolicyAgent<ContextData = JwtContext> + Send + Sync + 'static,
-{
-    ankurah_core::task::spawn(async move {
-        let Some(node) = node.upgrade() else {
-            tracing::warn!("on_node_ready: node already dropped before watcher start");
-            return;
-        };
-        let ctx = match node.context_async(JwtContext::system()).await {
-            Ok(ctx) => ctx,
-            Err(error) => {
-                tracing::error!("cannot start policy watcher: {error}");
-                return;
-            }
-        };
-        match crate::PolicyWatcher::start(policy_path, ctx, state_handle).await {
-            Ok(_watcher) => {
-                std::future::pending::<()>().await;
-            }
-            Err(e) => {
-                tracing::error!("on_node_ready: failed to start policy watcher: {}", e);
-            }
-        }
-    });
-}
-
-/// Start ephemeral policy sync: creates a weak-node LiveQuery on "jwtpolicy" (so the
-/// agent does not keep its own node alive) and spawns a background task that applies
-/// policy updates from the durable node.
-pub(crate) fn start_ephemeral_policy_sync<SE, PA>(
-    node: &Node<SE, PA>,
-    state_handle: Arc<RwLock<AgentState>>,
-    policy_livequery: &Arc<Mutex<Option<EntityLiveQuery>>>,
-) where
-    SE: StorageEngine + Send + Sync + 'static,
-    PA: ankurah_core::policy::PolicyAgent<ContextData = JwtContext> + Send + Sync + 'static,
-{
-    let args: ankurah_core::node::MatchArgs<ankql::ast::Parsed> = match "true".try_into() {
-        Ok(a) => a,
-        Err(e) => {
-            tracing::error!("on_node_ready: failed to parse selection: {}", e);
-            return;
-        }
-    };
-    let lq = match EntityLiveQuery::new_with_weak_node(
-        node,
-        Some(crate::JwtPolicy::descriptor()),
-        proto::CollectionId::from("jwtpolicy"),
-        args,
-        JwtContext::NoUser,
-    ) {
-        Ok(lq) => lq,
-        Err(e) => {
-            tracing::error!("on_node_ready: failed to create policy livequery: {}", e);
-            return;
-        }
-    };
-
-    let lq_clone = lq.clone();
-    *policy_livequery.lock().unwrap_or_else(|e| e.into_inner()) = Some(lq);
-
-    ankurah_core::task::spawn(async move {
-        if let Err(error) = lq_clone.wait_initialized().await {
-            tracing::error!("ephemeral policy sync: the policy livequery never initialized, so no policy will be applied: {error}");
-            return;
-        }
-
-        apply_policy_from_resultset(&lq_clone.resultset(), &state_handle);
-
-        let sh = state_handle.clone();
-        use ankurah::signals::Subscribe;
-        let _guard = lq_clone.resultset().wrap::<crate::JwtPolicyView>().subscribe(move |policies: Vec<crate::JwtPolicyView>| {
-            for policy in &policies {
-                apply_policy_view(policy, &sh);
-            }
-        });
-
-        std::future::pending::<()>().await;
-    });
-}
-
-/// Process all JwtPolicy entities in the resultset, updating the agent's config and keys.
-fn apply_policy_from_resultset(resultset: &EntityResultSet, state: &Arc<RwLock<AgentState>>) {
-    use ankurah_core::model::View;
-    let read = resultset.read();
-    for (_, entity) in read.iter_entities() {
-        let view = crate::JwtPolicyView::from_entity(entity.clone());
-        apply_policy_view(&view, state);
+impl AgentState {
+    pub(crate) fn new(config: PolicyConfig, keys: Option<JwtKeys>, config_loaded: bool) -> Self {
+        Self { config: Arc::new(config), keys, config_loaded, policy: None, policy_models: BTreeSet::new() }
     }
+
+    pub(crate) fn ready(&self) -> bool { self.config_loaded && self.keys.is_some() }
 }
 
-/// Process a single JwtPolicy view, updating config and keys atomically.
-fn apply_policy_view(view: &crate::JwtPolicyView, state: &Arc<RwLock<AgentState>>) {
-    let new_config = match view.config_json() {
-        Ok(json) => match serde_json::from_str::<PolicyConfig>(&json) {
-            Ok(c) => Some(c),
-            Err(e) => {
-                tracing::warn!("Ephemeral: failed to parse policy config: {e}");
-                None
-            }
-        },
-        Err(e) => {
-            tracing::warn!("Ephemeral: failed to read config_json: {e}");
-            None
-        }
-    };
+/// Load each policy model through its own livequery; observe stored IDs without resolving policy labels.
+pub(crate) async fn start_policy_sync<SE: StorageEngine + Send + Sync + 'static>(
+    node: WeakNode<SE, JwtAgent>, state: Mut<AgentState>, loaded: futures::channel::oneshot::Sender<anyhow::Result<()>>,
+) {
+    let initialize = async {
+        let owner = node.upgrade().ok_or(ankurah_core::error::NodeDropped)?;
+        let catalog = owner.catalog.clone();
+        let epoch = owner.system.system_epoch().ok_or(ankurah_core::error::RetrievalError::NodeNotReady)?;
+        let changed = Mut::new(());
+        let subscription = owner.catalog.subscribe_changes({ let changed = changed.clone(); move || changed.set(()) });
+        drop(owner);
+        let models = changed.wait_for(move |_| graph::bind_models(&catalog, epoch).ok()).await;
+        drop(subscription);
+        state.update(|state| state.policy_models = models);
 
-    let new_keys = match view.public_key_pem() {
-        Ok(pem) if !pem.is_empty() => match JwtKeys::from_public_pem(&pem) {
-            Ok(k) => Some(k),
-            Err(e) => {
-                tracing::warn!("Ephemeral: failed to parse public key: {e}");
-                None
-            }
-        },
-        _ => None,
+        let owner = node.upgrade().ok_or(ankurah_core::error::NodeDropped)?;
+        let queries = Arc::new(PolicyQueries::new(&Context::new_weak(&owner, JwtContext::NoUser))?);
+        drop(owner);
+        queries.wait_durable_answered().await?;
+        let refresh = {
+            let queries = Arc::downgrade(&queries);
+            let state = state.clone();
+            // Serialize snapshot through publication so a slower refresh cannot replace newer policy.
+            // Release before notifying listeners, which may trigger another refresh.
+            let refresh_lock = std::sync::Mutex::new(());
+            Arc::new(move || {
+                let Some(queries) = queries.upgrade() else { return };
+                let guard = refresh_lock.lock().unwrap_or_else(|error| error.into_inner());
+                let mut next = state.value();
+                let loaded = queries.snapshot().and_then(|graph| {
+                    let policy = BoundPolicy::from_graph(&graph, next.policy_models.clone())?;
+                    anyhow::ensure!(graph.keys.len() == 1, "waiting for one JWT verification key");
+                    let pem = &graph.keys.values().next().unwrap().public_key_pem;
+                    let keys = JwtKeys::from_public_pem(pem)?;
+                    let signing_matches = match &next.keys {
+                        Some(JwtKeys::Signing(signing)) => signing.public_key_pem().is_ok_and(|local| &local == pem),
+                        _ => false,
+                    };
+                    if !signing_matches { next.keys = Some(keys); }
+                    next.config = policy.config();
+                    next.policy = Some(Arc::new(policy));
+                    next.config_loaded = true;
+                    Ok(())
+                });
+                if let Err(error) = loaded {
+                    tracing::debug!("JWT policy graph is not ready: {error}");
+                    next.policy = None;
+                    next.config_loaded = false;
+                }
+                state.set_before_notify(next, || drop(guard));
+            })
+        };
+        let subscriptions = queries.subscribe({ let refresh = refresh.clone(); move || refresh() });
+        refresh();
+        state.wait_for(|state| (state.ready() && state.policy.is_some()).then_some(())).await;
+        Ok::<_, anyhow::Error>((queries, subscriptions))
     };
-
-    // Update config and keys atomically under a single write lock
-    if new_config.is_some() || new_keys.is_some() {
-        let mut guard = state.write().unwrap_or_else(|e| e.into_inner());
-        if let Some(c) = new_config {
-            guard.config = c;
-            tracing::info!("Ephemeral: policy config updated from LiveQuery");
+    match initialize.await {
+        Ok((_queries, _subscriptions)) => {
+            let _ = loaded.send(Ok(()));
+            std::future::pending::<()>().await;
         }
-        if let Some(k) = new_keys {
-            guard.keys = Some(k);
-            tracing::info!("Ephemeral: verification keys set from LiveQuery");
-        }
+        Err(error) => { let _ = loaded.send(Err(error)); }
     }
 }
