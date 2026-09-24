@@ -89,9 +89,6 @@ pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
         let inner = mapping.inner;
         let value_type = quote! { <#inner as #base::property::Property>::VALUE_TYPE };
 
-        let target_collection = reference_target(&field.ty).and_then(type_head).map(|name| name.to_lowercase());
-        let target_collection_tokens = option_str_tokens(target_collection.as_deref());
-
         let backend = quote! { <#active_type as #base::property::ActiveType>::BACKEND };
 
         let renamed_from = property_str_attr(&field.attrs, "renamed_from")?;
@@ -106,12 +103,12 @@ pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
         let field_build_id = ulid::Ulid::new().to_bytes();
         field_tokens.push(quote! {
             #base::schema::StructProperty {
+                model_label: #collection,
                 field: #field_name,
                 name: #display_name,
                 renamed_from: #renamed_from_tokens,
                 backend: #backend,
                 value_type: #value_type,
-                target_label: #target_collection_tokens,
                 optional: #optional,
                 explicit_id: #explicit_id_tokens,
                 build_id: [#(#field_build_id),*],
@@ -129,21 +126,18 @@ pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
     let field_count = field_tokens.len();
     let model_build_id = ulid::Ulid::new().to_bytes();
     Ok(quote! {
-        fn descriptor() -> &'static #base::schema::ModelStructDescriptor {
-            static __ANKURAH_MODEL_PROPERTIES: [#base::schema::StructProperty; #field_count] = [
-                #(#field_tokens),*
-            ];
-            static __ANKURAH_MODEL_SCHEMA: #base::schema::ModelStructDescriptor = #base::schema::ModelStructDescriptor {
-                label: #collection,
-                name: #name_str,
-                properties: &__ANKURAH_MODEL_PROPERTIES,
-                system: #system_tokens,
-                explicit_id: #model_explicit_id_tokens,
-                build_id: [#(#model_build_id),*],
-                resolved: #model_resolved,
-            };
-            &__ANKURAH_MODEL_SCHEMA
-        }
+        static __ANKURAH_MODEL_PROPERTIES: [#base::schema::StructProperty; #field_count] = [
+            #(#field_tokens),*
+        ];
+        static __ANKURAH_MODEL_SCHEMA: #base::schema::ModelStructDescriptor = #base::schema::ModelStructDescriptor {
+            label: #collection,
+            name: #name_str,
+            properties: &__ANKURAH_MODEL_PROPERTIES,
+            system: #system_tokens,
+            explicit_id: #model_explicit_id_tokens,
+            build_id: [#(#model_build_id),*],
+            resolved: #model_resolved,
+        };
     })
 }
 
@@ -152,16 +146,6 @@ fn map_value_type(ty: &Type) -> FieldSchemaType<'_> {
         return FieldSchemaType { optional: true, inner };
     }
     FieldSchemaType { optional: false, inner: ty }
-}
-
-/// The last path segment identifier of a type (e.g. `String`,
-/// `crate::property::value::Json` -> "Json"), if it is a path type.
-fn type_head(ty: &Type) -> Option<String> {
-    if let Type::Path(p) = ty {
-        p.path.segments.last().map(|s| s.ident.to_string())
-    } else {
-        None
-    }
 }
 
 /// If `ty` is `Option<Inner>`, return `Inner`.
@@ -173,21 +157,6 @@ fn option_inner(ty: &Type) -> Option<&Type> {
     }
     let syn::PathArguments::AngleBracketed(args) = &seg.arguments else { return None };
     args.args.iter().find_map(|a| if let syn::GenericArgument::Type(t) = a { Some(t) } else { None })
-}
-
-/// If `ty` is `Ref<T>` or `Option<Ref<T>>`, return `T`.
-fn reference_target(ty: &Type) -> Option<&Type> {
-    let ty = option_inner(ty).unwrap_or(ty);
-    let Type::Path(path) = ty else { return None };
-    let segment = path.path.segments.last()?;
-    if segment.ident != "Ref" {
-        return None;
-    }
-    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else { return None };
-    args.args.iter().find_map(|arg| match arg {
-        syn::GenericArgument::Type(target) => Some(target),
-        _ => None,
-    })
 }
 
 fn property_str_attr(attrs: &[syn::Attribute], key: &str) -> syn::Result<Option<String>> {

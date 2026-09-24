@@ -52,7 +52,8 @@ struct Inner<SE> {
     system_ready: RwLock<bool>,
     allow_system_replacement: AtomicBool,
     node_state: Mut<NodeState>,
-    /// Serializes initial system creation/adoption, never ordinary node operations.
+    /// Hold the root check through persistence and publication so concurrent create/adopt
+    /// calls cannot both claim an uninitialized node. Ordinary reads and writes do not take it.
     root_write: Arc<tokio::sync::Mutex<()>>,
 }
 

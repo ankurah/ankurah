@@ -21,7 +21,8 @@ pub async fn test_index_creation_and_reconnection() -> Result<(), anyhow::Error>
     tracing::info!("Initial database version: {}", initial_version);
 
     // Create an index spec for testing using the new common IndexSpec
-    let index_spec = KeySpec::new(vec![IndexKeyPart::asc("__collection", ValueType::String), IndexKeyPart::asc("name", ValueType::String)]);
+    let index_spec =
+        KeySpec::new(vec![IndexKeyPart::asc("__materialization", ValueType::String), IndexKeyPart::asc("name", ValueType::String)]);
     tracing::info!("Creating index: {}", index_spec.name_with("", "__"));
 
     // Test index creation (this should trigger reconnection)
@@ -35,9 +36,12 @@ pub async fn test_index_creation_and_reconnection() -> Result<(), anyhow::Error>
     assert!(post_index_version > initial_version, "Database version should have increased after index creation");
 
     // Verify we can create a transaction on the new connection and access the index
-    let transaction =
-        db.get_connection().await.transaction_with_str("entities").map_err(|e| anyhow::anyhow!("Failed to create transaction: {:?}", e))?;
-    let store = transaction.object_store("entities").map_err(|e| anyhow::anyhow!("Failed to get object store: {:?}", e))?;
+    let transaction = db
+        .get_connection()
+        .await
+        .transaction_with_str("materializations")
+        .map_err(|e| anyhow::anyhow!("Failed to create transaction: {:?}", e))?;
+    let store = transaction.object_store("materializations").map_err(|e| anyhow::anyhow!("Failed to get object store: {:?}", e))?;
 
     // Verify the index exists by trying to access it
     let index_result = store.index(&index_spec.name_with("", "__"));

@@ -172,11 +172,6 @@ impl ModelDescription {
 
         Ok(results)
     }
-    pub fn projected_field_types_turbofish(&self) -> Vec<TokenStream> { self.active_fields.iter().map(|f| as_turbofish(&f.ty)).collect() }
-    pub fn active_field_types_turbofish(&self) -> syn::Result<Vec<proc_macro2::TokenStream>> {
-        let active_types = self.active_field_types()?;
-        Ok(active_types.iter().map(as_turbofish).collect())
-    }
 
     // Computed accessors for ephemeral fields
     pub fn ephemeral_field_names(&self) -> Vec<&Option<Ident>> { self.ephemeral_fields.iter().map(|f| &f.ident).collect() }
@@ -505,29 +500,6 @@ fn to_snake(ident: &str) -> String {
     out
 }
 
-fn as_turbofish(type_path: &syn::Type) -> proc_macro2::TokenStream {
-    if let syn::Type::Path(path) = type_path {
-        let mut without_generics = path.clone();
-        let mut generics = syn::PathArguments::None;
-        if let Some(last_segment) = without_generics.path.segments.last_mut() {
-            generics = last_segment.arguments.clone();
-            last_segment.arguments = syn::PathArguments::None;
-        }
-
-        if let syn::PathArguments::AngleBracketed(generics) = generics {
-            quote! {
-                #without_generics::#generics
-            }
-        } else {
-            quote! {
-                #without_generics
-            }
-        }
-    } else {
-        unimplemented!("as_turbofish is not supported for non-path types")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -583,14 +555,14 @@ mod tests {
         assert_eq!(
             active_type_names,
             vec![
-                "::ankurah::property::value::LWW<i32>",
-                "::ankurah::property::value::LWW<i32>",
-                "::ankurah::property::value::LWW<i32>",
-                "::ankurah::property::value::LWW<String>",
-                "::ankurah::property::value::LWW<String>",
-                "::ankurah::property::value::YrsString<String>",
-                "::ankurah::property::value::YrsString<String>",
-                "::ankurah::property::value::LWW<Complex>" // Complex is assumed to be in scope
+                "::ankurah::property::value::LWWMut<i32>",
+                "::ankurah::property::value::LWWMut<i32>",
+                "::ankurah::property::value::LWWMut<i32>",
+                "::ankurah::property::value::LWWMut<String>",
+                "::ankurah::property::value::LWWMut<String>",
+                "::ankurah::property::value::YrsStringMut<String>",
+                "::ankurah::property::value::YrsStringMut<String>",
+                "::ankurah::property::value::LWWMut<Complex>" // Complex is assumed to be in scope
             ]
         );
         assert_eq!(

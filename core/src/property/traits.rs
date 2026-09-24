@@ -1,7 +1,7 @@
 use crate::internal::prelude::*;
 use anyhow::Result;
 
-use crate::entity::ProvisionalEntity;
+use crate::entity::LocalTrxEntity;
 use crate::property::PropertyId;
 use crate::value::CastError;
 
@@ -10,12 +10,9 @@ use thiserror::Error;
 use super::Value;
 
 /// Write a model field's initial value into the backend that will store it.
-///
-/// The receiver is the [`ProvisionalEntity`] being staged for creation:
-/// initial values are what the entity's id is derived from, so they exist
-/// before any entity does.
+// TODO: Separate backend initialization from the mutable-handle type used to select it.
 pub trait InitializeWith<T> {
-    fn initialize_with(provisional: &mut ProvisionalEntity, property: PropertyId, value: &T);
+    fn initialize_with(entity: &LocalTrxEntity, property: PropertyId, value: &T);
 }
 
 #[derive(Error, Debug)]
@@ -78,26 +75,6 @@ pub trait ActiveType {
     const BACKEND: &'static str;
 }
 
-pub trait FromEntity {
-    fn from_entity(property: PropertyId, entity: &Entity) -> Self;
+pub trait FromLocalTrxEntity: Sized {
+    fn from_local_entity(property: PropertyId, entity: &LocalTrxEntity) -> Result<Self, PropertyError>;
 }
-
-pub trait FromActiveType<A> {
-    fn from_active(active: A) -> Result<Self, PropertyError>
-    where Self: Sized;
-}
-
-/*
-impl<A, T> FromActiveType<A> for Option<T>
-where T: FromActiveType<A> {
-    fn from_active(active: Result<A, PropertyError>) -> Result<Option<T>, PropertyError> {
-        match T::from_active(active) {
-            Ok(projected) => {
-                Ok(Some(projected))
-            }
-            Err(PropertyError::Missing) => Ok(None),
-            Err(err) => Err(err),
-        }
-    }
-}
-*/

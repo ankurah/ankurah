@@ -19,7 +19,6 @@ use super::comparison::compare;
 use super::relation::AbstractCausalRelation;
 use ankurah_proto::{Clock, EntityId, Event, EventId, OperationSet};
 use async_trait::async_trait;
-use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 

@@ -85,8 +85,8 @@ fn content_nonce(mint_seq: u64, parts: &[&[u8]]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// The `SimRecord` collection id.
-pub fn sim_collection() -> proto::CollectionId { SimRecord::collection() }
+/// The deterministic runtime model identity used by forged simulation data.
+pub fn sim_model() -> proto::ModelId { proto::ModelId::EntityId(sim_model_id()) }
 
 /// The deterministic model id shared by every simulated node.
 pub fn sim_model_id() -> proto::EntityId { forged_catalog_rows().model }
@@ -176,7 +176,6 @@ pub fn genesis_event(counter: u64, field: Field, value: &str) -> proto::Event {
     let author = proto::AuthorId::Unknown;
     let entity_id: proto::EntityId = proto::EventId::from_genesis_parts(&system, &nonce, SIM_TIMESTAMP, &author, &operations).into();
     proto::Event {
-        collection: SimRecord::collection(),
         entity_id,
         parent: proto::Clock::default(),
         body: proto::EventBody::Genesis { system, nonce, timestamp: SIM_TIMESTAMP, author, operations },
@@ -192,7 +191,6 @@ pub fn edit_event(entity: proto::EntityId, parent: proto::Clock, field: Field, v
     let nonce =
         content_nonce(mint_seq, &[entity.to_bytes().as_slice(), parent.to_base64().as_bytes(), field.name().as_bytes(), value.as_bytes()]);
     proto::Event {
-        collection: SimRecord::collection(),
         entity_id: entity,
         parent,
         body: proto::EventBody::Update {

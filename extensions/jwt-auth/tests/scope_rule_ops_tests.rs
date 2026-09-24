@@ -53,9 +53,10 @@ async fn write_only_scope_rule_gates_writes_not_reads() -> anyhow::Result<()> {
 
     let node1 = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
     node1.system.create().await?;
+    agent.set_policy(&node1, &agent.config()).await?;
 
     // Seed one owner-keyed and one administrator-keyed assignment as system.
-    let system_ctx = node1.context(JwtContext::system())?;
+    let system_ctx = node1.context_async(JwtContext::system()).await?;
     let trx = system_ctx.begin();
     let owner_row = trx.create(&Assignment { role_key: "owner".into(), label: "seed owner".into() }).await?;
     let owner_row_id = owner_row.id();
@@ -69,7 +70,7 @@ async fn write_only_scope_rule_gates_writes_not_reads() -> anyhow::Result<()> {
 
     let admin_claims = make_claims("admin-1", &["Administrator"], "admin@scope.test");
     let admin_token = sign_token(&keys, &admin_claims);
-    let admin_ctx = node2.context(JwtContext::from_claims(admin_claims, admin_token))?;
+    let admin_ctx = node2.context_async(JwtContext::from_claims(admin_claims, admin_token)).await?;
 
     // Reads are NOT filtered by the write-only rule: both rows visible.
     let visible = admin_ctx.fetch::<AssignmentView>("true").await.expect("admin read fetch");
@@ -109,7 +110,7 @@ async fn write_only_scope_rule_gates_writes_not_reads() -> anyhow::Result<()> {
     // The bypass privilege (account:write) skips the rule entirely.
     let owner_claims = make_claims("owner-1", &["Owner"], "owner@scope.test");
     let owner_token = sign_token(&keys, &owner_claims);
-    let owner_ctx = node2.context(JwtContext::from_claims(owner_claims, owner_token))?;
+    let owner_ctx = node2.context_async(JwtContext::from_claims(owner_claims, owner_token)).await?;
     let trx = owner_ctx.begin();
     trx.create(&Assignment { role_key: "owner".into(), label: "legit grant".into() }).await.expect("owner create");
     trx.commit().await.expect("owner bypass commit should be allowed");

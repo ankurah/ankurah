@@ -14,8 +14,8 @@ pub fn model_impl(model: &crate::model::description::ModelDescription) -> TokenS
         Err(e) => return e.into_compile_error(),
     };
 
-    // The compiled schema: static ModelStructDescriptor + fn schema().
-    let schema_method = match crate::model::schema::schema_impl(model) {
+    // Shared by registration and accessors inside this model's private derive module.
+    let schema = match crate::model::schema::schema_impl(model) {
         Ok(tokens) => tokens,
         Err(e) => return e.into_compile_error(),
     };

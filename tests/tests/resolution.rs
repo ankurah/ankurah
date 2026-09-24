@@ -3,7 +3,7 @@
 mod common;
 use ankql::ast::{Expr, OrderByItem, Parsed, PathExpr, Predicate, PropertyId, Resolved, Selection};
 use ankurah::core::schema::resolver::resolve_selection;
-use ankurah::proto::EntityId;
+use ankurah::proto::{EntityId, ModelId};
 use common::*;
 use std::collections::BTreeMap;
 
@@ -22,7 +22,6 @@ fn register(collection: &str, props: &[(&str, &str, &str)]) -> proto::NodeReques
                     renamed_from: None,
                     backend: (*backend).into(),
                     value_type: (*value_type).into(),
-                    target_label: None,
                     explicit_id: None,
                     build_id: [0u8; 16],
                     optional: false,
@@ -151,7 +150,6 @@ async fn resolution_follows_renames_to_the_same_id() -> anyhow::Result<()> {
                 renamed_from: Some("name".into()),
                 backend: "yrs".into(),
                 value_type: "string".into(),
-                target_label: None,
                 explicit_id: None,
                 build_id: [0u8; 16],
                 optional: false,
@@ -234,7 +232,7 @@ async fn subpath_order_keys_and_id_subpaths_are_refused() -> anyhow::Result<()> 
         assert!(err.to_string().contains("unsupported subpath"), "steps {steps:?}: {err}");
     }
 
-    let catalog_collection = ankurah::core::schema::model_collection();
+    let catalog_collection = ModelId::System(proto::SystemModel::Model);
     let err = resolve_selection(&catalog_collection, server.catalog.as_ref(), order(&["name", "x"])).unwrap_err();
     assert!(err.to_string().contains("not sortable"), "got: {err}");
 
@@ -252,7 +250,7 @@ async fn subpath_order_keys_and_id_subpaths_are_refused() -> anyhow::Result<()> 
 #[tokio::test]
 async fn systemize_strips_the_collection_qualifier() -> anyhow::Result<()> {
     let server = durable_sled_setup().await?;
-    let collection = ankurah::core::schema::model_collection();
+    let collection = ModelId::System(proto::SystemModel::Model);
 
     let resolved = resolve_selection(&collection, server.catalog.as_ref(), ankql::parser::parse_selection("_ankurah_model.name = 'x'")?)?;
     match first_expr(&resolved) {

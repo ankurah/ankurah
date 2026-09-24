@@ -1,4 +1,5 @@
 mod common;
+use ankurah::core::storage::{StorageEngine, StorageTransaction};
 use ankurah::{policy::DEFAULT_CONTEXT as c, Node, PermissiveAgent};
 use anyhow::Result;
 use common::proto::{Attested, Event};
@@ -9,16 +10,17 @@ use std::sync::Arc;
 /// This test demonstrates that duplicate event insertions (e.g., from network retries,
 /// peer sync, etc.) should not cause errors. EventIDs are content-addressed (SHA256 hash
 /// of entity_id + operations + parent), so duplicate insertions are safe and should be
-/// idempotent - returning false on subsequent attempts rather than erroring.
+/// idempotent rather than erroring.
 #[tokio::test]
 async fn postgres_duplicate_event_idempotency() -> Result<()> {
     use common::*;
 
     let (_container, storage_engine) = create_postgres_container().await?;
 
-    let node = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new());
+    let storage_engine = Arc::new(storage_engine);
+    let node = Node::new_durable(storage_engine.clone(), PermissiveAgent::new());
     node.system.create().await?;
-    let context = node.context(c)?;
+    let context = node.context_async(c).await?;
 
     // Create an album
     let trx = context.begin();
@@ -26,26 +28,20 @@ async fn postgres_duplicate_event_idempotency() -> Result<()> {
     let album_id = album.id();
     trx.commit().await?;
 
-    // Get the collection to access storage directly
-    let collection = context.collection(&"album".into()).await?;
-
     // Get the first event that was created
-    let events = collection.dump_entity_events(album_id).await?;
+    let events = storage_engine.dump_entity_events(album_id).await?;
     assert_eq!(events.len(), 1, "Should have exactly one event");
     let event: Attested<Event> = events[0].clone();
 
-    // Try to add the same event again - this should be idempotent
-    let result1 = collection.add_event(&event).await;
-    assert!(result1.is_ok(), "First duplicate insert should succeed (idempotent): {:?}", result1.err());
-    assert_eq!(result1.unwrap(), false, "Should return false since event already exists");
-
-    // Try again to ensure it's consistently idempotent
-    let result2 = collection.add_event(&event).await;
-    assert!(result2.is_ok(), "Second duplicate insert should succeed (idempotent): {:?}", result2.err());
-    assert_eq!(result2.unwrap(), false, "Should return false since event already exists");
+    // Repeated event-only transactions remain idempotent.
+    for _ in 0..2 {
+        let mut transaction = storage_engine.transaction();
+        transaction.add_events(std::slice::from_ref(&event)).await?;
+        transaction.commit().await?.committed()?;
+    }
 
     // Verify we still only have one event
-    let events_after = collection.dump_entity_events(album_id).await?;
+    let events_after = storage_engine.dump_entity_events(album_id).await?;
     assert_eq!(events_after.len(), 1, "Should still have exactly one event");
 
     Ok(())

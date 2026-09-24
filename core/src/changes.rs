@@ -1,6 +1,6 @@
 use crate::{
     entity::Entity,
-    error::MutationError,
+    error::{MutationError, RetrievalError},
     model::{Model, View},
     reactor::ChangeNotification,
 };
@@ -207,16 +207,18 @@ where I: View + Clone + 'static
 // Note: ChangeSet<Entity> conversion removed since Entity doesn't implement View
 // and ChangeSet is no longer used by Reactor
 
-impl<I> From<ItemChange<Entity>> for ItemChange<I>
+impl<I> TryFrom<ItemChange<Entity>> for ItemChange<I>
 where I: View
 {
-    fn from(change: ItemChange<Entity>) -> Self {
-        match change {
-            ItemChange::Initial { item } => ItemChange::Initial { item: I::from_entity(item) },
-            ItemChange::Add { item, events } => ItemChange::Add { item: I::from_entity(item), events },
-            ItemChange::Update { item, events } => ItemChange::Update { item: I::from_entity(item), events },
-            ItemChange::Remove { item, events } => ItemChange::Remove { item: I::from_entity(item), events },
-        }
+    type Error = RetrievalError;
+
+    fn try_from(change: ItemChange<Entity>) -> Result<Self, RetrievalError> {
+        Ok(match change {
+            ItemChange::Initial { item } => ItemChange::Initial { item: I::from_entity(item)? },
+            ItemChange::Add { item, events } => ItemChange::Add { item: I::from_entity(item)?, events },
+            ItemChange::Update { item, events } => ItemChange::Update { item: I::from_entity(item)?, events },
+            ItemChange::Remove { item, events } => ItemChange::Remove { item: I::from_entity(item)?, events },
+        })
     }
 }
 

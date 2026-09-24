@@ -9,17 +9,18 @@
 //! The parent test starts a postgres container, hands the connection URI to the
 //! crash child through an env var, and keeps the container alive across the
 //! child's death and the parent's reopen. The crash wrapper is engine-generic,
-//! so it aborts the child mid-write exactly as on sled; postgres autocommits
-//! each statement, so writes completed before the crash are already durable on
+//! so it aborts the child at the batch boundary; completed transactions are durable on
 //! the server (the flush hook is a no-op).
 //!
 //! These tests are gated out of the default `cargo test` because they need
 //! Docker. Run with: `cargo test -p ankurah-tests --features postgres-crash`.
+use ankurah::core::test_helpers::commit_transaction;
 
 use std::sync::Arc;
 
-use ankurah::proto::{self, Attested};
-use ankurah::{policy::DEFAULT_CONTEXT as c, Model, Node, PermissiveAgent};
+use super::scenarios::{album_forge, generate_creation_batch, seed_album_catalog};
+use ankurah::proto;
+use ankurah::{policy::DEFAULT_CONTEXT as c, Node, PermissiveAgent};
 use ankurah_storage_postgres::Postgres;
 use anyhow::Result;
 use testcontainers::ContainerAsync;
@@ -29,7 +30,6 @@ use crate::harness::{
     assert_state_heads_resolvable, child_crash_point, event_present, handoff_write, handoff_write_event, has_persisted_state,
     spawn_crash_child_with, CrashPoint, CrashStorageEngine,
 };
-use crate::models::Album;
 
 /// Env var carrying the postgres connection URI from parent to crash child.
 const ENV_PG_URI: &str = "ANKURAH_C6_PG_URI";
@@ -71,7 +71,10 @@ async fn armed_child_pg_node(crash: CrashPoint) -> Result<(Node<PgCrashEngine, P
     let pg = Arc::new(Postgres::open(&uri).await?);
     let engine = Arc::new(CrashStorageEngine::new(pg, Some(crash)));
     let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
+    ankurah_tests::catalog_forge::plant(engine.as_ref(), album_forge()).await?;
     node.system.create().await?;
+    seed_album_catalog(&node)?;
+    node.wait_ready().await?;
     engine.arm();
     Ok((node, engine))
 }
@@ -80,75 +83,51 @@ async fn armed_child_pg_node(crash: CrashPoint) -> Result<(Node<PgCrashEngine, P
 async fn reopen_pg_node(uri: &str) -> Result<Node<Postgres, PermissiveAgent>> {
     let pg = Arc::new(Postgres::open(uri).await?);
     let node = Node::new_durable(pg, PermissiveAgent::new());
-    // Drive the async catalog load, then wait for the persisted root.
-    let _ = node.system.collection(&Album::collection()).await?;
-    node.system.wait_system_ready().await.unwrap();
+    node.wait_ready().await?;
+    seed_album_catalog(&node)?;
     Ok(node)
 }
 
-/// Generate `n` independent album creation events on a throwaway in-memory sled
-/// node (event generation is engine-independent).
-async fn generate_creation_batch(n: usize) -> Result<Vec<Attested<proto::Event>>> {
-    use ankurah_storage_sled::SledStorageEngine;
-    let helper = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
-    helper.system.create().await?;
-    let ctx = helper.context(c)?;
-    let trx = ctx.begin();
-    for i in 0..n {
-        trx.create(&Album { name: format!("PgBatch {i}"), year: format!("20{i:02}") }).await?;
-    }
-    let events = trx.commit_and_return_events().await?;
-    Ok(events.into_iter().map(Attested::from).collect())
-}
-
 // ============================================================================
-// SCENARIO 1 (postgres): crash after commit_event, before set_state
+// SCENARIO 1 (postgres): crash before the atomic commit
 // ============================================================================
 
 #[tokio::test]
-async fn child_pg_commit_event_before_set_state() -> Result<()> {
+async fn child_pg_atomic_commit() -> Result<()> {
     let Some(crash) = child_crash_point() else {
         return Ok(());
     };
     let (node, _engine) = armed_child_pg_node(crash).await?;
     let events = generate_creation_batch(1).await?;
     handoff_write("entity", &events[0].payload.entity_id.to_base64())?;
-    node.commit_remote_transaction(&c, proto::TransactionId::new(), events).await?;
+    commit_transaction(&node, &c, proto::TransactionId::new(), events).await?;
     panic!("pg scenario 1 child did not crash");
 }
 
-/// SCENARIO 1 (postgres) INVARIANT: identical to the sled arm. A crash after the
-/// creation event is committed but before its state is written must leave no
-/// persisted state referencing a missing event; here the durable state lives on
-/// the surviving postgres server, which the parent reopens.
+/// A crash before commit leaves neither state nor events on the surviving server.
 #[tokio::test]
-async fn scenario_pg_1_commit_event_before_set_state() -> Result<()> {
+async fn scenario_pg_1_atomic_commit() -> Result<()> {
     let fixture = start_postgres().await?;
-    let outcome = spawn_crash_child_with(
-        "postgres::child_pg_commit_event_before_set_state",
-        CrashPoint::BeforeSetState(0),
-        &[(ENV_PG_URI, &fixture.uri)],
-    )?;
+    let outcome =
+        spawn_crash_child_with("postgres::child_pg_atomic_commit", CrashPoint::BeforeCommit(0), &[(ENV_PG_URI, &fixture.uri)])?;
     assert!(outcome.crashed(), "child was expected to abort; stdout=\n{}\nstderr=\n{}", outcome.stdout, outcome.stderr);
 
     let entity_id = outcome.entity_id("entity").expect("child must record the entity id");
 
     let node = reopen_pg_node(&fixture.uri).await?;
-    let collection = node.system.collection(&Album::collection()).await?;
-    assert_state_heads_resolvable(&collection, &[entity_id]).await?;
+    assert_state_heads_resolvable(node.storage.as_ref(), &[entity_id]).await?;
     assert!(
-        !has_persisted_state(&collection, entity_id).await?,
-        "pg scenario 1: state must not be persisted when the crash preceded set_state"
+        !has_persisted_state(node.storage.as_ref(), entity_id).await?,
+        "pg scenario 1: state must not be persisted when the crash preceded commit"
     );
     Ok(())
 }
 
 // ============================================================================
-// SCENARIO 2 (postgres): mid-batch crash
+// SCENARIO 2 (postgres): atomic batch committed, acknowledgement lost
 // ============================================================================
 
 const PG_S2_BATCH: usize = 3;
-const PG_S2_CRASH_AT: usize = 2;
 
 #[tokio::test]
 async fn child_pg_mid_batch() -> Result<()> {
@@ -161,19 +140,15 @@ async fn child_pg_mid_batch() -> Result<()> {
         handoff_write("entity", &e.payload.entity_id.to_base64())?;
         handoff_write_event("event", e)?;
     }
-    node.commit_remote_transaction(&c, proto::TransactionId::new(), events).await?;
+    commit_transaction(&node, &c, proto::TransactionId::new(), events).await?;
     panic!("pg scenario 2 child did not crash");
 }
 
-/// SCENARIO 2 (postgres) INVARIANT: a crash partway through a received batch
-/// leaves the already-committed entities durable on the server and the rest
-/// absent, with no state referencing an uncommitted event. Re-delivering the
-/// full batch to a reopened node converges it.
+/// The complete batch survives a lost acknowledgement; redelivery is idempotent.
 #[tokio::test]
 async fn scenario_pg_2_mid_batch() -> Result<()> {
     let fixture = start_postgres().await?;
-    let outcome =
-        spawn_crash_child_with("postgres::child_pg_mid_batch", CrashPoint::BeforeAddEvent(PG_S2_CRASH_AT), &[(ENV_PG_URI, &fixture.uri)])?;
+    let outcome = spawn_crash_child_with("postgres::child_pg_mid_batch", CrashPoint::AfterCommit(0), &[(ENV_PG_URI, &fixture.uri)])?;
     assert!(outcome.crashed(), "child was expected to abort; stdout=\n{}\nstderr=\n{}", outcome.stdout, outcome.stderr);
 
     let entity_ids: Vec<_> = outcome
@@ -186,25 +161,18 @@ async fn scenario_pg_2_mid_batch() -> Result<()> {
     assert_eq!(events.len(), PG_S2_BATCH);
 
     let node = reopen_pg_node(&fixture.uri).await?;
-    let collection = node.system.collection(&Album::collection()).await?;
-    assert_state_heads_resolvable(&collection, &entity_ids).await?;
+    assert_state_heads_resolvable(node.storage.as_ref(), &entity_ids).await?;
     for (i, id) in entity_ids.iter().enumerate() {
         let event_id = events[i].payload.id();
-        if i < PG_S2_CRASH_AT {
-            assert!(has_persisted_state(&collection, *id).await?, "pg entity {i} before crash must have state");
-            assert!(event_present(&collection, event_id).await?, "pg entity {i} before crash must have its event");
-        } else {
-            assert!(!has_persisted_state(&collection, *id).await?, "pg entity {i} at/after crash must have no state");
-            assert!(!event_present(&collection, event_id).await?, "pg entity {i} at/after crash must have no event");
-        }
+        assert!(has_persisted_state(node.storage.as_ref(), *id).await?, "pg entity {i} before crash must have state");
+        assert!(event_present(node.storage.as_ref(), event_id).await?, "pg entity {i} before crash must have its event");
     }
 
     // Reconvergence: re-deliver the full batch on the reopened node.
-    node.commit_remote_transaction(&c, proto::TransactionId::new(), events.clone()).await?;
-    let collection = node.system.collection(&Album::collection()).await?;
-    assert_state_heads_resolvable(&collection, &entity_ids).await?;
+    commit_transaction(&node, &c, proto::TransactionId::new(), events.clone()).await?;
+    assert_state_heads_resolvable(node.storage.as_ref(), &entity_ids).await?;
     for id in &entity_ids {
-        assert!(has_persisted_state(&collection, *id).await?, "pg entity must be present after re-delivery");
+        assert!(has_persisted_state(node.storage.as_ref(), *id).await?, "pg entity must be present after re-delivery");
     }
     Ok(())
 }
@@ -222,19 +190,16 @@ async fn child_pg_entity_creation() -> Result<()> {
     let events = generate_creation_batch(1).await?;
     handoff_write("entity", &events[0].payload.entity_id.to_base64())?;
     handoff_write_event("event", &events[0])?;
-    node.commit_remote_transaction(&c, proto::TransactionId::new(), events).await?;
+    commit_transaction(&node, &c, proto::TransactionId::new(), events).await?;
     panic!("pg scenario 4 child did not crash");
 }
 
-/// SCENARIO 4 (postgres) INVARIANT: a crash after a creation event is committed
-/// but before its state is written leaves no state referencing the missing
-/// event; re-delivering the identical creation event converges the entity to a
-/// resolvable state on the reopened node.
+/// Retrying a creation whose transaction never committed persists it in full.
 #[tokio::test]
 async fn scenario_pg_4_entity_creation() -> Result<()> {
     let fixture = start_postgres().await?;
     let outcome =
-        spawn_crash_child_with("postgres::child_pg_entity_creation", CrashPoint::BeforeSetState(0), &[(ENV_PG_URI, &fixture.uri)])?;
+        spawn_crash_child_with("postgres::child_pg_entity_creation", CrashPoint::BeforeCommit(0), &[(ENV_PG_URI, &fixture.uri)])?;
     assert!(outcome.crashed(), "child was expected to abort; stdout=\n{}\nstderr=\n{}", outcome.stdout, outcome.stderr);
 
     let entity_id = outcome.entity_id("entity").expect("child must record the entity id");
@@ -242,17 +207,15 @@ async fn scenario_pg_4_entity_creation() -> Result<()> {
     assert_eq!(events.len(), 1);
 
     let node = reopen_pg_node(&fixture.uri).await?;
-    let collection = node.system.collection(&Album::collection()).await?;
-    assert_state_heads_resolvable(&collection, &[entity_id]).await?;
+    assert_state_heads_resolvable(node.storage.as_ref(), &[entity_id]).await?;
     assert!(
-        !has_persisted_state(&collection, entity_id).await?,
-        "pg scenario 4: state must not be persisted when the crash preceded set_state"
+        !has_persisted_state(node.storage.as_ref(), entity_id).await?,
+        "pg scenario 4: state must not be persisted when the crash preceded commit"
     );
 
     // Reconvergence via re-delivery of the identical creation event.
-    node.commit_remote_transaction(&c, proto::TransactionId::new(), events.clone()).await?;
-    let collection = node.system.collection(&Album::collection()).await?;
-    assert_state_heads_resolvable(&collection, &[entity_id]).await?;
-    assert!(has_persisted_state(&collection, entity_id).await?, "pg entity must be present after re-delivery");
+    commit_transaction(&node, &c, proto::TransactionId::new(), events.clone()).await?;
+    assert_state_heads_resolvable(node.storage.as_ref(), &[entity_id]).await?;
+    assert!(has_persisted_state(node.storage.as_ref(), entity_id).await?, "pg entity must be present after re-delivery");
     Ok(())
 }

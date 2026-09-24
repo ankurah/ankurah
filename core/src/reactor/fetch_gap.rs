@@ -2,7 +2,6 @@ use crate::internal::prelude::*;
 use crate::reactor::AbstractEntity;
 use crate::value::Value;
 use ankql::ast::Resolved;
-use ankurah_proto as proto;
 use async_trait::async_trait;
 
 /// Trait for fetching entities to fill gaps when LIMIT causes entities to be evicted
@@ -11,7 +10,6 @@ pub trait GapFetcher<E: AbstractEntity>: Send + Sync + 'static {
     /// Fetch entities to fill a gap in a limited result set
     ///
     /// # Arguments
-    /// * `collection_id` - The collection to fetch from
     /// * `selection` - The original selection (predicate, order_by, limit)
     /// * `last_entity` - The last entity in the current result set (used to build continuation predicate)
     /// * `gap_size` - Number of entities needed to fill the gap
@@ -20,7 +18,6 @@ pub trait GapFetcher<E: AbstractEntity>: Send + Sync + 'static {
     /// Vector of entities that match the selection and come after `last_entity` in sort order
     async fn fetch_gap(
         &self,
-        collection_id: &proto::CollectionId,
         selection: &ankql::ast::Selection<Resolved>,
         last_entity: Option<&E>,
         gap_size: usize,
@@ -40,7 +37,6 @@ impl QueryGapFetcher {
 impl GapFetcher<crate::entity::Entity> for QueryGapFetcher {
     async fn fetch_gap(
         &self,
-        collection_id: &proto::CollectionId,
         selection: &ankql::ast::Selection<Resolved>,
         last_entity: Option<&crate::entity::Entity>,
         gap_size: usize,
@@ -64,7 +60,7 @@ impl GapFetcher<crate::entity::Entity> for QueryGapFetcher {
             }
         };
 
-        self.context.0.fetch_entities(collection_id, MatchArgs { selection: gap_selection, cached: false }).await
+        self.context.0.fetch_entities(MatchArgs { selection: gap_selection, cache_policy: CachePolicy::Durable }).await
     }
 }
 
@@ -112,7 +108,7 @@ pub fn build_continuation_predicate<E: AbstractEntity>(
     let id_exclusion = Predicate::Comparison {
         left: Box::new(Expr::Path(ankql::ast::PropertyPath::id())),
         operator: ComparisonOperator::NotEqual,
-        right: Box::new(Expr::Literal(Value::EntityId(*last_entity.id()))),
+        right: Box::new(Expr::Literal(Value::EntityId(last_entity.id()))),
     };
     gap_conditions.push(id_exclusion);
 
@@ -164,7 +160,6 @@ mod tests {
     #[derive(Debug, Clone)]
     struct TestEntity {
         id: proto::EntityId,
-        collection: proto::CollectionId,
         data: Arc<Mutex<HashMap<PropertyId, Value>>>,
     }
 
@@ -172,18 +167,14 @@ mod tests {
         fn new(id: u8, data: HashMap<PropertyId, Value>) -> Self {
             let mut id_bytes = [0u8; 32];
             id_bytes[15] = id;
-            Self {
-                id: proto::EntityId::from_bytes(id_bytes),
-                collection: proto::CollectionId::fixed_name("test"),
-                data: Arc::new(Mutex::new(data)),
-            }
+            Self { id: proto::EntityId::from_bytes(id_bytes), data: Arc::new(Mutex::new(data)) }
         }
     }
 
     impl AbstractEntity for TestEntity {
-        fn collection(&self) -> proto::CollectionId { self.collection.clone() }
+        fn memberships(&self) -> std::collections::BTreeSet<proto::ModelId> { Default::default() }
 
-        fn id(&self) -> &proto::EntityId { &self.id }
+        fn id(&self) -> proto::EntityId { self.id }
 
         fn value(&self, property: &PropertyId) -> Option<Value> { self.data.lock().unwrap().get(property).cloned() }
     }

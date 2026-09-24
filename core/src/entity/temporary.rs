@@ -25,7 +25,7 @@ impl TemporaryEntity {
 
 impl Filterable for TemporaryEntity {
     fn is_member_of(&self, model: &ModelId) -> Result<bool, crate::selection::filter::Error> {
-        Ok(self.state.memberships.is_applied(model))
+        Ok(self.state.memberships.contains(model))
     }
 
     fn value(&self, property: &PropertyId) -> Option<Value> {

@@ -1,10 +1,10 @@
 use std::{marker::PhantomData, sync::Arc};
 
 use crate::{
-    entity::{Entity, ProvisionalEntity},
+    entity::LocalTrxEntity,
     property::{
         backend::{LWWBackend, PropertyBackend},
-        traits::{FromActiveType, FromEntity, PropertyError},
+        traits::{FromLocalTrxEntity, PropertyError},
         InitializeWith, Property, PropertyId, Value,
     },
 };
@@ -15,24 +15,23 @@ use ankurah_signals::{
 };
 
 #[derive(Clone)]
-pub struct LWW<T: Property> {
+pub struct LWWMut<T: Property> {
     pub property: PropertyId,
     pub backend: Arc<LWWBackend>,
-    pub entity: Entity,
+    pub entity: LocalTrxEntity,
     phantom: PhantomData<T>,
 }
 
-impl<T: Property> std::fmt::Debug for LWW<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.debug_struct("LWW").field("property", &self.property).finish() }
+impl<T: Property> std::fmt::Debug for LWWMut<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.debug_struct("LWWMut").field("property", &self.property).finish() }
 }
 
-impl<T: Property> LWW<T> {
+impl<T: Property> LWWMut<T> {
     pub fn set(&self, value: &T) -> Result<(), PropertyError> {
-        if !self.entity.is_writable() {
-            return Err(PropertyError::TransactionClosed);
-        }
+        self.entity.check_open()?;
         let value = value.into_value()?;
         self.backend.set(self.property.clone(), value);
+        self.entity.notify_changed();
         Ok(())
     }
 
@@ -44,38 +43,31 @@ impl<T: Property> LWW<T> {
     pub fn get_value(&self) -> Option<Value> { self.backend.get(&self.property) }
 }
 
-impl<T: Property> crate::property::traits::ActiveType for LWW<T> {
+impl<T: Property> crate::property::traits::ActiveType for LWWMut<T> {
     const BACKEND: &'static str = "lww";
 }
 
-impl<T: Property> FromEntity for LWW<T> {
-    fn from_entity(property: PropertyId, entity: &Entity) -> Self {
+impl<T: Property> FromLocalTrxEntity for LWWMut<T> {
+    fn from_local_entity(property: PropertyId, entity: &LocalTrxEntity) -> Result<Self, PropertyError> {
+        let backend = entity.get_backend::<LWWBackend>()?;
+        Ok(Self { property, backend, entity: entity.clone(), phantom: PhantomData })
+    }
+}
+
+impl<T: Property> InitializeWith<T> for LWWMut<T> {
+    fn initialize_with(entity: &LocalTrxEntity, property: PropertyId, value: &T) {
         let backend = entity.get_backend::<LWWBackend>().expect("LWW Backend should exist");
-        Self { property, backend, entity: entity.clone(), phantom: PhantomData }
-    }
-}
-
-impl<T: Property> FromActiveType<LWW<T>> for T {
-    fn from_active(active: LWW<T>) -> Result<Self, PropertyError>
-    where Self: Sized {
-        active.get()
-    }
-}
-
-impl<T: Property> InitializeWith<T> for LWW<T> {
-    fn initialize_with(provisional: &mut ProvisionalEntity, property: PropertyId, value: &T) {
-        let backend = provisional.get_backend::<LWWBackend>().expect("LWW Backend should exist");
         backend.set(property, value.into_value().unwrap());
     }
 }
 
-impl<T: Property> ankurah_signals::Signal for LWW<T> {
+impl<T: Property> ankurah_signals::Signal for LWWMut<T> {
     fn listen(&self, listener: Listener) -> ListenerGuard { self.backend.listen_field(&self.property, listener) }
 
     fn broadcast_id(&self) -> ankurah_signals::broadcast::BroadcastId { self.backend.field_broadcast_id(&self.property) }
 }
 
-impl<T: Property> ankurah_signals::Subscribe<T> for LWW<T>
+impl<T: Property> ankurah_signals::Subscribe<T> for LWWMut<T>
 where T: Clone + Send + Sync + 'static
 {
     fn subscribe<F>(&self, listener: F) -> ankurah_signals::SubscriptionGuard

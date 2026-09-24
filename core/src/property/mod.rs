@@ -4,8 +4,8 @@ pub mod value;
 
 use ankurah_proto::EntityId;
 
-pub use traits::{ActiveType, FromActiveType, FromEntity, InitializeWith, PropertyError};
-pub use value::{Json, Ref, YrsString};
+pub use traits::{ActiveType, FromLocalTrxEntity, InitializeWith, PropertyError};
+pub use value::{Json, Ref, YrsStringMut};
 
 use crate::value::Value;
 
@@ -88,7 +88,7 @@ impl<'a> Property for std::borrow::Cow<'a, str> {
 #[cfg(test)]
 mod tests {
     use super::backend::{LWWBackend, PropertyBackend, YrsBackend};
-    use super::value::{YrsString, LWW};
+    use super::value::{LWWMut, YrsStringMut};
     use super::ActiveType;
 
     /// The active types' declared backend names must match the names those
@@ -96,7 +96,7 @@ mod tests {
     /// naming a backend the registry cannot construct.
     #[test]
     fn active_type_backend_names_match_the_registry() {
-        assert_eq!(<LWW<String> as ActiveType>::BACKEND, LWWBackend::property_backend_name());
-        assert_eq!(<YrsString<String> as ActiveType>::BACKEND, YrsBackend::property_backend_name());
+        assert_eq!(<LWWMut<String> as ActiveType>::BACKEND, LWWBackend::property_backend_name());
+        assert_eq!(<YrsStringMut<String> as ActiveType>::BACKEND, YrsBackend::property_backend_name());
     }
 }

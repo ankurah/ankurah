@@ -11,12 +11,12 @@ use super::{ContextAuth, ContextInner};
 #[async_trait]
 pub(crate) trait SchemaResolver: Send + Sync {
     /// Bind the descriptor's model and property IDs, registering missing declarations if needed.
-    /// Return the model ID and the epoch the binding belongs to.
+    /// Preflight its policy, then return the model ID and the epoch the binding belongs to.
     async fn ensure_registered(&self, schema: &'static ModelStructDescriptor) -> Result<(proto::ModelId, SystemEpoch), RegistrationError>;
 
     /// Check entity ownership and bind the given descriptor locally, without registration or network access.
     /// Used by synchronous `Transaction::edit`.
-    fn bind_descriptor_local(&self, schema: &'static ModelStructDescriptor, entity: &Entity) -> Result<(), RetrievalError>;
+    fn bind_descriptor_local(&self, schema: &'static ModelStructDescriptor, entity: &Entity) -> Result<ModelId, RetrievalError>;
 
     /// Resolve names and literal types for `Context::fetch` after schema registration.
     /// Read-policy filtering is applied separately by `fetch_entities`.
@@ -30,8 +30,7 @@ pub(crate) trait SchemaResolver: Send + Sync {
     /// Missing bindings/readiness return errors; the caller decides whether to resolve asynchronously.
     fn resolve_query_selection(
         &self,
-        schema: Option<&'static ModelStructDescriptor>,
-        collection_id: &CollectionId,
+        schema: &'static ModelStructDescriptor,
         selection: Selection<Parsed>,
     ) -> Result<Selection<Resolved>, RetrievalError>;
 
@@ -39,8 +38,7 @@ pub(crate) trait SchemaResolver: Send + Sync {
     /// The returned future owns a weak context; the caller controls execution and cancellation.
     fn resolve_query_selection_when_ready(
         &self,
-        schema: Option<&'static ModelStructDescriptor>,
-        collection_id: CollectionId,
+        schema: &'static ModelStructDescriptor,
         selection: Selection<Parsed>,
     ) -> BoxFuture<'static, Result<Selection<Resolved>, RetrievalError>>;
 }
@@ -52,7 +50,7 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     /// Bind the descriptor's model and property IDs, registering missing declarations if needed.
-    /// Return the model ID and the epoch the binding belongs to.
+    /// Preflight its policy, then return the model ID and the epoch the binding belongs to.
     async fn ensure_registered(&self, schema: &'static ModelStructDescriptor) -> Result<(proto::ModelId, SystemEpoch), RegistrationError> {
         let node = self.node.upgrade()?;
         node.system.check_not_halted()?;
@@ -164,8 +162,7 @@ where
 /// Resolve names and literal types from local schema state and enforce this context's read policy.
 fn resolve_and_scope<SE, PA>(
     context: &ContextInner<SE, PA>,
-    schema: Option<&'static ModelStructDescriptor>,
-    collection_id: &CollectionId,
+    schema: &'static ModelStructDescriptor,
     selection: Selection<Parsed>,
 ) -> Result<Selection<Resolved>, RetrievalError>
 where

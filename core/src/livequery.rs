@@ -71,7 +71,7 @@ impl EntityLiveQuery {
         crate::task::spawn(task);
     }
 
-    pub fn map<R: View>(self) -> LiveQuery<R> { LiveQuery(self, PhantomData) }
+    pub(crate) fn map<R: View>(self) -> LiveQuery<R> { LiveQuery(self, PhantomData) }
 
     pub(crate) fn fail_resolution(&self, version: u32, error: RetrievalError) { self.0.fail_initialization(version, error); }
 
@@ -106,13 +106,7 @@ impl EntityLiveQuery {
     /// A peer's answer includes applying its initial rows; without a relay, local storage answers.
     pub async fn wait_durable_answered(&self) -> Result<(), RetrievalError> { self.0.wait_durable_answered().await }
 
-    /// Replace the resolved selection and start a new subscription version.
-    pub fn update_selection(&self, selection: Selection<Resolved>) -> Result<(), RetrievalError> {
-        self.update_resolution(QueryResolution::Resolved(self.0.context.filter_selection(selection)?))
-    }
-
-    /// Shared replacement path for typed and already-resolved selection updates:
-    /// advance the version, cancel pending resolution, and restart initialization.
+    /// Replace the selection: advance the version, cancel pending resolution, and restart initialization.
     fn update_resolution(&self, resolution: QueryResolution) -> Result<(), RetrievalError> {
         let version = self.0.advance_version();
         self.0.resultset.set_loaded(false);
@@ -121,13 +115,6 @@ impl EntityLiveQuery {
             return Err(error);
         }
         Ok(())
-    }
-
-    /// Replace the selection and await initialization, propagating update or initialization errors.
-    /// If superseded by another update, wait for the newer version instead.
-    pub async fn update_selection_wait(&self, selection: Selection<Resolved>) -> Result<(), RetrievalError> {
-        self.update_selection(selection)?;
-        self.wait_initialized().await
     }
 
     /// The current version's initialization error, cleared when a new version starts.

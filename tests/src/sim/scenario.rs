@@ -269,7 +269,10 @@ impl<'a> Workload<'a> {
                     id: proto::RequestId::new(),
                     to: node_ids[dst],
                     from: origin_id,
-                    body: proto::NodeRequestBody::CommitTransaction { id: proto::TransactionId::new(), events: vec![event.clone()] },
+                    body: proto::NodeRequestBody::CommitTransaction {
+                        id: proto::TransactionId::new(),
+                        events: vec![event.clone()],
+                    },
                 };
                 let message = proto::NodeMessage::Request { auth: vec![proto::AuthData(vec![])], request };
                 self.scheduler.enqueue_event(origin, dst, entity, event_id.clone(), message);

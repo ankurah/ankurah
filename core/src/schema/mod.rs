@@ -7,9 +7,10 @@ pub mod catalog;
 pub mod cell;
 pub mod compiled;
 pub mod registration;
+pub use crate::storage::CatalogResolver;
 pub use catalog::resolver;
 
-pub use cell::{PerSystemOnceCell, SystemEpoch};
+pub use cell::{PerSystemOnceCell, SystemEpoch, UninitializedCell};
 pub use compiled::{ModelStructDescriptor, StructProperty};
 
 use ankurah_proto::{ModelId, SystemModel};
@@ -20,39 +21,44 @@ pub const MODEL_PROPERTY_COLLECTION_ID: &str = "_ankurah_model_property";
 
 pub const RESERVED_COLLECTION_PREFIX: &str = "_ankurah_";
 
-pub const fn model_collection() -> ModelId { ModelId::System(SystemModel::Model) }
-pub const fn property_collection() -> ModelId { ModelId::System(SystemModel::Property) }
-pub const fn model_property_collection() -> ModelId { ModelId::System(SystemModel::ModelProperty) }
+pub(crate) const CATALOG_MODELS: [ModelId; 3] = [
+    ModelId::System(SystemModel::Model),
+    ModelId::System(SystemModel::Property),
+    ModelId::System(SystemModel::ModelProperty),
+];
 
-pub fn is_catalog_collection(id: &ModelId) -> bool {
-    matches!(id, ModelId::System(SystemModel::Model | SystemModel::Property | SystemModel::ModelProperty))
-}
+pub fn is_catalog_model(id: &ModelId) -> bool { CATALOG_MODELS.contains(id) }
 
 /// Catalog reads bypass policy so nodes can resolve names before authorization.
-pub fn reads_bypass_policy(collection: &ankurah_proto::CollectionId) -> bool {
-    matches!(collection.as_str(), MODEL_COLLECTION_ID | PROPERTY_COLLECTION_ID | MODEL_PROPERTY_COLLECTION_ID)
+pub fn reads_bypass_policy(model: &ModelId) -> bool { is_catalog_model(model) }
+
+/// Whether every matching entity must be a catalog row, so this read can bootstrap policy.
+pub(crate) fn is_catalog_read<S: ankql::ast::Stage<ModelId = ModelId>>(predicate: &ankql::ast::Predicate<S>) -> bool {
+    use ankql::ast::Predicate;
+    match predicate {
+        Predicate::MemberOf(model) => reads_bypass_policy(model),
+        Predicate::And(left, right) => is_catalog_read(left) || is_catalog_read(right),
+        Predicate::Or(left, right) => is_catalog_read(left) && is_catalog_read(right),
+        _ => false,
+    }
 }
 
 /// Whether this request is a policy-exempt catalog read.
 pub(crate) fn request_bypasses_policy(request: &ankurah_proto::NodeRequestBody) -> bool {
     use ankurah_proto::NodeRequestBody;
     match request {
-        NodeRequestBody::Fetch { collection, .. }
-        | NodeRequestBody::Get { collection, .. }
-        | NodeRequestBody::GetEvents { collection, .. }
-        | NodeRequestBody::SubscribeQuery { collection, .. } => reads_bypass_policy(collection),
-        NodeRequestBody::CommitTransaction { .. } | NodeRequestBody::RegisterSchema { .. } => false,
+        NodeRequestBody::Fetch { selection, .. } | NodeRequestBody::SubscribeQuery { selection, .. } => {
+            is_catalog_read(&selection.predicate)
+        }
+        NodeRequestBody::Get { .. } | NodeRequestBody::GetEvents { .. }
+        | NodeRequestBody::CommitTransaction { .. } | NodeRequestBody::RegisterSchema { .. } => false,
     }
 }
 
-pub fn is_protected_collection(id: &ModelId) -> bool { matches!(id, ModelId::System(_)) }
+pub fn is_reserved_model(model: &ModelId) -> bool { matches!(model, ModelId::System(_)) }
 
-pub fn is_reserved_collection(collection: &ankurah_proto::CollectionId) -> bool {
-    collection.as_str().starts_with(RESERVED_COLLECTION_PREFIX)
-}
-
-pub fn system_model_id(collection: &str) -> Option<ModelId> {
-    let model = match collection {
+pub fn system_model_id(label: &str) -> Option<ModelId> {
+    let model = match label {
         crate::system::SYSTEM_COLLECTION_ID => SystemModel::System,
         MODEL_COLLECTION_ID => SystemModel::Model,
         PROPERTY_COLLECTION_ID => SystemModel::Property,
@@ -62,7 +68,7 @@ pub fn system_model_id(collection: &str) -> Option<ModelId> {
     Some(ModelId::System(model))
 }
 
-pub const fn system_collection_label(model: SystemModel) -> &'static str {
+pub const fn system_model_label(model: SystemModel) -> &'static str {
     match model {
         SystemModel::System => crate::system::SYSTEM_COLLECTION_ID,
         SystemModel::Model => MODEL_COLLECTION_ID,
@@ -85,7 +91,7 @@ mod model_mapping_tests {
         ];
         for (system_model, collection) in pairs {
             let model = ModelId::System(system_model);
-            assert_eq!(system_collection_label(system_model), collection);
+            assert_eq!(system_model_label(system_model), collection);
             assert_eq!(system_model_id(collection), Some(model));
         }
         assert_eq!(system_model_id("albums"), None);
@@ -96,27 +102,22 @@ mod model_mapping_tests {
 mod request_policy_tests {
     use super::*;
     use ankql::ast::Predicate;
-    use ankurah_proto::{CollectionId, NodeRequestBody, QueryId, RegisterModel, TransactionId};
+    use ankurah_proto::{NodeRequestBody, QueryId, RegisterModel, TransactionId};
 
     #[test]
     fn only_catalog_reads_bypass_policy() {
-        for (label, exempt) in [
-            (MODEL_COLLECTION_ID, true),
-            (PROPERTY_COLLECTION_ID, true),
-            (MODEL_PROPERTY_COLLECTION_ID, true),
-            (crate::system::SYSTEM_COLLECTION_ID, false),
-            ("_ankurah_other", false),
-            ("albums", false),
+        for (model, exempt) in [
+            (ModelId::System(SystemModel::Model), true),
+            (ModelId::System(SystemModel::Property), true),
+            (ModelId::System(SystemModel::ModelProperty), true),
+            (ModelId::System(SystemModel::System), false),
+            (ModelId::EntityId(ankurah_proto::EntityId::random()), false),
         ] {
-            let collection = CollectionId::fixed_name(label);
             let requests = [
-                NodeRequestBody::Get { collection: collection.clone(), ids: Vec::new() },
-                NodeRequestBody::GetEvents { collection: collection.clone(), event_ids: Vec::new() },
-                NodeRequestBody::Fetch { collection: collection.clone(), selection: Predicate::True.into(), known_matches: Vec::new() },
+                NodeRequestBody::Fetch { selection: Predicate::MemberOf(model).into(), known_matches: Vec::new() },
                 NodeRequestBody::SubscribeQuery {
                     query_id: QueryId::new(),
-                    collection,
-                    selection: Predicate::True.into(),
+                    selection: Predicate::MemberOf(model).into(),
                     version: 1,
                     known_matches: Vec::new(),
                 },
@@ -125,7 +126,12 @@ mod request_policy_tests {
                 assert_eq!(request_bypasses_policy(&request), exempt, "{request:?}");
             }
         }
-        assert!(!request_bypasses_policy(&NodeRequestBody::CommitTransaction { id: TransactionId::new(), events: Vec::new() }));
+        assert!(!request_bypasses_policy(&NodeRequestBody::Get { ids: Vec::new() }));
+        assert!(!request_bypasses_policy(&NodeRequestBody::GetEvents { event_ids: Vec::new() }));
+        assert!(!request_bypasses_policy(&NodeRequestBody::CommitTransaction {
+            id: TransactionId::new(),
+            events: Vec::new()
+        }));
         assert!(!request_bypasses_policy(&NodeRequestBody::RegisterSchema {
             model: RegisterModel {
                 label: MODEL_COLLECTION_ID.into(),

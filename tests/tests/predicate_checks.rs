@@ -69,7 +69,6 @@ impl MockFilterable {
     }
 }
 impl Filterable for MockFilterable {
-    fn collection(&self) -> &str { &self.collection }
     fn value(&self, property: &ankql::ast::PropertyId) -> Option<Value> { self.values.get(property).cloned() }
 }
 

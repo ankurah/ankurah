@@ -23,13 +23,13 @@ use ankql::ast::Predicate;
 use ankurah::{Model, Node, Ref};
 use ankurah_core::{
     error::RetrievalError,
-    policy::{AccessDenied, PolicyAgent},
+    policy::{AccessDenied, ContextPolicy},
     selection::filter::{evaluate_predicate, Filterable},
     session::{Session, SessionSet},
     value::Value,
 };
 use ankurah_jwt_auth::{JwtAgent, JwtContext, JwtKeys, PolicyConfig, SigningKeys};
-use ankurah_proto::{CollectionId, EntityId};
+use ankurah_proto::EntityId;
 use ankurah_storage_sled::SledStorageEngine;
 use std::sync::Arc;
 
@@ -79,11 +79,6 @@ fn agent_with(config_json: &str, keys: &SigningKeys) -> JwtAgent {
     let agent = JwtAgent::new_ephemeral();
     agent.update_config(serde_json::from_str::<PolicyConfig>(config_json).expect("test policy must parse"));
     agent.set_keys(JwtKeys::Signing(keys.clone()));
-    // What node attach installs from the node's catalog: scope rules are
-    // authored in names and everything that consumes one addresses ids.
-    agent.set_selection_resolver(std::sync::Arc::new(|_collection, predicate| {
-        try_resolve_fixture(predicate).map_err(|error| error.to_string())
-    }));
     agent
 }
 
@@ -101,8 +96,9 @@ struct NoteRow {
 }
 
 impl Filterable for NoteRow {
-    fn collection(&self) -> &str { "note" }
-
+    fn is_member_of(&self, model: &ankurah_proto::ModelId) -> Result<bool, ankurah_core::selection::filter::Error> {
+        Ok(*model == common::model("note"))
+    }
     fn value(&self, property: &ankql::ast::PropertyId) -> Option<Value> {
         if *property == prop("owner") {
             Some(Value::EntityId(self.owner))
@@ -133,7 +129,15 @@ const OR_SCOPE_CONFIG: &str = r#"{
 fn test_or_composed_scope_with_a_non_id_subject_is_a_type_error() {
     let keys = common::test_keys();
     let agent = agent_with(OR_SCOPE_CONFIG, &keys);
-    let collection = CollectionId::from("note");
+    let models = common::policy_models(&agent, &["note"]);
+    let model = models.id("note");
+    agent.set_catalog(Arc::new(common::FixtureCatalog {
+        labels: [(model, "note".to_owned())].into(),
+        resolve: |predicate| try_resolve_fixture(predicate).map_err(|error| error.to_string()),
+        property_type: |property| if property == common::prop("visibility") {
+            ankurah_core_types::ValueType::String
+        } else { ankurah_core_types::ValueType::EntityId },
+    }));
 
     let owner = EntityId::random();
     let reviewer = EntityId::random();
@@ -155,16 +159,16 @@ fn test_or_composed_scope_with_a_non_id_subject_is_a_type_error() {
     // narrowing the query -- and its slice cannot bind, so this lone
     // credential leaves nothing to read by.
     let guest = context(&keys, "guest", "reader");
-    let refused = agent.filter_predicate(&guest, &collection, Predicate::True);
+    let refused = ContextPolicy::from_credentials(&agent, &guest).filter_predicate(common::in_model(model, Predicate::True));
     assert!(
-        matches!(refused, Err(AccessDenied::ByPolicy("No authorized context for row filtering"))),
+        matches!(&refused, Ok(Predicate::And(_, grant)) if **grant == Predicate::False),
         "a credential whose scope cannot bind leaves nothing to read by, got: {refused:?}"
     );
 
     // The control that keeps the refusal honest: a subject that IS an id
     // binds, and the same clauses admit that owner's own row.
     let member = context(&keys, &owner.to_base64(), "reader");
-    let filtered = agent.filter_predicate(&member, &collection, Predicate::True).expect("a member's subject filters too");
+    let filtered = ContextPolicy::from_credentials(&agent, &member).filter_predicate(common::in_model(model, Predicate::True)).expect("a member's subject filters too");
     assert!(
         evaluate_predicate(&private, &filtered).expect("the bound predicate must evaluate"),
         "the owner's own row must pass the clauses that refused the guest's credential"
@@ -202,10 +206,12 @@ const OWNER_SCOPE_CONFIG: &str = r#"{
 #[tokio::test]
 async fn test_non_id_subject_does_not_authorize_or_block_other_credentials() -> anyhow::Result<()> {
     let keys = common::test_keys();
-    let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent_with(OWNER_SCOPE_CONFIG, &keys));
+    let agent = agent_with(OWNER_SCOPE_CONFIG, &keys);
+    let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
     node.system.create().await?;
+    agent.set_policy(&node, &agent.config()).await?;
 
-    let root = node.context(JwtContext::system())?;
+    let root = node.context_async(JwtContext::system()).await?;
     let (person_id, doc_id) = {
         let trx = root.begin();
         let person = trx.create(&Person { name: "Owner".into() }).await?;
@@ -216,19 +222,19 @@ async fn test_non_id_subject_does_not_authorize_or_block_other_credentials() -> 
     };
 
     let member_credential = context(&keys, &person_id.to_base64(), "user");
-    let member = node.context(member_credential.clone())?;
+    let member = node.context_async(member_credential.clone()).await?;
     assert_eq!(member.fetch::<DocView>("body = 'hello'").await?.len(), 1, "the owner's query returns the owner's row");
     assert!(member.get::<DocView>(doc_id).await.is_ok(), "the owner may read its own row by id");
 
     let guest_credential = context(&keys, "guest", "guest");
-    let guest = node.context(guest_credential.clone())?;
+    let guest = node.context_async(guest_credential.clone()).await?;
     // A lone malformed subject still fails closed.
     if let Ok(rows) = guest.fetch::<DocView>("body = 'hello'").await {
         assert!(rows.is_empty(), "a subject that is not an id owns no row, but the query handed over {}", rows.len());
     }
     assert!(matches!(
         guest.get::<DocView>(doc_id).await,
-        Err(RetrievalError::AccessDenied(AccessDenied::ByPolicy("Read scope predicate could not be resolved")))
+        Err(RetrievalError::AccessDenied(AccessDenied::ByPolicy(_)))
     ));
 
     for credentials in [vec![guest_credential.clone(), member_credential.clone()], vec![member_credential, guest_credential.clone()]] {
@@ -236,7 +242,7 @@ async fn test_non_id_subject_does_not_authorize_or_block_other_credentials() -> 
         for credential in credentials {
             sessions.own(&Session::new(credential));
         }
-        let combined = node.context(sessions)?;
+        let combined = node.context_async(sessions).await?;
         assert_eq!(combined.get::<DocView>(doc_id).await?.id(), doc_id, "a malformed subject must not block an authorized owner");
         let rows = combined.fetch::<DocView>("body = 'hello'").await?;
         assert_eq!(rows.len(), 1);
@@ -249,7 +255,7 @@ async fn test_non_id_subject_does_not_authorize_or_block_other_credentials() -> 
         for credential in credentials {
             sessions.own(&Session::new(credential));
         }
-        let combined = node.context(sessions)?;
+        let combined = node.context_async(sessions).await?;
         assert!(combined.get::<DocView>(doc_id).await.is_err(), "neither credential owns this row");
         assert!(combined.fetch::<DocView>("body = 'hello'").await?.is_empty());
     }

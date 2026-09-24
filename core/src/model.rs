@@ -7,7 +7,7 @@ use std::sync::Arc;
 use ankurah_proto::{EntityId, ModelId, State};
 
 use crate::entity::{Entity, LocalTrxEntity};
-use crate::error::StateError;
+use crate::error::{RetrievalError, StateError};
 
 use crate::property::PropertyError;
 
@@ -25,9 +25,6 @@ use wasm_bindgen::JsCast;
 pub trait Model: Sized {
     type View: View;
     type Mutable: Mutable;
-
-    /// Catalog label used to register this model struct and references to it.
-    const LABEL: &'static str;
 
     /// The local compiled schema: the names and types a binary registers and
     /// binds against the catalog (ids exist only there) and the
@@ -54,7 +51,8 @@ pub trait View {
     fn id(&self) -> EntityId { self.entity().id() }
 
     fn entity(&self) -> &Entity;
-    fn from_entity(inner: Entity) -> Self;
+    fn from_entity(inner: Entity) -> Result<Self, RetrievalError>
+    where Self: Sized;
     fn to_model(&self) -> Result<Self::Model, PropertyError>;
 }
 
@@ -66,7 +64,9 @@ pub struct MutableBorrow<'rec, T: Mutable> {
 }
 
 impl<'rec, T: Mutable> MutableBorrow<'rec, T> {
-    pub fn new(entity_ref: &'rec LocalTrxEntity) -> Self { Self { mutable: T::new(entity_ref.clone()), _entity_ref: entity_ref } }
+    pub fn new(entity_ref: &'rec LocalTrxEntity) -> Result<Self, RetrievalError> {
+        Ok(Self { mutable: T::new(entity_ref.clone())?, _entity_ref: entity_ref })
+    }
 
     /// Extract the core mutable (for WASM usage)
     pub fn into_core(self) -> T { self.mutable }
@@ -89,12 +89,13 @@ pub trait Mutable {
     fn id(&self) -> EntityId { self.entity().id() }
 
     fn entity(&self) -> &LocalTrxEntity;
-    fn new(entity: LocalTrxEntity) -> Self
+    fn new(entity: LocalTrxEntity) -> Result<Self, RetrievalError>
     where Self: Sized;
 
     fn state(&self) -> Result<State, StateError> { self.entity().to_state() }
 
-    fn read(&self) -> Self::View { Self::View::from_entity(self.entity().read()) }
+    /// Fails with `TransactionClosed` once a creation's transaction rolls back.
+    fn read(&self) -> Result<Self::View, RetrievalError> { Self::View::from_entity(self.entity().read()) }
 }
 
 // Helper function to convert Result<T, PropertyError> to Result<T, JsValue> with context for generated WASM accessors

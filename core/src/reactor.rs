@@ -85,7 +85,9 @@ struct ReactorInner<E: AbstractEntity + Filterable + Send + 'static, Ev> {
     subscriptions: std::sync::Mutex<HashMap<ReactorSubscriptionId, Subscription<E, Ev>>>,
     // Shared with all subscriptions to allow them to manage their own watchers
     watcher_set: Arc<std::sync::Mutex<WatcherSet>>,
-    /// Coordinates query installation, change dispatch, and clearing; never held across fetch I/O.
+    /// Prevent query installation or clearing from interleaving with change dispatch's
+    /// watcher lookup, result updates, and watcher maintenance. The map locks protect
+    /// individual accesses, not that sequence. Fetch and gap-fill I/O stay outside this lock.
     notify_lock: tokio::sync::Mutex<()>,
     #[cfg(test)]
     publication_pause: Mutex<Option<(proto::ModelId, tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)>>,
@@ -276,7 +278,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         subscription_id: ReactorSubscriptionId,
         query_id: proto::QueryId,
         selection: ankql::ast::Selection<Resolved>,
-        node: &dyn LocalEntitySource<E>,
+        node: Arc<dyn LocalEntitySource<E>>,
         resultset: EntityResultSet<E>,
         gap_fetcher: std::sync::Arc<dyn GapFetcher<E>>,
         version: u32,
@@ -297,7 +299,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
             return Ok(());
         }
 
-        let is_new = subscription.ensure_query_registered(query_id, resultset.clone(), gap_fetcher);
+        let is_new = subscription.ensure_query_registered(query_id, resultset.clone(), gap_fetcher, node);
 
         let mut reactor_update_items = Vec::new();
         subscription.update_query(query_id, selection.clone(), included_entities, version, &mut reactor_update_items)?;
@@ -499,7 +501,7 @@ mod tests {
     }
     impl AbstractEntity for TestEntity {
         fn memberships(&self) -> std::collections::BTreeSet<proto::ModelId> { self.models.clone() }
-        fn id(&self) -> &proto::EntityId { &self.id }
+        fn id(&self) -> proto::EntityId { self.id }
         fn value(&self, property: &ankql::ast::PropertyId) -> Option<crate::value::Value> {
             self.state.lock().unwrap().get(property).cloned().map(crate::value::Value::String)
         }

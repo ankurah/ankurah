@@ -64,10 +64,13 @@ async fn ref_scope_rule_receives_live_updates() -> anyhow::Result<()> {
     let agent = JwtAgent::new_ephemeral();
     agent.update_config(serde_json::from_str::<PolicyConfig>(CONFIG_JSON)?);
     agent.set_keys(JwtKeys::Signing(keys.clone()));
-    let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent);
+    let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
     node.system.create().await?;
+    agent.set_policy(&node, &agent.config()).await?;
 
-    let root = node.context(JwtContext::system())?;
+    let root = node.context_async(JwtContext::system()).await?;
+    // This test isolates live delivery; first-use registration is covered below.
+    root.resolve_model_id::<ScopeItem>().await?;
     let (owner_id, other_id) = {
         let trx = root.begin();
         let owner = trx.create(&ScopeTarget { name: "owner".into() }).await?;
@@ -85,7 +88,7 @@ async fn ref_scope_rule_receives_live_updates() -> anyhow::Result<()> {
         custom: serde_json::Map::new(),
     };
     let member_token = keys.sign(&member_claims, Duration::from_hours(1))?;
-    let member_ctx = node.context(JwtContext::from_claims(member_claims, member_token))?;
+    let member_ctx = node.context_async(JwtContext::from_claims(member_claims, member_token)).await?;
 
     let query = format!("owner = '{}'", owner_id.to_base64());
     let lq = member_ctx.query::<ScopeItemView>(query.as_str())?;
@@ -108,6 +111,74 @@ async fn ref_scope_rule_receives_live_updates() -> anyhow::Result<()> {
     }
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
     assert_eq!(lq.ids().len(), 1, "out-of-scope item must not appear in the scoped LiveQuery");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn first_use_fetch_registers_schema_without_granting_write_access() -> anyhow::Result<()> {
+    let keys = common::test_keys();
+    let agent = JwtAgent::new_ephemeral();
+    agent.update_config(serde_json::from_str::<PolicyConfig>(CONFIG_JSON)?);
+    agent.set_keys(JwtKeys::Signing(keys.clone()));
+    let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
+    node.system.create().await?;
+    agent.set_policy(&node, &agent.config()).await?;
+
+    let member_claims = JwtClaims {
+        sub: ankurah::proto::EntityId::random().to_base64(),
+        roles: vec!["Member".into()],
+        email: "member@example.com".into(),
+        name: None,
+        custom: serde_json::Map::new(),
+    };
+    let token = keys.sign(&member_claims, Duration::from_hours(1))?;
+    let member_ctx = node.context_async(JwtContext::from_claims(member_claims, token)).await?;
+
+    let epoch = node.system.system_epoch().unwrap();
+    assert!(ScopeItem::descriptor().bind_local(&node.catalog, epoch).is_err());
+    assert!(member_ctx.fetch::<ScopeItemView>("label = 'x'").await?.is_empty());
+    assert!(ScopeItem::descriptor().bind_local(&node.catalog, epoch).is_ok());
+    let transaction = member_ctx.begin();
+    assert!(transaction.create(&ScopeItem { owner: ankurah::proto::EntityId::random().into(), label: "x".into() }).await.is_err(),
+        "schema registration does not grant CRUD permissions");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn first_use_live_query_grants_nothing_for_an_invalid_scope_claim() -> anyhow::Result<()> {
+    let keys = common::test_keys();
+    let agent = JwtAgent::new_ephemeral();
+    let mut config = serde_json::from_str::<PolicyConfig>(CONFIG_JSON)?;
+    config.collections.remove("scopetarget"); // No other membership may grant this query read access.
+    agent.update_config(config);
+    agent.set_keys(JwtKeys::Signing(keys.clone()));
+    let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
+    node.system.create().await?;
+    agent.set_policy(&node, &agent.config()).await?;
+
+    let member_claims = JwtClaims {
+        sub: "member-1".into(),
+        roles: vec!["Member".into()],
+        email: "member@example.com".into(),
+        name: None,
+        custom: serde_json::Map::new(),
+    };
+    let token = keys.sign(&member_claims, Duration::from_hours(1))?;
+    let member_ctx = node.context_async(JwtContext::from_claims(member_claims, token)).await?;
+
+    assert!(ScopeItem::descriptor().bind_local(&node.catalog, node.system.system_epoch().unwrap()).is_err());
+    let query = member_ctx.query::<ScopeItemView>("label = 'x'")?;
+    query.wait_initialized().await?;
+
+    let root = node.context_async(JwtContext::Root).await?;
+    let transaction = root.begin();
+    let id = transaction.create(&ScopeItem { owner: ankurah::proto::EntityId::random().into(), label: "x".into() }).await?.id();
+    transaction.commit().await?;
+    assert!(query.ids().is_empty(), "the non-EntityId subject supplies no grant");
+    assert!(member_ctx.fetch::<ScopeItemView>("label = 'x'").await?.is_empty());
+    assert!(member_ctx.get::<ScopeItemView>(id).await.is_err(), "known-ID retrieval must deny the same invalid credential");
 
     Ok(())
 }

@@ -6,7 +6,7 @@ use crate::{
     entity::Entity,
     error::SubscriptionError,
     node::Node,
-    policy::{PolicyAgent, ReadPolicy},
+    policy::{PolicyAgent, ContextPolicy},
     reactor::{
         fetch_gap::{GapFetcher, QueryGapFetcher},
         ReactorSubscription, ReactorUpdate,
@@ -23,7 +23,8 @@ pub struct SubscriptionHandler<CD: ContextData> {
     subscription: ReactorSubscription,
     _guard: SubscriptionGuard,
     /// Tracks each standing query's version and the credential source shared with its gap fetcher.
-    /// The mutex serializes this peer's query installation, failure cleanup, and removal.
+    /// Held through async installation and failure cleanup so removal cannot race an
+    /// installation that would leave a reactor query without its credential source.
     queries: tokio::sync::Mutex<HashMap<proto::QueryId, StandingQuery<CD>>>,
 }
 

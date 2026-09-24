@@ -8,7 +8,7 @@ mod common;
 
 use ankurah::{Model, Node, Ref};
 use ankurah_connector_local_process::LocalProcessConnection;
-use ankurah_jwt_auth::{JwtAgent, JwtClaims, JwtContext, JwtKeys, JwtPolicy, PolicyConfig};
+use ankurah_jwt_auth::{JwtAgent, JwtClaims, JwtContext, JwtKeys, PolicyConfig};
 use ankurah_storage_sled::SledStorageEngine;
 use jwt_simple::prelude::Duration;
 use std::sync::Arc;
@@ -60,20 +60,15 @@ async fn eventually_count(lq: &ankurah::LiveQuery<ScopeCredView>, expected: usiz
 #[tokio::test]
 async fn enduser_scoped_cached_fetch_over_relay() -> anyhow::Result<()> {
     let keys = common::test_keys();
-    let public_pem = keys.public_key_pem()?;
 
     let server_agent = JwtAgent::new_ephemeral();
     server_agent.update_config(serde_json::from_str::<PolicyConfig>(CONFIG_JSON)?);
     server_agent.set_keys(JwtKeys::Signing(keys.clone()));
-    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), server_agent);
+    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), server_agent.clone());
     server.system.create().await?;
+    server_agent.set_policy(&server, &server_agent.config()).await?;
 
-    let root = server.context(JwtContext::system())?;
-    {
-        let trx = root.begin();
-        trx.create(&JwtPolicy { config_json: CONFIG_JSON.to_string(), public_key_pem: public_pem.clone() }).await?;
-        trx.commit().await?;
-    }
+    let root = server.context_async(JwtContext::system()).await?;
 
     let (user_id, account_id, domain_id) = {
         let trx = root.begin();
@@ -114,7 +109,7 @@ async fn enduser_scoped_cached_fetch_over_relay() -> anyhow::Result<()> {
         custom: owner_custom,
     };
     let owner_token = keys.sign(&owner_claims, Duration::from_hours(1))?;
-    let owner_ctx = client.context(JwtContext::from_claims(owner_claims, owner_token))?;
+    let owner_ctx = client.context_async(JwtContext::from_claims(owner_claims, owner_token)).await?;
 
     let owner_q = format!("user = '{}'", user_id.to_base64());
     let owner_lq = owner_ctx.query::<ScopeCredView>(owner_q.as_str())?;
@@ -133,7 +128,7 @@ async fn enduser_scoped_cached_fetch_over_relay() -> anyhow::Result<()> {
         custom: enduser_custom,
     };
     let enduser_token = keys.sign(&enduser_claims, Duration::from_hours(1))?;
-    let enduser_ctx = client.context(JwtContext::from_claims(enduser_claims, enduser_token))?;
+    let enduser_ctx = client.context_async(JwtContext::from_claims(enduser_claims, enduser_token)).await?;
 
     let enduser_q = format!("user = '{}'", user_id.to_base64());
     let enduser_lq = enduser_ctx.query::<ScopeCredView>(enduser_q.as_str())?;

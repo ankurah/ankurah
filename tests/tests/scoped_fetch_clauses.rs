@@ -46,7 +46,7 @@ async fn relay_client_cached_fetch_with_composed_scope_clauses() -> Result<()> {
     let client = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
 
     let _conn = LocalProcessConnection::new(&server, &client).await?;
-    client.system.wait_system_ready().await.unwrap();
+    client.wait_ready().await?;
 
     let server_ctx = server.context(DEFAULT_CONTEXT)?;
     let client_ctx = client.context(DEFAULT_CONTEXT)?;
@@ -64,6 +64,10 @@ async fn relay_client_cached_fetch_with_composed_scope_clauses() -> Result<()> {
         trx.commit().await?;
         ids
     };
+
+    // `query` is synchronous and exercises pre-initialization cache behavior,
+    // so perform its asynchronous schema admission explicitly first.
+    client_ctx.resolve_model_id::<ScopeCred>().await?;
 
     // Owner-shaped two-clause predicate (this worked downstream).
     let owner_q = format!("user = '{}' AND account = '{}'", user_id.to_base64(), account_id.to_base64());

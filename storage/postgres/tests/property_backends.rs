@@ -2,7 +2,6 @@ mod common;
 
 use ankurah::{
     policy::DEFAULT_CONTEXT as c,
-    property::{value::LWW, YrsString},
     Model, Node, PermissiveAgent, Property,
 };
 use anyhow::Result;
@@ -33,7 +32,7 @@ async fn pg_property_backends() -> Result<()> {
     let (_container, storage_engine) = common::create_postgres_container().await?;
     let node = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new());
     node.system.create().await?;
-    let ctx = node.context(c)?;
+    let ctx = node.context_async(c).await?;
 
     let trx = ctx.begin();
     let cat_video = trx

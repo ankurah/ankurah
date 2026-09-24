@@ -50,63 +50,99 @@ pub trait StorageTransaction: Send {
     async fn commit(self) -> Result<StorageCommitOutcome, MutationError>;
 }
 
-#[async_trait]
-pub trait StorageEngine: Send + Sync {
-    type Value;
-    // Opens and/or creates a storage collection.
-    async fn collection(&self, id: &CollectionId) -> Result<Arc<dyn StorageCollection>, RetrievalError>;
-    // Delete all collections and their data from the storage engine
-    async fn delete_all_collections(&self) -> Result<bool, MutationError>;
+/// Successful persistence details for one prepared entity.
+// TODO: No caller uses this result; remove it unless per-entity commit reporting proves necessary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedEntityWrite {
+    /// Canonical entity identity.
+    pub entity_id: EntityId,
+    /// Whether the canonical head changed.
+    pub canonical_changed: bool,
+}
+
+/// Result of an atomically committed storage transaction.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StorageCommitResult {
+    /// One result per entity, in first-write order.
+    pub entities: Vec<CommittedEntityWrite>,
+}
+
+/// Outcome of attempting an exact-head storage transaction.
+#[derive(Debug, Clone)]
+pub enum StorageCommitOutcome {
+    /// Every expectation matched and the entire batch committed.
+    Committed(StorageCommitResult),
+    /// At least one expectation differed, so the engine rolled back the
+    /// complete batch. Values are canonical states observed while checking
+    /// this attempt; `None` means no canonical entity existed when checked.
+    Conflict { observed: BTreeMap<EntityId, Option<Attested<EntityState>>> },
+}
+
+impl StorageCommitOutcome {
+    /// Return the committed result, or a retryable write conflict.
+    pub fn committed(self) -> Result<StorageCommitResult, MutationError> {
+        match self {
+            Self::Committed(result) => Ok(result),
+            Self::Conflict { .. } => Err(MutationError::WriteConflict),
+        }
+    }
 }
 
 #[async_trait]
-pub trait StorageCollection: Send + Sync {
-    async fn set_state(&self, state: Attested<EntityState>) -> Result<bool, MutationError>;
+/// Semantic persistence boundary for canonical entity data, events,
+/// and model-specific query materializations.
+///
+/// Physical tables, object stores, trees, naming registries, and
+/// entity-to-model association layouts remain private to each implementation.
+pub trait StorageEngine: Send + Sync {
+    /// The engine's native value representation.
+    type Value;
+
+    /// This engine's transaction handle, borrowing only its engine handle.
+    type Transaction<'a>: StorageTransaction + 'a
+    where Self: 'a;
+
+    /// Begin an atomic storage transaction; the engine controls native transaction timing.
+    fn transaction(&self) -> Self::Transaction<'_>;
+
+    /// Retrieve canonical state by entity identity.
     async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError>;
 
-    // Fetch raw entity states matching a selection (predicate + order by + limit)
-    async fn fetch_states(&self, selection: &ankql::ast::Selection<Resolved>) -> Result<Vec<Attested<EntityState>>, RetrievalError>;
+    /// Fetch entities matching the selection, including its model-membership predicates.
+    async fn fetch_states(
+        &self,
+        selection: &ankql::ast::Selection<Resolved>,
+    ) -> Result<Vec<Attested<EntityState>>, RetrievalError>;
 
-    async fn set_states(&self, states: Vec<Attested<EntityState>>) -> Result<(), MutationError> {
-        for state in states {
-            self.set_state(state).await?;
-        }
-        Ok(())
-    }
-
-    async fn get_states(&self, ids: Vec<EntityId>) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
-        let mut states = Vec::new();
+    /// Retrieve one outcome per requested identity, in input order, distinguishing absence from predicate mismatch.
+    /// Engines may batch reads or join materializations; existence and predicate checks must use the same state.
+    async fn get_states(&self, ids: Vec<EntityId>, predicate: &Predicate<Resolved>) -> Result<Vec<GetStateResult>, RetrievalError> {
+        let mut states = Vec::with_capacity(ids.len());
         for id in ids {
-            match self.get_state(id).await {
-                Ok(state) => states.push(state),
-                Err(RetrievalError::EntityNotFound(_)) => {
-                    warn!("Entity not found: {:?}", id);
-                }
+            states.push(match self.get_state(id).await {
+                Ok(state) => GetStateResult::matching(state, predicate)?,
+                Err(RetrievalError::EntityNotFound(_)) => GetStateResult::NotFound(id),
                 Err(e) => return Err(e),
-            }
+            });
         }
         Ok(states)
     }
 
-    async fn add_event(&self, entity_event: &Attested<Event>) -> Result<bool, MutationError>;
+    /// Retrieve events whose entities match the predicate; omit missing or nonmatching events.
+    /// `True` does not require local entity state, so event-DAG reconstruction can read events before state exists.
+    async fn get_events(&self, event_ids: Vec<EventId>, predicate: &Predicate<Resolved>) -> Result<Vec<Attested<Event>>, RetrievalError>;
 
-    /// Retrieve a list of events
-    async fn get_events(&self, event_ids: Vec<EventId>) -> Result<Vec<Attested<Event>>, RetrievalError>;
-
-    /// Retrieve all events from the collection
+    /// Retrieve all events for an entity.
     async fn dump_entity_events(&self, id: EntityId) -> Result<Vec<Attested<Event>>, RetrievalError>;
-}
 
-/// Manages the storage and state of the collection without any knowledge of the model type
-#[derive(Clone)]
-pub struct StorageCollectionWrapper(pub(crate) Arc<dyn StorageCollection>);
+    /// Delete all engine-owned entity, event, association, materialization,
+    /// and physical-name data while retaining engine compatibility metadata.
+    async fn delete_all(&self) -> Result<bool, MutationError>;
 
-/// Storage interface for a collection
-impl StorageCollectionWrapper {
-    pub fn new(bucket: Arc<dyn StorageCollection>) -> Self { Self(bucket) }
-}
+/// List existing model materializations without creating any.
+    async fn list_materializations(&self) -> Result<Vec<ModelId>, RetrievalError> { Ok(Vec::new()) }
 
-impl std::ops::Deref for StorageCollectionWrapper {
-    type Target = Arc<dyn StorageCollection>;
-    fn deref(&self) -> &Self::Target { &self.0 }
+    /// Supply optional labels for engines to seed their own persistent physical names.
+    /// Injected after node construction; retained weakly to avoid an ownership cycle.
+    fn set_catalog_resolver(&self, resolver: std::sync::Weak<dyn crate::schema::CatalogResolver>) { let _ = resolver; }
 }

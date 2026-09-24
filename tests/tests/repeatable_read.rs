@@ -1,4 +1,3 @@
-use ankurah::property::YrsString;
 use ankurah::Model;
 use ankurah::{policy::DEFAULT_CONTEXT as c, Node, PermissiveAgent};
 use ankurah_storage_sled::SledStorageEngine;
@@ -24,7 +23,7 @@ pub struct Album {
 async fn repeatable_read() -> Result<()> {
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     node.system.create().await?;
-    let ctx = node.context(c)?;
+    let ctx = node.context_async(c).await?;
 
     let id;
     {

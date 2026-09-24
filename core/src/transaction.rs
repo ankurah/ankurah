@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use ankurah_proto::EntityId;
 
 use crate::context::DynContextInner;
-use crate::entity::ProvisionalEntity;
+use crate::entity::LocalTrxEntity;
 use crate::model::{Model, MutableBorrow};
 
 use append_only_vec::AppendOnlyVec;
@@ -23,13 +23,11 @@ use wasm_bindgen::prelude::*;
 pub struct Transaction {
     pub(crate) dyncontext: Arc<dyn DynContextInner + Send + Sync + 'static>,
     pub(crate) id: proto::TransactionId,
-    pub(crate) entities: AppendOnlyVec<Entity>,
+    pub(crate) entities: AppendOnlyVec<LocalTrxEntity>,
     /// Prevents concurrent get/edit calls from appending separate snapshots of the same EntityId
     /// to `entities`; AppendOnlyVec makes appends thread-safe, but does not enforce uniqueness.
     snapshot_creation_lock: Mutex<()>,
     pub(crate) alive: Arc<AtomicBool>,
-    /// Each created entity's genesis.
-    pub(crate) genesis_events: std::sync::RwLock<std::collections::BTreeMap<EntityId, proto::Event>>,
 }
 
 #[cfg(feature = "wasm")]
@@ -50,11 +48,10 @@ impl Transaction {
             entities: AppendOnlyVec::new(),
             snapshot_creation_lock: Mutex::new(()),
             alive: Arc::new(AtomicBool::new(true)),
-            genesis_events: std::sync::RwLock::new(std::collections::BTreeMap::new()),
         }
     }
 
-    pub(crate) fn add_entity(&self, entity: Entity) -> &Entity {
+    pub(crate) fn add_entity(&self, entity: LocalTrxEntity) -> &LocalTrxEntity {
         let index = self.entities.push(entity);
         &self.entities[index]
     }
@@ -63,22 +60,15 @@ impl Transaction {
     pub async fn create<'rec, 'trx: 'rec, M: Model>(&'trx self, model: &M) -> Result<MutableBorrow<'rec, M::Mutable>, MutationError> {
         let (model_id, epoch) = self.dyncontext.schema_resolver().ensure_registered(M::descriptor()).await?;
 
-        let mut provisional = ProvisionalEntity::new();
-        model.initialize_new_entity(&mut provisional, model_id, epoch)?;
         let system = self.dyncontext.system_id().ok_or(MutationError::SystemNotReady)?;
-        let genesis = proto::Event::genesis(Some(system), proto::AuthorId::Unknown, provisional.extract_operations()?);
-
-        let entity = self.dyncontext.create_entity(&genesis, self.alive.clone())?;
-        self.dyncontext.check_write(&entity)?;
-
-        if self.genesis_events.write().unwrap().insert(entity.id, genesis).is_some() {
-            return Err(MutationError::AlreadyExists);
-        }
+        let entity = LocalTrxEntity::new(Some(system), proto::AuthorId::Unknown, epoch, self.alive.clone());
+        model.initialize_new_entity(&entity, model_id, epoch)?;
+        self.dyncontext.check_write(&entity.read())?;
 
         let entity_ref = self.add_entity(entity);
-        Ok(MutableBorrow::new(entity_ref))
+        Ok(MutableBorrow::new(entity_ref)?)
     }
-    fn get_trx_entity(&self, id: &EntityId) -> Option<&Entity> { self.entities.iter().find(|e| e.id == *id) }
+    fn get_trx_entity(&self, id: &EntityId) -> Option<&LocalTrxEntity> { self.entities.iter().find(|e| e.assigned_id() == Some(*id)) }
 
     /// Retrieve an entity for editing, registering the model locally or remotely if needed.
     /// Reuses this transaction's existing snapshot when present.

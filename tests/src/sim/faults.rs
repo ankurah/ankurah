@@ -88,7 +88,7 @@ impl FaultConfig {
     /// from the seed but with `reorder` excluded. Reordering the subscription
     /// setup handshake (SubscribeQuery / QuerySubscribed) makes the initial setup
     /// fail, and the client relay then waits on a real 5-second `futures_timer`
-    /// retry (core/src/peer_subscription/client_relay.rs) that the deterministic,
+    /// retry (core/src/peer_subscription/relay.rs) that the deterministic,
     /// drain-based scheduler cannot advance. That injects multi-second wall-clock
     /// stalls into the quiescence barrier and, because the timer fires on a
     /// separate thread, makes the trace non-deterministic, so a subscription

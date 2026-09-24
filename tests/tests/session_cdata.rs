@@ -21,7 +21,7 @@ async fn sessions_extend_through_livequeries() -> anyhow::Result<()> {
     drop(second);
     assert_eq!(node.session_registry().len(), 1);
 
-    ctx.register_model::<Album>().await?;
+    ctx.resolve_model_id::<Album>().await?;
     let lq = ctx.query_wait::<AlbumView>("true").await?;
     drop(ctx);
     assert_eq!(node.session_registry().len(), 1, "a live query extends its session past the context drop");

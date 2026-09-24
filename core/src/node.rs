@@ -99,7 +99,7 @@ where PA: PolicyAgent
     pub storage: Arc<SE>,
 
     pub(crate) entities: WeakEntitySet,
-    /// Hold across storage commit and WeakEntitySet publication: register a new Primary
+    /// Hold across storage commit and WeakEntitySet publication: register a new resident entity
     /// or update one already registered there. Otherwise a competing writer could retry
     /// from stale in-memory state after storage advances. Reactor notification follows later.
     pub(crate) commit_publication_lock: tokio::sync::Mutex<()>,

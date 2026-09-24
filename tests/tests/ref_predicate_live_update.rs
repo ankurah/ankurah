@@ -31,7 +31,7 @@ pub struct RefPredMessage {
 async fn setup() -> Result<Context> {
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
     node.system.create().await?;
-    Ok(node.context(DEFAULT_CONTEXT)?)
+    Ok(node.context_async(DEFAULT_CONTEXT).await?)
 }
 
 async fn create_room(ctx: &Context, name: &str) -> Result<ankurah::proto::EntityId> {
@@ -68,6 +68,7 @@ async fn typed_ref_literal_receives_live_updates() -> Result<()> {
     let mut selection: ankurah::ankql::ast::Selection<ankurah::ankql::ast::Parsed> = "room = ?".try_into()?;
     selection.predicate = selection.predicate.populate([ankurah::ankql::ast::Expr::Literal(Value::EntityId(room_a))])?;
 
+    ctx.resolve_model_id::<RefPredMessage>().await?;
     let lq = ctx.query::<RefPredMessageView>(selection)?;
     lq.wait_initialized().await?;
     assert_eq!(lq.ids().len(), 0, "no messages yet");
@@ -95,6 +96,7 @@ async fn string_ref_literal_receives_live_updates() -> Result<()> {
     let selection: ankurah::ankql::ast::Selection<ankurah::ankql::ast::Parsed> =
         format!("room = '{}'", room_a.to_base64()).as_str().try_into()?;
 
+    ctx.resolve_model_id::<RefPredMessage>().await?;
     let lq = ctx.query::<RefPredMessageView>(selection)?;
     lq.wait_initialized().await?;
 

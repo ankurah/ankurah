@@ -219,7 +219,7 @@ async fn test_update_scope_requires_before_and_after_state() -> anyhow::Result<(
         let denied_account = trx.create(&Account { name: "Denied".into() }).await?;
         let denied_record = trx.create(&ScopedRecord { account: denied_account.id().into(), label: "denied".into() }).await?;
         let allowed_record = trx.create(&ScopedRecord { account: allowed_account.id().into(), label: "allowed".into() }).await?;
-        let values = (allowed_account.id(), denied_record.entity().clone(), allowed_record.entity().clone());
+        let values = (allowed_account.id(), denied_record.entity().read(), allowed_record.entity().read());
         trx.commit().await?;
         values
     };
@@ -231,7 +231,10 @@ async fn test_update_scope_requires_before_and_after_state() -> anyhow::Result<(
     let token = keys.sign(&claims, Duration::from_hours(1))?;
     let context = JwtContext::from_claims(claims, token);
 
-    let result = agent.check_state(&node, &context, Some(&denied_record), &allowed_record);
+    let event = ankurah::proto::Event::update(
+        denied_record.id(), denied_record.head(), ankurah::proto::AuthorId::Unknown, Default::default(),
+    );
+    let result = agent.check_write_event(&node, &context, &denied_record, &allowed_record, &event);
     assert!(result.is_err(), "updates must not retag an out-of-scope row into the caller's scope");
 
     Ok(())

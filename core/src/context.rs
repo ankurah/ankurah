@@ -29,12 +29,6 @@ impl Context {
 // Generic methods cannot cross the wasm_bindgen boundary; they live in this
 // plain impl and remain host-and-wasm callable from Rust.
 impl Context {
-    /// Return `M`'s identity using only this context's local schema bindings.
-    /// Fails if the node is not ready or the declaration cannot be bound locally.
-    pub fn model_id_of<M: crate::model::Model>(&self) -> Result<proto::ModelId, RetrievalError> {
-        self.0.schema_resolver().model_id(M::descriptor())
-    }
-
     /// Resolve `M`'s identity, registering missing declarations locally or through a durable peer.
     pub async fn resolve_model_id<M: crate::model::Model>(&self) -> Result<proto::ModelId, crate::schema::registration::RegistrationError> {
         self.0.schema_resolver().ensure_registered(M::descriptor()).await.map(|(model, _epoch)| model)
@@ -78,23 +72,15 @@ impl Context {
 
     pub async fn get<R: View>(&self, id: proto::EntityId) -> Result<R, RetrievalError> {
         use crate::model::Model;
-        let (model, _) = self.0.schema_resolver().ensure_registered(R::Model::descriptor()).await?;
-        let entity = self.0.get_entity(id, false).await?;
-        if !entity.has_membership(&model) {
-            return Err(RetrievalError::MissingComponent { entity_id: id, model_id: model });
-        }
-        Ok(R::from_entity(entity))
+        self.0.schema_resolver().ensure_registered(R::Model::descriptor()).await?;
+        R::from_entity(self.0.get_entity(id, false).await?)
     }
 
     /// Get an entity, allowing a local result when no durable peer is connected.
     pub async fn get_cached<R: View>(&self, id: proto::EntityId) -> Result<R, RetrievalError> {
         use crate::model::Model;
-        let (model, _) = self.0.schema_resolver().ensure_registered(R::Model::descriptor()).await?;
-        let entity = self.0.get_entity(id, true).await?;
-        if !entity.has_membership(&model) {
-            return Err(RetrievalError::MissingComponent { entity_id: id, model_id: model });
-        }
-        Ok(R::from_entity(entity))
+        self.0.schema_resolver().ensure_registered(R::Model::descriptor()).await?;
+        R::from_entity(self.0.get_entity(id, true).await?)
     }
 
     pub async fn fetch<R: View>(
@@ -111,7 +97,7 @@ impl Context {
 
         let entities = self.0.fetch_entities(args).await?;
 
-        Ok(entities.into_iter().map(|e| R::from_entity(e)).collect())
+        entities.into_iter().map(R::from_entity).collect()
     }
 
     pub async fn fetch_one<R: View + Clone + 'static>(

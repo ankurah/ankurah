@@ -4,13 +4,13 @@ use ankql::ast::Predicate;
 use ankurah::core::{
     entity::Entity,
     error::ValidationError,
-    node::{Node as NodeInnerAlias, NodeInner, WeakNode},
+    node::{Node as NodeInnerAlias, NodeInner},
     policy::{AccessDenied, DefaultContext, PolicyAgent, DEFAULT_CONTEXT},
     storage::StorageEngine,
     util::Iterable,
 };
 use ankurah::proto::{self, Attested};
-use ankurah::{Model, Mutable, Node};
+use ankurah::Node;
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use common::{Album, AlbumView};
 
-/// Permissive except for `check_event` on the album collection, where only
+/// Permissive except for `check_write_event` on the album collection, where only
 /// the first event is allowed. Used to pin commit failure atomicity: a
 /// denial partway through a multi-entity transaction must leave NOTHING
 /// durable.
@@ -60,7 +60,7 @@ impl PolicyAgent for DenySecondAlbumEventAgent {
         Ok(auth.iterable().map(|_| DEFAULT_CONTEXT).collect())
     }
 
-    fn check_event<SE: StorageEngine>(
+    fn check_write_event<SE: StorageEngine>(
         &self,
         _node: &NodeInnerAlias<SE, Self>,
         _cdata: &Self::ContextData,
@@ -68,7 +68,12 @@ impl PolicyAgent for DenySecondAlbumEventAgent {
         _entity_after: &Entity,
         event: &proto::Event,
     ) -> Result<Option<proto::Attestation>, AccessDenied> {
-        if event.collection.as_str() == "album" && self.album_checks.fetch_add(1, Ordering::SeqCst) >= 1 {
+        // Catalog writes use System models; this workload's only ordinary
+        // model is Album, so count the exact allocated model arm without
+        // reconstructing identity from its schema label.
+        if event.operations().memberships().any(|proto::Membership::Add(model)| matches!(model, ankurah::ModelId::EntityId(_)))
+            && self.album_checks.fetch_add(1, Ordering::SeqCst) >= 1
+        {
             return Err(AccessDenied::ByPolicy("test agent denies the second album event"));
         }
         Ok(None)
@@ -96,42 +101,19 @@ impl PolicyAgent for DenySecondAlbumEventAgent {
         Ok(())
     }
 
-    fn can_access_collection<C>(&self, _data: &C, _collection: &proto::CollectionId) -> Result<(), AccessDenied>
+    fn query_predicate<C>(&self, _data: &C) -> Result<Predicate<ankql::ast::Resolved>, AccessDenied>
     where C: Iterable<Self::ContextData> {
-        Ok(())
+        Ok(Predicate::True)
     }
 
-    fn filter_predicate<C>(
+    fn check_write(
         &self,
-        _data: &C,
-        _collection: &proto::CollectionId,
-        predicate: Predicate<ankql::ast::Resolved>,
-    ) -> Result<Predicate<ankql::ast::Resolved>, AccessDenied>
-    where
-        C: Iterable<Self::ContextData>,
-    {
-        Ok(predicate)
-    }
-
-    fn check_read<C>(
-        &self,
-        _data: &C,
-        _id: &proto::EntityId,
-        _collection: &proto::CollectionId,
-        _state: &proto::State,
-    ) -> Result<(), AccessDenied>
-    where
-        C: Iterable<Self::ContextData>,
-    {
+        _data: &Self::ContextData,
+        _entity: &Entity,
+        _event: Option<&proto::Event>,
+    ) -> Result<(), AccessDenied> {
         Ok(())
     }
-
-    fn check_read_event<C>(&self, _data: &C, _event: &Attested<proto::Event>) -> Result<(), AccessDenied>
-    where C: Iterable<Self::ContextData> {
-        Ok(())
-    }
-
-    fn check_write(&self, _data: &Self::ContextData, _entity: &Entity, _event: Option<&proto::Event>) -> Result<(), AccessDenied> { Ok(()) }
 
     fn validate_causal_assertion<SE: StorageEngine>(
         &self,
@@ -143,15 +125,12 @@ impl PolicyAgent for DenySecondAlbumEventAgent {
     }
 }
 
-/// V7: commit_local_trx must run every policy check before persisting any
-/// event. With the fused loop, the first entity's event was already durable
-/// when the second entity's check was denied, leaving an orphaned event in
-/// storage on a failed transaction.
+/// A later event denial must roll back earlier staged writes, leaving no durable events.
 #[tokio::test]
 async fn test_multi_entity_commit_denial_leaves_nothing_durable() -> Result<()> {
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), DenySecondAlbumEventAgent::new());
     node.system.create().await?;
-    let ctx = node.context(DEFAULT_CONTEXT)?;
+    let ctx = node.context_async(DEFAULT_CONTEXT).await?;
 
     let trx = ctx.begin();
     let album1 = trx.create(&Album { name: "First".to_owned(), year: "2001".to_owned() }).await?;
@@ -163,9 +142,8 @@ async fn test_multi_entity_commit_denial_leaves_nothing_durable() -> Result<()> 
     assert!(result.is_err(), "commit must fail when any event is denied, got {result:?}");
 
     // Failure atomicity: no event for EITHER entity may be durable.
-    let collection = ctx.collection(&Album::collection()).await?;
     for (label, id) in [("first", id1), ("second", id2)] {
-        let events = collection.dump_entity_events(id).await?;
+        let events = node.storage.dump_entity_events(id).await?;
         assert!(events.is_empty(), "{label} entity must have zero durable events after denied commit, found {}", events.len());
     }
 

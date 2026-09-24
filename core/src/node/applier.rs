@@ -1,10 +1,13 @@
+use crate::entity::{RemoteTrxEntity, StateApplyResult};
 use crate::error::{ApplyError, ApplyErrorItem};
 use crate::internal::prelude::*;
-use crate::retrieval::{CachedEventGetter, GetState, LocalStateGetter, SuspenseEvents};
-use crate::storage::{EntityWrite, StorageTransaction};
+use crate::reactor::ChangeNotification;
+use crate::retrieval::{CachedEventGetter, LocalStateGetter, SuspenseEvents};
+use crate::storage::StorageTransaction;
 use crate::util::ready_chunks::ReadyChunks;
 use futures::stream::StreamExt;
 use proto::Attested;
+use std::sync::{atomic::AtomicBool, Arc};
 
 /// Consolidates all logic for applying remote updates to a node
 /// Handles both SubscriptionUpdateItem (streaming updates) and EntityDelta (initial Fetch/QuerySubscribed)

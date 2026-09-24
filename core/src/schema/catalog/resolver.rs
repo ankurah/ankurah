@@ -152,7 +152,7 @@ fn check_predicate_names(
                 check_expr_names(right, check)
             }
             Predicate::IsNull(expr) => check_expr_names(expr, check),
-            Predicate::And(..) | Predicate::Or(..) | Predicate::Not(_) | Predicate::True | Predicate::False | Predicate::Placeholder => {
+            Predicate::And(..) | Predicate::Or(..) | Predicate::Not(_) | Predicate::MemberOf(_) | Predicate::True | Predicate::False | Predicate::Placeholder => {
                 Ok(())
             }
         }
@@ -172,7 +172,7 @@ fn check_expr_names(expr: &Expr<Parsed>, check: &impl Fn(&PathExpr) -> Result<()
     }
 }
 
-/// Resolve every property path and canonicalize its comparison literals.
+/// Resolve model labels and property paths, and canonicalize comparison literals.
 pub fn resolve_selection<R: ModelResolver + ?Sized>(
     model: &ModelId,
     resolver: &R,
@@ -225,6 +225,10 @@ fn resolve_predicate<R: ModelResolver + ?Sized>(
         }
         Predicate::Not(inner) => Predicate::Not(Box::new(resolve_predicate(model, resolver, inner)?)),
         Predicate::IsNull(expr) => Predicate::IsNull(Box::new(resolve_expr(model, resolver, expr)?.0)),
+        Predicate::MemberOf(reference) => Predicate::MemberOf(match reference {
+            ModelRef::Id(id) => *id,
+            ModelRef::Label(label) => resolver.resolve_model(label)?.ok_or_else(|| ModelResolutionError::UnknownModel(label.clone()))?,
+        }),
         Predicate::True => Predicate::True,
         Predicate::False => Predicate::False,
         Predicate::Placeholder => Predicate::Placeholder,
@@ -371,6 +375,10 @@ mod tests {
     struct ColdResolver;
 
     impl ModelResolver for WarmResolver {
+        fn resolve_model(&self, label: &str) -> Result<Option<ModelId>, ModelResolutionError> {
+            Ok((label == "album").then(model))
+        }
+
         fn resolve_property(&self, model: &ModelId, name: &str) -> Result<Option<ResolvedProperty>, ModelResolutionError> {
             Ok(match name {
                 "value" => Some(ResolvedProperty { id: property(), value_type: ValueType::I64 }),
@@ -401,12 +409,12 @@ mod tests {
     }
 
     #[test]
-    fn unregistered_collections_are_rejected() {
+    fn unregistered_models_are_rejected() {
         let catalog = CatalogManager::default();
-        let collection = CollectionId::fixed_name("unregistered");
+        let model = ModelId::EntityId(proto::EntityId::random());
         for source in ["TRUE LIMIT 2", "1 = 1", "name = 'Alice'", "id = ?", "TRUE ORDER BY id"] {
             let selection = ankql::parser::parse_selection(source).unwrap();
-            assert!(catalog.resolve_selection(&collection, selection).is_err(), "{source}");
+            assert!(catalog.resolve_selection(&model, selection).is_err(), "{source}");
         }
     }
 
@@ -414,6 +422,23 @@ mod tests {
     fn unresolved_property_is_unknown() {
         let error = resolve_selection(&model(), &ColdResolver, comparison(PathExpr::simple("value"), Value::I64(42))).unwrap_err();
         assert!(matches!(error, ModelResolutionError::UnknownProperty { .. }));
+    }
+
+    #[test]
+    fn membership_labels_and_ids_resolve() {
+        let selection = ankurah_derive::selection!("MEMBEROF('album') OR (NOT (MEMBEROF('system:model')))");
+        let resolved = resolve_selection(&model(), &WarmResolver, selection).unwrap();
+        assert_eq!(
+            resolved.predicate,
+            Predicate::Or(
+                Box::new(Predicate::MemberOf(model())),
+                Box::new(Predicate::Not(Box::new(Predicate::MemberOf(ModelId::System(SystemModel::Model))))),
+            )
+        );
+        let by_id = ankql::parser::parse_selection(&format!("MEMBEROF('{}')", model())).unwrap();
+        assert_eq!(resolve_selection(&model(), &ColdResolver, by_id).unwrap().predicate, Predicate::MemberOf(model()));
+        let unknown = ankql::parser::parse_selection("MEMBEROF('unknown')").unwrap();
+        assert!(matches!(resolve_selection(&model(), &WarmResolver, unknown), Err(ModelResolutionError::UnknownModel(_))));
     }
 
     #[test]

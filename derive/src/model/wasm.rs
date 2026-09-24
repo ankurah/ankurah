@@ -476,7 +476,7 @@ pub fn wasm_model_namespace(
                 selection.predicate =
                     ::ankurah::core::model::js_populate_predicate(selection.predicate, substitution_values)?;
 
-                let args = ::ankurah::MatchArgs { selection, cached: false };
+                let args = ::ankurah::MatchArgs { selection, cache_policy: ::ankurah::CachePolicy::Durable };
                 let livequery = context.query::<#view_name>(args)
                     .map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))?;
                 Ok(#livequery_name(livequery))
@@ -486,7 +486,7 @@ pub fn wasm_model_namespace(
                 use ankurah::Mutable;
                 let model = js_to_model(me)?;
                 let mutable_entity = transaction.create(&model).await?;
-                Ok(mutable_entity.read())
+                Ok(mutable_entity.read()?)
             }
 
             pub async fn create_one(context: &::ankurah::core::context::Context, me: ::wasm_bindgen::JsValue) -> Result<#view_name, ::wasm_bindgen::JsValue> {
@@ -494,7 +494,7 @@ pub fn wasm_model_namespace(
                 let tx = context.begin();
                 let model = js_to_model(me)?;
                 let mutable_entity = tx.create(&model).await?;
-                let read = mutable_entity.read();
+                let read = mutable_entity.read()?;
                 tx.commit().await.map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))?;
                 Ok(read)
             }

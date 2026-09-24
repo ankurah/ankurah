@@ -29,14 +29,8 @@ where
 
 #[async_trait]
 impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> DynContextInner for ContextInner<SE, PA> {
-    /// Remove the remote subscription when the livequery is dropped.
-    fn unsubscribe_remote_query(&self, query_id: proto::QueryId) {
-        if let Ok(node) = self.node.upgrade() {
-            if let Some(relay) = &node.subscription_relay {
-                relay.unsubscribe_predicate(query_id);
-            }
-        }
-    }
+    /// Access the node, retaining it for the caller; fail if a weak handle has expired.
+    fn node(&self) -> Result<Arc<dyn NodeErased>, NodeDropped> { Ok(self.node.upgrade()?.0.clone()) }
 
     /// Subscribe or update a resolved livequery using this context's sessions.
     /// Return `false` if the node has no relay.
@@ -58,9 +52,6 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         Ok(true)
     }
 
-    /// Return the reactor used to activate livequeries, or `None` if the node has been dropped.
-    fn reactor(&self) -> Option<crate::reactor::Reactor> { self.node.upgrade().ok().map(|node| node.reactor.clone()) }
-
     /// Access this context's descriptor binding and selection resolution.
     fn schema_resolver(&self) -> &dyn SchemaResolver { self }
 
@@ -71,22 +62,10 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     /// into its own id. `None` before the node has created or adopted a system.
     fn system_id(&self) -> Option<proto::EntityId> { self.node.upgrade().ok().and_then(|node| node.system.root_id()) }
 
-    /// Create an entity from its genesis event, returning its transaction-local state.
-    fn create_entity(&self, genesis: &Event, trx_alive: Arc<AtomicBool>) -> Result<Entity, MutationError> {
-        self.node.upgrade()?.entities.create_entity(genesis, trx_alive)
-    }
-
     /// Check whether this context may write the entity.
     fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied> {
         let node = self.node.upgrade()?;
-        match &self.auth {
-            ContextAuth::Sessions(sessions) => {
-                crate::node::event_admissibility::check_unprivileged_write(entity.collection())
-                    .map_err(|_| AccessDenied::ByPolicy("reserved collections accept writes only from the node's privileged context"))?;
-                node.policy_agent.check_write(&sessions.write_credential()?, entity, None)
-            }
-            ContextAuth::Privileged => Ok(()),
-        }
+        ContextPolicy::new(&node.policy_agent, self.auth.clone()).check_write(entity)
     }
 
     /// Retrieve an entity and enforce this context's read policy.
@@ -212,11 +191,18 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
+    fn can_read(&self, entity: &Entity) -> bool {
+        let Ok(node) = self.node.upgrade() else { return false };
+        ContextPolicy::new(&node.policy_agent, self.auth.clone()).can_read(entity)
+    }
+
     async fn fetch_entities_from_local(
         &self,
-        collection_id: &CollectionId,
         selection: &ankql::ast::Selection<Resolved>,
     ) -> Result<Vec<Entity>, RetrievalError> {
-        self.node.upgrade()?.fetch_entities_from_local(collection_id, selection).await
+        let node = self.node.upgrade()?;
+        let policy = ContextPolicy::new(&node.policy_agent, self.auth.clone());
+        let entities = node.fetch_entities_from_local(selection).await?;
+        Ok(entities.into_iter().filter(|entity| policy.can_read(entity)).collect())
     }
 }

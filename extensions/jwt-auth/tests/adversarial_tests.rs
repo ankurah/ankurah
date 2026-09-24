@@ -29,6 +29,7 @@ async fn test_server_rejects_wrongly_signed_token() -> anyhow::Result<()> {
 
     let node1 = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
     node1.system.create().await?;
+    agent.set_policy(&node1, &agent.config()).await?;
 
     let node2 = Node::new(Arc::new(SledStorageEngine::new_test()?), agent.clone());
     let _conn = LocalProcessConnection::new(&node1, &node2).await?;
@@ -43,7 +44,7 @@ async fn test_server_rejects_wrongly_signed_token() -> anyhow::Result<()> {
     };
     let bad_token = attacker_keys.sign(&claims, Duration::from_hours(24))?;
     let ctx = JwtContext::from_claims(claims, bad_token);
-    let context = node2.context(ctx)?;
+    let context = node2.context_async(ctx).await?;
 
     let trx = context.begin();
     let create_result = trx.create(&Post { title: "Wrongly Signed".into(), body: "Should be rejected by server".into() }).await;
@@ -88,6 +89,7 @@ async fn test_server_rejects_garbage_auth_data() -> anyhow::Result<()> {
 
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
     node.system.create().await?;
+    agent.set_policy(&node, &agent.config()).await?;
 
     let garbage_auth = vec![ankurah_proto::AuthData(b"NOT_A_JWT_TOKEN".to_vec())];
 
@@ -96,8 +98,7 @@ async fn test_server_rejects_garbage_auth_data() -> anyhow::Result<()> {
         to: ankurah_proto::EntityId::random(),
         from: ankurah_proto::EntityId::random(),
         body: ankurah_proto::NodeRequestBody::Fetch {
-            collection: ankurah_proto::CollectionId::from("post"),
-            selection: ankql::ast::Predicate::True.into(),
+            selection: ankql::ast::Predicate::MemberOf(ankurah::ModelId::EntityId(ankurah::EntityId::random())).into(),
             known_matches: vec![],
         },
     };

@@ -42,12 +42,12 @@ impl PolicyAgent for WriteProbe {
         Ok(auth.iterable().map(|_| DEFAULT_CONTEXT).collect())
     }
 
-    fn check_event<SE: StorageEngine>(
+    fn check_write_event<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
         _cdata: &Self::ContextData,
-        _before: &Entity,
-        _after: &Entity,
+        _entity_before: &Entity,
+        _entity_after: &Entity,
         _event: &proto::Event,
     ) -> Result<Option<proto::Attestation>, AccessDenied> {
         Ok(None)
@@ -73,42 +73,17 @@ impl PolicyAgent for WriteProbe {
         Ok(())
     }
 
-    fn can_access_collection<C>(&self, _data: &C, _collection: &proto::CollectionId) -> Result<(), AccessDenied>
+    fn query_predicate<C>(&self, _data: &C) -> Result<ankql::ast::Predicate<ankql::ast::Resolved>, AccessDenied>
     where C: Iterable<Self::ContextData> {
-        Ok(())
+        Ok(ankql::ast::Predicate::True)
     }
 
-    fn filter_predicate<C>(
+    fn check_write(
         &self,
-        _data: &C,
-        _collection: &proto::CollectionId,
-        predicate: ankql::ast::Predicate<ankql::ast::Resolved>,
-    ) -> Result<ankql::ast::Predicate<ankql::ast::Resolved>, AccessDenied>
-    where
-        C: Iterable<Self::ContextData>,
-    {
-        Ok(predicate)
-    }
-
-    fn check_read<C>(
-        &self,
-        _data: &C,
-        _id: &EntityId,
-        _collection: &proto::CollectionId,
-        _state: &proto::State,
-    ) -> Result<(), AccessDenied>
-    where
-        C: Iterable<Self::ContextData>,
-    {
-        Ok(())
-    }
-
-    fn check_read_event<C>(&self, _data: &C, _event: &proto::Attested<proto::Event>) -> Result<(), AccessDenied>
-    where C: Iterable<Self::ContextData> {
-        Ok(())
-    }
-
-    fn check_write(&self, _data: &Self::ContextData, _entity: &Entity, _event: Option<&proto::Event>) -> Result<(), AccessDenied> {
+        _data: &Self::ContextData,
+        _entity: &Entity,
+        _event: Option<&proto::Event>,
+    ) -> Result<(), AccessDenied> {
         (self.0)()
     }
 
@@ -138,7 +113,7 @@ async fn get_enforces_the_same_write_policy_as_edit() -> Result<()> {
     }));
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent);
     node.system.create().await?;
-    let context = node.context(DEFAULT_CONTEXT)?;
+    let context = node.context_async(DEFAULT_CONTEXT).await?;
     let id = seed_album(&context).await?;
     allow_write.store(false, Ordering::SeqCst);
 
@@ -175,14 +150,14 @@ async fn concurrent_get_and_edit_share_one_snapshot() -> Result<()> {
         }));
         let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent);
         node.system.create().await?;
-        let context = node.context(DEFAULT_CONTEXT)?;
+        let context = node.context_async(DEFAULT_CONTEXT).await?;
         let id = seed_album(&context).await?;
         let view = context.get::<AlbumView>(id).await?;
         let trx = context.begin();
         let runtime = tokio::runtime::Handle::current();
         armed.store(true, Ordering::SeqCst);
 
-        let acquire = |use_get| -> Result<Entity> {
+        let acquire = |use_get| -> Result<ankurah::core::entity::LocalTrxEntity> {
             let album = if use_get { runtime.block_on(trx.get::<Album>(&id))? } else { view.edit(&trx)? };
             Ok(album.entity().clone())
         };
@@ -192,7 +167,7 @@ async fn concurrent_get_and_edit_share_one_snapshot() -> Result<()> {
             Ok((left.join().unwrap()?, right.join().unwrap()?))
         })?;
         assert_eq!(left, right, "both callers must receive the same transaction snapshot");
-        assert_ne!(&left, view.entity(), "the snapshot must be detached from the resident entity");
+        assert_ne!(&left.read(), view.entity(), "the snapshot must be detached from the resident entity");
 
         trx.get::<Album>(&id).await?.name()?.replace("Updated")?;
         assert_eq!(view.edit(&trx)?.name()?.value().as_deref(), Some("Updated"));
@@ -214,5 +189,79 @@ async fn get_reuses_an_uncommitted_created_entity() -> Result<()> {
     assert_eq!(created.entity(), fetched.entity());
     assert_eq!(fetched.name()?.value().as_deref(), Some("Updated"));
     trx.commit().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn creation_freezes_only_when_identity_is_needed() -> Result<()> {
+    let context = durable_sled_setup().await?.context_async(DEFAULT_CONTEXT).await?;
+    for early_reference in [false, true] {
+        let trx = context.begin();
+        let album = trx.create(&Album { name: "Initial".into(), year: "2024".into() }).await?;
+        let view = album.read()?;
+        let name = album.name()?;
+        assert!(album.entity().head().is_empty(), "constructing and reading a Mutable must not freeze genesis");
+        assert_eq!(view.name()?, "Initial");
+        let reference = early_reference.then(|| ankurah::property::Ref::<Album>::from(&view));
+        if let Some(reference) = &reference {
+            assert!(matches!(context.get::<AlbumView>(reference.id()).await, Err(RetrievalError::EntityNotFound(_))));
+        }
+        name.replace("Edited before commit")?;
+        assert_eq!(view.name()?, "Edited before commit");
+        let events = trx.commit_and_return_events().await?;
+        assert_eq!(events.len(), if early_reference { 2 } else { 1 });
+        assert!(events[0].is_entity_create());
+        assert_eq!(view.id(), events[0].entity_id);
+        assert_eq!(view.name()?, "Edited before commit");
+        if let Some(reference) = reference { assert_eq!(reference.id(), view.id()); }
+        assert!(name.replace("too late").is_err());
+        assert_eq!(context.get::<AlbumView>(view.id()).await?.name()?, "Edited before commit");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn transaction_views_follow_commit_and_rollback() -> Result<()> {
+    let context = durable_sled_setup().await?.context_async(DEFAULT_CONTEXT).await?;
+    let trx = context.begin();
+    let record = trx.create(&Record { title: "Original".into(), artist: "Artist".into() }).await?;
+    let created_view = record.read()?;
+    record.title()?.set(&"Created".into())?;
+    assert_eq!(created_view.title()?, "Created");
+    trx.commit().await?;
+
+    let trx = context.begin();
+    let edit = created_view.edit(&trx)?;
+    let edited_view = edit.read()?;
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let _subscription = edited_view.subscribe({
+        let observed = observed.clone();
+        move |view: RecordView| observed.lock().unwrap().push(view.title().unwrap())
+    });
+    edit.title()?.set(&"Rolled back".into())?;
+    assert_eq!(edited_view.title()?, "Rolled back");
+    assert_eq!(created_view.title()?, "Created");
+    trx.rollback();
+    assert_eq!(edited_view.title()?, "Created");
+
+    let trx = context.begin();
+    created_view.edit(&trx)?.title()?.set(&"Committed".into())?;
+    trx.commit().await?;
+    assert_eq!(edited_view.title()?, "Committed");
+    assert_eq!(created_view.title()?, "Committed");
+    assert_eq!(*observed.lock().unwrap(), vec!["Rolled back", "Created", "Committed"]);
+
+    let trx = context.begin();
+    let rolled_back = trx.create(&Record { title: "Never created".into(), artist: "Artist".into() }).await?.read()?;
+    trx.rollback();
+    assert!(matches!(rolled_back.title(), Err(ankurah::property::PropertyError::TransactionClosed)));
+    // Handles to a rolled-back creation report no history or memberships, and fail rather than panic.
+    assert!(rolled_back.entity().head().is_empty() && rolled_back.entity().memberships().is_empty());
+    let _ = rolled_back.entity().to_string();
+    let trx = context.begin();
+    let outlived = trx.create(&Record { title: "Also never created".into(), artist: "Artist".into() }).await?.into_core();
+    trx.rollback();
+    let Err(RetrievalError::PropertyError(error)) = outlived.read() else { panic!("reading a rolled-back creation must fail") };
+    assert!(matches!(*error, ankurah::property::PropertyError::TransactionClosed));
     Ok(())
 }

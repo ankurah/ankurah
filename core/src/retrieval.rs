@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use crate::util::Iterable;
+use crate::storage::StorageTransaction;
 use ankurah_proto::{Attested, EntityId, Event, EventId};
 use async_trait::async_trait;
 
@@ -133,15 +134,14 @@ impl SuspenseEvents for LocalEventGetter {
 /// Cached event getter with staging + remote peer fallback. Used by ephemeral nodes.
 /// `get_event` checks staging, then local storage, then remote peer.
 /// `event_stored` checks permanent storage only.
-/// `commit_event` persists to storage and removes from staging.
+// FIXME: This getter persists remote misses, while callers persist accepted staged events.
+// Make both writes explicit at the caller's storage boundary.
 pub struct CachedEventGetter<'a, SE, PA, C>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
     C: Iterable<PA::ContextData> + Send + Sync + 'a,
 {
-    collection_id: proto::CollectionId,
-    collection: StorageCollectionWrapper,
     node: &'a Node<SE, PA>,
     cdata: &'a C,
     staging: Arc<RwLock<HashMap<EventId, Event>>>,
@@ -153,8 +153,8 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
     C: Iterable<PA::ContextData> + Send + Sync + 'a,
 {
-    pub fn new(collection_id: proto::CollectionId, collection: StorageCollectionWrapper, node: &'a Node<SE, PA>, cdata: &'a C) -> Self {
-        Self { collection_id, collection, node, cdata, staging: Arc::new(RwLock::new(HashMap::new())) }
+    pub fn new(node: &'a Node<SE, PA>, cdata: &'a C) -> Self {
+        Self { node, cdata, staging: Arc::new(RwLock::new(HashMap::new())) }
     }
 }
 
@@ -189,7 +189,7 @@ where
         }
 
         // Try local storage
-        let events = self.collection.get_events(vec![event_id.clone()]).await?;
+        let events = self.node.storage.get_events(vec![event_id.clone()], &ankql::ast::Predicate::True).await?;
         if let Some(event) = events.into_iter().next() {
             return Ok(event.payload);
         }

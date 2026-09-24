@@ -12,7 +12,9 @@
 //! on the node's id, which is random and would leak entropy into the
 //! schedule.
 
+use ankurah::core::test_helpers::commit_transaction;
 use ankurah::proto::{self, Attested};
+use ankurah::storage::StorageEngine;
 use ankurah::{Node, PermissiveAgent};
 use ankurah_storage_sled::SledStorageEngine;
 use std::sync::Arc;
@@ -57,9 +59,10 @@ impl SimNode {
     /// accepted. Used to seed a change at an origin node deterministically.
     /// The events flow through the real applier (staging, BFS lineage, policy,
     /// commit_event, set_state).
-    pub async fn origin_commit(&self, events: Vec<Attested<proto::Event>>) -> Result<(), ankurah::error::MutationError> {
+    pub async fn origin_commit(&self, events: Vec<Attested<proto::Event>>) -> anyhow::Result<()> {
         let txid = proto::TransactionId::new();
-        self.node.commit_remote_transaction(&ankurah::policy::DEFAULT_CONTEXT, txid, events).await
+        commit_transaction(&self.node, &ankurah::policy::DEFAULT_CONTEXT, txid, events).await?;
+        Ok(())
     }
 
     /// Register a live query for `SimRecord` on this (ephemeral) node against a
@@ -89,8 +92,7 @@ impl SimNode {
                 return Some(state);
             }
         }
-        let collection = self.node.collections.get(&SimRecord::collection()).await.ok()?;
-        match collection.get_state(entity).await {
+        match self.node.storage.get_state(entity).await {
             Ok(state) => Some(state.payload.state),
             Err(_) => None,
         }
@@ -99,11 +101,9 @@ impl SimNode {
     /// Every entity id this node currently holds materialized state for, in the
     /// `SimRecord` collection. A full table scan via a match-all selection.
     pub async fn known_entities(&self) -> Vec<proto::EntityId> {
-        let Ok(collection) = self.node.collections.get(&SimRecord::collection()).await else {
-            return Vec::new();
-        };
-        let selection = ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None };
-        match collection.fetch_states(&selection).await {
+        let model = proto::ModelId::EntityId(super::model::sim_model_id());
+        let selection = ankql::ast::Predicate::MemberOf(model).into();
+        match self.node.storage.fetch_states(&selection).await {
             Ok(states) => states.into_iter().map(|s| s.payload.entity_id).collect(),
             Err(_) => Vec::new(),
         }
@@ -120,10 +120,7 @@ impl SimNode {
     /// an unseen entity is correctly rejected by the empty-head guard, so
     /// propagating only the newest event would strand out-of-order receivers).
     pub async fn stored_events(&self, entity: proto::EntityId) -> Vec<Attested<proto::Event>> {
-        let Ok(collection) = self.node.collections.get(&SimRecord::collection()).await else {
-            return Vec::new();
-        };
-        collection.dump_entity_events(entity).await.unwrap_or_default()
+        self.node.storage.dump_entity_events(entity).await.unwrap_or_default()
     }
 }
 

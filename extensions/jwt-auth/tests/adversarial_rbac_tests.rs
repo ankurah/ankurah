@@ -3,7 +3,6 @@ mod common;
 use ankurah::Model;
 use ankurah::Node;
 use ankurah_jwt_auth::{JwtAgent, JwtContext};
-use ankurah_proto::CollectionId;
 use ankurah_storage_sled::SledStorageEngine;
 use common::{blog_config_path, load_blog_config, make_claims, sign_token};
 use std::sync::Arc;
@@ -28,6 +27,7 @@ async fn test_reader_cannot_write_post_via_ephemeral() -> anyhow::Result<()> {
 
     let node1 = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
     node1.system.create().await?;
+    agent.set_policy(&node1, &agent.config()).await?;
 
     let node2 = Node::new(Arc::new(SledStorageEngine::new_test()?), agent.clone());
     let _conn = LocalProcessConnection::new(&node1, &node2).await?;
@@ -36,7 +36,7 @@ async fn test_reader_cannot_write_post_via_ephemeral() -> anyhow::Result<()> {
     let reader_claims = make_claims("reader-adversarial", &["Reader"], "reader@adversarial.com");
     let reader_token = sign_token(&keys, &reader_claims);
     let reader_ctx = JwtContext::from_claims(reader_claims, reader_token);
-    let context = node2.context(reader_ctx)?;
+    let context = node2.context_async(reader_ctx).await?;
 
     let trx = context.begin();
     let result = trx.create(&Post { title: "Reader Escalation Attempt".into(), body: "Should be denied by server RBAC".into() }).await;
@@ -58,17 +58,18 @@ async fn test_reader_cannot_write_to_user_collection() -> anyhow::Result<()> {
     let reader_token = sign_token(&keys, &reader_claims);
     let reader_ctx = JwtContext::from_claims(reader_claims, reader_token);
 
-    let user_collection = CollectionId::from("user");
-    let result = agent.can_access_collection(&reader_ctx, &user_collection);
+    let models = common::policy_models(&agent, &["user"]);
+    let user_collection = models.id("user");
+    let result = agent.can_access_model(&reader_ctx, &user_collection);
     assert!(result.is_err(), "Reader must not be able to access the user collection");
 
     let config = load_blog_config();
     assert!(
-        !config.can_write_collection(&[String::from("Reader")], &user_collection),
+        !config.can_write_collection(&[String::from("Reader")], "user"),
         "Reader role must not have write access to the user collection"
     );
     assert!(
-        !config.can_access_collection(&[String::from("Reader")], &user_collection),
+        !config.can_access_collection(&[String::from("Reader")], "user"),
         "Reader role must not have any access to the user collection"
     );
 
@@ -82,11 +83,12 @@ async fn test_nouser_cannot_write_anything() -> anyhow::Result<()> {
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path())?;
 
     let storage = SledStorageEngine::new_test()?;
-    let node = Node::new_durable(Arc::new(storage), agent);
+    let node = Node::new_durable(Arc::new(storage), agent.clone());
     node.system.create().await?;
+    agent.set_policy(&node, &agent.config()).await?;
 
     let ctx = JwtContext::NoUser;
-    let context = node.context(ctx)?;
+    let context = node.context_async(ctx).await?;
 
     let trx = context.begin();
     let result = trx.create(&Post { title: "NoUser Post".into(), body: "Should be denied".into() }).await;
@@ -108,6 +110,7 @@ async fn test_root_context_cannot_be_sent_over_wire() -> anyhow::Result<()> {
 
     let node1 = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
     node1.system.create().await?;
+    agent.set_policy(&node1, &agent.config()).await?;
 
     let node2 = Node::new(Arc::new(SledStorageEngine::new_test()?), agent.clone());
     let _conn = LocalProcessConnection::new(&node1, &node2).await?;
@@ -117,7 +120,7 @@ async fn test_root_context_cannot_be_sent_over_wire() -> anyhow::Result<()> {
 
     assert!(root_ctx.auth_data().is_err(), "Root context must not produce auth_data");
 
-    let context = node2.context(root_ctx)?;
+    let context = node2.context_async(root_ctx).await?;
     let trx = context.begin();
     let create_result = trx.create(&Post { title: "Root Over Wire".into(), body: "Should fail at sign_request".into() }).await;
 
@@ -134,30 +137,31 @@ async fn test_root_context_cannot_be_sent_over_wire() -> anyhow::Result<()> {
 /// Only Root (privileged) contexts may write to the jwtpolicy collection.
 #[tokio::test]
 async fn test_non_privileged_cannot_write_jwtpolicy() -> anyhow::Result<()> {
-    use ankurah_jwt_auth::JwtPolicy;
+    use ankurah_jwt_auth::JwtVerificationKey;
 
     let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path())?;
 
     let storage = SledStorageEngine::new_test()?;
-    let node = Node::new_durable(Arc::new(storage), agent);
+    let node = Node::new_durable(Arc::new(storage), agent.clone());
     node.system.create().await?;
+    agent.set_policy(&node, &agent.config()).await?;
 
     let admin_claims = make_claims("admin-1", &["Admin"], "admin@blog.com");
     let admin_token = sign_token(&keys, &admin_claims);
     let admin_ctx = JwtContext::from_claims(admin_claims, admin_token);
-    let context = node.context(admin_ctx)?;
+    let context = node.context_async(admin_ctx).await?;
 
     let trx = context.begin();
-    let result = trx.create(&JwtPolicy { config_json: r#"{"roles":{},"collections":{}}"#.into(), public_key_pem: "fake-pem".into() }).await;
+    let result = trx.create(&JwtVerificationKey { public_key_pem: "fake-pem".into() }).await;
 
     assert!(result.is_err(), "Admin (non-Root) must not be able to write to the jwtpolicy collection");
 
     let root_ctx = JwtContext::system();
-    let root_context = node.context(root_ctx)?;
+    let root_context = node.context_async(root_ctx).await?;
     let trx2 = root_context.begin();
     let root_result =
-        trx2.create(&JwtPolicy { config_json: r#"{"roles":{},"collections":{}}"#.into(), public_key_pem: "fake-pem".into() }).await;
+        trx2.create(&JwtVerificationKey { public_key_pem: "fake-pem".into() }).await;
 
     assert!(root_result.is_ok(), "Root must be able to write to the jwtpolicy collection");
     trx2.commit().await?;
@@ -177,12 +181,13 @@ async fn test_nouser_can_read_jwtpolicy_but_not_other_collections() -> anyhow::R
 
     let nouser = JwtContext::NoUser;
 
-    let jwtpolicy = CollectionId::from("jwtpolicy");
-    assert!(agent.can_access_collection(&nouser, &jwtpolicy).is_ok(), "NoUser must be able to access jwtpolicy for bootstrap");
+    let models = common::policy_models(&agent, &["jwtagent_verification_key", "post", "user", "comment", "tag", "secret_stuff"]);
+    let jwtpolicy = models.id("jwtagent_verification_key");
+    assert!(agent.can_access_model(&nouser, &jwtpolicy).is_ok(), "NoUser must be able to access jwtpolicy for bootstrap");
 
     for name in &["post", "user", "comment", "tag", "secret_stuff"] {
-        let col = CollectionId::from(*name);
-        assert!(agent.can_access_collection(&nouser, &col).is_err(), "NoUser must not be able to access the {} collection", name);
+        let col = models.id(name);
+        assert!(agent.can_access_model(&nouser, &col).is_err(), "NoUser must not be able to access the {} collection", name);
     }
 
     Ok(())

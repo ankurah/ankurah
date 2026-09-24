@@ -18,7 +18,7 @@ mod common;
 use ankurah::core::property::backend::{lww::LWWBackend, PropertyBackend};
 use ankurah::core::value::Value;
 use ankurah::proto::{self, Attested};
-use ankurah::{policy::DEFAULT_CONTEXT as c, Model, Node, PermissiveAgent, View};
+use ankurah::{policy::DEFAULT_CONTEXT as c, Node, PermissiveAgent, View};
 use ankurah_connector_local_process::LocalProcessConnection;
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
@@ -42,7 +42,6 @@ fn forge_title_event(f: &Fixture, entity_id: proto::EntityId, parent: proto::Clo
     backend.set(common::resolved_prop(&f.server, Record::descriptor(), "title"), Some(Value::String(title.to_owned())));
     let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
     proto::Event::update(
-        Record::collection(),
         entity_id,
         parent,
         proto::AuthorId::Unknown,
@@ -57,12 +56,9 @@ fn forge_genesis_claiming(f: &Fixture, entity_id: proto::EntityId, title: &str) 
     let backend = LWWBackend::new();
     backend.set(common::resolved_prop(&f.server, Record::descriptor(), "title"), Some(Value::String(title.to_owned())));
     let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
-    let mut event = proto::Event::genesis(
-        Record::collection(),
-        None,
-        proto::AuthorId::Unknown,
-        proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)])),
-    );
+    let mut operations = proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)]));
+    operations.push(proto::Operation::Membership(proto::Membership::Add(f.model)));
+    let mut event = proto::Event::genesis(None, proto::AuthorId::Unknown, operations);
     event.entity_id = entity_id;
     event
 }
@@ -70,7 +66,6 @@ fn forge_genesis_claiming(f: &Fixture, entity_id: proto::EntityId, title: &str) 
 fn event_only_item(event: proto::Event) -> proto::SubscriptionUpdateItem {
     proto::SubscriptionUpdateItem {
         entity_id: event.entity_id,
-        collection: event.collection.clone(),
         content: proto::UpdateContent::EventOnly(vec![Attested::opt(event, None).into()]),
         predicate_relevance: vec![],
     }
@@ -81,7 +76,6 @@ fn event_only_item(event: proto::Event) -> proto::SubscriptionUpdateItem {
 fn event_only_multi(entity_id: proto::EntityId, events: Vec<proto::Event>) -> proto::SubscriptionUpdateItem {
     proto::SubscriptionUpdateItem {
         entity_id,
-        collection: Record::collection(),
         content: proto::UpdateContent::EventOnly(events.into_iter().map(|e| Attested::opt(e, None).into()).collect()),
         predicate_relevance: vec![],
     }
@@ -106,6 +100,7 @@ struct Fixture {
     client: Node<SledStorageEngine, PermissiveAgent>,
     ctx_s: ankurah::Context,
     ctx_c: ankurah::Context,
+    model: proto::ModelId,
     _conn: LocalProcessConnection<SledStorageEngine, PermissiveAgent, SledStorageEngine, PermissiveAgent>,
     _relay: ankurah::LiveQuery<RecordView>,
 }
@@ -115,13 +110,13 @@ async fn fixture() -> Result<Fixture> {
     server.system.create().await?;
     let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     let _conn = LocalProcessConnection::new(&client, &server).await?;
-    client.system.wait_system_ready().await.unwrap();
-    let ctx_s = server.context(c)?;
-    let ctx_c = client.context(c)?;
+    let ctx_s = server.context_async(c).await?;
+    let ctx_c = client.context_async(c).await?;
     // A live subscription establishes the relay context apply_updates requires
     // for this peer; held for the test's duration.
     let _relay = ctx_c.query_wait::<RecordView>("title = 'no-such-title'").await?;
-    Ok(Fixture { server, client, ctx_s, ctx_c, _conn, _relay })
+    let model = ctx_c.resolve_model_id::<Record>().await?;
+    Ok(Fixture { server, client, ctx_s, ctx_c, model, _conn, _relay })
 }
 
 /// Create a Record on the server and materialize it on the client, returning
@@ -139,9 +134,8 @@ async fn seed_record(f: &Fixture, title: &str, artist: &str) -> Result<(proto::E
     Ok((id, view))
 }
 
-async fn committed_event_ids(ctx: &ankurah::Context, id: proto::EntityId) -> Result<Vec<proto::EventId>> {
-    let collection = ctx.collection(&Record::collection()).await?;
-    Ok(collection.dump_entity_events(id).await?.iter().map(|e| e.payload.id()).collect())
+async fn committed_event_ids(node: &Node<SledStorageEngine, PermissiveAgent>, id: proto::EntityId) -> Result<Vec<proto::EventId>> {
+    Ok(node.storage.dump_entity_events(id).await?.iter().map(|e| e.payload.id()).collect())
 }
 
 // ===========================================================================
@@ -223,14 +217,15 @@ async fn malformed_clock_identity_is_order_independent_end_to_end() -> Result<()
         backend.set(common::resolved_prop(&f.server, Record::descriptor(), "artist"), Some(Value::String("c-artist".to_owned())));
         let ops = backend.to_operations().unwrap().expect("ops");
         proto::Event::update(
-            Record::collection(),
             rec_id,
             head0.clone(),
             proto::AuthorId::Unknown,
             proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)])),
         )
     };
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, vec![ev_b.clone(), ev_c.clone()])])).await?;
+    f.client
+        .handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, vec![ev_b.clone(), ev_c.clone()])]))
+        .await?;
 
     // The head is now the antichain {ev_b, ev_c}. Take one merge event and
     // re-parent a copy of it on the same two ids in the opposite order;
@@ -279,7 +274,9 @@ async fn forged_dangling_parent_is_contained() -> Result<()> {
     let id_forged = ev_b_forged.id();
 
     // handle_message returns Ok; the per-item failure rides the ack path.
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(ev_a), event_only_item(ev_b_forged)])).await?;
+    f.client
+        .handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(ev_a), event_only_item(ev_b_forged)]))
+        .await?;
 
     // A applied; B is unchanged, its head did not move, the forged event is not
     // committed, and B's real state survives.
@@ -287,8 +284,8 @@ async fn forged_dangling_parent_is_contained() -> Result<()> {
     assert_eq!(view_b.title().unwrap(), "b0", "forged event with a dangling parent must not apply");
     let b_head = view_b.entity().head();
     assert!(!b_head.contains(&id_forged), "forged event must not enter B's head");
-    assert!(committed_event_ids(&f.ctx_c, a_id).await?.contains(&id_ev_a), "A's valid event is committed");
-    assert!(!committed_event_ids(&f.ctx_c, b_id).await?.contains(&id_forged), "forged event must not be committed");
+    assert!(committed_event_ids(&f.client, a_id).await?.contains(&id_ev_a), "A's valid event is committed");
+    assert!(!committed_event_ids(&f.client, b_id).await?.contains(&id_forged), "forged event must not be committed");
     Ok(())
 }
 
@@ -312,14 +309,11 @@ async fn forged_extra_genesis_head_does_not_trigger_wholesale_adoption() -> Resu
         let backend = LWWBackend::new();
         backend.set(common::resolved_prop(&f.server, Record::descriptor(), "artist"), Some(Value::String("foreign-x".to_owned())));
         let ops = backend.to_operations().unwrap().expect("ops");
+        let mut operations = proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)]));
+        operations.push(proto::Operation::Membership(proto::Membership::Add(f.model)));
         // A genesis claiming an existing entity's id: structurally invalid
         // now that a genesis names whatever entity its own content derives.
-        let mut event = proto::Event::genesis(
-            Record::collection(),
-            None,
-            proto::AuthorId::Unknown,
-            proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)])),
-        );
+        let mut event = proto::Event::genesis(None, proto::AuthorId::Unknown, operations);
         event.entity_id = rec_id;
         event
     };
@@ -371,7 +365,6 @@ fn declared_cycle_is_unconstructible_content_addressing() {
         backend.set(title_prop, Some(Value::String(title.to_owned())));
         let ops = backend.to_operations().unwrap().expect("ops");
         proto::Event::update(
-            Record::collection(),
             entity,
             parent,
             proto::AuthorId::Unknown,
@@ -463,7 +456,9 @@ async fn replay_flood_is_idempotent() -> Result<()> {
     }
     // And the same event redelivered inside a multi-event batch alongside
     // itself (duplicate within one item), out of order.
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, vec![ev.clone(), ev.clone()])])).await?;
+    f.client
+        .handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, vec![ev.clone(), ev.clone()])]))
+        .await?;
 
     assert_eq!(view.title().unwrap(), "t1", "state reflects exactly one application");
     let head = view.entity().head();
@@ -491,7 +486,7 @@ async fn forged_second_genesis_rejected_on_durable_node() -> Result<()> {
     let f = fixture().await?;
     // Create on the durable server and record its committed genesis.
     let (rec_id, _view) = seed_record(&f, "t0", "a0").await?;
-    let before = committed_event_ids(&f.ctx_s, rec_id).await?;
+    let before = committed_event_ids(&f.server, rec_id).await?;
 
     // Forge a DISTINCT second genesis claiming the same entity id and deliver
     // it to the SERVER attributed to the client peer.
@@ -502,7 +497,7 @@ async fn forged_second_genesis_rejected_on_durable_node() -> Result<()> {
 
     // The durable node rejected it (Disjoint): the committed event set is
     // unchanged and the alt genesis is not present.
-    let after = committed_event_ids(&f.ctx_s, rec_id).await?;
+    let after = committed_event_ids(&f.server, rec_id).await?;
     assert_eq!(after.len(), before.len(), "durable node must not commit a second genesis");
     assert!(!after.contains(&alt_id), "the forged genesis must not be committed on the durable node");
     let server_view = f.ctx_s.get::<RecordView>(rec_id).await?;
@@ -531,7 +526,7 @@ async fn forged_second_genesis_rejected_on_ephemeral_node() -> Result<()> {
     let head_after = view.entity().head();
     assert!(!head_after.contains(&alt_id), "forged genesis must not enter the ephemeral head");
     assert_eq!(head_after.as_slice(), head_before.as_slice(), "head unchanged by the rejected second genesis");
-    assert!(!committed_event_ids(&f.ctx_c, rec_id).await?.contains(&alt_id), "forged genesis is not committed");
+    assert!(!committed_event_ids(&f.client, rec_id).await?.contains(&alt_id), "forged genesis is not committed");
     Ok(())
 }
 
@@ -549,7 +544,9 @@ async fn phantom_entity_is_evicted_on_failed_apply() -> Result<()> {
     // Non-creation event (non-empty parent) for an entity the client never saw.
     let ev_unknown = forge_title_event(&f, unknown_id, proto::Clock::from(vec![proto::EventId::from_bytes([7u8; 32])]), "ghost");
 
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(ev_a), event_only_item(ev_unknown)])).await?;
+    f.client
+        .handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(ev_a), event_only_item(ev_unknown)]))
+        .await?;
 
     assert_eq!(view_a.title().unwrap(), "a1", "sibling valid item applies");
     // The phantom empty-head resident was evicted: get() forces a retrieval
@@ -557,7 +554,7 @@ async fn phantom_entity_is_evicted_on_failed_apply() -> Result<()> {
     // empty-state view.
     let phantom = f.ctx_c.get::<RecordView>(unknown_id).await;
     assert!(phantom.is_err(), "phantom empty-head resident must be evicted, got {phantom:?}");
-    assert!(committed_event_ids(&f.ctx_c, unknown_id).await?.is_empty(), "nothing durable for the unknown entity");
+    assert!(committed_event_ids(&f.client, unknown_id).await?.is_empty(), "nothing durable for the unknown entity");
     Ok(())
 }
 
@@ -594,12 +591,12 @@ async fn oversized_event_batch_is_rejected() -> Result<()> {
         events.push(ev);
     }
 
-    let before = committed_event_ids(&f.ctx_c, rec_id).await?.len();
+    let before = committed_event_ids(&f.client, rec_id).await?.len();
     // handle_message returns Ok regardless (error rides the ack path); the
     // observable expectation once #246 lands is that NOTHING from an oversized
     // batch is committed. Today many events commit, so this assertion fails.
     f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, events)])).await?;
-    let after = committed_event_ids(&f.ctx_c, rec_id).await?.len();
+    let after = committed_event_ids(&f.client, rec_id).await?.len();
 
     assert_eq!(after, before, "an oversized batch must be rejected wholesale, committing nothing (G-3, #246)");
     Ok(())

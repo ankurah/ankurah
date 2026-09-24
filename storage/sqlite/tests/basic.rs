@@ -49,7 +49,7 @@ async fn test_sqlite_update_entity() -> Result<()> {
     // Create an album
     let album: AlbumView = {
         let trx = ctx.begin();
-        let album = trx.create(&Album { name: "Original Name".to_string(), year: "2020".to_string() }).await?.read();
+        let album = trx.create(&Album { name: "Original Name".to_string(), year: "2020".to_string() }).await?.read()?;
         trx.commit().await?;
         album
     };
@@ -80,7 +80,7 @@ async fn test_sqlite_state_change_detection() -> Result<()> {
     // Create an album
     let album: AlbumView = {
         let trx = ctx.begin();
-        let album = trx.create(&Album { name: "Test Album".to_string(), year: "2020".to_string() }).await?.read();
+        let album = trx.create(&Album { name: "Test Album".to_string(), year: "2020".to_string() }).await?.read()?;
         trx.commit().await?;
         album
     };
@@ -109,8 +109,8 @@ async fn test_sqlite_multiple_updates() -> Result<()> {
     // Create multiple albums
     let (album1, album2) = {
         let trx = ctx.begin();
-        let album1 = trx.create(&Album { name: "Album 1".to_string(), year: "2020".to_string() }).await?.read();
-        let album2 = trx.create(&Album { name: "Album 2".to_string(), year: "2021".to_string() }).await?.read();
+        let album1 = trx.create(&Album { name: "Album 1".to_string(), year: "2020".to_string() }).await?.read()?;
+        let album2 = trx.create(&Album { name: "Album 2".to_string(), year: "2021".to_string() }).await?.read()?;
         trx.commit().await?;
         (album1, album2)
     };

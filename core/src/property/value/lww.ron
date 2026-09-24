@@ -12,8 +12,8 @@ BackendConfig(
     },
     values: [
         ValueConfig(
-            type_pattern: "LWW(?:<(.+)>)?",
-            fully_qualified_type: "{PREFIX}::property::value::LWW<{T}>",
+            type_pattern: "LWW(?:Mut)?(?:<(.+)>)?",
+            fully_qualified_type: "{PREFIX}::property::value::LWWMut<{T}>",
             accepts: ".*",
             generic_params: ["T"],
             materialized_pattern: "LWW{T}",

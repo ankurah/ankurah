@@ -1,6 +1,5 @@
 mod entity;
 mod event_getter;
-mod membership;
 mod proxy;
 mod set;
 pub(crate) mod state;

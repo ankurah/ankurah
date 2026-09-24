@@ -57,7 +57,14 @@ impl<R: View> Deref for ResultSet<R> {
 }
 
 impl<R: View> ResultSet<R> {
-    pub fn by_id(&self, id: &proto::EntityId) -> Option<R> { self.0.by_id(id).map(|e| R::from_entity(e)) }
+    pub fn by_id(&self, id: &proto::EntityId) -> Option<R> { self.0.by_id(id).map(member_view) }
+}
+
+/// View an entity from a typed result set or its change notifications.
+pub(crate) fn member_view<R: View>(entity: Entity) -> R {
+    // Only core builds typed result sets (`map` and `wrap` are crate-private), each from a query on R's own model:
+    // resolving that query bound the model, its predicate admits only members, and memberships are never removed.
+    R::from_entity(entity).expect("typed result sets hold only members of their bound model")
 }
 
 #[derive(Debug)]
@@ -105,7 +112,7 @@ impl<'a, E: AbstractEntity> ResultSetWrite<'a, E> {
     /// Add an entity to the result set
     pub fn add(&mut self, entity: E) -> bool {
         let guard = self.guard.as_mut().expect("write guard already dropped");
-        let id = *entity.id();
+        let id = entity.id();
         if guard.index.contains_key(&id) {
             return false; // Already present
         }
@@ -122,11 +129,11 @@ impl<'a, E: AbstractEntity> ResultSetWrite<'a, E> {
                 match (&existing.sort_key, &entry.sort_key) {
                     (Some(existing_key), Some(entry_key)) => {
                         // Both have sort keys - compare keys first, then entity ID for tie-breaking
-                        existing_key.cmp(entry_key).then_with(|| existing.entity.id().cmp(entry.entity.id()))
+                        existing_key.cmp(entry_key).then_with(|| existing.entity.id().cmp(&entry.entity.id()))
                     }
                     (Some(_), None) => std::cmp::Ordering::Less, // Keyed entries sort before unkeyed
                     (None, Some(_)) => std::cmp::Ordering::Greater, // Unkeyed entries sort after keyed
-                    (None, None) => existing.entity.id().cmp(entry.entity.id()), // Both unkeyed - sort by entity ID
+                    (None, None) => existing.entity.id().cmp(&entry.entity.id()), // Both unkeyed - sort by entity ID
                 }
             })
             .unwrap_or_else(|pos| pos);
@@ -136,7 +143,7 @@ impl<'a, E: AbstractEntity> ResultSetWrite<'a, E> {
 
         // Fix indices for all entries after the insertion point
         for i in (pos + 1)..guard.order.len() {
-            let entry_id = *guard.order[i].entity.id();
+            let entry_id = guard.order[i].entity.id();
             guard.index.insert(entry_id, i);
         }
 
@@ -145,7 +152,7 @@ impl<'a, E: AbstractEntity> ResultSetWrite<'a, E> {
             if guard.order.len() > limit {
                 // Remove the last entry (beyond limit)
                 if let Some(removed_entry) = guard.order.pop() {
-                    let removed_id = *removed_entry.entity.id();
+                    let removed_id = removed_entry.entity.id();
                     guard.index.remove(&removed_id);
                     // TODO: Return the evicted entity ID for the caller to handle
                 }
@@ -186,7 +193,7 @@ impl<'a, E: AbstractEntity> ResultSetWrite<'a, E> {
     /// Returns an iterator over (entity_id, entity) pairs
     pub fn iter_entities(&self) -> impl Iterator<Item = (proto::EntityId, &E)> {
         let guard = self.guard.as_ref().expect("write guard already dropped");
-        guard.order.iter().map(|entry| (*entry.entity.id(), &entry.entity))
+        guard.order.iter().map(|entry| (entry.entity.id(), &entry.entity))
     }
 
     /// Mark all entities as dirty for re-evaluation
@@ -222,7 +229,7 @@ impl<'a, E: AbstractEntity> ResultSetWrite<'a, E> {
                 } else {
                     // Entity should be removed
                     let removed_entry = guard.order.remove(i);
-                    let removed_id = *removed_entry.entity.id();
+                    let removed_id = removed_entry.entity.id();
                     guard.index.remove(&removed_id);
                     removed_ids.push(removed_id);
                     // Don't increment i since we removed an element
@@ -234,7 +241,7 @@ impl<'a, E: AbstractEntity> ResultSetWrite<'a, E> {
 
         // Fix indices after removals (no re-sorting needed)
         guard.index.clear();
-        let index_updates: Vec<_> = guard.order.iter().enumerate().map(|(i, entry)| (*entry.entity.id(), i)).collect();
+        let index_updates: Vec<_> = guard.order.iter().enumerate().map(|(i, entry)| (entry.entity.id(), i)).collect();
         for (id, i) in index_updates {
             guard.index.insert(id, i);
         }
@@ -276,17 +283,17 @@ impl<'a, E: AbstractEntity> ResultSetWrite<'a, E> {
                         // Equal ORDER BY keys tie-break on entity id:
                         // deterministic across nodes, semantically arbitrary
                         // (ids are content hashes).
-                        key_a.cmp(key_b).then_with(|| a.entity.id().cmp(b.entity.id()))
+                        key_a.cmp(key_b).then_with(|| a.entity.id().cmp(&b.entity.id()))
                     }
                     (Some(_), None) => std::cmp::Ordering::Less,
                     (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => a.entity.id().cmp(b.entity.id()),
+                    (None, None) => a.entity.id().cmp(&b.entity.id()),
                 }
             });
         } else {
             // No ORDER BY: entity-id order -- deterministic across nodes,
             // semantically arbitrary (ids are content hashes).
-            guard.order.sort_by(|a, b| a.entity.id().cmp(b.entity.id()));
+            guard.order.sort_by(|a, b| a.entity.id().cmp(&b.entity.id()));
         }
 
         // Apply limit if configured
@@ -297,7 +304,7 @@ impl<'a, E: AbstractEntity> ResultSetWrite<'a, E> {
         }
 
         // Rebuild index
-        let index_updates: Vec<_> = guard.order.iter().enumerate().map(|(i, entry)| (*entry.entity.id(), i)).collect();
+        let index_updates: Vec<_> = guard.order.iter().enumerate().map(|(i, entry)| (entry.entity.id(), i)).collect();
         for (id, i) in index_updates {
             guard.index.insert(id, i);
         }
@@ -353,7 +360,7 @@ impl<'a, E: AbstractEntity> ResultSetRead<'a, E> {
     /// Iterate over all entities
     /// Returns an iterator over (entity_id, entity) pairs
     pub fn iter_entities(&self) -> impl Iterator<Item = (proto::EntityId, &E)> {
-        self.guard.order.iter().map(|entity| (*entity.entity.id(), &entity.entity))
+        self.guard.order.iter().map(|entity| (entity.entity.id(), &entity.entity))
     }
 
     /// Get the number of entities
@@ -369,7 +376,7 @@ impl<E: AbstractEntity> EntityResultSet<E> {
         let mut order = Vec::new();
 
         for (i, entity) in entities.into_iter().enumerate() {
-            index.insert(*entity.id(), i);
+            index.insert(entity.id(), i);
             order.push(EntityEntry { entity, sort_key: None, dirty: false });
         }
 
@@ -383,7 +390,7 @@ impl<E: AbstractEntity> EntityResultSet<E> {
     pub fn single(entity: E) -> Self {
         let entry = EntityEntry { entity: entity.clone(), sort_key: None, dirty: false };
         let mut state = State { order: vec![entry], index: HashMap::new(), key_spec: None, limit: None, gap_dirty: false };
-        state.index.insert(*entity.id(), 0);
+        state.index.insert(entity.id(), 0);
         Self(Arc::new(Inner { state: std::sync::Mutex::new(state), loaded: AtomicBool::new(false), broadcast: Broadcast::new() }))
     }
 
@@ -422,7 +429,7 @@ impl<E: AbstractEntity> EntityResultSet<E> {
         // TODO make a signal trait for tracked keys
         CurrentObserver::track(&self);
         let st = self.0.state.lock().unwrap();
-        let keys: Vec<proto::EntityId> = st.order.iter().map(|e| *e.entity.id()).collect();
+        let keys: Vec<proto::EntityId> = st.order.iter().map(|e| e.entity.id()).collect();
         EntityResultSetKeyIterator::new(keys)
     }
 
@@ -497,19 +504,19 @@ impl<E: AbstractEntity> EntityResultSet<E> {
                 (Some(key_a), Some(key_b)) => {
                     // First compare by sort key
                     match key_a.cmp(key_b) {
-                        std::cmp::Ordering::Equal => a.entity.id().cmp(b.entity.id()), // Tie-break by entity ID
+                        std::cmp::Ordering::Equal => a.entity.id().cmp(&b.entity.id()), // Tie-break by entity ID
                         other => other,
                     }
                 }
                 (Some(_), None) => std::cmp::Ordering::Greater,
                 (None, Some(_)) => std::cmp::Ordering::Less,
-                (None, None) => a.entity.id().cmp(b.entity.id()),
+                (None, None) => a.entity.id().cmp(&b.entity.id()),
             }
         });
 
         // Rebuild index after sorting
         st.index.clear();
-        let index_updates: Vec<_> = st.order.iter().enumerate().map(|(i, entry)| (*entry.entity.id(), i)).collect();
+        let index_updates: Vec<_> = st.order.iter().enumerate().map(|(i, entry)| (entry.entity.id(), i)).collect();
         for (id, i) in index_updates {
             st.index.insert(id, i);
         }
@@ -538,7 +545,7 @@ impl<E: AbstractEntity> EntityResultSet<E> {
 
                 // Rebuild index after truncation
                 st.index.clear();
-                let index_updates: Vec<_> = st.order.iter().enumerate().map(|(i, entry)| (*entry.entity.id(), i)).collect();
+                let index_updates: Vec<_> = st.order.iter().enumerate().map(|(i, entry)| (entry.entity.id(), i)).collect();
                 for (id, i) in index_updates {
                     st.index.insert(id, i);
                 }
@@ -589,7 +596,7 @@ mod tests {
     impl AbstractEntity for TestEntity {
         fn memberships(&self) -> std::collections::BTreeSet<proto::ModelId> { Default::default() }
 
-        fn id(&self) -> &proto::EntityId { &self.id }
+        fn id(&self) -> proto::EntityId { self.id }
 
         fn value(&self, property: &PropertyId) -> Option<Value> {
             if *property == PropertyId::Id {
@@ -801,7 +808,7 @@ mod tests {
 fn fix_from<E: AbstractEntity>(st: &mut State<E>, start: usize) {
     // Recompute indices for shifted tail
     for i in start..st.order.len() {
-        let id = *st.order[i].entity.id();
+        let id = st.order[i].entity.id();
         st.index.insert(id, i);
     }
 }
@@ -836,12 +843,12 @@ impl<E: View + Clone + 'static> Get<Vec<E>> for ResultSet<E> {
     fn get(&self) -> Vec<E> {
         use ankurah_signals::CurrentObserver;
         CurrentObserver::track(self);
-        self.0 .0.state.lock().unwrap().order.iter().map(|e| E::from_entity(e.entity.clone())).collect()
+        self.0 .0.state.lock().unwrap().order.iter().map(|e| member_view(e.entity.clone())).collect()
     }
 }
 
 impl<E: View + Clone + 'static> Peek<Vec<E>> for ResultSet<E> {
-    fn peek(&self) -> Vec<E> { self.0 .0.state.lock().unwrap().order.iter().map(|e| E::from_entity(e.entity.clone())).collect() }
+    fn peek(&self) -> Vec<E> { self.0 .0.state.lock().unwrap().order.iter().map(|e| member_view(e.entity.clone())).collect() }
 }
 
 impl<E: View + Clone + 'static> Subscribe<Vec<E>> for ResultSet<E> {
@@ -850,7 +857,7 @@ impl<E: View + Clone + 'static> Subscribe<Vec<E>> for ResultSet<E> {
         let listener = listener.into_subscribe_listener();
         let me = self.clone();
         let guard: ankurah_signals::broadcast::ListenerGuard<()> = self.0 .0.broadcast.reference().listen(move |_| {
-            let entities: Vec<E> = me.0 .0.state.lock().unwrap().order.iter().map(|e| E::from_entity(e.entity.clone())).collect();
+            let entities: Vec<E> = me.0 .0.state.lock().unwrap().order.iter().map(|e| member_view(e.entity.clone())).collect();
             listener(entities);
         });
         SubscriptionGuard::new(ListenerGuard::new(guard))
@@ -878,7 +885,7 @@ impl<E: View + Clone> Iterator for ResultSetIter<E> {
         let state = self.resultset.0 .0.state.lock().unwrap();
         if self.index < state.order.len() {
             let entity = &state.order[self.index].entity;
-            let view = E::from_entity(entity.clone());
+            let view = member_view(entity.clone());
             self.index += 1;
             Some(view)
         } else {
@@ -927,5 +934,5 @@ impl Iterator for EntityResultSetKeyIterator {
 
 // Specific implementation for EntityResultSet<Entity> to provide map method
 impl EntityResultSet<Entity> {
-    pub fn wrap<R: View>(&self) -> ResultSet<R> { ResultSet(self.clone(), std::marker::PhantomData) }
+    pub(crate) fn wrap<R: View>(&self) -> ResultSet<R> { ResultSet(self.clone(), std::marker::PhantomData) }
 }

@@ -1,9 +1,9 @@
 use crate::internal::prelude::*;
 use std::{marker::PhantomData, sync::Arc};
 
-use crate::entity::ProvisionalEntity;
+use crate::entity::LocalTrxEntity;
 use crate::property::backend::{PropertyBackend, YrsBackend};
-use crate::property::traits::{FromActiveType, FromEntity, InitializeWith, PropertyError};
+use crate::property::traits::{FromLocalTrxEntity, InitializeWith, PropertyError};
 use crate::property::PropertyId;
 
 use ankurah_signals::{
@@ -12,124 +12,94 @@ use ankurah_signals::{
 };
 
 #[derive(Debug, Clone)]
-pub struct YrsString<Projected> {
+pub struct YrsStringMut<Projected> {
     // ideally we'd store the yrs::TransactionMut in the Transaction as an ExtendableOp or something like that
     // and call encode_update_v2 on it when we're ready to commit
     // but its got a lifetime of 'doc and that requires some refactoring
     pub property: PropertyId,
     pub backend: Arc<YrsBackend>,
-    pub entity: Entity,
+    pub entity: LocalTrxEntity,
     phantom: PhantomData<Projected>,
-    // TODO: Pretty sure we need to store a clone of the Entity here so it's kept alive for the lifetime of the YrsString
-    // Previously this didn't matter because the YrsString wasn't clonable. Followup question on this:
+    // TODO: Pretty sure we need to store a clone of the Entity here so it's kept alive for the lifetime of the YrsStringMut
+    // Previously this didn't matter because the YrsStringMut wasn't clonable. Followup question on this:
     // Will we need to update ListenerGuard to hold a dyn Any to achieve this?
-    // I ask because the ListenerGuard/SubscriptionGuard will be the only thing directly held by the user, not the YrsString/LWW
-    // OR - will the closure be enough to hold the Entity or the YrsString/LWW alive? Ideally we wouldn't overthink this and just
+    // I ask because the ListenerGuard/SubscriptionGuard will be the only thing directly held by the user, not the YrsStringMut/LWWMut
+    // OR - will the closure be enough to hold the Entity or the YrsStringMut/LWWMut alive? Ideally we wouldn't overthink this and just
     // use TDD to determine it imperically.
 }
 
 // Starting with basic string type operations
-impl<Projected> YrsString<Projected> {
-    pub fn new(property: PropertyId, backend: Arc<YrsBackend>, entity: Entity) -> Self {
+impl<Projected> YrsStringMut<Projected> {
+    pub fn new(property: PropertyId, backend: Arc<YrsBackend>, entity: LocalTrxEntity) -> Self {
         Self { property, backend, entity, phantom: PhantomData }
     }
     pub fn value(&self) -> Option<String> { self.backend.get_string(&self.property) }
     pub fn insert(&self, index: u32, value: &str) -> Result<(), MutationError> {
-        if !self.entity.is_writable() {
-            return Err(PropertyError::TransactionClosed.into());
-        }
-        self.backend.insert(&self.property, index, value)
+        self.entity.check_open()?;
+        self.backend.insert(&self.property, index, value)?;
+        self.entity.notify_changed();
+        Ok(())
     }
     pub fn delete(&self, index: u32, length: u32) -> Result<(), MutationError> {
-        if !self.entity.is_writable() {
-            return Err(PropertyError::TransactionClosed.into());
-        }
-        self.backend.delete(&self.property, index, length)
+        self.entity.check_open()?;
+        self.backend.delete(&self.property, index, length)?;
+        self.entity.notify_changed();
+        Ok(())
     }
     pub fn overwrite(&self, start: u32, length: u32, value: &str) -> Result<(), MutationError> {
-        if !self.entity.is_writable() {
-            return Err(PropertyError::TransactionClosed.into());
-        }
+        self.entity.check_open()?;
         self.backend.delete(&self.property, start, length)?;
         self.backend.insert(&self.property, start, value)?;
+        self.entity.notify_changed();
         Ok(())
     }
     pub fn replace(&self, value: &str) -> Result<(), MutationError> {
-        if !self.entity.is_writable() {
-            return Err(PropertyError::TransactionClosed.into());
-        }
+        self.entity.check_open()?;
         self.backend.delete(&self.property, 0, self.value().unwrap_or_default().len() as u32)?;
         self.backend.insert(&self.property, 0, value)?;
+        self.entity.notify_changed();
         Ok(())
     }
 }
 
-impl<Projected> crate::property::traits::ActiveType for YrsString<Projected> {
+impl<Projected> crate::property::traits::ActiveType for YrsStringMut<Projected> {
     const BACKEND: &'static str = "yrs";
 }
 
-impl<Projected> FromEntity for YrsString<Projected> {
-    fn from_entity(property: PropertyId, entity: &Entity) -> Self {
+impl<Projected> FromLocalTrxEntity for YrsStringMut<Projected> {
+    fn from_local_entity(property: PropertyId, entity: &LocalTrxEntity) -> Result<Self, PropertyError> {
+        let backend = entity.get_backend::<YrsBackend>()?;
+        Ok(Self::new(property, backend, entity.clone()))
+    }
+}
+
+impl<Projected> InitializeWith<String> for YrsStringMut<Projected> {
+    fn initialize_with(entity: &LocalTrxEntity, property: PropertyId, value: &String) {
         let backend = entity.get_backend::<YrsBackend>().expect("YrsBackend should exist");
-        Self::new(property, backend, entity.clone())
-    }
-}
-
-impl<Projected, S: FromActiveType<YrsString<Projected>>> FromActiveType<YrsString<Projected>> for Option<S> {
-    fn from_active(active: YrsString<Projected>) -> Result<Self, PropertyError> {
-        match S::from_active(active) {
-            Ok(value) => Ok(Some(value)),
-            Err(PropertyError::Missing) => Ok(None),
-            Err(err) => Err(err),
-        }
-    }
-}
-
-impl<Projected> FromActiveType<YrsString<Projected>> for String {
-    fn from_active(active: YrsString<Projected>) -> Result<Self, PropertyError> {
-        match active.value() {
-            Some(value) => Ok(value),
-            None => Err(PropertyError::Missing),
-        }
-    }
-}
-
-impl<'a, Projected> FromActiveType<YrsString<Projected>> for std::borrow::Cow<'a, str> {
-    fn from_active(active: YrsString<Projected>) -> Result<Self, PropertyError> {
-        match active.value() {
-            Some(value) => Ok(Self::from(value)),
-            None => Err(PropertyError::Missing),
-        }
-    }
-}
-
-impl<Projected> InitializeWith<String> for YrsString<Projected> {
-    fn initialize_with(provisional: &mut ProvisionalEntity, property: PropertyId, value: &String) {
-        let backend = provisional.get_backend::<YrsBackend>().expect("YrsBackend should exist");
         backend.insert(&property, 0, value).unwrap();
     }
 }
 
-impl<Projected> InitializeWith<Option<String>> for YrsString<Projected> {
-    fn initialize_with(provisional: &mut ProvisionalEntity, property: PropertyId, value: &Option<String>) {
+impl<Projected> InitializeWith<Option<String>> for YrsStringMut<Projected> {
+    fn initialize_with(entity: &LocalTrxEntity, property: PropertyId, value: &Option<String>) {
         // The backend is created even when there is no value: whether a
         // model's yrs document exists at all is part of what the genesis
         // preimage commits to.
-        let backend = provisional.get_backend::<YrsBackend>().expect("YrsBackend should exist");
+        let backend = entity.get_backend::<YrsBackend>().expect("YrsBackend should exist");
         if let Some(value) = value {
             backend.insert(&property, 0, value).unwrap();
         }
     }
 }
 
-impl<Projected> ankurah_signals::Signal for YrsString<Projected> {
+impl<Projected> ankurah_signals::Signal for YrsStringMut<Projected> {
     fn listen(&self, listener: Listener) -> ListenerGuard { self.backend.listen_field(&self.property, listener) }
 
     // TODO: determine if we should cache this or not.
     fn broadcast_id(&self) -> ankurah_signals::broadcast::BroadcastId { self.backend.field_broadcast_id(&self.property) }
 }
 
-impl<Projected> ankurah_signals::Subscribe<String> for YrsString<Projected>
+impl<Projected> ankurah_signals::Subscribe<String> for YrsStringMut<Projected>
 where Projected: Clone + Send + Sync + 'static
 {
     fn subscribe<F>(&self, listener: F) -> ankurah_signals::SubscriptionGuard
@@ -148,7 +118,7 @@ where Projected: Clone + Send + Sync + 'static
 
 #[cfg(any(feature = "wasm", feature = "uniffi"))]
 pub mod ffi {
-    //! FFI wrapper types for YrsString backend (WASM and UniFFI)
+    //! FFI wrapper types for YrsStringMut (WASM and UniFFI)
     use super::*;
     #[cfg(feature = "wasm")]
     use ::wasm_bindgen::prelude::*;

@@ -78,7 +78,7 @@ fn changes_from_update<R: View>(resultset: ResultSet<R>, reactor_update: Reactor
     let mut changes = Vec::new();
 
     for item in reactor_update.items {
-        let view = R::from_entity(item.entity);
+        let view = crate::resultset::member_view(item.entity);
 
         if let Some((_, membership_change)) = item.predicate_relevance.first() {
             match membership_change {

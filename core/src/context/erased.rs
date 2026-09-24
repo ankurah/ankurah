@@ -19,9 +19,6 @@ pub(crate) trait DynContextInner: LocalEntitySource {
     fn subscribe_remote_query(&self, query: &EntityLiveQuery, selection: Selection<Resolved>, version: u32)
         -> Result<bool, RetrievalError>;
 
-    /// Return the reactor used to activate livequeries, or `None` if the node has been dropped.
-    fn reactor(&self) -> Option<crate::reactor::Reactor>;
-
     /// Access this context's descriptor binding and selection resolution.
     fn schema_resolver(&self) -> &dyn SchemaResolver;
 
@@ -31,9 +28,6 @@ pub(crate) trait DynContextInner: LocalEntitySource {
     /// This node's system root entity id, which every non-root genesis binds
     /// into its own id. `None` before the node has created or adopted a system.
     fn system_id(&self) -> Option<proto::EntityId>;
-
-    /// Create an entity from its genesis event, returning its transaction-local state.
-    fn create_entity(&self, genesis: &Event, trx_alive: Arc<AtomicBool>) -> Result<Entity, MutationError>;
 
     /// Check whether this context may write the entity.
     fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied>;

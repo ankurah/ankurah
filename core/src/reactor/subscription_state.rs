@@ -1,7 +1,7 @@
 use crate::internal::prelude::*;
 use crate::reactor::{
     AbstractEntity, CandidateChanges, ChangeNotification, MembershipChange, ReactorSubscriptionId, ReactorUpdate, ReactorUpdateItem,
-    WatcherChange,
+    LocalEntitySource, WatcherChange,
 };
 use crate::selection::filter::{evaluate_predicate, Filterable};
 use ankql::ast::Resolved;
@@ -23,14 +23,22 @@ impl<E: Clone, Ev> UpdateItemAccumulator<E> for Vec<ReactorUpdateItem<E, Ev>> {
     fn push_initial(&mut self, entity: &E, query_id: proto::QueryId) {
         Vec::push(
             self,
-            ReactorUpdateItem { entity: entity.clone(), events: vec![], predicate_relevance: vec![(query_id, MembershipChange::Initial)] },
+            ReactorUpdateItem {
+                entity: entity.clone(),
+                events: vec![],
+                predicate_relevance: vec![(query_id, MembershipChange::Initial)],
+            },
         );
     }
 
     fn push_remove(&mut self, entity: &E, query_id: proto::QueryId) {
         Vec::push(
             self,
-            ReactorUpdateItem { entity: entity.clone(), events: vec![], predicate_relevance: vec![(query_id, MembershipChange::Remove)] },
+            ReactorUpdateItem {
+                entity: entity.clone(),
+                events: vec![],
+                predicate_relevance: vec![(query_id, MembershipChange::Remove)],
+            },
         );
     }
 }
@@ -43,7 +51,6 @@ impl<E> UpdateItemAccumulator<E> for () {
 type GapFillData<E> = (
     proto::QueryId,
     std::sync::Arc<dyn crate::reactor::fetch_gap::GapFetcher<E>>,
-    proto::CollectionId,
     ankql::ast::Selection<Resolved>,
     EntityResultSet<E>,
     Option<E>,
@@ -51,9 +58,8 @@ type GapFillData<E> = (
 );
 
 /// State for a single predicate within a subscription
-pub(super) struct QueryState<E: AbstractEntity + Filterable> {
+pub(super) struct QueryState<E: AbstractEntity + Filterable + Send + 'static> {
     // TODO make this a clonable PredicateSubscription and store it instead of the channel?
-    pub(crate) collection_id: proto::CollectionId,
     /// None before initialization.
     pub(crate) selection: Option<ankql::ast::Selection<Resolved>>,
     pub(crate) gap_fetcher: std::sync::Arc<dyn crate::reactor::fetch_gap::GapFetcher<E>>, // For filling gaps when LIMIT is applied
@@ -65,30 +71,30 @@ pub(super) struct QueryState<E: AbstractEntity + Filterable> {
 
 // We would call this ReactorSubscription, but that name is reserved for the public API
 // so instead we will call it Subscription and just scope it to the reactor package
-pub(super) struct Subscription<E: AbstractEntity + Filterable, Ev>(Arc<Inner<E, Ev>>);
+pub(super) struct Subscription<E: AbstractEntity + Filterable + Send + 'static, Ev>(Arc<Inner<E, Ev>>);
 
-impl<E: AbstractEntity + Filterable, Ev> Clone for Subscription<E, Ev> {
+impl<E: AbstractEntity + Filterable + Send + 'static, Ev> Clone for Subscription<E, Ev> {
     fn clone(&self) -> Self { Self(self.0.clone()) }
 }
 
-impl<E: AbstractEntity + Filterable, Ev> std::ops::Deref for Subscription<E, Ev> {
+impl<E: AbstractEntity + Filterable + Send + 'static, Ev> std::ops::Deref for Subscription<E, Ev> {
     type Target = Inner<E, Ev>;
     fn deref(&self) -> &Self::Target { &self.0 }
 }
 
-impl<E: AbstractEntity + Filterable, Ev> Subscription<E, Ev> {
+impl<E: AbstractEntity + Filterable + Send + 'static, Ev> Subscription<E, Ev> {
     /// Get the subscription ID
     pub fn id(&self) -> ReactorSubscriptionId { self.0.id }
 }
 
-pub(super) struct Inner<E: AbstractEntity + Filterable, Ev> {
+pub(super) struct Inner<E: AbstractEntity + Filterable + Send + 'static, Ev> {
     pub(super) id: ReactorSubscriptionId,
     state: std::sync::Mutex<State<E, Ev>>,
     watcher_set: Arc<std::sync::Mutex<crate::reactor::watcherset::WatcherSet>>,
 }
-struct State<E: AbstractEntity + Filterable, Ev> {
+struct State<E: AbstractEntity + Filterable + Send + 'static, Ev> {
     pub(crate) queries: HashMap<proto::QueryId, QueryState<E>>,
-    /// The set of entities that are subscribed to by this subscription
+    /// Explicit entity subscriptions, independent of the matches in `queries`.
     pub(crate) entity_subscriptions: HashSet<proto::EntityId>,
     // not sure if we actually need this
     pub(crate) entities: HashMap<proto::EntityId, E>,
@@ -168,15 +174,15 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
     pub fn ensure_query_registered(
         &self,
         query_id: proto::QueryId,
-        collection_id: proto::CollectionId,
         resultset: EntityResultSet<E>,
         gap_fetcher: std::sync::Arc<dyn crate::reactor::fetch_gap::GapFetcher<E>>,
+        source: Arc<dyn LocalEntitySource<E>>,
     ) -> bool {
         let mut state = self.state.lock().unwrap();
         if state.queries.contains_key(&query_id) {
             return false;
         }
-        state.queries.insert(query_id, QueryState { collection_id, selection: None, gap_fetcher, paused: false, resultset, version: 0 });
+        state.queries.insert(query_id, QueryState { selection: None, gap_fetcher, source, paused: false, resultset, version: 0 });
         true
     }
 
@@ -186,7 +192,6 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
     pub fn update_predicate_watchers(
         &self,
         query_id: proto::QueryId,
-        collection_id: &proto::CollectionId,
         old_predicate: Option<&ankql::ast::Predicate<Resolved>>,
         new_predicate: &ankql::ast::Predicate<Resolved>,
     ) {
@@ -194,9 +199,9 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         let watcher_id = (self.id, query_id);
 
         if let Some(old_pred) = old_predicate {
-            watcher_set.recurse_predicate_watchers(collection_id, old_pred, watcher_id, crate::reactor::watcherset::WatcherOp::Remove);
+            watcher_set.recurse_predicate_watchers(old_pred, watcher_id, crate::reactor::watcherset::WatcherOp::Remove);
         }
-        watcher_set.recurse_predicate_watchers(collection_id, new_predicate, watcher_id, crate::reactor::watcherset::WatcherOp::Add);
+        watcher_set.recurse_predicate_watchers(new_predicate, watcher_id, crate::reactor::watcherset::WatcherOp::Add);
     }
 
     /// Add entity watchers for entities in a query's resultset
@@ -208,7 +213,6 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
     pub fn update_query<A: UpdateItemAccumulator<E>>(
         &self,
         query_id: proto::QueryId,
-        collection_id: proto::CollectionId,
         selection: ankql::ast::Selection<Resolved>,
         included_entities: Vec<E>,
         version: u32,

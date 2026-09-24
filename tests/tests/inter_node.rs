@@ -93,7 +93,7 @@ async fn server_edits_subscription() -> Result<()> {
         let snuffy = trx.create(&Pet { name: "Snuffy".to_string(), age: "2".to_string() }).await?;
         let jasper = trx.create(&Pet { name: "Jasper".to_string(), age: "6".to_string() }).await?;
 
-        let read = (rex.read(), snuffy.read(), jasper.read());
+        let read = (rex.read()?, snuffy.read()?, jasper.read()?);
         trx.commit().await?;
         read
     };
@@ -105,6 +105,10 @@ async fn server_edits_subscription() -> Result<()> {
     let cached_watcher = TestWatcher::changeset();
     let pred = "name = 'Rex' OR (age > 2 and age < 5)";
 
+    // `query` is deliberately synchronous and therefore requires prior schema
+    // admission; retain its pre-initialization cache behavior after doing that
+    // asynchronous work explicitly.
+    client.resolve_model_id::<Pet>().await?;
     let cached_query = client.query::<PetView>(pred)?; // Cached behavior: subscribe before remote initialization
     assert_eq!(cached_query.ids(), vec![]); // didn't wait for initialization AND the client cache is empty, so should be empty for two reasons
     let _cached_handle = cached_query.subscribe(&cached_watcher);
@@ -202,7 +206,7 @@ async fn subscription_empty_events_from_noop_delta() -> Result<()> {
         })
         .await
     };
-    client.system.wait_system_ready().await.unwrap();
+    client.wait_ready().await?;
 
     let server_ctx = server.context(c)?;
     let client_ctx = client.context(c)?;
@@ -211,7 +215,7 @@ async fn subscription_empty_events_from_noop_delta() -> Result<()> {
     let rex = {
         let trx = server_ctx.begin();
         let rex = trx.create(&Pet { name: "Rex".to_string(), age: "1".to_string() }).await?;
-        let read = rex.read();
+        let read = rex.read()?;
         trx.commit().await?;
         read
     };
@@ -220,6 +224,7 @@ async fn subscription_empty_events_from_noop_delta() -> Result<()> {
 
     // Query B: start (do NOT wait). Its known_matches are empty (Rex not local
     // yet) so the server returns a StateSnapshot for Rex - which the gate parks.
+    client_ctx.resolve_model_id::<Pet>().await?;
     let query_b = client_ctx.query::<PetView>(nocache(pred)?)?;
     *gate_query_id.lock().unwrap() = Some(query_b.query_id());
 
@@ -270,8 +275,8 @@ async fn test_client_server_propagation() -> Result<()> {
     let _conn_a = LocalProcessConnection::new(&client_a, &server).await?;
     let _conn_b = LocalProcessConnection::new(&client_b, &server).await?;
 
-    client_a.system.wait_system_ready().await.unwrap();
-    client_b.system.wait_system_ready().await.unwrap();
+    client_a.wait_ready().await?;
+    client_b.wait_ready().await?;
 
     let server = server.context(c)?;
     let client_a = client_a.context(c)?;
@@ -314,10 +319,10 @@ async fn test_client_server_subscription_propagation() -> Result<()> {
     let _conn_a = LocalProcessConnection::new(&client_a, &server).await?;
     let _conn_b = LocalProcessConnection::new(&client_b, &server).await?;
 
-    let server = server.context(c)?;
+    let server = server.context_async(c).await?;
 
-    client_a.system.wait_system_ready().await.unwrap();
-    client_b.system.wait_system_ready().await.unwrap();
+    client_a.wait_ready().await?;
+    client_b.wait_ready().await?;
     let client_a = client_a.context(c)?;
     let client_b = client_b.context(c)?;
 
@@ -354,7 +359,7 @@ async fn test_view_field_subscriptions_with_query_lifecycle() -> Result<()> {
     server.system.create().await?;
     let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     let _conn = LocalProcessConnection::new(&client, &server).await?;
-    client.system.wait_system_ready().await.unwrap();
+    client.wait_ready().await?;
 
     let server = server.context(c)?;
     let client = client.context(c)?;
@@ -375,6 +380,7 @@ async fn test_view_field_subscriptions_with_query_lifecycle() -> Result<()> {
 
     // Also exercise cached behavior by subscribing to a LiveQuery that uses cached initialization
     let cached_watcher = TestWatcher::changeset();
+    client.resolve_model_id::<Pet>().await?;
     let _cached_guard = client.query::<PetView>("name = 'Buddy'")?.subscribe(&cached_watcher);
 
     // This is the actual livequery, which has a predicate subscription with the server because the client node is ephemeral.
@@ -486,7 +492,7 @@ async fn test_lineage_event_bridge() -> Result<()> {
 
     // Connect the nodes
     let _conn = LocalProcessConnection::new(&client, &server).await?;
-    client.system.wait_system_ready().await.unwrap();
+    client.wait_ready().await?;
 
     let server = server.context(c)?;
     let client = client.context(c)?;
@@ -538,8 +544,8 @@ async fn test_event_bridge_uneven_diamond() -> Result<()> {
 
     let _conn_w = LocalProcessConnection::new(&writer, &server).await?;
     let _conn_r = LocalProcessConnection::new(&receiver, &server).await?;
-    writer.system.wait_system_ready().await.unwrap();
-    receiver.system.wait_system_ready().await.unwrap();
+    writer.wait_ready().await?;
+    receiver.wait_ready().await?;
 
     let ctx_s = server.context(c)?;
     let ctx_w = writer.context(c)?;
@@ -600,8 +606,7 @@ async fn test_event_bridge_uneven_diamond() -> Result<()> {
 
     // Prove the bridge (not a state snapshot fallback) served this fetch: the
     // receiver committed the bridge events to its local storage.
-    let collection_r = ctx_r.collection(&Pet::collection()).await?;
-    let events_r = collection_r.dump_entity_events(pet_id).await?;
+    let events_r = receiver.storage.dump_entity_events(pet_id).await?;
     let ids: std::collections::HashSet<_> = events_r.iter().map(|e| e.payload.id()).collect();
     for (label, id) in [("X", &id_x), ("P", &id_p), ("H1", &id_h1), ("H2", &id_h2)] {
         assert!(ids.contains(id), "receiver must hold bridge event {label}");
@@ -619,7 +624,7 @@ async fn test_fetch_view_field_subscriptions_behavior() -> Result<()> {
 
     // Connect the nodes
     let _conn = LocalProcessConnection::new(&client, &server).await?;
-    client.system.wait_system_ready().await.unwrap();
+    client.wait_ready().await?;
 
     let server = server.context(c)?;
     let client = client.context(c)?;
