@@ -57,12 +57,15 @@ impl<R: View> Deref for ResultSet<R> {
 }
 
 impl<R: View> ResultSet<R> {
+    /// Type the result set of a query on R's model; `member_view` relies on it holding only R's members.
+    pub(crate) fn of_query(resultset: EntityResultSet) -> Self { Self(resultset, std::marker::PhantomData) }
+
     pub fn by_id(&self, id: &proto::EntityId) -> Option<R> { self.0.by_id(id).map(member_view) }
 }
 
 /// View an entity from a typed result set or its change notifications.
 pub(crate) fn member_view<R: View>(entity: Entity) -> R {
-    // Only core builds typed result sets (`map` and `wrap` are crate-private), each from a query on R's own model:
+    // Typed result sets come only from core (crate-private `EntityLiveQuery::map`, `ResultSet::of_query`), each from a query on R's model:
     // resolving that query bound the model, its predicate admits only members, and memberships are never removed.
     R::from_entity(entity).expect("typed result sets hold only members of their bound model")
 }
@@ -930,9 +933,4 @@ impl Iterator for EntityResultSetKeyIterator {
             None
         }
     }
-}
-
-// Specific implementation for EntityResultSet<Entity> to provide map method
-impl EntityResultSet<Entity> {
-    pub(crate) fn wrap<R: View>(&self) -> ResultSet<R> { ResultSet(self.clone(), std::marker::PhantomData) }
 }

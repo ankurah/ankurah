@@ -48,7 +48,7 @@ impl<R: View> LiveQuery<R> {
     /// Wait for initialization or its terminal error.
     pub async fn wait_initialized(&self) -> Result<(), RetrievalError> { self.0.wait_initialized().await }
 
-    pub fn resultset(&self) -> ResultSet<R> { self.0 .0.resultset.wrap::<R>() }
+    pub fn resultset(&self) -> ResultSet<R> { ResultSet::of_query(self.0 .0.resultset.clone()) }
 
     pub fn loaded(&self) -> bool { self.0 .0.resultset.is_loaded() }
 
@@ -70,12 +70,12 @@ impl<R: View + Clone + 'static> Get<Vec<R>> for LiveQuery<R> {
     fn get(&self) -> Vec<R> {
         use ankurah_signals::CurrentObserver;
         CurrentObserver::track(&self);
-        self.0 .0.resultset.wrap::<R>().peek()
+        self.resultset().peek()
     }
 }
 
 impl<R: View + Clone + 'static> Peek<Vec<R>> for LiveQuery<R> {
-    fn peek(&self) -> Vec<R> { self.0 .0.resultset.wrap().peek() }
+    fn peek(&self) -> Vec<R> { self.resultset().peek() }
 }
 
 impl<R: View> Subscribe<ChangeSet<R>> for LiveQuery<R>
@@ -87,7 +87,7 @@ where R: Clone + Send + Sync + 'static
 
         let me = self.clone();
         self.0 .0.subscription.subscribe(move |reactor_update: ReactorUpdate| {
-            let changeset: ChangeSet<R> = changes_from_update(me.0 .0.resultset.wrap::<R>(), reactor_update);
+            let changeset: ChangeSet<R> = changes_from_update(me.resultset(), reactor_update);
             listener(changeset);
         })
     }

@@ -163,7 +163,7 @@ pub fn wasm_changeset_wrapper(changeset_name: &Ident, view_name: &Ident, results
         impl #changeset_name {
             #[wasm_bindgen(getter)]
             pub fn resultset(&self) -> #resultset_name {
-                #resultset_name(self.0.resultset.wrap())
+                #resultset_name(self.0.resultset.clone())
             }
 
             /// Items from the initial query load (before subscription was active)
