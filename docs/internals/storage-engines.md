@@ -140,6 +140,7 @@ are:
 |---|---|---|---|
 | PostgreSQL | `_ankurah_entity` and `_ankurah_event` | `_ankurah_entity_model` | One projected table per model; `_ankurah_postgres_model_map` assigns table names and `_ankurah_postgres_column_map` assigns columns |
 | SQLite | `_ankurah_entity` and `_ankurah_event` | `_ankurah_entity_model` | One projected table per model; `_ankurah_sqlite_model_map` assigns table names and `_ankurah_sqlite_column_map` assigns columns |
+| SQLite (node) | The same tables, over `node:sqlite` | The same | The same maps, so a file opens under either engine |
 | IndexedDB | `entities` and `events` object stores | `entity_models` object store | Shared `materializations` store scoped by durable materialization name; `model_registrations` and `property_columns` store assignments |
 | sled | Shared `entities` and `events` trees | `_ankurah_sled_entity_models` tree | One reversible identity-named tree per model; `_ankurah_sled_property_map` assigns numeric property slots |
 
@@ -147,6 +148,18 @@ PostgreSQL serializes competing entity inserts and updates with transaction
 advisory locks before comparing heads. SQLite uses `BEGIN IMMEDIATE`. Sled uses
 one multi-tree transaction. IndexedDB uses one read-write transaction spanning
 the canonical entity, association, and materialization stores.
+
+`ankurah-storage-sqlite-node` (`storage/sqlite-node`) is the same layout on
+Node.js's built-in `node:sqlite` module (Node 22.5 or later), for the WASM
+build of a node running inside Node.js, where IndexedDB does not exist (a VS
+Code extension host, an Electron main process, a JavaScript CLI). It reaches
+SQLite through a `DatabaseSync`-shaped object (`prepare`, `exec`, statements
+with `run` and `all`), so a `better-sqlite3` database works as well, and it
+runs synchronously on the host's single thread. Its tables, materializations,
+pushdown query and exact-head commit mirror the native SQLite engine statement
+for statement, so a database file is interchangeable between the two; the two
+engines are kept in step by hand, and the node crate runs the native crate's
+integration suite (including the shared membership cases) under Node.
 
 ## Query execution
 

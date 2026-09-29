@@ -496,6 +496,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "ankurah-storage-sqlite-node"
+version = "0.10.0"
+dependencies = [
+ "ankql",
+ "ankurah",
+ "ankurah-core",
+ "ankurah-core-types",
+ "ankurah-proto",
+ "ankurah-storage-common",
+ "anyhow",
+ "async-trait",
+ "bincode",
+ "futures-util",
+ "getrandom 0.3.4",
+ "js-sys",
+ "send_wrapper 0.6.0",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+ "tokio",
+ "tracing",
+ "wasm-bindgen",
+ "wasm-bindgen-test",
+]
+
+[[package]]
 name = "ankurah-tests"
 version = "0.10.0"
 dependencies = [

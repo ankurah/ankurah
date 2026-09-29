@@ -87,6 +87,12 @@ jobs:
       - name: Add wasm32 target
         run: rustup target add wasm32-unknown-unknown
 
+      # ankurah-storage-sqlite-node binds `node:sqlite`, built into Node.js 22.5 and later.
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
       - name: Run WASM tests
         run: ./scripts/run-wasm-tests.sh
         env:
