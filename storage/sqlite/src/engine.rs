@@ -39,11 +39,21 @@ impl SqliteStorageEngine {
         Ok(Self::new(pool))
     }
 
-    /// Open an in-memory SQLite database (for testing)
+    /// Open an in-memory SQLite database (for testing, and for ephemeral nodes)
     pub async fn open_in_memory() -> anyhow::Result<Self> {
         let manager = SqliteConnectionManager::memory();
-        // For in-memory, we use a single connection to keep the database alive
-        let pool = bb8::Pool::builder().max_size(1).build(manager).await?;
+        // An in-memory database lives exactly as long as the connection that opened it, so the
+        // pool holds a single connection and never lets it go. bb8's defaults would close it after
+        // ten minutes idle or thirty minutes old (or on a failed checkout test), and the next
+        // checkout would open a new, empty database under a node whose resident entities still
+        // carry the old one's heads.
+        let pool = bb8::Pool::builder()
+            .max_size(1)
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .test_on_check_out(false)
+            .build(manager)
+            .await?;
         Ok(Self::new(pool))
     }
 
