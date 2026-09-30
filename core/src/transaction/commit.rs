@@ -79,9 +79,15 @@ where
         }
         let publication = node.commit_publication_lock.lock().await;
         storage_trx.commit().await?.committed()?;
+        // Tests widen the window between the storage commit and the publication, in which a read
+        // may load what was committed (tests/tests/publication_window.rs).
+        #[cfg(feature = "test-helpers")]
+        if let Some(ms) = std::env::var("ANKURAH_TEST_PUBLICATION_DELAY_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        }
         let mut changes = Vec::new();
         for (entity, fork) in forks {
-            let change = fork.commit(&node.entities, &event_getter).await?;
+            let change = fork.commit_publishing(&node.entities, &event_getter, node.durable).await?;
             entity.committed(change.entity())?;
             if !change.events().is_empty() { changes.push(change); }
         }
