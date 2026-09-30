@@ -102,6 +102,40 @@ impl RemoteTrxEntity {
     }
 
     /// Publish admitted events after storage commits, then redirect any views to the resident entity.
+    /// On a durable node (`durable`), an event the resident has applied already is published too:
+    /// between the storage commit and this publication a read (a fetch, a new query's initial
+    /// rows) may have loaded the committed state into the resident, telling the reactor nothing,
+    /// and nothing else can have applied it, since the storage commit expected the fork's base.
+    /// Dropped, such an event would reach no live query. An ephemeral node keeps publishing only
+    /// what it applies here: an echo of its own commit from its durable peer, applied and
+    /// published by the applier, may have come first.
+    pub(crate) async fn commit_publishing<G>(
+        self,
+        entities: &WeakEntitySet,
+        getter: &G,
+        durable: bool,
+    ) -> Result<EntityChange, MutationError>
+    where
+        G: GetEvents + Send + Sync,
+    {
+        if !durable {
+            return self.commit(entities, getter).await;
+        }
+        let data = self.0.data();
+        let events = std::mem::take(&mut *data.events.lock().unwrap());
+        let resident = match &*self.0 {
+            RemoteTrxEntityInner::Mut { upstream, .. } => upstream.clone(),
+            RemoteTrxEntityInner::New { id, .. } => entities.publish_new(*id, &data.state)?.1,
+        };
+        for event in &events {
+            // Storage now contains the complete transaction's causal history.
+            resident.state.apply_event(getter, &event.payload).await?;
+        }
+        data.committed(resident.clone());
+        EntityChange::new(Entity::Resident(resident), events)
+    }
+
+    /// Publish admitted events after storage commits, then redirect any views to the resident entity.
     pub(crate) async fn commit<G>(self, entities: &WeakEntitySet, getter: &G) -> Result<EntityChange, MutationError>
     where G: GetEvents + Send + Sync {
         let data = self.0.data();
