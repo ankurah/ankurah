@@ -320,12 +320,14 @@ async fn registration_completes_before_catalog_delivery() -> anyhow::Result<()> 
         loop {
             let all_catalog_held = {
                 let updates = held.lock().unwrap();
-                catalog_ids.iter().all(|id| updates.as_ref().unwrap().iter().any(|message| match message {
-                    proto::NodeMessage::Update(update) => match &update.body {
-                        proto::NodeUpdateBody::SubscriptionUpdate { items } => items.iter().any(|item| item.entity_id == *id),
-                    },
-                    _ => false,
-                }))
+                catalog_ids.iter().all(|id| {
+                    updates.as_ref().unwrap().iter().any(|message| match message {
+                        proto::NodeMessage::Update(update) => match &update.body {
+                            proto::NodeUpdateBody::SubscriptionUpdate { items } => items.iter().any(|item| item.entity_id == *id),
+                        },
+                        _ => false,
+                    })
+                })
             };
             if all_catalog_held {
                 break;

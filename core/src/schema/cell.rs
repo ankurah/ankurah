@@ -41,8 +41,9 @@ impl<T: Copy> PerSystemOnceCell<T> {
     pub fn get(&self, epoch: SystemEpoch) -> Result<T, UninitializedCell> {
         match self {
             Self::Pinned(value) => Ok(*value),
-            Self::PerEpoch(entries) => entries.iter().find(|(e, _)| *e == epoch.0).map(|(_, value)| *value)
-                .ok_or(UninitializedCell { epoch }),
+            Self::PerEpoch(entries) => {
+                entries.iter().find(|(e, _)| *e == epoch.0).map(|(_, value)| *value).ok_or(UninitializedCell { epoch })
+            }
         }
     }
 
@@ -78,7 +79,11 @@ mod tests {
         cell.set(epoch(2), 20);
         assert_eq!(cell.get(epoch(1)), Ok(10));
         assert_eq!(cell.get(epoch(2)), Ok(20));
-        assert_eq!(cell.get(epoch(3)), Err(UninitializedCell { epoch: epoch(3) }), "an unentered epoch misses; it never borrows another epoch's identity");
+        assert_eq!(
+            cell.get(epoch(3)),
+            Err(UninitializedCell { epoch: epoch(3) }),
+            "an unentered epoch misses; it never borrows another epoch's identity"
+        );
     }
 
     #[test]

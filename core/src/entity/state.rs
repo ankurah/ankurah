@@ -1,14 +1,17 @@
 use crate::{
     error::{LineageError, MutationError, RetrievalError, StateError},
     event_dag::{AbstractCausalRelation, DEFAULT_BUDGET},
+    property::backend::{backend_from_string, PropertyBackend},
     retrieval::GetEvents,
     value::Value,
-    property::backend::{backend_from_string, PropertyBackend},
 };
 use ankurah_proto::{Clock, Event, EventId, ModelId, OperationSet, PropertyId, State};
 use ankurah_signals::broadcast::Broadcast;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, RwLock},
+};
 use tracing::{debug, error, warn};
-use std::{collections::{BTreeMap, BTreeSet}, sync::{Arc, RwLock}};
 
 /// Result of applying a state snapshot to an entity.
 pub enum StateApplyResult {
@@ -47,7 +50,11 @@ impl EntityInnerState {
     /// authority for entity-to-model membership, so nothing is filtered
     /// here; admissibility (which operations may be EMITTED today) is a
     /// commit-path concern, not an application one.
-    pub(super) fn apply_operations_from_event(&mut self, operations: &ankurah_proto::OperationSet, event_id: EventId) -> Result<(), MutationError> {
+    pub(super) fn apply_operations_from_event(
+        &mut self,
+        operations: &ankurah_proto::OperationSet,
+        event_id: EventId,
+    ) -> Result<(), MutationError> {
         for operation in operations.iter() {
             match operation {
                 ankurah_proto::Operation::Backend { backend: backend_name, operations } => {
@@ -103,9 +110,7 @@ pub(crate) struct EntityState {
 }
 
 impl EntityState {
-    pub(super) fn new(state: EntityInnerState) -> Self {
-        Self { inner: RwLock::new(state), broadcast: Broadcast::new() }
-    }
+    pub(super) fn new(state: EntityInnerState) -> Self { Self { inner: RwLock::new(state), broadcast: Broadcast::new() } }
 
     /// A state with no history: an entity before its genesis applies.
     pub(crate) fn empty() -> Self { Self::new(EntityInnerState::empty()) }
@@ -123,7 +128,9 @@ impl EntityState {
     /// Add a membership to this working state, reporting whether it is new.
     pub(super) fn add_membership(&self, model: ModelId) -> bool {
         let added = self.inner.write().unwrap().memberships.insert(model);
-        if added { self.broadcast.send(()); }
+        if added {
+            self.broadcast.send(());
+        }
         added
     }
 
@@ -428,5 +435,4 @@ impl EntityState {
         warn!("apply_state retries exhausted while chasing moving head");
         Err(MutationError::TOCTOUAttemptsExhausted)
     }
-
 }

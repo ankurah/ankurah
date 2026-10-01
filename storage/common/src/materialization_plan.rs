@@ -31,8 +31,8 @@ impl<'a> MaterializationPlan<'a> {
         materializations: &BTreeMap<ModelId, BTreeSet<EntityId>>,
         all_entities: impl IntoIterator<Item = EntityId>,
     ) -> Vec<EntityId> {
-        let candidates: BTreeSet<_> = all_entities.into_iter()
-            .chain(materializations.values().flat_map(|ids| ids.iter().copied())).collect();
+        let candidates: BTreeSet<_> =
+            all_entities.into_iter().chain(materializations.values().flat_map(|ids| ids.iter().copied())).collect();
         candidates.into_iter().filter(|id| self.may_match_memberships(|model| materializations[model].contains(id))).collect()
     }
 

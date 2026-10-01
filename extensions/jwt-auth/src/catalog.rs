@@ -1,8 +1,8 @@
 use ankql::ast::{Parsed, Predicate, Resolved};
 use ankurah_core::schema::catalog::CatalogManager;
 use ankurah_core::schema::resolver::{ModelResolver, ResolvedProperty};
-use ankurah_proto::{ModelId, PropertyId};
 use ankurah_core_types::ValueType;
+use ankurah_proto::{ModelId, PropertyId};
 
 /// Catalog lookup during policy authoring, never during enforcement.
 pub trait PolicyCatalog: Send + Sync {

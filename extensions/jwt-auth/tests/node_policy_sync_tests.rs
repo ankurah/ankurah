@@ -1,8 +1,8 @@
 mod common;
 
+use ankurah::signals::Wait;
 use ankurah::Model;
 use ankurah::Node;
-use ankurah::signals::Wait;
 use ankurah_jwt_auth::{JwtAgent, JwtContext};
 use ankurah_storage_sled::SledStorageEngine;
 use common::{blog_config_path, make_claims, sign_token};
@@ -70,7 +70,9 @@ async fn test_ephemeral_receives_policy_via_livequery() -> anyhow::Result<()> {
     let ctx2 = node2.context_async(editor_ctx).await?;
 
     let trx = ctx2.begin();
-    let _post = trx.create(&Post { title: "Synced Policy Post".into(), body: "RBAC works on ephemeral!".into() }).await
+    let _post = trx
+        .create(&Post { title: "Synced Policy Post".into(), body: "RBAC works on ephemeral!".into() })
+        .await
         .map_err(|error| anyhow::anyhow!("post-startup first create: {error:?}"))?;
     trx.commit().await?;
 

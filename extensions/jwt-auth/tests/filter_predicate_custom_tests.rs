@@ -90,8 +90,10 @@ fn test_filter_predicate_missing_claim_denied() {
     let collection = models.id("record");
 
     let result = ContextPolicy::from_credentials(&agent, &ctx).filter_predicate(common::in_model(collection, predicate));
-    assert!(matches!(result, Ok(ankql::ast::Predicate::And(_, grant)) if *grant == ankql::ast::Predicate::False),
-        "a missing custom claim supplies no grant");
+    assert!(
+        matches!(result, Ok(ankql::ast::Predicate::And(_, grant)) if *grant == ankql::ast::Predicate::False),
+        "a missing custom claim supplies no grant"
+    );
 }
 
 /// Multiple scope rules all AND together

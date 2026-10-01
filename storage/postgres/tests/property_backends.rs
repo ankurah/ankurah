@@ -1,9 +1,6 @@
 mod common;
 
-use ankurah::{
-    policy::DEFAULT_CONTEXT as c,
-    Model, Node, PermissiveAgent, Property,
-};
+use ankurah::{policy::DEFAULT_CONTEXT as c, Model, Node, PermissiveAgent, Property};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;

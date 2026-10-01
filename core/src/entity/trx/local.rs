@@ -1,6 +1,11 @@
 use super::TrxEntityData;
 use crate::{
-    entity::{entity::EntityInner, proxy::{ProxyTarget, RolledBackCreation}, state::EntityState, Entity},
+    entity::{
+        entity::EntityInner,
+        proxy::{ProxyTarget, RolledBackCreation},
+        state::EntityState,
+        Entity,
+    },
     error::{MutationError, RetrievalError, StateError},
     property::{backend::PropertyBackend, PropertyError},
     schema::SystemEpoch,
@@ -8,7 +13,10 @@ use crate::{
 use ankurah_proto::{Attested, AuthorId, Clock, EntityId, Event, Membership, ModelId, Operation, OperationSet, State};
 use std::{
     collections::BTreeSet,
-    sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, OnceLock,
+    },
 };
 
 /// Transaction-local property mutations, frozen into events before commit.
@@ -80,12 +88,18 @@ impl LocalTrxEntity {
         self.check_open()?;
         // Holding the staged set keeps event generation from seeing the addition in only one place.
         let mut staged = self.0.staged_memberships.lock().unwrap();
-        if self.0.data.state.add_membership(model) { staged.insert(model); }
+        if self.0.data.state.add_membership(model) {
+            staged.insert(model);
+        }
         Ok(())
     }
 
     pub(crate) fn check_open(&self) -> Result<(), PropertyError> {
-        if self.0.alive.load(Ordering::Acquire) { Ok(()) } else { Err(PropertyError::TransactionClosed) }
+        if self.0.alive.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(PropertyError::TransactionClosed)
+        }
     }
 
     pub(crate) fn notify_changed(&self) { self.0.data.state.broadcast.send(()); }
@@ -98,9 +112,7 @@ impl LocalTrxEntity {
     pub fn to_state(&self) -> Result<State, StateError> { self.0.data.state.to_state() }
 
     /// Read local mutations now, then follow the committed resident entity or rollback outcome.
-    pub fn read(&self) -> Entity {
-        self.0.data.read(ProxyTarget::Local(self.0.clone()), || RolledBackCreation::Local(self.0.clone()))
-    }
+    pub fn read(&self) -> Entity { self.0.data.read(ProxyTarget::Local(self.0.clone()), || RolledBackCreation::Local(self.0.clone())) }
 
     /// Freeze pending mutations for admission and storage; retries reuse these exact events.
     pub(crate) fn prepare_events(&self) -> Result<Vec<Attested<Event>>, MutationError> {
@@ -121,9 +133,7 @@ impl LocalTrxEntity {
         Ok(events.clone())
     }
 
-    pub(crate) fn rollback(&self) {
-        self.0.data.rollback(self.0.upstream(), RolledBackCreation::Local(self.0.clone()));
-    }
+    pub(crate) fn rollback(&self) { self.0.data.rollback(self.0.upstream(), RolledBackCreation::Local(self.0.clone())); }
 
     /// Redirect views after the admitted events have been persisted and published.
     pub(crate) fn committed(&self, entity: &Entity) -> Result<(), PropertyError> {
@@ -143,13 +153,15 @@ impl LocalTrxEntityInner {
         match &self.origin {
             Origin::Mut { upstream } => upstream.id,
             Origin::Pending { genesis, system } => {
-                genesis.get_or_init(|| {
-                    // Cannot fail: Yrs encoding has no error path, and LWW's bincode encoding of `Value`s cannot fail.
-                    let event = Event::genesis(*system, self.author.clone(), self.take_operations().unwrap());
-                    self.data.state.set_head(event.id().into());
-                    self.data.events.lock().unwrap().push(event.clone().into());
-                    event
-                }).entity_id
+                genesis
+                    .get_or_init(|| {
+                        // Cannot fail: Yrs encoding has no error path, and LWW's bincode encoding of `Value`s cannot fail.
+                        let event = Event::genesis(*system, self.author.clone(), self.take_operations().unwrap());
+                        self.data.state.set_head(event.id().into());
+                        self.data.events.lock().unwrap().push(event.clone().into());
+                        event
+                    })
+                    .entity_id
             }
         }
     }

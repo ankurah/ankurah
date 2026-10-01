@@ -2,11 +2,16 @@ mod local;
 mod remote;
 
 pub use local::LocalTrxEntity;
-pub use remote::RemoteTrxEntity;
 pub(super) use local::LocalTrxEntityInner;
+pub use remote::RemoteTrxEntity;
 pub(super) use remote::RemoteTrxEntityInner;
 
-use super::{entity::EntityInner, proxy::{EntityProxy, ProxyTarget, RolledBackCreation}, state::EntityState, Entity};
+use super::{
+    entity::EntityInner,
+    proxy::{EntityProxy, ProxyTarget, RolledBackCreation},
+    state::EntityState,
+    Entity,
+};
 use crate::schema::SystemEpoch;
 use ankurah_proto::{Attested, Event};
 use std::sync::{Arc, Mutex, Weak};
@@ -43,13 +48,13 @@ impl TrxEntityData {
                 entity
             })),
             TrxView::Resident(entity) => Entity::from_resident(entity.clone()),
-            TrxView::RolledBack => Entity::from_proxy(Arc::new(EntityProxy::new(ProxyTarget::RolledBack(rolled_back()), self.system_epoch))),
+            TrxView::RolledBack => {
+                Entity::from_proxy(Arc::new(EntityProxy::new(ProxyTarget::RolledBack(rolled_back()), self.system_epoch)))
+            }
         }
     }
 
-    fn committed(&self, resident: Arc<EntityInner>) {
-        self.finish(TrxView::Resident(resident.clone()), ProxyTarget::Resident(resident));
-    }
+    fn committed(&self, resident: Arc<EntityInner>) { self.finish(TrxView::Resident(resident.clone()), ProxyTarget::Resident(resident)); }
 
     fn rollback(&self, upstream: Option<&Arc<EntityInner>>, creation: RolledBackCreation) {
         match upstream {
@@ -64,6 +69,8 @@ impl TrxEntityData {
         let proxy = proxy.upgrade();
         *view = outcome;
         drop(view);
-        if let Some(proxy) = proxy { proxy.finish(target); }
+        if let Some(proxy) = proxy {
+            proxy.finish(target);
+        }
     }
 }

@@ -106,14 +106,7 @@ impl PolicyAgent for DenySecondAlbumEventAgent {
         Ok(Predicate::True)
     }
 
-    fn check_write(
-        &self,
-        _data: &Self::ContextData,
-        _entity: &Entity,
-        _event: Option<&proto::Event>,
-    ) -> Result<(), AccessDenied> {
-        Ok(())
-    }
+    fn check_write(&self, _data: &Self::ContextData, _entity: &Entity, _event: Option<&proto::Event>) -> Result<(), AccessDenied> { Ok(()) }
 
     fn validate_causal_assertion<SE: StorageEngine>(
         &self,

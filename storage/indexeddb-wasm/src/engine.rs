@@ -23,8 +23,8 @@ use crate::{
 #[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicBool, Ordering};
 
-mod transaction;
 pub(crate) mod query;
+mod transaction;
 pub use transaction::IndexedDbTransaction;
 
 const MODEL_REGISTRATIONS_STORE: &str = "model_registrations";
@@ -48,8 +48,7 @@ async fn registered_materialization_name(db: &Database, model: &ModelId) -> Resu
     let db_connection = db.get_connection().await;
     let key = model_registration_key(model);
     SendWrapper::new(async move {
-        let transaction =
-            db_connection.transaction_with_str(MODEL_REGISTRATIONS_STORE).require("create model registration transaction")?;
+        let transaction = db_connection.transaction_with_str(MODEL_REGISTRATIONS_STORE).require("create model registration transaction")?;
         let store = transaction.object_store(MODEL_REGISTRATIONS_STORE).require("get model registration store")?;
         let request = store.get(&JsValue::from_str(&key)).require("get model registration")?;
         cb_future(&request, "success", "error").await.require("await model registration")?;

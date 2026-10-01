@@ -20,8 +20,8 @@ use crate::{
     model_store::SledModelStore,
 };
 
-mod transaction;
 mod query;
+mod transaction;
 pub use transaction::SledTransaction;
 
 /// Sled implementation of the model-independent storage contract.

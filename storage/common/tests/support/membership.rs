@@ -70,10 +70,14 @@ pub async fn check(engine: &impl StorageEngine) -> anyhow::Result<()> {
     assert_eq!(engine.fetch_states(&limited).await?.iter().map(|state| state.payload.entity_id).collect::<Vec<_>>(), vec![id(3)]);
     let missing = PropertyId::EntityId(id(203));
     let denied = and(member(a), Predicate::Not(Box::new(equals(missing, "blocked"))));
-    assert!(engine.fetch_states(&Selection { predicate: denied.clone(), order_by: None, limit: Some(1) }).await?.is_empty(),
-        "single-materialization retrieval must preserve missing-property semantics");
-    assert!(engine.fetch_states(&Selection { predicate: and(denied, member(b)), order_by: None, limit: Some(1) }).await?.is_empty(),
-        "indexed retrieval must preserve the same missing-property semantics");
+    assert!(
+        engine.fetch_states(&Selection { predicate: denied.clone(), order_by: None, limit: Some(1) }).await?.is_empty(),
+        "single-materialization retrieval must preserve missing-property semantics"
+    );
+    assert!(
+        engine.fetch_states(&Selection { predicate: and(denied, member(b)), order_by: None, limit: Some(1) }).await?.is_empty(),
+        "indexed retrieval must preserve the same missing-property semantics"
+    );
     let before = engine.list_materializations().await?;
     let unknown = member(ModelId::EntityId(id(123)));
     for (predicate, expected) in [
@@ -82,7 +86,8 @@ pub async fn check(engine: &impl StorageEngine) -> anyhow::Result<()> {
         (and(member(a), Predicate::Not(Box::new(unknown.clone()))), vec![1, 3]),
         (Predicate::Not(Box::new(unknown)), vec![1, 2, 3, 4, 5]),
     ] {
-        let mut actual: Vec<_> = engine.fetch_states(&predicate.clone().into()).await?.iter().map(|state| state.payload.entity_id).collect();
+        let mut actual: Vec<_> =
+            engine.fetch_states(&predicate.clone().into()).await?.iter().map(|state| state.payload.entity_id).collect();
         actual.sort();
         assert_eq!(actual, expected.into_iter().map(id).collect::<Vec<_>>(), "{predicate:?}");
     }
@@ -112,7 +117,9 @@ pub async fn check(engine: &impl StorageEngine) -> anyhow::Result<()> {
 
 pub async fn check_id_order(engine: &impl StorageEngine) -> anyhow::Result<()> {
     let [a, b] = [101, 102].map(|byte| ModelId::EntityId(id(byte)));
-    for byte in [1, 208] { write(engine, byte, &[a, b], &[]).await?; }
+    for byte in [1, 208] {
+        write(engine, byte, &[a, b], &[]).await?;
+    }
     for (direction, expected) in [(OrderDirection::Asc, 1), (OrderDirection::Desc, 208)] {
         let selection = Selection {
             predicate: Predicate::And(Box::new(Predicate::MemberOf(a)), Box::new(Predicate::MemberOf(b))),
@@ -172,17 +179,24 @@ pub async fn check_indexed(engine: &impl StorageEngine) -> anyhow::Result<()> {
 
 async fn write(engine: &impl StorageEngine, byte: u8, models: &[ModelId], values: &[(PropertyId, &str)]) -> anyhow::Result<()> {
     let backend = LWWBackend::new();
-    for (property, value) in values { backend.set(*property, Some(Value::String((*value).into()))); }
+    for (property, value) in values {
+        backend.set(*property, Some(Value::String((*value).into())));
+    }
     let event = EventId::from_bytes([byte.wrapping_add(values.len() as u8); 32]);
-    if let Some(operations) = backend.to_operations()? { backend.apply_operations_with_event(&operations, event.clone())?; }
-    let state = Attested::opt(EntityState {
-        entity_id: id(byte),
-        state: State {
-            state_buffers: StateBuffers(BTreeMap::from([("lww".into(), backend.to_state_buffer()?)])),
-            memberships: models.iter().copied().collect(),
-            head: Clock::from(vec![event]),
+    if let Some(operations) = backend.to_operations()? {
+        backend.apply_operations_with_event(&operations, event.clone())?;
+    }
+    let state = Attested::opt(
+        EntityState {
+            entity_id: id(byte),
+            state: State {
+                state_buffers: StateBuffers(BTreeMap::from([("lww".into(), backend.to_state_buffer()?)])),
+                memberships: models.iter().copied().collect(),
+                head: Clock::from(vec![event]),
+            },
         },
-    }, None);
+        None,
+    );
     let expected = match engine.get_state(id(byte)).await {
         Ok(state) => state.payload.state.head,
         Err(ankurah_core::error::RetrievalError::EntityNotFound(_)) => Clock::default(),

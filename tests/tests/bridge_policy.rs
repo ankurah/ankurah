@@ -83,8 +83,10 @@ async fn state_read_hook_filters_fetch_cache_and_live_updates() -> Result<()> {
     agent.deny_read_states.lock().unwrap().insert(hidden);
     assert!(matches!(context.get_cached::<PetView>(hidden).await, Err(RetrievalError::AccessDenied(_))));
     let anonymous = ankurah::Context::new(node.clone(), ankurah::core::session::SessionSet::new());
-    assert!(matches!(anonymous.get_cached::<PetView>(hidden).await, Err(RetrievalError::AccessDenied(_))),
-        "an empty session set must not bypass policy");
+    assert!(
+        matches!(anonymous.get_cached::<PetView>(hidden).await, Err(RetrievalError::AccessDenied(_))),
+        "an empty session set must not bypass policy"
+    );
     assert_eq!(context.fetch::<PetView>("true").await?.iter().map(View::id).collect::<Vec<_>>(), vec![visible]);
 
     let trx = context.begin();
@@ -198,11 +200,20 @@ impl PolicyAgent for BridgePolicyAgent {
         Ok(Predicate::True)
     }
 
-    fn check_reads<C>(&self, _data: &C, states: &[(&proto::EntityId, &proto::State)]) -> std::collections::HashMap<proto::EntityId, AccessDenied>
-    where C: Iterable<Self::ContextData> {
+    fn check_reads<C>(
+        &self,
+        _data: &C,
+        states: &[(&proto::EntityId, &proto::State)],
+    ) -> std::collections::HashMap<proto::EntityId, AccessDenied>
+    where
+        C: Iterable<Self::ContextData>,
+    {
         let denied = self.deny_read_states.lock().unwrap();
-        states.iter().filter(|(id, _)| denied.contains(id))
-            .map(|(id, _)| (**id, AccessDenied::ByPolicy("state read denied by test agent"))).collect()
+        states
+            .iter()
+            .filter(|(id, _)| denied.contains(id))
+            .map(|(id, _)| (**id, AccessDenied::ByPolicy("state read denied by test agent")))
+            .collect()
     }
 
     fn check_read_event<C>(&self, _data: &C, event: &Attested<proto::Event>) -> Result<(), AccessDenied>
@@ -214,14 +225,7 @@ impl PolicyAgent for BridgePolicyAgent {
         Ok(())
     }
 
-    fn check_write(
-        &self,
-        _data: &Self::ContextData,
-        _entity: &Entity,
-        _event: Option<&proto::Event>,
-    ) -> Result<(), AccessDenied> {
-        Ok(())
-    }
+    fn check_write(&self, _data: &Self::ContextData, _entity: &Entity, _event: Option<&proto::Event>) -> Result<(), AccessDenied> { Ok(()) }
 
     fn validate_causal_assertion<SE: StorageEngine>(
         &self,
@@ -468,20 +472,32 @@ async fn get_events_retrieves_identities_across_model_memberships() -> Result<()
     }
 
     agent.deny_read_events.lock().unwrap().insert(pet_event.id());
-    let response = client.request(server.id, &DEFAULT_CONTEXT,
-        proto::NodeRequestBody::GetEvents { event_ids: vec![pet_event.id(), album_event.id()] }).await?;
-    assert!(matches!(response, proto::NodeResponseBody::GetEvents(events)
-        if events.len() == 1 && events[0].payload.id() == album_event.id()), "event-specific denial still applies");
+    let response = client
+        .request(server.id, &DEFAULT_CONTEXT, proto::NodeRequestBody::GetEvents { event_ids: vec![pet_event.id(), album_event.id()] })
+        .await?;
+    assert!(
+        matches!(response, proto::NodeResponseBody::GetEvents(events)
+        if events.len() == 1 && events[0].payload.id() == album_event.id()),
+        "event-specific denial still applies"
+    );
 
     let model = *Pet::descriptor().bind_local(&server.catalog, server.system.system_epoch().unwrap())?.as_entity_id().unwrap();
     let catalog_event = server.storage.dump_entity_events(model).await?.into_iter().next().unwrap();
     agent.deny_read_events.lock().unwrap().insert(catalog_event.payload.id());
     agent.deny_reads.store(true, Ordering::SeqCst);
-    let response = client.request(server.id, &DEFAULT_CONTEXT, proto::NodeRequestBody::GetEvents {
-        event_ids: vec![pet_event.id(), album_event.id(), catalog_event.payload.id(), EventId::from_bytes([0xfe; 32])],
-    }).await?;
-    assert!(matches!(response, proto::NodeResponseBody::GetEvents(events) if events == vec![catalog_event]),
-        "entity denial excludes user events but cannot block catalog bootstrap");
+    let response = client
+        .request(
+            server.id,
+            &DEFAULT_CONTEXT,
+            proto::NodeRequestBody::GetEvents {
+                event_ids: vec![pet_event.id(), album_event.id(), catalog_event.payload.id(), EventId::from_bytes([0xfe; 32])],
+            },
+        )
+        .await?;
+    assert!(
+        matches!(response, proto::NodeResponseBody::GetEvents(events) if events == vec![catalog_event]),
+        "entity denial excludes user events but cannot block catalog bootstrap"
+    );
 
     Ok(())
 }

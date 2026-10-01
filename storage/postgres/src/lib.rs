@@ -34,8 +34,8 @@ mod dump;
 mod materialization;
 mod query;
 mod transaction;
-pub use transaction::PostgresTransaction;
 use materialization::{Materialization, PreparedMaterialization};
+pub use transaction::PostgresTransaction;
 
 /// Default connection pool size for `Postgres::open()`.
 /// Production applications should configure their own pool via `Postgres::new()`.
@@ -434,10 +434,7 @@ impl StorageEngine for Postgres {
         load_states(&snapshot, &[id]).await?.into_iter().next().ok_or(RetrievalError::EntityNotFound(id))
     }
 
-    async fn fetch_states(
-        &self,
-        selection: &ankql::ast::Selection<Resolved>,
-    ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+    async fn fetch_states(&self, selection: &ankql::ast::Selection<Resolved>) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         query::Query::prepare(self, selection).await?.states(self).await
     }
 

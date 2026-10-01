@@ -92,8 +92,7 @@ impl TestStorageTransaction<'_> {
             })
             .collect();
         if self.states.iter().any(|(expected_head, state)| {
-            observed[&state.payload.entity_id].as_ref().map(|state| state.payload.state.head.clone()).unwrap_or_default()
-                != *expected_head
+            observed[&state.payload.entity_id].as_ref().map(|state| state.payload.state.head.clone()).unwrap_or_default() != *expected_head
         }) {
             return Ok(StorageCommitOutcome::Conflict { observed });
         }
@@ -149,7 +148,9 @@ impl StorageEngine for TestStorage {
         for state in states {
             // Membership-only scans do not decode unrelated property backends.
             if let ankql::ast::Predicate::MemberOf(model) = &predicate {
-                if state.payload.state.memberships.contains(model) { matching.push(state); }
+                if state.payload.state.memberships.contains(model) {
+                    matching.push(state);
+                }
                 continue;
             }
             let entity = crate::entity::TemporaryEntity::new(state.payload.entity_id, &state.payload.state)?;

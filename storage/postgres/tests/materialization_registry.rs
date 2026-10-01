@@ -231,7 +231,10 @@ async fn write_refreshes_every_canonical_membership_materialization() -> anyhow:
     assert_eq!(found[0].payload.entity_id, entity);
     let removed = state_for_models(state_with_strings(entity, 3, &[(property_a, "a3")]), [model_a, model_b]);
     commit_canonical_state(&engine, updated.payload.state.head, removed).await?;
-    assert!(engine.fetch_states(&selection.clone().and_member_of(model_b)).await?.is_empty(), "removed properties must not retain old values");
+    assert!(
+        engine.fetch_states(&selection.clone().and_member_of(model_b)).await?.is_empty(),
+        "removed properties must not retain old values"
+    );
 
     Ok(())
 }
@@ -255,14 +258,12 @@ async fn stale_head_rolls_back_the_complete_batch() -> anyhow::Result<()> {
     commit_state(&engine, Clock::default(), model_a, second.clone()).await?;
 
     let mut transaction = engine.transaction();
-    transaction.set_state(
-        &first.payload.state.head,
-        &state_for_model(state_with_strings(first_id, 3, &[(property, "first-new")]), model_b),
-    ).await?;
-    transaction.set_state(
-        &Clock::default(),
-        &state_for_model(state_with_strings(second_id, 4, &[(property, "second-new")]), model_b),
-    ).await?;
+    transaction
+        .set_state(&first.payload.state.head, &state_for_model(state_with_strings(first_id, 3, &[(property, "first-new")]), model_b))
+        .await?;
+    transaction
+        .set_state(&Clock::default(), &state_for_model(state_with_strings(second_id, 4, &[(property, "second-new")]), model_b))
+        .await?;
     let outcome = transaction.commit().await?;
     let StorageCommitOutcome::Conflict { observed } = outcome else {
         anyhow::bail!("one stale expected head must reject the complete batch");
@@ -273,7 +274,10 @@ async fn stale_head_rolls_back_the_complete_batch() -> anyhow::Result<()> {
     assert_eq!(engine.get_state(second_id).await?.payload.state.head, second.payload.state.head);
 
     let all = ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None };
-    assert!(engine.fetch_states(&all.clone().and_member_of(model_b)).await?.is_empty(), "a rejected batch must not publish associations or projections");
+    assert!(
+        engine.fetch_states(&all.clone().and_member_of(model_b)).await?.is_empty(),
+        "a rejected batch must not publish associations or projections"
+    );
     Ok(())
 }
 

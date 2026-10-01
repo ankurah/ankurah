@@ -9,8 +9,8 @@ use crate::internal::prelude::*;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use crate::util::Iterable;
 use crate::storage::StorageTransaction;
+use crate::util::Iterable;
 use ankurah_proto::{Attested, EntityId, Event, EventId};
 use async_trait::async_trait;
 
@@ -141,9 +141,7 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
     C: Iterable<PA::ContextData> + Send + Sync + 'a,
 {
-    pub fn new(node: &'a Node<SE, PA>, cdata: &'a C) -> Self {
-        Self { node, cdata, staging: Arc::new(RwLock::new(HashMap::new())) }
-    }
+    pub fn new(node: &'a Node<SE, PA>, cdata: &'a C) -> Self { Self { node, cdata, staging: Arc::new(RwLock::new(HashMap::new())) } }
 }
 
 /// The event in a peer's `GetEvents` response that actually answers a request
@@ -187,11 +185,7 @@ where
             return Err(RetrievalError::EventNotFound(event_id.clone()));
         };
 
-        match self
-            .node
-            .request(peer_id, self.cdata, proto::NodeRequestBody::GetEvents { event_ids: vec![event_id.clone()] })
-            .await?
-        {
+        match self.node.request(peer_id, self.cdata, proto::NodeRequestBody::GetEvents { event_ids: vec![event_id.clone()] }).await? {
             proto::NodeResponseBody::GetEvents(peer_events) => {
                 // Deliberately not checked here: the policy hook
                 // (validate_received_event) that the other three peer-event

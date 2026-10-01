@@ -145,11 +145,14 @@ fn response_descriptor(body: &proto::NodeResponseBody) -> String {
         }
         proto::NodeResponseBody::Fetch(deltas) => format!("fetch {}", deltas.len()),
         proto::NodeResponseBody::Get(results) => {
-            let mut ss: Vec<String> = results.iter().map(|result| match result {
-                proto::GetResult::Found(state) => state.payload.entity_id.to_base64_short(),
-                proto::GetResult::NotFound(id) => format!("{}:missing", id.to_base64_short()),
-                proto::GetResult::AccessDenied(id) => format!("{}:denied", id.to_base64_short()),
-            }).collect();
+            let mut ss: Vec<String> = results
+                .iter()
+                .map(|result| match result {
+                    proto::GetResult::Found(state) => state.payload.entity_id.to_base64_short(),
+                    proto::GetResult::NotFound(id) => format!("{}:missing", id.to_base64_short()),
+                    proto::GetResult::AccessDenied(id) => format!("{}:denied", id.to_base64_short()),
+                })
+                .collect();
             ss.sort();
             format!("get [{}]", ss.join("+"))
         }

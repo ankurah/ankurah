@@ -69,14 +69,17 @@ impl PolicyModels {
 
 /// Model identities and labels supplied by the catalog in node-backed tests.
 pub fn policy_models(agent: &ankurah_jwt_auth::JwtAgent, labels: &[&str]) -> PolicyModels {
-    let by_label: std::collections::BTreeMap<_, _> =
-        labels.iter().map(|label| ((*label).to_owned(), model(label))).collect();
+    let by_label: std::collections::BTreeMap<_, _> = labels.iter().map(|label| ((*label).to_owned(), model(label))).collect();
     agent.set_catalog(std::sync::Arc::new(FixtureCatalog {
         labels: by_label.iter().map(|(label, id)| (*id, label.clone())).collect(),
         resolve: |predicate| Ok(resolve_fixture(predicate)),
-        property_type: |property| if property == ankql::ast::PropertyId::Id {
-            ankurah_core_types::ValueType::EntityId
-        } else { ankurah_core_types::ValueType::String },
+        property_type: |property| {
+            if property == ankql::ast::PropertyId::Id {
+                ankurah_core_types::ValueType::EntityId
+            } else {
+                ankurah_core_types::ValueType::String
+            }
+        },
     }));
     PolicyModels(by_label)
 }
@@ -99,20 +102,27 @@ pub struct FixtureCatalog {
 }
 
 impl ankurah_jwt_auth::PolicyCatalog for FixtureCatalog {
-    fn property(&self, _model: &ankurah_proto::ModelId, name: &str)
-        -> Result<Option<ankurah_core::schema::resolver::ResolvedProperty>, String> {
+    fn property(
+        &self,
+        _model: &ankurah_proto::ModelId,
+        name: &str,
+    ) -> Result<Option<ankurah_core::schema::resolver::ResolvedProperty>, String> {
         let id = prop(name);
         Ok(Some(ankurah_core::schema::resolver::ResolvedProperty { id, value_type: (self.property_type)(id) }))
     }
-    fn model_labels(&self) -> Vec<(ankurah_proto::ModelId, String)> {
-        self.labels.iter().map(|(id, label)| (*id, label.clone())).collect()
-    }
-    fn property_type(&self, _model: &ankurah_proto::ModelId, property: &ankql::ast::PropertyId)
-        -> Result<ankurah_core_types::ValueType, String> {
+    fn model_labels(&self) -> Vec<(ankurah_proto::ModelId, String)> { self.labels.iter().map(|(id, label)| (*id, label.clone())).collect() }
+    fn property_type(
+        &self,
+        _model: &ankurah_proto::ModelId,
+        property: &ankql::ast::PropertyId,
+    ) -> Result<ankurah_core_types::ValueType, String> {
         Ok((self.property_type)(*property))
     }
-    fn resolve_predicate(&self, _model: &ankurah_proto::ModelId, predicate: Predicate<ankql::ast::Parsed>)
-        -> Result<Predicate<ankql::ast::Resolved>, String> {
+    fn resolve_predicate(
+        &self,
+        _model: &ankurah_proto::ModelId,
+        predicate: Predicate<ankql::ast::Parsed>,
+    ) -> Result<Predicate<ankql::ast::Resolved>, String> {
         (self.resolve)(predicate)
     }
 }

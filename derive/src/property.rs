@@ -8,8 +8,12 @@ pub fn derive_property_impl(input: TokenStream) -> TokenStream {
     let mut no_ffi = false;
     for attr in input.attrs.iter().filter(|attr| attr.path().is_ident("property")) {
         if let Err(error) = attr.parse_nested_meta(|meta| {
-            if !meta.path.is_ident("no_ffi") { return Err(meta.error("expected `no_ffi`")); }
-            if no_ffi { return Err(meta.error("duplicate `no_ffi`")); }
+            if !meta.path.is_ident("no_ffi") {
+                return Err(meta.error("expected `no_ffi`"));
+            }
+            if no_ffi {
+                return Err(meta.error("duplicate `no_ffi`"));
+            }
             no_ffi = true;
             Ok(())
         }) {

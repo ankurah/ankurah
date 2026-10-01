@@ -84,9 +84,12 @@ impl IndexManager {
             if let Some(match_result) = spec.matches(idx.spec()) {
                 // A shared index may omit entities missing a trailing property.
                 // Only total suffix keys are safe when reusing a shorter prefix.
-                if idx.spec().keyparts[spec.keyparts.len()..].iter().any(|part| {
-                    part.key != "id" && part.key != crate::materialization::MATERIALIZATION_COLUMN
-                }) { return None; }
+                if idx.spec().keyparts[spec.keyparts.len()..]
+                    .iter()
+                    .any(|part| part.key != "id" && part.key != crate::materialization::MATERIALIZATION_COLUMN)
+                {
+                    return None;
+                }
                 return Some((*id, idx.clone(), match_result));
             }
             None

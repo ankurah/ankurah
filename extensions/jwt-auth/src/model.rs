@@ -1,6 +1,6 @@
+use ankql::ast::{Predicate, Resolved};
 use ankurah::{Model, Property, Ref};
 use ankurah_core_types::{ModelId, PropertyId};
-use ankql::ast::{Predicate, Resolved};
 use serde::{Deserialize, Serialize};
 
 use crate::ScopeRuleOp;

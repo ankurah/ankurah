@@ -1,5 +1,12 @@
-use super::{entity::{Entity, EntityInner}, state::{EntityInnerState, EntityState, StateApplyResult}};
-use crate::{error::{MutationError, RetrievalError}, retrieval::{GetEvents, GetState}, schema::SystemEpoch};
+use super::{
+    entity::{Entity, EntityInner},
+    state::{EntityInnerState, EntityState, StateApplyResult},
+};
+use crate::{
+    error::{MutationError, RetrievalError},
+    retrieval::{GetEvents, GetState},
+    schema::SystemEpoch,
+};
 use ankurah_proto::{EntityId, State};
 use std::{
     collections::BTreeMap,
@@ -30,15 +37,11 @@ pub struct WeakEntitySet {
 }
 
 impl WeakEntitySet {
-    pub(crate) fn new(system_epoch: SystemEpoch) -> Self {
-        Self { entities: Arc::new(RwLock::new(BTreeMap::new())), system_epoch }
-    }
+    pub(crate) fn new(system_epoch: SystemEpoch) -> Self { Self { entities: Arc::new(RwLock::new(BTreeMap::new())), system_epoch } }
 
     pub(crate) fn system_epoch(&self) -> SystemEpoch { self.system_epoch }
 
-    pub fn get(&self, id: &EntityId) -> Option<Entity> {
-        self.entities.read().unwrap().get(id)?.upgrade().map(Entity::from_resident)
-    }
+    pub fn get(&self, id: &EntityId) -> Option<Entity> { self.entities.read().unwrap().get(id)?.upgrade().map(Entity::from_resident) }
 
     /// Deliberately load invalid state so adversarial tests can exercise phantom-entity rejection.
     #[cfg(feature = "test-helpers")]
@@ -51,7 +54,10 @@ impl WeakEntitySet {
     /// `None` means storage has no state for `id` either. Peers are never asked for the entity, so it may still exist on
     /// one, or in a creation that has not committed.
     pub async fn get_or_retrieve<S, E>(&self, state_getter: &S, event_getter: &E, id: &EntityId) -> Result<Option<Entity>, RetrievalError>
-    where S: GetState + Send + Sync, E: GetEvents + Send + Sync {
+    where
+        S: GetState + Send + Sync,
+        E: GetEvents + Send + Sync,
+    {
         match self.get(id) {
             Some(entity) => Ok(Some(entity)),
             None => match state_getter.get_state(*id).await? {
@@ -64,9 +70,13 @@ impl WeakEntitySet {
     /// Register a persisted creation, transferring its prepared state without decoding it again.
     /// Returns whether the resident entity already existed; only a new one takes the prepared state.
     pub(super) fn publish_new(&self, id: EntityId, state: &EntityState) -> Result<(bool, Arc<EntityInner>), MutationError> {
-        if state.head().is_empty() { return Err(MutationError::PhantomEntity(id)); }
+        if state.head().is_empty() {
+            return Err(MutationError::PhantomEntity(id));
+        }
         let mut entities = self.entities.write().unwrap();
-        if let Some(entity) = entities.get(&id).and_then(Weak::upgrade) { return Ok((true, entity)); }
+        if let Some(entity) = entities.get(&id).and_then(Weak::upgrade) {
+            return Ok((true, entity));
+        }
         let entity = Arc::new(EntityInner { id, state: EntityState::new(state.take()), registry: Registration(self.clone()) });
         entities.insert(id, Arc::downgrade(&entity));
         Ok((false, entity))
@@ -74,7 +84,9 @@ impl WeakEntitySet {
 
     fn get_or_insert_state(&self, id: EntityId, state: &State) -> Result<(bool, Arc<EntityInner>), RetrievalError> {
         let mut entities = self.entities.write().unwrap();
-        if let Some(entity) = entities.get(&id).and_then(Weak::upgrade) { return Ok((true, entity)); }
+        if let Some(entity) = entities.get(&id).and_then(Weak::upgrade) {
+            return Ok((true, entity));
+        }
         let state = EntityState::new(EntityInnerState::from_state(state)?);
         let entity = Arc::new(EntityInner { id, state, registry: Registration(self.clone()) });
         entities.insert(id, Arc::downgrade(&entity));
@@ -84,9 +96,16 @@ impl WeakEntitySet {
     /// Reconstitute or merge committed state without replacing a retained resident entity.
     /// Returns `(changed, entity)`; `changed` is `None` when first loading the entity.
     pub async fn with_state<S, E>(
-        &self, state_getter: &S, event_getter: &E, id: EntityId, state: State,
+        &self,
+        state_getter: &S,
+        event_getter: &E,
+        id: EntityId,
+        state: State,
     ) -> Result<(Option<bool>, Entity), RetrievalError>
-    where S: GetState + Send + Sync, E: GetEvents + Send + Sync {
+    where
+        S: GetState + Send + Sync,
+        E: GetEvents + Send + Sync,
+    {
         let entity = match self.get(&id) {
             Some(entity) => entity.resident()?,
             None => {
@@ -105,11 +124,14 @@ impl WeakEntitySet {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{entity::{LocalTrxEntity, TemporaryEntity}, property::backend::{LWWBackend, PropertyBackend}, value::Value};
+    use crate::{
+        entity::{LocalTrxEntity, TemporaryEntity},
+        property::backend::{LWWBackend, PropertyBackend},
+        value::Value,
+    };
     use ankurah_proto::{AuthorId, EventId, PropertyId};
     use std::sync::atomic::AtomicBool;
 
@@ -122,7 +144,9 @@ mod tests {
             (PropertyId::EntityId(EntityId::from_bytes([2; 32])), Some(Value::String("value".into()))),
             (PropertyId::System(ankurah_proto::SystemProperty::Name), None),
         ]);
-        for (property, value) in &expected { backend.set(*property, value.clone()); }
+        for (property, value) in &expected {
+            backend.set(*property, value.clone());
+        }
         let event_id = EventId::from_bytes([3; 32]);
         backend.apply_operations_with_event(&backend.to_operations()?.unwrap(), event_id.clone())?;
         state.set_head(event_id.into());

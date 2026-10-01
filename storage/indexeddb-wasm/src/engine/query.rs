@@ -44,7 +44,8 @@ pub(crate) async fn fetch(database: &Database, selection: &Selection<Resolved>) 
             }
         }
         select_states(states, selection)
-    }).await
+    })
+    .await
 }
 
 async fn entity_ids(store: &web_sys::IdbObjectStore, prefix: &str) -> Result<BTreeSet<EntityId>, RetrievalError> {
@@ -55,7 +56,9 @@ async fn entity_ids(store: &web_sys::IdbObjectStore, prefix: &str) -> Result<BTr
     let mut ids = BTreeSet::new();
     while let Some(result) = stream.next().await {
         let value = result.require("materialization cursor error")?;
-        if value.is_null() || value.is_undefined() { break; }
+        if value.is_null() || value.is_undefined() {
+            break;
+        }
         let cursor = value.dyn_into::<web_sys::IdbCursor>().require("cast materialization cursor")?;
         let key = cursor.key().require("get materialization key")?.as_string().require("materialization key is string")?;
         let id = key.strip_prefix(prefix).require("materialization key prefix")?;

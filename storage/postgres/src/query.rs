@@ -8,7 +8,11 @@ use ankurah_storage_common::{
 };
 use tokio_postgres::types::ToSql;
 
-use crate::{load_states, read_snapshot, sql_builder::{split_predicate_for_postgres, SqlBuilder}, Postgres, ENTITY_TABLE};
+use crate::{
+    load_states, read_snapshot,
+    sql_builder::{split_predicate_for_postgres, SqlBuilder},
+    Postgres, ENTITY_TABLE,
+};
 
 /// A selection over joined materializations, with any unsupported predicate retained for Rust.
 pub(super) struct Query {
@@ -50,7 +54,10 @@ impl Query {
         builder.selection(&join.lower(&pushed))?;
         let (predicate_sql, params) = builder.build_where_clause();
         Ok(Self {
-            sql: format!(r#"SELECT "id" FROM ({}) AS materialized WHERE {predicate_sql}"#, join.sql(ENTITY_TABLE, &properties, &plan.models)),
+            sql: format!(
+                r#"SELECT "id" FROM ({}) AS materialized WHERE {predicate_sql}"#,
+                join.sql(ENTITY_TABLE, &properties, &plan.models)
+            ),
             params,
             remaining: Selection { predicate: split.remaining_predicate, order_by: None, limit: selection.limit },
         })
@@ -58,8 +65,13 @@ impl Query {
 
     async fn read_ids(&self, snapshot: &tokio_postgres::Transaction<'_>) -> Result<Vec<EntityId>, RetrievalError> {
         let params: Vec<&(dyn ToSql + Sync)> = self.params.iter().map(|value| value.as_ref() as _).collect();
-        snapshot.query(&self.sql, &params).await.map_err(RetrievalError::storage)?
-            .into_iter().map(|row| row.try_get("id").map_err(RetrievalError::storage)).collect()
+        snapshot
+            .query(&self.sql, &params)
+            .await
+            .map_err(RetrievalError::storage)?
+            .into_iter()
+            .map(|row| row.try_get("id").map_err(RetrievalError::storage))
+            .collect()
     }
 
     pub async fn states(self, engine: &Postgres) -> Result<Vec<Attested<EntityState>>, RetrievalError> {

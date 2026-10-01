@@ -13,9 +13,7 @@ use std::{
 use tokio_postgres::{types::ToSql, GenericClient};
 use tracing::{debug, error, info, warn};
 
-use super::{
-    acquire_ddl_lock, error_kind, release_ddl_lock, ErrorKind, Postgres, COLUMN_MAP_TABLE, IDENTIFIER_MAX_BYTES,
-};
+use super::{acquire_ddl_lock, error_kind, release_ddl_lock, ErrorKind, Postgres, COLUMN_MAP_TABLE, IDENTIFIER_MAX_BYTES};
 use crate::value::PGValue;
 
 #[derive(Clone, Debug)]

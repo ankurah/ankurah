@@ -143,14 +143,7 @@ pub struct CrashStorageEngine<E: StorageEngine + CrashFlushable> {
 
 impl<E: StorageEngine + CrashFlushable + 'static> CrashStorageEngine<E> {
     pub fn new(inner: Arc<E>, crash: Option<CrashPoint>) -> Self {
-        Self {
-            inner,
-            state: Arc::new(CrashState {
-                crash,
-                armed: AtomicBool::new(false),
-                commit_counter: AtomicUsize::new(0),
-            }),
-        }
+        Self { inner, state: Arc::new(CrashState { crash, armed: AtomicBool::new(false), commit_counter: AtomicUsize::new(0) }) }
     }
 
     /// Begin counting operations and enable the crash hook. Call this after any
@@ -189,9 +182,7 @@ impl<E: StorageEngine + CrashFlushable + 'static> StorageEngine for CrashStorage
     type Value = ();
     type Transaction<'a> = CrashStorageTransaction<'a, E>;
 
-    fn transaction(&self) -> Self::Transaction<'_> {
-        CrashStorageTransaction { engine: self, inner: self.inner.transaction() }
-    }
+    fn transaction(&self) -> Self::Transaction<'_> { CrashStorageTransaction { engine: self, inner: self.inner.transaction() } }
 
     async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError> { self.inner.get_state(id).await }
 

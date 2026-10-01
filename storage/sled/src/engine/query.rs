@@ -29,13 +29,17 @@ pub(super) async fn fetch(database: Arc<Database>, selection: Selection<Resolved
             }
         }
         select_states(states, &selection)
-    }).await?
+    })
+    .await?
 }
 
 fn entity_ids(tree: &sled::Tree) -> Result<BTreeSet<EntityId>, RetrievalError> {
-    tree.iter().keys().map(|key| {
-        let bytes = key.map_err(sled_error)?;
-        let bytes = bytes.as_ref().try_into().map_err(RetrievalError::storage)?;
-        Ok(EntityId::from_bytes(bytes))
-    }).collect()
+    tree.iter()
+        .keys()
+        .map(|key| {
+            let bytes = key.map_err(sled_error)?;
+            let bytes = bytes.as_ref().try_into().map_err(RetrievalError::storage)?;
+            Ok(EntityId::from_bytes(bytes))
+        })
+        .collect()
 }

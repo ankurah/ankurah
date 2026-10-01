@@ -167,8 +167,7 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     /// Entities these credentials may discover through queries and subscriptions.
     /// Include all membership and row restrictions; core chooses where to evaluate them.
     fn query_predicate<C>(&self, data: &C) -> Result<Predicate<Resolved>, AccessDenied>
-    where
-        C: Iterable<Self::ContextData>;
+    where C: Iterable<Self::ContextData>;
 
     /// Entities these credentials may retrieve by identity, including their events.
     /// Override when retrieval is permitted more broadly than discovery.
@@ -184,7 +183,9 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
         _data: &C,
         _states: &[(&proto::EntityId, &proto::State)],
     ) -> std::collections::HashMap<proto::EntityId, AccessDenied>
-    where C: Iterable<Self::ContextData> {
+    where
+        C: Iterable<Self::ContextData>,
+    {
         std::collections::HashMap::new()
     }
 
@@ -195,12 +196,7 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     }
 
     /// Check if a context can edit an entity
-    fn check_write(
-        &self,
-        data: &Self::ContextData,
-        entity: &Entity,
-        event: Option<&proto::Event>,
-    ) -> Result<(), AccessDenied>;
+    fn check_write(&self, data: &Self::ContextData, entity: &Entity, event: Option<&proto::Event>) -> Result<(), AccessDenied>;
 
     /// Validate a lineage attestation from a peer
     /// This validates that the relation attestation correctly describes the lineage between two entity heads
@@ -301,12 +297,7 @@ impl PolicyAgent for PermissiveAgent {
         Ok(())
     }
 
-    fn check_write(
-        &self,
-        _context: &Self::ContextData,
-        _entity: &Entity,
-        _event: Option<&proto::Event>,
-    ) -> Result<(), AccessDenied> {
+    fn check_write(&self, _context: &Self::ContextData, _entity: &Entity, _event: Option<&proto::Event>) -> Result<(), AccessDenied> {
         Ok(())
     }
 
@@ -321,9 +312,7 @@ impl PolicyAgent for PermissiveAgent {
     }
 
     fn query_predicate<C>(&self, _data: &C) -> Result<Predicate<Resolved>, AccessDenied>
-    where
-        C: Iterable<Self::ContextData>,
-    {
+    where C: Iterable<Self::ContextData> {
         // PermissiveAgent allows regardless of which credentials are supplied, including none
         Ok(Predicate::True)
     }

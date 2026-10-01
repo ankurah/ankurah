@@ -23,13 +23,16 @@ impl MaterializationJoin {
     pub fn new(tables: Vec<MaterializationTable>) -> Self { Self { tables } }
 
     pub fn has_missing_properties(&self, predicate: &Predicate<Resolved>) -> bool {
-        predicate.referenced_properties().iter().any(|property| {
-            *property != PropertyId::Id && !self.tables.iter().any(|table| table.columns.contains_key(property))
-        })
+        predicate
+            .referenced_properties()
+            .iter()
+            .any(|property| *property != PropertyId::Id && !self.tables.iter().any(|table| table.columns.contains_key(property)))
     }
 
     pub fn lower(&self, selection: &Selection<Resolved>) -> Selection<EngineColumns> {
-        let absent: Vec<_> = selection.referenced_properties().into_iter()
+        let absent: Vec<_> = selection
+            .referenced_properties()
+            .into_iter()
             .filter(|property| *property != PropertyId::Id && !self.tables.iter().any(|table| table.columns.contains_key(property)))
             .collect();
         map_references(
@@ -53,9 +56,12 @@ impl MaterializationJoin {
             joins.push(format!(r#"LEFT JOIN {} t{index} ON t{index}."id" = e."id""#, quote(&table.table)));
         }
         for property in properties.iter().filter(|property| **property != PropertyId::Id) {
-            let values: Vec<_> = self.tables.iter().enumerate().filter_map(|(index, table)| {
-                table.columns.get(property).map(|column| format!("t{index}.{}", quote(column)))
-            }).collect();
+            let values: Vec<_> = self
+                .tables
+                .iter()
+                .enumerate()
+                .filter_map(|(index, table)| table.columns.get(property).map(|column| format!("t{index}.{}", quote(column))))
+                .collect();
             let value = match values.as_slice() {
                 [] => continue,
                 [value] => value.clone(),
@@ -69,8 +75,6 @@ impl MaterializationJoin {
 
 pub fn membership_column(model: &ModelId) -> String { format!("m_{model}") }
 
-fn property_column(property: &PropertyId) -> String {
-    if *property == PropertyId::Id { "id".to_owned() } else { format!("p_{property}") }
-}
+fn property_column(property: &PropertyId) -> String { if *property == PropertyId::Id { "id".to_owned() } else { format!("p_{property}") } }
 
 fn quote(identifier: &str) -> String { format!("\"{}\"", identifier.replace('"', "\"\"")) }

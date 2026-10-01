@@ -90,8 +90,7 @@ impl PolicyConfig {
     /// Row scopes still apply. Use [`Self::can_scan_collection`] to exclude retrieval-only grants.
     pub fn can_access_collection(&self, roles: &[String], collection_name: &str) -> bool {
         self.collections.get(collection_name).is_some_and(|rules| {
-            [&rules.read, &rules.write, &rules.retrieve].into_iter().flatten()
-                .any(|privilege| self.roles_have_privilege(roles, privilege))
+            [&rules.read, &rules.write, &rules.retrieve].into_iter().flatten().any(|privilege| self.roles_have_privilege(roles, privilege))
         })
     }
 
@@ -102,14 +101,15 @@ impl PolicyConfig {
     /// naming rows is the whole of what it grants.
     pub fn can_scan_collection(&self, roles: &[String], collection_name: &str) -> bool {
         self.collections.get(collection_name).is_some_and(|rules| {
-            [&rules.read, &rules.write].into_iter().flatten()
-                .any(|privilege| self.roles_have_privilege(roles, privilege))
+            [&rules.read, &rules.write].into_iter().flatten().any(|privilege| self.roles_have_privilege(roles, privilege))
         })
     }
 
     /// Check if any of the given roles can write to a collection.
     pub fn can_write_collection(&self, roles: &[String], collection_name: &str) -> bool {
-        self.collections.get(collection_name).and_then(|rules| rules.write.as_ref())
+        self.collections
+            .get(collection_name)
+            .and_then(|rules| rules.write.as_ref())
             .is_some_and(|privilege| self.roles_have_privilege(roles, privilege))
     }
 

@@ -1,5 +1,5 @@
-use crate::internal::prelude::*;
 use crate::entity::RemoteTrxEntity;
+use crate::internal::prelude::*;
 use crate::node::event_admissibility::check_genesis_membership;
 use crate::policy::ContextPolicy;
 use crate::reactor::ChangeNotification;
@@ -49,9 +49,7 @@ impl<'a, SE: StorageEngine + 'static, PA: PolicyAgent, C: Signal + Peek<Vec<PA::
         let entity = match self.entities.entries.entry(event.entity_id) {
             Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => {
-                let fork = RemoteTrxEntity::for_event(
-                    &self.node.entities, &self.state_getter, &self.event_getter, event,
-                ).await?;
+                let fork = RemoteTrxEntity::for_event(&self.node.entities, &self.state_getter, &self.event_getter, event).await?;
                 let before = fork.snapshot();
                 entry.insert(TransactionEntity { before, fork })
             }
@@ -62,7 +60,9 @@ impl<'a, SE: StorageEngine + 'static, PA: PolicyAgent, C: Signal + Peek<Vec<PA::
     /// Apply and authorize one borrowed event and its resulting state, writing both through storage.
     /// Failure or cancellation poisons the transaction, preventing further additions or commit.
     pub(crate) async fn add_event(&mut self, event: &Attested<Event>) -> Result<(), MutationError> {
-        if self.failed { return Err(MutationError::TransactionFailed); }
+        if self.failed {
+            return Err(MutationError::TransactionFailed);
+        }
         // Clear only on success, so errors and dropped futures leave the transaction poisoned.
         self.failed = true;
         event.payload.validate_structure()?;
@@ -73,9 +73,7 @@ impl<'a, SE: StorageEngine + 'static, PA: PolicyAgent, C: Signal + Peek<Vec<PA::
         let mut event = event.clone();
         let before = &self.entities.entries[&entity.id()].before;
         let after = entity.read();
-        entity.apply_event(&self.event_getter, &mut event, |event| {
-            self.policy.check_write_event(self.node, before, &after, event)
-        }).await?;
+        entity.apply_event(&self.event_getter, &mut event, |event| self.policy.check_write_event(self.node, before, &after, event)).await?;
         self.storage.add_events(std::slice::from_ref(&event)).await?;
         let state = EntityState { entity_id: entity.id(), state: entity.to_state()? };
         let attestation = self.policy.attest_state(self.node, &state);
@@ -87,13 +85,17 @@ impl<'a, SE: StorageEngine + 'static, PA: PolicyAgent, C: Signal + Peek<Vec<PA::
     /// Commit storage, then publish the events and notify the reactor.
     /// Any failure before storage commits drops the transaction without publishing its writes.
     pub(crate) async fn commit(mut self) -> Result<(), MutationError> {
-        if self.failed { return Err(MutationError::TransactionFailed); }
+        if self.failed {
+            return Err(MutationError::TransactionFailed);
+        }
         let publication = self.node.commit_publication_lock.lock().await;
         self.storage.commit().await?.committed()?;
         let mut changes = Vec::new();
         for (_, entity) in self.entities.entries.drain(..) {
             let change = entity.fork.commit(&self.node.entities, &self.event_getter).await?;
-            if !change.events().is_empty() { changes.push(change); }
+            if !change.events().is_empty() {
+                changes.push(change);
+            }
         }
         drop(publication);
         self.node.reactor.notify_change(changes).await;
@@ -103,6 +105,8 @@ impl<'a, SE: StorageEngine + 'static, PA: PolicyAgent, C: Signal + Peek<Vec<PA::
 
 impl Drop for TransactionEntities {
     fn drop(&mut self) {
-        for entity in self.entries.values() { entity.fork.rollback(); }
+        for entity in self.entries.values() {
+            entity.fork.rollback();
+        }
     }
 }

@@ -22,15 +22,18 @@ pub(super) struct EventRow {
 }
 
 pub(super) fn encode_events(events: &[Attested<Event>]) -> Result<Vec<EventRow>, RetrievalError> {
-    events.iter().map(|event| {
-        let object = Object::new(js_sys::Object::new().into());
-        object.set(&*ID_KEY, &event.payload.id())?;
-        object.set(&*ENTITY_ID_KEY, event.payload.entity_id.to_base64())?;
-        object.set(&*BODY_KEY, &event.payload.body)?;
-        object.set(&*ATTESTATIONS_KEY, &event.attestations)?;
-        object.set(&*PARENT_KEY, &event.payload.parent)?;
-        Ok(EventRow { key: event.payload.id().to_base64(), object })
-    }).collect()
+    events
+        .iter()
+        .map(|event| {
+            let object = Object::new(js_sys::Object::new().into());
+            object.set(&*ID_KEY, &event.payload.id())?;
+            object.set(&*ENTITY_ID_KEY, event.payload.entity_id.to_base64())?;
+            object.set(&*BODY_KEY, &event.payload.body)?;
+            object.set(&*ATTESTATIONS_KEY, &event.attestations)?;
+            object.set(&*PARENT_KEY, &event.payload.parent)?;
+            Ok(EventRow { key: event.payload.id().to_base64(), object })
+        })
+        .collect()
 }
 
 pub(super) async fn insert_events(store: &web_sys::IdbObjectStore, events: &[EventRow]) -> Result<(), RetrievalError> {
@@ -65,9 +68,13 @@ impl StorageTransaction for IndexedDbTransaction<'_> {
         }
         let mut materializations = Vec::new();
         for model in &state.payload.state.memberships {
-            let projection = self.engine.materialization(model).await
+            let projection = self
+                .engine
+                .materialization(model)
+                .await
                 .map_err(|error| MutationError::General(error.to_string().into()))?
-                .prepare_state(state).await?;
+                .prepare_state(state)
+                .await?;
             materializations.push(projection);
         }
         let object = Object::new(js_sys::Object::new().into());
@@ -177,13 +184,7 @@ impl StorageTransaction for IndexedDbTransaction<'_> {
                     cb_future(&request, "success", "error").await.require("await materialized entity")?;
                 }
 
-                committed.push((
-                    original_index,
-                    CommittedEntityWrite {
-                        entity_id,
-                        canonical_changed: write.expected_head != write.head,
-                    },
-                ));
+                committed.push((original_index, CommittedEntityWrite { entity_id, canonical_changed: write.expected_head != write.head }));
             }
             committed.sort_by_key(|(index, _)| *index);
             let entities = committed.into_iter().map(|(_, result)| result).collect();

@@ -1,8 +1,5 @@
 mod common;
-use ankurah::{
-    policy::DEFAULT_CONTEXT as c,
-    Model, Node, PermissiveAgent, Property,
-};
+use ankurah::{policy::DEFAULT_CONTEXT as c, Model, Node, PermissiveAgent, Property};
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
 

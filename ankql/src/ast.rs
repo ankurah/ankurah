@@ -9,7 +9,10 @@ pub use stage::{ModelRef, Parsed, Resolved, Stage};
 /// An expression whose references use stage `S`'s representations.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 // Serde impls shouldn't require Serialize on all Expr impls. Only Resolved needs it
-#[serde(bound(serialize = "S::Path: Serialize, S::ModelId: Serialize", deserialize = "S::Path: Deserialize<'de>, S::ModelId: Deserialize<'de>"))]
+#[serde(bound(
+    serialize = "S::Path: Serialize, S::ModelId: Serialize",
+    deserialize = "S::Path: Deserialize<'de>, S::ModelId: Deserialize<'de>"
+))]
 pub enum Expr<S: Stage> {
     Literal(Value),
     Path(S::Path),
@@ -45,7 +48,10 @@ impl ankurah_core_types::Path for PathExpr {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 // Serde impls shouldn't require Serialize on all Expr impls. Only Resolved needs it
-#[serde(bound(serialize = "S::Path: Serialize, S::ModelId: Serialize", deserialize = "S::Path: Deserialize<'de>, S::ModelId: Deserialize<'de>"))]
+#[serde(bound(
+    serialize = "S::Path: Serialize, S::ModelId: Serialize",
+    deserialize = "S::Path: Deserialize<'de>, S::ModelId: Deserialize<'de>"
+))]
 pub struct Selection<S: Stage> {
     pub predicate: Predicate<S>,
     pub order_by: Option<Vec<OrderByItem<S>>>,
@@ -115,9 +121,16 @@ impl<S: Stage> Selection<S> {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 // Serde impls shouldn't require Serialize on all Expr impls. Only Resolved needs it
-#[serde(bound(serialize = "S::Path: Serialize, S::ModelId: Serialize", deserialize = "S::Path: Deserialize<'de>, S::ModelId: Deserialize<'de>"))]
+#[serde(bound(
+    serialize = "S::Path: Serialize, S::ModelId: Serialize",
+    deserialize = "S::Path: Deserialize<'de>, S::ModelId: Deserialize<'de>"
+))]
 pub enum Predicate<S: Stage> {
-    Comparison { left: Box<Expr<S>>, operator: ComparisonOperator, right: Box<Expr<S>> },
+    Comparison {
+        left: Box<Expr<S>>,
+        operator: ComparisonOperator,
+        right: Box<Expr<S>>,
+    },
     IsNull(Box<Expr<S>>),
     And(Box<Predicate<S>>, Box<Predicate<S>>),
     Or(Box<Predicate<S>>, Box<Predicate<S>>),
@@ -205,7 +218,9 @@ impl<S: Stage> Predicate<S> {
     /// Model references mentioned by membership predicates, regardless of AND/OR/NOT.
     pub fn referenced_models(&self) -> std::collections::BTreeSet<S::ModelId> {
         self.walk(std::collections::BTreeSet::new(), &mut |mut models, predicate| {
-            if let Self::MemberOf(model) = predicate { models.insert(model.clone()); }
+            if let Self::MemberOf(model) = predicate {
+                models.insert(model.clone());
+            }
             models
         })
     }

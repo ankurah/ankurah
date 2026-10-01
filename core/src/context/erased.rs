@@ -1,6 +1,6 @@
 use crate::internal::prelude::*;
-use crate::{error::NodeDropped, node::NodeErased};
 use crate::reactor::LocalEntitySource;
+use crate::{error::NodeDropped, node::NodeErased};
 use ankql::ast::{Parsed, Resolved, Selection};
 use ankurah_proto::Event;
 use async_trait::async_trait;

@@ -161,11 +161,7 @@ async fn test_event_only_unknown_entity_does_not_poison_batch() -> Result<()> {
         from: server.id,
         to: client.id,
         body: proto::NodeUpdateBody::SubscriptionUpdate {
-            items: vec![
-                event_only_item(ev_a),
-                event_only_item(ev_unknown),
-                event_only_item(ev_b),
-            ],
+            items: vec![event_only_item(ev_a), event_only_item(ev_unknown), event_only_item(ev_b)],
         },
     };
 

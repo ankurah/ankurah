@@ -3,10 +3,10 @@ mod common;
 
 use std::sync::Arc;
 
-use ankurah::{Model, Node, View};
-use ankurah::model::Mutable;
 use ankurah::core::storage::StorageEngine;
+use ankurah::model::Mutable;
 use ankurah::policy::PolicyAgent;
+use ankurah::{Model, Node, View};
 use ankurah_jwt_auth::{JwtAgent, JwtContext, JwtKeys, PolicyConfig};
 use ankurah_proto as proto;
 use ankurah_storage_sled::SledStorageEngine;
@@ -36,12 +36,19 @@ async fn event_state_checks_and_late_denial_roll_back_the_transaction() -> anyho
     let storage = Arc::new(SledStorageEngine::new_test()?);
     let node = Node::new_durable(storage.clone(), agent.clone());
     node.system.create().await?;
-    agent.set_policy(&node, &serde_json::from_str(r#"{
+    agent
+        .set_policy(
+            &node,
+            &serde_json::from_str(
+                r#"{
         "roles": { "editor": ["edit"] },
         "collections": { "document": {
             "read": "edit", "write": "edit", "scope": [{ "filter": "owner = $jwt.sub" }]
         } }
-    }"#)?).await?;
+    }"#,
+            )?,
+        )
+        .await?;
     let root = node.context_async(JwtContext::Root).await?;
     let model = root.resolve_model_id::<Document>().await?;
     let credential = |subject| {
@@ -64,32 +71,45 @@ async fn event_state_checks_and_late_denial_roll_back_the_transaction() -> anyho
         Ok(proto::Operation::Backend { backend: "lww".into(), operations: backend.to_operations()?.unwrap() })
     };
     let create = |value: &str| -> anyhow::Result<proto::Event> {
-        Ok(proto::Event::genesis(node.system.root_id(), proto::AuthorId::Unknown, proto::OperationSet(vec![
-            proto::Operation::Membership(proto::Membership::Add(model)), set_owner(value)?,
-        ])))
+        Ok(proto::Event::genesis(
+            node.system.root_id(),
+            proto::AuthorId::Unknown,
+            proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(model)), set_owner(value)?]),
+        ))
     };
     let genesis = create("alice")?;
     let remote_id = genesis.entity_id;
-    let completion = proto::Event::update(remote_id, genesis.id().into(), proto::AuthorId::Unknown, proto::OperationSet(vec![set_owner("alice")?]));
+    let completion =
+        proto::Event::update(remote_id, genesis.id().into(), proto::AuthorId::Unknown, proto::OperationSet(vec![set_owner("alice")?]));
     commit_transaction(&node, &credential("alice"), proto::TransactionId::new(), vec![genesis.into(), completion.into()]).await?;
     assert_eq!(context.get::<DocumentView>(remote_id).await?.owner()?, "alice");
     assert_eq!(storage.dump_entity_events(remote_id).await?.len(), 2);
 
     let genesis = create("bob")?;
     let denied_id = genesis.entity_id;
-    let completion = proto::Event::update(denied_id, genesis.id().into(), proto::AuthorId::Unknown, proto::OperationSet(vec![set_owner("alice")?]));
-    assert!(commit_transaction(&node,
-        &credential("alice"), proto::TransactionId::new(), vec![genesis.into(), completion.into()],
-    ).await.is_err(), "a later event cannot rescue an unauthorized earlier state");
+    let completion =
+        proto::Event::update(denied_id, genesis.id().into(), proto::AuthorId::Unknown, proto::OperationSet(vec![set_owner("alice")?]));
+    assert!(
+        commit_transaction(&node, &credential("alice"), proto::TransactionId::new(), vec![genesis.into(), completion.into()],)
+            .await
+            .is_err(),
+        "a later event cannot rescue an unauthorized earlier state"
+    );
     assert!(storage.dump_entity_events(denied_id).await?.is_empty());
 
     let allowed = create("alice")?;
     let denied = create("alice")?;
     let ids = [allowed.entity_id, denied.entity_id];
-    let outside_scope = proto::Event::update(denied.entity_id, denied.id().into(), proto::AuthorId::Unknown, proto::OperationSet(vec![set_owner("bob")?]));
-    assert!(commit_transaction(&node,
-        &credential("alice"), proto::TransactionId::new(), vec![allowed.into(), denied.into(), outside_scope.into()],
-    ).await.is_err());
+    let outside_scope =
+        proto::Event::update(denied.entity_id, denied.id().into(), proto::AuthorId::Unknown, proto::OperationSet(vec![set_owner("bob")?]));
+    assert!(commit_transaction(
+        &node,
+        &credential("alice"),
+        proto::TransactionId::new(),
+        vec![allowed.into(), denied.into(), outside_scope.into()],
+    )
+    .await
+    .is_err());
     for id in ids {
         assert!(matches!(storage.get_state(id).await, Err(ankurah_core::error::RetrievalError::EntityNotFound(_))));
         assert!(storage.dump_entity_events(id).await?.is_empty(), "a state denial must roll back earlier entities and events too");
@@ -102,7 +122,8 @@ async fn existing_membership_authorizes_addition_but_new_membership_cannot_autho
     let keys = common::test_keys();
     let agent = JwtAgent::new_ephemeral();
     agent.set_keys(JwtKeys::Signing(keys.clone()));
-    agent.update_config(serde_json::from_str::<PolicyConfig>(r#"{
+    agent.update_config(serde_json::from_str::<PolicyConfig>(
+        r#"{
         "roles": {
             "editor": ["document:read", "document:write"],
             "reader": ["document:read", "attachment:write"]
@@ -114,7 +135,8 @@ async fn existing_membership_authorizes_addition_but_new_membership_cannot_autho
             },
             "attachment": { "read": "attachment:read", "write": "attachment:write" }
         }
-    }"#)?);
+    }"#,
+    )?);
     let storage = Arc::new(SledStorageEngine::new_test()?);
     let node = Node::new_durable(storage.clone(), agent.clone());
     node.system.create().await?;
@@ -138,27 +160,36 @@ async fn existing_membership_authorizes_addition_but_new_membership_cannot_autho
     assert!(trx.get::<Document>(&local).await.is_err(), "read access is insufficient to add a membership");
     drop(trx);
 
-    let add_attachment = |state: proto::Attested<proto::EntityState>| proto::Attested::from(proto::Event::update(
-        state.payload.entity_id, state.payload.state.head, proto::AuthorId::Unknown,
-        proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(attachment))]),
-    ));
+    let add_attachment = |state: proto::Attested<proto::EntityState>| {
+        proto::Attested::from(proto::Event::update(
+            state.payload.entity_id,
+            state.payload.state.head,
+            proto::AuthorId::Unknown,
+            proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(attachment))]),
+        ))
+    };
     let local_before = storage.get_state(local).await?;
-    assert!(commit_transaction(&node,
-        &credential("reader"), proto::TransactionId::new(), vec![add_attachment(local_before.clone())],
-    ).await.is_err(), "permission for the proposed membership cannot authorize its addition");
+    assert!(
+        commit_transaction(&node, &credential("reader"), proto::TransactionId::new(), vec![add_attachment(local_before.clone())],)
+            .await
+            .is_err(),
+        "permission for the proposed membership cannot authorize its addition"
+    );
     assert_eq!(storage.get_state(local).await?, local_before);
     let foreign_before = storage.get_state(foreign).await?;
-    assert!(commit_transaction(&node,
-        &credential("editor"), proto::TransactionId::new(), vec![add_attachment(foreign_before.clone())],
-    ).await.is_err(), "existing-membership row scope still applies");
+    assert!(
+        commit_transaction(&node, &credential("editor"), proto::TransactionId::new(), vec![add_attachment(foreign_before.clone())],)
+            .await
+            .is_err(),
+        "existing-membership row scope still applies"
+    );
     assert_eq!(storage.get_state(foreign).await?, foreign_before);
 
     let trx = editor.begin();
     trx.get::<Document>(&local).await?.entity().add_membership(attachment)?;
     trx.commit().await?;
-    commit_transaction(&node,
-        &credential("editor"), proto::TransactionId::new(), vec![add_attachment(storage.get_state(remote).await?)],
-    ).await?;
+    commit_transaction(&node, &credential("editor"), proto::TransactionId::new(), vec![add_attachment(storage.get_state(remote).await?)])
+        .await?;
     for id in [local, remote] {
         assert!(storage.get_state(id).await?.payload.state.memberships.contains(&attachment));
         assert_eq!(editor.get::<AttachmentView>(id).await?.id(), id, "read authorization uses ANY actual membership");
@@ -178,7 +209,11 @@ async fn wildcard_cannot_use_unconfigured_membership_to_escape_a_scope() -> anyh
     agent.set_keys(JwtKeys::Signing(keys.clone()));
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
     node.system.create().await?;
-    agent.set_policy(&node, &serde_json::from_str(r#"{
+    agent
+        .set_policy(
+            &node,
+            &serde_json::from_str(
+                r#"{
         "roles": { "admin": ["*"] },
         "collections": {
             "document": {
@@ -186,7 +221,10 @@ async fn wildcard_cannot_use_unconfigured_membership_to_escape_a_scope() -> anyh
                 "scope": [{ "filter": "owner = $jwt.sub" }]
             }
         }
-    }"#)?).await?;
+    }"#,
+            )?,
+        )
+        .await?;
     let root = node.context_async(JwtContext::Root).await?;
     let attachment = root.resolve_model_id::<Attachment>().await?;
     let trx = root.begin();

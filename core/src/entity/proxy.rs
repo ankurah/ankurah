@@ -100,7 +100,9 @@ impl EntityProxy {
     /// Commit or rollback redirects a proxy once; transaction drop cannot undo publication.
     pub(super) fn finish(&self, target: ProxyTarget) {
         let mut current = self.target.write().unwrap();
-        if matches!(*current, ProxyTarget::Resident(_) | ProxyTarget::RolledBack(_)) { return; }
+        if matches!(*current, ProxyTarget::Resident(_) | ProxyTarget::RolledBack(_)) {
+            return;
+        }
         let subscription = target.listen(&self.broadcast);
         *current = target;
         *self.subscription.lock().unwrap() = subscription;

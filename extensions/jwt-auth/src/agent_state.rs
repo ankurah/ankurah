@@ -1,9 +1,17 @@
 use std::{collections::BTreeSet, sync::Arc};
 
-use ankurah::{Context, proto::ModelId, signals::{Mut, Wait}};
+use ankurah::{
+    proto::ModelId,
+    signals::{Mut, Wait},
+    Context,
+};
 use ankurah_core::{node::WeakNode, storage::StorageEngine};
 
-use crate::{JwtAgent, JwtContext, JwtKeys, PolicyConfig, bound_policy::BoundPolicy, graph::{self, PolicyQueries}};
+use crate::{
+    bound_policy::BoundPolicy,
+    graph::{self, PolicyQueries},
+    JwtAgent, JwtContext, JwtKeys, PolicyConfig,
+};
 
 /// The locally loaded policy and verification keys. Private signing material stays local.
 #[derive(Clone)]
@@ -25,14 +33,19 @@ impl AgentState {
 
 /// Load each policy model through its own livequery; observe stored IDs without resolving policy labels.
 pub(crate) async fn start_policy_sync<SE: StorageEngine + Send + Sync + 'static>(
-    node: WeakNode<SE, JwtAgent>, state: Mut<AgentState>, loaded: futures::channel::oneshot::Sender<anyhow::Result<()>>,
+    node: WeakNode<SE, JwtAgent>,
+    state: Mut<AgentState>,
+    loaded: futures::channel::oneshot::Sender<anyhow::Result<()>>,
 ) {
     let initialize = async {
         let owner = node.upgrade().ok_or(ankurah_core::error::NodeDropped)?;
         let catalog = owner.catalog.clone();
         let epoch = owner.system.system_epoch().ok_or(ankurah_core::error::RetrievalError::NodeNotReady)?;
         let changed = Mut::new(());
-        let subscription = owner.catalog.subscribe_changes({ let changed = changed.clone(); move || changed.set(()) });
+        let subscription = owner.catalog.subscribe_changes({
+            let changed = changed.clone();
+            move || changed.set(())
+        });
         drop(owner);
         let models = changed.wait_for(move |_| graph::bind_models(&catalog, epoch).ok()).await;
         drop(subscription);
@@ -89,7 +102,10 @@ pub(crate) async fn start_policy_sync<SE: StorageEngine + Send + Sync + 'static>
                 }, || drop(guard));
             })
         };
-        let subscriptions = queries.subscribe({ let refresh = refresh.clone(); move || refresh() });
+        let subscriptions = queries.subscribe({
+            let refresh = refresh.clone();
+            move || refresh()
+        });
         refresh();
         state.wait_for(|state| (state.ready() && state.policy.is_some()).then_some(())).await;
         Ok::<_, anyhow::Error>((queries, subscriptions))
@@ -99,6 +115,8 @@ pub(crate) async fn start_policy_sync<SE: StorageEngine + Send + Sync + 'static>
             let _ = loaded.send(Ok(()));
             std::future::pending::<()>().await;
         }
-        Err(error) => { let _ = loaded.send(Err(error)); }
+        Err(error) => {
+            let _ = loaded.send(Err(error));
+        }
     }
 }

@@ -1,8 +1,8 @@
 use crate::internal::prelude::*;
-use crate::{error::NodeDropped, node::NodeErased};
 use crate::policy::ContextPolicy;
 use crate::reactor::LocalEntitySource;
 use crate::retrieval::CachedEventGetter;
+use crate::{error::NodeDropped, node::NodeErased};
 use ankql::ast::{Parsed, Resolved};
 use ankurah_proto::Event;
 use async_trait::async_trait;
@@ -96,8 +96,14 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         }
         debug!("{}.get_entity fetching from storage", node.as_ref());
 
-        let entity_state: proto::Attested<proto::EntityState> = node.storage.get_states(vec![id], &policy.retrieval_predicate()).await?
-            .into_iter().next().ok_or(RetrievalError::EntityNotFound(id))?.try_into()?;
+        let entity_state: proto::Attested<proto::EntityState> = node
+            .storage
+            .get_states(vec![id], &policy.retrieval_predicate())
+            .await?
+            .into_iter()
+            .next()
+            .ok_or(RetrievalError::EntityNotFound(id))?
+            .try_into()?;
         policy.check_read_state(&id, &entity_state.payload.state)?;
         let state_getter = crate::retrieval::LocalStateGetter::new(node.storage.clone());
         let event_getter = CachedEventGetter::new(node.as_ref(), &cdata);
@@ -161,10 +167,7 @@ where
         ContextPolicy::new(&node.policy_agent, self.auth.clone()).can_read(entity)
     }
 
-    async fn fetch_entities_from_local(
-        &self,
-        selection: &ankql::ast::Selection<Resolved>,
-    ) -> Result<Vec<Entity>, RetrievalError> {
+    async fn fetch_entities_from_local(&self, selection: &ankql::ast::Selection<Resolved>) -> Result<Vec<Entity>, RetrievalError> {
         let node = self.node.upgrade()?;
         let policy = ContextPolicy::new(&node.policy_agent, self.auth.clone());
         let entities = node.fetch_entities_from_local(selection).await?;

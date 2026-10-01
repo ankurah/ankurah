@@ -1,7 +1,7 @@
 use crate::internal::prelude::*;
 use crate::reactor::{
-    AbstractEntity, CandidateChanges, ChangeNotification, MembershipChange, ReactorSubscriptionId, ReactorUpdate, ReactorUpdateItem,
-    LocalEntitySource, WatcherChange,
+    AbstractEntity, CandidateChanges, ChangeNotification, LocalEntitySource, MembershipChange, ReactorSubscriptionId, ReactorUpdate,
+    ReactorUpdateItem, WatcherChange,
 };
 use crate::selection::filter::{evaluate_predicate, Filterable};
 use ankql::ast::Resolved;
@@ -23,22 +23,14 @@ impl<E: Clone, Ev> UpdateItemAccumulator<E> for Vec<ReactorUpdateItem<E, Ev>> {
     fn push_initial(&mut self, entity: &E, query_id: proto::QueryId) {
         Vec::push(
             self,
-            ReactorUpdateItem {
-                entity: entity.clone(),
-                events: vec![],
-                predicate_relevance: vec![(query_id, MembershipChange::Initial)],
-            },
+            ReactorUpdateItem { entity: entity.clone(), events: vec![], predicate_relevance: vec![(query_id, MembershipChange::Initial)] },
         );
     }
 
     fn push_remove(&mut self, entity: &E, query_id: proto::QueryId) {
         Vec::push(
             self,
-            ReactorUpdateItem {
-                entity: entity.clone(),
-                events: vec![],
-                predicate_relevance: vec![(query_id, MembershipChange::Remove)],
-            },
+            ReactorUpdateItem { entity: entity.clone(), events: vec![], predicate_relevance: vec![(query_id, MembershipChange::Remove)] },
         );
     }
 }
@@ -448,8 +440,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         resultset.clear_gap_dirty();
 
         // Process gap fill
-        let gap_filled_entities =
-            Self::process_gap_fill_entities(query_id, gap_fetcher, selection, resultset, last_entity, gap_size).await;
+        let gap_filled_entities = Self::process_gap_fill_entities(query_id, gap_fetcher, selection, resultset, last_entity, gap_size).await;
 
         // Register entity watchers and append entities
         if !gap_filled_entities.is_empty() {
@@ -474,8 +465,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         resultset.clear_gap_dirty();
 
         // Process gap fill
-        let gap_filled_entities =
-            Self::process_gap_fill_entities(query_id, gap_fetcher, selection, resultset, last_entity, gap_size).await;
+        let gap_filled_entities = Self::process_gap_fill_entities(query_id, gap_fetcher, selection, resultset, last_entity, gap_size).await;
 
         // Register entity watchers and push items for gap-filled entities
         if !gap_filled_entities.is_empty() {
@@ -538,10 +528,9 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         }
 
         // Process all gap fills concurrently
-        let gap_fill_futures =
-            gaps_to_fill.into_iter().map(|(query_id, gap_fetcher, selection, resultset, last_entity, gap_size)| {
-                Self::process_gap_fill(query_id, gap_fetcher, selection, resultset, last_entity, gap_size)
-            });
+        let gap_fill_futures = gaps_to_fill.into_iter().map(|(query_id, gap_fetcher, selection, resultset, last_entity, gap_size)| {
+            Self::process_gap_fill(query_id, gap_fetcher, selection, resultset, last_entity, gap_size)
+        });
 
         let gap_results: Vec<(ankurah_proto::QueryId, Vec<ReactorUpdateItem<E, Ev>>)> = future::join_all(gap_fill_futures).await;
 

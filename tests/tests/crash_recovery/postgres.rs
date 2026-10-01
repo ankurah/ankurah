@@ -108,8 +108,7 @@ async fn child_pg_atomic_commit() -> Result<()> {
 #[tokio::test]
 async fn scenario_pg_1_atomic_commit() -> Result<()> {
     let fixture = start_postgres().await?;
-    let outcome =
-        spawn_crash_child_with("postgres::child_pg_atomic_commit", CrashPoint::BeforeCommit(0), &[(ENV_PG_URI, &fixture.uri)])?;
+    let outcome = spawn_crash_child_with("postgres::child_pg_atomic_commit", CrashPoint::BeforeCommit(0), &[(ENV_PG_URI, &fixture.uri)])?;
     assert!(outcome.crashed(), "child was expected to abort; stdout=\n{}\nstderr=\n{}", outcome.stdout, outcome.stderr);
 
     let entity_id = outcome.entity_id("entity").expect("child must record the entity id");
@@ -198,8 +197,7 @@ async fn child_pg_entity_creation() -> Result<()> {
 #[tokio::test]
 async fn scenario_pg_4_entity_creation() -> Result<()> {
     let fixture = start_postgres().await?;
-    let outcome =
-        spawn_crash_child_with("postgres::child_pg_entity_creation", CrashPoint::BeforeCommit(0), &[(ENV_PG_URI, &fixture.uri)])?;
+    let outcome = spawn_crash_child_with("postgres::child_pg_entity_creation", CrashPoint::BeforeCommit(0), &[(ENV_PG_URI, &fixture.uri)])?;
     assert!(outcome.crashed(), "child was expected to abort; stdout=\n{}\nstderr=\n{}", outcome.stdout, outcome.stderr);
 
     let entity_id = outcome.entity_id("entity").expect("child must record the entity id");

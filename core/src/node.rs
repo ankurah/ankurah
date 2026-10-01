@@ -249,10 +249,7 @@ where
         let run = node.run.clone();
         let agent = node.policy_agent.clone();
         crate::task::spawn(async move {
-            let initialized = futures::future::try_join(
-                system.wait_system_ready(),
-                catalog.start(weak_node.clone()).err_into(),
-            );
+            let initialized = futures::future::try_join(system.wait_system_ready(), catalog.start(weak_node.clone()).err_into());
             let initialized = async move {
                 initialized.await?;
                 agent.start(weak_node).await.map_err(|error| NodeHaltReason::PolicyAgentStartFailed(error.to_string()))
@@ -578,13 +575,7 @@ where
         // TODO determine how many durable peers need to respond before we can proceed. The others should continue in the background.
         // as of this writing, we only have one durable peer, so we can just await the response from "all" of them
         for peer_id in self.get_durable_peers() {
-            match self
-                .request(
-                    peer_id,
-                    cdata,
-                    proto::NodeRequestBody::CommitTransaction { id: id.clone(), events: events.to_vec() },
-                )
-                .await
+            match self.request(peer_id, cdata, proto::NodeRequestBody::CommitTransaction { id: id.clone(), events: events.to_vec() }).await
             {
                 Ok(proto::NodeResponseBody::CommitComplete { .. }) => (),
                 Err(error) => return Err(RetrievalError::from(error).into()),
@@ -761,11 +752,7 @@ where
     }
 
     /// Retrieve peer states and persist them in this node.
-    pub(crate) async fn get_from_peer(
-        &self,
-        ids: Vec<proto::EntityId>,
-        cdata: &Vec<PA::ContextData>,
-    ) -> Result<(), RetrievalError> {
+    pub(crate) async fn get_from_peer(&self, ids: Vec<proto::EntityId>, cdata: &Vec<PA::ContextData>) -> Result<(), RetrievalError> {
         self.system.require_system_ready().map_err(MutationError::from)?;
         let peer_id = self.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
 
@@ -932,10 +919,7 @@ where
     }
 
     /// Load matching states from local storage into resident entities; does not apply read policy.
-    pub async fn fetch_entities_from_local(
-        &self,
-        selection: &ankql::ast::Selection<Resolved>,
-    ) -> Result<Vec<Entity>, RetrievalError> {
+    pub async fn fetch_entities_from_local(&self, selection: &ankql::ast::Selection<Resolved>) -> Result<Vec<Entity>, RetrievalError> {
         self.system.check_not_halted()?;
         let initial_states = self.storage.fetch_states(selection).await?;
         let state_getter = LocalStateGetter::new(self.storage.clone());

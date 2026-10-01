@@ -231,9 +231,8 @@ async fn test_update_scope_requires_before_and_after_state() -> anyhow::Result<(
     let token = keys.sign(&claims, Duration::from_hours(1))?;
     let context = JwtContext::from_claims(claims, token);
 
-    let event = ankurah::proto::Event::update(
-        denied_record.id(), denied_record.head(), ankurah::proto::AuthorId::Unknown, Default::default(),
-    );
+    let event =
+        ankurah::proto::Event::update(denied_record.id(), denied_record.head(), ankurah::proto::AuthorId::Unknown, Default::default());
     let result = agent.check_write_event(&node, &context, &denied_record, &allowed_record, &event);
     assert!(result.is_err(), "updates must not retag an out-of-scope row into the caller's scope");
 
@@ -262,7 +261,9 @@ async fn test_jwt_agent_durable_ephemeral_pair() -> anyhow::Result<()> {
 
     let post_id = {
         let trx = ctx1.begin();
-        let post = trx.create(&Post { title: "Cross-Node Post".into(), body: "Created on node1".into() }).await
+        let post = trx
+            .create(&Post { title: "Cross-Node Post".into(), body: "Created on node1".into() })
+            .await
             .map_err(|error| anyhow::anyhow!("durable first create: {error:?}"))?;
         let id = post.id();
         trx.commit().await?;
@@ -304,7 +305,9 @@ async fn test_jwt_check_request_roundtrip() -> anyhow::Result<()> {
     let ctx2 = node2.context_async(ctx).await?;
 
     let trx = ctx2.begin();
-    let _post = trx.create(&Post { title: "From Ephemeral".into(), body: "Sent via JWT auth".into() }).await
+    let _post = trx
+        .create(&Post { title: "From Ephemeral".into(), body: "Sent via JWT auth".into() })
+        .await
         .map_err(|error| anyhow::anyhow!("ephemeral first create: {error:?}"))?;
     trx.commit().await?;
 
