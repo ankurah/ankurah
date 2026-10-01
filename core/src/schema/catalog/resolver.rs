@@ -1,6 +1,6 @@
 //! Resolves property names to durable identities and canonical values.
 
-use ankql::ast::{Expr, OrderByItem, Parsed, PathExpr, Predicate, PropertyPath, Resolved, Selection};
+use ankql::ast::{Expr, ModelRef, OrderByItem, Parsed, PathExpr, Predicate, PropertyPath, Resolved, Selection};
 use ankurah_proto::{ModelId, PropertyId, SystemModel, SystemProperty};
 use thiserror::Error;
 
@@ -17,6 +17,8 @@ pub struct ResolvedProperty {
 pub enum ModelResolutionError {
     #[error(transparent)]
     Catalog(#[from] RetrievalError),
+    #[error("unknown model '{0}'")]
+    UnknownModel(String),
     #[error("property lookup for '{name}' in model '{model}' failed: {message}")]
     Lookup { model: ModelId, name: String, message: String },
     #[error("unknown property '{name}' in model '{model}'")]
@@ -39,7 +41,7 @@ impl From<ModelResolutionError> for RetrievalError {
 }
 
 pub trait ModelResolver {
-    /// Look up a model qualifier in a path such as `album.name`.
+    /// Look up a model label for membership or a path qualifier such as `album.name`.
     fn resolve_model(&self, _name: &str) -> Result<Option<ModelId>, ModelResolutionError> { Ok(None) }
 
     fn resolve_property(&self, model: &ModelId, name: &str) -> Result<Option<ResolvedProperty>, ModelResolutionError>;
@@ -99,7 +101,7 @@ pub(crate) struct DescriptorResolver<'a> {
 impl ModelResolver for DescriptorResolver<'_> {
     fn resolve_model(&self, name: &str) -> Result<Option<ModelId>, ModelResolutionError> {
         if name == self.schema.label {
-            if let Some(model) = self.schema.resolved.get(self.epoch) {
+            if let Ok(model) = self.schema.resolved.get(self.epoch) {
                 return Ok(Some(model));
             }
         }
@@ -108,7 +110,7 @@ impl ModelResolver for DescriptorResolver<'_> {
 
     fn resolve_property(&self, model: &ModelId, name: &str) -> Result<Option<ResolvedProperty>, ModelResolutionError> {
         let Some(field) = self.schema.field_by_name(name) else { return Ok(None) };
-        if let Some(id) = field.resolved.get(self.epoch) {
+        if let Ok(id) = field.resolved.get(self.epoch) {
             let value_type = ValueType::from_property_str(field.value_type).ok_or_else(|| ModelResolutionError::ValueTypeLookup {
                 model: *model,
                 property: id,
@@ -150,7 +152,7 @@ fn check_predicate_names(
                 check_expr_names(right, check)
             }
             Predicate::IsNull(expr) => check_expr_names(expr, check),
-            Predicate::And(..) | Predicate::Or(..) | Predicate::Not(_) | Predicate::True | Predicate::False | Predicate::Placeholder => {
+            Predicate::And(..) | Predicate::Or(..) | Predicate::Not(_) | Predicate::MemberOf(_) | Predicate::True | Predicate::False | Predicate::Placeholder => {
                 Ok(())
             }
         }
@@ -170,7 +172,7 @@ fn check_expr_names(expr: &Expr<Parsed>, check: &impl Fn(&PathExpr) -> Result<()
     }
 }
 
-/// Resolve every property path and canonicalize its comparison literals.
+/// Resolve model labels and property paths, and canonicalize comparison literals.
 pub fn resolve_selection<R: ModelResolver + ?Sized>(
     model: &ModelId,
     resolver: &R,
@@ -223,6 +225,10 @@ fn resolve_predicate<R: ModelResolver + ?Sized>(
         }
         Predicate::Not(inner) => Predicate::Not(Box::new(resolve_predicate(model, resolver, inner)?)),
         Predicate::IsNull(expr) => Predicate::IsNull(Box::new(resolve_expr(model, resolver, expr)?.0)),
+        Predicate::MemberOf(reference) => Predicate::MemberOf(match reference {
+            ModelRef::Id(id) => *id,
+            ModelRef::Label(label) => resolver.resolve_model(label)?.ok_or_else(|| ModelResolutionError::UnknownModel(label.clone()))?,
+        }),
         Predicate::True => Predicate::True,
         Predicate::False => Predicate::False,
         Predicate::Placeholder => Predicate::Placeholder,
@@ -369,6 +375,10 @@ mod tests {
     struct ColdResolver;
 
     impl ModelResolver for WarmResolver {
+        fn resolve_model(&self, label: &str) -> Result<Option<ModelId>, ModelResolutionError> {
+            Ok((label == "album").then(model))
+        }
+
         fn resolve_property(&self, model: &ModelId, name: &str) -> Result<Option<ResolvedProperty>, ModelResolutionError> {
             Ok(match name {
                 "value" => Some(ResolvedProperty { id: property(), value_type: ValueType::I64 }),
@@ -399,12 +409,12 @@ mod tests {
     }
 
     #[test]
-    fn unregistered_collections_are_rejected() {
+    fn unregistered_models_are_rejected() {
         let catalog = CatalogManager::default();
-        let collection = CollectionId::fixed_name("unregistered");
+        let model = ModelId::EntityId(proto::EntityId::random());
         for source in ["TRUE LIMIT 2", "1 = 1", "name = 'Alice'", "id = ?", "TRUE ORDER BY id"] {
             let selection = ankql::parser::parse_selection(source).unwrap();
-            assert!(catalog.resolve_selection(&collection, selection).is_err(), "{source}");
+            assert!(catalog.resolve_selection(&model, selection).is_err(), "{source}");
         }
     }
 
@@ -412,6 +422,23 @@ mod tests {
     fn unresolved_property_is_unknown() {
         let error = resolve_selection(&model(), &ColdResolver, comparison(PathExpr::simple("value"), Value::I64(42))).unwrap_err();
         assert!(matches!(error, ModelResolutionError::UnknownProperty { .. }));
+    }
+
+    #[test]
+    fn membership_labels_and_ids_resolve() {
+        let selection = ankurah_derive::selection!("MEMBEROF('album') OR (NOT (MEMBEROF('system:model')))");
+        let resolved = resolve_selection(&model(), &WarmResolver, selection).unwrap();
+        assert_eq!(
+            resolved.predicate,
+            Predicate::Or(
+                Box::new(Predicate::MemberOf(model())),
+                Box::new(Predicate::Not(Box::new(Predicate::MemberOf(ModelId::System(SystemModel::Model))))),
+            )
+        );
+        let by_id = ankql::parser::parse_selection(&format!("MEMBEROF('{}')", model())).unwrap();
+        assert_eq!(resolve_selection(&model(), &ColdResolver, by_id).unwrap().predicate, Predicate::MemberOf(model()));
+        let unknown = ankql::parser::parse_selection("MEMBEROF('unknown')").unwrap();
+        assert!(matches!(resolve_selection(&model(), &WarmResolver, unknown), Err(ModelResolutionError::UnknownModel(_))));
     }
 
     #[test]

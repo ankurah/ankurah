@@ -184,12 +184,17 @@ async fn test_json_path_missing_field() -> Result<()> {
 /// Verify planner generates correct sub_path for JSON queries
 #[test]
 fn test_json_path_planner_generates_sub_path() {
+    use ankql::selection::map_references;
     use ankurah_storage_common::planner::{Planner, PlannerConfig};
-    use ankurah_storage_common::{lower_selection, ColumnPath, Plan};
+    use ankurah_storage_common::{ColumnPath, Plan};
 
     let planner = Planner::new(PlannerConfig::full_support());
     let selection = ankql::parser::parse_selection("licensing.territory = 'US'").expect("parse selection");
-    let selection = lower_selection(&selection, &|path| ColumnPath::new(path.first(), path.steps[1..].to_vec()));
+    let selection = map_references(
+        &selection,
+        &|path| ColumnPath::new(path.first(), path.steps[1..].to_vec()),
+        &|model| *model.as_id().expect("model ID in physical-column fixture"),
+    );
     let plans = planner.plan(&selection, "id");
 
     // Find the index plan

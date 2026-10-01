@@ -3,11 +3,13 @@ mod common;
 use ankurah::{Model, Node, Ref};
 use ankurah_core::{
     connector::{PeerSender, SendError},
-    error::RetrievalError,
-    schema::{catalog::SysModelRowView, MODEL_COLLECTION_ID, MODEL_PROPERTY_COLLECTION_ID, PROPERTY_COLLECTION_ID},
+    error::{MutationError, RetrievalError},
+    policy::AccessDenied,
+    schema::catalog::SysModelRowView,
     signals::Get,
+    storage::StorageEngine,
 };
-use ankurah_jwt_auth::{JwtAgent, JwtContext};
+use ankurah_jwt_auth::{JwtAgent, JwtContext, Role};
 use ankurah_proto::{self as proto, EntityId};
 use ankurah_storage_sled::SledStorageEngine;
 use std::sync::{Arc, Mutex};
@@ -29,17 +31,17 @@ pub struct RegistrationRecord {
 
 async fn setup() -> anyhow::Result<TestNode> {
     let agent = JwtAgent::new_durable(common::test_keys(), common::blog_config_path())?;
-    let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent);
+    let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
     node.system.create().await?;
+    agent.set_policy(&node, &agent.config()).await?;
     node.wait_ready().await?;
     Ok(node)
 }
 
 async fn catalog_states(node: &TestNode) -> anyhow::Result<Vec<proto::Attested<proto::EntityState>>> {
     let mut states = Vec::new();
-    for name in [MODEL_COLLECTION_ID, PROPERTY_COLLECTION_ID, MODEL_PROPERTY_COLLECTION_ID] {
-        let collection = node.collections.get(&proto::CollectionId::fixed_name(name)).await?;
-        states.extend(collection.fetch_states(&ankql::ast::Predicate::True.into()).await?);
+    for model in [proto::SystemModel::Model, proto::SystemModel::Property, proto::SystemModel::ModelProperty] {
+        states.extend(node.storage.fetch_states(&ankql::ast::Predicate::MemberOf(proto::ModelId::System(model)).into()).await?);
     }
     states.sort_by_key(|state| state.payload.entity_id);
     Ok(states)
@@ -85,9 +87,9 @@ async fn wire_register(
 #[tokio::test]
 async fn anonymous_registration_cannot_mutate_catalog_locally_or_over_wire() -> anyhow::Result<()> {
     let node = setup().await?;
-    let anonymous = node.context(JwtContext::NoUser)?;
+    let anonymous = node.context_async(JwtContext::NoUser).await?;
     let before = catalog_states(&node).await?;
-    let error = anonymous.register_model::<RegistrationRecord>().await.expect_err("anonymous registration must be refused");
+    let error = anonymous.resolve_model_id::<RegistrationRecord>().await.expect_err("anonymous registration must be refused");
     assert!(error.to_string().contains("Anonymous contexts cannot change the catalog"), "{error}");
     assert_eq!(catalog_states(&node).await?, before, "no model, reference target, property, or membership may be persisted");
 
@@ -119,7 +121,7 @@ async fn anonymous_registration_cannot_mutate_catalog_locally_or_over_wire() -> 
     let response = wire_register(&node, peer, &mut replies, proto::AuthData::default(), model.clone()).await?;
     assert!(matches!(response, proto::NodeResponseBody::SchemaRegistered { model } if model.id == registered.id));
     assert_eq!(catalog_states(&node).await?, after, "anonymous no-op registration is still allowed");
-    assert_eq!(anonymous.register_model::<RegistrationRecord>().await?, proto::ModelId::EntityId(registered.id));
+    assert_eq!(anonymous.resolve_model_id::<RegistrationRecord>().await?, proto::ModelId::EntityId(registered.id));
     assert_eq!(anonymous.get::<SysModelRowView>(registered.id).await?.id(), registered.id, "catalog reads remain public");
 
     let mut extension = model;
@@ -138,9 +140,60 @@ async fn anonymous_registration_cannot_mutate_catalog_locally_or_over_wire() -> 
 }
 
 #[tokio::test]
+async fn signed_registration_cannot_change_policy_membership_optionality() -> anyhow::Result<()> {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let node = setup().await?;
+        let peer = EntityId::random();
+        let (tx, mut replies) = mpsc::unbounded_channel();
+        node.register_peer(
+            proto::Presence { node_id: peer, durable: false, system_root: None, protocol_version: proto::PROTOCOL_VERSION },
+            Box::new(ReplySender { peer, tx }),
+        )
+        .await?;
+        let claims = common::make_claims("editor", &["Editor"], "editor@example.com");
+        let auth = proto::AuthData(common::sign_token(&common::test_keys(), &claims).into_bytes());
+        let model = proto::RegisterModel::from(Role::descriptor());
+        let (role_id, _) = node.catalog.model_by_label(&model.label)?.expect("installed role model");
+        let (property_id, _) = node.catalog.property_by_name(&role_id, "name")?.expect("installed role name");
+        let (membership_id, membership) = node.catalog.membership(&role_id, &property_id)?.expect("installed role membership");
+        assert!(!membership.optional);
+        let before = catalog_states(&node).await?;
+
+        let mut changed = model.clone();
+        assert_eq!(changed.properties.len(), 1);
+        changed.properties[0].optional = true;
+        let response = wire_register(&node, peer, &mut replies, auth.clone(), changed).await?;
+        assert!(
+            matches!(response, proto::NodeResponseBody::Error(ref error) if error.contains("Only privileged contexts may change JWT policy schema")),
+            "{response:?}"
+        );
+        assert_eq!(catalog_states(&node).await?, before, "refused optionality changes must leave the catalog unchanged");
+        assert!(!node.catalog.membership_by_id(&membership_id)?.expect("unchanged role membership").optional);
+
+        // An application membership owns its optionality even when it shares a JWT-origin property.
+        let mut shared = model;
+        shared.label = "shared_role_name".into();
+        shared.name = "SharedRoleName".into();
+        shared.properties[0].explicit_id = Some(property_id);
+        let response = wire_register(&node, peer, &mut replies, auth.clone(), shared.clone()).await?;
+        assert!(matches!(response, proto::NodeResponseBody::SchemaRegistered { .. }), "{response:?}");
+        shared.properties[0].optional = true;
+        let response = wire_register(&node, peer, &mut replies, auth, shared).await?;
+        assert!(
+            matches!(response, proto::NodeResponseBody::SchemaRegistered { ref model } if model.properties[0].optional),
+            "{response:?}"
+        );
+        assert!(!node.catalog.membership_by_id(&membership_id)?.expect("unchanged role membership").optional);
+        node.deregister_peer(peer);
+        Ok::<(), anyhow::Error>(())
+    })
+    .await?
+}
+
+#[tokio::test]
 async fn catalog_read_exemption_does_not_cover_a_resident_application_entity() -> anyhow::Result<()> {
     let node = setup().await?;
-    let root = node.context(JwtContext::system())?;
+    let root = node.context_async(JwtContext::system()).await?;
     let id = {
         let trx = root.begin();
         let owner = trx.create(&RegistrationOwner { name: "Owner".into() }).await?;
@@ -149,9 +202,9 @@ async fn catalog_read_exemption_does_not_cover_a_resident_application_entity() -
         id
     };
     let resident = root.get::<RegistrationRecordView>(id).await?;
-    let anonymous = node.context(JwtContext::NoUser)?;
+    let anonymous = node.context_async(JwtContext::NoUser).await?;
     assert!(matches!(anonymous.get::<RegistrationRecordView>(id).await, Err(RetrievalError::AccessDenied(_))));
-    assert!(matches!(anonymous.get::<SysModelRowView>(id).await, Err(RetrievalError::EntityNotFound(found)) if found == id));
+    assert!(matches!(anonymous.get::<SysModelRowView>(id).await, Err(RetrievalError::AccessDenied(_))));
     let model_id = node.catalog.model_by_label("registrationrecord").unwrap().expect("registered model").0;
     assert_eq!(anonymous.get::<SysModelRowView>(model_id).await?.id(), model_id);
     assert_eq!(resident.id(), id, "keep the inaccessible entity resident through the mismatched read");
@@ -163,7 +216,7 @@ pub struct ScopeProbe {
     pub body: String,
 }
 
-/// The registration response binds the declaration independently of catalog subscription delivery.
+/// Registration and preflight allow first use before catalog or policy subscription updates arrive.
 #[tokio::test]
 async fn registration_completes_before_catalog_delivery() -> anyhow::Result<()> {
     tokio::time::timeout(Duration::from_secs(20), async {
@@ -176,8 +229,9 @@ async fn registration_completes_before_catalog_delivery() -> anyhow::Result<()> 
     }"#;
         let agent = JwtAgent::new_durable(common::test_keys(), common::blog_config_path())?;
         agent.update_config(serde_json::from_str(config)?);
-        let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent);
+        let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
         server.system.create().await?;
+        agent.set_policy(&server, &agent.config()).await?;
         let agent = JwtAgent::new_durable(common::test_keys(), common::blog_config_path())?;
         agent.update_config(serde_json::from_str(config)?);
         let client = Node::new(Arc::new(SledStorageEngine::new_test()?), agent);
@@ -223,15 +277,10 @@ async fn registration_completes_before_catalog_delivery() -> anyhow::Result<()> 
             let held = held.clone();
             tokio::spawn(async move {
                 while let Some(message) = client_rx.recv().await {
-                    if let proto::NodeMessage::Update(update) = &message {
-                        let proto::NodeUpdateBody::SubscriptionUpdate { items } = &update.body;
-                        if items.iter().all(|item| {
-                            matches!(item.collection.as_str(), MODEL_COLLECTION_ID | PROPERTY_COLLECTION_ID | MODEL_PROPERTY_COLLECTION_ID)
-                        }) {
-                            if let Some(held) = held.lock().unwrap().as_mut() {
-                                held.push(message);
-                                continue;
-                            }
+                    if matches!(&message, proto::NodeMessage::Update(_)) {
+                        if let Some(held) = held.lock().unwrap().as_mut() {
+                            held.push(message);
+                            continue;
                         }
                     }
                     let client = client.clone();
@@ -247,31 +296,40 @@ async fn registration_completes_before_catalog_delivery() -> anyhow::Result<()> 
 
         let claims = common::make_claims("hello", &["writer"], "writer@example.com");
         let token = common::sign_token(&common::test_keys(), &claims);
-        let context = client.context(JwtContext::from_claims(claims, token))?;
-        let model = context.register_model::<ScopeProbe>().await?;
+        let context = client.context_async(JwtContext::from_claims(claims, token)).await?;
+        let trx = context.begin();
+        let id = trx.create(&ScopeProbe { body: "hello".into() }).await?.id();
+        trx.commit().await?;
         let epoch = client.system.system_epoch().unwrap();
-        assert_eq!(ScopeProbe::descriptor().resolved.get(epoch), Some(model));
-        assert!(ScopeProbe::descriptor().properties.iter().all(|property| property.resolved.get(epoch).is_some()));
-        assert!(server.catalog.model_by_label("scopeprobe").unwrap().is_some());
+        let model = ScopeProbe::descriptor().bind_local(&client.catalog, epoch)?;
+        assert_eq!(ScopeProbe::descriptor().resolved.get(epoch), Ok(model));
+        assert!(ScopeProbe::descriptor().properties.iter().all(|property| property.resolved.get(epoch).is_ok()));
+        let (model_id, _) = server.catalog.model_by_label("scopeprobe")?.expect("registered scope model");
         assert!(client.catalog.model_by_label("scopeprobe").unwrap().is_none(), "registration must not wait for catalog delivery");
 
+        let denied = context.begin();
+        match denied.create(&ScopeProbe { body: "outside".into() }).await {
+            Err(MutationError::AccessDenied(AccessDenied::ByPolicy(message))) => assert_eq!(message, "Write outside permitted scope"),
+            Err(error) => anyhow::bail!("expected scoped denial before subscription delivery, got {error:?}"),
+            Ok(_) => anyhow::bail!("out-of-scope create must be refused before subscription delivery"),
+        }
+
+        let (property_id, _) = server.catalog.property_by_name(&model_id, "body")?.expect("registered scope property");
+        let (membership_id, _) = server.catalog.membership(&model_id, &property_id)?.expect("registered scope membership");
+        let catalog_ids = [model_id, property_id, membership_id];
         loop {
-            let count: usize = held
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .iter()
-                .map(|message| match message {
+            let all_catalog_held = {
+                let updates = held.lock().unwrap();
+                catalog_ids.iter().all(|id| updates.as_ref().unwrap().iter().any(|message| match message {
                     proto::NodeMessage::Update(update) => match &update.body {
-                        proto::NodeUpdateBody::SubscriptionUpdate { items } => items.len(),
+                        proto::NodeUpdateBody::SubscriptionUpdate { items } => items.iter().any(|item| item.entity_id == *id),
                     },
-                    _ => 0,
-                })
-                .sum();
-            if count >= 3 {
+                    _ => false,
+                }))
+            };
+            if all_catalog_held {
                 break;
-            } // One model, property, and membership row.
+            }
             tokio::task::yield_now().await;
         }
         let updates = held.lock().unwrap().take().unwrap();
@@ -279,10 +337,6 @@ async fn registration_completes_before_catalog_delivery() -> anyhow::Result<()> 
             client.handle_message(update).await?;
         }
 
-        // Scoped operations still need JWT's catalog-only resolver; that is separate from registration.
-        let trx = context.begin();
-        let id = trx.create(&ScopeProbe { body: "hello".into() }).await?.id();
-        trx.commit().await?;
         let query = context.query::<ScopeProbeView>("body = 'hello'")?;
         query.wait_durable_answered().await?;
         assert!(query.get().iter().any(|row| row.id() == id));

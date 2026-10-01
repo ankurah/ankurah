@@ -17,7 +17,7 @@ Tests are structured in three levels, each proving something different:
 
 Re-delivery of an already-applied event must be a no-op. This was the motivating bug for the Phase 5 staging rewrite: the old [`compare_unstored_event`](event-dag.md#why-compare-uses-the-events-own-id-not-its-parent-clock) would corrupt the head when a historical event was re-delivered.
 
-At the unit level, re-delivering the current head returns `Equal` and re-delivering an ancestor returns `StrictAscends` -- both no-ops. Integration tests build a linear chain, re-deliver a middle event via [`commit_remote_transaction`](node-architecture.md#durable-node-receives-remote-commit), and confirm the head, entity state, and event count are unchanged.
+At the unit level, re-delivering the current head returns `Equal` and re-delivering an ancestor returns `StrictAscends` -- both no-ops. Integration tests build a linear chain, re-deliver a middle event via [`commit_transaction`](node-architecture.md#durable-node-receives-remote-commit), and confirm the head, entity state, and event count are unchanged.
 
 ### Determinism
 
@@ -83,4 +83,4 @@ clock_eq!(dag, state.payload.state.head, [D]);
 
 **`apply_state` divergence path** -- The integration test creates a diverged topology but verifies that both concurrent changes are applied, rather than testing the [`apply_state`](entity-lifecycle.md#how-state-snapshots-are-applied) rejection path (`Ok(false)`) directly.
 
-**Multi-column ORDER BY** (`#[ignore]`) -- Three tests in `tests/tests/sled/multi_column_order_by.rs` are blocked on issue #210 (i64 sorted lexicographically). Unrelated to the event DAG.
+**Negative signed-integer ORDER BY** -- Issue #210 remains open because the Sled integer encoding does not yet preserve numeric order across negative and non-negative values. Positive-value multi-column ORDER BY coverage is enabled in `tests/tests/sled/multi_column_order_by.rs`. Unrelated to the event DAG.

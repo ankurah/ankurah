@@ -192,7 +192,7 @@ fn make_event(seed: u16, backend_name: &str, operations: Vec<Operation>, parents
         &parent,
         OperationSet::from_backends(BTreeMap::from([(backend_name.to_string(), operations)])),
     );
-    Event { entity_id, collection: "conformance".into(), body, parent }
+    Event { entity_id, body, parent }
 }
 
 /// Assemble an [`EventLayer`] from event references, deriving the DAG skeleton

@@ -1,6 +1,7 @@
 mod common;
 
 use ankql::ast::{ComparisonOperator, Expr, OrderByItem, OrderDirection, Predicate, PropertyPath, Selection};
+use ankurah::core::storage::StorageEngine;
 use ankurah::{policy::DEFAULT_CONTEXT as c, proto::EntityId, Model, Node, PermissiveAgent};
 use ankurah_core_types::Value;
 use ankurah_storage_sled::SledStorageEngine;
@@ -41,10 +42,9 @@ async fn test_id_range_optimization_integration() -> Result<()> {
         limit: Some(5),
     };
 
-    // Fetch results directly from storage collection to test optimization
-    let collection_id = TestEntity::collection();
-    let storage_collection = node.collections.get(&collection_id).await?;
-    let results_asc = storage_collection.fetch_states(&selection_asc).await?;
+    // Fetch results directly from storage to test optimization
+    let model_id = context.resolve_model_id::<TestEntity>().await?;
+    let results_asc = node.storage.fetch_states(&selection_asc.clone().and_member_of(model_id)).await?;
 
     // Should get exactly 5 results
     assert_eq!(results_asc.len(), 5, "Should return exactly 5 results due to LIMIT");
@@ -62,7 +62,7 @@ async fn test_id_range_optimization_integration() -> Result<()> {
         limit: Some(3),
     };
 
-    let results_desc = storage_collection.fetch_states(&selection_desc).await?;
+    let results_desc = node.storage.fetch_states(&selection_desc.clone().and_member_of(model_id)).await?;
 
     // Validate descending results
     assert_eq!(results_desc.len(), 3, "Should return exactly 3 results due to LIMIT");
@@ -80,7 +80,7 @@ async fn test_id_range_optimization_integration() -> Result<()> {
         limit: Some(5),
     };
 
-    let results_name = storage_collection.fetch_states(&selection_name).await?;
+    let results_name = node.storage.fetch_states(&selection_name.clone().and_member_of(model_id)).await?;
 
     // Validate name-sorted results - we just check that we get the expected count
     // The actual sorting behavior is tested in unit tests
@@ -126,9 +126,8 @@ async fn test_id_range_with_where_clause() -> Result<()> {
         limit: Some(3),
     };
 
-    let collection_id = TestEntity::collection();
-    let storage_collection = node.collections.get(&collection_id).await?;
-    let results = storage_collection.fetch_states(&selection).await?;
+    let model_id = context.resolve_model_id::<TestEntity>().await?;
+    let results = node.storage.fetch_states(&selection.clone().and_member_of(model_id)).await?;
 
     // Should get exactly 3 results
     assert_eq!(results.len(), 3, "Should return exactly 3 results due to LIMIT");

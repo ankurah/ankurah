@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::{
-    auth::Attested, clock::Clock, collection::CollectionId, data::Event, id::EntityId, subscription::QueryId, transaction::TransactionId,
-    EntityState, EventFragment, EventId, RegisterModel, RegisteredModel, StateFragment,
+    auth::Attested, clock::Clock, data::Event, id::EntityId, subscription::QueryId, transaction::TransactionId, EntityState, EventFragment,
+    EventId, RegisterModel, RegisteredModel, StateFragment,
 };
 
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Serialize, Deserialize, Hash, Default)]
@@ -111,7 +111,6 @@ pub enum DeltaContent {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct EntityDelta {
     pub entity_id: EntityId,
-    pub collection: CollectionId,
     pub content: DeltaContent,
 }
 
@@ -123,23 +122,19 @@ pub enum NodeRequestBody {
         id: TransactionId,
         events: Vec<Attested<Event>>,
     },
-    // Request to fetch entities matching a predicate
+    // Request entities by identity, distinguishing missing from denied reads.
     Get {
-        collection: CollectionId,
         ids: Vec<EntityId>,
     },
     GetEvents {
-        collection: CollectionId,
         event_ids: Vec<EventId>,
     },
     Fetch {
-        collection: CollectionId,
         selection: ast::Selection<ast::Resolved>,
         known_matches: Vec<KnownEntity>,
     },
     SubscribeQuery {
         query_id: QueryId,
-        collection: CollectionId,
         selection: ast::Selection<ast::Resolved>,
         version: u32,
         known_matches: Vec<KnownEntity>,
@@ -174,7 +169,8 @@ pub enum NodeResponseBody {
         id: TransactionId,
     },
     Fetch(Vec<EntityDelta>),
-    Get(Vec<Attested<EntityState>>),
+    /// One outcome per requested identity, in request order.
+    Get(Vec<GetResult>),
     GetEvents(Vec<Attested<Event>>),
     QuerySubscribed {
         query_id: QueryId,
@@ -186,6 +182,54 @@ pub enum NodeResponseBody {
     },
     Success,
     Error(String),
+}
+
+/// A known-ID read reports denial separately from absence, without returning denied state.
+#[derive(Debug, Serialize, Deserialize, Clone, strum::Display)]
+pub enum GetResult {
+    #[strum(transparent)]
+    Found(Attested<EntityState>),
+    #[strum(to_string = "{0}: not found")]
+    NotFound(EntityId),
+    #[strum(to_string = "{0}: access denied")]
+    AccessDenied(EntityId),
+}
+
+impl GetResult {
+    pub fn entity_id(&self) -> EntityId {
+        match self {
+            Self::Found(state) => state.payload.entity_id,
+            Self::NotFound(id) | Self::AccessDenied(id) => *id,
+        }
+    }
+}
+
+/// Failed known-ID read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GetFailure {
+    NotFound(EntityId),
+    AccessDenied(EntityId),
+}
+
+impl TryFrom<GetResult> for Attested<EntityState> {
+    type Error = GetFailure;
+
+    fn try_from(result: GetResult) -> Result<Self, Self::Error> {
+        match result {
+            GetResult::Found(state) => Ok(state),
+            GetResult::NotFound(id) => Err(GetFailure::NotFound(id)),
+            GetResult::AccessDenied(id) => Err(GetFailure::AccessDenied(id)),
+        }
+    }
+}
+
+impl TryFrom<GetResult> for EntityDelta {
+    type Error = GetFailure;
+
+    fn try_from(result: GetResult) -> Result<Self, Self::Error> {
+        let state = Attested::<EntityState>::try_from(result)?;
+        Ok(Self { entity_id: state.payload.entity_id, content: DeltaContent::StateSnapshot { state: state.into() } })
+    }
 }
 
 impl std::fmt::Display for NodeRequest {
@@ -203,20 +247,20 @@ impl std::fmt::Display for NodeResponse {
 impl std::fmt::Display for NodeRequestBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            NodeRequestBody::CommitTransaction { id, events } => {
+            NodeRequestBody::CommitTransaction { id, events, .. } => {
                 write!(f, "CommitTransaction {id} [{}]", events.iter().map(|e| format!("{}", e)).collect::<Vec<_>>().join(", "))
             }
-            NodeRequestBody::Get { collection, ids } => {
-                write!(f, "Get {collection} {}", ids.iter().map(|id| id.to_base64_short()).collect::<Vec<_>>().join(", "))
+            NodeRequestBody::Get { ids } => {
+                write!(f, "Get {}", ids.iter().map(|id| id.to_base64_short()).collect::<Vec<_>>().join(", "))
             }
-            NodeRequestBody::GetEvents { collection, event_ids } => {
-                write!(f, "GetEvents {collection} {}", event_ids.iter().map(|id| id.to_base64_short()).collect::<Vec<_>>().join(", "),)
+            NodeRequestBody::GetEvents { event_ids } => {
+                write!(f, "GetEvents {}", event_ids.iter().map(|id| id.to_base64_short()).collect::<Vec<_>>().join(", "),)
             }
-            NodeRequestBody::Fetch { collection, selection: query, known_matches } => {
-                write!(f, "Fetch {collection} {query} known:{}", known_matches.len())
+            NodeRequestBody::Fetch { selection: query, known_matches } => {
+                write!(f, "Fetch {query} known:{}", known_matches.len())
             }
-            NodeRequestBody::SubscribeQuery { query_id, collection, selection: query, version, known_matches } => {
-                write!(f, "Subscribe {query_id} {collection} {query} v{version} known:{}", known_matches.len())
+            NodeRequestBody::SubscribeQuery { query_id, selection: query, version, known_matches } => {
+                write!(f, "Subscribe {query_id} {query} v{version} known:{}", known_matches.len())
             }
             NodeRequestBody::RegisterSchema { model } => {
                 write!(f, "RegisterSchema {} properties:{}", model.label, model.properties.len())
@@ -254,12 +298,14 @@ impl std::fmt::Display for EntityDelta {
             DeltaContent::EventBridge { events } => {
                 let mut event_strs = Vec::new();
                 for event in events {
-                    let event = Attested::<Event>::from_parts(self.entity_id, self.collection.clone(), event.clone());
+                    let event = Attested::<Event>::from_parts(self.entity_id, event.clone());
                     event_strs.push(event.payload.to_string());
                 }
                 write!(f, "EntityDelta {}: EventBridge({})", self.entity_id, event_strs.join(", "))
             }
-            DeltaContent::StateAndRelation { state, relation } => write!(f, "EntityDelta {}: StateAndRelation({})", self.entity_id, state),
+            DeltaContent::StateAndRelation { state, relation: _ } => {
+                write!(f, "EntityDelta {}: StateAndRelation({})", self.entity_id, state)
+            }
         }
     }
 }

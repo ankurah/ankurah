@@ -25,7 +25,6 @@ fn property(name: &str, renamed_from: Option<&str>, backend: &str, value_type: &
         renamed_from: renamed_from.map(|s| s.to_string()),
         backend: backend.into(),
         value_type: value_type.into(),
-        target_label: None,
         explicit_id: None,
         build_id: [0u8; 16],
         optional: false,
@@ -42,16 +41,16 @@ fn album_request() -> proto::NodeRequestBody {
     proto::NodeRequestBody::RegisterSchema { model: album_model(vec![property("name", None, "yrs", "string")]) }
 }
 
-async fn catalog_values(node: &TestNode, collection: &str, id: EntityId) -> anyhow::Result<BTreeMap<String, Option<Value>>> {
-    let state = node.collections.get(&proto::CollectionId::fixed_name(collection)).await?.get_state(id).await?;
+async fn catalog_values(node: &TestNode, _model: &str, id: EntityId) -> anyhow::Result<BTreeMap<String, Option<Value>>> {
+    let state = node.storage.get_state(id).await?;
     let buffer = state.payload.state.state_buffers.0.get("lww").expect("catalog entities are LWW").clone();
     // Catalog collections are name-keyed at the backend layer (the bootstrap
     // exemption), so the values are already keyed by their registered names.
     Ok(LWWBackend::from_state_buffer(&buffer)?.property_values().into_iter().map(|(k, v)| (k.to_string(), v)).collect())
 }
 
-async fn catalog_head(node: &TestNode, collection: &str, id: EntityId) -> anyhow::Result<proto::Clock> {
-    Ok(node.collections.get(&proto::CollectionId::fixed_name(collection)).await?.get_state(id).await?.payload.state.head)
+async fn catalog_head(node: &TestNode, _model: &str, id: EntityId) -> anyhow::Result<proto::Clock> {
+    Ok(node.storage.get_state(id).await?.payload.state.head)
 }
 
 async fn connected_pair(
@@ -69,11 +68,6 @@ fn expect_registered(resp: proto::NodeResponseBody) -> proto::RegisteredModel {
         proto::NodeResponseBody::SchemaRegistered { model } => model,
         other => panic!("expected SchemaRegistered, got {other}"),
     }
-}
-
-/// The model's resolved property row by name.
-fn prop<'a>(model: &'a proto::RegisteredModel, name: &str) -> &'a proto::RegisteredProperty {
-    model.properties.iter().find(|p| p.name == name).unwrap_or_else(|| panic!("property '{name}' in response"))
 }
 
 fn expect_error(resp: proto::NodeResponseBody, needle: &str) {
@@ -166,81 +160,6 @@ async fn renamed_from_moves_the_lineage() -> anyhow::Result<()> {
     let again = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, rename()).await?);
     assert_eq!(again.properties[0].id, property_id);
     assert_eq!(catalog_head(&server, PROPERTY, property_id).await?, head_before, "an applied hint is a pure no-op");
-
-    Ok(())
-}
-
-/// A full descriptor's absent reference target means clear. Both the ordinary
-/// hit and rename paths emit a tombstone, and a later retarget remains mutable.
-#[tokio::test]
-async fn target_model_can_be_cleared_retargeted_and_cleared_on_rename() -> anyhow::Result<()> {
-    let (server, client, _conn) = connected_pair().await?;
-
-    let initial = proto::NodeRequestBody::RegisterSchema {
-        model: album_model(vec![proto::RegisterProperty {
-            name: "artist".into(),
-            renamed_from: None,
-            backend: "lww".into(),
-            value_type: "entityid".into(),
-            target_label: Some("artist".into()),
-            explicit_id: None,
-            build_id: [0u8; 16],
-            optional: false,
-        }]),
-    };
-    let first = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, initial).await?);
-    let property_id = first.properties[0].id;
-    let target_model = first.properties[0].target_model.expect("initial target resolved");
-
-    let clear = proto::NodeRequestBody::RegisterSchema {
-        model: album_model(vec![proto::RegisterProperty {
-            name: "artist".into(),
-            renamed_from: None,
-            backend: "lww".into(),
-            value_type: "entityid".into(),
-            target_label: None,
-            explicit_id: None,
-            build_id: [0u8; 16],
-            optional: false,
-        }]),
-    };
-    let cleared = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, clear).await?);
-    assert_eq!(cleared.properties[0].id, property_id);
-    assert_eq!(cleared.properties[0].target_model, None);
-    assert_eq!(catalog_values(&server, PROPERTY, property_id).await?.get("target_model"), Some(&None));
-
-    let retarget = proto::NodeRequestBody::RegisterSchema {
-        model: album_model(vec![proto::RegisterProperty {
-            name: "artist".into(),
-            renamed_from: None,
-            backend: "lww".into(),
-            value_type: "entityid".into(),
-            target_label: Some("artist".into()),
-            explicit_id: None,
-            build_id: [0u8; 16],
-            optional: false,
-        }]),
-    };
-    let retargeted = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, retarget).await?);
-    assert_eq!(retargeted.properties[0].target_model, Some(target_model));
-
-    let rename = proto::NodeRequestBody::RegisterSchema {
-        model: album_model(vec![proto::RegisterProperty {
-            name: "performer".into(),
-            renamed_from: Some("artist".into()),
-            backend: "lww".into(),
-            value_type: "entityid".into(),
-            target_label: None,
-            explicit_id: None,
-            build_id: [0u8; 16],
-            optional: false,
-        }]),
-    };
-    let renamed = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, rename).await?);
-    assert_eq!(renamed.properties[0].id, property_id);
-    assert_eq!(renamed.properties[0].target_model, None);
-    let values = catalog_values(&server, PROPERTY, property_id).await?;
-    assert_eq!(values.get("target_model"), Some(&None));
 
     Ok(())
 }
@@ -450,39 +369,6 @@ async fn model_display_name_renames_and_reverts() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A reference-typed property names its target model by COLLECTION; the
-/// executor resolves it, allocating a stub model on miss, and the response
-/// reports the allocation as the property's resolved target.
-#[tokio::test]
-async fn target_collection_resolves_and_allocates_on_miss() -> anyhow::Result<()> {
-    let (server, client, _conn) = connected_pair().await?;
-
-    let request = proto::NodeRequestBody::RegisterSchema {
-        model: album_model(vec![proto::RegisterProperty {
-            name: "artist".into(),
-            renamed_from: None,
-            backend: "lww".into(),
-            value_type: "entityid".into(),
-            target_label: Some("artist".into()),
-            explicit_id: None,
-            build_id: [0u8; 16],
-            optional: false,
-        }]),
-    };
-    let model = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, request).await?);
-
-    // The stub allocation is visible as the property's resolved target id.
-    let registered = prop(&model, "artist");
-    let artist_model_id = registered.target_model.expect("stub target model allocated");
-
-    let values = catalog_values(&server, PROPERTY, registered.id).await?;
-    assert_eq!(values.get("target_model"), Some(&Some(Value::EntityId(artist_model_id))));
-    let stub = catalog_values(&server, MODEL, artist_model_id).await?;
-    assert_eq!(stub.get("label"), Some(&Some(Value::String("artist".into()))));
-
-    Ok(())
-}
-
 /// An explicit-id binding references an existing property (sharing).
 /// Absence and an incompatible canonical declaration hard-fail.
 #[tokio::test]
@@ -505,7 +391,6 @@ async fn explicit_id_binding_and_sharing() -> anyhow::Result<()> {
                 renamed_from: None,
                 backend: "yrs".into(),
                 value_type: "string".into(),
-                target_label: None,
                 explicit_id: Some(property_id),
                 build_id: [0u8; 16],
                 optional: true,
@@ -527,7 +412,6 @@ async fn explicit_id_binding_and_sharing() -> anyhow::Result<()> {
             renamed_from: None,
             backend: "lww".into(),
             value_type: "string".into(),
-            target_label: None,
             explicit_id: Some(EntityId::random()),
             build_id: [0u8; 16],
             optional: false,
@@ -542,7 +426,6 @@ async fn explicit_id_binding_and_sharing() -> anyhow::Result<()> {
             renamed_from: None,
             backend: "lww".into(),
             value_type: "i64".into(),
-            target_label: None,
             explicit_id: Some(property_id),
             build_id: [0u8; 16],
             optional: false,
@@ -624,7 +507,6 @@ async fn explicit_id_binding_rejects_non_catalog_entities() -> anyhow::Result<()
             renamed_from: None,
             backend: "yrs".into(),
             value_type: "string".into(),
-            target_label: None,
             explicit_id: Some(ordinary_id),
             build_id: [0u8; 16],
             optional: false,
@@ -666,7 +548,6 @@ async fn explicit_id_binding_rejects_type_drift() -> anyhow::Result<()> {
                 renamed_from: None,
                 backend: "lww".into(),
                 value_type: "i64".into(),
-                target_label: None,
                 explicit_id: Some(property_id),
                 build_id: [0u8; 16],
                 optional: false,
@@ -699,7 +580,6 @@ async fn dangling_explicit_property_refuses_before_writes() -> anyhow::Result<()
                 renamed_from: None,
                 backend: "lww".into(),
                 value_type: "string".into(),
-                target_label: None,
                 explicit_id: Some(missing),
                 build_id: [0u8; 16],
                 optional: false,
@@ -738,7 +618,6 @@ async fn explicit_model_id_binding() -> anyhow::Result<()> {
         renamed_from: None,
         backend: "lww".into(),
         value_type: "string".into(),
-        target_label: None,
         explicit_id: None,
         build_id: [0u8; 16],
         optional: false,
@@ -799,7 +678,7 @@ impl ankurah::policy::PolicyAgent for ProbeAgent {
         Ok(auth.iterable().map(|_| DEFAULT_CONTEXT).collect())
     }
 
-    fn check_event<SE: ankurah::core::storage::StorageEngine>(
+    fn check_write_event<SE: ankurah::core::storage::StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
         _cdata: &Self::ContextData,
@@ -848,39 +727,9 @@ impl ankurah::policy::PolicyAgent for ProbeAgent {
         Ok(())
     }
 
-    fn can_access_collection<C>(&self, _data: &C, _collection: &proto::CollectionId) -> Result<(), ankurah::policy::AccessDenied>
+    fn query_predicate<C>(&self, _data: &C) -> Result<ankql::ast::Predicate<ankql::ast::Resolved>, ankurah::policy::AccessDenied>
     where C: ankurah::core::util::Iterable<Self::ContextData> {
-        Ok(())
-    }
-
-    fn filter_predicate<C>(
-        &self,
-        _data: &C,
-        _collection: &proto::CollectionId,
-        predicate: ankql::ast::Predicate<ankql::ast::Resolved>,
-    ) -> Result<ankql::ast::Predicate<ankql::ast::Resolved>, ankurah::policy::AccessDenied>
-    where
-        C: ankurah::core::util::Iterable<Self::ContextData>,
-    {
-        Ok(predicate)
-    }
-
-    fn check_read<C>(
-        &self,
-        _data: &C,
-        _id: &proto::EntityId,
-        _collection: &proto::CollectionId,
-        _state: &proto::State,
-    ) -> Result<(), ankurah::policy::AccessDenied>
-    where
-        C: ankurah::core::util::Iterable<Self::ContextData>,
-    {
-        Ok(())
-    }
-
-    fn check_read_event<C>(&self, _data: &C, _event: &proto::Attested<proto::Event>) -> Result<(), ankurah::policy::AccessDenied>
-    where C: ankurah::core::util::Iterable<Self::ContextData> {
-        Ok(())
+        Ok(ankql::ast::Predicate::True)
     }
 
     fn check_write(
@@ -979,23 +828,15 @@ async fn policy_verb_skipped_on_noop_reregistration() -> anyhow::Result<()> {
 async fn count_rows<PA>(node: &Node<SledStorageEngine, PA>, collection: &str) -> anyhow::Result<usize>
 where PA: ankurah::policy::PolicyAgent + Send + Sync + 'static {
     let selection = ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None };
-    Ok(node.collections.get(&proto::CollectionId::fixed_name(collection)).await?.fetch_states(&selection).await?.len())
+    let model = ankurah::core::schema::system_model_id(collection).expect("catalog helper only accepts built-in model labels");
+    Ok(node.storage.fetch_states(&selection.clone().and_member_of(model)).await?.len())
 }
 
-/// No legitimate registration names a reserved collection: the system and
-/// catalog collections route by name and have no catalog model entities of
-/// their own, so a descriptor naming one could only route ordinary traffic into a
-/// protected collection. The executor refuses the reserved prefix in every
-/// position a request can name a collection -- the model itself, a
-/// property's minting or target collection, and a membership -- up front,
-/// before policy, lookups, or writes (the executor-side twin of the
-/// descriptor-ingest guard in catalog.rs).
+/// Reserved model labels are refused before any catalog writes.
 #[tokio::test]
 async fn reserved_collection_prefix_refuses_registration() -> anyhow::Result<()> {
     let (server, client, _conn) = connected_pair().await?;
 
-    // As the model collection (a known catalog collection, and a novel name
-    // under the prefix: the rule is the prefix, not an allowlist).
     for collection in ["_ankurah_model", "_ankurah_custom"] {
         let as_model = proto::NodeRequestBody::RegisterSchema {
             model: proto::RegisterModel {
@@ -1009,32 +850,6 @@ async fn reserved_collection_prefix_refuses_registration() -> anyhow::Result<()>
         expect_error(client.request(server.id, &DEFAULT_CONTEXT, as_model).await?, "reserved prefix");
     }
 
-    // A reserved minting collection is unrepresentable under nesting:
-    // properties nest inside their model, so the model-label guard above IS
-    // the minting-scope guard.
-
-    // As a property's target collection, riding along with an otherwise
-    // ordinary request: the whole request is refused before any write.
-    let as_target = proto::NodeRequestBody::RegisterSchema {
-        model: album_model(vec![proto::RegisterProperty {
-            name: "owner".into(),
-            renamed_from: None,
-            backend: "lww".into(),
-            value_type: "entity_ref".into(),
-            target_label: Some("_ankurah_model".into()),
-            explicit_id: None,
-            build_id: [0u8; 16],
-            optional: false,
-        }]),
-    };
-    expect_error(client.request(server.id, &DEFAULT_CONTEXT, as_target).await?, "reserved prefix");
-
-    // A reserved membership collection is likewise unrepresentable: the
-    // nesting is the membership, so there is no separate collection field to
-    // abuse.
-
-    // The refusals happened before the plan committed anything: the catalog
-    // holds no model or property rows (not even the "album" rider).
     assert_eq!(count_rows(&server, MODEL).await?, 0, "no model row survives a refused request");
     assert_eq!(count_rows(&server, PROPERTY).await?, 0, "no property row survives a refused request");
 

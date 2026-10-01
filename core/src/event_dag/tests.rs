@@ -77,7 +77,7 @@ fn make_test_event(seed: u8, parent_ids: &[EventId]) -> Event {
     let entity_id = EntityId::from_bytes(entity_id_bytes);
 
     let parent = Clock::from(parent_ids.to_vec());
-    Event { entity_id, collection: "test".into(), body: fixture_body(&[seed], &parent, OperationSet::default()), parent }
+    Event { entity_id, body: fixture_body(&[seed], &parent, OperationSet::default()), parent }
 }
 
 /// Like make_test_event but with a two-byte seed, for tests that need a wide
@@ -87,7 +87,7 @@ fn make_test_event_u16(seed: u16, parent_ids: &[EventId]) -> Event {
     entity_id_bytes[0..2].copy_from_slice(&seed.to_be_bytes());
     let entity_id = EntityId::from_bytes(entity_id_bytes);
     let parent = Clock::from(parent_ids.to_vec());
-    Event { entity_id, collection: "test".into(), body: fixture_body(&seed.to_be_bytes(), &parent, OperationSet::default()), parent }
+    Event { entity_id, body: fixture_body(&seed.to_be_bytes(), &parent, OperationSet::default()), parent }
 }
 
 /// Create a Clock from EventIds without consuming them.
@@ -113,7 +113,6 @@ fn make_lww_event(seed: u8, properties: Vec<(&str, &str)>) -> Event {
     let parent = Clock::default();
     Event {
         entity_id,
-        collection: "test".into(),
         body: fixture_body(&[seed], &parent, OperationSet::from_backends(BTreeMap::from([("lww".to_string(), ops)]))),
         parent,
     }
@@ -1374,7 +1373,6 @@ mod yrs_layer_tests {
         let parent = Clock::default();
         Event {
             entity_id,
-            collection: "test".into(),
             body: fixture_body(&[seed], &parent, OperationSet::from_backends(BTreeMap::from([("yrs".to_string(), ops)]))),
             parent,
         }
@@ -1611,7 +1609,6 @@ mod edge_case_tests {
         let parent = Clock::default();
         let empty_event = Event {
             entity_id,
-            collection: "test".into(),
             body: fixture_body(&[99], &parent, OperationSet::default()), // No operations
             parent,
         };
@@ -1678,7 +1675,6 @@ mod edge_case_tests {
         let parent = Clock::default();
         let delete_event = Event {
             entity_id,
-            collection: "test".into(),
             body: fixture_body(&[2], &parent, OperationSet::from_backends(BTreeMap::from([("lww".to_string(), ops)]))),
             parent,
         };
@@ -1835,7 +1831,6 @@ mod phase4_idempotency {
 #[cfg(test)]
 mod phase4_duplicate_creation {
     use super::*;
-    use crate::entity::Entity;
     use crate::error::MutationError;
 
     fn make_creation_event(seed: u8) -> Event {
@@ -1852,7 +1847,6 @@ mod phase4_duplicate_creation {
         let parent = Clock::default(); // no parent = genesis
         Event {
             entity_id,
-            collection: "test".into(),
             body: fixture_body(&[seed], &parent, OperationSet::from_backends(BTreeMap::from([("lww".to_string(), ops)]))),
             parent,
         }
@@ -1860,10 +1854,7 @@ mod phase4_duplicate_creation {
 
     #[tokio::test]
     async fn test_second_creation_event_rejected() {
-        let mut entity_id_bytes = [0u8; 32];
-        entity_id_bytes[0] = 42;
-        let entity_id = EntityId::from_bytes(entity_id_bytes);
-        let entity = Entity::create(entity_id, "test".into(), crate::schema::SystemEpoch::BOOTSTRAP);
+        let entity = crate::entity::state::EntityState::empty();
 
         let mut retriever = MockRetriever::new();
 
@@ -1891,10 +1882,7 @@ mod phase4_duplicate_creation {
 
     #[tokio::test]
     async fn test_redelivery_of_same_creation_event_is_noop() {
-        let mut entity_id_bytes = [0u8; 32];
-        entity_id_bytes[0] = 42;
-        let entity_id = EntityId::from_bytes(entity_id_bytes);
-        let entity = Entity::create(entity_id, "test".into(), crate::schema::SystemEpoch::BOOTSTRAP);
+        let entity = crate::entity::state::EntityState::empty();
 
         let mut retriever = MockRetriever::new();
 
@@ -1902,7 +1890,7 @@ mod phase4_duplicate_creation {
         let creation_event = make_creation_event(1);
         retriever.add_event(creation_event.clone());
 
-        let result = entity.apply_event(&retriever, &creation_event).await;
+        let result = entity.apply_event(&retriever, &creation_event.clone()).await;
         assert!(result.is_ok() && result.unwrap(), "First apply should succeed");
 
         // Re-deliver the SAME creation event (same content, same id)
@@ -2649,14 +2637,14 @@ mod quick_check_disjoint_verify {
 #[cfg(test)]
 mod strict_descends_gap_jump {
     use super::*;
-    use crate::entity::Entity;
+    use crate::entity::state::EntityState;
     use crate::event_dag::ordering::topo_sort_events;
     use crate::property::backend::lww::LWWBackend;
     use crate::property::backend::PropertyBackend;
     use ankurah_proto::Attested;
 
     /// Read a committed LWW property value out of the entity's serialized state.
-    fn read_lww(entity: &Entity, name: &str) -> Option<Value> {
+    fn read_lww(entity: &EntityState, name: &str) -> Option<Value> {
         let state = entity.to_state().unwrap();
         let buf = state.state_buffers.0.get("lww")?;
         let backend = LWWBackend::from_state_buffer(buf).unwrap();
@@ -2673,10 +2661,7 @@ mod strict_descends_gap_jump {
     /// that wrong state is persisted via set_state and served as canonical.
     #[tokio::test]
     async fn test_strict_descends_gap_jump_skips_ancestor_ops() {
-        let mut entity_id_bytes = [0u8; 32];
-        entity_id_bytes[0] = 42;
-        let entity_id = EntityId::from_bytes(entity_id_bytes);
-        let entity = Entity::create(entity_id, "test".into(), crate::schema::SystemEpoch::BOOTSTRAP);
+        let entity = crate::entity::state::EntityState::empty();
 
         let mut retriever = MockRetriever::new();
 
@@ -2975,10 +2960,14 @@ mod comparison_property {
 mod entity_change_batches {
     use super::*;
     use crate::changes::EntityChange;
-    use crate::entity::Entity;
     use crate::property::backend::lww::LWWBackend;
     use crate::property::backend::PropertyBackend;
     use ankurah_proto::Attested;
+
+    #[async_trait]
+    impl crate::retrieval::GetState for MockRetriever {
+        async fn get_state(&self, _: EntityId) -> Result<Option<Attested<ankurah_proto::EntityState>>, RetrievalError> { Ok(None) }
+    }
 
     /// Like make_lww_event_with_parent, but for a FIXED entity id:
     /// EntityChange validates event ownership, so the events must genuinely
@@ -2993,7 +2982,6 @@ mod entity_change_batches {
         let parent = Clock::from(parent_ids.to_vec());
         Event {
             entity_id,
-            collection: "test".into(),
             body: fixture_body(
                 entity_id.to_bytes().as_slice(),
                 &parent,
@@ -3012,7 +3000,7 @@ mod entity_change_batches {
         let mut entity_id_bytes = [0u8; 32];
         entity_id_bytes[0] = 77;
         let entity_id = EntityId::from_bytes(entity_id_bytes);
-        let entity = Entity::create(entity_id, "test".into(), crate::schema::SystemEpoch::BOOTSTRAP);
+        let entity = crate::entity::state::EntityState::empty();
 
         let mut retriever = MockRetriever::new();
 
@@ -3023,11 +3011,13 @@ mod entity_change_batches {
         let ev_b = lww_event_for(entity_id, vec![("p2", "from_b")], &[ev_x.id()]);
         retriever.add_event(ev_b.clone());
 
-        assert!(entity.apply_event(&retriever, &ev_a).await.unwrap());
-        assert!(entity.apply_event(&retriever, &ev_x).await.unwrap());
-        assert!(entity.apply_event(&retriever, &ev_b).await.unwrap());
+        assert!(entity.apply_event(&retriever, &ev_a.clone()).await.unwrap());
+        assert!(entity.apply_event(&retriever, &ev_x.clone()).await.unwrap());
+        assert!(entity.apply_event(&retriever, &ev_b.clone()).await.unwrap());
         assert_eq!(entity.head(), Clock::from(vec![ev_b.id()]));
 
+        let entities = crate::entity::WeakEntitySet::new(crate::schema::SystemEpoch::BOOTSTRAP);
+        let (_, entity) = entities.with_state(&retriever, &retriever, entity_id, entity.to_state().unwrap()).await.unwrap();
         let batch = vec![Attested::opt(ev_x.clone(), None), Attested::opt(ev_b.clone(), None)];
         let change = EntityChange::new(entity.clone(), batch);
         assert!(change.is_ok(), "superseded ancestor X must be acceptable in a batch notification: {:?}", change.err());

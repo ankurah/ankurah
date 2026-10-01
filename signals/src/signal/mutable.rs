@@ -47,6 +47,15 @@ impl<T: 'static> Mut<T> {
         result
     }
 
+    /// Mutates the value in place, runs `before_notify`, then notifies listeners.
+    /// Unlike `set_before_notify`, fields the closure leaves alone keep any concurrent writes.
+    pub fn update_before_notify<R>(&self, f: impl FnOnce(&mut T), before_notify: impl FnOnce() -> R) -> R {
+        self.value.with_mut(f);
+        let result = before_notify();
+        self.broadcast.send(());
+        result
+    }
+
     /// Calls a closure with a borrow of the current value
     /// not tracked by the current context
     pub fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R { self.value.with(f) }
@@ -151,5 +160,23 @@ mod tests {
         signal.set_before_notify(2, || ready.store(true, std::sync::atomic::Ordering::Release));
         assert_eq!(signal.value(), 2);
         assert_eq!(*seen.lock().unwrap(), vec![2]);
+    }
+
+    #[test]
+    fn update_before_notify_mutates_in_place_and_runs_hook_before_listener() {
+        let signal = Mut::new((1, "kept"));
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let listener_ready = ready.clone();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener_seen = seen.clone();
+        let value = signal.read();
+        let _guard = signal.listen(Arc::new(move |_| {
+            assert!(listener_ready.load(std::sync::atomic::Ordering::Acquire));
+            listener_seen.lock().unwrap().push(value.value());
+        }));
+
+        signal.update_before_notify(|v| v.0 = 2, || ready.store(true, std::sync::atomic::Ordering::Release));
+        assert_eq!(signal.value(), (2, "kept"));
+        assert_eq!(*seen.lock().unwrap(), vec![(2, "kept")]);
     }
 }

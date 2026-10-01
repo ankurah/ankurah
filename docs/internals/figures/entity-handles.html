@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light">
+  <title>Entity handles in Ankurah 0.10</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    :root {
+      --paper: #f5f5f5;
+      --ink: #2d3142;
+      --muted: #4f5d75;
+      --accent: #eb6c36;
+      --rule: rgba(45, 49, 66, 0.12);
+    }
+    body { margin: 0; padding: 24px; background: var(--paper); color: var(--ink); font-family: 'Geist', sans-serif; }
+    main { max-width: 960px; margin: 0 auto; }
+    h1 { margin: 0 0 8px; font: 400 28px/1.2 'Instrument Serif', serif; }
+    p { margin: 0; max-width: 68ch; color: var(--muted); font-size: 16px; line-height: 1.5; }
+    .canvas { overflow-x: auto; margin-top: 8px; }
+    .canvas:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
+    svg { display: block; width: 100%; min-width: 640px; }
+    .edge { fill: none; stroke: var(--muted); stroke-width: 1.2; marker-end: url(#arrow); }
+    .node { fill: #fff; stroke: var(--ink); stroke-width: 1; }
+    .focal { fill: rgba(235, 108, 54, 0.08); stroke: var(--accent); stroke-width: 1.2; }
+    .store { fill: rgba(45, 49, 66, 0.05); stroke: var(--muted); stroke-width: 1; }
+    .name { fill: var(--ink); font: 600 20px 'Geist', sans-serif; }
+    .detail { fill: var(--muted); font: 400 16px 'Geist', sans-serif; }
+    .label { fill: var(--muted); font: 400 12px 'Geist Mono', monospace; }
+    .edge-label { fill: var(--muted); font: 400 16px 'Geist Mono', monospace; }
+    .mask { fill: var(--paper); }
+    @media print { body { padding: 0; } svg { min-width: 0; } }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Who holds what</h1>
+    <p>Read handles lead to committed or transaction state. Mutation has its own type.</p>
+    <div class="canvas" tabindex="0" role="region" aria-label="Entity structure diagram; scroll horizontally on small screens">
+      <svg viewBox="0 0 960 600" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="entity-handles-title entity-handles-desc">
+        <title id="entity-handles-title">Entity handles and transaction boundaries</title>
+        <desc id="entity-handles-desc">Views hold an Entity that reads a registered resident entity or a proxy; a proxy can read a local or remote transaction entity, while Mutables hold local transaction entities for property mutation.</desc>
+        <defs>
+          <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker>
+          <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#eb6c36"/></marker>
+          <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#2e5aa8"/></marker>
+        </defs>
+        <rect width="960" height="600" fill="#f5f5f5"/>
+
+        <path class="edge" d="M232 92 H328"/>
+        <path class="edge" d="M552 92 H680"/>
+        <path class="edge" d="M440 128 V200"/>
+        <path class="edge" d="M440 272 V344"/>
+        <path class="edge" d="M552 236 H792 Q800 236 800 244 V344"/>
+        <path class="edge" d="M232 380 H328"/>
+
+        <rect class="mask" x="252" y="68" width="56" height="16" rx="4"/>
+        <text class="edge-label" x="280" y="80" text-anchor="middle">HOLDS</text>
+        <rect class="mask" x="572" y="64" width="88" height="20" rx="4"/>
+        <text class="edge-label" x="616" y="80" text-anchor="middle">RESIDENT</text>
+        <rect class="mask" x="456" y="152" width="96" height="20" rx="4"/>
+        <text class="edge-label" x="464" y="168">OR PROXY</text>
+        <rect class="mask" x="456" y="296" width="64" height="20" rx="4"/>
+        <text class="edge-label" x="464" y="312">READS</text>
+        <rect class="mask" x="608" y="208" width="88" height="20" rx="4"/>
+        <text class="edge-label" x="652" y="224" text-anchor="middle">OR READS</text>
+        <rect class="mask" x="252" y="356" width="56" height="16" rx="4"/>
+        <text class="edge-label" x="280" y="368" text-anchor="middle">HOLDS</text>
+
+        <rect class="node" x="40" y="56" width="192" height="72" rx="8"/>
+        <text class="name" x="136" y="88" text-anchor="middle">View</text>
+        <text class="detail" x="136" y="112" text-anchor="middle">typed reads</text>
+
+        <rect class="mask" x="328" y="56" width="224" height="72" rx="8"/>
+        <rect class="focal" x="328" y="56" width="224" height="72" rx="8"/>
+        <text class="name" x="440" y="88" text-anchor="middle">Entity</text>
+        <text class="detail" x="440" y="112" text-anchor="middle">readable handle</text>
+
+        <rect class="mask" x="680" y="56" width="240" height="104" rx="8"/>
+        <rect class="store" x="680" y="56" width="240" height="104" rx="8"/>
+        <text class="name" x="800" y="88" text-anchor="middle">EntityInner</text>
+        <text class="detail" x="800" y="112" text-anchor="middle">committed resident</text>
+        <text class="label" x="800" y="140" text-anchor="middle">WeakEntitySet constructs it</text>
+
+        <rect class="node" x="328" y="200" width="224" height="72" rx="8"/>
+        <text class="name" x="440" y="232" text-anchor="middle">EntityProxy</text>
+        <text class="detail" x="440" y="256" text-anchor="middle">follows the outcome</text>
+
+        <rect class="node" x="40" y="344" width="192" height="72" rx="8"/>
+        <text class="name" x="136" y="376" text-anchor="middle">Mutable</text>
+        <text class="detail" x="136" y="400" text-anchor="middle">typed edits</text>
+
+        <rect class="node" x="328" y="344" width="248" height="88" rx="8"/>
+        <text class="name" x="452" y="376" text-anchor="middle">LocalTrxEntity</text>
+        <text class="detail" x="452" y="404" text-anchor="middle">property mutations → events</text>
+
+        <rect class="node" x="680" y="344" width="240" height="88" rx="8"/>
+        <text class="name" x="800" y="376" text-anchor="middle">RemoteTrxEntity</text>
+        <text class="detail" x="800" y="404" text-anchor="middle">events → working state</text>
+
+        <text class="detail" x="40" y="480">Each transaction entity contains its own TrxEntityData:</text>
+        <text class="detail" x="40" y="508">working state, retained events, transaction lifetime, and view outcome.</text>
+        <line x1="40" y1="544" x2="920" y2="544" stroke="rgba(45,49,66,0.12)" stroke-width="1"/>
+        <text class="detail" x="40" y="572">Arrows show handle relationships. Commit redirects a proxy to its resident entity.</text>
+      </svg>
+    </div>
+  </main>
+</body>
+</html>

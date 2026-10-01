@@ -109,6 +109,7 @@ fn split_predicate_recursive(predicate: &Predicate<Resolved>) -> (Predicate<Reso
 
         Predicate::True => (Predicate::True, Predicate::True),
         Predicate::False => (Predicate::False, Predicate::True),
+        Predicate::MemberOf(_) => (predicate.clone(), Predicate::True),
         Predicate::Placeholder => (Predicate::True, predicate.clone()),
     }
 }
@@ -285,6 +286,10 @@ impl SqlBuilder {
             Predicate::False => {
                 self.push_sql("1=0");
             }
+            Predicate::MemberOf(model) => {
+                let column = ankurah_storage_common::materialization_join::membership_column(model);
+                self.push_sql(&format!("\"{}\"", column.replace('"', "\"\"")));
+            }
             Predicate::Placeholder => {
                 return Err(SqlGenerationError::PlaceholderFound);
             }
@@ -355,10 +360,15 @@ fn comparison_op_to_sql(op: &ComparisonOperator) -> Result<&'static str, SqlGene
 mod tests {
     use super::*;
     use ankql::parser::parse_selection;
-    use ankurah_storage_common::{lower_selection, ColumnPath};
+    use ankql::selection::map_references;
+    use ankurah_storage_common::ColumnPath;
 
     fn lowered(query: &str) -> Selection<EngineColumns> {
-        lower_selection(&parse_selection(query).unwrap(), &|path| ColumnPath::new(path.first(), path.steps[1..].to_vec()))
+        map_references(
+            &parse_selection(query).unwrap(),
+            &|path| ColumnPath::new(path.first(), path.steps[1..].to_vec()),
+            &|model| *model.as_id().expect("model ID in physical-column fixture"),
+        )
     }
 
     #[test]

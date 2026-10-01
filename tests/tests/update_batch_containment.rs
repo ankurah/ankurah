@@ -1,6 +1,7 @@
 mod common;
 
 use ankurah::core::property::backend::{lww::LWWBackend, PropertyBackend};
+use ankurah::core::storage::StorageEngine;
 use ankurah::core::value::Value;
 use ankurah::proto::{self, Attested};
 use ankurah::{policy::DEFAULT_CONTEXT as c, Model, Node, PermissiveAgent, View};
@@ -18,7 +19,6 @@ fn forge_title_event(title_prop: proto::PropertyId, entity_id: proto::EntityId, 
     backend.set(title_prop, Some(Value::String(title.to_owned())));
     let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
     proto::Event::update(
-        Record::collection(),
         entity_id,
         parent,
         proto::AuthorId::Unknown,
@@ -29,7 +29,6 @@ fn forge_title_event(title_prop: proto::PropertyId, entity_id: proto::EntityId, 
 fn event_only_item(event: proto::Event) -> proto::SubscriptionUpdateItem {
     proto::SubscriptionUpdateItem {
         entity_id: event.entity_id,
-        collection: event.collection.clone(),
         content: proto::UpdateContent::EventOnly(vec![Attested::opt(event, None).into()]),
         predicate_relevance: vec![],
     }
@@ -49,10 +48,10 @@ async fn test_event_only_multi_event_wire_order_is_untrusted() -> Result<()> {
     let _conn = LocalProcessConnection::new(&client, &server).await?;
     client.system.wait_system_ready().await.unwrap();
 
-    let ctx_s = server.context(c)?;
-    let ctx_c = client.context(c)?;
+    let ctx_s = server.context_async(c).await?;
+    let ctx_c = client.context_async(c).await?;
 
-    let _relay_context = ctx_c.query_wait::<RecordView>("title = 'no-such-title'").await?;
+    let _relay_context = ctx_c.query_wait::<RecordView>("true").await?;
 
     let rec_id = {
         let trx = ctx_s.begin();
@@ -78,7 +77,6 @@ async fn test_event_only_multi_event_wire_order_is_untrusted() -> Result<()> {
         backend.set(artist_prop, Some(Value::String("artist-p1".to_owned())));
         let ops = backend.to_operations().unwrap().expect("ops");
         proto::Event::update(
-            ev_parent.collection.clone(),
             rec_id,
             ev_parent.parent.clone(),
             proto::AuthorId::Unknown,
@@ -90,7 +88,6 @@ async fn test_event_only_multi_event_wire_order_is_untrusted() -> Result<()> {
 
     let item = proto::SubscriptionUpdateItem {
         entity_id: rec_id,
-        collection: Record::collection(),
         content: proto::UpdateContent::EventOnly(vec![Attested::opt(ev_child, None).into(), Attested::opt(ev_parent, None).into()]),
         predicate_relevance: vec![],
     };
@@ -106,8 +103,7 @@ async fn test_event_only_multi_event_wire_order_is_untrusted() -> Result<()> {
     assert_eq!(view.title().unwrap(), "t-child", "child's write applied");
     assert_eq!(view.artist().unwrap(), "artist-p1", "parent's write must not be dropped by wire order");
 
-    let collection = ctx_c.collection(&Record::collection()).await?;
-    let ids: std::collections::HashSet<_> = collection.dump_entity_events(rec_id).await?.iter().map(|e| e.payload.id()).collect();
+    let ids: std::collections::HashSet<_> = client.storage.dump_entity_events(rec_id).await?.iter().map(|e| e.payload.id()).collect();
     assert!(ids.contains(&id_parent) && ids.contains(&id_child), "both events durable on the client");
 
     Ok(())
@@ -127,12 +123,12 @@ async fn test_event_only_unknown_entity_does_not_poison_batch() -> Result<()> {
     let _conn = LocalProcessConnection::new(&client, &server).await?;
     client.system.wait_system_ready().await.unwrap();
 
-    let ctx_s = server.context(c)?;
-    let ctx_c = client.context(c)?;
+    let ctx_s = server.context_async(c).await?;
+    let ctx_c = client.context_async(c).await?;
 
     // A live subscription (to anything) establishes the relay context that
     // apply_updates requires for this peer. Held for the test's duration.
-    let _relay_context = ctx_c.query_wait::<RecordView>("title = 'no-such-title'").await?;
+    let _relay_context = ctx_c.query_wait::<RecordView>("true").await?;
 
     // Two records created on the server; the client materializes them at
     // their creation heads and holds them resident.
@@ -165,7 +161,11 @@ async fn test_event_only_unknown_entity_does_not_poison_batch() -> Result<()> {
         from: server.id,
         to: client.id,
         body: proto::NodeUpdateBody::SubscriptionUpdate {
-            items: vec![event_only_item(ev_a), event_only_item(ev_unknown), event_only_item(ev_b)],
+            items: vec![
+                event_only_item(ev_a),
+                event_only_item(ev_unknown),
+                event_only_item(ev_b),
+            ],
         },
     };
 
@@ -179,13 +179,14 @@ async fn test_event_only_unknown_entity_does_not_poison_batch() -> Result<()> {
     assert_eq!(view_a.title().unwrap(), "a1", "item 1 must apply");
     assert_eq!(view_b.title().unwrap(), "b1", "item 3 must apply");
 
-    // Their events are durable on the client; nothing exists for the unknown.
-    let collection = ctx_c.collection(&Record::collection()).await?;
-    let a_events: Vec<_> = collection.dump_entity_events(a_id).await?.iter().map(|e| e.payload.id()).collect();
-    let b_events: Vec<_> = collection.dump_entity_events(b_id).await?.iter().map(|e| e.payload.id()).collect();
+    // The events that advance canonical state are durable on the client. The
+    // unknown entity's invalid event never enters the append-only store.
+    let a_events: Vec<_> = client.storage.dump_entity_events(a_id).await?.iter().map(|e| e.payload.id()).collect();
+    let b_events: Vec<_> = client.storage.dump_entity_events(b_id).await?.iter().map(|e| e.payload.id()).collect();
+    let unknown_events: Vec<_> = client.storage.dump_entity_events(unknown_id).await?.iter().map(|e| e.payload.id()).collect();
     assert!(a_events.contains(&id_ev_a), "A's forged event must be committed on the client");
     assert!(b_events.contains(&id_ev_b), "B's forged event must be committed on the client");
-    assert!(collection.dump_entity_events(unknown_id).await?.is_empty(), "no event may be durable for the unknown entity");
+    assert!(unknown_events.is_empty(), "the unknown entity's invalid event must not enter the append-only store");
 
     // The speculative empty-head resident for the unknown entity was evicted:
     // a phantom resident would satisfy get() with an empty-state view, while

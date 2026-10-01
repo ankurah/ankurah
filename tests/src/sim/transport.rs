@@ -16,7 +16,6 @@
 
 use ankurah::core::connector::{PeerSender, SendError};
 use ankurah::proto;
-use ankurah::Model;
 use std::sync::{Arc, Mutex};
 
 /// A message a node emitted, tagged with the logical index of its sender.
@@ -120,18 +119,18 @@ fn event_ids(events: &[proto::Attested<proto::Event>]) -> String {
 fn request_descriptor(body: &proto::NodeRequestBody) -> String {
     match body {
         proto::NodeRequestBody::CommitTransaction { events, .. } => format!("commit {}", event_ids(events)),
-        proto::NodeRequestBody::Get { collection, ids } => {
+        proto::NodeRequestBody::Get { ids } => {
             let mut ss: Vec<String> = ids.iter().map(|i| i.to_base64_short()).collect();
             ss.sort();
-            format!("get {} {}", collection, ss.join("+"))
+            format!("get {}", ss.join("+"))
         }
-        proto::NodeRequestBody::GetEvents { collection, event_ids } => {
+        proto::NodeRequestBody::GetEvents { event_ids } => {
             let mut ss: Vec<String> = event_ids.iter().map(|i| i.to_base64_short()).collect();
             ss.sort();
-            format!("getevents {} {}", collection, ss.join("+"))
+            format!("getevents {}", ss.join("+"))
         }
-        proto::NodeRequestBody::Fetch { collection, .. } => format!("fetch {}", collection),
-        proto::NodeRequestBody::SubscribeQuery { collection, .. } => format!("subscribe {}", collection),
+        proto::NodeRequestBody::Fetch { selection, .. } => format!("fetch {}", selection),
+        proto::NodeRequestBody::SubscribeQuery { selection, .. } => format!("subscribe {}", selection),
         proto::NodeRequestBody::RegisterSchema { model } => {
             format!("registerschema {} {}p", model.label, model.properties.len())
         }
@@ -145,8 +144,12 @@ fn response_descriptor(body: &proto::NodeResponseBody) -> String {
             format!("schemaregistered {} {}p", model.label, model.properties.len())
         }
         proto::NodeResponseBody::Fetch(deltas) => format!("fetch {}", deltas.len()),
-        proto::NodeResponseBody::Get(states) => {
-            let mut ss: Vec<String> = states.iter().map(|s| s.payload.entity_id.to_base64_short()).collect();
+        proto::NodeResponseBody::Get(results) => {
+            let mut ss: Vec<String> = results.iter().map(|result| match result {
+                proto::GetResult::Found(state) => state.payload.entity_id.to_base64_short(),
+                proto::GetResult::NotFound(id) => format!("{}:missing", id.to_base64_short()),
+                proto::GetResult::AccessDenied(id) => format!("{}:denied", id.to_base64_short()),
+            }).collect();
             ss.sort();
             format!("get [{}]", ss.join("+"))
         }
@@ -184,16 +187,7 @@ fn update_item_descriptor(item: &proto::SubscriptionUpdateItem) -> String {
 fn fragment_ids(entity: proto::EntityId, fragments: &[proto::EventFragment]) -> String {
     let mut ids: Vec<String> = fragments
         .iter()
-        .map(|f| {
-            proto::Event {
-                collection: super::model::SimRecord::collection(),
-                entity_id: entity,
-                parent: f.parent.clone(),
-                body: f.body.clone(),
-            }
-            .id()
-            .to_base64_short()
-        })
+        .map(|f| proto::Event { entity_id: entity, parent: f.parent.clone(), body: f.body.clone() }.id().to_base64_short())
         .collect();
     ids.sort();
     ids.join("+")

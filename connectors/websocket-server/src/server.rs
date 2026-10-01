@@ -248,11 +248,7 @@ where
             } else if let Connection::Initial(_) = state {
                 // A peer whose handshake we cannot read will never establish;
                 // close instead of leaving the connection dangling.
-                if proto::is_version0_presence(&d) {
-                    warn!("Refusing peer at {client_ip}: pre-versioning (0.9.x or older) protocol handshake");
-                } else {
-                    error!("Failed to deserialize handshake message from {client_ip}; closing");
-                }
+                error!("Failed to deserialize handshake message from {client_ip}; closing");
                 return ControlFlow::Break(());
             } else {
                 error!("Failed to deserialize message from {}", client_ip);

@@ -1,8 +1,11 @@
+use crate::node::handler::commit_transaction;
 use super::*;
 use crate::connector::SendError;
 use crate::policy::{PermissiveAgent, DEFAULT_CONTEXT};
 use crate::test_utils::TestStorage;
 use ankurah_signals::Subscribe;
+
+mod commit;
 
 #[derive(Clone)]
 struct ClosedSender(proto::EntityId);
@@ -48,10 +51,9 @@ async fn presence_does_not_require_an_adopted_system_but_rejects_a_halted_node()
 async fn lifecycle_waits_for_the_catalog_and_never_revives_after_halting() {
     for halt_during_startup in [false, true] {
         let storage = Arc::new(TestStorage::default());
-        let table = storage.table(&CollectionId::fixed_name(crate::schema::MODEL_COLLECTION_ID));
         let (entered, entered_rx) = oneshot::channel();
         let (release, release_rx) = oneshot::channel();
-        *table.hold_fetch.lock().unwrap() = Some((entered, release_rx));
+        storage.hold_fetch.lock().unwrap().insert(ModelId::System(proto::SystemModel::Model), (entered, release_rx));
         let node = Node::new_durable(storage, PermissiveAgent::new());
         let state = node.state();
         let run = node.run.clone();
@@ -121,10 +123,9 @@ async fn presence_waits_for_the_persisted_system_root() {
     let root = seed.system.root().unwrap();
     drop(seed);
 
-    let table = storage.table(&root.payload.collection);
     let (entered, entered_rx) = oneshot::channel();
     let (release, release_rx) = oneshot::channel();
-    *table.hold_fetch.lock().unwrap() = Some((entered, release_rx));
+    storage.hold_fetch.lock().unwrap().insert(ModelId::System(proto::SystemModel::System), (entered, release_rx));
     let node = Node::new_durable(storage, PermissiveAgent::new());
     entered_rx.await.unwrap();
     let presence = node.presence();
@@ -143,7 +144,11 @@ async fn disconnect_releases_pending_requests() {
     let peer = proto::EntityId::random();
     let (sent, _messages) = std::sync::mpsc::channel();
     node.register_peer(presence(peer), Box::new(RecordingSender(peer, sent))).await.unwrap();
-    let request = node.request(peer, &DEFAULT_CONTEXT, proto::NodeRequestBody::Get { collection: "test".into(), ids: vec![] });
+    let request = node.request(
+        peer,
+        &DEFAULT_CONTEXT,
+        proto::NodeRequestBody::Get { ids: vec![] },
+    );
     tokio::pin!(request);
     assert!(futures::poll!(&mut request).is_pending());
 
@@ -163,12 +168,12 @@ async fn an_inflight_read_can_finish_after_halt_but_new_work_is_rejected() {
     let peer = proto::EntityId::random();
     node.register_peer(presence(peer), Box::new(ClosedSender(peer))).await.unwrap();
 
-    let collection = CollectionId::fixed_name(crate::schema::MODEL_COLLECTION_ID);
+    let model = ModelId::System(proto::SystemModel::Model);
     let (entered, entered_rx) = oneshot::channel();
     let (release, release_rx) = oneshot::channel();
-    *storage.table(&collection).hold_fetch.lock().unwrap() = Some((entered, release_rx));
-    let selection = ankql::ast::Selection::<Resolved> { predicate: ankql::ast::Predicate::True, order_by: None, limit: None };
-    let read = node.fetch_entities_from_local(&collection, &selection);
+    storage.hold_fetch.lock().unwrap().insert(model, (entered, release_rx));
+    let selection = ankql::ast::Selection::<Resolved> { predicate: ankql::ast::Predicate::MemberOf(model), order_by: None, limit: None };
+    let read = node.fetch_entities_from_local(&selection);
     tokio::pin!(read);
     assert!(futures::poll!(&mut read).is_pending());
     entered_rx.await.unwrap();
@@ -176,12 +181,107 @@ async fn an_inflight_read_can_finish_after_halt_but_new_work_is_rejected() {
     let reason = node.system.halt(NodeHaltReason::SystemLoad("fixture".into()));
     release.send(()).unwrap();
     assert_eq!(read.await.unwrap().iter().map(Entity::id).collect::<Vec<_>>(), vec![id]);
-    assert!(
-        matches!(node.fetch_entities_from_local(&collection, &selection).await, Err(RetrievalError::NodeHalted(error)) if error == reason)
-    );
+    assert!(matches!(node.fetch_entities_from_local(&selection).await, Err(RetrievalError::NodeHalted(error)) if error == reason));
     assert!(matches!(
-        node.request(peer, &DEFAULT_CONTEXT, proto::NodeRequestBody::Get { collection: collection.clone(), ids: vec![id] }).await,
+        node.request(peer, &DEFAULT_CONTEXT, proto::NodeRequestBody::Get { ids: vec![id] }).await,
         Err(RequestError::NodeHalted(error)) if error == reason
     ));
     assert!(node.handle_message(proto::NodeMessage::UnsubscribeQuery { from: peer, query_id: proto::QueryId::new() }).await.is_err());
+}
+
+#[tokio::test]
+async fn remote_creations_are_not_registered_or_published_before_storage_succeeds() -> anyhow::Result<()> {
+    let storage = Arc::new(TestStorage::default());
+    let node = Node::new_durable(storage.clone(), PermissiveAgent::new());
+    node.system.create().await?;
+    node.wait_ready().await?;
+    let a = ModelId::EntityId(proto::EntityId::random());
+    let b = ModelId::EntityId(proto::EntityId::random());
+    let membership = |model| proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(model))]);
+    let genesis = proto::Event::genesis(node.system.root_id(), proto::AuthorId::Unknown, membership(a));
+    let update = proto::Event::update(genesis.entity_id, genesis.id().into(), proto::AuthorId::Unknown, membership(b));
+    let other_genesis = proto::Event::genesis(node.system.root_id(), proto::AuthorId::Unknown, membership(b));
+    let other_update = proto::Event::update(other_genesis.entity_id, other_genesis.id().into(), proto::AuthorId::Unknown, membership(a));
+
+    let events = vec![genesis.clone().into(), other_genesis.clone().into(), update.clone().into(), other_update.clone().into()];
+    let subscription = node.reactor.subscribe();
+    subscription.add_entity_subscriptions([genesis.entity_id, other_genesis.entity_id]);
+    let (updates, received) = std::sync::mpsc::channel();
+    let _guard = subscription.subscribe(move |update| updates.send(update).unwrap());
+
+    storage.fail_next_commit();
+    let error = commit_transaction(&node, &DEFAULT_CONTEXT, proto::TransactionId::new(), events.clone()).await.unwrap_err();
+    assert!(error.to_string().contains("test storage commit failed"), "{error}");
+    assert!(node.entities.get(&genesis.entity_id).is_none());
+    assert!(storage.dump_entity_events(genesis.entity_id).await?.is_empty());
+    assert!(node.entities.get(&other_genesis.entity_id).is_none());
+    assert!(storage.dump_entity_events(other_genesis.entity_id).await?.is_empty());
+    assert!(received.try_recv().is_err());
+
+    commit_transaction(&node, &DEFAULT_CONTEXT, proto::TransactionId::new(), events).await?;
+    let changes = received.try_recv()?.items;
+    let resident = changes.iter().find(|change| change.entity.id() == genesis.entity_id).unwrap().entity.clone();
+    let other_resident = changes.iter().find(|change| change.entity.id() == other_genesis.entity_id).unwrap().entity.clone();
+    assert_eq!(resident.head(), update.id().into());
+    assert_eq!(resident.memberships(), [a, b].into_iter().collect());
+    assert_eq!(storage.dump_entity_events(genesis.entity_id).await?.len(), 2);
+    assert_eq!(other_resident.head(), other_update.id().into());
+    assert_eq!(other_resident.memberships(), [a, b].into_iter().collect());
+    assert_eq!(storage.dump_entity_events(other_genesis.entity_id).await?.len(), 2);
+    assert_eq!(changes.len(), 2, "one change per entity, not per event");
+    for (entity, expected) in [(genesis.entity_id, vec![genesis.into(), update.into()]),
+        (other_genesis.entity_id, vec![other_genesis.into(), other_update.into()])] {
+        assert_eq!(changes.iter().find(|change| change.entity.id() == entity).unwrap().events, expected);
+    }
+    assert!(received.try_recv().is_err());
+    assert_eq!(node.entities.get(&resident.id()), Some(resident));
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_commit_waits_for_the_winners_resident_publication() -> anyhow::Result<()> {
+    let storage = Arc::new(TestStorage::default());
+    let node = Node::new_durable(storage.clone(), PermissiveAgent::new());
+    node.system.create().await?;
+    node.wait_ready().await?;
+    let [a, b, c] = [1, 2, 3].map(|byte| ModelId::EntityId(proto::EntityId::from_bytes([byte; 32])));
+    let membership = |model| proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(model))]);
+    let genesis = proto::Event::genesis(node.system.root_id(), proto::AuthorId::Unknown, membership(a));
+    let id = genesis.entity_id;
+    commit_transaction(&node, &DEFAULT_CONTEXT, proto::TransactionId::new(), vec![Attested::opt(genesis.clone(), None)]).await?;
+    let getter = LocalEventGetter::new(storage.clone(), true);
+    let entity = node.entities.get_or_retrieve(&LocalStateGetter::new(storage.clone()), &getter, &id).await?.unwrap();
+    let ours = proto::Event::update(id, genesis.id().into(), proto::AuthorId::Unknown, membership(c));
+    let other = proto::Event::update(id, genesis.id().into(), proto::AuthorId::Unknown, membership(b));
+    let expected_events = [other.id(), ours.id()];
+    let subscription = node.reactor.subscribe();
+    subscription.add_entity_subscriptions([id]);
+    let (updates, received) = std::sync::mpsc::channel();
+    let _guard = subscription.subscribe(move |update| updates.send(update).unwrap());
+    let (entered, entered_rx) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = tokio::sync::oneshot::channel();
+    *storage.hold_after_commit.lock().unwrap() = Some((entered, release_rx));
+    let winner = commit_transaction(&node, &DEFAULT_CONTEXT, proto::TransactionId::new(), vec![Attested::opt(other, None)]);
+    tokio::pin!(winner);
+    assert!(futures::poll!(&mut winner).is_pending());
+    entered_rx.await?;
+
+    assert_eq!(storage.get_state(id).await?.payload.state.memberships, [a, b].into_iter().collect());
+    assert_eq!(entity.memberships(), [a].into_iter().collect());
+    let pending = commit_transaction(&node, &DEFAULT_CONTEXT, proto::TransactionId::new(), vec![Attested::opt(ours, None)]);
+    tokio::pin!(pending);
+    assert!(futures::poll!(&mut pending).is_pending());
+    assert_eq!(entity.memberships(), [a].into_iter().collect());
+    assert!(received.try_recv().is_err());
+    release.send(()).unwrap();
+    winner.await?;
+    assert_eq!(entity.memberships(), [a, b].into_iter().collect());
+    pending.await?;
+
+    assert_eq!(entity.memberships(), [a, b, c].into_iter().collect());
+    assert_eq!(entity.to_state()?, storage.get_state(id).await?.payload.state);
+    let notified: Vec<_> = received.try_iter().flat_map(|update| update.items).flat_map(|item| item.events)
+        .map(|event| event.payload.id()).collect();
+    assert_eq!(notified, expected_events);
+    Ok(())
 }

@@ -4,10 +4,10 @@ pub mod wasm;
 
 use std::sync::Arc;
 
-use ankurah_proto::{CollectionId, EntityId, ModelId, State};
+use ankurah_proto::{EntityId, ModelId, State};
 
-use crate::entity::{Entity, ProvisionalEntity};
-use crate::error::StateError;
+use crate::entity::{Entity, LocalTrxEntity};
+use crate::error::{RetrievalError, StateError};
 
 use crate::property::PropertyError;
 
@@ -20,13 +20,11 @@ use wasm_bindgen;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::JsCast;
 
-/// A model is a struct that represents the present values for a given entity
-/// Schema is defined primarily by the Model object, and the View is derived from that via macro.
+/// A concrete, typed representation of a model's properties for one entity.
+/// Its descriptor binds the struct and its fields to catalog model and property identities.
 pub trait Model: Sized {
     type View: View;
     type Mutable: Mutable;
-
-    fn collection() -> CollectionId;
 
     /// The local compiled schema: the names and types a binary registers and
     /// binds against the catalog (ids exist only there) and the
@@ -37,10 +35,10 @@ pub trait Model: Sized {
     fn descriptor() -> &'static crate::schema::ModelStructDescriptor;
 
     /// Stage membership in `model_id` and the initial field values using this epoch's property bindings.
-    /// `Transaction::create` freezes these into the genesis event, which determines the entity's id.
+    /// The first id demand or commit preparation freezes these into the genesis event.
     fn initialize_new_entity(
         &self,
-        provisional: &mut ProvisionalEntity,
+        entity: &LocalTrxEntity,
         model_id: ModelId,
         epoch: crate::schema::SystemEpoch,
     ) -> Result<(), PropertyError>;
@@ -52,9 +50,9 @@ pub trait View {
     type Mutable: Mutable;
     fn id(&self) -> EntityId { self.entity().id() }
 
-    fn collection() -> CollectionId { <Self::Model as Model>::collection() }
     fn entity(&self) -> &Entity;
-    fn from_entity(inner: Entity) -> Self;
+    fn from_entity(inner: Entity) -> Result<Self, RetrievalError>
+    where Self: Sized;
     fn to_model(&self) -> Result<Self::Model, PropertyError>;
 }
 
@@ -62,11 +60,13 @@ pub trait View {
 #[derive(Debug)]
 pub struct MutableBorrow<'rec, T: Mutable> {
     mutable: T,
-    _entity_ref: &'rec Entity,
+    _entity_ref: &'rec LocalTrxEntity,
 }
 
 impl<'rec, T: Mutable> MutableBorrow<'rec, T> {
-    pub fn new(entity_ref: &'rec Entity) -> Self { Self { mutable: T::new(entity_ref.clone()), _entity_ref: entity_ref } }
+    pub fn new(entity_ref: &'rec LocalTrxEntity) -> Result<Self, RetrievalError> {
+        Ok(Self { mutable: T::new(entity_ref.clone())?, _entity_ref: entity_ref })
+    }
 
     /// Extract the core mutable (for WASM usage)
     pub fn into_core(self) -> T { self.mutable }
@@ -87,26 +87,15 @@ pub trait Mutable {
     type Model: Model;
     type View: View;
     fn id(&self) -> EntityId { self.entity().id() }
-    fn collection() -> CollectionId { <Self::Model as Model>::collection() }
 
-    fn entity(&self) -> &Entity;
-    fn new(entity: Entity) -> Self
+    fn entity(&self) -> &LocalTrxEntity;
+    fn new(entity: LocalTrxEntity) -> Result<Self, RetrievalError>
     where Self: Sized;
 
     fn state(&self) -> Result<State, StateError> { self.entity().to_state() }
 
-    fn read(&self) -> Self::View {
-        let inner = self.entity();
-
-        let new_inner = match &inner.kind {
-            // If there is an upstream, use it
-            crate::entity::EntityKind::Transacted { upstream, .. } => upstream.clone(),
-            // Else we're a new Entity, and we have to rely on the commit to add this to the node
-            crate::entity::EntityKind::Primary => inner.clone(),
-        };
-
-        Self::View::from_entity(new_inner)
-    }
+    /// Fails with `TransactionClosed` once a creation's transaction rolls back.
+    fn read(&self) -> Result<Self::View, RetrievalError> { Self::View::from_entity(self.entity().read()) }
 }
 
 // Helper function to convert Result<T, PropertyError> to Result<T, JsValue> with context for generated WASM accessors

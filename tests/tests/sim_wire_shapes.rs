@@ -9,7 +9,7 @@
 //! (so the applier's relay-context precondition holds), then injects a
 //! hand-forged batch through the seeded scheduler and asserts the outcome.
 
-use ankurah::proto::{self, Attested};
+use ankurah::proto;
 use ankurah_tests::sim::{body, model, run_once, FaultConfig, Field, Workload};
 
 /// Sanity: a subscription established over the virtual transport lets a plain

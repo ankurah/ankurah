@@ -19,7 +19,6 @@ fn album_entry(name: &str, backend: &str, value_type: &str, optional: bool) -> p
             renamed_from: None,
             backend: backend.into(),
             value_type: value_type.into(),
-            target_label: None,
             explicit_id: None,
             build_id: [0u8; 16],
             optional,
@@ -103,7 +102,7 @@ async fn durable_map_resolves_after_reconstruction() -> anyhow::Result<()> {
         let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
         node.system.create().await?;
         node.wait_ready().await?;
-        let model_id = node.context_async(DEFAULT_CONTEXT).await.unwrap().register_model::<Album>().await?;
+        let model_id = node.context_async(DEFAULT_CONTEXT).await.unwrap().resolve_model_id::<Album>().await?;
         wait_resolve(&node, "album", "name").await.expect("catalog should resolve the registered model");
         model_id
     };
@@ -141,7 +140,7 @@ async fn durable_map_updates_incrementally() -> anyhow::Result<()> {
 async fn an_answered_ephemeral_carries_the_catalog_it_never_registered() -> anyhow::Result<()> {
     let server = durable_sled_setup().await?;
     server.wait_ready().await?;
-    server.context_async(DEFAULT_CONTEXT).await.unwrap().register_model::<Album>().await?;
+    server.context_async(DEFAULT_CONTEXT).await.unwrap().resolve_model_id::<Album>().await?;
     let model = server.catalog.model_id_for("album").unwrap().expect("the durable registered album");
 
     let client = ephemeral_sled_setup().await?;
@@ -156,26 +155,27 @@ async fn an_answered_ephemeral_carries_the_catalog_it_never_registered() -> anyh
 }
 
 #[tokio::test]
-async fn standing_query_identity_and_version_do_not_regress() -> anyhow::Result<()> {
+async fn standing_query_membership_can_change_but_version_cannot_regress() -> anyhow::Result<()> {
     let (server, client, _connection) = connected_pair().await?;
     let query_id = proto::QueryId::new();
     let selection = ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None };
-    let subscribe = |collection: &str, version| proto::NodeRequestBody::SubscribeQuery {
+    let subscribe = |model: proto::SystemModel, version| proto::NodeRequestBody::SubscribeQuery {
         query_id,
-        collection: proto::CollectionId::fixed_name(collection),
-        selection: selection.clone(),
+        selection: selection.clone().and_member_of(proto::ModelId::System(model)),
         version,
         known_matches: Vec::new(),
     };
 
     assert!(matches!(
-        client.request(server.id, &DEFAULT_CONTEXT, subscribe(ankurah::core::schema::MODEL_COLLECTION_ID, 2)).await?,
+        client.request(server.id, &DEFAULT_CONTEXT, subscribe(proto::SystemModel::Model, 2)).await?,
         proto::NodeResponseBody::QuerySubscribed { .. }
     ));
-    let stale = client.request(server.id, &DEFAULT_CONTEXT, subscribe(ankurah::core::schema::MODEL_COLLECTION_ID, 1)).await?;
+    let stale = client.request(server.id, &DEFAULT_CONTEXT, subscribe(proto::SystemModel::Model, 1)).await?;
     assert!(matches!(stale, proto::NodeResponseBody::Error(message) if message.contains("stale subscription version")));
-    let rebound = client.request(server.id, &DEFAULT_CONTEXT, subscribe(ankurah::core::schema::PROPERTY_COLLECTION_ID, 3)).await?;
-    assert!(matches!(rebound, proto::NodeResponseBody::Error(message) if message.contains("already bound")));
+    let rebound = client.request(server.id, &DEFAULT_CONTEXT, subscribe(proto::SystemModel::Property, 3)).await?;
+    assert!(matches!(rebound, proto::NodeResponseBody::QuerySubscribed { .. }), "membership is part of the updatable predicate");
+    let stale = client.request(server.id, &DEFAULT_CONTEXT, subscribe(proto::SystemModel::Model, 2)).await?;
+    assert!(matches!(stale, proto::NodeResponseBody::Error(message) if message.contains("stale subscription version")));
     Ok(())
 }
 

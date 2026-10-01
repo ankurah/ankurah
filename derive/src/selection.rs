@@ -422,6 +422,20 @@ fn generate_predicate_code_with_replacements(
                 ::ankql::ast::Predicate::IsNull(Box::new(#expr_code))
             }
         }
+        ankql::ast::Predicate::MemberOf(model) => {
+            let model = match model {
+                ankql::ast::ModelRef::Id(ankurah_core_types::ModelId::EntityId(id)) => {
+                    let bytes = id.to_bytes();
+                    quote! { ::ankql::ast::ModelRef::Id(::ankql::ast::ModelId::EntityId(::ankql::ast::EntityId::from_bytes([#(#bytes),*]))) }
+                }
+                ankql::ast::ModelRef::Id(ankurah_core_types::ModelId::System(system)) => {
+                    let variant = syn::Ident::new((*system).into(), proc_macro2::Span::call_site());
+                    quote! { ::ankql::ast::ModelRef::Id(::ankql::ast::ModelId::System(::ankql::ast::SystemModel::#variant)) }
+                }
+                ankql::ast::ModelRef::Label(label) => quote! { ::ankql::ast::ModelRef::Label(#label.to_string()) },
+            };
+            quote! { ::ankql::ast::Predicate::MemberOf(#model) }
+        }
         ankql::ast::Predicate::True => quote! { ::ankql::ast::Predicate::True },
         ankql::ast::Predicate::False => quote! { ::ankql::ast::Predicate::False },
     }
@@ -499,7 +513,7 @@ fn generate_literal_code_with_replacements(
             let bytes = id.to_bytes();
             quote! {
                 ::ankql::ast::Expr::Literal(::ankql::ast::Value::EntityId(
-                    ::ankurah::proto::EntityId::from_bytes([#(#bytes),*])
+                    ::ankql::ast::EntityId::from_bytes([#(#bytes),*])
                 ))
             }
         }

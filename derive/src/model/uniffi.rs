@@ -57,7 +57,7 @@ pub fn uniffi_view_edit_impl(view_name: &Ident, model_name: &Ident, mutable_name
     }
 }
 
-/// Generate UniFFI getter methods for Mutable struct that return wrapper types.
+/// Generate the UniFFI methods for the Mutable struct: `id`, `read`, and a getter per field.
 ///
 /// For each active field, generates a getter that returns the UniFFI wrapper type
 /// (e.g., `LWWString`, `YrsStringString`). The wrapper types have the methods
@@ -67,6 +67,7 @@ pub fn uniffi_view_edit_impl(view_name: &Ident, model_name: &Ident, mutable_name
 /// Uses `uniffi_fieldname` as Rust name, exposed as `fieldname` in foreign bindings.
 pub fn uniffi_mutable_field_methods(model: &crate::model::description::ModelDescription) -> TokenStream {
     let mutable_name = model.mutable_name();
+    let view_name = model.view_name();
     let model_name_str = model.name().to_string();
 
     let methods: Vec<TokenStream> = model
@@ -100,13 +101,16 @@ pub fn uniffi_mutable_field_methods(model: &crate::model::description::ModelDesc
         })
         .collect();
 
-    if methods.is_empty() {
-        return quote! {};
-    }
-
     quote! {
         #[::uniffi::export]
         impl #mutable_name {
+            #[uniffi::method(name = "id")]
+            pub fn uniffi_id(&self) -> ::ankurah::proto::EntityId { self.entity.id() }
+
+            /// A View of this entity, which stays readable after commit.
+            #[uniffi::method(name = "read")]
+            pub fn uniffi_read(&self) -> Result<#view_name, ::ankurah::core::error::RetrievalError> { ::ankurah::model::Mutable::read(self) }
+
             #(#methods)*
         }
     }
@@ -196,7 +200,7 @@ pub fn uniffi_impl(model: &crate::model::description::ModelDescription) -> Token
     let mutable_field_methods = uniffi_mutable_field_methods(model);
     let ref_wrapper = uniffi_ref_wrapper(&ref_name, &name, &view_name);
     let input_record = uniffi_input_record(model, &input_name, &name);
-    let ops_wrapper = uniffi_ops_wrapper(&ops_name, &name, &view_name, &livequery_name, &input_name);
+    let ops_wrapper = uniffi_ops_wrapper(&ops_name, &name, &view_name, &mutable_name, &livequery_name, &input_name);
     let resultset_wrapper = uniffi_resultset_wrapper(&resultset_name, &view_name);
     let changeset_wrapper = uniffi_changeset_wrapper(&changeset_name, &view_name, &resultset_name);
     let livequery_wrapper = uniffi_livequery_wrapper(&name, &livequery_name, &view_name, &resultset_name, &changeset_name);
@@ -351,7 +355,14 @@ fn uniffi_input_record(model: &crate::model::description::ModelDescription, inpu
 /// Note: All args use borrowed references (&T) because owned args don't work cross-crate.
 /// Functions returning Vec<T> are defined here (same crate as T) because generic
 /// containers don't work cross-crate.
-fn uniffi_ops_wrapper(ops_name: &Ident, model_name: &Ident, view_name: &Ident, livequery_name: &Ident, input_name: &Ident) -> TokenStream {
+fn uniffi_ops_wrapper(
+    ops_name: &Ident,
+    model_name: &Ident,
+    view_name: &Ident,
+    mutable_name: &Ident,
+    livequery_name: &Ident,
+    input_name: &Ident,
+) -> TokenStream {
     quote! {
         /// Singleton providing static-like operations for this model type.
         /// Use `new()` to get an instance, then call methods like `get()` and `fetch()`.
@@ -416,24 +427,22 @@ fn uniffi_ops_wrapper(ops_name: &Ident, model_name: &Ident, view_name: &Ident, l
             ) -> Result<#livequery_name, ::ankurah::core::error::RetrievalError> {
                 let mut selection = ::ankurah::ankql::parser::parse_selection(&selection)?;
                 selection.predicate = selection.predicate.populate(values)?;
-                let args = ::ankurah::MatchArgs { selection, cached: false };
+                let args = ::ankurah::MatchArgs { selection, cache_policy: ::ankurah::CachePolicy::Durable };
                 let lq = ctx.query::<#view_name>(args)?;
                 Ok(#livequery_name::from(lq))
             }
 
-            /// Create a new entity within a transaction
+            /// Create a new entity within a transaction, returning its Mutable
             /// Use the Input record type which has EntityId fields for Ref<T> types
             pub async fn create(
                 &self,
                 trx: &::ankurah::transaction::Transaction,
                 input: #input_name,
-            ) -> Result<#view_name, ::ankurah::core::error::MutationError> {
-                use ::ankurah::Mutable;
+            ) -> Result<#mutable_name, ::ankurah::core::error::MutationError> {
                 use std::convert::TryInto;
                 let model: #model_name = input.try_into()
                     .map_err(|e: ::ankurah::proto::IdParseError| ::ankurah::core::error::MutationError::General(Box::new(e)))?;
-                let mutable = trx.create(&model).await?;
-                Ok(mutable.read())
+                Ok(trx.create(&model).await?.into_core())
             }
 
             /// Create a new entity with an auto-committed transaction
@@ -449,7 +458,7 @@ fn uniffi_ops_wrapper(ops_name: &Ident, model_name: &Ident, view_name: &Ident, l
                     .map_err(|e: ::ankurah::proto::IdParseError| ::ankurah::core::error::MutationError::General(Box::new(e)))?;
                 let tx = ctx.begin();
                 let mutable = tx.create(&model).await?;
-                let view = mutable.read();
+                let view = mutable.read()?;
                 tx.commit().await?;
                 Ok(view)
             }
@@ -530,7 +539,7 @@ fn uniffi_changeset_wrapper(changeset_name: &Ident, view_name: &Ident, resultset
         impl #changeset_name {
             /// Get the current result set
             pub fn resultset(&self) -> #resultset_name {
-                #resultset_name(self.0.resultset.wrap())
+                #resultset_name(self.0.resultset.clone())
             }
 
             /// Items from the initial query load (before subscription was active)

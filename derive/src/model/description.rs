@@ -1,4 +1,5 @@
 use ankurah_core_types::SystemModel;
+#[cfg(any(feature = "wasm", feature = "uniffi"))]
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::{meta::ParseNestedMeta, Data, DeriveInput, Fields, Ident, LitStr, Type, Visibility};
@@ -6,6 +7,7 @@ use syn::{meta::ParseNestedMeta, Data, DeriveInput, Fields, Ident, LitStr, Type,
 #[derive(Default)]
 struct ModelOptions {
     base: Option<String>,
+    label: Option<String>,
     system: Option<String>,
     explicit_id: Option<String>,
     no_ffi: bool,
@@ -26,6 +28,7 @@ pub struct ModelDescription {
     base: syn::Path,
     uses_crate_paths: bool,
     no_ffi: bool,
+    label: Option<String>,
     system: Option<SystemModel>,
     explicit_id: Option<String>,
 }
@@ -35,6 +38,9 @@ impl ModelDescription {
     pub fn parse(input: &DeriveInput) -> syn::Result<Self> {
         let name = input.ident.clone();
         let options = parse_model_options(&input.attrs)?;
+        if options.label.is_some() && options.system.is_some() {
+            return Err(syn::Error::new_spanned(&name, "#[model(label = ...)] cannot override a built-in system model's label"));
+        }
 
         let fields = match &input.data {
             Data::Struct(data) => match &data.fields {
@@ -78,6 +84,7 @@ impl ModelDescription {
             base,
             uses_crate_paths,
             no_ffi: options.no_ffi,
+            label: options.label,
             system,
             explicit_id: options.explicit_id,
         })
@@ -90,7 +97,7 @@ impl ModelDescription {
             // A built-in lives at its own reserved label, never at a name
             // derived from whatever struct happens to declare it.
             Some(model) => format!("{}{}", crate::model::RESERVED_COLLECTION_PREFIX, to_snake(model.into())),
-            None => self.name.to_string().to_lowercase(),
+            None => self.label.clone().unwrap_or_else(|| self.name.to_string().to_lowercase()),
         }
     }
     /// The path generated code reaches the core crate through.
@@ -165,11 +172,6 @@ impl ModelDescription {
         }
 
         Ok(results)
-    }
-    pub fn projected_field_types_turbofish(&self) -> Vec<TokenStream> { self.active_fields.iter().map(|f| as_turbofish(&f.ty)).collect() }
-    pub fn active_field_types_turbofish(&self) -> syn::Result<Vec<proc_macro2::TokenStream>> {
-        let active_types = self.active_field_types()?;
-        Ok(active_types.iter().map(as_turbofish).collect())
     }
 
     // Computed accessors for ephemeral fields
@@ -443,6 +445,7 @@ fn parse_model_options(attrs: &[syn::Attribute]) -> syn::Result<ModelOptions> {
             let key = meta.path.get_ident().map(|ident| ident.to_string()).unwrap_or_default();
             match key.as_str() {
                 "base" => set_model_option(&mut options.base, model_option_str(&meta, "base")?, &meta, "base"),
+                "label" => set_model_option(&mut options.label, model_option_str(&meta, "label")?, &meta, "label"),
                 "system" => set_model_option(&mut options.system, model_option_str(&meta, "system")?, &meta, "system"),
                 "id" => set_model_option(&mut options.explicit_id, model_option_str(&meta, "id")?, &meta, "id"),
                 "no_ffi" => {
@@ -455,7 +458,7 @@ fn parse_model_options(attrs: &[syn::Attribute]) -> syn::Result<ModelOptions> {
                     options.no_ffi = true;
                     Ok(())
                 }
-                _ => Err(meta.error("unknown #[model(...)] option; expected `base`, `system`, `id`, or `no_ffi`")),
+                _ => Err(meta.error("unknown #[model(...)] option; expected `base`, `label`, `system`, `id`, or `no_ffi`")),
             }
         })?;
     }
@@ -498,32 +501,23 @@ fn to_snake(ident: &str) -> String {
     out
 }
 
-fn as_turbofish(type_path: &syn::Type) -> proc_macro2::TokenStream {
-    if let syn::Type::Path(path) = type_path {
-        let mut without_generics = path.clone();
-        let mut generics = syn::PathArguments::None;
-        if let Some(last_segment) = without_generics.path.segments.last_mut() {
-            generics = last_segment.arguments.clone();
-            last_segment.arguments = syn::PathArguments::None;
-        }
-
-        if let syn::PathArguments::AngleBracketed(generics) = generics {
-            quote! {
-                #without_generics::#generics
-            }
-        } else {
-            quote! {
-                #without_generics
-            }
-        }
-    } else {
-        unimplemented!("as_turbofish is not supported for non-path types")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_invalid_label_options() {
+        for (attribute, expected) in [
+            (quote! { #[model(label = "one", label = "two")] }, "duplicate"),
+            (quote! { #[model(label = 42)] }, "string literal"),
+            (quote! { #[model(system = "Model", label = "custom")] }, "cannot override"),
+            (quote! { #[model(label = "_ankurah_custom")] }, "reserved"),
+        ] {
+            let input = syn::parse2(quote! { #attribute struct Example { title: String } }).unwrap();
+            let error = ModelDescription::parse(&input).and_then(|model| crate::model::schema::validate_schema_attrs(&model)).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
 
     #[test]
     fn test_resolve_active_type() {
@@ -562,14 +556,14 @@ mod tests {
         assert_eq!(
             active_type_names,
             vec![
-                "::ankurah::property::value::LWW<i32>",
-                "::ankurah::property::value::LWW<i32>",
-                "::ankurah::property::value::LWW<i32>",
-                "::ankurah::property::value::LWW<String>",
-                "::ankurah::property::value::LWW<String>",
-                "::ankurah::property::value::YrsString<String>",
-                "::ankurah::property::value::YrsString<String>",
-                "::ankurah::property::value::LWW<Complex>" // Complex is assumed to be in scope
+                "::ankurah::property::value::LWWMut<i32>",
+                "::ankurah::property::value::LWWMut<i32>",
+                "::ankurah::property::value::LWWMut<i32>",
+                "::ankurah::property::value::LWWMut<String>",
+                "::ankurah::property::value::LWWMut<String>",
+                "::ankurah::property::value::YrsStringMut<String>",
+                "::ankurah::property::value::YrsStringMut<String>",
+                "::ankurah::property::value::LWWMut<Complex>" // Complex is assumed to be in scope
             ]
         );
         assert_eq!(

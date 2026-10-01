@@ -14,16 +14,16 @@ use async_trait::async_trait;
 use thiserror::Error;
 use tracing::debug;
 
-mod read;
-pub(crate) use read::ReadPolicy;
+mod context;
+pub use context::ContextPolicy;
 
 /// The result of a policy check. Currently just Allow/Deny, but will support Trace in the future
 #[derive(Debug, Error, Clone)]
 pub enum AccessDenied {
     #[error("Access denied by policy: {0}")]
     ByPolicy(&'static str),
-    #[error("Access denied by collection: {0}")]
-    CollectionDenied(proto::CollectionId),
+    #[error("Access denied by model: {0}")]
+    ModelDenied(proto::ModelId),
     #[error("Access denied by property error: {0}")]
     PropertyError(std::sync::Arc<PropertyError>),
     #[error("Access denied by parse error: {0}")]
@@ -63,32 +63,29 @@ pub use crate::schema::registration::{PlannedModelPropertyMembership, PlannedUpd
 /// - attesting events for requests that were approved
 /// - validating attestations for events
 ///
-/// The four checks that take a credential collection
-/// ([`Self::can_access_collection`], [`Self::filter_predicate`],
-/// [`Self::check_read`], [`Self::check_read_event`]) can be handed
-/// several credentials, one, or none. An implementation must decide the
-/// empty case deliberately instead of inheriting whatever its loops
-/// happen to do with it: with no credential there is no principal to
-/// attribute the access to, so fail closed unless permissiveness is the
-/// point. The JWT agent in extensions/jwt-auth denies it wherever
-/// admission is decided — `can_access_collection`, and `check_read` and
-/// `check_read_event` which both reach that check (the first as its
-/// opening step, the second after the privileged short-circuit) — carving out only
-/// the policy collection, which is granted before any credential is
-/// consulted. (Its `filter_predicate` does return the predicate
-/// unnarrowed when the collection has no scope rules, which admits
-/// nobody: every caller passes `can_access_collection` before it.)
-/// [`PermissiveAgent`] allows the empty collection, that being the whole
-/// of what it is for.
+/// Read checks may receive several credentials, one, or none. Implementations
+/// must decide the empty case explicitly and authorize actual entity memberships,
+/// not a model supplied by the caller. `PermissiveAgent` allows all credentials.
 #[async_trait]
 pub trait PolicyAgent: Clone + Send + Sync + 'static {
     /// The context type that will be used for all resource requests.
     /// This will typically represent a user or service account.
     type ContextData: ContextData;
 
-    /// Called after the Node is fully constructed, giving the PolicyAgent a weak reference to its owning node.
-    /// Use this to start background tasks (file watchers, policy subscriptions) that need the node.
-    fn on_node_ready<SE: StorageEngine + Send + Sync + 'static>(&self, _node: WeakNode<SE, Self>) {}
+    /// Initialize policy after the system and catalog load, before ordinary contexts are issued.
+    /// Load existing policy; installing or updating shared policy is a separate bootstrap operation.
+    /// Bootstrap work must not wait for the node to finish this startup step.
+    async fn start<SE: StorageEngine + Send + Sync + 'static>(&self, _node: WeakNode<SE, Self>) -> anyhow::Result<()> { Ok(()) }
+
+    /// Load policy bindings for a registered model before synchronous access checks.
+    /// This prepares policy data; it neither resolves names nor grants access.
+    async fn preflight<SE: StorageEngine + Send + Sync + 'static>(
+        &self,
+        _node: &Node<SE, Self>,
+        _model: proto::ModelId,
+    ) -> Result<(), RetrievalError> {
+        Ok(())
+    }
 
     /// Create relevant auth data for a given request
     /// This could be a JWT or a cryptographic signature, or some other arbitrary method of authentication as defined by the PolicyAgent
@@ -103,7 +100,7 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
 
     /// Reverse of sign_request. This will typically parse + validate the auth data and return a ContextData if valid
     /// optionally, the PolicyAgent may introspect the request directly for signature validation, or other policy checks
-    /// Note that check_read and check_write will be called with the ContextData as well if the request is approved
+    /// Read predicates and check_write will use the ContextData as well if the request is approved
     /// Meaning that the PolicyAgent need not necessarily introspect the request directly here if it doesn't want to.
     async fn check_request<SE: StorageEngine, A>(
         &self,
@@ -115,8 +112,7 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
         Self: Sized,
         A: Iterable<proto::AuthData> + Send + Sync;
 
-    /// Check whether this registration plan is allowed -- the agent's only
-    /// voice on catalog writes (the executor commits privileged).
+    /// Authorize the complete registration plan; the executor commits privileged.
     fn check_schema_registration<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
@@ -126,9 +122,21 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
         Ok(())
     }
 
-    /// Judge an event under this credential, seeing the entity state both
-    /// before and after it applies; optionally return an attestation.
-    fn check_event<SE: StorageEngine>(
+    /// Stage policy bindings alongside an authorized schema registration, before its transaction commits.
+    /// Replicas apply the committed records; they do not run this hook.
+    /// The executor retains any returned authoring guard through the commit.
+    async fn schema_registered<SE: StorageEngine + Send + Sync + 'static>(
+        &self,
+        _node: &Node<SE, Self>,
+        _transaction: &Transaction,
+        _plan: &RegistrationPlan,
+    ) -> anyhow::Result<Option<tokio::sync::OwnedMutexGuard<()>>> {
+        Ok(None)
+    }
+
+    /// Authorize a proposed event, seeing the transaction's original state
+    /// and its state after applying the event; optionally return an attestation.
+    fn check_write_event<SE: StorageEngine>(
         &self,
         node: &Node<SE, Self>,
         cdata: &Self::ContextData,
@@ -156,41 +164,43 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
         state: &Attested<proto::EntityState>,
     ) -> Result<(), AccessDenied>;
 
-    // For checking if a context can access a collection
-    fn can_access_collection<C>(&self, data: &C, collection: &proto::CollectionId) -> Result<(), AccessDenied>
-    where C: Iterable<Self::ContextData>;
-
-    /// Filter a predicate based on the context data
-    /// An implementation may refuse a caller holding no authorized context, so callers gate on can_access_collection first.
-    fn filter_predicate<C>(
-        &self,
-        data: &C,
-        collection: &proto::CollectionId,
-        predicate: Predicate<Resolved>,
-    ) -> Result<Predicate<Resolved>, AccessDenied>
+    /// Entities these credentials may discover through queries and subscriptions.
+    /// Include all membership and row restrictions; core chooses where to evaluate them.
+    fn query_predicate<C>(&self, data: &C) -> Result<Predicate<Resolved>, AccessDenied>
     where
         C: Iterable<Self::ContextData>;
 
-    /// Check if a context can read an entity
-    /// If the policy agent wants to inspect the entity state, it can do so with either TemporaryEntity::new or entityset.with_state
-    /// Optimization: Consider adding a common trait implemented by Entity and TemporaryEntity returned by entityset.get_evaluation_entity that
-    /// returns a real entity if resident, falling back to a temporary entity if not. (as the former case would save cycles creating/populating the backends)
-    fn check_read<C>(
-        &self,
-        data: &C,
-        id: &proto::EntityId,
-        collection: &proto::CollectionId,
-        state: &proto::State,
-    ) -> Result<(), AccessDenied>
-    where
-        C: Iterable<Self::ContextData>;
+    /// Entities these credentials may retrieve by identity, including their events.
+    /// Override when retrieval is permitted more broadly than discovery.
+    fn retrieval_predicate<C>(&self, data: &C) -> Result<Predicate<Resolved>, AccessDenied>
+    where C: Iterable<Self::ContextData> {
+        self.query_predicate(data)
+    }
 
-    /// Check if a context can read an event
-    fn check_read_event<C>(&self, data: &C, event: &Attested<proto::Event>) -> Result<(), AccessDenied>
-    where C: Iterable<Self::ContextData>;
+    /// Additional restrictions on retrieved states, including cached reads and live updates.
+    /// Return denials keyed by entity id; omitted ids are allowed. Cannot grant access outside the read predicate.
+    fn check_reads<C>(
+        &self,
+        _data: &C,
+        _states: &[(&proto::EntityId, &proto::State)],
+    ) -> std::collections::HashMap<proto::EntityId, AccessDenied>
+    where C: Iterable<Self::ContextData> {
+        std::collections::HashMap::new()
+    }
+
+    /// Additional event restrictions after the entity passes the retrieval predicate.
+    fn check_read_event<C>(&self, _data: &C, _event: &Attested<proto::Event>) -> Result<(), AccessDenied>
+    where C: Iterable<Self::ContextData> {
+        Ok(())
+    }
 
     /// Check if a context can edit an entity
-    fn check_write(&self, data: &Self::ContextData, entity: &Entity, event: Option<&proto::Event>) -> Result<(), AccessDenied>;
+    fn check_write(
+        &self,
+        data: &Self::ContextData,
+        entity: &Entity,
+        event: Option<&proto::Event>,
+    ) -> Result<(), AccessDenied>;
 
     /// Validate a lineage attestation from a peer
     /// This validates that the relation attestation correctly describes the lineage between two entity heads
@@ -201,10 +211,8 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
         head_relation: &proto::CausalAssertion,
     ) -> Result<(), AccessDenied>;
 
-    // fn check_write_event(&self, data: &Self::ContextData, entity: &Entity, event: &proto::Event) -> Result<(), AccessDenied>;
-
     // // For checking if a context can subscribe to changes
-    // fn can_subscribe(&self, data: &Self::ContextData, collection: &CollectionId, predicate: &Predicate) -> AccessResult;
+    // fn can_subscribe(&self, data: &Self::ContextData, collection: &ModelId, predicate: &Predicate) -> AccessResult;
 
     // // For checking if a context can communicate with another node
     // fn can_communicate_with_node(&self, data: &Self::ContextData, node_id: &ID) -> AccessResult;
@@ -256,7 +264,7 @@ impl PolicyAgent for PermissiveAgent {
     }
 
     /// Create an attestation for an event
-    fn check_event<SE: StorageEngine>(
+    fn check_write_event<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
         _cdata: &Self::ContextData,
@@ -293,33 +301,12 @@ impl PolicyAgent for PermissiveAgent {
         Ok(())
     }
 
-    fn can_access_collection<C>(&self, _data: &C, _collection: &proto::CollectionId) -> Result<(), AccessDenied>
-    where C: Iterable<Self::ContextData> {
-        // PermissiveAgent allows regardless of which credentials are supplied, including none
-        Ok(())
-    }
-
-    fn check_read<C>(
+    fn check_write(
         &self,
-        _data: &C,
-        _id: &proto::EntityId,
-        _collection: &proto::CollectionId,
-        _state: &proto::State,
-    ) -> Result<(), AccessDenied>
-    where
-        C: Iterable<Self::ContextData>,
-    {
-        // PermissiveAgent allows regardless of which credentials are supplied, including none
-        Ok(())
-    }
-
-    fn check_read_event<C>(&self, _data: &C, _event: &Attested<proto::Event>) -> Result<(), AccessDenied>
-    where C: Iterable<Self::ContextData> {
-        // PermissiveAgent allows regardless of which credentials are supplied, including none
-        Ok(())
-    }
-
-    fn check_write(&self, _context: &Self::ContextData, _entity: &Entity, _event: Option<&proto::Event>) -> Result<(), AccessDenied> {
+        _context: &Self::ContextData,
+        _entity: &Entity,
+        _event: Option<&proto::Event>,
+    ) -> Result<(), AccessDenied> {
         Ok(())
     }
 
@@ -333,26 +320,21 @@ impl PolicyAgent for PermissiveAgent {
         Ok(())
     }
 
-    fn filter_predicate<C>(
-        &self,
-        _data: &C,
-        _collection: &proto::CollectionId,
-        predicate: Predicate<Resolved>,
-    ) -> Result<Predicate<Resolved>, AccessDenied>
+    fn query_predicate<C>(&self, _data: &C) -> Result<Predicate<Resolved>, AccessDenied>
     where
         C: Iterable<Self::ContextData>,
     {
         // PermissiveAgent allows regardless of which credentials are supplied, including none
-        Ok(predicate)
+        Ok(Predicate::True)
     }
 
     // fn can_read_entity(&self, _context: &Self::ContextData, _entity: &Entity) -> AccessResult { AccessResult::Allow }
 
-    // fn can_modify_entity(&self, _context: &Self::ContextData, _collection: &CollectionId, _id: &ID) -> AccessResult { AccessResult::Allow }
+    // fn can_modify_entity(&self, _context: &Self::ContextData, _collection: &ModelId, _id: &ID) -> AccessResult { AccessResult::Allow }
 
-    // fn can_create_in_collection(&self, _context: &Self::ContextData, _collection: &CollectionId) -> AccessResult { AccessResult::Allow }
+    // fn can_create_in_collection(&self, _context: &Self::ContextData, _collection: &ModelId) -> AccessResult { AccessResult::Allow }
 
-    // fn can_subscribe(&self, _context: &Self::ContextData, _collection: &CollectionId, _predicate: &Predicate) -> AccessResult {
+    // fn can_subscribe(&self, _context: &Self::ContextData, _collection: &ModelId, _predicate: &Predicate) -> AccessResult {
     //     AccessResult::Allow
     // }
 

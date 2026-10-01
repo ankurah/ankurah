@@ -193,7 +193,6 @@ impl<'a> Workload<'a> {
         let fragments: Vec<proto::EventFragment> = events.into_iter().map(|e| e.into()).collect();
         proto::SubscriptionUpdateItem {
             entity_id: entity,
-            collection: super::model::sim_collection(),
             content: proto::UpdateContent::EventOnly(fragments),
             predicate_relevance: vec![],
         }
@@ -208,7 +207,6 @@ impl<'a> Workload<'a> {
         let event_fragments: Vec<proto::EventFragment> = events.into_iter().map(|e| e.into()).collect();
         proto::SubscriptionUpdateItem {
             entity_id: entity,
-            collection: super::model::sim_collection(),
             content: proto::UpdateContent::StateAndEvent(state_fragment, event_fragments),
             predicate_relevance: vec![],
         }
@@ -271,7 +269,10 @@ impl<'a> Workload<'a> {
                     id: proto::RequestId::new(),
                     to: node_ids[dst],
                     from: origin_id,
-                    body: proto::NodeRequestBody::CommitTransaction { id: proto::TransactionId::new(), events: vec![event.clone()] },
+                    body: proto::NodeRequestBody::CommitTransaction {
+                        id: proto::TransactionId::new(),
+                        events: vec![event.clone()],
+                    },
                 };
                 let message = proto::NodeMessage::Request { auth: vec![proto::AuthData(vec![])], request };
                 self.scheduler.enqueue_event(origin, dst, entity, event_id.clone(), message);

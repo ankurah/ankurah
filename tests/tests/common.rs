@@ -9,6 +9,7 @@ use tracing::Level;
 pub use ankurah::{
     changes::{ChangeKind, ChangeSet},
     core::node::nocache,
+    core::storage::StorageEngine,
     error::MutationError,
     model::View,
     policy::DEFAULT_CONTEXT,
@@ -471,6 +472,7 @@ pub fn years(query: &LiveQuery<AlbumView>) -> Vec<String> { query.peek().iter().
 pub async fn durable_sled_setup() -> Result<Node<SledStorageEngine, PermissiveAgent>, anyhow::Error> {
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     node.system.create().await?;
+    node.wait_ready().await?;
     Ok(node)
 }
 

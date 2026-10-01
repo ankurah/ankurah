@@ -1,5 +1,9 @@
 # IndexedDB Indexing Plan for ORDER BY/LIMIT
 
+> Historical implementation plan. The current engine stores canonical
+> entities/events separately and scopes projected rows with
+> `__materialization`; see `specs/storage/architecture.md`.
+
 ## Overview
 
 Implement ORDER BY and LIMIT functionality in IndexedDB using the common `Planner` from `ankurah-storage-common` with on-demand index creation. The `Planner` generates index plans that IndexedDB executes using native indexes.

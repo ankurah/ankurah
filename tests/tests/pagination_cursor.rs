@@ -41,7 +41,7 @@ const TIMESTAMP_STEP: i64 = 1000;
 async fn setup() -> Result<Context> {
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
     node.system.create().await?;
-    Ok(node.context(DEFAULT_CONTEXT)?)
+    Ok(node.context_async(DEFAULT_CONTEXT).await?)
 }
 
 async fn create_room(ctx: &Context, name: &str) -> Result<EntityId> {
@@ -154,7 +154,7 @@ async fn test_pagination_inter_node() -> Result<()> {
     let client = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
 
     let _conn = LocalProcessConnection::new(&server, &client).await?;
-    client.system.wait_system_ready().await.unwrap();
+    client.wait_ready().await?;
 
     let server_ctx = server.context(DEFAULT_CONTEXT)?;
     let client_ctx = client.context(DEFAULT_CONTEXT)?;

@@ -3,7 +3,6 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 
 use crate::AttestationSet;
-use crate::CollectionId;
 use crate::StateBuffers;
 use crate::{Clock, DecodeError, EventBody, EventId};
 
@@ -127,22 +126,5 @@ impl TryFrom<&StateBuffers> for JsValue {
         let array = js_sys::Uint8Array::new_with_length(buffer.len() as u32);
         array.copy_from(&buffer);
         Ok(array.into())
-    }
-}
-
-impl TryFrom<JsValue> for CollectionId {
-    type Error = DecodeError;
-
-    fn try_from(value: JsValue) -> Result<Self, Self::Error> { Ok(value.as_string().ok_or(DecodeError::NotStringValue)?.into()) }
-}
-
-impl From<&CollectionId> for JsValue {
-    fn from(val: &CollectionId) -> Self { val.as_str().into() }
-}
-
-impl From<CollectionId> for JsValue {
-    fn from(val: CollectionId) -> Self {
-        let s: String = val.into();
-        s.into()
     }
 }

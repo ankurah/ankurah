@@ -100,7 +100,7 @@ fn to_snake_case(ident: &str) -> String {
 #[proc_macro_derive(WasmSignal)]
 pub fn derive_wasm_signal(input: TokenStream) -> TokenStream { wasm_signal::derive_wasm_signal_impl(input) }
 
-#[proc_macro_derive(Property)]
+#[proc_macro_derive(Property, attributes(property))]
 pub fn derive_property(input: TokenStream) -> TokenStream { property::derive_property_impl(input) }
 
 /// Generate a predicate at compile time

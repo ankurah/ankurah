@@ -14,8 +14,22 @@ pub enum NodeHaltReason {
     SystemLoad(String),
     #[error("failed to reconstruct the local catalog: {0}")]
     CatalogLoad(String),
+    #[error("failed to initialize policy: {0}")]
+    PolicyAgentStartFailed(String),
     #[error("system replacement requires a new node (current {current}, proposed {proposed})")]
     SystemReplacement { current: EntityId, proposed: EntityId },
+}
+
+#[derive(Error, Debug)]
+#[error(transparent)]
+pub(crate) struct CatalogStartError(#[from] RetrievalError);
+
+impl From<NodeDropped> for CatalogStartError {
+    fn from(error: NodeDropped) -> Self { Self(error.into()) }
+}
+
+impl From<CatalogStartError> for NodeHaltReason {
+    fn from(error: CatalogStartError) -> Self { Self::CatalogLoad(error.to_string()) }
 }
 
 /// Why the node cannot accept work requiring completed initialization.
@@ -47,12 +61,14 @@ pub enum RetrievalError {
     ParseError(ankql::error::ParseError),
     #[error("Entity not found: {0:?}")]
     EntityNotFound(EntityId),
+    #[error("Entity {entity_id} does not have component {model_id}")]
+    MissingComponent { entity_id: EntityId, model_id: ModelId },
     #[error("Event not found: {0:?}")]
     EventNotFound(EventId),
     #[error("Storage error: {0}")]
     StorageError(Arc<dyn std::error::Error + Send + Sync + 'static>),
-    #[error("Collection not found: {0}")]
-    CollectionNotFound(CollectionId),
+    #[error("Model not found: {0}")]
+    ModelNotFound(ModelId),
     #[error("Update failed: {0}")]
     FailedUpdate(Arc<dyn std::error::Error + Send + Sync + 'static>),
     #[error("Deserialization error: {0}")]
@@ -225,6 +241,8 @@ pub enum MutationError {
     LineageError(LineageError),
     #[error("peer rejected transaction")]
     PeerRejected,
+    #[error("transaction cannot continue after a failed operation")]
+    TransactionFailed,
     #[error("invalid event")]
     InvalidEvent,
     #[error("malformed event: {0}")]
@@ -259,6 +277,8 @@ pub enum MutationError {
     Anyhow(anyhow::Error),
     #[error("TOCTOU attempts exhausted")]
     TOCTOUAttemptsExhausted,
+    #[error("entity state changed before storage commit")]
+    WriteConflict,
 }
 
 impl From<NodeReadinessError> for MutationError {
@@ -349,12 +369,23 @@ impl From<AccessDenied> for RetrievalError {
     fn from(err: AccessDenied) -> Self { RetrievalError::AccessDenied(err) }
 }
 
+impl From<ankurah_proto::GetFailure> for RetrievalError {
+    fn from(error: ankurah_proto::GetFailure) -> Self {
+        match error {
+            ankurah_proto::GetFailure::NotFound(id) => Self::EntityNotFound(id),
+            ankurah_proto::GetFailure::AccessDenied(_) => AccessDenied::ByPolicy("Peer denied entity retrieval").into(),
+        }
+    }
+}
+
 impl From<SubscriptionError> for RetrievalError {
     fn from(err: SubscriptionError) -> Self { anyhow::anyhow!("Subscription error: {:?}", err).into() }
 }
 
 #[derive(Error, Debug)]
 pub enum StateError {
+    #[error("transaction was rolled back")]
+    TransactionClosed,
     #[error("serialization error: {0}")]
     SerializationError(Box<dyn std::error::Error + Send + Sync + 'static>),
     #[error("DDL error: {0}")]
@@ -395,7 +426,7 @@ pub enum ValidationError {
 #[derive(Debug)]
 pub enum ApplyError {
     Items(Vec<ApplyErrorItem>),
-    CollectionNotFound(CollectionId),
+    ModelNotFound(ModelId),
     RetrievalError(Box<RetrievalError>),
     MutationError(Box<MutationError>),
 }
@@ -410,7 +441,7 @@ impl std::fmt::Display for ApplyError {
                 }
                 Ok(())
             }
-            ApplyError::CollectionNotFound(id) => write!(f, "Collection not found: {}", id),
+            ApplyError::ModelNotFound(id) => write!(f, "Model not found: {}", id),
             ApplyError::RetrievalError(e) => write!(f, "Retrieval error: {}", e),
             ApplyError::MutationError(e) => write!(f, "Mutation error: {}", e),
         }
@@ -431,13 +462,12 @@ impl std::error::Error for ApplyError {
 #[derive(Debug)]
 pub struct ApplyErrorItem {
     pub entity_id: EntityId,
-    pub collection: CollectionId,
     pub cause: MutationError,
 }
 
 impl std::fmt::Display for ApplyErrorItem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Failed to apply delta for entity {} in collection {}: {}", self.entity_id.to_base64_short(), self.collection, self.cause)
+        write!(f, "Failed to apply delta for entity {}: {}", self.entity_id.to_base64_short(), self.cause)
     }
 }
 

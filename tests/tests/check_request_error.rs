@@ -61,12 +61,12 @@ impl PolicyAgent for RejectingAgent {
         Err(ValidationError::ValidationFailed("Request rejected by RejectingAgent".to_string()))
     }
 
-    fn check_event<SE: StorageEngine>(
+    fn check_write_event<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
         _cdata: &Self::ContextData,
-        _entity_before: &ankurah::entity::Entity,
-        _entity_after: &ankurah::entity::Entity,
+        _entity_before: &ankurah::core::entity::Entity,
+        _entity_after: &ankurah::core::entity::Entity,
         _event: &proto::Event,
     ) -> std::result::Result<Option<proto::Attestation>, AccessDenied> {
         Ok(None)
@@ -92,39 +92,9 @@ impl PolicyAgent for RejectingAgent {
         Ok(())
     }
 
-    fn can_access_collection<C>(&self, _data: &C, _collection: &proto::CollectionId) -> std::result::Result<(), AccessDenied>
+    fn query_predicate<C>(&self, _data: &C) -> std::result::Result<Predicate<ankql::ast::Resolved>, AccessDenied>
     where C: Iterable<Self::ContextData> {
-        Ok(())
-    }
-
-    fn filter_predicate<C>(
-        &self,
-        _data: &C,
-        _collection: &proto::CollectionId,
-        predicate: Predicate<ankql::ast::Resolved>,
-    ) -> std::result::Result<Predicate<ankql::ast::Resolved>, AccessDenied>
-    where
-        C: Iterable<Self::ContextData>,
-    {
-        Ok(predicate)
-    }
-
-    fn check_read<C>(
-        &self,
-        _data: &C,
-        _id: &proto::EntityId,
-        _collection: &proto::CollectionId,
-        _state: &proto::State,
-    ) -> std::result::Result<(), AccessDenied>
-    where
-        C: Iterable<Self::ContextData>,
-    {
-        Ok(())
-    }
-
-    fn check_read_event<C>(&self, _data: &C, _event: &proto::Attested<proto::Event>) -> std::result::Result<(), AccessDenied>
-    where C: Iterable<Self::ContextData> {
-        Ok(())
+        Ok(Predicate::True)
     }
 
     fn check_write(
@@ -161,7 +131,7 @@ async fn check_request_error_returns_to_client() -> Result<()> {
     let _conn = LocalProcessConnection::new(&server, &client).await?;
     client.system.wait_system_ready().await.unwrap();
 
-    let client_ctx = client.context(DEFAULT_CONTEXT)?;
+    let client_ctx = client.context_async(DEFAULT_CONTEXT).await?;
 
     // Try to create an entity on the client - this should fail when relaying
     // to the server because its check_request rejects everything. First-use

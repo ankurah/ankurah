@@ -1,5 +1,6 @@
 use super::EntityLiveQuery;
 use crate::internal::prelude::*;
+use crate::model::Model;
 use crate::reactor::ReactorUpdate;
 use crate::resultset::ResultSet;
 use ankurah_signals::{
@@ -13,12 +14,37 @@ use std::marker::PhantomData;
 #[derive(Clone)]
 pub struct LiveQuery<R: View>(pub(super) EntityLiveQuery, pub(super) PhantomData<R>);
 
+impl<R: View> From<LiveQuery<R>> for EntityLiveQuery {
+    fn from(query: LiveQuery<R>) -> Self { query.0 }
+}
+
 impl<R: View> std::ops::Deref for LiveQuery<R> {
     type Target = EntityLiveQuery;
     fn deref(&self) -> &Self::Target { &self.0 }
 }
 
 impl<R: View> LiveQuery<R> {
+    /// Resolve typed field names now; defer missing bindings or readiness.
+    pub fn update_selection(
+        &self,
+        selection: impl TryInto<ankql::ast::Selection<ankql::ast::Parsed>, Error = impl Into<RetrievalError>>,
+    ) -> Result<(), RetrievalError> {
+        let resolution = super::QueryResolution::prepare(
+            self.0.0.context.schema_resolver(), R::Model::descriptor(), selection.try_into().map_err(Into::into)?,
+        )?;
+        self.0.update_resolution(resolution)
+    }
+
+    /// Replace the selection and await initialization, propagating update or initialization errors.
+    /// If superseded by another update, wait for the newer version instead.
+    pub async fn update_selection_wait(
+        &self,
+        selection: impl TryInto<ankql::ast::Selection<ankql::ast::Parsed>, Error = impl Into<RetrievalError>>,
+    ) -> Result<(), RetrievalError> {
+        self.update_selection(selection)?;
+        self.wait_initialized().await
+    }
+
     /// Wait for initialization or its terminal error.
     pub async fn wait_initialized(&self) -> Result<(), RetrievalError> { self.0.wait_initialized().await }
 
@@ -73,7 +99,7 @@ fn changes_from_update<R: View>(resultset: ResultSet<R>, reactor_update: Reactor
     let mut changes = Vec::new();
 
     for item in reactor_update.items {
-        let view = R::from_entity(item.entity);
+        let view = crate::resultset::member_view(item.entity);
 
         if let Some((_, membership_change)) = item.predicate_relevance.first() {
             match membership_change {

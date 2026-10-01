@@ -6,7 +6,7 @@ use crate::{
     entity::Entity,
     error::SubscriptionError,
     node::Node,
-    policy::{PolicyAgent, ReadPolicy},
+    policy::{PolicyAgent, ContextPolicy},
     reactor::{
         fetch_gap::{GapFetcher, QueryGapFetcher},
         ReactorSubscription, ReactorUpdate,
@@ -22,13 +22,13 @@ pub struct SubscriptionHandler<CD: ContextData> {
     _peer_id: proto::EntityId,
     subscription: ReactorSubscription,
     _guard: SubscriptionGuard,
-    /// Tracks each standing query's collection and version, plus the credential source shared with its gap fetcher.
-    /// The mutex serializes this peer's query installation, failure cleanup, and removal.
+    /// Tracks each standing query's version and the credential source shared with its gap fetcher.
+    /// Held through async installation and failure cleanup so removal cannot race an
+    /// installation that would leave a reactor query without its credential source.
     queries: tokio::sync::Mutex<HashMap<proto::QueryId, StandingQuery<CD>>>,
 }
 
 struct StandingQuery<CD: ContextData> {
-    collection: proto::CollectionId,
     /// Initial credential snapshot; peer session updates are not synchronized yet (#484).
     sessions: SessionSet<CD>,
     version: u32,
@@ -81,7 +81,6 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         &self,
         node: &Node<SE, PA>,
         query_id: proto::QueryId,
-        collection_id: proto::CollectionId,
         mut selection: ankql::ast::Selection<Resolved>,
         cdata: Option<&PA::ContextData>,
         version: u32,
@@ -95,22 +94,15 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         if version == 0 {
             return Err(anyhow::anyhow!("Invalid version 0 for subscription"));
         }
-        if cdata.is_none() && !crate::schema::reads_bypass_policy(&collection_id) {
-            return Err(anyhow::anyhow!("subscribe to '{collection_id}' requires a credential"));
-        }
         let credentials: Vec<CD> = cdata.cloned().into_iter().collect();
-        let policy = ReadPolicy::new(&node.policy_agent, &credentials, &collection_id);
+        let policy = ContextPolicy::from_credentials(&node.policy_agent, &credentials);
         // Re-subscribes revalidate; #426 owns denied-update claw-back.
-        policy.check_collection()?;
         selection.predicate = policy.filter_predicate(selection.predicate)?;
 
         use std::collections::hash_map::Entry;
         let (sessions, query_created) = match queries.entry(query_id) {
             Entry::Occupied(mut o) => {
                 let standing = o.get_mut();
-                if standing.collection != collection_id {
-                    anyhow::bail!("query {query_id} is already bound to collection '{}'", standing.collection);
-                }
                 if version < standing.version {
                     anyhow::bail!("stale subscription version {version} for query {query_id}; current version is {}", standing.version);
                 }
@@ -122,13 +114,13 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
                     Some(cdata) => cdata.clone().into(),
                     None => SessionSet::new(),
                 };
-                v.insert(StandingQuery { collection: collection_id.clone(), sessions: sessions.clone(), version });
+                v.insert(StandingQuery { sessions: sessions.clone(), version });
                 (sessions, true)
             }
         };
 
         let response =
-            self.subscribe_query_inner(node, query_id, collection_id, selection, &sessions, &credentials, version, known_matches).await;
+            self.subscribe_query_inner(node, query_id, selection, &sessions, &credentials, version, known_matches).await;
 
         if response.is_err() && query_created {
             queries.remove(&query_id);
@@ -142,7 +134,6 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         &self,
         node: &Node<SE, PA>,
         query_id: proto::QueryId,
-        collection_id: proto::CollectionId,
         selection: ankql::ast::Selection<Resolved>,
         sessions: &SessionSet<CD>,
         credentials: &Vec<CD>,
@@ -153,16 +144,12 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
     {
-        let storage_collection = node.collections.get(&collection_id).await?;
-
         let context = crate::context::Context::new_weak(node, sessions.clone());
-        let gap_fetcher: std::sync::Arc<dyn GapFetcher<Entity>> = std::sync::Arc::new(QueryGapFetcher::new(context));
+        let gap_fetcher: std::sync::Arc<dyn GapFetcher<Entity>> = std::sync::Arc::new(QueryGapFetcher::new(context.clone()));
 
-        let included_entities = node.fetch_entities_from_local(&collection_id, &selection).await?;
-        let matching_entities = self
-            .subscription
-            .upsert_query(query_id, collection_id.clone(), selection.clone(), included_entities, gap_fetcher, version)
-            .await?;
+        let included_entities = context.0.fetch_entities_from_local(&selection).await?;
+        let matching_entities =
+            self.subscription.upsert_query(query_id, selection.clone(), included_entities, gap_fetcher, context.0, version).await?;
 
         // TASK: Audit SubscriptionUpdate vs QuerySubscribed sequencing https://github.com/ankurah/ankurah/issues/147
 
@@ -179,13 +166,13 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         let expanded_states = crate::util::expand_states::expand_states(
             initial_states,
             known_matches.iter().map(|k| k.entity_id).collect::<Vec<_>>(),
-            &storage_collection,
+            node.storage.as_ref(),
         )
         .await?;
 
         let known_map: std::collections::HashMap<_, _> = known_matches.into_iter().map(|k| (k.entity_id, k.head)).collect();
 
-        let policy = ReadPolicy::new(&node.policy_agent, credentials, &collection_id);
+        let policy = ContextPolicy::from_credentials(&node.policy_agent, credentials);
         let mut deltas = Vec::with_capacity(expanded_states.len());
         for state in expanded_states {
             // `known_matches` may resurface rows outside the current policy.
@@ -193,7 +180,7 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
                 continue;
             }
 
-            if let Some(delta) = node.generate_entity_delta(&known_map, state, &storage_collection, credentials).await? {
+            if let Some(delta) = node.generate_entity_delta(&known_map, state, credentials).await? {
                 deltas.push(delta);
             }
         }
@@ -245,10 +232,5 @@ where
         .collect();
 
     // Create subscription update item
-    Some(proto::SubscriptionUpdateItem {
-        entity_id: item.entity.id(),
-        collection: item.entity.collection().clone(),
-        content,
-        predicate_relevance,
-    })
+    Some(proto::SubscriptionUpdateItem { entity_id: item.entity.id(), content, predicate_relevance })
 }

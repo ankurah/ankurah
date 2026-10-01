@@ -14,8 +14,8 @@ BackendConfig(
     },
     values: [
         ValueConfig(
-            type_pattern: "YrsString(?:<(.+)>)?",
-            fully_qualified_type: "{PREFIX}::value::YrsString<{T}>",
+            type_pattern: "YrsString(?:Mut)?(?:<(.+)>)?",
+            fully_qualified_type: "{PREFIX}::value::YrsStringMut<{T}>",
             accepts: "^String$",
             generic_params: ["T"],
             materialized_pattern: "YrsString{T}",

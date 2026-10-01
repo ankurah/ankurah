@@ -34,8 +34,6 @@ impl RegistrantProperty for proto::RegisterProperty {
 
     fn value_type(&self) -> &str { &self.value_type }
 
-    fn target_label(&self) -> Option<&str> { self.target_label.as_deref() }
-
     fn explicit_id(&self) -> Option<proto::EntityId> { self.explicit_id }
 
     fn optional(&self) -> bool { self.optional }

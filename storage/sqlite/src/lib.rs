@@ -35,11 +35,10 @@ mod connection;
 mod dump;
 mod engine;
 mod error;
-pub mod lower;
 pub mod sql_builder;
 mod value;
 
 pub use connection::SqliteConnectionManager;
-pub use engine::{SqliteBucket, SqliteStorageEngine};
+pub use engine::{SqliteStorageEngine, SqliteTransaction};
 pub use error::SqliteError;
 pub use value::SqliteValue;
