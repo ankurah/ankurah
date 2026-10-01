@@ -1,6 +1,5 @@
 mod common;
 
-use ankurah::property::YrsString;
 use ankurah::Model;
 use ankurah::{policy::DEFAULT_CONTEXT as c, Node, PermissiveAgent};
 use anyhow::Result;
@@ -18,7 +17,7 @@ async fn pg_repeatable_read() -> Result<()> {
     let (_container, postgres) = common::create_postgres_container().await?;
     let node = Node::new_durable(Arc::new(postgres), PermissiveAgent::new());
     node.system.create().await?;
-    let ctx = node.context(c)?;
+    let ctx = node.context_async(c).await?;
 
     let id;
     {
@@ -68,7 +67,7 @@ async fn pg_events() -> Result<()> {
     let (_container, postgres) = common::create_postgres_container().await?;
     let node = Node::new_durable(Arc::new(postgres), PermissiveAgent::new());
     node.system.create().await?;
-    let ctx = node.context(c)?;
+    let ctx = node.context_async(c).await?;
 
     let id;
     {

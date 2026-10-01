@@ -1,7 +1,7 @@
 use crate::internal::prelude::*;
 use crate::reactor::{
     AbstractEntity, CandidateChanges, ChangeNotification, MembershipChange, ReactorSubscriptionId, ReactorUpdate, ReactorUpdateItem,
-    WatcherChange,
+    LocalEntitySource, WatcherChange,
 };
 use crate::selection::filter::{evaluate_predicate, Filterable};
 use ankql::ast::Resolved;
@@ -23,14 +23,22 @@ impl<E: Clone, Ev> UpdateItemAccumulator<E> for Vec<ReactorUpdateItem<E, Ev>> {
     fn push_initial(&mut self, entity: &E, query_id: proto::QueryId) {
         Vec::push(
             self,
-            ReactorUpdateItem { entity: entity.clone(), events: vec![], predicate_relevance: vec![(query_id, MembershipChange::Initial)] },
+            ReactorUpdateItem {
+                entity: entity.clone(),
+                events: vec![],
+                predicate_relevance: vec![(query_id, MembershipChange::Initial)],
+            },
         );
     }
 
     fn push_remove(&mut self, entity: &E, query_id: proto::QueryId) {
         Vec::push(
             self,
-            ReactorUpdateItem { entity: entity.clone(), events: vec![], predicate_relevance: vec![(query_id, MembershipChange::Remove)] },
+            ReactorUpdateItem {
+                entity: entity.clone(),
+                events: vec![],
+                predicate_relevance: vec![(query_id, MembershipChange::Remove)],
+            },
         );
     }
 }
@@ -43,7 +51,6 @@ impl<E> UpdateItemAccumulator<E> for () {
 type GapFillData<E> = (
     proto::QueryId,
     std::sync::Arc<dyn crate::reactor::fetch_gap::GapFetcher<E>>,
-    proto::CollectionId,
     ankql::ast::Selection<Resolved>,
     EntityResultSet<E>,
     Option<E>,
@@ -51,12 +58,12 @@ type GapFillData<E> = (
 );
 
 /// State for a single predicate within a subscription
-pub(super) struct QueryState<E: AbstractEntity + Filterable> {
+pub(super) struct QueryState<E: AbstractEntity + Filterable + Send + 'static> {
     // TODO make this a clonable PredicateSubscription and store it instead of the channel?
-    pub(crate) collection_id: proto::CollectionId,
     /// None before initialization.
     pub(crate) selection: Option<ankql::ast::Selection<Resolved>>,
     pub(crate) gap_fetcher: std::sync::Arc<dyn crate::reactor::fetch_gap::GapFetcher<E>>, // For filling gaps when LIMIT is applied
+    pub(crate) source: Arc<dyn LocalEntitySource<E>>,
     // I think we need to move these out of PredicateState and into WatcherState
     pub(crate) paused: bool, // When true, skip notifications (used during initialization and updates)
     pub(crate) resultset: EntityResultSet<E>,
@@ -65,30 +72,30 @@ pub(super) struct QueryState<E: AbstractEntity + Filterable> {
 
 // We would call this ReactorSubscription, but that name is reserved for the public API
 // so instead we will call it Subscription and just scope it to the reactor package
-pub(super) struct Subscription<E: AbstractEntity + Filterable, Ev>(Arc<Inner<E, Ev>>);
+pub(super) struct Subscription<E: AbstractEntity + Filterable + Send + 'static, Ev>(Arc<Inner<E, Ev>>);
 
-impl<E: AbstractEntity + Filterable, Ev> Clone for Subscription<E, Ev> {
+impl<E: AbstractEntity + Filterable + Send + 'static, Ev> Clone for Subscription<E, Ev> {
     fn clone(&self) -> Self { Self(self.0.clone()) }
 }
 
-impl<E: AbstractEntity + Filterable, Ev> std::ops::Deref for Subscription<E, Ev> {
+impl<E: AbstractEntity + Filterable + Send + 'static, Ev> std::ops::Deref for Subscription<E, Ev> {
     type Target = Inner<E, Ev>;
     fn deref(&self) -> &Self::Target { &self.0 }
 }
 
-impl<E: AbstractEntity + Filterable, Ev> Subscription<E, Ev> {
+impl<E: AbstractEntity + Filterable + Send + 'static, Ev> Subscription<E, Ev> {
     /// Get the subscription ID
     pub fn id(&self) -> ReactorSubscriptionId { self.0.id }
 }
 
-pub(super) struct Inner<E: AbstractEntity + Filterable, Ev> {
+pub(super) struct Inner<E: AbstractEntity + Filterable + Send + 'static, Ev> {
     pub(super) id: ReactorSubscriptionId,
     state: std::sync::Mutex<State<E, Ev>>,
     watcher_set: Arc<std::sync::Mutex<crate::reactor::watcherset::WatcherSet>>,
 }
-struct State<E: AbstractEntity + Filterable, Ev> {
+struct State<E: AbstractEntity + Filterable + Send + 'static, Ev> {
     pub(crate) queries: HashMap<proto::QueryId, QueryState<E>>,
-    /// The set of entities that are subscribed to by this subscription
+    /// Explicit entity subscriptions, independent of the matches in `queries`.
     pub(crate) entity_subscriptions: HashSet<proto::EntityId>,
     // not sure if we actually need this
     pub(crate) entities: HashMap<proto::EntityId, E>,
@@ -137,7 +144,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
             let mut update_items = Vec::new();
             for (query_id, query_state) in std::mem::take(&mut state.queries) {
                 for entity_id in query_state.resultset.keys() {
-                    if let Some(entity) = state.entities.get(&entity_id) {
+                    if let Some(entity) = state.entities.get(&entity_id).filter(|entity| query_state.source.can_read(entity)) {
                         update_items.push(ReactorUpdateItem {
                             entity: entity.clone(),
                             events: vec![],
@@ -168,15 +175,15 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
     pub fn ensure_query_registered(
         &self,
         query_id: proto::QueryId,
-        collection_id: proto::CollectionId,
         resultset: EntityResultSet<E>,
         gap_fetcher: std::sync::Arc<dyn crate::reactor::fetch_gap::GapFetcher<E>>,
+        source: Arc<dyn LocalEntitySource<E>>,
     ) -> bool {
         let mut state = self.state.lock().unwrap();
         if state.queries.contains_key(&query_id) {
             return false;
         }
-        state.queries.insert(query_id, QueryState { collection_id, selection: None, gap_fetcher, paused: false, resultset, version: 0 });
+        state.queries.insert(query_id, QueryState { selection: None, gap_fetcher, source, paused: false, resultset, version: 0 });
         true
     }
 
@@ -186,7 +193,6 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
     pub fn update_predicate_watchers(
         &self,
         query_id: proto::QueryId,
-        collection_id: &proto::CollectionId,
         old_predicate: Option<&ankql::ast::Predicate<Resolved>>,
         new_predicate: &ankql::ast::Predicate<Resolved>,
     ) {
@@ -194,9 +200,9 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         let watcher_id = (self.id, query_id);
 
         if let Some(old_pred) = old_predicate {
-            watcher_set.recurse_predicate_watchers(collection_id, old_pred, watcher_id, crate::reactor::watcherset::WatcherOp::Remove);
+            watcher_set.recurse_predicate_watchers(old_pred, watcher_id, crate::reactor::watcherset::WatcherOp::Remove);
         }
-        watcher_set.recurse_predicate_watchers(collection_id, new_predicate, watcher_id, crate::reactor::watcherset::WatcherOp::Add);
+        watcher_set.recurse_predicate_watchers(new_predicate, watcher_id, crate::reactor::watcherset::WatcherOp::Add);
     }
 
     /// Add entity watchers for entities in a query's resultset
@@ -208,7 +214,6 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
     pub fn update_query<A: UpdateItemAccumulator<E>>(
         &self,
         query_id: proto::QueryId,
-        collection_id: proto::CollectionId,
         selection: ankql::ast::Selection<Resolved>,
         included_entities: Vec<E>,
         version: u32,
@@ -239,13 +244,12 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         rw_resultset.mark_all_dirty();
 
         for entity in included_entities {
-            if evaluate_predicate(&entity, &selection.predicate).unwrap_or(false) {
-                let entity_id = *AbstractEntity::id(&entity);
+            if evaluate_predicate(&entity, &selection.predicate).unwrap_or(false) && query_state.source.can_read(&entity) {
+                let entity_id = AbstractEntity::id(&entity);
 
                 if !rw_resultset.contains(&entity_id) {
                     rw_resultset.add(entity.clone());
                     state.entities.insert(entity_id, entity.clone());
-                    state.entity_subscriptions.insert(entity_id);
                     reactor_updates.push_initial(&entity, query_id);
                     newly_added.push(entity);
                 }
@@ -254,14 +258,17 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
 
         let mut removed_entities = Vec::new();
         rw_resultset.retain_dirty(|entity| {
-            if let Ok(true) = evaluate_predicate(entity, &selection.predicate) {
+            let can_read = query_state.source.can_read(entity);
+            if can_read && evaluate_predicate(entity, &selection.predicate).unwrap_or(false) {
                 return true;
             };
-            let entity_id = *entity.id();
+            let entity_id = entity.id();
             tracing::debug!("Entity {:?} no longer matches predicate", entity_id);
 
             removed_entities.push(entity_id);
-            reactor_updates.push_remove(entity, query_id);
+            if can_read {
+                reactor_updates.push_remove(entity, query_id);
+            }
             false
         });
 
@@ -276,11 +283,11 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
 
         if should_update_watchers {
             let old_pred = old_selection.as_ref().map(|s| &s.predicate);
-            self.update_predicate_watchers(query_id, &collection_id, old_pred, &selection.predicate);
+            self.update_predicate_watchers(query_id, old_pred, &selection.predicate);
         }
 
         if !newly_added.is_empty() {
-            self.add_entity_watchers(query_id, newly_added.iter().map(|e| *AbstractEntity::id(e)));
+            self.add_entity_watchers(query_id, newly_added.iter().map(|e| AbstractEntity::id(e)));
         }
 
         if !removed_entities.is_empty() {
@@ -335,11 +342,12 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
             // Process all candidate changes for this query
             for change in query_candidate.iter() {
                 let entity = change.entity();
-                let entity_id = *AbstractEntity::id(entity);
+                let entity_id = AbstractEntity::id(entity);
 
                 debug!("Subscription {} evaluating entity {} for query {}", self.id(), entity_id, query_id);
 
-                let matches = evaluate_predicate(entity, &selection.predicate).unwrap_or(false);
+                let can_read = query_state.source.can_read(entity);
+                let matches = can_read && evaluate_predicate(entity, &selection.predicate).unwrap_or(false);
                 let did_match = query_state.resultset.contains_key(&entity_id);
 
                 // Process membership change in one match
@@ -371,7 +379,8 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
 
                 // Emit if matches, matched before, or explicitly subscribed
                 let entity_subscribed = state.entity_subscriptions.contains(&entity_id);
-                if matches || did_match || entity_subscribed {
+                // Removal currently carries state too; never send a newly denied state (#426 owns claw-back).
+                if can_read && (matches || did_match || entity_subscribed) {
                     let item = items.entry(entity_id).or_insert_with(|| ReactorUpdateItem {
                         entity: entity.clone(),
                         events: change.events().to_vec(),
@@ -388,10 +397,9 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         // Process entity-level subscriptions not covered by query processing
         for change in candidates.entity_iter() {
             let entity = change.entity();
-            let entity_id = *AbstractEntity::id(entity);
+            let entity_id = AbstractEntity::id(entity);
 
-            if state.entity_subscriptions.contains(&entity_id) {
-                // !items.contains_key(&entity_id) {
+            if state.entity_subscriptions.contains(&entity_id) && !items.contains_key(&entity_id) {
                 items.entry(entity_id).or_insert(ReactorUpdateItem {
                     entity: entity.clone(),
                     events: change.events().to_vec(),
@@ -432,7 +440,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
             state.queries.get(&query_id).and_then(|query_state| self.extract_gap_data(query_id, query_state))
         };
 
-        let Some((query_id, gap_fetcher, collection_id, selection, resultset, last_entity, gap_size)) = gap_data else {
+        let Some((query_id, gap_fetcher, selection, resultset, last_entity, gap_size)) = gap_data else {
             return;
         };
 
@@ -441,11 +449,11 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
 
         // Process gap fill
         let gap_filled_entities =
-            Self::process_gap_fill_entities(query_id, gap_fetcher, collection_id, selection, resultset, last_entity, gap_size).await;
+            Self::process_gap_fill_entities(query_id, gap_fetcher, selection, resultset, last_entity, gap_size).await;
 
         // Register entity watchers and append entities
         if !gap_filled_entities.is_empty() {
-            self.add_entity_watchers(query_id, gap_filled_entities.iter().map(|e| *AbstractEntity::id(e)));
+            self.add_entity_watchers(query_id, gap_filled_entities.iter().map(|e| AbstractEntity::id(e)));
             entities.extend(gap_filled_entities);
         }
     }
@@ -458,7 +466,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
             state.queries.get(&query_id).and_then(|query_state| self.extract_gap_data(query_id, query_state))
         };
 
-        let Some((query_id, gap_fetcher, collection_id, selection, resultset, last_entity, gap_size)) = gap_data else {
+        let Some((query_id, gap_fetcher, selection, resultset, last_entity, gap_size)) = gap_data else {
             return;
         };
 
@@ -467,11 +475,11 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
 
         // Process gap fill
         let gap_filled_entities =
-            Self::process_gap_fill_entities(query_id, gap_fetcher, collection_id, selection, resultset, last_entity, gap_size).await;
+            Self::process_gap_fill_entities(query_id, gap_fetcher, selection, resultset, last_entity, gap_size).await;
 
         // Register entity watchers and push items for gap-filled entities
         if !gap_filled_entities.is_empty() {
-            self.add_entity_watchers(query_id, gap_filled_entities.iter().map(|e| *AbstractEntity::id(e)));
+            self.add_entity_watchers(query_id, gap_filled_entities.iter().map(|e| AbstractEntity::id(e)));
 
             for entity in gap_filled_entities {
                 reactor_updates.push_initial(&entity, query_id);
@@ -482,7 +490,6 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
     async fn process_gap_fill_entities(
         query_id: proto::QueryId,
         gap_fetcher: std::sync::Arc<dyn crate::reactor::fetch_gap::GapFetcher<E>>,
-        collection_id: proto::CollectionId,
         selection: ankql::ast::Selection<Resolved>,
         resultset: EntityResultSet<E>,
         last_entity: Option<E>,
@@ -490,7 +497,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
     ) -> Vec<E> {
         tracing::debug!("Gap filling for query {} - need {} entities", query_id, gap_size);
 
-        match gap_fetcher.fetch_gap(&collection_id, &selection, last_entity.as_ref(), gap_size).await {
+        match gap_fetcher.fetch_gap(&selection, last_entity.as_ref(), gap_size).await {
             Ok(gap_entities) => {
                 if !gap_entities.is_empty() {
                     tracing::debug!("Gap filling fetched {} entities for query {}", gap_entities.len(), query_id);
@@ -526,14 +533,14 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         broadcast: ankurah_signals::broadcast::Broadcast<ReactorUpdate<E, Ev>>,
     ) {
         // Clear gap_dirty flags immediately for all queries
-        for (_, _, _, _, ref resultset, _, _) in &gaps_to_fill {
+        for (_, _, _, ref resultset, _, _) in &gaps_to_fill {
             resultset.clear_gap_dirty();
         }
 
         // Process all gap fills concurrently
         let gap_fill_futures =
-            gaps_to_fill.into_iter().map(|(query_id, gap_fetcher, collection_id, selection, resultset, last_entity, gap_size)| {
-                Self::process_gap_fill(query_id, gap_fetcher, collection_id, selection, resultset, last_entity, gap_size)
+            gaps_to_fill.into_iter().map(|(query_id, gap_fetcher, selection, resultset, last_entity, gap_size)| {
+                Self::process_gap_fill(query_id, gap_fetcher, selection, resultset, last_entity, gap_size)
             });
 
         let gap_results: Vec<(ankurah_proto::QueryId, Vec<ReactorUpdateItem<E, Ev>>)> = future::join_all(gap_fill_futures).await;
@@ -542,7 +549,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         for (query_id, gap_items) in gap_results {
             if !gap_items.is_empty() {
                 // Register entity watchers for gap-filled entities
-                let entity_ids: Vec<_> = gap_items.iter().map(|item| *AbstractEntity::id(&item.entity)).collect();
+                let entity_ids: Vec<_> = gap_items.iter().map(|item| AbstractEntity::id(&item.entity)).collect();
                 self.add_entity_watchers(query_id, entity_ids.into_iter());
 
                 items.extend(gap_items);
@@ -575,21 +582,12 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         // Selection should always be Some by the time gap filling happens
         let selection = query_state.selection.clone().expect("extract_gap_data called before update_query");
 
-        Some((
-            query_id,
-            query_state.gap_fetcher.clone(),
-            query_state.collection_id.clone(),
-            selection,
-            resultset.clone(),
-            last_entity,
-            gap_size,
-        ))
+        Some((query_id, query_state.gap_fetcher.clone(), selection, resultset.clone(), last_entity, gap_size))
     }
 
     async fn process_gap_fill(
         query_id: proto::QueryId,
         gap_fetcher: std::sync::Arc<dyn crate::reactor::fetch_gap::GapFetcher<E>>,
-        collection_id: proto::CollectionId,
         selection: ankql::ast::Selection<Resolved>,
         resultset: EntityResultSet<E>,
         last_entity: Option<E>,
@@ -597,7 +595,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
     ) -> (proto::QueryId, Vec<ReactorUpdateItem<E, Ev>>) {
         tracing::debug!("Gap filling for query {} - need {} entities", query_id, gap_size);
 
-        let gap_items = match gap_fetcher.fetch_gap(&collection_id, &selection, last_entity.as_ref(), gap_size).await {
+        let gap_items = match gap_fetcher.fetch_gap(&selection, last_entity.as_ref(), gap_size).await {
             Ok(gap_entities) => {
                 if !gap_entities.is_empty() {
                     tracing::debug!("Gap filling fetched {} entities for query {}", gap_entities.len(), query_id);
@@ -640,8 +638,8 @@ impl Subscription<crate::entity::Entity, ankurah_proto::Attested<ankurah_proto::
     pub fn register_or_get_query(
         &self,
         query_id: proto::QueryId,
-        collection_id: proto::CollectionId,
         gap_fetcher: std::sync::Arc<dyn crate::reactor::fetch_gap::GapFetcher<crate::entity::Entity>>,
+        source: Arc<dyn LocalEntitySource>,
     ) -> EntityResultSet<crate::entity::Entity> {
         let mut state = self.state.lock().unwrap();
 
@@ -649,14 +647,7 @@ impl Subscription<crate::entity::Entity, ankurah_proto::Attested<ankurah_proto::
         match state.queries.entry(query_id) {
             Entry::Vacant(v) => {
                 let resultset = EntityResultSet::empty();
-                v.insert(QueryState {
-                    collection_id,
-                    selection: None,
-                    gap_fetcher,
-                    paused: false,
-                    resultset: resultset.clone(),
-                    version: 0,
-                });
+                v.insert(QueryState { selection: None, gap_fetcher, source, paused: false, resultset: resultset.clone(), version: 0 });
                 resultset
             }
             Entry::Occupied(o) => o.get().resultset.clone(),

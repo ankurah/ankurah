@@ -1,14 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use ankurah_core_types::Value;
-use ankurah_proto::{self as proto, EntityId, PropertyId};
+use ankurah_proto::{self as proto, EntityId, ModelId, PropertyId, SystemModel};
 
 use super::{CatalogManager, SysModelPropertyRow, SysModelRow, SysPropertyRow};
 use crate::error::RetrievalError;
 use crate::node::Node;
 use crate::policy::{AccessDenied, PolicyAgent};
 use crate::schema::registration::{PlannedModelPropertyMembership, PlannedUpdate, RegistrationError, RegistrationPlan};
-use crate::schema::{model_collection, model_property_collection, property_collection};
 use crate::storage::StorageEngine;
 use crate::transaction::Transaction;
 
@@ -31,8 +30,6 @@ pub(crate) trait RegistrantProperty {
     fn backend(&self) -> &str;
     /// The required language-independent value type.
     fn value_type(&self) -> &str;
-    /// The model label a reference-valued property points to.
-    fn target_label(&self) -> Option<&str>;
     /// An existing property to bind by identity rather than by name.
     fn explicit_id(&self) -> Option<EntityId>;
     /// Whether this model allows the property to be absent.
@@ -69,7 +66,7 @@ pub(crate) trait Registrant {
 }
 
 /// Populate from the local catalog, registering here or through a durable peer when needed.
-/// Wait for node readiness; registration authority is needed only if local resolution cannot satisfy the declaration.
+/// Wait for the catalog; registration authority is needed only if local resolution cannot satisfy the declaration.
 pub(super) async fn resolve_or_register<SE, PA, R>(
     catalog: &CatalogManager,
     node: &Node<SE, PA>,
@@ -81,7 +78,12 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
     R: Registrant,
 {
-    node.wait_ready().await?;
+    // A failed catalog load halts the node without ever marking the catalog ready.
+    tokio::select! {
+        () = catalog.wait_ready() => {}
+        reason = node.system.wait_halted() => return Err(reason.into()),
+    }
+    node.system.check_not_halted()?;
     match resolve_local(catalog, registrant) {
         Ok(()) => return Ok(()),
         Err(RegistrationError::Retrieval(RetrievalError::UnboundDeclaration { .. })) => {}
@@ -155,7 +157,7 @@ where
                 if row.name == name {
                     plan.existing.push(id);
                 } else {
-                    plan.updates.push(planned(model_collection(), id, "name", string(&row.name), string(&name)));
+                    plan.updates.push(planned(ModelId::System(SystemModel::Model), id, "name", string(&row.name), string(&name)));
                     transaction.get::<SysModelRow>(&id).await?.name()?.set(&name)?;
                     row.name = name.clone();
                 }
@@ -170,7 +172,6 @@ where
         },
     };
 
-    let mut targets = BTreeMap::from([(label.clone(), model_id)]);
     let registered_properties = {
         let properties = registrant.properties();
         let mut registered_properties = Vec::with_capacity(properties.len());
@@ -194,10 +195,6 @@ where
                     (id, row, membership_id)
                 }
                 None => {
-                    let target = match property.target_label() {
-                        Some(target) => Some(resolve_target(catalog, &transaction, &mut plan, &mut targets, target).await?),
-                        None => None,
-                    };
                     let found = match member_property(catalog, model_id, property.name())? {
                         Some(hit) => Some(hit),
                         None => match property.renamed_from() {
@@ -208,29 +205,20 @@ where
                     match found {
                         Some(((id, mut row), (membership, optional))) => {
                             check_property_compat(&row, &label, property)?;
-                            let rename = row.name != property.name();
-                            let retarget = row.target_model != target;
-                            if !rename && !retarget {
+                            if row.name == property.name() {
                                 plan.existing.push(id);
                             } else {
                                 let mutable = transaction.get::<SysPropertyRow>(&id).await?;
-                                if rename {
-                                    let name = property.name().to_string();
-                                    plan.updates.push(planned(property_collection(), id, "name", string(&row.name), string(&name)));
-                                    mutable.name()?.set(&name)?;
-                                    row.name = name;
-                                }
-                                if retarget {
-                                    plan.updates.push(planned(
-                                        property_collection(),
-                                        id,
-                                        "target_model",
-                                        entity(row.target_model),
-                                        entity(target),
-                                    ));
-                                    mutable.target_model()?.set(&target)?;
-                                    row.target_model = target;
-                                }
+                                let name = property.name().to_string();
+                                plan.updates.push(planned(
+                                    ModelId::System(SystemModel::Property),
+                                    id,
+                                    "name",
+                                    string(&row.name),
+                                    string(&name),
+                                ));
+                                mutable.name()?.set(&name)?;
+                                row.name = name;
                             }
                             let membership_id =
                                 set_membership_optional(&transaction, &mut plan, membership, optional, property.optional()).await?;
@@ -242,7 +230,8 @@ where
                                 backend: property.backend().to_string(),
                                 value_type: property.value_type().to_string(),
                                 minted_for: Some(model_id),
-                                target_model: target,
+                                // TODO(#513): Eagerly register Ref targets through their descriptors and store their model IDs here.
+                                target_model: None,
                             };
                             let id = transaction.create(&row).await?.id();
                             plan.creates_properties.push((id, row.clone()));
@@ -268,6 +257,7 @@ where
                 .check_schema_registration(node, principal, &plan)
                 .map_err(|source| RegistrationError::PolicyDenied { collection: label.clone(), source })?;
         }
+        let _authoring = node.policy_agent.schema_registered(node, &transaction, &plan).await.map_err(crate::error::MutationError::from)?;
         transaction.commit().await?;
     }
     populate(registrant, model_id, model_row, registered_properties)
@@ -307,7 +297,6 @@ fn declaration<R: Registrant>(registrant: &R) -> proto::RegisterModel {
                 renamed_from: property.renamed_from().map(str::to_string),
                 backend: property.backend().to_string(),
                 value_type: property.value_type().to_string(),
-                target_label: property.target_label().map(str::to_string),
                 explicit_id: property.explicit_id(),
                 build_id: property.build_id(),
                 optional: property.optional(),
@@ -404,26 +393,15 @@ pub(super) fn resolve_local<R: Registrant>(catalog: &CatalogManager, registrant:
         if property.backend != field.backend() || property.value_type != field.value_type() {
             return Err(unbound());
         }
-        if field.explicit_id().is_none() {
-            let target = match field.target_label() {
-                Some(label) => Some(catalog.model_by_label(label)?.ok_or_else(unbound)?.0),
-                None => None,
-            };
-            if property.target_model != target {
-                return Err(unbound());
-            }
-        }
         properties.push((index, id, property, membership_id, membership.optional));
     }
     populate(registrant, model, model_row, properties)
 }
 
-/// Reject reserved model/target labels and conflicting declarations of the same property name.
+/// Reject reserved model labels and conflicting declarations of the same property name.
 fn validate<R: Registrant>(registrant: &R) -> Result<(), RegistrationError> {
-    for label in std::iter::once(registrant.label()).chain(registrant.properties().filter_map(RegistrantProperty::target_label)) {
-        if label.starts_with(crate::schema::RESERVED_COLLECTION_PREFIX) {
-            return Err(RegistrationError::ReservedCollection(label.to_string()));
-        }
+    if registrant.label().starts_with(crate::schema::RESERVED_COLLECTION_PREFIX) {
+        return Err(RegistrationError::ReservedCollection(registrant.label().to_string()));
     }
     let mut declared = BTreeMap::new();
     for property in registrant.properties() {
@@ -441,31 +419,6 @@ fn validate<R: Registrant>(registrant: &R) -> Result<(), RegistrationError> {
 
 fn incomplete(label: &str) -> RegistrationError {
     RetrievalError::Other(format!("registration of '{label}' succeeded without a complete compatible catalog binding")).into()
-}
-
-/// Find or create the model named by a reference property.
-/// The request-local cache includes models created in this transaction, which the catalog cannot see yet.
-async fn resolve_target(
-    catalog: &CatalogManager,
-    transaction: &Transaction,
-    plan: &mut RegistrationPlan,
-    targets: &mut BTreeMap<String, EntityId>,
-    target: &str,
-) -> Result<EntityId, RegistrationError> {
-    if let Some(id) = targets.get(target) {
-        return Ok(*id);
-    }
-    let id = match catalog.model_by_label(target)? {
-        Some((id, _)) => id,
-        None => {
-            let row = SysModelRow { label: target.to_string(), name: target.to_string() };
-            let id = transaction.create(&row).await?.id();
-            plan.creates_models.push((id, row));
-            id
-        }
-    };
-    targets.insert(target.to_string(), id);
-    Ok(id)
 }
 
 /// Resolve a model-scoped property name and return its row, membership ID, and optionality.
@@ -514,7 +467,7 @@ async fn set_membership_optional(
         plan.existing.push(membership);
     } else {
         plan.updates.push(planned(
-            model_property_collection(),
+            ModelId::System(SystemModel::ModelProperty),
             membership,
             "optional",
             Some(Value::Bool(current)),
@@ -532,15 +485,12 @@ fn planned(collection: crate::ModelId, entity: EntityId, field: &str, from: Opti
 
 fn string(value: &str) -> Option<Value> { Some(Value::String(value.to_string())) }
 
-fn entity(id: Option<EntityId>) -> Option<Value> { id.map(Value::EntityId) }
-
 /// Compare registration metadata; build IDs correlate responses but do not affect equivalence.
 fn same_declaration<P: RegistrantProperty>(left: &P, right: &P) -> bool {
     left.name() == right.name()
         && left.renamed_from() == right.renamed_from()
         && left.backend() == right.backend()
         && left.value_type() == right.value_type()
-        && left.target_label() == right.target_label()
         && left.explicit_id() == right.explicit_id()
         && left.optional() == right.optional()
 }

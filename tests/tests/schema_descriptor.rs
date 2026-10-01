@@ -28,8 +28,60 @@ const MEMBERSHIP: &str = "_ankurah_model_property";
 
 // A referenced model, so Ref<T> has a target.
 #[derive(Model, Debug, Serialize, Deserialize)]
+#[model(label = "schema_test_artist")]
 pub struct DescArtist {
     pub name: String,
+}
+
+#[derive(Model, Debug)]
+pub struct DescRef {
+    pub artist: Ref<DescArtist>,
+}
+
+#[tokio::test]
+async fn reference_get_binds_target_lazily_and_reuses_the_binding() -> anyhow::Result<()> {
+    let server = durable_sled_setup().await?;
+    let ctx = server.context(DEFAULT_CONTEXT)?;
+    let epoch = server.system.system_epoch().unwrap();
+    let missing = EntityId::random();
+    let trx = ctx.begin();
+    let source = trx.create(&DescRef { artist: Ref::new(missing) }).await?.id();
+    trx.commit().await?;
+
+    let source = ctx.get::<DescRefView>(source).await?;
+    let artist_ref = source.artist()?;
+    assert!(server.catalog.model_by_label("schema_test_artist")?.is_none());
+    assert!(DescArtist::descriptor().resolved.get(epoch).is_err());
+
+    assert!(matches!(artist_ref.get(&ctx).await, Err(ankurah::error::RetrievalError::EntityNotFound(id)) if id == missing));
+    let proto::ModelId::EntityId(model_id) = DescArtist::descriptor().resolved.get(epoch)? else {
+        panic!("user model must have a registered identity");
+    };
+    assert!(DescArtist::descriptor().properties[0].resolved.get(epoch).is_ok());
+
+    let trx = ctx.begin();
+    let artist_id = trx.create(&DescArtist { name: "Muse".into() }).await?.id();
+    trx.get::<DescRef>(&source.id()).await?.artist()?.set(&Ref::new(artist_id))?;
+    trx.commit().await?;
+    let artist_ref = source.artist()?;
+
+    // Re-resolution would overwrite this catalog edit with the descriptor's original name.
+    let client = ephemeral_sled_setup().await?;
+    let _conn = LocalProcessConnection::new(&server, &client).await?;
+    client.system.wait_system_ready().await?;
+    let mut declaration = proto::RegisterModel::from(DescArtist::descriptor());
+    declaration.name = "Edited catalog name".into();
+    assert!(matches!(
+        client.request(server.id, &DEFAULT_CONTEXT, proto::NodeRequestBody::RegisterSchema { model: declaration }).await?,
+        proto::NodeResponseBody::SchemaRegistered { .. }
+    ));
+
+    assert_eq!(artist_ref.get(&ctx).await?.name()?, "Muse");
+    assert_eq!(ctx.get::<DescArtistView>(artist_id).await?.name()?, "Muse");
+    assert_eq!(ctx.fetch::<DescArtistView>("true").await?.len(), 1);
+    assert_eq!(DescArtist::descriptor().bind_local(&server.catalog, epoch)?, proto::ModelId::EntityId(model_id));
+    assert_eq!(server.catalog.model_by_id(&model_id)?.unwrap().name, "Edited catalog name");
+    Ok(())
 }
 
 /// A model exercising EVERY row of the normative mapping table, plus
@@ -76,6 +128,10 @@ pub struct DescAllTypes {
 /// fields are excluded.
 #[test]
 fn schema_covers_every_normative_row() {
+    assert_eq!(DescArtist::descriptor().label, "schema_test_artist");
+    assert_eq!(DescArtist::descriptor().properties[0].model_label, "schema_test_artist");
+    assert_eq!(DescArtist::descriptor().name, "DescArtist");
+    assert_eq!(proto::RegisterModel::from(DescArtist::descriptor()).label, "schema_test_artist");
     let schema = DescAllTypes::descriptor();
     assert_eq!(schema.label, "descalltypes");
     assert_eq!(schema.name, "DescAllTypes");
@@ -102,12 +158,11 @@ fn schema_covers_every_normative_row() {
     assert_eq!(schema.properties.len(), expected.len(), "ephemeral `scratch` must be excluded");
     for (i, (field, name, backend, value_type, optional)) in expected.iter().enumerate() {
         let f = &schema.properties[i];
+        assert_eq!(f.model_label, schema.label);
         assert_eq!(f.field, *field, "field[{i}] name");
         assert_eq!(f.name, *name, "field[{i}] display name");
         assert_eq!(f.backend, *backend, "field[{i}] backend");
         assert_eq!(f.value_type, *value_type, "field[{i}] value_type");
-        let target = matches!(*field, "artist" | "maybe_artist").then_some("descartist");
-        assert_eq!(f.target_label, target, "field[{i}] reference target");
         assert_eq!(f.optional, *optional, "field[{i}] optional");
         assert_eq!(f.renamed_from, None, "field[{i}] renamed_from");
         assert_eq!(f.explicit_id, None, "field[{i}] explicit_id");
@@ -171,7 +226,6 @@ fn register_model_from_schema() {
     assert_eq!(model.properties.len(), 13);
     let artist = model.properties.iter().find(|p| p.name == "artist").unwrap();
     assert_eq!((artist.backend.as_str(), artist.value_type.as_str()), ("lww", "entityid"));
-    assert_eq!(artist.target_label.as_deref(), Some("descartist"));
     assert_eq!(artist.explicit_id, None);
 
     let yrs_opt = model.properties.iter().find(|p| p.name == "yrs_opt").unwrap();
@@ -197,11 +251,11 @@ fn register_model_honors_explicit_ids() {
 
 async fn catalog_values(
     node: &Node<SledStorageEngine, PermissiveAgent>,
-    collection: &str,
+    _collection: &str,
     id: EntityId,
 ) -> anyhow::Result<BTreeMap<String, Option<Value>>> {
     use ankurah::core::property::backend::{LWWBackend, PropertyBackend};
-    let state = node.collections.get(&proto::CollectionId::fixed_name(collection)).await?.get_state(id).await?;
+    let state = node.storage.get_state(id).await?;
     let buffer = state.payload.state.state_buffers.0.get("lww").expect("catalog entities are LWW").clone();
     // Catalog fields are closed system properties; their id renderings ARE
     // their registered names, so rendering the keys gives the name map the
@@ -234,7 +288,7 @@ async fn register_from_model_schema_end_to_end() -> anyhow::Result<()> {
     let registered = &reg_models;
     assert_eq!(registered.label, "descalltypes");
     let model_id = registered.id;
-    let artist_model_id = registered.properties.iter().find_map(|p| p.target_model).expect("reference target resolved via the property");
+    assert!(server.catalog.model_by_label("schema_test_artist")?.is_none(), "references do not register their target model");
     let property_ids: BTreeMap<String, EntityId> = registered.properties.iter().map(|p| (p.name.clone(), p.id)).collect();
 
     // The model entity exists with its collection + display name.
@@ -252,19 +306,7 @@ async fn register_from_model_schema_end_to_end() -> anyhow::Result<()> {
         assert_eq!(property.get("name"), Some(&Some(Value::String(f.name.into()))), "name for {}", f.field);
         assert_eq!(property.get("minted_for"), Some(&Some(Value::EntityId(model_id))), "minted_for for {}", f.field);
         let registered = registered.properties.iter().find(|p| p.id == property_id).expect("registered property returned");
-        match f.target_label {
-            Some("descartist") => {
-                assert_eq!(registered.target_model, Some(artist_model_id), "target_model response for {}", f.field);
-                assert_eq!(
-                    property.get("target_model"),
-                    Some(&Some(Value::EntityId(artist_model_id))),
-                    "stored target_model for {}",
-                    f.field
-                );
-            }
-            None => assert_eq!(registered.target_model, None, "non-reference {} has no target", f.field),
-            Some(other) => panic!("unexpected target collection {other}"),
-        }
+        assert_eq!(registered.target_model, None, "registration does not bind reference targets");
 
         // And the (model, property) membership exists with the field's
         // optionality, at the membership id the nested response row carries.

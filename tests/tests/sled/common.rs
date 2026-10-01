@@ -60,7 +60,7 @@ pub async fn create_albums(ctx: &Context, vec: Vec<(&'static str, &'static str)>
     let mut albums = Vec::new();
     for (name, year) in vec {
         let album = Album { name: name.to_owned(), year: year.to_owned() };
-        let album = trx.create(&album).await?.read();
+        let album = trx.create(&album).await?.read()?;
         albums.push(album);
     }
     trx.commit().await?;

@@ -1,7 +1,6 @@
 mod common;
 use ankurah::{
     policy::DEFAULT_CONTEXT as c,
-    property::{value::LWW, YrsString},
     Model, Node, PermissiveAgent, Property,
 };
 use ankurah_storage_sled::SledStorageEngine;
@@ -35,7 +34,7 @@ pub struct Video {
 async fn property_backends() -> Result<()> {
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     node.system.create().await?;
-    let ctx = node.context(c)?;
+    let ctx = node.context_async(c).await?;
 
     let trx = ctx.begin();
     let cat_video = trx
@@ -55,6 +54,18 @@ async fn property_backends() -> Result<()> {
     let video = ctx.get::<VideoView>(id).await?;
     assert_eq!(video.visibility().unwrap(), Visibility::Unlisted);
     assert_eq!(video.title().unwrap(), "Cat video #2918 (Very cute)");
+    assert_eq!(video.description()?, Some("Test".into()));
+    assert_eq!(video.attribution()?, None);
+
+    let trx = ctx.begin();
+    let video = trx
+        .create(&Video { title: "Untitled".into(), description: None, visibility: Visibility::Private, attribution: Some("Author".into()) })
+        .await?;
+    let id = video.id();
+    trx.commit().await?;
+    let video = ctx.get::<VideoView>(id).await?;
+    assert_eq!(video.description()?, None);
+    assert_eq!(video.attribution()?, Some("Author".into()));
 
     Ok(())
 }

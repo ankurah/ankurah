@@ -70,3 +70,9 @@ where T: Signal
 
     fn broadcast_id(&self) -> crate::broadcast::BroadcastId { Signal::broadcast_id(*self) }
 }
+
+impl<T: ?Sized, V: 'static> Peek<V> for &T
+where T: Peek<V>
+{
+    fn peek(&self) -> V { Peek::peek(*self) }
+}

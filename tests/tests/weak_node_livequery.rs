@@ -1,7 +1,6 @@
 mod common;
-use ankurah::core::livequery::EntityLiveQuery;
+use ankurah::Context;
 use ankurah::core::node::MatchArgs;
-use ankurah::proto::CollectionId;
 use ankurah::signals::Peek;
 use ankurah::{policy::DEFAULT_CONTEXT, Node, PermissiveAgent};
 use ankurah_storage_sled::SledStorageEngine;
@@ -15,21 +14,19 @@ pub struct Pet {
 }
 
 #[tokio::test]
-async fn pending_catalog_resolution_releases_node_and_storage() -> Result<()> {
-    let server = common::durable_sled_setup().await?;
+async fn pending_resolution_releases_node_and_storage() -> Result<()> {
     for weak in [true, false] {
         let engine = Arc::new(SledStorageEngine::new_test()?);
         let node = Node::new(engine.clone(), PermissiveAgent::new());
-        node.system.adopt_system(server.system.root().expect("durable root")).await?;
         let weak_node = node.weak();
         let args: MatchArgs<ankql::ast::Parsed> = "true".try_into()?;
         let query = if weak {
-            EntityLiveQuery::new_with_weak_node(&node, None, CollectionId::fixed_name("pet"), args, DEFAULT_CONTEXT)?
+            Context::new_weak(&node, DEFAULT_CONTEXT).query::<PetView>(args)?
         } else {
-            EntityLiveQuery::new(&node, None, CollectionId::fixed_name("pet"), args, DEFAULT_CONTEXT)?
+            Context::new(node.clone(), DEFAULT_CONTEXT).query::<PetView>(args)?
         };
         tokio::task::yield_now().await;
-        assert!(query.selection().peek().is_none(), "the offline catalog has no durable answer");
+        assert!(query.selection().peek().is_none(), "resolution waits for the node to adopt a system");
 
         drop(node);
         if weak {
@@ -39,7 +36,7 @@ async fn pending_catalog_resolution_releases_node_and_storage() -> Result<()> {
                 }
             })
             .await
-            .expect("a passive catalog wait must not keep a weak query's node alive");
+            .expect("pending resolution must not keep a weak query's node alive");
         } else {
             assert!(weak_node.upgrade().is_some(), "a strong query still owns its node");
         }
@@ -60,12 +57,11 @@ async fn test_weak_node_livequery_does_not_keep_node_alive() -> Result<()> {
     let engine = Arc::new(SledStorageEngine::new_test()?);
     let node = Node::new_durable(engine, PermissiveAgent::new());
     node.system.create().await?;
-    node.context(DEFAULT_CONTEXT)?.register_model::<Pet>().await?;
+    node.context_async(DEFAULT_CONTEXT).await?.resolve_model_id::<Pet>().await?;
 
     // Create a LiveQuery with a weak node binding
-    let collection_id = CollectionId::fixed_name("pet");
     let args: MatchArgs<ankql::ast::Parsed> = "true".try_into()?;
-    let weak_lq = EntityLiveQuery::new_with_weak_node(&node, None, collection_id, args, DEFAULT_CONTEXT)?;
+    let weak_lq = Context::new_weak(&node, DEFAULT_CONTEXT).query::<PetView>(args)?;
 
     // Get the query_id before dropping the node
     let query_id = weak_lq.query_id();
@@ -82,11 +78,11 @@ async fn test_weak_node_livequery_does_not_keep_node_alive() -> Result<()> {
     let engine2 = Arc::new(SledStorageEngine::new_test()?);
     let node2 = Node::new_durable(engine2, PermissiveAgent::new());
     node2.system.create().await?;
-    node2.context(DEFAULT_CONTEXT)?.register_model::<Pet>().await?;
+    node2.context_async(DEFAULT_CONTEXT).await?.resolve_model_id::<Pet>().await?;
     let weak_node = node2.weak();
 
     let args2: MatchArgs<ankql::ast::Parsed> = "true".try_into()?;
-    let weak_lq2 = EntityLiveQuery::new_with_weak_node(&node2, None, CollectionId::fixed_name("pet"), args2, DEFAULT_CONTEXT)?;
+    let weak_lq2 = Context::new_weak(&node2, DEFAULT_CONTEXT).query::<PetView>(args2)?;
 
     // Node should be alive while we hold it
     assert!(weak_node.upgrade().is_some(), "Node should be alive");
@@ -105,12 +101,11 @@ async fn test_entity_livequery_keeps_node_alive() -> Result<()> {
     let engine = Arc::new(SledStorageEngine::new_test()?);
     let node = Node::new_durable(engine, PermissiveAgent::new());
     node.system.create().await?;
-    node.context(DEFAULT_CONTEXT)?.register_model::<Pet>().await?;
+    node.context_async(DEFAULT_CONTEXT).await?.resolve_model_id::<Pet>().await?;
 
     // Create a regular EntityLiveQuery
-    let collection_id = CollectionId::fixed_name("pet");
     let args: MatchArgs<ankql::ast::Parsed> = "true".try_into()?;
-    let lq = EntityLiveQuery::new(&node, None, collection_id, args, DEFAULT_CONTEXT)?;
+    let lq = Context::new(node.clone(), DEFAULT_CONTEXT).query::<PetView>(args)?;
 
     // Get weak ref to test node liveness
     let weak_node = node.weak();

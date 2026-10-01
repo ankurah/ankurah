@@ -57,7 +57,7 @@
 //!   are the first to establish live subscriptions under the determinism audit,
 //!   and they reproduce identically, confirming those fixes hold. One residual
 //!   boundary remains: the client-relay subscription-setup retry uses a real
-//!   5-second `futures_timer` (`client_relay.rs`), so a schedule that reorders
+//!   5-second `futures_timer` (`relay.rs`), so a schedule that reorders
 //!   the setup handshake fails the first attempt and then waits on that timer,
 //!   which the drain-based scheduler cannot advance. Subscription scenarios
 //!   therefore avoid `reorder` via `FaultConfig::swarm_subscription_safe`; the

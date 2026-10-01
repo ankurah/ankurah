@@ -10,7 +10,7 @@
 //! and is byte-equal across nodes.
 
 use ankurah::proto;
-use ankurah::Model;
+use ankurah::storage::StorageEngine;
 
 use super::node::SimNode;
 
@@ -165,15 +165,9 @@ pub async fn check_head_antichain(nodes: &[SimNode], universe: &ExpectedUniverse
                 continue; // A single-tip (or empty) head is trivially an antichain.
             }
             // Build the parent map from this node's stored events.
-            let events = {
-                let collection = match node.node.collections.get(&super::model::SimRecord::collection()).await {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-                match collection.dump_entity_events(entity).await {
-                    Ok(evs) => evs,
-                    Err(_) => continue,
-                }
+            let events = match node.node.storage.dump_entity_events(entity).await {
+                Ok(events) => events,
+                Err(_) => continue,
             };
             let parent_of: std::collections::HashMap<proto::EventId, Vec<proto::EventId>> =
                 events.iter().map(|e| (e.payload.id(), e.payload.parent.to_vec())).collect();
@@ -214,13 +208,7 @@ pub async fn causal_closure(
     entity: proto::EntityId,
     frontier: &[proto::EventId],
 ) -> std::collections::HashSet<proto::EventId> {
-    let events = {
-        let collection = match node.node.collections.get(&super::model::SimRecord::collection()).await {
-            Ok(c) => c,
-            Err(_) => return std::collections::HashSet::new(),
-        };
-        collection.dump_entity_events(entity).await.unwrap_or_default()
-    };
+    let events = node.node.storage.dump_entity_events(entity).await.unwrap_or_default();
     let parent_of: std::collections::HashMap<proto::EventId, Vec<proto::EventId>> =
         events.iter().map(|e| (e.payload.id(), e.payload.parent.to_vec())).collect();
 

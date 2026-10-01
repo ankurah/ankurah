@@ -11,7 +11,7 @@ pub struct ForgedCatalog {
     pub model: proto::EntityId,
     pub properties: Vec<proto::EntityId>,
     pub memberships: Vec<proto::EntityId>,
-    pub rows: Vec<(proto::CollectionId, Attested<proto::EntityState>, Attested<proto::Event>)>,
+    pub rows: Vec<(Attested<proto::EntityState>, Attested<proto::Event>)>,
 }
 
 pub fn forge_catalog(label: &str, display: &str, properties: &[(&str, &str, &str)], namespace: &[u8]) -> ForgedCatalog {
@@ -66,12 +66,16 @@ pub fn forge_catalog(label: &str, display: &str, properties: &[(&str, &str, &str
 
 pub async fn plant<SE>(engine: &SE, forged: &ForgedCatalog) -> anyhow::Result<()>
 where SE: StorageEngine + Send + Sync + 'static {
-    for (collection, state, event) in &forged.rows {
-        let storage = engine.collection(collection).await?;
-        storage.add_event(event).await?;
-        storage.set_state(state.clone()).await?;
+    use ankurah::core::storage::{StorageCommitOutcome, StorageTransaction};
+    let mut transaction = engine.transaction();
+    for (state, event) in &forged.rows {
+        transaction.set_state(&Default::default(), state).await?;
+        transaction.add_events(std::slice::from_ref(event)).await?;
     }
-    Ok(())
+    match transaction.commit().await? {
+        StorageCommitOutcome::Committed(_) => Ok(()),
+        StorageCommitOutcome::Conflict { .. } => anyhow::bail!("forged catalog already exists"),
+    }
 }
 
 fn row(
@@ -80,7 +84,7 @@ fn row(
     counter: u64,
     membership: ModelId,
     values: Vec<(SystemProperty, Option<Value>)>,
-) -> (proto::EntityId, (proto::CollectionId, Attested<proto::EntityState>, Attested<proto::Event>)) {
+) -> (proto::EntityId, (Attested<proto::EntityState>, Attested<proto::Event>)) {
     let staged = LWWBackend::new();
     for (property, value) in &values {
         staged.set(PropertyId::System(*property), value.clone());
@@ -96,7 +100,6 @@ fn row(
     let event_id = proto::EventId::from_genesis_parts(&system, &nonce, timestamp, &author, &operations);
     let entity_id: proto::EntityId = event_id.clone().into();
     let event = proto::Event {
-        collection: proto::CollectionId::fixed_name(collection),
         entity_id,
         parent: proto::Clock::default(),
         body: proto::EventBody::Genesis { system, nonce, timestamp, author, operations },
@@ -110,8 +113,8 @@ fn row(
         memberships: std::collections::BTreeSet::from([membership]),
         head: event_id.into(),
     };
-    let entity_state = proto::EntityState { entity_id, collection: proto::CollectionId::fixed_name(collection), state };
-    (entity_id, (proto::CollectionId::fixed_name(collection), entity_state.into(), Attested::opt(event, None)))
+    let entity_state = proto::EntityState { entity_id, state };
+    (entity_id, (entity_state.into(), Attested::opt(event, None)))
 }
 
 fn content_nonce(counter: u64, parts: &[&[u8]]) -> [u8; 32] {

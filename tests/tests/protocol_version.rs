@@ -1,7 +1,7 @@
 //! #294: protocol version in the Presence handshake.
 //!
 //! Covers the refusal arms: register_peer (all transports), the websocket
-//! server against version-0 and mismatched handshakes, and the websocket
+//! server against unreadable and mismatched handshakes, and the websocket
 //! client against a mismatched server.
 
 use ankurah::core::connector::{PeerConnectionError, PeerSender, SendError};
@@ -75,19 +75,16 @@ async fn exchange_until_close(server_url: &str, first_frame: Vec<u8>) -> Result<
     }
 }
 
-/// A 0.9.x peer (no protocol_version in Presence) is detected and the
-/// connection is closed instead of left dangling.
+/// An unreadable handshake closes the connection instead of leaving it dangling.
 #[tokio::test]
-async fn server_refuses_version0_handshake() -> Result<()> {
+async fn server_refuses_unreadable_handshake() -> Result<()> {
     let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
     let (_server_node, server_url, server_task) = start_test_server().await?;
 
-    // The 0.9 encoding is a strict prefix of the current one (pinned by a
-    // proto unit test), so truncating the version field reproduces it.
-    let mut old_shape = bincode::serialize(&proto::Message::Presence(presence(proto::PROTOCOL_VERSION)))?;
-    old_shape.truncate(old_shape.len() - 4);
+    let mut frame = bincode::serialize(&proto::Message::Presence(presence(proto::PROTOCOL_VERSION)))?;
+    frame.pop();
 
-    exchange_until_close(&server_url, old_shape).await?;
+    exchange_until_close(&server_url, frame).await?;
     server_task.abort();
     Ok(())
 }

@@ -4,7 +4,8 @@ use common::*;
 
 #[tokio::test]
 async fn concurrent_lww_writes_choose_the_higher_event_id() -> Result<()> {
-    let ctx = durable_sled_setup().await?.context_async(DEFAULT_CONTEXT).await?;
+    let node = durable_sled_setup().await?;
+    let ctx = node.context_async(DEFAULT_CONTEXT).await?;
     let mut dag = TestDag::new();
 
     let record_id = {
@@ -29,8 +30,7 @@ async fn concurrent_lww_writes_choose_the_higher_event_id() -> Result<()> {
     dag.enumerate(trx_c.commit_and_return_events().await?); // C
 
     let title = ctx.get::<RecordView>(record_id).await?.title()?;
-    let collection = ctx.collection(&Record::collection()).await?;
-    let events = collection.dump_entity_events(record_id).await?;
+    let events = node.storage.dump_entity_events(record_id).await?;
 
     assert_dag!(dag, events, {
         A => [],
@@ -94,8 +94,7 @@ async fn test_deep_diamond_determinism() -> Result<()> {
     };
 
     // Now verify the deep chain has correct structure
-    let collection = ctx.collection(&Record::collection()).await?;
-    let events = collection.dump_entity_events(record_id).await?;
+    let events = node.storage.dump_entity_events(record_id).await?;
 
     assert_dag!(dag, events, {
         A => [],
@@ -145,8 +144,7 @@ async fn test_multi_property_determinism() -> Result<()> {
     dag.enumerate(trx1.commit_and_return_events().await?); // B
     dag.enumerate(trx2.commit_and_return_events().await?); // C
 
-    let collection = ctx.collection(&Record::collection()).await?;
-    let events = collection.dump_entity_events(record_id).await?;
+    let events = node.storage.dump_entity_events(record_id).await?;
 
     // Verify diamond structure
     assert_dag!(dag, events, {
@@ -162,7 +160,7 @@ async fn test_multi_property_determinism() -> Result<()> {
     assert_eq!(final_record.artist().unwrap(), "Artist from T2");
 
     // Verify head has both concurrent events
-    let state = collection.get_state(record_id).await?;
+    let state = node.storage.get_state(record_id).await?;
     clock_eq!(dag, state.payload.state.head, [B, C]);
 
     Ok(())
@@ -201,8 +199,7 @@ async fn test_three_way_concurrent_determinism() -> Result<()> {
     dag.enumerate(trx2.commit_and_return_events().await?); // C
     dag.enumerate(trx3.commit_and_return_events().await?); // D
 
-    let collection = ctx.collection(&Record::collection()).await?;
-    let events = collection.dump_entity_events(record_id).await?;
+    let events = node.storage.dump_entity_events(record_id).await?;
 
     // Verify three-way fork structure
     assert_dag!(dag, events, {
@@ -213,7 +210,7 @@ async fn test_three_way_concurrent_determinism() -> Result<()> {
     });
 
     // Head should have all three concurrent events
-    let state = collection.get_state(record_id).await?;
+    let state = node.storage.get_state(record_id).await?;
     clock_eq!(dag, state.payload.state.head, [B, C, D]);
 
     // Winner is determined by lexicographic EventId (all same depth)

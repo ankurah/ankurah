@@ -1,8 +1,8 @@
 mod common;
 
-use ankurah_core::policy::PolicyAgent;
+use ankurah_core::policy::ContextPolicy;
+
 use ankurah_jwt_auth::{JwtAgent, JwtClaims, JwtContext, JwtKeys, PolicyConfig};
-use ankurah_proto::CollectionId;
 use common::make_predicate;
 use jwt_simple::prelude::Duration;
 
@@ -31,7 +31,6 @@ fn test_filter_predicate_custom_claim_variable() {
 
     let keys = common::test_keys();
     let agent = JwtAgent::new_ephemeral();
-    agent.set_selection_resolver(common::fixture_binding());
     agent.update_config(config);
     agent.set_keys(JwtKeys::Signing(keys.clone()));
 
@@ -41,9 +40,10 @@ fn test_filter_predicate_custom_claim_variable() {
     let token = keys.sign(&claims, Duration::from_hours(1)).unwrap();
     let ctx = JwtContext::from_claims(claims, token);
     let predicate = make_predicate("status = 'active'");
-    let collection = CollectionId::from("record");
+    let models = common::policy_models(&agent, &["record"]);
+    let collection = models.id("record");
 
-    let result = agent.filter_predicate(&ctx, &collection, predicate).unwrap();
+    let result = ContextPolicy::from_credentials(&agent, &ctx).filter_predicate(common::in_model(collection, predicate)).unwrap();
 
     let display = format!("{}", result);
     assert!(display.contains("NYC"), "got: {}", display);
@@ -73,7 +73,6 @@ fn test_filter_predicate_missing_claim_denied() {
 
     let keys = common::test_keys();
     let agent = JwtAgent::new_ephemeral();
-    agent.set_selection_resolver(common::fixture_binding());
     agent.update_config(config);
     agent.set_keys(JwtKeys::Signing(keys.clone()));
 
@@ -87,10 +86,12 @@ fn test_filter_predicate_missing_claim_denied() {
     let token = keys.sign(&claims, Duration::from_hours(1)).unwrap();
     let ctx = JwtContext::from_claims(claims, token);
     let predicate = make_predicate("status = 'active'");
-    let collection = CollectionId::from("record");
+    let models = common::policy_models(&agent, &["record"]);
+    let collection = models.id("record");
 
-    let result = agent.filter_predicate(&ctx, &collection, predicate);
-    assert!(result.is_err(), "Missing custom claim should return AccessDenied");
+    let result = ContextPolicy::from_credentials(&agent, &ctx).filter_predicate(common::in_model(collection, predicate));
+    assert!(matches!(result, Ok(ankql::ast::Predicate::And(_, grant)) if *grant == ankql::ast::Predicate::False),
+        "a missing custom claim supplies no grant");
 }
 
 /// Multiple scope rules all AND together
@@ -121,7 +122,6 @@ fn test_filter_predicate_multiple_rules_anded() {
 
     let keys = common::test_keys();
     let agent = JwtAgent::new_ephemeral();
-    agent.set_selection_resolver(common::fixture_binding());
     agent.update_config(config);
     agent.set_keys(JwtKeys::Signing(keys.clone()));
 
@@ -131,9 +131,10 @@ fn test_filter_predicate_multiple_rules_anded() {
     let token = keys.sign(&claims, Duration::from_hours(1)).unwrap();
     let ctx = JwtContext::from_claims(claims, token);
     let predicate = make_predicate("status = 'open'");
-    let collection = CollectionId::from("job");
+    let models = common::policy_models(&agent, &["job"]);
+    let collection = models.id("job");
 
-    let result = agent.filter_predicate(&ctx, &collection, predicate).unwrap();
+    let result = ContextPolicy::from_credentials(&agent, &ctx).filter_predicate(common::in_model(collection, predicate)).unwrap();
 
     let display = format!("{}", result);
     assert!(display.contains("LA"), "got: {}", display);

@@ -13,11 +13,6 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
     let active_field_names = model.active_field_names();
     let active_field_indices: Vec<syn::Index> = (0..active_field_names.len()).map(syn::Index::from).collect();
     let projected_field_types = model.projected_field_types();
-    let projected_field_types_turbofish = model.projected_field_types_turbofish();
-    let active_field_types_turbofish = match model.active_field_types_turbofish() {
-        Ok(types) => types,
-        Err(e) => return e.into_compile_error(),
-    };
 
     // WASM field getters (conditionally generated; a `no_ffi` model has no
     // binding layer at all).
@@ -112,15 +107,20 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
                     &self.entity
                 }
 
-                fn from_entity(entity: #base::entity::Entity) -> Self {
-                    use #base::model::View;
-                    assert_eq!(&Self::collection(), entity.collection());
-                    #view_name {
+                fn from_entity(entity: #base::entity::Entity) -> Result<Self, #base::error::RetrievalError> {
+                    if !entity.is_alive() {
+                        return Err(#base::property::PropertyError::TransactionClosed.into());
+                    }
+                    let model = __ANKURAH_MODEL_SCHEMA.model_id(entity.system_epoch())?;
+                    if !entity.has_membership(&model) {
+                        return Err(#base::error::RetrievalError::MissingComponent { entity_id: entity.id(), model_id: model });
+                    }
+                    Ok(#view_name {
                         entity,
                         #(
                             #ephemeral_field_names: Default::default(),
                         )*
-                    }
+                    })
                 }
             }
 
@@ -184,11 +184,11 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
 
                 #(
                     pub fn #active_field_names(&self) -> Result<#projected_field_types, #base::property::PropertyError> {
-                        use #base::property::{FromActiveType, FromEntity};
+                        const PROPERTY: &#base::schema::StructProperty = &__ANKURAH_MODEL_PROPERTIES[#active_field_indices];
                         #base::signals::CurrentObserver::track(self);
-                        let property = <#name as #base::model::Model>::descriptor().resolved_field(#active_field_indices, &self.entity)?;
-                        let active_result = #active_field_types_turbofish::from_entity(property, &self.entity);
-                        #projected_field_types_turbofish::from_active(active_result)
+                        let property_id = PROPERTY.resolved_id(self.entity.system_epoch())?;
+                        let value = self.entity.read_property(PROPERTY.backend, &property_id)?;
+                        <#projected_field_types as #base::property::Property>::from_value(value)
                     }
                 )*
             }

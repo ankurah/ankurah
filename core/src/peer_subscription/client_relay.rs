@@ -1,6 +1,6 @@
 // TODO: Rename this module from client_relay to remote_subscription for clarity
 use ankql::ast::Resolved;
-use ankurah_proto::{self as proto, CollectionId};
+use ankurah_proto as proto;
 use ankurah_signals::{Peek, Subscribe, SubscriptionGuard};
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -38,7 +38,6 @@ pub enum Status {
 #[derive(Debug)]
 pub struct Content<CD: ContextData> {
     pub query_id: proto::QueryId,
-    pub collection_id: CollectionId,
     pub selection: ankql::ast::Selection<Resolved>,
     /// Read at each registration; credential changes alone do not notify the peer yet (#484).
     pub sessions: SessionSet<CD>,
@@ -138,14 +137,13 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
     pub fn subscribe_query(
         &self,
         query_id: proto::QueryId,
-        collection_id: CollectionId,
         selection: ankql::ast::Selection<Resolved>,
         sessions: SessionSet<CD>,
         version: u32,
         livequery: Q,
     ) {
         debug!("SubscriptionRelay.subscribe_query() - Query {} needs remote registration", query_id);
-        let content = Arc::new(Content { collection_id, selection, sessions, query_id, version });
+        let content = Arc::new(Content { selection, sessions, query_id, version });
         let cancel = CancelFlag::default();
         let peer = {
             let mut subscriptions = self.inner.subscriptions.lock().expect("poisoned lock");
@@ -173,7 +171,6 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
             self.update_query_on_peer(
                 peer,
                 query_id,
-                content.collection_id.clone(),
                 content.selection.clone(),
                 version,
                 content.sessions.clone(),
@@ -199,7 +196,6 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                     // Update the content with new predicate and version
                     let old_content = &state.content;
                     state.content = Arc::new(Content {
-                        collection_id: old_content.collection_id.clone(),
                         selection: selection.clone(),
                         sessions: old_content.sessions.clone(),
                         query_id: old_content.query_id,
@@ -211,7 +207,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                             // Update to new version, mark as requested for this peer
                             state.status = Status::Requested(peer_id, version);
                             state.cancel.cancel_and_swap();
-                            Some((peer_id, state.content.collection_id.clone(), state.content.sessions.clone(), state.cancel.clone()))
+                            Some((peer_id, state.content.sessions.clone(), state.cancel.clone()))
                             // Return the peer_id to send update to
                         }
                         _ => {
@@ -226,8 +222,8 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         };
 
         match update {
-            Some((peer_id, collection_id, sessions, cancel)) => {
-                self.update_query_on_peer(peer_id, query_id, collection_id, selection, version, sessions, cancel);
+            Some((peer_id, sessions, cancel)) => {
+                self.update_query_on_peer(peer_id, query_id, selection, version, sessions, cancel);
             }
             None => {
                 // Not established yet - use setup_remote_subscriptions for initial setup
@@ -242,7 +238,6 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         &self,
         peer_id: proto::EntityId,
         query_id: proto::QueryId,
-        collection_id: CollectionId,
         selection: ankql::ast::Selection<Resolved>,
         version: u32,
         sessions: SessionSet<CD>,
@@ -258,7 +253,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
 
                 // Send the updated predicate to the peer, under the
                 // credentials current at send time.
-                match node.remote_subscribe(peer_id, query_id, collection_id, selection, sessions.current(), version).await {
+                match node.remote_subscribe(peer_id, query_id, selection, sessions.current(), version).await {
                     _ if cancel.canceled() => debug!("Ignoring superseded reply for predicate {}", query_id),
                     Ok(()) => {
                         // Deltas applied successfully, now activate the livequery
@@ -451,7 +446,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
             { self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner()).get(&query_id).map(|state| state.livequery.clone()) };
 
         // Call remote_subscribe which fetches known matches, subscribes, applies deltas, and stores events
-        match node.remote_subscribe(target_peer, query_id, content.collection_id.clone(), predicate, cdatas, version).await {
+        match node.remote_subscribe(target_peer, query_id, predicate, cdatas, version).await {
             _ if cancel.canceled() => debug!("Ignoring superseded reply for predicate {}", query_id),
             Ok(()) => {
                 // Deltas applied successfully, now activate the livequery
@@ -552,7 +547,6 @@ pub trait TNode<CD: ContextData>: Send + Sync {
         &self,
         peer_id: proto::EntityId,
         query_id: proto::QueryId,
-        collection_id: CollectionId,
         selection: ankql::ast::Selection<Resolved>,
         context_data: Vec<CD>,
         version: u32,
@@ -574,7 +568,6 @@ where
         &self,
         peer_id: proto::EntityId,
         query_id: proto::QueryId,
-        collection_id: CollectionId,
         selection: ankql::ast::Selection<Resolved>,
         context_data: Vec<PA::ContextData>,
         version: u32,
@@ -584,7 +577,7 @@ where
 
         // 1. Pre-fetch known_matches from local storage
         let known_matches: Vec<ankurah_proto::KnownEntity> = node
-            .fetch_entities_from_local(&collection_id, &selection)
+            .fetch_entities_from_local(&selection)
             .await?
             .into_iter()
             .map(|entity| ankurah_proto::KnownEntity { entity_id: entity.id(), head: entity.head() })
@@ -597,7 +590,6 @@ where
                 &context_data,
                 ankurah_proto::NodeRequestBody::SubscribeQuery {
                     query_id,
-                    collection: collection_id.clone(),
                     selection: selection.clone(),
                     version,
                     known_matches,
@@ -610,16 +602,10 @@ where
             other => return Err(RetrievalError::RequestError(RequestError::UnexpectedResponse(other))),
         };
 
-        tracing::debug!(
-            "Node.remote_subscribe: query_id: {}, collection_id: {}, received deltas: {}",
-            query_id,
-            collection_id,
-            deltas.len()
-        );
+        tracing::debug!("Node.remote_subscribe: query_id: {}, received deltas: {}", query_id, deltas.len());
         // 3. Apply deltas to local node using NodeApplier
-        let collection = node.collections.get(&collection_id).await?;
-        let event_getter = crate::retrieval::CachedEventGetter::new(collection_id, collection.clone(), &node, &context_data);
-        let state_getter = crate::retrieval::LocalStateGetter::new(collection);
+        let event_getter = crate::retrieval::CachedEventGetter::new(&node, &context_data);
+        let state_getter = crate::retrieval::LocalStateGetter::new(node.storage.clone());
         crate::node::applier::NodeApplier::apply_deltas(&node, &peer_id, deltas, &event_getter, &state_getter).await?;
 
         Ok(())
@@ -638,7 +624,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ankurah_proto::EntityId;
+    use ankurah_proto::{EntityId, ModelId};
     use ankurah_signals::Mut;
     use std::sync::{Arc, Mutex};
 
@@ -648,14 +634,14 @@ mod tests {
     // - Direct calls test the setup mechanism itself (error handling, state transitions)
     // - Event-driven calls test the integration and user-facing API
 
-    // For testing, we'll use CollectionId as our ContextData
-    impl ContextData for CollectionId {}
+    // For testing, we'll use ModelId as our ContextData
+    impl ContextData for ModelId {}
 
     /// Mock message sender for testing
     #[derive(Debug)]
     struct MockMessageSender<CD: ContextData> {
         next_error: Arc<Mutex<Option<RequestError>>>,
-        sent_requests: Arc<Mutex<Vec<(EntityId, proto::QueryId, CollectionId, ankql::ast::Selection<Resolved>)>>>,
+        sent_requests: Arc<Mutex<Vec<(EntityId, proto::QueryId, Option<ankql::ast::Selection<Resolved>>)>>>,
         should_fail: Arc<Mutex<bool>>,
         failure_message: Arc<Mutex<String>>,
         held_reply: Mutex<Option<tokio::sync::oneshot::Receiver<Result<(), RequestError>>>>,
@@ -676,7 +662,7 @@ mod tests {
 
         fn set_fail_next(&self, error: RequestError) { *self.next_error.lock().unwrap() = Some(error); }
 
-        fn get_sent_requests(&self) -> Vec<(EntityId, proto::QueryId, CollectionId, ankql::ast::Selection<Resolved>)> {
+        fn get_sent_requests(&self) -> Vec<(EntityId, proto::QueryId, Option<ankql::ast::Selection<Resolved>>)> {
             self.sent_requests.lock().unwrap().clone()
         }
 
@@ -696,12 +682,11 @@ mod tests {
             &self,
             peer_id: EntityId,
             query_id: proto::QueryId,
-            collection_id: CollectionId,
             selection: ankql::ast::Selection<Resolved>,
             _context_data: Vec<CD>,
             _version: u32,
         ) -> Result<(), RetrievalError> {
-            self.sent_requests.lock().unwrap().push((peer_id, query_id, collection_id.clone(), selection.clone()));
+            self.sent_requests.lock().unwrap().push((peer_id, query_id, Some(selection.clone())));
 
             let held = self.held_reply.lock().unwrap().take();
             if let Some(reply) = held {
@@ -720,8 +705,7 @@ mod tests {
             self.sent_requests.lock().unwrap().push((
                 peer_id,
                 query_id,
-                CollectionId::from("unsubscribe"),
-                ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None },
+                None,
             ));
 
             // Check if there's an error to fail with
@@ -756,14 +740,14 @@ mod tests {
         ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None }
     }
 
-    fn create_test_collection_id() -> CollectionId { CollectionId::from("test_collection") }
+    fn create_test_model_id() -> ModelId { ModelId::EntityId(EntityId::from_bytes([0x01; 32])) }
 
     #[tokio::test]
     async fn stopping_run_cancels_registrations_and_stops_retries() {
         let run = Mut::new(true);
-        let relay = SubscriptionRelay::<CollectionId, MockLiveQuery>::new(&run);
+        let relay = SubscriptionRelay::<ModelId, MockLiveQuery>::new(&run);
         let query_id = proto::QueryId::new();
-        relay.subscribe_query(query_id, create_test_collection_id(), create_test_selection(), SessionSet::new(), 1, MockLiveQuery);
+        relay.subscribe_query(query_id, create_test_selection(), SessionSet::new(), 1, MockLiveQuery);
         let cancel = relay.inner.subscriptions.lock().unwrap().get(&query_id).unwrap().cancel.clone();
         assert!(!cancel.canceled());
 
@@ -773,18 +757,18 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(2), relay.inner.shutdown_tx.closed()).await.unwrap();
     }
 
-    fn connected_relay() -> (SubscriptionRelay<CollectionId, MockLiveQuery>, Arc<MockMessageSender<CollectionId>>, EntityId) {
+    fn connected_relay() -> (SubscriptionRelay<ModelId, MockLiveQuery>, Arc<MockMessageSender<ModelId>>, EntityId) {
         let relay = SubscriptionRelay::new_test();
-        let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
+        let mock_sender = Arc::new(MockMessageSender::<ModelId>::new());
         relay.set_node(mock_sender.clone()).expect("Failed to set message sender");
         let peer_id = EntityId::random();
         relay.notify_peer_connected(peer_id);
         (relay, mock_sender, peer_id)
     }
 
-    fn subscribe(relay: &SubscriptionRelay<CollectionId, MockLiveQuery>, query_id: proto::QueryId) {
-        let collection_id = create_test_collection_id();
-        relay.subscribe_query(query_id, collection_id.clone(), create_test_selection(), collection_id.into(), 1, MockLiveQuery);
+    fn subscribe(relay: &SubscriptionRelay<ModelId, MockLiveQuery>, query_id: proto::QueryId) {
+        let model_id = create_test_model_id();
+        relay.subscribe_query(query_id, create_test_selection(), model_id.into(), 1, MockLiveQuery);
     }
 
     /// Gives the relay's spawned tasks scheduler turns before the next assertion. The tests use the
@@ -798,11 +782,11 @@ mod tests {
     #[tokio::test]
     async fn test_new_subscription_setup() {
         let relay = SubscriptionRelay::new_test();
-        let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
+        let mock_sender = Arc::new(MockMessageSender::<ModelId>::new());
         relay.set_node(mock_sender.clone()).expect("Failed to set message sender");
 
         let query_id = proto::QueryId::new();
-        let collection_id = create_test_collection_id();
+        let model_id = create_test_model_id();
         let predicate = create_test_selection();
         let peer_id = EntityId::random();
 
@@ -811,7 +795,7 @@ mod tests {
 
         // Notify of new subscription
         let reply = mock_sender.hold_next_reply();
-        relay.subscribe_query(query_id, collection_id.clone(), predicate.clone(), collection_id.clone().into(), 0, MockLiveQuery);
+        relay.subscribe_query(query_id, predicate.clone(), model_id.clone().into(), 0, MockLiveQuery);
 
         settle().await;
         assert!(matches!(relay.get_status(query_id), Some(Status::Requested(peer, 0)) if peer == peer_id));
@@ -821,7 +805,7 @@ mod tests {
         assert_eq!(sent_requests.len(), 1);
         assert_eq!(sent_requests[0].0, peer_id);
         assert_eq!(sent_requests[0].1, query_id);
-        assert_eq!(sent_requests[0].2, collection_id);
+        assert_eq!(sent_requests[0].2, Some(predicate));
 
         // Verify subscription is marked as established
         reply.send(Ok(())).unwrap();
@@ -833,11 +817,11 @@ mod tests {
     async fn test_peer_disconnection_orphans_subscriptions() {
         let relay = SubscriptionRelay::new_test();
 
-        let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
+        let mock_sender = Arc::new(MockMessageSender::<ModelId>::new());
         relay.set_node(mock_sender.clone()).expect("Failed to set message sender");
 
         let query_id = proto::QueryId::new();
-        let collection_id = create_test_collection_id();
+        let model_id = create_test_model_id();
         let predicate = create_test_selection();
         let peer_id = EntityId::random();
 
@@ -845,7 +829,7 @@ mod tests {
         relay.notify_peer_connected(peer_id);
 
         // Setup established subscription by going through the full flow
-        relay.subscribe_query(query_id, collection_id.clone(), predicate, collection_id.clone().into(), 0, MockLiveQuery);
+        relay.subscribe_query(query_id, predicate, model_id.clone().into(), 0, MockLiveQuery);
 
         // Give async task time to complete
         futures_timer::Delay::new(std::time::Duration::from_millis(10)).await;
@@ -862,16 +846,16 @@ mod tests {
     #[tokio::test]
     async fn test_peer_connection_triggers_setup() {
         let relay = SubscriptionRelay::new_test();
-        let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
+        let mock_sender = Arc::new(MockMessageSender::<ModelId>::new());
         relay.set_node(mock_sender.clone()).expect("Failed to set message sender");
 
         let query_id = proto::QueryId::new();
-        let collection_id = create_test_collection_id();
+        let model_id = create_test_model_id();
         let predicate = create_test_selection();
         let peer_id = EntityId::random();
 
         // Add pending subscription (no peers connected yet)
-        relay.subscribe_query(query_id, collection_id.clone(), predicate.clone(), collection_id.clone().into(), 0, MockLiveQuery);
+        relay.subscribe_query(query_id, predicate.clone(), model_id.clone().into(), 0, MockLiveQuery);
         assert!(matches!(relay.get_status(query_id), Some(Status::PendingRemote)));
 
         // Clear any previous requests
@@ -896,17 +880,17 @@ mod tests {
     #[tokio::test]
     async fn test_failed_subscription_retry() {
         let relay = SubscriptionRelay::new_test();
-        let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
+        let mock_sender = Arc::new(MockMessageSender::<ModelId>::new());
         relay.set_node(mock_sender.clone()).expect("Failed to set message sender");
 
         let query_id = proto::QueryId::new();
-        let collection_id = create_test_collection_id();
+        let model_id = create_test_model_id();
         let predicate = create_test_selection();
         let peer_id = EntityId::random();
 
         // Connect peer and add subscription (should succeed initially)
         relay.notify_peer_connected(peer_id);
-        relay.subscribe_query(query_id, collection_id.clone(), predicate.clone(), collection_id.clone().into(), 0, MockLiveQuery);
+        relay.subscribe_query(query_id, predicate.clone(), model_id.clone().into(), 0, MockLiveQuery);
 
         // Give async task time to complete
         futures_timer::Delay::new(std::time::Duration::from_millis(10)).await;
@@ -942,25 +926,18 @@ mod tests {
     #[tokio::test]
     async fn test_retryable_vs_non_retryable_failures() {
         let relay = SubscriptionRelay::new_test();
-        let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
+        let mock_sender = Arc::new(MockMessageSender::<ModelId>::new());
         relay.set_node(mock_sender.clone()).expect("Failed to set message sender");
 
         let retryable_query_id = proto::QueryId::new();
         let non_retryable_query_id = proto::QueryId::new();
-        let collection_id = create_test_collection_id();
+        let model_id = create_test_model_id();
         let predicate = create_test_selection();
         let peer_id = EntityId::random();
 
         // Add subscriptions
-        relay.subscribe_query(retryable_query_id, collection_id.clone(), predicate.clone(), collection_id.clone().into(), 0, MockLiveQuery);
-        relay.subscribe_query(
-            non_retryable_query_id,
-            collection_id.clone(),
-            predicate.clone(),
-            collection_id.clone().into(),
-            0,
-            MockLiveQuery,
-        );
+        relay.subscribe_query(retryable_query_id, predicate.clone(), model_id.clone().into(), 0, MockLiveQuery);
+        relay.subscribe_query(non_retryable_query_id, predicate.clone(), model_id.clone().into(), 0, MockLiveQuery);
 
         // Manually set different failure types - retryable goes back to pending, non-retryable stays failed
         {
@@ -994,17 +971,17 @@ mod tests {
     #[tokio::test]
     async fn test_subscription_removal() {
         let relay = SubscriptionRelay::new_test();
-        let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
+        let mock_sender = Arc::new(MockMessageSender::<ModelId>::new());
         relay.set_node(mock_sender.clone()).expect("Failed to set message sender");
 
         let query_id = proto::QueryId::new();
-        let collection_id = create_test_collection_id();
+        let model_id = create_test_model_id();
         let predicate = create_test_selection();
         let peer_id = EntityId::random();
 
         // Connect peer and setup established subscription
         relay.notify_peer_connected(peer_id);
-        relay.subscribe_query(query_id, collection_id.clone(), predicate, collection_id.clone().into(), 0, MockLiveQuery);
+        relay.subscribe_query(query_id, predicate, model_id.clone().into(), 0, MockLiveQuery);
 
         // Give async task time to complete
         futures_timer::Delay::new(std::time::Duration::from_millis(10)).await;
@@ -1033,15 +1010,15 @@ mod tests {
     #[tokio::test]
     async fn test_edge_cases() {
         let relay = SubscriptionRelay::new_test();
-        let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
+        let mock_sender = Arc::new(MockMessageSender::<ModelId>::new());
 
         let query_id = proto::QueryId::new();
-        let collection_id = create_test_collection_id();
+        let model_id = create_test_model_id();
         let predicate = create_test_selection();
         let peer_id = EntityId::random();
 
         // Test setup without message sender - should not crash
-        relay.subscribe_query(query_id, collection_id.clone(), predicate.clone(), collection_id.clone().into(), 0, MockLiveQuery);
+        relay.subscribe_query(query_id, predicate.clone(), model_id.clone().into(), 0, MockLiveQuery);
         futures_timer::Delay::new(std::time::Duration::from_millis(10)).await;
 
         // Should still be pending since no sender
@@ -1069,15 +1046,15 @@ mod tests {
     #[tokio::test]
     async fn test_notify_unsubscribe_with_no_established_subscription() {
         let relay = SubscriptionRelay::new_test();
-        let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
+        let mock_sender = Arc::new(MockMessageSender::<ModelId>::new());
         relay.set_node(mock_sender.clone()).expect("Failed to set message sender");
 
         let query_id = proto::QueryId::new();
-        let collection_id = create_test_collection_id();
+        let model_id = create_test_model_id();
         let predicate = create_test_selection();
 
         // Add subscription but don't establish it
-        relay.subscribe_query(query_id, collection_id.clone(), predicate, collection_id.clone().into(), 0, MockLiveQuery);
+        relay.subscribe_query(query_id, predicate, model_id.clone().into(), 0, MockLiveQuery);
         assert!(matches!(relay.get_status(query_id), Some(Status::PendingRemote)));
 
         // Unsubscribe from pending subscription
@@ -1128,20 +1105,13 @@ mod tests {
         relay.inner.connected_peers.remove(&peer);
         relay.notify_peer_connected(EntityId::random());
 
-        relay.subscribe_query(
-            query_id,
-            create_test_collection_id(),
-            create_test_selection(),
-            create_test_collection_id().into(),
-            2,
-            MockLiveQuery,
-        );
+        relay.subscribe_query(query_id, create_test_selection(), create_test_model_id().into(), 2, MockLiveQuery);
         settle().await;
         stale.send(Err(RequestError::ServerError("stale".into()))).unwrap();
         settle().await;
 
         assert!(matches!(relay.get_status(query_id), Some(Status::Established(p, 2)) if p == peer));
-        assert!(sender.get_sent_requests().iter().all(|(p, _, _, _)| *p == peer));
+        assert!(sender.get_sent_requests().iter().all(|(p, _, _)| *p == peer));
     }
 
     /// After a disconnect and reconnect, the reply to the pre-disconnect request must not disturb the
@@ -1186,14 +1156,14 @@ mod tests {
         settle().await;
         let sent = mock_sender.get_sent_requests();
         assert_eq!(sent.len(), 3, "{sent:?}");
-        assert!(sent.iter().all(|(peer, _, _, _)| *peer == peer_id), "{sent:?}");
-        assert_eq!(sent[2].2, CollectionId::from("unsubscribe"));
+        assert!(sent.iter().all(|(peer, _, _)| *peer == peer_id), "{sent:?}");
+        assert!(sent[2].2.is_none(), "unsubscribe must reach the recorded peer");
     }
 
     /// The retry task must not own the relay, or dropping the last handle could never stop it.
     #[tokio::test]
     async fn retry_task_does_not_keep_relay_alive() {
-        let relay = SubscriptionRelay::<CollectionId, MockLiveQuery>::new_test();
+        let relay = SubscriptionRelay::<ModelId, MockLiveQuery>::new_test();
         let weak = relay.weak();
         drop(relay);
         assert!(weak.upgrade().is_none());

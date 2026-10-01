@@ -13,10 +13,6 @@ pub fn mutable_impl(model: &crate::model::description::ModelDescription) -> Toke
         Ok(types) => types,
         Err(_) => return quote! { compile_error!("Failed to generate active field types"); },
     };
-    let active_field_types_turbofish = match model.active_field_types_turbofish() {
-        Ok(types) => types,
-        Err(_) => return quote! { compile_error!("Failed to generate active field types turbofish"); },
-    };
 
     // FFI attributes for the struct and fields. A `no_ffi` model skips the
     // binding layers entirely, matching lib.rs's gating of wasm_impl: its
@@ -38,6 +34,13 @@ pub fn mutable_impl(model: &crate::model::description::ModelDescription) -> Toke
             quote! {
                 #[wasm_bindgen]
                 impl #mutable_name {
+                    #[wasm_bindgen(getter, js_name = "id")]
+                    pub fn wasm_id(&self) -> #base::proto::EntityId { self.entity.id() }
+
+                    /// A View of this entity, which stays readable after commit.
+                    #[wasm_bindgen(js_name = "read")]
+                    pub fn wasm_read(&self) -> Result<#view_name, JsValue> { Ok(#base::model::Mutable::read(self)?) }
+
                     #(#getter_methods)*
                 }
             },
@@ -50,25 +53,28 @@ pub fn mutable_impl(model: &crate::model::description::ModelDescription) -> Toke
     };
 
     let expanded = quote! {
-        // Core Mutable struct (no lifetime, owned Entity)
+        // Core Mutable struct (no lifetime, owned transaction entity)
         #struct_attributes
         #[derive(Debug)]
         pub struct #mutable_name {
             #field_attributes
-            pub entity: #base::entity::Entity,
+            pub entity: #base::entity::LocalTrxEntity,
         }
 
         impl #base::model::Mutable for #mutable_name {
             type Model = #name;
             type View = #view_name;
 
-            fn entity(&self) -> &#base::entity::Entity {
+            fn entity(&self) -> &#base::entity::LocalTrxEntity {
                 &self.entity
             }
 
-            fn new(entity: #base::entity::Entity) -> Self {
-                assert_eq!(entity.collection(), &Self::collection());
-                Self { entity }
+            fn new(entity: #base::entity::LocalTrxEntity) -> Result<Self, #base::error::RetrievalError> {
+                let model = __ANKURAH_MODEL_SCHEMA.model_id(entity.system_epoch())?;
+                if !entity.has_membership(&model) {
+                    return Err(#base::error::RetrievalError::MissingComponent { entity_id: entity.id(), model_id: model });
+                }
+                Ok(Self { entity })
             }
         }
 
@@ -79,9 +85,10 @@ pub fn mutable_impl(model: &crate::model::description::ModelDescription) -> Toke
 
             #(
                 pub fn #active_field_names(&self) -> Result<#active_field_types, #base::property::PropertyError> {
-                    use #base::property::FromEntity;
-                    let property = <#name as #base::model::Model>::descriptor().resolved_field(#active_field_indices, &self.entity)?;
-                    Ok(#active_field_types_turbofish::from_entity(property, &self.entity))
+                    use #base::property::FromLocalTrxEntity;
+                    const PROPERTY: &#base::schema::StructProperty = &__ANKURAH_MODEL_PROPERTIES[#active_field_indices];
+                    let property_id = PROPERTY.resolved_id(self.entity.system_epoch())?;
+                    <#active_field_types>::from_local_entity(property_id, &self.entity)
                 }
             )*
         }

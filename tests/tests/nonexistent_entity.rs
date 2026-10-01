@@ -1,7 +1,6 @@
 mod common;
 use ankurah::error::RetrievalError;
 use common::*;
-use std::collections::BTreeMap;
 
 /// context.get() with a nonexistent entity ID returns an error.
 #[tokio::test]
@@ -20,9 +19,8 @@ async fn local_rejects_phantom_commit() -> anyhow::Result<()> {
     let node = durable_sled_setup().await?;
     let ctx = node.context(DEFAULT_CONTEXT)?;
     // Register Album so the commit reaches the phantom-baseline check.
-    ctx.register_model::<Album>().await?;
-
-    let phantom = AlbumView::from_entity(node.conjure_evil_phantom(EntityId::random(), Album::collection()));
+    let album_model = ctx.resolve_model_id::<Album>().await?;
+    let phantom = AlbumView::from_entity(node.conjure_evil_phantom(EntityId::random(), album_model))?;
     let trx = ctx.begin();
     phantom.edit(&trx)?.name()?.replace("inside your mind")?;
 
@@ -37,21 +35,24 @@ async fn server_rejects_update_for_nonexistent() -> anyhow::Result<()> {
     let client = ephemeral_sled_setup().await?;
     let _conn: LocalProcessConnection<SledStorageEngine, PermissiveAgent, SledStorageEngine, PermissiveAgent> =
         LocalProcessConnection::new(&server, &client).await?;
-    client.system.wait_system_ready().await.unwrap();
+    client.system.wait_system_ready().await?;
+    let album_model = server.context(DEFAULT_CONTEXT)?.resolve_model_id::<Album>().await?;
 
     let fake_update = proto::Event::update(
-        Album::collection(),
         EntityId::random(),
         proto::Clock::new([proto::EventId::from_bytes([1u8; 32])]),
         proto::AuthorId::Unknown,
-        proto::OperationSet::from_backends(BTreeMap::new()),
+        proto::OperationSet::default(),
     );
 
     let resp = client
         .request(
             server.id,
             &DEFAULT_CONTEXT,
-            proto::NodeRequestBody::CommitTransaction { id: proto::TransactionId::new(), events: vec![fake_update.into()] },
+            proto::NodeRequestBody::CommitTransaction {
+                id: proto::TransactionId::new(),
+                events: vec![proto::Attested::opt(fake_update, None)],
+            },
         )
         .await?;
 
@@ -84,15 +85,22 @@ async fn server_refuses_a_genesis_whose_content_derives_a_different_id() -> anyh
 
     // Overwrite the derived id with the existing entity's, so the event's own
     // content no longer derives the id it names.
-    let mut fake_create =
-        proto::Event::genesis(Album::collection(), None, proto::AuthorId::Unknown, proto::OperationSet::from_backends(BTreeMap::new()));
+    let album_model = server.catalog.model_id_for("album")?.expect("Album registered by the create above");
+    let mut fake_create = proto::Event::genesis(
+        server.system.root_id(),
+        proto::AuthorId::Unknown,
+        proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(album_model))]),
+    );
     fake_create.entity_id = existing_id;
 
     let resp = client
         .request(
             server.id,
             &DEFAULT_CONTEXT,
-            proto::NodeRequestBody::CommitTransaction { id: proto::TransactionId::new(), events: vec![fake_create.into()] },
+            proto::NodeRequestBody::CommitTransaction {
+                id: proto::TransactionId::new(),
+                events: vec![proto::Attested::opt(fake_create, None)],
+            },
         )
         .await?;
 

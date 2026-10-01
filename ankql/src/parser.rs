@@ -83,9 +83,10 @@ fn parse_expr(pair: Pair<grammar::Rule>) -> Result<ast::Predicate<ast::Parsed>, 
                 //
                 parse_expr(next.into_inner().next().ok_or(ParseError::EmptyExpression)?)?
             }
+            grammar::Rule::MemberOf => parse_atomic_expr(next)?.try_into()?,
             _ => {
                 // TODO
-                return Err(ParseError::UnexpectedRule { expected: "ExpressionInParentheses", got: next.as_rule() });
+                return Err(ParseError::UnexpectedRule { expected: "ExpressionInParentheses or MemberOf", got: next.as_rule() });
             }
         })));
     }
@@ -198,6 +199,17 @@ fn create_logical_op(
 /// Parse an atomic expression, which can be a path, literal, or parenthesized expression
 fn parse_atomic_expr(pair: Pair<grammar::Rule>) -> Result<ast::Expr<ast::Parsed>, ParseError> {
     match pair.as_rule() {
+        grammar::Rule::MemberOf => {
+            let literal = pair.into_inner().next().ok_or(ParseError::EmptyExpression)?;
+            let ast::Expr::Literal(Value::String(model)) = parse_string_literal(literal)? else {
+                return Err(ParseError::InvalidPredicate("Expected a model reference".into()));
+            };
+            let model = match model.parse() {
+                Ok(id) => ast::ModelRef::Id(id),
+                Err(_) => ast::ModelRef::Label(model),
+            };
+            Ok(ast::Expr::Predicate(ast::Predicate::MemberOf(model)))
+        }
         grammar::Rule::PathExpr => parse_path_expr(pair),
         grammar::Rule::SingleQuotedString => parse_string_literal(pair),
         grammar::Rule::True => Ok(ast::Expr::Literal(Value::Bool(true))),

@@ -1,4 +1,3 @@
-use super::registry;
 use crate::context::{Context, DynContextInner};
 use crate::internal::prelude::*;
 use crate::reactor::fetch_gap::{GapFetcher, QueryGapFetcher};
@@ -8,18 +7,21 @@ use ankurah_signals::Mut;
 use futures::future::RemoteHandle;
 use std::sync::{
     atomic::{AtomicU32, Ordering},
-    Arc, Weak,
+    Arc,
 };
 use tracing::{debug, warn};
 
 /// Shared query state; versions identify selection attempts, not system epochs.
 pub(super) struct LiveQueryInner {
     pub(super) query_id: proto::QueryId,
-    // Must drop before context; cleanup uses the context's reactor.
+    // Must drop before context, which may hold the node's last strong reference.
     pub(super) subscription: ReactorSubscription,
     pub(super) context: Arc<dyn DynContextInner>,
     pub(super) resultset: EntityResultSet,
     pub(super) error: Mut<Option<Arc<RetrievalError>>>,
+    /// Keep the version check and selection/error publication together: an old resolution
+    /// must not overwrite a newer selection. Release before notifying signal listeners,
+    /// which may update the query again.
     pub(super) version_lock: std::sync::Mutex<()>,
     initialized_notify: tokio::sync::Notify,
     initialized_version: AtomicU32,
@@ -29,11 +31,10 @@ pub(super) struct LiveQueryInner {
     pub(super) current_version: AtomicU32,
     /// Resolved, policy-scoped intent; absent while initial resolution waits.
     pub(super) selection: Mut<Option<(ankql::ast::Selection<Resolved>, u32)>>,
-    pub(super) collection_id: CollectionId,
     gap_fetcher: Arc<dyn GapFetcher<Entity>>,
-    pub(super) schema: Option<&'static crate::schema::ModelStructDescriptor>,
-    pub(super) cached: bool,
-    registry: Weak<registry::RegistryInner>,
+    pub(super) cache_policy: CachePolicy,
+    /// Dropping this handle cancels pending resolution on replacement or query drop.
+    /// The task holds only a weak query reference, so it cannot keep its owner alive.
     pub(super) resolution_task: std::sync::Mutex<Option<RemoteHandle<()>>>,
     #[cfg(test)]
     before_wait: std::sync::Mutex<Option<Box<dyn FnOnce(&Self) + Send>>>,
@@ -41,19 +42,11 @@ pub(super) struct LiveQueryInner {
 
 impl LiveQueryInner {
     /// Create the shared inner before its resolved selection is installed.
-    pub(super) fn new<SE, PA>(
-        node: &Node<SE, PA>,
+    pub(super) fn new(
         context: Arc<dyn DynContextInner>,
-        schema: Option<&'static crate::schema::ModelStructDescriptor>,
-        cached: bool,
-        collection_id: CollectionId,
-    ) -> Self
-    where
-        SE: StorageEngine + Send + Sync + 'static,
-        PA: PolicyAgent + Send + Sync + 'static,
-    {
-        let subscription = node.reactor.subscribe();
-
+        subscription: ReactorSubscription,
+        cache_policy: CachePolicy,
+    ) -> Self {
         let query_id = proto::QueryId::new();
         let gap_fetcher: Arc<dyn GapFetcher<Entity>> = Arc::new(QueryGapFetcher::new(Context(context.clone())));
 
@@ -70,11 +63,8 @@ impl LiveQueryInner {
             durable_notify: tokio::sync::Notify::new(),
             current_version: AtomicU32::new(1),
             selection: Mut::new(None),
-            collection_id,
             gap_fetcher,
-            schema,
-            cached,
-            registry: node.live_queries.downgrade(),
+            cache_policy,
             resolution_task: std::sync::Mutex::new(None),
             #[cfg(test)]
             before_wait: std::sync::Mutex::new(None),
@@ -181,15 +171,14 @@ impl LiveQueryInner {
 
         debug!("LiveQuery.activate() for predicate {} (version {})", self.query_id, version);
 
-        let reactor = self.context.reactor().ok_or_else(|| RetrievalError::Other("Node has been dropped".into()))?;
+        let reactor = self.context.node()?.reactor().clone();
 
         reactor
             .upsert_query_and_notify(
                 self.subscription.id(),
                 self.query_id,
-                self.collection_id.clone(),
                 selection,
-                self.context.as_ref(),
+                self.context.clone(),
                 self.resultset.clone(),
                 self.gap_fetcher.clone(),
                 version,
@@ -227,9 +216,9 @@ impl crate::reactor::PreNotifyHook for &LiveQueryInner {
 
 impl Drop for LiveQueryInner {
     fn drop(&mut self) {
-        self.context.unsubscribe_remote_query(self.query_id);
-        if let Some(registry) = self.registry.upgrade() {
-            registry.unregister(self);
+        if let Ok(node) = self.context.node() {
+            node.unsubscribe_remote_query(self.query_id);
+            node.live_queries().unregister(self);
         }
     }
 }
@@ -245,7 +234,7 @@ mod tests {
     fn query() -> EntityLiveQuery {
         let node = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
         let context = Context::new(node.clone(), DEFAULT_CONTEXT);
-        crate::livequery::EntityLiveQuery(Arc::new(LiveQueryInner::new(&node, context.0, None, false, "test".into())))
+        crate::livequery::EntityLiveQuery(Arc::new(LiveQueryInner::new(context.0, node.reactor.subscribe(), CachePolicy::Durable)))
     }
 
     #[tokio::test]
@@ -332,7 +321,7 @@ mod tests {
 
     #[tokio::test]
     async fn selection_parse_errors_keep_their_variant() {
-        let query = query();
+        let query = query().map::<crate::schema::catalog::SysModelRowView>();
         assert!(matches!(query.update_selection("("), Err(RetrievalError::ParseError(_))));
     }
 }

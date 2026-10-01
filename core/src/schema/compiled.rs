@@ -11,7 +11,7 @@ use ankurah_proto::{EntityId, ModelId, PropertyId, RegisterModel, RegisterProper
 
 use crate::error::RetrievalError;
 
-/// One model's registration metadata and resolved identities.
+/// A compiled Model struct's field declarations and per-system catalog bindings.
 #[derive(Debug)]
 pub struct ModelStructDescriptor {
     /// Source-level registration label, currently the lowercased struct name.
@@ -33,6 +33,8 @@ pub struct ModelStructDescriptor {
 /// One active field's registration metadata and resolved identity.
 #[derive(Debug)]
 pub struct StructProperty {
+    /// Label of the compiled model declaring this field.
+    pub model_label: &'static str,
     /// The Rust field identifier (as declared).
     pub field: &'static str,
     /// Display and registration name, currently equal to `field`.
@@ -43,8 +45,6 @@ pub struct StructProperty {
     pub backend: &'static str,
     /// Language-independent value type derived from the original Rust type.
     pub value_type: &'static str,
-    /// Target model label for reference-typed fields.
-    pub target_label: Option<&'static str>,
     /// Whether this model-property membership is optional.
     pub optional: bool,
     /// Explicit existing property binding, possibly shared across models.
@@ -53,6 +53,13 @@ pub struct StructProperty {
     pub build_id: [u8; 16],
     /// Durable property identity resolved for each system epoch.
     pub resolved: PerSystemOnceCell<PropertyId>,
+}
+
+impl StructProperty {
+    /// Look up this property's binding in `epoch`.
+    pub fn resolved_id(&self, epoch: SystemEpoch) -> Result<PropertyId, crate::property::PropertyError> {
+        self.resolved.get(epoch).map_err(|_| crate::property::PropertyError::Unresolved { model: self.model_label, field: self.field })
+    }
 }
 
 impl RegistrantProperty for StructProperty {
@@ -66,18 +73,34 @@ impl RegistrantProperty for StructProperty {
 
     fn value_type(&self) -> &str { self.value_type }
 
-    fn target_label(&self) -> Option<&str> { self.target_label }
-
     fn explicit_id(&self) -> Option<EntityId> { self.explicit_id.map(parse_explicit_id) }
 
     fn optional(&self) -> bool { self.optional }
 }
 
 impl ModelStructDescriptor {
+    /// Return this struct's bound model identity for `epoch`.
+    pub fn model_id(&self, epoch: SystemEpoch) -> Result<ModelId, RetrievalError> {
+        self.resolved.get(epoch).map_err(|_| RetrievalError::UnboundDeclaration { label: self.label.into() })
+    }
+
     pub(crate) fn registrant(&'static self, epoch: SystemEpoch) -> DescriptorRegistrant {
         DescriptorRegistrant { schema: self, epoch, model: None, properties: vec![None; self.properties.len()] }
     }
 
+    /// Return this struct's model identity for `epoch`, binding it from the local catalog if needed; never registers.
+    pub fn bind_local(&'static self, catalog: &CatalogManager, epoch: SystemEpoch) -> Result<ModelId, RetrievalError> {
+        if self.resolved.get(epoch).is_err() {
+            // Cached rows may be stale until the catalog's first durable answer, and an epoch's first binding is permanent.
+            if !catalog.is_ready() {
+                return Err(RetrievalError::NodeNotReady);
+            }
+            catalog.resolve_local(&mut self.registrant(epoch))?;
+        }
+        self.model_id(epoch)
+    }
+
+    /// Resolve names and literal types against this model, restricting the selection to its members.
     pub(crate) fn resolve_selection(
         &'static self,
         catalog: &CatalogManager,
@@ -89,37 +112,13 @@ impl ModelStructDescriptor {
             (_, Some(epoch)) => epoch,
             (None, None) => return Err(RetrievalError::UnboundDeclaration { label: self.label.to_string() }),
         };
-        let model = match self.system {
-            Some(system) => ModelId::System(system),
-            None => {
-                if self.resolved.get(epoch).is_none() {
-                    let mut registrant = self.registrant(epoch);
-                    catalog.resolve_local(&mut registrant)?;
-                }
-                self.resolved.get(epoch).ok_or_else(|| RetrievalError::UnboundDeclaration { label: self.label.to_string() })?
-            }
-        };
+        let model = self.bind_local(catalog, epoch)?;
         let resolver = DescriptorResolver { schema: self, epoch, catalog };
-        Ok(resolve_selection(&model, &resolver, selection)?)
+        Ok(resolve_selection(&model, &resolver, selection)?.and_member_of(model))
     }
 
     /// The active field whose display name is `name`, if any.
     pub fn field_by_name(&self, name: &str) -> Option<&'static StructProperty> { self.properties.iter().find(|f| f.name == name) }
-
-    /// Resolve a field in the system epoch this entity belongs to.
-    pub fn resolved_field(
-        &'static self,
-        index: usize,
-        entity: &crate::entity::Entity,
-    ) -> Result<PropertyId, crate::property::PropertyError> {
-        self.resolved_field_at(index, entity.system_epoch())
-    }
-
-    /// Look up a field's binding in `epoch`; this does not check whether that epoch is still current.
-    pub fn resolved_field_at(&'static self, index: usize, epoch: super::SystemEpoch) -> Result<PropertyId, crate::property::PropertyError> {
-        let field = &self.properties[index];
-        field.resolved.get(epoch).ok_or(crate::property::PropertyError::Unresolved { model: self.label, field: field.field })
-    }
 }
 
 pub(crate) struct DescriptorRegistrant {
@@ -213,7 +212,6 @@ impl From<&ModelStructDescriptor> for RegisterModel {
                     renamed_from: field.renamed_from.map(|s| s.to_string()),
                     backend: field.backend.to_string(),
                     value_type: field.value_type.to_string(),
-                    target_label: field.target_label.map(str::to_string),
                     explicit_id: field.explicit_id.map(parse_explicit_id),
                     build_id: field.build_id,
                     optional: field.optional,
@@ -254,7 +252,7 @@ mod tests {
             } else {
                 assert!(matches!(error, RegistrationError::ReservedCollection(found) if found == label));
             }
-            assert!(schema.resolved.get(epoch).is_none());
+            assert!(schema.resolved.get(epoch).is_err());
         }
         assert_eq!(catalog.counts(), (0, 0, 0));
     }

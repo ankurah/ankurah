@@ -36,6 +36,7 @@ ankurah-proto          = { path = "../../proto", version = "=0.10.0" }
 ankurah-storage-common = { path = "../common", version = "=0.10.0" }
 
 [dev-dependencies]
+tempfile           = "3"
 tokio              = { version = "1", features = ["rt-multi-thread", "macros"] }
 ankurah            = { path = "../../ankurah", version = "=0.10.0", features = ["derive"] }
 tracing-subscriber = "0.3"

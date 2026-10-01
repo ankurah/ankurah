@@ -11,13 +11,13 @@ pub(crate) mod prelude {
     pub(crate) use crate::error::{MutationError, RetrievalError};
     pub(crate) use crate::livequery::{EntityLiveQuery, LiveQuery, WeakEntityLiveQuery};
     pub(crate) use crate::model::View;
-    pub(crate) use crate::node::{MatchArgs, Node, NodeHandle, NodeRef, NodeState, WeakNode};
+    pub(crate) use crate::node::{CachePolicy, MatchArgs, Node, NodeHandle, NodeRef, NodeState, WeakNode};
     pub(crate) use crate::policy::{AccessDenied, PolicyAgent};
     pub(crate) use crate::resultset::EntityResultSet;
     pub(crate) use crate::schema::catalog::CatalogManager;
     pub(crate) use crate::schema::{ModelStructDescriptor, SystemEpoch};
     pub(crate) use crate::session::SessionSet;
-    pub(crate) use crate::storage::{StorageCollectionWrapper, StorageEngine};
+    pub(crate) use crate::storage::StorageEngine;
     pub(crate) use crate::transaction::Transaction;
-    pub(crate) use ankurah_proto::{self as proto, CollectionId};
+    pub(crate) use ankurah_proto::{self as proto, ModelId};
 }

@@ -163,7 +163,7 @@ pub fn wasm_changeset_wrapper(changeset_name: &Ident, view_name: &Ident, results
         impl #changeset_name {
             #[wasm_bindgen(getter)]
             pub fn resultset(&self) -> #resultset_name {
-                #resultset_name(self.0.resultset.wrap())
+                #resultset_name(self.0.resultset.clone())
             }
 
             /// Items from the initial query load (before subscription was active)
@@ -384,6 +384,7 @@ pub fn wasm_model_namespace(
     pojo_interface: &Ident,
 ) -> TokenStream {
     let name = model.name();
+    let mutable_name = model.mutable_name();
     let ref_field_names: Vec<String> = model.ref_fields().iter().map(|(field, _)| field.ident.as_ref().unwrap().to_string()).collect();
     let preprocess_calls: Vec<TokenStream> = ref_field_names
         .iter()
@@ -404,8 +405,8 @@ pub fn wasm_model_namespace(
         static query(context: Context, selection: string, ...substitution_values: any): {livequery_name};
         /** Waits for remote subscription establishment - existing items are Initial, items added after are Add */
         static query_nocache(context: Context, selection: string, ...substitution_values: any): {livequery_name};
-        /** Create a new {name} */
-        static create(transaction: Transaction, me: {pojo_interface}): Promise<{view_name}>;
+        /** Create a new {name} in this transaction, returning its Mutable */
+        static create(transaction: Transaction, me: {pojo_interface}): Promise<{mutable_name}>;
         /** Create a new {name} within an automatically created and committed transaction. */
         static create_one(context: Context, me: {pojo_interface}): Promise<{view_name}>;
 }}"#
@@ -476,17 +477,15 @@ pub fn wasm_model_namespace(
                 selection.predicate =
                     ::ankurah::core::model::js_populate_predicate(selection.predicate, substitution_values)?;
 
-                let args = ::ankurah::MatchArgs { selection, cached: false };
+                let args = ::ankurah::MatchArgs { selection, cache_policy: ::ankurah::CachePolicy::Durable };
                 let livequery = context.query::<#view_name>(args)
                     .map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))?;
                 Ok(#livequery_name(livequery))
             }
 
-            pub async fn create(transaction: &::ankurah::transaction::Transaction, me: ::wasm_bindgen::JsValue) -> Result<#view_name, ::wasm_bindgen::JsValue> {
-                use ankurah::Mutable;
+            pub async fn create(transaction: &::ankurah::transaction::Transaction, me: ::wasm_bindgen::JsValue) -> Result<#mutable_name, ::wasm_bindgen::JsValue> {
                 let model = js_to_model(me)?;
-                let mutable_entity = transaction.create(&model).await?;
-                Ok(mutable_entity.read())
+                Ok(transaction.create(&model).await?.into_core())
             }
 
             pub async fn create_one(context: &::ankurah::core::context::Context, me: ::wasm_bindgen::JsValue) -> Result<#view_name, ::wasm_bindgen::JsValue> {
@@ -494,7 +493,7 @@ pub fn wasm_model_namespace(
                 let tx = context.begin();
                 let model = js_to_model(me)?;
                 let mutable_entity = tx.create(&model).await?;
-                let read = mutable_entity.read();
+                let read = mutable_entity.read()?;
                 tx.commit().await.map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))?;
                 Ok(read)
             }

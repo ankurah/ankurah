@@ -1,8 +1,10 @@
-//! Test seams that bypass production machinery. Feature-gated; never
+//! Test seams and direct access to internal handlers. Feature-gated; never
 //! compiled into a normal build.
 
 use crate::internal::prelude::*;
 use crate::schema::registration::RegistrationError;
+
+pub use crate::node::handler::commit_transaction;
 
 /// Bind `schema`'s cells from a hand-built definition under the node's
 /// current epoch, bypassing registration and the catalog: deterministic

@@ -62,7 +62,7 @@ pub async fn create_test_context(db_name: &str) -> Result<Context, JsValue> {
 
     node.system.create().await.map_err(|e| JsValue::from_str(&e.to_string()))?;
 
-    node.context(DEFAULT_CONTEXT).map_err(|e| JsValue::from_str(&e.to_string()))
+    node.context_async(DEFAULT_CONTEXT).await.map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
 /// Clean up a test database

@@ -26,14 +26,23 @@ pub enum PerSystemOnceCell<T: Copy> {
     PerEpoch(AppendOnlyVec<(u32, T)>),
 }
 
+/// The cell has no value for the requested system epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("cell is not initialized for {epoch:?}")]
+pub struct UninitializedCell {
+    pub epoch: SystemEpoch,
+}
+
 impl<T: Copy> PerSystemOnceCell<T> {
     pub const fn per_epoch() -> Self { Self::PerEpoch(AppendOnlyVec::new()) }
 
-    /// The identity for `epoch`; pinned identities ignore the epoch.
-    pub fn get(&self, epoch: SystemEpoch) -> Option<T> {
+    /// Return the value for `epoch`, or [`UninitializedCell`] if unset.
+    /// Pinned values ignore the epoch.
+    pub fn get(&self, epoch: SystemEpoch) -> Result<T, UninitializedCell> {
         match self {
-            Self::Pinned(value) => Some(*value),
-            Self::PerEpoch(entries) => entries.iter().find(|(e, _)| *e == epoch.0).map(|(_, value)| *value),
+            Self::Pinned(value) => Ok(*value),
+            Self::PerEpoch(entries) => entries.iter().find(|(e, _)| *e == epoch.0).map(|(_, value)| *value)
+                .ok_or(UninitializedCell { epoch }),
         }
     }
 
@@ -59,7 +68,7 @@ mod tests {
         let cell: PerSystemOnceCell<u8> = PerSystemOnceCell::per_epoch();
         cell.set(epoch(1), 10);
         cell.set(epoch(1), 20); // a later differing append cannot retype the epoch
-        assert_eq!(cell.get(epoch(1)), Some(10));
+        assert_eq!(cell.get(epoch(1)), Ok(10));
     }
 
     #[test]
@@ -67,18 +76,18 @@ mod tests {
         let cell: PerSystemOnceCell<u8> = PerSystemOnceCell::per_epoch();
         cell.set(epoch(1), 10);
         cell.set(epoch(2), 20);
-        assert_eq!(cell.get(epoch(1)), Some(10));
-        assert_eq!(cell.get(epoch(2)), Some(20));
-        assert_eq!(cell.get(epoch(3)), None, "an unentered epoch misses; it never borrows another epoch's identity");
+        assert_eq!(cell.get(epoch(1)), Ok(10));
+        assert_eq!(cell.get(epoch(2)), Ok(20));
+        assert_eq!(cell.get(epoch(3)), Err(UninitializedCell { epoch: epoch(3) }), "an unentered epoch misses; it never borrows another epoch's identity");
     }
 
     #[test]
     fn pinned_is_valid_at_every_epoch_and_ignores_writes() {
         let cell = PerSystemOnceCell::Pinned(7u8);
-        assert_eq!(cell.get(epoch(0)), Some(7));
-        assert_eq!(cell.get(epoch(99)), Some(7));
+        assert_eq!(cell.get(epoch(0)), Ok(7));
+        assert_eq!(cell.get(epoch(99)), Ok(7));
         cell.set(epoch(0), 8);
-        assert_eq!(cell.get(epoch(0)), Some(7));
+        assert_eq!(cell.get(epoch(0)), Ok(7));
     }
 
     #[test]

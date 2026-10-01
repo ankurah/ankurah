@@ -37,12 +37,13 @@ describe("Ref<T> preprocessing in create()", () => {
 
         // Pass View objects directly - this exercises js_preprocess_ref_field
         const trx = ctx.begin();
-        const msg = await TestMessage.create(trx, {
+        const created = await TestMessage.create(trx, {
             user: user, // TestUserView
             room: room, // TestRoomView
             text: "Hello from View!",
         });
         await trx.commit();
+        const msg = created.read();
 
         // Verify the refs were correctly extracted
         expect(msg.user.id.equals(user.id)).toBe(true);
@@ -60,12 +61,13 @@ describe("Ref<T> preprocessing in create()", () => {
 
         // Pass Ref wrappers - also exercises js_preprocess_ref_field
         const trx = ctx.begin();
-        const msg = await TestMessage.create(trx, {
+        const created = await TestMessage.create(trx, {
             user: userRef, // TestUserRef
             room: roomRef, // TestRoomRef
             text: "Hello from Ref!",
         });
         await trx.commit();
+        const msg = created.read();
 
         expect(msg.user.id.equals(user.id)).toBe(true);
         expect(msg.room.id.equals(room.id)).toBe(true);
@@ -77,12 +79,13 @@ describe("Ref<T> preprocessing in create()", () => {
 
         // Pass base64 strings - no preprocessing needed, direct serde
         const trx = ctx.begin();
-        const msg = await TestMessage.create(trx, {
+        const created = await TestMessage.create(trx, {
             user: user.id.to_base64(), // string
             room: room.id.to_base64(), // string
             text: "Hello from string!",
         });
         await trx.commit();
+        const msg = created.read();
 
         expect(msg.user.id.equals(user.id)).toBe(true);
         expect(msg.room.id.equals(room.id)).toBe(true);
@@ -93,7 +96,7 @@ describe("Ref<T> preprocessing in create()", () => {
         const room = await TestRoom.create_one(ctx, { name: "Lounge" });
 
         const trx = ctx.begin();
-        const msg = await TestMessage.create(trx, {
+        const created = await TestMessage.create(trx, {
             user: user,
             room: room,
             text: "Test traversal",
@@ -101,7 +104,7 @@ describe("Ref<T> preprocessing in create()", () => {
         await trx.commit();
 
         // Fetch the message and traverse the refs
-        const fetchedMsg = await TestMessage.get(ctx, msg.id);
+        const fetchedMsg = await TestMessage.get(ctx, created.id);
         const fetchedUser = await fetchedMsg.user.get(ctx);
         const fetchedRoom = await fetchedMsg.room.get(ctx);
 

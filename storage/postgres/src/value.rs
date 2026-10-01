@@ -2,7 +2,7 @@
 
 use ankurah_core::value::Value;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum PGValue {
     Bytea(Vec<u8>),
     CharacterVarying(String),

@@ -1,4 +1,9 @@
-use crate::{entity::Entity, error::MutationError, model::View, reactor::ChangeNotification};
+use crate::{
+    entity::Entity,
+    error::{MutationError, RetrievalError},
+    model::{Model, View},
+    reactor::ChangeNotification,
+};
 use ankurah_proto::{Attested, Event};
 
 #[derive(Debug, Clone)]
@@ -28,7 +33,7 @@ impl EntityChange {
         // after both events applied.
         let head = entity.head();
         for (i, event) in events.iter().enumerate() {
-            if event.payload.entity_id != entity.id {
+            if event.payload.entity_id != entity.id() {
                 return Err(MutationError::InvalidEvent);
             }
             let id = event.payload.id();
@@ -40,6 +45,16 @@ impl EntityChange {
         }
         Ok(Self { entity, events })
     }
+
+    /// Record an event immediately after application, before another event can supersede its head.
+    pub(crate) fn push_event(&mut self, event: Attested<Event>) -> Result<(), MutationError> {
+        if event.payload.entity_id != self.entity.id() || !self.entity.head().contains(&event.payload.id()) {
+            return Err(MutationError::InvalidEvent);
+        }
+        self.events.push(event);
+        Ok(())
+    }
+
     pub fn into_parts(self) -> (Entity, Vec<Attested<Event>>) { (self.entity, self.events) }
 }
 
@@ -80,25 +95,23 @@ where I: View
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ItemChange::Initial { item } => {
-                write!(f, "Initial {}/{}", I::collection(), item.id())
+                write!(f, "Initial {}/{}", I::Model::descriptor().label, item.id())
             }
             ItemChange::Add { item, .. } => {
-                write!(f, "Add {}/{}", I::collection(), item.id())
+                write!(f, "Add {}/{}", I::Model::descriptor().label, item.id())
             }
             ItemChange::Update { item, .. } => {
-                write!(f, "Update {}/{}", I::collection(), item.id())
+                write!(f, "Update {}/{}", I::Model::descriptor().label, item.id())
             }
             ItemChange::Remove { item, .. } => {
-                write!(f, "Remove {}/{}", I::collection(), item.id())
+                write!(f, "Remove {}/{}", I::Model::descriptor().label, item.id())
             }
         }
     }
 }
 
 impl std::fmt::Display for EntityChange {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "EntityChange {}/{}", self.entity.collection(), self.entity.id())
-    }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "EntityChange {}", self.entity.id()) }
 }
 
 use crate::resultset::ResultSet;
@@ -194,16 +207,18 @@ where I: View + Clone + 'static
 // Note: ChangeSet<Entity> conversion removed since Entity doesn't implement View
 // and ChangeSet is no longer used by Reactor
 
-impl<I> From<ItemChange<Entity>> for ItemChange<I>
+impl<I> TryFrom<ItemChange<Entity>> for ItemChange<I>
 where I: View
 {
-    fn from(change: ItemChange<Entity>) -> Self {
-        match change {
-            ItemChange::Initial { item } => ItemChange::Initial { item: I::from_entity(item) },
-            ItemChange::Add { item, events } => ItemChange::Add { item: I::from_entity(item), events },
-            ItemChange::Update { item, events } => ItemChange::Update { item: I::from_entity(item), events },
-            ItemChange::Remove { item, events } => ItemChange::Remove { item: I::from_entity(item), events },
-        }
+    type Error = RetrievalError;
+
+    fn try_from(change: ItemChange<Entity>) -> Result<Self, RetrievalError> {
+        Ok(match change {
+            ItemChange::Initial { item } => ItemChange::Initial { item: I::from_entity(item)? },
+            ItemChange::Add { item, events } => ItemChange::Add { item: I::from_entity(item)?, events },
+            ItemChange::Update { item, events } => ItemChange::Update { item: I::from_entity(item)?, events },
+            ItemChange::Remove { item, events } => ItemChange::Remove { item: I::from_entity(item)?, events },
+        })
     }
 }
 

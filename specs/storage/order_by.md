@@ -120,7 +120,7 @@ Sled uses byte-inversion to encode DESC columns directly in index keys. This mea
 - **Type definition**: `storage/common/src/types.rs` - `OrderByComponents`
 - **Planner logic**: `storage/common/src/planner.rs` - computes presort/spill
 - **Stream wrappers**: `storage/common/src/sorting.rs` - `SortedStream`, `TopKStream`
-- **IndexedDB usage**: `storage/indexeddb-wasm/src/collection.rs`
+- **IndexedDB usage**: `storage/indexeddb-wasm/src/bucket.rs`
 
 ## Edge Cases
 

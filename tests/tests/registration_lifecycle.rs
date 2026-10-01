@@ -18,7 +18,7 @@ type TestNode = Node<SledStorageEngine, PermissiveAgent>;
 /// current system epoch -- the registered-right-now probe, read from the
 /// descriptor itself.
 fn schema_registered(node: &TestNode, schema: &'static ankurah::core::schema::ModelStructDescriptor) -> bool {
-    node.system.system_epoch().is_some_and(|epoch| schema.resolved.get(epoch).is_some())
+    node.system.system_epoch().is_some_and(|epoch| schema.resolved.get(epoch).is_ok())
 }
 
 // Distinct models per behavior so the collections never collide.
@@ -84,7 +84,7 @@ async fn connected_pair(
     let server = durable_sled_setup().await?;
     let client = ephemeral_sled_setup().await?;
     let conn = LocalProcessConnection::new(&server, &client).await?;
-    client.system.wait_system_ready().await?;
+    client.wait_ready().await?;
     Ok((server, client, conn))
 }
 
@@ -111,8 +111,8 @@ fn resolve_by_collection(node: &TestNode, collection: &str, name: &str) -> Optio
 
 /// The stored catalog head for an entity (head-comparison helper; mirrors
 /// schema_registration.rs).
-async fn catalog_head(node: &TestNode, collection: &str, id: EntityId) -> anyhow::Result<proto::Clock> {
-    Ok(node.collections.get(&proto::CollectionId::fixed_name(collection)).await?.get_state(id).await?.payload.state.head)
+async fn catalog_head(node: &TestNode, _collection: &str, id: EntityId) -> anyhow::Result<proto::Clock> {
+    Ok(node.storage.get_state(id).await?.payload.state.head)
 }
 
 // (a) Auto-assert: create on the ephemeral; the durable executes the
@@ -211,17 +211,17 @@ async fn query_rejects_unknown_names_before_registration() -> anyhow::Result<()>
 #[tokio::test]
 async fn query_update_before_initial_resolution_uses_latest_selection() -> anyhow::Result<()> {
     let server = durable_sled_setup().await?;
-    let ctx = server.context(DEFAULT_CONTEXT)?;
+    let ctx = server.context_async(DEFAULT_CONTEXT).await?;
     let trx = ctx.begin();
     trx.create(&Widget { label: "old".into(), size: 1 }).await?;
     let latest = trx.create(&Widget { label: "latest".into(), size: 2 }).await?.id();
     trx.commit().await?;
 
-    for cached in [false, true] {
+    for cache_policy in [ankurah::CachePolicy::Durable, ankurah::CachePolicy::Local, ankurah::CachePolicy::Tracked] {
         let client = ephemeral_sled_setup().await?;
         let ctx = Context::new(client.clone(), DEFAULT_CONTEXT);
         let mut args = nocache("label = 'old'")?;
-        args.cached = cached;
+        args.cache_policy = cache_policy;
         let query = ctx.query::<WidgetView>(args)?;
         query.update_selection("label = 'intermediate'")?;
         query.update_selection("label = 'latest'")?;
@@ -237,6 +237,39 @@ async fn query_update_before_initial_resolution_uses_latest_selection() -> anyho
 }
 
 #[tokio::test]
+async fn tracked_fetch_still_requires_a_durable_answer_after_success() -> anyhow::Result<()> {
+    use ankurah::{CachePolicy, MatchArgs};
+
+    let server = durable_sled_setup().await?;
+    let writer = server.context_async(DEFAULT_CONTEXT).await?;
+    let trx = writer.begin();
+    let id = trx.create(&Widget { label: "cached".into(), size: 1 }).await?.id();
+    trx.commit().await?;
+
+    let client = ephemeral_sled_setup().await?;
+    let connection = LocalProcessConnection::new(&server, &client).await?;
+    let reader = client.context_async(DEFAULT_CONTEXT).await?;
+    let args = |selection: &str, cache_policy| -> anyhow::Result<MatchArgs<_>> {
+        Ok(MatchArgs { selection: ankql::parser::parse_selection(selection)?, cache_policy })
+    };
+    for policy in [CachePolicy::Durable, CachePolicy::Tracked] {
+        let rows = reader.fetch::<WidgetView>(args("true", policy)?).await?;
+        assert_eq!(rows.iter().map(|row| row.id()).collect::<Vec<_>>(), vec![id]);
+        assert!(reader.fetch::<WidgetView>(args("size = 0", policy)?).await?.is_empty());
+    }
+    drop(connection);
+
+    // Neither a populated nor an empty previous answer is tracked yet.
+    for policy in [CachePolicy::Durable, CachePolicy::Tracked] {
+        for selection in ["true", "size = 0"] {
+            let error = reader.fetch::<WidgetView>(args(selection, policy)?).await.unwrap_err();
+            assert!(matches!(error, RetrievalError::NoDurablePeers), "{policy:?}: {error:?}");
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn local_registration_resolution_does_not_require_a_write_credential() -> anyhow::Result<()> {
     use ankurah::core::schema::registration::RegistrationError;
 
@@ -245,7 +278,7 @@ async fn local_registration_resolution_does_not_require_a_write_credential() -> 
     let trx = writer.begin();
     let id = trx.create(&Widget { label: "present".into(), size: 1 }).await?.id();
     trx.commit().await?;
-    let model = writer.register_model::<Widget>().await?;
+    let model = writer.resolve_model_id::<Widget>().await?;
     let before = node.catalog.counts();
 
     for count in [0, 2] {
@@ -255,11 +288,11 @@ async fn local_registration_resolution_does_not_require_a_write_credential() -> 
         }
         assert!(sessions.write_credential().is_err());
         let context = node.context(sessions)?;
-        assert_eq!(context.register_model::<Widget>().await?, model);
+        assert_eq!(context.resolve_model_id::<Widget>().await?, model);
         assert_eq!(context.get::<WidgetView>(id).await?.label()?, "present");
         assert_eq!(context.fetch::<WidgetView>("label = 'present'").await?.len(), 1);
 
-        let error = context.register_model::<Gadget>().await.expect_err("unavailable credentials must not grant privilege");
+        let error = context.resolve_model_id::<Gadget>().await.expect_err("unavailable credentials must not grant privilege");
         assert!(matches!(error, RegistrationError::PolicyDenied { .. }));
         assert_eq!(node.catalog.counts(), before);
         assert!(!schema_registered(&node, Gadget::descriptor()));
@@ -319,7 +352,7 @@ async fn query_wait_rejects_unknown_names_without_registering() -> anyhow::Resul
 #[tokio::test]
 async fn query_registers_missing_fields_of_an_existing_model() -> anyhow::Result<()> {
     let server = durable_sled_setup().await?;
-    server.context(DEFAULT_CONTEXT)?.register_model::<offline_v1::Evolving>().await?;
+    server.context(DEFAULT_CONTEXT)?.resolve_model_id::<offline_v1::Evolving>().await?;
     let client = ephemeral_sled_setup().await?;
     let _conn = LocalProcessConnection::new(&server, &client).await?;
     client.system.wait_system_ready().await?;
@@ -377,7 +410,7 @@ async fn offline_create_unregistered_is_strict_registered_proceeds() -> anyhow::
 
     // Wait until Widget is known to the client's catalog before disconnecting.
     let ctx = client.context_async(DEFAULT_CONTEXT).await.unwrap();
-    ctx.register_model::<Widget>().await?;
+    ctx.resolve_model_id::<Widget>().await?;
     wait_resolve(&client, "widget", "label").await.expect("the projection delivers widget's rows while connected");
     assert!(client.catalog.model_by_label("widget").unwrap().is_some(), "widget known to the client's catalog while connected");
 
@@ -450,7 +483,7 @@ async fn offline_reassert_requires_every_compiled_field_to_be_bound() -> anyhow:
     let conn = LocalProcessConnection::new(&server, &client).await?;
     client.system.wait_system_ready().await?;
     let ctx = client.context_async(DEFAULT_CONTEXT).await.unwrap();
-    ctx.register_model::<offline_v1::Evolving>().await?;
+    ctx.resolve_model_id::<offline_v1::Evolving>().await?;
     // Wait until Evolving is known locally before testing offline reassertion.
     wait_resolve(&client, "evolving", "label").await.expect("the projection delivers evolving's rows while connected");
 
@@ -481,7 +514,7 @@ async fn descriptor_reasserts_mutable_catalog_metadata() -> anyhow::Result<()> {
     declaration.properties[0].optional = true;
     client.request(server.id, &DEFAULT_CONTEXT, proto::NodeRequestBody::RegisterSchema { model: declaration }).await?;
 
-    server.context(DEFAULT_CONTEXT)?.register_model::<Widget>().await?;
+    server.context(DEFAULT_CONTEXT)?.resolve_model_id::<Widget>().await?;
 
     let (model_id, model) = server.catalog.model_by_label("widget").unwrap().expect("widget model");
     assert_eq!(model.name, "Widget");
@@ -508,7 +541,7 @@ async fn predicate_read_path_heals_and_defines() -> anyhow::Result<()> {
     assert!(schema_registered(&server, Doohickey::descriptor()), "the healing read resolves the descriptor");
 
     // A second register is idempotent against the same rows.
-    ctx.register_model::<Doohickey>().await?;
+    ctx.resolve_model_id::<Doohickey>().await?;
     assert_eq!(resolve_by_collection(&server, "doohickey", "tag"), tag_id, "re-register must not re-mint");
 
     Ok(())
@@ -522,7 +555,7 @@ async fn healing_registers_only_the_added_field() -> anyhow::Result<()> {
     let ctx = server.context(DEFAULT_CONTEXT)?;
 
     // The system knows the one-field shape.
-    ctx.register_model::<offline_v1::Evolving>().await?;
+    ctx.resolve_model_id::<offline_v1::Evolving>().await?;
     let (model, _) = server.catalog.model_by_label("evolving").unwrap().expect("evolving model");
     let Some(PropertyId::EntityId(label)) = resolve_by_collection(&server, "evolving", "label") else {
         anyhow::bail!("evolving.label resolves after the first registration");
@@ -666,7 +699,7 @@ async fn transaction_get_binds_the_model_before_field_access() -> anyhow::Result
     Ok(())
 }
 
-// (a) Explicit register_model::<M>() on a durable node's context: catalog entries
+// (a) Explicit resolve_model_id::<M>() on a durable node's context: catalog entries
 // exist locally afterwards, and a second call is a no-op (catalog heads
 // unchanged, using the same head-comparison pattern as
 // schema_registration.rs).
@@ -677,7 +710,7 @@ async fn explicit_register_is_strict_and_idempotent() -> anyhow::Result<()> {
     let ctx = server.context(DEFAULT_CONTEXT)?;
 
     // Strict register: propagates errors (here, succeeds).
-    ctx.register_model::<Gizmo>().await?;
+    ctx.resolve_model_id::<Gizmo>().await?;
 
     // Catalog entries exist locally after the explicit register; the ids
     // are this durable's allocations.
@@ -690,7 +723,7 @@ async fn explicit_register_is_strict_and_idempotent() -> anyhow::Result<()> {
 
     // Second call: the collection is latched as ensured, so it is a pure
     // no-op -- no new events, catalog heads unchanged.
-    ctx.register_model::<Gizmo>().await?;
+    ctx.resolve_model_id::<Gizmo>().await?;
 
     let head_after = catalog_head(&server, "_ankurah_property", title_id).await?;
     let ms_head_after = catalog_head(&server, "_ankurah_model_property", membership).await?;
@@ -723,7 +756,7 @@ async fn offline_register_is_strict_reconnect_proceeds() -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    let err = ctx.register_model::<Gadget>().await.expect_err("offline register of an unregistered collection must fail");
+    let err = ctx.resolve_model_id::<Gadget>().await.expect_err("offline register of an unregistered collection must fail");
     assert!(err.to_string().contains("gadget"), "actionable strict error naming the collection, got: {err}");
     assert!(resolve_by_collection(&server, "gadget", "name").is_none(), "nothing reached the durable");
     assert!(!schema_registered(&client, Gadget::descriptor()), "a strict failure must leave the descriptor unresolved");
@@ -737,7 +770,7 @@ async fn offline_register_is_strict_reconnect_proceeds() -> anyhow::Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    ctx.register_model::<Gadget>().await?;
+    ctx.resolve_model_id::<Gadget>().await?;
     assert!(schema_registered(&client, Gadget::descriptor()), "the forwarded registration resolves on ack");
     let name_id = wait_resolve(&server, "gadget", "name").await.expect("durable allocates gadget.name after reconnect");
     assert_eq!(wait_resolve(&client, "gadget", "name").await, Some(name_id), "the client's projection converges on the allocator's ids");
@@ -771,16 +804,16 @@ async fn halted_node_cannot_reregister_even_an_already_bound_descriptor() -> any
         client.set_allow_system_replacement(true);
         assert_eq!(client.system.adopt_system(proposed).await, Err(PeerConnectionError::NodeHalted(halt_reason.clone())));
 
-        let bound_error = ctx.register_model::<Gizmo>().await.expect_err("halting must take priority over the already-bound fast path");
+        let bound_error = ctx.resolve_model_id::<Gizmo>().await.expect_err("halting must take priority over the already-bound fast path");
         assert!(matches!(bound_error, RegistrationError::Retrieval(RetrievalError::NodeHalted(error)) if error == halt_reason));
-        let unbound_error = ctx.register_model::<Gadget>().await.expect_err("halting must prevent new registration");
+        let unbound_error = ctx.resolve_model_id::<Gadget>().await.expect_err("halting must prevent new registration");
         assert!(matches!(unbound_error, RegistrationError::Retrieval(RetrievalError::NodeHalted(error)) if error == halt_reason));
 
         assert_eq!(client.state().peek(), NodeState::Halted(halt_reason));
         assert_eq!(client.system.system_epoch(), None);
-        assert_eq!(Gizmo::descriptor().resolved.get(epoch), Some(binding), "existing views keep their original bindings");
+        assert_eq!(Gizmo::descriptor().resolved.get(epoch), Ok(binding), "existing views keep their original bindings");
         assert_eq!(retained_view.title()?, "retained binding");
-        assert!(Gadget::descriptor().resolved.get(epoch).is_none());
+        assert!(Gadget::descriptor().resolved.get(epoch).is_err());
         assert!(server.catalog.model_by_label("gadget").unwrap().is_none(), "failed registration must not allocate on the durable");
         Ok(())
     })
@@ -828,11 +861,86 @@ async fn custom_property_type_declares_its_value_type() -> anyhow::Result<()> {
     // of the allocated definition.
     let node = durable_sled_setup().await?;
     let ctx = node.context_async(DEFAULT_CONTEXT).await.unwrap();
-    ctx.register_model::<Review>().await?;
+    ctx.resolve_model_id::<Review>().await?;
 
     let rating_id = wait_resolve(&node, "review", "rating").await.expect("review.rating resolves after register");
     let def = node.catalog.property_by_id(&rating_id).unwrap().expect("catalog property def");
     assert_eq!(def.value_type, "i64", "the catalog stores the declared value_type as the canonical type");
     assert_eq!(def.backend, "lww");
+    Ok(())
+}
+
+#[derive(Model, Debug)]
+pub struct ColdCatalog {
+    pub value: String,
+}
+
+#[tokio::test]
+async fn catalog_lookup_waits_for_subscription_delivery() -> anyhow::Result<()> {
+    use ankurah::core::schema::CatalogResolver;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
+
+    let server = durable_sled_setup().await?;
+    let client = ephemeral_sled_setup().await?;
+    let hold = Arc::new(AtomicBool::new(false));
+    let gated = hold.clone();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let observed_reads = reads.clone();
+    let (_connection, gate) = GatedConnection::new(&server, &client, move |message| {
+        if matches!(
+            message,
+            proto::NodeMessage::Response(proto::NodeResponse {
+                body: proto::NodeResponseBody::Get(_) | proto::NodeResponseBody::Fetch(_),
+                ..
+            })
+        ) {
+            observed_reads.fetch_add(1, Ordering::Relaxed);
+        }
+        gated.load(Ordering::Relaxed) && matches!(message, proto::NodeMessage::Update { .. })
+    })
+    .await;
+    let server_ctx = server.context_async(DEFAULT_CONTEXT).await?;
+    let client_ctx = client.context_async(DEFAULT_CONTEXT).await?;
+    hold.store(true, Ordering::Relaxed);
+
+    server_ctx.resolve_model_id::<ColdCatalog>().await?;
+    let schema = ColdCatalog::descriptor();
+    let epoch = server.system.system_epoch().unwrap();
+    let model = schema.resolved.get(epoch).unwrap();
+    let property = schema.field_by_name("value").unwrap().resolved.get(epoch).unwrap();
+    let proto::ModelId::EntityId(model_id) = model else { unreachable!() };
+    let PropertyId::EntityId(property_id) = property else { unreachable!() };
+    assert!(client.catalog.model_by_id(&model_id)?.is_none());
+    assert!(client.catalog.property_by_id(&property_id)?.is_none());
+    let before = server.catalog.counts();
+    let reads_before = reads.load(Ordering::Relaxed);
+
+    let labels = async { futures_util::join!(client.catalog.get_model_label(&model), client.catalog.get_property_label(&property)) };
+    futures_util::pin_mut!(labels);
+    assert!(futures_util::poll!(&mut labels).is_pending(), "known IDs must wait for their catalog rows");
+
+    hold.store(false, Ordering::Relaxed);
+    gate.release_held(&client).await;
+    assert_eq!(labels.await, (Some("ColdCatalog".to_owned()), Some("value".to_owned())));
+    assert_eq!(reads.load(Ordering::Relaxed), reads_before, "label lookups must not issue Get or Fetch requests");
+
+    let unknown_model = proto::ModelId::EntityId(EntityId::from_bytes([0xfe; 32]));
+    let unknown_property = PropertyId::EntityId(EntityId::from_bytes([0xfd; 32]));
+    let missing =
+        async { futures_util::join!(client.catalog.get_model_label(&unknown_model), client.catalog.get_property_label(&unknown_property)) };
+    futures_util::pin_mut!(missing);
+    assert!(futures_util::poll!(&mut missing).is_pending(), "unknown IDs should get a chance to arrive");
+    assert_eq!(missing.await, (None, None), "unavailable labels should time out");
+    assert_eq!(reads.load(Ordering::Relaxed), reads_before, "timed-out lookups must not issue read requests");
+    assert_eq!(server.catalog.counts(), before, "lookups must not register catalog definitions");
+
+    let trx = client_ctx.begin();
+    let entity = trx.create(&ColdCatalog { value: "available after catalog delivery".into() }).await?;
+    let id = entity.id();
+    trx.commit().await?;
+    assert_eq!(client_ctx.get::<ColdCatalogView>(id).await?.value()?, "available after catalog delivery");
     Ok(())
 }

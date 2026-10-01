@@ -2,7 +2,7 @@ mod common;
 
 use ankurah::core::{
     connector::PeerConnectionError,
-    error::{NodeHaltReason, RetrievalError},
+    error::{NodeHaltReason, NodeReadinessError, RetrievalError},
 };
 use common::*;
 use std::{sync::Arc, time::Duration};
@@ -105,9 +105,9 @@ async fn halted_node_stops_queries_and_new_operations_but_retained_views_remain_
         assert!(matches!(context.get_cached::<AlbumView>(id).await, Err(RetrievalError::NodeHalted(error)) if error == halt_reason));
         assert!(matches!(context.fetch::<AlbumView>("true").await, Err(RetrievalError::NodeHalted(error)) if error == halt_reason));
         assert!(matches!(context.query::<AlbumView>("true"), Err(RetrievalError::NodeHalted(error)) if error == halt_reason));
-        assert_eq!(client.context_async(DEFAULT_CONTEXT).await.err(), Some(halt_reason.clone()));
+        assert_eq!(client.context_async(DEFAULT_CONTEXT).await.err(), Some(halt_reason.clone().into()));
         let context_error = client.context(DEFAULT_CONTEXT).err().expect("a halted node cannot issue a new context");
-        assert_eq!(context_error.downcast_ref::<NodeHaltReason>(), Some(&halt_reason));
+        assert_eq!(context_error.downcast_ref::<NodeReadinessError>(), Some(&halt_reason.clone().into()));
 
         let new_transaction = context.begin();
         retained.edit(&new_transaction)?.name()?.replace("local only")?;

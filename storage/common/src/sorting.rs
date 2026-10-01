@@ -10,26 +10,28 @@ use crate::{EngineColumns, OrderByComponents};
 
 /// Helper function to sort items by ORDER BY clauses
 fn sort_items_by_order<T: ValueLookup<EngineColumns>>(items: &mut [T], order_by: &[ankql::ast::OrderByItem<EngineColumns>]) {
-    items.sort_by(|a, b| {
-        for order_item in order_by {
-            let a_val = a.value_at(&order_item.path);
-            let b_val = b.value_at(&order_item.path);
+    items.sort_by(|a, b| compare_items(a, b, order_by));
+}
 
-            // Handle None values: None sorts before Some
-            let cmp = match (a_val, b_val, &order_item.direction) {
-                (None, None, _) => Ordering::Equal,
-                (None, Some(_), _) => Ordering::Less,
-                (Some(_), None, _) => Ordering::Greater,
-                (Some(a), Some(b), ankql::ast::OrderDirection::Asc) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
-                (Some(a), Some(b), ankql::ast::OrderDirection::Desc) => b.partial_cmp(&a).unwrap_or(Ordering::Equal),
-            };
+pub(crate) fn compare_items<S: ankql::ast::Stage, T: ValueLookup<S>>(a: &T, b: &T, order_by: &[ankql::ast::OrderByItem<S>]) -> Ordering {
+    for order_item in order_by {
+        let a_val = a.value_at(&order_item.path);
+        let b_val = b.value_at(&order_item.path);
 
-            if cmp != Ordering::Equal {
-                return cmp;
-            }
+        // Handle None values: None sorts before Some
+        let cmp = match (a_val, b_val, &order_item.direction) {
+            (None, None, _) => Ordering::Equal,
+            (None, Some(_), _) => Ordering::Less,
+            (Some(_), None, _) => Ordering::Greater,
+            (Some(a), Some(b), ankql::ast::OrderDirection::Asc) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
+            (Some(a), Some(b), ankql::ast::OrderDirection::Desc) => b.partial_cmp(&a).unwrap_or(Ordering::Equal),
+        };
+
+        if cmp != Ordering::Equal {
+            return cmp;
         }
-        Ordering::Equal
-    });
+    }
+    Ordering::Equal
 }
 
 /// Extract partition key (presort column values) from an item
