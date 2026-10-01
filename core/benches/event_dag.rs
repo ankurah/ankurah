@@ -81,7 +81,7 @@ fn event(seed: u32, parents: &[EventId]) -> Event {
     } else {
         EventBody::Update { nonce, timestamp: 0, author: AuthorId::Unknown, operations }
     };
-    Event { entity_id: EntityId::from_bytes(entity_id_bytes), collection: "bench".into(), parent, body }
+    Event { entity_id: EntityId::from_bytes(entity_id_bytes), parent, body }
 }
 
 /// A generated scenario: the populated retriever plus the two clocks to
