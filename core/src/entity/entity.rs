@@ -1,5 +1,10 @@
 use super::{proxy::EntityProxy, set::Registration, state::EntityState};
-use crate::{error::{MutationError, StateError}, property::PropertyError, schema::SystemEpoch, value::Value};
+use crate::{
+    error::{MutationError, StateError},
+    property::PropertyError,
+    schema::SystemEpoch,
+    value::Value,
+};
 use ankurah_proto::{Clock, EntityId, EntityState as ProtoEntityState, ModelId, PropertyId, State};
 use ankurah_signals::broadcast::Broadcast;
 use std::{collections::BTreeSet, sync::Arc};
@@ -37,7 +42,9 @@ impl Entity {
     }
 
     pub(crate) fn check_epoch(&self, expected: SystemEpoch) -> Result<(), MutationError> {
-        if self.system_epoch() != expected { return Err(MutationError::ForeignEntity); }
+        if self.system_epoch() != expected {
+            return Err(MutationError::ForeignEntity);
+        }
         Ok(())
     }
 
@@ -64,7 +71,9 @@ impl Entity {
     pub fn values(&self) -> Result<Vec<(PropertyId, Option<Value>)>, PropertyError> { self.with_state(EntityState::values) }
 
     pub fn property_value(&self, property: &PropertyId) -> Result<Option<Value>, PropertyError> {
-        if *property == PropertyId::Id { return Ok(Some(Value::EntityId(self.id()))); }
+        if *property == PropertyId::Id {
+            return Ok(Some(Value::EntityId(self.id())));
+        }
         self.with_state(|state| state.value(property))
     }
 
@@ -149,10 +158,6 @@ impl EntityInner {
 
 impl std::fmt::Debug for EntityInner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EntityInner")
-            .field("id", &self.id)
-            .field("state", &self.state)
-            .field("system_epoch", &self.system_epoch())
-            .finish()
+        f.debug_struct("EntityInner").field("id", &self.id).field("state", &self.state).field("system_epoch", &self.system_epoch()).finish()
     }
 }

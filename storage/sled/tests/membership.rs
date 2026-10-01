@@ -7,9 +7,7 @@ async fn indexed_entity_id_order() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn joined_memberships() -> anyhow::Result<()> {
-    cases::check(&ankurah_storage_sled::SledStorageEngine::new_test()?).await
-}
+async fn joined_memberships() -> anyhow::Result<()> { cases::check(&ankurah_storage_sled::SledStorageEngine::new_test()?).await }
 
 #[tokio::test]
 async fn indexed_memberships() -> anyhow::Result<()> {

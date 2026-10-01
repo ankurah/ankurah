@@ -78,12 +78,7 @@ impl PolicyAgent for WriteProbe {
         Ok(ankql::ast::Predicate::True)
     }
 
-    fn check_write(
-        &self,
-        _data: &Self::ContextData,
-        _entity: &Entity,
-        _event: Option<&proto::Event>,
-    ) -> Result<(), AccessDenied> {
+    fn check_write(&self, _data: &Self::ContextData, _entity: &Entity, _event: Option<&proto::Event>) -> Result<(), AccessDenied> {
         (self.0)()
     }
 
@@ -206,7 +201,9 @@ async fn creation_freezes_only_when_identity_is_needed() -> Result<()> {
         if let Some(reference) = &reference {
             assert!(matches!(context.get::<AlbumView>(reference.id()).await, Err(RetrievalError::EntityNotFound(_))));
         }
-        let Err(RetrievalError::PropertyError(error)) = view.edit(&trx) else { panic!("only committed entities can be edited from a view") };
+        let Err(RetrievalError::PropertyError(error)) = view.edit(&trx) else {
+            panic!("only committed entities can be edited from a view")
+        };
         assert!(matches!(*error, ankurah::property::PropertyError::Uncommitted));
         assert_eq!(album.entity().head().is_empty(), !early_reference, "a rejected edit must not freeze genesis");
         name.replace("Edited before commit")?;
@@ -216,7 +213,9 @@ async fn creation_freezes_only_when_identity_is_needed() -> Result<()> {
         assert!(events[0].is_entity_create());
         assert_eq!(view.id(), events[0].entity_id);
         assert_eq!(view.name()?, "Edited before commit");
-        if let Some(reference) = reference { assert_eq!(reference.id(), view.id()); }
+        if let Some(reference) = reference {
+            assert_eq!(reference.id(), view.id());
+        }
         assert!(name.replace("too late").is_err());
         assert_eq!(context.get::<AlbumView>(view.id()).await?.name()?, "Edited before commit");
     }

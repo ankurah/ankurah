@@ -6,7 +6,7 @@ use crate::{
     entity::Entity,
     error::SubscriptionError,
     node::Node,
-    policy::{PolicyAgent, ContextPolicy},
+    policy::{ContextPolicy, PolicyAgent},
     reactor::{
         fetch_gap::{GapFetcher, QueryGapFetcher},
         ReactorSubscription, ReactorUpdate,
@@ -119,8 +119,7 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
             }
         };
 
-        let response =
-            self.subscribe_query_inner(node, query_id, selection, &sessions, &credentials, version, known_matches).await;
+        let response = self.subscribe_query_inner(node, query_id, selection, &sessions, &credentials, version, known_matches).await;
 
         if response.is_err() && query_created {
             queries.remove(&query_id);

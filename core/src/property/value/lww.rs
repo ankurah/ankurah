@@ -23,7 +23,9 @@ pub struct LWWMut<T: Property> {
 }
 
 impl<T: Property> std::fmt::Debug for LWWMut<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.debug_struct("LWWMut").field("property", &self.property).finish() }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LWWMut").field("property", &self.property).finish()
+    }
 }
 
 impl<T: Property> LWWMut<T> {

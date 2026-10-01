@@ -126,9 +126,7 @@ impl NodeApplier {
 
                 // We did not receive an entity fragment, so we need to retrieve it from local storage or a remote peer
                 let Some(first) = attested_events.first() else { return Ok(()) };
-                let candidate = RemoteTrxEntity::for_event(
-                    &node.entities, state_getter, event_getter, &first.payload,
-                ).await?;
+                let candidate = RemoteTrxEntity::for_event(&node.entities, state_getter, event_getter, &first.payload).await?;
 
                 let mut applied_events = Vec::new();
                 let mut failure: Option<MutationError> = None;
@@ -155,8 +153,12 @@ impl NodeApplier {
                     }
                 }
 
-                if let Some(entity) = node.entities.get(&entity_id) { entities.push(entity); }
-                if let Some(e) = failure { return Err(e); }
+                if let Some(entity) = node.entities.get(&entity_id) {
+                    entities.push(entity);
+                }
+                if let Some(e) = failure {
+                    return Err(e);
+                }
             }
 
             // StateAndEvent: equivalent to old SubscriptionItem::Add
@@ -174,7 +176,11 @@ impl NodeApplier {
                     changes.push(EntityChange::new(entity, attested_events)?);
                     return Ok(());
                 }
-                let entity = node.entities.get_or_retrieve(state_getter, event_getter, &entity_id).await?.ok_or(RetrievalError::EntityNotFound(entity_id))?;
+                let entity = node
+                    .entities
+                    .get_or_retrieve(state_getter, event_getter, &entity_id)
+                    .await?
+                    .ok_or(RetrievalError::EntityNotFound(entity_id))?;
                 entities.push(entity.clone());
                 let candidate = RemoteTrxEntity::edit(&entity)?;
                 let changed = matches!(candidate.apply_state(event_getter, &state.payload.state).await?, StateApplyResult::Applied);
@@ -266,9 +272,7 @@ impl NodeApplier {
             storage_trx.add_events(events).await?;
             let _publication = node.commit_publication_lock.lock().await;
             storage_trx.commit().await?.committed()?;
-            node.entities.with_state(
-                &LocalStateGetter::new(node.storage.clone()), event_getter, entity.id(), state.payload.state,
-            ).await?;
+            node.entities.with_state(&LocalStateGetter::new(node.storage.clone()), event_getter, entity.id(), state.payload.state).await?;
             Ok(())
         })
     }
@@ -289,9 +293,7 @@ impl NodeApplier {
         let Some(first) = events.first() else { return Ok(None) };
         let state_getter = LocalStateGetter::new(node.storage.clone());
         crate::util::retry::retry_on!(MutationError::WriteConflict, {
-            let candidate = RemoteTrxEntity::for_event(
-                &node.entities, &state_getter, event_getter, &first.payload,
-            ).await?;
+            let candidate = RemoteTrxEntity::for_event(&node.entities, &state_getter, event_getter, &first.payload).await?;
             let expected_head = candidate.head();
             for event in events {
                 candidate.apply_event(event_getter, &mut event.clone(), |_| Ok(None)).await?;
@@ -399,9 +401,14 @@ impl NodeApplier {
                 if let Some(entity) = Self::save_new_entity(node, &attested_state.payload, &[], event_getter, state_getter).await? {
                     return Ok(Some(EntityChange::new(entity, Vec::new())?));
                 }
-                let entity = node.entities.get_or_retrieve(state_getter, event_getter, &delta.entity_id).await?.ok_or(RetrievalError::EntityNotFound(delta.entity_id))?;
+                let entity = node
+                    .entities
+                    .get_or_retrieve(state_getter, event_getter, &delta.entity_id)
+                    .await?
+                    .ok_or(RetrievalError::EntityNotFound(delta.entity_id))?;
                 let candidate = RemoteTrxEntity::edit(&entity)?;
-                let changed = matches!(candidate.apply_state(event_getter, &attested_state.payload.state).await?, StateApplyResult::Applied);
+                let changed =
+                    matches!(candidate.apply_state(event_getter, &attested_state.payload.state).await?, StateApplyResult::Applied);
 
                 // Save state to storage
                 Self::save_state(node, &entity, candidate.to_state()?, &[], event_getter).await?;

@@ -75,8 +75,11 @@ fn test_filter_predicate_no_scope_rules() {
     let model = common::policy_models(&agent, &["comment"]).id("comment");
 
     let result = ContextPolicy::from_credentials(&agent, &ctx).filter_predicate(common::in_model(model, predicate.clone())).unwrap();
-    assert_eq!(result, Predicate::And(Box::new(common::in_model(model, predicate)), Box::new(Predicate::MemberOf(model))),
-        "a grant without scopes still requires membership");
+    assert_eq!(
+        result,
+        Predicate::And(Box::new(common::in_model(model, predicate)), Box::new(Predicate::MemberOf(model))),
+        "a grant without scopes still requires membership"
+    );
 }
 
 /// Author role (lacks manage_posts) gets scope filter AND-ed in
@@ -129,8 +132,11 @@ fn test_filter_predicate_unless_privilege_bypasses() {
     let model = common::policy_models(&agent, &["post"]).id("post");
 
     let result = ContextPolicy::from_credentials(&agent, &ctx).filter_predicate(common::in_model(model, predicate.clone())).unwrap();
-    assert_eq!(result, Predicate::And(Box::new(common::in_model(model, predicate)), Box::new(Predicate::MemberOf(model))),
-        "Editor should bypass the row scope, not the membership restriction");
+    assert_eq!(
+        result,
+        Predicate::And(Box::new(common::in_model(model, predicate)), Box::new(Predicate::MemberOf(model))),
+        "Editor should bypass the row scope, not the membership restriction"
+    );
 }
 
 /// NoUser supplies no grant, including when scope rules exist.
@@ -217,7 +223,9 @@ fn test_filter_predicate_injection_payload_is_inert() {
     // Claim values are populated into the parsed AST, never spliced into the
     // filter text — the payload lands as an ordinary string literal and the
     // scope clause structure is preserved intact.
-    let result = ContextPolicy::from_credentials(&agent, &ctx).filter_predicate(common::in_model(model, predicate)).expect("injection payload must be inert, not an error");
+    let result = ContextPolicy::from_credentials(&agent, &ctx)
+        .filter_predicate(common::in_model(model, predicate))
+        .expect("injection payload must be inert, not an error");
     match &result {
         Predicate::And(left, right) => {
             let scope_display = format!("{}", right);
@@ -304,7 +312,9 @@ fn assert_agrees_with_check_read<C: Iterable<JwtContext>>(
     let model = common::policy_models(&agent, &["post"]).id("post");
     // Install the fixture's stand-in for the catalog binding, so the agent's
     // row-side scope checks resolve the same identities the rows carry.
-    let filtered = ContextPolicy::from_credentials(agent, contexts).filter_predicate(common::in_model(model, base.clone())).expect("every scenario here yields a filter");
+    let filtered = ContextPolicy::from_credentials(agent, contexts)
+        .filter_predicate(common::in_model(model, base.clone()))
+        .expect("every scenario here yields a filter");
 
     for row in rows {
         let readable = ContextPolicy::from_credentials(agent, contexts).check_read(&proto::EntityId::random(), &post_state(*row)).is_ok();
@@ -332,12 +342,17 @@ fn test_filter_predicate_single_context_parity() {
     let ctx = blog_context(&keys, "author-42", "Author");
     let model = common::policy_models(&agent, &["post"]).id("post");
 
-    let result = ContextPolicy::from_credentials(&agent, &ctx).filter_predicate(common::in_model(model, make_predicate("title = 'hello'"))).unwrap();
+    let result =
+        ContextPolicy::from_credentials(&agent, &ctx).filter_predicate(common::in_model(model, make_predicate("title = 'hello'"))).unwrap();
 
-    assert_eq!(result, Predicate::And(
-        Box::new(common::in_model(model, make_predicate("title = 'hello'"))),
-        Box::new(common::in_model(model, make_predicate("author = 'author-42'"))),
-    ), "a lone credential's narrowing must not add an OR");
+    assert_eq!(
+        result,
+        Predicate::And(
+            Box::new(common::in_model(model, make_predicate("title = 'hello'"))),
+            Box::new(common::in_model(model, make_predicate("author = 'author-42'"))),
+        ),
+        "a lone credential's narrowing must not add an OR"
+    );
 }
 
 /// Two credentials see the union of their slices: each author's own posts
@@ -350,7 +365,9 @@ fn test_filter_predicate_unions_across_contexts() {
     let contexts = vec![blog_context(&keys, "author-1", "Author"), blog_context(&keys, "author-2", "Author")];
     let model = common::policy_models(&agent, &["post"]).id("post");
 
-    let result = ContextPolicy::from_credentials(&agent, &contexts).filter_predicate(common::in_model(model, make_predicate("title = 'hello'"))).unwrap();
+    let result = ContextPolicy::from_credentials(&agent, &contexts)
+        .filter_predicate(common::in_model(model, make_predicate("title = 'hello'")))
+        .unwrap();
 
     assert!(admits(&result, Post { author: "author-1", title: "hello" }), "the first credential's posts are readable");
     assert!(admits(&result, Post { author: "author-2", title: "hello" }), "the second credential's posts are readable too");
@@ -371,8 +388,11 @@ fn test_filter_predicate_unrestricted_context_collapses_union() {
 
     let result = ContextPolicy::from_credentials(&agent, &contexts).filter_predicate(common::in_model(model, predicate.clone())).unwrap();
 
-    assert_eq!(result, Predicate::And(Box::new(common::in_model(model, predicate)), Box::new(Predicate::MemberOf(model))),
-        "an unrestricted credential leaves no row scopes to union");
+    assert_eq!(
+        result,
+        Predicate::And(Box::new(common::in_model(model, predicate)), Box::new(Predicate::MemberOf(model))),
+        "an unrestricted credential leaves no row scopes to union"
+    );
     assert!(admits(&result, Post { author: "someone-else", title: "hello" }), "the editor may read posts it did not author");
     assert!(admits(&result, Post { author: "author-42", title: "hello" }), "the author's own posts stay readable");
     assert!(!admits(&result, Post { author: "someone-else", title: "other" }), "the caller's own predicate still binds");
@@ -392,7 +412,9 @@ fn test_filter_predicate_unions_three_contexts() {
     ];
     let model = common::policy_models(&agent, &["post"]).id("post");
 
-    let result = ContextPolicy::from_credentials(&agent, &contexts).filter_predicate(common::in_model(model, make_predicate("title = 'hello'"))).unwrap();
+    let result = ContextPolicy::from_credentials(&agent, &contexts)
+        .filter_predicate(common::in_model(model, make_predicate("title = 'hello'")))
+        .unwrap();
 
     assert!(admits(&result, Post { author: "author-1", title: "hello" }), "the first credential's posts are readable");
     assert!(admits(&result, Post { author: "author-2", title: "hello" }), "the second credential's posts are readable");
@@ -410,10 +432,14 @@ fn test_filter_predicate_deduplicates_equal_slices() {
     let model = common::policy_models(&agent, &["post"]).id("post");
 
     let lone = blog_context(&keys, "author-42", "Author");
-    let single = ContextPolicy::from_credentials(&agent, &lone).filter_predicate(common::in_model(model, make_predicate("title = 'hello'"))).unwrap();
+    let single = ContextPolicy::from_credentials(&agent, &lone)
+        .filter_predicate(common::in_model(model, make_predicate("title = 'hello'")))
+        .unwrap();
 
     let duplicated = vec![blog_context(&keys, "author-42", "Author"), blog_context(&keys, "author-42", "Author")];
-    let result = ContextPolicy::from_credentials(&agent, &duplicated).filter_predicate(common::in_model(model, make_predicate("title = 'hello'"))).unwrap();
+    let result = ContextPolicy::from_credentials(&agent, &duplicated)
+        .filter_predicate(common::in_model(model, make_predicate("title = 'hello'")))
+        .unwrap();
 
     assert_eq!(result, single, "a repeated credential must not repeat its branch");
 }
@@ -427,11 +453,12 @@ fn test_filter_predicate_empty_context_set() {
     let contexts: Vec<JwtContext> = Vec::new();
     let predicate = make_predicate("title = 'hello'");
 
-    let scoped = ContextPolicy::from_credentials(&agent, &contexts).filter_predicate(common::in_model(common::policy_models(&agent, &["post"]).id("post"), predicate.clone()));
+    let scoped = ContextPolicy::from_credentials(&agent, &contexts)
+        .filter_predicate(common::in_model(common::policy_models(&agent, &["post"]).id("post"), predicate.clone()));
     assert!(matches!(scoped, Ok(Predicate::And(_, grant)) if *grant == Predicate::False));
 
-    let unscoped =
-        ContextPolicy::from_credentials(&agent, &contexts).filter_predicate(common::in_model(common::policy_models(&agent, &["comment"]).id("comment"), predicate.clone()));
+    let unscoped = ContextPolicy::from_credentials(&agent, &contexts)
+        .filter_predicate(common::in_model(common::policy_models(&agent, &["comment"]).id("comment"), predicate.clone()));
     assert!(matches!(unscoped, Ok(Predicate::And(_, grant)) if *grant == Predicate::False));
 }
 
@@ -447,7 +474,9 @@ fn test_filter_predicate_ignores_unauthorized_context() {
     let contexts = vec![blog_context(&keys, "reader-1", "Reader"), blog_context(&keys, "author-42", "Author")];
     let model = common::policy_models(&agent, &["post"]).id("post");
 
-    let result = ContextPolicy::from_credentials(&agent, &contexts).filter_predicate(common::in_model(model, make_predicate("title = 'hello'"))).unwrap();
+    let result = ContextPolicy::from_credentials(&agent, &contexts)
+        .filter_predicate(common::in_model(model, make_predicate("title = 'hello'")))
+        .unwrap();
 
     assert!(admits(&result, Post { author: "author-42", title: "hello" }), "the authorized credential's posts are readable");
     assert!(!admits(&result, Post { author: "reader-1", title: "hello" }), "the unauthorized credential opens no window of its own");
@@ -549,15 +578,18 @@ fn test_filter_predicate_skips_unresolvable_credential() {
 
     let contexts = vec![unresolvable_author(&keys, "no-claim-1"), resolvable_author(&keys, "author-42")];
 
-    let result =
-        ContextPolicy::from_credentials(&agent, &contexts).filter_predicate(common::in_model(model, predicate.clone())).expect("one unresolvable credential must not refuse the query");
+    let result = ContextPolicy::from_credentials(&agent, &contexts)
+        .filter_predicate(common::in_model(model, predicate.clone()))
+        .expect("one unresolvable credential must not refuse the query");
 
     assert!(admits(&result, Post { author: "author-42", title: "hello" }), "the working credential's posts stay readable");
     assert!(!admits(&result, Post { author: "no-claim-1", title: "hello" }), "the skipped credential opens no window of its own");
     assert!(!admits(&result, Post { author: "author-42", title: "other" }), "the caller's own predicate still binds");
     assert_eq!(
         result,
-        ContextPolicy::from_credentials(&agent, &resolvable_author(&keys, "author-42")).filter_predicate(common::in_model(model, predicate)).unwrap(),
+        ContextPolicy::from_credentials(&agent, &resolvable_author(&keys, "author-42"))
+            .filter_predicate(common::in_model(model, predicate))
+            .unwrap(),
         "the broken credential must cost the caller nothing at all"
     );
 }
@@ -580,11 +612,7 @@ fn test_filter_predicate_all_unresolvable_refused() {
         filtered
     );
     let read = ContextPolicy::from_credentials(&agent, &lone).check_read(&proto::EntityId::random(), &row);
-    assert!(
-        matches!(read, Err(AccessDenied::ByPolicy(_))),
-        "known-ID reads must deny the same credential, got: {:?}",
-        read
-    );
+    assert!(matches!(read, Err(AccessDenied::ByPolicy(_))), "known-ID reads must deny the same credential, got: {:?}", read);
 
     let several = vec![unresolvable_author(&keys, "no-claim-1"), unresolvable_author(&keys, "no-claim-2")];
     let filtered = ContextPolicy::from_credentials(&agent, &several).filter_predicate(common::in_model(model, predicate));
@@ -594,11 +622,7 @@ fn test_filter_predicate_all_unresolvable_refused() {
         filtered
     );
     let read = ContextPolicy::from_credentials(&agent, &several).check_read(&proto::EntityId::random(), &row);
-    assert!(
-        matches!(read, Err(AccessDenied::ByPolicy(_))),
-        "the row-time half must deny that caller too, got: {:?}",
-        read
-    );
+    assert!(matches!(read, Err(AccessDenied::ByPolicy(_))), "the row-time half must deny that caller too, got: {:?}", read);
 }
 
 /// Both halves skip the same credential, so the answer cannot depend on the
@@ -614,7 +638,8 @@ fn test_filter_predicate_unresolvable_order_independent() {
     let broken_first = vec![unresolvable_author(&keys, "no-claim-1"), resolvable_author(&keys, "author-42")];
     let broken_last = vec![resolvable_author(&keys, "author-42"), unresolvable_author(&keys, "no-claim-1")];
 
-    let first = ContextPolicy::from_credentials(&agent, &broken_first).filter_predicate(common::in_model(model, predicate.clone())).unwrap();
+    let first =
+        ContextPolicy::from_credentials(&agent, &broken_first).filter_predicate(common::in_model(model, predicate.clone())).unwrap();
     let last = ContextPolicy::from_credentials(&agent, &broken_last).filter_predicate(common::in_model(model, predicate)).unwrap();
     assert_eq!(first, last, "the filtered query must not depend on credential order");
 
@@ -679,13 +704,18 @@ fn test_filter_predicate_agrees_with_check_read() {
 fn another_membership_can_grant_read_when_one_scope_cannot_evaluate() {
     let keys = common::test_keys();
     let agent = JwtAgent::new_ephemeral();
-    agent.update_config(serde_json::from_str(r#"{
+    agent.update_config(
+        serde_json::from_str(
+            r#"{
         "roles": { "reader": ["read"] },
         "collections": {
             "a": { "read": "read", "scope": [{ "filter": "missing = $jwt.sub" }] },
             "b": { "read": "read", "scope": [{ "filter": "author = $jwt.sub" }] }
         }
-    }"#).unwrap());
+    }"#,
+        )
+        .unwrap(),
+    );
     let models = common::policy_models(&agent, &["a", "b"]);
     let reader = blog_context(&keys, "alice", "reader");
     let id = proto::EntityId::random();

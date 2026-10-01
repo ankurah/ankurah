@@ -51,9 +51,8 @@ pub(crate) fn parse_template(filter_str: &str) -> Result<(Predicate<Parsed>, Vec
     while let Some(start) = rest.find("$jwt.") {
         query.push_str(&rest[..start]);
         let tail = &rest[start..];
-        let token_len = tail.char_indices().skip(1)
-            .find(|(_, c)| !c.is_alphanumeric() && *c != '.' && *c != '_')
-            .map(|(i, _)| i).unwrap_or(tail.len());
+        let token_len =
+            tail.char_indices().skip(1).find(|(_, c)| !c.is_alphanumeric() && *c != '.' && *c != '_').map(|(i, _)| i).unwrap_or(tail.len());
         variables.push(tail[..token_len].to_owned());
         query.push('?');
         rest = &tail[token_len..];

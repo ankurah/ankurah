@@ -11,8 +11,7 @@ use ankql::ast::{Parsed, Predicate, Resolved, Selection};
 use ankurah_proto::{self as proto, EntityId, ModelId, PropertyId};
 use ankurah_signals::{
     signal::{Calculated, Get, Map, Mut},
-    Subscribe, SubscriptionGuard,
-    Wait,
+    Subscribe, SubscriptionGuard, Wait,
 };
 use futures::FutureExt;
 
@@ -70,9 +69,7 @@ pub struct CatalogManager {
 }
 
 impl Default for CatalogManager {
-    fn default() -> Self {
-        Self { index: OnceLock::new(), ready: Mut::new(false), allocator: tokio::sync::Mutex::new(()) }
-    }
+    fn default() -> Self { Self { index: OnceLock::new(), ready: Mut::new(false), allocator: tokio::sync::Mutex::new(()) } }
 }
 
 fn rows<R: View + Clone + 'static>(query: &LiveQuery<R>) -> Vec<(EntityId, R::Model)> {
@@ -500,7 +497,8 @@ mod tests {
             let context = Context::new(node.clone(), DEFAULT_CONTEXT);
             let mut registration = Box::pin(context.resolve_model_id::<PublicationModel>());
             assert!(futures::poll!(&mut registration).is_pending());
-            let selection = Selection { predicate: Predicate::MemberOf(ModelId::System(proto::SystemModel::Model)), order_by: None, limit: None };
+            let selection =
+                Selection { predicate: Predicate::MemberOf(ModelId::System(proto::SystemModel::Model)), order_by: None, limit: None };
             assert_eq!(storage.fetch_states(&selection).await?.len(), 1);
             release_publication.send(()).unwrap();
 

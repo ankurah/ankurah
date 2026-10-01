@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use ankurah::{CachePolicy, Context, LiveQuery, MatchArgs};
 use ankql::ast::{Parsed, Predicate};
 use ankurah::core::model::{Model, View};
 use ankurah::core::schema::{catalog::CatalogManager, SystemEpoch};
 use ankurah::proto::{EntityId, ModelId};
 use ankurah::signals::{Get, Subscribe, SubscriptionGuard};
+use ankurah::{CachePolicy, Context, LiveQuery, MatchArgs};
 use futures::FutureExt;
 
 use crate::model::*;
@@ -81,7 +81,8 @@ impl PolicyQueries {
             self.resolved_scopes.wait_durable_answered().boxed(),
             self.parameters.wait_durable_answered().boxed(),
             self.keys.wait_durable_answered().boxed(),
-        ]).await?;
+        ])
+        .await?;
         Ok(())
     }
 
@@ -101,14 +102,38 @@ impl PolicyQueries {
 
     pub fn subscribe(&self, changed: impl Fn() + Clone + Send + Sync + 'static) -> Vec<SubscriptionGuard> {
         vec![
-            self.roles.subscribe({ let changed = changed.clone(); move |_| changed() }),
-            self.privileges.subscribe({ let changed = changed.clone(); move |_| changed() }),
-            self.grants.subscribe({ let changed = changed.clone(); move |_| changed() }),
-            self.models.subscribe({ let changed = changed.clone(); move |_| changed() }),
-            self.properties.subscribe({ let changed = changed.clone(); move |_| changed() }),
-            self.scopes.subscribe({ let changed = changed.clone(); move |_| changed() }),
-            self.resolved_scopes.subscribe({ let changed = changed.clone(); move |_| changed() }),
-            self.parameters.subscribe({ let changed = changed.clone(); move |_| changed() }),
+            self.roles.subscribe({
+                let changed = changed.clone();
+                move |_| changed()
+            }),
+            self.privileges.subscribe({
+                let changed = changed.clone();
+                move |_| changed()
+            }),
+            self.grants.subscribe({
+                let changed = changed.clone();
+                move |_| changed()
+            }),
+            self.models.subscribe({
+                let changed = changed.clone();
+                move |_| changed()
+            }),
+            self.properties.subscribe({
+                let changed = changed.clone();
+                move |_| changed()
+            }),
+            self.scopes.subscribe({
+                let changed = changed.clone();
+                move |_| changed()
+            }),
+            self.resolved_scopes.subscribe({
+                let changed = changed.clone();
+                move |_| changed()
+            }),
+            self.parameters.subscribe({
+                let changed = changed.clone();
+                move |_| changed()
+            }),
             self.keys.subscribe(move |_| changed()),
         ]
     }
@@ -130,7 +155,9 @@ pub(crate) fn bind_models(catalog: &CatalogManager, epoch: SystemEpoch) -> anyho
         ResolvedPolicyScope::descriptor().bind_local(catalog, epoch)?,
         ClaimParameter::descriptor().bind_local(catalog, epoch)?,
         JwtVerificationKey::descriptor().bind_local(catalog, epoch)?,
-    ].into_iter().collect())
+    ]
+    .into_iter()
+    .collect())
 }
 
 /// Resolve every policy model's ID, registering any that are missing; only policy installation registers them.
@@ -145,5 +172,7 @@ pub(crate) async fn register_models(context: &Context) -> anyhow::Result<BTreeSe
         context.resolve_model_id::<PolicyScope>().await?,
         context.resolve_model_id::<ClaimParameter>().await?,
         context.resolve_model_id::<JwtVerificationKey>().await?,
-    ].into_iter().collect())
+    ]
+    .into_iter()
+    .collect())
 }

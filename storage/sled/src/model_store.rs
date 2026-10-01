@@ -6,10 +6,7 @@ use std::sync::atomic::AtomicBool;
 
 use ankql::ast::Predicate;
 use ankurah_core::indexing::KeySpec;
-use ankurah_core::{
-    error::RetrievalError,
-    ModelId,
-};
+use ankurah_core::{error::RetrievalError, ModelId};
 use ankurah_proto::PropertyId;
 use ankurah_proto::{Attested, EntityState};
 use ankurah_storage_common::{filtering::ValueSetStream, KeyBounds, OrderByComponents, Plan, Planner, PlannerConfig, ScanDirection};
@@ -449,14 +446,14 @@ mod tests {
         commit_state(&engine, Clock::default(), model_a, second.clone()).await;
 
         let mut transaction = engine.transaction();
-        transaction.set_state(
-            &first.payload.state.head,
-            &state_for_model(state_with_strings(first_id, 3, &[(property, "first-new")]), model_b),
-        ).await.unwrap();
-        transaction.set_state(
-            &Clock::default(),
-            &state_for_model(state_with_strings(second_id, 4, &[(property, "second-new")]), model_b),
-        ).await.unwrap();
+        transaction
+            .set_state(&first.payload.state.head, &state_for_model(state_with_strings(first_id, 3, &[(property, "first-new")]), model_b))
+            .await
+            .unwrap();
+        transaction
+            .set_state(&Clock::default(), &state_for_model(state_with_strings(second_id, 4, &[(property, "second-new")]), model_b))
+            .await
+            .unwrap();
         let outcome = transaction.commit().await.unwrap();
         let StorageCommitOutcome::Conflict { observed } = outcome else {
             panic!("one stale expected head must reject the complete batch");

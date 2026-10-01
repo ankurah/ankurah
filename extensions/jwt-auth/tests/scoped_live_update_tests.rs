@@ -140,8 +140,10 @@ async fn first_use_fetch_registers_schema_without_granting_write_access() -> any
     assert!(member_ctx.fetch::<ScopeItemView>("label = 'x'").await?.is_empty());
     assert!(ScopeItem::descriptor().bind_local(&node.catalog, epoch).is_ok());
     let transaction = member_ctx.begin();
-    assert!(transaction.create(&ScopeItem { owner: ankurah::proto::EntityId::random().into(), label: "x".into() }).await.is_err(),
-        "schema registration does not grant CRUD permissions");
+    assert!(
+        transaction.create(&ScopeItem { owner: ankurah::proto::EntityId::random().into(), label: "x".into() }).await.is_err(),
+        "schema registration does not grant CRUD permissions"
+    );
 
     Ok(())
 }

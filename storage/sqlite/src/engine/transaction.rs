@@ -28,20 +28,27 @@ pub(super) struct EventRow {
 }
 
 pub(super) fn encode_events(events: &[Attested<Event>]) -> Result<Vec<EventRow>, SqliteError> {
-    events.iter().map(|event| Ok(EventRow {
-        id: event.payload.id().to_base64(),
-        entity_id: event.payload.entity_id.to_base64(),
-        body: bincode::serialize(&event.payload.body)?,
-        parent: serde_json::to_string(&event.payload.parent)?,
-        attestations: bincode::serialize(&event.attestations)?,
-    })).collect()
+    events
+        .iter()
+        .map(|event| {
+            Ok(EventRow {
+                id: event.payload.id().to_base64(),
+                entity_id: event.payload.entity_id.to_base64(),
+                body: bincode::serialize(&event.payload.body)?,
+                parent: serde_json::to_string(&event.payload.parent)?,
+                attestations: bincode::serialize(&event.attestations)?,
+            })
+        })
+        .collect()
 }
 
 pub(super) fn insert_events(conn: &Connection, events: &[EventRow]) -> Result<(), SqliteError> {
     for event in events {
         conn.execute(
-            &format!(r#"INSERT INTO "{EVENT_TABLE}" ("id", "entity_id", "body", "parent", "attestations")
-                VALUES (?, ?, ?, ?, ?) ON CONFLICT ("id") DO NOTHING"#),
+            &format!(
+                r#"INSERT INTO "{EVENT_TABLE}" ("id", "entity_id", "body", "parent", "attestations")
+                VALUES (?, ?, ?, ?, ?) ON CONFLICT ("id") DO NOTHING"#
+            ),
             rusqlite::params![&event.id, &event.entity_id, &event.body, &event.parent, &event.attestations],
         )?;
     }
@@ -67,9 +74,13 @@ impl StorageTransaction for SqliteTransaction<'_> {
         }
         let mut materializations = Vec::new();
         for model in &state.payload.state.memberships {
-            let projection = self.engine.materialization(model).await
+            let projection = self
+                .engine
+                .materialization(model)
+                .await
                 .map_err(|error| MutationError::General(error.to_string().into()))?
-                .prepare_state(state).await?;
+                .prepare_state(state)
+                .await?;
             materializations.push(projection);
         }
         let mut write = EntityRow {
@@ -171,23 +182,12 @@ impl StorageTransaction for SqliteTransaction<'_> {
                                "head" = excluded."head",
                                "attestations" = excluded."attestations""#
                     ),
-                    rusqlite::params![
-                        &write.entity_key,
-                        &write.state_buffers,
-                        &write.head_json,
-                        &write.attestations,
-                    ],
+                    rusqlite::params![&write.entity_key, &write.state_buffers, &write.head_json, &write.attestations,],
                 )?;
                 for projection in &write.materializations {
                     projection.write(&tx)?;
                 }
-                committed.push((
-                    original_index,
-                    CommittedEntityWrite {
-                        entity_id,
-                        canonical_changed: write.expected_head != write.head,
-                    },
-                ));
+                committed.push((original_index, CommittedEntityWrite { entity_id, canonical_changed: write.expected_head != write.head }));
             }
             committed.sort_by_key(|(index, _)| *index);
             let entities = committed.into_iter().map(|(_, result)| result).collect();

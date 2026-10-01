@@ -20,7 +20,14 @@ pub struct WatcherSet {
 }
 
 impl WatcherSet {
-    pub fn new() -> Self { Self { index_watchers: HashMap::new(), membership_watchers: HashMap::new(), wildcard_watchers: HashSet::new(), entity_watchers: HashMap::new() } }
+    pub fn new() -> Self {
+        Self {
+            index_watchers: HashMap::new(),
+            membership_watchers: HashMap::new(),
+            wildcard_watchers: HashSet::new(),
+            entity_watchers: HashMap::new(),
+        }
+    }
     /// Accumulate interested watchers for an entity change into CandidateChanges
     pub fn accumulate_interested_watchers<E: AbstractEntity, C>(
         &self,
@@ -34,18 +41,19 @@ impl WatcherSet {
 
         // Find subscriptions interested based on index watchers
         for (property_path, index_ref) in &self.index_watchers {
-                if let Some(value) = property_path.extract_value(entity) {
-                    for (subscription_id, query_id) in index_ref.find_matching(value) {
-                        candidates_by_sub
-                            .entry(subscription_id)
-                            .or_insert_with(|| CandidateChanges::new(changes_arc.clone()))
-                            .add_query(query_id, offset);
-                    }
+            if let Some(value) = property_path.extract_value(entity) {
+                for (subscription_id, query_id) in index_ref.find_matching(value) {
+                    candidates_by_sub
+                        .entry(subscription_id)
+                        .or_insert_with(|| CandidateChanges::new(changes_arc.clone()))
+                        .add_query(query_id, offset);
                 }
+            }
         }
 
         for (subscription_id, query_id) in &self.wildcard_watchers {
-            candidates_by_sub.entry(*subscription_id)
+            candidates_by_sub
+                .entry(*subscription_id)
                 .or_insert_with(|| CandidateChanges::new(changes_arc.clone()))
                 .add_query(*query_id, offset);
         }
@@ -217,8 +225,12 @@ impl WatcherSet {
             Predicate::MemberOf(model) => {
                 let set = self.membership_watchers.entry(*model).or_default();
                 match op {
-                    WatcherOp::Add => { set.insert(watcher_id); }
-                    WatcherOp::Remove => { set.remove(&watcher_id); }
+                    WatcherOp::Add => {
+                        set.insert(watcher_id);
+                    }
+                    WatcherOp::Remove => {
+                        set.remove(&watcher_id);
+                    }
                 }
             }
             Predicate::True => {
@@ -330,7 +342,12 @@ mod tests {
         let property = proto::EntityId::from_bytes([2; 32]);
         let path = PropertyPath::registered(property, "data", vec!["nested".into(), "key".into()]);
         let model = proto::ModelId::EntityId(proto::EntityId::from_bytes([3; 32]));
-        let pending = LocalTrxEntity::new(None, proto::AuthorId::Unknown, SystemEpoch::allocate(), Arc::new(std::sync::atomic::AtomicBool::new(true)));
+        let pending = LocalTrxEntity::new(
+            None,
+            proto::AuthorId::Unknown,
+            SystemEpoch::allocate(),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        );
         pending.add_membership(model)?;
         let backend = pending.get_backend::<LWWBackend>()?;
         let entity = pending.read();

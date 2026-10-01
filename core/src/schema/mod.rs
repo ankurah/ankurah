@@ -21,11 +21,8 @@ pub const MODEL_PROPERTY_COLLECTION_ID: &str = "_ankurah_model_property";
 
 pub const RESERVED_COLLECTION_PREFIX: &str = "_ankurah_";
 
-pub(crate) const CATALOG_MODELS: [ModelId; 3] = [
-    ModelId::System(SystemModel::Model),
-    ModelId::System(SystemModel::Property),
-    ModelId::System(SystemModel::ModelProperty),
-];
+pub(crate) const CATALOG_MODELS: [ModelId; 3] =
+    [ModelId::System(SystemModel::Model), ModelId::System(SystemModel::Property), ModelId::System(SystemModel::ModelProperty)];
 
 pub fn is_catalog_model(id: &ModelId) -> bool { CATALOG_MODELS.contains(id) }
 
@@ -50,8 +47,10 @@ pub(crate) fn request_bypasses_policy(request: &ankurah_proto::NodeRequestBody) 
         NodeRequestBody::Fetch { selection, .. } | NodeRequestBody::SubscribeQuery { selection, .. } => {
             is_catalog_read(&selection.predicate)
         }
-        NodeRequestBody::Get { .. } | NodeRequestBody::GetEvents { .. }
-        | NodeRequestBody::CommitTransaction { .. } | NodeRequestBody::RegisterSchema { .. } => false,
+        NodeRequestBody::Get { .. }
+        | NodeRequestBody::GetEvents { .. }
+        | NodeRequestBody::CommitTransaction { .. }
+        | NodeRequestBody::RegisterSchema { .. } => false,
     }
 }
 
@@ -128,10 +127,7 @@ mod request_policy_tests {
         }
         assert!(!request_bypasses_policy(&NodeRequestBody::Get { ids: Vec::new() }));
         assert!(!request_bypasses_policy(&NodeRequestBody::GetEvents { event_ids: Vec::new() }));
-        assert!(!request_bypasses_policy(&NodeRequestBody::CommitTransaction {
-            id: TransactionId::new(),
-            events: Vec::new()
-        }));
+        assert!(!request_bypasses_policy(&NodeRequestBody::CommitTransaction { id: TransactionId::new(), events: Vec::new() }));
         assert!(!request_bypasses_policy(&NodeRequestBody::RegisterSchema {
             model: RegisterModel {
                 label: MODEL_COLLECTION_ID.into(),

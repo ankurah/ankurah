@@ -759,8 +759,7 @@ async fn test_redelivery_of_ancestor_event_is_noop() -> Result<()> {
         events_b.into_iter().map(|event| ankurah::proto::Attested { payload: event, attestations: Default::default() }).collect();
 
     let trx_id = ankurah::proto::TransactionId::new();
-    commit_transaction(&node, &DEFAULT_CONTEXT, trx_id, attested_events)
-        .await?;
+    commit_transaction(&node, &DEFAULT_CONTEXT, trx_id, attested_events).await?;
 
     // Step 5: Assert head is still [C] — B is an ancestor of C, so re-delivery is a no-op
     let state = node.storage.get_state(album_id).await?;

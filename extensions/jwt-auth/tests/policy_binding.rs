@@ -2,11 +2,14 @@ mod common;
 
 use ankurah_core::policy::ContextPolicy;
 
-use std::sync::Arc;
-use ankurah::{Model, Node, model::{Mutable, View}};
 use ankurah::signals::Wait;
+use ankurah::{
+    model::{Mutable, View},
+    Model, Node,
+};
 use ankurah_jwt_auth::{Binding, JwtAgent, JwtContext, JwtKeys, ModelPolicyView, PolicyPropertyView, PolicyScopeView};
 use ankurah_storage_sled::SledStorageEngine;
+use std::sync::Arc;
 
 #[derive(Model, Debug, serde::Serialize, serde::Deserialize)]
 #[model(label = "document")]
@@ -61,27 +64,45 @@ async fn registration_fills_pending_bindings_and_restart_does_not_rebind() -> an
     let transaction = root.begin();
     let document = transaction.create(&Document { owner: "alice".into() }).await?.read()?;
     transaction.commit().await?;
-    assert!(ContextPolicy::from_credentials(&agent, &reader).check_read(&document.id(), &document.entity().to_state()?).is_err(),
-        "an unresolved restriction cannot become an unrestricted grant");
+    assert!(
+        ContextPolicy::from_credentials(&agent, &reader).check_read(&document.id(), &document.entity().to_state()?).is_err(),
+        "an unresolved restriction cannot become an unrestricted grant"
+    );
 
     assert!(root.resolve_model_id::<InvalidDocument>().await.is_err(), "an invalid scope binding must abort its schema transaction");
     let properties = root.fetch::<PolicyPropertyView>("true").await?;
     assert_eq!(properties.iter().find(|property| property.label().unwrap() == "embargo").unwrap().property()?, Binding::Pending);
-    assert!(node.catalog.property_by_name(&match model { ankurah::proto::ModelId::EntityId(id) => id, _ => unreachable!() }, "embargo")?.is_none());
+    assert!(node
+        .catalog
+        .property_by_name(
+            &match model {
+                ankurah::proto::ModelId::EntityId(id) => id,
+                _ => unreachable!(),
+            },
+            "embargo"
+        )?
+        .is_none());
     assert_eq!(root.resolve_model_id::<DocumentWithEmbargo>().await?, model);
     let transaction = root.begin();
     let document = transaction.create(&DocumentWithEmbargo { owner: "alice".into(), embargo: false }).await?.read()?;
     transaction.commit().await?;
     let id = document.id();
     let state = document.entity().to_state()?;
-    agent.state_handle().wait_for({
-        let agent = agent.clone();
-        let reader = reader.clone();
-        move |_| ContextPolicy::from_credentials(&agent, &reader).check_read(&id, &state).ok()
-    }).await;
+    agent
+        .state_handle()
+        .wait_for({
+            let agent = agent.clone();
+            let reader = reader.clone();
+            move |_| ContextPolicy::from_credentials(&agent, &reader).check_read(&id, &state).ok()
+        })
+        .await;
     let scope = root.fetch::<PolicyScopeView>("true").await?[0].resolved()?;
     assert!(scope.is_some());
-    assert_eq!(root.get::<PolicyPropertyView>(owner_id).await?.property()?, owner_binding, "adding a property must retain earlier bindings");
+    assert_eq!(
+        root.get::<PolicyPropertyView>(owner_id).await?.property()?,
+        owner_binding,
+        "adding a property must retain earlier bindings"
+    );
     let before_restart = ContextPolicy::from_credentials(&agent, &reader).filter_predicate(selection.clone())?;
     drop(root);
     drop(node);
@@ -93,6 +114,9 @@ async fn registration_fills_pending_bindings_and_restart_does_not_rebind() -> an
     assert_eq!(ContextPolicy::from_credentials(&agent, &reader).filter_predicate(selection)?, before_restart);
     assert_eq!(root.get::<ModelPolicyView>(policy).await?.model()?, Binding::AtRegistration(model));
     assert_eq!(root.get::<PolicyPropertyView>(owner_id).await?.property()?, owner_binding);
-    assert_eq!(root.fetch::<PolicyScopeView>("true").await?[0].resolved()?.map(|reference| reference.id()), scope.map(|reference| reference.id()));
+    assert_eq!(
+        root.fetch::<PolicyScopeView>("true").await?[0].resolved()?.map(|reference| reference.id()),
+        scope.map(|reference| reference.id())
+    );
     Ok(())
 }

@@ -168,14 +168,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         };
 
         if let Some(peer) = peer {
-            self.update_query_on_peer(
-                peer,
-                query_id,
-                content.selection.clone(),
-                version,
-                content.sessions.clone(),
-                cancel,
-            );
+            self.update_query_on_peer(peer, query_id, content.selection.clone(), version, content.sessions.clone(), cancel);
         } else if !self.inner.connected_peers.is_empty() {
             self.setup_remote_subscriptions();
         }
@@ -588,12 +581,7 @@ where
             .request(
                 peer_id,
                 &context_data,
-                ankurah_proto::NodeRequestBody::SubscribeQuery {
-                    query_id,
-                    selection: selection.clone(),
-                    version,
-                    known_matches,
-                },
+                ankurah_proto::NodeRequestBody::SubscribeQuery { query_id, selection: selection.clone(), version, known_matches },
             )
             .await?;
         let deltas = match response {
@@ -702,11 +690,7 @@ mod tests {
         }
 
         async fn peer_unsubscribe(&self, peer_id: EntityId, query_id: proto::QueryId) -> Result<(), anyhow::Error> {
-            self.sent_requests.lock().unwrap().push((
-                peer_id,
-                query_id,
-                None,
-            ));
+            self.sent_requests.lock().unwrap().push((peer_id, query_id, None));
 
             // Check if there's an error to fail with
             if let Some(error) = self.next_error.lock().unwrap().take() {

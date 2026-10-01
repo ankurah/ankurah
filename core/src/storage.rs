@@ -109,10 +109,7 @@ pub trait StorageEngine: Send + Sync {
     async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError>;
 
     /// Fetch entities matching the selection, including its model-membership predicates.
-    async fn fetch_states(
-        &self,
-        selection: &ankql::ast::Selection<Resolved>,
-    ) -> Result<Vec<Attested<EntityState>>, RetrievalError>;
+    async fn fetch_states(&self, selection: &ankql::ast::Selection<Resolved>) -> Result<Vec<Attested<EntityState>>, RetrievalError>;
 
     /// Retrieve one outcome per requested identity, in input order, distinguishing absence from predicate mismatch.
     /// Engines may batch reads or join materializations; existence and predicate checks must use the same state.

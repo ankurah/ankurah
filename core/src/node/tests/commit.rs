@@ -1,20 +1,22 @@
 use crate::node::handler::commit_transaction;
 use crate::{
     entity::{Entity, LocalTrxEntity, RemoteTrxEntity},
-    reactor::ChangeNotification,
     error::{MutationError, ValidationError},
     node::Node,
-    storage::{StorageCommitOutcome, StorageEngine, StorageTransaction},
     policy::{AccessDenied, DefaultContext, PolicyAgent, DEFAULT_CONTEXT},
     property::backend::{LWWBackend, PropertyBackend},
-    selection::filter::Filterable,
+    reactor::ChangeNotification,
     retrieval::{LocalEventGetter, SuspenseEvents},
+    selection::filter::Filterable,
+    storage::{StorageCommitOutcome, StorageEngine, StorageTransaction},
     test_utils::TestStorage,
     util::Iterable,
     value::Value,
 };
 use ankql::ast::{Predicate, Resolved};
-use ankurah_proto::{self as proto, Attested, AuthorId, EntityId, EntityState, Event, Membership, ModelId, Operation, OperationSet, PropertyId};
+use ankurah_proto::{
+    self as proto, Attested, AuthorId, EntityId, EntityState, Event, Membership, ModelId, Operation, OperationSet, PropertyId,
+};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
@@ -115,9 +117,8 @@ async fn local_creation_commits_after_its_events_arrive_remotely() -> anyhow::Re
 
     for echoed in [1, 2] {
         let trx = context.begin();
-        let entity = trx.add_entity(LocalTrxEntity::new(
-            node.system.root_id(), AuthorId::Unknown, node.entities.system_epoch(), trx.alive.clone(),
-        ));
+        let entity =
+            trx.add_entity(LocalTrxEntity::new(node.system.root_id(), AuthorId::Unknown, node.entities.system_epoch(), trx.alive.clone()));
         entity.add_membership(a)?;
         let id = entity.id();
         entity.add_membership(b)?;
@@ -142,9 +143,12 @@ async fn failed_add_event_poisons_the_transaction_even_if_the_error_is_caught() 
     node.system.create().await?;
     node.wait_ready().await?;
     let policy = crate::policy::ContextPolicy::from_credentials(&node.policy_agent, &DEFAULT_CONTEXT);
-    let valid: Attested<Event> = Event::genesis(node.system.root_id(), AuthorId::Unknown, OperationSet(vec![
-        Operation::Membership(Membership::Add(ModelId::EntityId(EntityId::from_bytes([1; 32])))),
-    ])).into();
+    let valid: Attested<Event> = Event::genesis(
+        node.system.root_id(),
+        AuthorId::Unknown,
+        OperationSet(vec![Operation::Membership(Membership::Add(ModelId::EntityId(EntityId::from_bytes([1; 32]))))]),
+    )
+    .into();
     let invalid: Attested<Event> = Event::genesis(node.system.root_id(), AuthorId::Unknown, OperationSet::default()).into();
     let mut trx = crate::transaction::remote::RemoteTransaction::new(&node, &policy);
     trx.add_event(&valid).await?;
@@ -174,7 +178,8 @@ async fn fork_commit_publishes_to_resident_without_changing_original_snapshot() 
     let update = Event::update(genesis.entity_id, genesis.id().into(), AuthorId::Unknown, OperationSet(vec![set(property, "Bob")?]));
     fork.apply_event(&getter, &mut Attested::from(update.clone()), |_| Ok(None)).await?;
     let branch_property = PropertyId::EntityId(EntityId::from_bytes([2; 32]));
-    let branch = Event::update(genesis.entity_id, genesis.id().into(), AuthorId::Unknown, OperationSet(vec![set(branch_property, "branch")?]));
+    let branch =
+        Event::update(genesis.entity_id, genesis.id().into(), AuthorId::Unknown, OperationSet(vec![set(branch_property, "branch")?]));
     let mut branch = Attested::opt(branch, Some(proto::Attestation(vec![1, 2, 3])));
     // Divergence must find the earlier fork events without storage or explicit staging.
     fork.apply_event(&getter, &mut branch, |event| {
@@ -182,13 +187,17 @@ async fn fork_commit_publishes_to_resident_without_changing_original_snapshot() 
         assert_eq!(before.value(&branch_property), None);
         assert_eq!(fork.read().value(&branch_property), Some(Value::String("branch".into())));
         Ok(Some(proto::Attestation(vec![4, 5, 6])))
-    }).await?;
+    })
+    .await?;
     assert_eq!(*branch.attestations, vec![proto::Attestation(vec![1, 2, 3]), proto::Attestation(vec![4, 5, 6])]);
     // Redelivered events must not appear twice in the published change.
     assert!(!fork.apply_event(&getter, &mut Attested::from(genesis.clone()), |_| Ok(None)).await?);
-    let invalid = Event::update(genesis.entity_id, fork.head(), AuthorId::Unknown, OperationSet(vec![
-        Operation::Backend { backend: "invalid-backend".into(), operations: Vec::new() },
-    ]));
+    let invalid = Event::update(
+        genesis.entity_id,
+        fork.head(),
+        AuthorId::Unknown,
+        OperationSet(vec![Operation::Backend { backend: "invalid-backend".into(), operations: Vec::new() }]),
+    );
     assert!(fork.apply_event(&getter, &mut Attested::from(invalid), |_| Ok(None)).await.is_err());
     assert!(entities.get(&genesis.entity_id).is_none());
 
@@ -257,7 +266,10 @@ async fn conflict_rechecks_policy_against_the_winning_state() -> anyhow::Result<
     assert!(matches!(transaction.commit().await?, StorageCommitOutcome::Committed(_)));
     candidate.commit(&node.entities, &events).await?;
     release.send(()).unwrap();
-    assert!(matches!(pending.await.unwrap_err().downcast_ref::<MutationError>(), Some(MutationError::AccessDenied(AccessDenied::ByPolicy(_)))));
+    assert!(matches!(
+        pending.await.unwrap_err().downcast_ref::<MutationError>(),
+        Some(MutationError::AccessDenied(AccessDenied::ByPolicy(_)))
+    ));
     assert_eq!(*agent.checked_owners.lock().unwrap(), vec![Some(Value::String("Alice".into())), Some(Value::String("Bob".into()))]);
     assert_eq!(storage.get_state(entity.id()).await?.payload.state.head, transfer.id().into());
     assert!(storage.get_events(vec![edit.id()]).await?.is_empty());

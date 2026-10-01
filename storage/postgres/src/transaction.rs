@@ -26,25 +26,32 @@ pub(super) struct EventRow {
 }
 
 pub(super) fn encode_events(events: &[Attested<Event>]) -> Result<Vec<EventRow>, MutationError> {
-    events.iter().map(|event| Ok(EventRow {
-        id: event.payload.id(),
-        entity_id: event.payload.entity_id,
-        body: bincode::serialize(&event.payload.body)?,
-        parent: event.payload.parent.clone(),
-        attestations: bincode::serialize(&event.attestations)?,
-    })).collect()
+    events
+        .iter()
+        .map(|event| {
+            Ok(EventRow {
+                id: event.payload.id(),
+                entity_id: event.payload.entity_id,
+                body: bincode::serialize(&event.payload.body)?,
+                parent: event.payload.parent.clone(),
+                attestations: bincode::serialize(&event.attestations)?,
+            })
+        })
+        .collect()
 }
 
-pub(super) async fn insert_events(
-    client: &(impl tokio_postgres::GenericClient + Sync),
-    events: &[EventRow],
-) -> Result<(), MutationError> {
+pub(super) async fn insert_events(client: &(impl tokio_postgres::GenericClient + Sync), events: &[EventRow]) -> Result<(), MutationError> {
     for event in events {
-        client.execute(
-            &format!(r#"INSERT INTO "{EVENT_TABLE}" ("id", "entity_id", "body", "parent", "attestations")
-                VALUES ($1, $2, $3, $4, $5) ON CONFLICT ("id") DO NOTHING"#),
-            &[&event.id, &event.entity_id, &event.body, &event.parent, &event.attestations],
-        ).await.map_err(|error| MutationError::UpdateFailed(Box::new(error)))?;
+        client
+            .execute(
+                &format!(
+                    r#"INSERT INTO "{EVENT_TABLE}" ("id", "entity_id", "body", "parent", "attestations")
+                VALUES ($1, $2, $3, $4, $5) ON CONFLICT ("id") DO NOTHING"#
+                ),
+                &[&event.id, &event.entity_id, &event.body, &event.parent, &event.attestations],
+            )
+            .await
+            .map_err(|error| MutationError::UpdateFailed(Box::new(error)))?;
     }
     Ok(())
 }
@@ -68,9 +75,13 @@ impl StorageTransaction for PostgresTransaction<'_> {
         }
         let mut materializations = Vec::new();
         for model in &state.payload.state.memberships {
-            let projection = self.engine.materialization(model).await
+            let projection = self
+                .engine
+                .materialization(model)
+                .await
                 .map_err(|error| MutationError::General(error.to_string().into()))?
-                .prepare_state(state).await?;
+                .prepare_state(state)
+                .await?;
             materializations.push(projection);
         }
         let mut write = EntityRow {
@@ -124,7 +135,8 @@ impl StorageTransaction for PostgresTransaction<'_> {
                 .await
                 .map_err(|error| MutationError::UpdateFailed(Box::new(error)))?;
             let current = if let Some(row) = current_row {
-                let memberships = self.engine
+                let memberships = self
+                    .engine
                     .associated_models(&transaction, entity_id)
                     .await
                     .map_err(|error| MutationError::General(error.to_string().into()))?
@@ -193,13 +205,7 @@ impl StorageTransaction for PostgresTransaction<'_> {
                 projection.write(&transaction).await?;
             }
             let canonical_changed = write.expected_head != write.head;
-            committed.push((
-                original_index,
-                CommittedEntityWrite {
-                    entity_id,
-                    canonical_changed,
-                },
-            ));
+            committed.push((original_index, CommittedEntityWrite { entity_id, canonical_changed }));
         }
 
         committed.sort_by_key(|(index, _)| *index);

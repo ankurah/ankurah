@@ -97,7 +97,10 @@ async fn adopted_root_persists_and_reconnecting_keeps_the_epoch() -> anyhow::Res
         assert_ne!(node.system.system_epoch(), epoch);
         assert!(node.get_durable_peers().is_empty());
         let selection = ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None };
-        assert_eq!(engine.fetch_states(&selection.clone().and_member_of(proto::ModelId::System(proto::SystemModel::System))).await?, vec![root]);
+        assert_eq!(
+            engine.fetch_states(&selection.clone().and_member_of(proto::ModelId::System(proto::SystemModel::System))).await?,
+            vec![root]
+        );
         Ok(())
     })
     .await?

@@ -30,7 +30,9 @@ impl<R: View> LiveQuery<R> {
         selection: impl TryInto<ankql::ast::Selection<ankql::ast::Parsed>, Error = impl Into<RetrievalError>>,
     ) -> Result<(), RetrievalError> {
         let resolution = super::QueryResolution::prepare(
-            self.0.0.context.schema_resolver(), R::Model::descriptor(), selection.try_into().map_err(Into::into)?,
+            self.0 .0.context.schema_resolver(),
+            R::Model::descriptor(),
+            selection.try_into().map_err(Into::into)?,
         )?;
         self.0.update_resolution(resolution)
     }

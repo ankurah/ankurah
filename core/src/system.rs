@@ -325,13 +325,11 @@ where SE: StorageEngine + Send + Sync + 'static
         let event_getter = LocalEventGetter::new(storage.clone(), self.0.durable);
 
         for state in storage
-            .fetch_states(
-                &ankql::ast::Selection {
-                    predicate: ankql::ast::Predicate::MemberOf(ModelId::System(proto::SystemModel::System)),
-                    order_by: None,
-                    limit: None,
-                },
-            )
+            .fetch_states(&ankql::ast::Selection {
+                predicate: ankql::ast::Predicate::MemberOf(ModelId::System(proto::SystemModel::System)),
+                order_by: None,
+                limit: None,
+            })
             .await?
         {
             let (_entity_changed, entity) =

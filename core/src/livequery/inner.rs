@@ -42,11 +42,7 @@ pub(super) struct LiveQueryInner {
 
 impl LiveQueryInner {
     /// Create the shared inner before its resolved selection is installed.
-    pub(super) fn new(
-        context: Arc<dyn DynContextInner>,
-        subscription: ReactorSubscription,
-        cache_policy: CachePolicy,
-    ) -> Self {
+    pub(super) fn new(context: Arc<dyn DynContextInner>, subscription: ReactorSubscription, cache_policy: CachePolicy) -> Self {
         let query_id = proto::QueryId::new();
         let gap_fetcher: Arc<dyn GapFetcher<Entity>> = Arc::new(QueryGapFetcher::new(Context(context.clone())));
 

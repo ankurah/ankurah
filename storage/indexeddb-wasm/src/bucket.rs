@@ -563,11 +563,8 @@ impl IndexedDBBucket {
             let entity_obj = result?;
 
             let id = entity_obj.get(&ID_KEY)?;
-            let memberships = if needs_memberships {
-                crate::engine::associated_models_in_store(membership_store, id).await?
-            } else {
-                BTreeSet::new()
-            };
+            let memberships =
+                if needs_memberships { crate::engine::associated_models_in_store(membership_store, id).await? } else { BTreeSet::new() };
             let record = IdbRecord { id, object: entity_obj, memberships };
 
             // Apply predicate filtering (uses lazy extraction from IdbRecord)
@@ -623,9 +620,7 @@ impl IdbRecord {
 }
 
 impl ankurah_core::selection::filter::ValueLookup<EngineColumns> for IdbRecord {
-    fn is_member_of(&self, model: &ModelId) -> Result<bool, ankurah_core::selection::filter::Error> {
-        Ok(self.memberships.contains(model))
-    }
+    fn is_member_of(&self, model: &ModelId) -> Result<bool, ankurah_core::selection::filter::Error> { Ok(self.memberships.contains(model)) }
 
     fn value_at(&self, path: &ColumnPath) -> Option<ankurah_core::value::Value> {
         let value = if path.column == "id" { ankurah_core::value::Value::EntityId(self.id) } else { self.field_value(&path.column)? };

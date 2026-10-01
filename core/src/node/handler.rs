@@ -72,7 +72,9 @@ async fn entity_states<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgen
     let mut unloaded = Vec::new();
     for id in ids.into_iter().collect::<BTreeSet<_>>() {
         match node.entities.get(&id) {
-            Some(entity) => { states.insert(id, entity.to_state()?); }
+            Some(entity) => {
+                states.insert(id, entity.to_state()?);
+            }
             None => unloaded.push(id),
         }
     }

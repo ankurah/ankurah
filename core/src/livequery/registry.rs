@@ -1,9 +1,6 @@
 //! Live-query bookkeeping without keeping queries alive.
 
-use std::{
-    collections::HashMap,
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
 use super::{inner::LiveQueryInner, EntityLiveQuery, WeakEntityLiveQuery};
 
@@ -40,8 +37,12 @@ mod tests {
     async fn clones_share_one_registration_until_the_last_handle_drops() {
         let node = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
         let context = Context::new(node.clone(), DEFAULT_CONTEXT);
-        let query =
-            EntityLiveQuery::new(context.0, CachePolicy::Durable, super::super::QueryResolution::Pending(Box::pin(futures::future::pending()))).unwrap();
+        let query = EntityLiveQuery::new(
+            context.0,
+            CachePolicy::Durable,
+            super::super::QueryResolution::Pending(Box::pin(futures::future::pending())),
+        )
+        .unwrap();
         let address = Arc::as_ptr(&query.0) as usize;
         let clone = query.clone();
         node.live_queries.insert(&clone);

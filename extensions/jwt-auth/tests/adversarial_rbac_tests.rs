@@ -160,8 +160,7 @@ async fn test_non_privileged_cannot_write_policy_records() -> anyhow::Result<()>
     let root_ctx = JwtContext::system();
     let root_context = node.context_async(root_ctx).await?;
     let trx2 = root_context.begin();
-    let root_result =
-        trx2.create(&JwtVerificationKey { public_key_pem: "fake-pem".into() }).await;
+    let root_result = trx2.create(&JwtVerificationKey { public_key_pem: "fake-pem".into() }).await;
 
     assert!(root_result.is_ok(), "Root must be able to write policy records");
     trx2.commit().await?;

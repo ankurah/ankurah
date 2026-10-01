@@ -134,9 +134,13 @@ fn test_or_composed_scope_with_a_non_id_subject_is_a_type_error() {
     agent.set_catalog(Arc::new(common::FixtureCatalog {
         labels: [(model, "note".to_owned())].into(),
         resolve: |predicate| try_resolve_fixture(predicate).map_err(|error| error.to_string()),
-        property_type: |property| if property == common::prop("visibility") {
-            ankurah_core_types::ValueType::String
-        } else { ankurah_core_types::ValueType::EntityId },
+        property_type: |property| {
+            if property == common::prop("visibility") {
+                ankurah_core_types::ValueType::String
+            } else {
+                ankurah_core_types::ValueType::EntityId
+            }
+        },
     }));
 
     let owner = EntityId::random();
@@ -168,7 +172,9 @@ fn test_or_composed_scope_with_a_non_id_subject_is_a_type_error() {
     // The control that keeps the refusal honest: a subject that IS an id
     // binds, and the same clauses admit that owner's own row.
     let member = context(&keys, &owner.to_base64(), "reader");
-    let filtered = ContextPolicy::from_credentials(&agent, &member).filter_predicate(common::in_model(model, Predicate::True)).expect("a member's subject filters too");
+    let filtered = ContextPolicy::from_credentials(&agent, &member)
+        .filter_predicate(common::in_model(model, Predicate::True))
+        .expect("a member's subject filters too");
     assert!(
         evaluate_predicate(&private, &filtered).expect("the bound predicate must evaluate"),
         "the owner's own row must pass the clauses that refused the guest's credential"
@@ -232,10 +238,7 @@ async fn test_non_id_subject_does_not_authorize_or_block_other_credentials() -> 
     if let Ok(rows) = guest.fetch::<DocView>("body = 'hello'").await {
         assert!(rows.is_empty(), "a subject that is not an id owns no row, but the query handed over {}", rows.len());
     }
-    assert!(matches!(
-        guest.get::<DocView>(doc_id).await,
-        Err(RetrievalError::AccessDenied(AccessDenied::ByPolicy(_)))
-    ));
+    assert!(matches!(guest.get::<DocView>(doc_id).await, Err(RetrievalError::AccessDenied(AccessDenied::ByPolicy(_)))));
 
     for credentials in [vec![guest_credential.clone(), member_credential.clone()], vec![member_credential, guest_credential.clone()]] {
         let sessions = SessionSet::new();

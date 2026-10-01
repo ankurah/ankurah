@@ -3,8 +3,8 @@
 //! prefix is reserved.
 
 mod common;
-use ankurah::core::test_helpers::commit_transaction;
 use ankurah::core::error::{InadmissibleEvent, RetrievalError};
+use ankurah::core::test_helpers::commit_transaction;
 use common::*;
 
 const PROTECTED: [&str; 4] = ["_ankurah_system", "_ankurah_model", "_ankurah_property", "_ankurah_model_property"];
@@ -65,9 +65,14 @@ async fn direct_remote_commit_refuses_a_protected_batch_before_writing_any_event
             proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(protected_model))]),
         );
         let protected_id = protected_event.entity_id;
-        let error = commit_transaction(&server, &DEFAULT_CONTEXT, proto::TransactionId::new(), vec![proto::Attested::opt(ordinary.clone(), None), proto::Attested::opt(protected_event, None)])
-            .await
-            .expect_err("direct callers must not bypass collection protection");
+        let error = commit_transaction(
+            &server,
+            &DEFAULT_CONTEXT,
+            proto::TransactionId::new(),
+            vec![proto::Attested::opt(ordinary.clone(), None), proto::Attested::opt(protected_event, None)],
+        )
+        .await
+        .expect_err("direct callers must not bypass collection protection");
         assert!(matches!(
             error.downcast_ref::<MutationError>(),
             Some(MutationError::InadmissibleEvent(InadmissibleEvent::ProtectedModel(id))) if *id == protected_model
@@ -79,8 +84,7 @@ async fn direct_remote_commit_refuses_a_protected_batch_before_writing_any_event
         assert!(matches!(storage.get_state(protected_id).await, Err(RetrievalError::EntityNotFound(_))));
     }
 
-    commit_transaction(&server, &DEFAULT_CONTEXT, proto::TransactionId::new(), vec![proto::Attested::opt(ordinary.clone(), None)])
-        .await?;
+    commit_transaction(&server, &DEFAULT_CONTEXT, proto::TransactionId::new(), vec![proto::Attested::opt(ordinary.clone(), None)]).await?;
     assert_eq!(storage.dump_entity_events(ordinary.entity_id).await?.len(), 1, "the ordinary event is valid on its own");
     Ok(())
 }

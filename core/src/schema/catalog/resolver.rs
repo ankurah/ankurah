@@ -152,9 +152,13 @@ fn check_predicate_names(
                 check_expr_names(right, check)
             }
             Predicate::IsNull(expr) => check_expr_names(expr, check),
-            Predicate::And(..) | Predicate::Or(..) | Predicate::Not(_) | Predicate::MemberOf(_) | Predicate::True | Predicate::False | Predicate::Placeholder => {
-                Ok(())
-            }
+            Predicate::And(..)
+            | Predicate::Or(..)
+            | Predicate::Not(_)
+            | Predicate::MemberOf(_)
+            | Predicate::True
+            | Predicate::False
+            | Predicate::Placeholder => Ok(()),
         }
     })
 }
@@ -375,9 +379,7 @@ mod tests {
     struct ColdResolver;
 
     impl ModelResolver for WarmResolver {
-        fn resolve_model(&self, label: &str) -> Result<Option<ModelId>, ModelResolutionError> {
-            Ok((label == "album").then(model))
-        }
+        fn resolve_model(&self, label: &str) -> Result<Option<ModelId>, ModelResolutionError> { Ok((label == "album").then(model)) }
 
         fn resolve_property(&self, model: &ModelId, name: &str) -> Result<Option<ResolvedProperty>, ModelResolutionError> {
             Ok(match name {

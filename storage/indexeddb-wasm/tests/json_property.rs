@@ -214,11 +214,9 @@ pub fn test_json_path_planner_generates_sub_path() {
 
     let planner = Planner::new(PlannerConfig::indexeddb());
     let selection = ankql::parser::parse_selection("licensing.territory = 'US'").expect("parse selection");
-    let selection = map_references(
-        &selection,
-        &|path| ColumnPath::new(path.first(), path.steps[1..].to_vec()),
-        &|model| *model.as_id().expect("model ID in physical-column fixture"),
-    );
+    let selection = map_references(&selection, &|path| ColumnPath::new(path.first(), path.steps[1..].to_vec()), &|model| {
+        *model.as_id().expect("model ID in physical-column fixture")
+    });
     let plans = planner.plan(&selection, "id");
 
     // Find the index plan

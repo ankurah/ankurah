@@ -1,9 +1,9 @@
 pub mod bounds;
 pub mod engine_columns;
 pub mod filtering;
-pub mod naming;
-pub mod materialization_plan;
 pub mod materialization_join;
+pub mod materialization_plan;
+pub mod naming;
 pub mod planner;
 pub mod predicate;
 pub mod selection;

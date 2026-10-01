@@ -1,12 +1,12 @@
 use super::*;
+use crate::index::Index;
 use ankurah_core::{
     property::backend::backend_from_string,
     storage::{CommittedEntityWrite, StorageCommitOutcome, StorageCommitResult, StorageTransaction},
     value::Value,
 };
 use ankurah_proto::{AttestationSet, Clock, PropertyId, State};
-use crate::index::Index;
-use sled::{IVec, transaction::ConflictableTransactionError};
+use sled::{transaction::ConflictableTransactionError, IVec};
 
 /// Sled encodings and property values for one atomic commit.
 pub struct SledTransaction<'a> {
@@ -51,10 +51,7 @@ fn sled_abort(error: impl std::fmt::Display) -> ConflictableTransactionError<Sle
 }
 
 pub(super) fn encode_events(events: &[Attested<Event>]) -> Result<Vec<(IVec, IVec)>, MutationError> {
-    events.iter().map(|event| Ok((
-        IVec::from(event.payload.id().as_bytes()),
-        IVec::from(bincode::serialize(event)?),
-    ))).collect()
+    events.iter().map(|event| Ok((IVec::from(event.payload.id().as_bytes()), IVec::from(bincode::serialize(event)?)))).collect()
 }
 
 impl<'a> SledTransaction<'a> {
@@ -85,10 +82,7 @@ impl StorageTransaction for SledTransaction<'_> {
             expected_head: expected_head.clone(),
             head: state.payload.state.head.clone(),
             memberships: state.payload.state.memberships.clone(),
-            encoded_state: bincode::serialize(&StateFragmentRef {
-                state: &state.payload.state,
-                attestations: &state.attestations,
-            })?.into(),
+            encoded_state: bincode::serialize(&StateFragmentRef { state: &state.payload.state, attestations: &state.attestations })?.into(),
             encoded_memberships: bincode::serialize(&state.payload.state.memberships)?.into(),
             values,
             materializations: Vec::new(),
@@ -243,10 +237,7 @@ fn commit_staged(
 
             results.push((
                 prepared.original_index,
-                CommittedEntityWrite {
-                    entity_id,
-                    canonical_changed: prepared.expected_head != prepared.head,
-                },
+                CommittedEntityWrite { entity_id, canonical_changed: prepared.expected_head != prepared.head },
             ));
         }
         results.sort_by_key(|(index, _)| *index);

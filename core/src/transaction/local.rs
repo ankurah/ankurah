@@ -162,7 +162,9 @@ impl Transaction {
     /// Privileged contexts bypass policy, not epoch or event-validity checks.
     /// The public `commit` reaches this through the context, which supplies the typed node and its auth.
     pub(crate) async fn commit_with<SE, PA>(
-        &self, node: &Node<SE, PA>, auth: &ContextAuth<SessionSet<PA::ContextData>>,
+        &self,
+        node: &Node<SE, PA>,
+        auth: &ContextAuth<SessionSet<PA::ContextData>>,
     ) -> Result<Vec<Event>, MutationError>
     where
         SE: StorageEngine + Send + Sync + 'static,
@@ -179,7 +181,9 @@ impl Transaction {
         let mut entity_events = Vec::new();
         // Prepare once, outside the retry loop: every attempt re-applies and relays these exact events.
         for entity in self.entities.iter() {
-            if entity.system_epoch() != epoch { return Err(MutationError::ForeignEntity); }
+            if entity.system_epoch() != epoch {
+                return Err(MutationError::ForeignEntity);
+            }
             let events = entity.prepare_events()?;
             for event in &events {
                 event.payload.validate_structure()?;
@@ -203,17 +207,15 @@ impl Transaction {
             for (entity, events) in &entity_events {
                 // TODO(#509): Finalize the existing transaction fork; rebase it only on write conflicts.
                 // A subscription echo may already have committed this creation locally.
-                let entity_after = RemoteTrxEntity::for_event(
-                    &node.entities, &state_getter, &event_getter, &events[0].payload,
-                ).await?;
+                let entity_after = RemoteTrxEntity::for_event(&node.entities, &state_getter, &event_getter, &events[0].payload).await?;
                 let entity_before = entity_after.snapshot();
                 let after = entity_after.read();
                 for event in events {
                     let expected_head = entity_after.head();
                     let mut attested = event.clone();
-                    entity_after.apply_event(&event_getter, &mut attested, |event| {
-                        policy.check_write_event(node, &entity_before, &after, event)
-                    }).await?;
+                    entity_after
+                        .apply_event(&event_getter, &mut attested, |event| policy.check_write_event(node, &entity_before, &after, event))
+                        .await?;
                     storage_trx.add_events(std::slice::from_ref(&attested)).await?;
                     let state = EntityState { entity_id: entity.id(), state: entity_after.to_state()? };
                     let attestation = policy.attest_state(node, &state);
@@ -236,7 +238,9 @@ impl Transaction {
             for (entity, fork) in forks {
                 let change = fork.commit(&node.entities, &event_getter).await?;
                 entity.committed(change.entity())?;
-                if !change.events().is_empty() { changes.push(change); }
+                if !change.events().is_empty() {
+                    changes.push(change);
+                }
             }
             drop(publication);
             node.reactor.notify_change(changes).await;
@@ -249,7 +253,9 @@ impl Drop for Transaction {
     fn drop(&mut self) {
         // Mark transaction as no longer alive when dropped
         self.alive.store(false, Ordering::Release);
-        for entity in self.entities.iter() { entity.rollback(); }
+        for entity in self.entities.iter() {
+            entity.rollback();
+        }
     }
 }
 
@@ -268,6 +274,8 @@ impl Transaction {
     #[uniffi::method(name = "rollback")]
     pub fn uniffi_rollback(&self) {
         self.alive.store(false, Ordering::Release);
-        for entity in self.entities.iter() { entity.rollback(); }
+        for entity in self.entities.iter() {
+            entity.rollback();
+        }
     }
 }

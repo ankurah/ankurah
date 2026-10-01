@@ -1,6 +1,6 @@
-mod common;
 #[path = "../../common/tests/support/membership.rs"]
 mod cases;
+mod common;
 
 #[tokio::test]
 async fn joined_memberships() -> anyhow::Result<()> {

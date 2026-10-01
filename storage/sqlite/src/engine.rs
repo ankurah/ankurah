@@ -11,9 +11,7 @@ use std::sync::Arc;
 
 use ankurah_core::error::{MutationError, RetrievalError};
 use ankurah_core::schema::CatalogResolver;
-use ankurah_core::storage::{
-    CommittedEntityWrite, StorageCommitOutcome, StorageCommitResult, StorageEngine, StorageTransaction,
-};
+use ankurah_core::storage::{CommittedEntityWrite, StorageCommitOutcome, StorageCommitResult, StorageEngine, StorageTransaction};
 use ankurah_proto::{Attested, Clock, EntityId, EntityState, Event, EventBody, EventId, State, StateBuffers, PROTOCOL_VERSION};
 use ankurah_proto::{ModelId, SystemModel};
 use async_trait::async_trait;
@@ -26,8 +24,8 @@ use crate::value::SqliteValue;
 mod materialization;
 mod query;
 mod transaction;
-pub use transaction::SqliteTransaction;
 use materialization::{Materialization, PreparedMaterialization};
+pub use transaction::SqliteTransaction;
 
 /// Default connection pool size
 pub const DEFAULT_POOL_SIZE: u32 = 10;
@@ -344,10 +342,7 @@ impl StorageEngine for SqliteStorageEngine {
         load_state(&conn, id).await
     }
 
-    async fn fetch_states(
-        &self,
-        selection: &ankql::ast::Selection<Resolved>,
-    ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+    async fn fetch_states(&self, selection: &ankql::ast::Selection<Resolved>) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         query::Query::prepare(self, selection).await?.states(self).await
     }
 
@@ -358,21 +353,22 @@ impl StorageEngine for SqliteStorageEngine {
         let conn = self.pool.get().await.map_err(|error| SqliteError::Pool(error.to_string()))?;
         self.ensure_shared_tables(&conn).await?;
         let event_ids: Vec<String> = event_ids.into_iter().map(|id| id.to_base64()).collect();
-        let events = conn.with_connection(move |c| {
-            let placeholders = (0..event_ids.len()).map(|_| "?").collect::<Vec<_>>().join(", ");
-            let mut stmt = c.prepare(&format!(
-                r#"SELECT "entity_id", "body", "parent", "attestations"
+        let events = conn
+            .with_connection(move |c| {
+                let placeholders = (0..event_ids.len()).map(|_| "?").collect::<Vec<_>>().join(", ");
+                let mut stmt = c.prepare(&format!(
+                    r#"SELECT "entity_id", "body", "parent", "attestations"
                    FROM "{EVENT_TABLE}" WHERE "id" IN ({placeholders})"#
-            ))?;
-            let params: Vec<&dyn rusqlite::ToSql> = event_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
-            let rows = stmt.query_map(params.as_slice(), event_from_sqlite_row)?;
-            Ok(rows.collect::<Result<Vec<_>, _>>()?)
-        })
-        .await
-        .map_err(RetrievalError::storage)?
-        .into_iter()
-        .map(decode_event_row)
-        .collect::<Result<_, _>>()?;
+                ))?;
+                let params: Vec<&dyn rusqlite::ToSql> = event_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+                let rows = stmt.query_map(params.as_slice(), event_from_sqlite_row)?;
+                Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            })
+            .await
+            .map_err(RetrievalError::storage)?
+            .into_iter()
+            .map(decode_event_row)
+            .collect::<Result<_, _>>()?;
         Ok(events)
     }
 
@@ -659,7 +655,10 @@ mod tests {
         let other = PropertyId::EntityId(entity_id(0xe8));
         let removed = state_for_model(state_with_strings(entity, 3, &[(other, "remaining")]), model);
         commit_canonical_state(&reopened, updated.payload.state.head, removed).await;
-        assert!(reopened.fetch_states(&selection.clone().and_member_of(model)).await.unwrap().is_empty(), "removed properties must not retain old values");
+        assert!(
+            reopened.fetch_states(&selection.clone().and_member_of(model)).await.unwrap().is_empty(),
+            "removed properties must not retain old values"
+        );
     }
 
     #[tokio::test]
@@ -836,14 +835,14 @@ mod tests {
         commit_state(&engine, Clock::default(), model_a, second.clone()).await;
 
         let mut transaction = engine.transaction();
-        transaction.set_state(
-            &first.payload.state.head,
-            &state_for_model(state_with_strings(first_id, 3, &[(property, "first-new")]), model_b),
-        ).await.unwrap();
-        transaction.set_state(
-            &Clock::default(),
-            &state_for_model(state_with_strings(second_id, 4, &[(property, "second-new")]), model_b),
-        ).await.unwrap();
+        transaction
+            .set_state(&first.payload.state.head, &state_for_model(state_with_strings(first_id, 3, &[(property, "first-new")]), model_b))
+            .await
+            .unwrap();
+        transaction
+            .set_state(&Clock::default(), &state_for_model(state_with_strings(second_id, 4, &[(property, "second-new")]), model_b))
+            .await
+            .unwrap();
         let outcome = transaction.commit().await.unwrap();
         let StorageCommitOutcome::Conflict { observed } = outcome else {
             panic!("one stale expected head must reject the complete batch");

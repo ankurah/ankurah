@@ -1,10 +1,9 @@
 use crate::agent_state::start_policy_sync;
 pub use crate::agent_state::AgentState;
+use crate::bound_policy::{BoundPolicy, ReadOperation};
 use crate::{JwtContext, JwtKeys, PolicyConfig, SigningKeys};
 use ankql::ast::{Predicate, Resolved};
 use ankurah::signals::{Mut, Read};
-use futures::FutureExt;
-use crate::bound_policy::{BoundPolicy, ReadOperation};
 use ankurah_core::{
     entity::Entity,
     error::ValidationError,
@@ -16,6 +15,7 @@ use ankurah_core::{
 };
 use ankurah_proto::{self as proto, Attested};
 use async_trait::async_trait;
+use futures::FutureExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tracing::debug;
@@ -81,7 +81,10 @@ impl JwtAgent {
     /// Set configuration for later installation; active permissions are unchanged.
     /// Use [`Self::set_policy`] to change the system's policy.
     pub fn update_config(&self, config: PolicyConfig) {
-        self.state.update(|state| { state.config = Arc::new(config); state.config_loaded = true; });
+        self.state.update(|state| {
+            state.config = Arc::new(config);
+            state.config_loaded = true;
+        });
     }
 
     /// Create or replace the system's stored policy, using this agent's public verification key.
@@ -128,22 +131,31 @@ impl JwtAgent {
     }
 
     pub fn can_access_model<C: Iterable<JwtContext>>(&self, data: &C, model: &proto::ModelId) -> Result<(), AccessDenied> {
-        if data.iterable().any(JwtContext::is_privileged) { return Ok(()); }
-        if self.state.with(|state| state.policy_models.contains(model)) { return Ok(()); }
+        if data.iterable().any(JwtContext::is_privileged) {
+            return Ok(());
+        }
+        if self.state.with(|state| state.policy_models.contains(model)) {
+            return Ok(());
+        }
         self.policy()?.can_access_model(data, model)
     }
 
     fn read_predicate<C: Iterable<JwtContext>>(&self, data: &C, operation: ReadOperation) -> Result<Predicate<Resolved>, AccessDenied> {
-        if data.iterable().any(JwtContext::is_privileged) { return Ok(Predicate::True); }
+        if data.iterable().any(JwtContext::is_privileged) {
+            return Ok(Predicate::True);
+        }
         self.state.with(|state| match &state.policy {
             Some(policy) => Ok(policy.read_predicate(data, operation)),
             // Policy records must be readable before their contents have loaded.
-            None => state.policy_models.iter().copied().map(Predicate::MemberOf)
+            None => state
+                .policy_models
+                .iter()
+                .copied()
+                .map(Predicate::MemberOf)
                 .reduce(|left, right| Predicate::Or(Box::new(left), Box::new(right)))
                 .ok_or(AccessDenied::ByPolicy("policy has not loaded")),
         })
     }
-
 }
 
 #[async_trait]
@@ -217,8 +229,8 @@ impl PolicyAgent for JwtAgent {
                     contexts.push(JwtContext::NoUser);
                     continue;
                 }
-                let token =
-                    std::str::from_utf8(&auth_data.0).map_err(|e| ValidationError::ValidationFailed(format!("Invalid UTF-8 in token: {e}")))?;
+                let token = std::str::from_utf8(&auth_data.0)
+                    .map_err(|e| ValidationError::ValidationFailed(format!("Invalid UTF-8 in token: {e}")))?;
                 let claims = keys.verify(token).map_err(|e| ValidationError::ValidationFailed(format!("JWT verification failed: {e}")))?;
                 contexts.push(JwtContext::from_claims(claims, token.to_string()));
             }
@@ -232,7 +244,9 @@ impl PolicyAgent for JwtAgent {
         cdata: &Self::ContextData,
         plan: &RegistrationPlan,
     ) -> Result<(), AccessDenied> {
-        if cdata.is_privileged() { return Ok(()); }
+        if cdata.is_privileged() {
+            return Ok(());
+        }
         if matches!(cdata, JwtContext::NoUser) && !plan.is_noop() {
             return Err(AccessDenied::ByPolicy("Anonymous contexts cannot change the catalog"));
         }
@@ -246,8 +260,10 @@ impl PolicyAgent for JwtAgent {
                     Ok(Some(membership)) => protects(membership.model),
                     _ => true,
                 },
-                _ => protects(update.entity)
-                    || node.catalog.property_by_id(&update.entity).ok().flatten().and_then(|row| row.minted_for).is_some_and(protects),
+                _ => {
+                    protects(update.entity)
+                        || node.catalog.property_by_id(&update.entity).ok().flatten().and_then(|row| row.minted_for).is_some_and(protects)
+                }
             });
         if modifies_policy {
             return Err(AccessDenied::ByPolicy("Only privileged contexts may change JWT policy schema"));
@@ -256,11 +272,16 @@ impl PolicyAgent for JwtAgent {
     }
 
     async fn schema_registered<SE: StorageEngine + Send + Sync + 'static>(
-        &self, node: &Node<SE, Self>, transaction: &ankurah::transaction::Transaction, plan: &RegistrationPlan,
+        &self,
+        node: &Node<SE, Self>,
+        transaction: &ankurah::transaction::Transaction,
+        plan: &RegistrationPlan,
     ) -> anyhow::Result<Option<tokio::sync::OwnedMutexGuard<()>>> {
         let context = ankurah::Context::new_weak(node, JwtContext::system());
         let Some(epoch) = node.system.system_epoch() else { return Ok(None) };
-        if crate::graph::bind_models(&node.catalog, epoch).is_err() { return Ok(None); }
+        if crate::graph::bind_models(&node.catalog, epoch).is_err() {
+            return Ok(None);
+        }
         let authoring = self.authoring.clone().lock_owned().await;
         crate::authoring::schema_registered(&context, &node.catalog, transaction, plan).await?;
         Ok(Some(authoring))
@@ -311,7 +332,9 @@ impl PolicyAgent for JwtAgent {
     }
 
     fn check_write(&self, cdata: &Self::ContextData, entity: &Entity, _event: Option<&proto::Event>) -> Result<(), AccessDenied> {
-        if cdata.is_privileged() { return Ok(()); }
+        if cdata.is_privileged() {
+            return Ok(());
+        }
         self.policy()?.check_write(cdata, None, entity)
     }
 

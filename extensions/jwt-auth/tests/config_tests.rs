@@ -116,7 +116,8 @@ fn test_wildcard_requires_an_explicit_operation_grant() {
     assert!(!config.can_scan_collection(&admin, "anything"));
     assert!(!config.can_write_collection(&admin, "anything"));
 
-    let config: PolicyConfig = serde_json::from_str(r#"{
+    let config: PolicyConfig = serde_json::from_str(
+        r#"{
         "roles": { "Admin": ["*"] },
         "collections": {
             "read_only": { "read": "read" },
@@ -124,7 +125,9 @@ fn test_wildcard_requires_an_explicit_operation_grant() {
             "write_only": { "write": "write" },
             "disabled": {}
         }
-    }"#).unwrap();
+    }"#,
+    )
+    .unwrap();
     for (label, retrieve, scan, write) in [
         ("read_only", true, true, false),
         ("retrieve_only", true, false, false),

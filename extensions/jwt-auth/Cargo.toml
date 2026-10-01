@@ -8,11 +8,11 @@ homepage    = "https://github.com/ankurah/ankurah"
 repository  = "https://github.com/ankurah/ankurah"
 
 [features]
-default = []
-wasm    = []
-watcher = ["dep:notify"]
+default      = []
+wasm         = []
+watcher      = ["dep:notify"]
 test-helpers = []
-uniffi  = ["dep:uniffi"]
+uniffi       = ["dep:uniffi"]
 
 [dependencies]
 # Internal dependencies

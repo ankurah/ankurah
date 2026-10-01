@@ -8,7 +8,10 @@ use ankurah_storage_common::{
 };
 
 use super::{load_states, SqliteStorageEngine, ENTITY_TABLE};
-use crate::{error::SqliteError, sql_builder::{split_predicate_for_sqlite, SqlBuilder}};
+use crate::{
+    error::SqliteError,
+    sql_builder::{split_predicate_for_sqlite, SqlBuilder},
+};
 
 /// A selection over joined materializations, with any unsupported predicate retained for Rust.
 pub(super) struct Query {
@@ -50,7 +53,10 @@ impl Query {
         builder.selection(&join.lower(&pushed)).map_err(SqliteError::from)?;
         let (predicate_sql, params) = builder.build_where_clause();
         Ok(Self {
-            sql: format!(r#"SELECT "id" FROM ({}) AS materialized WHERE {predicate_sql}"#, join.sql(ENTITY_TABLE, &properties, &plan.models)),
+            sql: format!(
+                r#"SELECT "id" FROM ({}) AS materialized WHERE {predicate_sql}"#,
+                join.sql(ENTITY_TABLE, &properties, &plan.models)
+            ),
             params,
             remaining: Selection { predicate: split.remaining_predicate, order_by: None, limit: selection.limit },
         })
@@ -65,11 +71,13 @@ impl Query {
     pub async fn states(self, engine: &SqliteStorageEngine) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         let conn = engine.pool.get().await.map_err(|error| SqliteError::Pool(error.to_string()))?;
         engine.ensure_shared_tables(&conn).await?;
-        let states = conn.with_connection_mut(move |c| {
-            let snapshot = c.transaction()?;
-            let ids = self.read_ids(&snapshot)?;
-            Ok((load_states(&snapshot, &ids)?, self.remaining))
-        }).await?;
+        let states = conn
+            .with_connection_mut(move |c| {
+                let snapshot = c.transaction()?;
+                let ids = self.read_ids(&snapshot)?;
+                Ok((load_states(&snapshot, &ids)?, self.remaining))
+            })
+            .await?;
         select_states(states.0, &states.1)
     }
 }

@@ -153,8 +153,9 @@ impl Scheduler {
         match message {
             proto::NodeMessage::Request { request, .. } => {
                 let protected = match &request.body {
-                    proto::NodeRequestBody::Fetch { selection, .. } => selection.predicate.referenced_models()
-                        .iter().any(ankurah::core::schema::reads_bypass_policy),
+                    proto::NodeRequestBody::Fetch { selection, .. } => {
+                        selection.predicate.referenced_models().iter().any(ankurah::core::schema::reads_bypass_policy)
+                    }
                     proto::NodeRequestBody::SubscribeQuery { .. } => true,
                     _ => return false,
                 };

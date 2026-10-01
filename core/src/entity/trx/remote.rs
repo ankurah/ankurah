@@ -1,7 +1,12 @@
 use super::TrxEntityData;
 use crate::{
     changes::EntityChange,
-    entity::{entity::EntityInner, proxy::{ProxyTarget, RolledBackCreation}, state::EntityState, Entity, WeakEntitySet},
+    entity::{
+        entity::EntityInner,
+        proxy::{ProxyTarget, RolledBackCreation},
+        state::EntityState,
+        Entity, WeakEntitySet,
+    },
     error::{MutationError, RetrievalError, StateError},
     property::PropertyError,
     retrieval::{GetEvents, GetState},
@@ -17,21 +22,18 @@ pub struct RemoteTrxEntity(Arc<RemoteTrxEntityInner>);
 
 #[derive(Debug)]
 pub(in crate::entity) enum RemoteTrxEntityInner {
-    New {
-        id: EntityId,
-        data: TrxEntityData,
-    },
-    Mut {
-        upstream: Arc<EntityInner>,
-        data: TrxEntityData,
-    },
+    New { id: EntityId, data: TrxEntityData },
+    Mut { upstream: Arc<EntityInner>, data: TrxEntityData },
 }
 
 impl RemoteTrxEntity {
     /// Fork the entity an event targets, loading it from storage if it isn't resident.
     /// If this node has no such entity, the event must create it.
     pub(crate) async fn for_event<S, G>(
-        entities: &WeakEntitySet, state_getter: &S, event_getter: &G, event: &Event,
+        entities: &WeakEntitySet,
+        state_getter: &S,
+        event_getter: &G,
+        event: &Event,
     ) -> Result<Self, MutationError>
     where
         S: GetState + Send + Sync,
@@ -47,12 +49,11 @@ impl RemoteTrxEntity {
     /// genesis next; no resident entity is registered until the creation commits.
     pub(crate) fn new(genesis: &Event, epoch: SystemEpoch) -> Result<Self, MutationError> {
         genesis.validate_structure()?;
-        if !genesis.is_entity_create() { return Err(MutationError::InvalidEvent); }
+        if !genesis.is_entity_create() {
+            return Err(MutationError::InvalidEvent);
+        }
 
-        Ok(Self(Arc::new(RemoteTrxEntityInner::New {
-            id: genesis.entity_id,
-            data: TrxEntityData::new(EntityState::empty(), epoch),
-        })))
+        Ok(Self(Arc::new(RemoteTrxEntityInner::New { id: genesis.entity_id, data: TrxEntityData::new(EntityState::empty(), epoch) })))
     }
 
     /// Fork a resident entity; committing the fork applies its events to that entity.
@@ -68,9 +69,7 @@ impl RemoteTrxEntity {
 
     pub fn to_state(&self) -> Result<State, StateError> { self.0.data().state.to_state() }
 
-    pub fn read(&self) -> Entity {
-        self.0.data().read(ProxyTarget::Remote(self.0.clone()), || RolledBackCreation::Remote(self.id()))
-    }
+    pub fn read(&self) -> Entity { self.0.data().read(ProxyTarget::Remote(self.0.clone()), || RolledBackCreation::Remote(self.id())) }
 
     pub(crate) async fn apply_state<G>(&self, getter: &G, state: &State) -> Result<crate::entity::StateApplyResult, MutationError>
     where G: GetEvents + Send + Sync {
@@ -84,8 +83,12 @@ impl RemoteTrxEntity {
         event: &mut Attested<Event>,
         check: impl FnOnce(&Event) -> Result<Option<Attestation>, MutationError>,
     ) -> Result<bool, MutationError>
-    where G: GetEvents + Send + Sync {
-        if event.payload.entity_id != self.id() { return Err(MutationError::InvalidEvent); }
+    where
+        G: GetEvents + Send + Sync,
+    {
+        if event.payload.entity_id != self.id() {
+            return Err(MutationError::InvalidEvent);
+        }
 
         let data = self.0.data();
         let getter = TransactionEventGetter::new(&data.events, &event.payload, getter);
@@ -95,7 +98,9 @@ impl RemoteTrxEntity {
             event.attestations.push(attestation);
         }
 
-        if applied { data.events.lock().unwrap().push(event.clone()); }
+        if applied {
+            data.events.lock().unwrap().push(event.clone());
+        }
         Ok(applied)
     }
 

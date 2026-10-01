@@ -48,10 +48,7 @@ pub trait LocalEntitySource<E: AbstractEntity + Filterable + Send + 'static = En
     /// Recheck an entity before publishing it, including changes arriving after the initial fetch.
     fn can_read(&self, _entity: &E) -> bool { true }
 
-    async fn fetch_entities_from_local(
-        &self,
-        selection: &ankql::ast::Selection<Resolved>,
-    ) -> Result<Vec<E>, RetrievalError>;
+    async fn fetch_entities_from_local(&self, selection: &ankql::ast::Selection<Resolved>) -> Result<Vec<E>, RetrievalError>;
 }
 
 /// Trait for types that can be used in notify_change
@@ -400,7 +397,8 @@ mod tests {
         };
         let node = Node::new_durable(std::sync::Arc::new(TestStorage::default()), PermissiveAgent::new());
         node.system.create().await.unwrap();
-        let query = node.context_async(DEFAULT_CONTEXT).await.unwrap().query_wait::<crate::schema::catalog::SysModelRowView>("true").await.unwrap();
+        let query =
+            node.context_async(DEFAULT_CONTEXT).await.unwrap().query_wait::<crate::schema::catalog::SysModelRowView>("true").await.unwrap();
         assert!(query.loaded());
 
         let notify = node.reactor.0.notify_lock.lock().await;
@@ -492,9 +490,7 @@ mod tests {
         }
     }
     impl Filterable for TestEntity {
-        fn is_member_of(&self, model: &ModelId) -> Result<bool, crate::selection::filter::Error> {
-            Ok(self.models.contains(model))
-        }
+        fn is_member_of(&self, model: &ModelId) -> Result<bool, crate::selection::filter::Error> { Ok(self.models.contains(model)) }
         fn value(&self, property: &ankql::ast::PropertyId) -> Option<crate::value::Value> {
             self.state.lock().unwrap().get(property).cloned().map(crate::value::Value::String)
         }
@@ -574,10 +570,19 @@ mod tests {
         entity.models.insert(b);
         let queries = [(QueryId::new(), a), (QueryId::new(), b)];
         for (query, model) in queries {
-            reactor.upsert_query_and_notify(
-                subscription.id(), query, ankql::ast::Predicate::MemberOf(model).into(),
-                Arc::new(MockNode { entities: vec![] }), EntityResultSet::empty(), Arc::new(MockGapFetcher::new()), 1, (),
-            ).await.unwrap();
+            reactor
+                .upsert_query_and_notify(
+                    subscription.id(),
+                    query,
+                    ankql::ast::Predicate::MemberOf(model).into(),
+                    Arc::new(MockNode { entities: vec![] }),
+                    EntityResultSet::empty(),
+                    Arc::new(MockGapFetcher::new()),
+                    1,
+                    (),
+                )
+                .await
+                .unwrap();
         }
         changes();
         let event = TestEvent { id: proto::EventId::from_bytes([3; 32]), changes: HashMap::new() };

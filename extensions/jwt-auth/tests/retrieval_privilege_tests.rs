@@ -101,7 +101,11 @@ fn retrieval_tier_scans_nothing() {
         "id = 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8' AND name = 'Ada'",
     ] {
         let out = ContextPolicy::from_credentials(&agent, &guest).filter_predicate(common::in_model(user, parse(scan))).unwrap();
-        assert_eq!(out, Predicate::And(Box::new(common::in_model(user, parse(scan))), Box::new(Predicate::False)), "every predicate is a scan at the retrieval tier: {scan}");
+        assert_eq!(
+            out,
+            Predicate::And(Box::new(common::in_model(user, parse(scan))), Box::new(Predicate::False)),
+            "every predicate is a scan at the retrieval tier: {scan}"
+        );
     }
 }
 
@@ -115,8 +119,11 @@ fn scan_tier_predicates_require_granted_membership() {
 
     for predicate in ["true", "name = 'Ada'", "id = 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8'"] {
         let out = ContextPolicy::from_credentials(&agent, &member).filter_predicate(common::in_model(user, parse(predicate))).unwrap();
-        assert_eq!(out, Predicate::And(Box::new(common::in_model(user, parse(predicate))), Box::new(Predicate::MemberOf(user))),
-            "read privilege scans members freely: {predicate}");
+        assert_eq!(
+            out,
+            Predicate::And(Box::new(common::in_model(user, parse(predicate))), Box::new(Predicate::MemberOf(user))),
+            "read privilege scans members freely: {predicate}"
+        );
     }
 }
 
@@ -136,9 +143,11 @@ fn retrieval_credential_never_widens_a_scoped_scan() {
     // A member scans its own slice, composed as before.
     let member = vec![member_ctx("member-1")];
     let out = ContextPolicy::from_credentials(&agent, &member).filter_predicate(common::in_model(note, parse("true"))).unwrap();
-    assert_eq!(out, Predicate::And(
-        Box::new(common::in_model(note, Predicate::True)), Box::new(common::in_model(note, parse("owner = 'member-1'"))),
-    ), "scope composition retains the membership predicate");
+    assert_eq!(
+        out,
+        Predicate::And(Box::new(common::in_model(note, Predicate::True)), Box::new(common::in_model(note, parse("owner = 'member-1'"))),),
+        "scope composition retains the membership predicate"
+    );
 }
 
 /// End to end through a node: the guest retrieves the user it names by the

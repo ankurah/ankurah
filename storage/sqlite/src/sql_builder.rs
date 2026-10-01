@@ -364,11 +364,9 @@ mod tests {
     use ankurah_storage_common::ColumnPath;
 
     fn lowered(query: &str) -> Selection<EngineColumns> {
-        map_references(
-            &parse_selection(query).unwrap(),
-            &|path| ColumnPath::new(path.first(), path.steps[1..].to_vec()),
-            &|model| *model.as_id().expect("model ID in physical-column fixture"),
-        )
+        map_references(&parse_selection(query).unwrap(), &|path| ColumnPath::new(path.first(), path.steps[1..].to_vec()), &|model| {
+            *model.as_id().expect("model ID in physical-column fixture")
+        })
     }
 
     #[test]

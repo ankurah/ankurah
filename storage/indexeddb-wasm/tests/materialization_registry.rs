@@ -187,7 +187,8 @@ async fn reader_reloads_property_fields_assigned_by_another_engine() -> anyhow::
         left: Box::new(ankql::ast::Expr::Path(added.into())),
         operator: ankql::ast::ComparisonOperator::Equal,
         right: Box::new(ankql::ast::Expr::Literal(Value::String("new".into()))),
-    }).and_member_of(model);
+    })
+    .and_member_of(model);
     let found = reader.fetch_states(&selection).await?;
     assert_eq!(found.iter().map(|state| state.payload.entity_id).collect::<Vec<_>>(), vec![entity]);
 
@@ -217,14 +218,12 @@ async fn stale_head_rolls_back_the_complete_batch() -> anyhow::Result<()> {
     commit_state(&engine, Clock::default(), model_a, second.clone()).await?;
 
     let mut transaction = engine.transaction();
-    transaction.set_state(
-        &first.payload.state.head,
-        &state_for_model(state_with_strings(first_id, 3, &[(property, "first-new")]), model_b),
-    ).await?;
-    transaction.set_state(
-        &Clock::default(),
-        &state_for_model(state_with_strings(second_id, 4, &[(property, "second-new")]), model_b),
-    ).await?;
+    transaction
+        .set_state(&first.payload.state.head, &state_for_model(state_with_strings(first_id, 3, &[(property, "first-new")]), model_b))
+        .await?;
+    transaction
+        .set_state(&Clock::default(), &state_for_model(state_with_strings(second_id, 4, &[(property, "second-new")]), model_b))
+        .await?;
     let outcome = transaction.commit().await?;
     let StorageCommitOutcome::Conflict { observed } = outcome else {
         anyhow::bail!("one stale expected head must reject the complete batch");

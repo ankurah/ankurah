@@ -39,8 +39,8 @@ impl Fixture {
             OperationSet(vec![Operation::Membership(Membership::Add(model_a())), value_operation("initial")?]),
         );
         events.stage_event(genesis.clone());
-        let (entity, _) = NodeApplier::save_events(&node, genesis.entity_id, &[Attested::opt(genesis, None)], &events)
-            .await?.unwrap().into_parts();
+        let (entity, _) =
+            NodeApplier::save_events(&node, genesis.entity_id, &[Attested::opt(genesis, None)], &events).await?.unwrap().into_parts();
         Ok(Self { node, storage, events, entity })
     }
 
@@ -95,17 +95,26 @@ async fn first_snapshot_initializes_an_entity_without_its_events() -> anyhow::Re
     };
     storage.fail_next_commit();
     let failed = NodeApplier::apply_delta_inner(
-        &node, &EntityId::from_bytes([5; 32]), delta.clone(),
-        &LocalEventGetter::new(storage.clone(), false), &LocalStateGetter::new(storage.clone()),
-    ).await;
+        &node,
+        &EntityId::from_bytes([5; 32]),
+        delta.clone(),
+        &LocalEventGetter::new(storage.clone(), false),
+        &LocalStateGetter::new(storage.clone()),
+    )
+    .await;
     assert!(failed.is_err());
     assert!(node.entities.get(&source.entity.id()).is_none());
     assert!(matches!(storage.get_state(source.entity.id()).await, Err(RetrievalError::EntityNotFound(_))));
 
     let change = NodeApplier::apply_delta_inner(
-        &node, &EntityId::from_bytes([5; 32]), delta,
-        &LocalEventGetter::new(storage.clone(), false), &LocalStateGetter::new(storage.clone()),
-    ).await?.expect("the first snapshot initializes the entity");
+        &node,
+        &EntityId::from_bytes([5; 32]),
+        delta,
+        &LocalEventGetter::new(storage.clone(), false),
+        &LocalStateGetter::new(storage.clone()),
+    )
+    .await?
+    .expect("the first snapshot initializes the entity");
     let (entity, _) = change.into_parts();
     assert_eq!(entity.to_state()?, state);
     assert_eq!(storage.get_state(entity.id()).await?.payload.state, state);
@@ -186,12 +195,8 @@ async fn divergent_state_and_event_commit_failure_keeps_retained_entity_and_list
 #[tokio::test]
 async fn event_only_commits_accepted_prefix_without_partial_failed_operations() -> anyhow::Result<()> {
     let fixture = Fixture::new().await?;
-    let accepted = Event::update(
-        fixture.entity.id(),
-        fixture.entity.head(),
-        AuthorId::Unknown,
-        OperationSet(vec![value_operation("accepted")?]),
-    );
+    let accepted =
+        Event::update(fixture.entity.id(), fixture.entity.head(), AuthorId::Unknown, OperationSet(vec![value_operation("accepted")?]));
     let failed = Event::update(
         fixture.entity.id(),
         accepted.id().into(),
@@ -206,7 +211,10 @@ async fn event_only_commits_accepted_prefix_without_partial_failed_operations() 
     let _listener = fixture.entity.broadcast().reference().listen(notifications);
     let update = proto::SubscriptionUpdateItem {
         entity_id: fixture.entity.id(),
-        content: proto::UpdateContent::EventOnly(vec![Attested::opt(accepted.clone(), None).into(), Attested::opt(failed.clone(), None).into()]),
+        content: proto::UpdateContent::EventOnly(vec![
+            Attested::opt(accepted.clone(), None).into(),
+            Attested::opt(failed.clone(), None).into(),
+        ]),
         predicate_relevance: vec![],
     };
     let mut changes = Vec::new();

@@ -1,6 +1,6 @@
-use crate::node::handler::commit_transaction;
 use super::*;
 use crate::connector::SendError;
+use crate::node::handler::commit_transaction;
 use crate::policy::{PermissiveAgent, DEFAULT_CONTEXT};
 use crate::test_utils::TestStorage;
 use ankurah_signals::Subscribe;
@@ -144,11 +144,7 @@ async fn disconnect_releases_pending_requests() {
     let peer = proto::EntityId::random();
     let (sent, _messages) = std::sync::mpsc::channel();
     node.register_peer(presence(peer), Box::new(RecordingSender(peer, sent))).await.unwrap();
-    let request = node.request(
-        peer,
-        &DEFAULT_CONTEXT,
-        proto::NodeRequestBody::Get { ids: vec![] },
-    );
+    let request = node.request(peer, &DEFAULT_CONTEXT, proto::NodeRequestBody::Get { ids: vec![] });
     tokio::pin!(request);
     assert!(futures::poll!(&mut request).is_pending());
 
@@ -229,8 +225,10 @@ async fn remote_creations_are_not_registered_or_published_before_storage_succeed
     assert_eq!(other_resident.memberships(), [a, b].into_iter().collect());
     assert_eq!(storage.dump_entity_events(other_genesis.entity_id).await?.len(), 2);
     assert_eq!(changes.len(), 2, "one change per entity, not per event");
-    for (entity, expected) in [(genesis.entity_id, vec![genesis.into(), update.into()]),
-        (other_genesis.entity_id, vec![other_genesis.into(), other_update.into()])] {
+    for (entity, expected) in [
+        (genesis.entity_id, vec![genesis.into(), update.into()]),
+        (other_genesis.entity_id, vec![other_genesis.into(), other_update.into()]),
+    ] {
         assert_eq!(changes.iter().find(|change| change.entity.id() == entity).unwrap().events, expected);
     }
     assert!(received.try_recv().is_err());
@@ -280,8 +278,8 @@ async fn remote_commit_waits_for_the_winners_resident_publication() -> anyhow::R
 
     assert_eq!(entity.memberships(), [a, b, c].into_iter().collect());
     assert_eq!(entity.to_state()?, storage.get_state(id).await?.payload.state);
-    let notified: Vec<_> = received.try_iter().flat_map(|update| update.items).flat_map(|item| item.events)
-        .map(|event| event.payload.id()).collect();
+    let notified: Vec<_> =
+        received.try_iter().flat_map(|update| update.items).flat_map(|item| item.events).map(|event| event.payload.id()).collect();
     assert_eq!(notified, expected_events);
     Ok(())
 }

@@ -12,10 +12,7 @@ pub(crate) struct BoundPredicate {
 }
 
 impl BoundPredicate {
-    pub(crate) fn from_stored(
-        predicate: Predicate<Resolved>,
-        parameters: Vec<(String, Option<ValueType>)>,
-    ) -> Result<Self, AccessDenied> {
+    pub(crate) fn from_stored(predicate: Predicate<Resolved>, parameters: Vec<(String, Option<ValueType>)>) -> Result<Self, AccessDenied> {
         let placeholders = parameters.iter().map(|_| Expr::<Resolved>::Placeholder);
         predicate.clone().populate(placeholders)?;
         Ok(Self { predicate, parameters })
@@ -23,23 +20,29 @@ impl BoundPredicate {
 
     pub(crate) fn bind(filter: &str, model: &ModelId, catalog: &dyn PolicyCatalog) -> Result<Self, AccessDenied> {
         let (predicate, variables) = crate::variables::parse_template(filter)?;
-        let predicate = catalog.resolve_predicate(model, predicate)
-            .map_err(|_| AccessDenied::ByPolicy("policy property bindings are not ready"))?;
+        let predicate =
+            catalog.resolve_predicate(model, predicate).map_err(|_| AccessDenied::ByPolicy("policy property bindings are not ready"))?;
         let mut types = Vec::new();
         parameter_types(&predicate, model, catalog, &mut types)?;
         Ok(Self { predicate, parameters: variables.into_iter().zip(types).collect() })
     }
 
     pub(crate) fn populate(&self, claims: &JwtClaims) -> Result<Predicate<Resolved>, AccessDenied> {
-        let values = self.parameters.iter().map(|(variable, target)| {
-            let value = crate::variables::resolve_variable(variable, claims)?;
-            let Expr::Literal(value) = crate::variables::typed_expr::<Resolved>(value) else { unreachable!() };
-            let value = match target {
-                Some(target) => value.cast_to(*target).map_err(|_| AccessDenied::ByPolicy("claim value does not match policy property type"))?,
-                None => value,
-            };
-            Ok(Expr::Literal(value))
-        }).collect::<Result<Vec<_>, AccessDenied>>()?;
+        let values = self
+            .parameters
+            .iter()
+            .map(|(variable, target)| {
+                let value = crate::variables::resolve_variable(variable, claims)?;
+                let Expr::Literal(value) = crate::variables::typed_expr::<Resolved>(value) else { unreachable!() };
+                let value = match target {
+                    Some(target) => {
+                        value.cast_to(*target).map_err(|_| AccessDenied::ByPolicy("claim value does not match policy property type"))?
+                    }
+                    None => value,
+                };
+                Ok(Expr::Literal(value))
+            })
+            .collect::<Result<Vec<_>, AccessDenied>>()?;
         self.predicate.clone().populate(values).map_err(Into::into)
     }
 }
@@ -53,7 +56,9 @@ fn parameter_types(
     match predicate {
         Predicate::Comparison { left, right, .. } => {
             let target = |expr: &Expr<Resolved>| match expr {
-                Expr::Path(path) => catalog.property_type(model, &path.property_id()).map(Some)
+                Expr::Path(path) => catalog
+                    .property_type(model, &path.property_id())
+                    .map(Some)
                     .map_err(|_| AccessDenied::ByPolicy("policy property type is unavailable")),
                 _ => Ok(None),
             };
@@ -81,7 +86,9 @@ fn expression_parameters(
     match expr {
         Expr::Placeholder => types.push(target),
         Expr::ExprList(items) => {
-            for item in items { expression_parameters(item, target, model, catalog, types)?; }
+            for item in items {
+                expression_parameters(item, target, model, catalog, types)?;
+            }
         }
         Expr::Predicate(predicate) => parameter_types(predicate, model, catalog, types)?,
         Expr::InfixExpr { left, right, .. } => {

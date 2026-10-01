@@ -223,9 +223,7 @@ async fn malformed_clock_identity_is_order_independent_end_to_end() -> Result<()
             proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)])),
         )
     };
-    f.client
-        .handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, vec![ev_b.clone(), ev_c.clone()])]))
-        .await?;
+    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, vec![ev_b.clone(), ev_c.clone()])])).await?;
 
     // The head is now the antichain {ev_b, ev_c}. Take one merge event and
     // re-parent a copy of it on the same two ids in the opposite order;
@@ -274,9 +272,7 @@ async fn forged_dangling_parent_is_contained() -> Result<()> {
     let id_forged = ev_b_forged.id();
 
     // handle_message returns Ok; the per-item failure rides the ack path.
-    f.client
-        .handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(ev_a), event_only_item(ev_b_forged)]))
-        .await?;
+    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(ev_a), event_only_item(ev_b_forged)])).await?;
 
     // A applied; B is unchanged, its head did not move, the forged event is not
     // committed, and B's real state survives.
@@ -456,9 +452,7 @@ async fn replay_flood_is_idempotent() -> Result<()> {
     }
     // And the same event redelivered inside a multi-event batch alongside
     // itself (duplicate within one item), out of order.
-    f.client
-        .handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, vec![ev.clone(), ev.clone()])]))
-        .await?;
+    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, vec![ev.clone(), ev.clone()])])).await?;
 
     assert_eq!(view.title().unwrap(), "t1", "state reflects exactly one application");
     let head = view.entity().head();
@@ -544,9 +538,7 @@ async fn phantom_entity_is_evicted_on_failed_apply() -> Result<()> {
     // Non-creation event (non-empty parent) for an entity the client never saw.
     let ev_unknown = forge_title_event(&f, unknown_id, proto::Clock::from(vec![proto::EventId::from_bytes([7u8; 32])]), "ghost");
 
-    f.client
-        .handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(ev_a), event_only_item(ev_unknown)]))
-        .await?;
+    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(ev_a), event_only_item(ev_unknown)])).await?;
 
     assert_eq!(view_a.title().unwrap(), "a1", "sibling valid item applies");
     // The phantom empty-head resident was evicted: get() forces a retrieval

@@ -92,7 +92,11 @@ impl<'a, PA: PolicyAgent, C: Signal + Peek<Vec<PA::ContextData>>> ContextPolicy<
                 allowed
             } else {
                 crate::schema::CATALOG_MODELS.into_iter().map(Predicate::MemberOf).fold(allowed, |allowed, catalog| {
-                    if allowed == Predicate::False { catalog } else { Predicate::Or(Box::new(allowed), Box::new(catalog)) }
+                    if allowed == Predicate::False {
+                        catalog
+                    } else {
+                        Predicate::Or(Box::new(allowed), Box::new(catalog))
+                    }
                 })
             };
             // Credentials changed while this ran: recompute rather than return or cache a stale predicate.
@@ -144,12 +148,17 @@ impl<'a, PA: PolicyAgent, C: Signal + Peek<Vec<PA::ContextData>>> ContextPolicy<
 
     /// Apply additional checks to a batch that has already passed the storage predicate.
     pub(crate) fn check_reads(&self, results: &mut [GetResult]) {
-        if matches!(&self.auth, ContextAuth::Privileged) { return; }
-        let states: Vec<_> = results.iter().filter_map(|result| {
-            let GetResult::Found(state) = result else { return None };
-            (!state.payload.state.memberships.iter().any(crate::schema::reads_bypass_policy))
-                .then_some((&state.payload.entity_id, &state.payload.state))
-        }).collect();
+        if matches!(&self.auth, ContextAuth::Privileged) {
+            return;
+        }
+        let states: Vec<_> = results
+            .iter()
+            .filter_map(|result| {
+                let GetResult::Found(state) = result else { return None };
+                (!state.payload.state.memberships.iter().any(crate::schema::reads_bypass_policy))
+                    .then_some((&state.payload.entity_id, &state.payload.state))
+            })
+            .collect();
         let denied = self.agent.check_reads(&self.credentials(), &states);
         for result in results {
             if let GetResult::Found(state) = result {

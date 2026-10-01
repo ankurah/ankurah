@@ -28,7 +28,11 @@ mod tests {
         let mut attempts = 0;
         let result = retry_on!(MutationError::WriteConflict, {
             attempts += 1;
-            if attempts == 1 { Err(MutationError::WriteConflict) } else { Ok(7) }
+            if attempts == 1 {
+                Err(MutationError::WriteConflict)
+            } else {
+                Ok(7)
+            }
         });
         assert_eq!(result.unwrap(), 7);
         assert_eq!(attempts, 2);
