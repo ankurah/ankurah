@@ -4,6 +4,7 @@ use crate::grammar;
 use ankurah_core_types::Value;
 use pest::iterators::{Pair, Pairs};
 use pest::Parser;
+use std::iter::Peekable;
 
 /// Print a parse tree node and its children recursively
 #[cfg(test)]
@@ -66,35 +67,46 @@ pub fn parse_selection(input: &str) -> Result<ast::Selection<ast::Parsed>, Parse
     Ok(ast::Selection { predicate, order_by, limit })
 }
 
-/// Parse a boolean expression, which can be a comparison, AND, or OR expression
+/// Parse a boolean expression; precedence follows SQL, from loosest: OR, AND, NOT, then comparisons.
 fn parse_expr(pair: Pair<grammar::Rule>) -> Result<ast::Predicate<ast::Parsed>, ParseError> {
     assert_eq!(pair.as_rule(), grammar::Rule::Expr, "Expected Expr rule");
-    let mut pairs = pair.into_inner();
+    // Start at OR, the lowest-precedence layer, so tighter operators stay inside its operands.
+    // With no OR, parse_disjunction simply returns the one conjunction it parsed.
+    parse_disjunction(&mut pair.into_inner().peekable())
+}
 
-    // Parse the first value
-    let first = pairs.next().ok_or(ParseError::MissingOperand("first"))?;
-
-    // handle unary operators which have precedence over infix operators
-    if first.as_rule() == grammar::Rule::UnaryNot {
-        let next: Pair<'_, grammar::Rule> = pairs.next().ok_or(ParseError::EmptyExpression)?;
-
-        return Ok(ast::Predicate::Not(Box::new(match next.as_rule() {
-            grammar::Rule::ExpressionInParentheses => {
-                //
-                parse_expr(next.into_inner().next().ok_or(ParseError::EmptyExpression)?)?
-            }
-            grammar::Rule::MemberOf => parse_atomic_expr(next)?.try_into()?,
-            _ => {
-                // TODO
-                return Err(ParseError::UnexpectedRule { expected: "ExpressionInParentheses or MemberOf", got: next.as_rule() });
-            }
-        })));
+/// Conjunctions joined by OR, grouped from the left.
+fn parse_disjunction(pairs: &mut Peekable<Pairs<grammar::Rule>>) -> Result<ast::Predicate<ast::Parsed>, ParseError> {
+    let mut predicate = parse_conjunction(pairs)?;
+    while pairs.next_if(|pair| pair.as_rule() == grammar::Rule::Or).is_some() {
+        predicate = ast::Predicate::Or(Box::new(predicate), Box::new(parse_conjunction(pairs)?));
     }
+    Ok(predicate)
+}
 
-    let mut result = parse_atomic_expr(first)?;
+/// Negations joined by AND, grouped from the left.
+fn parse_conjunction(pairs: &mut Peekable<Pairs<grammar::Rule>>) -> Result<ast::Predicate<ast::Parsed>, ParseError> {
+    let mut predicate = parse_negation(pairs)?;
+    while pairs.next_if(|pair| pair.as_rule() == grammar::Rule::And).is_some() {
+        predicate = ast::Predicate::And(Box::new(predicate), Box::new(parse_negation(pairs)?));
+    }
+    Ok(predicate)
+}
+
+/// A comparison preceded by any number of NOTs, which negate it and nothing after it.
+fn parse_negation(pairs: &mut Peekable<Pairs<grammar::Rule>>) -> Result<ast::Predicate<ast::Parsed>, ParseError> {
+    if pairs.next_if(|pair| pair.as_rule() == grammar::Rule::UnaryNot).is_some() {
+        return Ok(ast::Predicate::Not(Box::new(parse_negation(pairs)?)));
+    }
+    parse_comparison(pairs)?.try_into()
+}
+
+/// An operand and its comparison and IS NULL operators, applied left to right up to the next AND or OR.
+fn parse_comparison(pairs: &mut Peekable<Pairs<grammar::Rule>>) -> Result<ast::Expr<ast::Parsed>, ParseError> {
+    let mut result = parse_atomic_expr(pairs.next().ok_or(ParseError::MissingOperand("first"))?)?;
 
     // Handle postfix and infix operators
-    while let Some(op) = pairs.next() {
+    while let Some(op) = pairs.next_if(|pair| !matches!(pair.as_rule(), grammar::Rule::And | grammar::Rule::Or)) {
         match op.as_rule() {
             grammar::Rule::IsNullPostfix => {
                 // Check if this is "IS NULL" or "IS NOT NULL" by examining the text
@@ -114,16 +126,15 @@ fn parse_expr(pair: Pair<grammar::Rule>) -> Result<ast::Predicate<ast::Parsed>, 
                     | grammar::Rule::Lt
                     | grammar::Rule::NotEq
                     | grammar::Rule::In => create_comparison(result, op.as_rule(), right)?,
-                    grammar::Rule::And | grammar::Rule::Or => create_logical_op(op.as_rule(), result, right, &mut pairs)?,
                     _ => {
-                        return Err(ParseError::UnexpectedRule { expected: "comparison operator, And, or Or", got: op.as_rule() });
+                        return Err(ParseError::UnexpectedRule { expected: "comparison operator", got: op.as_rule() });
                     }
                 }
             }
         };
     }
 
-    result.try_into()
+    Ok(result)
 }
 
 /// Create a comparison predicate from a left expression and a right pair
@@ -133,12 +144,7 @@ fn create_comparison(
     right: Pair<grammar::Rule>,
 ) -> Result<ast::Expr<ast::Parsed>, ParseError> {
     let right_expr = if op == grammar::Rule::In && right.as_rule() == grammar::Rule::ExpressionInParentheses {
-        let mut values = right.into_inner().next().ok_or(ParseError::EmptyExpression)?.into_inner();
-        let value = parse_atomic_expr(values.next().ok_or(ParseError::EmptyExpression)?)?;
-        if values.next().is_some() {
-            return Err(ParseError::InvalidPredicate("Expected a value in IN list".into()));
-        }
-        ast::Expr::ExprList(vec![value])
+        ast::Expr::ExprList(vec![parse_list_item(right.into_inner().next().ok_or(ParseError::EmptyExpression)?)?])
     } else {
         parse_atomic_expr(right)?
     };
@@ -157,43 +163,14 @@ fn create_comparison(
     Ok(ast::Expr::Predicate(ast::Predicate::Comparison { left: Box::new(left), operator, right: Box::new(right_expr) }))
 }
 
-/// Create a logical operation (AND/OR) from a left expression and a right pair
-fn create_logical_op(
-    op: grammar::Rule,
-    left: ast::Expr<ast::Parsed>,
-    right: Pair<grammar::Rule>,
-    rest: &mut Pairs<grammar::Rule>,
-) -> Result<ast::Expr<ast::Parsed>, ParseError> {
-    let left_pred = left.try_into()?;
-
-    // Parse the right side, which might be part of a comparison
-    let right_expr = parse_atomic_expr(right)?;
-    let right_pred = if let Some(next_op) = rest.peek().filter(|op| !matches!(op.as_rule(), grammar::Rule::And | grammar::Rule::Or)) {
-        rest.next();
-        match next_op.as_rule() {
-            grammar::Rule::Eq
-            | grammar::Rule::GtEq
-            | grammar::Rule::Gt
-            | grammar::Rule::LtEq
-            | grammar::Rule::Lt
-            | grammar::Rule::NotEq
-            | grammar::Rule::In => {
-                let next_right = rest.next().ok_or(ParseError::MissingOperand("comparison right"))?;
-                create_comparison(right_expr, next_op.as_rule(), next_right)?.try_into()?
-            }
-            _ => {
-                return Err(ParseError::UnexpectedRule { expected: "comparison operator", got: next_op.as_rule() });
-            }
-        }
-    } else {
-        right_expr.try_into()?
-    };
-
-    Ok(ast::Expr::Predicate(match op {
-        grammar::Rule::And => ast::Predicate::And(Box::new(left_pred), Box::new(right_pred)),
-        grammar::Rule::Or => ast::Predicate::Or(Box::new(left_pred), Box::new(right_pred)),
-        _ => unimplemented!("rule not implemented: {:?}", op),
-    }))
+/// One item of a parenthesized list: a single value with nothing after it.
+fn parse_list_item(item: Pair<grammar::Rule>) -> Result<ast::Expr<ast::Parsed>, ParseError> {
+    let mut values = item.into_inner();
+    let value = parse_atomic_expr(values.next().ok_or(ParseError::EmptyExpression)?)?;
+    if values.next().is_some() {
+        return Err(ParseError::InvalidPredicate("Expected a value in IN list".into()));
+    }
+    Ok(value)
 }
 
 /// Parse an atomic expression, which can be a path, literal, or parenthesized expression
@@ -225,8 +202,7 @@ fn parse_atomic_expr(pair: Pair<grammar::Rule>) -> Result<ast::Expr<ast::Parsed>
             let mut exprs = Vec::new();
             for expr_pair in pair.into_inner() {
                 if expr_pair.as_rule() == grammar::Rule::Expr {
-                    let expr = parse_atomic_expr(expr_pair.into_inner().next().ok_or(ParseError::EmptyExpression)?)?;
-                    exprs.push(expr);
+                    exprs.push(parse_list_item(expr_pair)?);
                 } else {
                     exprs.push(parse_atomic_expr(expr_pair)?);
                 }
@@ -507,14 +483,59 @@ mod tests {
         );
     }
 
+    /// `name = value` with an integer literal.
+    fn eq(name: &str, value: i32) -> ast::Predicate<ast::Parsed> {
+        ast::Predicate::Comparison {
+            left: Box::new(ast::Expr::Path(ast::PathExpr::simple(name))),
+            operator: ast::ComparisonOperator::Equal,
+            right: Box::new(ast::Expr::Literal(Value::I32(value))),
+        }
+    }
+
+    fn and(left: ast::Predicate<ast::Parsed>, right: ast::Predicate<ast::Parsed>) -> ast::Predicate<ast::Parsed> {
+        ast::Predicate::And(Box::new(left), Box::new(right))
+    }
+
+    fn or(left: ast::Predicate<ast::Parsed>, right: ast::Predicate<ast::Parsed>) -> ast::Predicate<ast::Parsed> {
+        ast::Predicate::Or(Box::new(left), Box::new(right))
+    }
+
+    fn not(operand: ast::Predicate<ast::Parsed>) -> ast::Predicate<ast::Parsed> { ast::Predicate::Not(Box::new(operand)) }
+
+    /// Parse `source`, requiring that its display parses back to the same selection.
+    fn parse_round_trip(source: &str) -> ast::Predicate<ast::Parsed> {
+        let selection = parse_selection(source).unwrap();
+        let rendered = selection.to_string();
+        assert_eq!(parse_selection(&rendered).unwrap(), selection, "{source} displays as {rendered}");
+        selection.predicate
+    }
+
     #[test]
-    fn unary_not_unparenthesized() {
-        // currently we don't support this - mostly because I'm not totally sure of the precedence rules, or how to parse it. lol
-        let input = r#"NOT status = 'active'"#;
-        matches!(
-            parse_selection(input),
-            Err(ParseError::UnexpectedRule { expected: "ExpressionInParentheses", got: grammar::Rule::ExpressionInParentheses })
-        );
+    fn and_binds_tighter_than_or() {
+        assert_eq!(parse_round_trip("a = 1 OR b = 2 AND c = 3"), or(eq("a", 1), and(eq("b", 2), eq("c", 3))));
+        assert_eq!(parse_round_trip("a = 1 AND b = 2 OR c = 3"), or(and(eq("a", 1), eq("b", 2)), eq("c", 3)));
+    }
+
+    #[test]
+    fn not_negates_only_its_operand() {
+        assert_eq!(parse_round_trip("NOT a = 1 AND b = 2"), and(not(eq("a", 1)), eq("b", 2)));
+        assert_eq!(parse_round_trip("NOT a = 1 OR b = 2"), or(not(eq("a", 1)), eq("b", 2)));
+        assert_eq!(parse_round_trip("a = 1 AND NOT b = 2"), and(eq("a", 1), not(eq("b", 2))));
+        assert_eq!(parse_round_trip("a = 1 OR NOT b = 2 AND c = 3"), or(eq("a", 1), and(not(eq("b", 2)), eq("c", 3))));
+        assert_eq!(parse_round_trip("NOT (a = 1) AND b = 2"), and(not(eq("a", 1)), eq("b", 2)));
+    }
+
+    #[test]
+    fn nested_negation_preserves_its_structure() {
+        assert_eq!(parse_round_trip("NOT NOT a = 1"), not(not(eq("a", 1))));
+        assert_eq!(parse_round_trip("NOT (a = 1 AND b = 2)"), not(and(eq("a", 1), eq("b", 2))));
+    }
+
+    #[test]
+    fn is_null_after_and_or_applies_to_its_operand() {
+        let is_null = |name| ast::Predicate::IsNull(Box::new(ast::Expr::Path(ast::PathExpr::simple(name))));
+        assert_eq!(parse_round_trip("a = 1 AND b IS NULL"), and(eq("a", 1), is_null("b")));
+        assert_eq!(parse_round_trip("a = 1 OR b IS NOT NULL"), or(eq("a", 1), not(is_null("b"))));
     }
 
     #[test]
@@ -564,6 +585,13 @@ mod tests {
                 ]))
             }
         );
+    }
+
+    #[test]
+    fn in_list_item_with_trailing_tokens_is_refused() {
+        for source in ["n IN (1 + 2)", "n IN (1 + 2, 4)", "n IN (4, 1 + 2)", "s IN ('a' AND x = 1)", "s IN ('a', 'b' AND x = 1)"] {
+            assert!(matches!(parse_selection(source), Err(ParseError::InvalidPredicate(_))), "{source} must be refused");
+        }
     }
 
     #[test]

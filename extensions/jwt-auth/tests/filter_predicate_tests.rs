@@ -730,3 +730,29 @@ fn another_membership_can_grant_read_when_one_scope_cannot_evaluate() {
     assert!(ContextPolicy::from_credentials(&agent, &stranger).check_read(&id, &state).is_err());
     assert!(!evaluate_predicate(&entity, &filtered).unwrap_or(false), "an invalid scope supplies no grant");
 }
+
+/// This scope admits only other authors' posts titled 'shared'; its leading NOT must not discard the clause after it.
+#[test]
+fn negated_scope_clause_keeps_the_rest_of_the_scope() {
+    let keys = common::test_keys();
+    let agent = JwtAgent::new_ephemeral();
+    agent.update_config(
+        serde_json::from_str(
+            r#"{
+        "roles": { "reader": ["read"] },
+        "collections": {
+            "post": { "read": "read", "scope": [{ "filter": "NOT (author = $jwt.sub) AND title = 'shared'" }] }
+        }
+    }"#,
+        )
+        .unwrap(),
+    );
+    common::policy_models(&agent, &["post"]);
+    let reader = blog_context(&keys, "alice", "reader");
+    let readable =
+        |post| ContextPolicy::from_credentials(&agent, &reader).check_read(&proto::EntityId::random(), &post_state(post)).is_ok();
+
+    assert!(!readable(Post { author: "bob", title: "draft" }), "a post that is not shared is outside the scope");
+    assert!(readable(Post { author: "bob", title: "shared" }), "another author's shared post is inside it");
+    assert!(!readable(Post { author: "alice", title: "shared" }), "the reader's own post is outside it");
+}

@@ -147,3 +147,38 @@ async fn test_id_range_with_where_clause() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_negated_residual_is_filtered_before_limit() -> Result<()> {
+    let storage = SledStorageEngine::new_test()?;
+    let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
+    node.system.create().await?;
+    let context = node.context_async(c).await.unwrap();
+
+    let trx = context.begin();
+    let mut ids = Vec::new();
+    for (name, value) in [("0", 8), ("a", 7), ("b", 7), ("c", 7)] {
+        ids.push(trx.create(&TestEntity { name: name.to_owned(), value }).await?.id());
+    }
+    trx.commit().await?;
+
+    let model_id = context.resolve_model_id::<TestEntity>().await?;
+    // The value index excludes "0". In name order, "a" is the first candidate;
+    // rejecting it must leave room for "b" to satisfy LIMIT 1.
+    for (parsed, expected) in [
+        (ankurah::selection!("value = {} ORDER BY name LIMIT 1", 7i64), ids[1]),
+        (ankurah::selection!("value = {} AND NOT (name = 'a' AND value = {}) ORDER BY name LIMIT 1", 7i64, 7i64), ids[2]),
+    ] {
+        let selection = ankql::selection::map_references(
+            &parsed,
+            &|path| common::resolved_prop(&node, TestEntity::descriptor(), path.first()).into(),
+            &|model| *model.as_id().expect("model ID in storage fixture"),
+        )
+        .and_member_of(model_id);
+        // Read storage directly so subsequent core filtering cannot hide an incorrect result.
+        let results = node.storage.fetch_states(&selection).await?;
+        assert_eq!(results.iter().map(|state| state.payload.entity_id).collect::<Vec<_>>(), vec![expected], "{parsed}");
+    }
+
+    Ok(())
+}
