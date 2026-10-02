@@ -1117,6 +1117,28 @@ mod tests {
         };
     }
 
+    #[test]
+    fn negated_conjunction_remains_whole_after_index_pushdown() {
+        assert_eq!(
+            plan_full_support!("a = 1 AND NOT (b = 2 AND c = 3)"),
+            vec![
+                Plan::Index {
+                    index_spec: KeySpec::new(vec![asc!("a", ValueType::I32)]),
+                    scan_direction: ScanDirection::Forward,
+                    bounds: bounds!("a" => (1..=1)),
+                    remaining_predicate: selection!("NOT (b = 2 AND c = 3)").predicate,
+                    order_by_spill: order_by_components!(),
+                },
+                Plan::TableScan {
+                    bounds: KeyBounds::empty(),
+                    scan_direction: ScanDirection::Forward,
+                    remaining_predicate: selection!("a = 1 AND NOT (b = 2 AND c = 3)").predicate,
+                    order_by_spill: order_by_components!(),
+                },
+            ]
+        );
+    }
+
     // Test cases for ORDER BY scenarios
     mod order_by_tests {
         use super::*;

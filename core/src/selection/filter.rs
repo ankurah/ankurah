@@ -326,6 +326,29 @@ mod tests {
     }
 
     #[test]
+    fn and_binds_tighter_than_or_when_filtering() {
+        let items =
+            vec![TestItem::new("Alice", "20"), TestItem::new("Bob", "25"), TestItem::new("Bob", "30"), TestItem::new("Charlie", "30")];
+
+        // SQL reads both as: name = 'Alice' OR (name = 'Bob' AND age = '30').
+        for query in ["name = 'Alice' OR name = 'Bob' AND age = '30'", "name = 'Bob' AND age = '30' OR name = 'Alice'"] {
+            let selection = resolve(query, PEOPLE);
+            let results: Vec<_> = FilterIterator::new(items.clone().into_iter(), selection.predicate).collect();
+
+            assert_eq!(
+                results,
+                vec![
+                    FilterResult::Pass(TestItem::new("Alice", "20")),
+                    FilterResult::Skip(TestItem::new("Bob", "25")),
+                    FilterResult::Pass(TestItem::new("Bob", "30")),
+                    FilterResult::Skip(TestItem::new("Charlie", "30")),
+                ],
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
     fn test_in_operator() {
         let items = vec![
             TestItem::new("Alice", "20"),
