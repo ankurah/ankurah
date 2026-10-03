@@ -83,15 +83,15 @@ impl Collatable for &str {
 // Implementation for integers
 impl Collatable for i64 {
     fn to_bytes(&self) -> Vec<u8> {
-        // Use big-endian encoding to preserve ordering
-        self.to_be_bytes().to_vec()
+        // Flip the sign bit so big-endian byte order matches signed numeric order.
+        ((*self as u64) ^ (1 << 63)).to_be_bytes().to_vec()
     }
 
     fn successor_bytes(&self) -> Option<Vec<u8>> {
         if self == &i64::MAX {
             None
         } else {
-            Some((self + 1).to_be_bytes().to_vec())
+            Some((self + 1).to_bytes())
         }
     }
 
@@ -99,7 +99,7 @@ impl Collatable for i64 {
         if self == &i64::MIN {
             None
         } else {
-            Some((self - 1).to_be_bytes().to_vec())
+            Some((self - 1).to_bytes())
         }
     }
 
@@ -114,12 +114,7 @@ impl Collatable for f64 {
         let bits = if self.is_nan() {
             u64::MAX // NaN sorts last
         } else {
-            let bits = self.to_bits();
-            if *self >= 0.0 {
-                bits ^ (1 << 63) // Flip sign bit for positive numbers
-            } else {
-                !bits // Flip all bits for negative numbers
-            }
+            float_key_bits(*self)
         };
         bits.to_be_bytes().to_vec()
     }
@@ -128,11 +123,7 @@ impl Collatable for f64 {
         if self.is_nan() || (self.is_infinite() && *self > 0.0) {
             None
         } else {
-            let bits = if *self >= 0.0 {
-                self.to_bits() ^ (1 << 63) // Apply same sign bit flip as to_bytes
-            } else {
-                !self.to_bits() // Apply same bit inversion as to_bytes
-            };
+            let bits = float_key_bits(*self);
             let next_bits = bits + 1;
             Some(next_bits.to_be_bytes().to_vec())
         }
@@ -142,11 +133,7 @@ impl Collatable for f64 {
         if self.is_nan() || (self.is_infinite() && *self < 0.0) {
             None
         } else {
-            let bits = if *self >= 0.0 {
-                self.to_bits() ^ (1 << 63) // Apply same sign bit flip as to_bytes
-            } else {
-                !self.to_bits() // Apply same bit inversion as to_bytes
-            };
+            let bits = float_key_bits(*self);
             let prev_bits = bits - 1;
             Some(prev_bits.to_be_bytes().to_vec())
         }
@@ -155,6 +142,17 @@ impl Collatable for f64 {
     fn is_minimum(&self) -> bool { *self == f64::NEG_INFINITY }
 
     fn is_maximum(&self) -> bool { *self == f64::INFINITY }
+}
+
+/// A non-NaN float's bits arranged so that unsigned order matches numeric order.
+fn float_key_bits(f: f64) -> u64 {
+    // Both zeros compare equal, so negative zero takes positive zero's key.
+    let f = if f == 0.0 { 0.0 } else { f };
+    if f >= 0.0 {
+        f.to_bits() ^ (1 << 63) // Flip sign bit for positive numbers
+    } else {
+        !f.to_bits() // Flip all bits for negative numbers
+    }
 }
 
 // Implementation for EntityId: the raw hash bytes order lexicographically.
@@ -226,8 +224,8 @@ mod tests {
     #[test]
     fn test_integer_collation() {
         let n = 42i64;
-        assert_eq!(i64::from_be_bytes(n.successor_bytes().unwrap().try_into().unwrap()), 43);
-        assert_eq!(i64::from_be_bytes(n.predecessor_bytes().unwrap().try_into().unwrap()), 41);
+        assert_eq!(n.successor_bytes(), Some(43i64.to_bytes()));
+        assert_eq!(n.predecessor_bytes(), Some(41i64.to_bytes()));
         assert!(!n.is_minimum());
         assert!(!n.is_maximum());
 

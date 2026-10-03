@@ -8,22 +8,10 @@ impl Collatable for Value {
         match self {
             Value::String(s) => s.as_bytes().to_vec(),
             // Use fixed-width big-endian encoding to preserve numeric order across widths
-            Value::I16(x) => (*x as i64).to_be_bytes().to_vec(),
-            Value::I32(x) => (*x as i64).to_be_bytes().to_vec(),
-            Value::I64(x) => x.to_be_bytes().to_vec(),
-            Value::F64(f) => {
-                let bits = if f.is_nan() {
-                    u64::MAX // NaN sorts last
-                } else {
-                    let bits = f.to_bits();
-                    if *f >= 0.0 {
-                        bits ^ (1 << 63) // Flip sign bit for positive numbers
-                    } else {
-                        !bits // Flip all bits for negative numbers
-                    }
-                };
-                bits.to_be_bytes().to_vec()
-            }
+            Value::I16(x) => (*x as i64).to_bytes(),
+            Value::I32(x) => (*x as i64).to_bytes(),
+            Value::I64(x) => x.to_bytes(),
+            Value::F64(f) => f.to_bytes(),
             Value::Bool(b) => vec![*b as u8],
             Value::EntityId(entity_id) => entity_id.to_bytes().to_vec(),
             // For binary/object, return raw bytes; tuple framing will add type-tag/len for cross-type ordering
@@ -44,32 +32,18 @@ impl Collatable for Value {
                 if *x == i16::MAX {
                     None
                 } else {
-                    Some(((*x as i64) + 1).to_be_bytes().to_vec())
+                    Some(((*x as i64) + 1).to_bytes())
                 }
             }
             Value::I32(x) => {
                 if *x == i32::MAX {
                     None
                 } else {
-                    Some(((*x as i64) + 1).to_be_bytes().to_vec())
+                    Some(((*x as i64) + 1).to_bytes())
                 }
             }
-            Value::I64(x) => {
-                if *x == i64::MAX {
-                    None
-                } else {
-                    Some((x + 1).to_be_bytes().to_vec())
-                }
-            }
-            Value::F64(f) => {
-                if f.is_nan() || (f.is_infinite() && *f > 0.0) {
-                    None
-                } else {
-                    let bits = if *f >= 0.0 { f.to_bits() ^ (1 << 63) } else { !f.to_bits() };
-                    let next_bits = bits + 1;
-                    Some(next_bits.to_be_bytes().to_vec())
-                }
-            }
+            Value::I64(x) => x.successor_bytes(),
+            Value::F64(f) => f.successor_bytes(),
             Value::Bool(b) => {
                 if *b {
                     None
@@ -108,32 +82,18 @@ impl Collatable for Value {
                 if *x == i16::MIN {
                     None
                 } else {
-                    Some(((*x as i64) - 1).to_be_bytes().to_vec())
+                    Some(((*x as i64) - 1).to_bytes())
                 }
             }
             Value::I32(x) => {
                 if *x == i32::MIN {
                     None
                 } else {
-                    Some(((*x as i64) - 1).to_be_bytes().to_vec())
+                    Some(((*x as i64) - 1).to_bytes())
                 }
             }
-            Value::I64(x) => {
-                if *x == i64::MIN {
-                    None
-                } else {
-                    Some((x - 1).to_be_bytes().to_vec())
-                }
-            }
-            Value::F64(f) => {
-                if f.is_nan() || (f.is_infinite() && *f < 0.0) {
-                    None
-                } else {
-                    let bits = if *f >= 0.0 { f.to_bits() ^ (1 << 63) } else { !f.to_bits() };
-                    let prev_bits = bits - 1;
-                    Some(prev_bits.to_be_bytes().to_vec())
-                }
-            }
+            Value::I64(x) => x.predecessor_bytes(),
+            Value::F64(f) => f.predecessor_bytes(),
             Value::Bool(b) => {
                 if *b {
                     Some(vec![0])
@@ -223,5 +183,57 @@ mod tests {
         let max = Value::EntityId(EntityId::from_bytes([255; EntityId::BYTE_LEN]));
         assert!(max.is_maximum());
         assert!(max.successor_bytes().is_none());
+    }
+
+    #[test]
+    fn integer_keys_follow_numeric_order_across_zero() {
+        let widths: [(fn(i64) -> Value, i64, i64); 3] = [
+            (|n| Value::I16(n as i16), i16::MIN.into(), i16::MAX.into()),
+            (|n| Value::I32(n as i32), i32::MIN.into(), i32::MAX.into()),
+            (Value::I64, i64::MIN, i64::MAX),
+        ];
+        for (value, min, max) in widths {
+            let ascending = [min, min + 1, -300, -256, -255, -2, -1, 0, 1, 2, 255, 256, 300, max - 1, max];
+            let keys: Vec<_> = ascending.iter().map(|&n| value(n).to_bytes()).collect();
+            assert!(keys.windows(2).all(|pair| pair[0] < pair[1]), "keys must ascend with {ascending:?}");
+            for n in ascending {
+                let (key, successor, predecessor) = (value(n).to_bytes(), value(n).successor_bytes(), value(n).predecessor_bytes());
+                assert_eq!(successor, (n < max).then(|| value(n + 1).to_bytes()), "successor of {n}");
+                assert_eq!(predecessor, (n > min).then(|| value(n - 1).to_bytes()), "predecessor of {n}");
+                assert!(successor.is_none_or(|s| s > key) && predecessor.is_none_or(|p| p < key), "neighbours of {n}");
+            }
+        }
+    }
+
+    #[test]
+    fn primitive_and_value_numeric_keys_agree() {
+        fn check<T: Collatable>(primitive: T, value: Value) {
+            assert_eq!(primitive.to_bytes(), value.to_bytes());
+            assert_eq!(primitive.predecessor_bytes(), value.predecessor_bytes());
+            assert_eq!(primitive.successor_bytes(), value.successor_bytes());
+        }
+        for n in [i64::MIN, -256, -1, 0, 1, 256, i64::MAX] {
+            check(n, Value::I64(n));
+        }
+        for n in [-256i16, -1, 0, 1, 256] {
+            check(n as i64, Value::I16(n));
+            check(n as i64, Value::I32(n as i32));
+        }
+        let nearest = f64::from_bits(1);
+        for f in [f64::NEG_INFINITY, -1.0, -nearest, -0.0, 0.0, nearest, 1.0, f64::INFINITY, f64::NAN] {
+            check(f, Value::F64(f));
+        }
+    }
+
+    #[test]
+    fn both_zeros_share_one_key_between_the_nearest_negative_and_positive() {
+        let nearest = f64::from_bits(1); // the smallest positive subnormal
+        let [below, negative_zero, zero, above] = [-nearest, -0.0, 0.0, nearest].map(|f| Value::F64(f).to_bytes());
+        assert_eq!(negative_zero, zero);
+        for z in [Value::F64(-0.0), Value::F64(0.0)] {
+            let (predecessor, successor) = (z.predecessor_bytes().unwrap(), z.successor_bytes().unwrap());
+            assert!(below <= predecessor && predecessor < zero, "x >= {z:?} must admit zero and no negative");
+            assert!(zero < successor && successor <= above, "x <= {z:?} must admit zero and no positive");
+        }
     }
 }
