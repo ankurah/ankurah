@@ -3,22 +3,18 @@
 //! IndexedDB has specific constraints on what can be used as keys:
 //! - Valid key types: number, string, Date, ArrayBuffer, Array
 //! - Boolean is NOT a valid key type and must be encoded as 0/1
-//! - Binary data must use ArrayBuffer (not Uint8Array) for proper lexicographic ordering
+//! - Binary data is encoded as Uint8Array for lexicographic byte ordering
 //!
 //! ## Integer Range Limitation
 //!
 //! JavaScript numbers are IEEE 754 double-precision floats (f64).
 //! Safe integer range: ±2^53 - 1 = ±9,007,199,254,740,991
 //!
-//! Values outside this range will lose precision when converted to f64.
-//! This is acceptable for:
-//! - Unix millisecond timestamps (safe until year ~285,000 CE)
-//! - Most application-level counters and IDs
-//!
-//! For values requiring full i64 range, consider alternative encoding strategies.
+//! Positive i64 values beyond this range use zero-padded strings to retain precision.
+//! Negative i64 values remain numbers and may lose precision below the safe range.
 
-use ankurah_core::value::Value;
-use wasm_bindgen::JsValue;
+use ankurah_core::value::{Value, ValueType};
+use wasm_bindgen::{JsCast, JsValue};
 
 /// Convert boolean values to 0/1 numbers recursively in a JSON structure.
 /// IndexedDB doesn't support boolean keys, so we must encode bools as numbers
@@ -44,19 +40,46 @@ pub const MIN_SAFE_INTEGER: i64 = -9_007_199_254_740_991;
 
 /// IndexedDB-compatible value wrapper
 ///
-/// Provides symmetric encoding/decoding between Ankurah `Value` and JavaScript `JsValue`
-/// that respects IndexedDB key constraints.
+/// Encodes index keys and decodes projections with their durable property type.
 ///
 /// Key encoding rules:
 /// - Bool → number (0/1) because booleans are not valid IndexedDB keys
-/// - I64 → f64 with accepted precision loss outside ±2^53
-/// - Binary/Object → ArrayBuffer for lexicographic byte ordering
+/// - I64 → number, or zero-padded text for positive values above 2^53 - 1
+/// - Binary/Object → Uint8Array for lexicographic byte ordering
 /// - All other types → standard JsValue encoding
 pub struct IdbValue(Value);
 
 impl IdbValue {
-    /// Extract the inner Value
+    /// Extract the inner Value.
     pub fn into_value(self) -> Value { self.0 }
+
+    /// Decode a projection using its durable property type, never its apparent JS type.
+    pub fn from_js(value: JsValue, value_type: ValueType) -> Result<Self, JsValue> {
+        fn as_integer(value: &JsValue) -> Option<f64> { value.as_f64().filter(|n| n.fract() == 0.0) }
+
+        let decoded = match value_type {
+            ValueType::I16 => as_integer(&value).filter(|n| *n >= i16::MIN as f64 && *n <= i16::MAX as f64).map(|n| Value::I16(n as i16)),
+            ValueType::I32 => as_integer(&value).filter(|n| *n >= i32::MIN as f64 && *n <= i32::MAX as f64).map(|n| Value::I32(n as i32)),
+            ValueType::I64 => match value.as_string() {
+                Some(text) => text.parse::<i64>().ok().map(Value::I64),
+                None => as_integer(&value).filter(|n| *n >= i64::MIN as f64 && *n < -(i64::MIN as f64)).map(|n| Value::I64(n as i64)),
+            },
+            ValueType::F64 => value.as_f64().map(Value::F64),
+            ValueType::Bool => value.as_f64().filter(|n| *n == 0.0 || *n == 1.0).map(|n| Value::Bool(n == 1.0)),
+            ValueType::String => value.as_string().map(Value::String),
+            ValueType::EntityId => value.as_string().and_then(|text| text.parse().ok()).map(Value::EntityId),
+            ValueType::Binary | ValueType::Object => {
+                if value.is_instance_of::<js_sys::Uint8Array>() || value.is_instance_of::<js_sys::ArrayBuffer>() {
+                    let bytes = js_sys::Uint8Array::new(&value).to_vec();
+                    Some(if value_type == ValueType::Binary { Value::Binary(bytes) } else { Value::Object(bytes) })
+                } else {
+                    None
+                }
+            }
+            ValueType::Json => serde_wasm_bindgen::from_value(value.clone()).ok().map(Value::Json),
+        };
+        decoded.map(Self).ok_or(value)
+    }
 }
 
 impl From<Value> for IdbValue {
@@ -120,43 +143,45 @@ impl From<IdbValue> for JsValue {
     }
 }
 
-impl TryFrom<JsValue> for IdbValue {
-    type Error = JsValue;
-
-    /// Convert from JsValue to IdbValue
-    ///
-    /// Uses standard Value conversion without schema information. Type information may be lost:
-    /// - 0/1 numbers → I32 (bool type info lost)
-    /// - Zero-padded numeric strings → String (i64 type info lost for large values)
-    /// - JS objects → Value::Json (serialized back to JSON bytes)
-    ///
-    /// **Future enhancement:** Accept schema/ValueType hints for direct conversion to proper types.
-    ///
-    /// **Current workaround:** We rely on Value-to-Value casting in predicate comparisons
-    /// (see `compare_values_with_cast` in `filter.rs`). When comparing values from IndexedDB
-    /// against query literals, the casting system automatically converts:
-    /// - `Value::I32(1)` ↔ `Value::Bool(true)`
-    /// - `Value::String("9007199254740992000")` ↔ `Value::I64(9007199254740992000)`
-    fn try_from(js_value: JsValue) -> Result<Self, Self::Error> {
-        // Try standard Value conversion first
-        if let Ok(value) = Value::try_from(js_value.clone()) {
-            return Ok(IdbValue(value));
-        }
-
-        // If standard conversion failed and it's an object, try to serialize as JSON
-        if js_value.is_object() {
-            if let Ok(json) = serde_wasm_bindgen::from_value::<serde_json::Value>(js_value.clone()) {
-                return Ok(IdbValue(Value::Json(json)));
-            }
-        }
-
-        Err(js_value)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    fn projections_decode_to_their_recorded_type() {
+        for value in [
+            Value::I16(-123),
+            Value::I32(123),
+            Value::I64(-123),
+            Value::I64(MAX_SAFE_INTEGER),
+            Value::I64(MAX_SAFE_INTEGER + 1),
+            Value::I64(i64::MAX),
+            Value::F64(9_007_199_254_740_992.0),
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::String("00009007199254740992".into()),
+            Value::EntityId(ankurah_proto::EntityId::from_bytes([1; 32])),
+            Value::Binary(vec![0, 1, 255]),
+            Value::Object(vec![0, 1, 255]),
+            Value::Json(serde_json::json!({"name": "123", "count": 7})),
+            Value::Json(serde_json::json!("123")),
+        ] {
+            let encoded: JsValue = IdbValue::from(&value).into();
+            assert_eq!(IdbValue::from_js(encoded, value.value_type()).unwrap().into_value(), value);
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    fn invalid_projections_are_not_coerced() {
+        assert!(IdbValue::from_js(JsValue::from_f64(1.5), ValueType::I32).is_err());
+        assert!(IdbValue::from_js(JsValue::from_f64(32768.0), ValueType::I16).is_err());
+        assert!(IdbValue::from_js(JsValue::from_f64(2.0), ValueType::Bool).is_err());
+        assert!(IdbValue::from_js(JsValue::from_str("12"), ValueType::F64).is_err());
+        assert!(IdbValue::from_js(JsValue::from_f64(12.0), ValueType::String).is_err());
+        assert!(IdbValue::from_js(JsValue::from_str("9223372036854775808"), ValueType::I64).is_err());
+    }
 
     #[test]
     fn test_safe_integer_range() {

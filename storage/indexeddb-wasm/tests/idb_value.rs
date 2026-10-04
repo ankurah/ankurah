@@ -61,23 +61,11 @@ fn test_i64_negative_always_number() {
 
 #[wasm_bindgen_test]
 fn test_i64_string_roundtrip() {
-    // Large positive i64 should roundtrip through string encoding + casting
+    // The stored type distinguishes encoded integers from actual string properties.
     let original = Value::I64(9_223_372_036_854_775_000);
     let js_val: JsValue = IdbValue::from(original.clone()).into();
-
-    // Should be stored as string
-    assert!(js_val.as_string().is_some());
-
-    // Comes back as String, use casting to recover i64
-    let idb_val = IdbValue::try_from(js_val).unwrap();
-    let recovered = idb_val.into_value();
-
-    // Should be a String initially
-    assert!(matches!(recovered, Value::String(_)));
-
-    // Cast back to I64
-    let cast_back = recovered.cast_to(ValueType::I64).unwrap();
-    assert_eq!(cast_back, original);
+    assert_eq!(IdbValue::from_js(js_val.clone(), ValueType::I64).unwrap().into_value(), original);
+    assert_eq!(IdbValue::from_js(js_val, ValueType::String).unwrap().into_value(), Value::String("09223372036854775000".into()));
 }
 
 #[wasm_bindgen_test]

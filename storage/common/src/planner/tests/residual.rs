@@ -1,5 +1,81 @@
 use super::*;
 
+#[test]
+fn remaining_predicate_respects_endpoint_inclusivity_and_strength() {
+    let planner = Planner::new(PlannerConfig::full_support());
+    // Supply bounds directly: the planner normally tightens them to match the query.
+    for (predicate, bounds, expected) in [
+        (selection!("age > 5").predicate, bounds!("age" => (5..)), selection!("age > 5").predicate),
+        (selection!("age >= 5").predicate, bounds!("age" => (5..)), Predicate::True),
+        (selection!("age > 5").predicate, bounds_list!(open_lower!("age" => 5..)), Predicate::True),
+        (selection!("age >= 5").predicate, bounds_list!(open_lower!("age" => 5..)), Predicate::True),
+        (selection!("age > 5").predicate, bounds!("age" => (6..)), Predicate::True),
+        (selection!("age >= 5").predicate, bounds!("age" => (4..)), selection!("age >= 5").predicate),
+        (selection!("age < 5").predicate, bounds!("age" => (..=5)), selection!("age < 5").predicate),
+        (selection!("age <= 5").predicate, bounds!("age" => (..=5)), Predicate::True),
+        (selection!("age < 5").predicate, bounds!("age" => (..5)), Predicate::True),
+        (selection!("age <= 5").predicate, bounds!("age" => (..5)), Predicate::True),
+        (selection!("age < 5").predicate, bounds!("age" => (..=4)), Predicate::True),
+        (selection!("age <= 5").predicate, bounds!("age" => (..=6)), selection!("age <= 5").predicate),
+    ] {
+        assert_eq!(planner.calculate_remaining_predicate(std::slice::from_ref(&predicate), &bounds), expected, "{predicate:?}, {bounds:?}");
+    }
+}
+
+#[test]
+fn remaining_predicate_removes_equality_only_for_matching_point_bounds() {
+    let planner = Planner::new(PlannerConfig::full_support());
+    for (bounds, expected) in [
+        (bounds!("age" => (5..=5)), Predicate::True),
+        (bounds!("age" => (4..=4)), selection!("age = 5").predicate),
+        (bounds!("age" => (4..=5)), selection!("age = 5").predicate),
+        (bounds!("age" => (5..=6)), selection!("age = 5").predicate),
+        (bounds!("age" => (5..)), selection!("age = 5").predicate),
+        (bounds!("age" => (..=5)), selection!("age = 5").predicate),
+    ] {
+        assert_eq!(planner.calculate_remaining_predicate(&[selection!("age = 5").predicate], &bounds), expected, "{bounds:?}");
+    }
+}
+
+#[test]
+fn remaining_predicate_keeps_conditions_without_enforcing_bounds() {
+    let planner = Planner::new(PlannerConfig::full_support());
+    for (predicate, bounds) in [
+        (selection!("age > 5").predicate, KeyBounds::empty()),
+        (selection!("age > 5").predicate, bounds!("other" => (5..))),
+        (selection!("age > 5").predicate, bounds!("age" => (..10))),
+        (selection!("age < 5").predicate, bounds!("age" => (0..))),
+        (selection!("age > 5").predicate, bounds!("age" => ("abc"..))),
+        (selection!("age < 5").predicate, bounds!("age" => (.."abc"))),
+        (selection!("age != 5").predicate, bounds!("age" => (0..10))),
+        (selection!("age IN (3, 5)").predicate, bounds!("age" => (0..10))),
+        (selection!("NOT (age > 5 AND age < 10)").predicate, bounds!("age" => (6..9))),
+        (selection!("age > 5 OR other = 1").predicate, bounds!("age" => (6..))),
+    ] {
+        assert_eq!(planner.calculate_remaining_predicate(std::slice::from_ref(&predicate), &bounds), predicate, "{bounds:?}");
+    }
+}
+
+#[test]
+fn remaining_predicate_recombines_only_unenforced_conjuncts() {
+    let planner = Planner::new(PlannerConfig::full_support());
+    assert_eq!(planner.calculate_remaining_predicate(&[], &KeyBounds::empty()), Predicate::True);
+    assert_eq!(
+        planner.calculate_remaining_predicate(
+            &[selection!("age >= 5").predicate, selection!("age <= 10").predicate],
+            &bounds!("age" => (5..=10)),
+        ),
+        Predicate::True
+    );
+    assert_eq!(
+        planner.calculate_remaining_predicate(
+            &[selection!("age > 5").predicate, selection!("age >= 5").predicate, selection!("age != 8").predicate],
+            &bounds!("age" => (5..)),
+        ),
+        selection!("age > 5 AND age != 8").predicate
+    );
+}
+
 fn lower(query: &str) -> ankql::ast::Selection<EngineColumns> {
     ankql::selection::map_references(
         &ankql::parser::parse_selection(query).unwrap(),
@@ -105,4 +181,146 @@ fn residuals_contain_only_conditions_not_enforced_by_bounds() {
             assert!(index_plans > 0, "expected an index plan for {query}");
         }
     }
+}
+
+#[test]
+fn equality_prefix_ignores_redundant_desc_with_full_support() {
+    assert_eq!(
+        plan_full_support!("foo = 5 ORDER BY foo DESC, bar DESC"),
+        vec![
+            Plan::Index {
+                index_spec: KeySpec::new(vec![asc!("foo", ValueType::I32), desc!("bar", ValueType::String)]),
+                scan_direction: ScanDirection::Forward,
+                bounds: bounds!("foo" => (5..=5)),
+                remaining_predicate: Predicate::True,
+                order_by_spill: order_by_components!(presort: [oby_desc!("foo"), oby_desc!("bar")]),
+            },
+            Plan::TableScan {
+                bounds: KeyBounds::empty(),
+                scan_direction: ScanDirection::Forward,
+                remaining_predicate: selection!("foo = 5").predicate,
+                order_by_spill: order_by_components!(spill: [oby_desc!("foo"), oby_desc!("bar")]),
+            },
+        ]
+    );
+}
+
+#[test]
+fn equality_prefix_ignores_redundant_desc_with_indexeddb() {
+    assert_eq!(
+        plan!("foo = 5 ORDER BY foo DESC, bar DESC"),
+        vec![
+            Plan::Index {
+                index_spec: KeySpec::new(vec![asc!("foo", ValueType::I32), asc!("bar", ValueType::String)]),
+                scan_direction: ScanDirection::Reverse,
+                bounds: bounds!("foo" => (5..=5)),
+                remaining_predicate: Predicate::True,
+                order_by_spill: order_by_components!(presort: [oby_desc!("foo"), oby_desc!("bar")]),
+            },
+            Plan::TableScan {
+                bounds: KeyBounds::empty(),
+                scan_direction: ScanDirection::Forward,
+                remaining_predicate: selection!("foo = 5").predicate,
+                order_by_spill: order_by_components!(spill: [oby_desc!("foo"), oby_desc!("bar")]),
+            },
+        ]
+    );
+}
+
+#[test]
+fn contradictory_ranges_are_empty_in_either_direction() {
+    assert_eq!(plan!("foo > 10 AND foo < 0"), vec![Plan::EmptyScan]);
+    assert_eq!(plan!("foo > 10 AND foo < 0 ORDER BY foo ASC"), vec![Plan::EmptyScan]);
+    assert_eq!(plan!("foo > 10 AND foo < 0 ORDER BY foo DESC"), vec![Plan::EmptyScan]);
+    assert_eq!(plan_full_support!("foo > 10 AND foo < 0"), vec![Plan::EmptyScan]);
+    assert_eq!(plan_full_support!("foo > 10 AND foo < 0 ORDER BY foo ASC"), vec![Plan::EmptyScan]);
+    assert_eq!(plan_full_support!("foo > 10 AND foo < 0 ORDER BY foo DESC"), vec![Plan::EmptyScan]);
+}
+
+#[test]
+fn bounded_range_asc_with_full_support() {
+    assert_eq!(
+        plan_full_support!("foo > 10 AND foo < 20 ORDER BY foo ASC"),
+        vec![
+            Plan::Index {
+                index_spec: KeySpec::new(vec![asc!("foo", ValueType::String)]),
+                scan_direction: ScanDirection::Forward,
+                bounds: bounds_list!(open_lower!("foo" => 10..20)),
+                remaining_predicate: Predicate::True,
+                order_by_spill: order_by_components!(presort: [oby_asc!("foo")]),
+            },
+            Plan::TableScan {
+                bounds: KeyBounds::empty(),
+                scan_direction: ScanDirection::Forward,
+                remaining_predicate: selection!("foo > 10 AND foo < 20").predicate,
+                order_by_spill: order_by_components!(spill: [oby_asc!("foo")]),
+            },
+        ]
+    );
+}
+
+#[test]
+fn bounded_range_desc_with_full_support() {
+    assert_eq!(
+        plan_full_support!("foo > 10 AND foo < 20 ORDER BY foo DESC"),
+        vec![
+            Plan::Index {
+                index_spec: KeySpec::new(vec![desc!("foo", ValueType::String)]),
+                scan_direction: ScanDirection::Forward,
+                bounds: bounds_list!(open_lower!("foo" => 10..20)),
+                remaining_predicate: Predicate::True,
+                order_by_spill: order_by_components!(presort: [oby_desc!("foo")]),
+            },
+            Plan::TableScan {
+                bounds: KeyBounds::empty(),
+                scan_direction: ScanDirection::Forward,
+                remaining_predicate: selection!("foo > 10 AND foo < 20").predicate,
+                order_by_spill: order_by_components!(spill: [oby_desc!("foo")]),
+            },
+        ]
+    );
+}
+
+#[test]
+fn bounded_range_asc_with_indexeddb() {
+    assert_eq!(
+        plan!("foo > 10 AND foo < 20 ORDER BY foo ASC"),
+        vec![
+            Plan::Index {
+                index_spec: KeySpec::new(vec![asc!("foo", ValueType::String)]),
+                scan_direction: ScanDirection::Forward,
+                bounds: bounds_list!(open_lower!("foo" => 10..20)),
+                remaining_predicate: Predicate::True,
+                order_by_spill: order_by_components!(presort: [oby_asc!("foo")]),
+            },
+            Plan::TableScan {
+                bounds: KeyBounds::empty(),
+                scan_direction: ScanDirection::Forward,
+                remaining_predicate: selection!("foo > 10 AND foo < 20").predicate,
+                order_by_spill: order_by_components!(spill: [oby_asc!("foo")]),
+            },
+        ]
+    );
+}
+
+#[test]
+fn bounded_range_desc_with_indexeddb() {
+    assert_eq!(
+        plan!("foo > 10 AND foo < 20 ORDER BY foo DESC"),
+        vec![
+            Plan::Index {
+                index_spec: KeySpec::new(vec![asc!("foo", ValueType::String)]),
+                scan_direction: ScanDirection::Reverse,
+                bounds: bounds_list!(open_lower!("foo" => 10..20)),
+                remaining_predicate: Predicate::True,
+                order_by_spill: order_by_components!(presort: [oby_desc!("foo")]),
+            },
+            Plan::TableScan {
+                bounds: KeyBounds::empty(),
+                scan_direction: ScanDirection::Forward,
+                remaining_predicate: selection!("foo > 10 AND foo < 20").predicate,
+                order_by_spill: order_by_components!(spill: [oby_desc!("foo")]),
+            },
+        ]
+    );
 }

@@ -50,6 +50,36 @@ async fn commit(engine: &IndexedDBStorageEngine, state: EntityState) -> anyhow::
     Ok(())
 }
 
+#[wasm_bindgen_test]
+async fn typed_residuals_survive_reopen() -> anyhow::Result<()> {
+    let db_name = format!("typed_projections_{}", ulid::Ulid::new());
+    let engine = IndexedDBStorageEngine::open(&db_name).await?;
+    let model = ModelId::EntityId(EntityId::from_bytes([0x71; 32]));
+    let value_id = EntityId::from_bytes([0x72; 32]);
+    commit(&engine, state(&model, 1, value_id, Some(Value::I64(9_007_199_254_740_991)), 0)?).await?;
+    commit(&engine, state(&model, 2, value_id, Some(Value::I64(9_007_199_254_740_992)), 0)?).await?;
+    engine.db.close().await;
+    drop(engine);
+
+    // No catalog resolver is attached: decoding must use the persisted field types.
+    let engine = IndexedDBStorageEngine::open(&db_name).await?;
+    let resolver = FixtureResolver { value_id, value_type: ValueType::I64 };
+    let selection = resolve_selection(
+        &model,
+        &resolver,
+        ankql::parser::parse_selection("rank = 0 AND value != 9007199254740991 ORDER BY rank ASC, value DESC LIMIT 1")?,
+    )?;
+    let rows = engine.fetch_states(&selection.and_member_of(model)).await?;
+    assert_eq!(rows.iter().map(|row| row.payload.entity_id).collect::<Vec<_>>(), vec![EntityId::from_bytes([2; 32])]);
+
+    // A property cannot silently acquire a new decoding type on a later write.
+    let error = commit(&engine, state(&model, 3, value_id, Some(Value::String("9007199254740992".into())), 0)?).await.unwrap_err();
+    assert!(error.to_string().contains("cannot store String"), "{error}");
+    engine.db.close().await;
+    IndexedDBStorageEngine::cleanup(&db_name).await?;
+    Ok(())
+}
+
 fn state(model: &ModelId, marker: u8, value_id: EntityId, value: Option<Value>, rank: i32) -> anyhow::Result<EntityState> {
     let backend = LWWBackend::new();
     if let Some(value) = value {

@@ -21,6 +21,15 @@ impl PlannerConfig {
     pub fn full_support() -> Self { Self::new(true) }
 }
 
+/// Keep the first index position for each column. Equality-prefix columns are constant,
+/// so their direction is immaterial when ORDER BY names the same column.
+fn push_keypart_once(keyparts: &mut Vec<IndexKeyPart<String>>, part: IndexKeyPart<String>) {
+    let path = part.full_path();
+    if !keyparts.iter().any(|existing| existing.full_path() == path) {
+        keyparts.push(part);
+    }
+}
+
 pub struct Planner {
     config: PlannerConfig,
 }
@@ -131,18 +140,23 @@ impl Planner {
         }
 
         // Keyparts: EQ prefix (using asc_path for multi-step path support)
-        let mut index_keyparts: Vec<IndexKeyPart<String>> =
-            equalities.iter().map(|(f, v)| IndexKeyPart::asc_path(f, ValueType::of(v))).collect();
+        let mut index_keyparts: Vec<IndexKeyPart<String>> = Vec::new();
+        for (field, value) in equalities {
+            push_keypart_once(&mut index_keyparts, IndexKeyPart::asc_path(field, ValueType::of(value)));
+        }
 
         // Append ORDER BY fields per capability
         if self.config.supports_desc_indexes {
             for item in order_by {
                 if item.path.is_simple() {
                     let name = item.path.column.as_str();
-                    index_keyparts.push(match item.direction {
-                        ankql::ast::OrderDirection::Asc => IndexKeyPart::asc(name.to_string(), ValueType::String),
-                        ankql::ast::OrderDirection::Desc => IndexKeyPart::desc(name.to_string(), ValueType::String),
-                    });
+                    push_keypart_once(
+                        &mut index_keyparts,
+                        match item.direction {
+                            ankql::ast::OrderDirection::Asc => IndexKeyPart::asc(name.to_string(), ValueType::String),
+                            ankql::ast::OrderDirection::Desc => IndexKeyPart::desc(name.to_string(), ValueType::String),
+                        },
+                    );
                 }
             }
         } else {
@@ -153,7 +167,7 @@ impl Planner {
                 if item.path.is_simple() {
                     let name = item.path.column.as_str();
                     if !broke && item.direction == first_dir {
-                        index_keyparts.push(IndexKeyPart::asc(name.to_string(), ValueType::String));
+                        push_keypart_once(&mut index_keyparts, IndexKeyPart::asc(name.to_string(), ValueType::String));
                     } else {
                         broke = true;
                     }
@@ -179,8 +193,7 @@ impl Planner {
             return Some(Plan::EmptyScan);
         }
 
-        // Remaining predicate excludes the applied OB inequality if any
-        let remaining_predicate = self.calculate_remaining_predicate(conjuncts, equalities, applied_ineq.map(|(f, _)| f));
+        let remaining_predicate = self.calculate_remaining_predicate(conjuncts, &bounds);
 
         // Scan direction
         let scan_direction = if self.config.supports_desc_indexes {
@@ -247,10 +260,12 @@ impl Planner {
         // Keyparts: EQ + primary INEQ (do not append ORDER BY fields; they do not satisfy global order after a range)
         // NOTE (micro-optimization): Appending OB columns after the range could help spill comparator locality,
         // but it does not change correctness and the tests expect the simpler invariant-preserving form.
-        let mut index_keyparts: Vec<IndexKeyPart<String>> =
-            equalities.iter().map(|(f, v)| IndexKeyPart::asc_path(f, ValueType::of(v))).collect();
+        let mut index_keyparts: Vec<IndexKeyPart<String>> = Vec::new();
+        for (field, value) in equalities {
+            push_keypart_once(&mut index_keyparts, IndexKeyPart::asc_path(field, ValueType::of(value)));
+        }
         let primary_value = &primary.1[0].1; // Get Value from first inequality
-        index_keyparts.push(IndexKeyPart::asc_path(primary.0, ValueType::of(primary_value))); // Use actual primary key value type
+        push_keypart_once(&mut index_keyparts, IndexKeyPart::asc_path(primary.0, ValueType::of(primary_value))); // Use actual primary key value type
 
         // Bounds: EQ + primary INEQ (most-restrictive)
         let bounds = self.build_bounds(equalities, Some(primary), &index_keyparts)?;
@@ -258,8 +273,7 @@ impl Planner {
             return Some(Plan::EmptyScan);
         }
 
-        // Remaining predicate: all inequalities except the primary one
-        let remaining_predicate = self.calculate_remaining_predicate(conjuncts, equalities, Some(primary.0));
+        let remaining_predicate = self.calculate_remaining_predicate(conjuncts, &bounds);
 
         // Scan direction
         let scan_direction = if self.config.supports_desc_indexes {
@@ -372,13 +386,13 @@ impl Planner {
         // Add equality fields first
         let mut index_keyparts = Vec::new();
         for (field, value) in equalities {
-            index_keyparts.push(IndexKeyPart::asc_path(field, ValueType::of(value)));
+            push_keypart_once(&mut index_keyparts, IndexKeyPart::asc_path(field, ValueType::of(value)));
         }
 
         // Add the inequality field
         let inequality_values = inequalities.get(inequality_field)?;
         let first_inequality_value = &inequality_values[0].1; // Get Value from first inequality
-        index_keyparts.push(IndexKeyPart::asc_path(inequality_field, ValueType::of(first_inequality_value)));
+        push_keypart_once(&mut index_keyparts, IndexKeyPart::asc_path(inequality_field, ValueType::of(first_inequality_value)));
 
         // Build bounds
         let bounds = self.build_bounds(equalities, Some((inequality_field, inequality_values)), &index_keyparts);
@@ -394,8 +408,7 @@ impl Planner {
             None => return Some(Plan::EmptyScan),
         };
 
-        // Calculate remaining predicate (exclude this inequality field)
-        let remaining_predicate = self.calculate_remaining_predicate(conjuncts, equalities, Some(inequality_field));
+        let remaining_predicate = self.calculate_remaining_predicate(conjuncts, &bounds);
 
         // Build OrderByComponents: presort (EQ + inequality) and spill (rest)
         let order_by_spill = if let Some(order_by_items) = order_by {
@@ -427,10 +440,10 @@ impl Planner {
         // Add all equality fields
         let mut index_keyparts = Vec::new();
         for (field, value) in equalities {
-            index_keyparts.push(IndexKeyPart::asc_path(field, ValueType::of(value)));
+            push_keypart_once(&mut index_keyparts, IndexKeyPart::asc_path(field, ValueType::of(value)));
         }
 
-        // Build bounds (exact match on all equality values)
+        // Build bounds (point range on the first equality per column)
         let bounds = self.build_bounds(equalities, None, &index_keyparts);
 
         // Check for empty scan
@@ -444,8 +457,7 @@ impl Planner {
             None => return Some(Plan::EmptyScan),
         };
 
-        // Calculate remaining predicate
-        let remaining_predicate = self.calculate_remaining_predicate(conjuncts, equalities, None);
+        let remaining_predicate = self.calculate_remaining_predicate(conjuncts, &bounds);
 
         let index_spec = KeySpec::new(index_keyparts);
         Some(Plan::Index {
@@ -472,7 +484,7 @@ impl Planner {
         for keypart in index_keyparts {
             let full_path = keypart.full_path();
 
-            // Check if this path has an equality constraint
+            // Only the first equality supplies a bound; other conditions may remain residual.
             let equality_value = equalities.iter().find(|(field, _)| field == &full_path).map(|(_, value)| value);
 
             if let Some(value) = equality_value {
@@ -632,35 +644,28 @@ impl Planner {
         false
     }
 
-    /// Calculate remaining predicate by removing consumed conjuncts
-    fn calculate_remaining_predicate(
-        &self,
-        conjuncts: &[Predicate<EngineColumns>],
-        consumed_equalities: &[(String, Value)],
-        consumed_inequality_field: Option<&str>,
-    ) -> Predicate<EngineColumns> {
+    /// Remove only comparisons enforced by the bounds actually built.
+    fn calculate_remaining_predicate(&self, conjuncts: &[Predicate<EngineColumns>], bounds: &KeyBounds) -> Predicate<EngineColumns> {
         let mut remaining_conjuncts = Vec::new();
 
         for conjunct in conjuncts {
             let mut consumed = false;
-
-            // Check if this conjunct is consumed by equalities
-            if let Some((field, _, _)) = self.extract_comparison(conjunct) {
-                // Check if it's a consumed equality
-                for (eq_field, _) in consumed_equalities {
-                    if field == *eq_field {
-                        consumed = true;
-                        break;
+            if let Some((field, op, value)) = self.extract_comparison(conjunct)
+                && let Some(bound) = bounds.keyparts.iter().find(|bound| bound.column == field)
+            {
+                // A shared column is insufficient: the endpoints must imply this comparison.
+                consumed = match op {
+                    ComparisonOperator::Equal => bound.low == Endpoint::incl(value.clone()) && bound.high == bound.low,
+                    ComparisonOperator::GreaterThan | ComparisonOperator::GreaterThanOrEqual => {
+                        let endpoint = if op == ComparisonOperator::GreaterThan { Endpoint::excl(value) } else { Endpoint::incl(value) };
+                        bound.low == endpoint || self.is_more_restrictive_lower(&bound.low, &endpoint)
                     }
-                }
-
-                // Check if it's a consumed inequality
-                if !consumed
-                    && let Some(ineq_field) = consumed_inequality_field
-                    && field == ineq_field
-                {
-                    consumed = true;
-                }
+                    ComparisonOperator::LessThan | ComparisonOperator::LessThanOrEqual => {
+                        let endpoint = if op == ComparisonOperator::LessThan { Endpoint::excl(value) } else { Endpoint::incl(value) };
+                        bound.high == endpoint || self.is_more_restrictive_upper(&bound.high, &endpoint)
+                    }
+                    _ => false,
+                };
             }
 
             if !consumed {
