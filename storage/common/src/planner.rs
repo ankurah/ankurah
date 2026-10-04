@@ -1117,6 +1117,8 @@ mod tests {
         };
     }
 
+    mod residual;
+
     #[test]
     fn negated_conjunction_remains_whole_after_index_pushdown() {
         assert_eq!(
