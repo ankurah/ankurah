@@ -237,3 +237,91 @@ pub async fn test_equality_prefix_edge_cases() -> Result<(), anyhow::Error> {
     IndexedDBStorageEngine::cleanup(&db_name).await?;
     Ok(())
 }
+
+#[wasm_bindgen_test]
+pub async fn repeated_integer_constraints_filter_before_limit() -> Result<(), anyhow::Error> {
+    let (ctx, db_name) = setup_context().await?;
+    // Our IndexedDB key encoding uses zero-padded strings for positive i64 values above
+    // JavaScript's safe integer limit (2^53 - 1), avoiding precision loss. These values straddle
+    // that limit: residuals must compare the original i64 values, not the encoded keys.
+    create_events(
+        &ctx,
+        vec![
+            ("Event1", 9_007_199_254_740_990, true),
+            ("Event2", 9_007_199_254_740_991, false),
+            ("Event3", 9_007_199_254_740_992, true),
+            ("Event4", 9_007_199_254_741_000, false),
+        ],
+    )
+    .await?;
+
+    // Bounding a column used to drop every predicate on it, including conditions the bound
+    // did not enforce. The conflicting equality and != exclusions must remain as residuals,
+    // filtering out those rows before LIMIT is applied.
+    assert_eq!(
+        event_timestamps(&ctx.fetch::<EventView>("timestamp = 9007199254740992 AND timestamp = 9007199254741000").await?),
+        Vec::<i64>::new()
+    );
+    assert_eq!(
+        event_timestamps(
+            &ctx.fetch::<EventView>("timestamp >= 9007199254740990 AND timestamp != 9007199254740990 ORDER BY timestamp ASC LIMIT 2")
+                .await?
+        ),
+        vec![9_007_199_254_740_991, 9_007_199_254_740_992]
+    );
+    assert_eq!(
+        event_timestamps(
+            &ctx.fetch::<EventView>("timestamp >= 9007199254740990 AND timestamp != 9007199254741000 ORDER BY name DESC LIMIT 2").await?
+        ),
+        vec![9_007_199_254_740_992, 9_007_199_254_740_991]
+    );
+
+    IndexedDBStorageEngine::cleanup(&db_name).await?;
+    Ok(())
+}
+
+#[wasm_bindgen_test]
+pub async fn repeated_string_constraints_preserve_leading_zeroes() -> Result<(), anyhow::Error> {
+    let (ctx, db_name) = setup_context().await?;
+    create_events(&ctx, vec![("00009007199254740992", 1, true), ("9007199254740992", 2, true)]).await?;
+
+    assert_eq!(event_timestamps(&ctx.fetch::<EventView>("name = '00009007199254740992'").await?), vec![1]);
+    assert_eq!(
+        event_timestamps(&ctx.fetch::<EventView>("name = '00009007199254740992' AND name = '9007199254740992'").await?),
+        Vec::<i64>::new()
+    );
+    assert_eq!(event_timestamps(&ctx.fetch::<EventView>("name >= '00009007199254740992' AND name < '9007199254740992'").await?), vec![1]);
+
+    IndexedDBStorageEngine::cleanup(&db_name).await?;
+    Ok(())
+}
+
+#[wasm_bindgen_test]
+pub async fn residual_filter_precedes_mixed_direction_spill_sort() -> Result<(), anyhow::Error> {
+    let (ctx, db_name) = setup_context().await?;
+    create_events(
+        &ctx,
+        vec![
+            ("group", 9_007_199_254_740_990, true),
+            ("group", 9_007_199_254_740_991, false),
+            ("group", 9_007_199_254_740_992, false),
+            ("group", 9_007_199_254_741_000, false),
+        ],
+    )
+    .await?;
+
+    // IndexedDB can supply the ASC prefix; the DESC suffix must be sorted in memory.
+    assert_eq!(
+        event_timestamps(
+            &ctx.fetch::<EventView>(
+                "name = 'group' AND timestamp >= 9007199254740990 AND timestamp != 9007199254741000 \
+                 ORDER BY active ASC, timestamp DESC LIMIT 2"
+            )
+            .await?
+        ),
+        vec![9_007_199_254_740_992, 9_007_199_254_740_991]
+    );
+
+    IndexedDBStorageEngine::cleanup(&db_name).await?;
+    Ok(())
+}
