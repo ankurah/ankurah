@@ -6,18 +6,18 @@ use ankurah_core_types::Value;
 use ankurah_storage_common::{ColumnPath, EngineColumns};
 use std::collections::BTreeMap;
 
-use crate::statics::MATERIALIZATION_KEY;
+use crate::{bucket::PropertyColumn, statics::MATERIALIZATION_KEY};
 
 /// Lower through durable field assignments and restrict the shared store to this materialization.
 pub(crate) fn lower(
     selection: &Selection<Resolved>,
-    columns: &BTreeMap<PropertyId, String>,
+    columns: &BTreeMap<PropertyId, PropertyColumn>,
     materialization: &str,
 ) -> Selection<EngineColumns> {
     let mut lowered = map_references(
         selection,
         &|path| {
-            let column = if path.property_id() == PropertyId::Id { "id".to_owned() } else { columns[&path.property_id()].clone() };
+            let column = if path.property_id() == PropertyId::Id { "id".to_owned() } else { columns[&path.property_id()].field.clone() };
             ColumnPath::new(column, path.subpath.clone())
         },
         &|model| *model,
@@ -46,7 +46,8 @@ mod tests {
                 order_by: Some(vec![OrderByItem { path: property.into(), direction: OrderDirection::Asc }]),
                 limit: None,
             };
-            let columns = [(property, property.to_string())].into();
+            let columns =
+                [(property, PropertyColumn { field: property.to_string(), value_type: ankurah_core_types::ValueType::String })].into();
             assert_eq!(lower(&selection, &columns, "key_paths").order_by.unwrap()[0].path.column, property.to_string());
         }
     }

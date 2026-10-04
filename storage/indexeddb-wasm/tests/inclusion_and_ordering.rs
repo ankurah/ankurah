@@ -243,7 +243,7 @@ pub async fn repeated_integer_constraints_filter_before_limit() -> Result<(), an
     let (ctx, db_name) = setup_context().await?;
     // Our IndexedDB key encoding uses zero-padded strings for positive i64 values above
     // JavaScript's safe integer limit (2^53 - 1), avoiding precision loss. These values straddle
-    // that limit: residuals must compare the original i64 values, not the encoded keys.
+    // that limit: decoding must recover i64 values for residual filtering and numeric spill sorting.
     create_events(
         &ctx,
         vec![
@@ -254,6 +254,25 @@ pub async fn repeated_integer_constraints_filter_before_limit() -> Result<(), an
         ],
     )
     .await?;
+
+    assert_eq!(
+        event_timestamps(
+            &ctx.fetch::<EventView>(
+                "timestamp >= 9007199254740990 AND (timestamp = 9007199254740992 OR timestamp = 9007199254741000) ORDER BY timestamp"
+            )
+            .await?
+        ),
+        vec![9_007_199_254_740_992, 9_007_199_254_741_000]
+    );
+    assert_eq!(
+        event_timestamps(
+            &ctx.fetch::<EventView>(
+                "timestamp >= 9007199254740990 AND timestamp IN (9007199254740991, 9007199254740992) ORDER BY timestamp"
+            )
+            .await?
+        ),
+        vec![9_007_199_254_740_991, 9_007_199_254_740_992]
+    );
 
     // Bounding a column used to drop every predicate on it, including conditions the bound
     // did not enforce. The conflicting equality and != exclusions must remain as residuals,

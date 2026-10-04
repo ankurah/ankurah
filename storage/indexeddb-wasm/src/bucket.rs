@@ -10,6 +10,7 @@ use ankurah_core::{
     error::{MutationError, RetrievalError},
     schema::CatalogResolver,
     selection::filter::evaluate_predicate,
+    value::{Value, ValueType},
     ModelId,
 };
 use ankurah_proto::{self as proto, Attested, EntityState};
@@ -40,19 +41,37 @@ pub struct IndexedDBBucket {
     /// The injected catalog resolver (shared with the engine): the NAME SOURCE
     /// for [`Self::column_for_key`]. Weak so storage never keeps the node alive.
     pub(crate) resolver: Arc<RwLock<Option<std::sync::Weak<dyn CatalogResolver>>>>,
-    /// This materialization's slice of the engine-owned durable identity-to-field map
-    /// (the `property_columns` object store), cached in memory and keyed by
+    /// This materialization's field names and value types from the `property_columns`
+    /// object store, cached in memory and keyed by
     /// durable [`PropertyId`] (NOT `EntityId`) so the write side (a backend's
     /// `property_values()` id) and the read side (a `PropertyId` off the resolved
     /// AST) address the same row. The map -- not the display name -- is what
     /// addresses a property's field once assigned: renames never move fields,
     /// collisions were deduped at assignment.
-    pub(crate) property_columns: Arc<RwLock<BTreeMap<PropertyId, String>>>,
+    pub(crate) property_columns: Arc<RwLock<BTreeMap<PropertyId, PropertyColumn>>>,
     /// Whether [`Self::ensure_property_columns_loaded`] has hydrated
     /// `property_columns` from the store; cleared when a query needs a missing field.
     pub(crate) property_columns_loaded: AtomicBool,
     #[cfg(debug_assertions)]
     pub(crate) prefix_guard_disabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Durable metadata for decoding a property's projected field without reading entity state.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PropertyColumn {
+    pub field: String,
+    pub value_type: ValueType,
+}
+
+impl PropertyColumn {
+    fn check_type(&self, value_type: ValueType) -> Result<(), MutationError> {
+        if self.value_type != value_type {
+            return Err(MutationError::General(
+                anyhow::anyhow!("property column {} has type {:?}, cannot store {:?}", self.field, self.value_type, value_type).into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// A projection whose durable property fields are already assigned.
@@ -91,7 +110,7 @@ fn property_field_key(model: &ModelId, field: &str) -> String {
     format!("field\0{}\0{field}", serde_json::to_string(model).expect("ModelId always serializes"))
 }
 
-fn decode_property_column_row(prefix: &str, key: &str, field: String) -> Result<(PropertyId, String), MutationError> {
+fn decode_property_column_row(prefix: &str, key: &str, column: PropertyColumn) -> Result<(PropertyId, PropertyColumn), MutationError> {
     let suffix = key.strip_prefix(prefix).ok_or_else(|| {
         MutationError::General(
             std::io::Error::new(
@@ -110,7 +129,7 @@ fn decode_property_column_row(prefix: &str, key: &str, field: String) -> Result<
             .into(),
         )
     })?;
-    Ok((property_id, field))
+    Ok((property_id, column))
 }
 
 fn materialization_entity_key(materialization_name: &str, entity_id: proto::EntityId) -> String {
@@ -184,7 +203,7 @@ impl IndexedDBBucket {
                 if matches!(pid, PropertyId::Id) {
                     return Some("id".to_string());
                 }
-                assigned.get(pid).cloned()
+                assigned.get(pid).map(|column| column.field.clone())
             }
         };
 
@@ -201,6 +220,9 @@ impl IndexedDBBucket {
         let selection = if absent.is_empty() { selection.clone() } else { selection.assume_null(&absent) };
 
         let amended_selection = crate::lower::lower(&selection, &assigned, &self.materialization_name);
+        let mut field_types: BTreeMap<String, ValueType> =
+            assigned.values().map(|column| (column.field.clone(), column.value_type)).collect();
+        field_types.insert(MATERIALIZATION_KEY.to_string(), ValueType::String);
         let planner = ankurah_storage_common::Planner::new(ankurah_storage_common::PlannerConfig::indexeddb());
         let plans = planner.plan(&amended_selection, "id");
         let plan = plans.first().ok_or_else(|| RetrievalError::Other("No plan generated".into()))?;
@@ -252,6 +274,7 @@ impl IndexedDBBucket {
                             eq_prefix_len,
                             eq_prefix_values,
                             &order_by_spill,
+                            &field_types,
                         )
                         .await?;
 
@@ -271,7 +294,7 @@ impl IndexedDBBucket {
 
 impl IndexedDBBucket {
     /// Hydrate `property_columns` with this model's durable
-    /// identity-to-field assignments. Runs BEFORE any write
+    /// field names and value types. Runs BEFORE any write
     /// transaction so the loaded cache is the authoritative taken-set for
     /// [`Self::column_for_key`] (and so a field lookup never has to read the
     /// store while the entities transaction is open -- IndexedDB auto-commits a
@@ -313,17 +336,11 @@ impl IndexedDBBucket {
                         std::io::Error::new(std::io::ErrorKind::InvalidData, "property_columns key is not a string").into(),
                     )
                 })?;
-                let name = value.as_string().ok_or_else(|| {
-                    MutationError::General(
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("property_columns value for {key_str:?} is not a string"),
-                        )
-                        .into(),
-                    )
+                let column: PropertyColumn = serde_wasm_bindgen::from_value(value).map_err(|error| {
+                    MutationError::General(anyhow::anyhow!("invalid property_columns metadata for {key_str:?}: {error}").into())
                 })?;
-                let (property_id, name) = decode_property_column_row(&prefix, &key_str, name)?;
-                map.insert(property_id, name);
+                let (property_id, column) = decode_property_column_row(&prefix, &key_str, column)?;
+                map.insert(property_id, column);
                 cursor.continue_().require("advance property_columns cursor")?;
             }
 
@@ -336,9 +353,10 @@ impl IndexedDBBucket {
 
     /// Assign a sticky physical name on a cache miss, using a label or an ID prefix.
     /// Call after loading the name map and before opening the publication transaction.
-    async fn column_for_key(&self, property_id: &PropertyId) -> Result<String, MutationError> {
-        if let Some(field) = self.property_columns.read().unwrap().get(property_id) {
-            return Ok(field.clone());
+    async fn column_for_key(&self, property_id: &PropertyId, value_type: ValueType) -> Result<String, MutationError> {
+        if let Some(column) = self.property_columns.read().unwrap().get(property_id) {
+            column.check_type(value_type)?;
+            return Ok(column.field.clone());
         }
 
         let label = match property_id {
@@ -373,7 +391,7 @@ impl IndexedDBBucket {
                         ));
                     }
                     let assigned = self.property_columns.read().unwrap();
-                    if let Some((owner, _)) = assigned.iter().find(|(owner, taken)| *owner != property_id && taken.as_str() == field) {
+                    if let Some((owner, _)) = assigned.iter().find(|(owner, taken)| *owner != property_id && taken.field == field) {
                         return Err(MutationError::General(
                             anyhow::anyhow!(
                                 "system property {:?} sanitizes to field {:?}, which is already assigned to property {} in materialization {}; refusing the assignment",
@@ -393,7 +411,7 @@ impl IndexedDBBucket {
                     let assigned = self.property_columns.read().unwrap();
                     let is_taken = |candidate: &str| {
                         RESERVED_FIELDS.contains(&candidate)
-                            || assigned.iter().any(|(other, name)| other != property_id && name == candidate)
+                            || assigned.iter().any(|(other, name)| other != property_id && name.field == candidate)
                     };
                     match label.as_deref() {
                         Some(label) => naming::dedupe(&naming::sanitize(label), id, is_taken),
@@ -408,10 +426,10 @@ impl IndexedDBBucket {
                 }
             };
 
-            match self.persist_property_column(property_id, &field).await? {
+            match self.persist_property_column(property_id, &field, value_type).await? {
                 PropertyFieldClaim::Stored(stored) => {
                     self.property_columns.write().unwrap().insert(*property_id, stored.clone());
-                    return Ok(stored);
+                    return Ok(stored.field);
                 }
                 PropertyFieldClaim::Collision if matches!(property_id, PropertyId::System(_)) => {
                     return Err(MutationError::General(
@@ -441,14 +459,19 @@ impl IndexedDBBucket {
         ))
     }
 
-    /// Persist an identity-to-field assignment to the `property_columns` store,
+    /// Persist a property's field name and value type in the `property_columns` store,
     /// returning the durable claim result. Forward and reverse rows are written
     /// in one readwrite transaction, so separate tabs or engine instances
     /// cannot assign the same field to different property identities.
-    async fn persist_property_column(&self, property_id: &PropertyId, proposed: &str) -> Result<PropertyFieldClaim, MutationError> {
+    async fn persist_property_column(
+        &self,
+        property_id: &PropertyId,
+        proposed: &str,
+        value_type: ValueType,
+    ) -> Result<PropertyFieldClaim, MutationError> {
         let map_key = property_columns_key(&self.model_id, property_id);
         let field_key = property_field_key(&self.model_id, proposed);
-        let proposed = proposed.to_string();
+        let proposed = PropertyColumn { field: proposed.to_string(), value_type };
         let db_connection = self.db.get_connection().await;
         SendWrapper::new(async move {
             let transaction = db_connection
@@ -459,8 +482,11 @@ impl IndexedDBBucket {
             let get_request = store.get(&JsValue::from_str(&map_key)).require("get property_columns entry")?;
             cb_future(&get_request, "success", "error").await.require("await property_columns get")?;
             let existing = get_request.result().require("get property_columns result")?;
-            if let Some(name) = existing.as_string() {
-                return Ok(PropertyFieldClaim::Stored(name));
+            if !existing.is_undefined() {
+                let column: PropertyColumn = serde_wasm_bindgen::from_value(existing)
+                    .map_err(|error| MutationError::General(anyhow::anyhow!("invalid property_columns metadata: {error}").into()))?;
+                column.check_type(value_type)?;
+                return Ok(PropertyFieldClaim::Stored(column));
             }
 
             let reverse_request = store.get(&JsValue::from_str(&field_key)).require("get property field owner")?;
@@ -472,8 +498,9 @@ impl IndexedDBBucket {
                 }
             }
 
-            let put_request =
-                store.put_with_key(&JsValue::from_str(&proposed), &JsValue::from_str(&map_key)).require("put property_columns entry")?;
+            let metadata = serde_wasm_bindgen::to_value(&proposed)
+                .map_err(|error| MutationError::General(anyhow::anyhow!("encode property_columns metadata: {error}").into()))?;
+            let put_request = store.put_with_key(&metadata, &JsValue::from_str(&map_key)).require("put property_columns entry")?;
             cb_future(&put_request, "success", "error").await.require("await property_columns put")?;
             let reverse_put =
                 store.put_with_key(&JsValue::from_str(&map_key), &JsValue::from_str(&field_key)).require("put property field owner")?;
@@ -490,30 +517,24 @@ impl IndexedDBBucket {
         use ankurah_core::property::backend::backend_from_string;
         use std::collections::HashSet;
 
-        let mut seen_fields = HashSet::new();
+        let mut seen_properties = HashSet::new();
 
         // Process all property values from state buffers
         for (backend_name, state_buffer) in entity_state.state.state_buffers.iter() {
             let backend = backend_from_string(backend_name, Some(state_buffer)).map_err(|e| MutationError::General(Box::new(e)))?;
 
             for (property_id, value) in backend.property_values() {
-                // This object is prepared before the engine opens its publication transaction.
-                let field_name = self.column_for_key(&property_id).await?;
-                // First occurrence wins on same-field collisions (a cross-backend
-                // duplicate). Same-materialization identity collisions can't reach
-                // here: assignment deduped them to distinct fields (EntityId) or
-                // refused the state outright (System), so no property field ever
-                // lands on a reserved record field or another identity's field.
-                if !seen_fields.insert(field_name.clone()) {
+                // Each property has one sticky field; the first backend occurrence wins.
+                if !seen_properties.insert(property_id) {
                     continue;
                 }
-
+                // An unset property has no projection. Assign its field and type on the first value.
+                let Some(value) = value else { continue };
+                // Capture the exact backend value type before IndexedDB encoding loses it.
+                let field_name = self.column_for_key(&property_id, value.value_type()).await?;
                 // Set field directly on entity object (no prefix - they become the primary fields)
                 // Use IdbValue encoding to ensure fields are IndexedDB-key-compatible (bool as 0/1, etc.)
-                let js_value = match value {
-                    Some(ref prop_value) => crate::idb_value::IdbValue::from(prop_value).into(),
-                    None => JsValue::NULL,
-                };
+                let js_value: JsValue = crate::idb_value::IdbValue::from(value).into();
                 entity_obj.set(&field_name, js_value)?;
             }
         }
@@ -534,6 +555,7 @@ impl IndexedDBBucket {
         eq_prefix_len: usize,
         eq_prefix_values: Vec<ankurah_core::value::Value>,
         order_by_spill: &OrderByComponents,
+        field_types: &BTreeMap<String, ValueType>,
     ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         if limit == Some(0) {
             return Ok(Vec::new());
@@ -565,7 +587,7 @@ impl IndexedDBBucket {
             let id = entity_obj.get(&ID_KEY)?;
             let memberships =
                 if needs_memberships { crate::engine::associated_models_in_store(membership_store, id).await? } else { BTreeSet::new() };
-            let record = IdbRecord { id, object: entity_obj, memberships };
+            let record = IdbRecord { id, object: entity_obj, memberships, field_types };
 
             // Apply predicate filtering (uses lazy extraction from IdbRecord)
             if evaluate_predicate(&record, predicate).map_err(|e| RetrievalError::storage(format!("Predicate evaluation failed: {}", e)))? {
@@ -601,25 +623,26 @@ impl IndexedDBBucket {
 }
 
 enum PropertyFieldClaim {
-    Stored(String),
+    Stored(PropertyColumn),
     Collision,
 }
 
 /// A materialized row, evaluated against physical column paths.
-struct IdbRecord {
+struct IdbRecord<'a> {
+    field_types: &'a BTreeMap<String, ValueType>,
     id: ankurah_proto::EntityId,
     object: Object,
     memberships: BTreeSet<ModelId>,
 }
 
-impl IdbRecord {
-    fn field_value(&self, field: &str) -> Option<ankurah_core::value::Value> {
-        let value: crate::idb_value::IdbValue = self.object.get_opt(&field.into()).ok()??;
-        Some(value.into_value())
+impl IdbRecord<'_> {
+    fn field_value(&self, field: &str) -> Option<Value> {
+        let value: JsValue = self.object.get_opt(&field.into()).ok()??;
+        crate::idb_value::IdbValue::from_js(value, *self.field_types.get(field)?).ok().map(crate::idb_value::IdbValue::into_value)
     }
 }
 
-impl ankurah_core::selection::filter::ValueLookup<EngineColumns> for IdbRecord {
+impl ankurah_core::selection::filter::ValueLookup<EngineColumns> for IdbRecord<'_> {
     fn is_member_of(&self, model: &ModelId) -> Result<bool, ankurah_core::selection::filter::Error> { Ok(self.memberships.contains(model)) }
 
     fn value_at(&self, path: &ColumnPath) -> Option<ankurah_core::value::Value> {
@@ -632,7 +655,7 @@ impl ankurah_core::selection::filter::ValueLookup<EngineColumns> for IdbRecord {
     }
 }
 
-impl ankurah_storage_common::filtering::HasEntityId for IdbRecord {
+impl ankurah_storage_common::filtering::HasEntityId for IdbRecord<'_> {
     fn entity_id(&self) -> ankurah_proto::EntityId { self.id }
 }
 
@@ -645,7 +668,12 @@ mod tests {
     fn corrupt_property_column_rows_are_rejected() {
         let model = ModelId::EntityId(EntityId::from_bytes([4; EntityId::BYTE_LEN]));
         let prefix = property_columns_prefix(&model);
-        let error = decode_property_column_row(&prefix, &format!("{prefix}not-json"), "field".to_owned()).unwrap_err();
+        let error = decode_property_column_row(
+            &prefix,
+            &format!("{prefix}not-json"),
+            PropertyColumn { field: "field".to_owned(), value_type: ValueType::String },
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("invalid PropertyId suffix"), "{error}");
     }
 }

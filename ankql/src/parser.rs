@@ -293,12 +293,15 @@ fn parse_order_by_clause(pair: Pair<grammar::Rule>) -> Result<Vec<ast::OrderByIt
         return Err(ParseError::UnexpectedRule { expected: "OrderByClause", got: pair.as_rule() });
     }
 
-    let mut order_by_items = Vec::new();
+    let mut order_by_items: Vec<ast::OrderByItem<ast::Parsed>> = Vec::new();
 
     // Parse each OrderByItem in the clause
     for inner_pair in pair.into_inner() {
         if inner_pair.as_rule() == grammar::Rule::OrderByItem {
             let order_by_item = parse_order_by_item(inner_pair)?;
+            if order_by_items.iter().any(|existing| existing.path == order_by_item.path && existing.direction != order_by_item.direction) {
+                return Err(ParseError::InvalidPredicate(format!("Conflicting ORDER BY directions for {}", order_by_item.path)));
+            }
             order_by_items.push(order_by_item);
         }
     }
@@ -809,6 +812,17 @@ mod tests {
         );
         assert_eq!(selection.limit, None);
         Ok(())
+    }
+
+    #[test]
+    fn conflicting_order_by_directions_are_rejected() {
+        for query in [
+            "foo > 10 ORDER BY foo DESC, foo ASC, bar ASC",
+            "foo > 10 ORDER BY foo ASC, bar ASC, foo DESC",
+            "foo > 10 ORDER BY foo, foo DESC",
+        ] {
+            assert_eq!(parse_selection(query).unwrap_err().to_string(), "Invalid predicate: Conflicting ORDER BY directions for foo");
+        }
     }
 
     #[test]
