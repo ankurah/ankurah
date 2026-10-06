@@ -23,20 +23,36 @@ pub enum NodePrefixError {
     InvalidByte(u8),
     #[error("a chunk shorter than seven bits can only end a prefix")]
     ShortChunkBeforeEnd,
+    #[error("a prefix holds at most {max} bits", max = NodePrefix::MAX_BITS)]
+    TooLong,
 }
 
 /// Bits per encoded byte; see [`NodePrefix::to_bytes`].
 const CHUNK: u32 = 7;
 
+/// The per-index key length limit, in bytes, that bounds node prefixes:
+/// 4096 for now.
+const KEY_LIMIT: u32 = 4096;
+
 impl NodePrefix {
+    /// The most bits a prefix holds. A node never needs more bits than the
+    /// leaf addresses it divides, and an address is a key of at most 4096
+    /// bytes, the per-index key length limit for now, followed by a 32-byte
+    /// entity id. The deepest split a store allows, a refresher setting, is
+    /// no deeper than this. A longer key still files its leaf, which no node
+    /// separates from its neighbours beyond this depth.
+    pub const MAX_BITS: u32 = 8 * (KEY_LIMIT + 32);
+
     /// The empty prefix, which names the root and contains every address.
     pub fn root() -> Self { Self { bits: Vec::new(), len: 0 } }
 
     /// The first `len` bits of `address`.
     ///
     /// # Panics
-    /// When `address` holds fewer than `len` bits.
+    /// When `address` holds fewer than `len` bits, or `len` exceeds
+    /// [`NodePrefix::MAX_BITS`].
     pub fn of(address: &[u8], len: u32) -> Self {
+        assert!(len <= Self::MAX_BITS, "a prefix holds at most {} bits, not {len}", Self::MAX_BITS);
         assert!(len as usize <= address.len() * 8, "a {}-byte address has no {len}-bit prefix", address.len());
         let mut bits = address[..(len as usize).div_ceil(8)].to_vec();
         if !len.is_multiple_of(8) {
@@ -59,7 +75,11 @@ impl NodePrefix {
     }
 
     /// This prefix followed by one more bit.
+    ///
+    /// # Panics
+    /// When this prefix already holds [`NodePrefix::MAX_BITS`] bits.
     pub fn child(&self, bit: bool) -> Self {
+        assert!(self.len < Self::MAX_BITS, "a prefix holds at most {} bits", Self::MAX_BITS);
         let mut child = self.clone();
         if child.len.is_multiple_of(8) {
             child.bits.push(0);
@@ -148,7 +168,8 @@ impl NodePrefix {
         out
     }
 
-    /// Decode [`NodePrefix::to_bytes`].
+    /// Decode [`NodePrefix::to_bytes`], refusing a prefix longer than
+    /// [`NodePrefix::MAX_BITS`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, NodePrefixError> {
         let mut prefix = Self::root();
         for (position, &byte) in bytes.iter().enumerate() {
@@ -162,6 +183,9 @@ impl NodePrefix {
                 let right = place >= subtree_size(level);
                 if right {
                     place -= subtree_size(level);
+                }
+                if prefix.len == Self::MAX_BITS {
+                    return Err(NodePrefixError::TooLong);
                 }
                 prefix = prefix.child(right);
                 if place == 0 {
@@ -377,6 +401,40 @@ mod tests {
             &[hex("01 ff 80"), hex("01 ff ff ff ff ff")],
             &[hex("01 ff"), hex("01 ff 7f ff ff ff"), hex("02")],
         );
+    }
+
+    /// The longest prefix, as long as the longest leaf address, encodes and
+    /// decodes; one bit more is refused, whether decoded or built.
+    #[test]
+    fn prefixes_stop_at_the_longest_address() {
+        let max = NodePrefix::MAX_BITS;
+        assert_eq!(max, 33_024, "4096-byte keys and 32-byte entity ids");
+        let longest = NodePrefix::of(&vec![0xFF; (max / 8) as usize], max);
+        assert_eq!(NodePrefix::from_bytes(&longest.to_bytes()), Ok(longest));
+        // A chunk of n zero bits encodes as n - 1, the place of its last node
+        // in the walk, so these bytes spell runs of zero bits.
+        let zeros = |n: u32| {
+            let mut bytes = vec![6u8; (n / CHUNK) as usize];
+            if !n.is_multiple_of(CHUNK) {
+                bytes.push((n % CHUNK - 1) as u8);
+            }
+            bytes
+        };
+        assert_eq!(NodePrefix::from_bytes(&zeros(max)), Ok(NodePrefix::of(&vec![0; (max / 8) as usize], max)));
+        assert_eq!(NodePrefix::from_bytes(&zeros(max + 1)), Err(NodePrefixError::TooLong));
+        assert_eq!(NodePrefix::from_bytes(&zeros(max + CHUNK)), Err(NodePrefixError::TooLong));
+    }
+
+    #[test]
+    #[should_panic(expected = "at most")]
+    fn no_child_extends_the_longest_prefix() {
+        NodePrefix::of(&vec![0; (NodePrefix::MAX_BITS / 8) as usize], NodePrefix::MAX_BITS).child(false);
+    }
+
+    #[test]
+    #[should_panic(expected = "at most")]
+    fn no_prefix_is_taken_past_the_longest() {
+        NodePrefix::of(&vec![0; (NodePrefix::MAX_BITS / 8) as usize + 1], NodePrefix::MAX_BITS + 1);
     }
 
     #[test]
