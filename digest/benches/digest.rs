@@ -3,8 +3,8 @@
 //! node whose digest is held uncompressed, and 5.1 µs to update a node through
 //! the compressed encoding.
 //!
-//! `cargo bench -p ankurah-digest`. Every benchmark cycles through 4,096
-//! distinct inputs so that no single input stays in cache.
+//! `cargo bench -p ankurah-digest`. Each benchmark cycles through 4,096 fixed
+//! inputs rather than repeating one.
 
 use std::hint::black_box;
 
@@ -70,6 +70,10 @@ fn primitives(c: &mut Criterion) {
         })
     });
 
+    // An in-memory codec benchmark: the rows are byte arrays in a Vec, so it
+    // measures decoding, adding and encoding, and excludes storage I/O,
+    // building the commit's difference, and batching a node's updates into one
+    // decode and one encode.
     c.bench_function("node update through its row (decode, add, encode)", |b| {
         let mut rows: Vec<[u8; DIGEST_ROW_LEN]> = points.iter().map(|point| Digest::from(*point).to_row_bytes()).collect();
         let mut i = 0;
