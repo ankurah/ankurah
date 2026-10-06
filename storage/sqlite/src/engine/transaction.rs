@@ -192,7 +192,7 @@ impl StorageTransaction for SqliteTransaction<'_> {
             committed.sort_by_key(|(index, _)| *index);
             let entities = committed.into_iter().map(|(_, result)| result).collect();
             tx.commit()?;
-            Ok(StorageCommitOutcome::Committed(StorageCommitResult { entities }))
+            Ok(StorageCommitOutcome::Committed(StorageCommitResult { entities, position: None }))
         })
         .await
         .map_err(MutationError::from)

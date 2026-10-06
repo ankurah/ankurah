@@ -32,6 +32,14 @@ pub use catalog::CatalogResolver;
 mod read;
 pub use read::GetStateResult;
 
+pub mod log;
+pub mod tree;
+
+#[cfg(any(test, feature = "storage-conformance"))]
+pub mod conformance;
+#[cfg(test)]
+pub(crate) mod memory;
+
 /// One atomic storage transaction. Engines may execute writes as they arrive or buffer them until commit.
 /// Dropping the handle without committing must leave its writes uncommitted.
 #[async_trait]
@@ -45,8 +53,10 @@ pub trait StorageTransaction: Send {
     async fn set_state(&mut self, expected_head: &Clock, state: &Attested<EntityState>) -> Result<(), MutationError>;
 
     /// Compare every expected head, then atomically persist events, canonical
-    /// states, memberships, and materializations. Any conflict publishes none
-    /// of those records and returns the observed stored states.
+    /// states, memberships, and materializations, and, on an engine that keeps
+    /// a [`log::CommitLog`], one log row per entity whose state was set. Any
+    /// conflict publishes none of those records and returns the observed
+    /// stored states.
     async fn commit(self) -> Result<StorageCommitOutcome, MutationError>;
 }
 
@@ -65,6 +75,11 @@ pub struct CommittedEntityWrite {
 pub struct StorageCommitResult {
     /// One result per entity, in first-write order.
     pub entities: Vec<CommittedEntityWrite>,
+    /// The position of this commit's log rows, or `None` when it wrote none:
+    /// it set no entity's state, or its engine keeps no commit log. `None`
+    /// acknowledges nothing about durability, and an engine with a log may
+    /// still have used a position for the commit, leaving a gap.
+    pub position: Option<log::LogPosition>,
 }
 
 /// Outcome of attempting an exact-head storage transaction.

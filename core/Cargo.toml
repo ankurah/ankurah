@@ -26,6 +26,9 @@ default = []
 instrument = []
 # Enables test helper methods for adversarial testing (e.g., creating phantom entities)
 test-helpers = []
+# Exposes the conformance suite for engines with a commit log and tree storage
+# (`storage::conformance` and `tree_storage_conformance!`), for engines' tests.
+storage-conformance = []
 # Exposes narrow wrappers over the crate-internal event DAG engine
 # (`bench_support`) for the criterion benches in `benches/`. Never enabled by
 # the default build; keeps the DAG comparison/layering/ordering primitives
