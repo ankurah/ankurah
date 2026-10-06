@@ -75,8 +75,9 @@ fn primitives(c: &mut Criterion) {
         let mut i = 0;
         b.iter(|| {
             i = (i + 1) % INPUTS;
-            let node = Digest::from_row_bytes(black_box(&rows[i])).expect("a row this benchmark wrote") + differences[i];
-            rows[i] = node.to_row_bytes();
+            let node = Digest::from_row_bytes(black_box(&rows[i])).expect("a row this benchmark wrote");
+            // A decoded count may be any i64, so the update is checked.
+            rows[i] = node.checked_add(differences[i]).expect("the benchmark's counts stay at one").to_row_bytes();
             rows[i]
         })
     });

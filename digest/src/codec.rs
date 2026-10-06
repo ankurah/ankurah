@@ -55,7 +55,9 @@ impl Digest {
     }
 
     /// Decode [`Digest::to_wire_bytes`], refusing any point bytes that are not
-    /// a canonical encoding.
+    /// a canonical encoding. The count may be any `i64`, so combine the
+    /// decoded digest with others through the checked operations, such as
+    /// [`Digest::checked_add`], which return an overflow as an error.
     pub fn from_wire_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
         let bytes = exact::<DIGEST_WIRE_LEN>(bytes)?;
         let (point, count) = bytes.split_at(POINT_LEN);
@@ -74,7 +76,8 @@ impl Digest {
     }
 
     /// Decode [`Digest::to_row_bytes`], refusing an unknown version and any
-    /// point bytes that are not a canonical encoding.
+    /// point bytes that are not a canonical encoding. As with
+    /// [`Digest::from_wire_bytes`], the count may be any `i64`.
     pub fn from_row_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
         let bytes = exact::<DIGEST_ROW_LEN>(bytes)?;
         Self::from_wire_bytes(versioned(bytes)?)

@@ -82,4 +82,4 @@ mod point;
 
 pub use codec::{DecodeError, DIGEST_ROW_LEN, DIGEST_WIRE_LEN, LEAF_POINT_ROW_LEN};
 pub use leaf::{HeadHash, Leaf, HEAD_TAG, LEAF_DST};
-pub use point::{Digest, LeafPoint};
+pub use point::{CountOverflow, Digest, LeafPoint};
