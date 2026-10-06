@@ -6,6 +6,7 @@ ankql
 ankurah-proto
 ankurah-derive
 ankurah-signals
+ankurah-digest
 
 # Tier 3: Core functionality (depends on tier 1 & 2)
 ankurah-core

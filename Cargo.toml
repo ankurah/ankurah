@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "core-types",
+    "digest",
     "core",
     "derive",
     "proto",
@@ -25,6 +26,7 @@ members = [
 # separately via wasm-pack. See https://github.com/ankurah/ankurah/issues/211
 default-members = [
     "core-types",
+    "digest",
     "core",
     "derive",
     "proto",
