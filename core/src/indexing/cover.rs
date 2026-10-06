@@ -88,7 +88,7 @@ use std::ops::Bound;
 use ankurah_proto::PropertyId;
 use thiserror::Error;
 
-use super::encoding::{encode_component_typed, KeyEncoding};
+use super::encoding::{encode_component_typed, encodes_alike, KeyEncoding};
 use super::key_spec::{IndexDirection, IndexKeyPart};
 use crate::storage::tree::HashedIndex;
 use crate::value::{Value, ValueType};
@@ -275,7 +275,7 @@ fn encode(index: usize, part: &IndexKeyPart<PropertyId>, value: &Value) -> Resul
     }
     let found = ValueType::of(value);
     let mismatch = RangeError::TypeMismatch { part: index, expected: part.value_type, found };
-    if found != part.value_type && !(is_integer(found) && is_integer(part.value_type)) {
+    if !encodes_alike(found, part.value_type) {
         return Err(mismatch);
     }
     encode_component_typed(value, part.value_type, part.direction.is_desc()).map_err(|_| mismatch)
@@ -290,8 +290,6 @@ fn is_prefix_free(value_type: ValueType, direction: IndexDirection) -> bool {
         ValueType::Json => false,
     }
 }
-
-fn is_integer(value_type: ValueType) -> bool { matches!(value_type, ValueType::I16 | ValueType::I32 | ValueType::I64) }
 
 /// A point of the address space, read as a binary fraction.
 #[derive(Debug, Clone, PartialEq)]

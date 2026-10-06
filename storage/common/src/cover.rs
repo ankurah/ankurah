@@ -5,17 +5,18 @@
 //! data-independent representation as that range: the Selection names the component the
 //! index files, by one membership every match must have, or names none for the entity-id
 //! index of every entity; the planner pushes the rest of the predicate into an index whose
-//! KeySpec the tree's matches, exactly or as a prefix, with no residual; the Selection has no
-//! limit; the tree files no entity twice within the range; and the tree leaves out no entity
-//! the range names. An order alone never matters, because ordering does not change the set.
-//! Any other Selection is refused with its reason, and a temporary digest over its result
-//! serves it instead.
+//! KeySpec the tree's matches, exactly or as a prefix, with no residual; the tree keeps each
+//! matched key part in the value type, null order and collation the Selection compares it by;
+//! the Selection has no limit; the tree files no entity twice within the range; and the tree
+//! leaves out no entity the range names. An order alone never matters, because ordering does
+//! not change the set. Any other Selection is refused with its reason, and a temporary digest
+//! over its result serves it instead.
 
 use std::ops::Bound;
 
 use ankql::ast::{Predicate, Resolved, Selection};
 use ankql::selection::map_references;
-use ankurah_core::indexing::{Cover, IndexKeyPart, KeyRange, KeySpec, RangeError};
+use ankurah_core::indexing::{Cover, IndexKeyPart, KeyRange, KeySpec, RangeError, encodes_alike};
 use ankurah_core::storage::tree::HashedIndex;
 use ankurah_core::value::Value;
 use ankurah_proto::{ModelId, PropertyId};
@@ -47,6 +48,11 @@ pub enum NotReusable {
     /// canonical property ids, and no registered tree of the component (of every entity when
     /// `None`) matches it.
     NoMatchingTree { component: Option<ModelId>, key_spec: KeySpec<String> },
+    /// The tree keeps this key part in another value type than the Selection compares it by,
+    /// integer widths counting as one, or orders its nulls or collates it otherwise, so the
+    /// tree's keys need not order as the Selection compares values. KeySpec::matches, which
+    /// finds the tree, compares only properties, subpaths and directions.
+    KeyPartMismatch { index: HashedIndex, part: usize },
     /// The tree can file one entity under several values of this key part within the range.
     FilesEntityTwice { index: HashedIndex, part: usize },
     /// The tree leaves out entities that lack this key part, which the range leaves open.
@@ -101,7 +107,7 @@ fn serve(plan: Plan, component: Option<ModelId>, trees: &[RegisteredTree]) -> Re
     };
     let mut refusal = None;
     for tree in trees.iter().filter(|tree| tree.matches(component, &key_spec)) {
-        match tree.cover(&bounds) {
+        match tree.cover(&key_spec, &bounds) {
             Ok(cover) => return Ok(cover),
             Err(error) => refusal = refusal.or(Some(error)),
         }
@@ -121,8 +127,12 @@ impl RegisteredTree {
     }
 
     /// The cover of the planner's `bounds` on this tree's leading key parts, unless the tree
-    /// does not hold exactly the entities they name.
-    fn cover(&self, bounds: &KeyBounds) -> Result<Cover, NotReusable> {
+    /// keeps those parts otherwise than the planner's `key_spec` compares them, or does not
+    /// hold exactly the entities the bounds name.
+    fn cover(&self, key_spec: &KeySpec<String>, bounds: &KeyBounds) -> Result<Cover, NotReusable> {
+        if let Some(part) = self.mismatched_part(key_spec) {
+            return Err(NotReusable::KeyPartMismatch { index: self.index.clone(), part });
+        }
         let range = key_range(bounds).ok_or_else(|| NotReusable::UnreadableBounds(bounds.clone()))?;
         let fixed = range.prefix.len();
         if let Some(&part) = self.multi_valued_parts.iter().find(|&&part| part >= fixed) {
@@ -141,6 +151,14 @@ impl RegisteredTree {
             return Err(NotReusable::Unsatisfiable);
         }
         Ok(cover)
+    }
+
+    /// The first of the planner's key parts that this tree keeps in another value type
+    /// (integer widths share one encoding, so they count as one), null order or collation.
+    fn mismatched_part(&self, key_spec: &KeySpec<String>) -> Option<usize> {
+        key_spec.keyparts.iter().zip(key_parts(&self.index)).position(|(compared, kept)| {
+            !encodes_alike(compared.value_type, kept.value_type) || compared.nulls != kept.nulls || compared.collation != kept.collation
+        })
     }
 }
 
@@ -202,7 +220,7 @@ fn engine_key_spec(parts: &[IndexKeyPart<PropertyId>]) -> KeySpec<String> {
 #[cfg(test)]
 mod tests {
     use ankql::ast::{ComparisonOperator, Expr, Parsed, PropertyPath};
-    use ankurah_core::indexing::{Block, IndexDirection, encode_component_typed};
+    use ankurah_core::indexing::{Block, IndexDirection, NullsOrder, encode_component_typed};
     use ankurah_core::schema::resolver::{ModelResolutionError, ModelResolver, ResolvedProperty, resolve_selection};
     use ankurah_core::selection::filter::{self, Filterable, evaluate_predicate};
     use ankurah_core::value::ValueType;
@@ -419,6 +437,36 @@ mod tests {
         assert_eq!(refusal, Err(NotReusable::NoMatchingTree { component: Some(albums()), key_spec }));
     }
 
+    /// KeySpec::matches finds a tree by its properties, subpaths and directions alone; the tree
+    /// must also keep each matched part in the value type, null order and collation the
+    /// Selection compares it by, and the refusal names the first part that differs.
+    #[test]
+    fn a_tree_keeping_a_part_otherwise_than_the_selection_compares_it_is_refused() {
+        let team = entity(0x10);
+        let both = selection(&format!("team = '{}' AND score > 3", team.to_base64()));
+        let teams = part("team", ValueType::EntityId, IndexDirection::Asc);
+        let score = |value_type| part("score", value_type, IndexDirection::Asc);
+        let nulls_first = IndexKeyPart { nulls: Some(NullsOrder::First), ..score(ValueType::I64) };
+        let collated = IndexKeyPart { collation: Some("und-u-ks-level2".to_owned()), ..score(ValueType::I64) };
+        for (parts, part) in [
+            (vec![part("team", ValueType::String, IndexDirection::Asc), score(ValueType::I64)], 0),
+            (vec![teams.clone(), score(ValueType::F64)], 1),
+            (vec![teams.clone(), score(ValueType::String)], 1),
+            (vec![teams.clone(), nulls_first], 1),
+            (vec![teams.clone(), collated], 1),
+        ] {
+            let tree = tree(parts);
+            let refusal = cover_selection(&both, std::slice::from_ref(&tree));
+            assert_eq!(refusal, Err(NotReusable::KeyPartMismatch { index: tree.index.clone(), part }));
+        }
+        // Integer widths share one encoding, so they count as one type.
+        let narrower = tree(vec![teams, score(ValueType::I32)]);
+        assert_eq!(
+            cover_selection(&both, std::slice::from_ref(&narrower)),
+            Ok(expected(&narrower, vec![Value::EntityId(team)], Bound::Excluded(Value::I64(3)), Bound::Unbounded))
+        );
+    }
+
     #[test]
     fn a_tree_that_leaves_out_entities_the_range_names_is_refused() {
         // An entity of the team without a score is in the result but not in the tree.
@@ -521,7 +569,7 @@ mod tests {
             [(Endpoint::incl(nan()), Endpoint::UnboundedHigh(ValueType::F64)), (Endpoint::incl(nan()), Endpoint::incl(nan()))]
         {
             let bounds = KeyBounds::new(vec![KeyBoundComponent { column: column.clone(), low, high }]);
-            assert_eq!(tree.cover(&bounds), Err(NotReusable::Unsatisfiable));
+            assert_eq!(tree.cover(&engine_key_spec(key_parts(&tree.index)), &bounds), Err(NotReusable::Unsatisfiable));
         }
     }
 }

@@ -30,6 +30,13 @@ const JSON_TAG_INT: u8 = 0x20; // i64: fixed 8 bytes, no sentinel needed
 const JSON_TAG_FLOAT: u8 = 0x30; // f64: fixed 8 bytes, no sentinel needed
 const JSON_TAG_STRING: u8 = 0x40; // variable length, uses 0x00 sentinel with 0x00→0x00 0xFF escaping
 
+/// Whether the canonical encoding encodes values of the two types alike: equal types, or two
+/// integer widths, which share one 8-byte encoding.
+pub fn encodes_alike(a: ValueType, b: ValueType) -> bool {
+    let integer = |value_type| matches!(value_type, ValueType::I16 | ValueType::I32 | ValueType::I64);
+    a == b || (integer(a) && integer(b))
+}
+
 /// Encode a single component (no NULL handling for now - TODO: add NULL support later)
 pub fn encode_component_typed(value: &Value, expected_type: ValueType, descending: bool) -> Result<Vec<u8>, IndexError> {
     // Cast value to expected type (short-circuits if types already match)
