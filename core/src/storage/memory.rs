@@ -759,5 +759,5 @@ impl TreeBatch for MemoryTreeBatch<'_> {
 mod tests {
     use super::MemoryStorageEngine;
 
-    crate::tree_storage_conformance!(MemoryStorageEngine::new());
+    crate::tree_storage_conformance!(MemoryStorageEngine::new(), batches: crate::storage::conformance::BatchConcurrency::Waits);
 }

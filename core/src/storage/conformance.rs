@@ -22,6 +22,11 @@
 //! }
 //! ```
 //!
+//! An engine fixture may also state how its batches on one tree meet, as a
+//! [`BatchConcurrency`] after `batches:` (and after `reopen:`, when both are
+//! given), so that the cases racing batches order their contenders on purpose
+//! rather than by timing.
+//!
 //! The cases assume nothing an engine may choose: positions may have gaps,
 //! batches may lock or detect conflicts optimistically, and tree ids may be
 //! any numbers.
@@ -38,6 +43,10 @@ use ankql::ast::PropertyId;
 use ankurah_proto::{Attested, AuthorId, Clock, EntityId, EntityState, Event, EventId, ModelId, OperationSet, State, StateBuffers};
 use async_trait::async_trait;
 use futures::StreamExt;
+use tokio::sync::{
+    oneshot::{self, error::TryRecvError},
+    Barrier,
+};
 
 use super::{
     log::{CommitLog, LogError, LogIncarnation, LogPage, LogPosition, LogRow},
@@ -65,20 +74,27 @@ const BLOCKED: Duration = Duration::from_millis(100);
 /// Expand to one `#[tokio::test]` per conformance case, each running against
 /// a fresh engine that `$make` builds; `$make` may `.await`. Given `reopen:`,
 /// also one per case that crashes and reopens a store, each with a fresh
-/// [`Reopen`](crate::storage::conformance::Reopen) that `$reopen` builds. The
-/// calling crate needs tokio with its `macros` and `rt` features.
+/// [`Reopen`](crate::storage::conformance::Reopen) that `$reopen` builds.
+/// Given `batches:`, the cases racing batches order their contenders by the
+/// [`BatchConcurrency`](crate::storage::conformance::BatchConcurrency) it
+/// states. The calling crate needs tokio with its `macros` and `rt` features.
 #[macro_export]
 macro_rules! tree_storage_conformance {
-    ($make:expr, reopen: $reopen:expr) => {
-        $crate::tree_storage_conformance!($make);
-        $crate::tree_storage_conformance!(@reopen ($reopen)
-            reopen_keeps_what_was_durable
-            reopen_keeps_tree_batches_whole
-            reopen_restarts_trees_past_the_durable_position
-            reopen_after_a_reset_keeps_the_new_incarnation
+    ($make:expr $(, reopen: $reopen:expr)? $(, batches: $batches:expr)? $(,)?) => {
+        $crate::tree_storage_conformance!(@racing ($make)
+            (::core::option::Option::<$crate::storage::conformance::BatchConcurrency>::None
+                $(.or(::core::option::Option::Some($batches)))?)
+            concurrent_batches_commit_one
+            one_of_several_contenders_commits
         );
-    };
-    ($make:expr) => {
+        $(
+            $crate::tree_storage_conformance!(@reopen ($reopen)
+                reopen_keeps_what_was_durable
+                reopen_keeps_tree_batches_whole
+                reopen_restarts_trees_past_the_durable_position
+                reopen_after_a_reset_keeps_the_new_incarnation
+            );
+        )?
         $crate::tree_storage_conformance!(@cases ($make)
             fresh_store_keeps_an_entity_id_tree
             commits_take_increasing_positions
@@ -97,8 +113,6 @@ macro_rules! tree_storage_conformance {
             entity_to_keys_lookup
             tombstones_through_a_split
             snapshot_reads_inside_a_batch
-            concurrent_batches_commit_one
-            one_of_several_contenders_commits
             trees_do_not_wait_for_each_other
             readers_never_see_an_open_batch
             a_cancelled_wait_leaves_no_trace
@@ -122,6 +136,12 @@ macro_rules! tree_storage_conformance {
             async fn $case() { $crate::storage::conformance::$case(::std::sync::Arc::new($make)).await; }
         )*
     };
+    (@racing ($make:expr) ($batches:expr) $($case:ident)*) => {
+        $(
+            #[tokio::test]
+            async fn $case() { $crate::storage::conformance::$case(::std::sync::Arc::new($make), $batches).await; }
+        )*
+    };
     (@reopen ($reopen:expr) $($case:ident)*) => {
         $(
             #[tokio::test]
@@ -143,6 +163,19 @@ pub trait Reopen: Send + Sync {
     /// Abandon `engine` as a crash would, closing nothing cleanly, and open
     /// the same store again.
     async fn crash_and_reopen(&self, engine: Arc<Self::Engine>) -> Arc<Self::Engine>;
+}
+
+/// How an engine's batches on one tree meet, as an engine fixture may state
+/// it. The cases racing batches then order their contenders' phases (begun,
+/// about to commit) on purpose; without it they assume nothing about overlap
+/// and check exclusion, the final tree and progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchConcurrency {
+    /// A batch waits to begin while another batch on its tree is open.
+    Waits,
+    /// Batches on one tree run side by side, and of those committed against
+    /// one cell all but the first conflict.
+    SideBySide,
 }
 
 /// A new store keeps a ready entity-id tree folded from the start of its log,
@@ -664,7 +697,10 @@ pub async fn snapshot_reads_inside_a_batch<E: TreeStorage + 'static>(engine: Arc
 
 /// Of two batches prepared against the same cell exactly one commits, whole,
 /// and a batch's reads stay as they were while its rival tries to commit.
-pub async fn concurrent_batches_commit_one<E: TreeStorage + 'static>(engine: Arc<E>) {
+/// Where batches run side by side, the rival begins beside the open batch and
+/// commits first, and the open batch then conflicts; where a batch waits, the
+/// rival begins only once the open batch has ended, and conflicts.
+pub async fn concurrent_batches_commit_one<E: TreeStorage + 'static>(engine: Arc<E>, batches: Option<BatchConcurrency>) {
     let tree = entity_id_tree(&*engine).await;
     let position = create(&*engine, vec![state(entity(1), 1, &[], &[])]).await;
     let contest = Contest::set_up(&*engine, tree, position).await;
@@ -672,30 +708,56 @@ pub async fn concurrent_batches_commit_one<E: TreeStorage + 'static>(engine: Arc
 
     let mut first = engine.batch(tree).await.unwrap();
     let seen = batch_reads(&first).await;
-    let mut rival = tokio::spawn(contest.contend(engine.clone(), 2));
-    // The rival either commits while this batch is open, as an engine that
-    // detects conflicts at commit lets it, or waits for this batch, as a
-    // locking engine makes it; past the wait it is taken to be waiting.
-    let finished = tokio::time::timeout(BLOCKED, &mut rival).await.ok().map(|joined| joined.unwrap());
-    assert_eq!(batch_reads(&first).await, seen, "a batch's reads do not move while its rival commits");
+    let (begun, mut rival_begun) = oneshot::channel();
+    let mut rival = tokio::spawn(contest.contend(engine.clone(), 2, Phases { begun: Some(begun), ..Phases::default() }));
+    let finished = match batches {
+        Some(BatchConcurrency::SideBySide) => {
+            tokio::time::timeout(PROGRESS, &mut rival_begun).await.expect("a batch begins beside an open one").unwrap();
+            Some(tokio::time::timeout(PROGRESS, &mut rival).await.expect("the rival commits beside the open batch").unwrap())
+        }
+        Some(BatchConcurrency::Waits) => {
+            // Let the rival run until it waits; whenever it runs, it must not
+            // begin while this batch is open.
+            tokio::task::yield_now().await;
+            assert!(matches!(rival_begun.try_recv(), Err(TryRecvError::Empty)), "a batch does not begin while another on its tree is open");
+            None
+        }
+        None => None,
+    };
+    assert_eq!(batch_reads(&first).await, seen, "a batch's reads do not move while its rival tries to commit");
     contest.write(&mut first, 3).await;
     let first = first.commit(&contest.cell).await.unwrap();
     let second = match finished {
         Some(outcome) => outcome,
-        None => tokio::time::timeout(PROGRESS, rival).await.expect("the rival proceeds once the batch ends").unwrap(),
+        None => tokio::time::timeout(PROGRESS, rival).await.expect("the rival finishes once the batch ends").unwrap(),
     };
     let (winner, cell) = one_winner([(3, first), (2, second)]);
+    match batches {
+        Some(BatchConcurrency::SideBySide) => assert_eq!(winner, 2, "the rival that committed beside the open batch wins"),
+        Some(BatchConcurrency::Waits) => assert_eq!(winner, 3, "the open batch commits before its rival begins"),
+        None => {}
+    }
     assert_eq!(view(&*engine, tree, &contest.probes()).await, contest.won_by(&before, winner, cell));
 }
 
 /// Of several batches prepared against one cell exactly one commits, whole;
-/// every other conflicts with the cell it left, and all of them finish.
-pub async fn one_of_several_contenders_commits<E: TreeStorage + 'static>(engine: Arc<E>) {
+/// every other conflicts with the cell it left, and all of them finish. Where
+/// batches run side by side, every contender has begun before any writes, and
+/// every one has written before any commits.
+pub async fn one_of_several_contenders_commits<E: TreeStorage + 'static>(engine: Arc<E>, batches: Option<BatchConcurrency>) {
     let tree = entity_id_tree(&*engine).await;
     let position = create(&*engine, vec![state(entity(1), 1, &[], &[])]).await;
     let contest = Contest::set_up(&*engine, tree, position).await;
     let before = view(&*engine, tree, &contest.probes()).await;
-    let contenders: Vec<_> = (2..=5).map(|n| (n, tokio::spawn(contest.contend(engine.clone(), n)))).collect();
+    let numbers = 2..=5u8;
+    let phases = match batches {
+        Some(BatchConcurrency::SideBySide) => {
+            let together = || Some(Arc::new(Barrier::new(numbers.len())));
+            Phases { all_begun: together(), all_committing: together(), ..Phases::default() }
+        }
+        Some(BatchConcurrency::Waits) | None => Phases::default(),
+    };
+    let contenders: Vec<_> = numbers.map(|n| (n, tokio::spawn(contest.contend(engine.clone(), n, phases.clone())))).collect();
     let mut outcomes = Vec::new();
     for (n, contender) in contenders {
         outcomes.push((n, tokio::time::timeout(PROGRESS, contender).await.expect("every contender finishes").unwrap()));
@@ -735,7 +797,7 @@ pub async fn trees_do_not_wait_for_each_other<E: TreeStorage + 'static>(engine: 
 
     let contenders: Vec<_> = (0..2)
         .flat_map(|side| (3..=5).map(move |n| (side, n)))
-        .map(|(side, n)| (side, n, tokio::spawn(contests[side].contend(engine.clone(), n))))
+        .map(|(side, n)| (side, n, tokio::spawn(contests[side].contend(engine.clone(), n, Phases::default()))))
         .collect();
     let mut outcomes = [Vec::new(), Vec::new()];
     for (side, n, contender) in contenders {
@@ -1521,10 +1583,20 @@ impl Contest {
         batch.set_folded(self.stable).await.unwrap();
     }
 
-    /// Contender `n`'s whole attempt, from beginning its batch to committing it.
-    async fn contend<E: TreeStorage>(self, engine: Arc<E>, n: u8) -> TreeBatchOutcome {
+    /// Contender `n`'s whole attempt, from beginning its batch to committing
+    /// it, passing each of `phases` on the way.
+    async fn contend<E: TreeStorage>(self, engine: Arc<E>, n: u8, phases: Phases) -> TreeBatchOutcome {
         let mut batch = engine.batch(self.tree).await.unwrap();
+        if let Some(begun) = phases.begun {
+            let _ = begun.send(());
+        }
+        if let Some(all_begun) = &phases.all_begun {
+            all_begun.wait().await;
+        }
         self.write(&mut batch, n).await;
+        if let Some(all_committing) = &phases.all_committing {
+            all_committing.wait().await;
+        }
         batch.commit(&self.cell).await.unwrap()
     }
 
@@ -1538,6 +1610,24 @@ impl Contest {
         won.nodes = vec![(NodePrefix::root(), self.node(n))];
         won
     }
+}
+
+/// Where a contender tells the case how far it has got, so that the case can
+/// order contenders on purpose.
+#[derive(Default)]
+struct Phases {
+    /// Told once the contender's batch has begun.
+    begun: Option<oneshot::Sender<()>>,
+    /// Waited at, with the other contenders, once the batch has begun.
+    all_begun: Option<Arc<Barrier>>,
+    /// Waited at, with the other contenders, once the writes are made and
+    /// just before the commit.
+    all_committing: Option<Arc<Barrier>>,
+}
+
+impl Clone for Phases {
+    /// A clone shares the barriers; a sender is one contender's alone.
+    fn clone(&self) -> Self { Self { begun: None, all_begun: self.all_begun.clone(), all_committing: self.all_committing.clone() } }
 }
 
 /// The one contender that committed, and the cell it left. Every other
