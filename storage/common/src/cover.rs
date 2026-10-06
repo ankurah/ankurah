@@ -786,6 +786,53 @@ mod tests {
         }
     }
 
+    /// A float range before an explicit entity-id part, through the reuse decision, judged album
+    /// by album by Selection evaluation: the bounds' neighbours, the subnormals and both zeros
+    /// fall on the side evaluation puts them, the albums of +∞ are held whatever their ids when
+    /// the range admits +∞, and those of NaN never are. A range the decision finds empty admits
+    /// no album.
+    #[test]
+    fn a_float_range_before_an_explicit_entity_id_part_holds_exactly_the_albums_it_names() {
+        use ComparisonOperator::{Equal, GreaterThan, GreaterThanOrEqual, LessThan, LessThanOrEqual};
+        let bounds = [f64::NEG_INFINITY, -1.0, -0.0, 0.0, f64::from_bits(1), f64::MIN_POSITIVE, f64::MAX, f64::INFINITY];
+        let mut weights = vec![f64::NAN];
+        weights.extend(bounds.iter().flat_map(|&bound| [bound.next_down(), bound, bound.next_up()]));
+        let mut ids = [0x7F; 32];
+        ids[0] = 0x80;
+        let entities = [entity(0x00), EntityId::from_bytes(ids), entity(0xFF)];
+        let weight = |operator, value| comparison("weight", operator, Value::F64(value));
+        let and = |left, right| Predicate::And(Box::new(left), Box::new(right));
+        let mut predicates = Vec::new();
+        for low in bounds {
+            predicates.extend([weight(Equal, low), weight(GreaterThanOrEqual, low), weight(GreaterThan, low)]);
+            predicates.extend([weight(LessThanOrEqual, low), weight(LessThan, low)]);
+            for high in bounds {
+                predicates.extend([
+                    and(weight(GreaterThanOrEqual, low), weight(LessThanOrEqual, high)),
+                    and(weight(GreaterThanOrEqual, low), weight(LessThan, high)),
+                    and(weight(GreaterThan, low), weight(LessThanOrEqual, high)),
+                    and(weight(GreaterThan, low), weight(LessThan, high)),
+                ]);
+            }
+        }
+        for direction in [IndexDirection::Asc, IndexDirection::Desc] {
+            let tree = tree(vec![part("weight", ValueType::F64, direction), part("id", ValueType::EntityId, IndexDirection::Asc)]);
+            for predicate in &predicates {
+                let selection = albums_where(predicate.clone());
+                let cover = match cover_selection(&selection, std::slice::from_ref(&tree), declared_type) {
+                    Ok(cover) => Some(cover),
+                    Err(NotReusable::Unsatisfiable) => None,
+                    Err(refusal) => panic!("{predicate:?} over {direction:?}: {refusal:?}"),
+                };
+                for album in weights.iter().flat_map(|&weight| entities.map(|entity| Album::weighing(weight, entity))) {
+                    let admitted = evaluate_predicate(&album, &selection.predicate).unwrap();
+                    let held = cover.as_ref().is_some_and(|cover| holds(cover, &tree, &album));
+                    assert_eq!(held, admitted, "{predicate:?} over {direction:?}: weight {}", album.value);
+                }
+            }
+        }
+    }
+
     /// An equality or ordered comparison with NaN matches nothing. The planner's bounds never
     /// imply one, so it stays residual and the Selection is refused; bounds holding NaN that do
     /// reach a tree name no key and are refused as unsatisfiable.
