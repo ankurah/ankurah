@@ -21,6 +21,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ops::Bound,
     sync::Arc,
+    time::Duration,
 };
 
 use ankql::ast::PropertyId;
@@ -41,6 +42,10 @@ use crate::{
     value::{Value, ValueType},
 };
 
+/// How long a case waits for an operation that must finish before it calls
+/// the operation stuck.
+const PROGRESS: Duration = Duration::from_secs(10);
+
 /// Expand to one `#[tokio::test]` per conformance case, each running against
 /// a fresh engine that `$make` builds; `$make` may `.await`. The calling crate
 /// needs tokio with its `macros` and `rt` features.
@@ -54,6 +59,7 @@ macro_rules! tree_storage_conformance {
             state_only_commits_are_logged
             log_rows_carry_keys_under_every_tree
             log_reads_end_at_whole_positions
+            durable_position_trails_the_stable_position
             retention_floor_bounds_reads
             reset_mints_a_new_incarnation
             conditional_position_check
@@ -183,6 +189,48 @@ pub async fn log_reads_end_at_whole_positions<E: TreeStorage + 'static>(engine: 
     assert_eq!(engine.read_log(start, 1).await.unwrap().rows.len(), 2, "a commit larger than the limit is still read whole");
 }
 
+/// The durable position never lies above the stable position and never moves
+/// back, through commits, aborts, event-only commits and trimming, and it
+/// reaches every commit.
+pub async fn durable_position_trails_the_stable_position<E: TreeStorage + 'static>(engine: Arc<E>) {
+    let start = LogPosition::start(engine.stable_position().await.unwrap().incarnation());
+    let durable = durable_after(&*engine, start).await;
+    create(&*engine, vec![state(entity(1), 1, &[], &[])]).await;
+    let durable = durable_after(&*engine, durable).await;
+    let stale = commit_states(&*engine, vec![(head(99), state(entity(1), 2, &[], &[]))]).await;
+    assert!(matches!(stale, StorageCommitOutcome::Conflict { .. }));
+    let durable = durable_after(&*engine, durable).await;
+    let mut events_only = engine.transaction();
+    events_only
+        .add_events(&[Attested::opt(Event::update(entity(1), head(1), AuthorId::Unknown, OperationSet(Vec::new())), None)])
+        .await
+        .unwrap();
+    events_only.commit().await.unwrap();
+    let durable = durable_after(&*engine, durable).await;
+    let last = create(&*engine, vec![state(entity(2), 2, &[], &[]), state(entity(3), 3, &[], &[])]).await;
+    let durable = durable_after(&*engine, durable).await;
+    engine.discard_log_below(last).await.unwrap();
+    durable_after(&*engine, durable).await;
+
+    let deadline = tokio::time::Instant::now() + PROGRESS;
+    while engine.durable_position().await.unwrap() <= last {
+        assert!(tokio::time::Instant::now() < deadline, "the durable position never passed the last commit");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Read the durable position, checking it against the stable position and
+/// the durable position read before.
+async fn durable_after<E: CommitLog>(engine: &E, before: LogPosition) -> LogPosition {
+    // Both only rise, so reading the durable position first keeps the check
+    // sound while commits go on.
+    let durable = engine.durable_position().await.unwrap();
+    let stable = engine.stable_position().await.unwrap();
+    assert!(durable <= stable, "the durable position {durable:?} lies above the stable position {stable:?}");
+    assert!(durable >= before, "the durable position moved back from {before:?} to {durable:?}");
+    durable
+}
+
 /// Reading below the retention floor fails; the floor rises when rows are
 /// discarded, never falls, and never passes the stable position.
 pub async fn retention_floor_bounds_reads<E: TreeStorage + 'static>(engine: Arc<E>) {
@@ -210,6 +258,7 @@ pub async fn reset_mints_a_new_incarnation<E: TreeStorage + 'static>(engine: Arc
     let stable = engine.stable_position().await.unwrap();
     assert_ne!(stable.incarnation(), old.incarnation());
     assert_eq!(stable.partial_cmp(&old), None, "positions of different incarnations do not compare");
+    assert!(engine.durable_position().await.unwrap() <= stable, "the durable position belongs to the new incarnation");
     assert!(matches!(engine.read_log(old, 10).await, Err(LogError::IncarnationMismatch { .. })));
     let trees = engine.trees().await.unwrap();
     assert_eq!(trees.iter().map(|tree| &tree.index).collect::<Vec<_>>(), [&HashedIndex::EntityId]);

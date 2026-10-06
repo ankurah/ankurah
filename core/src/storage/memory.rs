@@ -402,6 +402,11 @@ impl StorageEngine for MemoryStorageEngine {
 impl CommitLog for MemoryStorageEngine {
     async fn stable_position(&self) -> Result<LogPosition, LogError> { Ok(self.store.lock().unwrap().stable()) }
 
+    /// Nothing here outlives the process, and a store that starts again
+    /// starts a new incarnation, so within an incarnation every settled
+    /// commit is as durable as this store gets.
+    async fn durable_position(&self) -> Result<LogPosition, LogError> { Ok(self.store.lock().unwrap().stable()) }
+
     async fn retention_floor(&self) -> Result<LogPosition, LogError> {
         let store = self.store.lock().unwrap();
         Ok(LogPosition::new(store.log.incarnation, store.log.floor))

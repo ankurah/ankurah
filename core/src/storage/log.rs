@@ -42,8 +42,9 @@ impl LogIncarnation {
 /// durability setting, and a log row is as durable as its commit. An aborted
 /// transaction leaves its position unused, so positions may have gaps; the
 /// [stable position](CommitLog::stable_position) says where no gap can still
-/// fill. Positions compare only within one incarnation: across incarnations
-/// `partial_cmp` is `None`.
+/// fill, and the [durable position](CommitLog::durable_position) how far
+/// commits survive a crash. Positions compare only within one incarnation:
+/// across incarnations `partial_cmp` is `None`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct LogPosition {
     incarnation: LogIncarnation,
@@ -119,6 +120,18 @@ pub trait CommitLog: StorageEngine {
     /// can still commit below it, so a reader that stops here never skips a
     /// slow commit at a lower position.
     async fn stable_position(&self) -> Result<LogPosition, LogError>;
+
+    /// The position below which every commit is durable: settled, as below the
+    /// stable position, and kept through a crash under the engine's durability
+    /// setting. It never lies above the stable position, never moves back
+    /// within an incarnation, and advances on its own as the engine makes
+    /// commits durable.
+    ///
+    /// A refresher folds only below the lesser of the stable and the durable
+    /// positions, that is below this one, so a crash never leaves a tree
+    /// describing a commit that recovery discards; and a store acknowledges a
+    /// position to a partner only below this one.
+    async fn durable_position(&self) -> Result<LogPosition, LogError>;
 
     /// The lowest position whose rows the log still holds; reading from below
     /// it fails. It only rises, through [`CommitLog::discard_log_below`] or the
