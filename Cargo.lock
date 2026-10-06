@@ -237,6 +237,7 @@ dependencies = [
  "ankurah-core-types",
  "curve25519-dalek",
  "sha2",
+ "thiserror 2.0.17",
 ]
 
 [[package]]
