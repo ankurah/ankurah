@@ -19,7 +19,7 @@ use super::{
     log::{CommitLog, LogError, LogIncarnation, LogPage, LogPosition, LogRow},
     tree::{
         leaf_address, AddressRange, BuildStatus, FoldedRow, HashedIndex, NodePrefix, NodeRow, SnapshotEntity, Tombstone, TreeBatch,
-        TreeBatchOutcome, TreeCell, TreeId, TreeRead, TreeRegistration, TreeSnapshot, TreeStorage, TreeStorageError,
+        TreeBatchOutcome, TreeCell, TreeId, TreeOptions, TreeRead, TreeRegistration, TreeSnapshot, TreeStorage, TreeStorageError,
     },
     CommittedEntityWrite, StorageCommitOutcome, StorageCommitResult, StorageEngine, StorageTransaction,
 };
@@ -426,12 +426,19 @@ impl TreeStorage for MemoryStorageEngine {
     type Batch<'a> = MemoryTreeBatch<'a>;
     type Snapshot<'a> = stream::Iter<std::vec::IntoIter<Result<SnapshotEntity, TreeStorageError>>>;
 
-    async fn register_tree(&self, index: HashedIndex) -> Result<TreeRegistration, TreeStorageError> {
+    async fn register_tree(&self, index: HashedIndex, options: TreeOptions) -> Result<Option<TreeRegistration>, TreeStorageError> {
         let mut store = self.store.lock().unwrap();
-        if let Some((id, _)) = store.trees.iter().find(|(_, registered)| registered.index == index) {
-            return Ok(TreeRegistration { id: *id, index });
+        let serving = store.trees.iter().find(|(_, registered)| registered.index == index).map(|(id, _)| *id);
+        match (serving, options.opted_out) {
+            (_, true) if index == HashedIndex::EntityId => Err(TreeStorageError::PermanentTree),
+            (Some(id), true) => {
+                store.trees.remove(&id);
+                Ok(None)
+            }
+            (None, true) => Ok(None),
+            (Some(id), false) => Ok(Some(TreeRegistration { id, index })),
+            (None, false) => Ok(Some(store.add_tree(index, BuildStatus::Building))),
         }
-        Ok(store.add_tree(index, BuildStatus::Building))
     }
 
     async fn unregister_tree(&self, tree: TreeId) -> Result<(), TreeStorageError> {

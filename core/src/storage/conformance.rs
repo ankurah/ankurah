@@ -43,7 +43,7 @@ use super::{
     log::{CommitLog, LogError, LogIncarnation, LogPage, LogPosition, LogRow},
     tree::{
         AddressRange, BuildStatus, FoldedRow, HashedIndex, NodePrefix, NodeRow, SnapshotEntity, Tombstone, TreeBatch, TreeBatchOutcome,
-        TreeCell, TreeId, TreeRead, TreeStorage, TreeStorageError,
+        TreeCell, TreeId, TreeOptions, TreeRead, TreeRegistration, TreeStorage, TreeStorageError,
     },
     StorageCommitOutcome, StorageEngine, StorageTransaction,
 };
@@ -106,6 +106,7 @@ macro_rules! tree_storage_conformance {
             large_scans_continue_exactly
             empty_trees_read_empty
             build_state_and_generation
+            an_index_that_opts_out_keeps_no_tree
             a_status_only_cell_change_conflicts
             removal_is_whole_when_cancelled
             snapshot_and_replay_give_the_current_index
@@ -150,7 +151,7 @@ pub async fn fresh_store_keeps_an_entity_id_tree<E: TreeStorage + 'static>(engin
     assert_eq!(trees[0].index, HashedIndex::EntityId);
     let start = LogPosition::start(engine.stable_position().await.unwrap().incarnation());
     assert_eq!(cell_of(&*engine, trees[0].id).await, TreeCell { generation: 0, status: BuildStatus::Ready, folded: start });
-    assert_eq!(engine.register_tree(HashedIndex::EntityId).await.unwrap(), trees[0], "registration is keyed by the index");
+    assert_eq!(register(&*engine, HashedIndex::EntityId).await, trees[0], "registration is keyed by the index");
     assert!(matches!(engine.unregister_tree(trees[0].id).await, Err(TreeStorageError::PermanentTree)));
     assert_eq!(engine.prune_horizon().await.unwrap(), start);
 }
@@ -210,7 +211,7 @@ pub async fn state_only_commits_are_logged<E: TreeStorage + 'static>(engine: Arc
 /// commit, as a set that may be empty, and nothing for a tree registered after.
 pub async fn log_rows_carry_keys_under_every_tree<E: TreeStorage + 'static>(engine: Arc<E>) {
     let before = create(&*engine, vec![state(entity(9), 9, &[component()], &[(title(), text("early"))])]).await;
-    let tree = engine.register_tree(title_index()).await.unwrap().id;
+    let tree = register(&*engine, title_index()).await.id;
     let registered = cell_of(&*engine, tree).await.folded;
     assert!(registered > before, "a tree starts after the commits that preceded it");
     let position = create(
@@ -236,7 +237,7 @@ pub async fn log_rows_carry_keys_under_every_tree<E: TreeStorage + 'static>(engi
 /// or not it moves the entity's head, and one that takes the entity out of the
 /// component or back into it logs the empty set or the key it regains.
 pub async fn key_changes_are_logged_with_or_without_a_new_head<E: TreeStorage + 'static>(engine: Arc<E>) {
-    let tree = engine.register_tree(title_index()).await.unwrap().id;
+    let tree = register(&*engine, title_index()).await.id;
     let titled = |n: u8, memberships: &[ModelId], value: &str| state(entity(1), n, memberships, &[(title(), text(value))]);
     create(&*engine, vec![titled(1, &[component()], "a")]).await;
     let logged = |outcome: StorageCommitOutcome| outcome.committed().unwrap().position.expect("a commit that sets a state is logged");
@@ -260,7 +261,7 @@ pub async fn key_changes_are_logged_with_or_without_a_new_head<E: TreeStorage + 
 /// another entity's state was prepared before it: no state, event or log row
 /// is written, and the store takes the next commit.
 pub async fn a_failed_derivation_writes_nothing<E: TreeStorage + 'static>(engine: Arc<E>) {
-    engine.register_tree(rank_index()).await.unwrap();
+    register(&*engine, rank_index()).await;
     let start = engine.stable_position().await.unwrap();
     let event = Event::update(entity(1), head(1), AuthorId::Unknown, OperationSet(Vec::new()));
     let mut transaction = engine.transaction();
@@ -435,7 +436,7 @@ pub async fn retention_floor_bounds_reads<E: TreeStorage + 'static>(engine: Arc<
 /// read, and only a fresh entity-id tree remains.
 pub async fn reset_mints_a_new_incarnation<E: TreeStorage + 'static>(engine: Arc<E>) {
     let old = create(&*engine, vec![state(entity(1), 1, &[], &[])]).await;
-    engine.register_tree(title_index()).await.unwrap();
+    register(&*engine, title_index()).await;
     engine.delete_all().await.unwrap();
     let stable = engine.stable_position().await.unwrap();
     assert_ne!(stable.incarnation(), old.incarnation());
@@ -446,7 +447,7 @@ pub async fn reset_mints_a_new_incarnation<E: TreeStorage + 'static>(engine: Arc
     assert_eq!(trees.iter().map(|tree| &tree.index).collect::<Vec<_>>(), [&HashedIndex::EntityId]);
     let start = LogPosition::start(stable.incarnation());
     assert_eq!(cell_of(&*engine, trees[0].id).await, TreeCell { generation: 0, status: BuildStatus::Ready, folded: start });
-    assert_eq!(engine.register_tree(HashedIndex::EntityId).await.unwrap(), trees[0], "registration is keyed by the index");
+    assert_eq!(register(&*engine, HashedIndex::EntityId).await, trees[0], "registration is keyed by the index");
     assert!(matches!(engine.unregister_tree(trees[0].id).await, Err(TreeStorageError::PermanentTree)), "the fresh tree is permanent");
     assert_eq!(engine.prune_horizon().await.unwrap(), start);
     assert!(matches!(engine.get_state(entity(1)).await, Err(RetrievalError::EntityNotFound(_))));
@@ -526,7 +527,7 @@ pub async fn positions_stay_in_the_tree_incarnation<E: TreeStorage + 'static>(en
 /// The lookup from an entity to its keys finds every folded row of the entity,
 /// follows a move, and forgets removed rows.
 pub async fn entity_to_keys_lookup<E: TreeStorage + 'static>(engine: Arc<E>) {
-    let tree = engine.register_tree(title_index()).await.unwrap().id;
+    let tree = register(&*engine, title_index()).await.id;
     let position = create(&*engine, vec![state(entity(9), 9, &[], &[])]).await;
     let row = |key: &[u8], id: EntityId| folded_row(key, id, position);
     let (moved, other) = (entity(1), entity(2));
@@ -618,7 +619,7 @@ pub async fn tombstones_through_a_split<E: TreeStorage + 'static>(engine: Arc<E>
 /// Reads through a batch see the batch's own writes, a restart included, and a
 /// batch dropped without committing leaves the tree as it was.
 pub async fn snapshot_reads_inside_a_batch<E: TreeStorage + 'static>(engine: Arc<E>) {
-    let tree = engine.register_tree(title_index()).await.unwrap().id;
+    let tree = register(&*engine, title_index()).await.id;
     let position = create(&*engine, vec![state(entity(9), 9, &[], &[])]).await;
     let stable = engine.stable_position().await.unwrap();
     let kept = (folded_row(b"a", entity(3), position), Tombstone { key: b"b".to_vec(), entity_id: entity(4), position });
@@ -707,7 +708,7 @@ pub async fn one_of_several_contenders_commits<E: TreeStorage + 'static>(engine:
 /// trees at once settle each tree on its own.
 pub async fn trees_do_not_wait_for_each_other<E: TreeStorage + 'static>(engine: Arc<E>) {
     let position = create(&*engine, vec![state(entity(1), 1, &[], &[])]).await;
-    let mut trees = [entity_id_tree(&*engine).await, engine.register_tree(title_index()).await.unwrap().id];
+    let mut trees = [entity_id_tree(&*engine).await, register(&*engine, title_index()).await.id];
     trees.sort();
     let mut contests = [Contest::set_up(&*engine, trees[0], position).await, Contest::set_up(&*engine, trees[1], position).await];
     let mut views = [view(&*engine, trees[0], &contests[0].probes()).await, view(&*engine, trees[1], &contests[1].probes()).await];
@@ -798,10 +799,10 @@ pub async fn a_cancelled_wait_leaves_no_trace<E: TreeStorage + 'static>(engine: 
 /// reset those of every tree fail, the entity-id tree's included.
 pub async fn handles_do_not_outlive_their_tree<E: TreeStorage + 'static>(engine: Arc<E>) {
     let position = create(&*engine, vec![state(entity(1), 1, &[], &[])]).await;
-    let old = engine.register_tree(title_index()).await.unwrap().id;
+    let old = register(&*engine, title_index()).await.id;
     let old_reader = engine.reader(old).await.unwrap();
     engine.unregister_tree(old).await.unwrap();
-    let again = engine.register_tree(title_index()).await.unwrap().id;
+    let again = register(&*engine, title_index()).await.id;
     assert_ne!(again, old, "a tree id is not reused within an incarnation");
     let mut batch = engine.batch(again).await.unwrap();
     let cell = batch.cell().await.unwrap();
@@ -822,7 +823,7 @@ pub async fn handles_do_not_outlive_their_tree<E: TreeStorage + 'static>(engine:
 /// A prefix's children are the nearest stored nodes beneath it at any depth,
 /// and its address range holds exactly the leaves beneath it.
 pub async fn children_and_leaf_ranges_at_ragged_depths<E: TreeStorage + 'static>(engine: Arc<E>) {
-    let tree = engine.register_tree(title_index()).await.unwrap().id;
+    let tree = register(&*engine, title_index()).await.id;
     let position = create(&*engine, vec![state(entity(200), 9, &[], &[])]).await;
     let firsts = [0x00, 0x01, 0x0F, 0x10, 0x80, 0xA0, 0xAA, 0xAB, 0xFF];
     let keys = firsts.into_iter().flat_map(|first| [[first, 0x00], [first, 0xAA], [first, 0xFF]]);
@@ -881,7 +882,7 @@ pub async fn children_and_leaf_ranges_at_ragged_depths<E: TreeStorage + 'static>
 /// page ended, at every page size and over a part of the address space; a
 /// limit of zero reads nothing.
 pub async fn large_scans_continue_exactly<E: TreeStorage + 'static>(engine: Arc<E>) {
-    let tree = engine.register_tree(title_index()).await.unwrap().id;
+    let tree = register(&*engine, title_index()).await.id;
     let position = create(&*engine, vec![state(entity(1), 1, &[], &[])]).await;
     // Many entities under each key, so that pages end inside a key's rows.
     let rows: Vec<FoldedRow> = (0..1000u16).map(|n| folded_row(&(n % 250).to_be_bytes(), numbered(n), position)).collect();
@@ -926,7 +927,7 @@ pub async fn empty_trees_read_empty<E: TreeStorage + 'static>(engine: Arc<E>) {
     let entity_ids = entity_id_tree(&*engine).await;
     assert_empty(&engine.reader(entity_ids).await.unwrap()).await;
     assert_eq!(cell_of(&*engine, entity_ids).await.status, BuildStatus::Ready, "a new store's entity-id tree is ready and empty");
-    let tree = engine.register_tree(title_index()).await.unwrap().id;
+    let tree = register(&*engine, title_index()).await.id;
     assert_empty(&engine.reader(tree).await.unwrap()).await;
     assert_empty(&engine.batch(tree).await.unwrap()).await;
 
@@ -983,9 +984,9 @@ async fn assert_empty<R: TreeRead>(reader: &R) {
 /// position; tree ids are not reused.
 pub async fn build_state_and_generation<E: TreeStorage + 'static>(engine: Arc<E>) {
     create(&*engine, vec![state(entity(9), 9, &[], &[])]).await;
-    let registration = engine.register_tree(title_index()).await.unwrap();
+    let registration = register(&*engine, title_index()).await;
     let registered = engine.stable_position().await.unwrap();
-    assert_eq!(engine.register_tree(title_index()).await.unwrap(), registration, "registration is keyed by the index");
+    assert_eq!(register(&*engine, title_index()).await, registration, "registration is keyed by the index");
     let building = cell_of(&*engine, registration.id).await;
     assert_eq!(building, TreeCell { generation: 0, status: BuildStatus::Building, folded: registered });
 
@@ -1017,16 +1018,32 @@ pub async fn build_state_and_generation<E: TreeStorage + 'static>(engine: Arc<E>
     engine.unregister_tree(registration.id).await.unwrap();
     assert!(matches!(engine.reader(registration.id).await, Err(TreeStorageError::UnknownTree(_))));
     assert!(matches!(engine.batch(registration.id).await, Err(TreeStorageError::UnknownTree(_))));
-    let again = engine.register_tree(title_index()).await.unwrap();
+    let again = register(&*engine, title_index()).await;
     assert_ne!(again.id, registration.id, "a tree id is not reused within an incarnation");
     let stable = engine.stable_position().await.unwrap();
     assert_eq!(cell_of(&*engine, again.id).await, TreeCell { generation: 0, status: BuildStatus::Building, folded: stable });
 }
 
+/// An index registered as opted out keeps no tree: registration returns and
+/// lists none, and registering it so again removes the tree it had, whose
+/// handles then fail. The entity-id index cannot opt out.
+pub async fn an_index_that_opts_out_keeps_no_tree<E: TreeStorage + 'static>(engine: Arc<E>) {
+    let opted_out = TreeOptions { opted_out: true };
+    assert_eq!(engine.register_tree(title_index(), opted_out).await.unwrap(), None);
+    assert!(engine.trees().await.unwrap().iter().all(|tree| tree.index != title_index()), "an index that opted out has no tree");
+    let tree = register(&*engine, title_index()).await;
+    let reader = engine.reader(tree.id).await.unwrap();
+    assert_eq!(engine.register_tree(title_index(), opted_out).await.unwrap(), None);
+    assert!(!engine.trees().await.unwrap().contains(&tree), "opting out removes the index's tree");
+    assert_gone(&*engine, tree.id, &reader).await;
+    assert!(matches!(engine.register_tree(HashedIndex::EntityId, opted_out).await, Err(TreeStorageError::PermanentTree)));
+    assert_eq!(engine.trees().await.unwrap().len(), 1, "the entity-id tree stays");
+}
+
 /// A batch prepared against a cell that differs from the tree's only in its
 /// build status conflicts and writes nothing.
 pub async fn a_status_only_cell_change_conflicts<E: TreeStorage + 'static>(engine: Arc<E>) {
-    let tree = engine.register_tree(title_index()).await.unwrap().id;
+    let tree = register(&*engine, title_index()).await.id;
     let position = create(&*engine, vec![state(entity(1), 1, &[], &[])]).await;
     let building = cell_of(&*engine, tree).await;
     let mut batch = engine.batch(tree).await.unwrap();
@@ -1046,7 +1063,7 @@ pub async fn a_status_only_cell_change_conflicts<E: TreeStorage + 'static>(engin
 /// the tree exists, and once it is gone every handle fails.
 pub async fn removal_is_whole_when_cancelled<E: TreeStorage + 'static>(engine: Arc<E>) {
     let position = create(&*engine, vec![state(entity(1), 1, &[], &[])]).await;
-    let tree = engine.register_tree(title_index()).await.unwrap().id;
+    let tree = register(&*engine, title_index()).await.id;
     let reader = engine.reader(tree).await.unwrap();
     let mut batch = engine.batch(tree).await.unwrap();
     let cell = batch.cell().await.unwrap();
@@ -1070,7 +1087,7 @@ pub async fn removal_is_whole_when_cancelled<E: TreeStorage + 'static>(engine: A
     }
     assert_gone(&*engine, tree, &reader).await;
 
-    let tree = engine.register_tree(title_index()).await.unwrap().id;
+    let tree = register(&*engine, title_index()).await.id;
     let entity_ids = entity_id_tree(&*engine).await;
     let (reader, entity_id_reader) = (engine.reader(tree).await.unwrap(), engine.reader(entity_ids).await.unwrap());
     let mut batch = engine.batch(tree).await.unwrap();
@@ -1126,7 +1143,7 @@ pub async fn snapshot_and_replay_give_the_current_index<E: TreeStorage + 'static
         ],
     )
     .await;
-    let tree = engine.register_tree(title_index()).await.unwrap().id;
+    let tree = register(&*engine, title_index()).await.id;
     let registered = cell_of(&*engine, tree).await.folded;
     let before = create(&*engine, vec![state(entity(6), 6, &[component()], &[(title(), text("f"))])]).await;
 
@@ -1175,7 +1192,7 @@ pub async fn snapshot_and_replay_give_the_current_index<E: TreeStorage + 'static
 /// write nothing, and the new build replays the log and publishes.
 pub async fn a_build_overtaken_by_retention_starts_over<E: TreeStorage + 'static>(engine: Arc<E>) {
     create(&*engine, vec![state(entity(1), 1, &[component()], &[(title(), text("a"))])]).await;
-    let tree = engine.register_tree(title_index()).await.unwrap().id;
+    let tree = register(&*engine, title_index()).await.id;
     let registered = cell_of(&*engine, tree).await;
     let first = engine.snapshot(tree).await.unwrap();
     let mut batch = engine.batch(tree).await.unwrap();
@@ -1238,7 +1255,7 @@ where
 /// registration, a prune and a restart. It never falls.
 pub async fn prune_horizon_rises_with_every_lost_removal<E: TreeStorage + 'static>(engine: Arc<E>) {
     create(&*engine, vec![state(entity(1), 1, &[], &[])]).await;
-    let tree = engine.register_tree(title_index()).await.unwrap().id;
+    let tree = register(&*engine, title_index()).await.id;
     let registered = cell_of(&*engine, tree).await;
     assert_eq!(engine.prune_horizon().await.unwrap(), registered.folded, "a new tree saw no removal before it");
 
@@ -1268,7 +1285,7 @@ pub async fn prune_horizon_rises_with_every_lost_removal<E: TreeStorage + 'stati
 pub async fn reopen_keeps_what_was_durable<H: Reopen>(reopen: H) {
     let engine = reopen.open().await;
     let first = create(&*engine, vec![state(entity(1), 1, &[component()], &[(title(), text("a"))])]).await;
-    let tree = engine.register_tree(title_index()).await.unwrap();
+    let tree = register(&*engine, title_index()).await;
     let last = create(&*engine, vec![state(entity(2), 2, &[component()], &[(title(), text("b"))])]).await;
     let durable = durable_through(&*engine, last).await;
     let rows = read_all(&*engine, first).await;
@@ -1310,7 +1327,7 @@ pub async fn reopen_keeps_tree_batches_whole<H: Reopen>(reopen: H) {
 pub async fn reopen_after_a_reset_keeps_the_new_incarnation<H: Reopen>(reopen: H) {
     let engine = reopen.open().await;
     let old = create(&*engine, vec![state(entity(1), 1, &[], &[])]).await;
-    engine.register_tree(title_index()).await.unwrap();
+    register(&*engine, title_index()).await;
     engine.delete_all().await.unwrap();
     let new = create(&*engine, vec![state(entity(2), 2, &[], &[])]).await;
     durable_through(&*engine, new).await;
@@ -1526,6 +1543,11 @@ async fn create<E: StorageEngine>(engine: &E, states: Vec<Attested<EntityState>>
 }
 
 async fn read_all<E: CommitLog>(engine: &E, from: LogPosition) -> Vec<LogRow> { engine.read_log(from, usize::MAX).await.unwrap().rows }
+
+/// Register a tree for `index` with the default options, which keep one.
+async fn register<E: TreeStorage>(engine: &E, index: HashedIndex) -> TreeRegistration {
+    engine.register_tree(index, TreeOptions::default()).await.unwrap().expect("an index that did not opt out keeps a tree")
+}
 
 async fn entity_id_tree<E: TreeStorage>(engine: &E) -> TreeId {
     let trees = engine.trees().await.unwrap();

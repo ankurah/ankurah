@@ -113,6 +113,15 @@ pub struct TreeRegistration {
     pub index: HashedIndex,
 }
 
+/// What an index lifecycle registers an index's tree with.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TreeOptions {
+    /// The index keeps no tree, because nobody will compare across it. Off by
+    /// default: every index keeps a tree unless it opts out, and the entity-id
+    /// index cannot.
+    pub opted_out: bool,
+}
+
 /// Whether sessions and claims may use a tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BuildStatus {
@@ -372,10 +381,15 @@ pub trait TreeStorage: CommitLog {
 
     /// Register a tree for `index`, or return the tree already serving it. A
     /// new tree starts building at generation 0 from the stable position, and
-    /// the store's prune horizon rises to that position. The engine's index
-    /// lifecycle calls this when it creates an index and then hands the tree
-    /// to the core's build hook.
-    async fn register_tree(&self, index: HashedIndex) -> Result<TreeRegistration, TreeStorageError>;
+    /// the store's prune horizon rises to that position.
+    ///
+    /// The engine's index lifecycle calls this when it creates an index, with
+    /// the options the index was created with, and hands a new tree to the
+    /// core's build hook. An index that opted out keeps no tree: the call
+    /// registers none, removes one already serving the index as
+    /// [`TreeStorage::unregister_tree`] would, and returns `None`. The
+    /// entity-id index cannot opt out.
+    async fn register_tree(&self, index: HashedIndex, options: TreeOptions) -> Result<Option<TreeRegistration>, TreeStorageError>;
 
     /// Remove a tree with all its rows. The entity-id tree is permanent.
     ///
