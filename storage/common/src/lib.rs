@@ -1,4 +1,5 @@
 pub mod bounds;
+pub mod cover;
 pub mod engine_columns;
 pub mod filtering;
 pub mod materialization_join;

@@ -9,6 +9,18 @@ pub enum IndexError {
     TypeMismatch(ValueType, ValueType),
 }
 
+/// The canonical key encoding: the address format of the rows a digest tree files and of the
+/// blocks two members compare. Members compare blocks only under one encoding, so a cover
+/// names it, as tree registrations and sessions will. A change to how any value encodes, such
+/// as making variable-length values prefix-free, mints a new version rather than redefining
+/// V1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KeyEncoding {
+    /// A row's address is each key part encoded by [`encode_component_typed`] in its KeySpec
+    /// value type and direction, concatenated without separators, then the 32-byte entity id.
+    V1,
+}
+
 // Type tags for JSON encoding.
 // These are chosen to provide sensible sort order: null < bool < int < float < string
 // Each type uses fixed-width encoding where possible to avoid sentinel issues.
@@ -17,6 +29,13 @@ const JSON_TAG_BOOL: u8 = 0x10;
 const JSON_TAG_INT: u8 = 0x20; // i64: fixed 8 bytes, no sentinel needed
 const JSON_TAG_FLOAT: u8 = 0x30; // f64: fixed 8 bytes, no sentinel needed
 const JSON_TAG_STRING: u8 = 0x40; // variable length, uses 0x00 sentinel with 0x00→0x00 0xFF escaping
+
+/// Whether the canonical encoding encodes values of the two types alike: equal types, or two
+/// integer widths, which share one 8-byte encoding.
+pub fn encodes_alike(a: ValueType, b: ValueType) -> bool {
+    let integer = |value_type| matches!(value_type, ValueType::I16 | ValueType::I32 | ValueType::I64);
+    a == b || (integer(a) && integer(b))
+}
 
 /// Encode a single component (no NULL handling for now - TODO: add NULL support later)
 pub fn encode_component_typed(value: &Value, expected_type: ValueType, descending: bool) -> Result<Vec<u8>, IndexError> {
