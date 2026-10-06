@@ -860,7 +860,8 @@ pub async fn a_cancelled_wait_leaves_no_trace<E: TreeStorage + 'static>(engine: 
 
 /// Readers never outlive their tree: one taken before an unregistration fails
 /// and never reaches the tree registered again for the same index, and after a
-/// reset those of every tree fail, the entity-id tree's included.
+/// reset those of every tree fail, the entity-id tree's included, whatever
+/// ids the fresh store's trees take.
 pub async fn handles_do_not_outlive_their_tree<E: TreeStorage + 'static>(engine: Arc<E>) {
     let position = create(&*engine, vec![state(entity(1), 1, &[], &[])]).await;
     let old = register(&*engine, title_index()).await.id;
@@ -877,10 +878,9 @@ pub async fn handles_do_not_outlive_their_tree<E: TreeStorage + 'static>(engine:
     let entity_ids = entity_id_tree(&*engine).await;
     let (reader, entity_id_reader) = (engine.reader(again).await.unwrap(), engine.reader(entity_ids).await.unwrap());
     engine.delete_all().await.unwrap();
-    assert_gone(&*engine, again, &reader).await;
-    assert_gone(&*engine, entity_ids, &entity_id_reader).await;
+    assert_retired(&reader, again).await;
+    assert_retired(&entity_id_reader, entity_ids).await;
     let fresh = entity_id_tree(&*engine).await;
-    assert!(fresh != entity_ids && fresh != again, "a reset's fresh tree takes a new id");
     assert_eq!(view(&*engine, fresh, &[entity(1)]).await.rows, [], "nothing of the old store reaches the fresh tree");
 }
 
@@ -1169,16 +1169,25 @@ pub async fn removal_is_whole_when_cancelled<E: TreeStorage + 'static>(engine: A
         assert_eq!(reader.row(b"k", entity(1)).await.unwrap(), None, "the store outlived the cancelled reset, without the dropped batch");
         engine.delete_all().await.unwrap();
     }
-    assert_gone(&*engine, tree, &reader).await;
-    assert_gone(&*engine, entity_ids, &entity_id_reader).await;
+    assert_retired(&reader, tree).await;
+    assert_retired(&entity_id_reader, entity_ids).await;
     let trees = engine.trees().await.unwrap();
-    assert_eq!(trees.len(), 1, "only a fresh entity-id tree remains");
-    assert!(trees[0].id != entity_ids && trees[0].index == HashedIndex::EntityId);
+    assert_eq!(trees.iter().map(|tree| &tree.index).collect::<Vec<_>>(), [&HashedIndex::EntityId], "only a fresh entity-id tree remains");
 }
 
-/// Every handle to a removed tree fails: each read through a reader taken
-/// before the removal, and a new reader or batch.
+/// Every handle to a tree removed within the incarnation fails: each read
+/// through a reader taken before the removal, and a new reader or batch, since
+/// the tree's id names no other tree until a reset.
 async fn assert_gone<E: TreeStorage, R: TreeRead>(engine: &E, tree: TreeId, reader: &R) {
+    assert_retired(reader, tree).await;
+    let unknown = |result: Result<(), TreeStorageError>| matches!(result, Err(TreeStorageError::UnknownTree(id)) if id == tree);
+    assert!(unknown(engine.reader(tree).await.map(drop)), "a removed tree has no new reader");
+    assert!(unknown(engine.batch(tree).await.map(drop)), "a removed tree has no new batch");
+}
+
+/// Every read through a reader of a removed tree fails, whether or not a tree
+/// of a later incarnation has taken its id.
+async fn assert_retired<R: TreeRead>(reader: &R, tree: TreeId) {
     let gone = |result: Result<(), TreeStorageError>| matches!(result, Err(TreeStorageError::UnknownTree(id)) if id == tree);
     let all = AddressRange::all();
     assert!(gone(reader.cell().await.map(drop)), "a reader of a removed tree reads no cell");
@@ -1188,8 +1197,6 @@ async fn assert_gone<E: TreeStorage, R: TreeRead>(engine: &E, tree: TreeId, read
     assert!(gone(reader.tombstones(&all, 10).await.map(drop)), "a reader of a removed tree scans no tombstones");
     assert!(gone(reader.node(&NodePrefix::root()).await.map(drop)), "a reader of a removed tree reads no node");
     assert!(gone(reader.children(&NodePrefix::root()).await.map(drop)), "a reader of a removed tree reads no children");
-    assert!(gone(engine.reader(tree).await.map(drop)), "a removed tree has no new reader");
-    assert!(gone(engine.batch(tree).await.map(drop)), "a removed tree has no new batch");
 }
 
 /// A snapshot shows the tree's index as of its boundary while commits go on,

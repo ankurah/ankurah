@@ -119,8 +119,8 @@ impl Store {
     }
 
     /// Empty the store under a new log incarnation, leaving only a fresh
-    /// entity-id tree. Tree ids keep counting, so a stale handle never
-    /// reaches a new tree.
+    /// entity-id tree. Tree ids keep counting, which the contract does not
+    /// require: a handle is retired by its tree's identity, not its id.
     fn reset(&mut self) {
         self.trees.clear();
         self.states.clear();

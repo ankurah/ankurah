@@ -115,7 +115,8 @@ use super::log::{CommitLog, LogIncarnation, LogPosition};
 
 /// Names one registration of a tree within a store. Not reused within a log
 /// incarnation, so a handle to an unregistered tree fails instead of reaching
-/// its successor.
+/// its successor. A reset retires every handle by itself, so the trees of the
+/// next incarnation may take any ids, earlier ones included.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TreeId(pub u64);
 
