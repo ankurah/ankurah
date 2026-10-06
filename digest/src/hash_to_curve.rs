@@ -207,7 +207,8 @@ mod tests {
 
     /// RFC 9496 appendix A.3: element derivation from 64 uniform bytes, the
     /// map `hash_to_ristretto255` applies after the expansion. Checked here so
-    /// the suite pins the curve library to the RFC's map.
+    /// the suite pins the curve library to the RFC's map; a separate Python
+    /// implementation of RFC 9496 section 4.3.4 reproduces every answer.
     #[test]
     fn element_derivation_matches_rfc_9496_vectors() {
         let vectors = [
@@ -219,8 +220,39 @@ mod tests {
                 "f116b34b8f17ceb56e8732a60d913dd10cce47a6d53bee9204be8b44f6678b270102a56902e2488c46120e9276cfe54638286b9e4b3cdb470b542d46c2068d38",
                 "f26e5b6f7d362d2d2a94c5d0e7602cb4773c95a2e5c31a64f133189fa76ed61b",
             ),
+            (
+                "8422e1bbdaab52938b81fd602effb6f89110e1e57208ad12d9ad767e2e25510c27140775f9337088b982d83d7fcf0b2fa1edffe51952cbe7365e95c86eaf325c",
+                "006ccd2a9e6867e6a2c5cea83d3302cc9de128dd2a9a57dd8ee7b9d7ffe02826",
+            ),
+            (
+                "ac22415129b61427bf464e17baee8db65940c233b98afce8d17c57beeb7876c2150d15af1cb1fb824bbd14955f2b57d08d388aab431a391cfc33d5bafb5dbbaf",
+                "f8f0c87cf237953c5890aec3998169005dae3eca1fbb04548c635953c817f92a",
+            ),
+            (
+                "165d697a1ef3d5cf3c38565beefcf88c0f282b8e7dbd28544c483432f1cec7675debea8ebb4e5fe7d6f6e5db15f15587ac4d4d4a1de7191e0c1ca6664abcc413",
+                "ae81e7dedf20a497e10c304a765c1767a42d6e06029758d2d7e8ef7cc4c41179",
+            ),
+            (
+                "a836e6c9a9ca9f1e8d486273ad56a78c70cf18f0ce10abb1c7172ddd605d7fd2979854f47ae1ccf204a33102095b4200e5befc0465accc263175485f0e17ea5c",
+                "e2705652ff9f5e44d3e841bf1c251cf7dddb77d140870d1ab2ed64f1a9ce8628",
+            ),
+            (
+                "2cdc11eaeb95daf01189417cdddbf95952993aa9cb9c640eb5058d09702c74622c9965a697a3b345ec24ee56335b556e677b30e6f90ac77d781064f866a3c982",
+                "80bd07262511cdde4863f8a7434cef696750681cb9510eea557088f76d9e5065",
+            ),
         ];
-        for (input, expected) in vectors {
+        // Four inputs that all write the field elements 0 and 18: they differ
+        // only in the top bit of each 32-byte half, which the derivation masks
+        // off, and in halves written as p or more, which it reduces modulo p.
+        // All four derive one element.
+        let equivalent = "304282791023b73128d277bdcb5c7746ef2eac08dde9f2983379cb8e5ef0517f";
+        let equivalent_inputs = [
+            "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff1200000000000000000000000000000000000000000000000000000000000000",
+            "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "0000000000000000000000000000000000000000000000000000000000000080ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+            "00000000000000000000000000000000000000000000000000000000000000001200000000000000000000000000000000000000000000000000000000000080",
+        ];
+        for (input, expected) in vectors.into_iter().chain(equivalent_inputs.map(|input| (input, equivalent))) {
             let uniform: [u8; 64] = hex(input).try_into().unwrap();
             let expected = CompressedRistretto(hex(expected).try_into().unwrap());
             assert_eq!(RistrettoPoint::from_uniform_bytes(&uniform).compress(), expected);
