@@ -1,16 +1,25 @@
 //! Whether a tree a member already keeps serves a Selection, and with which cover.
 //!
 //! An interest is any Selection. A tree kept for an index serves it, through the cover of a
-//! range of that index's keys, exactly when the Selection's result has an exact,
-//! data-independent representation as that range: the Selection names the component the
-//! index files, by one membership every match must have, or names none for the entity-id
-//! index of every entity; the planner pushes the rest of the predicate into an index whose
-//! KeySpec the tree's matches, exactly or as a prefix, with no residual; the tree keeps each
-//! matched key part in the value type, null order and collation the Selection compares it by;
-//! the Selection has no limit; the tree files no entity twice within the range; and the tree
-//! leaves out no entity the range names. An order alone never matters, because ordering does
-//! not change the set. Any other Selection is refused with its reason, and a temporary digest
-//! over its result serves it instead.
+//! range of that index's keys, only when the Selection's result has an exact,
+//! data-independent representation as that range. This decision recognizes one when the
+//! Selection names the component the index files, by one membership every match must have,
+//! or names none for the entity-id index of every entity; the planner pushes the rest of the
+//! predicate into an index whose KeySpec the tree's matches, exactly or as a prefix, with no
+//! residual; the tree keeps each matched key part in the value type, null order and collation
+//! the Selection compares it by; the Selection has no limit; the tree files no entity twice
+//! within the range; and the tree leaves out no entity the range names. An order alone never
+//! matters, because ordering does not change the set. Any other Selection is refused with its
+//! reason, and a temporary digest over its result serves it instead.
+//!
+//! The decision is conservative, not complete: some Selections it refuses do have such a
+//! representation, since it reads them through the planner as the planner stands. The planner
+//! keys equality conjuncts in the order they are written, so `b = 2 AND a = 1` does not match
+//! a tree keyed by a then b; KeySpec::matches accepts the same directions or all of them
+//! inverted, so `a = 1 AND b >= 2` does not match a tree keyed by a descending then b
+//! ascending, though with a fixed the range of b is contiguous; and the planner keeps
+//! comparisons of the entity id as a residual, so no Selection reaches a range of the entity
+//! id, though the cover can tile one.
 
 use std::ops::Bound;
 
@@ -465,6 +474,36 @@ mod tests {
             cover_selection(&both, std::slice::from_ref(&narrower)),
             Ok(expected(&narrower, vec![Value::EntityId(team)], Bound::Excluded(Value::I64(3)), Bound::Unbounded))
         );
+    }
+
+    /// The decision is conservative: each of these Selections is a range of the tree beside it,
+    /// but the planner as it stands does not find that range, so the Selection is refused.
+    #[test]
+    fn ranges_the_planner_does_not_find_are_refused() {
+        let key_spec =
+            |parts: [&str; 2]| KeySpec::new(parts.map(|name| IndexKeyPart::asc(property(name).to_string(), ValueType::I64)).to_vec());
+        // The planner keys equality conjuncts in the order they are written.
+        let scores_then_ranks =
+            tree(vec![part("score", ValueType::I64, IndexDirection::Asc), part("rank", ValueType::I64, IndexDirection::Asc)]);
+        assert_eq!(
+            cover_selection(&selection("rank = 2 AND score = 1"), std::slice::from_ref(&scores_then_ranks)),
+            Err(NotReusable::NoMatchingTree { component: Some(albums()), key_spec: key_spec(["rank", "score"]) })
+        );
+        // KeySpec::matches accepts the same directions or all of them inverted, though with the
+        // score fixed the ranks at least 2 are contiguous in this tree too.
+        let mixed = tree(vec![part("score", ValueType::I64, IndexDirection::Desc), part("rank", ValueType::I64, IndexDirection::Asc)]);
+        assert_eq!(
+            cover_selection(&selection("score = 1 AND rank >= 2"), std::slice::from_ref(&mixed)),
+            Err(NotReusable::NoMatchingTree { component: Some(albums()), key_spec: key_spec(["score", "rank"]) })
+        );
+        // The planner keeps comparisons of the entity id as a residual, for the members of a
+        // component and for every entity alike.
+        let after = format!("id > '{}'", entity(0x80).to_base64());
+        let refusal = cover_selection(&selection(&after), &[tree(Vec::new())]);
+        assert!(matches!(refusal, Err(NotReusable::Residual(_))), "{refusal:?}");
+        let every_entity = resolve_selection(&albums(), &Properties, ankql::parser::parse_selection(&after).unwrap()).unwrap();
+        let refusal = cover_selection(&every_entity, &[entity_id_tree()]);
+        assert!(matches!(refusal, Err(NotReusable::Residual(_))), "{refusal:?}");
     }
 
     #[test]
