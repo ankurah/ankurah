@@ -15,7 +15,11 @@
 //!   change that last set the row;
 //! - tombstones in the same address space, each recording that an entity left
 //!   a key and the position at which it did. Node watermarks rise with them, so
-//!   a partner learns of removals; they stay until pruned;
+//!   a partner learns of removals. They leave only through
+//!   [`TreeBatch::prune_tombstones`], which raises the prune horizon, or with
+//!   every other row of the tree: in a [restart](TreeBatch::restart), which
+//!   raises the horizon too, and when the tree is unregistered or the store
+//!   reset;
 //! - the lookup from an entity id to its keys in the index. A commit names
 //!   only the entity, so this lookup is how the refresher finds the old leaf
 //!   to subtract when an entity changes or moves. The engine maintains it from
@@ -27,6 +31,14 @@
 //! - the [`TreeCell`]: the build generation, the build status and the fold
 //!   position.
 //!
+//! The engine's index lifecycle, where indexes are created and removed, owns
+//! the coupling of indexes and trees. It registers a tree when it creates an
+//! index, unless the index opted out at registration, and unregisters the
+//! tree when it removes the index; the entity-id tree exists from the store's
+//! creation and is permanent. It hands each new tree to the core's build hook,
+//! which fills the tree from a [snapshot](TreeStorage::snapshot) and publishes
+//! it.
+//!
 //! The commit log ([`super::log`]) feeds the trees. A tree starts at the
 //! stable position where it was registered: the engine serializes
 //! registration with commits, so every log row at or above that position
@@ -35,18 +47,40 @@
 //! every handle as [`TreeStorage::unregister_tree`] removes one, and leaves
 //! only a fresh entity-id tree.
 //!
+//! Two rebuilds differ in what they keep. A [restart](TreeBatch::restart) is
+//! the fresh backfill from a snapshot: a new generation, every row and
+//! tombstone dropped, and the prune horizon raised to the snapshot's boundary.
+//! A node-only rebuild, the audit's recompute of the nodes from the folded
+//! rows, keeps the folded rows and the tombstones and rewrites the node rows
+//! through ordinary batches; it is the core's alone and asks nothing more of
+//! the engine.
+//!
 //! A [`TreeBatch`] changes one tree atomically. Reads through it are
 //! consistent with each other and with the cell it is compared against, and
 //! see the batch's own earlier writes. Its commit applies every write together
 //! if the cell still equals the one the caller expected, and none otherwise;
 //! a caller that meets a conflict starts over from the cell it observed.
 //!
+//! An engine may make a batch wait while another batch on the same tree is
+//! open, and may make a read of that tree or its unregistration wait too, and
+//! a reset wait for a batch on any tree; it never makes a batch or a read wait
+//! for a batch on another tree. A task holding a batch therefore reads its
+//! tree through the batch and ends the batch before it unregisters the tree or
+//! resets the store, and a task that holds batches on several trees at once
+//! begins them in ascending [`TreeId`] order, so that no two tasks wait for
+//! each other in a cycle.
+//!
 //! The store keeps one prune horizon for all its trees: the position below
 //! which some tree may hold no tombstone for a removal, because tombstones
 //! there were pruned, or because a tree was registered or rebuilt there and
 //! never saw the removals before it. A partner whose cursor lies below the
 //! horizon gets no watermark shortcut and compares the whole scope, and a
-//! rebuild sets every watermark to at least the horizon.
+//! rebuild sets every watermark to at least the horizon. The horizon only
+//! rises within an incarnation, and a batch raises it in its commit, visible
+//! no later than the batch's other writes, so a consumer reads the horizon
+//! after the tree rows it judges by it: read later, it holds for every
+//! earlier read of the same incarnation; read earlier, it may predate the
+//! prune of a tombstone whose absence the consumer then trusts.
 
 mod index;
 mod prefix;
@@ -149,6 +183,16 @@ pub struct NodeRow {
 /// Where a tree files a key-and-entity pair: the canonical key followed by the
 /// entity id. Folded rows and tombstones are ordered by it, and a node's
 /// prefix is a run of its leading bits.
+///
+/// Addresses keep each key's rows together and in key order only where no
+/// key's encoding is a proper prefix of another's. The canonical encoding is
+/// prefix-free for fixed-width key parts but not for every variable-length
+/// one: an ascending string ends in a zero byte that a longer string may
+/// continue (the empty string encodes as 00, "\0" as 00 FF 00), so one key's
+/// rows can interleave with another's. A range of addresses is exactly the
+/// rows of a key range only over prefix-free key parts; the cover from a
+/// Selection refuses ranges over the others until the canonical encoding is
+/// made prefix-free.
 pub fn leaf_address(key: &[u8], entity_id: EntityId) -> Vec<u8> {
     let mut address = Vec::with_capacity(key.len() + 32);
     address.extend_from_slice(key);
@@ -258,6 +302,10 @@ pub trait TreeRead: Send + Sync {
     /// The first `limit` tombstones in `range`, in address order.
     async fn tombstones(&self, range: &AddressRange, limit: usize) -> Result<Vec<Tombstone>, TreeStorageError>;
 
+    /// The node row stored at `prefix`. A tree with no leaves and no
+    /// tombstones may store no root row, as a new tree does; the core reads an
+    /// absent root as the empty node: no leaves, the empty digest, and nothing
+    /// beneath it changed at or above the prune horizon.
     async fn node(&self, prefix: &NodePrefix) -> Result<Option<NodeRow>, TreeStorageError>;
 
     /// The stored nodes nearest beneath `prefix`, in prefix order: every node
@@ -321,7 +369,9 @@ pub trait TreeStorage: CommitLog {
 
     /// Register a tree for `index`, or return the tree already serving it. A
     /// new tree starts building at generation 0 from the stable position, and
-    /// the store's prune horizon rises to that position.
+    /// the store's prune horizon rises to that position. The engine's index
+    /// lifecycle calls this when it creates an index and then hands the tree
+    /// to the core's build hook.
     async fn register_tree(&self, index: HashedIndex) -> Result<TreeRegistration, TreeStorageError>;
 
     /// Remove a tree with all its rows. The entity-id tree is permanent.
@@ -338,6 +388,8 @@ pub trait TreeStorage: CommitLog {
     async fn trees(&self) -> Result<Vec<TreeRegistration>, TreeStorageError>;
 
     /// The position below which some tree may hold no tombstone for a removal.
+    /// Read it after the tree rows it judges, as the module documentation
+    /// explains.
     async fn prune_horizon(&self) -> Result<LogPosition, TreeStorageError>;
 
     /// Reads of one tree outside any batch. A read may wait while a batch on

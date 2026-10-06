@@ -13,6 +13,12 @@ use crate::selection::filter::{self, Filterable};
 /// A key is ankurah's engine-independent encoding of the index key
 /// ([`encode_tuple_values_with_key_spec`]), so two stores on different engines
 /// file an entity under the same bytes and can compare any prefix.
+///
+/// Each kind derives an entity's keys from the entity's own state alone and
+/// files it under at most one key. Indexes whose keys follow other entities (a
+/// derived group membership, a relation, the catalog) or that file an entity
+/// under several keys have no kind yet; they arrive with the group-keyed index,
+/// together with the transaction interface that logs their key changes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum HashedIndex {
     /// Every entity, filed under its own id. Every store keeps a tree for it.

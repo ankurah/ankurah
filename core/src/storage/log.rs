@@ -7,10 +7,13 @@
 //!
 //! Each commit that sets entity states writes, beside those states and in the
 //! same transaction, one [`LogRow`] per entity, all carrying the commit's
-//! [`LogPosition`]. Every change of an entity's head or keys reaches the log in
-//! the transaction that makes it, including a change that moves keys without a
-//! commit on the entity, such as a derived group membership or a catalog
-//! change.
+//! [`LogPosition`] and the keys derived from the state the commit writes. That
+//! covers every change of a head or of keys that exists today, because no
+//! current index kind files an entity under more than one key or derives keys
+//! from anything but the entity's own state. Changes that move keys without a
+//! commit on the entity (a derived group membership, a relation or catalog
+//! change) and entities filed under several keys have no producer yet; the
+//! transaction interface that logs them arrives with the group-keyed index.
 
 use std::{
     cmp::Ordering,
@@ -82,7 +85,8 @@ pub struct LogRow {
     pub head: Clock,
     /// The entity's canonical keys after the commit under each tree registered
     /// when the commit serialized. An empty set means the tree's index files
-    /// the entity under no key; a tree registered later is absent.
+    /// the entity under no key; a tree registered later is absent. No current
+    /// index kind files an entity under more than one key.
     pub keys: BTreeMap<TreeId, BTreeSet<Vec<u8>>>,
 }
 
