@@ -19,6 +19,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    future::Future,
     ops::Bound,
     sync::Arc,
     time::Duration,
@@ -29,7 +30,7 @@ use ankurah_proto::{Attested, AuthorId, Clock, EntityId, EntityState, Event, Eve
 use futures::StreamExt;
 
 use super::{
-    log::{CommitLog, LogError, LogIncarnation, LogPosition, LogRow},
+    log::{CommitLog, LogError, LogIncarnation, LogPage, LogPosition, LogRow},
     tree::{
         AddressRange, BuildStatus, FoldedRow, HashedIndex, NodePrefix, NodeRow, SnapshotEntity, Tombstone, TreeBatch, TreeBatchOutcome,
         TreeCell, TreeId, TreeRead, TreeStorage, TreeStorageError,
@@ -64,6 +65,7 @@ macro_rules! tree_storage_conformance {
             state_only_commits_are_logged
             log_rows_carry_keys_under_every_tree
             log_reads_end_at_whole_positions
+            log_pages_at_their_limits
             durable_position_trails_the_stable_position
             retention_floor_bounds_reads
             reset_mints_a_new_incarnation
@@ -79,6 +81,7 @@ macro_rules! tree_storage_conformance {
             a_cancelled_wait_leaves_no_trace
             handles_do_not_outlive_their_tree
             children_and_leaf_ranges_at_ragged_depths
+            large_scans_continue_exactly
             build_state_and_generation
             removal_is_whole_when_cancelled
             snapshot_and_replay_give_the_current_index
@@ -199,6 +202,66 @@ pub async fn log_reads_end_at_whole_positions<E: TreeStorage + 'static>(engine: 
     assert_eq!(rest.rows.iter().map(|row| row.position).collect::<Vec<_>>(), [positions[2], positions[2]]);
     assert_eq!(rest.next, engine.stable_position().await.unwrap());
     assert_eq!(engine.read_log(start, 1).await.unwrap().rows.len(), 2, "a commit larger than the limit is still read whole");
+}
+
+/// Log pages at their limits: an empty log reads nothing; a limit of zero or
+/// one reads one whole position; a page ends after the position that reaches
+/// its limit; a commit larger than the limit is read whole; a read from inside
+/// a long gap of aborted commits crosses it; reads at and beyond the stable
+/// position return nothing without moving back; and paging one row at a time
+/// reads every row once.
+pub async fn log_pages_at_their_limits<E: TreeStorage + 'static>(engine: Arc<E>) {
+    let start = engine.stable_position().await.unwrap();
+    assert_eq!(engine.read_log(start, 10).await.unwrap(), LogPage { rows: vec![], next: start }, "an empty log reads nothing");
+    let created = |range: std::ops::RangeInclusive<u8>| range.map(|n| state(entity(n), n, &[], &[])).collect::<Vec<_>>();
+    let first = create(&*engine, created(1..=2)).await;
+    let second = create(&*engine, created(3..=5)).await;
+    for _ in 0..40 {
+        let aborted = commit_states(&*engine, vec![(head(99), state(entity(1), 50, &[], &[]))]).await;
+        assert!(matches!(aborted, StorageCommitOutcome::Conflict { .. }));
+    }
+    let third = create(&*engine, created(6..=6)).await;
+    let stable = engine.stable_position().await.unwrap();
+    let positions = |page: &LogPage| page.rows.iter().map(|row| row.position).collect::<Vec<_>>();
+
+    for limit in [0, 1, 2] {
+        let page = engine.read_log(start, limit).await.unwrap();
+        assert_eq!(positions(&page), [first, first], "a limit of {limit} reads the first position whole");
+        assert!(page.next > first && page.next <= second);
+    }
+    for limit in [3, 5] {
+        let page = engine.read_log(start, limit).await.unwrap();
+        assert_eq!(positions(&page), [first, first, second, second, second], "a limit of {limit} ends after the second position");
+        assert!(page.next > second && page.next <= third);
+    }
+    for limit in [6, 7, usize::MAX] {
+        let page = engine.read_log(start, limit).await.unwrap();
+        assert_eq!(positions(&page), [first, first, second, second, second, third], "a limit of {limit} reads everything");
+        assert_eq!(page.next, stable);
+    }
+    let crossing = engine.read_log(second.next(), 1).await.unwrap();
+    assert_eq!(positions(&crossing), [third], "a read from inside the gap crosses it");
+    assert!(crossing.next > third);
+    assert_eq!(engine.read_log(stable, 10).await.unwrap(), LogPage { rows: vec![], next: stable });
+    let beyond = LogPosition::new(stable.incarnation(), stable.offset() + 5);
+    assert_eq!(engine.read_log(beyond, 10).await.unwrap(), LogPage { rows: vec![], next: beyond }, "a read never moves back");
+
+    let large = create(&*engine, (0..300u16).map(|n| state(numbered(n), 7, &[], &[])).collect()).await;
+    let page = engine.read_log(stable, 1).await.unwrap();
+    assert_eq!(page.rows.len(), 300, "a commit larger than the limit is read whole");
+    assert!(page.rows.iter().all(|row| row.position == large) && page.next > large);
+    let (mut paged, mut from) = (Vec::new(), start);
+    loop {
+        let page = engine.read_log(from, 1).await.unwrap();
+        if page.rows.is_empty() {
+            assert_eq!(page.next, engine.stable_position().await.unwrap(), "a page with no rows ends at the stable position");
+            break;
+        }
+        assert!(page.next > from, "a page with rows moves forward");
+        paged.extend(page.rows);
+        from = page.next;
+    }
+    assert_eq!(paged, read_all(&*engine, start).await, "paging reads every row once, in order");
 }
 
 /// The durable position never lies above the stable position and never moves
@@ -700,16 +763,51 @@ pub async fn children_and_leaf_ranges_at_ragged_depths<E: TreeStorage + 'static>
     assert_eq!(reader.rows(&keys, usize::MAX).await.unwrap(), by_address(rows.iter().filter(|row| keys.contains(&row.address())).cloned()));
 
     // The forward scan, three rows a page.
-    let (mut scanned, mut range) = (Vec::<FoldedRow>::new(), AddressRange::all());
-    loop {
-        let page = reader.rows(&range, 3).await.unwrap();
-        let Some(last) = page.last() else { break };
-        assert!(page.len() <= 3, "a page holds at most its limit");
-        assert!(scanned.last().is_none_or(|previous| previous.address() < page[0].address()), "each page continues after the last");
-        range = range.after(&last.address());
-        scanned.extend(page);
-    }
+    let reader = &reader;
+    let scanned = scan(&AddressRange::all(), 3, |range, limit| async move { reader.rows(&range, limit).await.unwrap() }).await;
     assert_eq!(scanned, by_address(rows.iter().cloned()));
+}
+
+/// Scans of many folded rows and tombstones continue exactly where the last
+/// page ended, at every page size and over a part of the address space; a
+/// limit of zero reads nothing.
+pub async fn large_scans_continue_exactly<E: TreeStorage + 'static>(engine: Arc<E>) {
+    let tree = engine.register_tree(title_index()).await.unwrap().id;
+    let position = create(&*engine, vec![state(entity(1), 1, &[], &[])]).await;
+    // Many entities under each key, so that pages end inside a key's rows.
+    let rows: Vec<FoldedRow> = (0..1000u16).map(|n| folded_row(&(n % 250).to_be_bytes(), numbered(n), position)).collect();
+    let tombstones: Vec<Tombstone> =
+        (0..600u16).map(|n| Tombstone { key: (n % 150).to_be_bytes().to_vec(), entity_id: numbered(n), position }).collect();
+    let mut cell = cell_of(&*engine, tree).await;
+    for (rows, tombstones) in rows.chunks(250).zip(tombstones.chunks(150)) {
+        let mut batch = engine.batch(tree).await.unwrap();
+        for row in rows {
+            batch.put_row(row.clone()).await.unwrap();
+        }
+        for tombstone in tombstones {
+            batch.put_tombstone(tombstone.clone()).await.unwrap();
+        }
+        cell = committed(batch.commit(&cell).await.unwrap());
+    }
+    let (rows, tombstones) = (by_address(rows.into_iter()), by_address(tombstones.into_iter()));
+    let reader = &engine.reader(tree).await.unwrap();
+    let all = AddressRange::all();
+    assert!(reader.rows(&all, 0).await.unwrap().is_empty(), "a limit of zero reads no row");
+    assert!(reader.tombstones(&all, 0).await.unwrap().is_empty(), "a limit of zero reads no tombstone");
+    for limit in [1, 7, 150, 250, 599, 600, 601, 999, 1000, 1001] {
+        let scanned = scan(&all, limit, |range, limit| async move { reader.rows(&range, limit).await.unwrap() }).await;
+        assert!(scanned == rows, "scanning rows {limit} a page reads each once, in order");
+        let scanned = scan(&all, limit, |range, limit| async move { reader.tombstones(&range, limit).await.unwrap() }).await;
+        assert!(scanned == tombstones, "scanning tombstones {limit} a page reads each once, in order");
+    }
+    // The key 00 07 holds four rows and four tombstones.
+    let key = AddressRange::under(&NodePrefix::of(&[0x00, 0x07], 16));
+    let beneath = scan(&key, 1, |range, limit| async move { reader.rows(&range, limit).await.unwrap() }).await;
+    assert_eq!(beneath, rows.iter().filter(|row| row.key == [0x00, 0x07]).cloned().collect::<Vec<_>>());
+    assert_eq!(beneath.len(), 4);
+    let beneath = scan(&key, 3, |range, limit| async move { reader.tombstones(&range, limit).await.unwrap() }).await;
+    assert_eq!(beneath, tombstones.iter().filter(|tombstone| tombstone.key == [0x00, 0x07]).cloned().collect::<Vec<_>>());
+    assert_eq!(beneath.len(), 4);
 }
 
 /// A new registration builds at generation 0 from the stable position;
@@ -1054,6 +1152,13 @@ fn one_winner(outcomes: impl IntoIterator<Item = (u8, TreeBatchOutcome)>) -> (u8
 
 fn entity(n: u8) -> EntityId { EntityId::from_bytes([n; 32]) }
 
+/// One of many entities, for cases that need more than `entity` offers.
+fn numbered(n: u16) -> EntityId {
+    let mut bytes = [0xEE; 32];
+    bytes[..2].copy_from_slice(&n.to_be_bytes());
+    EntityId::from_bytes(bytes)
+}
+
 fn head(n: u8) -> Clock { Clock::from(EventId::from_bytes([n; 32])) }
 
 fn text(value: &str) -> Value { Value::String(value.to_owned()) }
@@ -1128,6 +1233,25 @@ fn prefixes(children: Vec<(NodePrefix, NodeRow)>) -> Vec<NodePrefix> { children.
 
 async fn child_prefixes<R: TreeRead>(reader: &R, prefix: NodePrefix) -> Vec<NodePrefix> {
     prefixes(reader.children(&prefix).await.unwrap())
+}
+
+/// Read everything in `range` a page of `limit` at a time, checking that each
+/// page holds at most `limit` items and begins after the last page ended.
+async fn scan<T, F, Fut>(range: &AddressRange, limit: usize, read: F) -> Vec<T>
+where
+    T: Addressed,
+    F: Fn(AddressRange, usize) -> Fut,
+    Fut: Future<Output = Vec<T>>,
+{
+    let (mut scanned, mut range) = (Vec::<T>::new(), range.clone());
+    loop {
+        let page = read(range.clone(), limit).await;
+        assert!(page.len() <= limit, "a page holds at most its limit");
+        let Some(last) = page.last() else { return scanned };
+        assert!(scanned.last().is_none_or(|previous| previous.address() < page[0].address()), "each page continues after the last");
+        range = range.after(&last.address());
+        scanned.extend(page);
+    }
 }
 
 /// Folded rows or tombstones in address order.
