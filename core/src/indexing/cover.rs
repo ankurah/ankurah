@@ -42,6 +42,16 @@
 //! the table for the opposite side. With both bounds open the interval is the block of P, so
 //! a prefix match is one block, and the open range of an entity-id index is the root block.
 //!
+//! # NaN
+//!
+//! NaN equals nothing and satisfies no comparison, yet the encoder files it above every
+//! number, +∞ included. A range whose prefix or bound holds NaN therefore names no key, and its
+//! cover is empty. A range that bounds a float part below and leaves it open above stops at +∞,
+//! inclusive, instead of running on past NaN: on an ascending part the interval ends past the
+//! addresses of +∞, and on a descending part it starts at them. Every other open side already
+//! ends short of NaN, and a float part open on both sides is not constrained at all, so its
+//! range holds NaN with every other value.
+//!
 //! # Terminators
 //!
 //! The table treats Pv as whole encoded values, terminators included. Fixed-width values
@@ -153,7 +163,8 @@ impl Cover {
     /// hold exactly the entities the range names.
     pub fn new(index: HashedIndex, range: KeyRange) -> Result<Self, RangeError> {
         let (start, end) = range.interval(key_parts(&index))?;
-        Ok(Self { blocks: tile(&start, &end), index, encoding: KeyEncoding::V1, range })
+        let blocks = if range.names_nan() { Vec::new() } else { tile(&start, &end) };
+        Ok(Self { blocks, index, encoding: KeyEncoding::V1, range })
     }
 
     pub fn index(&self) -> &HashedIndex { &self.index }
@@ -203,8 +214,9 @@ impl KeyRange {
                 _ => Err(RangeError::NoSuchPart { part: bounded, parts: parts.len() }),
             };
         };
+        let upper = self.upper_excluding_nan(part);
         // In address order: a descending part's upper value bound starts the interval.
-        let (from, to) = if part.direction.is_desc() { (&self.upper, &self.lower) } else { (&self.lower, &self.upper) };
+        let (from, to) = if part.direction.is_desc() { (&upper, &self.lower) } else { (&self.lower, &upper) };
         let under = |value: &Value| -> Result<Vec<u8>, RangeError> { Ok([fixed.as_slice(), &encode(bounded, part, value)?].concat()) };
         let start = match from {
             Bound::Unbounded => Point::first_under(&fixed),
@@ -217,6 +229,26 @@ impl KeyRange {
             Bound::Excluded(value) => Point::first_under(&under(value)?),
         };
         Ok((start, end))
+    }
+
+    /// The upper bound of `part`, except that a float part bounded below and open above stops
+    /// at +∞, short of the NaN the encoder files above every number.
+    fn upper_excluding_nan(&self, part: &IndexKeyPart<PropertyId>) -> Bound<Value> {
+        match (&self.lower, &self.upper) {
+            (Bound::Included(_) | Bound::Excluded(_), Bound::Unbounded) if part.value_type == ValueType::F64 => {
+                Bound::Included(Value::F64(f64::INFINITY))
+            }
+            _ => self.upper.clone(),
+        }
+    }
+
+    /// Whether a prefix or bound value is NaN, which equals nothing and satisfies no comparison.
+    fn names_nan(&self) -> bool {
+        let bounds = [&self.lower, &self.upper].into_iter().filter_map(|bound| match bound {
+            Bound::Included(value) | Bound::Excluded(value) => Some(value),
+            Bound::Unbounded => None,
+        });
+        self.prefix.iter().chain(bounds).any(|value| matches!(value, Value::F64(number) if number.is_nan()))
     }
 }
 
@@ -326,11 +358,13 @@ fn first_difference(a: &[u8], b: &[u8]) -> Option<usize> {
 mod tests {
     use std::cmp::Ordering;
 
+    use ankql::ast::{ComparisonOperator, Expr, Predicate, PropertyPath, Resolved};
     use ankurah_proto::{EntityId, ModelId};
     use rand::{rngs::SmallRng, Rng, SeedableRng};
 
     use super::*;
     use crate::indexing::KeySpec;
+    use crate::selection::filter::{evaluate_predicate, Filterable};
 
     fn property(name: &str) -> PropertyId {
         let mut bytes = [0u8; 32];
@@ -455,37 +489,63 @@ mod tests {
         address
     }
 
-    /// Whether a row's key lies in the range, judged on the values rather than their encoding.
-    fn satisfies(range: &KeyRange, values: &[Value]) -> bool {
-        let bounded = range.prefix.len();
-        if values[..bounded] != range.prefix[..] {
-            return false;
-        }
-        let Some(value) = values.get(bounded) else { return true };
-        let above = match &range.lower {
-            Bound::Unbounded => true,
-            Bound::Included(lower) => value.ge(lower),
-            Bound::Excluded(lower) => value.gt(lower),
-        };
-        let below = match &range.upper {
-            Bound::Unbounded => true,
-            Bound::Included(upper) => value.le(upper),
-            Bound::Excluded(upper) => value.lt(upper),
-        };
-        above && below
+    /// One entity as an index files it: its value for each key part, and its entity id.
+    struct Row<'a> {
+        parts: &'a [IndexKeyPart<PropertyId>],
+        values: &'a [Value],
+        entity: EntityId,
     }
 
-    /// Every row lies in at most one block of the cover, and in one exactly when its key lies in
-    /// the range. Entity ids starting 0x00 and 0xFF sit right after the key's last byte.
+    impl Filterable for Row<'_> {
+        fn value(&self, property: &PropertyId) -> Option<Value> {
+            if *property == PropertyId::Id {
+                return Some(Value::EntityId(self.entity));
+            }
+            let at = self.parts.iter().position(|part| part.key == *property)?;
+            Some(self.values[at].clone())
+        }
+    }
+
+    /// The predicate a Selection would state for the range: each prefix value equal to its key
+    /// part's value, and the bounded key part within the bounds.
+    fn predicate(parts: &[IndexKeyPart<PropertyId>], range: &KeyRange) -> Predicate<Resolved> {
+        let compare = |key: PropertyId, operator, value: &Value| Predicate::Comparison {
+            left: Box::new(Expr::Path(PropertyPath::from(key))),
+            operator,
+            right: Box::new(Expr::Literal(value.clone())),
+        };
+        let mut conjuncts: Vec<_> =
+            parts.iter().zip(&range.prefix).map(|(part, value)| compare(part.key, ComparisonOperator::Equal, value)).collect();
+        if let Some(part) = parts.get(range.prefix.len()) {
+            match &range.lower {
+                Bound::Included(value) => conjuncts.push(compare(part.key, ComparisonOperator::GreaterThanOrEqual, value)),
+                Bound::Excluded(value) => conjuncts.push(compare(part.key, ComparisonOperator::GreaterThan, value)),
+                Bound::Unbounded => {}
+            }
+            match &range.upper {
+                Bound::Included(value) => conjuncts.push(compare(part.key, ComparisonOperator::LessThanOrEqual, value)),
+                Bound::Excluded(value) => conjuncts.push(compare(part.key, ComparisonOperator::LessThan, value)),
+                Bound::Unbounded => {}
+            }
+        }
+        conjuncts.into_iter().fold(Predicate::True, |all, conjunct| Predicate::And(Box::new(all), Box::new(conjunct)))
+    }
+
+    /// Every row lies in at most one block of the cover, and in one exactly when Selection
+    /// evaluation of the range's predicate admits it. Entity ids starting 0x00 and 0xFF sit
+    /// right after the key's last byte.
     fn assert_exact(index: &HashedIndex, range: &KeyRange, rows: &[Vec<Value>]) {
         let cover = Cover::new(index.clone(), range.clone()).unwrap_or_else(|error| panic!("{range:?}: {error}"));
+        let parts = key_parts(index);
+        let predicate = predicate(parts, range);
         let entities = [entity(0x00, 0x00), entity(0x7F, 0xFF), entity(0x80, 0x00), entity(0xFF, 0xFF)];
         for values in rows {
-            for entity in &entities {
-                let address = address(index, values, entity);
+            for entity in entities {
+                let address = address(index, values, &entity);
                 let holding = cover.blocks().iter().filter(|block| block.contains(&address)).count();
                 assert!(holding <= 1, "{range:?}: row {values:?} lies in {holding} blocks");
-                assert_eq!(holding == 1, satisfies(range, values), "{range:?}: row {values:?}, cover {:?}", cover.blocks());
+                let admitted = evaluate_predicate(&Row { parts, values, entity }, &predicate).unwrap();
+                assert_eq!(holding == 1, admitted, "{range:?}: row {values:?}, cover {:?}", cover.blocks());
             }
         }
     }
@@ -547,7 +607,8 @@ mod tests {
 
     #[test]
     fn ranges_on_floats_booleans_and_entity_ids_hold_exactly_the_rows_inside_them() {
-        let floats = [f64::NEG_INFINITY, -1.5, -0.0, 0.0, 0.5, 1.0, f64::INFINITY].map(Value::F64).to_vec();
+        // NaN, as a row and as a bound, beside the infinities and both zeros.
+        let floats = [f64::NAN, f64::NEG_INFINITY, -1.5, -0.0, 0.0, 0.5, 1.0, f64::INFINITY].map(Value::F64).to_vec();
         let booleans = [false, true].map(Value::Bool).to_vec();
         for (index, values) in [
             (index(vec![asc("weight", ValueType::F64)]), floats.clone()),
@@ -560,6 +621,72 @@ mod tests {
             let rows = values.iter().map(|value| vec![value.clone()]).collect::<Vec<_>>();
             for range in every_range(&[], &values) {
                 assert_exact(&index, &range, &rows);
+            }
+        }
+    }
+
+    /// The review's counterexample: weight >= 0.0 was tiled [80.., End) ascending, the one block
+    /// 80/1, and [0, 0x80) descending, the block 00/1, and each held the row of a NaN weight
+    /// and the entity id 00×32, which the Selection rejects.
+    #[test]
+    fn a_float_range_bounded_below_stops_at_infinity_short_of_nan() {
+        for (weight, nan) in [(asc("weight", ValueType::F64), [0xFF; 8]), (desc("weight", ValueType::F64), [0x00; 8])] {
+            let weights = index(vec![weight]);
+            let from_zero = |upper| Cover::new(weights.clone(), range(Vec::new(), Bound::Included(Value::F64(0.0)), upper)).unwrap();
+            let cover = from_zero(Bound::Unbounded);
+            let nan_row = [nan.as_slice(), &[0; 32]].concat();
+            assert!(!cover.blocks().iter().any(|block| block.contains(&nan_row)), "{:?}", cover.blocks());
+            assert_eq!(cover.blocks(), from_zero(Bound::Included(Value::F64(f64::INFINITY))).blocks());
+        }
+    }
+
+    #[test]
+    fn a_nan_bound_or_prefix_names_no_key() {
+        let nan = || Value::F64(f64::NAN);
+        let floats = [f64::NAN, f64::NEG_INFINITY, 0.0, f64::INFINITY].map(Value::F64);
+        let scores = [i64::MIN, 0, i64::MAX].map(Value::I64);
+        for weight in [asc("weight", ValueType::F64), desc("weight", ValueType::F64)] {
+            let weights = index(vec![weight.clone()]);
+            let rows = floats.iter().map(|value| vec![value.clone()]).collect::<Vec<_>>();
+            for range in [
+                KeyRange::prefix(vec![nan()]),
+                range(Vec::new(), Bound::Included(nan()), Bound::Unbounded),
+                range(Vec::new(), Bound::Unbounded, Bound::Excluded(nan())),
+                range(Vec::new(), Bound::Excluded(Value::F64(0.0)), Bound::Included(nan())),
+            ] {
+                assert_eq!(Cover::new(weights.clone(), range.clone()).unwrap().blocks(), [], "{range:?}");
+                assert_exact(&weights, &range, &rows);
+            }
+            // A NaN prefix names no key, however the next part is bounded.
+            let weights_then_scores = index(vec![weight, asc("score", ValueType::I64)]);
+            let rows = floats.iter().flat_map(|weight| scores.iter().map(|score| vec![weight.clone(), score.clone()])).collect::<Vec<_>>();
+            for range in every_range(&[nan()], &scores) {
+                assert_eq!(Cover::new(weights_then_scores.clone(), range.clone()).unwrap().blocks(), [], "{range:?}");
+                assert_exact(&weights_then_scores, &range, &rows);
+            }
+        }
+        // NaN given for an integer part is a value of another type.
+        assert_eq!(
+            Cover::new(index(vec![asc("score", ValueType::I64)]), range(Vec::new(), Bound::Included(nan()), Bound::Unbounded)),
+            Err(RangeError::TypeMismatch { part: 0, expected: ValueType::I64, found: ValueType::F64 })
+        );
+    }
+
+    #[test]
+    fn a_range_after_a_float_prefix_holds_exactly_the_rows_inside_it() {
+        // Rows of a NaN weight file next to those of +∞, in either direction.
+        let floats = || [f64::NAN, f64::NEG_INFINITY, -0.0, 0.0, f64::INFINITY].map(Value::F64).to_vec();
+        let scores = || [i64::MIN, -1, 0, 1, i64::MAX].map(Value::I64).to_vec();
+        for weight in [asc("weight", ValueType::F64), desc("weight", ValueType::F64)] {
+            let index = index(vec![weight, desc("score", ValueType::I64)]);
+            let rows = floats()
+                .into_iter()
+                .flat_map(|weight| scores().into_iter().map(move |score| vec![weight.clone(), score]))
+                .collect::<Vec<_>>();
+            for prefix in [f64::NEG_INFINITY, -0.0, 0.0, f64::INFINITY] {
+                for range in every_range(&[Value::F64(prefix)], &scores()) {
+                    assert_exact(&index, &range, &rows);
+                }
             }
         }
     }

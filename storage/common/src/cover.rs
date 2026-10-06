@@ -201,21 +201,23 @@ fn engine_key_spec(parts: &[IndexKeyPart<PropertyId>]) -> KeySpec<String> {
 
 #[cfg(test)]
 mod tests {
-    use ankql::ast::Parsed;
-    use ankurah_core::indexing::{Block, IndexDirection};
+    use ankql::ast::{ComparisonOperator, Expr, Parsed, PropertyPath};
+    use ankurah_core::indexing::{Block, IndexDirection, encode_component_typed};
     use ankurah_core::schema::resolver::{ModelResolutionError, ModelResolver, ResolvedProperty, resolve_selection};
+    use ankurah_core::selection::filter::{self, Filterable, evaluate_predicate};
     use ankurah_core::value::ValueType;
     use ankurah_proto::EntityId;
 
     use super::*;
 
-    const PROPERTIES: [(&str, ValueType); 6] = [
+    const PROPERTIES: [(&str, ValueType); 7] = [
         ("score", ValueType::I64),
         ("rank", ValueType::I64),
         ("name", ValueType::String),
         ("team", ValueType::EntityId),
         ("owner", ValueType::EntityId),
         ("done", ValueType::Bool),
+        ("weight", ValueType::F64),
     ];
 
     fn property(name: &str) -> PropertyId {
@@ -287,6 +289,24 @@ mod tests {
 
     fn expected(tree: &RegisteredTree, prefix: Vec<Value>, lower: Bound<Value>, upper: Bound<Value>) -> Cover {
         Cover::new(tree.index.clone(), KeyRange { prefix, lower, upper }).unwrap()
+    }
+
+    /// An album as Selection evaluation sees it: a member of the albums component with a weight.
+    struct Album {
+        entity: EntityId,
+        weight: f64,
+    }
+
+    impl Filterable for Album {
+        fn value(&self, id: &PropertyId) -> Option<Value> {
+            if *id == PropertyId::Id {
+                Some(Value::EntityId(self.entity))
+            } else {
+                (*id == property("weight")).then_some(Value::F64(self.weight))
+            }
+        }
+
+        fn is_member_of(&self, model: &ModelId) -> Result<bool, filter::Error> { Ok(*model == albums()) }
     }
 
     #[test]
@@ -454,6 +474,54 @@ mod tests {
     fn a_predicate_that_can_never_match_is_refused() {
         for text in ["score > 5 AND score < 3", "score >= 5 AND score < 5"] {
             assert_eq!(cover_selection(&selection(text), &[scores(IndexDirection::Asc)]), Err(NotReusable::Unsatisfiable), "{text}");
+        }
+    }
+
+    /// The review's counterexample, judged row by row by Selection evaluation: weight >= 0.0
+    /// reused the block 80/1 of an ascending tree, and 00/1 of a descending one, each holding
+    /// the rows of NaN weights, which the Selection rejects.
+    #[test]
+    fn a_float_range_reuses_no_block_holding_nan() {
+        let weights = [f64::NAN, f64::NEG_INFINITY, -1.5, -0.0, 0.0, 0.5, f64::INFINITY];
+        for direction in [IndexDirection::Asc, IndexDirection::Desc] {
+            let tree = tree(vec![part("weight", ValueType::F64, direction)]);
+            for text in ["weight >= 0.0", "weight > 0.5", "weight <= 0.5", "weight >= 0.0 AND weight < 1.0", "weight = 0.0"] {
+                let selection = selection(text);
+                let cover = cover_selection(&selection, std::slice::from_ref(&tree)).unwrap();
+                for album in weights.into_iter().flat_map(|weight| [entity(0x00), entity(0xFF)].map(|entity| Album { entity, weight })) {
+                    let key = encode_component_typed(&Value::F64(album.weight), ValueType::F64, direction.is_desc()).unwrap();
+                    let address = [key.as_slice(), &album.entity.to_bytes()].concat();
+                    let held = cover.blocks().iter().any(|block| block.contains(&address));
+                    let admitted = evaluate_predicate(&album, &selection.predicate).unwrap();
+                    assert_eq!(held, admitted, "{text} over {direction:?} weights: weight {}", album.weight);
+                }
+            }
+        }
+    }
+
+    /// NaN equals nothing, so a comparison with NaN matches nothing. The planner's bounds never
+    /// imply such a comparison, so it stays residual and the Selection is refused; bounds
+    /// holding NaN that do reach a tree name no key and are refused as unsatisfiable.
+    #[test]
+    fn a_comparison_with_nan_is_refused() {
+        let tree = tree(vec![part("weight", ValueType::F64, IndexDirection::Asc)]);
+        let nan = || Value::F64(f64::NAN);
+        for operator in [ComparisonOperator::GreaterThanOrEqual, ComparisonOperator::LessThan, ComparisonOperator::Equal] {
+            let comparison = Predicate::Comparison {
+                left: Box::new(Expr::Path(PropertyPath::from(property("weight")))),
+                operator,
+                right: Box::new(Expr::Literal(nan())),
+            };
+            let selection = Selection { predicate: comparison, order_by: None, limit: None }.and_member_of(albums());
+            let refusal = cover_selection(&selection, std::slice::from_ref(&tree));
+            assert!(matches!(refusal, Err(NotReusable::Residual(_))), "{refusal:?}");
+        }
+        let column = property("weight").to_string();
+        for (low, high) in
+            [(Endpoint::incl(nan()), Endpoint::UnboundedHigh(ValueType::F64)), (Endpoint::incl(nan()), Endpoint::incl(nan()))]
+        {
+            let bounds = KeyBounds::new(vec![KeyBoundComponent { column: column.clone(), low, high }]);
+            assert_eq!(tree.cover(&bounds), Err(NotReusable::Unsatisfiable));
         }
     }
 }
