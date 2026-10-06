@@ -64,6 +64,8 @@ macro_rules! tree_storage_conformance {
             multi_entity_commit_shares_one_position
             state_only_commits_are_logged
             log_rows_carry_keys_under_every_tree
+            key_changes_are_logged_with_or_without_a_new_head
+            a_failed_derivation_writes_nothing
             log_reads_end_at_whole_positions
             log_pages_at_their_limits
             durable_position_trails_the_stable_position
@@ -84,8 +86,10 @@ macro_rules! tree_storage_conformance {
             large_scans_continue_exactly
             empty_trees_read_empty
             build_state_and_generation
+            a_status_only_cell_change_conflicts
             removal_is_whole_when_cancelled
             snapshot_and_replay_give_the_current_index
+            a_build_overtaken_by_retention_starts_over
             prune_horizon_rises_with_every_lost_removal
         );
     };
@@ -185,6 +189,59 @@ pub async fn log_rows_carry_keys_under_every_tree<E: TreeStorage + 'static>(engi
     assert_eq!(keys(entity(1)), Some(BTreeSet::from([encoded])));
     assert_eq!(keys(entity(2)), Some(BTreeSet::new()), "a member without the title is filed under no key");
     assert_eq!(keys(entity(3)), Some(BTreeSet::new()), "an entity outside the component is filed under no key");
+}
+
+/// A commit that changes an entity's keys is logged with the new keys whether
+/// or not it moves the entity's head, and one that takes the entity out of the
+/// component or back into it logs the empty set or the key it regains.
+pub async fn key_changes_are_logged_with_or_without_a_new_head<E: TreeStorage + 'static>(engine: Arc<E>) {
+    let tree = engine.register_tree(title_index()).await.unwrap().id;
+    let titled = |n: u8, memberships: &[ModelId], value: &str| state(entity(1), n, memberships, &[(title(), text(value))]);
+    create(&*engine, vec![titled(1, &[component()], "a")]).await;
+    let logged = |outcome: StorageCommitOutcome| outcome.committed().unwrap().position.expect("a commit that sets a state is logged");
+    let rows_at = |position: LogPosition| {
+        let engine = engine.clone();
+        async move {
+            let rows = read_all(&*engine, position).await;
+            rows.into_iter().filter(|row| row.position == position).map(|row| (row.head, row.keys[&tree].clone())).collect::<Vec<_>>()
+        }
+    };
+
+    let same_head = logged(commit_states(&*engine, vec![(head(1), titled(1, &[component()], "b"))]).await);
+    assert_eq!(rows_at(same_head).await, [(head(1), BTreeSet::from([title_key("b")]))], "a new key under the same head is logged");
+    let left = logged(commit_states(&*engine, vec![(head(1), titled(2, &[], "b"))]).await);
+    assert_eq!(rows_at(left).await, [(head(2), BTreeSet::new())], "leaving the component files the entity under no key");
+    let rejoined = logged(commit_states(&*engine, vec![(head(2), titled(3, &[component()], "c"))]).await);
+    assert_eq!(rows_at(rejoined).await, [(head(3), BTreeSet::from([title_key("c")]))], "rejoining files it under its title");
+}
+
+/// A transaction in which one entity's keys do not derive fails whole, though
+/// another entity's state was prepared before it: no state, event or log row
+/// is written, and the store takes the next commit.
+pub async fn a_failed_derivation_writes_nothing<E: TreeStorage + 'static>(engine: Arc<E>) {
+    engine.register_tree(rank_index()).await.unwrap();
+    let start = engine.stable_position().await.unwrap();
+    let event = Event::update(entity(1), head(1), AuthorId::Unknown, OperationSet(Vec::new()));
+    let mut transaction = engine.transaction();
+    transaction.add_events(&[Attested::opt(event.clone(), None)]).await.unwrap();
+    transaction.set_state(&Clock::default(), &state(entity(1), 1, &[component()], &[(rank(), Value::I64(1))])).await.unwrap();
+    // A rank that is no number cannot take the index's integer key part. An
+    // engine may refuse it as it is prepared or as the transaction commits.
+    let failed = match transaction.set_state(&Clock::default(), &state(entity(2), 2, &[component()], &[(rank(), text("high"))])).await {
+        Ok(()) => transaction.commit().await.map(drop),
+        Err(error) => Err(error),
+    };
+    assert!(failed.is_err(), "the second entity's key does not derive");
+    for id in [entity(1), entity(2)] {
+        assert!(matches!(engine.get_state(id).await, Err(RetrievalError::EntityNotFound(_))), "no state of {id:?} was written");
+    }
+    assert!(engine.get_events(vec![event.id()]).await.unwrap().is_empty(), "no event was written");
+    assert!(read_all(&*engine, start).await.is_empty(), "no log row was written");
+    let position = create(&*engine, vec![state(entity(1), 1, &[component()], &[(rank(), Value::I64(1))])]).await;
+    assert_eq!(
+        read_all(&*engine, start).await.iter().map(|row| (row.position, row.entity_id)).collect::<Vec<_>>(),
+        [(position, entity(1))]
+    );
 }
 
 /// A log read returns whole positions: it stops after the first position at
@@ -917,6 +974,24 @@ pub async fn build_state_and_generation<E: TreeStorage + 'static>(engine: Arc<E>
     assert_eq!(cell_of(&*engine, again.id).await, TreeCell { generation: 0, status: BuildStatus::Building, folded: stable });
 }
 
+/// A batch prepared against a cell that differs from the tree's only in its
+/// build status conflicts and writes nothing.
+pub async fn a_status_only_cell_change_conflicts<E: TreeStorage + 'static>(engine: Arc<E>) {
+    let tree = engine.register_tree(title_index()).await.unwrap().id;
+    let position = create(&*engine, vec![state(entity(1), 1, &[], &[])]).await;
+    let building = cell_of(&*engine, tree).await;
+    let mut batch = engine.batch(tree).await.unwrap();
+    batch.publish().await.unwrap();
+    let ready = committed(batch.commit(&building).await.unwrap());
+    assert_eq!(ready, TreeCell { status: BuildStatus::Ready, ..building });
+    let before = view(&*engine, tree, &[entity(1)]).await;
+    let mut stale = engine.batch(tree).await.unwrap();
+    stale.put_row(folded_row(b"k", entity(1), position)).await.unwrap();
+    stale.put_node(NodePrefix::root(), node_row(1, position)).await.unwrap();
+    assert_eq!(stale.commit(&building).await.unwrap(), TreeBatchOutcome::Conflict { observed: ready }, "same generation and position");
+    assert_eq!(view(&*engine, tree, &[entity(1)]).await, before);
+}
+
 /// Unregistering a tree or resetting the store is whole even when cancelled
 /// while it waits for an open batch: afterwards every handle agrees whether
 /// the tree exists, and once it is gone every handle fails.
@@ -1044,6 +1119,70 @@ pub async fn snapshot_and_replay_give_the_current_index<E: TreeStorage + 'static
     }
     let current = [(1, keyed(11, "z")), (2, keyed(2, "b")), (4, keyed(14, "d")), (6, keyed(6, "f")), (7, keyed(17, "g"))];
     assert_eq!(index, current.map(|(n, keyed)| (entity(n), keyed)).into(), "with the log from the boundary, the current index");
+}
+
+/// A build whose boundary falls below the retention floor before it catches
+/// up starts over from a fresh snapshot; the abandoned build's batches fail and
+/// write nothing, and the new build replays the log and publishes.
+pub async fn a_build_overtaken_by_retention_starts_over<E: TreeStorage + 'static>(engine: Arc<E>) {
+    create(&*engine, vec![state(entity(1), 1, &[component()], &[(title(), text("a"))])]).await;
+    let tree = engine.register_tree(title_index()).await.unwrap().id;
+    let registered = cell_of(&*engine, tree).await;
+    let first = engine.snapshot(tree).await.unwrap();
+    let mut batch = engine.batch(tree).await.unwrap();
+    batch.restart(first.boundary).await.unwrap();
+    fill(&mut batch, first.boundary, first.entities).await;
+    let abandoned = committed(batch.commit(&registered).await.unwrap());
+    assert_eq!(abandoned, TreeCell { generation: registered.generation + 1, status: BuildStatus::Building, folded: first.boundary });
+
+    // Commits pass, and the log is trimmed past the boundary before the build
+    // replays it.
+    create(&*engine, vec![state(entity(2), 2, &[component()], &[(title(), text("b"))])]).await;
+    engine.discard_log_below(engine.stable_position().await.unwrap()).await.unwrap();
+    assert!(matches!(engine.read_log(first.boundary, 10).await, Err(LogError::BelowRetentionFloor { .. })));
+
+    let second = engine.snapshot(tree).await.unwrap();
+    assert!(second.boundary >= engine.retention_floor().await.unwrap(), "a fresh snapshot's boundary is still in the log");
+    let mut batch = engine.batch(tree).await.unwrap();
+    batch.restart(second.boundary).await.unwrap();
+    fill(&mut batch, second.boundary, second.entities).await;
+    let rebuilt = committed(batch.commit(&abandoned).await.unwrap());
+    assert_eq!(rebuilt, TreeCell { generation: abandoned.generation + 1, status: BuildStatus::Building, folded: second.boundary });
+    assert!(engine.prune_horizon().await.unwrap() >= second.boundary, "the new build saw no removal before its boundary");
+    let probes = [entity(1), entity(2), entity(3)];
+    let before = view(&*engine, tree, &probes).await;
+    assert_eq!(before.rows.iter().map(|row| row.entity_id).collect::<Vec<_>>(), [entity(1), entity(2)]);
+
+    let mut stale = engine.batch(tree).await.unwrap();
+    stale.put_row(folded_row(&title_key("c"), entity(3), second.boundary)).await.unwrap();
+    stale.publish().await.unwrap();
+    assert_eq!(stale.commit(&abandoned).await.unwrap(), TreeBatchOutcome::Conflict { observed: rebuilt }, "the abandoned build");
+    assert_eq!(view(&*engine, tree, &probes).await, before);
+
+    let caught_up = engine.read_log(second.boundary, usize::MAX).await.unwrap();
+    assert!(caught_up.rows.is_empty(), "nothing committed since the fresh snapshot");
+    let mut batch = engine.batch(tree).await.unwrap();
+    batch.set_folded(caught_up.next).await.unwrap();
+    batch.publish().await.unwrap();
+    assert_eq!(
+        committed(batch.commit(&rebuilt).await.unwrap()),
+        TreeCell { status: BuildStatus::Ready, folded: caught_up.next, ..rebuilt }
+    );
+}
+
+/// Write a folded row for every key of every entity of a snapshot.
+async fn fill<B, S>(batch: &mut B, boundary: LogPosition, entities: S)
+where
+    B: TreeBatch,
+    S: futures::Stream<Item = Result<SnapshotEntity, TreeStorageError>>,
+{
+    let mut entities = Box::pin(entities);
+    while let Some(entity) = entities.next().await {
+        let SnapshotEntity { entity_id, head, keys } = entity.unwrap();
+        for key in keys {
+            batch.put_row(FoldedRow { head: head.clone(), ..folded_row(&key, entity_id, boundary) }).await.unwrap();
+        }
+    }
 }
 
 /// The prune horizon rises wherever a tree may stop holding a removal: at a
@@ -1232,6 +1371,13 @@ fn title_key_spec() -> KeySpec<PropertyId> { KeySpec::new(vec![IndexKeyPart::asc
 
 /// The component's members, filed by title.
 fn title_index() -> HashedIndex { HashedIndex::Component { component: component(), key_spec: title_key_spec() } }
+
+fn rank() -> PropertyId { PropertyId::EntityId(entity(242)) }
+
+/// The component's members, filed by an integer rank.
+fn rank_index() -> HashedIndex {
+    HashedIndex::Component { component: component(), key_spec: KeySpec::new(vec![IndexKeyPart::asc(rank(), ValueType::I64)]) }
+}
 
 /// The key the title index files a member with this title under.
 fn title_key(value: &str) -> Vec<u8> { encode_tuple_values_with_key_spec(&[text(value)], &title_key_spec()).unwrap() }
