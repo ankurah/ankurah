@@ -41,6 +41,12 @@ impl HeadHash {
         Self(hasher.finalize().into())
     }
 
+    /// The head hash with these 32 bytes, for rebuilding a leaf from the head
+    /// hash a row stores or the wire carries. It reconstructs a value and
+    /// checks nothing: it cannot verify an advertised head against its event
+    /// ids, which only hashing the events with [`HeadHash::of`] does.
+    pub fn from_bytes(bytes: [u8; 32]) -> Self { Self(bytes) }
+
     /// The 32 bytes of the hash.
     pub fn as_bytes(&self) -> &[u8; 32] { &self.0 }
 }
@@ -106,6 +112,12 @@ mod tests {
         assert_eq!(HeadHash::of([a, b, a]), HeadHash::of([a, b]), "repetition");
         assert_ne!(HeadHash::of([a, b]), HeadHash::of([a, c]));
         assert_ne!(HeadHash::of([a]), HeadHash::of([a, b]));
+    }
+
+    #[test]
+    fn a_head_hash_rebuilt_from_its_bytes_is_the_same_value() {
+        let head = HeadHash::of([[1u8; 32], [2u8; 32]]);
+        assert_eq!(HeadHash::from_bytes(*head.as_bytes()), head);
     }
 
     /// Known answers for one entity's leaf in two indexes: one keyed by a
