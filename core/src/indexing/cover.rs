@@ -48,13 +48,15 @@
 //!
 //! # NaN
 //!
-//! NaN equals nothing and satisfies no comparison, yet the encoder files it above every
-//! number, +∞ included. A range whose prefix or bound holds NaN therefore names no key, and its
-//! cover is empty. A range that bounds a float part below and leaves it open above stops at +∞,
-//! inclusive, instead of running on past NaN: on an ascending part the interval ends past the
-//! addresses of +∞, and on a descending part it starts at them. Every other open side already
-//! ends short of NaN, and a float part open on both sides is not constrained at all, so its
-//! range holds NaN with every other value.
+//! Selection evaluation compares floats by IEEE rules, so an equality or ordered comparison
+//! with NaN on either side matches nothing, though NaN != x matches every value, NaN included.
+//! The encoder instead files NaN above every number, +∞ included. A range states only
+//! equalities, in its prefix, and ordered comparisons, in its bounds, so a range whose prefix
+//! or bound holds NaN names no key, and its cover is empty. A range that bounds a float part
+//! below and leaves it open above stops at +∞, inclusive, instead of running on past NaN: on an
+//! ascending part the interval ends past the addresses of +∞, and on a descending part it
+//! starts at them. Every other open side already ends short of NaN, and a float part open on
+//! both sides is not constrained at all, so its range holds NaN with every other value.
 //!
 //! # Terminators
 //!
@@ -245,7 +247,7 @@ impl KeyRange {
         }
     }
 
-    /// Whether a prefix or bound value is NaN, which equals nothing and satisfies no comparison.
+    /// Whether a prefix or bound value is NaN, which no equality or ordered comparison matches.
     fn names_nan(&self) -> bool {
         let bounds = [&self.lower, &self.upper].into_iter().filter_map(|bound| match bound {
             Bound::Included(value) | Bound::Excluded(value) => Some(value),
