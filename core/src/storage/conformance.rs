@@ -73,6 +73,11 @@ macro_rules! tree_storage_conformance {
             tombstones_through_a_split
             snapshot_reads_inside_a_batch
             concurrent_batches_commit_one
+            one_of_several_contenders_commits
+            trees_do_not_wait_for_each_other
+            readers_never_see_an_open_batch
+            a_cancelled_wait_leaves_no_trace
+            handles_do_not_outlive_their_tree
             children_and_leaf_ranges_at_ragged_depths
             build_state_and_generation
             removal_is_whole_when_cancelled
@@ -486,7 +491,8 @@ pub async fn snapshot_reads_inside_a_batch<E: TreeStorage + 'static>(engine: Arc
 /// and a batch's reads stay as they were while its rival tries to commit.
 pub async fn concurrent_batches_commit_one<E: TreeStorage + 'static>(engine: Arc<E>) {
     let tree = entity_id_tree(&*engine).await;
-    let contest = Contest::set_up(&*engine, tree).await;
+    let position = create(&*engine, vec![state(entity(1), 1, &[], &[])]).await;
+    let contest = Contest::set_up(&*engine, tree, position).await;
     let before = view(&*engine, tree, &contest.probes()).await;
 
     let mut first = engine.batch(tree).await.unwrap();
@@ -505,6 +511,140 @@ pub async fn concurrent_batches_commit_one<E: TreeStorage + 'static>(engine: Arc
     };
     let (winner, cell) = one_winner([(3, first), (2, second)]);
     assert_eq!(view(&*engine, tree, &contest.probes()).await, contest.won_by(&before, winner, cell));
+}
+
+/// Of several batches prepared against one cell exactly one commits, whole;
+/// every other conflicts with the cell it left, and all of them finish.
+pub async fn one_of_several_contenders_commits<E: TreeStorage + 'static>(engine: Arc<E>) {
+    let tree = entity_id_tree(&*engine).await;
+    let position = create(&*engine, vec![state(entity(1), 1, &[], &[])]).await;
+    let contest = Contest::set_up(&*engine, tree, position).await;
+    let before = view(&*engine, tree, &contest.probes()).await;
+    let contenders: Vec<_> = (2..=5).map(|n| (n, tokio::spawn(contest.contend(engine.clone(), n)))).collect();
+    let mut outcomes = Vec::new();
+    for (n, contender) in contenders {
+        outcomes.push((n, tokio::time::timeout(PROGRESS, contender).await.expect("every contender finishes").unwrap()));
+    }
+    let (winner, cell) = one_winner(outcomes);
+    assert_eq!(view(&*engine, tree, &contest.probes()).await, contest.won_by(&before, winner, cell));
+}
+
+/// Nothing waits for a batch on another tree: a task holds batches on two
+/// trees at once, begun in ascending id order, and commits both; a read of
+/// one tree goes on while a batch on the other is open; and contenders on two
+/// trees at once settle each tree on its own.
+pub async fn trees_do_not_wait_for_each_other<E: TreeStorage + 'static>(engine: Arc<E>) {
+    let position = create(&*engine, vec![state(entity(1), 1, &[], &[])]).await;
+    let mut trees = [entity_id_tree(&*engine).await, engine.register_tree(title_index()).await.unwrap().id];
+    trees.sort();
+    let mut contests = [Contest::set_up(&*engine, trees[0], position).await, Contest::set_up(&*engine, trees[1], position).await];
+    let mut views = [view(&*engine, trees[0], &contests[0].probes()).await, view(&*engine, trees[1], &contests[1].probes()).await];
+
+    let mut low = tokio::time::timeout(PROGRESS, engine.batch(trees[0])).await.expect("no batch is open").unwrap();
+    let read = async { engine.reader(trees[1]).await.unwrap().cell().await.unwrap() };
+    assert_eq!(tokio::time::timeout(PROGRESS, read).await.expect("a read waits for no batch on another tree"), contests[1].cell);
+    let mut high =
+        tokio::time::timeout(PROGRESS, engine.batch(trees[1])).await.expect("a batch waits for no batch on another tree").unwrap();
+    contests[0].write(&mut low, 2).await;
+    contests[1].write(&mut high, 2).await;
+    let cells = [committed(low.commit(&contests[0].cell).await.unwrap()), committed(high.commit(&contests[1].cell).await.unwrap())];
+    // Each round's batches advance the fold position, without which batches
+    // against one cell would not exclude each other.
+    create(&*engine, vec![state(entity(2), 2, &[], &[])]).await;
+    let stable = engine.stable_position().await.unwrap();
+    for side in 0..2 {
+        views[side] = contests[side].won_by(&views[side], 2, cells[side]);
+        assert_eq!(view(&*engine, trees[side], &contests[side].probes()).await, views[side]);
+        contests[side] = Contest { cell: cells[side], stable, ..contests[side] };
+    }
+
+    let contenders: Vec<_> = (0..2)
+        .flat_map(|side| (3..=5).map(move |n| (side, n)))
+        .map(|(side, n)| (side, n, tokio::spawn(contests[side].contend(engine.clone(), n))))
+        .collect();
+    let mut outcomes = [Vec::new(), Vec::new()];
+    for (side, n, contender) in contenders {
+        outcomes[side].push((n, tokio::time::timeout(PROGRESS, contender).await.expect("every contender finishes").unwrap()));
+    }
+    for (side, outcomes) in outcomes.into_iter().enumerate() {
+        let (winner, cell) = one_winner(outcomes);
+        assert_eq!(view(&*engine, trees[side], &contests[side].probes()).await, contests[side].won_by(&views[side], winner, cell));
+    }
+}
+
+/// A read never sees an open batch's writes: made while the batch is open, it
+/// shows the tree as it was, or waits and shows the tree as the batch left it.
+pub async fn readers_never_see_an_open_batch<E: TreeStorage + 'static>(engine: Arc<E>) {
+    let tree = entity_id_tree(&*engine).await;
+    let position = create(&*engine, vec![state(entity(1), 1, &[], &[])]).await;
+    let contest = Contest::set_up(&*engine, tree, position).await;
+    let before = view(&*engine, tree, &contest.probes()).await;
+    let held = engine.reader(tree).await.unwrap();
+
+    let mut batch = engine.batch(tree).await.unwrap();
+    contest.write(&mut batch, 2).await;
+    let mut reading = tokio::spawn({
+        let engine = engine.clone();
+        async move { engine.reader(tree).await.unwrap().rows(&AddressRange::all(), usize::MAX).await.unwrap() }
+    });
+    let early = tokio::time::timeout(BLOCKED, &mut reading).await.ok().map(|joined| joined.unwrap());
+    if let Some(rows) = &early {
+        assert_eq!(*rows, before.rows, "a read made while a batch is open shows the tree as it was");
+        assert_eq!(held.rows(&AddressRange::all(), usize::MAX).await.unwrap(), before.rows);
+    }
+    let after = contest.won_by(&before, 2, committed(batch.commit(&contest.cell).await.unwrap()));
+    let rows = match early {
+        Some(rows) => rows,
+        None => tokio::time::timeout(PROGRESS, reading).await.expect("a waiting read proceeds once the batch ends").unwrap(),
+    };
+    assert!(rows == before.rows || rows == after.rows, "a read shows a batch whole or not at all");
+    assert_eq!(held.rows(&AddressRange::all(), usize::MAX).await.unwrap(), after.rows, "a reader held across the batch sees its commit");
+    assert_eq!(view(&*engine, tree, &contest.probes()).await, after);
+}
+
+/// A batch cancelled while it waits for another batch on its tree leaves no
+/// trace: the open batch commits whole, and the next batch begins.
+pub async fn a_cancelled_wait_leaves_no_trace<E: TreeStorage + 'static>(engine: Arc<E>) {
+    let tree = entity_id_tree(&*engine).await;
+    let position = create(&*engine, vec![state(entity(1), 1, &[], &[])]).await;
+    let contest = Contest::set_up(&*engine, tree, position).await;
+    let before = view(&*engine, tree, &contest.probes()).await;
+    let mut open = engine.batch(tree).await.unwrap();
+    contest.write(&mut open, 2).await;
+    // An engine that makes the second batch wait is cancelled there; one that
+    // does not hands out a batch, dropped unused.
+    drop(tokio::time::timeout(BLOCKED, engine.batch(tree)).await);
+    let cell = committed(open.commit(&contest.cell).await.unwrap());
+    let next = tokio::time::timeout(PROGRESS, engine.batch(tree)).await.expect("a cancelled wait leaves the tree free").unwrap();
+    assert_eq!(next.cell().await.unwrap(), cell);
+    drop(next);
+    assert_eq!(view(&*engine, tree, &contest.probes()).await, contest.won_by(&before, 2, cell));
+}
+
+/// Readers never outlive their tree: one taken before an unregistration fails
+/// and never reaches the tree registered again for the same index, and after a
+/// reset those of every tree fail, the entity-id tree's included.
+pub async fn handles_do_not_outlive_their_tree<E: TreeStorage + 'static>(engine: Arc<E>) {
+    let position = create(&*engine, vec![state(entity(1), 1, &[], &[])]).await;
+    let old = engine.register_tree(title_index()).await.unwrap().id;
+    let old_reader = engine.reader(old).await.unwrap();
+    engine.unregister_tree(old).await.unwrap();
+    let again = engine.register_tree(title_index()).await.unwrap().id;
+    assert_ne!(again, old, "a tree id is not reused within an incarnation");
+    let mut batch = engine.batch(again).await.unwrap();
+    let cell = batch.cell().await.unwrap();
+    batch.put_row(folded_row(b"k", entity(1), position)).await.unwrap();
+    committed(batch.commit(&cell).await.unwrap());
+    assert_gone(&*engine, old, &old_reader).await;
+
+    let entity_ids = entity_id_tree(&*engine).await;
+    let (reader, entity_id_reader) = (engine.reader(again).await.unwrap(), engine.reader(entity_ids).await.unwrap());
+    engine.delete_all().await.unwrap();
+    assert_gone(&*engine, again, &reader).await;
+    assert_gone(&*engine, entity_ids, &entity_id_reader).await;
+    let fresh = entity_id_tree(&*engine).await;
+    assert!(fresh != entity_ids && fresh != again, "a reset's fresh tree takes a new id");
+    assert_eq!(view(&*engine, fresh, &[entity(1)]).await.rows, [], "nothing of the old store reaches the fresh tree");
 }
 
 /// A prefix's children are the nearest stored nodes beneath it at any depth,
@@ -834,8 +974,9 @@ async fn batch_reads<B: TreeBatch>(batch: &B) -> (TreeCell, Vec<FoldedRow>, Vec<
 }
 
 /// One tree that several batches contend for: entity 1's row and the root
-/// node, set up at `cell`. Contender `n` writes its own version of both and a
-/// tombstone of its own, then commits against `cell`.
+/// node, set up at `cell`, with rows positioned at an earlier commit. Contender
+/// `n` writes its own version of both and a tombstone of its own, then commits
+/// against `cell`.
 #[derive(Clone, Copy)]
 struct Contest {
     tree: TreeId,
@@ -845,8 +986,7 @@ struct Contest {
 }
 
 impl Contest {
-    async fn set_up<E: TreeStorage>(engine: &E, tree: TreeId) -> Self {
-        let position = create(engine, vec![state(entity(1), 1, &[], &[])]).await;
+    async fn set_up<E: TreeStorage>(engine: &E, tree: TreeId, position: LogPosition) -> Self {
         let mut contest = Self { tree, position, stable: position, cell: cell_of(engine, tree).await };
         let mut setup = engine.batch(tree).await.unwrap();
         setup.put_row(contest.row(1)).await.unwrap();
@@ -886,7 +1026,7 @@ impl Contest {
         won.cell = cell;
         won.rows = vec![self.row(n)];
         won.lookup.insert(entity(1), vec![self.row(n)]);
-        won.tombstones = vec![self.tombstone(n)];
+        won.tombstones = by_address(before.tombstones.iter().cloned().chain([self.tombstone(n)]));
         won.nodes = vec![(NodePrefix::root(), self.node(n))];
         won
     }

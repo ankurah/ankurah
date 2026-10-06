@@ -60,6 +60,9 @@
 //! see the batch's own earlier writes. Its commit applies every write together
 //! if the cell still equals the one the caller expected, and none otherwise;
 //! a caller that meets a conflict starts over from the cell it observed.
+//! Batches exclude each other only through the cell: two that leave it as they
+//! found it can both commit, so a batch that must exclude a rival changes the
+//! cell, as the refresher does when it advances the fold position.
 //!
 //! An engine may make a batch wait while another batch on the same tree is
 //! open, and may make a read of that tree or its unregistration wait too, and
