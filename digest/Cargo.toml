@@ -16,8 +16,11 @@ sha2             = "0.10.8"
 thiserror        = "2"
 
 [dev-dependencies]
+proptest = { version = "1.11", default-features = false, features = ["std"] }
+
+# criterion's default rayon feature refuses wasm32, and the benchmarks run natively.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 criterion = "0.5"
-proptest  = { version = "1.11", default-features = false, features = ["std"] }
 
 # harness = false because criterion provides its own harness.
 [[bench]]
