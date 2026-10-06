@@ -26,12 +26,13 @@ use std::{
 
 use ankql::ast::PropertyId;
 use ankurah_proto::{Attested, AuthorId, Clock, EntityId, EntityState, Event, EventId, ModelId, OperationSet, State, StateBuffers};
+use futures::StreamExt;
 
 use super::{
     log::{CommitLog, LogError, LogIncarnation, LogPosition, LogRow},
     tree::{
-        AddressRange, BuildStatus, FoldedRow, HashedIndex, NodePrefix, NodeRow, Tombstone, TreeBatch, TreeBatchOutcome, TreeCell, TreeId,
-        TreeRead, TreeStorage, TreeStorageError,
+        AddressRange, BuildStatus, FoldedRow, HashedIndex, NodePrefix, NodeRow, SnapshotEntity, Tombstone, TreeBatch, TreeBatchOutcome,
+        TreeCell, TreeId, TreeRead, TreeStorage, TreeStorageError,
     },
     StorageCommitOutcome, StorageEngine, StorageTransaction,
 };
@@ -70,6 +71,7 @@ macro_rules! tree_storage_conformance {
             concurrent_batches_commit_one
             children_and_leaf_ranges_at_ragged_depths
             build_state_and_generation
+            snapshot_and_replay_give_the_current_index
             prune_horizon_rises_with_every_lost_removal
         );
     };
@@ -614,6 +616,65 @@ pub async fn build_state_and_generation<E: TreeStorage + 'static>(engine: Arc<E>
     assert_eq!(cell_of(&*engine, again.id).await, TreeCell { generation: 0, status: BuildStatus::Building, folded: stable });
 }
 
+/// A snapshot shows the tree's index as of its boundary while commits go on,
+/// and with the log replayed from the boundary it gives the current index:
+/// nothing missing, nothing twice.
+pub async fn snapshot_and_replay_give_the_current_index<E: TreeStorage + 'static>(engine: Arc<E>) {
+    create(
+        &*engine,
+        vec![
+            state(entity(1), 1, &[component()], &[(title(), text("a"))]),
+            state(entity(2), 2, &[component()], &[(title(), text("b"))]),
+            state(entity(3), 3, &[component()], &[(title(), text("c"))]),
+            state(entity(4), 4, &[component()], &[]),
+            state(entity(5), 5, &[], &[(title(), text("e"))]),
+        ],
+    )
+    .await;
+    let tree = engine.register_tree(title_index()).await.unwrap().id;
+    let registered = cell_of(&*engine, tree).await.folded;
+    let before = create(&*engine, vec![state(entity(6), 6, &[component()], &[(title(), text("f"))])]).await;
+
+    let snapshot = engine.snapshot(tree).await.unwrap();
+    let boundary = snapshot.boundary;
+    assert!(boundary >= registered, "the boundary lies at or above the tree's registration");
+    assert!(boundary > before && boundary <= engine.stable_position().await.unwrap(), "the boundary is where the snapshot was taken");
+    let mut entities = Box::pin(snapshot.entities);
+    let mut seen: Vec<SnapshotEntity> = vec![entities.next().await.expect("the index files entities").unwrap()];
+    // Commits while the snapshot is read: a move, a departure from the
+    // component, a member gaining its title, and a new member.
+    let during = commit_states(
+        &*engine,
+        vec![
+            (head(1), state(entity(1), 11, &[component()], &[(title(), text("z"))])),
+            (head(3), state(entity(3), 13, &[], &[(title(), text("c"))])),
+            (head(4), state(entity(4), 14, &[component()], &[(title(), text("d"))])),
+            (Clock::default(), state(entity(7), 17, &[component()], &[(title(), text("g"))])),
+        ],
+    );
+    tokio::time::timeout(PROGRESS, during).await.expect("a commit does not wait for an open snapshot").committed().unwrap();
+    while let Some(entity) = entities.next().await {
+        seen.push(entity.unwrap());
+    }
+
+    let keyed = |n: u8, value: &str| (head(n), BTreeSet::from([title_key(value)]));
+    let mut index = BTreeMap::new();
+    for entity in seen {
+        let id = entity.entity_id;
+        assert!(index.insert(id, (entity.head, entity.keys)).is_none(), "the snapshot holds {id:?} twice");
+    }
+    let as_of_boundary = [(1, keyed(1, "a")), (2, keyed(2, "b")), (3, keyed(3, "c")), (6, keyed(6, "f"))];
+    assert_eq!(index, as_of_boundary.map(|(n, keyed)| (entity(n), keyed)).into(), "the snapshot is the index as of its boundary");
+    for row in read_all(&*engine, boundary).await {
+        match row.keys[&tree].clone() {
+            keys if keys.is_empty() => index.remove(&row.entity_id),
+            keys => index.insert(row.entity_id, (row.head, keys)),
+        };
+    }
+    let current = [(1, keyed(11, "z")), (2, keyed(2, "b")), (4, keyed(14, "d")), (6, keyed(6, "f")), (7, keyed(17, "g"))];
+    assert_eq!(index, current.map(|(n, keyed)| (entity(n), keyed)).into(), "with the log from the boundary, the current index");
+}
+
 /// The prune horizon rises wherever a tree may stop holding a removal: at a
 /// registration, a prune and a restart. It never falls.
 pub async fn prune_horizon_rises_with_every_lost_removal<E: TreeStorage + 'static>(engine: Arc<E>) {
@@ -656,6 +717,9 @@ fn title_key_spec() -> KeySpec<PropertyId> { KeySpec::new(vec![IndexKeyPart::asc
 
 /// The component's members, filed by title.
 fn title_index() -> HashedIndex { HashedIndex::Component { component: component(), key_spec: title_key_spec() } }
+
+/// The key the title index files a member with this title under.
+fn title_key(value: &str) -> Vec<u8> { encode_tuple_values_with_key_spec(&[text(value)], &title_key_spec()).unwrap() }
 
 /// An entity's state at the head `head(n)`, with these memberships and these
 /// property values written by that head's event.

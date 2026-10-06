@@ -50,10 +50,11 @@
 mod index;
 mod prefix;
 
-use std::ops::Bound;
+use std::{collections::BTreeSet, ops::Bound};
 
 use ankurah_proto::{Clock, EntityId};
 use async_trait::async_trait;
+use futures::Stream;
 use serde::{Deserialize, Serialize};
 
 pub use index::{HashedIndex, KeyDerivationError};
@@ -190,6 +191,26 @@ impl AddressRange {
     }
 }
 
+/// One entity of a tree's index as a build snapshot saw it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotEntity {
+    pub entity_id: EntityId,
+    pub head: Clock,
+    /// The keys the tree's index files the entity under; never empty.
+    pub keys: BTreeSet<Vec<u8>>,
+}
+
+/// Every entity a tree's index files, as of one log position: what a build
+/// fills the tree's folded rows from before it folds the log from there.
+pub struct TreeSnapshot<S> {
+    /// The position the snapshot was taken at. It shows every commit below
+    /// the boundary and none at or above it.
+    pub boundary: LogPosition,
+    /// Each entity the index files under at least one key, once, in no
+    /// promised order.
+    pub entities: S,
+}
+
 /// The result of committing a batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TreeBatchOutcome {
@@ -210,6 +231,8 @@ pub enum TreeStorageError {
     IncarnationMismatch { expected: LogIncarnation, found: LogIncarnation },
     #[error("the fold position cannot move back from {current:?} to {requested:?}")]
     FoldBackwards { current: LogPosition, requested: LogPosition },
+    #[error("the keys of entity {entity_id} do not derive: {source}")]
+    KeyDerivation { entity_id: EntityId, source: KeyDerivationError },
     #[error("storage error: {0}")]
     Storage(Box<dyn std::error::Error + Send + Sync + 'static>),
 }
@@ -274,8 +297,8 @@ pub trait TreeBatch: TreeRead {
     /// Start the tree's build over from `folded`: remove every row, take the
     /// next generation, mark the tree building, and raise the store's prune
     /// horizon to at least `folded`, since the new build records no removal
-    /// before it. A build that fills from a snapshot starts here, with the
-    /// snapshot's position.
+    /// before it. A build that fills from a [snapshot](TreeStorage::snapshot)
+    /// starts here, with the snapshot's boundary.
     async fn restart(&mut self, folded: LogPosition) -> Result<(), TreeStorageError>;
 
     /// Apply every write if the tree's cell still equals `expected`, and none
@@ -290,6 +313,9 @@ pub trait TreeStorage: CommitLog {
     where Self: 'a;
 
     type Batch<'a>: TreeBatch + 'a
+    where Self: 'a;
+
+    type Snapshot<'a>: Stream<Item = Result<SnapshotEntity, TreeStorageError>> + Send + 'a
     where Self: 'a;
 
     /// Register a tree for `index`, or return the tree already serving it. A
@@ -313,4 +339,19 @@ pub trait TreeStorage: CommitLog {
     /// Begin a batch on one tree. It may wait while another batch on the same
     /// tree is open.
     async fn batch(&self, tree: TreeId) -> Result<Self::Batch<'_>, TreeStorageError>;
+
+    /// Take a snapshot of the tree's index for a build: every entity the
+    /// index files, with its head and its keys, as of the stable position.
+    /// The engine fixes the boundary where commits serialize, so the snapshot
+    /// shows every commit below it and none at or above it, however long its
+    /// entities take to read and whatever commits meanwhile. The boundary is
+    /// at or above the position the tree was registered at, so every log row
+    /// from it on carries the tree's keys.
+    ///
+    /// The core's build hook restarts the tree at the boundary, fills the
+    /// folded rows from the entities, folds the log from the boundary until
+    /// it catches up, and publishes the tree in the batch that does. A build
+    /// whose boundary falls below the retention floor before it catches up
+    /// starts over from a fresh snapshot.
+    async fn snapshot(&self, tree: TreeId) -> Result<TreeSnapshot<Self::Snapshot<'_>>, TreeStorageError>;
 }

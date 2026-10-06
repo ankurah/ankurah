@@ -12,13 +12,14 @@ use std::{
 use ankql::ast::{Predicate, Resolved, Selection};
 use ankurah_proto::{Attested, Clock, EntityId, EntityState, Event, EventId, ModelId};
 use async_trait::async_trait;
+use futures::stream;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use super::{
     log::{CommitLog, LogError, LogIncarnation, LogPage, LogPosition, LogRow},
     tree::{
-        leaf_address, AddressRange, BuildStatus, FoldedRow, HashedIndex, NodePrefix, NodeRow, Tombstone, TreeBatch, TreeBatchOutcome,
-        TreeCell, TreeId, TreeRead, TreeRegistration, TreeStorage, TreeStorageError,
+        leaf_address, AddressRange, BuildStatus, FoldedRow, HashedIndex, NodePrefix, NodeRow, SnapshotEntity, Tombstone, TreeBatch,
+        TreeBatchOutcome, TreeCell, TreeId, TreeRead, TreeRegistration, TreeSnapshot, TreeStorage, TreeStorageError,
     },
     CommittedEntityWrite, StorageCommitOutcome, StorageCommitResult, StorageEngine, StorageTransaction,
 };
@@ -425,6 +426,7 @@ impl CommitLog for MemoryStorageEngine {
 impl TreeStorage for MemoryStorageEngine {
     type Reader<'a> = MemoryTreeReader;
     type Batch<'a> = MemoryTreeBatch<'a>;
+    type Snapshot<'a> = stream::Iter<std::vec::IntoIter<Result<SnapshotEntity, TreeStorageError>>>;
 
     async fn register_tree(&self, index: HashedIndex) -> Result<TreeRegistration, TreeStorageError> {
         let mut store = self.store.lock().unwrap();
@@ -466,6 +468,24 @@ impl TreeStorage for MemoryStorageEngine {
         contents.live(tree)?;
         let begun = contents.cell;
         Ok(MemoryTreeBatch { engine: self, tree, contents, begun, undo: Vec::new(), horizon: None, committed: false })
+    }
+
+    async fn snapshot(&self, tree: TreeId) -> Result<TreeSnapshot<Self::Snapshot<'_>>, TreeStorageError> {
+        // No commit serializes while the store's lock is held, so these states
+        // are exactly those the commits below the stable position left.
+        let store = self.store.lock().unwrap();
+        let index = &store.trees.get(&tree).ok_or(TreeStorageError::UnknownTree(tree))?.index;
+        let mut entities = Vec::new();
+        for state in store.states.values() {
+            let EntityState { entity_id, state } = &state.payload;
+            let entity = TemporaryEntity::new(*entity_id, state).map_err(|error| TreeStorageError::Storage(Box::new(error)))?;
+            let keys =
+                index.keys(*entity_id, &entity).map_err(|source| TreeStorageError::KeyDerivation { entity_id: *entity_id, source })?;
+            if !keys.is_empty() {
+                entities.push(Ok(SnapshotEntity { entity_id: *entity_id, head: state.head.clone(), keys }));
+            }
+        }
+        Ok(TreeSnapshot { boundary: store.stable(), entities: stream::iter(entities) })
     }
 }
 
