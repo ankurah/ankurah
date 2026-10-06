@@ -1,0 +1,459 @@
+//! Whether a tree a member already keeps serves a Selection, and with which cover.
+//!
+//! An interest is any Selection. A tree kept for an index serves it, through the cover of a
+//! range of that index's keys, exactly when the Selection's result has an exact,
+//! data-independent representation as that range: the Selection names the component the
+//! index files, by one membership every match must have, or names none for the entity-id
+//! index of every entity; the planner pushes the rest of the predicate into an index whose
+//! KeySpec the tree's matches, exactly or as a prefix, with no residual; the Selection has no
+//! limit; the tree files no entity twice within the range; and the tree leaves out no entity
+//! the range names. An order alone never matters, because ordering does not change the set.
+//! Any other Selection is refused with its reason, and a temporary digest over its result
+//! serves it instead.
+
+use std::ops::Bound;
+
+use ankql::ast::{Predicate, Resolved, Selection};
+use ankql::selection::map_references;
+use ankurah_core::indexing::{Cover, IndexKeyPart, KeyRange, KeySpec, RangeError};
+use ankurah_core::storage::tree::HashedIndex;
+use ankurah_core::value::Value;
+use ankurah_proto::{ModelId, PropertyId};
+
+use crate::materialization_plan::MaterializationPlan;
+use crate::{ColumnPath, Endpoint, EngineColumns, KeyBoundComponent, KeyBounds, KeyDatum, Plan, Planner, PlannerConfig};
+
+/// A tree a member keeps, as the reuse decision needs to know it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RegisteredTree {
+    pub index: HashedIndex,
+    /// The key parts, by position, under which one entity can be filed with several values,
+    /// such as a group part that files an entity once per group it belongs to. Every other
+    /// part holds one value per entity.
+    pub multi_valued_parts: Vec<usize>,
+}
+
+/// Why no tree a member keeps serves a Selection.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NotReusable {
+    /// A limit cuts the result at an edge that moves with the data.
+    Limit(u64),
+    /// The planner evaluates this part of the predicate on fetched rows, so the result is a
+    /// subset of the range it scans, chosen by the data.
+    Residual(Predicate<EngineColumns>),
+    /// The predicate can never match, so there is nothing to compare.
+    Unsatisfiable,
+    /// The planner pushes the whole predicate into an index with this KeySpec, whose keys are
+    /// canonical property ids, and no registered tree of the component (of every entity when
+    /// `None`) matches it.
+    NoMatchingTree { component: Option<ModelId>, key_spec: KeySpec<String> },
+    /// The tree can file one entity under several values of this key part within the range.
+    FilesEntityTwice { index: HashedIndex, part: usize },
+    /// The tree leaves out entities that lack this key part, which the range leaves open.
+    OmitsEntities { index: HashedIndex, part: usize },
+    /// The range has no exact cover in the tree.
+    Range { index: HashedIndex, error: RangeError },
+    /// The planner's bounds take a shape this decision does not read: a bound after the first
+    /// key part that is not fixed to one value, or an infinite endpoint. The planner builds
+    /// neither today.
+    UnreadableBounds(KeyBounds),
+}
+
+/// The cover of `selection` over the first of `trees` that serves it, or the reason none does.
+pub fn cover_selection(selection: &Selection<Resolved>, trees: &[RegisteredTree]) -> Result<Cover, NotReusable> {
+    if let Some(limit) = selection.limit {
+        return Err(NotReusable::Limit(limit));
+    }
+    // A membership every match must have names the component whose trees may serve the rest
+    // of the predicate; any other membership condition stays in it, as a residual.
+    let (component, predicate) = match MaterializationPlan::new(selection).indexed_materialization() {
+        Some((component, rest)) => (Some(component), rest.predicate),
+        None => (None, selection.predicate.clone()),
+    };
+    let unordered = Selection { predicate, order_by: None, limit: None };
+    let lowered =
+        map_references(&unordered, &|path| ColumnPath::new(path.property_id().to_string(), path.subpath.clone()), &|model| *model);
+    let plans = Planner::new(PlannerConfig::full_support()).plan(&lowered, &PropertyId::Id.to_string());
+    // A plan that pushes the predicate down whole says more about why it failed than a residual.
+    let (mut specific, mut residual) = (None, None);
+    for plan in plans {
+        match serve(plan, component, trees) {
+            Ok(cover) => return Ok(cover),
+            Err(refusal @ NotReusable::Residual(_)) => residual = residual.or(Some(refusal)),
+            Err(refusal) => specific = specific.or(Some(refusal)),
+        }
+    }
+    Err(specific.or(residual).unwrap_or(NotReusable::Residual(lowered.predicate)))
+}
+
+/// The cover of one plan over the first tree of `component` that matches and serves it.
+fn serve(plan: Plan, component: Option<ModelId>, trees: &[RegisteredTree]) -> Result<Cover, NotReusable> {
+    let (key_spec, bounds) = match plan {
+        Plan::EmptyScan => return Err(NotReusable::Unsatisfiable),
+        // The residual of a table scan keeps every conjunct, comparisons of the entity id
+        // included, so an empty one means the predicate is always true: every entity of the
+        // component, which an entity-id index holds whole.
+        Plan::TableScan { remaining_predicate: Predicate::True, .. } => (KeySpec::new(Vec::new()), KeyBounds::empty()),
+        Plan::Index { index_spec, bounds, remaining_predicate: Predicate::True, .. } => (index_spec, bounds),
+        Plan::TableScan { remaining_predicate, .. } | Plan::Index { remaining_predicate, .. } => {
+            return Err(NotReusable::Residual(remaining_predicate));
+        }
+    };
+    let mut refusal = None;
+    for tree in trees.iter().filter(|tree| tree.matches(component, &key_spec)) {
+        match tree.cover(&bounds) {
+            Ok(cover) => return Ok(cover),
+            Err(error) => refusal = refusal.or(Some(error)),
+        }
+    }
+    Err(refusal.unwrap_or(NotReusable::NoMatchingTree { component, key_spec }))
+}
+
+impl RegisteredTree {
+    /// Whether this tree files the members of `component` (every entity when `None`) under a
+    /// key the planner's `key_spec` matches, exactly or as a prefix.
+    fn matches(&self, component: Option<ModelId>, key_spec: &KeySpec<String>) -> bool {
+        let files = match &self.index {
+            HashedIndex::EntityId => None,
+            HashedIndex::Component { component, .. } => Some(*component),
+        };
+        files == component && key_spec.matches(&engine_key_spec(key_parts(&self.index))).is_some()
+    }
+
+    /// The cover of the planner's `bounds` on this tree's leading key parts, unless the tree
+    /// does not hold exactly the entities they name.
+    fn cover(&self, bounds: &KeyBounds) -> Result<Cover, NotReusable> {
+        let range = key_range(bounds).ok_or_else(|| NotReusable::UnreadableBounds(bounds.clone()))?;
+        let fixed = range.prefix.len();
+        if let Some(&part) = self.multi_valued_parts.iter().find(|&&part| part >= fixed) {
+            return Err(NotReusable::FilesEntityTwice { index: self.index.clone(), part });
+        }
+        let bounded = !matches!((&range.lower, &range.upper), (Bound::Unbounded, Bound::Unbounded));
+        // The entity id is the one key part every entity has; an index files no entity that
+        // lacks one of the others.
+        let mut open_parts = key_parts(&self.index).iter().enumerate().skip(fixed + usize::from(bounded));
+        if let Some((part, _)) = open_parts.find(|(_, part)| part.key != PropertyId::Id) {
+            return Err(NotReusable::OmitsEntities { index: self.index.clone(), part });
+        }
+        let cover = Cover::new(self.index.clone(), range).map_err(|error| NotReusable::Range { index: self.index.clone(), error })?;
+        // An empty range is a predicate that can never match, which the planner does not always detect.
+        if cover.blocks().is_empty() {
+            return Err(NotReusable::Unsatisfiable);
+        }
+        Ok(cover)
+    }
+}
+
+/// The key parts under which `index` files an entity, before its entity id.
+fn key_parts(index: &HashedIndex) -> &[IndexKeyPart<PropertyId>] {
+    match index {
+        HashedIndex::EntityId => &[],
+        HashedIndex::Component { key_spec, .. } => &key_spec.keyparts,
+    }
+}
+
+/// The key range of the planner's bounds: the key parts fixed to one value, then at most one
+/// part bounded on either side. `None` for any other shape.
+fn key_range(bounds: &KeyBounds) -> Option<KeyRange> {
+    let prefix: Vec<Value> = bounds.keyparts.iter().map_while(fixed_value).cloned().collect();
+    match &bounds.keyparts[prefix.len()..] {
+        [] => Some(KeyRange::prefix(prefix)),
+        [bounded] => Some(KeyRange { prefix, lower: bound(&bounded.low, true)?, upper: bound(&bounded.high, false)? }),
+        _ => None,
+    }
+}
+
+/// The one value a component of the planner's bounds fixes its key part to, if it fixes one.
+fn fixed_value(component: &KeyBoundComponent) -> Option<&Value> {
+    match (&component.low, &component.high) {
+        (
+            Endpoint::Value { datum: KeyDatum::Val(low), inclusive: true },
+            Endpoint::Value { datum: KeyDatum::Val(high), inclusive: true },
+        ) if low == high => Some(low),
+        _ => None,
+    }
+}
+
+/// One side of the bounded key part, or `None` for an endpoint the planner does not build on
+/// that side.
+fn bound(endpoint: &Endpoint, is_lower: bool) -> Option<Bound<Value>> {
+    match endpoint {
+        Endpoint::Value { datum: KeyDatum::Val(value), inclusive: true } => Some(Bound::Included(value.clone())),
+        Endpoint::Value { datum: KeyDatum::Val(value), inclusive: false } => Some(Bound::Excluded(value.clone())),
+        Endpoint::UnboundedLow(_) if is_lower => Some(Bound::Unbounded),
+        Endpoint::UnboundedHigh(_) if !is_lower => Some(Bound::Unbounded),
+        _ => None,
+    }
+}
+
+/// A tree's key parts as the planner names columns here: each property by its canonical id.
+fn engine_key_spec(parts: &[IndexKeyPart<PropertyId>]) -> KeySpec<String> {
+    let parts = parts.iter().map(|part| IndexKeyPart {
+        key: part.key.to_string(),
+        sub_path: part.sub_path.clone(),
+        direction: part.direction,
+        value_type: part.value_type,
+        nulls: part.nulls,
+        collation: part.collation.clone(),
+    });
+    KeySpec::new(parts.collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use ankql::ast::Parsed;
+    use ankurah_core::indexing::{Block, IndexDirection};
+    use ankurah_core::schema::resolver::{ModelResolutionError, ModelResolver, ResolvedProperty, resolve_selection};
+    use ankurah_core::value::ValueType;
+    use ankurah_proto::EntityId;
+
+    use super::*;
+
+    const PROPERTIES: [(&str, ValueType); 6] = [
+        ("score", ValueType::I64),
+        ("rank", ValueType::I64),
+        ("name", ValueType::String),
+        ("team", ValueType::EntityId),
+        ("owner", ValueType::EntityId),
+        ("done", ValueType::Bool),
+    ];
+
+    fn property(name: &str) -> PropertyId {
+        let mut bytes = [0u8; 32];
+        bytes[..name.len()].copy_from_slice(name.as_bytes());
+        PropertyId::EntityId(EntityId::from_bytes(bytes))
+    }
+
+    /// The component the Selections are written for.
+    fn albums() -> ModelId { ModelId::EntityId(EntityId::from_bytes([7; 32])) }
+
+    fn other_component() -> ModelId { ModelId::EntityId(EntityId::from_bytes([8; 32])) }
+
+    struct Properties;
+
+    impl ModelResolver for Properties {
+        fn resolve_property(&self, _model: &ModelId, name: &str) -> Result<Option<ResolvedProperty>, ModelResolutionError> {
+            Ok(PROPERTIES
+                .iter()
+                .find(|(known, _)| *known == name)
+                .map(|&(name, value_type)| ResolvedProperty { id: property(name), value_type }))
+        }
+    }
+
+    /// Parse and resolve a Selection for the albums component, as a query does: its literals
+    /// take their properties' types, and every match must be a member of the component.
+    fn selection(text: &str) -> Selection<Resolved> {
+        let parsed: Selection<Parsed> = ankql::parser::parse_selection(text).unwrap();
+        resolve_selection(&albums(), &Properties, parsed).unwrap().and_member_of(albums())
+    }
+
+    fn everything() -> Selection<Resolved> { Selection { predicate: Predicate::True, order_by: None, limit: None } }
+
+    fn part(name: &str, value_type: ValueType, direction: IndexDirection) -> IndexKeyPart<PropertyId> {
+        let key = if name == "id" { PropertyId::Id } else { property(name) };
+        match direction {
+            IndexDirection::Asc => IndexKeyPart::asc(key, value_type),
+            IndexDirection::Desc => IndexKeyPart::desc(key, value_type),
+        }
+    }
+
+    /// A tree over an index of the albums component.
+    fn tree(parts: Vec<IndexKeyPart<PropertyId>>) -> RegisteredTree {
+        RegisteredTree {
+            index: HashedIndex::Component { component: albums(), key_spec: KeySpec::new(parts) },
+            multi_valued_parts: Vec::new(),
+        }
+    }
+
+    fn entity_id_tree() -> RegisteredTree { RegisteredTree { index: HashedIndex::EntityId, multi_valued_parts: Vec::new() } }
+
+    fn scores(direction: IndexDirection) -> RegisteredTree { tree(vec![part("score", ValueType::I64, direction)]) }
+
+    /// Teams, then the entity id: every entity has the last part.
+    fn teams() -> RegisteredTree {
+        tree(vec![part("team", ValueType::EntityId, IndexDirection::Asc), part("id", ValueType::EntityId, IndexDirection::Asc)])
+    }
+
+    /// Teams, then owners, then the entity id.
+    fn teams_and_owners() -> RegisteredTree {
+        tree(vec![
+            part("team", ValueType::EntityId, IndexDirection::Asc),
+            part("owner", ValueType::EntityId, IndexDirection::Asc),
+            part("id", ValueType::EntityId, IndexDirection::Asc),
+        ])
+    }
+
+    fn entity(byte: u8) -> EntityId { EntityId::from_bytes([byte; 32]) }
+
+    fn expected(tree: &RegisteredTree, prefix: Vec<Value>, lower: Bound<Value>, upper: Bound<Value>) -> Cover {
+        Cover::new(tree.index.clone(), KeyRange { prefix, lower, upper }).unwrap()
+    }
+
+    #[test]
+    fn the_full_replica_reuses_the_root_of_the_entity_id_tree() {
+        let members = tree(Vec::new());
+        assert_eq!(cover_selection(&everything(), &[members.clone(), entity_id_tree()]), Ok(Cover::root()));
+        // A tree of one component never holds every entity.
+        assert_eq!(
+            cover_selection(&everything(), &[members]),
+            Err(NotReusable::NoMatchingTree { component: None, key_spec: KeySpec::new(Vec::new()) })
+        );
+    }
+
+    #[test]
+    fn a_bare_membership_reuses_the_root_of_the_component_entity_id_tree() {
+        let members = tree(Vec::new());
+        let every_album = everything().and_member_of(albums());
+        let cover = cover_selection(&every_album, &[entity_id_tree(), scores(IndexDirection::Asc), members.clone()]).unwrap();
+        assert_eq!(cover, expected(&members, Vec::new(), Bound::Unbounded, Bound::Unbounded));
+        assert_eq!(cover.blocks(), [Block::root()]);
+        // The full replica's tree holds every entity, not only the component's members.
+        assert_eq!(
+            cover_selection(&every_album, &[entity_id_tree()]),
+            Err(NotReusable::NoMatchingTree { component: Some(albums()), key_spec: KeySpec::new(Vec::new()) })
+        );
+    }
+
+    #[test]
+    fn a_range_on_an_integer_reuses_its_tree_in_either_direction() {
+        for tree in [scores(IndexDirection::Asc), scores(IndexDirection::Desc)] {
+            for (text, lower, upper) in [
+                ("score >= 10 AND score < 20", Bound::Included(10), Bound::Excluded(20)),
+                ("score > 10 AND score <= 20", Bound::Excluded(10), Bound::Included(20)),
+                ("score > 10", Bound::Excluded(10), Bound::Unbounded),
+                ("score <= 20", Bound::Unbounded, Bound::Included(20)),
+            ] {
+                let cover = cover_selection(&selection(text), std::slice::from_ref(&tree)).unwrap();
+                assert_eq!(cover, expected(&tree, Vec::new(), lower.map(Value::I64), upper.map(Value::I64)), "{text}");
+            }
+            let cover = cover_selection(&selection("score = 15"), std::slice::from_ref(&tree)).unwrap();
+            assert_eq!(cover, expected(&tree, vec![Value::I64(15)], Bound::Unbounded, Bound::Unbounded));
+            assert_eq!(cover.blocks().len(), 1, "an equality on the whole key is one block");
+        }
+    }
+
+    #[test]
+    fn a_tree_of_another_component_does_not_serve() {
+        let elsewhere = RegisteredTree {
+            index: HashedIndex::Component {
+                component: other_component(),
+                key_spec: KeySpec::new(vec![part("score", ValueType::I64, IndexDirection::Asc)]),
+            },
+            multi_valued_parts: Vec::new(),
+        };
+        let refusal = cover_selection(&selection("score > 10"), &[elsewhere, entity_id_tree()]);
+        assert!(
+            matches!(refusal, Err(NotReusable::NoMatchingTree { component: Some(component), .. }) if component == albums()),
+            "{refusal:?}"
+        );
+    }
+
+    #[test]
+    fn a_prefix_of_a_multi_part_tree_is_one_block() {
+        let (team, owner) = (entity(0x10), entity(0x20));
+        let tree = teams_and_owners();
+        let both = selection(&format!("team = '{}' AND owner = '{}'", team.to_base64(), owner.to_base64()));
+        let cover = cover_selection(&both, std::slice::from_ref(&tree)).unwrap();
+        let key = [team.to_bytes(), owner.to_bytes()].concat();
+        assert_eq!(cover.range(), &KeyRange::prefix(vec![Value::EntityId(team), Value::EntityId(owner)]));
+        assert_eq!(cover.blocks(), [Block::new(&key, 512)]);
+        let one = selection(&format!("team = '{}'", team.to_base64()));
+        assert_eq!(cover_selection(&one, &[teams()]).unwrap().blocks(), [Block::new(&team.to_bytes(), 256)]);
+    }
+
+    #[test]
+    fn an_order_never_prevents_reuse_and_a_limit_always_does() {
+        let tree = scores(IndexDirection::Asc);
+        let unordered = cover_selection(&selection("score >= 10"), std::slice::from_ref(&tree)).unwrap();
+        for text in ["score >= 10 ORDER BY rank DESC", "score >= 10 ORDER BY score"] {
+            assert_eq!(cover_selection(&selection(text), std::slice::from_ref(&tree)), Ok(unordered.clone()), "{text}");
+        }
+        for text in ["score >= 10 LIMIT 5", "score >= 10 ORDER BY score LIMIT 5"] {
+            assert_eq!(cover_selection(&selection(text), std::slice::from_ref(&tree)), Err(NotReusable::Limit(5)), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_residual_prevents_reuse() {
+        let trees = [scores(IndexDirection::Asc), tree(vec![part("rank", ValueType::I64, IndexDirection::Asc)]), tree(Vec::new())];
+        for text in ["score > 5 AND rank > 3", "score > 5 OR score < 2", "score != 5", "score IN (1, 2)"] {
+            let refusal = cover_selection(&selection(text), &trees);
+            assert!(matches!(refusal, Err(NotReusable::Residual(_))), "{text}: {refusal:?}");
+        }
+        // Only the one membership every match must have names the component; another stays.
+        let both_components = selection("score >= 10").and_member_of(other_component());
+        let refusal = cover_selection(&both_components, &trees);
+        assert!(matches!(refusal, Err(NotReusable::Residual(Predicate::MemberOf(_)))), "{refusal:?}");
+        let either = Selection {
+            predicate: Predicate::Or(Box::new(Predicate::MemberOf(albums())), Box::new(Predicate::MemberOf(other_component()))),
+            order_by: None,
+            limit: None,
+        };
+        assert!(matches!(cover_selection(&either, &[tree(Vec::new()), entity_id_tree()]), Err(NotReusable::Residual(_))));
+    }
+
+    #[test]
+    fn a_tree_must_match_the_index_the_planner_chooses() {
+        let refusal = cover_selection(&selection("rank = 3"), &[scores(IndexDirection::Asc), tree(Vec::new())]);
+        let key_spec = KeySpec::new(vec![IndexKeyPart::asc(property("rank").to_string(), ValueType::I64)]);
+        assert_eq!(refusal, Err(NotReusable::NoMatchingTree { component: Some(albums()), key_spec }));
+    }
+
+    #[test]
+    fn a_tree_that_leaves_out_entities_the_range_names_is_refused() {
+        // An entity of the team without a score is in the result but not in the tree.
+        let team = entity(0x10);
+        let tree = tree(vec![part("team", ValueType::EntityId, IndexDirection::Asc), part("score", ValueType::I64, IndexDirection::Asc)]);
+        let refusal = cover_selection(&selection(&format!("team = '{}'", team.to_base64())), std::slice::from_ref(&tree));
+        assert_eq!(refusal, Err(NotReusable::OmitsEntities { index: tree.index.clone(), part: 1 }));
+        // Bounding the score as well names only entities the tree files.
+        let both = selection(&format!("team = '{}' AND score > 3", team.to_base64()));
+        assert_eq!(
+            cover_selection(&both, std::slice::from_ref(&tree)),
+            Ok(expected(&tree, vec![Value::EntityId(team)], Bound::Excluded(Value::I64(3)), Bound::Unbounded))
+        );
+    }
+
+    #[test]
+    fn a_tree_that_can_file_an_entity_twice_within_the_range_is_refused() {
+        let team = entity(0x10);
+        let tree = RegisteredTree { multi_valued_parts: vec![0], ..teams() };
+        let across_teams = selection(&format!("team > '{}'", team.to_base64()));
+        assert_eq!(
+            cover_selection(&across_teams, std::slice::from_ref(&tree)),
+            Err(NotReusable::FilesEntityTwice { index: tree.index.clone(), part: 0 })
+        );
+        // Within one team the tree files each entity once.
+        let one_team = selection(&format!("team = '{}'", team.to_base64()));
+        assert_eq!(cover_selection(&one_team, std::slice::from_ref(&tree)).unwrap().blocks(), [Block::new(&team.to_bytes(), 256)]);
+    }
+
+    #[test]
+    fn the_first_tree_that_serves_the_selection_is_used() {
+        let team = entity(0x10);
+        let open_score =
+            tree(vec![part("team", ValueType::EntityId, IndexDirection::Asc), part("score", ValueType::I64, IndexDirection::Asc)]);
+        let one_team = selection(&format!("team = '{}'", team.to_base64()));
+        let cover = cover_selection(&one_team, &[open_score, teams_and_owners(), teams()]).unwrap();
+        assert_eq!(cover.index(), &teams().index);
+    }
+
+    #[test]
+    fn a_range_on_an_ascending_string_is_refused_until_its_encoding_is_prefix_free() {
+        let ascending = tree(vec![part("name", ValueType::String, IndexDirection::Asc)]);
+        let refusal = cover_selection(&selection("name = 'jazz'"), std::slice::from_ref(&ascending));
+        let error = RangeError::AmbiguousEncoding { part: 0, value_type: ValueType::String, direction: IndexDirection::Asc };
+        assert_eq!(refusal, Err(NotReusable::Range { index: ascending.index.clone(), error }));
+        let descending = tree(vec![part("name", ValueType::String, IndexDirection::Desc)]);
+        let cover = cover_selection(&selection("name >= 'blues' AND name < 'jazz'"), std::slice::from_ref(&descending)).unwrap();
+        let text = |text: &str| Value::String(text.to_owned());
+        assert_eq!(cover, expected(&descending, Vec::new(), Bound::Included(text("blues")), Bound::Excluded(text("jazz"))));
+    }
+
+    #[test]
+    fn a_predicate_that_can_never_match_is_refused() {
+        for text in ["score > 5 AND score < 3", "score >= 5 AND score < 5"] {
+            assert_eq!(cover_selection(&selection(text), &[scores(IndexDirection::Asc)]), Err(NotReusable::Unsatisfiable), "{text}");
+        }
+    }
+}
