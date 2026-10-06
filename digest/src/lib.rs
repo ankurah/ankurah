@@ -60,10 +60,13 @@
 //! and lays them out differently on 32-bit and 64-bit targets, so storing them
 //! would mean unsafe copies of a private layout that any release of the library
 //! may change, and a damaged row could be caught only by an audit. The
-//! canonical encoding is portable across targets and library versions, is
-//! refused on read when damaged, since decompression accepts only canonical
-//! encodings of group elements, and keeps a digest row at 41 bytes rather than
-//! 169.
+//! canonical encoding is portable across targets and library versions, keeps a
+//! digest row at 41 bytes rather than 169, and rejects invalid point encodings
+//! on read, since decompression accepts only canonical encodings of group
+//! elements. A damaged row whose bytes are still valid, such as one with a
+//! changed count byte or with another valid point in place of the right one,
+//! decodes all the same, so the audit, which recomputes a tree from its leaves,
+//! remains what catches it.
 //!
 //! The cost falls on the refresher, off the commit path: one decompress and
 //! one compress per node a folded batch touches, and the same pair for a
