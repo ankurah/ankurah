@@ -37,6 +37,8 @@ pub mod tree;
 
 #[cfg(any(test, feature = "storage-conformance"))]
 pub mod conformance;
+#[cfg(test)]
+pub(crate) mod memory;
 
 /// One atomic storage transaction. Engines may execute writes as they arrive or buffer them until commit.
 /// Dropping the handle without committing must leave its writes uncommitted.
