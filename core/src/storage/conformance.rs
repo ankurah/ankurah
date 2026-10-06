@@ -47,6 +47,10 @@ use crate::{
 /// the operation stuck.
 const PROGRESS: Duration = Duration::from_secs(10);
 
+/// How long a case lets an operation run before taking it to be waiting for
+/// another, as an engine that locks may make it.
+const BLOCKED: Duration = Duration::from_millis(100);
+
 /// Expand to one `#[tokio::test]` per conformance case, each running against
 /// a fresh engine that `$make` builds; `$make` may `.await`. The calling crate
 /// needs tokio with its `macros` and `rt` features.
@@ -71,6 +75,7 @@ macro_rules! tree_storage_conformance {
             concurrent_batches_commit_one
             children_and_leaf_ranges_at_ragged_depths
             build_state_and_generation
+            removal_is_whole_when_cancelled
             snapshot_and_replay_give_the_current_index
             prune_horizon_rises_with_every_lost_removal
         );
@@ -614,6 +619,76 @@ pub async fn build_state_and_generation<E: TreeStorage + 'static>(engine: Arc<E>
     assert_ne!(again.id, registration.id, "a tree id is not reused within an incarnation");
     let stable = engine.stable_position().await.unwrap();
     assert_eq!(cell_of(&*engine, again.id).await, TreeCell { generation: 0, status: BuildStatus::Building, folded: stable });
+}
+
+/// Unregistering a tree or resetting the store is whole even when cancelled
+/// while it waits for an open batch: afterwards every handle agrees whether
+/// the tree exists, and once it is gone every handle fails.
+pub async fn removal_is_whole_when_cancelled<E: TreeStorage + 'static>(engine: Arc<E>) {
+    let position = create(&*engine, vec![state(entity(1), 1, &[], &[])]).await;
+    let tree = engine.register_tree(title_index()).await.unwrap().id;
+    let reader = engine.reader(tree).await.unwrap();
+    let mut batch = engine.batch(tree).await.unwrap();
+    let cell = batch.cell().await.unwrap();
+    batch.put_row(folded_row(b"k", entity(1), position)).await.unwrap();
+    // An engine whose removal waits for the open batch is cancelled there.
+    let finished = match tokio::time::timeout(BLOCKED, engine.unregister_tree(tree)).await {
+        Ok(result) => {
+            result.unwrap();
+            true
+        }
+        Err(_cancelled) => false,
+    };
+    let committed = batch.commit(&cell).await;
+    if engine.trees().await.unwrap().iter().any(|registration| registration.id == tree) {
+        assert!(!finished, "a finished removal leaves the tree listed");
+        assert!(matches!(committed, Ok(TreeBatchOutcome::Committed(_))), "the tree outlived the cancelled removal");
+        assert!(reader.row(b"k", entity(1)).await.unwrap().is_some(), "a reader from before still reads the tree");
+        engine.unregister_tree(tree).await.unwrap();
+    } else {
+        assert!(matches!(committed, Err(TreeStorageError::UnknownTree(_))), "a batch commits nothing to a removed tree");
+    }
+    assert_gone(&*engine, tree, &reader).await;
+
+    let tree = engine.register_tree(title_index()).await.unwrap().id;
+    let entity_ids = entity_id_tree(&*engine).await;
+    let (reader, entity_id_reader) = (engine.reader(tree).await.unwrap(), engine.reader(entity_ids).await.unwrap());
+    let mut batch = engine.batch(tree).await.unwrap();
+    batch.put_row(folded_row(b"k", entity(1), position)).await.unwrap();
+    let finished = match tokio::time::timeout(BLOCKED, engine.delete_all()).await {
+        Ok(result) => {
+            result.unwrap();
+            true
+        }
+        Err(_cancelled) => false,
+    };
+    drop(batch);
+    if engine.stable_position().await.unwrap().incarnation() == position.incarnation() {
+        assert!(!finished, "a finished reset mints a new incarnation");
+        assert_eq!(reader.row(b"k", entity(1)).await.unwrap(), None, "the store outlived the cancelled reset, without the dropped batch");
+        engine.delete_all().await.unwrap();
+    }
+    assert_gone(&*engine, tree, &reader).await;
+    assert_gone(&*engine, entity_ids, &entity_id_reader).await;
+    let trees = engine.trees().await.unwrap();
+    assert_eq!(trees.len(), 1, "only a fresh entity-id tree remains");
+    assert!(trees[0].id != entity_ids && trees[0].index == HashedIndex::EntityId);
+}
+
+/// Every handle to a removed tree fails: each read through a reader taken
+/// before the removal, and a new reader or batch.
+async fn assert_gone<E: TreeStorage, R: TreeRead>(engine: &E, tree: TreeId, reader: &R) {
+    let gone = |result: Result<(), TreeStorageError>| matches!(result, Err(TreeStorageError::UnknownTree(id)) if id == tree);
+    let all = AddressRange::all();
+    assert!(gone(reader.cell().await.map(drop)), "a reader of a removed tree reads no cell");
+    assert!(gone(reader.row(b"k", entity(1)).await.map(drop)), "a reader of a removed tree reads no row");
+    assert!(gone(reader.entity_rows(entity(1)).await.map(drop)), "a reader of a removed tree reads no lookup");
+    assert!(gone(reader.rows(&all, 10).await.map(drop)), "a reader of a removed tree scans no rows");
+    assert!(gone(reader.tombstones(&all, 10).await.map(drop)), "a reader of a removed tree scans no tombstones");
+    assert!(gone(reader.node(&NodePrefix::root()).await.map(drop)), "a reader of a removed tree reads no node");
+    assert!(gone(reader.children(&NodePrefix::root()).await.map(drop)), "a reader of a removed tree reads no children");
+    assert!(gone(engine.reader(tree).await.map(drop)), "a removed tree has no new reader");
+    assert!(gone(engine.batch(tree).await.map(drop)), "a removed tree has no new batch");
 }
 
 /// A snapshot shows the tree's index as of its boundary while commits go on,

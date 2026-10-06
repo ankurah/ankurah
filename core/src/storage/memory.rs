@@ -13,7 +13,7 @@ use ankql::ast::{Predicate, Resolved, Selection};
 use ankurah_proto::{Attested, Clock, EntityId, EntityState, Event, EventId, ModelId};
 use async_trait::async_trait;
 use futures::stream;
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, OwnedMutexGuard};
 
 use super::{
     log::{CommitLog, LogError, LogIncarnation, LogPage, LogPosition, LogRow},
@@ -30,6 +30,8 @@ use crate::{
 };
 
 pub(crate) struct MemoryStorageEngine {
+    /// Taken only briefly and never across an await. A task holding a tree's
+    /// lock may take it, never the other way round.
     store: Mutex<Store>,
 }
 
@@ -54,6 +56,9 @@ struct Log {
     rows: BTreeMap<(u64, EntityId), LogRow>,
 }
 
+/// A tree in the registry. Its handles share `contents` and stay usable only
+/// while the registry still holds that same `contents` under the tree's id,
+/// so removing the entry is all it takes to retire every handle.
 struct Registered {
     index: HashedIndex,
     contents: Arc<AsyncMutex<TreeContents>>,
@@ -62,8 +67,6 @@ struct Registered {
 /// One tree's cell and rows. A batch holds the lock from start to finish, so
 /// its reads form a snapshot and it can write in place.
 struct TreeContents {
-    /// Set when the tree is unregistered or the store reset; handles then fail.
-    removed: bool,
     cell: TreeCell,
     tables: Tables,
 }
@@ -89,6 +92,14 @@ impl MemoryStorageEngine {
         let store = self.store.lock().unwrap();
         store.trees.get(&tree).map(|registered| registered.contents.clone()).ok_or(TreeStorageError::UnknownTree(tree))
     }
+
+    /// Fail unless `contents` is still the registered tree `tree`.
+    fn check_registered(&self, tree: TreeId, contents: &Arc<AsyncMutex<TreeContents>>) -> Result<(), TreeStorageError> {
+        match self.store.lock().unwrap().holds(tree, contents) {
+            true => Ok(()),
+            false => Err(TreeStorageError::UnknownTree(tree)),
+        }
+    }
 }
 
 impl Store {
@@ -108,16 +119,20 @@ impl Store {
     }
 
     /// Empty the store under a new log incarnation, leaving only a fresh
-    /// entity-id tree, and return the removed trees' contents for marking.
-    /// Tree ids keep counting, so a stale handle never reaches a new tree.
-    fn reset(&mut self) -> Vec<Arc<AsyncMutex<TreeContents>>> {
-        let removed = mem::take(&mut self.trees).into_values().map(|registered| registered.contents).collect();
+    /// entity-id tree. Tree ids keep counting, so a stale handle never
+    /// reaches a new tree.
+    fn reset(&mut self) {
+        self.trees.clear();
         self.states.clear();
         self.events.clear();
         self.log = Log::new();
         self.prune_horizon = 0;
         self.add_tree(HashedIndex::EntityId, BuildStatus::Ready);
-        removed
+    }
+
+    /// Whether `contents` is the registered tree `tree`.
+    fn holds(&self, tree: TreeId, contents: &Arc<AsyncMutex<TreeContents>>) -> bool {
+        self.trees.get(&tree).is_some_and(|registered| Arc::ptr_eq(&registered.contents, contents))
     }
 
     fn stable(&self) -> LogPosition { LogPosition::new(self.log.incarnation, self.log.next) }
@@ -129,7 +144,7 @@ impl Store {
         self.next_tree += 1;
         let cell = TreeCell { generation: 0, status, folded: self.stable() };
         self.prune_horizon = self.prune_horizon.max(self.log.next);
-        let contents = Arc::new(AsyncMutex::new(TreeContents { removed: false, cell, tables: Tables::default() }));
+        let contents = Arc::new(AsyncMutex::new(TreeContents { cell, tables: Tables::default() }));
         self.trees.insert(id, Registered { index: index.clone(), contents });
         TreeRegistration { id, index }
     }
@@ -216,20 +231,6 @@ impl Log {
             self.floor = floor;
         }
         Ok(())
-    }
-}
-
-impl TreeContents {
-    fn live(&self, tree: TreeId) -> Result<&Tables, TreeStorageError> {
-        match self.removed {
-            false => Ok(&self.tables),
-            true => Err(TreeStorageError::UnknownTree(tree)),
-        }
-    }
-
-    fn remove(&mut self) {
-        self.removed = true;
-        self.tables = Tables::default();
     }
 }
 
@@ -381,14 +382,11 @@ impl StorageEngine for MemoryStorageEngine {
     }
 
     async fn delete_all(&self) -> Result<bool, MutationError> {
-        let (any_deleted, removed) = {
-            let mut store = self.store.lock().unwrap();
-            let any_deleted = !store.states.is_empty() || !store.events.is_empty() || !store.log.rows.is_empty();
-            (any_deleted, store.reset())
-        };
-        for contents in removed {
-            contents.lock().await.remove();
-        }
+        // Emptying the registry retires every tree's handles at once, and
+        // nothing here waits, so a cancelled reset happens whole or not at all.
+        let mut store = self.store.lock().unwrap();
+        let any_deleted = !store.states.is_empty() || !store.events.is_empty() || !store.log.rows.is_empty();
+        store.reset();
         Ok(any_deleted)
     }
 
@@ -424,7 +422,7 @@ impl CommitLog for MemoryStorageEngine {
 
 #[async_trait]
 impl TreeStorage for MemoryStorageEngine {
-    type Reader<'a> = MemoryTreeReader;
+    type Reader<'a> = MemoryTreeReader<'a>;
     type Batch<'a> = MemoryTreeBatch<'a>;
     type Snapshot<'a> = stream::Iter<std::vec::IntoIter<Result<SnapshotEntity, TreeStorageError>>>;
 
@@ -437,16 +435,17 @@ impl TreeStorage for MemoryStorageEngine {
     }
 
     async fn unregister_tree(&self, tree: TreeId) -> Result<(), TreeStorageError> {
-        let contents = {
-            let mut store = self.store.lock().unwrap();
-            match store.trees.get(&tree) {
-                None => return Err(TreeStorageError::UnknownTree(tree)),
-                Some(registered) if registered.index == HashedIndex::EntityId => return Err(TreeStorageError::PermanentTree),
-                Some(_) => store.trees.remove(&tree).expect("the tree is registered").contents,
+        // Leaving the registry retires every handle at once, and nothing here
+        // waits, so a cancelled call has either removed the tree or not.
+        let mut store = self.store.lock().unwrap();
+        match store.trees.get(&tree) {
+            None => Err(TreeStorageError::UnknownTree(tree)),
+            Some(registered) if registered.index == HashedIndex::EntityId => Err(TreeStorageError::PermanentTree),
+            Some(_) => {
+                store.trees.remove(&tree);
+                Ok(())
             }
-        };
-        contents.lock().await.remove();
-        Ok(())
+        }
     }
 
     async fn trees(&self) -> Result<Vec<TreeRegistration>, TreeStorageError> {
@@ -459,13 +458,14 @@ impl TreeStorage for MemoryStorageEngine {
         Ok(LogPosition::new(store.log.incarnation, store.prune_horizon))
     }
 
-    async fn reader(&self, tree: TreeId) -> Result<MemoryTreeReader, TreeStorageError> {
-        Ok(MemoryTreeReader { tree, contents: self.contents(tree)? })
+    async fn reader(&self, tree: TreeId) -> Result<MemoryTreeReader<'_>, TreeStorageError> {
+        Ok(MemoryTreeReader { engine: self, tree, contents: self.contents(tree)? })
     }
 
     async fn batch(&self, tree: TreeId) -> Result<MemoryTreeBatch<'_>, TreeStorageError> {
         let contents = self.contents(tree)?.lock_owned().await;
-        contents.live(tree)?;
+        // The tree may have left the registry while this waited for its lock.
+        self.check_registered(tree, OwnedMutexGuard::mutex(&contents))?;
         let begun = contents.cell;
         Ok(MemoryTreeBatch { engine: self, tree, contents, begun, undo: Vec::new(), horizon: None, committed: false })
     }
@@ -489,41 +489,47 @@ impl TreeStorage for MemoryStorageEngine {
     }
 }
 
-pub(crate) struct MemoryTreeReader {
+pub(crate) struct MemoryTreeReader<'a> {
+    engine: &'a MemoryStorageEngine,
     tree: TreeId,
     contents: Arc<AsyncMutex<TreeContents>>,
 }
 
-#[async_trait]
-impl TreeRead for MemoryTreeReader {
-    async fn cell(&self) -> Result<TreeCell, TreeStorageError> {
+impl MemoryTreeReader<'_> {
+    /// The tree's contents for one read, while the tree is registered. The
+    /// check follows the lock, so a read that waited behind a batch still
+    /// learns whether the tree outlived the wait.
+    async fn live(&self) -> Result<AsyncMutexGuard<'_, TreeContents>, TreeStorageError> {
         let contents = self.contents.lock().await;
-        contents.live(self.tree)?;
-        Ok(contents.cell)
+        self.engine.check_registered(self.tree, &self.contents)?;
+        Ok(contents)
     }
+}
+
+#[async_trait]
+impl TreeRead for MemoryTreeReader<'_> {
+    async fn cell(&self) -> Result<TreeCell, TreeStorageError> { Ok(self.live().await?.cell) }
 
     async fn row(&self, key: &[u8], entity_id: EntityId) -> Result<Option<FoldedRow>, TreeStorageError> {
-        Ok(self.contents.lock().await.live(self.tree)?.row(key, entity_id))
+        Ok(self.live().await?.tables.row(key, entity_id))
     }
 
     async fn entity_rows(&self, entity_id: EntityId) -> Result<Vec<FoldedRow>, TreeStorageError> {
-        Ok(self.contents.lock().await.live(self.tree)?.entity_rows(entity_id))
+        Ok(self.live().await?.tables.entity_rows(entity_id))
     }
 
     async fn rows(&self, range: &AddressRange, limit: usize) -> Result<Vec<FoldedRow>, TreeStorageError> {
-        Ok(self.contents.lock().await.live(self.tree)?.rows(range, limit))
+        Ok(self.live().await?.tables.rows(range, limit))
     }
 
     async fn tombstones(&self, range: &AddressRange, limit: usize) -> Result<Vec<Tombstone>, TreeStorageError> {
-        Ok(self.contents.lock().await.live(self.tree)?.tombstones(range, limit))
+        Ok(self.live().await?.tables.tombstones(range, limit))
     }
 
-    async fn node(&self, prefix: &NodePrefix) -> Result<Option<NodeRow>, TreeStorageError> {
-        Ok(self.contents.lock().await.live(self.tree)?.node(prefix))
-    }
+    async fn node(&self, prefix: &NodePrefix) -> Result<Option<NodeRow>, TreeStorageError> { Ok(self.live().await?.tables.node(prefix)) }
 
     async fn children(&self, prefix: &NodePrefix) -> Result<Vec<(NodePrefix, NodeRow)>, TreeStorageError> {
-        Ok(self.contents.lock().await.live(self.tree)?.children(prefix))
+        Ok(self.live().await?.tables.children(prefix))
     }
 }
 
@@ -718,9 +724,7 @@ impl TreeBatch for MemoryTreeBatch<'_> {
         }
         {
             let mut store = self.engine.store.lock().unwrap();
-            let registered =
-                store.trees.get(&self.tree).is_some_and(|tree| Arc::ptr_eq(&tree.contents, OwnedMutexGuard::mutex(&self.contents)));
-            if !registered {
+            if !store.holds(self.tree, OwnedMutexGuard::mutex(&self.contents)) {
                 drop(store);
                 self.roll_back();
                 return Err(TreeStorageError::UnknownTree(self.tree));

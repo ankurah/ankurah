@@ -31,8 +31,9 @@
 //! stable position where it was registered: the engine serializes
 //! registration with commits, so every log row at or above that position
 //! carries the tree's keys. Every position a tree records belongs to the log
-//! incarnation of its cell; a reset removes every tree and leaves only a fresh
-//! entity-id tree.
+//! incarnation of its cell; a reset removes every tree, whole and retiring
+//! every handle as [`TreeStorage::unregister_tree`] removes one, and leaves
+//! only a fresh entity-id tree.
 //!
 //! A [`TreeBatch`] changes one tree atomically. Reads through it are
 //! consistent with each other and with the cell it is compared against, and
@@ -324,6 +325,13 @@ pub trait TreeStorage: CommitLog {
     async fn register_tree(&self, index: HashedIndex) -> Result<TreeRegistration, TreeStorageError>;
 
     /// Remove a tree with all its rows. The entity-id tree is permanent.
+    ///
+    /// Once the tree leaves the registry every handle to it fails: a reader's
+    /// next read, and the commit of a batch, which until then reads what it
+    /// began with. The removal is whole: cancelled, the call has either
+    /// removed the tree or left it registered with every handle working. It
+    /// may wait for an open batch on the tree, so a task ends its own batch
+    /// before it unregisters the tree.
     async fn unregister_tree(&self, tree: TreeId) -> Result<(), TreeStorageError>;
 
     /// Every registered tree, in id order.
