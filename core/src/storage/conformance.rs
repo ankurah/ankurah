@@ -13,6 +13,15 @@
 //! }
 //! ```
 //!
+//! An engine whose store outlives its process also implements [`Reopen`] and
+//! adds the cases that crash and reopen the store:
+//!
+//! ```ignore
+//! mod tree_storage {
+//!     ankurah_core::tree_storage_conformance!(MyEngine::open_temporary().await.unwrap(), reopen: MyReopen::temporary());
+//! }
+//! ```
+//!
 //! The cases assume nothing an engine may choose: positions may have gaps,
 //! batches may lock or detect conflicts optimistically, and tree ids may be
 //! any numbers.
@@ -27,6 +36,7 @@ use std::{
 
 use ankql::ast::PropertyId;
 use ankurah_proto::{Attested, AuthorId, Clock, EntityId, EntityState, Event, EventId, ModelId, OperationSet, State, StateBuffers};
+use async_trait::async_trait;
 use futures::StreamExt;
 
 use super::{
@@ -53,10 +63,20 @@ const PROGRESS: Duration = Duration::from_secs(10);
 const BLOCKED: Duration = Duration::from_millis(100);
 
 /// Expand to one `#[tokio::test]` per conformance case, each running against
-/// a fresh engine that `$make` builds; `$make` may `.await`. The calling crate
-/// needs tokio with its `macros` and `rt` features.
+/// a fresh engine that `$make` builds; `$make` may `.await`. Given `reopen:`,
+/// also one per case that crashes and reopens a store, each with a fresh
+/// [`Reopen`](crate::storage::conformance::Reopen) that `$reopen` builds. The
+/// calling crate needs tokio with its `macros` and `rt` features.
 #[macro_export]
 macro_rules! tree_storage_conformance {
+    ($make:expr, reopen: $reopen:expr) => {
+        $crate::tree_storage_conformance!($make);
+        $crate::tree_storage_conformance!(@reopen ($reopen)
+            reopen_keeps_what_was_durable
+            reopen_keeps_tree_batches_whole
+            reopen_after_a_reset_keeps_the_new_incarnation
+        );
+    };
     ($make:expr) => {
         $crate::tree_storage_conformance!(@cases ($make)
             fresh_store_keeps_an_entity_id_tree
@@ -99,6 +119,27 @@ macro_rules! tree_storage_conformance {
             async fn $case() { $crate::storage::conformance::$case(::std::sync::Arc::new($make)).await; }
         )*
     };
+    (@reopen ($reopen:expr) $($case:ident)*) => {
+        $(
+            #[tokio::test]
+            async fn $case() { $crate::storage::conformance::$case($reopen).await; }
+        )*
+    };
+}
+
+/// How a persistent engine's store is opened, and opened again after a crash,
+/// for the cases that check what a crash keeps. The in-memory engine keeps
+/// nothing past its process and implements none of this.
+#[async_trait]
+pub trait Reopen: Send + Sync {
+    type Engine: TreeStorage + 'static;
+
+    /// Open a new, empty store.
+    async fn open(&self) -> Arc<Self::Engine>;
+
+    /// Abandon `engine` as a crash would, closing nothing cleanly, and open
+    /// the same store again.
+    async fn crash_and_reopen(&self, engine: Arc<Self::Engine>) -> Arc<Self::Engine>;
 }
 
 /// A new store keeps a ready entity-id tree folded from the start of its log,
@@ -344,10 +385,18 @@ pub async fn durable_position_trails_the_stable_position<E: TreeStorage + 'stati
     let durable = durable_after(&*engine, durable).await;
     engine.discard_log_below(last).await.unwrap();
     durable_after(&*engine, durable).await;
+    durable_through(&*engine, last).await;
+}
 
+/// Wait until the durable position passes `position`, returning it.
+async fn durable_through<E: CommitLog>(engine: &E, position: LogPosition) -> LogPosition {
     let deadline = tokio::time::Instant::now() + PROGRESS;
-    while engine.durable_position().await.unwrap() <= last {
-        assert!(tokio::time::Instant::now() < deadline, "the durable position never passed the last commit");
+    loop {
+        let durable = engine.durable_position().await.unwrap();
+        if durable > position {
+            return durable;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "the durable position never passed {position:?}");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
@@ -1211,6 +1260,68 @@ pub async fn prune_horizon_rises_with_every_lost_removal<E: TreeStorage + 'stati
     batch.restart(restarted).await.unwrap();
     committed(batch.commit(&cell).await.unwrap());
     assert_eq!(engine.prune_horizon().await.unwrap(), restarted, "a rebuilt tree saw no removal before its start");
+}
+
+/// A crash keeps the log incarnation and everything below the durable
+/// position: its commits' states and log rows, and the trees registered
+/// before them.
+pub async fn reopen_keeps_what_was_durable<H: Reopen>(reopen: H) {
+    let engine = reopen.open().await;
+    let first = create(&*engine, vec![state(entity(1), 1, &[component()], &[(title(), text("a"))])]).await;
+    let tree = engine.register_tree(title_index()).await.unwrap();
+    let last = create(&*engine, vec![state(entity(2), 2, &[component()], &[(title(), text("b"))])]).await;
+    let durable = durable_through(&*engine, last).await;
+    let rows = read_all(&*engine, first).await;
+    let engine = reopen.crash_and_reopen(engine).await;
+
+    let stable = engine.stable_position().await.unwrap();
+    assert_eq!(stable.incarnation(), first.incarnation(), "a reopened store keeps its log incarnation");
+    assert!(stable >= durable && engine.durable_position().await.unwrap() >= durable, "what was durable stays settled and durable");
+    assert!(engine.trees().await.unwrap().contains(&tree), "a tree registered before a durable commit survives");
+    assert_eq!(read_all(&*engine, first).await.into_iter().filter(|row| row.position < durable).collect::<Vec<_>>(), rows);
+    for (id, n) in [(entity(1), 1), (entity(2), 2)] {
+        assert_eq!(engine.get_state(id).await.unwrap().payload.state.head, head(n), "a durable commit's state survives");
+    }
+}
+
+/// A crash keeps a tree's batches whole and in order: the reopened tree is as
+/// some prefix of its committed batches left it, prune horizon included.
+pub async fn reopen_keeps_tree_batches_whole<H: Reopen>(reopen: H) {
+    let engine = reopen.open().await;
+    let tree = entity_id_tree(&*engine).await;
+    let position = create(&*engine, vec![state(entity(1), 1, &[], &[])]).await;
+    let probes: Vec<EntityId> = (1..=9).map(entity).collect();
+    let mut states = vec![view(&*engine, tree, &probes).await];
+    let contest = Contest::set_up(&*engine, tree, position).await;
+    states.push(view(&*engine, tree, &probes).await);
+    let mut batch = engine.batch(tree).await.unwrap();
+    batch.prune_tombstones(contest.stable).await.unwrap();
+    contest.write(&mut batch, 2).await;
+    committed(batch.commit(&contest.cell).await.unwrap());
+    states.push(view(&*engine, tree, &probes).await);
+    let engine = reopen.crash_and_reopen(engine).await;
+
+    let reopened = view(&*engine, tree, &probes).await;
+    assert!(states.contains(&reopened), "a crash keeps each batch whole and in order, not {reopened:?}");
+}
+
+/// A reset's new incarnation survives a crash once a commit in it is durable,
+/// and nothing of the old store returns.
+pub async fn reopen_after_a_reset_keeps_the_new_incarnation<H: Reopen>(reopen: H) {
+    let engine = reopen.open().await;
+    let old = create(&*engine, vec![state(entity(1), 1, &[], &[])]).await;
+    engine.register_tree(title_index()).await.unwrap();
+    engine.delete_all().await.unwrap();
+    let new = create(&*engine, vec![state(entity(2), 2, &[], &[])]).await;
+    durable_through(&*engine, new).await;
+    let engine = reopen.crash_and_reopen(engine).await;
+
+    assert_eq!(engine.stable_position().await.unwrap().incarnation(), new.incarnation(), "the reset's incarnation survives");
+    assert!(matches!(engine.read_log(old, 10).await, Err(LogError::IncarnationMismatch { .. })));
+    assert!(matches!(engine.get_state(entity(1)).await, Err(RetrievalError::EntityNotFound(_))), "the old store does not return");
+    assert_eq!(engine.get_state(entity(2)).await.unwrap().payload.state.head, head(2));
+    let trees = engine.trees().await.unwrap();
+    assert_eq!(trees.iter().map(|tree| &tree.index).collect::<Vec<_>>(), [&HashedIndex::EntityId], "only the fresh entity-id tree");
 }
 
 /// Everything a reader sees of one tree, with the store's prune horizon.
