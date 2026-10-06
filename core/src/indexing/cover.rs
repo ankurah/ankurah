@@ -590,8 +590,52 @@ mod tests {
 
     fn integers() -> Vec<Value> { [i64::MIN, -2, -1, 0, 1, 2, 5, 6, 255, 256, i64::MAX].map(Value::I64).to_vec() }
 
+    /// NUL, whose descending byte is escaped, and the bytes beside it, shared prefixes, and
+    /// two-, three- and four-byte UTF-8 up to the last code point.
     fn descending_strings() -> Vec<Value> {
-        ["", "\0", "\0\0", "a", "a\0", "a\0b", "ab", "b", "\u{e9}"].map(|text| Value::String(text.to_owned())).to_vec()
+        [
+            "",
+            "\0",
+            "\0\0",
+            "\0\u{1}",
+            "\u{1}",
+            "\u{1}\0",
+            "a",
+            "a\0",
+            "a\0b",
+            "a\u{1}",
+            "ab",
+            "b",
+            "\u{7f}",
+            "\u{e9}",
+            "\u{20ac}",
+            "\u{ffff}",
+            "\u{10000}",
+            "\u{1f600}",
+            "\u{10ffff}",
+        ]
+        .map(|text| Value::String(text.to_owned()))
+        .to_vec()
+    }
+
+    /// The empty value, NUL and 0xFF, whose descending encodings are the terminator and an
+    /// escaped byte, embedded NULs, and shared prefixes.
+    fn descending_bytes() -> Vec<Vec<u8>> {
+        vec![
+            vec![],
+            vec![0x00],
+            vec![0x00, 0x00],
+            vec![0x00, 0xFF],
+            vec![0x01],
+            vec![0x61],
+            vec![0x61, 0x00],
+            vec![0x61, 0x00, 0x62],
+            vec![0x61, 0x62],
+            vec![0xFE],
+            vec![0xFF],
+            vec![0xFF, 0x00],
+            vec![0xFF, 0xFF],
+        ]
     }
 
     /// Group ids adjacent in byte order, and the two extremes.
@@ -624,6 +668,64 @@ mod tests {
         let rows = descending_strings().into_iter().map(|value| vec![value]).collect::<Vec<_>>();
         for range in every_range(&[], &descending_strings()) {
             assert_exact(&index, &range, &rows);
+        }
+    }
+
+    #[test]
+    fn a_range_on_descending_binary_or_object_values_holds_exactly_the_rows_inside_it() {
+        for (value_type, wrap) in [(ValueType::Binary, Value::Binary as fn(Vec<u8>) -> Value), (ValueType::Object, Value::Object)] {
+            let index = index(vec![desc("blob", value_type)]);
+            let values = descending_bytes().into_iter().map(wrap).collect::<Vec<_>>();
+            let rows = values.iter().map(|value| vec![value.clone()]).collect::<Vec<_>>();
+            for range in every_range(&[], &values) {
+                assert_exact(&index, &range, &rows);
+            }
+        }
+    }
+
+    /// Integers at the limits of each width, as rows and as bounds: a bound narrower than its
+    /// part widens to it, a wider one narrows when it fits, and one that does not fit is
+    /// refused rather than clamped.
+    #[test]
+    fn ranges_on_integers_hold_exactly_the_rows_inside_them_at_the_limits_of_every_width() {
+        let i16s = [i16::MIN, i16::MIN + 1, -1, 0, 1, i16::MAX - 1, i16::MAX];
+        let i32s = [i32::MIN, i32::MIN + 1, -1, 0, 1, i32::MAX - 1, i32::MAX];
+        let beside_i16 = [i16::MIN as i64 - 1, i16::MIN.into(), i16::MAX.into(), i16::MAX as i64 + 1];
+        let beside_i32 = [i32::MIN as i64 - 1, i32::MIN.into(), i32::MAX.into(), i32::MAX as i64 + 1];
+        let narrow = i16s.map(Value::I16);
+        let cases = [
+            (
+                ValueType::I16,
+                narrow.to_vec(),
+                i16s.iter().flat_map(|&n| [Value::I16(n), Value::I32(n.into()), Value::I64(n.into())]).collect::<Vec<_>>(),
+                vec![Value::I32(i16::MAX as i32 + 1), Value::I64(i16::MIN as i64 - 1)],
+            ),
+            (
+                ValueType::I32,
+                i32s.into_iter().chain(beside_i16.map(|n| n as i32)).map(Value::I32).collect(),
+                narrow.iter().cloned().chain(i32s.iter().flat_map(|&n| [Value::I32(n), Value::I64(n.into())])).collect(),
+                vec![Value::I64(i32::MAX as i64 + 1), Value::I64(i32::MIN as i64 - 1)],
+            ),
+            (
+                ValueType::I64,
+                [i64::MIN, -1, 0, 1, i64::MAX].into_iter().chain(beside_i16).chain(beside_i32).map(Value::I64).collect(),
+                narrow.iter().cloned().chain(i32s.map(Value::I32)).collect(),
+                Vec::new(),
+            ),
+        ];
+        for (value_type, rows, bounds, too_wide) in cases {
+            let rows = rows.into_iter().map(|value| vec![value]).collect::<Vec<_>>();
+            for index in [index(vec![asc("rank", value_type)]), index(vec![desc("rank", value_type)])] {
+                for range in every_range(&[], &bounds) {
+                    assert_exact(&index, &range, &rows);
+                }
+                for value in &too_wide {
+                    assert_eq!(
+                        Cover::new(index.clone(), range(Vec::new(), Bound::Included(value.clone()), Bound::Unbounded)),
+                        Err(RangeError::TypeMismatch { part: 0, expected: value_type, found: ValueType::of(value) })
+                    );
+                }
+            }
         }
     }
 
@@ -726,6 +828,33 @@ mod tests {
                 .collect::<Vec<_>>();
             for range in every_range(&groups()[..1], &integers()) {
                 assert_exact(&index, &range, &rows);
+            }
+        }
+    }
+
+    /// The empty string's descending encoding is the bare terminator 0xFF 0xFF, and "a\0" ends
+    /// in an escaped NUL beside it; the parts after them are descending too.
+    #[test]
+    fn a_range_after_descending_prefixes_holds_exactly_the_rows_inside_it() {
+        let text = |text: &str| Value::String(text.to_owned());
+        let names = ["", "\0", "a", "a\0", "a\0b", "b"].map(text);
+        let blobs = [vec![], vec![0x00], vec![0xFF]].map(Value::Binary);
+        let scores = [i64::MIN, -1, 0, 1, i64::MAX].map(Value::I64);
+        let index = index(vec![desc("name", ValueType::String), desc("blob", ValueType::Binary), desc("score", ValueType::I64)]);
+        let mut rows = Vec::new();
+        for name in &names {
+            for blob in &blobs {
+                rows.extend(scores.iter().map(|score| vec![name.clone(), blob.clone(), score.clone()]));
+            }
+        }
+        for name in [text(""), text("a\0")] {
+            for range in every_range(std::slice::from_ref(&name), &blobs) {
+                assert_exact(&index, &range, &rows);
+            }
+            for blob in &blobs {
+                for range in every_range(&[name.clone(), blob.clone()], &scores) {
+                    assert_exact(&index, &range, &rows);
+                }
             }
         }
     }
