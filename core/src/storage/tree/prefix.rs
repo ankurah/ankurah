@@ -338,15 +338,7 @@ mod tests {
     fn address_bounds_at_the_edges() {
         let bits = |text: &str| text.chars().filter(|c| *c != ' ').fold(NodePrefix::root(), |prefix, bit| prefix.child(bit == '1'));
         let hex = |text: &str| text.split(' ').map(|byte| u8::from_str_radix(byte, 16).unwrap()).collect::<Vec<u8>>();
-        let check = |prefix: NodePrefix, bounds: (Vec<u8>, Option<Vec<u8>>), inside: &[Vec<u8>], outside: &[Vec<u8>]| {
-            assert_eq!(prefix.address_bounds(), bounds, "{prefix:?}");
-            for address in inside {
-                assert!(admits(&prefix, address) && prefix.contains_address(address), "{prefix:?} holds {address:02x?}");
-            }
-            for address in outside {
-                assert!(!admits(&prefix, address) && !prefix.contains_address(address), "{prefix:?} excludes {address:02x?}");
-            }
-        };
+        let check = check_bounds;
         let zeros = |n: usize| vec![0u8; n];
 
         check(NodePrefix::root(), (vec![], None), &[vec![], hex("ff"), vec![0xFF; 33]], &[]);
@@ -401,6 +393,48 @@ mod tests {
             &[hex("01 ff 80"), hex("01 ff ff ff ff ff")],
             &[hex("01 ff"), hex("01 ff 7f ff ff ff"), hex("02")],
         );
+    }
+
+    /// Bounds of prefixes as long as the cap allows: exact at the last bit,
+    /// across a carry past whole bytes, and with no end for all ones.
+    #[test]
+    fn address_bounds_at_the_cap() {
+        let bytes = (NodePrefix::MAX_BITS / 8) as usize;
+        let zeros = |n: usize| vec![0u8; n];
+        let longest = |address: &[u8]| NodePrefix::of(address, NodePrefix::MAX_BITS);
+        check_bounds(
+            longest(&zeros(bytes)),
+            (zeros(bytes), Some([zeros(bytes - 1), vec![0x01]].concat())),
+            &[zeros(bytes), zeros(bytes + 1)],
+            &[zeros(bytes - 1), [zeros(bytes - 1), vec![0x01]].concat()],
+        );
+        // The last byte carries: the end drops the zero byte the carry leaves,
+        // so the one-byte-shorter address it would admit stays outside.
+        let carrying = [zeros(bytes - 1), vec![0xFF]].concat();
+        check_bounds(
+            longest(&carrying),
+            (carrying.clone(), Some([zeros(bytes - 2), vec![0x01]].concat())),
+            &[carrying.clone(), [carrying, vec![0x00]].concat()],
+            &[[zeros(bytes - 2), vec![0x01]].concat(), [zeros(bytes - 1), vec![0xFE]].concat(), zeros(bytes - 1)],
+        );
+        check_bounds(
+            longest(&vec![0xFF; bytes]),
+            (vec![0xFF; bytes], None),
+            &[vec![0xFF; bytes], vec![0xFF; bytes + 1]],
+            &[vec![0xFF; bytes - 1], [vec![0xFF; bytes - 1], vec![0xFE]].concat()],
+        );
+    }
+
+    /// Check a prefix's bounds, and that exactly the addresses `inside` lie
+    /// within them, judged by the bounds and by `contains_address` alike.
+    fn check_bounds(prefix: NodePrefix, bounds: (Vec<u8>, Option<Vec<u8>>), inside: &[Vec<u8>], outside: &[Vec<u8>]) {
+        assert_eq!(prefix.address_bounds(), bounds, "{prefix:?}");
+        for address in inside {
+            assert!(admits(&prefix, address) && prefix.contains_address(address), "{prefix:?} holds {address:02x?}");
+        }
+        for address in outside {
+            assert!(!admits(&prefix, address) && !prefix.contains_address(address), "{prefix:?} excludes {address:02x?}");
+        }
     }
 
     /// The longest prefix, as long as the longest leaf address, encodes and
