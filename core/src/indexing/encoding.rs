@@ -9,6 +9,18 @@ pub enum IndexError {
     TypeMismatch(ValueType, ValueType),
 }
 
+/// The canonical key encoding: the address format of the rows a digest tree files and of the
+/// blocks two members compare. Members compare blocks only under one encoding, so a cover
+/// names it, as tree registrations and sessions will. A change to how any value encodes, such
+/// as making variable-length values prefix-free, mints a new version rather than redefining
+/// V1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KeyEncoding {
+    /// A row's address is each key part encoded by [`encode_component_typed`] in its KeySpec
+    /// value type and direction, concatenated without separators, then the 32-byte entity id.
+    V1,
+}
+
 // Type tags for JSON encoding.
 // These are chosen to provide sensible sort order: null < bool < int < float < string
 // Each type uses fixed-width encoding where possible to avoid sentinel issues.

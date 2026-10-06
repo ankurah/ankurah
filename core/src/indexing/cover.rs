@@ -74,19 +74,10 @@ use std::ops::Bound;
 use ankurah_proto::PropertyId;
 use thiserror::Error;
 
-use super::encoding::encode_component_typed;
+use super::encoding::{encode_component_typed, KeyEncoding};
 use super::key_spec::{IndexDirection, IndexKeyPart};
 use crate::storage::tree::HashedIndex;
 use crate::value::{Value, ValueType};
-
-/// The canonical key encoding of a tree's addresses. Blocks are bit prefixes of encoded keys,
-/// so two members compare blocks only under one encoding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum KeyEncoding {
-    /// Each key part encoded by [`encode_component_typed`] in its KeySpec value type and
-    /// direction, the parts concatenated without separators.
-    V1,
-}
 
 /// A range of one index's keys: the leading key parts fixed to the values of `prefix`, and the
 /// next key part bounded on each side in the order of its values, whatever its direction.
