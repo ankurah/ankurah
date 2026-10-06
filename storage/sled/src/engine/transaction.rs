@@ -242,7 +242,7 @@ fn commit_staged(
         }
         results.sort_by_key(|(index, _)| *index);
         let entities = results.into_iter().map(|(_, result)| result).collect();
-        Ok(StorageCommitResult { entities })
+        Ok(StorageCommitResult { entities, position: None })
     });
     drop(index_guard);
 

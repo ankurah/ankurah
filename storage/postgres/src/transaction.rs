@@ -211,6 +211,6 @@ impl StorageTransaction for PostgresTransaction<'_> {
         committed.sort_by_key(|(index, _)| *index);
         let entities = committed.into_iter().map(|(_, result)| result).collect();
         transaction.commit().await.map_err(|error| MutationError::UpdateFailed(Box::new(error)))?;
-        Ok(StorageCommitOutcome::Committed(StorageCommitResult { entities }))
+        Ok(StorageCommitOutcome::Committed(StorageCommitResult { entities, position: None }))
     }
 }
