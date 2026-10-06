@@ -55,6 +55,19 @@
 //! through ordinary batches; it is the core's alone and asks nothing more of
 //! the engine.
 //!
+//! Trees follow the log's durability. A refresher folds only below the
+//! [durable position](CommitLog::durable_position), but a build fills from a
+//! snapshot taken at the stable position, which may lie above it. A tree is
+//! therefore ready only while its fold position lies at or below the durable
+//! position: a build publishes once durability has reached its snapshot's
+//! boundary, and an engine refuses to commit a ready tree whose fold position
+//! lies past the durable position. On recovery an engine restarts every tree
+//! whose fold position lies above the durable position it recovered to, as a
+//! [restart](TreeBatch::restart) at that position would, because such a tree
+//! may describe commits that recovery discarded; the core's build hook then
+//! builds it again. A build's fold position never lies below its snapshot's
+//! boundary, so the fold position is the one position to check.
+//!
 //! A [`TreeBatch`] changes one tree atomically. Reads through it are
 //! consistent with each other and with the cell it is compared against, and
 //! see the batch's own earlier writes. Its commit applies every write together
@@ -288,6 +301,8 @@ pub enum TreeStorageError {
     IncarnationMismatch { expected: LogIncarnation, found: LogIncarnation },
     #[error("the fold position cannot move back from {current:?} to {requested:?}")]
     FoldBackwards { current: LogPosition, requested: LogPosition },
+    #[error("a ready tree cannot fold to {folded:?}, past the durable position {durable:?}")]
+    NotYetDurable { folded: LogPosition, durable: LogPosition },
     #[error("the keys of entity {entity_id} do not derive: {source}")]
     KeyDerivation { entity_id: EntityId, source: KeyDerivationError },
     #[error("storage error: {0}")]
@@ -349,10 +364,17 @@ pub trait TreeBatch: TreeRead {
     async fn delete_node(&mut self, prefix: &NodePrefix) -> Result<(), TreeStorageError>;
 
     /// Advance the fold position to `position`, which must not lie below it:
-    /// every log row below `position` is now folded into the tree.
+    /// every log row below `position` is now folded into the tree. A ready
+    /// tree's fold position does not pass the durable position; see
+    /// [`TreeBatch::publish`].
     async fn set_folded(&mut self, position: LogPosition) -> Result<(), TreeStorageError>;
 
-    /// Publish the tree for sessions and claims.
+    /// Publish the tree for sessions and claims. A tree is ready only while its
+    /// fold position lies at or below the durable position, so a build
+    /// publishes once durability has reached its snapshot's boundary; the
+    /// commit of a batch that would leave its tree ready with the fold
+    /// position past the durable position fails with
+    /// [`TreeStorageError::NotYetDurable`] and writes nothing.
     async fn publish(&mut self) -> Result<(), TreeStorageError>;
 
     /// Start the tree's build over from `folded`: remove every row, take the
@@ -430,8 +452,10 @@ pub trait TreeStorage: CommitLog {
     ///
     /// The core's build hook restarts the tree at the boundary, fills the
     /// folded rows from the entities, folds the log from the boundary until
-    /// it catches up, and publishes the tree in the batch that does. A build
-    /// whose boundary falls below the retention floor before it catches up
-    /// starts over from a fresh snapshot.
+    /// it catches up, and publishes the tree once the durable position has
+    /// reached the boundary: until then a crash may lose a commit the snapshot
+    /// shows, and a tree recovery finds folded past the durable position
+    /// restarts. A build whose boundary falls below the retention floor before
+    /// it catches up starts over from a fresh snapshot.
     async fn snapshot(&self, tree: TreeId) -> Result<TreeSnapshot<Self::Snapshot<'_>>, TreeStorageError>;
 }

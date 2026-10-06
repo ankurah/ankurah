@@ -137,6 +137,11 @@ impl Store {
 
     fn stable(&self) -> LogPosition { LogPosition::new(self.log.incarnation, self.log.next) }
 
+    /// Nothing here outlives the process, and a store that starts again
+    /// starts a new incarnation, so within an incarnation every settled
+    /// commit is as durable as this store gets.
+    fn durable(&self) -> LogPosition { self.stable() }
+
     /// Register a tree at the stable position, from which every commit carries
     /// its keys.
     fn add_tree(&mut self, index: HashedIndex, status: BuildStatus) -> TreeRegistration {
@@ -401,10 +406,7 @@ impl StorageEngine for MemoryStorageEngine {
 impl CommitLog for MemoryStorageEngine {
     async fn stable_position(&self) -> Result<LogPosition, LogError> { Ok(self.store.lock().unwrap().stable()) }
 
-    /// Nothing here outlives the process, and a store that starts again
-    /// starts a new incarnation, so within an incarnation every settled
-    /// commit is as durable as this store gets.
-    async fn durable_position(&self) -> Result<LogPosition, LogError> { Ok(self.store.lock().unwrap().stable()) }
+    async fn durable_position(&self) -> Result<LogPosition, LogError> { Ok(self.store.lock().unwrap().durable()) }
 
     async fn retention_floor(&self) -> Result<LogPosition, LogError> {
         let store = self.store.lock().unwrap();
@@ -735,6 +737,14 @@ impl TreeBatch for MemoryTreeBatch<'_> {
                 drop(store);
                 self.roll_back();
                 return Err(TreeStorageError::UnknownTree(self.tree));
+            }
+            // A ready tree describes durable commits only.
+            let (cell, durable) = (self.contents.cell, store.durable());
+            let folded_durably = cell.folded <= durable;
+            if cell.status == BuildStatus::Ready && !folded_durably {
+                drop(store);
+                self.roll_back();
+                return Err(TreeStorageError::NotYetDurable { folded: cell.folded, durable });
             }
             if let Some(horizon) = self.horizon {
                 store.prune_horizon = store.prune_horizon.max(horizon.offset());

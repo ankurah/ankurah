@@ -134,7 +134,11 @@ pub trait CommitLog: StorageEngine {
     /// A refresher folds only below the lesser of the stable and the durable
     /// positions, that is below this one, so a crash never leaves a tree
     /// describing a commit that recovery discards; and a store acknowledges a
-    /// position to a partner only below this one.
+    /// position to a partner only below this one. A build fills from a
+    /// snapshot taken at the stable position, which may lie above this one, so
+    /// it is published only once this position has reached the snapshot's
+    /// boundary, and recovery restarts any tree whose fold position lies above
+    /// the durable position it recovers to.
     async fn durable_position(&self) -> Result<LogPosition, LogError>;
 
     /// The lowest position whose rows the log still holds; reading from below

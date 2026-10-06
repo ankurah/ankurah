@@ -74,6 +74,7 @@ macro_rules! tree_storage_conformance {
         $crate::tree_storage_conformance!(@reopen ($reopen)
             reopen_keeps_what_was_durable
             reopen_keeps_tree_batches_whole
+            reopen_restarts_trees_past_the_durable_position
             reopen_after_a_reset_keeps_the_new_incarnation
         );
     };
@@ -111,6 +112,7 @@ macro_rules! tree_storage_conformance {
             removal_is_whole_when_cancelled
             snapshot_and_replay_give_the_current_index
             a_build_overtaken_by_retention_starts_over
+            a_tree_is_ready_only_below_the_durable_position
             prune_horizon_rises_with_every_lost_removal
         );
     };
@@ -386,18 +388,18 @@ pub async fn durable_position_trails_the_stable_position<E: TreeStorage + 'stati
     let durable = durable_after(&*engine, durable).await;
     engine.discard_log_below(last).await.unwrap();
     durable_after(&*engine, durable).await;
-    durable_through(&*engine, last).await;
+    wait_until_durable(&*engine, last.next()).await;
 }
 
-/// Wait until the durable position passes `position`, returning it.
-async fn durable_through<E: CommitLog>(engine: &E, position: LogPosition) -> LogPosition {
+/// Wait until the durable position reaches `position`, and return it.
+async fn wait_until_durable<E: CommitLog>(engine: &E, position: LogPosition) -> LogPosition {
     let deadline = tokio::time::Instant::now() + PROGRESS;
     loop {
         let durable = engine.durable_position().await.unwrap();
-        if durable > position {
+        if durable >= position {
             return durable;
         }
-        assert!(tokio::time::Instant::now() < deadline, "the durable position never passed {position:?}");
+        assert!(tokio::time::Instant::now() < deadline, "the durable position never reached {position:?}");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
@@ -1251,6 +1253,45 @@ where
     }
 }
 
+/// A tree is ready only while its fold position lies at or below the durable
+/// position: a batch that would publish a build, or fold a ready tree, past
+/// the durable position fails and writes nothing, and the build publishes once
+/// durability has reached its snapshot's boundary.
+pub async fn a_tree_is_ready_only_below_the_durable_position<E: TreeStorage + 'static>(engine: Arc<E>) {
+    create(&*engine, vec![state(entity(1), 1, &[component()], &[(title(), text("a"))])]).await;
+    let tree = register(&*engine, title_index()).await.id;
+    let registered = cell_of(&*engine, tree).await;
+    let snapshot = engine.snapshot(tree).await.unwrap();
+    let boundary = snapshot.boundary;
+    let mut batch = engine.batch(tree).await.unwrap();
+    batch.restart(boundary).await.unwrap();
+    fill(&mut batch, boundary, snapshot.entities).await;
+    let building = committed(batch.commit(&registered).await.unwrap());
+    let before = view(&*engine, tree, &[entity(1)]).await;
+
+    // Nothing past the stable position is durable, on any engine.
+    let stable = engine.stable_position().await.unwrap();
+    let past = LogPosition::new(stable.incarnation(), stable.offset() + 1);
+    let mut batch = engine.batch(tree).await.unwrap();
+    batch.set_folded(past).await.unwrap();
+    batch.publish().await.unwrap();
+    let refused = batch.commit(&building).await;
+    assert!(matches!(refused, Err(TreeStorageError::NotYetDurable { .. })), "a build folded past the durable position is not published");
+    assert_eq!(view(&*engine, tree, &[entity(1)]).await, before, "the refused batch writes nothing");
+
+    wait_until_durable(&*engine, boundary).await;
+    let mut batch = engine.batch(tree).await.unwrap();
+    batch.publish().await.unwrap();
+    let ready = committed(batch.commit(&building).await.unwrap());
+    assert_eq!(ready, TreeCell { status: BuildStatus::Ready, ..building }, "a build publishes once its boundary is durable");
+
+    let mut batch = engine.batch(tree).await.unwrap();
+    batch.set_folded(past).await.unwrap();
+    let refused = batch.commit(&ready).await;
+    assert!(matches!(refused, Err(TreeStorageError::NotYetDurable { .. })), "a ready tree does not fold past the durable position");
+    assert_eq!(cell_of(&*engine, tree).await, ready);
+}
+
 /// The prune horizon rises wherever a tree may stop holding a removal: at a
 /// registration, a prune and a restart. It never falls.
 pub async fn prune_horizon_rises_with_every_lost_removal<E: TreeStorage + 'static>(engine: Arc<E>) {
@@ -1287,7 +1328,7 @@ pub async fn reopen_keeps_what_was_durable<H: Reopen>(reopen: H) {
     let first = create(&*engine, vec![state(entity(1), 1, &[component()], &[(title(), text("a"))])]).await;
     let tree = register(&*engine, title_index()).await;
     let last = create(&*engine, vec![state(entity(2), 2, &[component()], &[(title(), text("b"))])]).await;
-    let durable = durable_through(&*engine, last).await;
+    let durable = wait_until_durable(&*engine, last.next()).await;
     let rows = read_all(&*engine, first).await;
     let engine = reopen.crash_and_reopen(engine).await;
 
@@ -1311,6 +1352,9 @@ pub async fn reopen_keeps_tree_batches_whole<H: Reopen>(reopen: H) {
     let mut states = vec![view(&*engine, tree, &probes).await];
     let contest = Contest::set_up(&*engine, tree, position).await;
     states.push(view(&*engine, tree, &probes).await);
+    // The batch folds no further than the durable position, so recovery has
+    // no reason to restart the tree.
+    wait_until_durable(&*engine, contest.stable).await;
     let mut batch = engine.batch(tree).await.unwrap();
     batch.prune_tombstones(contest.stable).await.unwrap();
     contest.write(&mut batch, 2).await;
@@ -1322,6 +1366,44 @@ pub async fn reopen_keeps_tree_batches_whole<H: Reopen>(reopen: H) {
     assert!(states.contains(&reopened), "a crash keeps each batch whole and in order, not {reopened:?}");
 }
 
+/// Recovery never leaves a tree describing commits it discarded: after a
+/// crash no tree's fold position lies above the durable position, and a build
+/// restarted at a snapshot boundary that the crash left undurable is either
+/// lost with its batch or restarted again: a later generation, building, and
+/// empty.
+pub async fn reopen_restarts_trees_past_the_durable_position<H: Reopen>(reopen: H) {
+    let engine = reopen.open().await;
+    create(&*engine, vec![state(entity(1), 1, &[component()], &[(title(), text("a"))])]).await;
+    let tree = register(&*engine, title_index()).await.id;
+    let registered = cell_of(&*engine, tree).await;
+    // A durable commit after the registration keeps the registration too.
+    let kept = create(&*engine, vec![state(entity(2), 2, &[component()], &[(title(), text("b"))])]).await;
+    wait_until_durable(&*engine, kept.next()).await;
+    // A commit the crash may lose, and a build restarted at a boundary past it.
+    create(&*engine, vec![state(entity(3), 3, &[component()], &[(title(), text("c"))])]).await;
+    let building = {
+        let snapshot = engine.snapshot(tree).await.unwrap();
+        let mut batch = engine.batch(tree).await.unwrap();
+        batch.restart(snapshot.boundary).await.unwrap();
+        fill(&mut batch, snapshot.boundary, snapshot.entities).await;
+        committed(batch.commit(&registered).await.unwrap())
+    };
+    let engine = reopen.crash_and_reopen(engine).await;
+
+    let durable = engine.durable_position().await.unwrap();
+    for registration in engine.trees().await.unwrap() {
+        let cell = cell_of(&*engine, registration.id).await;
+        assert!(cell.folded <= durable, "after recovery {registration:?} folds past the durable position: {cell:?}");
+    }
+    let (cell, boundary_kept) = (cell_of(&*engine, tree).await, building.folded <= durable);
+    if !boundary_kept && cell != registered {
+        assert!(cell.generation > building.generation && cell.status == BuildStatus::Building, "recovery restarts the build: {cell:?}");
+        let view = view(&*engine, tree, &[entity(1), entity(2), entity(3)]).await;
+        assert!(view.rows.is_empty() && view.tombstones.is_empty() && view.nodes.is_empty(), "a restarted tree holds nothing");
+        assert!(view.horizon >= cell.folded, "a restarted tree saw no removal before its start");
+    }
+}
+
 /// A reset's new incarnation survives a crash once a commit in it is durable,
 /// and nothing of the old store returns.
 pub async fn reopen_after_a_reset_keeps_the_new_incarnation<H: Reopen>(reopen: H) {
@@ -1330,7 +1412,7 @@ pub async fn reopen_after_a_reset_keeps_the_new_incarnation<H: Reopen>(reopen: H
     register(&*engine, title_index()).await;
     engine.delete_all().await.unwrap();
     let new = create(&*engine, vec![state(entity(2), 2, &[], &[])]).await;
-    durable_through(&*engine, new).await;
+    wait_until_durable(&*engine, new.next()).await;
     let engine = reopen.crash_and_reopen(engine).await;
 
     assert_eq!(engine.stable_position().await.unwrap().incarnation(), new.incarnation(), "the reset's incarnation survives");
