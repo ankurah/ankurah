@@ -276,36 +276,55 @@ pub async fn reset_mints_a_new_incarnation<E: TreeStorage + 'static>(engine: Arc
 }
 
 /// A batch commits only while the tree's cell equals the one the caller
-/// expected; otherwise none of its writes applies and the caller learns the
-/// cell.
+/// expected; otherwise none of its writes applies, the prune horizon
+/// included, and the caller learns the cell.
 pub async fn conditional_position_check<E: TreeStorage + 'static>(engine: Arc<E>) {
     let tree = entity_id_tree(&*engine).await;
     let position = create(&*engine, vec![state(entity(1), 1, &[], &[])]).await;
     let stable = engine.stable_position().await.unwrap();
-    let cell = cell_of(&*engine, tree).await;
-    let key = entity(1).to_bytes();
-    let reader = engine.reader(tree).await.unwrap();
+    // A tombstone the batches below prune.
+    let mut setup = engine.batch(tree).await.unwrap();
+    let cell = setup.cell().await.unwrap();
+    setup.put_tombstone(Tombstone { key: b"older".to_vec(), entity_id: entity(3), position }).await.unwrap();
+    assert_eq!(setup.commit(&cell).await.unwrap(), TreeBatchOutcome::Committed(cell));
+    let probes = [entity(1), entity(2), entity(3)];
+    let before = view(&*engine, tree, &probes).await;
+    let row = folded_row(&entity(1).to_bytes(), entity(1), position);
+    let tombstone = Tombstone { key: b"left".to_vec(), entity_id: entity(2), position };
+    let node = node_row(1, position);
+    async fn write<B: TreeBatch>(batch: &mut B, stable: LogPosition, row: &FoldedRow, tombstone: &Tombstone, node: &NodeRow) {
+        batch.prune_tombstones(stable).await.unwrap();
+        batch.put_row(row.clone()).await.unwrap();
+        batch.put_tombstone(tombstone.clone()).await.unwrap();
+        batch.put_node(NodePrefix::root(), node.clone()).await.unwrap();
+        batch.set_folded(stable).await.unwrap();
+    }
 
     let mut batch = engine.batch(tree).await.unwrap();
-    batch.put_row(folded_row(&key, entity(1), position)).await.unwrap();
-    batch.set_folded(stable).await.unwrap();
+    write(&mut batch, stable, &row, &tombstone, &node).await;
     let stale = TreeCell { generation: cell.generation + 1, ..cell };
     assert_eq!(batch.commit(&stale).await.unwrap(), TreeBatchOutcome::Conflict { observed: cell });
-    assert_eq!(reader.row(&key, entity(1)).await.unwrap(), None, "a failed batch writes nothing");
-    assert_eq!(reader.cell().await.unwrap(), cell);
+    assert_eq!(view(&*engine, tree, &probes).await, before, "a failed batch writes nothing");
 
     let mut batch = engine.batch(tree).await.unwrap();
-    batch.put_row(folded_row(&key, entity(1), position)).await.unwrap();
-    batch.set_folded(stable).await.unwrap();
+    write(&mut batch, stable, &row, &tombstone, &node).await;
     let advanced = TreeCell { folded: stable, ..cell };
     assert_eq!(batch.commit(&cell).await.unwrap(), TreeBatchOutcome::Committed(advanced));
-    assert_eq!(reader.cell().await.unwrap(), advanced);
-    assert!(reader.row(&key, entity(1)).await.unwrap().is_some());
+    let after = TreeView {
+        cell: advanced,
+        rows: vec![row.clone()],
+        lookup: BTreeMap::from([(entity(1), vec![row]), (entity(2), vec![]), (entity(3), vec![])]),
+        tombstones: vec![tombstone],
+        nodes: vec![(NodePrefix::root(), node)],
+        horizon: stable,
+    };
+    assert_eq!(view(&*engine, tree, &probes).await, after, "a batch that commits writes everything");
 
     let mut late = engine.batch(tree).await.unwrap();
-    late.delete_row(&key, entity(1)).await.unwrap();
+    late.delete_row(&entity(1).to_bytes(), entity(1)).await.unwrap();
+    late.delete_node(&NodePrefix::root()).await.unwrap();
     assert_eq!(late.commit(&cell).await.unwrap(), TreeBatchOutcome::Conflict { observed: advanced }, "the cell moved since");
-    assert!(reader.row(&key, entity(1)).await.unwrap().is_some());
+    assert_eq!(view(&*engine, tree, &probes).await, after);
 }
 
 /// Every position written into a tree belongs to its cell's incarnation, and
@@ -433,7 +452,8 @@ pub async fn snapshot_reads_inside_a_batch<E: TreeStorage + 'static>(engine: Arc
     setup.put_tombstone(kept.1.clone()).await.unwrap();
     setup.put_node(kept_node.0.clone(), kept_node.1.clone()).await.unwrap();
     let cell = committed(setup.commit(&cell).await.unwrap());
-    let horizon = engine.prune_horizon().await.unwrap();
+    let probes = [entity(1), entity(3)];
+    let before = view(&*engine, tree, &probes).await;
 
     let row = folded_row(b"k", entity(1), position);
     let tombstone = Tombstone { key: b"j".to_vec(), entity_id: entity(2), position };
@@ -459,55 +479,32 @@ pub async fn snapshot_reads_inside_a_batch<E: TreeStorage + 'static>(engine: Arc
     assert!(batch.children(&NodePrefix::root()).await.unwrap().is_empty());
     assert_eq!(batch.cell().await.unwrap(), TreeCell { generation: cell.generation + 1, status: BuildStatus::Building, folded: stable });
     drop(batch);
-
-    let reader = engine.reader(tree).await.unwrap();
-    assert_eq!(reader.cell().await.unwrap(), cell, "a dropped batch changes nothing");
-    assert_eq!(reader.rows(&AddressRange::all(), 10).await.unwrap(), [kept.0]);
-    assert_eq!(reader.tombstones(&AddressRange::all(), 10).await.unwrap(), [kept.1]);
-    assert_eq!(reader.children(&NodePrefix::root()).await.unwrap(), [kept_node]);
-    assert_eq!(engine.prune_horizon().await.unwrap(), horizon);
+    assert_eq!(view(&*engine, tree, &probes).await, before, "a dropped batch changes nothing");
 }
 
-/// Of two batches prepared against the same cell exactly one commits, and a
-/// batch's reads stay as they were while the other tries to commit.
+/// Of two batches prepared against the same cell exactly one commits, whole,
+/// and a batch's reads stay as they were while its rival tries to commit.
 pub async fn concurrent_batches_commit_one<E: TreeStorage + 'static>(engine: Arc<E>) {
     let tree = entity_id_tree(&*engine).await;
-    let position = create(&*engine, vec![state(entity(1), 1, &[], &[])]).await;
-    let key = entity(1).to_bytes().to_vec();
-    let version = move |n: u8| FoldedRow { head: head(n), ..folded_row(&entity(1).to_bytes(), entity(1), position) };
-    let cell = cell_of(&*engine, tree).await;
-    let mut setup = engine.batch(tree).await.unwrap();
-    setup.put_row(version(1)).await.unwrap();
-    setup.put_node(NodePrefix::root(), node_row(1, position)).await.unwrap();
-    let cell = committed(setup.commit(&cell).await.unwrap());
-    let stable = engine.stable_position().await.unwrap();
+    let contest = Contest::set_up(&*engine, tree).await;
+    let before = view(&*engine, tree, &contest.probes()).await;
 
     let mut first = engine.batch(tree).await.unwrap();
-    let before = (first.row(&key, entity(1)).await.unwrap(), first.node(&NodePrefix::root()).await.unwrap());
-    let rival = tokio::spawn({
-        let engine = engine.clone();
-        async move {
-            let mut second = engine.batch(tree).await.unwrap();
-            second.put_row(version(2)).await.unwrap();
-            second.put_node(NodePrefix::root(), node_row(2, position)).await.unwrap();
-            second.set_folded(stable).await.unwrap();
-            second.commit(&cell).await.unwrap()
-        }
-    });
-    for _ in 0..10 {
-        tokio::task::yield_now().await;
-    }
-    let after = (first.row(&key, entity(1)).await.unwrap(), first.node(&NodePrefix::root()).await.unwrap());
-    assert_eq!(before, after, "a batch's reads do not move while another batch commits");
-    first.put_row(version(3)).await.unwrap();
-    first.set_folded(stable).await.unwrap();
-    let first = first.commit(&cell).await.unwrap();
-    let second = rival.await.unwrap();
-
-    let winners = [&first, &second].into_iter().filter(|outcome| matches!(outcome, TreeBatchOutcome::Committed(_))).count();
-    assert_eq!(winners, 1, "exactly one of two batches against the same cell commits");
-    let winner = if matches!(first, TreeBatchOutcome::Committed(_)) { version(3) } else { version(2) };
-    assert_eq!(engine.reader(tree).await.unwrap().row(&key, entity(1)).await.unwrap(), Some(winner));
+    let seen = batch_reads(&first).await;
+    let mut rival = tokio::spawn(contest.contend(engine.clone(), 2));
+    // The rival either commits while this batch is open, as an engine that
+    // detects conflicts at commit lets it, or waits for this batch, as a
+    // locking engine makes it; past the wait it is taken to be waiting.
+    let finished = tokio::time::timeout(BLOCKED, &mut rival).await.ok().map(|joined| joined.unwrap());
+    assert_eq!(batch_reads(&first).await, seen, "a batch's reads do not move while its rival commits");
+    contest.write(&mut first, 3).await;
+    let first = first.commit(&contest.cell).await.unwrap();
+    let second = match finished {
+        Some(outcome) => outcome,
+        None => tokio::time::timeout(PROGRESS, rival).await.expect("the rival proceeds once the batch ends").unwrap(),
+    };
+    let (winner, cell) = one_winner([(3, first), (2, second)]);
+    assert_eq!(view(&*engine, tree, &contest.probes()).await, contest.won_by(&before, winner, cell));
 }
 
 /// A prefix's children are the nearest stored nodes beneath it at any depth,
@@ -776,6 +773,143 @@ pub async fn prune_horizon_rises_with_every_lost_removal<E: TreeStorage + 'stati
     batch.restart(restarted).await.unwrap();
     committed(batch.commit(&cell).await.unwrap());
     assert_eq!(engine.prune_horizon().await.unwrap(), restarted, "a rebuilt tree saw no removal before its start");
+}
+
+/// Everything a reader sees of one tree, with the store's prune horizon.
+#[derive(Debug, Clone, PartialEq)]
+struct TreeView {
+    cell: TreeCell,
+    rows: Vec<FoldedRow>,
+    /// The entity-to-keys lookup of every entity with rows and every probe.
+    lookup: BTreeMap<EntityId, Vec<FoldedRow>>,
+    tombstones: Vec<Tombstone>,
+    /// Every stored node, in prefix order.
+    nodes: Vec<(NodePrefix, NodeRow)>,
+    horizon: LogPosition,
+}
+
+/// Read the whole of one tree. The lookup is read for every entity with rows
+/// and for each probe, so a lookup entry that outlived its row shows.
+async fn view<E: TreeStorage>(engine: &E, tree: TreeId, probes: &[EntityId]) -> TreeView {
+    let reader = engine.reader(tree).await.unwrap();
+    let rows = reader.rows(&AddressRange::all(), usize::MAX).await.unwrap();
+    let mut lookup = BTreeMap::new();
+    for entity_id in rows.iter().map(|row| row.entity_id).chain(probes.iter().copied()) {
+        lookup.insert(entity_id, reader.entity_rows(entity_id).await.unwrap());
+    }
+    TreeView {
+        cell: reader.cell().await.unwrap(),
+        rows,
+        lookup,
+        tombstones: reader.tombstones(&AddressRange::all(), usize::MAX).await.unwrap(),
+        nodes: all_nodes(&reader).await,
+        horizon: engine.prune_horizon().await.unwrap(),
+    }
+}
+
+/// Every stored node: the root's row, if any, and each stored node's
+/// nearest stored descendants, in prefix order.
+async fn all_nodes<R: TreeRead>(reader: &R) -> Vec<(NodePrefix, NodeRow)> {
+    let mut nodes: Vec<_> = reader.node(&NodePrefix::root()).await.unwrap().map(|row| (NodePrefix::root(), row)).into_iter().collect();
+    let mut pending = vec![NodePrefix::root()];
+    while let Some(prefix) = pending.pop() {
+        for (child, row) in reader.children(&prefix).await.unwrap() {
+            pending.push(child.clone());
+            nodes.push((child, row));
+        }
+    }
+    nodes.sort_by(|(a, _), (b, _)| a.cmp(b));
+    nodes
+}
+
+/// What a batch reads of the contested tree, to compare over its life.
+async fn batch_reads<B: TreeBatch>(batch: &B) -> (TreeCell, Vec<FoldedRow>, Vec<Tombstone>, Vec<(NodePrefix, NodeRow)>) {
+    let all = AddressRange::all();
+    (
+        batch.cell().await.unwrap(),
+        batch.rows(&all, usize::MAX).await.unwrap(),
+        batch.tombstones(&all, usize::MAX).await.unwrap(),
+        all_nodes(batch).await,
+    )
+}
+
+/// One tree that several batches contend for: entity 1's row and the root
+/// node, set up at `cell`. Contender `n` writes its own version of both and a
+/// tombstone of its own, then commits against `cell`.
+#[derive(Clone, Copy)]
+struct Contest {
+    tree: TreeId,
+    position: LogPosition,
+    stable: LogPosition,
+    cell: TreeCell,
+}
+
+impl Contest {
+    async fn set_up<E: TreeStorage>(engine: &E, tree: TreeId) -> Self {
+        let position = create(engine, vec![state(entity(1), 1, &[], &[])]).await;
+        let mut contest = Self { tree, position, stable: position, cell: cell_of(engine, tree).await };
+        let mut setup = engine.batch(tree).await.unwrap();
+        setup.put_row(contest.row(1)).await.unwrap();
+        setup.put_node(NodePrefix::root(), contest.node(1)).await.unwrap();
+        contest.cell = committed(setup.commit(&contest.cell).await.unwrap());
+        contest.stable = engine.stable_position().await.unwrap();
+        contest
+    }
+
+    fn row(&self, n: u8) -> FoldedRow { FoldedRow { head: head(n), ..folded_row(&entity(1).to_bytes(), entity(1), self.position) } }
+
+    fn node(&self, n: u8) -> NodeRow { node_row(u64::from(n), self.position) }
+
+    fn tombstone(&self, n: u8) -> Tombstone { Tombstone { key: vec![n], entity_id: entity(n), position: self.position } }
+
+    /// Entity 1 and every contender's tombstone entity, whose lookups must
+    /// stay empty.
+    fn probes(&self) -> Vec<EntityId> { (1..=9).map(entity).collect() }
+
+    async fn write<B: TreeBatch>(&self, batch: &mut B, n: u8) {
+        batch.put_row(self.row(n)).await.unwrap();
+        batch.put_node(NodePrefix::root(), self.node(n)).await.unwrap();
+        batch.put_tombstone(self.tombstone(n)).await.unwrap();
+        batch.set_folded(self.stable).await.unwrap();
+    }
+
+    /// Contender `n`'s whole attempt, from beginning its batch to committing it.
+    async fn contend<E: TreeStorage>(self, engine: Arc<E>, n: u8) -> TreeBatchOutcome {
+        let mut batch = engine.batch(self.tree).await.unwrap();
+        self.write(&mut batch, n).await;
+        batch.commit(&self.cell).await.unwrap()
+    }
+
+    /// The tree once contender `n` won, leaving `cell`.
+    fn won_by(&self, before: &TreeView, n: u8, cell: TreeCell) -> TreeView {
+        let mut won = before.clone();
+        won.cell = cell;
+        won.rows = vec![self.row(n)];
+        won.lookup.insert(entity(1), vec![self.row(n)]);
+        won.tombstones = vec![self.tombstone(n)];
+        won.nodes = vec![(NodePrefix::root(), self.node(n))];
+        won
+    }
+}
+
+/// The one contender that committed, and the cell it left. Every other
+/// contender conflicted with that cell.
+fn one_winner(outcomes: impl IntoIterator<Item = (u8, TreeBatchOutcome)>) -> (u8, TreeCell) {
+    let outcomes: Vec<_> = outcomes.into_iter().collect();
+    let winners: Vec<(u8, TreeCell)> = outcomes
+        .iter()
+        .filter_map(|(n, outcome)| match outcome {
+            TreeBatchOutcome::Committed(cell) => Some((*n, *cell)),
+            TreeBatchOutcome::Conflict { .. } => None,
+        })
+        .collect();
+    let [(winner, cell)] = winners[..] else { panic!("exactly one of the batches against one cell commits: {outcomes:?}") };
+    for (n, outcome) in &outcomes {
+        if let TreeBatchOutcome::Conflict { observed } = outcome {
+            assert_eq!(*observed, cell, "contender {n} conflicted with the winner's cell");
+        }
+    }
+    (winner, cell)
 }
 
 fn entity(n: u8) -> EntityId { EntityId::from_bytes([n; 32]) }
