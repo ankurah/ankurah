@@ -461,7 +461,14 @@ pub async fn children_and_leaf_ranges_at_ragged_depths<E: TreeStorage + 'static>
     let position = create(&*engine, vec![state(entity(200), 9, &[], &[])]).await;
     let firsts = [0x00, 0x01, 0x0F, 0x10, 0x80, 0xA0, 0xAA, 0xAB, 0xFF];
     let keys = firsts.into_iter().flat_map(|first| [[first, 0x00], [first, 0xAA], [first, 0xFF]]);
-    let rows: Vec<FoldedRow> = keys.zip(0u8..).map(|(key, n)| folded_row(&key, entity(n), position)).collect();
+    let mut rows: Vec<FoldedRow> = keys.zip(0u8..).map(|(key, n)| folded_row(&key, entity(n), position)).collect();
+    // Beneath 264 zero bits then a one lies the 34-byte address of the key
+    // 00 00 and an id ending in 80, but not the 33-byte address of the key 00
+    // and an id ending in 01, which a carry past whole bytes once admitted.
+    let id_ending_in = |last: u8| EntityId::from_bytes(std::array::from_fn(|index| if index == 31 { last } else { 0 }));
+    let beneath = folded_row(&[0x00, 0x00], id_ending_in(0x80), position);
+    let deep = NodePrefix::of(&beneath.address(), 265);
+    rows.extend([beneath, folded_row(&[0x00], id_ending_in(0x01), position)]);
     let at = |address: [u8; 2], len: u32| NodePrefix::of(&address, len);
     // Ragged depths with path compression: no rows at 0000 0000 or 1010 1010.
     let nodes = [
@@ -491,7 +498,7 @@ pub async fn children_and_leaf_ranges_at_ragged_depths<E: TreeStorage + 'static>
     assert!(children(at([0xAA, 0xA0], 13)).await.is_empty());
 
     let mut probes = nodes.to_vec();
-    probes.extend([at([0x01, 0x00], 8), at([0x80, 0x00], 1), at([0xAA, 0xA0], 11), at([0xAA, 0xFF], 16), at([0xAB, 0x00], 8)]);
+    probes.extend([at([0x01, 0x00], 8), at([0x80, 0x00], 1), at([0xAA, 0xA0], 11), at([0xAA, 0xFF], 16), at([0xAB, 0x00], 8), deep]);
     for prefix in &probes {
         let beneath = by_address(rows.iter().filter(|row| prefix.contains_address(&row.address())).cloned());
         assert_eq!(reader.rows(&AddressRange::under(prefix), usize::MAX).await.unwrap(), beneath, "{prefix:?}");
