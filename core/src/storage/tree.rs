@@ -421,9 +421,12 @@ pub trait TreeStorage: CommitLog {
     /// index files, with its head and its keys, as of the stable position.
     /// The engine fixes the boundary where commits serialize, so the snapshot
     /// shows every commit below it and none at or above it, however long its
-    /// entities take to read and whatever commits meanwhile. The boundary is
-    /// at or above the position the tree was registered at, so every log row
-    /// from it on carries the tree's keys.
+    /// entities take to read and whatever commits meanwhile. Commits never wait
+    /// for an open snapshot: the build reads it across many batches while the
+    /// store goes on committing, so an engine must not hold back commits, by a
+    /// lock or a blocking read transaction, until the snapshot is read or
+    /// dropped. The boundary is at or above the position the tree was
+    /// registered at, so every log row from it on carries the tree's keys.
     ///
     /// The core's build hook restarts the tree at the boundary, fills the
     /// folded rows from the entities, folds the log from the boundary until
