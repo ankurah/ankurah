@@ -110,7 +110,7 @@ impl TestStorageTransaction<'_> {
         for event in self.events {
             data.events.insert(event.payload.id(), event);
         }
-        Ok(StorageCommitOutcome::Committed(StorageCommitResult { entities }))
+        Ok(StorageCommitOutcome::Committed(StorageCommitResult { entities, position: None }))
     }
 }
 
