@@ -1,7 +1,8 @@
 //! Properties a digest tree relies on: a set of leaves has one digest however
 //! the leaves are grouped and whatever order they arrive in, a commit's
-//! subtract-and-add update agrees with recomputation, a leaf is bound to its
-//! key, and the byte layouts round-trip.
+//! subtract-and-add update agrees with recomputation whether it changes an
+//! entity's head or moves the entity to another key, a leaf's canonical
+//! encoding is injective and binds its key, and the byte layouts round-trip.
 
 use ankurah_core_types::EntityId;
 use ankurah_digest::{Digest, HeadHash, Leaf, LeafPoint, DIGEST_WIRE_LEN};
@@ -54,6 +55,13 @@ fn leaf_points(max: usize) -> impl Strategy<Value = Vec<LeafPoint>> {
 }
 
 fn digests(points: &[LeafPoint]) -> Vec<Digest> { points.iter().map(|point| Digest::from(*point)).collect() }
+
+/// The first part of a canonical leaf encoding, read through the eight
+/// big-endian bytes of its length, and the bytes after it.
+fn split_part(bytes: &[u8]) -> (&[u8], &[u8]) {
+    let (length, rest) = bytes.split_at(8);
+    rest.split_at(u64::from_be_bytes(length.try_into().unwrap()) as usize)
+}
 
 /// Sum consecutive runs of `digests`, cutting before each position in `cuts`:
 /// one level of a tree whose nodes hold consecutive leaves.
@@ -114,6 +122,44 @@ proptest! {
         let recomputed: Digest = after.iter().map(|leaf| Digest::from(leaf.point())).sum();
         prop_assert_eq!(updated, recomputed);
         prop_assert_eq!(updated.count(), leaves.len() as i64);
+    }
+
+    /// A commit that moves one entity to another key, its head unchanged,
+    /// updates a digest the same way: subtracting the old leaf's point and
+    /// adding the new one gives the digest recomputed from scratch, a digest
+    /// other than the one before, with the same count.
+    #[test]
+    fn moving_an_entity_to_another_key_equals_recomputation(
+        leaves in vec(leaf_parts(), 1..16),
+        moved in any::<Index>(),
+        new_key in index_key(),
+    ) {
+        let i = moved.index(leaves.len());
+        prop_assume!(new_key != leaves[i].key);
+        let before: Digest = leaves.iter().map(|leaf| Digest::from(leaf.point())).sum();
+        let mut after = leaves.clone();
+        after[i].key = new_key;
+        let updated = before - Digest::from(leaves[i].point()) + Digest::from(after[i].point());
+        let recomputed: Digest = after.iter().map(|leaf| Digest::from(leaf.point())).sum();
+        prop_assert_eq!(updated, recomputed);
+        prop_assert_ne!(updated, before);
+        prop_assert_eq!(updated.count(), leaves.len() as i64);
+    }
+
+    /// The canonical encoding is injective: it parses back into exactly the
+    /// key, entity id and head hash it was made from, with nothing left over,
+    /// so no two distinct leaves share an encoding.
+    #[test]
+    fn the_canonical_encoding_is_injective(leaf in leaf_parts()) {
+        let head = HeadHash::of(leaf.head.iter().copied());
+        let encoded = Leaf::new(&leaf.key, EntityId::from_bytes(leaf.entity_id), head).encode();
+        let (key, rest) = split_part(&encoded);
+        let (entity_id, rest) = split_part(rest);
+        let (head_hash, rest) = split_part(rest);
+        prop_assert_eq!(key, &leaf.key[..]);
+        prop_assert_eq!(entity_id, &leaf.entity_id[..]);
+        prop_assert_eq!(head_hash, &head.as_bytes()[..]);
+        prop_assert!(rest.is_empty());
     }
 
     /// The same entity with the same head under two keys is two distinct
