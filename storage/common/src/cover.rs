@@ -786,9 +786,9 @@ mod tests {
         }
     }
 
-    /// NaN equals nothing, so a comparison with NaN matches nothing. The planner's bounds never
-    /// imply such a comparison, so it stays residual and the Selection is refused; bounds
-    /// holding NaN that do reach a tree name no key and are refused as unsatisfiable.
+    /// An equality or ordered comparison with NaN matches nothing. The planner's bounds never
+    /// imply one, so it stays residual and the Selection is refused; bounds holding NaN that do
+    /// reach a tree name no key and are refused as unsatisfiable.
     #[test]
     fn a_comparison_with_nan_is_refused() {
         let tree = tree(vec![part("weight", ValueType::F64, IndexDirection::Asc)]);
@@ -809,6 +809,44 @@ mod tests {
         {
             let bounds = KeyBounds::new(vec![KeyBoundComponent { column: column.clone(), low, high }]);
             assert_eq!(tree.cover(&engine_key_spec(key_parts(&tree.index)), &bounds, &declared_type), Err(NotReusable::Unsatisfiable));
+        }
+    }
+
+    /// A comparison with NaN is not always empty: NaN != x matches every album with a weight,
+    /// NaN's included, and so does the negation of an equality or ordered comparison with NaN.
+    /// The planner's bounds imply no comparison with NaN, alone, negated or combined with a
+    /// range of weights, so each stays residual and the Selection is refused, over a tree in
+    /// either direction.
+    #[test]
+    fn a_negated_or_unequal_comparison_with_nan_is_refused() {
+        use ComparisonOperator::{Equal, GreaterThanOrEqual, LessThan, NotEqual};
+        let weight = |operator, value| comparison("weight", operator, Value::F64(value));
+        let not = |predicate| Predicate::Not(Box::new(predicate));
+        let and = |left, right| Predicate::And(Box::new(left), Box::new(right));
+        let or = |left, right| Predicate::Or(Box::new(left), Box::new(right));
+        let nan = f64::NAN;
+        let predicates = [
+            weight(NotEqual, nan),
+            not(weight(Equal, nan)),
+            not(weight(GreaterThanOrEqual, nan)),
+            not(weight(NotEqual, nan)),
+            and(weight(GreaterThanOrEqual, 0.0), weight(NotEqual, nan)),
+            and(not(weight(LessThan, nan)), weight(LessThan, 1.0)),
+            or(weight(NotEqual, nan), weight(GreaterThanOrEqual, 0.0)),
+            or(not(weight(Equal, nan)), weight(Equal, 0.0)),
+            not(and(weight(GreaterThanOrEqual, 0.0), weight(Equal, nan))),
+        ];
+        for direction in [IndexDirection::Asc, IndexDirection::Desc] {
+            let tree = tree(vec![part("weight", ValueType::F64, direction)]);
+            for predicate in &predicates {
+                let refusal = cover_selection(&albums_where(predicate.clone()), std::slice::from_ref(&tree), declared_type);
+                assert!(matches!(refusal, Err(NotReusable::Residual(_))), "{predicate:?} over {direction:?}: {refusal:?}");
+            }
+        }
+        for album in [f64::NAN, f64::NEG_INFINITY, 0.0, f64::INFINITY].map(|weight| Album::weighing(weight, entity(0x00))) {
+            for predicate in [weight(NotEqual, nan), not(weight(GreaterThanOrEqual, nan))] {
+                assert!(evaluate_predicate(&album, &predicate).unwrap(), "{predicate:?} at weight {}", album.value);
+            }
         }
     }
 }
