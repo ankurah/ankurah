@@ -75,16 +75,29 @@ fn expand_message_xmd_sha512(msg: &[u8], dst: &[u8], out: &mut [u8]) {
 mod tests {
     use super::*;
     use curve25519_dalek::ristretto::CompressedRistretto;
+    use sha2::Sha256;
+
+    /// The domain separation tag of RFC 9380 appendix K.3's vectors.
+    const DST: &[u8] = b"QUUX-V01-CS02-with-expander-SHA512-256";
 
     fn hex(s: &str) -> Vec<u8> { (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect() }
 
-    /// RFC 9380 appendix K.3: expand_message_xmd with SHA-512. The expansion
-    /// is checked at the 32- and 128-byte lengths the RFC publishes, which
-    /// between them exercise the first block and the chained blocks that the
-    /// 64-byte expansion of a leaf is made of.
+    fn expand(msg: &[u8], dst: &[u8], len: usize) -> Vec<u8> {
+        let mut out = vec![0u8; len];
+        expand_message_xmd_sha512(msg, dst, &mut out);
+        out
+    }
+
+    /// RFC 9380 appendix K.3: expand_message_xmd with SHA-512, at the 32- and
+    /// 128-byte lengths the RFC publishes. These test the algorithm's
+    /// branches, an output within the first block and blocks chained through
+    /// strxor, but not the 64-byte answer a leaf uses: the requested length
+    /// enters b_0, so no other length's answer contains it. The next test
+    /// checks 64 bytes directly, and the leaf fixtures in leaf.rs
+    /// (`leaf_points_match_known_answers`) are the production-length
+    /// known-answer test, from a leaf's bytes to its point.
     #[test]
     fn expand_message_xmd_sha512_matches_rfc_9380_vectors() {
-        const DST: &[u8] = b"QUUX-V01-CS02-with-expander-SHA512-256";
         let q128 = format!("q128_{}", "q".repeat(128));
         let a512 = format!("a512_{}", "a".repeat(512));
         let vectors: [(&[u8], usize, &str); 10] = [
@@ -130,6 +143,67 @@ mod tests {
             assert_eq!(out, hex(expected), "msg of {} bytes expanded to {len}", msg.len());
         }
     }
+
+    /// The messages and tag of RFC 9380 appendix K.3, expanded to the 64 bytes
+    /// a leaf uses. The answers come from a separate Python implementation of
+    /// RFC 9380 section 5.3.1 on hashlib's SHA-512, which reproduces every
+    /// appendix K.3 answer in the test above.
+    #[test]
+    fn expand_message_xmd_sha512_matches_independent_64_byte_answers() {
+        let q128 = format!("q128_{}", "q".repeat(128));
+        let a512 = format!("a512_{}", "a".repeat(512));
+        let vectors: [(&[u8], &str); 5] = [
+            (b"", "bb1edd5eb9d2013ba76c24410c8f54232fd258cdb088d54b1b3923f7deba035a10d9eee746edc2c6618ba48877d6a102ac850f9dde8d78d968abc9dc5658d851"),
+            (b"abc", "4a05d1b49d7153fb512df83b8564fe1754c607e2fbbc3d97c591fa175b6fca1efb300462d96ed613f1534ecb260671eb8469a20071049dc8021b986828540592"),
+            (
+                b"abcdef0123456789",
+                "ef58305dfa26469536b72eaa3dc6cb9f82a06b6d99c4a2bd60f24320b5e4a395b148ae89ce203dfda386f58a86f2533284356c8d437760b85ca5011deb2b9db3",
+            ),
+            (
+                q128.as_bytes(),
+                "8f091e488dabc12f3be9f70f5d14ec2a4d732b6d37f7813773fc6c91f8130ce7daac7283c059fe8e06dbeadcfe870bd2a5f40de96d702fb01ed53411600b9487",
+            ),
+            (
+                a512.as_bytes(),
+                "d3202e2019f687c6a9aff89e949d869d2e97544bf1404a02bea623fbb480606672481c4e42845b3b775155db6c650dcefaa829c88b38f4075be4af7cd6dc5bf6",
+            ),
+        ];
+        for (msg, expected) in vectors {
+            assert_eq!(expand(msg, DST, 64), hex(expected), "msg of {} bytes", msg.len());
+        }
+    }
+
+    /// Lengths either side of one SHA-512 block, and the helper's limits, with
+    /// answers from the same Python implementation: "abc" expanded to 63 and
+    /// 65 bytes; to 16,320 bytes, the 255 blocks the expansion can produce,
+    /// pinned by the SHA-256 of the output; and to 64 bytes under a 255-byte
+    /// tag, the longest the helper takes, made of the bytes 0 to 254.
+    #[test]
+    fn expand_message_xmd_sha512_at_the_block_boundary_and_its_limits() {
+        assert_eq!(
+            expand(b"abc", DST, 63),
+            hex("6efcc59228154a197acc37c8fd68b6d1e23abf1c952423a398e81083820d10db73c0b8976b0d4d6c13433c023d666b6b465050bf5395ec531c990d70cce8b2")
+        );
+        assert_eq!(
+            expand(b"abc", DST, 65),
+            hex("c7c619bcb1887e1384c7adec85a09b5818913db58b2fbb48db3cba2fe5397a27f73e3336e653ea2784a38a2d89e0fb2b1041e0e541d28907734aae67db42095a86")
+        );
+        let longest = expand(b"abc", DST, 255 * B_IN_BYTES);
+        assert_eq!(Sha256::digest(&longest).to_vec(), hex("9278e866d9c3185b57dab028bdf9890f0d0756fd64c0228354838901947d1521"));
+        let longest_tag: [u8; 255] = std::array::from_fn(|i| i as u8);
+        assert_eq!(
+            expand(b"abc", &longest_tag, 64),
+            hex("7ed3b1694c070acf03a237397ba74e75a921a109e67f44999f58e31ef63431dfe4e44d36cb94dc9280e79c27081bbabdb685d79cab1449e3af4861b6c5b2f118")
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "expand_message_xmd produces at most 255 blocks")]
+    fn expand_message_xmd_sha512_refuses_more_than_255_blocks() { expand(b"abc", DST, 255 * B_IN_BYTES + 1); }
+
+    #[test]
+    #[should_panic(expected = "domain separation tags are at most 255 bytes")]
+    fn expand_message_xmd_sha512_refuses_a_tag_longer_than_255_bytes() { expand(b"abc", &[0u8; 256], 64); }
 
     /// RFC 9496 appendix A.3: element derivation from 64 uniform bytes, the
     /// map `hash_to_ristretto255` applies after the expansion. Checked here so
