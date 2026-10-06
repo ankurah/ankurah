@@ -186,8 +186,7 @@ pub async fn fresh_store_keeps_an_entity_id_tree<E: TreeStorage + 'static>(engin
     assert_eq!(trees[0].index, HashedIndex::EntityId);
     let start = LogPosition::start(engine.stable_position().await.unwrap().incarnation());
     assert_eq!(cell_of(&*engine, trees[0].id).await, TreeCell { generation: 0, status: BuildStatus::Ready, folded: start });
-    assert_eq!(register(&*engine, HashedIndex::EntityId).await, trees[0], "registration is keyed by the index");
-    assert!(matches!(engine.unregister_tree(trees[0].id).await, Err(TreeStorageError::PermanentTree)));
+    assert_eq!(permanent_entity_id_tree(&*engine).await, trees[0]);
     assert_eq!(engine.prune_horizon().await.unwrap(), start);
 }
 
@@ -482,8 +481,7 @@ pub async fn reset_mints_a_new_incarnation<E: TreeStorage + 'static>(engine: Arc
     assert_eq!(trees.iter().map(|tree| &tree.index).collect::<Vec<_>>(), [&HashedIndex::EntityId]);
     let start = LogPosition::start(stable.incarnation());
     assert_eq!(cell_of(&*engine, trees[0].id).await, TreeCell { generation: 0, status: BuildStatus::Ready, folded: start });
-    assert_eq!(register(&*engine, HashedIndex::EntityId).await, trees[0], "registration is keyed by the index");
-    assert!(matches!(engine.unregister_tree(trees[0].id).await, Err(TreeStorageError::PermanentTree)), "the fresh tree is permanent");
+    assert_eq!(permanent_entity_id_tree(&*engine).await, trees[0], "the fresh tree is the permanent entity-id tree");
     assert_eq!(engine.prune_horizon().await.unwrap(), start);
     assert!(matches!(engine.get_state(entity(1)).await, Err(RetrievalError::EntityNotFound(_))));
 }
@@ -1235,7 +1233,12 @@ pub async fn snapshot_and_replay_give_the_current_index<E: TreeStorage + 'static
             (Clock::default(), state(entity(7), 17, &[component()], &[(title(), text("g"))])),
         ],
     );
-    tokio::time::timeout(PROGRESS, during).await.expect("a commit does not wait for an open snapshot").committed().unwrap();
+    let during = tokio::time::timeout(PROGRESS, during).await.expect("a commit does not wait for an open snapshot");
+    let during = during.committed().unwrap().position.expect("a commit that sets states is logged");
+    // The first commit after the snapshot takes the boundary itself unless a
+    // gap lies there, as none does on the in-memory engine; the replay starts
+    // at the boundary, inclusive.
+    assert!(during >= boundary);
     while let Some(entity) = entities.next().await {
         seen.push(entity.unwrap());
     }
@@ -1248,7 +1251,14 @@ pub async fn snapshot_and_replay_give_the_current_index<E: TreeStorage + 'static
     }
     let as_of_boundary = [(1, keyed(1, "a")), (2, keyed(2, "b")), (3, keyed(3, "c")), (6, keyed(6, "f"))];
     assert_eq!(index, as_of_boundary.map(|(n, keyed)| (entity(n), keyed)).into(), "the snapshot is the index as of its boundary");
-    for row in read_all(&*engine, boundary).await {
+    let replay = read_all(&*engine, boundary).await;
+    let replayed: Vec<_> = replay.iter().map(|row| (row.position, row.entity_id)).collect();
+    assert_eq!(
+        replayed,
+        [1, 3, 4, 7].map(|n| (during, entity(n))),
+        "the replay holds the later commit's rows, each once, and none from below"
+    );
+    for row in replay {
         match row.keys[&tree].clone() {
             keys if keys.is_empty() => index.remove(&row.entity_id),
             keys => index.insert(row.entity_id, (row.head, keys)),
@@ -1409,6 +1419,7 @@ pub async fn reopen_keeps_what_was_durable<H: Reopen>(reopen: H) {
     for (id, n) in [(entity(1), 1), (entity(2), 2)] {
         assert_eq!(engine.get_state(id).await.unwrap().payload.state.head, head(n), "a durable commit's state survives");
     }
+    permanent_entity_id_tree(&*engine).await;
 }
 
 /// A crash keeps a tree's batches whole and in order: the reopened tree is as
@@ -1490,6 +1501,7 @@ pub async fn reopen_after_a_reset_keeps_the_new_incarnation<H: Reopen>(reopen: H
     assert_eq!(engine.get_state(entity(2)).await.unwrap().payload.state.head, head(2));
     let trees = engine.trees().await.unwrap();
     assert_eq!(trees.iter().map(|tree| &tree.index).collect::<Vec<_>>(), [&HashedIndex::EntityId], "only the fresh entity-id tree");
+    permanent_entity_id_tree(&*engine).await;
 }
 
 /// Everything a reader sees of one tree, with the store's prune horizon.
@@ -1722,6 +1734,18 @@ async fn create<E: StorageEngine>(engine: &E, states: Vec<Attested<EntityState>>
 }
 
 async fn read_all<E: CommitLog>(engine: &E, from: LogPosition) -> Vec<LogRow> { engine.read_log(from, usize::MAX).await.unwrap().rows }
+
+/// The store's entity-id tree, checked to be the registration for its index
+/// and permanent: it cannot be unregistered, and its index cannot opt out.
+async fn permanent_entity_id_tree<E: TreeStorage>(engine: &E) -> TreeRegistration {
+    let trees = engine.trees().await.unwrap();
+    let tree = trees.into_iter().find(|tree| tree.index == HashedIndex::EntityId).expect("every store keeps an entity-id tree");
+    assert_eq!(register(engine, HashedIndex::EntityId).await, tree, "registration is keyed by the index");
+    assert!(matches!(engine.unregister_tree(tree.id).await, Err(TreeStorageError::PermanentTree)), "the entity-id tree is permanent");
+    let opted_out = engine.register_tree(HashedIndex::EntityId, TreeOptions { opted_out: true }).await;
+    assert!(matches!(opted_out, Err(TreeStorageError::PermanentTree)), "the entity-id index cannot opt out");
+    tree
+}
 
 /// Register a tree for `index` with the default options, which keep one.
 async fn register<E: TreeStorage>(engine: &E, index: HashedIndex) -> TreeRegistration {
