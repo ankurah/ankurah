@@ -32,6 +32,8 @@ pub use catalog::CatalogResolver;
 mod read;
 pub use read::GetStateResult;
 
+pub mod tree;
+
 /// One atomic storage transaction. Engines may execute writes as they arrive or buffer them until commit.
 /// Dropping the handle without committing must leave its writes uncommitted.
 #[async_trait]
