@@ -22,11 +22,15 @@
 //! # From bounds to an interval of addresses
 //!
 //! A [`KeyRange`] fixes the leading key parts to the values of its prefix, whose encodings
-//! concatenate to the bytes P, and bounds the next key part. For encoded bytes c, the first
-//! address under c is the fraction 0.c; past every address under c is c with its last byte
-//! that is not 0xFF incremented and the bytes after it dropped, or the end of the address
-//! space when c is empty or all 0xFF. With v the encoding of a bound's value x and Pv the
-//! bytes P followed by v, on a key part whose direction is ascending:
+//! concatenate to the bytes P, and bounds the part after them: the next key part, or, once the
+//! prefix fixes every key part, the entity id that ends every address, which is how a range of
+//! an entity-id index bounds the entity id. The entity id's 32 bytes are what an ascending
+//! entity-id key part would encode, so it bounds like one while the address holds it once.
+//! For encoded bytes c, the first address under c is the fraction 0.c; past every address
+//! under c is c with its last byte that is not 0xFF incremented and the bytes after it
+//! dropped, or the end of the address space when c is empty or all 0xFF. With v the encoding
+//! of a bound's value x and Pv the bytes P followed by v, on a key part whose direction is
+//! ascending:
 //!
 //! | bound               | the interval of addresses                 |
 //! |---------------------|-------------------------------------------|
@@ -90,7 +94,9 @@ use crate::storage::tree::HashedIndex;
 use crate::value::{Value, ValueType};
 
 /// A range of one index's keys: the leading key parts fixed to the values of `prefix`, and the
-/// next key part bounded on each side in the order of its values, whatever its direction.
+/// part after them bounded on each side in the order of its values, whatever its direction.
+/// That part is the next key part or, once `prefix` fixes every key part, the entity id that
+/// ends every address; a range of an entity-id index bounds the entity id.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KeyRange {
     pub prefix: Vec<Value>,
@@ -185,12 +191,13 @@ fn key_parts(index: &HashedIndex) -> &[IndexKeyPart<PropertyId>] {
     }
 }
 
-/// Why a range of an index has no exact cover.
+/// Why a range of an index has no exact cover. Parts are numbered in address order: the key
+/// parts from 0, then the entity id.
 #[derive(Debug, Clone, PartialEq, Error)]
 pub enum RangeError {
     #[error("the range constrains key part {part}, but the index has {parts} key parts")]
     NoSuchPart { part: usize, parts: usize },
-    #[error("key part {part} holds {expected:?} values, which cannot represent this {found:?} value")]
+    #[error("part {part} holds {expected:?} values, which cannot represent this {found:?} value")]
     TypeMismatch { part: usize, expected: ValueType, found: ValueType },
     #[error("key part {part} encodes {value_type:?} values {direction:?} with a terminator that can begin another value's encoding")]
     AmbiguousEncoding { part: usize, value_type: ValueType, direction: IndexDirection },
@@ -208,12 +215,8 @@ impl KeyRange {
         for (index, (value, part)) in self.prefix.iter().zip(parts).enumerate() {
             fixed.extend(encode(index, part, value)?);
         }
-        let Some(part) = parts.get(bounded) else {
-            return match (&self.lower, &self.upper) {
-                (Bound::Unbounded, Bound::Unbounded) => Ok((Point::first_under(&fixed), Point::past(&fixed))),
-                _ => Err(RangeError::NoSuchPart { part: bounded, parts: parts.len() }),
-            };
-        };
+        // The part after the prefix: the next key part, or the entity id once every key part is fixed.
+        let part = parts.get(bounded).unwrap_or(&ENTITY_ID);
         let upper = self.upper_excluding_nan(part);
         // In address order: a descending part's upper value bound starts the interval.
         let (from, to) = if part.direction.is_desc() { (&upper, &self.lower) } else { (&self.lower, &upper) };
@@ -251,6 +254,16 @@ impl KeyRange {
         self.prefix.iter().chain(bounds).any(|value| matches!(value, Value::F64(number) if number.is_nan()))
     }
 }
+
+/// The entity id that ends every address, as the key part whose encoding its bytes are.
+static ENTITY_ID: IndexKeyPart<PropertyId> = IndexKeyPart {
+    key: PropertyId::Id,
+    sub_path: None,
+    direction: IndexDirection::Asc,
+    value_type: ValueType::EntityId,
+    nulls: None,
+    collation: None,
+};
 
 /// The canonical encoding of `value` as key part number `index`. Refused when the part's
 /// encoding is not prefix-free or the value is not of the part's type; integer widths share one
@@ -391,6 +404,17 @@ mod tests {
         EntityId::from_bytes(bytes)
     }
 
+    /// The extreme entity ids, their neighbours, and the two ids either side of the top bit:
+    /// the ids after every row's key, and the bounds of ranges on the entity id.
+    fn entities() -> Vec<EntityId> {
+        let ending = |rest: u8, last: u8| {
+            let mut bytes = [rest; 32];
+            bytes[31] = last;
+            EntityId::from_bytes(bytes)
+        };
+        vec![entity(0x00, 0x00), ending(0x00, 0x01), entity(0x7F, 0xFF), entity(0x80, 0x00), ending(0xFF, 0xFE), entity(0xFF, 0xFF)]
+    }
+
     // ---- checking a list of blocks against the interval it should tile ----
 
     /// Points compared as fractions: bytes padded with zeros to one length compare in order.
@@ -507,7 +531,7 @@ mod tests {
     }
 
     /// The predicate a Selection would state for the range: each prefix value equal to its key
-    /// part's value, and the bounded key part within the bounds.
+    /// part's value, and the bounded part, a key part or the entity id, within the bounds.
     fn predicate(parts: &[IndexKeyPart<PropertyId>], range: &KeyRange) -> Predicate<Resolved> {
         let compare = |key: PropertyId, operator, value: &Value| Predicate::Comparison {
             left: Box::new(Expr::Path(PropertyPath::from(key))),
@@ -516,31 +540,29 @@ mod tests {
         };
         let mut conjuncts: Vec<_> =
             parts.iter().zip(&range.prefix).map(|(part, value)| compare(part.key, ComparisonOperator::Equal, value)).collect();
-        if let Some(part) = parts.get(range.prefix.len()) {
-            match &range.lower {
-                Bound::Included(value) => conjuncts.push(compare(part.key, ComparisonOperator::GreaterThanOrEqual, value)),
-                Bound::Excluded(value) => conjuncts.push(compare(part.key, ComparisonOperator::GreaterThan, value)),
-                Bound::Unbounded => {}
-            }
-            match &range.upper {
-                Bound::Included(value) => conjuncts.push(compare(part.key, ComparisonOperator::LessThanOrEqual, value)),
-                Bound::Excluded(value) => conjuncts.push(compare(part.key, ComparisonOperator::LessThan, value)),
-                Bound::Unbounded => {}
-            }
+        let bounded = parts.get(range.prefix.len()).map_or(PropertyId::Id, |part| part.key);
+        match &range.lower {
+            Bound::Included(value) => conjuncts.push(compare(bounded, ComparisonOperator::GreaterThanOrEqual, value)),
+            Bound::Excluded(value) => conjuncts.push(compare(bounded, ComparisonOperator::GreaterThan, value)),
+            Bound::Unbounded => {}
+        }
+        match &range.upper {
+            Bound::Included(value) => conjuncts.push(compare(bounded, ComparisonOperator::LessThanOrEqual, value)),
+            Bound::Excluded(value) => conjuncts.push(compare(bounded, ComparisonOperator::LessThan, value)),
+            Bound::Unbounded => {}
         }
         conjuncts.into_iter().fold(Predicate::True, |all, conjunct| Predicate::And(Box::new(all), Box::new(conjunct)))
     }
 
     /// Every row lies in at most one block of the cover, and in one exactly when Selection
-    /// evaluation of the range's predicate admits it. Entity ids starting 0x00 and 0xFF sit
-    /// right after the key's last byte.
+    /// evaluation of the range's predicate admits it. Each row is tried with every id of
+    /// [`entities`]; those starting 0x00 and 0xFF sit right after the key's last byte.
     fn assert_exact(index: &HashedIndex, range: &KeyRange, rows: &[Vec<Value>]) {
         let cover = Cover::new(index.clone(), range.clone()).unwrap_or_else(|error| panic!("{range:?}: {error}"));
         let parts = key_parts(index);
         let predicate = predicate(parts, range);
-        let entities = [entity(0x00, 0x00), entity(0x7F, 0xFF), entity(0x80, 0x00), entity(0xFF, 0xFF)];
         for values in rows {
-            for entity in entities {
+            for entity in entities() {
                 let address = address(index, values, &entity);
                 let holding = cover.blocks().iter().filter(|block| block.contains(&address)).count();
                 assert!(holding <= 1, "{range:?}: row {values:?} lies in {holding} blocks");
@@ -741,6 +763,41 @@ mod tests {
         assert_ne!(members.index(), Cover::root().index());
     }
 
+    #[test]
+    fn a_range_on_the_entity_id_of_an_entity_id_index_holds_exactly_the_entities_inside_it() {
+        let ids = entities().into_iter().map(Value::EntityId).collect::<Vec<_>>();
+        for index in [HashedIndex::EntityId, index(Vec::new())] {
+            // Each row is an entity id alone; assert_exact tries every id of `entities`.
+            for range in every_range(&[], &ids) {
+                assert_exact(&index, &range, &[Vec::new()]);
+            }
+            // The address holds the id once: one id is the block of its 256 bits.
+            let id = entities()[2];
+            let one =
+                Cover::new(index.clone(), range(Vec::new(), Bound::Included(Value::EntityId(id)), Bound::Included(Value::EntityId(id))));
+            assert_eq!(one.unwrap().blocks(), [Block::new(&id.to_bytes(), 256)]);
+            // A bound is the one way to name the id: no prefix fixes it.
+            assert_eq!(
+                Cover::new(index.clone(), KeyRange::prefix(vec![Value::EntityId(id)])),
+                Err(RangeError::NoSuchPart { part: 0, parts: 0 })
+            );
+            assert_eq!(
+                Cover::new(index, range(Vec::new(), Bound::Excluded(Value::I64(5)), Bound::Unbounded)),
+                Err(RangeError::TypeMismatch { part: 0, expected: ValueType::EntityId, found: ValueType::I64 })
+            );
+        }
+    }
+
+    #[test]
+    fn a_range_on_the_entity_id_after_a_whole_key_holds_exactly_the_rows_inside_it() {
+        let ids = entities().into_iter().map(Value::EntityId).collect::<Vec<_>>();
+        let index = index(vec![desc("score", ValueType::I64)]);
+        let rows = [-1, 0, 1].map(|score| vec![Value::I64(score)]);
+        for range in every_range(&[Value::I64(0)], &ids) {
+            assert_exact(&index, &range, &rows);
+        }
+    }
+
     /// Blocks follow the bounds, not any tree: a range of 16 integers falls into blocks of 61 to
     /// 64 bits, which no tree with four or eight bits per level stores as nodes. Each member sums
     /// whatever nodes lie inside a block and scans leaves where it keeps none.
@@ -804,15 +861,16 @@ mod tests {
     }
 
     #[test]
-    fn a_range_past_the_last_key_part_is_refused() {
+    fn a_prefix_past_the_last_key_part_is_refused() {
         let scores = index(vec![asc("score", ValueType::I64)]);
         assert_eq!(
             Cover::new(scores.clone(), KeyRange::prefix(vec![Value::I64(1), Value::I64(2)])),
             Err(RangeError::NoSuchPart { part: 1, parts: 1 })
         );
+        // After the whole key the bounds are on the entity id, part 1 of this index's addresses.
         assert_eq!(
             Cover::new(scores.clone(), range(vec![Value::I64(1)], Bound::Included(Value::I64(2)), Bound::Unbounded)),
-            Err(RangeError::NoSuchPart { part: 1, parts: 1 })
+            Err(RangeError::TypeMismatch { part: 1, expected: ValueType::EntityId, found: ValueType::I64 })
         );
         let whole_key = Cover::new(scores, KeyRange::prefix(vec![Value::I64(1)])).unwrap();
         let one = encode_component_typed(&Value::I64(1), ValueType::I64, false).unwrap();
