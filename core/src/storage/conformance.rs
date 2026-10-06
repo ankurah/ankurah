@@ -82,6 +82,7 @@ macro_rules! tree_storage_conformance {
             handles_do_not_outlive_their_tree
             children_and_leaf_ranges_at_ragged_depths
             large_scans_continue_exactly
+            empty_trees_read_empty
             build_state_and_generation
             removal_is_whole_when_cancelled
             snapshot_and_replay_give_the_current_index
@@ -339,6 +340,8 @@ pub async fn reset_mints_a_new_incarnation<E: TreeStorage + 'static>(engine: Arc
     assert_eq!(trees.iter().map(|tree| &tree.index).collect::<Vec<_>>(), [&HashedIndex::EntityId]);
     let start = LogPosition::start(stable.incarnation());
     assert_eq!(cell_of(&*engine, trees[0].id).await, TreeCell { generation: 0, status: BuildStatus::Ready, folded: start });
+    assert_eq!(engine.register_tree(HashedIndex::EntityId).await.unwrap(), trees[0], "registration is keyed by the index");
+    assert!(matches!(engine.unregister_tree(trees[0].id).await, Err(TreeStorageError::PermanentTree)), "the fresh tree is permanent");
     assert_eq!(engine.prune_horizon().await.unwrap(), start);
     assert!(matches!(engine.get_state(entity(1)).await, Err(RetrievalError::EntityNotFound(_))));
 }
@@ -808,6 +811,64 @@ pub async fn large_scans_continue_exactly<E: TreeStorage + 'static>(engine: Arc<
     let beneath = scan(&key, 3, |range, limit| async move { reader.tombstones(&range, limit).await.unwrap() }).await;
     assert_eq!(beneath, tombstones.iter().filter(|tombstone| tombstone.key == [0x00, 0x07]).cloned().collect::<Vec<_>>());
     assert_eq!(beneath.len(), 4);
+}
+
+/// Every read of an empty tree reads nothing, whether the tree is new,
+/// emptied of its last leaf or published empty, and a tree of tombstones alone
+/// holds no rows; an empty tree may store no root row, as a new one does.
+pub async fn empty_trees_read_empty<E: TreeStorage + 'static>(engine: Arc<E>) {
+    let entity_ids = entity_id_tree(&*engine).await;
+    assert_empty(&engine.reader(entity_ids).await.unwrap()).await;
+    assert_eq!(cell_of(&*engine, entity_ids).await.status, BuildStatus::Ready, "a new store's entity-id tree is ready and empty");
+    let tree = engine.register_tree(title_index()).await.unwrap().id;
+    assert_empty(&engine.reader(tree).await.unwrap()).await;
+    assert_empty(&engine.batch(tree).await.unwrap()).await;
+
+    let position = create(&*engine, vec![state(entity(1), 1, &[], &[])]).await;
+    let mut batch = engine.batch(tree).await.unwrap();
+    let cell = batch.cell().await.unwrap();
+    batch.put_row(folded_row(b"k", entity(1), position)).await.unwrap();
+    batch.put_node(NodePrefix::root(), node_row(1, position)).await.unwrap();
+    let cell = committed(batch.commit(&cell).await.unwrap());
+    let mut batch = engine.batch(tree).await.unwrap();
+    batch.delete_row(b"k", entity(1)).await.unwrap();
+    batch.delete_node(&NodePrefix::root()).await.unwrap();
+    assert_empty(&batch).await;
+    let cell = committed(batch.commit(&cell).await.unwrap());
+    assert_empty(&engine.reader(tree).await.unwrap()).await;
+
+    let mut batch = engine.batch(tree).await.unwrap();
+    batch.publish().await.unwrap();
+    let cell = committed(batch.commit(&cell).await.unwrap());
+    assert_eq!(cell.status, BuildStatus::Ready);
+    assert_empty(&engine.reader(tree).await.unwrap()).await;
+
+    // Tombstones alone: no rows, no lookup, and a root that counts no leaves.
+    let tombstone = Tombstone { key: b"k".to_vec(), entity_id: entity(1), position };
+    let mut batch = engine.batch(tree).await.unwrap();
+    batch.put_tombstone(tombstone.clone()).await.unwrap();
+    batch.put_node(NodePrefix::root(), node_row(0, position)).await.unwrap();
+    committed(batch.commit(&cell).await.unwrap());
+    let reader = engine.reader(tree).await.unwrap();
+    let all = AddressRange::all();
+    assert_eq!(reader.row(b"k", entity(1)).await.unwrap(), None);
+    assert!(reader.entity_rows(entity(1)).await.unwrap().is_empty(), "a tombstone is not in the lookup");
+    assert!(reader.rows(&all, 10).await.unwrap().is_empty());
+    assert_eq!(reader.tombstones(&all, 10).await.unwrap(), [tombstone]);
+    assert_eq!(reader.node(&NodePrefix::root()).await.unwrap(), Some(node_row(0, position)));
+    assert!(reader.children(&NodePrefix::root()).await.unwrap().is_empty());
+}
+
+/// Every read of an empty tree, through a reader or a batch, reads nothing.
+async fn assert_empty<R: TreeRead>(reader: &R) {
+    let all = AddressRange::all();
+    assert_eq!(reader.row(b"k", entity(1)).await.unwrap(), None, "an empty tree has no row");
+    assert!(reader.entity_rows(entity(1)).await.unwrap().is_empty(), "an empty tree's lookup is empty");
+    assert!(reader.rows(&all, 10).await.unwrap().is_empty(), "an empty tree scans no rows");
+    assert!(reader.rows(&AddressRange::under(&NodePrefix::of(b"k", 8)), 10).await.unwrap().is_empty());
+    assert!(reader.tombstones(&all, 10).await.unwrap().is_empty(), "an empty tree has no tombstones");
+    assert_eq!(reader.node(&NodePrefix::root()).await.unwrap(), None, "an empty tree stores no root row unless given one");
+    assert!(reader.children(&NodePrefix::root()).await.unwrap().is_empty(), "an empty tree has no nodes");
 }
 
 /// A new registration builds at generation 0 from the stable position;
