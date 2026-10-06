@@ -16,4 +16,10 @@ sha2             = "0.10.8"
 thiserror        = "2"
 
 [dev-dependencies]
-proptest = { version = "1.11", default-features = false, features = ["std"] }
+criterion = "0.5"
+proptest  = { version = "1.11", default-features = false, features = ["std"] }
+
+# harness = false because criterion provides its own harness.
+[[bench]]
+name    = "digest"
+harness = false

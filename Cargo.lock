@@ -235,6 +235,7 @@ name = "ankurah-digest"
 version = "0.10.0"
 dependencies = [
  "ankurah-core-types",
+ "criterion",
  "curve25519-dalek",
  "proptest",
  "sha2",
