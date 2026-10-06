@@ -37,6 +37,7 @@ bench-internals = []
 ankurah-derive     = { path = "../derive", version = "=0.10.0" }
 ankql              = { path = "../ankql", version = "=0.10.0" }
 ankurah-core-types = { path = "../core-types", version = "=0.10.0" }
+ankurah-digest     = { path = "../digest", version = "=0.10.0" }
 ankurah-proto      = { path = "../proto", version = "=0.10.0" }
 ankurah-signals    = { path = "../signals", version = "=0.10.0" }
 
