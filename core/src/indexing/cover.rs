@@ -643,6 +643,25 @@ mod tests {
         [entity(0x10, 0x00), entity(0x10, 0x01), entity(0x0F, 0xFF), entity(0x00, 0x00), entity(0xFF, 0xFF)].map(Value::EntityId).to_vec()
     }
 
+    /// NaN, both zeros, and on either side of them the smallest and largest subnormal
+    /// magnitudes, the smallest normal one, 1.0 with its neighbours, the two largest finite
+    /// magnitudes, and infinity: floats beside each other in the encoding's order.
+    fn neighbouring_floats() -> Vec<Value> {
+        let magnitudes = [
+            f64::from_bits(1),
+            f64::MIN_POSITIVE.next_down(),
+            f64::MIN_POSITIVE,
+            1.0f64.next_down(),
+            1.0,
+            1.0f64.next_up(),
+            f64::MAX.next_down(),
+            f64::MAX,
+            f64::INFINITY,
+        ];
+        let signed = magnitudes.into_iter().flat_map(|magnitude| [-magnitude, magnitude]);
+        [f64::NAN, -0.0, 0.0].into_iter().chain(signed).map(Value::F64).collect()
+    }
+
     #[test]
     fn a_range_on_an_ascending_integer_holds_exactly_the_rows_inside_it() {
         let index = index(vec![asc("score", ValueType::I64)]);
@@ -745,6 +764,86 @@ mod tests {
             let rows = values.iter().map(|value| vec![value.clone()]).collect::<Vec<_>>();
             for range in every_range(&[], &values) {
                 assert_exact(&index, &range, &rows);
+            }
+        }
+    }
+
+    /// Beside the sampled floats above, floats next to each other in the encoding's order, as
+    /// rows and as bounds: each bound's neighbours fall on the side Selection evaluation puts
+    /// them, subnormals and the largest finite values included.
+    #[test]
+    fn ranges_on_neighbouring_floats_hold_exactly_the_rows_inside_them() {
+        let floats = neighbouring_floats();
+        let rows = floats.iter().map(|value| vec![value.clone()]).collect::<Vec<_>>();
+        for index in [index(vec![asc("weight", ValueType::F64)]), index(vec![desc("weight", ValueType::F64)])] {
+            for range in every_range(&[], &floats) {
+                assert_exact(&index, &range, &rows);
+            }
+        }
+    }
+
+    /// A ranged float before open parts: neither the parts after it nor the entity id carries
+    /// an address across the float's bounds, nor across the stop at +∞ that keeps a range open
+    /// above short of NaN.
+    #[test]
+    fn a_range_on_a_float_before_open_parts_holds_exactly_the_rows_inside_it() {
+        let bounds = [f64::NEG_INFINITY, -0.0, f64::from_bits(1), 1.0, f64::MAX, f64::INFINITY].map(Value::F64);
+        let mut rows = Vec::new();
+        for weight in neighbouring_floats() {
+            for score in [i64::MIN, i64::MAX] {
+                rows.extend([false, true].map(|done| vec![weight.clone(), Value::I64(score), Value::Bool(done)]));
+            }
+        }
+        for weight in [asc("weight", ValueType::F64), desc("weight", ValueType::F64)] {
+            let index = index(vec![weight, desc("score", ValueType::I64), asc("done", ValueType::Bool)]);
+            for range in every_range(&[], &bounds) {
+                assert_exact(&index, &range, &rows);
+            }
+        }
+    }
+
+    /// No float encodes between +∞ and NaN: ascending, no key lies strictly between
+    /// fff0000000000000 and ffffffffffffffff, and descending, none between 0000000000000000 and
+    /// 000fffffffffffff. A float range bounded below and open above stops exactly at the
+    /// addresses of +∞, holding every one of them whatever follows the float: ascending, its
+    /// last block ends where they end, and descending, its first block starts where they start.
+    /// It holds no address of that gap or of NaN, before open parts as at the end of the key.
+    #[test]
+    fn a_float_range_open_above_holds_every_address_of_infinity_and_none_of_the_gap_before_nan() {
+        let key = |bits: u64| bits.to_be_bytes().to_vec();
+        for suffix in [Vec::new(), vec![desc("score", ValueType::I64)]] {
+            // The bytes after the float: the suffix's parts and the entity id.
+            let trailing = 8 * suffix.len() + 32;
+            for direction in [IndexDirection::Asc, IndexDirection::Desc] {
+                let weight = IndexKeyPart { direction, ..asc("weight", ValueType::F64) };
+                let weights = index([vec![weight], suffix.clone()].concat());
+                let (infinity, gap, nan): (u64, [u64; 3], u64) = match direction {
+                    IndexDirection::Asc => (0xfff0000000000000, [0xfff0000000000001, 0xfff8000000000000, 0xfffffffffffffffe], u64::MAX),
+                    IndexDirection::Desc => (0x000fffffffffffff, [0x0000000000000001, 0x0007ffffffffffff, 0x000ffffffffffffe], 0),
+                };
+                let lowers = [
+                    Bound::Included(f64::NEG_INFINITY),
+                    Bound::Excluded(-1.0),
+                    Bound::Included(0.0),
+                    Bound::Excluded(f64::MAX),
+                    Bound::Included(f64::INFINITY),
+                ];
+                for lower in lowers {
+                    let cover = Cover::new(weights.clone(), range(Vec::new(), lower.map(Value::F64), Bound::Unbounded)).unwrap();
+                    let holds = |key: Vec<u8>, fill: u8| {
+                        let address = [key, vec![fill; trailing]].concat();
+                        cover.blocks().iter().any(|block| block.contains(&address))
+                    };
+                    let edge = match direction {
+                        IndexDirection::Asc => compare(&end_of(cover.blocks().last().unwrap()), &Point::At(key(infinity + 1))),
+                        IndexDirection::Desc => compare(&start_of(&cover.blocks()[0]), &Point::At(key(infinity))),
+                    };
+                    assert_eq!(edge, Ordering::Equal, "{lower:?} over {direction:?}: {:?}", cover.blocks());
+                    assert!(holds(key(infinity), 0x00) && holds(key(infinity), 0xFF), "{lower:?} over {direction:?}");
+                    for unused in gap.into_iter().chain([nan]) {
+                        assert!(!holds(key(unused), 0x00) && !holds(key(unused), 0xFF), "{lower:?} over {direction:?}: {unused:016x}");
+                    }
+                }
             }
         }
     }
