@@ -24,11 +24,29 @@ impl LeafParts {
 }
 
 fn leaf_parts() -> impl Strategy<Value = LeafParts> {
-    (vec(any::<u8>(), 0..12), any::<[u8; 32]>(), vec(any::<[u8; 32]>(), 1..4)).prop_map(|(key, entity_id, head)| LeafParts {
-        key,
-        entity_id,
-        head,
-    })
+    (index_key(), any::<[u8; 32]>(), head()).prop_map(|(key, entity_id, head)| LeafParts { key, entity_id, head })
+}
+
+/// Index keys: mostly short, some of 250 to 261 bytes, either side of 255,
+/// the largest length one byte can hold, and with zero bytes common, since the
+/// key encoder writes them as terminators and escapes.
+fn index_key() -> impl Strategy<Value = Vec<u8>> {
+    let byte = prop_oneof![Just(0u8), any::<u8>()];
+    prop_oneof![3 => vec(byte.clone(), 0..12), 1 => vec(byte, 250..262)]
+}
+
+/// A head of up to three event ids, empty included.
+fn head() -> impl Strategy<Value = Vec<[u8; 32]>> { vec(any::<[u8; 32]>(), 0..4) }
+
+/// A second key for a leaf filed under `key`: a prefix of it, it followed by
+/// more bytes, or any key.
+fn second_key(key: Vec<u8>) -> impl Strategy<Value = Vec<u8>> {
+    let extended = key.clone();
+    prop_oneof![
+        any::<Index>().prop_map(move |cut| key[..cut.index(key.len() + 1)].to_vec()),
+        vec(any::<u8>(), 1..4).prop_map(move |more| [&extended[..], &more].concat()),
+        index_key(),
+    ]
 }
 
 fn leaf_points(max: usize) -> impl Strategy<Value = Vec<LeafPoint>> {
@@ -86,7 +104,7 @@ proptest! {
     fn subtracting_the_old_leaf_and_adding_the_new_equals_recomputation(
         leaves in vec(leaf_parts(), 1..16),
         changed in any::<Index>(),
-        new_head in vec(any::<[u8; 32]>(), 1..4),
+        new_head in head(),
     ) {
         let i = changed.index(leaves.len());
         let before: Digest = leaves.iter().map(|leaf| Digest::from(leaf.point())).sum();
@@ -102,7 +120,7 @@ proptest! {
     /// leaves: different points, a digest that counts both, and removing one
     /// leaves exactly the other.
     #[test]
-    fn a_leaf_under_two_keys_is_two_distinct_leaves(leaf in leaf_parts(), other_key in vec(any::<u8>(), 0..12)) {
+    fn a_leaf_under_two_keys_is_two_distinct_leaves((leaf, other_key) in leaf_parts().prop_flat_map(|leaf| (Just(leaf.clone()), second_key(leaf.key)))) {
         prop_assume!(other_key != leaf.key);
         let filed_twice = LeafParts { key: other_key, ..leaf.clone() };
         let (a, b) = (leaf.point(), filed_twice.point());

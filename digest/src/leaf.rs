@@ -120,24 +120,39 @@ mod tests {
         assert_eq!(HeadHash::from_bytes(*head.as_bytes()), head);
     }
 
-    /// Known answers for one entity's leaf in two indexes: one keyed by a
-    /// string property, filed under the canonical ascending key of "blue"
-    /// (the UTF-8 bytes and a zero terminator), and the entity-id index, whose
-    /// key is empty. The head hash, the encodings and the 64 uniform bytes were
-    /// computed independently (Python's hashlib, following the definitions
-    /// above and RFC 9380 section 5.3.1); the points follow from those bytes
-    /// through the RFC 9496 element derivation. The canonical encodings of the
-    /// points are pinned so that any other implementation of the leaf hash can
-    /// be checked against them.
+    /// A leaf's point checked against its known 64 uniform bytes and the
+    /// known canonical encoding of the point.
+    fn assert_point_matches(leaf: &Leaf, uniform_bytes: &str, point: &str) {
+        let uniform_bytes: [u8; 64] = unhex(uniform_bytes).try_into().unwrap();
+        assert_eq!(leaf.point(), LeafPoint(RistrettoPoint::from_uniform_bytes(&uniform_bytes)));
+        assert_eq!(hex(leaf.point().0.compress().as_bytes()), point);
+    }
+
+    /// Known answers for one entity's leaves, each pinned at its encoding, its
+    /// 64 uniform bytes and its point: filed under the canonical ascending key
+    /// of the string "blue" (its UTF-8 bytes and a zero terminator); in the
+    /// entity-id index, whose key is empty; under the composite key ("blue",
+    /// "sky"), whose bytes begin with the first key's; under the key of the
+    /// string "a\0b", whose zero byte the key encoder escapes as 00 ff; and
+    /// under "blue" with an empty head. Every value was computed independently
+    /// in Python: the head hashes, the encodings and the uniform bytes with
+    /// hashlib, following the definitions above and RFC 9380 section 5.3.1,
+    /// and the points with an implementation of RFC 9496's element derivation
+    /// and encoding. They are pinned so that any other implementation of the
+    /// leaf hash can be checked against them.
     #[test]
     fn leaf_points_match_known_answers() {
         let entity_id = EntityId::from_bytes(std::array::from_fn(|i| i as u8));
-        let head = HeadHash::of([[0xaa; 32], [0x11; 32]]);
-        assert_eq!(hex(head.as_bytes()), "08d80e932baa3f23e52effe20e309b03dae93d74adbba74962427c038afe94dd");
+        let head = HeadHash::from_bytes(unhex("08d80e932baa3f23e52effe20e309b03dae93d74adbba74962427c038afe94dd").try_into().unwrap());
+        assert_eq!(head, HeadHash::of([[0xaa; 32], [0x11; 32]]));
+        let empty_head =
+            HeadHash::from_bytes(unhex("00f6de2079099bd503a07158f10da38202683a6374822bb72c738c4f5d0fe208").try_into().unwrap());
+        assert_eq!(empty_head, HeadHash::of([]));
 
-        let vectors: [(&[u8], &str, &str, &str); 2] = [
+        let vectors: [(&[u8], HeadHash, &str, &str, &str); 5] = [
             (
                 b"blue\0",
+                head,
                 "0000000000000005626c756500\
                  0000000000000020000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\
                  000000000000002008d80e932baa3f23e52effe20e309b03dae93d74adbba74962427c038afe94dd",
@@ -146,19 +161,77 @@ mod tests {
             ),
             (
                 b"",
+                head,
                 "0000000000000000\
                  0000000000000020000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\
                  000000000000002008d80e932baa3f23e52effe20e309b03dae93d74adbba74962427c038afe94dd",
                 "3b1aba62df4d742ee83643bec08ee5ea1dc5a50e3c9ecffbf2ad8eabed7b43a6951b860860790f2a0ed0191d02872f1bec39e31f86a657e875798cf804b2dd34",
                 "887d4ede28887ba10ffa31e2fb5b4eb614bdd54940549635858cbb69d6acea28",
             ),
+            (
+                b"blue\0sky\0",
+                head,
+                "0000000000000009626c756500736b7900\
+                 0000000000000020000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\
+                 000000000000002008d80e932baa3f23e52effe20e309b03dae93d74adbba74962427c038afe94dd",
+                "4f73c826ed1011e241daa4a0bc62ad27765b6d1739fc27c95c023d428b491595e643f4b8f2f80183d8992aa43926e8a2d227af383c3391e0f579695a839f1daa",
+                "54f12e8da336940e2dd4e8814d39958395b05a068b95a89ecf3187766ec46f43",
+            ),
+            (
+                b"a\0\xffb\0",
+                head,
+                "00000000000000056100ff6200\
+                 0000000000000020000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\
+                 000000000000002008d80e932baa3f23e52effe20e309b03dae93d74adbba74962427c038afe94dd",
+                "97320ec4c6c7f28d9d18a1760325d3c9741dda4d3e19f72d001915d53b37f0ee426be93d2c8ab2771f21772a276fc77efc57aa1e0c9bcad2f755a944508f0b13",
+                "4e196198d12e2b65ae03d041f8fc103d835384ba2d08c4fd386b70c75c75f723",
+            ),
+            (
+                b"blue\0",
+                empty_head,
+                "0000000000000005626c756500\
+                 0000000000000020000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\
+                 000000000000002000f6de2079099bd503a07158f10da38202683a6374822bb72c738c4f5d0fe208",
+                "292bb6d9113f79db77696c0640dd2966410a32ac58cf2bb5c661352c54a3805e5f2361f506f0d7af6cebff1d6d5bec62d8431f05825e5e4d2c6cd212c51eb2d3",
+                "6c91efcdd7b75493ff9f020dd409a9aca3c28d7e682f9bb808a2a65d8993d060",
+            ),
         ];
-        for (key, encoding, uniform_bytes, point) in vectors {
+        for (key, head, encoding, uniform_bytes, point) in vectors {
             let leaf = Leaf::new(key, entity_id, head);
             assert_eq!(hex(&leaf.encode()), encoding);
-            let uniform_bytes: [u8; 64] = unhex(uniform_bytes).try_into().unwrap();
-            assert_eq!(leaf.point(), LeafPoint(RistrettoPoint::from_uniform_bytes(&uniform_bytes)));
-            assert_eq!(hex(leaf.point().0.compress().as_bytes()), point);
+            assert_point_matches(&leaf, uniform_bytes, point);
+        }
+    }
+
+    /// Keys of 255 and 256 bytes, the bytes 0 to 254 and 0 to 255: the eight
+    /// length bytes carry the whole length, which a single byte could not.
+    /// The uniform bytes and points come from the same Python implementation.
+    #[test]
+    fn keys_of_255_and_256_bytes_keep_their_whole_length() {
+        let entity_id = EntityId::from_bytes(std::array::from_fn(|i| i as u8));
+        let head = HeadHash::of([[0xaa; 32], [0x11; 32]]);
+        let vectors = [
+            (
+                255,
+                "00000000000000ff",
+                "a814d321d48a7d473d4c49f485542ab73084343e2f84d9be47b0ec78a67a0579bdacdc40e93178813f25e2dee1bf398b73e064f45436e19ac384447179e66c28",
+                "ee2c2ddfb7e7a2280eac7f1bfe5a12582c973f5ca9087b42d7ff3f2861d7cc58",
+            ),
+            (
+                256,
+                "0000000000000100",
+                "aa8f69aa010bd789fc713a69df6344f15f15b63d70f710a91dee30bb6e218614672475f71ad892887446d8466241cb24d91799ce79034498609850a1827ecd2c",
+                "98e43d964bd8b516061a914f81a7c35fa88468f5b92cc289c979c08114416214",
+            ),
+        ];
+        for (len, length_bytes, uniform_bytes, point) in vectors {
+            let key: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            let leaf = Leaf::new(&key, entity_id, head);
+            let encoded = leaf.encode();
+            assert_eq!(hex(&encoded[..8]), length_bytes);
+            assert_eq!(encoded[8..8 + len], key[..]);
+            assert_eq!(encoded.len(), 8 + len + 2 * (8 + 32));
+            assert_point_matches(&leaf, uniform_bytes, point);
         }
     }
 }
