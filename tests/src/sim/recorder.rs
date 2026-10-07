@@ -94,7 +94,7 @@ impl SubscriptionRecorder {
                         title: view.title().ok(),
                         body: view.body().ok(),
                         event_ids: change.events().iter().map(|e| e.payload.id()).collect(),
-                        head: view.entity().head().to_vec(),
+                        head: view.entity().head().ids().cloned().collect::<Vec<_>>(),
                     }
                 })
                 .collect();

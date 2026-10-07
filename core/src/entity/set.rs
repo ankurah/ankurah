@@ -132,7 +132,7 @@ mod tests {
         property::backend::{LWWBackend, PropertyBackend},
         value::Value,
     };
-    use ankurah_proto::{AuthorId, EventId, PropertyId};
+    use ankurah_proto::{AuthorId, Clock, EventId, PropertyId};
     use std::sync::atomic::AtomicBool;
 
     #[test]
@@ -149,7 +149,7 @@ mod tests {
         }
         let event_id = EventId::from_bytes([3; 32]);
         backend.apply_operations_with_event(&backend.to_operations()?.unwrap(), event_id.clone())?;
-        state.set_head(event_id.into());
+        state.set_head(Clock::genesis(event_id));
         let entity = Entity::from_resident(entities.get_or_insert_state(EntityId::from_bytes([1; 32]), &state.to_state()?)?.1);
         assert_eq!(entity.values()?, expected.into_iter().collect::<Vec<_>>());
         let temporary = TemporaryEntity::new(entity.id(), &entity.to_state()?)?;
@@ -162,7 +162,7 @@ mod tests {
         let original = WeakEntitySet::new(SystemEpoch::allocate());
         let replacement = WeakEntitySet::new(SystemEpoch::allocate());
         let id = EntityId::from_bytes([1; 32]);
-        let state = State { head: EventId::from_bytes([2; 32]).into(), ..State::default() };
+        let state = State { head: Clock::genesis(EventId::from_bytes([2; 32])), ..State::default() };
         let resident = Entity::from_resident(original.get_or_insert_state(id, &state)?.1);
         let fresh = Entity::from_resident(replacement.get_or_insert_state(id, &state)?.1);
         assert_ne!(resident, fresh);

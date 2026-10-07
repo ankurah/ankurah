@@ -5,7 +5,7 @@ use ankurah_core::{
     storage::{CatalogResolver, StorageCommitOutcome, StorageEngine, StorageTransaction},
     value::{Value, ValueType},
 };
-use ankurah_proto::{EntityId, EntityState, EventId, ModelId, PropertyId, State, StateBuffers};
+use ankurah_proto::{Clock, EntityId, EntityState, EventId, ModelId, PropertyId, State, StateBuffers};
 use ankurah_storage_indexeddb_wasm::IndexedDBStorageEngine;
 use std::sync::Arc;
 use wasm_bindgen_test::*;
@@ -93,7 +93,7 @@ fn state(model: &ModelId, marker: u8, value_id: EntityId, value: Option<Value>, 
         entity_id: EntityId::from_bytes([marker; 32]),
         state: State {
             state_buffers: StateBuffers([(String::from("lww"), backend.to_state_buffer()?)].into()),
-            head: vec![event_id].into(),
+            head: Clock::genesis(event_id),
             memberships: [*model].into(),
             ..State::default()
         },

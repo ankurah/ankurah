@@ -340,6 +340,6 @@ fn record_write(
     value: &str,
 ) {
     let head = w.head_of(entity).expect("entity has a head after a write");
-    let event = head.to_vec().into_iter().next().expect("a single-tip head after a linear write");
+    let event = head.ids().next().cloned().expect("a single-tip head after a linear write");
     writes.lock().unwrap().push(LocalWrite { origin, entity, field, value: value.to_owned(), event });
 }

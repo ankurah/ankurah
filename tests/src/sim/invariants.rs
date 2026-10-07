@@ -160,7 +160,7 @@ pub async fn check_head_antichain(nodes: &[SimNode], universe: &ExpectedUniverse
     for node in nodes {
         for &entity in &universe.created {
             let Some(state) = node.entity_state(entity).await else { continue };
-            let head: Vec<proto::EventId> = state.head.to_vec();
+            let head: Vec<proto::EventId> = state.head.ids().cloned().collect::<Vec<_>>();
             if head.len() < 2 {
                 continue; // A single-tip (or empty) head is trivially an antichain.
             }
@@ -170,7 +170,7 @@ pub async fn check_head_antichain(nodes: &[SimNode], universe: &ExpectedUniverse
                 Err(_) => continue,
             };
             let parent_of: std::collections::HashMap<proto::EventId, Vec<proto::EventId>> =
-                events.iter().map(|e| (e.payload.id(), e.payload.parent.to_vec())).collect();
+                events.iter().map(|e| (e.payload.id(), e.payload.parent.ids().cloned().collect::<Vec<_>>())).collect();
 
             // For each head event, compute its strict ancestor set and ensure
             // no other head event is inside it.
@@ -210,7 +210,7 @@ pub async fn causal_closure(
 ) -> std::collections::HashSet<proto::EventId> {
     let events = node.node.storage.dump_entity_events(entity).await.unwrap_or_default();
     let parent_of: std::collections::HashMap<proto::EventId, Vec<proto::EventId>> =
-        events.iter().map(|e| (e.payload.id(), e.payload.parent.to_vec())).collect();
+        events.iter().map(|e| (e.payload.id(), e.payload.parent.ids().cloned().collect::<Vec<_>>())).collect();
 
     let mut closure = std::collections::HashSet::new();
     let mut stack: Vec<proto::EventId> = frontier.to_vec();

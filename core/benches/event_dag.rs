@@ -43,6 +43,7 @@ struct MemRetriever {
 
 impl MemRetriever {
     fn new() -> Self { Self { events: HashMap::new() } }
+    fn clock(&self, ids: &[EventId]) -> Clock { Clock::from_events(ids.iter().map(|id| self.events.get(id).expect("event was added"))) }
     fn add(&mut self, event: Event) -> EventId {
         let id = event.id();
         self.events.insert(id.clone(), event);
@@ -69,19 +70,22 @@ impl GetEvents for MemRetriever {
 /// no-parent event here is a genesis that `Event::validate_structure` would
 /// refuse; nothing under measurement consults it, since comparison, layering
 /// and ordering see only ids and parent clocks.
-fn event(seed: u32, parents: &[EventId]) -> Event {
+fn event(seed: u32, parent: Clock) -> Event {
     let mut entity_id_bytes = [0u8; 32];
     entity_id_bytes[0..4].copy_from_slice(&seed.to_be_bytes());
     let mut nonce = [0u8; 32];
     nonce[0..4].copy_from_slice(&seed.to_be_bytes());
     let operations = OperationSet::from_backends(BTreeMap::new());
-    let parent = Clock::from(parents.to_vec());
     let body = if parent.is_empty() {
         EventBody::Genesis { system: None, nonce, timestamp: 0, author: AuthorId::Unknown, operations }
     } else {
         EventBody::Update { nonce, timestamp: 0, author: AuthorId::Unknown, operations }
     };
     Event { entity_id: EntityId::from_bytes(entity_id_bytes), parent, body }
+}
+
+impl MemRetriever {
+    fn event(&mut self, seed: u32, parents: &[EventId]) -> EventId { self.add(event(seed, self.clock(parents))) }
 }
 
 /// A generated scenario: the populated retriever plus the two clocks to
@@ -102,7 +106,7 @@ fn linear_deep(depth: usize) -> Scenario {
     let mut root = None;
     let mut head = None;
     for i in 0..depth {
-        let id = r.add(event(i as u32, &prev));
+        let id = r.event(i as u32, &prev);
         if i == 0 {
             root = Some(id.clone());
         }
@@ -110,10 +114,10 @@ fn linear_deep(depth: usize) -> Scenario {
         head = Some(id);
     }
     Scenario {
-        retriever: r,
-        subject: Clock::from(vec![head.expect("depth >= 1")]),
-        comparison: Clock::from(vec![root.expect("depth >= 1")]),
+        subject: r.clock(&[head.expect("depth >= 1")]),
+        comparison: r.clock(&[root.expect("depth >= 1")]),
         events: depth as u64,
+        retriever: r,
     }
 }
 
@@ -131,22 +135,22 @@ fn diamond_chain(n: usize) -> Scenario {
         s
     };
 
-    let mut base = r.add(event(next(), &[]));
+    let mut base = r.event(next(), &[]);
     let mut last_a = base.clone();
     let mut last_b = base.clone();
 
     for _ in 0..n {
-        let a = r.add(event(next(), &[base.clone()]));
-        let b = r.add(event(next(), &[base.clone()]));
+        let a = r.event(next(), &[base.clone()]);
+        let b = r.event(next(), &[base.clone()]);
         last_a = a.clone();
         last_b = b.clone();
-        let join = r.add(event(next(), &[a, b]));
+        let join = r.event(next(), &[a, b]);
         base = join;
     }
 
     // Compare the two pre-join tips of the final diamond: concurrent, meeting
     // at the previous join (or the root for n == 1).
-    Scenario { retriever: r, subject: Clock::from(vec![last_a]), comparison: Clock::from(vec![last_b]), events: (1 + n * 3) as u64 }
+    Scenario { subject: r.clock(&[last_a]), comparison: r.clock(&[last_b]), events: (1 + n * 3) as u64, retriever: r }
 }
 
 /// A single root with `width` concurrent children (a wide antichain), joined
@@ -155,13 +159,13 @@ fn diamond_chain(n: usize) -> Scenario {
 /// antichain, stressing the multi-parent frontier expansion.
 fn wide_antichain(width: usize) -> Scenario {
     let mut r = MemRetriever::new();
-    let root = r.add(event(0, &[]));
+    let root = r.event(0, &[]);
     let mut children = Vec::with_capacity(width);
     for i in 0..width {
-        children.push(r.add(event(i as u32 + 1, &[root.clone()])));
+        children.push(r.event(i as u32 + 1, &[root.clone()]));
     }
-    let join = r.add(event(width as u32 + 1, &children));
-    Scenario { retriever: r, subject: Clock::from(vec![join]), comparison: Clock::from(vec![root]), events: (width + 2) as u64 }
+    let join = r.event(width as u32 + 1, &children);
+    Scenario { subject: r.clock(&[join]), comparison: r.clock(&[root]), events: (width + 2) as u64, retriever: r }
 }
 
 /// Two independent linear chains of `depth` each, sharing no root. Comparing
@@ -173,7 +177,7 @@ fn disjoint(depth: usize) -> Scenario {
         let mut prev: Vec<EventId> = vec![];
         let mut head = None;
         for i in 0..depth {
-            let id = r.add(event(base_seed + i as u32, &prev));
+            let id = r.event(base_seed + i as u32, &prev);
             prev = vec![id.clone()];
             head = Some(id);
         }
@@ -181,7 +185,7 @@ fn disjoint(depth: usize) -> Scenario {
     };
     let head_a = mk_chain(0);
     let head_b = mk_chain(1_000_000);
-    Scenario { retriever: r, subject: Clock::from(vec![head_a]), comparison: Clock::from(vec![head_b]), events: (2 * depth) as u64 }
+    Scenario { subject: r.clock(&[head_a]), comparison: r.clock(&[head_b]), events: (2 * depth) as u64, retriever: r }
 }
 
 // ============================================================================
@@ -260,7 +264,7 @@ fn bench_layers(c: &mut Criterion) {
     // tip so the partition into to_apply / already_applied is non-trivial.
     for n in [4usize, 16, 64] {
         let s = diamond_chain(n);
-        let current_head: Vec<EventId> = s.comparison.to_vec();
+        let current_head: Vec<EventId> = s.comparison.ids().cloned().collect();
         group.throughput(Throughput::Elements(s.events));
         group.bench_with_input(BenchmarkId::new("diamond_chain_drain", n), &s, |b, s| {
             b.to_async(&rt).iter(|| async {
@@ -282,33 +286,34 @@ fn bench_layers(c: &mut Criterion) {
 // Clock operations: membership, normalization, insert
 // ============================================================================
 
-/// A vector of `n` distinct event ids in reverse (worst case for a sort that
-/// normalizes), plus a mid-vector member to probe for.
-fn clock_ids(n: usize) -> Vec<EventId> { (0..n as u32).rev().map(|i| event(i, &[]).id()).collect() }
-
 fn bench_clock(c: &mut Criterion) {
     let mut group = c.benchmark_group("clock");
 
     for n in [8usize, 64, 512] {
-        let ids = clock_ids(n);
-        let sorted = Clock::from(ids.clone());
-        // A member guaranteed present: the id at the middle of the set.
-        let needle = ids[n / 2].clone();
+        let entries: Vec<_> = (0..n as u32).rev().map(|i| (1, event(i, Clock::default()).id())).collect();
+        let clock = Clock::new(entries.clone()).unwrap();
+        let needle = entries[n / 2].1.clone();
 
-        // Membership: binary search over the normalized inner vec.
-        group.bench_with_input(BenchmarkId::new("contains", n), &(&sorted, &needle), |b, (clock, needle)| {
+        group.bench_with_input(BenchmarkId::new("contains", n), &(&clock, &needle), |b, (clock, needle)| {
             b.iter(|| std::hint::black_box(clock.contains(needle)));
         });
 
-        // Normalizing construction: sort + dedup from unsorted input.
-        group.bench_with_input(BenchmarkId::new("normalize_from", n), &ids, |b, ids| {
-            b.iter_batched(|| ids.clone(), |ids| std::hint::black_box(Clock::from(ids)), criterion::BatchSize::SmallInput);
+        group.bench_with_input(BenchmarkId::new("normalize_from", n), &entries, |b, entries| {
+            b.iter_batched(
+                || entries.clone(),
+                |entries| std::hint::black_box(Clock::new(entries).unwrap()),
+                criterion::BatchSize::SmallInput,
+            );
         });
 
-        // Insert: clone-and-insert a new id into a normalized clock.
-        let extra = event(n as u32 + 1, &[]).id();
-        group.bench_with_input(BenchmarkId::new("with_event", n), &(&sorted, &extra), |b, (clock, extra)| {
-            b.iter(|| std::hint::black_box(clock.with_event((*extra).clone())));
+        // Insert: clone-and-insert a new event into a normalized clock.
+        let extra = event(n as u32 + 1, Clock::default());
+        group.bench_with_input(BenchmarkId::new("join", n), &(&clock, &extra), |b, (clock, extra)| {
+            b.iter(|| {
+                let mut clock = (*clock).clone();
+                clock.join(extra);
+                std::hint::black_box(clock)
+            });
         });
     }
 
@@ -323,11 +328,11 @@ fn bench_clock(c: &mut Criterion) {
 /// no event precedes its parent in input order: worst case for Kahn's
 /// algorithm, which must reorder the whole batch parents-first.
 fn shuffled_chain_batch(n: usize) -> Vec<Attested<Event>> {
-    let mut prev: Vec<EventId> = vec![];
+    let mut parent = Clock::default();
     let mut events = Vec::with_capacity(n);
     for i in 0..n {
-        let ev = event(i as u32, &prev);
-        prev = vec![ev.id()];
+        let ev = event(i as u32, parent);
+        parent = Clock::singleton(&ev);
         events.push(ev);
     }
     // Rotate by half so children appear before parents in the input.

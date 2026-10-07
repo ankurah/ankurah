@@ -195,9 +195,10 @@ async fn remote_creations_are_not_registered_or_published_before_storage_succeed
     let b = ModelId::EntityId(proto::EntityId::random());
     let membership = |model| proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(model))]);
     let genesis = proto::Event::genesis(node.system.root_id(), proto::AuthorId::Unknown, membership(a));
-    let update = proto::Event::update(genesis.entity_id, genesis.id().into(), proto::AuthorId::Unknown, membership(b));
+    let update = proto::Event::update(genesis.entity_id, proto::Clock::singleton(&genesis), proto::AuthorId::Unknown, membership(b));
     let other_genesis = proto::Event::genesis(node.system.root_id(), proto::AuthorId::Unknown, membership(b));
-    let other_update = proto::Event::update(other_genesis.entity_id, other_genesis.id().into(), proto::AuthorId::Unknown, membership(a));
+    let other_update =
+        proto::Event::update(other_genesis.entity_id, proto::Clock::singleton(&other_genesis), proto::AuthorId::Unknown, membership(a));
 
     let events = vec![genesis.clone().into(), other_genesis.clone().into(), update.clone().into(), other_update.clone().into()];
     let subscription = node.reactor.subscribe();
@@ -218,10 +219,10 @@ async fn remote_creations_are_not_registered_or_published_before_storage_succeed
     let changes = received.try_recv()?.items;
     let resident = changes.iter().find(|change| change.entity.id() == genesis.entity_id).unwrap().entity.clone();
     let other_resident = changes.iter().find(|change| change.entity.id() == other_genesis.entity_id).unwrap().entity.clone();
-    assert_eq!(resident.head(), update.id().into());
+    assert_eq!(resident.head(), proto::Clock::singleton(&update));
     assert_eq!(resident.memberships(), [a, b].into_iter().collect());
     assert_eq!(storage.dump_entity_events(genesis.entity_id).await?.len(), 2);
-    assert_eq!(other_resident.head(), other_update.id().into());
+    assert_eq!(other_resident.head(), proto::Clock::singleton(&other_update));
     assert_eq!(other_resident.memberships(), [a, b].into_iter().collect());
     assert_eq!(storage.dump_entity_events(other_genesis.entity_id).await?.len(), 2);
     assert_eq!(changes.len(), 2, "one change per entity, not per event");
@@ -249,8 +250,8 @@ async fn remote_commit_waits_for_the_winners_resident_publication() -> anyhow::R
     commit_transaction(&node, &DEFAULT_CONTEXT, proto::TransactionId::new(), vec![Attested::opt(genesis.clone(), None)]).await?;
     let getter = LocalEventGetter::new(storage.clone(), true);
     let entity = node.entities.get_or_retrieve(&LocalStateGetter::new(storage.clone()), &getter, &id).await?.unwrap();
-    let ours = proto::Event::update(id, genesis.id().into(), proto::AuthorId::Unknown, membership(c));
-    let other = proto::Event::update(id, genesis.id().into(), proto::AuthorId::Unknown, membership(b));
+    let ours = proto::Event::update(id, proto::Clock::singleton(&genesis), proto::AuthorId::Unknown, membership(c));
+    let other = proto::Event::update(id, proto::Clock::singleton(&genesis), proto::AuthorId::Unknown, membership(b));
     let expected_events = [other.id(), ours.id()];
     let subscription = node.reactor.subscribe();
     subscription.add_entity_subscriptions([id]);

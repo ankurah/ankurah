@@ -109,7 +109,7 @@ async fn an_edit_after_create_becomes_an_update_on_the_frozen_genesis() -> Resul
     let genesis = events.iter().find(|e| e.is_entity_create()).expect("genesis");
     let update = events.iter().find(|e| !e.is_entity_create()).expect("update");
     assert_eq!(proto::EntityId::from(genesis.id()), id);
-    assert_eq!(update.parent.as_slice(), &[genesis.id()], "the update is parented on the genesis");
+    assert_eq!(update.parent, proto::Clock::singleton(&genesis), "the update is parented on the genesis");
     update.validate_structure().expect("the update is structurally well formed");
 
     let view = ctx.get::<AlbumView>(id).await?;

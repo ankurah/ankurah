@@ -126,7 +126,7 @@ impl LocalTrxEntity {
             let operations = self.0.take_operations()?;
             if !operations.is_empty() {
                 let event = Event::update(id, data.state.head(), self.0.author.clone(), operations);
-                data.state.set_head(event.id().into());
+                data.state.set_head(Clock::singleton(&event));
                 events.push(event.into());
             }
         }
@@ -157,7 +157,7 @@ impl LocalTrxEntityInner {
                     .get_or_init(|| {
                         // Cannot fail: Yrs encoding has no error path, and LWW's bincode encoding of `Value`s cannot fail.
                         let event = Event::genesis(*system, self.author.clone(), self.take_operations().unwrap());
-                        self.data.state.set_head(event.id().into());
+                        self.data.state.set_head(Clock::singleton(&event));
                         self.data.events.lock().unwrap().push(event.clone().into());
                         event
                     })

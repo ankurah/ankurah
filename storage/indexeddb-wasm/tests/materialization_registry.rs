@@ -5,7 +5,7 @@ use ankurah::core::{
     storage::{StorageCommitOutcome, StorageEngine, StorageTransaction},
     value::Value,
 };
-use ankurah::proto::{Attested, Clock, EntityId, EntityState, EventId, ModelId, State, StateBuffers};
+use ankurah::proto::{Attested, AuthorId, Clock, EntityId, EntityState, Event, EventId, ModelId, State, StateBuffers};
 use ankurah_storage_indexeddb_wasm::IndexedDBStorageEngine;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -42,7 +42,8 @@ fn state_with_strings(entity_id: EntityId, event_byte: u8, values: &[(PropertyId
             state: State {
                 state_buffers: StateBuffers(BTreeMap::from([("lww".to_owned(), backend.to_state_buffer().unwrap())])),
                 memberships: BTreeSet::new(),
-                head: Clock::from(vec![event_id]),
+                // A synthetic first-generation state: the engine stores what it is given, and stamping is not exercised here.
+                head: Clock::genesis(event_id),
             },
         },
         None,
@@ -238,6 +239,40 @@ async fn stale_head_rolls_back_the_complete_batch() -> anyhow::Result<()> {
         engine.fetch_states(&all.clone().and_member_of(model_b)).await?.is_empty(),
         "a rejected batch must not publish associations or projections"
     );
+
+    engine.db.close().await;
+    IndexedDBStorageEngine::cleanup(&db_name).await?;
+    Ok(())
+}
+
+/// An update event stored by IndexedDB retains its complete parent annotations.
+#[wasm_bindgen_test]
+async fn a_stored_update_event_reads_back_unchanged() -> anyhow::Result<()> {
+    let db_name = format!("event_round_trip_{}", ulid::Ulid::new());
+    let engine = IndexedDBStorageEngine::open(&db_name).await?;
+    // Storage preserves the event as given; admission is the caller's responsibility.
+    let parent = Clock::genesis(EventId::from_bytes([0x92; 32]));
+    let event = Attested::opt(Event::update(entity_id(0x91), parent, AuthorId::Unknown, Default::default()), None);
+    let mut transaction = engine.transaction();
+    transaction.add_events(std::slice::from_ref(&event)).await?;
+    assert!(matches!(transaction.commit().await?, StorageCommitOutcome::Committed(_)));
+    assert_eq!(engine.get_events(vec![event.payload.id()]).await?, vec![event]);
+
+    engine.db.close().await;
+    IndexedDBStorageEngine::cleanup(&db_name).await?;
+    Ok(())
+}
+
+#[wasm_bindgen_test]
+async fn distinct_tip_generations_survive_a_write_and_a_read() -> anyhow::Result<()> {
+    let db_name = format!("generation_round_trip_{}", ulid::Ulid::new());
+    let engine = IndexedDBStorageEngine::open(&db_name).await?;
+    let mut state = state_with_strings(entity_id(0x51), 1, &[(PropertyId::EntityId(entity_id(0x52)), "value")]);
+    // Synthetic tips with distinct generations: the engine must retain each association.
+    state.payload.state.head = Clock::new(vec![(7, EventId::from_bytes([1; 32])), (2, EventId::from_bytes([2; 32]))]).unwrap();
+    commit_canonical_state(&engine, Clock::default(), state.clone()).await?;
+    let stored = engine.get_state(entity_id(0x51)).await?.payload.state;
+    assert_eq!(stored.head, state.payload.state.head);
 
     engine.db.close().await;
     IndexedDBStorageEngine::cleanup(&db_name).await?;

@@ -424,7 +424,7 @@ pub async fn assert_state_heads_resolvable<E: StorageEngine + ?Sized>(engine: &E
             Err(e) => return Err(e.into()),
         };
         let head = state.payload.state.head.clone();
-        let head_ids: Vec<EventId> = head.as_slice().to_vec();
+        let head_ids: Vec<EventId> = head.ids().cloned().collect();
         if head_ids.is_empty() {
             continue;
         }

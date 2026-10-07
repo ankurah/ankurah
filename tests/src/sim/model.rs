@@ -189,7 +189,7 @@ pub fn genesis_event(counter: u64, field: Field, value: &str) -> proto::Event {
 /// keeps them two; see [`content_nonce`].
 pub fn edit_event(entity: proto::EntityId, parent: proto::Clock, field: Field, value: &str, mint_seq: u64) -> proto::Event {
     let nonce =
-        content_nonce(mint_seq, &[entity.to_bytes().as_slice(), parent.to_base64().as_bytes(), field.name().as_bytes(), value.as_bytes()]);
+        content_nonce(mint_seq, &[entity.to_bytes().as_slice(), parent.to_string().as_bytes(), field.name().as_bytes(), value.as_bytes()]);
     proto::Event {
         entity_id: entity,
         parent,
@@ -237,7 +237,7 @@ pub fn causal_sort(mut events: Vec<Attested<proto::Event>>) -> Vec<Attested<prot
     let mut remaining_parents: HashMap<proto::EventId, HashSet<proto::EventId>> = HashMap::new();
     for e in &events {
         let id = e.payload.id();
-        let deps: HashSet<proto::EventId> = e.payload.parent.iter().filter(|p| present.contains(p)).cloned().collect();
+        let deps: HashSet<proto::EventId> = e.payload.parent.ids().filter(|p| present.contains(p)).cloned().collect();
         remaining_parents.insert(id, deps);
     }
 

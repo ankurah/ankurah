@@ -125,6 +125,19 @@ impl EntityState {
 
     pub(super) fn memberships(&self) -> BTreeSet<ModelId> { self.inner.read().unwrap().memberships.clone() }
 
+    /// Replace this state only if its head matches `expected_head`.
+    /// Fork `prepared` so its backends remain independent, then notify this state's listeners.
+    pub(super) fn replace_if_head_matches(&self, expected_head: &Clock, prepared: &EntityState) -> bool {
+        let mut state = self.inner.write().unwrap();
+        if &state.head != expected_head {
+            return false;
+        }
+        *state = prepared.inner.read().unwrap().fork();
+        drop(state);
+        self.broadcast.send(());
+        true
+    }
+
     /// Add a membership to this working state, reporting whether it is new.
     pub(super) fn add_membership(&self, model: ModelId) -> bool {
         let added = self.inner.write().unwrap().memberships.insert(model);
@@ -226,7 +239,7 @@ impl EntityState {
             if state.head.is_empty() {
                 // this is the creation event for a new entity, so we simply accept it
                 state.apply_operations_from_event(event.operations(), event.id())?;
-                state.head = event.id().into();
+                state.head = Clock::singleton(event);
                 drop(state); // Release lock before broadcast
                              // Notify Signal subscribers about the change
                 self.broadcast.send(());
@@ -248,8 +261,9 @@ impl EntityState {
 
         for attempt in 0..MAX_RETRIES {
             // Stage the event so BFS can discover it, then compare event's clock vs head
-            let subject_clock: Clock = event.id().into();
+            let subject_clock = Clock::singleton(event);
             let comparison_result = crate::event_dag::compare(getter, &subject_clock, &head, DEFAULT_BUDGET).await?;
+
             match comparison_result.relation {
                 AbstractCausalRelation::Equal => {
                     debug!("Equal - skip");
@@ -257,7 +271,7 @@ impl EntityState {
                 }
                 AbstractCausalRelation::StrictDescends { .. } => {
                     debug!("Descends - apply (attempt {})", attempt + 1);
-                    let new_head: Clock = event.id().into();
+                    let new_head = Clock::singleton(event);
                     let event_id = event.id();
                     if self.try_mutate(&mut head, |state| -> Result<(), MutationError> {
                         state.apply_operations_from_event(event.operations(), event_id.clone())?;
@@ -282,7 +296,7 @@ impl EntityState {
                     // Decompose the result to get the accumulator.
                     // The event is already in the accumulated DAG (found via staging in BFS).
                     let (_relation, accumulator) = comparison_result.into_parts();
-                    let mut layers = accumulator.into_layers(meet.clone(), head.as_slice().to_vec());
+                    let mut layers = accumulator.into_layers(meet.clone(), head.ids().cloned().collect());
 
                     let mut applied_layers: Vec<crate::event_dag::EventLayer> = Vec::new();
 
@@ -337,7 +351,7 @@ impl EntityState {
                         for parent_id in &meet {
                             state.head.remove(parent_id);
                         }
-                        state.head.insert(event.id());
+                        state.head.join(event);
                     }
                     self.broadcast.send(());
                     return Ok(true);
@@ -436,3 +450,6 @@ impl EntityState {
         Err(MutationError::TOCTOUAttemptsExhausted)
     }
 }
+
+#[cfg(test)]
+mod tests;

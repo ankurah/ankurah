@@ -70,7 +70,7 @@ fn v6_unknown_entity_item_does_not_poison_batch_or_leave_phantom() {
                     let ev_b = model::attest(model::edit_event(b, head_b, Field::Body, "b1", w.next_mint_seq()));
 
                     let unknown = w.reserve_unknown_entity();
-                    let ghost_parent = proto::Clock::from(vec![proto::EventId::from_bytes([9u8; 32])]);
+                    let ghost_parent = proto::Clock::genesis(proto::EventId::from_bytes([9u8; 32]));
                     let ev_unknown = model::attest(model::edit_event(unknown, ghost_parent, Field::Title, "ghost", w.next_mint_seq()));
 
                     // Apply the valid edits at node 0 so it and node 1 converge.
@@ -114,7 +114,7 @@ fn v4_bridge_events_arrive_child_first() {
                     // writing different fields so both writes are observable.
                     let head0 = w.head_of(e).unwrap();
                     let ev_mid = model::attest(model::edit_event(e, head0, Field::Body, "mid", w.next_mint_seq()));
-                    let mid_clock = proto::Clock::from(vec![ev_mid.payload.id()]);
+                    let mid_clock = proto::Clock::singleton(&ev_mid.payload);
                     let ev_tip = model::attest(model::edit_event(e, mid_clock, Field::Title, "tip", w.next_mint_seq()));
 
                     // Apply both at node 0 (parent-first) so it is the source of truth.

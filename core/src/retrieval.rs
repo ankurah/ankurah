@@ -248,31 +248,22 @@ mod tests {
     use ankurah_proto::{AttestationSet, Attested, Clock, EntityId, Event, EventId, OperationSet};
     use std::sync::Arc;
 
-    /// Create a test event with a deterministic content-hashed ID.
+    /// Create a test genesis with a deterministic content-hashed ID.
     ///
     /// The nonce comes from the seed rather than from entropy, so every id is
     /// reproducible across runs. A genesis derives its entity id from its own
     /// content, the way the production mint does, so the staging lifecycle runs
     /// over the only genesis shape a node can produce rather than one the
-    /// commit funnels would refuse. An update names the seed-derived id
-    /// instead, because a fixture's parents are synthetic event ids with no
-    /// genesis behind them.
-    fn make_test_event(seed: u8, parent_ids: &[EventId]) -> Event {
-        let mut entity_id_bytes = [0u8; 32];
-        entity_id_bytes[0] = seed;
+    /// commit funnels would refuse.
+    fn make_test_event(seed: u8) -> Event {
         let mut nonce = [0u8; 32];
         nonce[0] = seed;
 
-        let parent = Clock::from(parent_ids.to_vec());
         let author = ankurah_proto::AuthorId::Unknown;
         let operations = OperationSet::default();
-        let (entity_id, body) = if parent.is_empty() {
-            let entity_id = EntityId::from(EventId::from_genesis_parts(&None, &nonce, 0, &author, &operations));
-            (entity_id, ankurah_proto::EventBody::Genesis { system: None, nonce, timestamp: 0, author, operations })
-        } else {
-            (EntityId::from_bytes(entity_id_bytes), ankurah_proto::EventBody::Update { nonce, timestamp: 0, author, operations })
-        };
-        Event { entity_id, body, parent }
+        let entity_id = EntityId::from(EventId::from_genesis_parts(&None, &nonce, 0, &author, &operations));
+        let body = ankurah_proto::EventBody::Genesis { system: None, nonce, timestamp: 0, author, operations };
+        Event { entity_id, body, parent: Clock::default() }
     }
 
     // ====================================================================
@@ -289,7 +280,7 @@ mod tests {
         let collection = Arc::new(TestStorage::default());
         let getter = LocalEventGetter::new(collection, true);
 
-        let event = make_test_event(1, &[]);
+        let event = make_test_event(1);
         let event_id = event.id();
 
         // Before staging, event should not be found
@@ -316,7 +307,7 @@ mod tests {
         let collection = Arc::new(TestStorage::default());
         let getter = LocalEventGetter::new(collection, true);
 
-        let event = make_test_event(2, &[]);
+        let event = make_test_event(2);
         let event_id = event.id();
 
         // Before staging, event_stored should be false
@@ -334,7 +325,7 @@ mod tests {
     async fn event_stored_observes_storage_not_staging() {
         let storage = Arc::new(TestStorage::default());
         let getter = LocalEventGetter::new(storage.clone(), true);
-        let event = make_test_event(3, &[]);
+        let event = make_test_event(3);
         let event_id = event.id();
         getter.stage_event(event.clone());
         assert!(!getter.event_stored(&event_id).await.unwrap());

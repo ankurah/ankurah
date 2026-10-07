@@ -1,6 +1,6 @@
 use crate::{
     entity::Entity,
-    error::{MutationError, RetrievalError},
+    error::RetrievalError,
     model::{Model, View},
     reactor::ChangeNotification,
 };
@@ -24,36 +24,9 @@ impl ChangeNotification for EntityChange {
 
 // TODO consider a flattened version of EntityChange that includes the entity and Vec<(operations, parent, attestations)> rather than a Vec<Attested<Event>>
 impl EntityChange {
-    pub fn new(entity: Entity, events: Vec<Attested<Event>>) -> Result<Self, MutationError> {
-        // Every event must belong to this entity and be part of its current
-        // history: either a head tip, or the parent of a later event in the
-        // same batch (an ancestor superseded within an ordered multi-event
-        // batch, e.g. a bridge or a multi-event subscription item). Requiring
-        // head membership alone rejects legitimate parent-then-child batches
-        // after both events applied.
-        let head = entity.head();
-        for (i, event) in events.iter().enumerate() {
-            if event.payload.entity_id != entity.id() {
-                return Err(MutationError::InvalidEvent);
-            }
-            let id = event.payload.id();
-            let in_head = head.contains(&id);
-            let superseded_in_batch = events[i + 1..].iter().any(|later| later.payload.parent.contains(&id));
-            if !in_head && !superseded_in_batch {
-                return Err(MutationError::InvalidEvent);
-            }
-        }
-        Ok(Self { entity, events })
-    }
-
-    /// Record an event immediately after application, before another event can supersede its head.
-    pub(crate) fn push_event(&mut self, event: Attested<Event>) -> Result<(), MutationError> {
-        if event.payload.entity_id != self.entity.id() || !self.entity.head().contains(&event.payload.id()) {
-            return Err(MutationError::InvalidEvent);
-        }
-        self.events.push(event);
-        Ok(())
-    }
+    /// Package an accepted state change for notification.
+    /// Callers must establish that the events belong to this entity's committed history.
+    pub fn new(entity: Entity, events: Vec<Attested<Event>>) -> Self { Self { entity, events } }
 
     pub fn into_parts(self) -> (Entity, Vec<Attested<Event>>) { (self.entity, self.events) }
 }

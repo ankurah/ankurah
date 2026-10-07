@@ -49,6 +49,7 @@ use std::collections::{BTreeSet, HashMap};
 ///
 /// Takes ownership of the retriever, wrapping it in an `EventAccumulator`.
 /// Returns a `ComparisonResult` containing both the relation and the accumulated DAG.
+/// Rejects known generation contradictions in subject tips and the history read, without additional reads.
 ///
 /// Budget escalation: if the initial budget is exhausted, retries internally
 /// with up to 4x the initial budget before returning `BudgetExceeded`.
@@ -58,29 +59,33 @@ pub async fn compare<E: GetEvents>(
     comparison: &Clock,
     budget: usize,
 ) -> Result<ComparisonResult<E>, RetrievalError> {
-    // Identical clocks (including two empty ones) are equal.
-    if subject.as_slice() == comparison.as_slice() {
-        let accumulator = EventAccumulator::new(event_getter);
-        return Ok(ComparisonResult::new(AbstractCausalRelation::Equal, accumulator));
+    let mut accumulator = EventAccumulator::new(event_getter);
+    let relation = compare_ancestry(&mut accumulator, subject, comparison, budget).await?;
+    accumulator.validate_generation_claims(subject, comparison)?;
+    Ok(ComparisonResult::new(relation, accumulator))
+}
+
+async fn compare_ancestry<E: GetEvents>(
+    accumulator: &mut EventAccumulator<E>,
+    subject: &Clock,
+    comparison: &Clock,
+    budget: usize,
+) -> Result<AbstractCausalRelation<EventId>, RetrievalError> {
+    if subject.ids().eq(comparison.ids()) {
+        return Ok(AbstractCausalRelation::Equal);
     }
 
     // A clock with no history shares nothing with a non-empty one: diverged
     // with an empty meet.
-    if subject.as_slice().is_empty() || comparison.as_slice().is_empty() {
-        let accumulator = EventAccumulator::new(event_getter);
-        return Ok(ComparisonResult::new(
-            AbstractCausalRelation::DivergedSince {
-                meet: vec![],
-                subject: vec![],
-                other: vec![],
-                subject_chain: vec![],
-                other_chain: vec![],
-            },
-            accumulator,
-        ));
+    if subject.is_empty() || comparison.is_empty() {
+        return Ok(AbstractCausalRelation::DivergedSince {
+            meet: vec![],
+            subject: vec![],
+            other: vec![],
+            subject_chain: vec![],
+            other_chain: vec![],
+        });
     }
-
-    let mut accumulator = EventAccumulator::new(event_getter);
 
     // Quick check: if every subject event sits exactly one step above the
     // comparison heads (nonempty parent set, all parents within the comparison
@@ -96,20 +101,19 @@ pub async fn compare<E: GetEvents>(
     // foreign lineage) is silently vouched for by its siblings, and the BFS
     // that would detect the disjoint lineage never runs.
     {
-        let comparison_set: BTreeSet<EventId> = comparison.as_slice().iter().cloned().collect();
         let mut all_parents: BTreeSet<EventId> = BTreeSet::new();
         let mut applicable = true;
 
-        for id in subject.as_slice() {
+        for id in subject.ids() {
             match accumulator.get_event(id).await {
                 Ok(event) => {
                     accumulator.accumulate(&event);
-                    let parents = event.parent.as_slice();
-                    if parents.is_empty() || !parents.iter().all(|p| comparison_set.contains(p)) {
+                    let parents = &event.parent;
+                    if parents.is_empty() || !parents.ids().all(|p| comparison.contains(p)) {
                         applicable = false;
                         break;
                     }
-                    all_parents.extend(parents.iter().cloned());
+                    all_parents.extend(parents.ids().cloned());
                 }
                 Err(_) => {
                     applicable = false;
@@ -118,10 +122,10 @@ pub async fn compare<E: GetEvents>(
             }
         }
 
-        if applicable && comparison_set.is_subset(&all_parents) {
+        if applicable && comparison.ids().all(|id| all_parents.contains(id)) {
             // Subject's parents cover all comparison heads -> StrictDescends
-            let chain: Vec<EventId> = subject.as_slice().to_vec();
-            return Ok(ComparisonResult::new(AbstractCausalRelation::StrictDescends { chain }, accumulator));
+            let chain: Vec<EventId> = subject.ids().cloned().collect();
+            return Ok(AbstractCausalRelation::StrictDescends { chain });
         }
     }
 
@@ -130,7 +134,7 @@ pub async fn compare<E: GetEvents>(
     let mut current_budget = initial_budget;
 
     loop {
-        let mut comp = Comparison::new(&mut accumulator, subject, comparison, current_budget);
+        let mut comp = Comparison::new(accumulator, subject, comparison, current_budget);
         let relation = loop {
             if let Some(relation) = comp.step().await? {
                 break relation;
@@ -144,7 +148,7 @@ pub async fn compare<E: GetEvents>(
                 continue;
             }
             _ => {
-                return Ok(ComparisonResult::new(relation, accumulator));
+                return Ok(relation);
             }
         }
     }
@@ -210,13 +214,13 @@ impl Side {
     /// Expansion filters out parents already processed on this side: a longer
     /// path arriving later must not re-queue a finished node, which would
     /// re-spend budget and duplicate visited/chain entries.
-    fn absorb(&mut self, id: &EventId, parents: &[EventId], opposite_original: &BTreeSet<EventId>) {
+    fn absorb(&mut self, id: &EventId, parents: &Clock, opposite_original: &BTreeSet<EventId>) {
         self.visited.push(id.clone());
         if parents.is_empty() && self.root.is_none() {
             self.root = Some(id.clone());
         }
         if self.processed.insert(id.clone()) {
-            self.frontier.extend(parents.iter().filter(|p| !self.processed.contains(*p)).cloned());
+            self.frontier.extend(parents.ids().filter(|p| !self.processed.contains(*p)).cloned());
             if opposite_original.contains(id) {
                 self.opposite_heads_seen.insert(id.clone());
             }
@@ -275,8 +279,8 @@ impl<'a, E: GetEvents> Comparison<'a, E> {
     fn new(accumulator: &'a mut EventAccumulator<E>, subject: &Clock, comparison: &Clock, budget: usize) -> Self {
         Self {
             accumulator,
-            subject: Side::new(subject.as_slice().iter().cloned().collect()),
-            comparison: Side::new(comparison.as_slice().iter().cloned().collect()),
+            subject: Side::new(subject.ids().cloned().collect()),
+            comparison: Side::new(comparison.ids().cloned().collect()),
             states: HashMap::new(),
             meet_candidates: BTreeSet::new(),
             any_common: false,
@@ -310,7 +314,7 @@ impl<'a, E: GetEvents> Comparison<'a, E> {
                     // because process_event for earlier events in this loop may
                     // have added IDs to frontiers.
                     if self.subject.frontier.ids.contains(id) && self.comparison.frontier.ids.contains(id) {
-                        self.process_event(id.clone(), &[]);
+                        self.process_event(id.clone(), &Clock::default());
                         continue;
                     }
                     return Err(RetrievalError::EventNotFound(id.clone()));
@@ -319,14 +323,14 @@ impl<'a, E: GetEvents> Comparison<'a, E> {
             };
             self.accumulator.accumulate(&event);
             self.remaining_budget = self.remaining_budget.saturating_sub(1);
-            self.process_event(event.id(), event.parent.as_slice());
+            self.process_event(event.id(), &event.parent);
         }
 
         // Check if we have a result
         Ok(self.check_result())
     }
 
-    fn process_event(&mut self, id: EventId, parents: &[EventId]) {
+    fn process_event(&mut self, id: EventId, parents: &Clock) {
         let from_subject = self.subject.frontier.remove(&id);
         let from_comparison = self.comparison.frontier.remove(&id);
 
@@ -342,13 +346,13 @@ impl<'a, E: GetEvents> Comparison<'a, E> {
         // (an ancestor of shared history is not its edge).
         if is_common && self.meet_candidates.insert(id.clone()) {
             self.any_common = true;
-            for parent in parents {
+            for parent in parents.ids() {
                 self.states.entry(parent.clone()).or_insert_with(NodeState::new).common_child_count += 1;
             }
         }
 
         // Register this event as a child of each of its parents (for immediate children tracking)
-        for parent in parents {
+        for parent in parents.ids() {
             self.states.entry(parent.clone()).or_insert_with(NodeState::new).add_child(id.clone(), from_subject, from_comparison);
         }
 

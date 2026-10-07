@@ -202,9 +202,8 @@ pub enum EventBody {
     },
 }
 
-/// An event whose shape contradicts itself. Refused before any staging or
-/// storage at the seams that check it.
-#[derive(Debug, thiserror::Error, PartialEq)]
+/// Invalid event structure or a generation claim contradicted by known history.
+#[derive(Debug, Clone, thiserror::Error, PartialEq)]
 pub enum EventStructureError {
     #[error("genesis event carries a non-empty parent clock")]
     GenesisWithParent,
@@ -212,6 +211,8 @@ pub enum EventStructureError {
     UpdateWithoutParent,
     #[error("genesis id does not match the claimed entity id (event {event}, claimed {claimed})")]
     GenesisIdMismatch { event: EventId, claimed: EntityId },
+    #[error("generation mismatch for event {event}: claimed {claimed}, known {known}")]
+    GenerationMismatch { event: EventId, claimed: u32, known: u32 },
 }
 
 impl Event {
@@ -261,6 +262,15 @@ impl Event {
     pub fn author(&self) -> AuthorId {
         match &self.body {
             EventBody::Genesis { author, .. } | EventBody::Update { author, .. } => *author,
+        }
+    }
+
+    /// One above the greatest parent generation, saturating at `u32::MAX`; genesis is 1.
+    pub fn generation(&self) -> u32 {
+        if self.is_entity_create() {
+            1
+        } else {
+            self.parent.child_generation()
         }
     }
 
@@ -456,7 +466,8 @@ pub struct State {
     pub state_buffers: StateBuffers,
     /// Model-backed memberships established by this entity's causal history.
     pub memberships: BTreeSet<ModelId>,
-    /// The set of concurrent events (usually only one) which have been applied to the entity state above
+    /// The materialized head: the concurrent tips (usually one) applied to the state above, each with its
+    /// generation; empty before the genesis applies.
     pub head: Clock,
 }
 
@@ -597,7 +608,7 @@ mod tests {
         assert_eq!(EventId::from_genesis_parts(&system, &nonce, timestamp, &author, &operations), EventId::from_bytes(expected));
 
         let entity_id = EntityId::from_bytes([7u8; 32]);
-        let parent = Clock::new([EventId::from_bytes([5u8; 32])]);
+        let parent = Clock::genesis(EventId::from_bytes([5u8; 32]));
         let mut preimage = event_tag.to_vec();
         preimage.extend(bincode::serialize(&(entity_id, author, nonce, timestamp, operations.clone(), parent.clone())).unwrap());
         let expected: [u8; 32] = Sha256::digest(&preimage).into();
@@ -647,7 +658,7 @@ mod tests {
         );
 
         let entity_id = EntityId::from_bytes([7u8; 32]);
-        let parent = Clock::new([EventId::from_bytes([5u8; 32])]);
+        let parent = Clock::genesis(EventId::from_bytes([5u8; 32]));
         assert_ne!(
             EventId::from_update_parts(&entity_id, &AuthorId::Unknown, &nonce, timestamp, &operations, &parent),
             EventId::from_update_parts(&entity_id, &author, &nonce, timestamp, &operations, &parent)
@@ -678,7 +689,7 @@ mod tests {
 
         // A genesis with a parent clock.
         let mut genesis = Event::genesis(None, AuthorId::Unknown, operations());
-        genesis.parent = Clock::new([EventId::from_bytes([1u8; 32])]);
+        genesis.parent = Clock::genesis(EventId::from_bytes([1u8; 32]));
         assert_eq!(genesis.validate_structure(), Err(EventStructureError::GenesisWithParent));
 
         // An update with no parent: parent is empty if and only if genesis.
@@ -686,8 +697,36 @@ mod tests {
         assert_eq!(update.validate_structure(), Err(EventStructureError::UpdateWithoutParent));
 
         let update =
-            Event::update(EntityId::from_bytes([7u8; 32]), Clock::new([EventId::from_bytes([1u8; 32])]), AuthorId::Unknown, operations());
+            Event::update(EntityId::from_bytes([7u8; 32]), Clock::genesis(EventId::from_bytes([1u8; 32])), AuthorId::Unknown, operations());
         update.validate_structure().expect("a parented update is well formed");
+    }
+
+    #[test]
+    fn a_genesis_is_generation_one() {
+        let genesis = Event::genesis(None, AuthorId::Unknown, operations());
+        assert_eq!(genesis.generation(), 1);
+    }
+
+    #[test]
+    fn parent_annotations_are_hashed_even_when_the_maximum_does_not_change() {
+        let (a, b) = (EventId::from_bytes([1; 32]), EventId::from_bytes([2; 32]));
+        let parent = Clock::new(vec![(2, a.clone()), (7, b.clone())]).unwrap();
+        let update = Event::update(EntityId::from_bytes([7; 32]), parent, AuthorId::Unknown, operations());
+        let mut changed = update.clone();
+        changed.parent = Clock::new(vec![(3, a), (7, b)]).unwrap();
+        assert_eq!(update.generation(), 8);
+        assert_eq!(changed.generation(), 8);
+        assert_ne!(update.id(), changed.id());
+    }
+
+    #[test]
+    fn generation_is_derived_from_parents_and_saturates() {
+        let at = |generation| Clock::new(vec![(generation, EventId::from_bytes([1; 32]))]).unwrap();
+        let update = |parent| Event::update(EntityId::from_bytes([7; 32]), parent, AuthorId::Unknown, operations());
+        assert_eq!(update(at(1)).generation(), 2);
+        assert_eq!(update(Clock::new(vec![(3, EventId::from_bytes([1; 32])), (7, EventId::from_bytes([2; 32]))]).unwrap()).generation(), 8);
+        assert_eq!(update(at(u32::MAX - 1)).generation(), u32::MAX);
+        assert_eq!(update(at(u32::MAX)).generation(), u32::MAX);
     }
 }
 

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use crate::error::RetrievalError;
 use crate::event_dag::accumulator::{compute_ancestry_from_dag, is_descendant_dag, EventAccumulator};
 use crate::retrieval::GetEvents;
-use ankurah_proto::{Event, EventId};
+use ankurah_proto::{Clock, Event, EventId};
 
 /// Causal relation types for event layer comparison.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,7 +34,7 @@ pub(crate) struct EventLayers<E: GetEvents> {
     children_index: BTreeMap<EventId, Vec<EventId>>,
 
     /// Shared DAG structure reference, passed to each yielded EventLayer
-    dag: Arc<BTreeMap<EventId, Vec<EventId>>>,
+    dag: Arc<BTreeMap<EventId, Clock>>,
 
     // Iteration state
     processed: BTreeSet<EventId>,
@@ -46,7 +46,7 @@ impl<E: GetEvents> EventLayers<E> {
         // Build parent->children index from accumulated DAG: O(N)
         let mut children_index: BTreeMap<EventId, Vec<EventId>> = BTreeMap::new();
         for (id, parents) in accumulator.dag() {
-            for parent in parents {
+            for parent in parents.ids() {
                 children_index.entry(parent.clone()).or_default().push(id.clone());
             }
         }
@@ -68,7 +68,7 @@ impl<E: GetEvents> EventLayers<E> {
                 accumulator
                     .dag()
                     .get(*id)
-                    .map(|ps| ps.iter().all(|p| processed.contains(p) || !accumulator.dag().contains_key(p)))
+                    .map(|ps| ps.ids().all(|p| processed.contains(p) || !accumulator.dag().contains_key(p)))
                     .unwrap_or(true)
             })
             .cloned()
@@ -115,7 +115,7 @@ impl<E: GetEvents> EventLayers<E> {
                             .accumulator
                             .dag()
                             .get(child)
-                            .map(|ps| ps.iter().all(|p| self.processed.contains(p) || !self.accumulator.dag().contains_key(p)))
+                            .map(|ps| ps.ids().all(|p| self.processed.contains(p) || !self.accumulator.dag().contains_key(p)))
                             .unwrap_or(false);
                         if all_parents_done {
                             next_frontier.insert(child.clone());
@@ -138,7 +138,7 @@ impl<E: GetEvents> EventLayers<E> {
 
 /// A layer of concurrent events for unified backend application.
 ///
-/// Carries DAG structure (parent pointers only) rather than full event
+/// Carries DAG metadata rather than full event
 /// clones. The `compare()` method is infallible since it only traverses
 /// parent pointers, treating missing entries as dead ends.
 ///
@@ -150,13 +150,13 @@ impl<E: GetEvents> EventLayers<E> {
 pub struct EventLayer {
     pub(crate) already_applied: Vec<Event>,
     pub(crate) to_apply: Vec<Event>,
-    /// Shared DAG structure for causal comparison: event_id -> parent_ids.
-    dag: Arc<BTreeMap<EventId, Vec<EventId>>>,
+    /// Shared DAG metadata for causal comparison.
+    dag: Arc<BTreeMap<EventId, Clock>>,
 }
 
 impl EventLayer {
     /// Create a new EventLayer with the given events and DAG structure.
-    pub(crate) fn new(already_applied: Vec<Event>, to_apply: Vec<Event>, dag: Arc<BTreeMap<EventId, Vec<EventId>>>) -> Self {
+    pub(crate) fn new(already_applied: Vec<Event>, to_apply: Vec<Event>, dag: Arc<BTreeMap<EventId, Clock>>) -> Self {
         Self { already_applied, to_apply, dag }
     }
 
@@ -194,9 +194,9 @@ mod tests {
         let b = EventId::from_bytes([2; 32]);
         let c = EventId::from_bytes([3; 32]);
 
-        dag.insert(a.clone(), vec![]);
-        dag.insert(b.clone(), vec![a.clone()]);
-        dag.insert(c.clone(), vec![a.clone()]);
+        dag.insert(a.clone(), Clock::default());
+        dag.insert(b.clone(), Clock::new(vec![(1, a.clone())]).unwrap());
+        dag.insert(c.clone(), Clock::new(vec![(1, a.clone())]).unwrap());
 
         let layer = EventLayer { to_apply: vec![], already_applied: vec![], dag: Arc::new(dag) };
 
@@ -213,8 +213,8 @@ mod tests {
         let b = EventId::from_bytes([2; 32]);
         let c = EventId::from_bytes([3; 32]);
 
-        dag.insert(a.clone(), vec![]);
-        dag.insert(b.clone(), vec![a.clone()]);
+        dag.insert(a.clone(), Clock::default());
+        dag.insert(b.clone(), Clock::new(vec![(1, a.clone())]).unwrap());
 
         let layer = EventLayer { to_apply: vec![], already_applied: vec![], dag: Arc::new(dag) };
 

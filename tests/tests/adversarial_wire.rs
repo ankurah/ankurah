@@ -142,57 +142,29 @@ async fn committed_event_ids(node: &Node<SledStorageEngine, PermissiveAgent>, id
 // Malformed clocks (C4-03)
 // ===========================================================================
 
-/// C4-03: any Clock reconstructed from the wire is sorted and deduplicated
-/// before use; wire order is never trusted for the binary-search membership
-/// tests head maintenance depends on. The proto layer normalizes at the serde
-/// boundary via `#[serde(from = "Vec<EventId>")]`.
-///
-/// This pins the serde path directly: a raw `Vec<EventId>` in unsorted,
-/// duplicate-bearing order deserializes into a normalized `Clock`, and
-/// membership/removal (which binary-search) behave correctly afterward. This
-/// is the exact shape a buggy or malicious peer puts on the wire (T0/T1).
+/// Wire clocks normalize complete annotations before hashing or head maintenance.
 #[test]
 fn malformed_clock_deserialization_normalizes() {
     let id = |b: u8| proto::EventId::from_bytes([b; 32]);
-    // Unsorted with a duplicate, as a peer might serialize its head.
-    let raw = vec![id(4), id(1), id(4), id(2), id(1)];
-    let bytes = bincode::serialize(&raw).expect("serialize raw vec");
-    let clock: proto::Clock = bincode::deserialize(&bytes).expect("deserialize into Clock via serde from");
-
-    assert_eq!(clock.as_slice(), &[id(1), id(2), id(4)], "serde boundary sorts and dedups");
-    // Binary-search membership is now sound regardless of the wire order.
+    let raw = vec![(1u32, id(4)), (4, id(1)), (1, id(4)), (2, id(2)), (4, id(1))];
+    let bytes = bincode::serialize(&raw).unwrap();
+    let mut clock: proto::Clock = bincode::deserialize(&bytes).unwrap();
+    assert_eq!(clock.entries(), &[(4, id(1)), (2, id(2)), (1, id(4))]);
     assert!(clock.contains(&id(1)) && clock.contains(&id(4)));
     assert!(!clock.contains(&id(3)));
-    let mut clock = clock;
-    assert!(clock.remove(&id(2)), "removal binary-searches the correct region");
-    assert_eq!(clock.as_slice(), &[id(1), id(4)]);
+    assert!(clock.remove(&id(2)));
+    assert_eq!(clock.entries(), &[(4, id(1)), (1, id(4))]);
 }
 
-/// C4-03 (residual): the only construction paths that wrap a raw `Vec` without
-/// going through `#[serde(from = ...)]` are the postgres `FromSql` and wasm
-/// `TryFrom<JsValue>` impls, and both normalize by hand (insertion sort +
-/// dedup) before building the `Clock`. From outside the crate there is no
-/// public non-normalizing constructor: every reachable path
-/// (`Clock::new`, `Clock::from`, `Clock::from_strings`, and
-/// `TryInto<Clock> for Vec<Vec<u8>>`) normalizes. This test pins that, so a
-/// regression that added an order-trusting public constructor would fail here.
-/// Ties to threat-model C4-03's note that #274 should still make clock
-/// validation an explicit ingress check, not solely a serde attribute.
+/// Public construction and decoding normalize complete annotations before they are hashed.
 #[test]
 fn no_public_non_normalizing_clock_constructor() {
     let id = |b: u8| proto::EventId::from_bytes([b; 32]);
-    let unsorted = vec![id(3), id(1), id(2), id(1)];
-    let expected = [id(1), id(2), id(3)];
-
-    assert_eq!(proto::Clock::new(unsorted.clone()).as_slice(), &expected, "Clock::new normalizes");
-    assert_eq!(proto::Clock::from(unsorted.clone()).as_slice(), &expected, "From<Vec<EventId>> normalizes");
-
-    let strings: Vec<String> = unsorted.iter().map(|i| i.to_base64()).collect();
-    assert_eq!(proto::Clock::from_strings(strings).unwrap().as_slice(), &expected, "from_strings normalizes");
-
-    let raw_bytes: Vec<Vec<u8>> = unsorted.iter().map(|i| i.as_bytes().to_vec()).collect();
-    let via_bytes: proto::Clock = raw_bytes.try_into().unwrap();
-    assert_eq!(via_bytes.as_slice(), &expected, "TryInto<Clock> for Vec<Vec<u8>> normalizes");
+    let unsorted = vec![(1u32, id(3)), (3, id(1)), (2, id(2)), (3, id(1))];
+    let expected = [(3, id(1)), (2, id(2)), (1, id(3))];
+    assert_eq!(proto::Clock::new(unsorted.clone()).unwrap().entries(), &expected);
+    let decoded: proto::Clock = bincode::deserialize(&bincode::serialize(&unsorted).unwrap()).unwrap();
+    assert_eq!(decoded.entries(), &expected);
 }
 
 /// C4-03 end to end: because every clock is normalized before it is hashed, a
@@ -229,12 +201,12 @@ async fn malformed_clock_identity_is_order_independent_end_to_end() -> Result<()
     // re-parent a copy of it on the same two ids in the opposite order;
     // both must hash equal. The two copies share a nonce on purpose: two
     // separate mints would differ by nonce and say nothing about the clock.
-    let two_ids = vec![ev_b.id(), ev_c.id()];
+    let two_ids = vec![(ev_b.generation(), ev_b.id()), (ev_c.generation(), ev_c.id())];
     let mut reversed = two_ids.clone();
     reversed.reverse();
-    let ev_merge_a = forge_title_event(&f, rec_id, proto::Clock::from(two_ids.clone()), "merged");
+    let ev_merge_a = forge_title_event(&f, rec_id, proto::Clock::new(two_ids.clone())?, "merged");
     let mut ev_merge_b = ev_merge_a.clone();
-    ev_merge_b.parent = proto::Clock::from(reversed);
+    ev_merge_b.parent = proto::Clock::new(reversed)?;
     assert_eq!(ev_merge_a.id(), ev_merge_b.id(), "parent-clock input order must not change event identity");
 
     // Deliver the merge event; the resulting head is a single valid tip.
@@ -267,7 +239,7 @@ async fn forged_dangling_parent_is_contained() -> Result<()> {
     // created (a fabricated 32-byte hash below any real history).
     let ev_a = forge_title_event(&f, a_id, view_a.entity().head().clone(), "a1");
     let id_ev_a = ev_a.id();
-    let dangling = proto::Clock::from(vec![proto::EventId::from_bytes([0xAB; 32])]);
+    let dangling = proto::Clock::genesis(proto::EventId::from_bytes([0xAB; 32]));
     let ev_b_forged = forge_title_event(&f, b_id, dangling, "forged");
     let id_forged = ev_b_forged.id();
 
@@ -325,7 +297,7 @@ async fn forged_extra_genesis_head_does_not_trigger_wholesale_adoption() -> Resu
     let head = view.entity().head();
     // The original genesis lineage must not have been wholesale-replaced by the
     // foreign root standing alone.
-    assert_ne!(head.as_slice(), &[id_x], "foreign genesis must not be adopted as the wholesale head");
+    assert_ne!(head, proto::Clock::genesis(id_x), "foreign genesis must not be adopted as the wholesale head");
     // The legitimate child either applied (its write survives) or the item was
     // contained; in neither case may the foreign root have overwritten the
     // entity to its own value.
@@ -373,8 +345,8 @@ fn declared_cycle_is_unconstructible_content_addressing() {
     // has a concrete id. To close the cycle we would need B to have referenced
     // *that* id, but B's parent was fixed before A existed, so B.id() is fixed
     // and does not name A.
-    let b = mk("b", proto::Clock::from(vec![proto::EventId::from_bytes([0xAAu8; 32])]));
-    let a = mk("a", proto::Clock::from(vec![b.id()]));
+    let b = mk("b", proto::Clock::genesis(proto::EventId::from_bytes([0xAAu8; 32])));
+    let a = mk("a", proto::Clock::singleton(&b));
     // A names B, but B does NOT name A: no cycle among {a, b}.
     assert!(a.parent.contains(&b.id()), "A references B");
     assert!(!b.parent.contains(&a.id()), "B cannot reference A: its id was fixed before A existed");
@@ -384,7 +356,7 @@ fn declared_cycle_is_unconstructible_content_addressing() {
     // (rather than mint a fresh one, whose nonce would differ anyway) so the
     // id change is attributable to the parent alone.
     let mut b2 = b.clone();
-    b2.parent = proto::Clock::from(vec![a.id()]);
+    b2.parent = proto::Clock::singleton(&a);
     assert_ne!(b.id(), b2.id(), "adding A to B's parent changes B's content hash");
     assert!(!a.parent.contains(&b2.id()), "A's edge now dangles; the loop cannot be closed");
     // Hence no set of honest events forms a declared parent cycle. A batch that
@@ -408,8 +380,8 @@ async fn fabricated_cycle_batch_is_contained() -> Result<()> {
     // recomputed content id, so the batch graph has no edges between them.
     let fake1 = proto::EventId::from_bytes([0x11; 32]);
     let fake2 = proto::EventId::from_bytes([0x22; 32]);
-    let ev1 = forge_title_event(&f, rec_id, proto::Clock::from(vec![fake2]), "cycle-1");
-    let ev2 = forge_title_event(&f, rec_id, proto::Clock::from(vec![fake1]), "cycle-2");
+    let ev1 = forge_title_event(&f, rec_id, proto::Clock::genesis(fake2), "cycle-1");
+    let ev2 = forge_title_event(&f, rec_id, proto::Clock::genesis(fake1), "cycle-2");
     let id1 = ev1.id();
     let id2 = ev2.id();
 
@@ -519,7 +491,7 @@ async fn forged_second_genesis_rejected_on_ephemeral_node() -> Result<()> {
     assert_eq!(view.title().unwrap(), "t0", "ephemeral node must not adopt the forged genesis' value");
     let head_after = view.entity().head();
     assert!(!head_after.contains(&alt_id), "forged genesis must not enter the ephemeral head");
-    assert_eq!(head_after.as_slice(), head_before.as_slice(), "head unchanged by the rejected second genesis");
+    assert_eq!(head_after, head_before, "head unchanged by the rejected second genesis");
     assert!(!committed_event_ids(&f.client, rec_id).await?.contains(&alt_id), "forged genesis is not committed");
     Ok(())
 }
@@ -536,7 +508,7 @@ async fn phantom_entity_is_evicted_on_failed_apply() -> Result<()> {
     let ev_a = forge_title_event(&f, a_id, view_a.entity().head().clone(), "a1");
     let unknown_id = proto::EntityId::random();
     // Non-creation event (non-empty parent) for an entity the client never saw.
-    let ev_unknown = forge_title_event(&f, unknown_id, proto::Clock::from(vec![proto::EventId::from_bytes([7u8; 32])]), "ghost");
+    let ev_unknown = forge_title_event(&f, unknown_id, proto::Clock::genesis(proto::EventId::from_bytes([7u8; 32])), "ghost");
 
     f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(ev_a), event_only_item(ev_unknown)])).await?;
 
@@ -579,7 +551,7 @@ async fn oversized_event_batch_is_rejected() -> Result<()> {
     let mut events: Vec<proto::Event> = Vec::with_capacity(OVERSIZED);
     for i in 0..OVERSIZED {
         let ev = forge_title_event(&f, rec_id, parent.clone(), &format!("flood-{i}"));
-        parent = proto::Clock::from(vec![ev.id()]);
+        parent = proto::Clock::singleton(&ev);
         events.push(ev);
     }
 

@@ -37,9 +37,10 @@ entity's head when the event was created) and a set of backend-specific
 operations. An event with an empty parent clock is a **creation event**
 (genesis).
 
-**Clock** -- An ordered set of event IDs representing a frontier in the DAG. An
-entity's **head** is a clock: usually a single event ID (linear history), but
-multiple IDs when concurrent branches coexist.
+**Clock** -- A frontier of `(generation, event_id)` pairs, ordered by event id.
+An entity's **head** usually names one event in linear history and
+several tips when concurrent branches coexist. Event parents, state heads,
+peer frontiers, and storage expectations all use this same type.
 
 **Meet point** -- The greatest common ancestor(s) of two diverged clocks. The
 meet is itself a frontier: no member is an ancestor of another. Everything
@@ -60,6 +61,53 @@ topological generations for merge. See [Event Layers](#event-layers) for the
 precise definition and its guarantees, and
 [LWW merge](lww-merge.md#the-three-stage-pipeline) for how property backends
 consume the layers.
+
+
+## Generations
+
+Every event has a **generation**: its depth counted from the genesis, where
+[layers](#event-layers) count depth from a meet. A genesis is generation 1.
+An update derives its generation from its annotated parent clock:
+
+```text
+generation(update) = 1 + max(generation(parent) for each parent), saturating at u32::MAX
+```
+
+There is no separate generation field in an event body. An update's id hashes
+its complete parent clock, including every generation annotation. Copying the
+current head into an update's parents supplies everything needed to derive its
+generation without reading any events. `Clock` preserves these annotations in
+resident state, on the wire, and in every storage engine. Its equality includes
+annotations; causal comparison determines ancestry from event IDs and parent
+links.
+
+Structural validation refuses an update without parents, and clock construction
+and decoding reject zero generations or conflicting annotations for one ID.
+Applying an update first compares it with the head, then checks each parent
+annotation against independently known evidence before changing state. Evidence
+comes from parent payloads the comparison read, or from resident head tips when
+the payload was not read. Unknown parents require no additional reads; known
+parents must match exactly, even if their generation is below another parent's.
+This also checks an update naming only a subset of the head, without treating
+unrelated tips as parents. A durable node refuses a parent its comparison walk
+cannot read rather than fetching it.
+
+Every pre-commit application checks the evidence available then, including when
+rebuilding a candidate for persistence. After storage commits, publication
+copies the prepared state if the resident still has the fork's original head,
+including its annotations. If the resident advanced, ordinary event application
+reconciles with that head. The getter's fetch of missing history, which only an
+ephemeral node performs, stores what a durable peer already admitted and checks
+structure alone.
+
+An ephemeral node adopts a trusted peer's state, including the head annotations.
+Events accompanying that snapshot bypass apply. Before persistence, each must
+belong to the same entity and connect to the snapshot's head through the ordered
+carried batch. Their parent annotations are checked against resident tips, carried
+parents, and locally stored parents. This check never fetches peer history.
+Unknown annotations remain trusted; known contradictions are rejected.
+Comparison still follows parent links; generation-directed traversal is a
+separate optimization.
 
 
 ## Comparing Two Clocks

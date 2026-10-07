@@ -131,7 +131,10 @@ async fn server_edits_subscription() -> Result<()> {
     }
 
     // Client watcher doesn't get an ::Initial notification because we waited for initialization to be completed before subscribing
-    assert_eq!(client_watcher.take_one().await, vec![(rex.id(), ChangeKind::Update, rex.entity().head().to_vec())]);
+    assert_eq!(
+        client_watcher.take_one().await,
+        vec![(rex.id(), ChangeKind::Update, rex.entity().head().ids().cloned().collect::<Vec<_>>())]
+    );
     assert_eq!(client_query.ids(), vec![rex.id()]);
     assert_eq!(client_query.peek().iter().map(|r| r.age().unwrap_or_default()).collect::<Vec<String>>(), vec!["7"]);
     assert_eq!(client_query.loaded(), true);
@@ -155,7 +158,10 @@ async fn server_edits_subscription() -> Result<()> {
     }
 
     // Wait for and verify Snuffy being added (now matches age > 2 and age < 5)
-    assert_eq!(client_watcher.take_one().await, vec![(snuffy.id(), ChangeKind::Add, snuffy.entity().head().to_vec())]);
+    assert_eq!(
+        client_watcher.take_one().await,
+        vec![(snuffy.id(), ChangeKind::Add, snuffy.entity().head().ids().cloned().collect::<Vec<_>>())]
+    );
     // assert_eq!(one.into_iter().map(|(e, k, _)| (e, k)).collect::<Vec<(EntityId, ChangeKind)>>(), vec![(snuffy.id(), ChangeKind::Add)]);
 
     // Ensure no additional unexpected changes
@@ -255,7 +261,7 @@ async fn subscription_empty_events_from_noop_delta() -> Result<()> {
         rex.edit(&trx)?.age()?.overwrite(0, 1, "7")?;
         trx.commit().await?;
     }
-    assert_eq!(watcher_a.take_one().await, vec![(rex.id(), ChangeKind::Update, rex.entity().head().to_vec())]);
+    assert_eq!(watcher_a.take_one().await, vec![(rex.id(), ChangeKind::Update, rex.entity().head().ids().cloned().collect::<Vec<_>>())]);
     assert_eq!(watcher_a.quiesce().await, 0);
 
     let _ = query_b; // keep B alive through the assertions

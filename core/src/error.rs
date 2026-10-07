@@ -65,6 +65,8 @@ pub enum RetrievalError {
     MissingComponent { entity_id: EntityId, model_id: ModelId },
     #[error("Event not found: {0:?}")]
     EventNotFound(EventId),
+    #[error(transparent)]
+    EventStructure(#[from] ankurah_proto::EventStructureError),
     #[error("Storage error: {0}")]
     StorageError(Arc<dyn std::error::Error + Send + Sync + 'static>),
     #[error("Model not found: {0}")]
@@ -361,6 +363,7 @@ impl From<RetrievalError> for MutationError {
             RetrievalError::NodeNotReady => MutationError::NodeNotReady,
             RetrievalError::NodeHalted(error) => MutationError::NodeHalted(error),
             RetrievalError::AccessDenied(a) => MutationError::AccessDenied(a),
+            RetrievalError::EventStructure(error) => MutationError::EventStructure(error),
             _ => MutationError::RetrievalError(err),
         }
     }

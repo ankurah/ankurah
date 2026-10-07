@@ -270,8 +270,7 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
                 ankurah::core::schema::system_model_id(label).unwrap(),
             ))]),
         );
-        let update_id = update.id();
-        state.payload.state.head = update_id.clone().into();
+        state.payload.state.head = proto::Clock::singleton(&update);
         let mut transaction = storage.transaction();
         transaction.set_state(&known_head, &state).await?;
         transaction.add_events(&[Attested::opt(update, None)]).await?;

@@ -12,7 +12,6 @@ struct EntityRow {
     entity_key: String,
     expected_head: Clock,
     head: Clock,
-    head_json: String,
     memberships: BTreeSet<ModelId>,
     state_buffers: Vec<u8>,
     attestations: Vec<u8>,
@@ -88,7 +87,6 @@ impl StorageTransaction for SqliteTransaction<'_> {
             entity_key: entity_id.to_base64(),
             expected_head: expected_head.clone(),
             head: state.payload.state.head.clone(),
-            head_json: serde_json::to_string(&state.payload.state.head).map_err(SqliteError::from)?,
             memberships: state.payload.state.memberships.clone(),
             state_buffers: bincode::serialize(&state.payload.state.state_buffers)?,
             attestations: bincode::serialize(&state.attestations)?,
@@ -182,7 +180,7 @@ impl StorageTransaction for SqliteTransaction<'_> {
                                "head" = excluded."head",
                                "attestations" = excluded."attestations""#
                     ),
-                    rusqlite::params![&write.entity_key, &write.state_buffers, &write.head_json, &write.attestations,],
+                    rusqlite::params![&write.entity_key, &write.state_buffers, &serde_json::to_string(&write.head)?, &write.attestations,],
                 )?;
                 for projection in &write.materializations {
                     projection.write(&tx)?;

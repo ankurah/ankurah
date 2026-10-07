@@ -136,10 +136,14 @@ waits for peer confirmation. A storage retry does not relay them again.
 storage still matches the heads from which the forks were made. A conflict
 discards the attempt's application forks and repeats validation from the resident entities.
 
-**5. Publish.** After storage commits, consume each working fork to apply its
-retained events to its upstream resident entity. A creation instead transfers its
-prepared state into a newly registered resident entity. Redirect transaction views and
-emit change notifications.
+**5. Publish.** After storage commits, compare the resident's head with the head
+captured when its working fork was created. If unchanged, copy the prepared state
+under the resident's write lock, preserving its identity and broadcast, without
+another event comparison or application. If the resident advanced, reconcile the
+retained events through ordinary checked application instead. A creation transfers
+its prepared state into a newly registered resident entity. Redirect transaction
+views and emit change notifications. `EntityChange` packages the accepted events
+without revalidating their history.
 The node serializes storage commit and WeakEntitySet publication; a losing writer
 cannot retry its commit before the winner publishes. Peer waits and reactor
 notification happen outside that lock.
@@ -183,8 +187,9 @@ The private shared state implementation's `apply_event` is the central
 integration point, used by both local commit and remote delivery. Readable
 `Entity` handles do not expose it. It works in two stages: guard checks, then a retry loop.
 
-The head clock records the event IDs at the frontier of the entity's applied
-history. Comparing those heads through the [event DAG](event-dag.md) determines
+The head records the event IDs at the frontier of the entity's applied
+history, with a [generation](event-dag.md#generations) for each tip.
+Comparing those heads through the [event DAG](event-dag.md) determines
 whether an incoming event extends, duplicates, or diverges from that history.
 
 ### Guard Ordering
@@ -211,7 +216,9 @@ events and empty heads:
 After guards pass, `apply_event` enters a bounded retry loop (up to 5
 attempts). Each attempt reads the current head, runs
 [`compare()`](event-dag.md#comparing-two-clocks) against the event DAG,
-and acts on the [`causal relation`](event-dag.md#key-concepts):
+checks its parent [generation annotations](event-dag.md#generations) against
+parent payloads read by comparison or resident tip annotations, unless the event
+is already integrated, and acts on the [`causal relation`](event-dag.md#key-concepts):
 
 | Relation | Action |
 |----------|--------|

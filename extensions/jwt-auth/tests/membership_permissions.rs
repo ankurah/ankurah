@@ -79,16 +79,24 @@ async fn event_state_checks_and_late_denial_roll_back_the_transaction() -> anyho
     };
     let genesis = create("alice")?;
     let remote_id = genesis.entity_id;
-    let completion =
-        proto::Event::update(remote_id, genesis.id().into(), proto::AuthorId::Unknown, proto::OperationSet(vec![set_owner("alice")?]));
+    let completion = proto::Event::update(
+        remote_id,
+        proto::Clock::singleton(&genesis),
+        proto::AuthorId::Unknown,
+        proto::OperationSet(vec![set_owner("alice")?]),
+    );
     commit_transaction(&node, &credential("alice"), proto::TransactionId::new(), vec![genesis.into(), completion.into()]).await?;
     assert_eq!(context.get::<DocumentView>(remote_id).await?.owner()?, "alice");
     assert_eq!(storage.dump_entity_events(remote_id).await?.len(), 2);
 
     let genesis = create("bob")?;
     let denied_id = genesis.entity_id;
-    let completion =
-        proto::Event::update(denied_id, genesis.id().into(), proto::AuthorId::Unknown, proto::OperationSet(vec![set_owner("alice")?]));
+    let completion = proto::Event::update(
+        denied_id,
+        proto::Clock::singleton(&genesis),
+        proto::AuthorId::Unknown,
+        proto::OperationSet(vec![set_owner("alice")?]),
+    );
     assert!(
         commit_transaction(&node, &credential("alice"), proto::TransactionId::new(), vec![genesis.into(), completion.into()],)
             .await
@@ -100,8 +108,12 @@ async fn event_state_checks_and_late_denial_roll_back_the_transaction() -> anyho
     let allowed = create("alice")?;
     let denied = create("alice")?;
     let ids = [allowed.entity_id, denied.entity_id];
-    let outside_scope =
-        proto::Event::update(denied.entity_id, denied.id().into(), proto::AuthorId::Unknown, proto::OperationSet(vec![set_owner("bob")?]));
+    let outside_scope = proto::Event::update(
+        denied.entity_id,
+        proto::Clock::singleton(&denied),
+        proto::AuthorId::Unknown,
+        proto::OperationSet(vec![set_owner("bob")?]),
+    );
     assert!(commit_transaction(
         &node,
         &credential("alice"),

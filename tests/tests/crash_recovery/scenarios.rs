@@ -312,7 +312,7 @@ async fn child_mid_merge() -> Result<()> {
     t1.commit().await?;
 
     // Record the pre-merge head (should be {B}) so the parent can compare.
-    let pre_head = ctx.get::<AlbumView>(album).await?.entity().head().to_vec();
+    let pre_head = ctx.get::<AlbumView>(album).await?.entity().head().ids().cloned().collect::<Vec<_>>();
     for id in &pre_head {
         handoff_write("pre_head", &id.to_base64())?;
     }
@@ -354,7 +354,7 @@ async fn scenario_3_mid_merge() -> Result<()> {
     // state, so the durable head must still be the pre-merge one. This is the
     // probe result: partial-layer application never reaches storage.
     let head = persisted_head(&engine, entity_id).await?.expect("entity state must be persisted (pre-merge state survived)");
-    let head_set: std::collections::HashSet<_> = head.as_slice().iter().cloned().collect();
+    let head_set: std::collections::HashSet<_> = head.ids().cloned().collect();
     assert_eq!(
         head_set, pre_head,
         "scenario 3: persisted head after a mid-merge crash must equal the pre-merge head, never a (partial) merge result"

@@ -575,7 +575,8 @@ mod tests {
                 state: State {
                     state_buffers: StateBuffers(BTreeMap::from([("lww".to_owned(), backend.to_state_buffer().unwrap())])),
                     memberships: BTreeSet::new(),
-                    head: Clock::from(vec![event_id]),
+                    // A synthetic first-generation state: the engine stores what it is given, and stamping is not exercised here.
+                    head: Clock::genesis(event_id),
                 },
             },
             None,
@@ -677,7 +678,8 @@ mod tests {
         let snapshot = reader.transaction()?;
         let selected: String = snapshot.query_row("SELECT id FROM _ankurah_model", [], |row| row.get(0))?;
         let selected = EntityId::from_base64(&selected)?;
-        let after = state_for_models(state_with_strings(id, 2, &[(property, "after")]), [model, second_model]);
+        let mut after = state_for_models(state_with_strings(id, 2, &[(property, "after")]), [model, second_model]);
+        after.payload.state.head = Clock::new(vec![(2, EventId::from_bytes([2; 32]))]).unwrap();
         commit_canonical_state(&engine, before.payload.state.head.clone(), after.clone()).await;
 
         assert_eq!(load_states(&snapshot, &[selected])?, vec![before]);
@@ -937,7 +939,7 @@ mod tests {
             let event =
                 Event::update(old.payload.entity_id, old.payload.state.head.clone(), ankurah_proto::AuthorId::Unknown, Default::default());
             let mut state = state_with_strings(old.payload.entity_id, 3, &[(property, "after")]);
-            state.payload.state.head = event.id().into();
+            state.payload.state.head = Clock::singleton(&event);
             events.push(Attested::opt(event, None));
             writes.push((old.payload.state.head.clone(), state));
         }
@@ -977,10 +979,26 @@ mod tests {
             transaction.set_state(expected_head, state).await?;
         }
         assert!(matches!(transaction.commit().await?, StorageCommitOutcome::Committed(_)));
-        assert_eq!(engine.get_events(events.iter().map(|event| event.payload.id()).collect()).await?.len(), 2);
+        let mut stored = engine.get_events(events.iter().map(|event| event.payload.id()).collect()).await?;
+        stored.sort_by_key(|event| event.payload.id());
+        events.sort_by_key(|event| event.payload.id());
+        assert_eq!(stored, events, "the stored events read back unchanged, generation included");
         for (_, state) in writes {
             assert_eq!(engine.get_state(state.payload.entity_id).await?.payload.state, state.payload.state);
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn distinct_tip_generations_survive_a_write_and_a_read() -> anyhow::Result<()> {
+        let engine = SqliteStorageEngine::open_in_memory().await?;
+        let entity = entity_id(0x51);
+        let mut state = state_with_strings(entity, 1, &[(PropertyId::System(ankurah_proto::SystemProperty::Name), "value")]);
+        // Synthetic tips with distinct generations: the engine must retain each association.
+        state.payload.state.head = Clock::new(vec![(7, EventId::from_bytes([1; 32])), (2, EventId::from_bytes([2; 32]))]).unwrap();
+        commit_canonical_state(&engine, Clock::default(), state.clone()).await;
+        let stored = engine.get_state(entity).await?.payload.state;
+        assert_eq!(stored.head, state.payload.state.head);
         Ok(())
     }
 

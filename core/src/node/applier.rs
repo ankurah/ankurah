@@ -6,7 +6,7 @@ use crate::retrieval::{CachedEventGetter, LocalStateGetter, SuspenseEvents};
 use crate::storage::StorageTransaction;
 use crate::util::ready_chunks::ReadyChunks;
 use futures::stream::StreamExt;
-use proto::Attested;
+use proto::{Attested, EventStructureError};
 
 /// Consolidates all logic for applying remote updates to a node
 /// Handles both SubscriptionUpdateItem (streaming updates) and EntityDelta (initial Fetch/QuerySubscribed)
@@ -173,7 +173,7 @@ impl NodeApplier {
 
                 if let Some(entity) = Self::save_new_entity(node, &state.payload, &attested_events, event_getter, state_getter).await? {
                     entities.push(entity.clone());
-                    changes.push(EntityChange::new(entity, attested_events)?);
+                    changes.push(EntityChange::new(entity, attested_events));
                     return Ok(());
                 }
                 let entity = node
@@ -188,7 +188,7 @@ impl NodeApplier {
                 if changed {
                     // State applied successfully (new entity or strictly descends)
                     Self::save_state(node, &entity, candidate.to_state()?, &attested_events, event_getter).await?;
-                    changes.push(EntityChange::new(entity, attested_events)?);
+                    changes.push(EntityChange::new(entity, attested_events));
                 } else {
                     // State not applied (divergence or older) - fall back to event-by-event application
                     // This handles DivergedSince where we need to merge concurrent branches
@@ -207,6 +207,58 @@ impl NodeApplier {
             }
         }
 
+        Ok(())
+    }
+
+    /// Before adopting a snapshot, check that its events lead to its head through the ordered batch,
+    /// then check known parent generations. Missing history is never fetched from a peer for these checks.
+    async fn check_snapshot_events<SE, PA, E>(
+        node: &Node<SE, PA>,
+        snapshot: &proto::EntityState,
+        known_head: &proto::Clock,
+        events: &[Attested<proto::Event>],
+        event_getter: &E,
+    ) -> Result<(), MutationError>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+        E: SuspenseEvents + Send + Sync,
+    {
+        if events.is_empty() {
+            return Ok(());
+        }
+        for (i, event) in events.iter().enumerate() {
+            if event.payload.entity_id != snapshot.entity_id {
+                return Err(MutationError::InvalidEvent);
+            }
+            let id = event.payload.id();
+            let in_head = snapshot.state.head.contains(&id);
+            let superseded_in_batch = events[i + 1..].iter().any(|later| later.payload.parent.contains(&id));
+            if !in_head && !superseded_in_batch {
+                return Err(MutationError::InvalidEvent);
+            }
+        }
+        let mut generations: std::collections::BTreeMap<_, _> =
+            known_head.entries().iter().map(|(generation, id)| (id.clone(), *generation)).collect();
+        // Carried payloads take precedence over resident head annotations.
+        generations.extend(events.iter().map(|event| (event.payload.id(), event.payload.generation())));
+        let missing: std::collections::BTreeSet<_> =
+            events.iter().flat_map(|event| event.payload.parent.ids()).filter(|id| !generations.contains_key(*id)).cloned().collect();
+        if !missing.is_empty() {
+            for event in node.storage.get_events(missing.into_iter().collect()).await? {
+                generations.insert(event.payload.id(), event.payload.generation());
+                // Reuse these local reads if the subsequent state comparison needs the same history.
+                event_getter.stage_event(event.payload);
+            }
+        }
+        for event in events {
+            for &(claimed, ref parent) in &event.payload.parent {
+                let Some(known) = generations.get(parent).copied() else { continue };
+                if claimed != known {
+                    return Err(EventStructureError::GenerationMismatch { event: parent.clone(), claimed, known }.into());
+                }
+            }
+        }
         Ok(())
     }
 
@@ -229,6 +281,7 @@ impl NodeApplier {
         }
         // Reject undecodable snapshots before persisting them or attaching a resident.
         crate::entity::TemporaryEntity::new(state.entity_id, &state.state)?;
+        Self::check_snapshot_events(node, state, &proto::Clock::default(), events, event_getter).await?;
         let attestation = node.policy_agent.attest_state(node, state);
         let mut storage_trx = node.storage.transaction();
         storage_trx.set_state(&proto::Clock::default(), &Attested::opt(state.clone(), attestation)).await?;
@@ -256,11 +309,13 @@ impl NodeApplier {
         PA: PolicyAgent + Send + Sync + 'static,
         E: SuspenseEvents + Send + Sync,
     {
+        let state = proto::EntityState { entity_id: entity.id(), state };
+        Self::check_snapshot_events(node, &state, &entity.head(), events, event_getter).await?;
         crate::util::retry::retry_on!(MutationError::WriteConflict, {
             let candidate = RemoteTrxEntity::edit(&entity)?;
             let expected_head = candidate.head();
-            if let StateApplyResult::DivergedRequiresEvents = candidate.apply_state(event_getter, &state).await? {
-                for event_id in state.head.iter() {
+            if let StateApplyResult::DivergedRequiresEvents = candidate.apply_state(event_getter, &state.state).await? {
+                for event_id in state.state.head.ids() {
                     candidate.apply_event(event_getter, &mut Attested::from(event_getter.get_event(event_id).await?), |_| Ok(None)).await?;
                 }
             }
@@ -277,7 +332,8 @@ impl NodeApplier {
         })
     }
 
-    /// Replay only accepted events, discarding any partial mutations from a failed application.
+    /// Re-apply accepted events to a clean fork, checking them against the currently available history.
+    /// A failed application may have partially mutated the earlier candidate.
     /// Each storage retry starts with a fresh fork; publication follows successful persistence.
     async fn save_events<SE, PA, E>(
         node: &Node<SE, PA>,
@@ -399,7 +455,7 @@ impl NodeApplier {
                 node.policy_agent.validate_received_state(node, from_peer_id, &attested_state)?;
 
                 if let Some(entity) = Self::save_new_entity(node, &attested_state.payload, &[], event_getter, state_getter).await? {
-                    return Ok(Some(EntityChange::new(entity, Vec::new())?));
+                    return Ok(Some(EntityChange::new(entity, Vec::new())));
                 }
                 let entity = node
                     .entities
@@ -428,7 +484,7 @@ impl NodeApplier {
                 }
 
                 // Snapshots carry no events, so the change reports an empty events list.
-                Ok(Some(EntityChange::new(entity, Vec::new())?))
+                Ok(Some(EntityChange::new(entity, Vec::new())))
             }
 
             proto::DeltaContent::EventBridge { events } => {
@@ -455,7 +511,7 @@ impl NodeApplier {
 
                 // Bridges carry no events on the change itself; the events were applied
                 // above, so the change reports an empty events list.
-                Ok(Some(EntityChange::new(entity, Vec::new())?))
+                Ok(Some(EntityChange::new(entity, Vec::new())))
             }
 
             proto::DeltaContent::StateAndRelation { .. } => Err(MutationError::InvalidUpdate("StateAndRelation not yet implemented")),
